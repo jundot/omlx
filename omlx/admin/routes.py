@@ -845,6 +845,7 @@ class GlobalSettingsRequest(BaseModel):
     sushi_prefix_cache_entries: int | None = None
     sushi_prefix_cache_mem: str | None = None
     sushi_extra_args: str | None = None
+    sushi_ssd_budget_gb: float | None = None
 
     # UI settings
     ui_language: str | None = None
@@ -5866,6 +5867,7 @@ async def update_global_settings(
         "sushi_prefix_cache_entries",
         "sushi_prefix_cache_mem",
         "sushi_extra_args",
+        "sushi_ssd_budget_gb",
     ):
         if field_name in request.model_fields_set:
             value = getattr(request, field_name)

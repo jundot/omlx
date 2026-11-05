@@ -1006,6 +1006,8 @@ class IntegrationSettings:
     sushi_prefix_cache_entries: int | None = 1
     sushi_prefix_cache_mem: str | None = None
     sushi_extra_args: str = ""  # appended to `sushi serve`, shell-quoted
+    # --ssd-budget-gb for streamed packs; None = Sushi's own default
+    sushi_ssd_budget_gb: float | None = None
     sushi_auto_install: bool = True  # download Sushi on first use
     sushi_auto_wired_limit: bool = True  # raise iogpu.wired_limit_mb (admin dialog)
     sushi_scan_models_dir: bool = True  # list ~/.sushi/models alongside oMLX's
@@ -1052,6 +1054,7 @@ class IntegrationSettings:
             "sushi_prefix_cache_entries": self.sushi_prefix_cache_entries,
             "sushi_prefix_cache_mem": self.sushi_prefix_cache_mem,
             "sushi_extra_args": self.sushi_extra_args,
+            "sushi_ssd_budget_gb": self.sushi_ssd_budget_gb,
             "sushi_auto_install": self.sushi_auto_install,
             "sushi_auto_wired_limit": self.sushi_auto_wired_limit,
             "sushi_scan_models_dir": self.sushi_scan_models_dir,
@@ -1108,6 +1111,7 @@ class IntegrationSettings:
             sushi_prefix_cache_entries=data.get("sushi_prefix_cache_entries", 1),
             sushi_prefix_cache_mem=data.get("sushi_prefix_cache_mem") or None,
             sushi_extra_args=data.get("sushi_extra_args", "") or "",
+            sushi_ssd_budget_gb=data.get("sushi_ssd_budget_gb"),
             sushi_auto_install=data.get("sushi_auto_install", True),
             sushi_auto_wired_limit=data.get("sushi_auto_wired_limit", True),
             sushi_scan_models_dir=data.get("sushi_scan_models_dir", True),
@@ -1972,6 +1976,9 @@ class GlobalSettings:
             errors.append("splash_ssd_cache_gb must be >= 0")
         if self.integrations.sushi_kv_quant not in ("8", "4", "16", "off"):
             errors.append("sushi_kv_quant must be one of 8, 4, 16, off")
+        budget = self.integrations.sushi_ssd_budget_gb
+        if budget is not None and budget <= 0:
+            errors.append("sushi_ssd_budget_gb must be > 0")
         if self.integrations.sushi_ctx_size is not None and (
             self.integrations.sushi_ctx_size <= 0
         ):

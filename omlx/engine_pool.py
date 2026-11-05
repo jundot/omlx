@@ -61,8 +61,11 @@ from .engine.sushi import (
     find_sushi_binary,
     is_sushi_pack,
     parse_size_bytes,
+    physical_memory_bytes,
     resolve_sushi_target,
+    sushi_default_ssd_budget_gb,
     sushi_memory_estimate,
+    wired_limit_target_mb,
 )
 from .engine.tts import TTSEngine
 from .engine.vlm import OCR_MODEL_GENERATION_DEFAULTS, VLMBatchedEngine
@@ -2359,9 +2362,32 @@ class EnginePool:
             prefix_cache_disk=i.sushi_prefix_cache_disk or None,
             prefix_cache_entries=i.sushi_prefix_cache_entries,
             prefix_cache_mem=i.sushi_prefix_cache_mem or None,
+            ssd_budget_gb=i.sushi_ssd_budget_gb,
             extra_args=shlex.split(i.sushi_extra_args or ""),
             auto_install=bool(i.sushi_auto_install),
             auto_wired_limit=bool(i.sushi_auto_wired_limit),
+        )
+
+    @staticmethod
+    def _sushi_model_type(entry: EngineEntry) -> str:
+        return str((_read_config(Path(entry.model_path)) or {}).get("model_type") or "")
+
+    def _sushi_ssd_budget_gb(
+        self, entry: EngineEntry, options: SushiOptions
+    ) -> float | None:
+        """The resident budget a streamed load keeps: the setting, else the
+        one Sushi picks itself for this Mac (counting a wired limit oMLX will
+        raise before launch)."""
+        if options.ssd_budget_gb:
+            return options.ssd_budget_gb
+        from .process_memory_enforcer import get_iogpu_wired_limit_bytes
+
+        ram = physical_memory_bytes()
+        wired_mb = get_iogpu_wired_limit_bytes() // 1024**2
+        if options.auto_wired_limit:
+            wired_mb = max(wired_mb, wired_limit_target_mb(0, ram))
+        return sushi_default_ssd_budget_gb(
+            self._sushi_model_type(entry), ram, wired_mb
         )
 
     def _sushi_wanted_bytes(self, entry: EngineEntry) -> int:
@@ -2371,6 +2397,8 @@ class EnginePool:
             options.ctx_size,
             options.kv_quant,
             parse_size_bytes(options.prefix_cache_mem),
+            model_type=self._sushi_model_type(entry),
+            ssd_budget_gb=self._sushi_ssd_budget_gb(entry, options),
         )
 
     def _sushi_engine_for(self, entry: EngineEntry) -> SushiEngine:
@@ -2386,7 +2414,8 @@ class EnginePool:
                 entry.model_id,
                 f"Sushi needs about {wanted / 1024**3:.1f} GiB for "
                 f"'{entry.model_id}' (weights + KV for its context), more than "
-                "the oMLX memory limit leaves; lower sushi_ctx_size or unload "
+                "the oMLX memory limit leaves; lower sushi_ctx_size or "
+                "sushi_ssd_budget_gb, or unload "
                 "other models",
             )
         logger.info(

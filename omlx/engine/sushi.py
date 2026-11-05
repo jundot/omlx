@@ -59,7 +59,17 @@ SUSHI_INSTALL_HINT = (
 )
 
 # Architectures Sushi serves (its README / docs/*-arch.md), by config model_type.
-SUSHI_MODEL_TYPES = frozenset({"qwen4_exp", "glm5_next", "mimo_v2"})
+SUSHI_MODEL_TYPES = frozenset({"qwen4_exp", "glm5_next", "mimo_v2", "deepseek_v41"})
+# Routed-expert formats Sushi packs store and no in-process engine reads.
+SUSHI_EXPERT_FORMATS = frozenset({"exl3", "stq"})
+# The oldest Sushi that serves a pack: by architecture, then by expert format
+# (README "Model support list").
+_MIN_VERSION_BY_TYPE = {"deepseek_v41": (1, 5, 0)}
+_MIN_VERSION_BY_FORMAT = {"stq": (1, 3, 0)}
+# The launch flags tuned for Qwen packs (--kv-quant, --mtp-head-kv-quant,
+# context, prefill chunk...). Other architectures refuse some of them
+# (DeepSeek stops on --kv-quant) and get Sushi's own defaults.
+_QWEN_TUNED_TYPES = frozenset({"qwen4_exp"})
 
 # Where oMLX installs Sushi itself, and the release asset it fetches.
 SUSHI_INSTALL_DIR = Path.home() / ".omlx" / "bin" / "sushi-macos-arm64"
@@ -174,14 +184,35 @@ def find_sushi_binary(configured: str | None) -> tuple[SushiBinary | None, str]:
 # -- model compatibility ---------------------------------------------------------
 
 
+def sushi_expert_format(config: dict) -> str | None:
+    """The Sushi expert format a config declares (``exl3``, ``stq``), else None."""
+    for block in (config, config.get("text_config") or {}):
+        quant = block.get("expert_quant")
+        if isinstance(quant, dict):
+            fmt = str(quant.get("format", "")).lower()
+            if fmt in SUSHI_EXPERT_FORMATS:
+                return fmt
+    return None
+
+
 def is_sushi_pack(config: dict) -> bool:
-    """Whether a config describes a Sushi pack (EXL3 routed experts)."""
-    quant = config.get("expert_quant")
-    if isinstance(quant, dict) and str(quant.get("format", "")).lower() == "exl3":
-        return True
-    text = config.get("text_config") or {}
-    quant = text.get("expert_quant")
-    return isinstance(quant, dict) and str(quant.get("format", "")).lower() == "exl3"
+    """Whether a config describes a Sushi pack (EXL3 or STQ routed experts)."""
+    return sushi_expert_format(config) is not None
+
+
+def sushi_min_version(config: dict) -> tuple[int, int, int] | None:
+    """The oldest Sushi that serves this pack, when it needs a newer one."""
+    needs = [
+        _MIN_VERSION_BY_TYPE.get(str(config.get("model_type") or "")),
+        _MIN_VERSION_BY_FORMAT.get(sushi_expert_format(config) or ""),
+    ]
+    needs = [v for v in needs if v]
+    return max(needs) if needs else None
+
+
+def _version_tuple(version: str) -> tuple[int, int, int] | None:
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version or "")
+    return tuple(int(x) for x in match.groups()) if match else None
 
 
 def sushi_model_type(config: dict) -> str | None:
@@ -217,6 +248,16 @@ def resolve_sushi_target(
     binary, reason = find_sushi_binary(configured_binary)
     if binary is None and not (auto_install and not configured_binary):
         return None, reason
+    minimum = sushi_min_version(config)
+    if binary is not None and minimum:
+        have = _version_tuple(binary.version)
+        if have is not None and have < minimum:
+            need = ".".join(map(str, minimum))
+            return None, (
+                f"this pack needs Sushi {need} or later; {binary.path} is "
+                f"{binary.version} (update it with `sushi update` or "
+                "`brew upgrade sushi`)"
+            )
     return SushiTarget(binary, model_type, is_sushi_pack(config)), ""
 
 
@@ -330,14 +371,61 @@ def _weights_bytes(path: Path) -> int:
     return sum(f.stat().st_size for f in path.glob("*.safetensors"))
 
 
+# DeepSeek-V4.1 (docs/usage.md): a 1M-token request's state, an image encode.
+_DSV41_STATE_BYTES = int(3.7 * 1024**3)
+_DSV41_IMAGE_BYTES = int(1.6 * 1024**3)
+# Context, KV and workspace for GLM and MiMo packs, which Sushi plans itself.
+_OTHER_ARCH_RESERVE_BYTES = 8 * 1024**3
+
+
+def sushi_default_ssd_budget_gb(
+    model_type: str, ram_bytes: int, wired_limit_mb: int
+) -> int | None:
+    """The ``--ssd-budget-gb`` Sushi picks for a streamed pack by itself.
+
+    DeepSeek-V4.1 (docs/usage.md): 80 on a 96 GB Mac; 96 on 128 GB, or 108
+    once iogpu.wired_limit_mb is 120000 or more; fully resident (None) from
+    192 GB. Other packs load resident unless the flag is passed.
+    """
+    if model_type != "deepseek_v41":
+        return None
+    ram_gb = ram_bytes / 1000**3
+    if ram_gb >= 190:
+        return None
+    if ram_gb >= 125:
+        return 108 if wired_limit_mb >= 120_000 else 96
+    if ram_gb >= 94:
+        return 80
+    return 32 if ram_gb >= 47 else 17
+
+
 def sushi_memory_estimate(
     model_path: str | Path,
     ctx_size: int | None,
     kv_quant: str,
     prefix_cache_mem_bytes: int = 0,
+    model_type: str = "qwen4_exp",
+    ssd_budget_gb: float | None = None,
 ) -> int:
-    """Memory Sushi will wire for the weights and one ``ctx_size`` window."""
+    """Memory Sushi will wire for the model and one ``ctx_size`` window.
+
+    A streamed load (``ssd_budget_gb``) keeps that budget resident instead
+    of the weights: the trunk, the drafter and a cache of routed experts.
+    """
     path = Path(model_path)
+    resident = (
+        int(ssd_budget_gb * 1024**3) if ssd_budget_gb else _weights_bytes(path)
+    )
+    if model_type == "deepseek_v41":
+        return (
+            resident
+            + _DSV41_STATE_BYTES
+            + _DSV41_IMAGE_BYTES
+            + prefix_cache_mem_bytes
+            + _RUNTIME_RESERVE_BYTES
+        )
+    if model_type not in _QWEN_TUNED_TYPES:
+        return resident + _OTHER_ARCH_RESERVE_BYTES + prefix_cache_mem_bytes
     if not ctx_size:
         text = (_read_config(path) or {}).get("text_config") or {}
         ctx_size = int(text.get("max_position_embeddings") or 262_144)
@@ -347,7 +435,7 @@ def sushi_memory_estimate(
     elif kv_quant in ("16", "off"):
         per_token *= 2
     return (
-        _weights_bytes(path)
+        resident
         + per_token * int(ctx_size)
         + prefix_cache_mem_bytes
         + _RUNTIME_RESERVE_BYTES
@@ -374,6 +462,9 @@ class SushiOptions:
     prefix_cache_disk: str | None = "20GB"
     prefix_cache_entries: int | None = 1
     prefix_cache_mem: str | None = None
+    # Stream experts from SSD within this resident budget; None leaves it to
+    # Sushi (DeepSeek-V4.1 streams by default on Macs under 192 GB).
+    ssd_budget_gb: float | None = None
     extra_args: list[str] = field(default_factory=list)
     # Download Sushi on first use when no binary is found.
     auto_install: bool = True
@@ -495,7 +586,9 @@ class SushiEngine(SplashEngine):
     def max_context_tokens(self) -> int | None:
         if self._context_length:
             return self._context_length
-        return self._options.ctx_size
+        if self._target.model_type in _QWEN_TUNED_TYPES:
+            return self._options.ctx_size
+        return None
 
     @property
     def ssd_cache_dir(self) -> Path | None:
@@ -543,6 +636,13 @@ class SushiEngine(SplashEngine):
             binary, reason = inspect_sushi_binary(path, auto_detected=True)
             if binary is None:
                 raise RuntimeError(f"Sushi was downloaded but does not run: {reason}")
+        minimum = sushi_min_version(_read_config(self._path) or {})
+        have = _version_tuple(binary.version)
+        if minimum and have is not None and have < minimum:
+            raise RuntimeError(
+                f"this pack needs Sushi {'.'.join(map(str, minimum))} or later; "
+                f"{binary.path} is {binary.version}"
+            )
         self._target = SushiTarget(binary, self._target.model_type, self._target.exl3)
 
     def _ensure_wired_limit(self) -> None:
@@ -592,20 +692,22 @@ class SushiEngine(SplashEngine):
             "--no-update-check",
             "--log-file",
             "off",
-            "--kv-quant",
-            o.kv_quant,
         ]
-        command.append("--mtp" if o.mtp else "--no-mtp")
-        if o.mtp and o.mtp_head_kv_quant:
-            command.append("--mtp-head-kv-quant")
-        if o.ctx_size:
-            command += ["--ctx-size", str(o.ctx_size)]
-        if o.prefill_chunk:
-            command += ["--prefill-chunk", str(o.prefill_chunk)]
-        if o.max_tokens:
-            command += ["--max-tokens", str(o.max_tokens)]
-        if o.temperature is not None:
-            command += ["--temp", f"{o.temperature:g}"]
+        if self._target.model_type in _QWEN_TUNED_TYPES:
+            command += ["--kv-quant", o.kv_quant]
+            command.append("--mtp" if o.mtp else "--no-mtp")
+            if o.mtp and o.mtp_head_kv_quant:
+                command.append("--mtp-head-kv-quant")
+            if o.ctx_size:
+                command += ["--ctx-size", str(o.ctx_size)]
+            if o.prefill_chunk:
+                command += ["--prefill-chunk", str(o.prefill_chunk)]
+            if o.max_tokens:
+                command += ["--max-tokens", str(o.max_tokens)]
+            if o.temperature is not None:
+                command += ["--temp", f"{o.temperature:g}"]
+        if o.ssd_budget_gb:
+            command += ["--ssd-budget-gb", f"{o.ssd_budget_gb:g}"]
         if o.prefix_cache_disk:
             command += ["--prefix-cache-disk", o.prefix_cache_disk]
         if o.prefix_cache_entries:
