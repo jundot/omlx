@@ -180,11 +180,15 @@ def test_failed_canary_declines_to_a16(monkeypatch):
     assert _run(problem) is None
 
 
-def _v41_reference(x, gate, up, idx, rmap, bits, act, limit, rw, dequant=None):
+def _v41_reference(
+    x, gate, up, idx, rmap, bits, act, limit, rw, dequant=None, oai=None
+):
     """The DeepSeek V4.1 A8 contract in float32: Stage A codes times their row
     or GS64 scales, against the dequantized experts, then the clamped,
     route-weighted SwiGLU (or the plain projection when ``up`` is None).
-    ``dequant`` maps a packed operand to float weights (default: affine)."""
+    ``dequant`` maps a packed operand to float weights (default: affine).
+    ``oai`` = ``(alpha, beta, (gate scales, up scales))`` is the MiniMax
+    SwiGLU-OAI instead."""
     qa, sa, _ = quant_fast.oq_a8_quantize(x, act)
     tokens, k_dim = x.shape[0], x.shape[-1]
     scale = sa.reshape(tokens, -1, 1) if act else sa.reshape(tokens, 1, 1)
@@ -213,9 +217,14 @@ def _v41_reference(x, gate, up, idx, rmap, bits, act, limit, rw, dequant=None):
 
     if up is None:
         return project(gate)
-    g = np.minimum(project(gate), limit)
-    u = np.clip(project(up), -limit, limit)
-    return g / (1 + np.exp(-g)) * u * np.array(rw)[:, None]
+    g, u = project(gate), project(up)
+    if oai is None:
+        g, u = np.minimum(g, limit), np.clip(u, -limit, limit)
+        return g / (1 + np.exp(-g)) * u * np.array(rw)[:, None]
+    alpha, beta, (gs, us) = oai
+    g = np.minimum(g * np.array(gs)[np.array(idx)][:, None], limit)
+    u = np.clip(u * np.array(us)[np.array(idx)][:, None], -limit, limit)
+    return g / (1 + np.exp(-alpha * g)) * (u + beta)
 
 
 @needs_a8
@@ -347,6 +356,59 @@ def test_mx_formats_match_the_contract(fmt, group_scales, swiglu, bm):
         rw,
         dequant=_mx_dequantize(fmt),
     )
+    _assert_close_to_contract(out, ref)
+
+
+@needs_a8
+@pytest.mark.parametrize("bits", [2, 3])
+def test_swiglu_oai_matches_the_contract(bits):
+    """The MiniMax M3 epilogue: gate and up times their expert's scale,
+    clamped, then gate * sigmoid(alpha * gate) * (up + beta)."""
+    tokens, idx, rmap = _routes("partial_tiles", 100, TOPK, E, 3)
+    x = (mx.random.normal((tokens, 1, H), key=mx.random.key(5)) * 0.6).astype(
+        mx.bfloat16
+    )
+    w = mx.random.normal((2, E, INTER, H), key=mx.random.key(11)) * 0.05
+    gate, up = (mx.quantize(w[i].astype(mx.bfloat16), bits=bits) for i in (0, 1))
+    scales = tuple(mx.random.uniform(0.5, 2.0, (2, E), key=mx.random.key(14)))
+    out = a8.sorted_gather_qmm_a8(
+        x,
+        *gate,
+        idx,
+        rmap,
+        group_size=GROUP,
+        bits=bits,
+        up=up,
+        swiglu=True,
+        swiglu_limit=1.0,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        expert_scales=scales,
+    )
+    assert out is not None
+    oai = (1.702, 1.0, scales)
+    _assert_close_to_contract(
+        out, _v41_reference(x, gate, up, idx, rmap, bits, 0, 1.0, None, oai=oai)
+    )
+
+
+@needs_a8
+def test_mx_staging_holds_384_scale_groups():
+    """K = 12288 (the MiniMax M3 dense MLP down in MXFP8) stages 64 rows x 384
+    E8M0 scales in threadgroup memory."""
+    k_dim = 12288
+    assert k_dim // 32 == a8._STAGE_MAX_MX_GROUPS
+    tokens, idx, rmap = _routes("uniform", 40, 2, E, 3)
+    x = (mx.random.normal((tokens, 1, k_dim), key=mx.random.key(5)) * 0.6).astype(
+        mx.bfloat16
+    )
+    w = _mx_operand(a8._FMT_INT8, 11, 64, k_dim)
+    out = a8.sorted_gather_qmm_a8_mx(
+        x, *w, idx, rmap, fmt=a8._FMT_INT8, group_scales=True
+    )
+    assert out is not None
+    dequant = _mx_dequantize(a8._FMT_INT8)
+    ref = _v41_reference(x, w, None, idx, rmap, None, 1, 0.0, None, dequant=dequant)
     _assert_close_to_contract(out, ref)
 
 

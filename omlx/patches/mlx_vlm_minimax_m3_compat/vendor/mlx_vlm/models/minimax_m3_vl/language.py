@@ -13,6 +13,8 @@ from mlx_lm.models.switch_layers import (
     _scatter_unsort,
 )
 
+from omlx.patches.mlx_vlm_minimax_m3_compat import a8
+from omlx.patches.qwen35_oq_a8 import _PREPARED_ATTR as _A8_PREPARED
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 from omlx.patches.qwen35_verify_sdpa_split import row_exact_causal_sdpa
 
@@ -858,6 +860,8 @@ class MiniMaxScaledSwitchGLU(SwitchGLU):
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         y = scaled_switch_glu(self, x, indices)
+        if y is None:
+            y = a8.routed(self, x, indices)
         if y is not None:
             return y
         x = mx.expand_dims(x, (-2, -3))
@@ -951,6 +955,8 @@ def _fuse_projections(module, names) -> List[_FusedProjections]:
             rows = proj["weight"].shape[0]
             for k in keys:
                 proj[k] = buffers[k][start : start + rows]
+            # The A8 prefill cache holds the replaced arrays.
+            proj.__dict__.pop(_A8_PREPARED, None)
             start += rows
             ends.append(start)
         mx.eval([proj[k] for proj in projs for k in keys])
@@ -994,7 +1000,11 @@ def _project(module, names, x: mx.array, unfused=None) -> dict:
     for name in names:
         if name not in out:
             proj = module[name]
-            out[name] = proj(x) if unfused is None else unfused(proj, x)
+            if unfused is not None:
+                out[name] = unfused(proj, x)
+                continue
+            y = a8.dense(proj, x)
+            out[name] = proj(x) if y is None else y
     return out
 
 

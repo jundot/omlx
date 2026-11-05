@@ -1353,10 +1353,10 @@ final class ModelSettingsScreenVM {
     }
 
     var isA8PrefillModel: Bool {
-        // qwen4_exp (Qwen3.8-Flash-Next) and DeepSeek V4.1 match exactly: only
-        // those validated families have routed-expert A8, not every qwen4*.
+        // Exact matches: only these validated families have routed-expert A8.
         if isQwen4Exp || isDeepseekV41 { return true }
         let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+        if type == "minimax_m3" || type == "minimax_m3_vl" { return true }
         return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
     }
 

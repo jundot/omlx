@@ -19,6 +19,7 @@ import mlx.core as mx
 import mlx_vlm.utils as vlm_utils
 from mlx_vlm.models.base import create_attention_mask
 
+from ...patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
 from ...utils.model_loading import (
     expand_per_layer_quant_keys,
     maybe_apply_pre_load_patches,
@@ -107,6 +108,8 @@ class MiniMaxM3Adapter(StageAdapter):
         lm = model.language_model
         self.keep_first(lm, k)
         mx.eval(lm.parameters())
+        if a8_min_tokens is not None:
+            minimax_a8.tag(lm, a8_min_tokens)
         return lm
 
     def run_first(
