@@ -3,6 +3,10 @@
 
 import math
 
+# Ceiling for the "auto" SSD cache budget. Without it the budget is half of
+# free space plus existing cache, so it grows with the size of the volume.
+AUTO_SSD_CACHE_MAX_BYTES = 100 * 1024**3
+
 
 def parse_size(size_str: str) -> int:
     """
