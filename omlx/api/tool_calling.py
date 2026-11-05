@@ -4084,6 +4084,11 @@ def build_json_system_prompt(
         return None
 
     if format_type == "json_object":
+        if not tools_available:
+            return (
+                "You must respond with valid JSON only. "
+                "Do not include any explanation or text outside the JSON object."
+            )
         prompt = (
             "Your final answer must be valid JSON only. "
             "Do not include Markdown or text outside the final JSON object."
@@ -4094,14 +4099,20 @@ def build_json_system_prompt(
         name = json_schema_spec.get("name", "response")
         description = json_schema_spec.get("description", "")
 
-        prompt = f"Your final answer must be valid JSON matching the '{name}' schema."
+        if tools_available:
+            prompt = f"Your final answer must be valid JSON matching the '{name}' schema."
+        else:
+            prompt = f"You must respond with valid JSON matching the '{name}' schema."
         if description:
             prompt += f" {description}"
-        prompt += (
-            f"\n\nJSON Schema:\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
-            "For the final answer, return only the JSON value, "
-            "with no Markdown or text outside it."
-        )
+        prompt += f"\n\nJSON Schema:\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
+        if tools_available:
+            prompt += (
+                "For the final answer, return only the JSON value, "
+                "with no Markdown or text outside it."
+            )
+        else:
+            prompt += "Respond with only the JSON object, no additional text or explanation."
     else:
         return None
 

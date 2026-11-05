@@ -252,7 +252,7 @@ Run `python -m pytest -q tests/integration/test_server_endpoints.py -k structure
 
 # Structured output with tools
 
-Run `python -m pytest -q tests/test_grammar_tool_calls.py tests/integration/test_responses_tool_merge.py` for the grammar and endpoint regressions: tool calls alongside final JSON, newline token masks, parser compatibility, and schema visibility after tool results. The endpoint cases cover both OpenAI endpoints, streaming, MCP tools, native format delegation, and fallback warnings. Check model behavior separately with a representative multi-turn tool conversation.
+Run `python -m pytest -q tests/test_grammar_tool_calls.py tests/integration/test_responses_tool_merge.py` to check tool calls with final JSON, argument ordering and schema references, newline token masks, missing tool markers, and leading JSON instructions on both OpenAI endpoints.
 
 # Batched Qwen4 QSA decode and verify tests
 

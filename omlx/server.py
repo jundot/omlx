@@ -5133,9 +5133,8 @@ async def create_chat_completion(
                 tools=tools_for_template,
             )
         )
-        # A grammar masks tokens but does not show the model the output contract.
-        # Explain the final JSON format even when grammar compilation succeeds.
-        # Only failed enforcement earns a Warning response header (#1241).
+        # Tool-enabled requests need a visible final-answer contract even when
+        # grammar compilation succeeds. Preserve the existing prompt otherwise.
         # Only response formats that actually request grammar-constrained JSON
         # (json_object / json_schema) can be "unenforced"; a plain text format
         # never asked for enforcement, so it must not warn (#1241 review).
@@ -5146,16 +5145,16 @@ async def create_chat_completion(
             and _response_format_requests_grammar(response_format)
         ):
             response_format_warning = _response_format_warning_header(response_format)
-        if native_response_format is None:
+        if native_response_format is None and (
+            tools_for_template or compiled_grammar is None
+        ):
             json_instruction = _json_instruction_for_request(
                 structured_outputs=structured_outputs,
                 response_format=response_format,
                 tools=tools_for_template,
             )
             if json_instruction:
-                messages = _inject_json_instruction(
-                    messages, json_instruction, at_current_turn=not is_partial
-                )
+                messages = _inject_json_instruction(messages, json_instruction)
 
         # Resolve template defaults before preparing the prompt for reuse.
         _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
@@ -5531,20 +5530,13 @@ async def create_chat_completion(
         raise
 
 
-def _inject_json_instruction(
-    messages: list, instruction: str, *, at_current_turn: bool = False
-) -> list:
+def _inject_json_instruction(messages: list, instruction: str) -> list:
     """
     Inject JSON instruction into messages.
 
-    At the current turn, append a format reminder after the conversation and
-    tool results. Template preparation preserves it or uses its safe fallback.
-    The default leading placement also supports assistant-prefill requests.
+    If a system message exists, append to it. Otherwise, prepend a new system message.
     """
     messages = list(messages)  # Make a copy
-    if at_current_turn:
-        messages.append({"role": "system", "content": instruction})
-        return messages
 
     # Only attach to a leading system message. A mid-conversation system
     # message may be intentionally placed there to preserve prefix cache hits.
@@ -5805,17 +5797,15 @@ def _allow_reasoning_opener(tag_dict: dict) -> None:
         content["excludes"] = [x for x in content["excludes"] if x != opener]
 
 
-def _end_harmony_messages_on_stop(tag_dict: dict) -> None:
-    """Let Harmony final and tool messages end with their stop tokens.
+def _end_harmony_final_on_stop(tag_dict: dict) -> None:
+    """Let the Harmony final message end with the model's stop token.
 
-    xgrammar accepts ``<|return|>`` and ``<|call|>`` only as stop tokens,
-    never as tag end text. Leave analysis message separators in the grammar.
+    ``<|return|>`` is the gpt-oss EOS, so xgrammar accepts it only as a stop
+    token and never as tag end text. The builtin end list then leaves only
+    ``<|end|>``, after which the model opens another message.
     """
     for tag in tag_dict["format"]["tags"]:
-        if (
-            tag.get("begin") == "<|channel|>final<|message|>"
-            or tag.get("end") == "<|call|>"
-        ):
+        if tag.get("begin") == "<|channel|>final<|message|>":
             tag["end"] = ""
 
 
@@ -5829,12 +5819,7 @@ def _grammar_reasoning_parser(engine, reasoning_parser: str | None) -> str | Non
 
 
 def _compile_with_structural_tag(
-    compiler,
-    fmt: dict,
-    reasoning_parser: str,
-    chat_template_kwargs: dict | None,
-    *,
-    tools=None,
+    compiler, fmt: dict, reasoning_parser: str, chat_template_kwargs: dict | None
 ):
     """Compile a grammar wrapped in an xgrammar builtin structural tag.
 
@@ -5852,14 +5837,11 @@ def _compile_with_structural_tag(
         reasoning = _minimax_m3_reasoning_mode(ct_kwargs)
     else:
         reasoning = ct_kwargs.get("enable_thinking") is not False
-    tag_kwargs = {"tools": tools} if tools else {}
-    tag = xgr.get_builtin_structural_tag(
-        reasoning_parser, reasoning=reasoning, **tag_kwargs
-    )
+    tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
     tag_dict = tag.model_dump()
     _allow_reasoning_opener(tag_dict)
     if reasoning_parser == "harmony":
-        _end_harmony_messages_on_stop(tag_dict)
+        _end_harmony_final_on_stop(tag_dict)
     # Compiling the tag without the user grammar would leave the answer
     # unconstrained, so fail and let the caller report it.
     if not _patch_output_format(tag_dict, fmt):
@@ -6036,19 +6018,16 @@ def _compile_grammar_for_request(
         return None
 
     try:
-        # Harmony routes calls through recipient/channel headers, rather than
-        # a tool envelope inside final content. Its builtin owns both paths.
-        if tools and reasoning_parser != "harmony":
+        if tools:
             from .api.grammar import with_tool_call_alternative
 
-            fmt = with_tool_call_alternative(fmt, engine.tokenizer, tools)
+            fmt = with_tool_call_alternative(fmt, engine.tokenizer)
         if reasoning_parser:
             return _compile_with_structural_tag(
                 compiler,
                 fmt,
                 reasoning_parser,
                 chat_template_kwargs,
-                **({"tools": tools} if tools and reasoning_parser == "harmony" else {}),
             )
         return _compile_bare_grammar(compiler, fmt)
     except Exception as e:
@@ -8752,7 +8731,7 @@ async def create_response(
                         "strict": fmt.strict or False,
                     },
                 }
-                if fmt.description is not None:
+                if tools_for_template and fmt.description is not None:
                     response_format["json_schema"]["description"] = fmt.description
             if response_format:
                 from .api.openai_models import ResponseFormat
@@ -8777,7 +8756,9 @@ async def create_response(
                         reasoning_parser=reasoning_parser,
                         tools=tools_for_template,
                     )
-                if native_response_format is None:
+                if native_response_format is None and (
+                    tools_for_template or compiled_grammar is None
+                ):
                     if compiled_grammar is None:
                         # Prompt guidance is not schema enforcement. Keep the
                         # downgrade warning when compilation is unavailable.
@@ -8786,9 +8767,7 @@ async def create_response(
                         response_format=rf, tools=tools_for_template
                     )
                     if json_instruction:
-                        messages = _inject_json_instruction(
-                            messages, json_instruction, at_current_turn=True
-                        )
+                        messages = _inject_json_instruction(messages, json_instruction)
             else:
                 compiled_grammar = None
 

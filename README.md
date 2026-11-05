@@ -307,7 +307,7 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 
 Models not listed above may still work if their chat template accepts `tools` and their output uses a recognized `<tool_call>` XML format. For tool-enabled streaming, assistant text is emitted incrementally while known tool-call control markup is suppressed from visible content; structured tool calls are emitted after parsing the completed turn.
 
-When tools are combined with `response_format` or `structured_outputs`, the requested format applies to the final text answer. The model can make tool calls before that answer; `tool_choice="none"` disables them. JSON format instructions are supplied to the model alongside grammar enforcement, so clients do not need to repeat the schema in their prompt.
+When tools are combined with `response_format` or `structured_outputs`, models with declared tool-call markers can make tool calls before returning the final text answer in the requested format; `tool_choice="none"` disables them. Tool arguments retain the existing parser validation. JSON format instructions stay in the leading system message across tool turns, so clients do not need to repeat the schema in their prompt. Requests without tools and models without declared markers keep their existing prompt and grammar behavior, respectively.
 
 A bare JSON, EBNF, or regex grammar constrains the answer from the first generated token, so `thinking_budget` is ignored. Configure a compatible `reasoning_parser` to combine constrained output with a separate, budgeted reasoning phase.
 
