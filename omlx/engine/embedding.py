@@ -260,6 +260,11 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         activity is reported, the batch is length-grouped and the caller's order
         is restored before returning. The caller owns the token window; the
         returned rows are sliced to each sequence's own length.
+
+        Sequences with a NaN/Inf token vector are reported in
+        ``non_finite_items`` as request-level indices (mapped through the
+        length-grouping permutation); no vectors are returned for such a
+        request.
         """
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
@@ -283,6 +288,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             token_embeddings: List[List[List[float]]] = []
             total_tokens = 0
             dimensions = 0
+            non_finite_items: List[int] = []
 
             order = sorted(range(len(sequences)), key=lambda i: len(sequences[i]))
             ordered_sequences = [sequences[i] for i in order]
@@ -294,6 +300,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                 cap = fairness.chunk_cap()
                 size = batch_size if cap is None else max(1, min(batch_size, cap))
                 batch = ordered_sequences[index:index + size]
+                batch_start = index
                 index += len(batch)
 
                 def _embed_sync(batch=batch):
@@ -312,6 +319,17 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                             mx.clear_cache()
 
                 output = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+                if output.non_finite_items:
+                    # Map this batch's local rows back to request indices.
+                    return TokenEmbeddingOutput(
+                        token_embeddings=[],
+                        total_tokens=total_tokens + output.total_tokens,
+                        dimensions=dimensions or output.dimensions,
+                        non_finite_items=[
+                            order[batch_start + row]
+                            for row in output.non_finite_items
+                        ],
+                    )
                 token_embeddings.extend(output.token_embeddings)
                 total_tokens += output.total_tokens
                 if output.dimensions:
@@ -333,6 +351,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                 token_embeddings=token_embeddings,
                 total_tokens=total_tokens,
                 dimensions=dimensions,
+                non_finite_items=non_finite_items,
             )
             self._update_activity(
                 activity_id,
@@ -342,7 +361,6 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             return output
         finally:
             self._end_activity(activity_id)
-
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
