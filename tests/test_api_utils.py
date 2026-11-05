@@ -59,13 +59,14 @@ from omlx.api.utils import (
     uses_native_reasoning_content,
 )
 from omlx.exceptions import InvalidRequestError
-from omlx.model_settings import ModelSettings
+from omlx.model_settings import ModelSettings, merge_chat_template_request_kwargs
 
 
 class TestReasoningEffortChatTemplateKwargs:
     def test_adds_top_level_reasoning_effort(self):
         assert merge_reasoning_effort_chat_template_kwargs(None, "xhigh") == {
-            "reasoning_effort": "xhigh"
+            "reasoning_effort": "xhigh",
+            "enable_thinking": True,
         }
 
     def test_explicit_template_kwarg_wins(self):
@@ -82,8 +83,51 @@ class TestReasoningEffortChatTemplateKwargs:
     def test_numeric_effort_forwarded_unchanged(self):
         merged = merge_reasoning_effort_chat_template_kwargs(None, 0.9)
 
-        assert merged == {"reasoning_effort": 0.9}
+        assert merged == {"reasoning_effort": 0.9, "enable_thinking": True}
         assert isinstance(merged["reasoning_effort"], float)
+
+    def test_effort_off_does_not_promote_thinking(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, "off") == {
+            "reasoning_effort": "off"
+        }
+        assert merge_reasoning_effort_chat_template_kwargs(None, "None") == {
+            "reasoning_effort": "None"
+        }
+
+    def test_explicit_enable_thinking_false_wins_over_effort(self):
+        merged = merge_reasoning_effort_chat_template_kwargs(
+            {"enable_thinking": False}, "low"
+        )
+
+        assert merged == {"reasoning_effort": "low", "enable_thinking": False}
+
+    def test_effort_overrides_model_default_off(self):
+        """Regression: admin thinking-off + request effort must think again.
+
+        A request carrying an explicit reasoning effort opts into thinking
+        (OpenAI/vLLM semantics); a title-style request without effort keeps
+        the model-level default-off.
+        """
+        ms = ModelSettings(enable_thinking=False)
+
+        main = merge_chat_template_request_kwargs(
+            ms, merge_reasoning_effort_chat_template_kwargs(None, "low")
+        )
+        title = merge_chat_template_request_kwargs(
+            ms, merge_reasoning_effort_chat_template_kwargs(None, None)
+        )
+
+        assert main["enable_thinking"] is True
+        assert title["enable_thinking"] is False
+
+    def test_forced_lock_beats_request_effort(self):
+        ms = ModelSettings(enable_thinking=False, forced_ct_kwargs=["enable_thinking"])
+
+        merged = merge_chat_template_request_kwargs(
+            ms, merge_reasoning_effort_chat_template_kwargs(None, "low")
+        )
+
+        assert merged["enable_thinking"] is False
 
 
 class TestCleanOutputText:
