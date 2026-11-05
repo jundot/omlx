@@ -23,7 +23,7 @@ from ..base import (
 )
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
-from . import decode_kernels
+from . import decode_kernels, msa_nax
 from .moe_rows import scaled_switch_glu
 from .msa import (
     build_grouped_msa_topk,
@@ -1199,6 +1199,11 @@ class MiniMaxAttention(nn.Module):
                 else None
             ),
         )[0]
+        out = msa_nax.sparse_attention(
+            queries, keys, values, q2k, q_start=q_start, scale=self.scale
+        )
+        if out is not None:
+            return out.transpose(0, 2, 1, 3)
         q = queries[0].transpose(1, 0, 2)
         k = keys[0].transpose(1, 0, 2)
         v = values[0].transpose(1, 0, 2)
