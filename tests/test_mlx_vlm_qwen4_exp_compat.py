@@ -2378,3 +2378,77 @@ def test_ple_depthwise_conv_validation_mismatch_disables_kernel(_depthwise_conv_
     assert mx.array_equal(out, conv(x)).item()
     assert language._DEPTHWISE_CONV_STATE["enabled"] is False
     assert language._DEPTHWISE_CONV_STATE["validated"] is False
+
+
+def test_hadamard_hc_wrapper_handles_the_mixer_two_tuple(monkeypatch):
+    """The no-inject write path returns (mixed[hidden], hyper[hc*hidden]); the
+    wrapper must rotate each with its own width."""
+    from omlx.patches import qwen4_hadamard as qh
+
+    monkeypatch.setattr(qh, "_ACTIVE", qh.HadamardSpec(block=8, signs_seed=1234))
+    qh.apply_qwen4_hadamard()
+
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    config = _tiny_config()
+    model = LanguageModel(config.text_config, config)
+    mixer = model.model.hyper_connection_mixer
+    assert mixer._qh_rot is not None and mixer._qh_rot_mixed is not None
+    assert model.model._omlx_hadamard_capture_rots is not None
+
+    hc, hidden = model.model.args.hc_count, model.model.args.hidden_size
+    hyper = mx.random.normal((1, 3, hc * hidden)).astype(mx.bfloat16)
+    branch = mx.random.normal((1, 3, hidden)).astype(mx.bfloat16)
+    gate = mx.ones((1, 3, hc)).astype(mx.bfloat16)
+    mixed, written = mixer(hyper, write=(branch, gate))
+    mx.eval(mixed, written)
+    assert mixed.shape == (1, 3, hidden)
+    assert written.shape == (1, 3, hc * hidden)
+
+
+def test_hadamard_rotation_keeps_the_input_dtype(monkeypatch):
+    from omlx.patches import qwen4_hadamard as qh
+
+    spec = qh.HadamardSpec(block=8, signs_seed=1234)
+    rots = qh.build_rotations(32, spec)
+    for dtype in (mx.bfloat16, mx.float16):
+        x = mx.random.normal((1, 3, 32)).astype(dtype)
+        assert qh.apply_rotation(x, rots).dtype == dtype
+
+
+def test_hadamard_ple_layer_runs_in_the_unrotated_basis(monkeypatch):
+    """Rotating the residual around the PLE layer must equal rotating its
+    plain-basis output: the conv/norm sub-path stays unrotated."""
+    from mlx_vlm.models.cache import ArraysCache
+    from omlx.patches import qwen4_hadamard as qh
+
+    spec = qh.HadamardSpec(block=8, signs_seed=1234)
+    monkeypatch.setattr(qh, "_ACTIVE", spec)
+    mx.random.seed(0)
+    config = _tiny_config()
+    layer = qwen4_language.Qwen4ExpPLELayer(
+        config.text_config, layer_idx=0, ple_layer_index=0
+    )
+    assert layer._qh_rot is not None
+    hc, hidden = config.text_config.hc_count, config.text_config.hidden_size
+    rots = layer._qh_rot
+    hidden_states = mx.random.normal((1, 4, hc * hidden)).astype(mx.float32)
+    input_ids = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
+
+    def run(h):
+        cache = ArraysCache(size=4)
+        out = layer(h, input_ids, cache, None)
+        mx.eval(out)
+        return out
+
+    saved = layer._qh_rot
+    layer._qh_rot = None
+    try:
+        plain = run(hidden_states)
+    finally:
+        layer._qh_rot = saved
+    rotated = run(qh.apply_rotation(hidden_states, rots))
+    expected = qh.apply_rotation(plain, rots)
+    assert rotated.shape == plain.shape
+    assert rotated.dtype == plain.dtype
+    assert mx.allclose(rotated, expected, atol=2e-4).item()
