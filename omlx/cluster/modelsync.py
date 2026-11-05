@@ -38,6 +38,7 @@ from .deployment import validate_ssh_target
 from .ssh_policy import cluster_ssh_options
 from .staging import (
     index_shards,
+    is_safe_relative_shard_path,
     model_identity_digest,
     shards_for_stage,
     sidecar_files,
@@ -188,8 +189,27 @@ def build_manifest(
         if index_path.is_file()
         else None
     )
+    # Index-declared weights may live in a model-root subdirectory
+    # (``optiq/…``); peer comparison must see the same set staging copies.
+    if index_path.is_file():
+        weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+        if isinstance(weight_map, dict):
+            declared = {
+                str(filename)
+                for filename in weight_map.values()
+                if is_safe_relative_shard_path(str(filename))
+                and Path(str(filename)).name != str(filename)
+            }
+            for filename in sorted(declared):
+                path = root / filename
+                if path.is_file() and path not in weights:
+                    weights.append(path)
+    weights.sort(key=lambda path: path.relative_to(root).as_posix())
     files = [
-        ManifestFile(name=path.name, size_bytes=path.stat().st_size) for path in weights
+        ManifestFile(
+            name=path.relative_to(root).as_posix(), size_bytes=path.stat().st_size
+        )
+        for path in weights
     ]
     for name in sidecar_files(root):
         path = root / name
