@@ -25,6 +25,7 @@ The processor supports two usage modes:
 """
 
 import logging
+import os
 from typing import List, Optional
 
 import mlx.core as mx
@@ -32,9 +33,75 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Budget for xgrammar's compiled-grammar LRU cache (#4321).
+#
+# ``GrammarCompiler`` was created with ``cache_limit_bytes=-1`` — xgrammar's
+# unbounded default — at every oMLX call site, so each JSON schema the server
+# had not seen before pinned its compiled grammar for as long as the engine
+# stayed loaded (~0.45 GB per unseen schema on a ~262k-token vocabulary).
+# Many distinct schemas drove the process footprint into the prefill memory
+# guard, which then rejected otherwise small requests with HTTP 400
+# ``prefill_memory_exceeded``; the retained bytes are not MLX memory, so the
+# enforcer's eviction cannot reclaim them.
+#
+# 1 GiB is a starting point for review rather than a derived number: it keeps
+# a couple of dozen schemas hot on the vocabulary the issue measured while
+# leaving the guard's headroom intact. 512 MiB-2 GiB are all defensible.
+DEFAULT_GRAMMAR_CACHE_MAX_BYTES = 1 * 1024**3
 
-def create_grammar_compiler(tokenizer, model, *, cache_limit_bytes=-1):
+# k2_horizon has compiled its tool-name grammar with a 64 MiB cap since
+# before this default existed; keep the cap and the behaviour that came with
+# it, and do not let the setting below widen it.
+K2_HORIZON_GRAMMAR_CACHE_MAX_BYTES = 64 * 1024**2
+
+# Same grammar as the cache size settings ("512MB", "2GB"), a bare byte
+# count, ``0`` to disable caching, or ``-1`` for the unbounded pre-#4321
+# behaviour.
+_ENV_GRAMMAR_CACHE_MAX_SIZE = "OMLX_GRAMMAR_CACHE_MAX_SIZE"
+
+
+def grammar_cache_limit_bytes(model_type: str | None = None) -> int:
+    """Compiled-grammar cache budget in bytes for an engine.
+
+    Every engine passes this to :func:`create_grammar_compiler` so the bound
+    covers all engine entry points (``batched.py`` and ``vlm.py``), not just
+    the k2_horizon branch that already passed one.
+
+    ``OMLX_GRAMMAR_CACHE_MAX_SIZE`` overrides the default.  An unset or
+    unparsable value falls back to :data:`DEFAULT_GRAMMAR_CACHE_MAX_BYTES`:
+    the point of the bound is that a typo cannot lose it.
+    """
+    if model_type == "k2_horizon":
+        return K2_HORIZON_GRAMMAR_CACHE_MAX_BYTES
+    raw = os.environ.get(_ENV_GRAMMAR_CACHE_MAX_SIZE)
+    if raw is None or not raw.strip():
+        return DEFAULT_GRAMMAR_CACHE_MAX_BYTES
+    try:
+        from ..config import parse_size
+
+        value = parse_size(raw)
+    except ValueError:
+        value = None
+    if value is None or value < -1:
+        logger.warning(
+            "Ignoring unusable %s=%r; using the %d byte default",
+            _ENV_GRAMMAR_CACHE_MAX_SIZE,
+            raw,
+            DEFAULT_GRAMMAR_CACHE_MAX_BYTES,
+        )
+        return DEFAULT_GRAMMAR_CACHE_MAX_BYTES
+    return value
+
+
+def create_grammar_compiler(
+    tokenizer, model, *, cache_limit_bytes=DEFAULT_GRAMMAR_CACHE_MAX_BYTES
+):
     """Create an xgrammar GrammarCompiler for the given tokenizer and model.
+
+    ``cache_limit_bytes`` defaults to the bounded budget (:data:`DEFAULT_GRAMMAR_CACHE_MAX_BYTES`).
+    The engines pass :func:`grammar_cache_limit_bytes` instead, so the
+    environment override and the k2_horizon cap reach this call; ``-1`` is
+    still the explicit opt-in for the unbounded pre-#4321 behaviour.
 
     Returns None if vocab_size cannot be determined.
     """
