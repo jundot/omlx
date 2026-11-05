@@ -1988,6 +1988,81 @@ class TestNativeQwen2Embedding:
 
         assert isinstance(model.model, Qwen2EmbeddingModel)
 
+    def test_load_native_qwen2_model_bare_checkpoint(self, tmp_path):
+        """A ``Qwen2Model`` export with bare keys loads through the native adapter.
+
+        nomic-ai/nomic-embed-code declares ``architectures=["Qwen2Model"]`` and
+        ships transformer weights without the ``model.`` prefix. Without a
+        native route it falls back to mlx-embeddings, which has no qwen2 module.
+        """
+        from mlx.utils import tree_flatten
+        from omlx.models.embedding import MLXEmbeddingModel
+        from omlx.models.qwen2_embedding import Model, ModelArgs
+        from safetensors.numpy import save_file
+
+        config = {**self._CONFIG, "architectures": ["Qwen2Model"]}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        weights = {
+            name.removeprefix("model."): np.array(value)
+            for name, value in tree_flatten(Model(ModelArgs(**config)).parameters())
+        }
+        save_file(weights, str(tmp_path / "model.safetensors"))
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        tokenizer = self.MockQwen2Tokenizer(vocab_size=config["vocab_size"])
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=tokenizer,
+        ):
+            model.load()
+
+        assert model._using_native is True
+        assert isinstance(model.model, Model)
+        output = model.embed(["def add(a, b): return a + b"])
+        assert len(output.embeddings[0]) == config["hidden_size"]
+
+    def test_qwen2_model_custom_code_without_direction_skips_native(self, tmp_path):
+        """A ``Qwen2Model`` with ``auto_map`` but no ``is_causal`` is not run natively.
+
+        Custom modeling code such as infly/inf-retriever-v1 runs the decoder
+        bidirectionally without declaring it, so the causal default would
+        silently produce wrong vectors.
+        """
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        config = {
+            **self._CONFIG,
+            "architectures": ["Qwen2Model"],
+            "auto_map": {"AutoModel": "modeling_qwen.Qwen2Model"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        self._write_full_qwen2_checkpoint(tmp_path, self._CONFIG)
+
+        assert MLXEmbeddingModel(str(tmp_path))._load_native() is False
+
+    def test_qwen2_model_custom_code_with_direction_loads_native(self, tmp_path):
+        """A ``Qwen2Model`` with ``auto_map`` and ``is_causal`` loads natively."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        config = {
+            **self._CONFIG,
+            "architectures": ["Qwen2Model"],
+            "auto_map": {"AutoModel": "modeling_qwen.Qwen2Model"},
+            "is_causal": False,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        self._write_full_qwen2_checkpoint(tmp_path, self._CONFIG)
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        tokenizer = self.MockQwen2Tokenizer(vocab_size=config["vocab_size"])
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=tokenizer,
+        ):
+            model.load()
+        assert model._using_native is True
+        assert model.model.config.is_causal is False
+
     def test_qwen2_embed_shape_and_normalized(self, tmp_path):
         """embed() returns one L2-normalized vector per input at the model dim."""
         model = self._load(tmp_path)
