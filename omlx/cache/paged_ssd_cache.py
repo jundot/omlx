@@ -31,6 +31,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -1335,7 +1336,11 @@ class PagedSSDCacheIndex:
         """
         with self._lock:
             result = []
-            for block_hash in list(self._lru.keys())[:count]:
+            # Victim selection asks for one entry per eviction. Do not copy
+            # the entire index while holding its lock for that bounded peek.
+            # Keep the old list-slice bounds, including oversized counts.
+            stop = slice(None, count).indices(len(self._lru))[1]
+            for block_hash in islice(self._lru, stop):
                 if block_hash in self._index:
                     result.append(self._index[block_hash])
             return result
@@ -1531,7 +1536,8 @@ class GDNCheckpointIndex:
     def get_lru_entries(self, count: int) -> list[GDNCheckpointMetadata]:
         with self._lock:
             result = []
-            for key in list(self._lru)[:count]:
+            stop = slice(None, count).indices(len(self._lru))[1]
+            for key in islice(self._lru, stop):
                 metadata = self._index.get(key)
                 if metadata is not None:
                     result.append(metadata)
