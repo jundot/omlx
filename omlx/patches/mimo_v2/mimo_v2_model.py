@@ -599,8 +599,20 @@ class Model(nn.Module):
         if hasattr(self.model, "mtp") and self.args.omlx_mtp_sidecar:
             weights = {**weights, **mx.load(self.args.omlx_mtp_sidecar)}
 
+        # mlx-vlm-layout conversions (e.g. nativ-community MLX quants) nest
+        # the text weights under ``language_model.`` beside the vision and
+        # audio towers. The per-layer quant overrides are already mirrored
+        # without the prefix by expand_per_layer_quant_keys.
+        text_prefix = "language_model."
+        if any(k.startswith(text_prefix) for k in weights):
+            weights = {
+                (k[len(text_prefix) :] if k.startswith(text_prefix) else k): v
+                for k, v in weights.items()
+            }
+
         skip_prefixes = (
             "visual.",
+            "vision_tower.",
             "audio_encoder.",
             "speech_embeddings.",
         )
