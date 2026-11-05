@@ -1343,8 +1343,17 @@ class EnginePool:
         # metadata on every module it classifies. None of that can be undone
         # in place, so a change here has to land on a fresh engine.
         # Without INT8 tensor units here, A8 only reaches a Prefill Accelerator
-        # Mac's layers, which follow it without reloading this model.
-        oq_a8_active = a8_prefill_on(data) and quant_fast.oq_a8_available()
+        # Mac's layers, which follow it without reloading this model. DeepSeek
+        # V4.1 tensor-parallel ranks load A8 by their own hardware, so it reloads.
+        deployment = (
+            self._distributed_deployment_for_entry(entry) if entry is not None else None
+        )
+        rank_a8 = (
+            deployment is not None
+            and deployment.tensor_parallel_size > 1
+            and entry.config_model_type == "deepseek_v41"
+        )
+        oq_a8_active = a8_prefill_on(data) and (quant_fast.oq_a8_available() or rank_a8)
         add("a8_prefill_enabled", oq_a8_active)
         if oq_a8_active:
             add("a8_prefill_min_tokens", data.get("a8_prefill_min_tokens", 128))
@@ -4260,6 +4269,7 @@ class EnginePool:
                         ),
                         model_settings=model_settings,
                         vision_checkpoint=entry.model_type == "vlm",
+                        config_model_type=entry.config_model_type,
                     )
                     logger.info(
                         "Distributed inference enabled for %s: ranks=%d "

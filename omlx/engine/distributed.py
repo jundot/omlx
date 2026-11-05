@@ -34,6 +34,7 @@ from ..cluster.liveness import (
     read_marker,
 )
 from ..exceptions import InvalidRequestError
+from ..model_settings import a8_prefill_on, ced_prefill_on
 from ..patches.deepseek_v41.processing import (
     install_tokenizer_protocol as install_deepseek_v41_tokenizer_protocol,
 )
@@ -171,6 +172,30 @@ def _with_model_mtp(
     )
 
 
+def _with_model_prefill(
+    deployment: ClusterDeployment,
+    model_settings: Any | None,
+    model_type: str | None,
+) -> ClusterDeployment:
+    """The deployment with the model's CED and A8 prefill settings applied.
+
+    Only DeepSeek V4.1 tensor-parallel ranks read them.
+    """
+
+    if model_type != "deepseek_v41" or deployment.tensor_parallel_size < 2:
+        return deployment
+    a8 = a8_prefill_on(model_settings)
+    # Model settings check the threshold only while A8 is on.
+    min_tokens = getattr(model_settings, "a8_prefill_min_tokens", None) if a8 else None
+    execution = replace(
+        deployment.execution,
+        ced_prefill=ced_prefill_on(model_settings),
+        a8_prefill=a8,
+        a8_prefill_min_tokens=int(min_tokens or 128),
+    )
+    return replace(deployment, execution=execution)
+
+
 class DistributedInferenceError(RuntimeError):
     """A bounded error surfaced when the private rank-zero backend fails."""
 
@@ -226,6 +251,7 @@ class DistributedBatchedEngine(BatchedEngine):
         abort_drain_timeout: float = 15.0,
         orphan_reap_grace: float = 5.0,
         vision_checkpoint: bool = False,
+        config_model_type: str | None = None,
     ) -> None:
         if request_read_timeout is None:
             raw = os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "300.0")
@@ -244,6 +270,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if abort_drain_timeout < 0 or orphan_reap_grace < 0:
             raise ValueError("distributed abort timeouts must be non-negative")
         deployment = _with_model_mtp(deployment, model_settings)
+        deployment = _with_model_prefill(deployment, model_settings, config_model_type)
         super().__init__(
             model_name=deployment.model,
             trust_remote_code=deployment.trust_remote_code,

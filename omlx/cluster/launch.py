@@ -1361,6 +1361,16 @@ def build_mlx_launch_argv(
         argv.extend(["--mtp", "--mtp-depth", str(deployment.execution.mtp_depth)])
         if deployment.execution.mtp_fixed_depth:
             argv.append("--mtp-fixed-depth")
+    if deployment.execution.ced_prefill:
+        argv.append("--ced-prefill")
+    if deployment.execution.a8_prefill:
+        argv.extend(
+            [
+                "--a8-prefill",
+                "--a8-prefill-min-tokens",
+                str(deployment.execution.a8_prefill_min_tokens),
+            ]
+        )
     if deployment.trust_remote_code:
         argv.append("--trust-remote-code")
     return argv

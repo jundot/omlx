@@ -128,9 +128,20 @@ def shared_build():
     return get
 
 
-@pytest.mark.parametrize("fmt,tiles", [("mxfp", False), ("affine", False), ("affine", True)])
-def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles):
-    model = verify_exact(build(fmt=fmt)) if tiles else build(fmt=fmt)
+# 384 is a tensor-parallel expert slice: its down projection ends in a part-lane step.
+@pytest.mark.parametrize(
+    "fmt,tiles,inter",
+    [
+        ("mxfp", False, 256),
+        ("affine", False, 256),
+        ("affine", True, 256),
+        ("mxfp", False, 384),
+        ("affine", True, 384),
+    ],
+)
+def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles, inter):
+    model = build(fmt=fmt, moe_inter_dim=inter)
+    model = verify_exact(model) if tiles else model
     c = model._config
     decode_fused._window_idx.cache_clear()
     assert all(decode_fused.supported(layer, c) for layer in model.layers)
@@ -625,9 +636,10 @@ def tensor_run(model):
     # Each block sums its attention output, then its MoE output.
     return mx.concatenate(sums[0::2]), block.sum_ranks(one), block.sum_ranks(both)
 
-full = t.build(n_heads=16, moe_inter_dim=512)
+# 384-wide slices, as 2304-wide experts split over two ranks: not a multiple of 256.
+full = t.build(n_heads=16, moe_inter_dim=768)
 reference = tensor_run(full)
-model = t.build(n_heads=8, o_groups=1, moe_inter_dim=256)
+model = t.build(n_heads=8, o_groups=1, moe_inter_dim=384)
 model.load_weights(
     [(k, tensor_slice(k, v, group.rank(), group.size())) for k, v in tree_flatten(full.parameters())],
     strict=True,
