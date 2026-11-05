@@ -103,12 +103,10 @@ from .api.embedding_models import (
     TokenEmbeddingData,
     TokenEmbeddingRequest,
     TokenEmbeddingResponse,
-    TokenEmbeddingUsage,
 )
 from .api.embedding_utils import (
     encode_embedding_base64,
     find_non_finite_embeddings,
-    find_non_finite_token_embeddings,
     normalize_embedding_items,
     normalize_input,
     truncate_embedding,
@@ -4283,7 +4281,7 @@ async def create_token_embeddings(
         elapsed = time.perf_counter() - start_time
         resolved_model = resolve_model_id(request.model) or request.model
 
-        non_finite = find_non_finite_token_embeddings(output.token_embeddings)
+        non_finite = output.non_finite_items
         if non_finite:
             logger.error(
                 f"Token embeddings: model={resolved_model} returned non-finite "
@@ -4298,11 +4296,7 @@ async def create_token_embeddings(
             )
 
         data = [
-            TokenEmbeddingData(
-                index=index,
-                embedding=vectors,
-                token_count=len(vectors),
-            )
+            TokenEmbeddingData(index=index, embedding=vectors)
             for index, vectors in enumerate(output.token_embeddings)
         ]
 
@@ -4321,11 +4315,19 @@ async def create_token_embeddings(
             f"{output.total_tokens} tokens in {elapsed:.3f}s"
         )
 
-        return TokenEmbeddingResponse(
+        response = TokenEmbeddingResponse(
             data=data,
             model=request.model,
-            usage=TokenEmbeddingUsage(total_tokens=output.total_tokens),
-        ).model_dump_json()
+            usage=EmbeddingUsage(
+                prompt_tokens=output.total_tokens,
+                total_tokens=output.total_tokens,
+            ),
+        )
+        # Serialization is CPU work proportional to tokens x dims; run it off
+        # the event loop so a large response does not stall keepalives.
+        return await asyncio.get_running_loop().run_in_executor(
+            None, response.model_dump_json
+        )
 
     return await _json_response_or_keepalive(http_request, _build_token_embeddings())
 
