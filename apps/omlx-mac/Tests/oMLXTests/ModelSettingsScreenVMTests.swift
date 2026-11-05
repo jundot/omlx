@@ -382,11 +382,12 @@ final class ModelSettingsScreenVMTests: XCTestCase {
 
     func testA8PrefillModelGateCoversExactFamilies() {
         let vm = ModelSettingsScreenVM()
-        for type in ["qwen3_5", "qwen3_5_moe", "qwen3_6", "qwen3_8", "qwen4_exp", "Qwen4-Exp", "deepseek_v41"] {
+        for type in ["qwen3_5", "qwen3_5_moe", "qwen3_6", "qwen3_8", "qwen4_exp", "Qwen4-Exp", "deepseek_v41",
+                     "minimax_m3", "minimax_m3_vl"] {
             vm.model = makeModel(id: "m", configModelType: type)
             XCTAssertTrue(vm.isA8PrefillModel, type)
         }
-        for type in ["qwen4", "qwen4_exp_x", "qwen3", "llama", "k2_horizon", "deepseek_v4"] {
+        for type in ["qwen4", "qwen4_exp_x", "qwen3", "llama", "k2_horizon", "deepseek_v4", "minimax_m2"] {
             vm.model = makeModel(id: "m", configModelType: type)
             XCTAssertFalse(vm.isA8PrefillModel, type)
         }

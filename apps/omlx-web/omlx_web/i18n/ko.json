@@ -1484,7 +1484,7 @@
   "modal.model_settings.qwen_ane_tune_test": "Test",
   "modal.model_settings.qwen_ane_tune_throughput": "Prompt tok/s",
   "modal.model_settings.qwen_oq_a8": "INT8 Activation Prefill",
-  "modal.model_settings.qwen_oq_a8_hint": "지원되는 Qwen·DeepSeek V4.1 모델에서 INT8 활성화로 prefill을 실행합니다. M5 이상 칩과 네이티브 커널이 필요합니다. 출력 품질이 달라질 수 있고 ANE prefill과 함께 쓸 수 없습니다. 모델을 다시 로드한 뒤 적용됩니다.",
+  "modal.model_settings.qwen_oq_a8_hint": "지원되는 Qwen·DeepSeek V4.1·MiniMax M3 모델에서 INT8 활성화로 prefill을 실행합니다. M5 이상 칩과 네이티브 커널이 필요합니다. 출력 품질이 달라질 수 있고 ANE prefill과 함께 쓸 수 없습니다. 모델을 다시 로드한 뒤 적용됩니다.",
   "modal.model_settings.qwen_oq_a8_helper_only": "This Mac has no INT8 tensor units, so only the layers on the Prefill Accelerator Mac use INT8 activations.",
   "modal.model_settings.qwen_oq_a8_min_tokens": "Minimum prompt tokens",
   "modal.model_settings.moe_expert_offload": "MoE Expert Offload",

@@ -287,11 +287,14 @@ def test_short_calls_fuse_mlp_gate_and_up_bit_exactly(language, monkeypatch, mod
     separate = [mlp(x) for x in xs]
     mx.eval(separate)
     monkeypatch.undo()
+    # An A8 prefill cache would keep the unfused arrays alive.
+    object.__setattr__(mlp.gate_proj, language._A8_PREPARED, (mlp.gate_proj.weight,))
     fused = [mlp(x) for x in xs]
     mx.eval(fused)
 
     groups = mlp.__dict__["_omlx_fused_projections"]
     assert [group.names for group in groups] == [("gate_proj", "up_proj")]
+    assert language._A8_PREPARED not in mlp.gate_proj.__dict__
     for a, b in zip(separate, fused):
         assert mx.array_equal(a, b).item()
 

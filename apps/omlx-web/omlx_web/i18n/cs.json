@@ -1484,7 +1484,7 @@
   "modal.model_settings.qwen_ane_tune_test": "Test",
   "modal.model_settings.qwen_ane_tune_throughput": "Prompt tok/s",
   "modal.model_settings.qwen_oq_a8": "Prefill s aktivacemi INT8",
-  "modal.model_settings.qwen_oq_a8_hint": "Spouští prefill s aktivacemi INT8 na podporovaných modelech Qwen a DeepSeek V4.1. Vyžaduje M5 nebo novější a nativní jádra. Kvalita výstupu se může změnit a nelze to kombinovat s prefillem na ANE. Projeví se po opětovném načtení modelu.",
+  "modal.model_settings.qwen_oq_a8_hint": "Spouští prefill s aktivacemi INT8 na podporovaných modelech Qwen, DeepSeek V4.1 a MiniMax M3. Vyžaduje M5 nebo novější a nativní jádra. Kvalita výstupu se může změnit a nelze to kombinovat s prefillem na ANE. Projeví se po opětovném načtení modelu.",
   "modal.model_settings.qwen_oq_a8_helper_only": "This Mac has no INT8 tensor units, so only the layers on the Prefill Accelerator Mac use INT8 activations.",
   "modal.model_settings.qwen_oq_a8_min_tokens": "Minimální tokeny promptu",
   "modal.model_settings.moe_expert_offload": "Offload expertů MoE",

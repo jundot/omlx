@@ -1484,7 +1484,7 @@
   "modal.model_settings.qwen_ane_tune_test": "Test",
   "modal.model_settings.qwen_ane_tune_throughput": "Prompt tok/s",
   "modal.model_settings.qwen_oq_a8": "INT8 Activation Prefill",
-  "modal.model_settings.qwen_oq_a8_hint": "在支援的 Qwen 與 DeepSeek V4.1 模型上以 INT8 活化值執行預填充。需要 M5 或更新的晶片與原生核心。輸出品質可能改變，且無法與 ANE 預填充同時使用。重新載入模型後生效。",
+  "modal.model_settings.qwen_oq_a8_hint": "在支援的 Qwen、DeepSeek V4.1 與 MiniMax M3 模型上以 INT8 活化值執行預填充。需要 M5 或更新的晶片與原生核心。輸出品質可能改變，且無法與 ANE 預填充同時使用。重新載入模型後生效。",
   "modal.model_settings.qwen_oq_a8_helper_only": "This Mac has no INT8 tensor units, so only the layers on the Prefill Accelerator Mac use INT8 activations.",
   "modal.model_settings.qwen_oq_a8_min_tokens": "Minimum prompt tokens",
   "modal.model_settings.moe_expert_offload": "MoE Expert Offload",
