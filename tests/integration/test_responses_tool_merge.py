@@ -314,6 +314,60 @@ class TestMCPMergeOrderingResponses:
         assert matching[0]["function"]["description"] == "client override"
 
 
+@pytest.mark.parametrize("endpoint", ["responses", "chat/completions"])
+@pytest.mark.parametrize("tools_available", [False, True])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_structured_output_prompt(
+    client_with_mcp, engine, monkeypatch, endpoint, tools_available, fallback
+):
+    import xgrammar as xgr
+
+    if not fallback:
+        vocab = [bytes([i]) for i in range(256)] + [b"</s>"]
+        engine._grammar_compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(vocab, stop_token_ids=[256]), max_threads=1
+        )
+    engine.tokenizer.tool_call_start = "<tool_call>"
+    engine.tokenizer.tool_call_end = "</tool_call>"
+    engine.tokenizer.chat_template = "{{ tools }} {{ tool_calls }}"
+    engine.tokenizer._omlx_supports_mid_system_messages = True
+
+    async def chat(messages, **kwargs):
+        engine.recorded_chat_kwargs.append(kwargs)
+        return MockGenerationOutput(text='{"answer":"done"}')
+
+    monkeypatch.setattr(engine, "chat", chat)
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    messages = [{"role": "user", "content": "Check the weather."}]
+    payload = {
+        "model": "test-model",
+        "tool_choice": "auto" if tools_available else "none",
+    }
+    format_spec = {"name": "answer", "schema": schema}
+    if endpoint == "responses":
+        payload["input"] = messages
+        payload["text"] = {"format": {"type": "json_schema", **format_spec}}
+    else:
+        payload["messages"] = messages
+        payload["response_format"] = {"type": "json_schema", "json_schema": format_spec}
+    response = client_with_mcp.post(f"/v1/{endpoint}", json=payload)
+    assert response.status_code == 200, response.text
+    prepared = engine.recorded_count_calls[-1]["messages"]
+    assert prepared[-1] == messages[-1]
+    if tools_available or fallback:
+        instruction = prepared[0]
+        assert instruction["role"] == "system"
+        assert "JSON Schema:" in instruction["content"]
+        prefix = "Your final answer" if tools_available else "You must respond"
+        assert instruction["content"].startswith(prefix)
+    else:
+        assert prepared == messages
+    kwargs = engine.recorded_chat_kwargs[-1]
+    assert bool(kwargs.get("tools")) == tools_available
+    assert (kwargs.get("compiled_grammar") is None) == fallback
+    assert ("Warning" in response.headers) == fallback
+
+
 class TestToolChoiceNoneSuppressesTemplateExposure:
     """Regression test for a real bug found in /v1/responses.
 

@@ -25,12 +25,65 @@ The processor supports two usage modes:
 """
 
 import logging
+import re
 from typing import List, Optional
 
 import mlx.core as mx
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def with_tool_call_alternative(output_format: dict, tokenizer) -> dict:
+    """Allow a tool response independently of the final answer's format.
+
+    Keep tool payload validation with the existing output parser. Only use
+    the tokenizer's explicit markers; without them, preserve the original
+    grammar rather than disabling final-answer enforcement.
+    """
+    begin = getattr(tokenizer, "tool_call_start", None)
+    end = getattr(tokenizer, "tool_call_end", None)
+    if not isinstance(begin, str) or not begin or not isinstance(end, str):
+        return output_format
+
+    # A Tag's AnyText eagerly consumes a closing marker quoted in arguments.
+    # Match the whole envelope instead. An empty end marker denotes a protocol
+    # that runs until EOS; require a payload after its opening marker.
+    payload_pattern = r"[\s\S]*" if end else r"[\s\S]+"
+    tool_format = {
+        "type": "regex",
+        "pattern": re.escape(begin) + payload_pattern + re.escape(end),
+    }
+
+    whitespace = {"type": "regex", "pattern": r"[ \t\r\n]{0,32}"}
+    tool_calls = {
+        "type": "sequence",
+        "elements": [
+            whitespace,
+            {
+                "type": "plus",
+                "content": {
+                    "type": "sequence",
+                    "elements": [
+                        tool_format,
+                        whitespace,
+                    ],
+                },
+            },
+        ],
+    }
+    if output_format["type"] == "json_schema":
+        # JSON permits surrounding whitespace. It must remain a valid prefix
+        # for the final answer too, or a newline commits decoding to tools.
+        output_format = {
+            "type": "sequence",
+            "elements": [
+                whitespace,
+                {**output_format, "max_whitespace_cnt": 32},
+                whitespace,
+            ],
+        }
+    return {"type": "or", "elements": [output_format, tool_calls]}
 
 
 def create_grammar_compiler(tokenizer, model, *, cache_limit_bytes=-1):
