@@ -9048,7 +9048,12 @@ async def create_response(
             if reasoning_text:
                 output_items.append(build_reasoning_output_item(reasoning_text))
             output_items.append(
-                build_message_output_item(cleaned_text.strip() if cleaned_text else "")
+                build_message_output_item(
+                    cleaned_text.strip() if cleaned_text else "",
+                    phase=("commentary" if tool_calls else "final_answer")
+                    if request.tools
+                    else None,
+                )
             )
 
             if tool_calls:
@@ -9702,21 +9707,23 @@ async def stream_responses_api(
     )
 
     # response.output_item.done (message)
+    message_item: dict = {
+        "type": "message",
+        "id": msg_id,
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": final_text, "annotations": []}],
+    }
+    if has_tools:
+        message_item["phase"] = "commentary" if tool_calls else "final_answer"
+
     seq = stream_state.next_sequence()
     yield format_sse_event(
         "response.output_item.done",
         {
             "type": "response.output_item.done",
             "output_index": msg_output_index,
-            "item": {
-                "type": "message",
-                "id": msg_id,
-                "status": "completed",
-                "role": "assistant",
-                "content": [
-                    {"type": "output_text", "text": final_text, "annotations": []}
-                ],
-            },
+            "item": message_item,
             "sequence_number": seq,
         },
     )
@@ -9733,15 +9740,7 @@ async def stream_responses_api(
                 "summary": [{"type": "summary_text", "text": reasoning_text}],
             }
         )
-    output_items.append(
-        {
-            "type": "message",
-            "id": msg_id,
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": final_text, "annotations": []}],
-        }
-    )
+    output_items.append(message_item)
 
     # Emit function call items if present
     if tool_calls:
