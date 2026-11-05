@@ -7,6 +7,7 @@ weight sources (safetensors and the pinned ONNX graph).
 """
 
 import json
+import math
 from pathlib import Path
 
 import mlx.core as mx
@@ -57,6 +58,7 @@ def _write_dense_module(
     *,
     use_residual=None,
     bias: bool = False,
+    activation: str = "torch.nn.modules.linear.Identity",
 ) -> None:
     """Write one pylate Dense module. ``linear`` is the [out, in] torch layout."""
     directory = root / name
@@ -71,7 +73,7 @@ def _write_dense_module(
             "in_features": len(linear[0]),
             "out_features": len(linear),
             "bias": bias,
-            "activation_function": "torch.nn.modules.linear.Identity",
+            "activation_function": activation,
             "use_residual": (
                 residual is not None if use_residual is None else use_residual
             ),
@@ -87,6 +89,7 @@ def _write_dense_config(
     out_features: int,
     use_residual: bool,
     bias: bool = False,
+    activation: str = "torch.nn.modules.linear.Identity",
 ) -> None:
     """Write a Dense module's config without any weight file."""
     directory = root / name
@@ -97,7 +100,7 @@ def _write_dense_config(
             "in_features": in_features,
             "out_features": out_features,
             "bias": bias,
-            "activation_function": "torch.nn.modules.linear.Identity",
+            "activation_function": activation,
             "use_residual": use_residual,
         },
     )
@@ -146,12 +149,27 @@ def _tiny_colbert_dir(tmp_path: Path) -> Path:
     return root
 
 
-def _one_dense_dir(tmp_path: Path, name: str, linear, residual=None) -> Path:
+def _one_dense_dir(
+    tmp_path: Path,
+    name: str,
+    linear,
+    residual=None,
+    *,
+    use_residual=None,
+    activation: str = "torch.nn.modules.linear.Identity",
+) -> Path:
     root = tmp_path / name
     root.mkdir()
     _write_pipeline(root, ["1_Dense"])
     _write_encoder_safetensors(root)
-    _write_dense_module(root, "1_Dense", linear, residual)
+    _write_dense_module(
+        root,
+        "1_Dense",
+        linear,
+        residual,
+        use_residual=use_residual,
+        activation=activation,
+    )
     return root
 
 
@@ -374,14 +392,20 @@ class TestColbertProjectionMath:
         _assert_close(result.tolist(), [TINY_PROJECTED])
 
     def test_residual_is_a_learned_matmul_not_an_identity_skip(self, tmp_path):
-        # linear is identity and residual swaps the entries: a learned MatMul
-        # gives [a+b, a+b], an identity skip would give [2a, 2b].
-        root = _one_dense_dir(tmp_path, "swap", [[1, 0], [0, 1]], [[0, 1], [1, 0]])
+        # A shape-changing layer's residual is a second learned MatMul; an
+        # identity skip is not even shape-compatible here (2 -> 3).
+        root = _one_dense_dir(
+            tmp_path,
+            "swap",
+            [[1, 0], [0, 1], [1, 1]],
+            [[0, 1], [1, 0], [0, 0]],
+        )
         projection = ColbertProjection.from_layout(resolve_colbert_layout(root))
 
         result = projection(mx.array([[1.0, 2.0]], dtype=mx.float32))
 
-        _assert_close(result.tolist(), [[0.7071067812, 0.7071067812]])
+        # linear -> [1, 2, 3]; residual -> [2, 1, 0]; sum -> [3, 3, 3].
+        _assert_close(result.tolist(), [[3 / 27**0.5] * 3])
 
     def test_the_final_layer_has_no_residual(self, tmp_path):
         # Doubling the linear map is observable only if the input were added too.
@@ -551,8 +575,60 @@ class TestColbertEmbedTokenIds:
         assert info["weight_file"] == "model.safetensors"
 
 
+def _tensor(name, dtype, dims, values, *, raw: bool = False):
+    """Build an initializer, optionally with ``raw_data`` bytes.
+
+    ``helper.make_tensor`` stores values in the typed repeated fields, which
+    ONNX's external-data conversion cannot move to a sidecar; ``numpy_helper``
+    produces the raw byte form the exporter and the external-data path use.
+    """
+    pytest.importorskip("onnx")
+    from onnx import TensorProto, helper, numpy_helper
+
+    if not raw:
+        return helper.make_tensor(name, dtype, dims, values)
+
+    import numpy as np
+
+    np_dtype = {
+        TensorProto.FLOAT: np.float32,
+        TensorProto.INT8: np.int8,
+    }[dtype]
+    array = np.asarray(values, dtype=np_dtype)
+    array = array.reshape(dims) if dims else array.reshape(())
+    return numpy_helper.from_array(array, name)
+
+
+def _save_onnx_graph(graph, path: Path, *, external_data: bool = False) -> None:
+    """Save ``graph``, optionally moving every tensor into a sidecar file."""
+    onnx = pytest.importorskip("onnx")
+    from onnx import helper
+
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
+    if external_data:
+        onnx.save_model(
+            model,
+            str(path),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="weights.bin",
+            size_threshold=0,
+        )
+    else:
+        onnx.save(model, str(path))
+
+
 def _onnx_graph_with_projection(
-    path: Path, *, quantized: bool = False, include_residual: bool = True
+    path: Path,
+    *,
+    quantized: bool = False,
+    include_residual: bool = True,
+    quantized_values=None,
+    scale: float = 1.0,
+    zero_point: int = 0,
+    scale_shape: tuple[int, ...] | None = None,
+    external_data: bool = False,
+    raw_tensors: bool = False,
 ) -> None:
     """A minimal graph: one encoder MatMul plus one linear+residual pair.
 
@@ -560,29 +636,40 @@ def _onnx_graph_with_projection(
       * encoder    3 -> 2
       * 1_Dense    2 -> 3, with a residual
     """
-    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnx")
     from onnx import TensorProto, helper
 
     encoder = [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]  # [in=3, out=2]
     linear = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]  # [in=2, out=3]
     residual = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]  # [in=2, out=3]
 
+    def _init(name, dtype, dims, values):
+        return _tensor(name, dtype, dims, values, raw=raw_tensors)
+
     initializers = [
-        helper.make_tensor(
-            "bert.final_norm.weight", TensorProto.FLOAT, [3], [1.0, 1.0, 1.0]
-        ),
-        helper.make_tensor("w_linear", TensorProto.FLOAT, [2, 3], _flatten(linear)),
-        helper.make_tensor("w_residual", TensorProto.FLOAT, [2, 3], _flatten(residual)),
+        _init("bert.final_norm.weight", TensorProto.FLOAT, [3], [1.0, 1.0, 1.0]),
+        _init("w_linear", TensorProto.FLOAT, [2, 3], _flatten(linear)),
+        _init("w_residual", TensorProto.FLOAT, [2, 3], _flatten(residual)),
     ]
     encoder_inputs = ["x", "w_encoder"]
     if quantized:
+        values = quantized_values or _flatten(encoder)
+        scale_dims = list(scale_shape) if scale_shape is not None else []
+        scale_count = 1
+        for dim in scale_dims:
+            scale_count *= dim
         initializers += [
-            helper.make_tensor(
-                "w_encoder_quantized", TensorProto.INT8, [3, 2], _flatten(encoder)
+            _init("w_encoder_quantized", TensorProto.INT8, [3, 2], values),
+            _init(
+                "w_encoder_scale", TensorProto.FLOAT, scale_dims, [scale] * scale_count
             ),
-            helper.make_tensor("w_encoder_scale", TensorProto.FLOAT, [], [1.0]),
-            helper.make_tensor("x_zero_point", TensorProto.INT8, [], [0]),
-            helper.make_tensor("w_encoder_zero_point", TensorProto.INT8, [], [0]),
+            _init("x_zero_point", TensorProto.INT8, [], [0]),
+            _init(
+                "w_encoder_zero_point",
+                TensorProto.INT8,
+                scale_dims,
+                [zero_point] * scale_count,
+            ),
         ]
         encoder_inputs = [
             "x",
@@ -592,9 +679,7 @@ def _onnx_graph_with_projection(
         ]
     else:
         initializers.append(
-            helper.make_tensor(
-                "w_encoder", TensorProto.FLOAT, [3, 2], _flatten(encoder)
-            )
+            _init("w_encoder", TensorProto.FLOAT, [3, 2], _flatten(encoder))
         )
 
     nodes = [
@@ -627,9 +712,95 @@ def _onnx_graph_with_projection(
         [helper.make_tensor_value_info("p_linear", TensorProto.FLOAT, None)],
         initializers,
     )
-    onnx.save(
-        helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)]), str(path)
+    _save_onnx_graph(graph, path, external_data=external_data)
+
+
+def _onnx_graph_identity_residual(
+    path: Path,
+    *,
+    include_residual: bool = False,
+    external_data: bool = False,
+) -> None:
+    """A 2 -> 2 projection with ``use_residual`` and no residual node.
+
+    pylate applies the residual as an identity skip for a same-width layer, so
+    its export carries no ``residual.weight`` and no residual MatMul at all.
+    """
+    pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    identity = [[1.0, 0.0], [0.0, 1.0]]
+    initializers = [
+        helper.make_tensor(
+            "bert.final_norm.weight", TensorProto.FLOAT, [2], [1.0, 1.0]
+        ),
+        helper.make_tensor("w_encoder", TensorProto.FLOAT, [2, 2], _flatten(identity)),
+        helper.make_tensor("w_linear", TensorProto.FLOAT, [2, 2], _flatten(identity)),
+    ]
+    if include_residual:
+        initializers.append(
+            helper.make_tensor(
+                "w_residual", TensorProto.FLOAT, [2, 2], _flatten(identity)
+            )
+        )
+    nodes = [
+        helper.make_node(
+            "MatMul",
+            ["x", "w_encoder"],
+            ["h"],
+            name="/bert/layers.0/attn/Wo/MatMul",
+        ),
+        helper.make_node(
+            "MatMul",
+            ["h", "w_linear"],
+            ["p_linear"],
+            name="/projection_layers.0/linear/MatMul",
+        ),
+    ]
+    if include_residual:
+        nodes.append(
+            helper.make_node(
+                "MatMul",
+                ["h", "w_residual"],
+                ["p_residual"],
+                name="/projection_layers.0/residual/MatMul",
+            )
+        )
+    graph = helper.make_graph(
+        nodes,
+        "tiny-colbert-identity-residual",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, ["b", "t", 2])],
+        [helper.make_tensor_value_info("p_linear", TensorProto.FLOAT, None)],
+        initializers,
     )
+    _save_onnx_graph(graph, path, external_data=external_data)
+
+
+def _onnx_graph_dynamo_layout(path: Path) -> None:
+    """A graph using the newer torch.onnx dynamo export naming scheme."""
+    pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    initializers = [
+        helper.make_tensor(
+            "transformer.embeddings.tok_embeddings.weight",
+            TensorProto.FLOAT,
+            [2, 2],
+            [1.0, 0.0, 0.0, 1.0],
+        ),
+        helper.make_tensor("w", TensorProto.FLOAT, [2, 2], [1.0, 0.0, 0.0, 1.0]),
+    ]
+    nodes = [
+        helper.make_node("MatMul", ["x", "w"], ["h"], name="node_MatMul_1"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "dynamo-colbert",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, ["b", "t", 2])],
+        [helper.make_tensor_value_info("h", TensorProto.FLOAT, None)],
+        initializers,
+    )
+    _save_onnx_graph(graph, path)
 
 
 def _flatten(matrix):
@@ -681,15 +852,55 @@ class TestOnnxWeightSource:
 
     def test_dequantizes_an_int8_matmul_operand(self, tmp_path):
         graph_path = tmp_path / "model_int8.onnx"
-        _onnx_graph_with_projection(graph_path, quantized=True)
+        # (q - zero_point) * scale, not the raw int8 values: the weight is
+        # [[2, 4], [6, 8], [0, 2]], scale 0.5 and zero point -2 give
+        # [[2, 3], [4, 5], [1, 2]] in ONNX [in, out] layout, i.e. this after
+        # the transpose into [out, in].
+        _onnx_graph_with_projection(
+            graph_path,
+            quantized=True,
+            quantized_values=[2, 4, 6, 8, 0, 2],
+            scale=0.5,
+            zero_point=-2,
+        )
 
         weights = read_colbert_onnx(graph_path, _one_dense_specs(tmp_path))
 
         assert weights.quantized is True
         assert weights.encoder["layers.0.mlp.Wo.weight"].tolist() == [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
+            [2.0, 4.0, 1.0],
+            [3.0, 5.0, 2.0],
         ]
+
+    def test_a_scale_that_cannot_be_applied_is_rejected(self, tmp_path):
+        # 5 scales cannot be broadcast against a [3, 2] weight along its output
+        # axis, so the graph is refused rather than silently mis-scaled.
+        graph_path = tmp_path / "model_int8.onnx"
+        _onnx_graph_with_projection(
+            graph_path,
+            quantized=True,
+            quantized_values=[2, 4, 6, 8, 0, 2],
+            scale=0.5,
+            zero_point=-2,
+            scale_shape=(5,),
+        )
+
+        with pytest.raises(ColbertLayoutError, match="cannot be applied"):
+            read_colbert_onnx(graph_path, _one_dense_specs(tmp_path))
+
+    def test_quantization_is_detected_from_the_graph_not_the_file_name(self, tmp_path):
+        quantized_path = tmp_path / "model.onnx"
+        _onnx_graph_with_projection(quantized_path, quantized=True)
+        assert (
+            read_colbert_onnx(quantized_path, _one_dense_specs(tmp_path)).quantized
+            is True
+        )
+
+        float_path = tmp_path / "model_int8.onnx"
+        _onnx_graph_with_projection(float_path)
+        assert (
+            read_colbert_onnx(float_path, _one_dense_specs(tmp_path)).quantized is False
+        )
 
     def test_a_module_without_a_residual_needs_no_residual_node(self, tmp_path):
         # The export omits the residual MatMul entirely for the last module.
@@ -722,3 +933,316 @@ class TestOnnxWeightSource:
         # linear([1, 1]) = [5, 7, 9]; residual = [1, 1, 0] -> [6, 8, 9];
         # norm = sqrt(36 + 64 + 81) = sqrt(181).
         _assert_close(result.tolist(), [[6 / 181**0.5, 8 / 181**0.5, 9 / 181**0.5]])
+
+
+def _same_width_specs(tmp_path: Path):
+    """A 2 -> 2 ``use_residual`` module: pylate's identity-skip case."""
+    from omlx.models.colbert_projection import ColbertDenseSpec
+
+    return [
+        ColbertDenseSpec(
+            directory=tmp_path,
+            in_features=2,
+            out_features=2,
+            use_residual=True,
+            bias=False,
+            weights=None,
+        )
+    ]
+
+
+class TestActivationFunctions:
+    """The module's declared ``activation_function`` is honored exactly."""
+
+    def test_relu_is_applied_to_the_linear_output(self, tmp_path):
+        root = _one_dense_dir(
+            tmp_path,
+            "relu",
+            [[1, 0], [0, 1]],
+            activation="torch.nn.modules.activation.ReLU",
+        )
+        projection = ColbertProjection.from_layout(resolve_colbert_layout(root))
+
+        result = projection(mx.array([[-1.0, 2.0]], dtype=mx.float32))
+
+        _assert_close(result.tolist(), [[0.0, 1.0]])
+
+    def test_gelu_is_the_exact_erf_form(self, tmp_path):
+        root = _one_dense_dir(
+            tmp_path,
+            "gelu",
+            [[1, 0], [0, 1]],
+            activation="torch.nn.modules.activation.GELU",
+        )
+        projection = ColbertProjection.from_layout(resolve_colbert_layout(root))
+
+        result = projection(mx.array([[1.0, -1.0]], dtype=mx.float32))
+
+        vector = [
+            0.5 * value * (1.0 + math.erf(value / math.sqrt(2.0)))
+            for value in (1.0, -1.0)
+        ]
+        norm = math.sqrt(sum(value * value for value in vector))
+        _assert_close(result.tolist(), [[value / norm for value in vector]])
+
+    def test_tanh_is_applied(self, tmp_path):
+        root = _one_dense_dir(
+            tmp_path,
+            "tanh",
+            [[1, 0], [0, 1]],
+            activation="torch.nn.modules.activation.Tanh",
+        )
+        projection = ColbertProjection.from_layout(resolve_colbert_layout(root))
+
+        result = projection(mx.array([[0.5, -2.0]], dtype=mx.float32))
+
+        vector = [math.tanh(0.5), math.tanh(-2.0)]
+        norm = math.sqrt(sum(value * value for value in vector))
+        _assert_close(result.tolist(), [[value / norm for value in vector]])
+
+    def test_activation_is_applied_before_the_residual(self, tmp_path):
+        # pylate computes activation(2x) then adds x; applying the activation
+        # after the residual would yield relu(3x) instead.
+        root = _one_dense_dir(
+            tmp_path,
+            "order",
+            [[2, 0], [0, 2]],
+            use_residual=True,
+            activation="torch.nn.modules.activation.ReLU",
+        )
+        projection = ColbertProjection.from_layout(resolve_colbert_layout(root))
+
+        result = projection(mx.array([[-1.0, 2.0]], dtype=mx.float32))
+
+        vector = [-1.0, 6.0]  # relu(2 * x) + x
+        norm = math.sqrt(sum(value * value for value in vector))
+        _assert_close(result.tolist(), [[value / norm for value in vector]])
+
+    def test_a_missing_activation_key_means_identity(self, tmp_path):
+        root = _one_dense_dir(tmp_path, "no-key", [[1, 0], [0, 1]])
+        _write_json(
+            root / "1_Dense" / "config.json",
+            {
+                "in_features": 2,
+                "out_features": 2,
+                "bias": False,
+                "use_residual": False,
+            },
+        )
+        projection = ColbertProjection.from_layout(resolve_colbert_layout(root))
+
+        result = projection(mx.array([[3.0, 4.0]], dtype=mx.float32))
+
+        _assert_close(result.tolist(), [[0.6, 0.8]])
+
+    def test_an_unsupported_activation_is_rejected(self, tmp_path):
+        root = _one_dense_dir(
+            tmp_path,
+            "sigmoid",
+            [[1, 0], [0, 1]],
+            activation="torch.nn.modules.activation.Sigmoid",
+        )
+
+        with pytest.raises(ColbertLayoutError, match="Sigmoid"):
+            resolve_colbert_layout(root)
+
+    def test_a_non_string_activation_is_rejected(self, tmp_path):
+        root = _one_dense_dir(tmp_path, "numeric", [[1, 0], [0, 1]])
+        _write_json(
+            root / "1_Dense" / "config.json",
+            {
+                "in_features": 2,
+                "out_features": 2,
+                "bias": False,
+                "use_residual": False,
+                "activation_function": 5,
+            },
+        )
+
+        with pytest.raises(ColbertLayoutError, match="non-string"):
+            resolve_colbert_layout(root)
+
+
+class TestResidualSemantics:
+    """pylate's residual is a learned MatMul only when the width changes."""
+
+    def test_same_width_residual_is_an_identity_skip(self, tmp_path):
+        root = _one_dense_dir(
+            tmp_path, "identity-residual", [[1, 0], [0, 1]], use_residual=True
+        )
+        projection = ColbertProjection.from_layout(resolve_colbert_layout(root))
+
+        result = projection(mx.array([[1.0, 2.0]], dtype=mx.float32))
+
+        _assert_close(result.tolist(), [[1 / 5**0.5, 2 / 5**0.5]])
+
+    def test_same_width_residual_with_weights_is_rejected(self, tmp_path):
+        root = _one_dense_dir(
+            tmp_path,
+            "identity-residual-weights",
+            [[1, 0], [0, 1]],
+            [[1, 0], [0, 1]],
+        )
+
+        with pytest.raises(ColbertLayoutError, match="identity skip"):
+            ColbertProjection.from_layout(resolve_colbert_layout(root))
+
+    def test_a_shape_changing_residual_still_needs_its_matrix(self, tmp_path):
+        root = _one_dense_dir(
+            tmp_path,
+            "missing-residual",
+            [[1, 0], [0, 1], [1, 1]],
+            use_residual=True,
+        )
+
+        with pytest.raises(ColbertLayoutError, match="residual.weight"):
+            ColbertProjection.from_layout(resolve_colbert_layout(root))
+
+
+class TestOnnxResidualSemantics:
+    """The ONNX reader applies the same residual rule as the safetensors one."""
+
+    def test_same_width_residual_is_an_identity_skip(self, tmp_path):
+        graph_path = tmp_path / "model.onnx"
+        _onnx_graph_identity_residual(graph_path)
+        specs = _same_width_specs(tmp_path)
+
+        weights = read_colbert_onnx(graph_path, specs)
+        assert weights.projection[0].residual is None
+
+        projection = ColbertProjection.from_matrices(
+            specs,
+            [weights.projection[0].linear],
+            [weights.projection[0].residual],
+        )
+        result = projection(mx.array([[1.0, 1.0]], dtype=mx.float32))
+
+        _assert_close(result.tolist(), [[0.7071067812, 0.7071067812]])
+
+    def test_a_shape_changing_residual_needs_its_node(self, tmp_path):
+        graph_path = tmp_path / "model.onnx"
+        _onnx_graph_with_projection(graph_path, include_residual=False)
+
+        with pytest.raises(ColbertLayoutError, match="residual"):
+            read_colbert_onnx(graph_path, _one_dense_specs(tmp_path, use_residual=True))
+
+    def test_same_width_residual_with_a_residual_node_is_rejected(self, tmp_path):
+        graph_path = tmp_path / "model.onnx"
+        _onnx_graph_identity_residual(graph_path, include_residual=True)
+
+        with pytest.raises(ColbertLayoutError, match="identity skip"):
+            read_colbert_onnx(graph_path, _same_width_specs(tmp_path))
+
+
+class TestOnnxExternalDataAndLayout:
+    """External sidecars resolve beside the graph, and unsupported layouts say so."""
+
+    def test_external_data_is_resolved_against_the_graph_directory(
+        self, tmp_path, monkeypatch
+    ):
+        graph_dir = tmp_path / "graph"
+        graph_dir.mkdir()
+        graph_path = graph_dir / "model.onnx"
+        _onnx_graph_with_projection(graph_path, external_data=True, raw_tensors=True)
+        assert (graph_dir / "weights.bin").is_file()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        weights = read_colbert_onnx(graph_path, _one_dense_specs(tmp_path))
+
+        assert weights.encoder["final_norm.weight"].tolist() == [1.0, 1.0, 1.0]
+
+    def test_a_dynamo_export_names_the_supported_layout(self, tmp_path):
+        graph_path = tmp_path / "model.onnx"
+        _onnx_graph_dynamo_layout(graph_path)
+
+        with pytest.raises(ColbertLayoutError, match="dynamo"):
+            read_colbert_onnx(graph_path, _one_dense_specs(tmp_path))
+
+
+class TestColbertLoadDispatch:
+    """``MLXEmbeddingModel.load`` routes a ColBERT directory to its own loader."""
+
+    @staticmethod
+    def _colbert_dir(tmp_path: Path) -> Path:
+        root = _tiny_colbert_dir(tmp_path)
+        _write_json(root / "config.json", {"model_type": "modernbert"})
+        return root
+
+    @staticmethod
+    def _patch_mlx_embeddings(monkeypatch) -> None:
+        class _StubModelArgs:
+            @classmethod
+            def from_dict(cls, config):
+                return dict(config)
+
+        class _StubEncoder:
+            def __init__(self):
+                self.loaded_weights = None
+                self.training = True
+
+            def parameters(self):
+                return {"final_norm.weight": mx.ones((2,), dtype=mx.float32)}
+
+            def load_weights(self, weights, strict=True):
+                self.loaded_weights = dict(weights)
+
+            def train(self, mode):
+                self.training = mode
+
+        class _StubWrapper:
+            def __init__(self, args):
+                self.model = _StubEncoder()
+
+        class _StubModule:
+            ModelArgs = _StubModelArgs
+            Model = _StubWrapper
+
+        import importlib
+
+        monkeypatch.setattr(importlib, "import_module", lambda name: _StubModule)
+
+    def test_dispatch_tokenizer_fallback_and_reload(self, tmp_path, monkeypatch):
+        root = self._colbert_dir(tmp_path)
+        self._patch_mlx_embeddings(monkeypatch)
+
+        import transformers
+
+        tokenizer_calls: list[dict] = []
+        tokenizer = object()
+
+        def fake_from_pretrained(path, **kwargs):
+            tokenizer_calls.append(dict(kwargs))
+            if len(tokenizer_calls) == 1:
+                raise ValueError("no slow tokenizer for this checkpoint")
+            return tokenizer
+
+        monkeypatch.setattr(
+            transformers.AutoTokenizer, "from_pretrained", fake_from_pretrained
+        )
+
+        model = MLXEmbeddingModel(str(root))
+        model.load()
+
+        info = model.get_model_info()
+        assert info["late_interaction"] is True
+        assert info["weight_source"] == WEIGHT_SOURCE_SAFETENSORS
+        assert info["projection_dim"] == 2
+        assert model.hidden_size == 2
+        assert model.processor is tokenizer
+        # The slow tokenizer is tried first, then the regular (fast) load.
+        assert tokenizer_calls[0]["use_fast"] is False
+        assert "use_fast" not in tokenizer_calls[1]
+        assert model.model.training is False
+        assert list(model.model.loaded_weights) == ["final_norm.weight"]
+        with pytest.raises(ValueError, match="late-interaction"):
+            model.embed(["a query"])
+
+        model.close()
+        assert model._colbert_projection is None
+        assert model._colbert_layout is None
+        assert model._loaded is False
+
+        model.load()
+        assert model._colbert_projection is not None

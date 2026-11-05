@@ -4240,9 +4240,16 @@ async def create_token_embeddings(
 
     Unlike ``/v1/embeddings`` the caller supplies the token ids, so the returned
     rows line up exactly with the text window the caller already embedded with
-    ``/v1/embeddings``. One vector per token id, padding never included; the
-    final hidden state (before pooling and L2 normalization) is returned, so a
-    caller that needs the ColBERT convention normalizes the rows itself.
+    ``/v1/embeddings``. One vector per token id, padding never included.
+
+    Two contracts are served, decided by the loaded model:
+
+    * A plain embedder returns the final hidden state, before pooling and before
+      L2 normalization; a caller that needs the ColBERT/MaxSim convention
+      normalizes the rows itself.
+    * A pylate ColBERT model returns its projected per-token vectors, already L2
+      normalized (that checkpoint's ONNX graph folds the projection and the
+      normalization into the model). Callers must **not** normalize them again.
 
     Example request:
     ```json

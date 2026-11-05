@@ -702,7 +702,11 @@ class MLXEmbeddingModel:
         if layout.weight_source == WEIGHT_SOURCE_ONNX:
             from .colbert_onnx_weights import read_colbert_onnx
 
-            assert layout.onnx_graph is not None  # guaranteed by the resolver
+            if layout.onnx_graph is None:
+                raise ColbertLayoutError(
+                    f"ColBERT layout at {model_path} selected the ONNX weight "
+                    "source but resolved no ONNX graph"
+                )
             onnx_weights = read_colbert_onnx(layout.onnx_graph, layout.dense)
             weights = onnx_weights.encoder
             projection = ColbertProjection.from_matrices(
@@ -714,7 +718,11 @@ class MLXEmbeddingModel:
             if onnx_weights.quantized:
                 weights_note += " (int8 dequantized)"
         else:
-            assert layout.encoder_weights is not None  # guaranteed by the resolver
+            if layout.encoder_weights is None:
+                raise ColbertLayoutError(
+                    f"ColBERT layout at {model_path} selected the safetensors "
+                    "weight source but resolved no encoder weight file"
+                )
             weights = mx.load(str(layout.encoder_weights))
             projection = ColbertProjection.from_layout(layout)
             weights_note = f"safetensors={layout.encoder_weights.name}"
