@@ -56,7 +56,7 @@ Unloading the model stops the Splash process. Splash runs in its own process gro
 | Model's max context window, when set | `--max-context` (at most 256K); Splash refuses to start when its memory budget cannot hold it |
 | Integrations → Memory limit (empty: enough for the model's context window) | `--max-memory`, never more than the oMLX memory limit leaves free |
 | Integrations → KV cache precision | `--kv-format` |
-| Integrations → SSD cache, per Splash model (empty: the oMLX SSD cache size, 0: off) | `--max-cache-disk` with `--persistent-cache` under `<SSD cache dir>/splash/<model>/` |
+| Integrations → SSD cache, per Splash model (empty: the oMLX SSD cache size, 0: off) | `--max-cache-disk` with `--persistent-cache` under `<SSD cache dir>/splash/<model>/`; `--max-cache-disk 0` when it is 0 or the oMLX SSD cache is off (cache disabled or hot cache only) |
 | Integrations → Neural Engine prefill | off adds `--disable-ane` |
 | `reasoning_effort`, `enable_thinking: false` | `reasoning_effort` (`enable_thinking: false` becomes `none`); Flint decides when to reason itself and ignores it |
 | `response_format` (JSON object / JSON schema) | enforced by Splash itself, no prompt injection |

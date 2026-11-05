@@ -1067,10 +1067,19 @@ class TestRequestTranslation:
         for flag in (
             "--max-context",
             "--max-memory",
-            "--max-cache-disk",
             "--disable-ane",
         ):
             assert flag not in command
+
+    def test_serve_command_turns_ssd_cache_off_without_omlx_ssd_cache(self, tmp_path):
+        # Cache disabled, hot cache only and a Splash SSD size of 0 all reach
+        # Splash as cache_disk_bytes == 0.
+        command = _engine(tmp_path)._serve_command(9000)
+
+        assert command[command.index("--max-cache-disk") + 1] == "0"
+        # Splash rejects --persistent-cache next to --max-cache-disk 0.
+        assert "--persistent-cache" not in command
+        assert "--cache-dir" not in command
 
     def test_request_body_passes_sampling_through(self, tmp_path):
         body = _engine(tmp_path)._request_body(

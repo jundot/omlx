@@ -1356,6 +1356,9 @@ class SplashEngine(BaseEngine):
                 "--cache-dir",
                 str(options.cache_dir),
             ]
+        else:
+            # Without the flag Splash keeps its own auto-sized SSD cache.
+            command += ["--max-cache-disk", "0"]
         return command
 
     async def start(self) -> None:
