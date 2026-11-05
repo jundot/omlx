@@ -26,7 +26,10 @@ from omlx.api.openai_models import (
 from omlx.api.tool_calling import (
     ToolCallStreamFilter,
     _coerce_param_value,
+    _args_fit_schema,
     _gemma4_args_to_json_robust,
+    _gemma4_fit_args,
+    _gemma4_reassemble_extras,
     _json_value_end,
     _marker_payloads,
     _parse_attribute_function_tool_calls,
@@ -2901,6 +2904,220 @@ class TestParseGemma4ToolCallFallback:
             _parse_gemma4_tool_call_fallback("just words, no payload")
 
 
+# ---------------------------------------------------------------------------
+# Gemma 4 <|\"|> fragmentation tripwire (#3229)
+# ---------------------------------------------------------------------------
+
+_PDF_TOOLS_3229 = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create-pdf-file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+        },
+    }
+]
+
+def _gemma4_marked(value: str) -> str:
+    return f'<|"|>{value}<|"|>'
+
+
+# Compact Technoprobe-style wire form: spurious <|\"|> close/reopen at
+# markdown **Label:** constructs, plus a list-valued trailing extra.
+_TECHNOPROBE_FRAGMENTED_CALL = (
+    "call:google:mcp:text_generation:create-pdf-file{"
+    f"filename: {_gemma4_marked('eclipse.pdf')}, "
+    "content: "
+    + _gemma4_marked(
+        "# Technical Summary: Technoprobe Eclipse Dynamic Probe Card\n\n"
+        "## Executive Summary\nThe **Technoprobe Eclipse Dynamic** is a highly advanced"
+    )
+    + ", "
+    + _gemma4_marked(
+        "eliminating the need for cumbersome external optical positioning equipment.\n\n"
+        "---\n\n## 1. Core Operational Principles\nThe Eclipse Dynamic addresses the "
+        '"throughput bottleneck" in silicon photonics manufacturing by merging electrical '
+        "and optical characterization into one unified testing step.\n\n"
+        "* **Integrated Dual-Functionality"
+    )
+    + ": "
+    + _gemma4_marked(
+        "** Unlike traditional setups that require separate electrical and optical "
+        "alignment stages"
+    )
+    + ", "
+    + _gemma4_marked(
+        "the Eclipse Dynamic co-locates standard vertical/RF probes with an embedded "
+        "FAU.\n* **Piezoelectric Micro-Positioning"
+    )
+    + ": "
+    + _gemma4_marked(
+        "** The system utilizes internal piezoelectric actuators to manipulate the "
+        "FAU. This allows for high-speed"
+    )
+    + ", "
+    + _gemma4_marked(
+        "facilitating precise coupling between the optical fiber and the photonic die.\n"
+        "* **Flexure-Based Mechanism"
+    )
+    + ": "
+    + _gemma4_marked("** The FAU is mounted on a specialized flexure mechanism...")
+    + ", "
+    + _gemma4_marked("* Technoprobe Official")
+    + ': ["https://www.technoprobe.com/"]}'
+)
+
+
+class TestGemma4ArgsFragmentation3229:
+    """Schema-aware reassembly / fail-closed for Gemma 4 extra keys (#3229)."""
+
+    def test_technoprobe_style_reassembly(self, caplog):
+        """Fragmented **Label:** extras rejoin into content; bogus keys drop."""
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _parse_gemma4_tool_call_fallback(
+                _TECHNOPROBE_FRAGMENTED_CALL, _PDF_TOOLS_3229
+            )
+        args = result["arguments"]
+        assert set(args) == {"filename", "content"}
+        assert args["filename"] == "eclipse.pdf"
+        content = args["content"]
+        assert content.startswith(
+            "# Technical Summary: Technoprobe Eclipse Dynamic Probe Card"
+        )
+        assert "highly advancedeliminating the need" in content
+        assert (
+            "* **Integrated Dual-Functionality:** Unlike traditional setups"
+            in content
+        )
+        assert (
+            "* **Piezoelectric Micro-Positioning:** The system utilizes internal"
+            in content
+        )
+        assert (
+            "* **Flexure-Based Mechanism:** The FAU is mounted on a specialized"
+            in content
+        )
+        assert '* Technoprobe Official:["https://www.technoprobe.com/"]' in content
+        assert "https://www.technoprobe.com/" in content
+        assert any(
+            "reassembled" in msg and "got 6 keys, schema declares 2" in msg
+            for msg in caplog.messages
+        )
+
+    def test_fail_closed_when_extras_are_not_reassembly_shape(self):
+        """Keys ≫ schema but extras are not joinable strings → no tool_calls."""
+        text = (
+            "call:create-pdf-file{"
+            'filename: <|"|>a.pdf<|"|>, '
+            'content: <|"|>hello<|"|>, '
+            "foo: 1, bar: 2, baz: 3}"
+        )
+        with pytest.raises(ValueError, match="[Nn]o function call found"):
+            _parse_gemma4_tool_call_fallback(text, _PDF_TOOLS_3229)
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+        tok.tool_parser = MagicMock(side_effect=ValueError("mlx-lm parser failed"))
+        wrapped = f"<|tool_call>\n{text}\n<tool_call|>"
+        cleaned, tool_calls = parse_tool_calls(wrapped, tok, _PDF_TOOLS_3229)
+        assert tool_calls is None
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
+    def test_exact_schema_keys_unchanged(self):
+        """A call whose keys match the schema is not rewritten."""
+        text = (
+            "call:create-pdf-file{"
+            'filename: <|"|>a.pdf<|"|>, '
+            'content: <|"|>hello **Label:** world<|"|>}'
+        )
+        result = _parse_gemma4_tool_call_fallback(text, _PDF_TOOLS_3229)
+        assert result["arguments"] == {
+            "filename": "a.pdf",
+            "content": "hello **Label:** world",
+        }
+
+    def test_no_tools_does_not_trip(self):
+        """Without a schema, extra keys are kept (same as before #3229)."""
+        result = _parse_gemma4_tool_call_fallback(_TECHNOPROBE_FRAGMENTED_CALL)
+        args = result["arguments"]
+        assert args["filename"] == "eclipse.pdf"
+        assert args["content"].endswith("highly advanced")
+        assert any("Dual-Functionality" in key for key in args)
+        assert len(args) > 2
+
+    def test_issue_dict_reassembly_helper(self):
+        """The captured Technoprobe dict rejoins without inventing bytes."""
+        fragmented = {
+            "content": (
+                "# Technical Summary: Technoprobe Eclipse Dynamic Probe Card\n\n"
+                "## Executive Summary\nThe **Technoprobe Eclipse Dynamic** is a "
+                "highly advanced"
+            ),
+            (
+                "eliminating the need for cumbersome external optical positioning "
+                "equipment.\n\n---\n\n## 1. Core Operational Principles\nThe Eclipse "
+                "Dynamic addresses the \"throughput bottleneck\" in silicon photonics "
+                "manufacturing by merging electrical and optical characterization "
+                "into one unified testing step.\n\n* **Integrated Dual-Functionality"
+            ): (
+                "** Unlike traditional setups that require separate electrical and "
+                "optical alignment stages"
+            ),
+            (
+                "the Eclipse Dynamic co-locates standard vertical/RF probes with an "
+                "embedded FAU.\n* **Piezoelectric Micro-Positioning"
+            ): (
+                "** The system utilizes internal piezoelectric actuators to "
+                "manipulate the FAU. This allows for high-speed"
+            ),
+            (
+                "facilitating precise coupling between the optical fiber and the "
+                "photonic die.\n* **Flexure-Based Mechanism"
+            ): "** The FAU is mounted on a specialized flexure mechanism...",
+            "* Technoprobe Official": ["https://www.technoprobe.com/"],
+        }
+        kept = _gemma4_fit_args(
+            fragmented, "create-pdf-file", _PDF_TOOLS_3229
+        )
+        assert kept is not None
+        assert set(kept) == {"content"}
+        content = kept["content"]
+        assert (
+            "* **Integrated Dual-Functionality:** Unlike traditional setups"
+            in content
+        )
+        assert "* Technoprobe Official:" in content
+
+    def test_args_fit_schema_rejects_without_reassemble(self):
+        """Shared tripwire rejects extras; it does not keep truncated success."""
+        props = {
+            "filename": {"type": "string"},
+            "content": {"type": "string"},
+        }
+        exact = {"filename": "a.pdf", "content": "hello"}
+        assert _args_fit_schema(exact, props) == exact
+        assert _args_fit_schema({"a": 1, "b": 2, "c": 3}, props) is None
+        oversized = {"content": "hello", "extra": "x", "more": "y"}
+        assert _args_fit_schema(oversized, {}) == oversized
+        fitted = _gemma4_reassemble_extras(
+            {"content": "hello", " Dual-Functionality": "** Unlike"},
+            props,
+        )
+        assert fitted == {"content": "hello Dual-Functionality:** Unlike"}
+        assert _args_fit_schema(
+            oversized, props, reassemble=_gemma4_reassemble_extras
+        ) == {"content": "helloextra:xmore:y"}
+
+
 class TestParseToolCallsGemma4Integration:
     """Integration tests for parse_tool_calls() with Gemma 4 tokenizer."""
 
@@ -3015,6 +3232,24 @@ class TestParseToolCallsGemma4Integration:
         assert tool_calls is None
         assert "<|tool_call>" not in cleaned
         assert "<tool_call|>" not in cleaned
+
+    def test_fragmentation_3229_reassembled_end_to_end(self):
+        """Native parser raises; fallback reassembles Technoprobe extras (#3229)."""
+        tok = self._make_gemma4_tokenizer()
+        text = f"<|tool_call>\n{_TECHNOPROBE_FRAGMENTED_CALL}\n<tool_call|>"
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, _PDF_TOOLS_3229)
+
+        assert tool_calls is not None and len(tool_calls) == 1
+        assert tool_calls[0].function.name == "create-pdf-file"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert set(args) == {"filename", "content"}
+        assert args["filename"] == "eclipse.pdf"
+        assert (
+            "* **Integrated Dual-Functionality:** Unlike traditional setups"
+            in args["content"]
+        )
+        assert "<|tool_call>" not in cleaned
 
     def test_markers_stripped_on_total_failure(self, caplog):
         """Even when fallback fails, markers are stripped and warning is logged."""

@@ -23,7 +23,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import regex
 from jsonschema import Draft202012Validator, SchemaError, ValidationError, validate
@@ -216,6 +216,45 @@ def _tool_param_properties(func_name: str, tools: Optional[List]) -> dict:
                 return props
         return {}
     return {}
+
+
+def _args_fit_schema(
+    arguments: dict,
+    props: dict,
+    func_name: str = "",
+    *,
+    reassemble: Optional[Callable[[dict, dict], Optional[dict]]] = None,
+) -> Optional[dict]:
+    """Keep parsed args, try a model-specific reassemble, or reject.
+
+    When the tool schema is known and ``len(arguments) > len(props)``, a
+    successful parse can still be silently truncated (extra keys holding
+    fragments of an intended string).  Do not keep that dict: if
+    ``reassemble`` returns a fitted object, keep that; otherwise return
+    ``None`` so the caller drops the tool call.  No properties, or no
+    extra keys, leaves ``arguments`` unchanged.
+    """
+    if (
+        not isinstance(arguments, dict)
+        or not props
+        or len(arguments) <= len(props)
+    ):
+        return arguments
+    elif (
+        reassemble is not None
+        and isinstance((fitted := reassemble(arguments, props)), dict)
+        and len(fitted) <= len(props)
+    ):
+        return fitted
+    else:
+        logger.warning(
+            "args: got %d keys, schema declares %d — dropping truncated "
+            "tool call %r",
+            len(arguments),
+            len(props),
+            func_name,
+        )
+        return None
 
 
 def _merge_json_fragments(val: str, spec: Any) -> Optional[list]:
@@ -1873,7 +1912,106 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
     return result
 
 
-def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
+def _schema_declares_string(spec: Any) -> bool:
+    """True when a JSON Schema property admits a string value."""
+    if not isinstance(spec, dict):
+        return False
+    raw = spec.get("type")
+    if isinstance(raw, str):
+        types: list[Any] = [raw]
+    elif isinstance(raw, list):
+        types = raw
+    else:
+        union = _union_keyword_types(spec)
+        types = list(union) if union else []
+    return any(
+        isinstance(t, str) and t.strip().lower() in _SCHEMA_STRING_TYPES
+        for t in types
+    )
+
+
+def _gemma4_param_properties(func_name: str, tools: Optional[List]) -> dict:
+    """Like ``_tool_param_properties``, also matching a ``:``-suffix name.
+
+    ``call:google:mcp:...:create-pdf-file`` must still see the registered
+    ``create-pdf-file`` schema so the #3229 tripwire fires on the payload
+    that reaches clients.  Same ``:``-boundary suffix rule as
+    ``_remap_tool_call_names``.
+    """
+    props = _tool_param_properties(func_name, tools)
+    if props or not tools or not func_name or ":" not in func_name:
+        return props
+    valid_names = _extract_tool_names(tools)
+    if func_name in valid_names:
+        return props
+    parts = func_name.split(":")
+    suffixes = {":".join(parts[i:]) for i in range(1, len(parts))}
+    candidates = suffixes & valid_names
+    if len(candidates) != 1:
+        return props
+    return _tool_param_properties(next(iter(candidates)), tools)
+
+
+def _gemma4_reassemble_extras(arguments: dict, props: dict) -> Optional[dict]:
+    """Rejoin Gemma 4 ``<|"|>`` fragments spilled into extra keys (#3229).
+
+    One insertion-order scan: schema keys before the last one stay; extras
+    after it are already ``key + ":" + value`` pieces of that field.  The
+    last schema key must be string-typed.  A later schema key drops
+    interleaved extras (they are not joined).  ``None`` if the shape
+    does not match.
+    """
+    leading: list[tuple[str, Any]] = []
+    extras: list[str] = []
+    extras_ok = True
+    for key, value in arguments.items():
+        if key in props:
+            leading.append((key, value))
+            extras = []
+            extras_ok = True
+            continue
+        if isinstance(value, str):
+            extras.append(key + ":" + value)
+            continue
+        if isinstance(value, (list, tuple)) and all(
+            isinstance(item, str) for item in value
+        ):
+            extras.append(key + ":" + json.dumps(value))
+            continue
+        extras_ok = False
+    if not extras_ok or not extras or not leading:
+        return None
+    target, target_value = leading[-1]
+    if not isinstance(target_value, str) or not _schema_declares_string(
+        props.get(target)
+    ):
+        return None
+    kept = dict(leading[:-1])
+    kept[target] = target_value + "".join(extras)
+    logger.warning(
+        "gemma4 args: got %d keys, schema declares %d — reassembled "
+        'fragmented <|"|> extras',
+        len(arguments),
+        len(props),
+    )
+    return kept
+
+
+def _gemma4_fit_args(
+    arguments: dict, func_name: str, tools: Optional[List]
+) -> Optional[dict]:
+    """Fit Gemma 4 args via ``_args_fit_schema`` and #3229 reassemble."""
+    return _args_fit_schema(
+        arguments,
+        _gemma4_param_properties(func_name, tools),
+        func_name,
+        reassemble=_gemma4_reassemble_extras,
+    )
+
+
+def _parse_gemma4_tool_call_fallback(
+    text: str, tools: Optional[List] = None
+) -> Union[dict, list]:
     """Robust fallback parser for Gemma 4 ``call:name{args}`` format.
 
     Activated only for Gemma 4 models (guarded by the ``tool_call_start``
@@ -1899,6 +2037,10 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
     that is a post-parse concern handled by ``_remap_tool_call_names`` so
     it covers every producer path (native parser, this fallback, XML
     recovery, thinking-content promotion), not just this one.
+
+    ``tools`` (when provided) is passed to ``_gemma4_fit_args``: extra
+    keys are Gemma-reassembled (#3229) or the call is dropped.  With no
+    tools the parsed dict is kept as-is.
     """
     squote_closes = _squote_close_positions(text)
 
@@ -1933,6 +2075,10 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
         except (ValueError, json.JSONDecodeError, RecursionError):
             continue  # one malformed call must not drop its siblings
         if not isinstance(arguments, dict):
+            continue
+        arguments = _gemma4_fit_args(arguments, m.group(1), tools)
+        if arguments is None:
+            # Schema tripwire fired and extras were not the #3229 shape.
             continue
         results.append({"name": m.group(1), "arguments": arguments})
         consumed_until = end
@@ -2130,6 +2276,15 @@ def _parse_tool_calls_impl(
                         name = p.get("name", "")
                         arguments = p.get("arguments", {})
                         if (
+                            tool_call_start == "<|tool_call>"
+                            and isinstance(arguments, dict)
+                        ):
+                            arguments = _gemma4_fit_args(
+                                arguments, name, tools
+                            )
+                            if arguments is None:
+                                continue
+                        if (
                             getattr(tool_parser, "__module__", None)
                             in (
                                 "mlx_lm.tool_parsers.qwen3_coder",
@@ -2182,7 +2337,7 @@ def _parse_tool_calls_impl(
                     if tool_call_start == "<|tool_call>":
                         try:
                             parsed = _parse_gemma4_tool_call_fallback(
-                                match.strip()
+                                match.strip(), tools
                             )
                             items = (
                                 parsed if isinstance(parsed, list) else [parsed]
