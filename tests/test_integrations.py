@@ -425,7 +425,11 @@ class TestCodexConfigWriter:
 
 
 def make_app_bundle(
-    root: Path, name: str, bundle_id: str, with_cli: bool = True
+    root: Path,
+    name: str,
+    bundle_id: str,
+    with_cli: bool = True,
+    cli_path: str = "codex",
 ) -> Path:
     """Create a fake macOS app bundle with an Info.plist and optional CLI."""
     contents = root / name / "Contents"
@@ -433,9 +437,8 @@ def make_app_bundle(
     with (contents / "Info.plist").open("wb") as f:
         plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
     if with_cli:
-        resources = contents / "Resources"
-        resources.mkdir()
-        cli = resources / "codex"
+        cli = contents / "Resources" / cli_path
+        cli.parent.mkdir(parents=True)
         cli.write_text("#!/bin/sh\n")
         cli.chmod(0o755)
     return root / name
@@ -557,8 +560,13 @@ class TestCodexAppIntegration:
             assert not CodexAppIntegration().is_installed()
 
     @pytest.mark.usefixtures("codex_probe")
-    def test_launch_falls_back_to_bundled_cli(self, tmp_path):
-        bundle = make_app_bundle(tmp_path, "Codex.app", "com.openai.codex")
+    @pytest.mark.parametrize(
+        "cli_path", ["codex", "codex-cli/CodexCLI.app/Contents/MacOS/codex"]
+    )
+    def test_launch_falls_back_to_bundled_cli(self, tmp_path, cli_path):
+        bundle = make_app_bundle(
+            tmp_path, "Codex.app", "com.openai.codex", cli_path=cli_path
+        )
         config_path = tmp_path / "codex" / "config.toml"
         captured = {}
 
@@ -576,7 +584,7 @@ class TestCodexAppIntegration:
                 ctx(port=8000, api_key="key", model="q", models_status_map=CODEX_STATUS)
             )
 
-        bundled = str(bundle / "Contents" / "Resources" / "codex")
+        bundled = str(bundle / "Contents" / "Resources" / cli_path)
         assert captured["binary"] == bundled
         assert captured["argv"] == [bundled, "app"]
 

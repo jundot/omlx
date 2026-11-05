@@ -47,6 +47,12 @@ CODEX_APP_BUNDLE_ID = "com.openai.codex"
 # Both pre-rename (Codex.app) and post-rename (ChatGPT.app) folder names.
 _APP_BUNDLE_NAMES = ("Codex.app", "ChatGPT.app")
 _APP_BUNDLE_ROOTS = (Path("/Applications"), Path.home() / "Applications")
+# Bundled CLI under Contents/Resources: nested app first, then the flat
+# executable of older releases.
+_BUNDLED_CLI_PATHS = (
+    Path("codex-cli/CodexCLI.app/Contents/MacOS/codex"),
+    Path("codex"),
+)
 
 
 def find_codex_app_bundle() -> Path | None:
@@ -62,9 +68,11 @@ def bundled_codex_binary() -> str | None:
     """Return the codex CLI shipped inside the desktop app bundle, or None."""
     bundle = find_codex_app_bundle()
     if bundle is not None:
-        bundled = bundle / "Contents" / "Resources" / "codex"
-        if bundled.is_file() and os.access(bundled, os.X_OK):
-            return str(bundled)
+        resources = bundle / "Contents" / "Resources"
+        for relative in _BUNDLED_CLI_PATHS:
+            bundled = resources / relative
+            if bundled.is_file() and os.access(bundled, os.X_OK):
+                return str(bundled)
     return None
 
 
