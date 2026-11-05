@@ -43,6 +43,7 @@ if HAS_MLX:
         estimate_offload_admission_bytes,
         moe_offload_caches,
         moe_offload_stats,
+        releasable_moe_offload_bytes,
         release_moe_offload_slots,
         restore_moe_offload_slots,
     )
@@ -685,6 +686,162 @@ class TestApplyAndForward:
         assert apply_moe_expert_offload(model, tmp_path, 0.25) == 2
         # OffloadSwitchGLU is not `type(...) is SwitchGLU`; nothing to rewrap
         assert apply_moe_expert_offload(model, tmp_path, 0.25) == 0
+
+
+def _assert_slot_state(cache, glu):
+    """slot_of, slot_expert, map and free agree, and each slot holds its expert."""
+    used = {s: e for e, s in cache.slot_of.items()}
+    assert len(used) == len(cache.slot_of)  # no slot shared by two experts
+    assert sorted(cache.free) == [s for s in range(cache.capacity) if s not in used]
+    assert cache.slot_expert.tolist() == [
+        used.get(s, -1) for s in range(cache.capacity)
+    ]
+    assert cache.map.tolist() == [cache.slot_of.get(e, -1) for e in range(E)]
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        lin = getattr(glu, proj)
+        for slots, field in zip(cache.resident[proj], ("weight", "scales", "biases")):
+            if slots is None:
+                continue
+            assert slots.shape[0] == cache.capacity
+            for e, s in cache.slot_of.items():
+                assert bool(mx.array_equal(slots[s], lin[field][e]))
+
+
+class TestSlotRelease:
+    """A sized release keeps the hottest experts, and restore keeps them all."""
+
+    def _switch(self, tmp_path, seed, n_layers=1, fraction=0.75):
+        glus = [_make_glu(seed=seed + i) for i in range(n_layers)]
+        tensors = {}
+        for i, g in enumerate(glus):
+            tensors.update(_glu_tensors(g, f"layers.{i}.experts.switch_glu"))
+        _save_checkpoint(tmp_path, tensors)
+        model = _MiniMoE(glus)
+        assert apply_moe_expert_offload(model, tmp_path, fraction) == n_layers
+        return model, glus
+
+    @staticmethod
+    def _count_reads(cache):
+        reads = []
+        inner = cache.disk.plan
+
+        def spy(proj, field, e):
+            if proj == "gate_proj" and field == "weight":
+                reads.append(e)
+            return inner(proj, field, e)
+
+        cache.disk.plan = spy
+        return reads
+
+    def test_release_keeps_the_hottest_experts_without_reads(self, tmp_path):
+        model, (glu,) = self._switch(tmp_path, seed=40)
+        cache = model.layers[0].experts.switch_glu.cache
+        assert (cache.capacity, cache.floor) == (24, 8)
+        cache.ensure(mx.arange(24))
+        hot = [1, 4, 6, 9, 13, 17, 20, 22, 23, 2, 11, 15]
+        for _ in range(2):
+            cache.ensure(mx.array(hot))
+        reads = self._count_reads(cache)
+        assert cache.release_slots(12) == 12 * cache.expert_bytes
+        assert cache.capacity == 12
+        assert sorted(cache.slot_of) == sorted(hot)
+        assert reads == []
+        _assert_slot_state(cache, glu)
+        hits = cache.hits
+        cache.ensure(mx.array(hot))
+        assert (cache.hits - hits, reads) == (12, [])
+
+    def test_restore_keeps_every_resident_expert(self, tmp_path):
+        model, (glu,) = self._switch(tmp_path, seed=41)
+        cache = model.layers[0].experts.switch_glu.cache
+        cache.ensure(mx.arange(24))
+        cache.release_slots(12)
+        kept = dict(cache.slot_of)
+        reads = self._count_reads(cache)
+        assert cache.restore_slots() == 12 * cache.expert_bytes
+        assert cache.capacity == 24
+        assert cache.slot_of == kept  # same experts in the same slots
+        assert sorted(cache.free) == list(range(12, 24))
+        _assert_slot_state(cache, glu)
+        # The new misses fill the free slots; no kept expert is evicted.
+        new = [e for e in range(E) if e not in kept][:12]
+        cache.ensure(mx.array(new))
+        assert sorted(reads) == new
+        assert set(kept) <= set(cache.slot_of) and not cache.free
+        _assert_slot_state(cache, glu)
+        assert cache.restore_slots() == 0
+
+    def test_release_of_a_partly_empty_cache(self, tmp_path):
+        model, (glu,) = self._switch(tmp_path, seed=42)
+        cache = model.layers[0].experts.switch_glu.cache
+        cache.ensure(mx.array([5, 3, 30]))
+        assert cache.release_slots(12) == 12 * cache.expert_bytes
+        assert sorted(cache.slot_of) == [3, 5, 30]
+        assert len(cache.free) == 9
+        _assert_slot_state(cache, glu)
+        cache.ensure(mx.arange(8, 20))
+        _assert_slot_state(cache, glu)
+        assert cache.release_slots(12) == 0  # already there
+        assert cache.release_slots(1) == 4 * cache.expert_bytes  # clamped to floor
+        assert cache.capacity == cache.floor
+        _assert_slot_state(cache, glu)
+
+    def test_sized_release_steps_cover_the_shortfall(self, tmp_path):
+        """Each sized release takes the smallest quarter step of the slots above
+        the floor that covers the shortfall, counting what was already given up."""
+        model, _ = self._switch(tmp_path, seed=43, n_layers=2)
+        caches = moe_offload_caches(model)
+        for c in caches:
+            c.ensure(mx.arange(24))
+        b = caches[0].expert_bytes
+        reclaims = []
+
+        def release(need):
+            freed = release_moe_offload_slots(caches, need, lambda: reclaims.append(1))
+            return freed, [c.capacity for c in caches]
+
+        assert release(0) == (0, [24, 24])
+        assert releasable_moe_offload_bytes(caches) == 2 * 16 * b
+        assert release(1) == (2 * 4 * b, [20, 20])  # 1/4 of the 16 above the floor
+        assert len(reclaims) == 2  # once per cache that shrank
+        assert release(2 * 4 * b + 1) == (2 * 8 * b, [12, 12])  # 3/4: 1/2 is short
+        assert release(1) == (2 * 4 * b, [8, 8])  # 1/2 frees nothing more
+        assert releasable_moe_offload_bytes(caches) == 0
+        assert release(10**12) == (0, [8, 8])
+        restore_moe_offload_slots(caches, lambda: reclaims.append(1))
+        assert [c.capacity for c in caches] == [24, 24]
+        assert len(reclaims) == 2 + 2 + 2 + 2
+        assert release(10**12) == (2 * 16 * b, [8, 8])  # past every step: floor
+        restore_moe_offload_slots(caches)
+        assert release_moe_offload_slots(caches) == 2 * 16 * b  # unsized: floor
+
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_random_release_restore_matches_resident(self, tmp_path, seed):
+        """Releases and restores interleaved with decode and prefill calls keep
+        the slot state consistent and every output equal to the resident model."""
+        model, (glu,) = self._switch(tmp_path, seed=44 + seed)
+        ref_glu = _make_glu(seed=44 + seed)
+        switch = model.layers[0].experts.switch_glu
+        cache = switch.cache
+        rng = np.random.default_rng(seed)
+        mx.random.seed(seed)
+        for _ in range(40):
+            op = rng.integers(4)
+            if op == 0:
+                cache.release_slots(int(rng.integers(cache.floor, cache.capacity + 1)))
+            elif op == 1:
+                cache.restore_slots()
+            else:
+                n_tok = 1 if op == 2 else int(rng.integers(2, 40))
+                x = mx.random.normal((1, n_tok, D))
+                idx = mx.array(rng.integers(0, E, (1, n_tok, K)), dtype=mx.int32)
+                got, ref = switch(x, idx), ref_glu(x, idx)
+                mx.eval(got, ref)
+                if n_tok * K < 64:  # unsorted kernel on both sides: bit-exact
+                    assert bool(mx.array_equal(got, ref))
+                else:
+                    assert mx.allclose(got, ref, rtol=1e-4, atol=1e-5).item()
+            _assert_slot_state(cache, glu)
 
 
 class TestParallelFetch:
