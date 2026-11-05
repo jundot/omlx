@@ -129,7 +129,7 @@ def test_bootstrap_authorizes_only_the_pinned_controller_address(
 
     authorized = (tmp_path / ".ssh" / "authorized_keys").read_text()
     assert authorized == (
-        'from="10.42.0.10",restrict '
+        'from="10.42.0.10",restrict,pty '
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAworker controller\n"
     )
 
@@ -162,7 +162,7 @@ def test_reenrollment_moves_the_controller_key_source_restriction(
 
     authorized = authorized_keys.read_text()
     assert authorized == (
-        'from="10.42.0.11",restrict '
+        'from="10.42.0.11",restrict,pty '
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAworker controller\n"
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAunrelated operator\n"
     )
