@@ -220,6 +220,24 @@ class Model(Qwen3_5Model):
                             down_key
                         )
                         break
+                # Quantisation parameters must follow the same rename. A packed expert
+                # checkpoint stores them next to the weight, so leaving them under
+                # ``experts.*`` makes the loader reject them as parameters not in the model.
+                for suffix in ("scales", "biases"):
+                    gate_up_q = f"{prefix}.experts.gate_up_proj.{suffix}"
+                    if gate_up_q in weights:
+                        gate_q, up_q = mx.split(weights.pop(gate_up_q), 2, axis=-2)
+                        weights[f"{prefix}.switch_mlp.gate_proj.{suffix}"] = gate_q
+                        weights[f"{prefix}.switch_mlp.up_proj.{suffix}"] = up_q
+                    for down_q in (
+                        f"{prefix}.experts.down_proj.{suffix}",
+                        f"{prefix}.experts.down_proj.weight.{suffix}",
+                    ):
+                        if down_q in weights:
+                            weights[f"{prefix}.switch_mlp.down_proj.{suffix}"] = (
+                                weights.pop(down_q)
+                            )
+                            break
                 return
 
             if f"{prefix}.experts.0.gate_proj.weight" not in weights:
