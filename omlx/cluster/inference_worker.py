@@ -335,35 +335,9 @@ def _thinking_budget_token_to_piece(
     tokenizer: Any, token_id: int
 ) -> str | bytes | None:
     """Best-effort token piece lookup for UTF-8-safe budget forcing."""
-    try:
-        token = tokenizer.convert_ids_to_tokens(token_id)
-        if isinstance(token, bytes):
-            return token
-        if isinstance(token, str):
-            byte_fallback = re.fullmatch(r"(?:<0x[0-9A-Fa-f]{2}>)+", token)
-            if byte_fallback is not None:
-                return bytes(
-                    int(match.group(1), 16)
-                    for match in re.finditer(r"<0x([0-9A-Fa-f]{2})>", token)
-                )
-            byte_decoder = getattr(tokenizer, "byte_decoder", None)
-            if isinstance(byte_decoder, dict) and token:
-                try:
-                    return bytes(byte_decoder[character] for character in token)
-                except (KeyError, TypeError, ValueError):
-                    pass
-            return token
-    except (AttributeError, KeyError, TypeError, ValueError):
-        pass
-    try:
-        return tokenizer.decode([token_id], skip_special_tokens=False)
-    except TypeError:
-        try:
-            return tokenizer.decode([token_id])
-        except Exception:
-            return None
-    except Exception:
-        return None
+    from omlx.api.thinking import BudgetTokenPieces
+
+    return BudgetTokenPieces(tokenizer)(token_id)
 
 
 @contextmanager
@@ -394,7 +368,11 @@ def _install_thinking_budget_support(mlx_server: Any, tokenizer: Any):
     an ``omlx`` ``ThinkingBudgetProcessor`` appended, enforcing the budget in
     the rank's decode loop exactly like single-machine inference does.
     """
-    from omlx.api.thinking import ThinkingBudgetProcessor, prompt_opens_thinking
+    from omlx.api.thinking import (
+        BudgetTokenPieces,
+        ThinkingBudgetProcessor,
+        prompt_opens_thinking,
+    )
 
     think_end_ids, think_start_id = _think_token_ids(tokenizer)
     if not think_end_ids:
@@ -407,8 +385,7 @@ def _install_thinking_budget_support(mlx_server: Any, tokenizer: Any):
     think_end_text = getattr(tokenizer, "think_end", None) or "</think>"
     leading_ids, trailing_ids = _thinking_close_pattern(tokenizer, think_end_text)
 
-    def token_to_piece(token_id: int) -> str | bytes | None:
-        return _thinking_budget_token_to_piece(tokenizer, token_id)
+    token_to_piece = BudgetTokenPieces(tokenizer)
 
     @wraps(original_tokenize)
     def tokenize_with_thinking_state(

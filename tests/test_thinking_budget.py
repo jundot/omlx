@@ -14,7 +14,7 @@ except ImportError:
     HAS_MLX = False
 
 from omlx.adapter.output_parser import OutputParserFactory
-from omlx.api.thinking import ThinkingBudgetProcessor
+from omlx.api.thinking import BudgetTokenPieces, ThinkingBudgetProcessor
 from omlx.model_settings import ModelSettings
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler
@@ -302,6 +302,9 @@ class TestParserBackedThinkingBudgetWiring:
             scheduler, Scheduler
         )
         scheduler._token_piece_to_bytes = Scheduler._token_piece_to_bytes.__get__(
+            scheduler, Scheduler
+        )
+        scheduler._budget_token_pieces = Scheduler._budget_token_pieces.__get__(
             scheduler, Scheduler
         )
         scheduler._resolve_output_parser_thinking_trailing_ids = (
@@ -916,3 +919,164 @@ class TestResolveThinkClosePattern:
         template = "{{ '<channel|>' }} {{ '\\n<channel|>\\n\\n' }}"
         scheduler = self._make_scheduler(template)
         assert scheduler._resolve_think_close_pattern("<channel|>") == ([198], [271])
+
+
+# ---------------------------------------------------------------------------
+# Token pieces for the UTF-8 boundary wait
+# ---------------------------------------------------------------------------
+
+
+class _StubPieceTokenizer:
+    """Tokenizer stub exposing a real ``tokenizers`` decoder for detection."""
+
+    def __init__(self, pieces, decoder, added=()):
+        self._pieces = pieces
+        self.backend_tokenizer = MagicMock()
+        self.backend_tokenizer.decoder = decoder
+        self.added_tokens_decoder = {token_id: object() for token_id in added}
+
+    def convert_ids_to_tokens(self, token_id):
+        return self._pieces[token_id]
+
+
+def _byte_level_pieces():
+    """Qwen3.6's pieces for "思考🤔": the emoji spans three tokens."""
+    return {
+        99496: "æĢĿèĢĥ",  # 思考
+        9008: "ðŁ",  # F0 9F
+        97: "¤",  # A4
+        242: "Ķ",  # 94
+        198: "Ċ",  # \n
+        248068: "<think>",
+        248069: "</think>",
+    }
+
+
+class TestBudgetTokenPieces:
+    def test_byte_level_pieces_map_to_their_bytes(self):
+        from tokenizers import decoders
+
+        tokenizer = _StubPieceTokenizer(
+            _byte_level_pieces(), decoders.ByteLevel(), added=(248068, 248069)
+        )
+        pieces = BudgetTokenPieces(tokenizer)
+
+        assert pieces(99496) == "思考".encode()
+        assert pieces(9008) == b"\xf0\x9f"
+        assert pieces(97) == b"\xa4"
+        assert pieces(242) == b"\x94"
+        assert pieces(9008) + pieces(97) + pieces(242) == "🤔".encode()
+        assert pieces(198) == b"\n"
+
+    def test_byte_level_added_tokens_stay_text(self):
+        from tokenizers import decoders
+
+        tokenizer = _StubPieceTokenizer(
+            _byte_level_pieces(), decoders.ByteLevel(), added=(248068, 248069)
+        )
+        pieces = BudgetTokenPieces(tokenizer)
+
+        assert pieces(248068) == "<think>"
+        assert pieces(248069) == "</think>"
+
+    def test_byte_level_inside_a_decoder_sequence_is_detected(self):
+        from tokenizers import decoders
+
+        decoder = decoders.Sequence([decoders.ByteLevel(), decoders.Strip(" ", 1, 0)])
+        pieces = BudgetTokenPieces(_StubPieceTokenizer(_byte_level_pieces(), decoder))
+
+        assert pieces(97) == b"\xa4"
+
+    def test_sentencepiece_pieces_are_unchanged(self):
+        from tokenizers import decoders
+
+        tokenizer = _StubPieceTokenizer(
+            {1: "<0xE2><0x82>", 2: "▁hello", 3: "¤"},
+            decoders.Metaspace(),
+        )
+        pieces = BudgetTokenPieces(tokenizer)
+
+        assert pieces(1) == b"\xe2\x82"
+        assert pieces(2) == "▁hello"
+        # Not a byte-level vocabulary: Latin-1 characters are just text.
+        assert pieces(3) == "¤"
+
+    def test_slow_tokenizer_byte_decoder_is_still_used(self):
+        tokenizer = MagicMock()
+        tokenizer.byte_decoder = {"Ġ": 32, "a": 97}
+        tokenizer.added_tokens_decoder = {}
+        tokenizer.convert_ids_to_tokens.return_value = "Ġa"
+
+        assert BudgetTokenPieces(tokenizer)(5) == b" a"
+
+    def test_gpt2_table_covers_every_byte(self):
+        from omlx.api.thinking import _gpt2_byte_decoder
+
+        table = _gpt2_byte_decoder()
+        assert len(table) == 256
+        assert sorted(table.values()) == list(range(256))
+        assert table["Ċ"] == 10
+        assert table["Ġ"] == 32
+        assert table["!"] == 33
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx not available")
+    def test_budget_waits_for_the_rest_of_a_split_emoji(self):
+        """A forced close must not land between the bytes of one character."""
+        from tokenizers import decoders
+
+        tokenizer = _StubPieceTokenizer(
+            _byte_level_pieces(), decoders.ByteLevel(), added=(248068, 248069)
+        )
+        think_end_id = 69
+        proc = ThinkingBudgetProcessor(
+            think_end_token_ids=[think_end_id],
+            budget=2,
+            token_to_piece=BudgetTokenPieces(tokenizer),
+        )
+
+        proc(_make_tokens(99496), _make_logits())
+        # Budget reached right after the first byte pair of the emoji.
+        logits = proc(_make_tokens(99496, 9008), _make_logits())
+        assert proc._waiting_utf8
+        assert not proc._forcing
+        assert mx.array_equal(logits, _make_logits())
+
+        logits = proc(_make_tokens(99496, 9008, 97), _make_logits())
+        assert proc._waiting_utf8
+        assert mx.array_equal(logits, _make_logits())
+
+        logits = proc(_make_tokens(99496, 9008, 97, 242), _make_logits())
+        assert proc._forcing
+        assert logits[0, think_end_id].item() == 0.0
+
+
+class TestSchedulerBudgetTokenPieces:
+    def test_scheduler_piece_lookup_maps_byte_level_pieces(self):
+        from tokenizers import decoders
+
+        scheduler = MagicMock(spec=Scheduler)
+        scheduler.tokenizer = _StubPieceTokenizer(
+            _byte_level_pieces(), decoders.ByteLevel(), added=(248068, 248069)
+        )
+        scheduler._budget_token_pieces = Scheduler._budget_token_pieces.__get__(
+            scheduler, Scheduler
+        )
+        to_piece = Scheduler._thinking_budget_token_to_piece.__get__(
+            scheduler, Scheduler
+        )
+
+        assert [to_piece(i) for i in (9008, 97, 242)] == [b"\xf0\x9f", b"\xa4", b"\x94"]
+        assert to_piece(248069) == "</think>"
+
+    def test_scheduler_piece_lookup_follows_a_tokenizer_swap(self):
+        from tokenizers import decoders
+
+        scheduler = MagicMock(spec=Scheduler)
+        scheduler._budget_token_pieces = Scheduler._budget_token_pieces.__get__(
+            scheduler, Scheduler
+        )
+        scheduler.tokenizer = _StubPieceTokenizer({1: "¤"}, decoders.Metaspace())
+        assert scheduler._budget_token_pieces()(1) == "¤"
+
+        scheduler.tokenizer = _StubPieceTokenizer({1: "¤"}, decoders.ByteLevel())
+        assert scheduler._budget_token_pieces()(1) == b"\xa4"
