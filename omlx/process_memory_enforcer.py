@@ -487,6 +487,11 @@ class ProcessMemoryEnforcer:
         # prefill chunk / step boundary. See the grace check in
         # _check_and_enforce.
         self._pressure_reclaim_grace_polls: int = 0
+        # "No evictable models" idle-reclaim backoff: polls left before the next
+        # re-issue, consecutive fruitless re-issues, footprint at the last one.
+        self._no_evictable_reclaim_cooldown: int = 0
+        self._no_evictable_reclaim_streak: int = 0
+        self._no_evictable_reclaim_footprint: int = 0
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -1350,6 +1355,17 @@ class ProcessMemoryEnforcer:
     # while a reclaimable pool drains. Prefill chunks run ~5s at full step
     # size, so 5 one-second polls cover at least one chunk boundary.
     _PRESSURE_RECLAIM_GRACE_POLLS_MAX = 5
+    # Backoff ladder (in 1 s polls) for re-issuing the idle reclaim while hard
+    # pressure persists with nothing evictable. The flag only drains on a truly
+    # idle scheduler, so an ungated re-ask spams one WARNING per second for a
+    # reclaim that frees nothing. Lengthens while the footprint fails to fall.
+    _NO_EVICTABLE_RECLAIM_BACKOFF_POLLS = (1, 2, 5, 15, 60)
+
+    def _reset_no_evictable_reclaim_backoff(self) -> None:
+        """Restart the idle-reclaim backoff once the pressure episode ends."""
+        self._no_evictable_reclaim_cooldown = 0
+        self._no_evictable_reclaim_streak = 0
+        self._no_evictable_reclaim_footprint = 0
 
     def _pool_bytes(self) -> int:
         """MLX buffer-pool size, 0 when unreadable (mocked mx in tests)."""
@@ -1759,6 +1775,7 @@ class ProcessMemoryEnforcer:
             self._pressure_level = "ok"
             self._over_ceiling_polls = 0
             self._pressure_reclaim_grace_polls = 0
+            self._reset_no_evictable_reclaim_backoff()
             return
 
         current = self._current_usage_bytes()
@@ -1789,6 +1806,7 @@ class ProcessMemoryEnforcer:
             # the next one gets a fresh reclaim-grace budget. Must happen
             # before the ok-level early return below.
             self._pressure_reclaim_grace_polls = 0
+            self._reset_no_evictable_reclaim_backoff()
 
         if new_level != prev_level:
             self._pressure_level = new_level
@@ -2014,6 +2032,13 @@ class ProcessMemoryEnforcer:
                             # turns. This only sets a flag; the actual reclaim
                             # runs on the inference thread when it is idle, so
                             # we never touch Metal from the enforcer thread.
+                            #
+                            # That flag only drains on a truly idle scheduler,
+                            # so with nothing evictable the same reclaim would
+                            # be re-asked every poll; back the re-issue off.
+                            if self._no_evictable_reclaim_cooldown > 0:
+                                self._no_evictable_reclaim_cooldown -= 1
+                                break
                             requested = 0
                             for entry in self._engine_pool._entries.values():
                                 sched = self._resolve_scheduler(entry)
@@ -2028,6 +2053,16 @@ class ProcessMemoryEnforcer:
                                 "idle reclaim on %d scheduler(s).",
                                 requested,
                             )
+                            if current < self._no_evictable_reclaim_footprint:
+                                self._no_evictable_reclaim_streak = 0
+                            else:
+                                self._no_evictable_reclaim_streak += 1
+                            ladder = self._NO_EVICTABLE_RECLAIM_BACKOFF_POLLS
+                            self._no_evictable_reclaim_cooldown = ladder[
+                                min(self._no_evictable_reclaim_streak, len(ladder) - 1)
+                            ]
+                            self._no_evictable_reclaim_footprint = current
+
                         else:
                             logger.warning("Hard memory pressure but no models loaded.")
                 # soft + all pinned: nothing to do beyond admission pause.
