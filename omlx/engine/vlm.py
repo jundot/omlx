@@ -59,6 +59,7 @@ from ..models.vlm import VLMModelAdapter
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
+from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
 from ..prefill_helper.adapters import adapter_for as stage_adapter_for
@@ -2694,7 +2695,15 @@ class VLMBatchedEngine(BaseEngine):
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
         # DeepSeek V4.1 applies the setting in its own loader.
-        if a8_prefill_on(self._model_settings) and self.model_type != "deepseek_v41":
+        a8_on = a8_prefill_on(self._model_settings)
+        if a8_on and self.model_type in MINIMAX_M3_MODEL_TYPES:
+            tagged = minimax_a8.tag(
+                self._vlm_model,
+                int(getattr(self._model_settings, "a8_prefill_min_tokens", 128)),
+            )
+            if tagged:
+                logger.info("MiniMax A8 prefill on %d modules", tagged)
+        elif a8_on and self.model_type != "deepseek_v41":
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 

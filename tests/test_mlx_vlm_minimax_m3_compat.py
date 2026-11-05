@@ -478,6 +478,126 @@ def test_minimax_nvfp4_experts_match_dequantized_reference():
     assert error < 2e-2 * max(mx.abs(expected).max().item(), 1.0)
 
 
+def _a8_ready() -> bool:
+    from omlx.custom_kernels.quant_matmul import fast
+
+    return bool(fast.oq_a8_available())
+
+
+def _a8_moe_block(gate_up, down):
+    """A scaled MiniMax MoE block with routed gate/up and down in ``"nvfp4"``
+    or affine GS64 ``"q2"`` / ``"q3"``, and random expert scales."""
+    mx = pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+    args = _tiny_text_config(
+        pack_shared_expert=False,
+        routed_expert_scales=True,
+        use_routing_bias=True,
+        intermediate_size=64,
+        shared_intermediate_size=64,
+        num_local_experts=8,
+        num_experts_per_tok=2,
+    )
+    block = MiniMaxSparseMoeBlock(args)
+    mx.random.seed(3)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        linear = block.switch_mlp[name]
+        linear.weight = mx.random.normal(linear.weight.shape) * 0.05
+    block.set_dtype(mx.bfloat16)
+    specs = {
+        "nvfp4": {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        "q2": {"group_size": 64, "bits": 2, "mode": "affine"},
+        "q3": {"group_size": 64, "bits": 3, "mode": "affine"},
+    }
+    nn.quantize(
+        block,
+        class_predicate=lambda path, m: (
+            specs[down if path.endswith("down_proj") else gate_up]
+            if path.startswith("switch_mlp.") and hasattr(m, "to_quantized")
+            else False
+        ),
+    )
+    for name in ("gate_scale", "up_scale", "down_scale"):
+        block.switch_mlp[name] = mx.random.uniform(0.5, 2.0, (8,))
+    return block
+
+
+def _a8_layers(**modules):
+    nn = pytest.importorskip("mlx.nn")
+    layer = nn.Module()
+    for name, module in modules.items():
+        setattr(layer, name, module)
+    return SimpleNamespace(layers=[layer])
+
+
+@pytest.mark.skipif(not _a8_ready(), reason="needs the M5 NAX + oQ A8 kernels")
+@pytest.mark.parametrize(
+    "gate_up, down, gathers", [("q2", "q2", 2), ("q3", "q3", 2), ("q3", "nvfp4", 1)]
+)
+def test_minimax_a8_routed_experts_track_a16(gate_up, down, gathers, monkeypatch):
+    """oQ2e and oQ3e (affine) experts run both projections on the A8 gather;
+    oQ3.5e (NVFP4 down) runs gate/up only. Both stay near the A16 block."""
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import a8
+
+    block = _a8_moe_block(gate_up, down)
+    x = (mx.random.normal((1, 160, 64), key=mx.random.key(4)) * 0.6).astype(mx.bfloat16)
+    a16 = block(x).astype(mx.float32)
+    calls = []
+    gather = a8.sorted_gather_qmm_a8
+    monkeypatch.setattr(
+        a8, "sorted_gather_qmm_a8", lambda *a, **k: calls.append(1) or gather(*a, **k)
+    )
+    assert a8.tag(_a8_layers(block_sparse_moe=block), 128) == 1
+    out = block(x).astype(mx.float32)
+    assert len(calls) == gathers
+    error = mx.linalg.norm(out - a16) / mx.linalg.norm(a16)
+    assert error.item() < 0.05
+
+
+def test_minimax_a8_tags_and_declines(monkeypatch):
+    """Dense projections get GS64 activation plans, indexers and NVFP4 experts
+    stay A16, and short, float32 or untagged routed calls decline."""
+    mx = pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    from omlx.custom_kernels.quant_matmul import fast
+    from omlx.patches.mlx_vlm_minimax_m3_compat import a8
+
+    monkeypatch.setattr(fast, "oq_a8_available", lambda: True)
+    attn = nn.Module()
+    for name, quant in (
+        ("q_proj", {"group_size": 64, "bits": 5}),
+        ("k_proj", {"group_size": 32, "bits": 8, "mode": "mxfp8"}),
+        ("index_q_proj", {"group_size": 32, "bits": 8, "mode": "mxfp8"}),
+    ):
+        linear = nn.Linear(128, 64, bias=False)
+        linear.set_dtype(mx.bfloat16)
+        setattr(attn, name, nn.QuantizedLinear.from_linear(linear, **quant))
+    nvfp4 = _a8_moe_block("nvfp4", "nvfp4")
+    assert a8.tag(_a8_layers(self_attn=attn, block_sparse_moe=nvfp4), 64) == 2
+    plan, min_tokens = attn.q_proj._omlx_a8_plan
+    assert (plan.act_mode, min_tokens) == (1, 128)
+    assert not hasattr(attn.index_q_proj, "_omlx_a8_plan")
+    assert not hasattr(nvfp4.switch_mlp, a8._ROUTED)
+
+    switch = _a8_moe_block("q3", "q3").switch_mlp
+    x = mx.zeros((1, 160, 64), dtype=mx.bfloat16)
+    inds = mx.zeros((1, 160, 2), dtype=mx.uint32)
+    assert a8.routed(switch, x, inds) is None  # untagged
+    object.__setattr__(switch, a8._ROUTED, 256)
+    assert a8.routed(switch, x, inds) is None  # below min_tokens
+    object.__setattr__(switch, a8._ROUTED, 128)
+    assert a8.routed(switch, x.astype(mx.float32), inds) is None
+
+
 def test_minimax_unpack_sanitizer_keeps_shared_expert_separate():
     mx = pytest.importorskip("mlx.core")
     from omlx.patches.mlx_vlm_minimax_m3_compat import (
