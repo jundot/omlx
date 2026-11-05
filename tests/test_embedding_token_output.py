@@ -2,7 +2,7 @@
 """Tests for the per-token (late-interaction / MaxSim) embedding output."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,9 +11,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omlx.api.embedding_models import (
+    MAX_TOKEN_IDS_PER_REQUEST,
+    EmbeddingUsage,
+    TokenEmbeddingData,
     TokenEmbeddingRequest,
+    TokenEmbeddingResponse,
 )
-from omlx.api.embedding_utils import find_non_finite_token_embeddings
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.models.embedding import MLXEmbeddingModel, TokenEmbeddingOutput
 from omlx.server import ServerState, app
@@ -43,14 +46,49 @@ class _StubModel:
         return SimpleNamespace(last_hidden_state=expanded)
 
 
+class _NanStubModel(_StubModel):
+    """Like ``_StubModel`` but emits NaN wherever ``bad_token`` appears."""
+
+    def __init__(self, bad_token: int, hidden: int = 1):
+        super().__init__(hidden)
+        self.bad_token = bad_token
+
+    def __call__(self, **kwargs):
+        output = super().__call__(**kwargs)
+        bad = mx.expand_dims(
+            mx.equal(kwargs["input_ids"], self.bad_token), -1
+        )
+        corrupt = mx.full(output.last_hidden_state.shape, float("nan"))
+        return SimpleNamespace(
+            last_hidden_state=mx.where(bad, corrupt, output.last_hidden_state)
+        )
+
+
+class _MaskAwareModel:
+    """A forward that actually applies ``attention_mask``.
+
+    Every position's value is its own id plus the mean of the real (unmasked)
+    token ids in its row. If padding or the mask is mishandled the mean shifts
+    and a padded batch disagrees with the single-sequence forward.
+    """
+
+    def __call__(self, input_ids, attention_mask=None):
+        ids = input_ids.astype(mx.float32)
+        mask = attention_mask.astype(mx.float32)
+        denom = mx.maximum(mx.sum(mask, axis=-1, keepdims=True), 1.0)
+        mean = mx.sum(ids * mask, axis=-1, keepdims=True) / denom
+        return SimpleNamespace(last_hidden_state=mx.expand_dims(ids + mean, -1))
+
+
 def _stub_backed_model(
     hidden: int = 1,
     vocab_size: int | None = None,
     max_position_embeddings: int | None = None,
+    stub=None,
 ):
     model = MLXEmbeddingModel("stub-token-embedder")
     model._loaded = True
-    model.model = _StubModel(hidden)
+    model.model = stub if stub is not None else _StubModel(hidden)
     if vocab_size is not None or max_position_embeddings is not None:
         cfg = {}
         if vocab_size is not None:
@@ -86,16 +124,43 @@ class TestTokenEmbeddingRequest:
         with pytest.raises(ValueError):
             TokenEmbeddingRequest(model="m", input_ids=[[-1]])
 
+    def test_accepts_a_request_at_the_token_cap(self):
+        request = TokenEmbeddingRequest(
+            model="m", input_ids=[[1] * MAX_TOKEN_IDS_PER_REQUEST]
+        )
+        assert len(request.input_ids[0]) == MAX_TOKEN_IDS_PER_REQUEST
 
-class TestNonFiniteTokenEmbeddings:
-    """The NaN/Inf guard for nested token output."""
+    def test_rejects_a_request_over_the_token_cap(self):
+        with pytest.raises(ValueError, match="per-request limit"):
+            TokenEmbeddingRequest(
+                model="m", input_ids=[[1] * (MAX_TOKEN_IDS_PER_REQUEST + 1)]
+            )
 
-    def test_flags_the_offending_sequence(self):
-        bad = [[[0.0, float("nan")], [1.0, 1.0]], [[2.0, 2.0]]]
-        assert find_non_finite_token_embeddings(bad) == [0]
+    def test_rejects_a_ragged_batch_over_the_token_cap(self):
+        # The cap counts the whole request, not one sequence.
+        per_sequence = MAX_TOKEN_IDS_PER_REQUEST // 2 + 1
+        with pytest.raises(ValueError, match="per-request limit"):
+            TokenEmbeddingRequest(
+                model="m", input_ids=[[1] * per_sequence] * 2
+            )
 
-    def test_clean_input_passes(self):
-        assert find_non_finite_token_embeddings([[[1.0], [2.0]]]) == []
+
+class TestTokenEmbeddingResponseContract:
+    """The response reuses the pooled usage envelope and drops token_count."""
+
+    def test_usage_is_the_shared_embedding_usage(self):
+        response = TokenEmbeddingResponse(
+            data=[TokenEmbeddingData(index=0, embedding=[[0.5, 1.5]])],
+            model="m",
+            usage=EmbeddingUsage(prompt_tokens=4, total_tokens=4),
+        )
+        payload = response.model_dump()
+        assert payload["usage"] == {"prompt_tokens": 4, "total_tokens": 4}
+
+    def test_data_item_has_no_token_count(self):
+        item = TokenEmbeddingData(index=0, embedding=[[1.0], [2.0]])
+        assert "token_count" not in item.model_dump()
+        assert item.embedding == [[1.0], [2.0]]
 
 
 class TestEmbedTokenIds:
@@ -110,6 +175,7 @@ class TestEmbedTokenIds:
         assert all(len(vec) == 3 for row in out.token_embeddings for vec in row)
         assert out.total_tokens == 5
         assert out.dimensions == 3
+        assert out.non_finite_items == []
 
     def test_pads_the_batch_then_slices_each_row(self):
         model = _stub_backed_model()
@@ -121,11 +187,54 @@ class TestEmbedTokenIds:
         assert [vec[0] for vec in out.token_embeddings[0]] == [7.0, 8.0, 9.0]
         assert [vec[0] for vec in out.token_embeddings[1]] == [3.0]
 
+    def test_mask_aware_padding_matches_single_sequence_forwards(self):
+        # The stub uses attention_mask, so a padding leak changes the values.
+        model = _stub_backed_model(stub=_MaskAwareModel())
+        batched = model.embed_token_ids([[5, 6, 7], [8]])
+        single0 = model.embed_token_ids([[5, 6, 7]]).token_embeddings[0]
+        single1 = model.embed_token_ids([[8]]).token_embeddings[0]
+
+        for got, want in zip(batched.token_embeddings[0], single0, strict=True):
+            assert got == pytest.approx(want, abs=1e-6)
+        for got, want in zip(batched.token_embeddings[1], single1, strict=True):
+            assert got == pytest.approx(want, abs=1e-6)
+
     def test_values_are_the_raw_final_hidden_state(self):
         # No pooling and no L2 normalization: the caller owns both.
         model = _stub_backed_model(hidden=2)
         out = model.embed_token_ids([[1, 2]])
         assert out.token_embeddings == [[[1.0, 2.0], [2.0, 3.0]]]
+
+    def test_splits_forwards_on_the_encoder_token_budget(self, monkeypatch):
+        # 3 padded tokens * 3 sequences would be 9; a budget of 6 must split it.
+        monkeypatch.setattr(
+            "omlx.models.embedding.ENCODER_BATCH_TOKEN_BUDGET", 6
+        )
+        model = _stub_backed_model()
+        out = model.embed_token_ids([[1, 2, 3], [4, 5], [6]])
+
+        assert all(batch * width <= 6 for batch, width in model.model.batch_shapes)
+        assert len(model.model.batch_shapes) > 1
+        assert [vec[0] for row in out.token_embeddings for vec in row] == [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+        ]
+        assert out.total_tokens == 6
+
+    def test_non_finite_rows_are_reported_without_vectors(self):
+        model = _stub_backed_model(stub=_NanStubModel(bad_token=2))
+        out = model.embed_token_ids([[1, 2, 3], [4, 5]])
+
+        assert out.non_finite_items == [0]
+        assert out.token_embeddings == []
+        assert out.total_tokens == 5
+
+    def test_nan_at_padding_positions_is_not_reported(self):
+        # Token 0 is the pad id: a NaN there is not a returned token vector.
+        model = _stub_backed_model(stub=_NanStubModel(bad_token=0))
+        out = model.embed_token_ids([[1, 2, 3], [4]])
+
+        assert out.non_finite_items == []
+        assert [len(row) for row in out.token_embeddings] == [3, 1]
 
     def test_rejects_an_empty_sequence(self):
         model = _stub_backed_model()
@@ -158,6 +267,13 @@ class TestEmbedTokenIds:
         with pytest.raises(ValueError, match="exceeds maximum context length of 10"):
             model.embed_token_ids([[1] * 12], max_length=10)
 
+    def test_explicit_max_length_cannot_exceed_the_model_bound(self):
+        # A caller value above the position table must not lift the bound: an
+        # out-of-range table row reads zeros instead of raising.
+        model = _stub_backed_model(max_position_embeddings=512)
+        with pytest.raises(ValueError, match="exceeds maximum context length of 512"):
+            model.embed_token_ids([[1] * 600], max_length=100_000)
+
 
 class _StubEngineModel:
     """Engine-level stub: only `embed_token_ids` is exercised."""
@@ -183,12 +299,26 @@ class TestEngineEmbedTokenIds:
         assert [vec[0] for vec in out.token_embeddings[1]] == [4.0]
         assert out.total_tokens == 4
 
+    def test_non_finite_items_are_mapped_to_request_indices(self):
+        # The short (bad) sequence is grouped first; the engine must report the
+        # caller's index, not the length-grouped position.
+        engine = EmbeddingEngine("stub-token-embedder", batch_size=16)
+        engine._model = _StubEngineModel(
+            _stub_backed_model(stub=_NanStubModel(bad_token=20))
+        )
+
+        out = asyncio.run(engine.embed_token_ids([[10, 11, 12], [20]]))
+
+        assert out.non_finite_items == [1]
+        assert out.token_embeddings == []
+
     def test_empty_batch_is_empty(self):
         engine = EmbeddingEngine("stub-token-embedder")
         engine._model = _StubEngineModel(_stub_backed_model())
         out = asyncio.run(engine.embed_token_ids([]))
         assert out.token_embeddings == []
         assert out.total_tokens == 0
+        assert out.non_finite_items == []
 
     def test_requires_a_started_engine(self):
         engine = EmbeddingEngine("stub-token-embedder")
@@ -252,28 +382,37 @@ class TestEngineEmbedTokenIds:
 
 
 class TestServerTokenEmbeddingsEndpoint:
-    """`/v1/embeddings/tokens` endpoint returns 400 for model bounds violations."""
+    """`/v1/embeddings/tokens` model-bound and contract behaviour."""
 
-    @pytest.fixture
-    def test_client(self):
-        engine = EmbeddingEngine("test-stub-embedder")
-        engine._model = _stub_backed_model(vocab_size=1000, max_position_embeddings=512)
+    @staticmethod
+    @asynccontextmanager
+    async def _noop_acquire(engine):
+        yield engine
 
-        @asynccontextmanager
-        async def _acquire(_model):
-            yield engine
-
+    @classmethod
+    @contextmanager
+    def _client(cls, engine):
         state = ServerState()
         with (
             patch("omlx.server._JSON_KEEPALIVE_GRACE_S", 2),
             patch("omlx.server._server_state", state),
             patch("omlx.server.get_embedding_engine", AsyncMock(return_value=engine)),
-            patch("omlx.server.acquire_embedding_engine", _acquire),
+            patch(
+                "omlx.server.acquire_embedding_engine",
+                lambda _model: cls._noop_acquire(engine),
+            ),
             patch("omlx.server.get_max_context_window", return_value=None),
             patch("omlx.server.resolve_model_id", return_value="test-stub-embedder"),
             patch("omlx.server.get_server_metrics", return_value=MagicMock()),
         ):
             yield TestClient(app)
+
+    @pytest.fixture
+    def test_client(self):
+        engine = EmbeddingEngine("test-stub-embedder")
+        engine._model = _stub_backed_model(vocab_size=1000, max_position_embeddings=512)
+        with self._client(engine) as client:
+            yield client
 
     def test_rejects_token_id_past_vocab_size_with_400(self, test_client):
         res = test_client.post(
@@ -301,12 +440,55 @@ class TestServerTokenEmbeddingsEndpoint:
         assert res.status_code == 400
         assert "context length" in res.text
 
-    def test_returns_200_for_valid_input(self, test_client):
+    def test_explicit_max_length_cannot_exceed_the_model_bound(self, test_client):
+        res = test_client.post(
+            "/v1/embeddings/tokens",
+            json={
+                "model": "test-stub-embedder",
+                "input_ids": [[1] * 600],
+                "max_length": 100_000,
+            },
+        )
+        assert res.status_code == 400
+        assert "context length of 512" in res.text
+
+    def test_rejects_a_request_over_the_token_cap_with_422(self, test_client):
+        res = test_client.post(
+            "/v1/embeddings/tokens",
+            json={
+                "model": "test-stub-embedder",
+                "input_ids": [[1] * (MAX_TOKEN_IDS_PER_REQUEST + 1)],
+            },
+        )
+        assert res.status_code == 422
+        assert "per-request limit" in res.text
+
+    def test_returns_200_with_shared_usage_and_no_token_count(self, test_client):
         res = test_client.post(
             "/v1/embeddings/tokens",
             json={"model": "test-stub-embedder", "input_ids": [[1, 2, 3]]},
         )
         assert res.status_code == 200
-        data = res.json()["data"]
-        assert len(data) == 1
-        assert data[0]["token_count"] == 3
+        body = res.json()
+        assert body["object"] == "list"
+        assert body["model"] == "test-stub-embedder"
+        assert body["usage"] == {"prompt_tokens": 3, "total_tokens": 3}
+        assert len(body["data"]) == 1
+        assert "token_count" not in body["data"][0]
+        assert len(body["data"][0]["embedding"]) == 3
+
+    def test_non_finite_output_is_a_500_listing_the_item(self):
+        engine = EmbeddingEngine("test-stub-embedder")
+        engine._model = _stub_backed_model(
+            vocab_size=1000,
+            max_position_embeddings=512,
+            stub=_NanStubModel(bad_token=2),
+        )
+        with self._client(engine) as client:
+            res = client.post(
+                "/v1/embeddings/tokens",
+                json={"model": "test-stub-embedder", "input_ids": [[1, 2, 3]]},
+            )
+        assert res.status_code == 500
+        assert "non-finite" in res.text
+        assert "item(s) [0]" in res.text
