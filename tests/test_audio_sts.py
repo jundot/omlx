@@ -53,6 +53,7 @@ def _make_mock_sts_engine(output_wav: bytes = None) -> MagicMock:
 def _make_mock_pool(sts_engine=None, model_id: str = "deepfilternet") -> MagicMock:
     """Build a mock EnginePool that returns the given STS engine."""
     pool = MagicMock()
+    pool.release_engine = AsyncMock()
     pool.get_engine = AsyncMock(return_value=sts_engine or _make_mock_sts_engine())
     pool.get_entry = MagicMock(return_value=MagicMock(
         model_type="audio_sts",
@@ -300,7 +301,9 @@ class TestSTSModelAliasResolution:
                     files={"file": ("test.wav", TINY_WAV, "audio/wav")},
                 )
                 assert response.status_code == 200
-                mock_pool.get_engine.assert_awaited_once_with("MossFormer2-SE")
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "MossFormer2-SE", _lease=True
+                )
 
     def test_process_direct_model_id(self):
         """POST /v1/audio/process with direct model ID works without alias."""
@@ -331,7 +334,9 @@ class TestSTSModelAliasResolution:
                     files={"file": ("test.wav", TINY_WAV, "audio/wav")},
                 )
                 assert response.status_code == 200
-                mock_pool.get_engine.assert_awaited_once_with("MossFormer2-SE")
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "MossFormer2-SE", _lease=True
+                )
 
 
 # ---------------------------------------------------------------------------
