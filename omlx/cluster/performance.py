@@ -178,6 +178,11 @@ class ExecutionSettings:
     mtp: bool = False
     mtp_depth: int = 0
     mtp_fixed_depth: bool = False
+    # The model's DeepSeek V4.1 prefill paths. Tensor-parallel ranks load with
+    # them; pipeline stages keep the plain prefill.
+    ced_prefill: bool = False
+    a8_prefill: bool = False
+    a8_prefill_min_tokens: int = 128
 
     def __post_init__(self) -> None:
         if self.profile not in {"interactive", "balanced", "throughput"}:
@@ -190,6 +195,7 @@ class ExecutionSettings:
             "pipeline_microbatch_size",
             "ring_connections_per_ip",
             "prompt_cache_ssd_max_bytes",
+            "a8_prefill_min_tokens",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -243,6 +249,9 @@ class ExecutionSettings:
             "mtp": self.mtp,
             "mtp_depth": self.mtp_depth,
             "mtp_fixed_depth": self.mtp_fixed_depth,
+            "ced_prefill": self.ced_prefill,
+            "a8_prefill": self.a8_prefill,
+            "a8_prefill_min_tokens": self.a8_prefill_min_tokens,
         }
 
     @classmethod
