@@ -1288,7 +1288,7 @@ class Affine4KVCache(TurboQuantKVCache):
         batch, heads, query_length, _ = queries.shape
         tokens = keys.shape[-2]
         step = max(1, _MAX_SCORE_ELEMENTS // max(1, batch * heads * tokens))
-        sinks = None if sinks is None else sinks.astype(mx.float32)
+        sinks = None if sinks is None else sinks.astype(queries.dtype)
         if query_length <= step:
             return mx.fast.scaled_dot_product_attention(
                 queries,
@@ -1361,9 +1361,11 @@ class Affine4KVCache(TurboQuantKVCache):
             and _state_length(keys_state) >= _MIN_NATIVE_TOKENS
             and self.key_codec.dim == self.value_codec.dim
             and self.key_codec.dim in (64, 72, 80, 96, 128, 256)
-            and sinks is None
             and (effective_mask is None or isinstance(effective_mask, str))
         ):
+            # Attention sinks add one logit per head to the softmax denominator. They
+            # do not depend on K/V, so the orthonormal rotation leaves them unchanged.
+            fused_sinks = None if sinks is None else sinks.astype(mx.bfloat16)
             rotated_queries = self.key_codec.prepare_queries(queries).astype(
                 mx.bfloat16
             )
@@ -1382,6 +1384,7 @@ class Affine4KVCache(TurboQuantKVCache):
                     rotated_values,
                     scale=scale,
                     mask=effective_mask,
+                    sinks=fused_sinks,
                     force_fused=True,
                 )
             else:
@@ -1391,7 +1394,7 @@ class Affine4KVCache(TurboQuantKVCache):
                     rotated_values,
                     scale,
                     effective_mask,
-                    None,
+                    fused_sinks,
                 )
             output = self.value_codec._rotate_inverse(
                 rotated_output.astype(mx.float32)
@@ -1484,6 +1487,10 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
             raise ValueError(
                 f"Unsupported {self.quantization_scheme} attention mask: {mask}"
             )
+        # Without left padding the plain mask is exact; keeping it a string lets the
+        # bf16 prefill use the fused kernel instead of a (query x cache) mask array.
+        if (mask is None or causal) and not mx.any(self.left_padding).item():
+            return mask
         columns = mx.arange(tokens)
         allowed = columns[None, None, None, :] >= self.left_padding[:, None, None, None]
         if causal:
