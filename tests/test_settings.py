@@ -3057,6 +3057,76 @@ class TestClaudeCodeRouteIntegration:
             GlobalSettings.load(base_path=tmp_path).claude_code.desktop_enabled is False
         )
 
+    @pytest.mark.asyncio
+    async def test_desktop_restore_serializes_with_settings_save(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio
+        import threading
+
+        import httpx
+        from fastapi import FastAPI
+
+        from omlx.admin import routes as admin_routes
+        from omlx.admin.auth import require_admin
+        from omlx.integrations import claude_desktop
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.claude_code.desktop_enabled = True
+        gs.save()
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: None)
+        monkeypatch.setattr(admin_routes, "_settings_save_lock", asyncio.Lock())
+        monkeypatch.setattr(claude_desktop, "is_configured", lambda: False)
+        restore_called = asyncio.Event()
+
+        def restore():
+            restore_called.set()
+            return True
+
+        monkeypatch.setattr(claude_desktop, "restore", restore)
+        app = FastAPI()
+        app.include_router(admin_routes.router)
+        app.dependency_overrides[require_admin] = lambda: True
+        writer_entered = threading.Event()
+        release_writer = threading.Event()
+        main_thread = threading.get_ident()
+        fsync = os.fsync
+
+        def pause_first_writer(fd):
+            if threading.get_ident() != main_thread and not writer_entered.is_set():
+                writer_entered.set()
+                if not release_writer.wait(5):
+                    raise TimeoutError("settings writer was not released")
+            fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", pause_first_writer)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            saving = asyncio.create_task(
+                client.post("/admin/api/global-settings", json={})
+            )
+            restoring = None
+            try:
+                assert await asyncio.to_thread(writer_entered.wait, 5)
+                restoring = asyncio.create_task(
+                    client.post("/admin/api/claude-desktop/restore", json={})
+                )
+                await asyncio.wait_for(restore_called.wait(), timeout=5)
+                release_writer.set()
+                saved, restored = await asyncio.wait_for(
+                    asyncio.gather(saving, restoring), timeout=5
+                )
+                assert saved.status_code == 200, saved.text
+                assert restored.status_code == 200, restored.text
+                persisted = json.loads((tmp_path / "settings.json").read_text())
+                assert persisted["claude_code"]["desktop_enabled"] is False
+            finally:
+                release_writer.set()
+                pending = [saving] + ([restoring] if restoring is not None else [])
+                await asyncio.gather(*pending, return_exceptions=True)
+
 
 class TestCORSMiddleware:
     """Test that CORS middleware is correctly applied to the server."""
