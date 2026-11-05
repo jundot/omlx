@@ -1417,7 +1417,7 @@ class TestPagedSSDCacheManagerWithMLX:
 
         current = sum(write(i, "model-a", 256) for i in range(2))
         old_layout = sum(write(2 + i, "model-a", 2048) for i in range(3))
-        write(5, "model-b", 256)
+        other_model = write(5, "model-b", 256)
 
         manager = PagedSSDCacheManager(
             cache_dir=cache_dir,
@@ -1445,6 +1445,11 @@ class TestPagedSSDCacheManagerWithMLX:
 
             assert stats.num_files == 6
             assert stats.total_size_bytes == current + old_layout + 300
+
+            # #5063: the dashboard header also counts unloaded models' blocks.
+            tracked = manager.get_tracked_files()
+            assert len(tracked) == 7
+            assert sum(tracked.values()) == current + old_layout + other_model + 300
         finally:
             manager.close()
 

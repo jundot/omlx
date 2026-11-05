@@ -6604,6 +6604,7 @@ def _build_runtime_cache_observability(
 
     block_sizes = set()
     live_splash_dirs = set()
+    ssd_files: dict[Path, int] = {}
 
     for model_info in engine_pool.get_status().get("models", []):
         model_id = model_info.get("id")
@@ -6834,12 +6835,19 @@ def _build_runtime_cache_observability(
                 live_splash_dirs.add(entry.engine.ssd_cache_dir)
 
         payload["models"].append(model_payload)
-        payload["total_num_files"] += model_payload["num_files"]
-        payload["total_size_bytes"] += model_payload["total_size_bytes"]
+        if ssd_manager is not None and not model_filter:
+            # Managers share one SSD directory and budget, and each also tracks
+            # blocks of unloaded models. Count every tracked file once.
+            ssd_files.update(ssd_manager.get_tracked_files())
+        else:
+            payload["total_num_files"] += model_payload["num_files"]
+            payload["total_size_bytes"] += model_payload["total_size_bytes"]
 
         if isinstance(block_size, int) and block_size > 0:
             block_sizes.add(block_size)
 
+    payload["total_num_files"] += len(ssd_files)
+    payload["total_size_bytes"] += sum(ssd_files.values())
     payload["effective_block_sizes"] = sorted(block_sizes)
 
     # Aggregate hot-cache and disk-max across models. Hot cache max is a single

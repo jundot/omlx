@@ -5403,6 +5403,22 @@ class PagedSSDCacheManager(CacheManager):
         with self._lock:
             return self._gdn_legacy_fp32_fallbacks
 
+    def get_tracked_files(self) -> dict[Path, int]:
+        """Return the size of each tracked SSD file, keyed by path.
+
+        Includes other models' blocks and sidecars, the same files that
+        ``_tracked_ssd_size()`` charges to the shared SSD budget.
+        """
+        with self._lock:
+            return {
+                metadata.file_path: metadata.file_size
+                for metadata in (
+                    *self._index.get_all_metadata(),
+                    *self._incompatible_index.get_all_metadata(),
+                    *self._gdn_sidecar_index.get_all_metadata(),
+                )
+            }
+
     def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
         """Get model-scoped SSD cache statistics.
 
