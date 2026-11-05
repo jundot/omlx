@@ -2758,9 +2758,12 @@ class ToolCallStreamFilter:
         if self._opens_payload_at(tail, 0):
             return True
         start = len(self._opener_at(tail, 0))
-        # A declared tool name is call evidence in any call format.
+        # A declared tool name is call evidence only in call position, right
+        # after the opener (`<tool_call>write(...`, `<tool_call>name\n<arg_key>`).
+        # Coding-agent tool names are common words (read, write, edit, bash):
+        # anywhere else they are prose, and counting them failed quoted markers.
         for name in self._registered_tool_names:
-            if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", tail[start:]):
+            if re.match(rf"\s*{re.escape(name)}(?![\w-])", tail[start:]):
                 return True
         # One forward cursor per marker keeps marker-heavy tails linear.
         cursors = {
