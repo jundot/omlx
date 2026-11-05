@@ -33,7 +33,8 @@
   <a href="README.md">English</a> ·
   <b>中文</b> ·
   <a href="README.ko.md">한국어</a> ·
-  <a href="README.ja.md">日本語</a>
+  <a href="README.ja.md">日本語</a> ·
+  <a href="README.it.md">Italiano</a>
 </p>
 
 ---
