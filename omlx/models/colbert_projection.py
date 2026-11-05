@@ -8,47 +8,59 @@ output is a *projected*, per-token L2-normalized vector.
 
 The projection is not part of the transformer checkpoint. sentence-transformers
 describes it in ``modules.json`` as a chain of ``pylate.models.Dense.Dense``
-modules. The pinned ONNX export folds those modules **and** the final per-token
-L2 into the graph, so its output is the contract to reproduce. Reading that graph
-back pins the recipe exactly::
+modules. Each module is a ``torch.nn.Linear`` plus an optional residual, followed
+by the module's declared activation function. Reproducing
+``pylate.models.Dense.Dense.forward`` exactly gives::
 
-    h = encoder(input_ids, attention_mask)     # (B, T, 768)
-    x = h @ W0.linear + h @ W0.residual        # (B, T, 1536)
-    x = x @ W1.linear + x @ W1.residual        # (B, T, 768)
-    x = x @ W2.linear                          # (B, T, 128)
-    x = x / clip(||x||_2, axis=-1, eps)        # per-token L2
+    y = activation(h @ W.linear.T + b.linear)               # torch Linear
+    if use_residual:
+        y = y + (h if in_features == out_features else h @ W.residual.T)
+    h = y
+    ...
+    h = h / clip(||h||_2, axis=-1, eps)                     # per-token L2
 
-Two facts the graph makes explicit and that are easy to get wrong:
+Three facts the module config makes explicit and that are easy to get wrong:
 
-* ``residual`` is a **second learned MatMul over the same input**, added to the
-  ``linear`` result -- not an identity skip, which is not even shape-compatible
-  here (``1_Dense`` maps 768 -> 1536).
-* The final Dense has no residual, and the per-token L2 is part of the model
-  contract rather than a caller convention. The export spells it
-  ``ReduceL2 -> Clip(min=1e-12) -> Div``.
+* The activation is applied to the *linear* output, **before** the residual is
+  added, because that is the order in pylate's ``Dense.forward``. The published
+  ColBERT projections declare ``Identity``, but a checkpoint that declares
+  anything else is applied faithfully -- or rejected (see ``_ACTIVATION_MODULES``)
+  rather than served un-activated.
+* ``residual`` is an identity skip when ``in_features == out_features``; pylate
+  only builds a ``residual`` submodule (a second learned ``nn.Linear``, with
+  ``bias=False``) when the layer changes width. So a shape-changing layer adds
+  ``h @ W.residual.T`` and a same-width layer adds ``h``.
+* The per-token L2 is part of the model contract rather than a caller
+  convention. The pinned export spells it ``ReduceL2 -> Clip(min=1e-12) -> Div``,
+  which is ``torch.nn.functional.normalize``; ``_L2_EPS`` matches that clamp.
 
 Weight sources
 --------------
-
 A ColBERT repository can ship two weight sets that are **not the same numbers**:
 the sentence-transformers ``model.safetensors`` and the exported ``model.onnx``
-(measured on ``lightonai/LateOn-multilingual``: projection weights correlate
-0.99996 with a 1.1e-3 max difference, giving ~0.99 per-token cosine between the
-two outputs). Serving one set where the other produced the frozen retrieval
-measurements silently changes the representation, so the source is explicit in
-the layout, logged at load, reported by ``get_model_info``, and overridable with
+(measured on the pinned checkpoint: projection weights correlate 0.99996 with a
+1.1e-3 max difference, giving ~0.99 per-token cosine between the two outputs).
+Serving one set where the other produced the frozen retrieval measurements
+silently changes the representation, so the source is explicit in the layout,
+logged at load, reported by ``get_model_info``, and overridable with
 ``OMLX_COLBERT_WEIGHT_SOURCE``.
 
-Orientation differs between the two: ``pylate.models.Dense.Dense`` wraps
-``torch.nn.Linear``, so its safetensors weight is ``[out_features,
-in_features]`` and the operation is ``x @ W.T``; the ONNX MatMul B operand is
-``[in_features, out_features]``. The ONNX reader transposes at the boundary so
-both sources share one ``[out, in]`` forward path, and the loader validates every
-shape so a transposed export fails loudly instead of quietly producing noise.
+``model.safetensors`` is the default source: it is native to MLX and every
+sentence-transformers export ships it, whereas the ONNX graph is optional and
+only readable in a specific historical export layout (see
+``colbert_onnx_weights``). Both sources share this module's ``[out, in]``
+forward path: the ONNX reader transposes at the boundary, and the loader
+validates every shape so a transposed export fails loudly instead of quietly
+producing noise.
+
+Orientation: ``pylate.models.Dense.Dense`` wraps ``torch.nn.Linear``, so its
+safetensors weight is ``[out_features, in_features]`` and the operation is
+``x @ W.T``; the ONNX MatMul B operand is ``[in_features, out_features]``.
 """
 
 import json
 import logging
+import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -91,6 +103,38 @@ _ROPE_PARAMETER_FIELDS = (
     ("sliding_attention", "local_rope_theta"),
 )
 
+# Activations a ``pylate.models.Dense.Dense`` module may declare. sentence-
+# transformers serializes the torch module as a dotted path in the module's
+# config.json (newer builds; older ones wrote the bare class name), so both are
+# accepted. Anything else is a hard error: applying the projection without its
+# declared activation would silently move every vector.
+_ACTIVATION_MODULES: dict[str, str] = {
+    "torch.nn.modules.linear.Identity": "identity",
+    "torch.nn.Identity": "identity",
+    "torch.nn.modules.activation.ReLU": "relu",
+    "torch.nn.ReLU": "relu",
+    "torch.nn.modules.activation.GELU": "gelu",
+    "torch.nn.GELU": "gelu",
+    "torch.nn.modules.activation.Tanh": "tanh",
+    "torch.nn.Tanh": "tanh",
+    # Older sentence-transformers builds serialized only the class name.
+    "Identity": "identity",
+    "ReLU": "relu",
+    "GELU": "gelu",
+    "Tanh": "tanh",
+}
+
+# The kernels behind ``_ACTIVATION_MODULES``. These mirror the torch modules'
+# forward passes; ``gelu`` is torch's default (exact, erf-based) form. A torch
+# ``nn.GELU(approximate="tanh")`` serializes the same class path and therefore
+# cannot be distinguished here.
+_ACTIVATIONS = {
+    "identity": lambda x: x,
+    "relu": lambda x: mx.maximum(x, 0.0),
+    "gelu": lambda x: 0.5 * x * (1.0 + mx.erf(x * (1.0 / math.sqrt(2.0)))),
+    "tanh": lambda x: mx.tanh(x),
+}
+
 
 class ColbertLayoutError(ValueError):
     """A directory that claims to be a pylate ColBERT export cannot be served."""
@@ -110,13 +154,31 @@ class ColbertDenseSpec:
     """Width produced by this module."""
 
     use_residual: bool
-    """Whether ``residual.weight`` is applied to the same input and added."""
+    """Whether the input is added back after the linear projection."""
 
     bias: bool
-    """Whether ``linear.bias`` (and ``residual.bias``) exist."""
+    """Whether ``linear.bias`` exists."""
 
     weights: Path | None = None
     """``model.safetensors`` for the safetensors source; None when ONNX-sourced."""
+
+    activation: str = "identity"
+    """Declared activation: ``identity``, ``relu``, ``gelu`` or ``tanh``."""
+
+    @property
+    def residual_is_identity(self) -> bool:
+        """Whether pylate adds the input itself instead of a residual MatMul.
+
+        ``pylate.models.Dense.Dense`` only builds its ``residual`` submodule when
+        the layer changes width, so a same-width ``use_residual`` module is an
+        identity skip and carries no ``residual.weight`` at all.
+        """
+        return self.use_residual and self.in_features == self.out_features
+
+    @property
+    def needs_residual_matrix(self) -> bool:
+        """Whether this module must carry a ``residual.weight`` matrix."""
+        return self.use_residual and self.in_features != self.out_features
 
 
 @dataclass(frozen=True)
@@ -158,7 +220,10 @@ class ColbertLayout:
         """The file the weights actually came from."""
         if self.weight_source == WEIGHT_SOURCE_ONNX and self.onnx_graph is not None:
             return self.onnx_graph
-        assert self.encoder_weights is not None
+        if self.encoder_weights is None:
+            raise ColbertLayoutError(
+                f"ColBERT layout at {self.model_path} has no encoder weight file"
+            )
         return self.encoder_weights
 
 
@@ -285,6 +350,29 @@ def resolve_weight_source(
     return WEIGHT_SOURCE_SAFETENSORS
 
 
+def _resolve_activation(config: dict[str, Any], directory: Path) -> str:
+    """Map a module's declared ``activation_function`` onto a local kernel."""
+    declared = config.get("activation_function")
+    if declared is None:
+        # pylate's Dense defaults to nn.Identity() when the key is absent.
+        return "identity"
+    if not isinstance(declared, str):
+        raise ColbertLayoutError(
+            f"{directory.name}/config.json declares a non-string "
+            f"activation_function {declared!r}"
+        )
+    name = _ACTIVATION_MODULES.get(declared)
+    if name is None:
+        supported = ", ".join(sorted(_ACTIVATION_MODULES))
+        raise ColbertLayoutError(
+            f"{directory.name}/config.json declares activation_function "
+            f"{declared!r}, which this loader cannot reproduce. Supported "
+            f"activations: {supported}. Refusing to serve an un-activated "
+            "projection."
+        )
+    return name
+
+
 def _dense_spec(
     model_path: Path,
     module: dict[str, Any],
@@ -326,6 +414,7 @@ def _dense_spec(
         use_residual=bool(config.get("use_residual")),
         bias=bool(config.get("bias")),
         weights=weights if weights.is_file() else None,
+        activation=_resolve_activation(config, directory),
     )
 
 
@@ -337,8 +426,8 @@ def resolve_colbert_layout(
 
     Raises:
         ColbertLayoutError: when the directory is a ColBERT export but cannot be
-            served -- no projection modules, no usable weight artifact, or an
-            inconsistent projection chain.
+            served -- no projection modules, no usable weight artifact, an
+            unsupported activation, or an inconsistent projection chain.
     """
     model_path = Path(model_path)
     modules = _dense_modules(model_path)
@@ -463,12 +552,24 @@ def _checked_matrix(
     return matrix
 
 
+def _identity_residual_conflict(
+    spec: ColbertDenseSpec, label: str
+) -> ColbertLayoutError:
+    """Error for a same-width layer that also ships learned residual weights."""
+    return ColbertLayoutError(
+        f"{spec.directory.name}/config.json sets use_residual on a "
+        f"{spec.in_features} -> {spec.out_features} layer, which pylate implements "
+        f"as an identity skip and for which it creates no residual submodule, but "
+        f"{label} also carries residual weights. The artifact is inconsistent."
+    )
+
+
 class ColbertProjection:
     """The Dense chain plus the final per-token L2.
 
     Mirrors the pinned ONNX export's ``/projection_layers.*`` and ``/ReduceL2``
     subgraph. Weights are plain ``mx.array`` attributes rather than an
-    ``nn.Module``: the chain is five fixed matrices with no other state, and the
+    ``nn.Module``: the chain is a few fixed matrices with no other state, and the
     encoder it accompanies owns dtype policy. MLX promotes the activations to the
     wider of the two dtypes, so a reduced-precision checkpoint cannot silently
     truncate the projection.
@@ -477,11 +578,17 @@ class ColbertProjection:
     def __init__(self, dense: Sequence[ColbertDenseSpec]):
         if not dense:
             raise ValueError("a ColBERT projection requires at least one Dense module")
+        for spec in dense:
+            if spec.activation not in _ACTIVATIONS:
+                raise ValueError(
+                    f"unknown ColBERT projection activation {spec.activation!r} for "
+                    f"{spec.directory}"
+                )
         self.dense: tuple[ColbertDenseSpec, ...] = tuple(dense)
         self._linear: list[mx.array] = []
         self._linear_bias: list[mx.array | None] = []
+        # None is pylate's identity skip for a same-width use_residual layer.
         self._residual: list[mx.array | None] = []
-        self._residual_bias: list[mx.array | None] = []
         self._loaded = False
 
     @property
@@ -518,22 +625,20 @@ class ColbertProjection:
                 if spec.use_residual
                 else None
             )
-            if spec.use_residual and residual is None:
+            if spec.needs_residual_matrix and residual is None:
                 raise ColbertLayoutError(
-                    f"{spec.directory.name}/config.json sets use_residual but "
-                    f"{spec.weights} has no residual.weight (keys: "
-                    f"{sorted(weights.keys())})"
+                    f"{spec.directory.name}/config.json sets use_residual on a "
+                    f"{spec.in_features} -> {spec.out_features} layer, which pylate "
+                    f"implements with residual.weight, but {spec.weights} does not "
+                    f"carry it (keys: {sorted(weights.keys())})"
                 )
+            if spec.residual_is_identity and residual is not None:
+                raise _identity_residual_conflict(spec, str(spec.weights))
             projection._linear.append(linear)
             projection._linear_bias.append(
                 weights.get("linear.bias") if spec.bias else None
             )
             projection._residual.append(residual)
-            projection._residual_bias.append(
-                weights.get("residual.bias")
-                if spec.bias and residual is not None
-                else None
-            )
         return projection._finalize()
 
     @classmethod
@@ -560,15 +665,23 @@ class ColbertProjection:
                     f"projection module {index} ({spec.directory.name}) has no linear "
                     "weight matrix"
                 )
-            if spec.use_residual and residual[index] is None:
+            residual_matrix = (
+                _checked_matrix(
+                    residual[index], f"projection_layers.{index}.residual", spec
+                )
+                if spec.use_residual
+                else None
+            )
+            if spec.needs_residual_matrix and residual_matrix is None:
                 raise ColbertLayoutError(
                     f"projection module {index} ({spec.directory.name}) sets "
                     "use_residual but has no residual weight matrix"
                 )
+            if spec.residual_is_identity and residual_matrix is not None:
+                raise _identity_residual_conflict(spec, f"projection module {index}")
             projection._linear.append(matrix)
             projection._linear_bias.append(None)
-            projection._residual.append(residual[index])
-            projection._residual_bias.append(None)
+            projection._residual.append(residual_matrix)
         return projection._finalize()
 
     def _finalize(self) -> "ColbertProjection":
@@ -576,12 +689,7 @@ class ColbertProjection:
         mx.eval(
             [
                 array
-                for array in (
-                    self._linear
-                    + self._residual
-                    + self._linear_bias
-                    + self._residual_bias
-                )
+                for array in (self._linear + self._residual + self._linear_bias)
                 if array is not None
             ]
         )
@@ -598,11 +706,13 @@ class ColbertProjection:
             bias = self._linear_bias[index]
             if bias is not None:
                 y = y + bias
+            # pylate applies the activation to the linear output, before the
+            # residual is added (pylate.models.Dense.Dense.forward).
+            y = _ACTIVATIONS[spec.activation](y)
             if spec.use_residual:
-                y = y + x @ mx.transpose(self._residual[index])
-                residual_bias = self._residual_bias[index]
-                if residual_bias is not None:
-                    y = y + residual_bias
+                residual = self._residual[index]
+                # None is the identity skip of a same-width layer.
+                y = y + (x if residual is None else x @ mx.transpose(residual))
             x = y
         return l2_normalize_tokens(x)
 
