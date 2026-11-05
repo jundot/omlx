@@ -2634,7 +2634,12 @@ def init_server(
         scheduler_config=scheduler_config,
     )
     _server_state.engine_pool.configure_gpu_keep_warm(
-        global_settings.server.gpu_keep_warm_interval if global_settings else 0.5
+        global_settings.server.gpu_keep_warm_interval if global_settings else 0.5,
+        (
+            global_settings.server.gpu_keep_warm_idle_window
+            if global_settings
+            else 300.0
+        ),
     )
     from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents

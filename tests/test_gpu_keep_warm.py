@@ -116,3 +116,35 @@ def test_settings_default_roundtrip_and_env(monkeypatch):
     monkeypatch.setenv("OMLX_GPU_KEEP_WARM_INTERVAL", "nope")
     settings._apply_env_overrides()
     assert settings.server.gpu_keep_warm_interval == 2.0
+
+
+@pytest.mark.asyncio
+async def test_idle_window_is_configurable(pool):
+    # A model last used 10 s ago: inside a 60 s window, outside a 5 s one.
+    pool._entries["m"] = _entry(idle_for=10.0)
+    pool.configure_gpu_keep_warm(0.005, 60.0)
+    assert pool._gpu_keep_warm_needed() is True
+    pool.configure_gpu_keep_warm(0.005, 5.0)
+    assert pool._gpu_keep_warm_needed() is False
+    # None keeps the current window; the default stays 5 minutes.
+    pool.configure_gpu_keep_warm(0.005)
+    assert pool._gpu_keep_warm_needed() is False
+    assert ep.EnginePool()._gpu_keep_warm_idle_window == 300.0
+
+
+def test_idle_window_settings_default_roundtrip_and_env(monkeypatch):
+    assert ServerSettings().gpu_keep_warm_idle_window == 300.0
+    assert ServerSettings.from_dict({}).gpu_keep_warm_idle_window == 300.0
+    s = ServerSettings.from_dict({"gpu_keep_warm_idle_window": 3600})
+    assert s.gpu_keep_warm_idle_window == 3600.0
+    assert (
+        ServerSettings.from_dict(s.to_dict()).gpu_keep_warm_idle_window == 3600.0
+    )
+
+    settings = GlobalSettings()
+    monkeypatch.setenv("OMLX_GPU_KEEP_WARM_IDLE_WINDOW", "900")
+    settings._apply_env_overrides()
+    assert settings.server.gpu_keep_warm_idle_window == 900.0
+    monkeypatch.setenv("OMLX_GPU_KEEP_WARM_IDLE_WINDOW", "nope")
+    settings._apply_env_overrides()
+    assert settings.server.gpu_keep_warm_idle_window == 900.0
