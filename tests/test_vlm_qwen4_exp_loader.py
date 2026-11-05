@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from types import SimpleNamespace
 
@@ -80,9 +81,14 @@ def test_qwen4_exp_mlx_metadata_is_hidden_only_for_model_shards(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("model_type", "expected_lazy"),
-    [("qwen4_exp", True), ("qwen2_vl", None)],
+    [
+        ("qwen4_exp", True),
+        ("minimax_m3", True),
+        ("minimax_m3_vl", True),
+        ("qwen2_vl", None),
+    ],
 )
-async def test_only_qwen4_exp_loader_defers_parameter_eval_to_materialize(
+async def test_large_moe_loaders_defer_parameter_eval_to_materialize(
     tmp_path, monkeypatch, model_type, expected_lazy
 ):
     import mlx_vlm.utils as vlm_utils
@@ -99,6 +105,13 @@ async def test_only_qwen4_exp_loader_defers_parameter_eval_to_materialize(
         raise RuntimeError("stop after load")
 
     monkeypatch.setattr(vlm_utils, "load", stop_after_load)
+    # Keep the MiniMax compat patch out of this test: it installs its
+    # load_config wrapper process-wide, which other test files observe.
+    monkeypatch.setattr(
+        vlm_module,
+        "_force_minimax_m3_moe_sanitize_on_load",
+        lambda _model_dir: contextlib.nullcontext(),
+    )
     monkeypatch.setattr(vlm_module, "_patch_video_processor_bug", lambda: None)
     monkeypatch.setattr(vlm_module, "apply_pixtral_torch_free_patch", lambda: None)
     monkeypatch.setattr(
