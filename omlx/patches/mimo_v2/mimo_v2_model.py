@@ -387,22 +387,53 @@ class MiMoV2MultiTokenPredictor(nn.Module):
         ]
 
     def __call__(self, hidden, tokens, embed, cache):
+        """Parallel heads: layer k pairs the trunk hidden at position p with
+        token p+k+1 and predicts token p+k+2 (``tokens[:, q]`` is token q+1).
+        """
         outputs = []
-        for layer, layer_cache in zip(self.layers, cache):
-            if tokens.shape[1] == 0:
+        n = tokens.shape[1]
+        for k, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
+            if n - k <= 0:
                 break
-            hidden = layer(hidden, embed(tokens), layer_cache)
-            outputs.append(hidden)
-            hidden, tokens = hidden[:, :-1], tokens[:, 1:]
+            outputs.append(layer(hidden[:, : n - k], embed(tokens[:, k:]), layer_cache))
         return outputs
 
 
 class _MiMoMTPCache(list):
-    """Per-head caches plus the current predictor index for one draft cycle."""
+    """Per-layer head caches plus the bookkeeping of one draft cycle.
+
+    MiMo's next-token-prediction layers are parallel heads on the trunk:
+    layer k pairs the trunk hidden at position p with the embedding of token
+    p+k+1 and predicts token p+k+2.  None consumes another layer's output
+    (measured: fed layer 0's output instead, layers 1 and 2 agree with their
+    target token <9% of the time; fed the trunk hidden, 74% and 71%).
+
+    Layer k's committed history therefore ends k positions behind layer 0's:
+    its newest rows would need tokens that are still drafts.  ``trunk_rows``
+    keeps the last trunk rows those layers fold next.  ``mtp_begin_cycle``
+    marks the next ``mtp_forward`` as the cycle's committed fold and the calls
+    after it as draft steps on layers 1, 2, ...; the generator runs those on
+    a clone of this list (``copy.copy``, see ``__copy__``), so their
+    speculative rows die with the clone.  Only such clones draft: every call
+    on the persistent cache is a fold, including the ones that never follow
+    ``mtp_begin_cycle`` (prompt priming, and the history the generator folds
+    when MTP resumes after parking mid-cycle).
+    """
 
     def __init__(self, values=()):
         super().__init__(values)
         self.layer_idx = 0
+        self.in_cycle = False
+        self.draft_clone = False
+        # Replaced, never mutated: clones share these objects.
+        self.trunk_rows = None
+        self.draft_tokens = ()
+
+    def __copy__(self):
+        clone = type(self)(self)
+        clone.__dict__.update(self.__dict__)
+        clone.draft_clone = True
+        return clone
 
 
 class MiMoV2Model(PipelineMixin, nn.Module):
@@ -552,6 +583,64 @@ class Model(nn.Module):
         del depth
         if isinstance(mtp_cache, _MiMoMTPCache):
             mtp_cache.layer_idx = 0
+            mtp_cache.in_cycle = True
+            mtp_cache.draft_tokens = ()
+
+    def _mtp_active_layers(self):
+        # Layers past the loaded draft depth never draft; skip their folds.
+        depth = int(getattr(self, "_omlx_mtp_depth", 0) or len(self.mtp.layers))
+        return self.mtp.layers[: max(1, min(depth, len(self.mtp.layers)))]
+
+    def _mtp_fold(self, mtp_cache, hidden_states, next_token_ids):
+        """Fold n committed (trunk row, next token) pairs into every head.
+
+        Row i of ``hidden_states`` is the trunk hidden at the position before
+        ``next_token_ids[i]``.  Layer k pairs the same n tokens with the trunk
+        rows k positions earlier, the oldest of which come from the previous
+        fold; rows that do not exist yet (fresh history) are skipped.
+        Returns layer 0's output.
+        """
+        layers = self._mtp_active_layers()
+        embed = self.model.embed_tokens
+        n = int(next_token_ids.shape[1])
+        previous = mtp_cache.trunk_rows
+        rows = (
+            hidden_states
+            if previous is None
+            else mx.concatenate([previous, hidden_states], axis=1)
+        )
+        held = rows.shape[1] - n
+        emb = embed(next_token_ids)
+        first = None
+        for k, layer in enumerate(layers):
+            lag = max(0, k - held)
+            if n - lag <= 0:
+                break
+            end = rows.shape[1] - k
+            out = layer(rows[:, end - (n - lag) : end], emb[:, lag:], mtp_cache[k])
+            if k == 0:
+                first = out
+        if len(layers) > 1:
+            mtp_cache.trunk_rows = rows[:, -(len(layers) - 1) :]
+        return first
+
+    def _mtp_draft_step(self, mtp_cache, step, next_token_ids):
+        """Draft with layer ``step`` from the drafts of this cycle so far.
+
+        Layer j's committed history ends j positions behind layer 0's, so it
+        runs over the newest j trunk rows paired with drafts 1..j; its last
+        row predicts draft j+1.
+        """
+        drafts = mtp_cache.draft_tokens + (next_token_ids,)
+        mtp_cache.draft_tokens = drafts
+        trunk = mtp_cache.trunk_rows
+        if trunk is None:
+            raise ValueError("MiMo MTP draft step before any committed fold")
+        count = min(step, trunk.shape[1], len(drafts))
+        tokens = mx.concatenate(drafts[-count:], axis=1)
+        return self.mtp.layers[step](
+            trunk[:, -count:], self.model.embed_tokens(tokens), mtp_cache[step]
+        )
 
     def mtp_forward(
         self,
@@ -561,12 +650,29 @@ class Model(nn.Module):
         return_hidden: bool = False,
         logits_keep: int = 0,
     ):
-        layer_idx = getattr(mtp_cache, "layer_idx", 0) % len(self.mtp.layers)
-        cache = mtp_cache[layer_idx] if mtp_cache else None
-        token_embeddings = self.model.embed_tokens(next_token_ids)
-        hidden = self.mtp.layers[layer_idx](hidden_states, token_embeddings, cache)
-        if isinstance(mtp_cache, _MiMoMTPCache):
-            mtp_cache.layer_idx = layer_idx + 1
+        """Head forward: the cycle's committed fold, or one draft step.
+
+        Draft steps (calls on the cycle's clone after the fold of a
+        ``mtp_begin_cycle`` cycle) ignore ``hidden_states``: each head reads
+        the trunk rows the fold kept, not the previous head's output.
+        """
+        layers = self.mtp.layers
+        if not isinstance(mtp_cache, _MiMoMTPCache) or not mtp_cache:
+            cache = mtp_cache[0] if mtp_cache else None
+            token_embeddings = self.model.embed_tokens(next_token_ids)
+            hidden = layers[0](hidden_states, token_embeddings, cache)
+        else:
+            drafting = mtp_cache.in_cycle and mtp_cache.draft_clone
+            step = mtp_cache.layer_idx if drafting else 0
+            if step >= len(self._mtp_active_layers()):
+                raise ValueError(
+                    f"MiMo MTP draft step {step} exceeds the loaded draft depth"
+                )
+            if step == 0:
+                hidden = self._mtp_fold(mtp_cache, hidden_states, next_token_ids)
+            else:
+                hidden = self._mtp_draft_step(mtp_cache, step, next_token_ids)
+            mtp_cache.layer_idx = step + 1
         logits_source = hidden[:, -logits_keep:] if logits_keep else hidden
         if self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(logits_source)
