@@ -19,7 +19,10 @@ Projections that read the same input (GDN qkv/z, attention q/k/v, MLP
 gate/up) share one buffer, so a verify forward serves them in one dispatch.
 Every row count runs on packed kernels: one row on a SIMD matvec, 2..8 rows
 on a tensor-unit kernel, more rows on a tensor-unit GEMM that dequantizes
-each group tile into threadgroup memory. ``PackedLinear`` does not subclass
+each group tile into threadgroup memory. Row-exact verify forwards
+(``qwen35_verify_qmm.is_row_exact_armed()``) instead run every row with the
+one-row matvec arithmetic, on each projection's own geometry, so a verify
+row has the bits of the serial decode step. ``PackedLinear`` does not subclass
 ``nn.QuantizedLinear``, so code that reads stock quantized weights directly
 skips it and calls the module instead.
 """
@@ -40,6 +43,7 @@ logger = logging.getLogger(__name__)
 TILE_N = 128
 _SMALL_ROWS = 8
 _KERNELS: dict = {}
+_ROW_EXACT_KERNELS: dict = {}
 
 _SMALL_HEADER = """
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -469,6 +473,168 @@ def _reduce(y: mx.array, ksplit: int, M: int, N: int) -> mx.array:
     return out
 
 
+# Row-exact verify (2..8 rows): the per-column arithmetic of ``_MATVEC_SOURCE``
+# at M == 1, i.e. a sequential fp32 dot over k = 0..63 per group, the
+# sequential fp32 group sum of x, ``acc += s * dot + b * sum`` over the
+# groups of one K split, the same K splits and the same split reduce. Two
+# things are shared across rows without changing any row's arithmetic: the
+# nibble decode of a code word, and the group sums of x, which do not depend
+# on the column and are computed once per (row, group) by a separate kernel.
+_ROW_EXACT_XSUM_SOURCE = """
+    constexpr int GROUPS = K / 64;
+    const uint t = thread_position_in_grid.x;
+    if (t >= M * GROUPS) {
+        return;
+    }
+    const uint r = t / GROUPS;
+    const uint g = t % GROUPS;
+    const device bfloat* xr = (const device bfloat*)x + r * K + g * 64;
+    float sum = 0.0f;
+    for (int q = 0; q < 8; ++q) {
+        const vec<float, 8> xv = vec<float, 8>(*(const device vec<bfloat, 8>*)(xr + q * 8));
+        for (int e = 0; e < 8; ++e) {
+            sum += xv[e];
+        }
+    }
+    xs[t] = sum;
+"""
+
+_ROW_EXACT_SOURCE = """
+    constexpr int GROUPS = K / 64;
+    constexpr int GPS = GROUPS / KSPLIT;
+    const uint tile = threadgroup_position_in_grid.x;
+    const uint split = threadgroup_position_in_grid.y;
+    const uint col = thread_position_in_threadgroup.x;
+    const uint g0 = split * GPS;
+    const device uchar* wt = (const device uchar*)w + ulong(tile) * GROUPS * TILE_N * 32;
+    const device bfloat* st = (const device bfloat*)sc + ulong(tile) * GROUPS * TILE_N;
+    const device bfloat* bt = (const device bfloat*)bi + ulong(tile) * GROUPS * TILE_N;
+    float acc[M];
+    for (int r = 0; r < M; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (uint gq = 0; gq < GPS; gq += 4) {
+        const uint g = g0 + gq;
+        const ulong at = (ulong(g / 4) * TILE_N + col) * 4;
+        const vec<bfloat, 4> s4 = *(const device vec<bfloat, 4>*)(st + at);
+        const vec<bfloat, 4> b4 = *(const device vec<bfloat, 4>*)(bt + at);
+        for (int j = 0; j < 4; ++j) {
+            const device uint4* wp = (const device uint4*)(wt + (ulong(g + j) * TILE_N + col) * 32);
+            const uint4 w0 = wp[0];
+            const uint4 w1 = wp[1];
+            const uint words[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+            float dot[M];
+            for (int r = 0; r < M; ++r) {
+                dot[r] = 0.0f;
+            }
+            for (int q = 0; q < 8; ++q) {
+                float wq[8];
+                for (int e = 0; e < 8; ++e) {
+                    wq[e] = float((words[q] >> (4 * e)) & 15u);
+                }
+                for (int r = 0; r < M; ++r) {
+                    const device bfloat* xr = (const device bfloat*)x + r * K + (g + j) * 64;
+                    const vec<float, 8> xv = vec<float, 8>(*(const device vec<bfloat, 8>*)(xr + q * 8));
+                    for (int e = 0; e < 8; ++e) {
+                        dot[r] += wq[e] * xv[e];
+                    }
+                }
+            }
+            for (int r = 0; r < M; ++r) {
+                const float sum = xs[r * GROUPS + g + j];
+                acc[r] += float(s4[j]) * dot[r] + float(b4[j]) * sum;
+            }
+        }
+    }
+    const uint n = tile * TILE_N + col;
+    for (int r = 0; r < M; ++r) {
+        if (KSPLIT == 1) {
+            ((device bfloat*)y)[r * N + n] = bfloat(acc[r]);
+        } else {
+            ((device float*)y)[(split * M + r) * N + n] = acc[r];
+        }
+    }
+"""
+
+
+def _row_exact_kernels():
+    """Kernels of the row-exact verify path, built on first armed use only."""
+    if not _ROW_EXACT_KERNELS:
+        _ROW_EXACT_KERNELS["xsum"] = mx.fast.metal_kernel(
+            name="omlx_qwen35_packed_row_exact_xsum",
+            input_names=["x"],
+            output_names=["xs"],
+            source=_ROW_EXACT_XSUM_SOURCE,
+        )
+        _ROW_EXACT_KERNELS["row_exact"] = mx.fast.metal_kernel(
+            name="omlx_qwen35_packed_row_exact",
+            input_names=["x", "w", "sc", "bi", "xs"],
+            output_names=["y"],
+            source=_ROW_EXACT_SOURCE,
+        )
+    return _ROW_EXACT_KERNELS
+
+
+def _row_exact_armed() -> bool:
+    from .qwen35_verify_qmm import is_row_exact_armed
+
+    return bool(is_row_exact_armed())
+
+
+def _x_group_sums(x2: mx.array, K: int) -> mx.array:
+    """fp32 sum of each 64-wide group of each row, in the matvec's order."""
+    M = int(x2.shape[0])
+    groups = K // 64
+    (xs,) = _row_exact_kernels()["xsum"](
+        inputs=[x2],
+        template=[("K", K), ("M", M)],
+        grid=(M * groups, 1, 1),
+        threadgroup=(min(256, M * groups), 1, 1),
+        output_shapes=[(M * groups,)],
+        output_dtypes=[mx.float32],
+    )
+    return xs
+
+
+def row_exact_matmul(x2: mx.array, w, sc, bi, K: int, N: int, xs=None) -> mx.array:
+    """``x2`` (M, K) times a packed (N, K) weight, each row bit-identical to
+    the one-row ``_matvec`` call on the same N (weights read once).
+
+    ``N`` must be the projection's own width: the K split depends on it.
+    ``xs`` optionally passes precomputed ``_x_group_sums`` of ``x2``.
+    """
+    if x2.dtype != mx.bfloat16:
+        raise ValueError(f"row_exact_matmul expects bfloat16 rows, got {x2.dtype}")
+    M = int(x2.shape[0])
+    x2 = mx.contiguous(x2)
+    if M > _SMALL_ROWS:
+        return mx.concatenate(
+            [
+                row_exact_matmul(x2[i : i + _SMALL_ROWS], w, sc, bi, K, N)
+                for i in range(0, M, _SMALL_ROWS)
+            ],
+            axis=0,
+        )
+    if xs is None:
+        xs = _x_group_sums(x2, K)
+    ksplit = _ksplit(N // TILE_N, K // 256)
+    (y,) = _row_exact_kernels()["row_exact"](
+        inputs=[x2, w, sc, bi, xs],
+        template=[
+            ("K", K),
+            ("N", N),
+            ("M", M),
+            ("TILE_N", TILE_N),
+            ("KSPLIT", ksplit),
+        ],
+        grid=(N, ksplit, 1),
+        threadgroup=(TILE_N, 1, 1),
+        output_shapes=[(M, N) if ksplit == 1 else (ksplit * M * N,)],
+        output_dtypes=[mx.bfloat16 if ksplit == 1 else mx.float32],
+    )
+    return _reduce(y, ksplit, M, N)
+
+
 class _PackedStore:
     """Packed buffers shared by projections that read the same input."""
 
@@ -505,7 +671,10 @@ class PackedLinear(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
         x2 = x.reshape(-1, self.input_dims).astype(mx.bfloat16)
-        y = packed_matmul(
+        matmul = packed_matmul
+        if x2.shape[0] > 1 and _row_exact_armed():
+            matmul = row_exact_matmul
+        y = matmul(
             x2,
             self.packed_weight,
             self.packed_scales,
@@ -761,6 +930,8 @@ def apply(verifier_cls) -> bool:
 
     def _linears(self, linears, x):
         linears = tuple(linears)
+        if _row_exact_armed():
+            return _row_exact_linears(self, linears, x)
         out = project(linears, x)
         if out is not None:
             return out
@@ -770,6 +941,36 @@ def apply(verifier_cls) -> bool:
         head = project(linears[: len(packed)], x)
         if head is None:
             return original_linears(self, linears, x)
+        return head + tuple(original_linears(self, linears[len(packed) :], x))
+
+    def _row_exact_linears(self, linears, x):
+        # Serial decode calls each projection alone, so a row-exact verify
+        # never serves a shared store with its combined width: each packed
+        # projection runs on its own N, sharing only x's group sums.
+        packed = [i for i, lin in enumerate(linears) if isinstance(lin, PackedLinear)]
+        if not packed or packed != list(range(len(packed))):
+            return original_linears(self, linears, x)
+        x2 = mx.contiguous(x.reshape(-1, x.shape[-1]).astype(mx.bfloat16))
+        if x2.shape[0] == 1 or x2.shape[0] > _SMALL_ROWS:
+            head = tuple(lin(x) for lin in linears[: len(packed)])
+        else:
+            xs = _x_group_sums(x2, x2.shape[-1])
+            head = tuple(
+                row_exact_matmul(
+                    x2,
+                    lin.packed_weight,
+                    lin.packed_scales,
+                    lin.packed_biases,
+                    lin.input_dims,
+                    lin.output_dims,
+                    xs,
+                )
+                .reshape(*x.shape[:-1], lin.output_dims)
+                .astype(x.dtype)
+                for lin in linears[: len(packed)]
+            )
+        if len(packed) == len(linears):
+            return head
         return head + tuple(original_linears(self, linears[len(packed) :], x))
 
     verifier_cls._linears = _linears
