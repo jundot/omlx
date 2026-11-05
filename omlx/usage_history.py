@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Local, bounded serving history. No request objects or content enter this module."""
+"""Local, bounded serving history. No request objects or content enter this module.
+
+Per-client history (opt-in) receives only short labels from
+``omlx.client_identity``: an API key's name and the peer IP, never the key itself.
+"""
 
 import logging
 import math
@@ -24,6 +28,39 @@ _FIELDS = (
     "request_seconds",
     "timed_requests",
 )
+_KEY_KINDS = ("main_key", "sub_key", "none")
+_MAX_CLIENT_LABEL = 256
+# Added without bumping user_version: older builds ignore the extra table, so
+# downgrading keeps model history readable instead of refusing the file.
+_CLIENT_TABLE = """
+    CREATE TABLE IF NOT EXISTS client_usage_hourly (
+        timestamp_hour INTEGER NOT NULL,
+        model_id TEXT NOT NULL,
+        key_kind TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        client_ip TEXT NOT NULL,
+        requests INTEGER NOT NULL,
+        prompt_tokens INTEGER NOT NULL,
+        completion_tokens INTEGER NOT NULL,
+        cached_tokens INTEGER NOT NULL,
+        prefill_seconds REAL NOT NULL,
+        generation_seconds REAL NOT NULL,
+        request_seconds REAL NOT NULL,
+        timed_requests INTEGER NOT NULL,
+        PRIMARY KEY (timestamp_hour, model_id, key_kind, key_id, client_ip)
+    ) WITHOUT ROWID
+"""
+
+
+def _add(target: dict, key: tuple, values: list) -> bool:
+    """Accumulate into a bounded pending map; False when a new key won't fit."""
+    if key in target:
+        target[key] = [a + b for a, b in zip(target[key], values, strict=True)]
+    elif len(target) < _MAX_PENDING_BUCKETS:
+        target[key] = values
+    else:
+        return False
+    return True
 
 
 def _hour(timestamp: float) -> int:
@@ -61,6 +98,10 @@ def _summary(values) -> dict:
     return result
 
 
+def _ranked(rows) -> list[dict]:
+    return sorted(rows, key=lambda item: item["total_tokens"], reverse=True)
+
+
 def _bounds(period: str, now: float) -> tuple[datetime, datetime]:
     today = datetime.fromtimestamp(now).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -86,17 +127,21 @@ class UsageHistory:
     runs only at startup, on the writer, or on admin worker threads.
     """
 
-    def __init__(self, path: Path, *, enabled: bool = True):
+    def __init__(self, path: Path, *, enabled: bool = True, by_client: bool = False):
         self.path = path.resolve()
         self.enabled = enabled
+        self.by_client = by_client
         self._lock = threading.Lock()
         self._flush_lock = threading.Lock()
         self._pending: dict[tuple[int, str], list] = {}
+        # Separate bound: many distinct clients must not crowd out model totals.
+        self._pending_clients: dict[tuple[int, str, str, str, str], list] = {}
         self._stop = threading.Event()
         self._closed = False
         self.available = False
         self._initialized = False
         self.dropped_requests = 0
+        self.dropped_client_requests = 0
         self._last_prune = 0.0
         self._bucket_minute: int | None = None
         self._bucket_hour = 0
@@ -173,6 +218,7 @@ class UsageHistory:
                         ) WITHOUT ROWID
                     """)
                     connection.execute("PRAGMA user_version=1")
+            connection.execute(_CLIENT_TABLE)
             return connection
         except Exception:
             connection.close()
@@ -189,6 +235,7 @@ class UsageHistory:
         generation_duration: float,
         request_duration: float | None = None,
         timestamp: float | None = None,
+        client: tuple[str, str, str] | None = None,
     ) -> None:
         # Validate only scalar counters. Never accept a request or arbitrary metadata.
         counts = (prompt_tokens, completion_tokens, cached_tokens)
@@ -213,16 +260,20 @@ class UsageHistory:
             if minute != self._bucket_minute:
                 self._bucket_hour = _hour(timestamp)
                 self._bucket_minute = minute
-            key = (self._bucket_hour, model_id)
-            if key not in self._pending:
-                if len(self._pending) >= _MAX_PENDING_BUCKETS:
-                    self.dropped_requests += 1
-                    return
-                self._pending[key] = values
-            else:
-                self._pending[key] = [
-                    a + b for a, b in zip(self._pending[key], values, strict=True)
-                ]
+            if not _add(self._pending, (self._bucket_hour, model_id), values):
+                self.dropped_requests += 1
+                return
+            if not self.by_client or client is None:
+                return
+            kind, label, ip = client
+            if kind not in _KEY_KINDS or any(
+                not isinstance(text, str) or len(text) > _MAX_CLIENT_LABEL
+                for text in (label, ip)
+            ):
+                return
+            key = (self._bucket_hour, model_id, kind, label, ip)
+            if not _add(self._pending_clients, key, list(values)):
+                self.dropped_client_requests += 1
 
     def set_enabled(self, enabled: bool) -> None:
         """Runtime toggle. Disabling flushes pending aggregates; the file stays."""
@@ -232,11 +283,16 @@ class UsageHistory:
         if changed:
             self.flush()
 
+    def set_by_client(self, enabled: bool) -> None:
+        """Runtime toggle for per-client attribution. Existing rows are kept."""
+        with self._lock:
+            self.by_client = enabled
+
     def _run(self) -> None:
         while not self._stop.wait(FLUSH_SECONDS):
             # While disabled, only retry aggregates left over from a failed
             # flush; otherwise leave usage.sqlite3 alone.
-            if self.enabled or self._pending:
+            if self.enabled or self._pending or self._pending_clients:
                 self.flush()
 
     def flush(self) -> bool:
@@ -244,9 +300,14 @@ class UsageHistory:
         with self._flush_lock:
             with self._lock:
                 batch, self._pending = self._pending, {}
+                client_batch, self._pending_clients = self._pending_clients, {}
             now = time.time()
             prune_due = now - self._last_prune >= 86400
-            if not batch and (not self.enabled or (self.available and not prune_due)):
+            if (
+                not batch
+                and not client_batch
+                and (not self.enabled or (self.available and not prune_due))
+            ):
                 return True
             connection = None
             try:
@@ -265,11 +326,22 @@ class UsageHistory:
                             for (hour, model), values in batch.items()
                         ],
                     )
+                    connection.executemany(
+                        "INSERT INTO client_usage_hourly "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(timestamp_hour, model_id, key_kind, key_id, "
+                        "client_ip) "
+                        "DO UPDATE SET "
+                        + ",".join(f"{f}={f}+excluded.{f}" for f in _FIELDS),
+                        [(*key, *values) for key, values in client_batch.items()],
+                    )
                     if prune_due:
-                        connection.execute(
-                            "DELETE FROM model_usage_hourly WHERE timestamp_hour < ?",
-                            (_hour(now - RETENTION_DAYS * 86400),),
-                        )
+                        cutoff = _hour(now - RETENTION_DAYS * 86400)
+                        for table in ("model_usage_hourly", "client_usage_hourly"):
+                            connection.execute(
+                                f"DELETE FROM {table} WHERE timestamp_hour < ?",
+                                (cutoff,),
+                            )
                 if prune_due:
                     self._last_prune = now
                     # Maintenance failure must not replay a committed batch.
@@ -284,16 +356,11 @@ class UsageHistory:
                 # Keep a bounded aggregate for retry, never a growing request queue.
                 with self._lock:
                     for key, values in batch.items():
-                        if key in self._pending:
-                            self._pending[key] = [
-                                a + b
-                                for a, b in zip(self._pending[key], values, strict=True)
-                            ]
-                        elif len(self._pending) < _MAX_PENDING_BUCKETS:
-                            self._pending[key] = values
-                        else:
-                            requests, *_ = values
-                            self.dropped_requests += requests
+                        if not _add(self._pending, key, values):
+                            self.dropped_requests += values[0]
+                    for key, values in client_batch.items():
+                        if not _add(self._pending_clients, key, values):
+                            self.dropped_client_requests += values[0]
                 return False
             finally:
                 if connection is not None:
@@ -306,6 +373,24 @@ class UsageHistory:
         self._thread.join(timeout=3)
         self.flush()
 
+    @staticmethod
+    def _query_clients(connection, start: datetime, end: datetime, model: str) -> list:
+        sums = ",".join(f"SUM({f})" for f in _FIELDS)
+        try:
+            return connection.execute(
+                f"SELECT key_kind, key_id, client_ip, {sums} "
+                "FROM client_usage_hourly "
+                "WHERE timestamp_hour >= ? AND timestamp_hour < ?"
+                + (" AND model_id = ?" if model else "")
+                + " GROUP BY key_kind, key_id, client_ip",
+                (start.timestamp(), end.timestamp(), *((model,) if model else ())),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            # A file last written by a build without per-client history.
+            if "no such table" in str(exc):
+                return []
+            raise
+
     def query(
         self,
         period: str = "today",
@@ -317,6 +402,7 @@ class UsageHistory:
         now = time.time() if now is None else now
         start, end = _bounds(period, now)
         rows: list = []
+        client_rows: list = []
         # Read-only connection: polling cannot silently recreate a deleted database.
         # Disabled history answers with an empty, explicitly flagged payload
         # without opening the database at all.
@@ -335,6 +421,7 @@ class UsageHistory:
                         else (start.timestamp(), end.timestamp())
                     ),
                 ).fetchall()
+                client_rows = self._query_clients(connection, start, end, model)
         finally:
             if connection is not None:
                 connection.close()
@@ -348,6 +435,19 @@ class UsageHistory:
             day_cursor += timedelta(days=1)
         days = {day: [0] * len(_FIELDS) for day in heatmap} if include_details else {}
         hourly: dict[int, list] = {}
+        # One query, three views: each key+IP pair, per key, and per IP.
+        pairs: dict[tuple[str, str, str], list] = {}
+        by_key: dict[tuple[str, str], list] = {}
+        by_ip: dict[str, list] = {}
+        for kind, key_id, ip, *values in client_rows:
+            pairs[(kind, key_id, ip)] = values
+            for target, group in ((by_key, (kind, key_id)), (by_ip, ip)):
+                target[group] = [
+                    a + b
+                    for a, b in zip(
+                        target.get(group, [0] * len(_FIELDS)), values, strict=True
+                    )
+                ]
         for hour, model_id, *values in rows:
             local = datetime.fromtimestamp(hour)
             day = local.date().isoformat()
@@ -374,6 +474,8 @@ class UsageHistory:
             "enabled": self.enabled,
             "available": self.available,
             "dropped_requests": self.dropped_requests,
+            "by_client": self.by_client,
+            "dropped_client_requests": self.dropped_client_requests,
             "totals": _summary(totals),
             "models": sorted(
                 [{"model_id": key, **_summary(value)} for key, value in models.items()],
@@ -383,6 +485,19 @@ class UsageHistory:
             "heatmap": [
                 {"date": key, "tokens": value} for key, value in heatmap.items()
             ],
+            # Rows recorded while per-client tracking was on stay visible after
+            # it is turned off; ``by_client`` says whether new ones accrue.
+            "clients": _ranked(
+                {"key_kind": kind, "key_id": key_id, "client_ip": ip, **_summary(v)}
+                for (kind, key_id, ip), v in pairs.items()
+            ),
+            "clients_by_key": _ranked(
+                {"key_kind": kind, "key_id": key_id, **_summary(v)}
+                for (kind, key_id), v in by_key.items()
+            ),
+            "clients_by_ip": _ranked(
+                {"client_ip": ip, **_summary(v)} for ip, v in by_ip.items()
+            ),
         }
         if include_details:
             result["daily"] = [
