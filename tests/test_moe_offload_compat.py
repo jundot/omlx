@@ -24,6 +24,9 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
     raw = {"model_type": kind, "quantization": {"bits": 4, "group_size": 32}}
     if kind == "olmoe":
         raw.update(text)
+    elif kind == "qwen3_moe":
+        # flat config like olmoe; layer 0 is dense through mlp_only_layers
+        raw.update(text, mlp_only_layers=[0], decoder_sparse_step=1)
     elif kind == "glm_moe_dsa":
         # the flagship layout: n_routed_experts, and the first layer dense
         raw.update(text, n_routed_experts=16, first_k_dense_replace=1)
@@ -43,9 +46,9 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
     (path / "config.json").write_text(json.dumps(raw))
     tensors = {}
     for layer in range(2):
-        if kind in ("glm_moe_dsa", "glm5_next") and layer == 0:
+        if kind in ("glm_moe_dsa", "glm5_next", "qwen3_moe") and layer == 0:
             continue  # dense layer: no experts to cover
-        if kind in ("olmoe", "glm_moe_dsa"):
+        if kind in ("olmoe", "glm_moe_dsa", "qwen3_moe"):
             prefix = f"model.layers.{layer}.mlp.switch_mlp"
         elif kind == "gemma4":
             prefix = f"language_model.model.layers.{layer}.experts.switch_glu"
@@ -78,6 +81,8 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
         ("gemma4", False),
         ("olmoe", False),
         ("olmoe", True),
+        ("qwen3_moe", False),
+        ("qwen3_moe", True),
         ("glm_moe_dsa", False),
         ("deepseek_v4", False),
         ("glm5_next", False),
@@ -145,6 +150,30 @@ def test_glm5_next_dense_layers_skipped_and_routed_required(tmp_path):
     raw["text_config"]["mlp_layer_types"] = ["dense", "dense"]
     path.write_text(json.dumps(raw))
     assert moe_offload_compatibility(tmp_path)[0] is False
+
+
+def test_qwen3_moe_dense_layers_follow_the_model_rule(tmp_path):
+    """mlp_only_layers and decoder_sparse_step choose the layers with experts."""
+    tensors = _checkpoint(tmp_path, "qwen3_moe")
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+    path = tmp_path / "config.json"
+    raw = json.loads(path.read_text())
+    # step 2, nothing forced dense: layer 0 is still dense ((0 + 1) % 2), layer 1 sparse
+    raw.update(mlp_only_layers=[], decoder_sparse_step=2)
+    path.write_text(json.dumps(raw))
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+    # step 1, nothing forced dense: layer 0 is sparse and has no experts in the file
+    raw.update(decoder_sparse_step=1)
+    path.write_text(json.dumps(raw))
+    ok, reason = moe_offload_compatibility(tmp_path)
+    assert ok is False and "layers.0" in reason
+    # a missing routed projection on the sparse layer hides the model
+    raw.update(mlp_only_layers=[0])
+    path.write_text(json.dumps(raw))
+    del tensors["model.layers.1.mlp.switch_mlp.up_proj.scales"]
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    ok, reason = moe_offload_compatibility(tmp_path)
+    assert ok is False and "layers.1" in reason
 
 
 def test_glm_moe_dsa_requires_every_moe_layer(tmp_path):
