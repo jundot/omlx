@@ -497,12 +497,25 @@ class EnginePool:
         # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
         # from ServerSettings.gpu_keep_warm_interval; started on first load.
         self._gpu_keep_warm_interval: float = 0.0
+        self._gpu_keep_warm_idle_window: float = _GPU_KEEP_WARM_IDLE_WINDOW_S
         self._gpu_keep_warm_task: asyncio.Task[None] | None = None
         self._gpu_keep_warm_last_active = 0.0
         self.configure_hot_cache_budget()
 
-    def configure_gpu_keep_warm(self, interval_seconds: float) -> None:
-        """Set the idle keep-warm period in seconds (0 or less disables it)."""
+    def configure_gpu_keep_warm(
+        self, interval_seconds: float, idle_window_seconds: float | None = None
+    ) -> None:
+        """Set the idle keep-warm period in seconds (0 or less disables it).
+
+        ``idle_window_seconds`` is how long after the last request the ticks
+        keep running; None keeps the current window.
+        """
+        if idle_window_seconds is not None:
+            try:
+                window = float(idle_window_seconds)
+            except (TypeError, ValueError):
+                window = _GPU_KEEP_WARM_IDLE_WINDOW_S
+            self._gpu_keep_warm_idle_window = max(0.0, window)
         try:
             interval = float(interval_seconds or 0.0)
         except (TypeError, ValueError):
@@ -537,7 +550,7 @@ class EnginePool:
                 return False
             # Leases refresh last_access at both request start and completion.
             last_request = max(last_request, entry.last_access)
-        return loaded and now - last_request < _GPU_KEEP_WARM_IDLE_WINDOW_S
+        return loaded and now - last_request < self._gpu_keep_warm_idle_window
 
     async def _gpu_keep_warm_loop(self) -> None:
         loop = asyncio.get_running_loop()
