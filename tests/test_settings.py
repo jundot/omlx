@@ -2851,6 +2851,7 @@ class TestIntegrationSettings:
         assert settings.web_search_brave_api_key == ""
         assert settings.web_search_searxng_url == ""
         assert settings.web_search_ddgs_backends == ""
+        assert settings.web_search_keenable_api_key == ""
         assert settings.web_search_max_results == 3
         assert settings.web_search_content_mode == "snippet"
         assert settings.web_search_content_truncate is True
@@ -2862,6 +2863,7 @@ class TestIntegrationSettings:
             web_search_brave_api_key="key123",
             web_search_searxng_url="http://searx.local:8080",
             web_search_ddgs_backends="yahoo,mojeek",
+            web_search_keenable_api_key="kn-key",
             web_search_max_results=7,
             web_search_content_mode="full",
             web_search_content_truncate=False,
@@ -2874,6 +2876,7 @@ class TestIntegrationSettings:
         settings = IntegrationSettings.from_dict({})
         assert settings.web_search_provider == "ddgs"
         assert settings.web_search_ddgs_backends == ""
+        assert settings.web_search_keenable_api_key == ""
         assert settings.web_search_max_results == 3
         assert settings.web_search_content_mode == "snippet"
 

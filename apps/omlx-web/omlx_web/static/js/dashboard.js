@@ -208,6 +208,7 @@
                     web_search_brave_api_key: '',
                     web_search_searxng_url: '',
                     web_search_ddgs_backends: '',
+                    web_search_keenable_api_key: '',
                     web_search_max_results: 3,
                     web_search_content_mode: 'snippet',
                     web_search_content_truncate: true,
@@ -4721,6 +4722,7 @@
                             web_search_brave_api_key: this.globalSettings.integrations.web_search_brave_api_key,
                             web_search_searxng_url: this.globalSettings.integrations.web_search_searxng_url,
                             web_search_ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends,
+                            web_search_keenable_api_key: this.globalSettings.integrations.web_search_keenable_api_key,
                             web_search_max_results: this.globalSettings.integrations.web_search_max_results,
                             web_search_content_mode: this.globalSettings.integrations.web_search_content_mode,
                             web_search_content_truncate: this.globalSettings.integrations.web_search_content_truncate,
@@ -4871,6 +4873,7 @@
                             brave_api_key: this.globalSettings.integrations.web_search_brave_api_key || '',
                             searxng_url: this.globalSettings.integrations.web_search_searxng_url || '',
                             ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends || '',
+                            keenable_api_key: this.globalSettings.integrations.web_search_keenable_api_key || '',
                             max_results: this.globalSettings.integrations.web_search_max_results,
                         }),
                     });
