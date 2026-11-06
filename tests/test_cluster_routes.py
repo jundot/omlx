@@ -771,6 +771,61 @@ def test_cluster_plan_follows_the_saved_engram_ssd_offload_setting(monkeypatch):
     )
 
 
+def test_cluster_plan_follows_the_saved_qwen4_ple_ssd_offload_setting(monkeypatch):
+    """A Qwen4-Exp PLE table is the same planning problem as DeepSeek Engram.
+
+    Live, a 37 GiB PLE layer in a 117 GiB model made every Qwen4-Exp pipeline
+    split infeasible, because the planner only read the DeepSeek setting and
+    charged that table as resident.
+    """
+
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(4 * gib,) * 4,
+            tensor_parallel_ssd_layer_bytes=(0, 3 * gib, 0, 0),
+            supports_pipeline=True,
+        ),
+    )
+    saved = {"qwen": True}
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {"id": "qwen", "model_path": "/models/qwen", "model_type": "vlm"}
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: SimpleNamespace(
+            deepseek_v41_engram_ssd_offload=False,
+            qwen4_ple_ssd_offload=saved[model_id],
+        ),
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+    body = {
+        "model_path": "/models/qwen",
+        "nodes": [
+            {"node_id": "local", "capacity_bytes": 128 * gib, "reserve_bytes": 2 * gib}
+        ],
+    }
+
+    offloaded = _client().post("/admin/api/cluster/plan", json=body)
+    saved["qwen"] = False
+    resident = _client().post("/admin/api/cluster/plan", json=body)
+
+    assert offloaded.status_code == resident.status_code == 200
+    assert offloaded.json()["assignments"][0]["ssd_weight_bytes"] == 3 * gib
+    assert resident.json()["assignments"][0]["ssd_weight_bytes"] == 0
+
+
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
     from omlx.cluster.planner import ModelLayout
 

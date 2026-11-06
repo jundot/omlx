@@ -907,6 +907,44 @@ def maybe_apply_pre_load_patches(
             mtp_enabled=mtp_active,
         )
 
+    if not for_vlm and model_type == "qwen4_exp":
+        # Cluster ranks load through mlx-lm. Register the text-only root before
+        # the capability probe imports mlx_lm.models.qwen4_exp.
+        from ..patches.qwen4_exp_mlx_lm import apply_qwen4_exp_mlx_lm_patch
+
+        if apply_qwen4_exp_mlx_lm_patch():
+            logger.info("Qwen4-Exp mlx-lm registration applied for %s", model_name)
+
+        from ..patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            set_mtp_active,
+            set_mtp_depth,
+        )
+
+        mtp_requested = bool(
+            model_settings is not None and getattr(model_settings, "mtp_enabled", False)
+        )
+        has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+        mtp_active = mtp_requested and has_mtp_weights
+        set_mtp_active(mtp_active)
+        depth = (
+            getattr(model_settings, "mtp_adaptive_max_depth", None)
+            if model_settings is not None
+            else None
+        )
+        fixed = getattr(model_settings, "mtp_fixed_depth", None)
+        if fixed:
+            set_mtp_depth(int(fixed), fixed=True)
+        else:
+            set_mtp_depth(int(depth) if depth else 3)
+        if mtp_active and not apply_mlx_lm_mtp_patch():
+            logger.warning(
+                "Qwen4-Exp cluster Lightning MTP dispatch patch failed for %s; "
+                "speculative decoding will remain inactive",
+                model_name,
+            )
+            set_mtp_active(False)
+
     if for_vlm and model_type == "glm5_next":
         from ..patches.mlx_vlm_glm5_next_compat import (
             apply_mlx_vlm_glm5_next_compat_patch,
