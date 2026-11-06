@@ -13,6 +13,7 @@ import pytest
 
 from omlx.admin.benchmark import (
     BENCHMARK_CONTEXT_PROFILES,
+    DEFAULT_GENERATION_LENGTH,
     BenchmarkContextProfile,
     BenchmarkRequest,
     BenchmarkRun,
@@ -27,8 +28,8 @@ from omlx.admin.benchmark import (
     _log_ane_benchmark_trace,
     _prefill_helper_details,
     _run_batch_test,
-    _setting_feature_flags,
     _run_single_test,
+    _setting_feature_flags,
     _upload_model_name,
     _upload_model_repo,
     cleanup_old_runs,
@@ -36,6 +37,7 @@ from omlx.admin.benchmark import (
     get_run,
     run_benchmark,
 )
+from omlx.model_settings import ModelSettings
 
 # =============================================================================
 # BenchmarkRequest validation tests
@@ -175,6 +177,15 @@ class TestBenchmarkRequest:
                 model_id="test-model",
                 prompt_lengths=[1024],
                 context_profile="unknown",
+            )
+
+    @pytest.mark.parametrize("generation_length", [-1, 0])
+    def test_generation_length_rejection(self, generation_length):
+        with pytest.raises(ValueError, match="must be higher than 0"):
+            BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=generation_length
             )
 
 
@@ -764,25 +775,32 @@ class _FakeSettingsManager:
 
 
 class _FakeBenchEnginePool:
-    def __init__(self, settings=None, engine=None):
+    def __init__(self, settings=None, engine=None, engine_id=None, model_context_length=None):
         self._settings_manager = (
             _FakeSettingsManager(settings) if settings is not None else None
         )
         self._engine = engine or _FakeBenchEngine()
+        self._engine_id = engine_id
+        self._model_context_length = model_context_length
         self.force_lm_values = []
+        self.runtime_settings_values = []
 
     def get_loaded_model_ids(self):
         return []
 
     def get_entry(self, model_id):
-        return SimpleNamespace(config_model_type="llama")
+        return SimpleNamespace(config_model_type="llama", model_context_length=self._model_context_length)
 
-    async def get_engine(self, model_id, force_lm=False):
+    async def get_engine(self, model_id, force_lm=False, runtime_settings=None):
         self.force_lm_values.append(force_lm)
+        self.runtime_settings_values.append(runtime_settings)
         return self._engine
 
     async def _unload_engine(self, model_id):
         pass
+
+    def external_engine_id(self, model_id: str, model_settings):
+        return self._engine_id
 
 
 class TestBenchmarkEngineSelection:
@@ -995,6 +1013,41 @@ class TestBenchmarkEngineSelection:
         # exactly 2,048 tokens for the ANE-eligible prefill invocation.
         assert len(engine.calls[0]["prompt"]) == 2049
         assert len(engine.calls[1]["prompt"]) == 1024
+
+
+# =============================================================================
+# Generation length upload gate tests
+# =============================================================================
+
+
+class TestGenerationLengthUploadGate:
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "generation_length, uploads, skipped_reason",
+        [
+            (DEFAULT_GENERATION_LENGTH, 1, None),
+            (64, 0, "custom_generation_length"),
+        ],
+    )
+    async def test_only_default_generation_length_uploads(self, generation_length, uploads, skipped_reason):
+        upload = AsyncMock()
+        run = BenchmarkRun(
+            bench_id="bench-tg",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=generation_length,
+            ),
+        )
+        pool = _FakeBenchEnginePool(settings=ModelSettings())
+
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", upload):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        assert upload.await_count == uploads
+        assert run.upload_state.get("skipped_reason") == skipped_reason
 
 
 # =============================================================================

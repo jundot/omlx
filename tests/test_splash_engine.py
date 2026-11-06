@@ -28,9 +28,13 @@ import omlx.server as srv
 from omlx.admin import routes as admin_routes
 from omlx.admin.benchmark import (
     _CHAT_CALIBRATION_TOKENS,
+    DEFAULT_GENERATION_LENGTH,
     BenchmarkRequest,
     BenchmarkRun,
+    BenchmarkWarmupMode,
     _ChatBenchmark,
+    _computed_context_for_benchmark,
+    _single_prompt_lengths,
     run_benchmark,
 )
 from omlx.admin.external_api import StreamStats
@@ -43,6 +47,7 @@ from omlx.api.responses_utils import ResponseStore
 from omlx.engine import splash as splash_mod
 from omlx.engine.base import GenerationOutput
 from omlx.engine.splash import (
+    SPLASH_MAX_CONTEXT,
     SplashBinary,
     SplashEngine,
     SplashOptions,
@@ -2226,23 +2231,50 @@ class TestSplashBenchmark:
         monkeypatch.setattr(
             "omlx.admin.benchmark.ExternalAPIClient", lambda config: client
         )
+
+        model_settings = ModelSettings(max_context_window=1024)
+
         pool = MagicMock()
         pool.get_loaded_model_ids.return_value = []
         pool.get_engine = AsyncMock(return_value=_bench_engine(2000))
         pool._unload_engine = AsyncMock()
+        pool.external_engine_id.return_value = "splash"
         pool.get_entry.return_value = SimpleNamespace(
-            model_type="qwen3_5", model_settings=None, model_path=Path("/tmp/model")
+            model_type="qwen3_5", model_path=Path("/tmp/model"), model_context_length=8192
         )
+        pool._settings_manager.get_settings.return_value = model_settings
+
         run = BenchmarkRun(
             bench_id="splash-run-1",
             request=BenchmarkRequest(
-                model_id="splash-model", prompt_lengths=[1024], batch_sizes=[2]
+                model_id="splash-model",
+                prompt_lengths=[1024],
+                batch_sizes=[2],
+                generation_length=128,
             ),
         )
 
         await run_benchmark(run, pool)
 
         client.aclose.assert_awaited_once()
+
+        # The benchmark must launch Splash with enough context for the requested
+        # prompt plus generation, without mutating the model's persisted settings.
+        pool.get_engine.assert_awaited_once()
+        runtime_settings = pool.get_engine.await_args.kwargs["runtime_settings"]
+        assert isinstance(runtime_settings, ModelSettings)
+        assert runtime_settings is not model_settings
+        assert runtime_settings.max_context_window == 1152
+        assert model_settings.max_context_window == 1024
+
+        # Splash admits a request only while pp < max_context and caps generation
+        # at max_context - pp. The launched window must satisfy both
+        # for the longest trial, which is exactly what used to produce HTTP 400
+        limit = runtime_settings.max_context_window
+        max_pp = max(_single_prompt_lengths(run.request))
+        assert max_pp < limit
+        assert limit - max_pp >= run.request.generation_length
+
         results = {r["test_type"]: r for r in run.results}
         assert (results["single"]["requested_pp"], results["single"]["pp"]) == (
             1024,
@@ -2257,6 +2289,151 @@ class TestSplashBenchmark:
         assert run.upload_state["skipped_reason"] == "splash"
         skipped = next(e for e in run.events if e["type"] == "upload_skipped")
         assert skipped["reason"] == "splash"
+
+
+class FakeSplashPool:
+    """Minimal EnginePool surface for _computed_context_for_benchmark()."""
+
+    def __init__(self, model_context_length=None, engine_id="splash"):
+        self._model_context_length = model_context_length
+        self._engine_id = engine_id
+
+    def get_entry(self, model_id):
+        return SimpleNamespace(model_context_length=self._model_context_length)
+
+    def external_engine_id(self, model_id, model_settings):
+        return self._engine_id
+
+
+class TestSplashContextWindow:
+    """Launch windows for Splash benchmarks (#4938)."""
+
+    def _compute(self, request, settings=None, *, model_context_length=None, engine_id="splash"):
+        pool = FakeSplashPool(
+            model_context_length=model_context_length, engine_id=engine_id
+        )
+        return _computed_context_for_benchmark(request, settings, pool)
+
+    def test_window_covers_prompt_plus_generation(self):
+        request = BenchmarkRequest(
+            model_id="m",
+            prompt_lengths=[1024],
+            generation_length=DEFAULT_GENERATION_LENGTH,
+        )
+        settings = ModelSettings(max_context_window=1024)
+
+        window = self._compute(request, settings, model_context_length=32768)
+
+        assert isinstance(window, ModelSettings)
+        assert window is not settings
+        assert window.max_context_window == 1024 + DEFAULT_GENERATION_LENGTH
+        assert settings.max_context_window == 1024
+        max_pp = max(_single_prompt_lengths(request))
+        assert max_pp < window.max_context_window
+        assert window.max_context_window - max_pp >= request.generation_length
+
+    def test_stored_window_is_never_trusted_as_total_budget(self):
+        request = BenchmarkRequest(
+            model_id="m",
+            prompt_lengths=[1024],
+            generation_length=DEFAULT_GENERATION_LENGTH,
+        )
+
+        window = self._compute(
+            request,
+            ModelSettings(max_context_window=1025),
+            model_context_length=32768,
+        )
+
+        assert window.max_context_window == 1024 + DEFAULT_GENERATION_LENGTH
+
+    def test_longest_prompt_wins(self):
+        request = BenchmarkRequest(
+            model_id="m", prompt_lengths=[1024, 4096], generation_length=128
+        )
+
+        window = self._compute(request, ModelSettings(), model_context_length=32768)
+
+        assert window.max_context_window == 4096 + 128
+
+    def test_ane_aligned_prompts_add_one_token(self):
+        request = BenchmarkRequest(
+            model_id="m",
+            prompt_lengths=[1024],
+            generation_length=128,
+            align_prompt_to_ane=True,
+        )
+
+        window = self._compute(request, ModelSettings(), model_context_length=32768)
+
+        assert window.max_context_window == 1024 + 1 + 128
+
+    def test_ane_warmup_dominates_short_prompts(self):
+        request = BenchmarkRequest(
+            model_id="m",
+            prompt_lengths=[1024],
+            generation_length=128,
+            warmup_mode=BenchmarkWarmupMode.ANE_2048,
+        )
+
+        window = self._compute(request, ModelSettings(), model_context_length=32768)
+
+        assert window.max_context_window == 2049 + 8
+
+    def test_batch_selection_does_not_change_window(self):
+        request = BenchmarkRequest(
+            model_id="m", prompt_lengths=[1024], generation_length=128, batch_sizes=[2, 4]
+        )
+
+        window = self._compute(request, ModelSettings(), model_context_length=32768)
+
+        assert window.max_context_window == 1024 + 128
+
+    @pytest.mark.parametrize("engine_id", [None, "other-engine"])
+    def test_non_splash_models_get_no_override(self, engine_id):
+        request = BenchmarkRequest(model_id="m", prompt_lengths=[1024])
+        settings = ModelSettings(max_context_window=1024)
+
+        window = self._compute(request, settings, engine_id=engine_id)
+
+        assert window is None
+        assert settings.max_context_window == 1024
+
+    def test_missing_settings_get_no_override(self):
+        request = BenchmarkRequest(model_id="m", prompt_lengths=[1024])
+
+        assert self._compute(request, None) is None
+
+    def test_window_above_splash_limit_rejected(self):
+        request = BenchmarkRequest(
+            model_id="m",
+            prompt_lengths=[200000],
+            generation_length=SPLASH_MAX_CONTEXT - 200000 + 1,
+        )
+
+        with pytest.raises(ValueError, match=f"supported size of {SPLASH_MAX_CONTEXT}"):
+            self._compute(request, ModelSettings())
+
+    def test_window_above_native_context_rejected(self):
+        request = BenchmarkRequest(
+            model_id="m", prompt_lengths=[4096], generation_length=128
+        )
+
+        with pytest.raises(
+            ValueError, match="exceeding the model's supported context size of 4096"
+        ):
+            self._compute(
+                request, ModelSettings(max_context_window=4096), model_context_length=4096
+            )
+
+    def test_unknown_native_context_proceeds(self):
+        request = BenchmarkRequest(
+            model_id="m", prompt_lengths=[200000], generation_length=128
+        )
+
+        window = self._compute(request, ModelSettings(max_context_window=200000))
+
+        assert window.max_context_window == 200000 + 128
 
 
 # -- cache observability ---------------------------------------------------------------
