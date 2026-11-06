@@ -1660,6 +1660,25 @@ def test_recovery_candidate_payload_versus_quoted_marker(markers, text, is_paylo
     assert f.take_recovery_candidate()
 
 
+@pytest.mark.parametrize(
+    "text,is_bare",
+    [
+        ("<tool_call>", True),
+        ("<tool_call>\n", True),
+        ('<tool_call>{"name":"f"', False),
+        ("<tool_call><function=write>", False),
+    ],
+)
+def test_recovery_candidate_bare_opener_is_only_the_opener(text, is_bare):
+    tokenizer = _make_tokenizer()
+    f = ToolCallStreamFilter(tokenizer)
+    f.feed(text)
+    f.finish()
+
+    assert f.recovery_candidate_is_bare_opener() is is_bare
+    assert f.take_recovery_candidate()
+
+
 def test_recovery_candidate_unclosed_envelope_3153_is_payload():
     """Issue #3153 sample is a truncated call payload, not quoted-marker prose.
 

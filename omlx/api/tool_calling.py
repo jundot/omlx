@@ -2402,6 +2402,11 @@ def parse_qwen_tool_calls(
             envelope = text[start:end]
         else:
             end = function_end
+            if end is None and paired and found is None and finish_reason == "stop":
+                if not text[match.end() :].strip():
+                    # A bare opener ended the reply: no call body to recover.
+                    pos = len(text)
+                    break
             if end is None or (
                 paired
                 and (
@@ -2774,6 +2779,15 @@ class ToolCallStreamFilter:
                 return True
             cursors[marker] = tail.find(marker, index + len(marker))
         return False
+
+    def recovery_candidate_is_bare_opener(self) -> bool:
+        """Whether the withheld tail is an opening marker with no body after it.
+
+        Read it with ``recovery_candidate_is_payload``: a bare opener is a call
+        payload only when generation was cut by the token limit.
+        """
+        tail = self._recovery_candidate.rstrip()
+        return bool(tail) and tail == self._opener_at(tail, 0)
 
     def take_completed_envelopes(self) -> List[str]:
         """Return complete suppressed envelopes ready for exact parsing.
