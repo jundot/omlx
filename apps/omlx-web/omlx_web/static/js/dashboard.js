@@ -147,6 +147,8 @@
             customThemeError: '',
             customThemeJson: '',
             customThemeJsonError: '',
+            themeImageError: '',
+            themeImageBusy: false,
             _customThemeSavedTimer: null,
             _customThemeReady: false,
 
@@ -7468,34 +7470,25 @@
                     + ` --theme-cell-hover:${color('bg-tertiary')}; --theme-cell-ring:${color('focus-ring-color')};`;
             },
 
-            // Edited tokens also carry their derived channels and status tints.
-            themePreviewStyle(mode) {
-                const api = window.OmlxCustomTheme;
-                const stock = this.customThemeDefaults[mode];
-                const lines = api.DERIVED.map(token => `--${token}: ${stock[token]};`);
-                for (const token of api.TOKENS) {
-                    const color = this.themeTokenColor(mode, token);
-                    lines.push(...(color === stock[token]
-                        ? [`--${token}: ${color};`]
-                        : api.declarations(mode, token, color)));
-                }
-                return lines.join(' ');
-            },
-
-            // The only contrast check: the server stores any #rrggbb it gets.
-            themeContrastChecks(mode) {
+            // The mode's tokens plus each status badge's fill, line and text as
+            // opaque hex on the page: what the preview draws and the contrast checks read.
+            themeDrawColors(mode) {
                 const api = window.OmlxCustomTheme;
                 const stock = this.customThemeDefaults[mode];
                 const colors = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor(mode, token)]));
                 const page = colors['bg-primary'];
                 for (const status of api.STATUS) {
                     const badge = colors[status] === stock[status]
-                        ? { soft: api.flatten(stock[`${status}-soft`], page), text: api.flatten(stock[`${status}-text`], page) }
+                        ? Object.fromEntries(['soft', 'line', 'text'].map(part => [part, api.flatten(stock[`${status}-${part}`], page)]))
                         : api.badgeColors(mode, colors[status], page);
-                    colors[`${status}-soft`] = badge.soft;
-                    colors[`${status}-text`] = badge.text;
+                    for (const [part, color] of Object.entries(badge)) colors[`${status}-${part}`] = color;
                 }
-                return api.contrastChecks(colors);
+                return colors;
+            },
+
+            // The only contrast check: the server stores any #rrggbb it gets.
+            themeContrastChecks(mode) {
+                return window.OmlxCustomTheme.contrastChecks(this.themeDrawColors(mode));
             },
 
             // The lowest failing pair per foreground, in both modes, with the token to fix.
@@ -7549,8 +7542,50 @@
                 this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
             },
 
+            // Redrawn by x-effect whenever a color it reads changes, and on resize.
+            drawThemePreview(canvas, mode) {
+                const preview = window.OmlxThemePreview;
+                if (!canvas._resize) {
+                    canvas._resize = new ResizeObserver(() => this.drawThemePreview(canvas, mode));
+                    canvas._resize.observe(canvas);
+                }
+                const status = Object.fromEntries(window.OmlxCustomTheme.STATUS.map(name => [name, window.t(`settings.theme.token.${name}`)]));
+                canvas._regions = preview.drawPreview(canvas, this.themeDrawColors(mode), {
+                    mode,
+                    sans: getComputedStyle(document.body).fontFamily,
+                    hover: canvas._hover,
+                    labels: {
+                        ...preview.LABELS,
+                        version: canvas.dataset.version,
+                        heading: window.t('settings.theme.heading'),
+                        subtitle: window.t('settings.theme.preview_subtitle'),
+                        port: window.t('settings.theme.preview_port'),
+                        link: window.t('settings.theme.preview_link'),
+                        danger: window.t('settings.theme.preview_danger'),
+                        hover: window.t('settings.theme.preview_hover'),
+                        save: window.t('settings.save.button'),
+                        tabStatus: window.t('navbar.tab.status'),
+                        tabSettings: window.t('navbar.tab.settings'),
+                        status,
+                    },
+                });
+            },
+
+            themePreviewRegion(canvas, event) {
+                const scale = window.OmlxThemePreview.CARD_W / canvas.clientWidth;
+                return window.OmlxThemePreview.regionAt(canvas._regions || [], event.offsetX * scale, event.offsetY * scale);
+            },
+
+            hoverThemePreview(canvas, mode, event) {
+                const region = event && this.themePreviewRegion(canvas, event);
+                if (region === canvas._hover) return;
+                canvas._hover = region;
+                canvas.style.cursor = region ? 'pointer' : '';
+                this.drawThemePreview(canvas, mode);
+            },
+
             focusThemeToken(mode, event) {
-                const token = event.target.closest('[data-token]')?.dataset.token;
+                const token = this.themePreviewRegion(event.currentTarget, event)?.[4];
                 const field = token && document.getElementById(`theme-token-${mode}-${token}`);
                 if (!field) return;
                 field.focus();
@@ -7618,6 +7653,65 @@
                     await navigator.clipboard.writeText(this.customThemeJson);
                 } catch (error) {
                     console.debug('Clipboard unavailable:', error);
+                }
+            },
+
+            // Applies the theme a Save as image PNG carries. A theme with a pair below
+            // its contrast floor fills the fields but is not saved, as with Apply.
+            async loadThemeImage(event) {
+                const file = event.target.files?.[0];
+                event.target.value = '';
+                if (!file) return;
+                const preview = window.OmlxThemePreview;
+                const api = window.OmlxCustomTheme;
+                this.themeImageError = '';
+                let theme = null;
+                try {
+                    theme = api.sanitize(JSON.parse(preview.readTextChunk(new Uint8Array(await file.arrayBuffer()), preview.KEYWORD)));
+                } catch (error) {
+                    console.debug('No theme in the image:', error);
+                }
+                if (!theme || api.isEmpty(theme)) {
+                    this.themeImageError = window.t('settings.theme.image_no_theme');
+                    return;
+                }
+                this.fillCustomThemeDraft(theme);
+                if (this.customThemeInputsValid) await this.applyCustomTheme();
+                else this.themeImageError = window.t('settings.theme.image_review');
+            },
+
+            // Both preview cards as one English PNG to share: every hex, plus the JSON in a text chunk.
+            async saveThemePreviewImage(version) {
+                if (this.themeImageBusy) return;
+                this.themeImageError = '';
+                this.themeImageBusy = true;
+                try {
+                    // Load Inter explicitly, then wait: the image must look the same in every UI language.
+                    if (document.fonts?.load) {
+                        await Promise.all([300, 400, 500, 600, 700, 800].map(weight =>
+                            document.fonts.load(`${weight} 11px Inter`).catch(() => {})));
+                    }
+                    if (document.fonts?.ready) await document.fonts.ready;
+                    const blob = await window.OmlxThemePreview.png({
+                        theme: { light: this.themeDrawColors('light'), dark: this.themeDrawColors('dark') },
+                        groups: window.OmlxCustomTheme.GROUPS,
+                        version,
+                    });
+                    const link = document.createElement('a');
+                    const now = new Date();
+                    const pad = value => String(value).padStart(2, '0');
+                    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}`;
+                    link.href = URL.createObjectURL(blob);
+                    link.download = `omlx-theme-${stamp}.png`;
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+                } catch (error) {
+                    console.error('Failed to save the theme image:', error);
+                    this.themeImageError = window.t('settings.theme.image_failed');
+                } finally {
+                    this.themeImageBusy = false;
                 }
             },
 

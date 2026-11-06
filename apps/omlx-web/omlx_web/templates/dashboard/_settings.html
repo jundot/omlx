@@ -2107,68 +2107,41 @@
                                 <div class="flex items-center gap-3 px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                     <i data-lucide="eye" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.theme.preview') }}</span>
-                                    <button type="button" @click="generateDarkCustomTheme()"
-                                            title="{{ t('settings.theme.generate_dark_hint') }}"
-                                            class="ml-auto -my-1.5 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-neutral-300 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50">
-                                        <i data-lucide="wand-sparkles" class="w-3.5 h-3.5"></i>{{ t('settings.theme.generate_dark') }}
+                                    <label title="{{ t('settings.theme.load_image_hint') }}"
+                                           class="ml-auto -my-2 inline-flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap px-3 py-1.5 rounded-full border border-neutral-300 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50 focus-within:ring-2 focus-within:ring-neutral-900">
+                                        <i data-lucide="image-up" class="w-3.5 h-3.5"></i>{{ t('settings.theme.load_image') }}
+                                        <input type="file" accept="image/png" class="sr-only" @change="loadThemeImage($event)">
+                                    </label>
+                                    <button type="button" @click="saveThemePreviewImage({{ version | tojson | forceescape }})"
+                                            :disabled="themeImageBusy"
+                                            title="{{ t('settings.theme.image_hint') }}"
+                                            class="-my-2 inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap px-3 py-1.5 rounded-full border border-neutral-300 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed">
+                                        <i data-lucide="image-down" class="w-3.5 h-3.5"></i>{{ t('settings.theme.save_image') }}
                                     </button>
                                 </div>
+                                <template x-if="themeImageError">
+                                    <p class="px-4 pt-3 text-xs text-red-600" x-text="themeImageError"></p>
+                                </template>
                                 <div class="p-4 space-y-3">
                                     <div class="theme-previews">
                                         <template x-for="mode in ['light', 'dark']" :key="mode">
                                             <div class="min-w-0 space-y-2">
-                                                <div class="flex items-center gap-1.5 text-xs font-semibold text-neutral-500">
+                                                <div class="flex h-7 items-center gap-1.5 text-xs font-semibold text-neutral-500">
                                                     <i x-show="mode === 'light'" data-lucide="sun" class="w-3.5 h-3.5"></i>
                                                     <i x-show="mode === 'dark'" data-lucide="moon" class="w-3.5 h-3.5"></i>
                                                     <span x-text="window.t(mode === 'light' ? 'settings.theme.light' : 'settings.theme.dark')"></span>
+                                                    <button type="button" x-show="mode === 'dark'" @click="generateDarkCustomTheme()"
+                                                            title="{{ t('settings.theme.generate_dark_hint') }}"
+                                                            class="ml-auto inline-flex items-center gap-1 px-2.5 py-1 rounded-full border border-neutral-300 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50">
+                                                        <i data-lucide="wand-sparkles" class="w-3.5 h-3.5"></i>{{ t('settings.theme.generate_dark') }}
+                                                    </button>
                                                 </div>
-                                                <div class="theme-preview" :style="themePreviewStyle(mode)"
-                                                     @click="focusThemeToken(mode, $event)" aria-hidden="true">
-                                                    <div class="tp-accent" data-token="timeline-accent"></div>
-                                                    <div class="tp-nav" data-token="bg-primary">
-                                                        <span class="tp-logo" data-token="text-primary"></span>
-                                                        <span class="tp-brand" data-token="text-primary">oMLX</span>
-                                                        <span class="tp-version" data-token="text-muted">v{{ version }}</span>
-                                                        <span class="tp-tabs" data-token="bg-tertiary">
-                                                            <span class="tp-tab tp-tab--active" data-token="text-primary">{{ t('navbar.tab.status') }}</span>
-                                                            <span class="tp-tab" data-token="text-secondary">{{ t('navbar.tab.settings') }}</span>
-                                                        </span>
-                                                    </div>
-                                                    <div class="tp-body">
-                                                        <div class="tp-hero">
-                                                            <span class="tp-display" data-token="text-primary">Aa</span>
-                                                            <span class="min-w-0">
-                                                                <span class="tp-heading" data-token="text-primary">{{ t('settings.theme.heading') }}</span>
-                                                                <span class="tp-sub" data-token="text-tertiary">{{ t('settings.theme.preview_subtitle') }}</span>
-                                                            </span>
-                                                        </div>
-                                                        <div class="tp-card" data-token="border-faint">
-                                                            <div class="tp-row">
-                                                                <span class="tp-label" data-token="text-secondary">{{ t('settings.theme.preview_port') }}</span>
-                                                                <span class="tp-input" data-token="border-normal">8000</span>
-                                                            </div>
-                                                            <div class="tp-row tp-row--alt" data-token="bg-secondary">
-                                                                <span class="tp-code" data-token="code-bg">/v1/models</span>
-                                                                <span class="tp-link" data-token="link-color">{{ t('settings.theme.preview_link') }}</span>
-                                                            </div>
-                                                            <div class="tp-row">
-                                                                <span class="tp-meter" data-token="timeline-accent"><span class="tp-meter__fill"></span></span>
-                                                                <span class="tp-danger" data-token="text-danger">{{ t('settings.theme.preview_danger') }}</span>
-                                                            </div>
-                                                        </div>
-                                                        <div class="tp-badges">
-                                                            <span class="tp-badge tp-badge--success" data-token="success">{{ t('settings.theme.token.success') }}</span>
-                                                            <span class="tp-badge tp-badge--warning" data-token="warning">{{ t('settings.theme.token.warning') }}</span>
-                                                            <span class="tp-badge tp-badge--danger" data-token="danger">{{ t('settings.theme.token.danger') }}</span>
-                                                            <span class="tp-badge tp-badge--info" data-token="info">{{ t('settings.theme.token.info') }}</span>
-                                                        </div>
-                                                        <div class="tp-actions">
-                                                            <span class="tp-switch" data-token="switch-on"><span class="tp-switch__knob"></span></span>
-                                                            <span class="tp-btn tp-btn--hover" data-token="btn-primary-hover">{{ t('settings.theme.preview_hover') }}</span>
-                                                            <span class="tp-btn tp-btn--primary tp-btn--focus" data-token="btn-primary">{{ t('settings.save.button') }}</span>
-                                                        </div>
-                                                    </div>
-                                                </div>
+                                                <!-- Drawn by theme_preview.js, the same card the image export draws -->
+                                                <canvas class="theme-preview" aria-hidden="true" data-version="{{ version }}"
+                                                        x-effect="drawThemePreview($el, mode)"
+                                                        @click="focusThemeToken(mode, $event)"
+                                                        @mousemove="hoverThemePreview($el, mode, $event)"
+                                                        @mouseleave="hoverThemePreview($el, mode, null)"></canvas>
                                             </div>
                                         </template>
                                     </div>

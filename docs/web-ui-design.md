@@ -41,6 +41,8 @@ Families outside Tailwind's palette:
 4. A color outside sRGB keeps its lightness and hue and loses chroma until it fits.
 5. A foreground below its contrast floor on any of its backgrounds moves its lightness away from them in 0.01 steps until it passes.
 
+The Preview header's Save as image button writes both modes, every token's English name and exact hex, and the same palette as JSON in an `omlx-theme` `tEXt` chunk. The image is English-only so it can be handed to an agent or shared outside the dashboard. `theme_preview.js` draws the preview card for both: the Preview canvases in the UI language, the image with its fixed English labels, so the two never drift apart.
+
 ## Type
 
 | Step | Class | Size | Use |
