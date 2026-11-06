@@ -2300,7 +2300,8 @@
                                                                :aria-invalid="themeTokenValid(mode, token) ? 'false' : 'true'"
                                                                spellcheck="false" autocomplete="off" maxlength="7"
                                                                class="theme-hex-input px-2.5 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all"
-                                                               :class="themeTokenValid(mode, token) ? '' : 'theme-hex-input--invalid'">
+                                                               :class="themeTokenValid(mode, token) ? '' : 'theme-hex-input--invalid'"
+                                                               :style="'--theme-cell-danger:' + themeModeColor(mode, 'text-danger')">
                                                     </div>
                                                 </template>
                                             </div>
