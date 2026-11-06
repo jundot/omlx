@@ -12836,7 +12836,7 @@ class Scheduler:
                 request_id=request.request_id,
                 current=current,
                 target_cap=hard_limit,
-                predicted_transient=peak,
+                predicted_transient=max(0, int(est.estimated) - int(current)),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
             )
@@ -13146,7 +13146,9 @@ class Scheduler:
                 model_id=getattr(self.config, "model_name", ""),
                 current_bytes=int(current),
                 target_cap_bytes=int(admission_limit + hot_cache_credit),
-                predicted_transient_bytes=int(est.kv_exact + est.transient),
+                predicted_transient_bytes=max(
+                    0, int(est.estimated) - int(current)
+                ),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
                 stale_usage=stale_usage,

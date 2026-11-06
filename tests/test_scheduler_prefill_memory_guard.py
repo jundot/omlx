@@ -1422,3 +1422,39 @@ def test_admission_credits_reclaimable_mlx_pool_residue():
         # charged, on the route path and on the in-stream path alike.
         scheduler.preflight_or_raise(num_prompt_tokens=32768)
         assert scheduler._preflight_memory_check(_make_request(32768)) is None
+
+
+def test_route_eviction_sizes_transient_with_the_pool_credit():
+    """#3147 follow-up: the eviction request sizes what it must free with the
+    credited estimate. Otherwise the buffer-cache credit passes admission
+    while eviction still claims the full uncredited KV as its target."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18  # admission branch only
+    residue = 8 * 1024**3
+    pool_cache = 8 * 1024**3
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.mx.get_cache_memory", return_value=pool_cache),
+        patch("omlx.scheduler.get_phys_footprint", return_value=residue),
+    ):
+        current = scheduler._current_usage_bytes()
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+        raw_charge = est.kv_exact + est.transient
+        assert raw_charge > 0
+        # Limit just under the credited estimate so the admission branch fires.
+        scheduler._memory_hard_limit_bytes = est.estimated - 1024
+        scheduler._memory_hard_watermark_bytes = est.estimated - 1024
+        scheduler._memory_abort_limit_bytes = 10**18
+        eviction = scheduler.preflight_eviction_request(
+            num_prompt_tokens=32768,
+            request_id="req-evict-credit",
+        )
+    assert eviction is not None
+    assert eviction.reason == "prefill_preflight"
+    assert eviction.target_cap_bytes == scheduler._memory_hard_limit_bytes
+    # The credited growth, not the raw KV+SDPA charge: the pool absorbs it.
+    assert eviction.predicted_transient_bytes == max(0, est.estimated - current)
+    assert eviction.predicted_transient_bytes < raw_charge
