@@ -21,6 +21,7 @@ struct IntegrationsScreen: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ExternalEnginesSection(vm: vm, client: services.client)
+            MarkItDownSection(vm: vm, client: services.client)
             ClaudeCodeSection(vm: vm, client: services.client)
             ClaudeSetupCommandSection(vm: vm)
             OtherIntegrationsSection(vm: vm, client: services.client)
@@ -209,6 +210,98 @@ private struct ExternalEnginesSection: View {
             }
             .buttonStyle(.omlx(.primary))
             .disabled(!vm.hasPendingSplashLimits)
+        }
+    }
+}
+
+// MARK: - MarkItDown
+
+private struct MarkItDownSection: View {
+    @Bindable var vm: IntegrationsScreenVM
+    let client: OMLXClient
+
+    @FocusState private var focusedLimit: IntegrationsScreenVM.Field?
+
+    var body: some View {
+        SectionHeader(
+            String(localized: "integrations.section.markitdown",
+                   defaultValue: "MarkItDown",
+                   comment: "Section header for MarkItDown document conversion")
+        )
+
+        ListGroup {
+            Row(label: String(localized: "integrations.markitdown.enabled",
+                              defaultValue: "Enable MarkItDown",
+                              comment: "Row label for enabling MarkItDown"),
+                sublabel: String(localized: "integrations.markitdown.enabled.sub",
+                                 defaultValue: "Preprocess supported file attachments before LLM requests.",
+                                 comment: "Sublabel for enabling MarkItDown")) {
+                RowSwitch(isOn: vm.bind($vm.markitdownEnabled, save: {
+                    Task { await vm.save(.markitdownEnabled, client: client) }
+                }))
+                .disabled(vm.isSavingMarkitdownVisibility)
+                .accessibilityLabel(Text("integrations.markitdown.enabled"))
+            }
+
+            Row(label: String(localized: "integrations.markitdown.expose_model",
+                              defaultValue: "Show as model",
+                              comment: "Row label for exposing MarkItDown in model lists"),
+                sublabel: String(localized: "integrations.markitdown.expose_model.sub",
+                                 defaultValue: "Expose MarkItDown in model lists for direct Markdown conversion requests.",
+                                 comment: "Sublabel for exposing MarkItDown in model lists")) {
+                RowSwitch(isOn: vm.bind($vm.markitdownModelVisible, save: {
+                    Task { await vm.save(.markitdownExposeModel, client: client) }
+                }))
+                .disabled(!vm.markitdownEnabled || vm.isSavingMarkitdownVisibility)
+                .accessibilityLabel(Text("integrations.markitdown.expose_model"))
+            }
+
+            Row(label: String(localized: "integrations.markitdown.max_file_size",
+                              defaultValue: "Max file size",
+                              comment: "Row label for the maximum MarkItDown file size"),
+                sublabel: String(localized: "integrations.markitdown.max_file_size.sub",
+                                 defaultValue: "Reject larger document attachments before conversion.",
+                                 comment: "Sublabel for the maximum MarkItDown file size")) {
+                TextInput(text: $vm.markitdownMaxFileSizeText, suffix: "MB", width: .controlNarrow)
+                    .focused($focusedLimit, equals: .markitdownMaxFileSize)
+                    .onSubmit { Task { await vm.save(.markitdownMaxFileSize, client: client) } }
+                    .disabled(vm.savingMarkitdownFields.contains(.markitdownMaxFileSize))
+                    .accessibilityLabel(Text("integrations.markitdown.max_file_size"))
+            }
+
+            Row(label: String(localized: "integrations.markitdown.max_files",
+                              defaultValue: "Max files per request",
+                              comment: "Row label for the maximum MarkItDown files per request"),
+                sublabel: String(localized: "integrations.markitdown.max_files.sub",
+                                 defaultValue: "Limit document attachments converted in one request.",
+                                 comment: "Sublabel for the maximum MarkItDown files per request")) {
+                TextInput(text: $vm.markitdownMaxFilesText, width: .controlNarrow)
+                    .focused($focusedLimit, equals: .markitdownMaxFiles)
+                    .onSubmit { Task { await vm.save(.markitdownMaxFiles, client: client) } }
+                    .disabled(vm.savingMarkitdownFields.contains(.markitdownMaxFiles))
+                    .accessibilityLabel(Text("integrations.markitdown.max_files"))
+            }
+
+            Row(label: String(localized: "integrations.markitdown.pdf_processing_engine",
+                              defaultValue: "PDF processing engine",
+                              comment: "Row label for the MarkItDown PDF processing engine"),
+                sublabel: String(localized: "integrations.markitdown.pdf_processing_engine.sub",
+                                 defaultValue: "Select whether PDF document requests are processed by MarkItDown itself or by an OCR engine.",
+                                 comment: "Sublabel for the MarkItDown PDF processing engine"),
+                warning: vm.markitdownPdfWarning,
+                isLast: true) {
+                Popup(selection: vm.bind($vm.markitdownPdfProcessingEngine, save: {
+                    Task { await vm.save(.markitdownPdfProcessingEngine, client: client) }
+                }), width: .controlMedium, options: vm.markitdownPdfOptions)
+                .disabled(vm.savingMarkitdownFields.contains(.markitdownPdfProcessingEngine))
+                .accessibilityLabel(Text("integrations.markitdown.pdf_processing_engine"))
+            }
+        }
+        .onChange(of: focusedLimit) { previous, _ in
+            if let previous { Task { await vm.save(previous, client: client) } }
+        }
+        .onDisappear {
+            if let focusedLimit { Task { await vm.save(focusedLimit, client: client) } }
         }
     }
 }

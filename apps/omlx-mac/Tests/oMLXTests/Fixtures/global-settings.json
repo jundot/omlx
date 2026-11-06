@@ -86,7 +86,12 @@
         "pi_model": null,
         "copilot_model": null,
         "dsh_model": null,
-        "openclaw_tools_profile": "coding"
+        "openclaw_tools_profile": "coding",
+        "markitdown_enabled": true,
+        "markitdown_expose_model": false,
+        "markitdown_max_file_size_mb": 25,
+        "markitdown_max_files_per_request": 5,
+        "markitdown_pdf_processing_engine": "markitdown"
     },
     "system": {
         "total_memory_bytes": 68719476736,

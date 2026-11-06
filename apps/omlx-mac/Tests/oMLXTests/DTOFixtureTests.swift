@@ -143,6 +143,11 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertNotNil(settings.integrations,  "integrations block missing")
         XCTAssertEqual(settings.scheduler?.embeddingBatchSize, 32)
         XCTAssertEqual(settings.huggingface?.hfCacheEnabled, true)
+        XCTAssertEqual(settings.integrations?.markitdownEnabled, true)
+        XCTAssertEqual(settings.integrations?.markitdownExposeModel, false)
+        XCTAssertEqual(settings.integrations?.markitdownMaxFileSizeMb, 25)
+        XCTAssertEqual(settings.integrations?.markitdownMaxFilesPerRequest, 5)
+        XCTAssertEqual(settings.integrations?.markitdownPdfProcessingEngine, "markitdown")
     }
 
     // MARK: - Models list
