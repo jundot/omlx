@@ -151,7 +151,11 @@
             customThemeError: '',
             customThemeJson: '',
             customThemeJsonError: '',
+            customThemeJsonCopied: false,
+            customThemeJsonCopyBlocked: false,
+            showCustomThemeRestoreConfirm: false,
             _customThemeSavedTimer: null,
+            _customThemeJsonCopiedTimer: null,
             _customThemeReady: false,
 
             // Global settings section rail
@@ -7570,14 +7574,25 @@
                 }
                 this.customThemeJson = JSON.stringify(theme, null, 2);
                 this.customThemeJsonError = '';
+                this.customThemeJsonCopied = false;
+                this.customThemeJsonCopyBlocked = false;
                 try {
                     await navigator.clipboard.writeText(this.customThemeJson);
+                    this.customThemeJsonCopied = true;
+                    clearTimeout(this._customThemeJsonCopiedTimer);
+                    this._customThemeJsonCopiedTimer = setTimeout(() => { this.customThemeJsonCopied = false; }, 2000);
                 } catch (error) {
+                    // Plain-http LAN access has no clipboard; leave the JSON selected instead.
                     console.debug('Clipboard unavailable:', error);
+                    this.customThemeJsonCopyBlocked = true;
+                    this.$nextTick(() => {
+                        this.$refs.customThemeJsonField.focus();
+                        this.$refs.customThemeJsonField.select();
+                    });
                 }
             },
 
-            // Fills the fields only; Apply still runs the contrast check.
+            // Overwrites only the tokens in the JSON; Apply still runs the contrast check.
             importCustomThemeJson() {
                 const api = window.OmlxCustomTheme;
                 let clean;
@@ -7591,11 +7606,20 @@
                     return;
                 }
                 this.customThemeJsonError = '';
-                this.fillCustomThemeDraft(clean);
+                this.customThemeJsonCopyBlocked = false;
+                for (const mode of ['light', 'dark']) Object.assign(this.customThemeDraft[mode], clean[mode]);
             },
 
-            async resetCustomTheme() {
-                if (!window.confirm(window.t('settings.theme.restore_confirm'))) return;
+            resetCustomTheme() {
+                this.showCustomThemeRestoreConfirm = true;
+            },
+
+            cancelCustomThemeRestore() {
+                this.showCustomThemeRestoreConfirm = false;
+            },
+
+            async confirmCustomThemeRestore() {
+                this.showCustomThemeRestoreConfirm = false;
                 await this.saveCustomTheme(null);
             },
 

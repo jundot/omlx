@@ -4,6 +4,7 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const WEB = path.join(__dirname, '..', 'omlx_web');
 const theme = require(path.join(WEB, 'static/js/custom_theme.js'));
@@ -45,4 +46,80 @@ test('contrast checks flag every pair below the floor', () => {
         'btn-primary': '#000000', 'btn-primary-text': '#ffffff',
     });
     assert.deepEqual(checks.filter(c => c.ratio < theme.CONTRAST_FLOOR).map(c => c.foreground), Array(3).fill('link-color'));
+});
+
+function editor() {
+    const source = fs.readFileSync(path.join(WEB, 'static/js/dashboard.js'), 'utf8');
+    const clipboard = {text: null, writeText: async text => { clipboard.text = text; }};
+    const create = vm.runInNewContext(source + '\n dashboard;', {
+        URL, console, localStorage: {getItem: () => null},
+        THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+        window: {t: key => key, OmlxCustomTheme: theme}, navigator: {language: 'en', clipboard},
+        document: {}, setTimeout: () => {}, clearTimeout: () => {},
+    });
+    const state = create();
+    const stock = mode => Object.fromEntries(theme.TOKENS.map(token => [token, mode === 'light' ? '#eeeeee' : '#111111']));
+    state.customThemeDefaults = {light: stock('light'), dark: stock('dark')};
+    state.fillCustomThemeDraft();
+    return {state, clipboard};
+}
+
+function assertComplete(json) {
+    const copied = JSON.parse(json);
+    for (const mode of ['light', 'dark']) {
+        assert.deepEqual(Object.keys(copied[mode]).sort(), [...theme.TOKENS].sort(), mode);
+        for (const token of theme.TOKENS) assert.match(copied[mode][token], /^#[0-9a-f]{6}$/, `${mode} ${token}`);
+    }
+    return copied;
+}
+
+test('loading partial JSON keeps the other draft colors', () => {
+    const {state} = editor();
+    state.customThemeDraft.light['bg-primary'] = '#fafafa';
+    state.customThemeDraft.dark['link-color'] = '#88aaff';
+    state.customThemeJson = JSON.stringify({light: {'text-primary': '#222222'}});
+    state.importCustomThemeJson();
+    assert.equal(state.customThemeJsonError, '');
+    assert.equal(state.customThemeDraft.light['text-primary'], '#222222');
+    assert.equal(state.customThemeDraft.light['bg-primary'], '#fafafa');
+    assert.equal(state.customThemeDraft.dark['link-color'], '#88aaff');
+    assert.equal(state.customThemeDraft.dark['text-primary'], '#111111');
+
+    for (const bad of ['', '{"light": {"nope": "#000000"}}', 'not json']) {
+        state.customThemeJson = bad;
+        state.importCustomThemeJson();
+        assert.equal(state.customThemeJsonError, 'settings.theme.json.invalid', bad);
+    }
+    assert.equal(state.customThemeDraft.light['text-primary'], '#222222');
+});
+
+test('copy writes every token in both modes, also after a partial load', async () => {
+    const {state, clipboard} = editor();
+    state.customThemeDraft.light['bg-primary'] = '#fafafa';
+    state.customThemeDraft.dark['btn-primary'] = 'oops';
+    await state.copyCustomThemeJson();
+    assert.equal(state.customThemeJsonCopied, true);
+    let copied = assertComplete(clipboard.text);
+    assert.equal(copied.light['bg-primary'], '#fafafa');
+    assert.equal(copied.dark['btn-primary'], '#111111');
+
+    state.customThemeJson = JSON.stringify({dark: {'text-muted': '#999999'}});
+    state.importCustomThemeJson();
+    await state.copyCustomThemeJson();
+    copied = assertComplete(clipboard.text);
+    assert.equal(copied.dark['text-muted'], '#999999');
+    assert.equal(copied.light['bg-primary'], '#fafafa');
+});
+
+test('a blocked clipboard leaves the JSON selected with a hint', async () => {
+    const {state, clipboard} = editor();
+    clipboard.writeText = async () => { throw new Error('NotAllowedError'); };
+    const calls = [];
+    state.$nextTick = fn => fn();
+    state.$refs = {customThemeJsonField: {focus: () => calls.push('focus'), select: () => calls.push('select')}};
+    await state.copyCustomThemeJson();
+    assert.equal(state.customThemeJsonCopied, false);
+    assert.equal(state.customThemeJsonCopyBlocked, true);
+    assert.deepEqual(calls, ['focus', 'select']);
+    assertComplete(state.customThemeJson);
 });
