@@ -12832,11 +12832,17 @@ class Scheduler:
             # retry. If eviction can't help (already retried, no idle
             # models), the call is a no-op and we fall through to the
             # typed rejection.
+            # Size with the credited growth, but never below the overshoot:
+            # a zero transient skips the eviction ladder, which would leave
+            # the pooled bytes unreclaimed and the request rejected.
             self._raise_prefill_eviction_if_available(
                 request_id=request.request_id,
                 current=current,
                 target_cap=hard_limit,
-                predicted_transient=max(0, int(est.estimated) - int(current)),
+                predicted_transient=max(
+                    max(0, int(est.estimated) - int(current)),
+                    int(est.estimated) - int(hard_limit),
+                ),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
             )
@@ -13147,7 +13153,9 @@ class Scheduler:
                 current_bytes=int(current),
                 target_cap_bytes=int(admission_limit + hot_cache_credit),
                 predicted_transient_bytes=max(
-                    0, int(est.estimated) - int(current)
+                    0,
+                    int(est.estimated) - int(current),
+                    int(est.estimated) - int(admission_limit),
                 ),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",

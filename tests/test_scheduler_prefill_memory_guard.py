@@ -1432,7 +1432,7 @@ def test_route_eviction_sizes_transient_with_the_pool_credit():
     scheduler._prefill_memory_guard = True
     scheduler._memory_abort_limit_bytes = 10**18  # admission branch only
     residue = 8 * 1024**3
-    pool_cache = 8 * 1024**3
+    pool_cache = 2 * 1024**3
     with (
         patch("omlx.scheduler.mx.get_active_memory", return_value=0),
         patch("omlx.scheduler.mx.get_cache_memory", return_value=pool_cache),
@@ -1440,8 +1440,9 @@ def test_route_eviction_sizes_transient_with_the_pool_credit():
     ):
         current = scheduler._current_usage_bytes()
         est = scheduler._admission_estimate(
-            num_prompt_tokens=32768, cached_tokens=0, current=0
+            num_prompt_tokens=32768, cached_tokens=0, current=current
         )
+        assert est is not None
         raw_charge = est.kv_exact + est.transient
         assert raw_charge > 0
         # Limit just under the credited estimate so the admission branch fires.
@@ -1455,6 +1456,47 @@ def test_route_eviction_sizes_transient_with_the_pool_credit():
     assert eviction is not None
     assert eviction.reason == "prefill_preflight"
     assert eviction.target_cap_bytes == scheduler._memory_hard_limit_bytes
-    # The credited growth, not the raw KV+SDPA charge: the pool absorbs it.
-    assert eviction.predicted_transient_bytes == max(0, est.estimated - current)
+    # The credited growth, not the raw KV+SDPA charge: the pool absorbs part
+    # of it, so eviction has less to free.
+    assert eviction.predicted_transient_bytes == est.estimated - current
     assert eviction.predicted_transient_bytes < raw_charge
+
+
+def test_route_eviction_keeps_a_transient_when_the_pool_covers_the_charge():
+    """#3147 follow-up: a zero transient would skip the eviction ladder.
+
+    The pool can cover the whole charge while current still sits above the
+    limit. Then the credited growth is zero, but the request still needs the
+    pooled bytes reclaimed, so the eviction request must stay positive.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18  # admission branch only
+    residue = 12 * 1024**3
+    pool_cache = 12 * 1024**3
+    limit = 11 * 1024**3 + 387 * 1024**2
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.mx.get_cache_memory", return_value=pool_cache),
+        patch("omlx.scheduler.get_phys_footprint", return_value=residue),
+    ):
+        current = scheduler._current_usage_bytes()
+        assert current == residue
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=current
+        )
+        # The pool covers the whole charge, so the credited growth is zero.
+        assert est.estimated == current
+        scheduler._memory_hard_limit_bytes = limit
+        scheduler._memory_hard_watermark_bytes = limit
+        scheduler._memory_abort_limit_bytes = 10**18
+        eviction = scheduler.preflight_eviction_request(
+            num_prompt_tokens=32768,
+            request_id="req-evict-overshoot",
+        )
+    assert eviction is not None
+    assert eviction.reason == "prefill_preflight"
+    # The overshoot over the limit, not zero: a zero transient skips the
+    # eviction ladder and the pooled bytes stay unreclaimed.
+    assert eviction.predicted_transient_bytes > 0
+    assert eviction.predicted_transient_bytes == est.estimated - limit
