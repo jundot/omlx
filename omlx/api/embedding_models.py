@@ -4,6 +4,7 @@ Pydantic models for OpenAI-compatible Embeddings API.
 
 These models define the request and response schemas for:
 - /v1/embeddings endpoint
+- /v1/embeddings/tokens endpoint (per-token / late-interaction vectors)
 """
 
 import time
@@ -133,6 +134,95 @@ class EmbeddingResponse(BaseModel):
 
     data: List[EmbeddingData]
     """List of embedding objects."""
+
+    model: str
+    """The model used for embedding."""
+
+    usage: EmbeddingUsage
+    """Usage statistics."""
+
+
+# Hard per-request ceiling on caller-supplied token ids. The response is
+# proportional to the number of tokens returned, so this bounds both the
+# forwards and the Python/JSON materialization done for one request.
+MAX_TOKEN_IDS_PER_REQUEST = 32768
+
+
+class TokenEmbeddingRequest(BaseModel):
+    """
+    Request for per-token (late-interaction / MaxSim) embeddings.
+
+    Unlike ``/v1/embeddings`` the caller supplies the EXACT token ids — not
+    text — so the returned rows line up one-to-one with the text window the
+    caller already computed a pooled embedding over. This is used by the
+    offline ColBERT-style producers, which build the ids from the pinned
+    tokenizer (head-truncated, special tokens preserved).
+    """
+
+    model: str
+    """ID of the model to use."""
+
+    input_ids: List[List[int]]
+    """One list of token ids per input sequence. All sequences must be non-empty."""
+
+    max_length: Optional[int] = Field(default=None, gt=0)
+    """
+    Optional maximum token length for each input sequence. A sequence longer
+    than this is rejected, never truncated; the effective limit is the smaller
+    of this value and the model's own context window. When omitted, the server
+    uses the model's effective context window.
+    """
+
+    @model_validator(mode="after")
+    def validate_input_ids(self) -> "TokenEmbeddingRequest":
+        """Reject an empty batch, an oversized request, or a negative token id."""
+        if not self.input_ids:
+            raise ValueError("input_ids must not be empty")
+        total_ids = 0
+        for ids in self.input_ids:
+            if not ids:
+                raise ValueError("every input_ids entry must be non-empty")
+            total_ids += len(ids)
+        if total_ids > MAX_TOKEN_IDS_PER_REQUEST:
+            raise ValueError(
+                f"input_ids contains {total_ids} token ids, which exceeds the "
+                f"per-request limit of {MAX_TOKEN_IDS_PER_REQUEST}; split the "
+                "request into smaller batches"
+            )
+        for ids in self.input_ids:
+            for token_id in ids:
+                if token_id < 0:
+                    raise ValueError("token ids must be non-negative integers")
+        return self
+
+
+class TokenEmbeddingData(BaseModel):
+    """A single per-token embedding result."""
+
+    object: str = "embedding"
+    """The object type, always "embedding"."""
+
+    index: int
+    """The index of the input sequence in the request."""
+
+    embedding: List[List[float]]
+    """One vector per token id of that sequence (padding is never included)."""
+
+
+class TokenEmbeddingResponse(BaseModel):
+    """
+    Response from creating per-token embeddings.
+
+    OpenAI-shaped envelope (`object`/`data`/`model`/`usage`) that reuses
+    ``EmbeddingUsage`` so the usage fields match ``/v1/embeddings``. Note that
+    ``embedding`` is ragged: one vector per token id, not one pooled vector.
+    """
+
+    object: str = "list"
+    """The object type, always "list"."""
+
+    data: List[TokenEmbeddingData]
+    """List of per-token embedding objects, in request order."""
 
     model: str
     """The model used for embedding."""
