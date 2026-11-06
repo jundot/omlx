@@ -7463,10 +7463,13 @@
                 return `background:${color('bg-primary')}; border-color:${color('border-normal')}; color:${color('text-secondary')};`;
             },
 
-            themeModeCellStyle(mode) {
+            themeModeCellStyle(mode, surface = 'bg-primary') {
                 const color = token => this.themeModeColor(mode, token);
                 return `--theme-cell-bg:${color('bg-primary')}; --theme-cell-fg:${color('text-primary')};`
-                    + ` --theme-cell-border:${color('border-normal')}; --theme-cell-placeholder:${color('text-muted')};`;
+                    + ` --theme-cell-border:${color('border-normal')}; --theme-cell-placeholder:${color('text-muted')};`
+                    + ` --theme-cell-surface:${color(surface)}; --theme-cell-line:${color('border-faint')};`
+                    + ` --theme-cell-icon:${color('text-tertiary')}; --theme-cell-icon-hover:${color('text-primary')};`
+                    + ` --theme-cell-hover:${color('bg-tertiary')}; --theme-cell-ring:${color('focus-ring-color')};`;
             },
 
             // Edited tokens also carry their derived channels and status tints.

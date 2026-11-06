@@ -2253,22 +2253,26 @@
                         <div class="space-y-4 min-w-0">
                             <template x-for="group in customThemeGroups" :key="group.id">
                                 <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                                    <div class="theme-token-row theme-token-row--head px-4 sm:px-6 bg-neutral-100 border-b border-neutral-200">
-                                        <span class="text-xs font-bold uppercase tracking-wider text-neutral-600"
+                                    <div class="theme-token-row theme-token-row--head bg-neutral-100">
+                                        <span class="theme-token-label text-xs font-bold uppercase tracking-wider text-neutral-600"
                                               x-text="window.t('settings.theme.group.' + group.id)"></span>
-                                        <span class="theme-token-cell theme-mode-head text-xs font-semibold"
-                                              :style="themeModeHeadStyle('light')">
-                                            <i data-lucide="sun" class="w-3.5 h-3.5"></i>{{ t('settings.theme.light') }}
-                                        </span>
-                                        <span class="theme-token-cell theme-mode-head text-xs font-semibold"
-                                              :style="themeModeHeadStyle('dark')">
-                                            <i data-lucide="moon" class="w-3.5 h-3.5"></i>{{ t('settings.theme.dark') }}
-                                        </span>
+                                        <div class="theme-mode-cell" :style="themeModeCellStyle('light', 'bg-tertiary')">
+                                            <span class="theme-token-cell theme-mode-head text-xs font-semibold"
+                                                  :style="themeModeHeadStyle('light')">
+                                                <i data-lucide="sun" class="w-3.5 h-3.5"></i>{{ t('settings.theme.light') }}
+                                            </span>
+                                        </div>
+                                        <div class="theme-mode-cell" :style="themeModeCellStyle('dark', 'bg-tertiary')">
+                                            <span class="theme-token-cell theme-mode-head text-xs font-semibold"
+                                                  :style="themeModeHeadStyle('dark')">
+                                                <i data-lucide="moon" class="w-3.5 h-3.5"></i>{{ t('settings.theme.dark') }}
+                                            </span>
+                                        </div>
                                     </div>
-                                    <div class="settings-rows px-4 sm:px-6">
+                                    <div class="theme-token-rows">
                                         <template x-for="token in group.tokens" :key="token">
                                             <div class="theme-token-row">
-                                                <div class="min-w-0">
+                                                <div class="theme-token-label min-w-0">
                                                     <div class="text-sm text-neutral-700" x-text="window.t('settings.theme.token.' + token)"></div>
                                                     <code class="text-caption text-neutral-400" x-text="'--' + token"></code>
                                                 </div>
@@ -2276,7 +2280,7 @@
                                                     <div class="theme-token-cell theme-mode-cell" :style="themeModeCellStyle(mode)">
                                                         <button type="button" @click="resetThemeToken(mode, token)"
                                                                 :style="themeTokenChanged(mode, token) ? '' : 'visibility: hidden'"
-                                                                class="p-1.5 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-colors"
+                                                                class="theme-cell-reset p-1.5 rounded-lg transition-colors"
                                                                 :title="window.t('settings.theme.reset_token')"
                                                                 :aria-label="window.t('settings.theme.reset_token')">
                                                             <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
