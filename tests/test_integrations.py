@@ -244,7 +244,8 @@ class TestCodexIntegration:
             "time.sleep(60)\n",
         )
 
-        with patch("omlx.integrations.codex._PROBE_TIMEOUT_SECONDS", 1.0):
+        # The probe kills the group at its deadline; a slow interpreter start must not beat the pid write.
+        with patch("omlx.integrations.codex._PROBE_TIMEOUT_SECONDS", 5.0):
             assert capture_codex_instructions(codex_bin, dict(os.environ)) is None
 
         child_pid = int(pid_file.read_text())
