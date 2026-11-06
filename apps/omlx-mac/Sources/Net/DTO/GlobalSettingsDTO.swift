@@ -190,6 +190,11 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let hermesModel: String?
         let copilotModel: String?
         let dshModel: String?
+        let markitdownEnabled: Bool?
+        let markitdownExposeModel: Bool?
+        let markitdownMaxFileSizeMb: Int?
+        let markitdownMaxFilesPerRequest: Int?
+        let markitdownPdfProcessingEngine: String?
         /// Splash launcher path; nil means the server detects it.
         let splashPath: String?
         let splashKvFormat: String?
@@ -295,6 +300,13 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var integrationsHermesModel: String? = nil
     var integrationsCopilotModel: String? = nil
     var integrationsDshModel: String? = nil
+
+    // MarkItDown document conversion.
+    var markitdownEnabled: Bool? = nil
+    var markitdownExposeModel: Bool? = nil
+    var markitdownMaxFileSizeMb: Int? = nil
+    var markitdownMaxFilesPerRequest: Int? = nil
+    var markitdownPdfProcessingEngine: String? = nil
 
     // External engines: Splash. An empty path returns to automatic
     // detection; `.null` sizes return to automatic sizing.

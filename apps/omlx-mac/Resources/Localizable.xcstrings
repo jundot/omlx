@@ -10205,6 +10205,258 @@
         }
       }
     },
+    "integrations.section.markitdown" : {
+      "comment" : "Section header for MarkItDown document conversion",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MarkItDown"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MarkItDown"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.enabled" : {
+      "comment" : "Row label for enabling MarkItDown",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MarkItDown aktivieren"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enable MarkItDown"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.enabled.sub" : {
+      "comment" : "Sublabel for enabling MarkItDown",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Unterstützte Dateianhänge vor LLM-Anfragen vorverarbeiten."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Preprocess supported file attachments before LLM requests."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.expose_model" : {
+      "comment" : "Row label for exposing MarkItDown in model lists",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Als Modell anzeigen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Show as model"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.expose_model.sub" : {
+      "comment" : "Sublabel for exposing MarkItDown in model lists",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MarkItDown in Modelllisten anzeigen, um direkte Anfragen zur Markdown-Konvertierung zu ermöglichen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Expose MarkItDown in model lists for direct Markdown conversion requests."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.max_file_size" : {
+      "comment" : "Row label for the maximum MarkItDown file size",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Dateigröße"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max file size"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.max_file_size.sub" : {
+      "comment" : "Sublabel for the maximum MarkItDown file size",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Größere Dokumentanhänge vor der Konvertierung ablehnen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reject larger document attachments before conversion."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.max_files" : {
+      "comment" : "Row label for the maximum MarkItDown files per request",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Dateien pro Anfrage"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max files per request"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.max_files.sub" : {
+      "comment" : "Sublabel for the maximum MarkItDown files per request",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Anzahl der Dokumentanhänge begrenzen, die in einer Anfrage konvertiert werden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Limit document attachments converted in one request."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.pdf_processing_engine" : {
+      "comment" : "Row label for the MarkItDown PDF processing engine",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Engine für die PDF-Verarbeitung"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PDF processing engine"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.pdf_processing_engine.sub" : {
+      "comment" : "Sublabel for the MarkItDown PDF processing engine",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Festlegen, ob PDF-Dokumentanfragen von MarkItDown selbst oder von einer OCR-Engine verarbeitet werden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Select whether PDF document requests are processed by MarkItDown itself or by an OCR engine."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.pdf_processing_missing_model" : {
+      "comment" : "Warning when the configured PDF OCR model is unavailable",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das ausgewählte OCR-Modell ist nicht verfügbar. PDFs werden mit MarkItDown verarbeitet, bis das Modell wieder verfügbar ist oder Sie eine andere Engine auswählen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The selected OCR model is unavailable. PDFs use MarkItDown until the model is available again or you select another engine."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.pdf_processing_markitdown_warning" : {
+      "comment" : "Warning when PDFs are processed by MarkItDown without OCR",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gescannte PDFs und PDFs, die nur Bilder enthalten, können mit MarkItDown nicht verarbeitet werden. PDFs mit Tabellen werden möglicherweise nicht korrekt verarbeitet."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scanned or image-only PDFs will fail when MarkItDown is selected, and PDFs with tables may not be processed correctly."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.limits.invalid" : {
+      "comment" : "Error when a MarkItDown file limit is not a positive integer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geben Sie eine ganze Zahl größer als null ein."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter a whole number greater than zero."
+          }
+        }
+      }
+    },
     "integrations.section.external_engines" : {
       "comment" : "Section header for engines that serve models from their own process",
       "extractionState" : "manual",
