@@ -1785,6 +1785,8 @@
   "bench.config.batch_tests": "Kontinuierliche Batch-Tests",
   "bench.config.batch_hint": "Batch-Tests verwenden pp1024 / tg128",
   "bench.config.run_button": "Benchmark ausführen",
+  "bench.config.add_to_queue": "Zur Warteschlange hinzufügen",
+  "bench.completed.section_label": "Abgeschlossene Läufe",
   "bench.progress.preparing": "Vorbereitung...",
   "bench.progress.cancel": "Abbrechen",
   "bench.confirm.title": "Diesen Benchmark starten?",

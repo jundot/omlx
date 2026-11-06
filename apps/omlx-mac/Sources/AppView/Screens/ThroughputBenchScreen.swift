@@ -69,6 +69,7 @@ struct ThroughputBenchScreen: View {
                 genLength: $vm.genLength,
                 batchSizes: $vm.batchSizes,
                 running: vm.running,
+                queued: vm.queuedAhead != nil,
                 canRun: vm.canRun,
                 pendingFlags: vm.pendingFeatureFlags,
                 onRun: { vm.runBenchmark(client: services.client) },
@@ -79,6 +80,8 @@ struct ThroughputBenchScreen: View {
                 LiveProgressCard(
                     resultCount: vm.singleResults.count + vm.batchResults.count
                 )
+            } else if let ahead = vm.queuedAhead {
+                QueuedCard(ahead: ahead)
             }
 
             MessageBanner(error: vm.lastError)
@@ -167,6 +170,7 @@ private struct ConfigurationSection: View {
     @Binding var genLength: String
     @Binding var batchSizes: Set<Int>
     let running: Bool
+    let queued: Bool
     let canRun: Bool
     let pendingFlags: [String]
     let onRun: () -> Void
@@ -291,7 +295,7 @@ private struct ConfigurationSection: View {
             Row(isLast: true) {
                 HStack {
                     Spacer()
-                    if running {
+                    if running || queued {
                         Button {
                             onCancel()
                         } label: {
@@ -411,6 +415,31 @@ private struct Chip: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Queued
+
+private struct QueuedCard: View {
+    let ahead: Int
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        ListGroup {
+            FreeRow(isLast: true) {
+                HStack(spacing: 10) {
+                    Image(systemName: "hourglass")
+                        .foregroundStyle(theme.textSecondary)
+                    Text(String(localized: "bench.throughput.progress.queued",
+                                defaultValue: "Queued — \(ahead) run(s) ahead; starts automatically",
+                                comment: "Throughput Bench queue label; placeholder is the number of runs ahead"))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
+                        .foregroundStyle(theme.textSecondary)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
     }
 }
 
