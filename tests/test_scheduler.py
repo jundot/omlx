@@ -2239,6 +2239,56 @@ class TestSchedulerQueryMethods:
         scheduler.step()
         assert len(calls) == 1
 
+    def test_abort_clears_orphaned_prefilling_entry(self, mock_model, mock_tokenizer):
+        """An abort removes a prefilling request even without a prefill state.
+
+        A request can sit in the prefilling deque with no _prefill_states
+        entry. The abort must still drop it: a stale entry makes the idle
+        reclaim gate read the scheduler as busy.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="aborted-req",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.prefilling.append(request)
+        scheduler.requests[request.request_id] = request
+
+        scheduler.abort_request(request.request_id)
+        scheduler._process_pending_aborts()
+
+        assert not any(
+            r.request_id == request.request_id for r in scheduler.prefilling
+        )
+
+    def test_aborted_prefill_does_not_block_idle_reclaim(
+        self, mock_model, mock_tokenizer
+    ):
+        """Idle reclaim runs in the step that aborts a prefilling request.
+
+        The prefill gate stays closed during a cross-engine decode hold, so
+        the sweep that would drop an orphaned entry does not run. The abort
+        itself must clear the entry, or the reclaim defers on every step.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        calls = self._install_reclaim_probe(scheduler)
+        scheduler._prefill_gate_open = lambda: False
+        request = Request(
+            request_id="aborted-req",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.prefilling.append(request)
+        scheduler.requests[request.request_id] = request
+
+        scheduler.abort_request(request.request_id)
+        scheduler.request_idle_reclaim()
+        scheduler.step()
+
+        assert len(calls) == 1
+        assert scheduler._pending_reclaim_request is False
+
     def test_get_num_waiting(self, mock_model, mock_tokenizer):
         """Test get_num_waiting() returns correct count."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
