@@ -244,11 +244,12 @@ class _PreflightRejection:
 @dataclass
 class _AdmissionEstimate:
     """Single deterministic admission estimate shared by every preflight
-    path: ``current + kv_exact + transient`` is compared against both the
-    dynamic hard limit and the prefill safety cap. ``kv_exact`` is the
-    exact-shape resident KV (full + window-capped rotating + fixed state),
-    ``transient`` the floor-chunk charge including the session's observed
-    max chunk transient."""
+    path: ``current + max(kv_exact + transient - sampled_buffer_cache, 0)``
+    is compared against both the dynamic hard limit and the prefill safety
+    cap. ``kv_exact`` is the exact-shape resident KV (full + window-capped
+    rotating + fixed state), ``transient`` the floor-chunk charge including
+    the session's observed max chunk transient. The buffer-cache credit
+    keeps freed-but-resident pool bytes from being priced twice (#3147)."""
 
     kv_exact: int
     transient: int
@@ -12831,11 +12832,17 @@ class Scheduler:
             # retry. If eviction can't help (already retried, no idle
             # models), the call is a no-op and we fall through to the
             # typed rejection.
+            # Size with the credited growth, but never below the overshoot:
+            # a zero transient skips the eviction ladder, which would leave
+            # the pooled bytes unreclaimed and the request rejected.
             self._raise_prefill_eviction_if_available(
                 request_id=request.request_id,
                 current=current,
                 target_cap=hard_limit,
-                predicted_transient=peak,
+                predicted_transient=max(
+                    max(0, int(est.estimated) - int(current)),
+                    int(est.estimated) - int(hard_limit),
+                ),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
             )
@@ -12878,7 +12885,8 @@ class Scheduler:
     ) -> _AdmissionEstimate | None:
         """Deterministic admission estimate shared by every preflight path.
 
-        One formula: ``current + kv_exact + transient`` where
+        One formula: ``current + max(kv_exact + transient -
+        sampled_buffer_cache, 0)`` where
 
         - ``kv_exact`` is the exact-shape resident KV this prefill will
           allocate (full-attention layers linear in new tokens, sliding
@@ -12935,12 +12943,26 @@ class Scheduler:
         )
         if kv_exact <= 0 and transient <= 0:
             return None
+        # The MLX buffer cache holds freed KV from finished requests until it
+        # is cleared or reused (#3147). Prefill allocations reuse it, so the
+        # footprint grows only past the sampled cache size. Crediting it also
+        # matches the worst case where the cache is cleared before prefill.
+        # The credit may only cover pool bytes the usage sample counts, so a
+        # sample stale after a clear cannot over-credit past current - active.
+        pool_cache = max(
+            0, int(getattr(self, "_last_mlx_cache_memory_bytes", 0) or 0)
+        )
+        active_bytes = max(
+            0, int(getattr(self, "_last_mlx_active_memory_bytes", 0) or 0)
+        )
+        pool_cache = min(pool_cache, max(0, int(current) - active_bytes))
+        charge = kv_exact + transient
         return _AdmissionEstimate(
             kv_exact=kv_exact,
             transient=transient,
             floor_chunk=floor_chunk,
             kv_len=kv_len,
-            estimated=int(current) + kv_exact + transient,
+            estimated=int(current) + max(charge - pool_cache, 0),
         )
 
     def _format_rejection_message(
@@ -13130,7 +13152,11 @@ class Scheduler:
                 model_id=getattr(self.config, "model_name", ""),
                 current_bytes=int(current),
                 target_cap_bytes=int(admission_limit + hot_cache_credit),
-                predicted_transient_bytes=int(est.kv_exact + est.transient),
+                predicted_transient_bytes=max(
+                    0,
+                    int(est.estimated) - int(current),
+                    int(est.estimated) - int(admission_limit),
+                ),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
                 stale_usage=stale_usage,
@@ -13178,7 +13204,7 @@ class Scheduler:
 
         kv_growth = est.kv_exact
         min_transient = est.transient
-        estimated = int(current_usage_bytes) + kv_growth + min_transient
+        estimated = est.estimated
         if estimated - hot_cache_credit <= cap:
             return None
 
