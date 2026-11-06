@@ -202,6 +202,7 @@
   "status.header.running": "執行中",
   "status.header.restarting": "正在重新啟動",
   "status.header.uptime": "執行時間",
+  "status.header.started_at": "啟動於 {time}",
   "status.header.unload_all": "卸載全部模型",
   "status.header.unload_all_confirm": "卸載全部 {count} 個常駐模型？",
   "status.onboarding.first.title": "New here? You don't have any models yet.",

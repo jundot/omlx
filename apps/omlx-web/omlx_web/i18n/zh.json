@@ -202,6 +202,7 @@
   "status.header.running": "运行中",
   "status.header.restarting": "正在重启",
   "status.header.uptime": "运行时长",
+  "status.header.started_at": "启动于 {time}",
   "status.header.unload_all": "卸载全部模型",
   "status.header.unload_all_confirm": "卸载全部 {count} 个常驻模型？",
   "status.onboarding.first.title": "第一次使用？你还没有任何模型。",

@@ -202,6 +202,7 @@
   "status.header.running": "Running",
   "status.header.restarting": "Restarting",
   "status.header.uptime": "Uptime",
+  "status.header.started_at": "Started {time}",
   "status.header.unload_all": "Unload all models",
   "status.header.unload_all_confirm": "Unload all {count} resident models?",
   "status.onboarding.first.title": "New here? You don't have any models yet.",

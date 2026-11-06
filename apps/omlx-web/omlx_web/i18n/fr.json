@@ -202,6 +202,7 @@
   "status.header.running": "En service",
   "status.header.restarting": "Redémarrage",
   "status.header.uptime": "Durée de service",
+  "status.header.started_at": "Démarré le {time}",
   "status.header.unload_all": "Décharger tous les modèles",
   "status.header.unload_all_confirm": "Décharger les {count} modèles résidents ?",
   "status.onboarding.first.title": "New here? You don't have any models yet.",

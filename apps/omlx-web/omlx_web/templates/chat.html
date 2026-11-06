@@ -1247,19 +1247,31 @@
                     </a>
                     <div class="flex flex-col gap-0">
                         <a href="/admin/dashboard" class="font-semibold leading-tight">{{ t('chat.brand') }}</a>
-                        <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
-                           class="relative text-caption leading-none hover:opacity-80 transition-opacity"
-                           style="color: var(--text-muted);"
-                           @mouseenter="versionHover = true" @mouseleave="versionHover = false">
-                            v{{ version }}
-                            <span x-show="updateAvailable" x-cloak
-                                  class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
-                            <span x-show="versionHover" x-cloak
-                                  class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-caption text-white bg-neutral-800 rounded whitespace-nowrap z-50"
-                                  x-text="updateAvailable && latestVersion
-                                      ? window.t('navbar.update_available').replace('{version}', latestVersion)
-                                      : window.t('navbar.go_to_github')"></span>
-                        </a>
+                        <div class="flex items-baseline gap-1 leading-none">
+                            <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
+                               class="relative text-caption leading-none hover:opacity-80 transition-opacity"
+                               style="color: var(--text-muted);"
+                               @mouseenter="versionHover = true" @mouseleave="versionHover = false">
+                                v{{ version }}
+                                <span x-show="updateAvailable" x-cloak
+                                      class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
+                                <span x-show="versionHover" x-cloak
+                                      class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-caption text-white bg-neutral-800 rounded whitespace-nowrap z-50"
+                                      x-text="updateAvailable && latestVersion
+                                          ? window.t('navbar.update_available').replace('{version}', latestVersion)
+                                          : window.t('navbar.go_to_github')"></span>
+                            </a>
+                            <!-- Uptime follows the version wherever the version is drawn; the chat page has no
+                                 server card, so this is the only place it can appear here. -->
+                            <span x-show="serverStartedAt != null" x-cloak
+                                  x-data="{ hover: false }" @mouseenter="hover = true" @mouseleave="hover = false"
+                                  class="relative text-caption leading-none whitespace-nowrap" style="color: var(--text-muted);">
+                                · {{ t('status.header.uptime') }} <span x-text="formatUptime(serverUptimeSeconds)"></span>
+                                <span x-show="hover" x-cloak
+                                      class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-caption text-white bg-neutral-800 rounded whitespace-nowrap z-50"
+                                      x-text="window.t('status.header.started_at').replace('{time}', formatStartedAt(serverStartedAt))"></span>
+                            </span>
+                        </div>
                     </div>
                 </div>
                 <button @click="sidebarOpen = false"
@@ -2879,6 +2891,10 @@
             showShortcutsHelp: false,
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
+            // Server start moment (ms), taken from the stats endpoint; the header's
+            // uptime ticks from it instead of polling the server every second.
+            serverStartedAt: null,
+            uptimeNow: Date.now(),
 
             // Chat State
             currentChatId: null,
@@ -4336,6 +4352,8 @@
         this.applyTheme();
         this.checkForUpdate();
         this.startUpdateCheckTimer();
+        this.loadServerUptime();
+        setInterval(() => { this.uptimeNow = Date.now(); }, 30000);
 
         this.$nextTick(() => {
             this.setupScrollListener();
@@ -5174,6 +5192,46 @@
         }
         return { signal: controller.signal, dispose };
     },
+
+        async loadServerUptime() {
+            try {
+                // Same auth as the other admin calls from this page: session
+                // cookie, or the main API key when the page runs without one.
+                const apiKey = this.getApiKey();
+                const response = await fetch('/admin/api/stats', {
+                    credentials: 'same-origin',
+                    headers: apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {},
+                });
+                if (!response.ok) return;
+                const data = await response.json();
+                if (Number.isFinite(data.uptime_seconds)) {
+                    this.serverStartedAt = Date.now() - data.uptime_seconds * 1000;
+                    this.uptimeNow = Date.now();
+                }
+            } catch {
+                // Without stats the header keeps the version line only; chat is unaffected.
+            }
+        },
+
+        formatUptime(seconds) {
+            if (seconds == null || !Number.isFinite(seconds)) return '';
+            const total = Math.floor(seconds);
+            const days = Math.floor(total / 86400);
+            const hours = Math.floor((total % 86400) / 3600);
+            const minutes = Math.floor((total % 3600) / 60);
+            if (days > 0) return `${days}d ${hours}h`;
+            if (hours > 0) return `${hours}h ${minutes}m`;
+            return `${minutes}m`;
+        },
+
+        get serverUptimeSeconds() {
+            if (this.serverStartedAt == null) return null;
+            return Math.max(0, (this.uptimeNow - this.serverStartedAt) / 1000);
+        },
+
+        formatStartedAt(ms) {
+            return new Date(ms).toLocaleString(document.documentElement.lang, { dateStyle: 'medium', timeStyle: 'short' });
+        },
 
             async loadModels() {
         try {
