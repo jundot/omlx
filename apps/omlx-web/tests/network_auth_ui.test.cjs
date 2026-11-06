@@ -12,7 +12,7 @@ function fixture(defaults, defaultsOK = true) {
     const create = vm.runInNewContext(source + '\n dashboard;', {
         URL, console,
         localStorage: {getItem: () => null},
-        THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+        THEME_STORAGE_KEY: 'theme',
         window: win, navigator: {language: 'en'}, document: {},
         setTimeout: () => {},
         fetch: async (url, options) => {

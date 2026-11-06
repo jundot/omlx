@@ -616,7 +616,7 @@ const catalog = JSON.parse(fs.readFileSync('omlx_web/i18n/en.json', 'utf8'));
 function setup(fetch) {
     const context = {
         localStorage: {getItem: () => null},
-        THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+        THEME_STORAGE_KEY: 'theme',
         window: {t: key => (catalog[key] !== undefined ? catalog[key] : key)},
         navigator: {language: 'en'}, document: {}, fetch,
     };
