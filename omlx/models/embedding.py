@@ -32,7 +32,6 @@ from .base_model import (
     token_budget_batches,
 )
 from .colbert_projection import (
-    WEIGHT_SOURCE_ONNX,
     ColbertLayout,
     ColbertLayoutError,
     ColbertProjection,
@@ -650,14 +649,14 @@ class MLXEmbeddingModel:
         pooled (batch, hidden) tensor, which would leave ``embed_token_ids``
         without per-token features at all.
 
-        The weights come from the source the layout resolved -- the ONNX graph by
-        preference, the sentence-transformers safetensors otherwise. They are not
-        interchangeable (see ``colbert_projection``), so the choice is logged and
-        reported by :meth:`get_model_info`.
+        The weights are the sentence-transformers safetensors the layout
+        validated: the top-level ``model.safetensors`` for the encoder and each
+        Dense module's own ``model.safetensors`` for the projection.
 
         Raises:
             ColbertLayoutError: when the projection cannot be read (no usable
-                weight artifact) or the base architecture exposes no raw encoder.
+                safetensors artifact) or the base architecture exposes no raw
+                encoder.
         """
         model_path = Path(self.model_name)
         layout = resolve_colbert_layout(model_path)
@@ -699,33 +698,9 @@ class MLXEmbeddingModel:
             )
         del wrapper
 
-        if layout.weight_source == WEIGHT_SOURCE_ONNX:
-            from .colbert_onnx_weights import read_colbert_onnx
-
-            if layout.onnx_graph is None:
-                raise ColbertLayoutError(
-                    f"ColBERT layout at {model_path} selected the ONNX weight "
-                    "source but resolved no ONNX graph"
-                )
-            onnx_weights = read_colbert_onnx(layout.onnx_graph, layout.dense)
-            weights = onnx_weights.encoder
-            projection = ColbertProjection.from_matrices(
-                layout.dense,
-                [module_weights.linear for module_weights in onnx_weights.projection],
-                [module_weights.residual for module_weights in onnx_weights.projection],
-            )
-            weights_note = f"onnx={onnx_weights.graph_path.name}"
-            if onnx_weights.quantized:
-                weights_note += " (int8 dequantized)"
-        else:
-            if layout.encoder_weights is None:
-                raise ColbertLayoutError(
-                    f"ColBERT layout at {model_path} selected the safetensors "
-                    "weight source but resolved no encoder weight file"
-                )
-            weights = mx.load(str(layout.encoder_weights))
-            projection = ColbertProjection.from_layout(layout)
-            weights_note = f"safetensors={layout.encoder_weights.name}"
+        weights = mx.load(str(layout.encoder_weights))
+        projection = ColbertProjection.from_layout(layout)
+        weights_note = f"safetensors={layout.encoder_weights.name}"
 
         self._validate_native_weights(encoder, weights)
         encoder.load_weights(list(weights.items()), strict=False)
@@ -1451,13 +1426,11 @@ class MLXEmbeddingModel:
         Two contracts are served, and which one applies is decided at load time:
 
         * A plain embedder (Qwen3-Embedding and the like) returns the final hidden
-          state, before pooling and before L2 normalization — the tensor the
-          pinned ONNX export exposes as ``token_embeddings`` — so a caller that
+          state, before pooling and before L2 normalization, so a caller that
           needs the ColBERT/MaxSim convention normalizes the rows itself.
         * A pylate ColBERT model applies its Dense projection chain and the
-          per-token L2, because both are folded into that checkpoint's own ONNX
-          graph and are therefore part of its output contract, not a caller
-          convention. Those vectors are already unit length.
+          per-token L2, because both are part of pylate's model contract rather
+          than a caller convention. Those vectors are already unit length.
 
         The batch is split on ``ENCODER_BATCH_TOKEN_BUDGET`` like the pooled
         path, right-padded to the longest sequence in each sub-batch, and each
@@ -1683,16 +1656,13 @@ class MLXEmbeddingModel:
         }
 
         if self._colbert_layout is not None:
-            # Which artifact supplied the weights is part of the model identity
-            # here: the ONNX export and the safetensors hold different numbers.
+            # A projected per-token model: report the shape it serves.
             info.update(
                 {
                     "late_interaction": True,
                     "projection_dim": self._colbert_layout.output_dim,
                     "projection_layers": self._colbert_layout.layer_count,
                     "encoder_hidden_size": self._colbert_layout.encoder_input_dim,
-                    "weight_source": self._colbert_layout.weight_source,
-                    "weight_file": self._colbert_layout.weights_path.name,
                 }
             )
 
