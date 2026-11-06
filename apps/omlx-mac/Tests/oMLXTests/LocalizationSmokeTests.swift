@@ -63,6 +63,7 @@ final class LocalizationSmokeTests: XCTestCase {
         "integrations.section.external_engines",
         "performance.section.cache", "performance.cache.enabled",
         "askai.row.enabled", "askai.section.presets",
+        "settings.search.prompt", "settings.search.empty",
         "status.section.system", "status.section.active_now",
         // High-density screens
         "models.active.title", "models.library.title",
