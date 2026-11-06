@@ -1454,6 +1454,15 @@ def _batch_park_memory(model: Any):
     return entry[1]
 
 
+def _shared_verify_width(model: Any) -> int:
+    """Rows one shared verify forward of an independent-verify host holds (0: none)."""
+    for host in (model, getattr(model, "language_model", None), getattr(model, "_language_model", None)):
+        width = getattr(host, "_omlx_mtp_shared_verify_rows", 0) if host is not None else 0
+        if width:
+            return int(width)
+    return 0
+
+
 def _batch_policy_for_next(gen_batch: Any):
     from .batch_policy import BatchPolicy
 
@@ -1463,6 +1472,10 @@ def _batch_policy_for_next(gen_batch: Any):
         if policy is not None:
             memory.retired(policy)
         chain, depth, _ = _resolve_mtp_chain_depth(gen_batch.model)
+        width = _shared_verify_width(gen_batch.model)
+        if chain and width:
+            # Deeper blocks than one shared verify forward holds verify row by row.
+            depth = max(1, min(depth, width // len(gen_batch.uids) - 1))
         policy = BatchPolicy(
             gen_batch.uids,
             depth if chain else 1,
@@ -3166,6 +3179,67 @@ def _dspark_next_drafts(
     mx.async_eval(state.drafts)
 
 
+def _dspark_draft_jobs(jobs: List[tuple]) -> None:
+    """``draft_next`` for several requests' chain jobs (``_run_verify_cycle_chain`` with
+    ``draft_jobs``) on an embedded DSpark host.
+
+    The requests are greedy without logits processors. Each keeps its own context-copy
+    proposal and DSpark stages; requests at one depth share the vocabulary head and the
+    Markov steps, whose per-row arithmetic does not depend on the other rows.
+    """
+    import mlx.core as mx
+
+    shared: List[tuple] = []
+    for gen_batch, state, hidden_rows, committed, prev_buf in jobs:
+        if not state.head_clone:
+            _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
+        committed_ids = [int(t) for t in committed.tolist()]
+        copied = _context_copy_drafts(gen_batch, state, committed_ids)
+        depth = state.controller.cur if state.controller is not None else state.depth
+        if copied or depth <= 0:
+            _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf, depth=0 if copied else None)
+            if copied:
+                state.drafts = mx.array(copied, dtype=mx.uint32)
+                state.draft_lps = []
+                state.draft_accept_lps = []
+                state.copy_drafts = True
+            continue
+        shared.append((gen_batch, state, hidden_rows, committed))
+    if not shared:
+        return
+    host = _dspark_host(shared[0][0].model)
+    depths = {}
+    for job in shared:
+        state = job[1]
+        depth = state.controller.cur if state.controller is not None else state.depth
+        depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+        depths.setdefault(depth, []).append(job)
+    for depth, group in depths.items():
+        hidden, anchors = [], []
+        for gen_batch, state, hidden_rows, committed in group:
+            anchor = committed[-1:].reshape(1, 1)
+            hidden.append(host.dspark_hidden(hidden_rows, anchor, state.mtp_cache, draft_length=depth))
+            state.hist_offset += int(committed.shape[0])
+            anchors.append(anchor.reshape(1))
+        logits = host.dspark_logits(mx.concatenate(hidden, 0))
+        previous = mx.concatenate(anchors)
+        tokens, lps = [], []
+        for idx in range(depth):
+            bias, _ = host.dspark_markov(previous)
+            lp = _logprobs(logits[:, idx, :] + bias)
+            token = _ensure_uint32(mx.argmax(lp, axis=-1))
+            tokens.append(token)
+            lps.append(lp)
+            previous = token
+        drafts = mx.stack(tokens, axis=1)
+        for r, (gen_batch, state, _, _) in enumerate(group):
+            sampler = _resolve_sampler(gen_batch)
+            state.drafts = drafts[r]
+            state.draft_lps = [lp[r] for lp in lps]
+            state.draft_accept_lps = [_accept_lp_for(sampler, lp[r : r + 1]).squeeze(0) for lp in lps]
+            mx.async_eval(state.drafts)
+
+
 def _chain_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -3574,8 +3648,9 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
         for state in states:
             state.controller = None
             state.depth = requested
-    if _drafter_for(gen_batch.model) is not None:
-        # Clip before grouping so rows that share a window verify together.
+    if _drafter_for(gen_batch.model) is not None or _shared_verify_width(gen_batch.model):
+        # Clip before grouping so rows that share a window verify together. A shared
+        # verify host also drops drafts made deeper than the policy's (capped) depth.
         for state in states:
             if state.chain:
                 _clip_block_drafts(

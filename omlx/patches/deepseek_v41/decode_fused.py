@@ -385,7 +385,7 @@ def decode_attention(att, x, xq, cache, shared, start, c, tiles=False):
 
 
 # ---- batched decode: B requests, one token each --------------------------------------------
-MAX_BATCH = 8
+MAX_BATCH = 16
 
 
 def mix_nb(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
@@ -578,9 +578,16 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
                 offs = [0] * b_n
                 pooled = parts[0][0].reshape(-1, parts[0][0].shape[-1]) if ncs[0] else _dummy(mx.uint8)
             else:
-                offs = [sum(ncs[:r]) for r in range(b_n)]
-                pooled = (mx.concatenate([p.reshape(-1, p.shape[-1]) for p, _ in parts if p.shape[1]], 0)
-                          if sum(ncs) else _dummy(mx.uint8))
+                # Queries of one request share its rows: each distinct array enters once.
+                distinct, offs = [], []
+                for p, _ in parts:
+                    at = next((i for i, d in enumerate(distinct) if d is p), None)
+                    if at is None:
+                        at = len(distinct)
+                        distinct.append(p)
+                    offs.append(sum(int(d.shape[1]) for d in distinct[:at]))
+                rows = [d.reshape(-1, d.shape[-1]) for d in distinct if d.shape[1]]
+                pooled = mx.concatenate(rows, 0) if rows else _dummy(mx.uint8)
             cmax = max(max(cs_), 1)
             ci = mx.concatenate([mx.pad(i.reshape(1, -1).astype(mx.int32), [(0, 0), (0, cmax - i.shape[-1])], constant_values=-1)
                                  if i.shape[-1] < cmax else i.reshape(1, -1).astype(mx.int32) for _, i in parts], 0)
@@ -660,18 +667,28 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
     The verify rollback states that Attention and Compressor record for a block
     (DSparkMixin.mtp_partial_rollback) are rebuilt from the same rows.
     """
-    r_n = h.shape[1]
-    hc, dim = c.hc_mult, c.dim
-    att = blk.attn
+    h3, fp = decode_block_verify_nb(blk, h, pre, [cache], [shared], [start], c)
+    return h3, fp
+
+
+def _verify_attention(att, x, qr, q, packed, cos, sin, cache, shared, start, c):
+    """The per-request part of a verify block (decode_block_verify): window, compressor,
+    indexer and sparse attention of R consecutive tokens from `start`, with the rollback
+    states. Returns act_quant(o) [R, H*D]."""
+    prepared = _verify_prepare(att, x, qr, q, packed, cos, sin, cache, shared, start, c)
+    if prepared[0] == "done":
+        return prepared[1]
+    _, win, parts, memo = prepared
+    return window_attention_bq(att, q, win, parts, memo, cos, sin, c)
+
+
+def _verify_prepare(att, x, qr, q, packed, cos, sin, cache, shared, start, c):
+    """_verify_attention up to the split attention. With a full window returns ("bq",
+    per-token windows, per-token compressed parts or None, the request's memo) for
+    window_attention_bq, which several requests' queries can share; else ("done", oq)."""
+    r_n = x.shape[0]
     layer = att._layer
     ratio = c.compress_ratios[layer]
-    hf = h.reshape(r_n, hc * dim)
-    coef_a, x, xq, _ = mix_nb(blk, "attn", c, hf, pre.reshape(r_n, hc))
-    ap, ao, ac = coef_a[:, :hc], coef_a[:, hc:2 * hc], coef_a[:, 2 * hc:]
-    qa, kv_in = gemv_fp8_nb(xq, att.wq_a, att.wkv, mma=False)
-    cos, sin = _cos_sin_nb(c, bool(ratio), range(start, start + r_n))
-    qr, qrq, packed = attn_mid_nb(att, qa, kv_in, cos, sin, c)
-    q = wqb_rope_nb(att, qrq, cos, sin, c, False)
     state = getattr(cache, "_mtp_verify_state", None)
     old = cache[1]
     old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
@@ -700,7 +717,7 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
                     # Compressor.__call__ recorded (pending rows + this token's projection).
                     kv, gate = state["compressor"]
                     pending.append((kv[:, -1:], gate[:, -1:]))
-        oq = window_attention_bq(att, q, win, parts, tokens[0], cos, sin, c)
+        result = ("bq", win, parts, tokens[0])
     else:
         oq = []
         for j in range(r_n):
@@ -708,13 +725,57 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
             if pooling:
                 kv, gate = state["compressor"]
                 pending.append((kv[:, -1:], gate[:, -1:]))
-        oq = mx.stack(oq)
+        result = ("done", mx.stack(oq))
     if state is not None:
         # Attention.__call__'s verify-block window: the kept rows, then the block's rows.
         new = packed.reshape(1, r_n, -1)
         state["window"] = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
         if pooling:
             state["compressor"] = tuple(mx.concatenate([p[i] for p in pending], 1) for i in (0, 1))
+    return result
+
+
+def decode_block_verify_nb(blk, h, pre, caches, shareds, starts, c):
+    """decode_block_verify for B requests' verify blocks of R tokens each (h: [B, R, hc,
+    dim], pre: [B, R, hc]; caches / shareds / starts per request). The weight-streaming
+    kernels run once for all B * R rows; they are per-row arithmetic (rows kernels, or
+    matrix tiles whose padded columns never mix), so each request gets the result its own
+    decode_block_verify gives. The window, compressor, indexer and attention run per
+    request."""
+    b_n, r_n = h.shape[0], h.shape[1]
+    t_n = b_n * r_n
+    hc, dim = c.hc_mult, c.dim
+    att = blk.attn
+    ratio = c.compress_ratios[att._layer]
+    hf = h.reshape(t_n, hc * dim)
+    coef_a, x, xq, _ = mix_nb(blk, "attn", c, hf, pre.reshape(t_n, hc))
+    ap, ao, ac = coef_a[:, :hc], coef_a[:, hc:2 * hc], coef_a[:, 2 * hc:]
+    qa, kv_in = gemv_fp8_nb(xq, att.wq_a, att.wkv, mma=False)
+    positions = [s + j for s in starts for j in range(r_n)]
+    cos, sin = _cos_sin_nb(c, bool(ratio), positions)
+    qr, qrq, packed = attn_mid_nb(att, qa, kv_in, cos, sin, c)
+    q = wqb_rope_nb(att, qrq, cos, sin, c, False)
+    if b_n == 1:
+        oq = _verify_attention(att, x, qr, q, packed, cos, sin, caches[0], shareds[0], starts[0], c)
+    else:
+        rows = [slice(r * r_n, (r + 1) * r_n) for r in range(b_n)]
+        prepared = [
+            _verify_prepare(att, x[sl], qr[sl], q[sl], packed[sl], cos[sl], sin[sl],
+                            caches[r], shareds[r], starts[r], c)
+            for r, sl in enumerate(rows)
+        ]
+        if all(p[0] == "bq" for p in prepared):
+            # Every request's window is full: one split attention for all B * R queries,
+            # each over its own window and compressed rows (window_attention_bq is per query).
+            win = mx.concatenate([p[1] for p in prepared], 0)
+            parts = None if prepared[0][2] is None else [part for p in prepared for part in p[2]]
+            memo = shareds[0].setdefault("_verify_batch", {})
+            oq = window_attention_bq(att, q, win, parts, memo, cos, sin, c)
+        else:
+            oq = mx.concatenate([
+                p[1] if p[0] == "done" else window_attention_bq(att, q[sl], p[1], p[2], p[3], cos[sl], sin[sl], c)
+                for p, sl in zip(prepared, rows)
+            ], 0)
     tiles = getattr(blk, "_omlx_verify_exact", False)
     yq = woa_nb(att, oq, c, tiles)
     a = blk.sum_ranks(gemv_fp8_nb(yq, att.wo_b, mma=False)[0])
@@ -722,7 +783,7 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
     fp, fo, fc = coef_f[:, :hc], coef_f[:, hc:2 * hc], coef_f[:, 2 * hc:]
     f = blk.sum_ranks(DM.fused_decode_moe_nb(blk.ffn, x2, c, mma=tiles)[0])
     h3 = hc_post_nb(f, h2, fo, fc, c)
-    return h3.reshape(1, r_n, hc, dim), fp.reshape(1, r_n, hc)
+    return h3.reshape(b_n, r_n, hc, dim), fp.reshape(b_n, r_n, hc)
 
 
 def supported(blk, c):

@@ -1347,6 +1347,107 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             item.advance(1)
         return logits
 
+    def _batched_verify_ok(self, input_ids, cache, masks, inputs_embeds, kwargs):
+        """B >= 2 requests' MTP verify blocks of one width, run through the fused layers:
+        the B * R rows fit the multi-vector kernels and no request has a pending replay."""
+        b_n, r_n = input_ids.shape
+        if not (
+            b_n >= 2
+            and b_n * r_n <= decode_fused.MAX_BATCH
+            and inputs_embeds is None
+            and not kwargs.get("_ced_prefill", False)
+            and self.pipeline_size == 1
+            and self._stage()[0][1]._tensor_group is None
+        ):
+            return False
+        if masks is not None and not bool(np.all(np.asarray(masks))):
+            return False
+        if any(item.has_pending() for item in cache):
+            return False
+        return all(not item.empty() for item in cache) and self._stages_decode_fused()
+
+    def _forward_verify_batched(self, input_ids, cache, verify_states, capture, skip_logits=False):
+        """_forward for B requests' verify blocks ([B, R] tokens): each request gets the
+        result of its own verify forward (decode_fused.decode_block_verify_nb), with the
+        weights read once for all B * R rows. verify_states[r] holds request r's per-layer
+        rollback states."""
+        c = self._config
+        b_n, r_n = input_ids.shape
+        rcs = [[item.extract(row) for item in cache] for row in range(b_n)]
+        starts = []
+        for rc, states in zip(rcs, verify_states):
+            start = rc[0].size()
+            if any(item.size() != start for item in rc):
+                raise ValueError("DeepSeek V4.1 cache offsets diverged across layers")
+            starts.append(start)
+            for item, state in zip(rc, states):
+                item._mtp_verify_state = state
+        hashes, histories = None, None
+        if self._hasher is not None:
+            per_row = [self._hasher(input_ids[r : r + 1], rcs[r][0][6], None) for r in range(b_n)]
+            hashes = np.concatenate([p[0] for p in per_row], 0)
+            histories = [p[1] for p in per_row]
+        h = self.embed(input_ids)
+        h = mx.repeat(h[..., None, :], c.hc_mult, -2)
+        pre = mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1])
+        shareds = [{} for _ in range(b_n)]
+        captured = {}
+        engram_ids = list(c.engram_layer_ids)
+        stage = self._stage()
+        prefetch = getattr(self, "_engram_prefetch", None)
+        with prefetch.forward() if prefetch is not None else nullcontext():
+            first = self._next_engram(stage, -1)
+            if prefetch is not None and first is not None:
+                prefetch.submit(
+                    self.layers[first].engram.embed, hashes[:, :, engram_ids.index(first)]
+                )
+            for j, (i, layer) in enumerate(stage):
+                if "engram" in layer:
+                    ix = engram_ids.index(i)
+                    if prefetch is not None:
+                        mx.async_eval(h, pre)
+                    h = layer.engram(h, hashes[:, :, ix], None)
+                    following = self._next_engram(stage, i)
+                    if prefetch is not None and following is not None:
+                        prefetch.submit(
+                            self.layers[following].engram.embed,
+                            hashes[:, :, engram_ids.index(following)],
+                        )
+                if capture and i in c.dspark_target_layer_ids:
+                    captured[i] = mx.mean(h, axis=2)
+                h, pre = decode_fused.decode_block_verify_nb(
+                    layer, h, pre, [rcs[r][j] for r in range(b_n)], shareds, starts, c
+                )
+                mx.async_eval(h, pre)
+                for r in range(b_n):
+                    rc = rcs[r]
+                    rc[j][0] = mx.array([starts[r] + r_n], mx.int32)
+                    if histories is not None and j == 0:
+                        rc[j][6] = mx.array(histories[r], mx.int64)
+                    for slot in range(1, 7):
+                        if rc[j][slot] is None:
+                            width = c.index_head_dim if slot == 3 else c.head_dim
+                            empty = mx.zeros((1, 0, width), h.dtype)
+                            if slot == 1:
+                                empty = pack_activation(empty)
+                            elif slot == 2:
+                                empty = pack_activation(empty, 4, 16, True)
+                            elif slot == 3:
+                                empty = pack_activation(empty, 4)
+                            rc[j][slot] = mx.zeros((1, 0), mx.int64) if slot == 6 else empty
+        logits = self._stage_output(h, pre, skip_logits)
+        for rc in rcs:
+            for item in rc:
+                del item._mtp_verify_state
+        for i, item in enumerate(cache):
+            item.adopt_rows([rcs[r][i] for r in range(b_n)])
+            item.advance(r_n)
+        if capture:
+            if set(captured) != set(c.dspark_target_layer_ids):
+                raise ValueError("Incomplete DSpark target hidden capture")
+            return logits, mx.concatenate([captured[i] for i in c.dspark_target_layer_ids], axis=-1)
+        return logits
+
     def _forward(
         self, input_ids, cache=None, inputs_embeds=None, token_types=None, **kwargs
     ):
@@ -1370,6 +1471,11 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         capture = bool(kwargs.get("return_dspark_hidden", False))
         if self._batched_decode_ok(input_ids, cache, masks, inputs_embeds, capture, kwargs):
             return self._forward_decode_batched(input_ids, cache, skip_logits)
+        verify_rows = kwargs.get("mtp_verify_states")
+        if verify_rows is not None and input_ids.shape[0] > 1:
+            if not self._batched_verify_ok(input_ids, cache, masks, inputs_embeds, kwargs):
+                raise ValueError("DeepSeek V4.1 cannot verify these requests together")
+            return self._forward_verify_batched(input_ids, cache, verify_rows, capture, skip_logits)
         if capture and input_ids.shape[0] != 1:
             raise ValueError(
                 "DSpark target capture currently requires one unpadded row"

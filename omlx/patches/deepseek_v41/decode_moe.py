@@ -646,10 +646,10 @@ _UP_NB = r"""
                 hblock[b][sg * 4 + lane] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
             }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg < uint(NB)) {
-            const float v = hblock[sg][lane];
-            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hqs[sg * INTER + rb * 32 + lane] = act_quant_value(v, s);
+        for (uint v = sg; v < uint(NB); v += 8) {
+            const float y = hblock[v][lane];
+            const float s = act_scale(max(simd_max(abs(y)), 1e-4f));
+            hqs[v * INTER + rb * 32 + lane] = act_quant_value(y, s);
         }
     }
 """
@@ -691,22 +691,29 @@ _UP_NB_MMA = r"""
             hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = act_quant_value(v, s);
         }
     } else {
-        // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups
-        threadgroup float red[4][2 * 64], tg_g[4][64], tg_u[4][64];
+        // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups,
+        // one column tile per 8 tokens (a later tile reads the rows again from the GPU caches)
+        constexpr int CT = (NB + 7) / 8, NB0 = NB < 8 ? NB : 8, NB1 = NB > 8 ? NB - 8 : 1;
+        threadgroup float red[4][2 * 64], tg_g[CT][4][64], tg_u[CT][4][64];
         const uint t = sg / 2, ks = sg % 2, r0 = rb * 32 + t * 8;
-        S1_MMA8(DIM, 2, NB, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[t]);
-        S3_MMA8(DIM, 2, NB, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[t]);
+        S1_MMA8(DIM, 2, NB0, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[0][t]);
+        S3_MMA8(DIM, 2, NB0, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[0][t]);
+        if (CT > 1) {
+            S1_MMA8(DIM, 2, NB1, sw1, ss1, sb1, r0, xq + 8 * DIM, uint(DIM), lane, ks, red[t], tg_g[CT - 1][t]);
+            S3_MMA8(DIM, 2, NB1, sw3, ss3, sb3, r0, xq + 8 * DIM, uint(DIM), lane, ks, red[t], tg_u[CT - 1][t]);
+        }
         for (uint i = tid; i < uint(32 * NB); i += 256) {
             const uint r = i % 32, b = i / 32;
-            float gate = float(bfloat16_t(tg_g[r / 8][(r % 8) * 8 + b])), up = float(bfloat16_t(tg_u[r / 8][(r % 8) * 8 + b]));
+            const uint e = (r % 8) * 8 + b % 8;
+            float gate = float(bfloat16_t(tg_g[b / 8][r / 8][e])), up = float(bfloat16_t(tg_u[b / 8][r / 8][e]));
             if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
             hblock[b][r] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg < uint(NB)) {
-            const float v = hblock[sg][lane];
-            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hqs[sg * INTER + rb * 32 + lane] = act_quant_value(v, s);
+        for (uint v = sg; v < uint(NB); v += 8) {
+            const float y = hblock[v][lane];
+            const float s = act_scale(max(simd_max(abs(y)), 1e-4f));
+            hqs[v * INTER + rb * 32 + lane] = act_quant_value(y, s);
         }
     }
 """
@@ -744,13 +751,15 @@ _DOWN_S_NB = r"""
 
 # _DOWN_S_NB on simdgroup matrices: one 8-row tile per threadgroup, K split over 2 simdgroups.
 _DOWN_S_NB_MMA = r"""
-    threadgroup float red[2 * 64], tile[64];
+    constexpr int CT = (NB + 7) / 8, NB0 = NB < 8 ? NB : 8, NB1 = NB > 8 ? NB - 8 : 1;
+    threadgroup float red[2 * 64], tile[CT][64];
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
     const uint r0 = threadgroup_position_in_grid.x * 8;
-    S2_MMA8(INTER, 2, NB, sw2, ss2, sb2, r0, hqs, uint(INTER), lane, sg, red, tile);
+    S2_MMA8(INTER, 2, NB0, sw2, ss2, sb2, r0, hqs, uint(INTER), lane, sg, red, tile[0]);
+    if (CT > 1) S2_MMA8(INTER, 2, NB1, sw2, ss2, sb2, r0, hqs + 8 * INTER, uint(INTER), lane, sg, red, tile[CT - 1]);
     for (uint i = tid; i < uint(8 * NB); i += 64) {
         const uint r = i % 8, b = i / 8;
-        out[b * DIM + r0 + r] = bfloat16_t(partial[b * DIM + r0 + r] + float(bfloat16_t(tile[r * 8 + b])));
+        out[b * DIM + r0 + r] = bfloat16_t(partial[b * DIM + r0 + r] + float(bfloat16_t(tile[b / 8][r * 8 + b % 8])));
     }
 """
 

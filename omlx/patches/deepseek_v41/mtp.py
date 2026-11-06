@@ -3,7 +3,8 @@
 
 import mlx.core as mx
 
-from . import growth
+from . import decode_fused, growth
+from .head import project_logits
 
 
 class AcceptanceDepthController:
@@ -64,6 +65,8 @@ class DSparkMixin:
         self._omlx_mtp_head_clone = False
         self._omlx_mtp_rowwise_unsupported = True
         self._omlx_mtp_independent_verify = True
+        # mtp_verify_rows: requests' blocks of up to this many rows share one forward.
+        self._omlx_mtp_shared_verify_rows = decode_fused.MAX_BATCH
         self._omlx_mtp_depth = max(1, min(depth, self._config.dspark_block_size))
         # One-token decode then runs the kernels of verify blocks (decode_fused), so a
         # verified draft gets the logits that decoding it alone gives.
@@ -91,6 +94,17 @@ class DSparkMixin:
         self.dspark_append_context(main_hidden, cache)
         return proposal_forward(self, anchor_ids, cache, draft_length)
 
+    def dspark_hidden(self, main_hidden, anchor_ids, cache, *, draft_length=None):
+        """dspark_forward without the vocabulary head: the last stage's normed input."""
+        from .dspark import proposal_hidden
+
+        self.dspark_append_context(main_hidden, cache)
+        return proposal_hidden(self, anchor_ids, cache, draft_length)
+
+    def dspark_logits(self, hidden):
+        """The DSpark vocabulary head of dspark_hidden outputs (any number of rows)."""
+        return project_logits(self.mtp[-1].norm(hidden), self.head.weight)
+
     def dspark_markov(self, token_ids):
         return self.mtp[-1].markov_head(token_ids)
 
@@ -106,6 +120,33 @@ class DSparkMixin:
         from ..mlx_lm_mtp.deepseek_v4_dspark import take_primed
 
         return take_primed(self, cache, main_token)
+
+    def mtp_verify_rows_ok(self, row_caches, width):
+        """Whether mtp_verify_rows can verify these requests' blocks of `width` tokens."""
+        if len(row_caches) < 2 or getattr(self, "_omlx_mtp_verify_only", False):
+            return False
+        merged = [type(row_caches[0][i]).merge([rc[i] for rc in row_caches]) for i in range(len(row_caches[0]))]
+        ids = mx.zeros((len(row_caches), width), mx.int32)
+        return self._batched_verify_ok(ids, merged, merged[0].make_mask(width), None, {})
+
+    def mtp_verify_rows(self, inputs, row_caches):
+        """Verify B requests' MTP blocks (inputs: [B, R]) in one forward.
+
+        row_caches holds each request's cache. Returns (logits [B, R, V], DSpark target
+        hidden [B, R, taps * dim], the requests' advanced caches): each request's cache
+        and rollback record are those of its own verify forward, so mtp_partial_rollback
+        then runs on each request alone.
+        """
+        merged = [type(row_caches[0][i]).merge([rc[i] for rc in row_caches]) for i in range(len(row_caches[0]))]
+        logits, hidden = self(inputs, cache=merged, return_hidden=True, n_confirmed=1)
+        stashes = merged[0]._mtp_row_stashes
+        merged[0]._mtp_row_stashes = None
+        out = []
+        for r, stash in enumerate(stashes):
+            rc = [item.extract(r) for item in merged]
+            rc[0]._mtp_draft_stash = stash
+            out.append(rc)
+        return logits, hidden, out
 
     def mtp_partial_rollback(self, cache, accepted, num_drafts):
         if not 0 <= accepted <= num_drafts:
@@ -176,12 +217,24 @@ class DSparkMixin:
                 raise ValueError("CED prefill cannot supply full hidden/verify states")
         prime = active and not capture and not verify and input_ids.shape[0] == 1
         verify_states = None
+        rows = input_ids.shape[0]
         if verify:
-            if input_ids.shape[0] != 1 or inputs_embeds is not None:
-                raise ValueError("DSpark verification requires one text decode row")
-            before = cache[0].size()
-            snapshots = [(list(c.cache), c.left_padding, c.lengths) for c in cache]
-            verify_states = [{} for _ in cache]
+            if inputs_embeds is not None:
+                raise ValueError("DSpark verification requires text decode rows")
+            if rows == 1:
+                before = cache[0].size()
+                snapshots = [(list(c.cache), c.left_padding, c.lengths) for c in cache]
+                verify_states = [{} for _ in cache]
+            else:
+                # Several requests' blocks in one forward: each row keeps the rollback
+                # record its own verify forward would leave (see mtp_verify_rows).
+                row_caches = [[c.extract(r) for c in cache] for r in range(rows)]
+                before = [rc[0].size() for rc in row_caches]
+                snapshots = [
+                    [(list(c.cache), c.left_padding, c.lengths) for c in rc]
+                    for rc in row_caches
+                ]
+                verify_states = [[{} for _ in cache] for _ in range(rows)]
         result = self._forward(
             input_ids,
             cache=cache,
@@ -192,8 +245,13 @@ class DSparkMixin:
             _dspark_prime=prime,
             **kwargs,
         )
-        if verify:
+        if verify and rows == 1:
             cache[0]._mtp_draft_stash = (input_ids, snapshots, before, verify_states)
+        elif verify:
+            cache[0]._mtp_row_stashes = [
+                (input_ids[r : r + 1], snapshots[r], before[r], verify_states[r])
+                for r in range(rows)
+            ]
         if prime:
             logits, hidden = result
             # The draft ring retains one window; reset across omitted spans
