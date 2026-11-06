@@ -1301,6 +1301,12 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         shareds = [{} for _ in range(b_n)]
         engram_ids = list(c.engram_layer_ids)
         stage = self._stage()
+        # Requests verify together only on one plain rank (DSparkMixin.mtp_shared_verify_rows).
+        together = (
+            not getattr(self, "_omlx_mtp_verify_only", False)
+            and self.pipeline_size == 1
+            and stage[0][1]._tensor_group is None
+        )
         prefetch = getattr(self, "_engram_prefetch", None)
         with prefetch.forward() if prefetch is not None else nullcontext():
             first = self._next_engram(stage, -1)
@@ -1321,7 +1327,7 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                             hashes[:, :, engram_ids.index(following)],
                         )
                 h, pre = decode_fused.decode_block_nb(
-                    layer, h, pre, [rcs[r][j] for r in range(b_n)], shareds, starts, c
+                    layer, h, pre, [rcs[r][j] for r in range(b_n)], shareds, starts, c, together
                 )
                 # Submit each layer: the GPU runs it while the next one is built.
                 mx.async_eval(h, pre)

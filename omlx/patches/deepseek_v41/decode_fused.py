@@ -617,7 +617,7 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
         output_shapes=[(b_n * h * d,)], output_dtypes=[mx.float32])[0].reshape(b_n, h * d)
 
 
-def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
+def decode_block_nb(blk, h, pre, caches, shareds, starts, c, together=True):
     """decode_block for B requests at their own positions. h: [B, 1, hc, dim] bf16, pre:
     [B, 1, hc]; caches / shareds / starts: per request. Weight-streaming kernels run once for
     the batch; window, compressor, indexer and attention run per request."""
@@ -629,10 +629,13 @@ def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
     coef_a, x, xq, _ = mix_nb(blk, "attn", c, hf, pre.reshape(b_n, hc))
     ap, ao, ac = coef_a[:, :hc], coef_a[:, hc:2 * hc], coef_a[:, 2 * hc:]
     tiles = DM.use_mma(b_n) or getattr(blk, "_omlx_verify_exact", False)
-    qa, kv_in = gemv_fp8_nb(xq, att.wq_a, att.wkv, mma=tiles)
+    # Below MMA_MIN_BATCH, MXFP8 projections take matrix tiles only where requests verify
+    # together (their shared verify runs on tiles); the rows kernels are faster there.
+    mx_tiles = DM.use_mma(b_n) or (together and getattr(blk, "_omlx_verify_exact", False))
+    qa, kv_in = gemv_fp8_nb(xq, att.wq_a, att.wkv, mma=mx_tiles)
     cos, sin = _cos_sin_nb(c, bool(ratio), starts)
     qr, qrq, packed = attn_mid_nb(att, qa, kv_in, cos, sin, c)
-    q = wqb_rope_nb(att, qrq, cos, sin, c, tiles)
+    q = wqb_rope_nb(att, qrq, cos, sin, c, mx_tiles)
     oq = batched_attention(att, q, packed, x, qr, caches, shareds, starts, cos, sin, c)
     if oq is None:   # a request still filling its window: per-request attention
         xs, qrs, qs, ps = mx.split(x, b_n), mx.split(qr, b_n), mx.split(q, b_n), mx.split(packed, b_n)
@@ -641,7 +644,7 @@ def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
                                             caches[r], shareds[r], starts[r], cs[r].reshape(-1), ss[r].reshape(-1), c)[None]
                              for r in range(b_n)])
     yq = woa_nb(att, oq, c, tiles)
-    a = blk.sum_ranks(gemv_fp8_nb(yq, att.wo_b, mma=tiles)[0])
+    a = blk.sum_ranks(gemv_fp8_nb(yq, att.wo_b, mma=mx_tiles)[0])
     coef_f, x2, _, h2 = mix_nb(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)
     fp, fo, fc = coef_f[:, :hc], coef_f[:, hc:2 * hc], coef_f[:, 2 * hc:]
     f = blk.sum_ranks(DM.fused_decode_moe_nb(blk.ffn, x2, c, mma=tiles)[0])
