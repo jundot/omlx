@@ -53,7 +53,7 @@ const assert = require('node:assert/strict');
 const source = fs.readFileSync('omlx_web/static/js/dashboard.js', 'utf8');
 const state = vm.runInNewContext(source + '\n dashboard;', {
     localStorage: {getItem: () => null},
-    THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+    THEME_STORAGE_KEY: 'theme',
     window: {t: key => key}, navigator: {language: 'en'}, document: {},
 })();
 state.hfModels = [

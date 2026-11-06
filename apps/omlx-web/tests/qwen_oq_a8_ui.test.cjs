@@ -9,7 +9,6 @@ const source = fs.readFileSync(
 const context = {
     localStorage: {getItem: () => null},
     THEME_STORAGE_KEY: 'theme',
-    ENHANCED_READABILITY_KEY: 'readability',
     window: {t: key => key},
     navigator: {language: 'en'},
     document: {},

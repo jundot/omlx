@@ -19,12 +19,11 @@ Where to use what:
 | Stylesheets | Semantic tokens, or palette entries for one-off marks |
 | Styles built in JS | `rgb(var(--palette-x) / alpha)` |
 
-Do not write hex or `rgb()` literals outside `theme.css`. The one exception is the Enhanced Readability block in `base.html`: its `[style*="color: #..."]` selectors match inline style text, so they keep the literal hex.
+Do not write hex or `rgb()` literals outside `theme.css`.
 
 Families outside Tailwind's palette:
 
 - `night-*`: dark mode surfaces and text.
-- `signal-red-*`: the readability red.
 - `mid-gray`: empty cells in the usage strip.
 
 ## Custom theme
@@ -41,7 +40,7 @@ Families outside Tailwind's palette:
 | Large | `text-base`, `text-lg` | 16px, 18px | Emphasis, card titles |
 | Heading | `text-xl`, `text-2xl` | 20px, 24px | Page headings, stat figures |
 
-Do not use pixel sizes such as `text-[11px]`. The serving stat figures (`lg:text-[32px]`) are the only exception. Enhanced Readability raises `text-caption` and badge text to 12px.
+Do not use pixel sizes such as `text-[11px]`. The serving stat figures (`lg:text-[32px]`) are the only exception.
 
 ## Buttons
 
