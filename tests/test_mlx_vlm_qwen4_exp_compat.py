@@ -219,10 +219,10 @@ def test_qwen4_exp_custom_model_file_keeps_its_module(tmp_path):
     )
     config = {"model_type": "qwen4_exp", "model_file": "custom_qwen4.py"}
 
-    module, model_type = get_model_and_args(config, model_path=tmp_path)
+    module, _ = get_model_and_args(config, model_path=tmp_path)
 
-    assert model_type == "qwen4_exp"
     assert module is not qwen4_exp
+    assert module.__file__ == str(tmp_path / "custom_qwen4.py")
     assert hasattr(module, "ModelConfig")
 
 
