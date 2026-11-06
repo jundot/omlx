@@ -1376,3 +1376,44 @@ def test_post_prefill_guard_uses_stable_physical_cap(
     else:
         check()
     assert scheduler._reclaim_prefill_headroom.call_count == reclaims
+
+
+def test_admission_credits_reclaimable_mlx_pool_residue():
+    """#3147: admission must not price the MLX buffer cache twice.
+
+    After a large turn, freed KV stays resident in the MLX buffer cache until
+    it is cleared or reused. Admission charged that residue as ``current`` and
+    added the new prompt's KV on top, so follow-up requests the server
+    demonstrably served were rejected. The new KV grows the footprint only
+    past the sampled cache size, so admission credits up to that sample.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18  # keep safety cap out
+    residue = 8 * 1024**3
+    pool_cache = 8 * 1024**3
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.mx.get_cache_memory", return_value=pool_cache),
+        patch("omlx.scheduler.get_phys_footprint", return_value=residue),
+    ):
+        # Warm the executor-held sample the route preflight reads back.
+        current = scheduler._current_usage_bytes()
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est is not None
+    charge = est.kv_exact + est.transient  # raw admission charge, no residue
+    assert charge > 0
+    # The honest bound: the pool absorbs the new KV, so only the transient
+    # rides on top of the residue. Admission must stay under this.
+    limit = current + charge // 2
+    scheduler._memory_hard_limit_bytes = limit
+    scheduler._memory_hard_watermark_bytes = limit
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.mx.get_cache_memory", return_value=pool_cache),
+        patch("omlx.scheduler.get_phys_footprint", return_value=residue),
+    ):
+        # Red on current code: the residue and the full KV are both charged.
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)

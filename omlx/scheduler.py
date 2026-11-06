@@ -12935,12 +12935,20 @@ class Scheduler:
         )
         if kv_exact <= 0 and transient <= 0:
             return None
+        # The MLX buffer cache holds freed KV from finished requests until it
+        # is cleared or reused (#3147). Prefill allocations reuse it, so the
+        # footprint grows only past the sampled cache size. Crediting it also
+        # matches the worst case where the cache is cleared before prefill.
+        pool_cache = max(
+            0, int(getattr(self, "_last_mlx_cache_memory_bytes", 0) or 0)
+        )
+        charge = kv_exact + transient
         return _AdmissionEstimate(
             kv_exact=kv_exact,
             transient=transient,
             floor_chunk=floor_chunk,
             kv_len=kv_len,
-            estimated=int(current) + kv_exact + transient,
+            estimated=int(current) + max(charge - pool_cache, 0),
         )
 
     def _format_rejection_message(
