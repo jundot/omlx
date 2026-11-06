@@ -12,7 +12,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -42,6 +42,9 @@ _benchmark_runs: dict[str, "BenchmarkRun"] = {}
 
 # Valid prompt lengths for single request tests
 VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
+
+# Default prompt generation length for any request
+DEFAULT_GENERATION_LENGTH = 128
 
 # Valid batch sizes for continuous batching tests
 VALID_BATCH_SIZES = [2, 4, 8]
@@ -114,7 +117,7 @@ class BenchmarkRequest(BaseModel):
 
     model_id: str
     prompt_lengths: list[int]
-    generation_length: int = 128
+    generation_length: int = DEFAULT_GENERATION_LENGTH
     batch_sizes: list[int] = []
     context_profile: BenchmarkContextProfile = BenchmarkContextProfile.CODE_PYTHON
     warmup_mode: BenchmarkWarmupMode = BenchmarkWarmupMode.QUICK
@@ -136,6 +139,15 @@ class BenchmarkRequest(BaseModel):
                     f"Invalid prompt length {pl}. Must be one of {VALID_PROMPT_LENGTHS}"
                 )
         return sorted(v)
+
+    @field_validator("generation_length")
+    @classmethod
+    def validate_generation_length(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(
+                f"Generation length ({v}) must be higher than 0"
+            )
+        return v
 
     @field_validator("batch_sizes")
     @classmethod
@@ -1918,6 +1930,55 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     )
 
 
+def _computed_context_for_benchmark(request: BenchmarkRequest, model_settings: Any, engine_pool: Any) -> object | None:
+    """Helper function to Compute benchmark context size if needed.
+
+    External engines such as Splash fix their context window when they launch, so
+    instead of using the stored ``max_context_window`` it is computed from the run: the
+    longest prompt plus the generation, or the warm-up when that is larger.
+
+    Returns:
+        A copy of ``model_settings`` to utilice on ``get_engine(runtime_settings=...)``
+        or ``None``
+
+    Raises:
+        ValueError: The run needs more context than the engine or the model supports.
+    """
+    benchmark_settings = None
+
+    if model_settings is not None:
+        model_context_length = getattr(engine_pool.get_entry(request.model_id), "model_context_length", None)
+        engine_id = engine_pool.external_engine_id(request.model_id, model_settings)
+
+        match engine_id:
+            case "splash":
+                from ..engine.splash import EXTERNAL_ENGINES, SPLASH_MAX_CONTEXT
+                max_context_window_override = max(
+                    max(_single_prompt_lengths(request)) + request.generation_length,
+                    _warmup_prompt_tokens(request.warmup_mode) + 8
+                )
+
+                if max_context_window_override > SPLASH_MAX_CONTEXT:
+                    raise ValueError(
+                        f"Request requires {max_context_window_override} tokens of context, "
+                        f"exceeding {EXTERNAL_ENGINES[engine_id]} supported size of {SPLASH_MAX_CONTEXT}"
+                    )
+
+                if model_context_length:
+                    if max_context_window_override > model_context_length:
+                        raise ValueError(
+                            f"Request requires {max_context_window_override} tokens of context, "
+                            f"exceeding the model's supported context size of {model_context_length}"
+                        )
+                else:
+                    logger.info("Could not gather model's supported context size, continuing benchmark either way")
+
+                benchmark_settings = replace(model_settings, max_context_window=max_context_window_override)
+                logger.info(f"Benchmark: Updated context window for {EXTERNAL_ENGINES[engine_id]} to {max_context_window_override} tokens")
+
+    return benchmark_settings
+
+
 async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     """Execute a complete benchmark run.
 
@@ -2017,9 +2078,16 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         force_lm = request.force_lm_engine or not (
             external_vlm_mtp_active or lightning_mtp_active
         )
+
+        # Can be ModelSettings or None.
+        # It is used to determine the correct context size for
+        # External Engines (such as Splash) benchmarking.
+        runtime_settings = _computed_context_for_benchmark(request, model_settings, engine_pool)
+
         engine = await engine_pool.get_engine(
             request.model_id,
             force_lm=force_lm,
+            runtime_settings=runtime_settings,
         )
         logger.info(f"Benchmark: loaded {request.model_id}")
         if model_settings is not None:
@@ -2380,6 +2448,21 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 {
                     "type": "upload_skipped",
                     "reason": "splash",
+                    "features": run.feature_flags,
+                },
+            )
+            return
+
+        if request.generation_length != DEFAULT_GENERATION_LENGTH:
+            # Non-standard generation lengths are used to test different scenarios; keep them out of the
+            # oMLX community leaderboard.
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "custom_generation_length"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": "custom_generation_length",
                     "features": run.feature_flags,
                 },
             )

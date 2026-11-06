@@ -666,6 +666,8 @@
             benchContextProfile: 'code_python',
             benchAlignPromptToAne: false,
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
+            benchCustomGenerationLength: false,
+            benchGenerationLength: 128,
             benchBatchSizes: { 2: true, 4: true, 8: false },
             benchForceLmEngine: false,
             benchAdvancedOptionsOpen: false,
@@ -5366,6 +5368,14 @@
                     return;
                 }
 
+                // Collect written token generation
+                if (this.benchCustomGenerationLength) {
+                    if (this.benchGenerationLength <= 0) {
+                        this.benchError = window.t('js.error.custom_token_gen');
+                        return;
+                    }
+                }
+
                 // Collect selected batch sizes
                 const batchSizes = Object.entries(this.benchBatchSizes)
                     .filter(([_, v]) => v)
@@ -5401,7 +5411,7 @@
                             context_profile: this.benchContextProfile,
                             align_prompt_to_ane: this.benchAlignPromptToAne,
                             prompt_lengths: promptLengths,
-                            generation_length: 128,
+                            generation_length: this.benchCustomGenerationLength ? this.benchGenerationLength : 128,
                             batch_sizes: batchSizes,
                             force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
                             external: this.benchExternalEnabled ? this.externalRequestBody() : null,
@@ -6043,6 +6053,16 @@
                 // the run is still active. Use case: user wants to keep
                 // reviewing their previous result for a moment.
                 this.benchOtherActive = null;
+            },
+
+            skipBenchUpload() {
+                const keys = {
+                    splash: 'bench.upload_skipped.reason_splash',
+                    custom_generation_length: 'bench.upload_skipped.reason_token_generation',
+                    external_endpoint: 'bench.upload_skipped.reason_external',
+                };
+
+                return window.t(keys[this.benchUploadSkipped?.reason] || keys.external_endpoint);
             },
 
             // Bench sub-tab
