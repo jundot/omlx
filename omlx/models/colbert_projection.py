@@ -8,9 +8,10 @@ output is a *projected*, per-token L2-normalized vector.
 
 The projection is not part of the transformer checkpoint. sentence-transformers
 describes it in ``modules.json`` as a chain of ``pylate.models.Dense.Dense``
-modules. Each module is a ``torch.nn.Linear`` plus an optional residual, followed
-by the module's declared activation function. Reproducing
-``pylate.models.Dense.Dense.forward`` exactly gives::
+modules, each with its own subdirectory (``1_Dense``, ``2_Dense``, ...) holding a
+``config.json`` and a ``model.safetensors``. Each module is a ``torch.nn.Linear``
+plus an optional residual, followed by the module's declared activation function.
+Reproducing ``pylate.models.Dense.Dense.forward`` exactly gives::
 
     y = activation(h @ W.linear.T + b.linear)               # torch Linear
     if use_residual:
@@ -31,37 +32,25 @@ Three facts the module config makes explicit and that are easy to get wrong:
   ``bias=False``) when the layer changes width. So a shape-changing layer adds
   ``h @ W.residual.T`` and a same-width layer adds ``h``.
 * The per-token L2 is part of the model contract rather than a caller
-  convention. The pinned export spells it ``ReduceL2 -> Clip(min=1e-12) -> Div``,
-  which is ``torch.nn.functional.normalize``; ``_L2_EPS`` matches that clamp.
+  convention: it is ``torch.nn.functional.normalize``, whose clamp ``_L2_EPS``
+  matches.
 
-Weight sources
---------------
-A ColBERT repository can ship two weight sets that are **not the same numbers**:
-the sentence-transformers ``model.safetensors`` and the exported ``model.onnx``
-(measured on the pinned checkpoint: projection weights correlate 0.99996 with a
-1.1e-3 max difference, giving ~0.99 per-token cosine between the two outputs).
-Serving one set where the other produced the frozen retrieval measurements
-silently changes the representation, so the source is explicit in the layout,
-logged at load, reported by ``get_model_info``, and overridable with
-``OMLX_COLBERT_WEIGHT_SOURCE``.
-
-``model.safetensors`` is the default source: it is native to MLX and every
-sentence-transformers export ships it, whereas the ONNX graph is optional and
-only readable in a specific historical export layout (see
-``colbert_onnx_weights``). Both sources share this module's ``[out, in]``
-forward path: the ONNX reader transposes at the boundary, and the loader
-validates every shape so a transposed export fails loudly instead of quietly
-producing noise.
+Weight layout
+-------------
+A pylate export ships its weights as safetensors: the transformer weights in the
+export's top-level ``model.safetensors`` (mapped onto mlx-embeddings'
+``ModernBertModel`` parameter names), plus each projection module's own
+``model.safetensors``. The loader validates every Dense matrix shape, so a
+transposed export fails loudly instead of quietly producing noise.
 
 Orientation: ``pylate.models.Dense.Dense`` wraps ``torch.nn.Linear``, so its
 safetensors weight is ``[out_features, in_features]`` and the operation is
-``x @ W.T``; the ONNX MatMul B operand is ``[in_features, out_features]``.
+``x @ W.T``.
 """
 
 import json
 import logging
 import math
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,27 +63,13 @@ logger = logging.getLogger(__name__)
 # `model_type` written by pylate/sentence-transformers for a ColBERT checkpoint.
 COLBERT_MODEL_TYPE = "ColBERT"
 
-# Where a ColBERT projection can be read from. They are not interchangeable; see
-# the module docstring.
-WEIGHT_SOURCE_SAFETENSORS = "safetensors"
-WEIGHT_SOURCE_ONNX = "onnx"
-WEIGHT_SOURCES = (WEIGHT_SOURCE_ONNX, WEIGHT_SOURCE_SAFETENSORS)
-
-# Selects the source for a directory that ships both. Anything else (unset,
-# "auto") keeps the default preference below.
-WEIGHT_SOURCE_ENV = "OMLX_COLBERT_WEIGHT_SOURCE"
-
-# Candidate ONNX graphs, most preferred first: the fp32 export defined the frozen
-# measurements, the int8 export is a quantized derivative of it.
-ONNX_GRAPH_NAMES: tuple[str, ...] = ("model.onnx", "model_int8.onnx")
-
 _SENTENCE_TRANSFORMERS_CONFIG = "config_sentence_transformers.json"
 _MODULES_FILE = "modules.json"
 _WEIGHTS_FILE = "model.safetensors"
 
-# The per-token L2 the export folds into the graph: ReduceL2 -> Clip(min) -> Div.
-# Anything at or below this is a degenerate row (the export yields a zero
-# vector); real token vectors are many orders of magnitude above it.
+# The clamp the per-token L2 uses (torch.nn.functional.normalize's default).
+# Anything at or below this is a degenerate row (a zero vector); real token
+# vectors are many orders of magnitude above it.
 _L2_EPS = 1e-12
 
 # HF's nested rope dialect -> mlx-embeddings' flat ModernBERT fields.
@@ -145,7 +120,7 @@ class ColbertDenseSpec:
     """One ``pylate.models.Dense.Dense`` module of a ColBERT projection chain."""
 
     directory: Path
-    """Directory holding the module's ``config.json`` (and safetensors, if any)."""
+    """Directory holding the module's ``config.json`` and ``model.safetensors``."""
 
     in_features: int
     """Width consumed by this module."""
@@ -159,8 +134,8 @@ class ColbertDenseSpec:
     bias: bool
     """Whether ``linear.bias`` exists."""
 
-    weights: Path | None = None
-    """``model.safetensors`` for the safetensors source; None when ONNX-sourced."""
+    weights: Path
+    """The module's ``model.safetensors``."""
 
     activation: str = "identity"
     """Declared activation: ``identity``, ``relu``, ``gelu`` or ``tanh``."""
@@ -188,17 +163,11 @@ class ColbertLayout:
     model_path: Path
     """Root of the sentence-transformers export."""
 
-    weight_source: str
-    """``onnx`` or ``safetensors`` -- which artifact supplies the weights."""
-
     dense: tuple[ColbertDenseSpec, ...]
     """Projection modules, in pipeline order."""
 
-    encoder_weights: Path | None = None
-    """``model.safetensors`` holding the encoder weights (safetensors source)."""
-
-    onnx_graph: Path | None = None
-    """``model.onnx`` / ``model_int8.onnx`` supplying the weights (ONNX source)."""
+    encoder_weights: Path
+    """The export's top-level ``model.safetensors`` (encoder weights)."""
 
     @property
     def output_dim(self) -> int:
@@ -214,17 +183,6 @@ class ColbertLayout:
     def encoder_input_dim(self) -> int:
         """Width the first Dense module consumes (the encoder's hidden size)."""
         return self.dense[0].in_features
-
-    @property
-    def weights_path(self) -> Path:
-        """The file the weights actually came from."""
-        if self.weight_source == WEIGHT_SOURCE_ONNX and self.onnx_graph is not None:
-            return self.onnx_graph
-        if self.encoder_weights is None:
-            raise ColbertLayoutError(
-                f"ColBERT layout at {self.model_path} has no encoder weight file"
-            )
-        return self.encoder_weights
 
 
 def _load_json(path: Path) -> Any | None:
@@ -302,54 +260,6 @@ def is_pylate_colbert_dir(model_path: Path) -> bool:
     return False
 
 
-def find_onnx_graph(model_path: Path) -> Path | None:
-    """The best ONNX graph in ``model_path``, or None."""
-    model_path = Path(model_path)
-    for name in ONNX_GRAPH_NAMES:
-        candidate = model_path / name
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-def _requested_weight_source(explicit: str | None) -> str | None:
-    """Resolve the requested source from an argument, then the environment."""
-    value = explicit if explicit is not None else os.getenv(WEIGHT_SOURCE_ENV)
-    if value is None:
-        return None
-    normalized = str(value).strip().lower()
-    if normalized in ("", "auto"):
-        return None
-    if normalized not in WEIGHT_SOURCES:
-        raise ColbertLayoutError(
-            f"unknown ColBERT weight source {value!r}; expected one of "
-            f"{', '.join(WEIGHT_SOURCES)} (set through {WEIGHT_SOURCE_ENV})"
-        )
-    return normalized
-
-
-def resolve_weight_source(
-    model_path: Path,
-    explicit: str | None = None,
-) -> str:
-    """Choose where a ColBERT export takes its weights from.
-
-    An explicit request (argument or ``OMLX_COLBERT_WEIGHT_SOURCE``) wins. With
-    nothing requested, safetensors is preferred when present (since onnx is an
-    optional dependency and safetensors is native to MLX). When safetensors is
-    not present, fallback to the ONNX graph if available.
-    """
-    requested = _requested_weight_source(explicit)
-    if requested is not None:
-        return requested
-    model_path = Path(model_path)
-    if (model_path / _WEIGHTS_FILE).is_file():
-        return WEIGHT_SOURCE_SAFETENSORS
-    if find_onnx_graph(model_path) is not None:
-        return WEIGHT_SOURCE_ONNX
-    return WEIGHT_SOURCE_SAFETENSORS
-
-
 def _resolve_activation(config: dict[str, Any], directory: Path) -> str:
     """Map a module's declared ``activation_function`` onto a local kernel."""
     declared = config.get("activation_function")
@@ -376,7 +286,6 @@ def _resolve_activation(config: dict[str, Any], directory: Path) -> str:
 def _dense_spec(
     model_path: Path,
     module: dict[str, Any],
-    require_safetensors: bool,
 ) -> ColbertDenseSpec:
     """Resolve one Dense module entry into a validated spec."""
     relative = str(module.get("path") or "")
@@ -400,12 +309,11 @@ def _dense_spec(
         ) from e
 
     weights = directory / _WEIGHTS_FILE
-    if require_safetensors and not weights.is_file():
+    if not weights.is_file():
         raise ColbertLayoutError(
-            f"ColBERT projection module {directory} has no {_WEIGHTS_FILE}, which "
-            f"the safetensors weight source requires. Set "
-            f"{WEIGHT_SOURCE_ENV}={WEIGHT_SOURCE_ONNX} to read this checkpoint "
-            "from its ONNX graph instead."
+            f"ColBERT projection module {directory} has no {_WEIGHTS_FILE}. A "
+            "pylate ColBERT export must ship model.safetensors for the encoder "
+            "and for every Dense module."
         )
     return ColbertDenseSpec(
         directory=directory,
@@ -413,21 +321,19 @@ def _dense_spec(
         out_features=out_features,
         use_residual=bool(config.get("use_residual")),
         bias=bool(config.get("bias")),
-        weights=weights if weights.is_file() else None,
+        weights=weights,
         activation=_resolve_activation(config, directory),
     )
 
 
-def resolve_colbert_layout(
-    model_path: Path,
-    weight_source: str | None = None,
-) -> ColbertLayout:
+def resolve_colbert_layout(model_path: Path) -> ColbertLayout:
     """Validate a pylate ColBERT export and describe its projection chain.
 
     Raises:
         ColbertLayoutError: when the directory is a ColBERT export but cannot be
-            served -- no projection modules, no usable weight artifact, an
-            unsupported activation, or an inconsistent projection chain.
+            served -- no projection modules, missing ``model.safetensors``
+            weights, an unsupported activation, or an inconsistent projection
+            chain.
     """
     model_path = Path(model_path)
     modules = _dense_modules(model_path)
@@ -437,15 +343,7 @@ def resolve_colbert_layout(
             f"Dense projection module in {_MODULES_FILE}"
         )
 
-    source = resolve_weight_source(model_path, weight_source)
-    dense = tuple(
-        _dense_spec(
-            model_path,
-            module,
-            require_safetensors=(source == WEIGHT_SOURCE_SAFETENSORS),
-        )
-        for module in modules
-    )
+    dense = tuple(_dense_spec(model_path, module) for module in modules)
     for previous, current in zip(dense, dense[1:]):
         if previous.out_features != current.in_features:
             raise ColbertLayoutError(
@@ -455,34 +353,24 @@ def resolve_colbert_layout(
             )
 
     encoder_weights = model_path / _WEIGHTS_FILE
-    onnx_graph = find_onnx_graph(model_path)
-    if source == WEIGHT_SOURCE_SAFETENSORS and not encoder_weights.is_file():
+    if not encoder_weights.is_file():
         raise ColbertLayoutError(
             f"ColBERT export at {model_path} has no {_WEIGHTS_FILE} for its "
-            "encoder. Set "
-            f"{WEIGHT_SOURCE_ENV}={WEIGHT_SOURCE_ONNX} to read this checkpoint "
-            "from its ONNX graph instead."
-        )
-    if source == WEIGHT_SOURCE_ONNX and onnx_graph is None:
-        raise ColbertLayoutError(
-            f"ColBERT export at {model_path} has no ONNX graph "
-            f"({' or '.join(ONNX_GRAPH_NAMES)}) to take weights from"
+            "encoder. A pylate ColBERT export must ship model.safetensors for "
+            "the encoder and for every Dense module."
         )
 
     layout = ColbertLayout(
         model_path=model_path,
-        weight_source=source,
         dense=dense,
-        encoder_weights=encoder_weights if encoder_weights.is_file() else None,
-        onnx_graph=onnx_graph,
+        encoder_weights=encoder_weights,
     )
     logger.debug(
-        "ColBERT layout at %s: source=%s (%s), %d Dense modules, output dim %d",
+        "ColBERT layout at %s: %d Dense modules, output dim %d, weights %s",
         model_path,
-        layout.weight_source,
-        layout.weights_path.name,
         len(dense),
         layout.output_dim,
+        encoder_weights.name,
     )
     return layout
 
@@ -524,10 +412,10 @@ def flatten_rope_parameters(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def l2_normalize_tokens(vectors: mx.array, eps: float = _L2_EPS) -> mx.array:
-    """Per-token L2 normalization, as the pinned export computes it.
+    """Per-token L2 normalization, as pylate / ``torch.nn.functional.normalize``.
 
-    The graph is ``ReduceL2`` -> ``Clip(min=eps)`` -> ``Div``, so a degenerate
-    all-zero row divides by ``eps`` and stays zero instead of producing NaN.
+    A degenerate all-zero row divides by ``eps`` and stays zero instead of
+    producing NaN.
     """
     norms = mx.linalg.norm(vectors, axis=-1, keepdims=True)
     return vectors / mx.clip(norms, eps, None)
@@ -567,12 +455,11 @@ def _identity_residual_conflict(
 class ColbertProjection:
     """The Dense chain plus the final per-token L2.
 
-    Mirrors the pinned ONNX export's ``/projection_layers.*`` and ``/ReduceL2``
-    subgraph. Weights are plain ``mx.array`` attributes rather than an
-    ``nn.Module``: the chain is a few fixed matrices with no other state, and the
-    encoder it accompanies owns dtype policy. MLX promotes the activations to the
-    wider of the two dtypes, so a reduced-precision checkpoint cannot silently
-    truncate the projection.
+    Weights are plain ``mx.array`` attributes rather than an ``nn.Module``: the
+    chain is a few fixed matrices with no other state, and the encoder it
+    accompanies owns dtype policy. MLX promotes the activations to the wider of
+    the two dtypes, so a reduced-precision checkpoint cannot silently truncate
+    the projection.
     """
 
     def __init__(self, dense: Sequence[ColbertDenseSpec]):
@@ -603,14 +490,9 @@ class ColbertProjection:
 
     @classmethod
     def from_layout(cls, layout: ColbertLayout) -> "ColbertProjection":
-        """Load every Dense module of a safetensors-sourced layout."""
+        """Load every Dense module of the layout."""
         projection = cls(layout.dense)
         for spec in layout.dense:
-            if spec.weights is None:
-                raise ColbertLayoutError(
-                    f"{spec.directory} has no {_WEIGHTS_FILE} to load the "
-                    "projection from"
-                )
             weights = mx.load(str(spec.weights))
             linear = _checked_matrix(
                 weights.get("linear.weight"), "linear.weight", spec
@@ -639,49 +521,6 @@ class ColbertProjection:
                 weights.get("linear.bias") if spec.bias else None
             )
             projection._residual.append(residual)
-        return projection._finalize()
-
-    @classmethod
-    def from_matrices(
-        cls,
-        dense: Sequence[ColbertDenseSpec],
-        linear: Sequence[mx.array | None],
-        residual: Sequence[mx.array | None],
-    ) -> "ColbertProjection":
-        """Build a projection from already-loaded ``[out, in]`` matrices."""
-        projection = cls(dense)
-        if (
-            len(linear) != projection.layer_count
-            or len(residual) != projection.layer_count
-        ):
-            raise ColbertLayoutError(
-                f"projection chain length mismatch: {projection.layer_count} Dense "
-                f"modules but {len(linear)} linear / {len(residual)} residual matrices"
-            )
-        for index, spec in enumerate(projection.dense):
-            matrix = _checked_matrix(linear[index], f"projection_layers.{index}", spec)
-            if matrix is None:
-                raise ColbertLayoutError(
-                    f"projection module {index} ({spec.directory.name}) has no linear "
-                    "weight matrix"
-                )
-            residual_matrix = (
-                _checked_matrix(
-                    residual[index], f"projection_layers.{index}.residual", spec
-                )
-                if spec.use_residual
-                else None
-            )
-            if spec.needs_residual_matrix and residual_matrix is None:
-                raise ColbertLayoutError(
-                    f"projection module {index} ({spec.directory.name}) sets "
-                    "use_residual but has no residual weight matrix"
-                )
-            if spec.residual_is_identity and residual_matrix is not None:
-                raise _identity_residual_conflict(spec, f"projection module {index}")
-            projection._linear.append(matrix)
-            projection._linear_bias.append(None)
-            projection._residual.append(residual_matrix)
         return projection._finalize()
 
     def _finalize(self) -> "ColbertProjection":
