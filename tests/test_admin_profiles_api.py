@@ -1150,8 +1150,6 @@ def test_a8_profile_roundtrip_supported_architectures(client, monkeypatch, model
         {"dflash_block_size": 1.5},
         {"specprefill_enabled": "not-a-boolean"},
         {"dflash_draft_quant_enabled": []},
-        {"specprefill_draft_model": "/missing-draft-for-validation"},
-        {"vlm_mtp_draft_model": "./missing-draft-for-validation"},
         {"reasoning_parser": "unknown-parser"},
     ],
 )
@@ -1188,6 +1186,124 @@ def test_invalid_settings_do_not_change_storage(client, monkeypatch, operation, 
     assert {p.name: p.read_bytes() for p in mgr.base_path.glob("*.json")} == before
     assert mgr.get_settings("model-a").temperature == 0.5
     assert len(mgr.list_profiles("model-a")) == 1
+
+
+@pytest.mark.parametrize("feature", ["specprefill", "vlm_mtp"])
+def test_parked_draft_does_not_block_saves(client, tmp_path, feature):
+    """A draft parked while its feature is off must not brick unrelated saves.
+
+    Every model-settings save re-sends the whole payload, so a draft directory
+    deleted from disk — or a path imported from another machine — used to reject
+    every PUT, including saves that never enable the feature. #4217 settled this
+    for DFlash only; this covers the other two draft fields.
+    """
+    c, mgr = client
+    missing = str(tmp_path / "deleted-draft")
+    mgr.set_settings(
+        "model-a",
+        ModelSettings(**{f"{feature}_draft_model": missing}),
+    )
+    url = "/admin/api/models/model-a"
+
+    # Send the fields the settings PUT accepts, as the dashboard does. A few
+    # model fields are hardware-specific internals and deliberately stay out
+    # of the request model (e.g. the M5 NAX prefill switch).
+    payload = {
+        key: value
+        for key, value in mgr.get_settings("model-a").to_dict().items()
+        if key in admin_routes.ModelSettingsRequest.model_fields
+    }
+    payload.update(temperature=0.9, mtp_adaptive_max_depth=6)
+    payload[f"{feature}_enabled"] = False
+    response = c.put(url + "/settings", json=payload)
+    assert response.status_code == 200, response.text
+    stored = mgr.get_settings("model-a")
+    assert stored.temperature == 0.9
+    assert stored.mtp_adaptive_max_depth == 6
+    assert getattr(stored, f"{feature}_draft_model") == missing
+
+    # Turning the feature on with an unusable draft is still rejected, and the
+    # parked value plus the unrelated settings survive untouched.
+    response = c.put(
+        url + "/settings",
+        json={f"{feature}_enabled": True, f"{feature}_draft_model": missing},
+    )
+    assert response.status_code == 422, response.text
+    stored = mgr.get_settings("model-a")
+    assert getattr(stored, f"{feature}_enabled") is False
+    assert stored.temperature == 0.9
+    assert stored.mtp_adaptive_max_depth == 6
+    assert getattr(stored, f"{feature}_draft_model") == missing
+
+
+def test_partial_draft_save_checks_the_effective_enabled_state(client, tmp_path):
+    """A draft-only payload must not sneak past a feature that is already on.
+
+    The rule reads the state the save leaves behind, not the flag in the
+    payload. This request never names the enable toggle, but the stored
+    feature is on, so the broken draft must still be refused.
+    """
+    c, mgr = client
+    usable = tmp_path / "usable-draft"
+    usable.mkdir()
+    (usable / "config.json").write_text("{}", encoding="utf-8")
+    missing = str(tmp_path / "deleted-draft")
+    mgr.set_settings(
+        "model-a",
+        ModelSettings(
+            specprefill_enabled=True,
+            specprefill_draft_model=str(usable),
+        ),
+    )
+    url = "/admin/api/models/model-a"
+
+    response = c.put(
+        url + "/settings",
+        json={"specprefill_draft_model": missing},
+    )
+
+    assert response.status_code == 422, response.text
+    stored = mgr.get_settings("model-a")
+    assert stored.specprefill_enabled is True
+    assert stored.specprefill_draft_model == str(usable)
+
+
+def test_exposed_profile_rejects_draft_that_cannot_load(client, tmp_path):
+    """An exposed profile may not park a draft the base model would load.
+
+    An exposed profile is merged over the base settings per request, so a
+    draft it only parks still loads when the base model has the feature on.
+    """
+    c, mgr = client
+    usable = tmp_path / "usable-draft"
+    usable.mkdir()
+    (usable / "config.json").write_text("{}", encoding="utf-8")
+    missing = str(tmp_path / "deleted-draft")
+    mgr.set_settings(
+        "model-a",
+        ModelSettings(
+            temperature=0.5,
+            specprefill_enabled=True,
+            specprefill_draft_model=str(usable),
+        ),
+    )
+
+    response = c.post(
+        "/admin/api/models/model-a/profiles",
+        json={
+            "name": "broken",
+            "display_name": "Broken",
+            "expose_as_model": True,
+            "settings": {"specprefill_draft_model": missing},
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    assert "no config.json" in response.json()["detail"]
+    assert mgr.get_profile("model-a", "broken") is None
+    stored = mgr.get_settings("model-a")
+    assert stored.temperature == 0.5
+    assert stored.specprefill_draft_model == str(usable)
 
 
 @pytest.mark.parametrize("operation", ["settings", "create", "update"])
@@ -1984,3 +2100,26 @@ class TestSettingsSnapshotRoutes:
             "/admin/api/models/model-a/settings", json={"cache_reasoning_output": None}
         )
         assert "cache_reasoning_output" not in r.json()["settings"]
+
+
+def test_apply_rejects_profile_draft_that_cannot_load(client, tmp_path):
+    """Applying a profile may not turn on a feature with an unloadable draft."""
+    c, mgr = client
+    missing = str(tmp_path / "deleted-draft")
+    mgr.save_profile(
+        model_id="model-a",
+        name="broken",
+        display_name="Broken",
+        description=None,
+        settings={"specprefill_enabled": True, "specprefill_draft_model": missing},
+    )
+    mgr.set_settings("model-a", ModelSettings(temperature=0.5))
+
+    response = c.post("/admin/api/models/model-a/profiles/broken/apply")
+
+    assert response.status_code == 422, response.text
+    assert "no config.json" in response.json()["detail"]
+    stored = mgr.get_settings("model-a")
+    assert stored.temperature == 0.5
+    assert stored.active_profile_name is None
+    assert stored.specprefill_draft_model != missing
