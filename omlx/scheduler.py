@@ -12360,9 +12360,9 @@ class Scheduler:
             state = self._prefill_states.pop(request_id, None)
             if keep_cache and state is not None:
                 prepared = self._prepare_abort_prefill_store(request, state.cache)
-            self.prefilling = deque(
-                r for r in self.prefilling if r.request_id != request_id
-            )
+        self.prefilling = deque(
+            r for r in self.prefilling if r.request_id != request_id
+        )
         if keep_cache and prepared is not None:
             store_future = self._submit_abort_store(request, prepared)
 
