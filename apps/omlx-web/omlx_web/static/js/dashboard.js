@@ -7597,6 +7597,13 @@
                 this.fillCustomThemeDraft();
             },
 
+            // Fills the dark fields only; Apply still runs the contrast check.
+            generateDarkCustomTheme() {
+                const api = window.OmlxCustomTheme;
+                const light = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor('light', token)]));
+                this.customThemeDraft.dark = api.darkFromLight(light);
+            },
+
             // The full palette, so an agent sees every token, not only the overrides.
             async copyCustomThemeJson() {
                 const theme = { light: {}, dark: {} };
