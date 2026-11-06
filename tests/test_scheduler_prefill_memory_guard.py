@@ -173,6 +173,7 @@ def test_preflight_does_not_charge_a_resumed_request_for_its_own_reserve():
     scheduler._memory_abort_limit_bytes = 10**18
     with (
         patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.mx.get_cache_memory", return_value=0),
         patch("omlx.scheduler.get_phys_footprint", return_value=spare),
     ):
         assert scheduler._preflight_memory_check(req) is not None
