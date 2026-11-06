@@ -5090,7 +5090,6 @@ async def test_recoverable_quoted_marker_without_qwen_parser():
     [
         (_RECOVERY_TRUNCATED_JSON, ""),
         ("<function=write><parameter=content>cut", ""),
-        ("<tool_call>", ""),
         (
             "The tag <tool_call> is it. Now calling: " + _RECOVERY_TRUNCATED_JSON,
             "The tag ",
@@ -5114,6 +5113,33 @@ def _chat_finish_reasons(events):
         for c in e.get("choices", [])
         if c.get("finish_reason")
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_bare_opener_after_answer_at_stop_is_not_a_failed_call(api):
+    """A bare opener then end of sequence adds no call body, so the answer stands.
+
+    Issue #4422: finish_reason is stop, so the opener is not a truncated call.
+    """
+    events = await _recovery_stream("The weather is rain.\n<tool_call>", api)
+
+    assert _recovery_error_codes(events, api) == []
+    assert not _recovery_calls(events, api)
+    assert _recovery_text(events, api) == "The weather is rain.\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_bare_opener_cut_by_length_keeps_prose_without_error(api):
+    """A length cut keeps its own finish reason: the prose is delivered, not failed."""
+    events = await _recovery_stream(
+        "The weather is rain.\n<tool_call>", api, finish_reason="length"
+    )
+
+    assert _recovery_error_codes(events, api) == []
+    assert not _recovery_calls(events, api)
+    assert _recovery_text(events, api) == "The weather is rain.\n"
 
 
 @pytest.mark.asyncio
@@ -5315,6 +5341,40 @@ def test_nonstream_truncated_or_malformed_call_still_fails(monkeypatch, raw):
 
     assert response.status_code == 500, response.text
     assert response.json()["error"]["code"] == "incomplete_tool_call"
+
+
+@pytest.mark.parametrize("path", list(_NONSTREAM_RECOVERY_REQUESTS))
+@pytest.mark.parametrize(
+    "qwen_parser",
+    [True, False],
+    ids=["qwen3_coder", "no_qwen_parser"],
+)
+def test_nonstream_bare_opener_at_stop_is_prose_without_marker(
+    monkeypatch, path, qwen_parser
+):
+    """Issue #4422: a bare opener at stop adds no call; prose is returned, trimmed."""
+    request = dict(_NONSTREAM_RECOVERY_REQUESTS[path])
+    client = _nonstream_tool_call_client(
+        monkeypatch, "The weather is rain.\n<tool_call>", qwen_parser=qwen_parser
+    )
+    response = client.post(path, json=request)
+    client.close()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if path == "/v1/chat/completions":
+        assert body["choices"][0]["message"]["content"] == "The weather is rain."
+        assert body["choices"][0]["finish_reason"] == "stop"
+    elif path == "/v1/messages":
+        assert body["content"][0]["text"] == "The weather is rain."
+    else:
+        texts = [
+            part["text"]
+            for item in body["output"]
+            if item["type"] == "message"
+            for part in item["content"]
+        ]
+        assert texts == ["The weather is rain."]
 
 
 @pytest.mark.parametrize(

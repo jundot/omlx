@@ -6443,13 +6443,20 @@ def _take_recoverable_withheld_text(
     ``payload`` reports only the content channel: reasoning may quote an
     opener without making a call. A length cut keeps its own finish reason.
     """
-    content_payload = bool(tool_filter and tool_filter.recovery_candidate_is_payload())
+    bare_opener = finish_reason != "length" and bool(
+        tool_filter and tool_filter.recovery_candidate_is_bare_opener()
+    )
+    content_payload = not bare_opener and bool(
+        tool_filter and tool_filter.recovery_candidate_is_payload()
+    )
     is_payload = content_payload or bool(
         thinking_filter and thinking_filter.recovery_candidate_is_payload()
     )
     stopped_in_call = content_payload and finish_reason != "length"
     thinking = thinking_filter.take_recovery_candidate() if thinking_filter else ""
     content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if bare_opener:
+        content = ""
     if (
         tool_calls
         or streamed_tool_calls
@@ -6523,13 +6530,17 @@ def _nonstream_recovery_text(
         leading_only=leading_thinking_only(tokenizer),
     )
     probe = ToolCallStreamFilter(tokenizer, tools=tools)
-    probe.feed(generated)
-    probe.finish()
-    withheld_payload = probe.recovery_candidate_is_payload()
+    emitted = probe.feed(generated) + probe.finish()
+    bare_opener = output.finish_reason != "length" and (
+        probe.recovery_candidate_is_bare_opener()
+    )
+    withheld_payload = probe.recovery_candidate_is_payload() and not bare_opener
     recovered = probe.take_recovery_candidate()
     if withheld_payload:
         # A length cut keeps its own finish reason.
         return None, output.finish_reason != "length"
+    if bare_opener:
+        return emitted, False
     if recovered:
         return raw_text, False
     return None, False
