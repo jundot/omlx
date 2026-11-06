@@ -170,7 +170,8 @@ class Engram(nn.Module):
         ids_host, inverse = dedupe_tuple_ids(ids_np)
         rows = self.embed(mx.array(ids_host)).flatten(-2)
         count = math.prod(ids_np.shape[:-1]) if ids_np.ndim >= 2 else 1
-        if 1 < count <= DECODE_ROWS:
+        requests = ids_np.shape[0] if ids_np.ndim >= 2 else 1
+        if 1 < count <= 8 or (requests > 1 and count <= DECODE_ROWS):
             # Decode-sized inputs (one token for each of B requests, or an MTP verify block
             # of one request): project each row on its own, exactly as a single-token
             # decode does. A multi-row quantized_matmul runs a different MLX kernel whose

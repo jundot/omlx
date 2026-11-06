@@ -344,8 +344,8 @@ def decode_rows(data, shape, bits, group_size, scaled):
     return values.reshape(*shape, values.shape[-1]).astype(mx.bfloat16)
 
 
-# Engram inputs of at most this many rows (batched decode, verify blocks) are projected
-# row by row in input order.
+# Engram inputs of several requests with at most this many rows (batched decode, verify
+# blocks) are projected row by row in input order.
 DECODE_ROWS = 16
 
 
@@ -357,7 +357,8 @@ def dedupe_tuple_ids(ids):
     Returns the original ids with no inverse when every tuple is unique.
     """
     host = np.asarray(ids, dtype=np.int64)
-    if host.ndim != 3 or host.shape[0] * host.shape[1] <= DECODE_ROWS:
+    rows = host.shape[0] * host.shape[1] if host.ndim == 3 else 0
+    if host.ndim != 3 or rows <= 8 or (host.shape[0] > 1 and rows <= DECODE_ROWS):
         return host, None
     flat = host.reshape(-1, host.shape[-1])
     unique, inverse = np.unique(flat, axis=0, return_inverse=True)

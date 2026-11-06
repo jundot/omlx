@@ -103,8 +103,9 @@ def advance(batch, batch_state):
     groups = defaultdict(list)
     replacements = {}
     host = _row_verify_host(batch.model)
+    limit = bg._shared_verify_width(batch.model) if host is not None else 0
     together = set()
-    if host is not None and len(states) > 1:
+    if limit and len(states) > 1:
         # Each request verifies its own block, but blocks of one width share a forward.
         by_width = defaultdict(list)
         for index, state in enumerate(states):
@@ -115,9 +116,8 @@ def advance(batch, batch_state):
                 and state.drafts is not None
             ):
                 by_width[int(state.drafts.shape[0])].append(index)
-        limit = int(getattr(host, "_omlx_mtp_shared_verify_rows", 0) or 0)
         for width, members in by_width.items():
-            per_forward = max(1, limit // (width + 1)) if limit else len(members)
+            per_forward = max(1, limit // (width + 1))
             for start in range(0, len(members), per_forward):
                 chunk = members[start : start + per_forward]
                 if len(chunk) > 1 and _verify_rows_together(batch, batch_state, host, chunk, replacements):

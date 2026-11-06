@@ -214,6 +214,8 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
         for i, layer in enumerate(model.layers):
             layer.ffn.experts = OffloadedExpert(layer.ffn.experts, plan, f"language_model.layers.{i}.ffn.experts")
         assert not decode_fused.supported(model.layers[0], c)
+        # Requests then verify one by one, so the batch policy must not cap their depth.
+        assert model.mtp_shared_verify_rows() == 0
         cache = model.make_cache()
         mx.eval(model(mx.array([[1, 2, 3, 4, 5]]), cache=cache))
         assert mx.isfinite(model(mx.array([[6]]), cache=cache)).all().item()
@@ -224,14 +226,15 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
 @pytest.mark.parametrize("batch", [3, 8, 17])   # odd: a tile lane holds half a vector pair
 def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
-    """On the row kernels (below decode_moe.MMA_MIN_BATCH requests, and in MTP verify blocks),
-    B single-token requests through decode_block_nb give each request the logits it gets
+    """On the row kernels (below decode_moe.MMA_MIN_BATCH requests without the drafter), B
+    single-token requests through decode_block_nb give each request the logits it gets
     decoding alone (per-request arithmetic is the single-request kernels')."""
     from omlx.patches.deepseek_v41 import decode_moe
     from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 
     monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
-    model = verify_exact(build(fmt=fmt))   # affine batches always run on matrix tiles
+    # Affine batches always run on matrix tiles; so do MXFP8 ones once the drafter verifies.
+    model = verify_exact(build(fmt=fmt)) if fmt == "affine" else build(fmt=fmt)
     batches = []
     real = decode_fused.decode_block_nb
 
@@ -541,36 +544,47 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
 
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-def test_requests_verified_together_match_their_own_verify(fmt):
-    """mtp_verify_rows gives each request bit for bit the logits and DSpark taps of its own
-    verify forward, and each request's cache then rolls back like that forward's."""
+def test_requests_verified_together_match_their_batched_decode(fmt):
+    """mtp_verify_rows gives each request bit for bit the logits that decoding the same
+    requests token by token as a batch gives, and after rolling back to the same accepted
+    count the caches continue exactly like that batch's."""
+    from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
+
     model = verify_exact(build(fmt=fmt, vocab_size=4096, dspark_target_layer_ids=(2, 3, 4)))
     rng = np.random.default_rng(37)
     # One request with a full window, one still filling it; different positions.
     prompts = [rng.integers(3, 60, 11).tolist(), rng.integers(3, 60, 3).tolist()]
     blocks = [rng.integers(3, 60, 3).tolist() for _ in prompts]
-    accepted = [1, 2]
-    own, together = [], []
-    for prompt in prompts:
-        for caches in (own, together):
+
+    def prefilled():
+        caches = []
+        for prompt in prompts:
             cache = model.make_cache()
             mx.eval(model(mx.array([prompt]), cache=cache))
             caches.append(cache)
-    expected = []
-    for cache, block, keep in zip(own, blocks, accepted):
-        logits, hidden = model(mx.array([block]), cache=cache, n_confirmed=1, return_hidden=True)
-        expected.append((logits, hidden))
-        assert model.mtp_partial_rollback(cache, keep, len(block) - 1)
+        return caches
+
+    def batch(rows):
+        return [DeepseekV41Cache.merge([rc[i] for rc in rows]) for i in range(len(rows[0]))]
+
+    def decode(cache, column):
+        return model(mx.array([[block[column]] for block in blocks]), cache=cache)[:, -1]
+
+    sequential, accepted_only = batch(prefilled()), batch(prefilled())
+    expected = [decode(sequential, j) for j in range(3)]
+    together = prefilled()
     assert model.mtp_verify_rows_ok(together, 3)
     logits, hidden, together = model.mtp_verify_rows(mx.array(blocks), together)
-    for r, (want_logits, want_hidden) in enumerate(expected):
-        assert mx.array_equal(logits[r], want_logits[0]).item(), f"logits {r}"
-        assert mx.array_equal(hidden[r], want_hidden[0]).item(), f"hidden {r}"
-    for r, (cache, block, keep) in enumerate(zip(together, blocks, accepted)):
-        assert model.mtp_partial_rollback(cache, keep, len(block) - 1)
-        assert cache[0].size() == own[r][0].size()
-        nxt = mx.array([[block[keep]]])
-        assert mx.array_equal(model(nxt, cache=cache), model(nxt, cache=own[r])).item()
+    assert hidden.shape == (2, 3, 3 * model._config.dim)
+    for j, want in enumerate(expected):
+        assert mx.array_equal(logits[:, j], want).item(), f"row {j}"
+    for cache in together:
+        assert model.mtp_partial_rollback(cache, 1, 2)
+    for j in range(2):
+        decode(accepted_only, j)
+    together = batch(together)
+    assert all(a.size() == b.size() for a, b in zip(together, accepted_only))
+    assert mx.array_equal(decode(together, 2), decode(accepted_only, 2)).item()
 
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
@@ -635,7 +649,10 @@ def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, 
     from omlx.patches.mlx_lm_mtp import batch_generator
 
     batch_generator.apply()
+    # Affine projections run on matrix tiles alone and in a batch, so each request's greedy
+    # tokens are its single-request ones (batched MXFP8 rows round like batched decode).
     model = build(
+        fmt="affine",
         vocab_size=4096,
         preserve_mtp=True,
         n_mtp_layers=1,

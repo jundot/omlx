@@ -1457,9 +1457,9 @@ def _batch_park_memory(model: Any):
 def _shared_verify_width(model: Any) -> int:
     """Rows one shared verify forward of an independent-verify host holds (0: none)."""
     for host in (model, getattr(model, "language_model", None), getattr(model, "_language_model", None)):
-        width = getattr(host, "_omlx_mtp_shared_verify_rows", 0) if host is not None else 0
-        if width:
-            return int(width)
+        rows = getattr(host, "mtp_shared_verify_rows", None) if host is not None else None
+        if callable(rows):
+            return int(rows())
     return 0
 
 

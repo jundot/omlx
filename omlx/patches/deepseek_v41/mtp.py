@@ -65,8 +65,6 @@ class DSparkMixin:
         self._omlx_mtp_head_clone = False
         self._omlx_mtp_rowwise_unsupported = True
         self._omlx_mtp_independent_verify = True
-        # mtp_verify_rows: requests' blocks of up to this many rows share one forward.
-        self._omlx_mtp_shared_verify_rows = decode_fused.MAX_BATCH
         self._omlx_mtp_depth = max(1, min(depth, self._config.dspark_block_size))
         # One-token decode then runs the kernels of verify blocks (decode_fused), so a
         # verified draft gets the logits that decoding it alone gives.
@@ -120,6 +118,18 @@ class DSparkMixin:
         from ..mlx_lm_mtp.deepseek_v4_dspark import take_primed
 
         return take_primed(self, cache, main_token)
+
+    def mtp_shared_verify_rows(self):
+        """Rows one mtp_verify_rows forward holds, or 0 when requests cannot verify together
+        (layers off the fused kernels, pipeline / tensor ranks, verify-only ranks)."""
+        if (
+            getattr(self, "_omlx_mtp_verify_only", False)
+            or self.pipeline_size != 1
+            or self._stage()[0][1]._tensor_group is not None
+            or not self._stages_decode_fused()
+        ):
+            return 0
+        return decode_fused.MAX_BATCH
 
     def mtp_verify_rows_ok(self, row_caches, width):
         """Whether mtp_verify_rows can verify these requests' blocks of `width` tokens."""
