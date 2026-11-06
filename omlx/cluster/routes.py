@@ -314,11 +314,28 @@ def _saved_lightning_mtp(model_path: str) -> bool | None:
     return None if settings is None else bool(settings.mtp_enabled)
 
 
-def _saved_engram_ssd_offload(model_path: str | None) -> bool:
-    """Whether the saved settings keep DeepSeek V4.1 Engram tables on SSD."""
+def _saved_ssd_offload(model_path: str | None) -> bool:
+    """Whether the saved settings stream this model's big tables from SSD.
+
+    DeepSeek V4.1 Engram and Qwen4-Exp PLE are the same problem: one table far
+    larger than the weights around it, read per token instead of held resident.
+    Both settings mean "keep it on SSD", and a checkpoint only ever honours the
+    one its architecture uses — so planning may treat either as offloaded. With
+    neither set, the table is charged as resident and a Qwen4-Exp pipeline plan
+    can never fit (a 37 GiB PLE layer in a 117 GiB model).
+    """
 
     settings = _saved_model_settings(model_path) if model_path else None
-    return bool(getattr(settings, "deepseek_v41_engram_ssd_offload", False))
+    if settings is None:
+        return False
+    return bool(
+        getattr(settings, "deepseek_v41_engram_ssd_offload", False)
+        or getattr(settings, "qwen4_ple_ssd_offload", False)
+    )
+
+
+# Kept for callers and tests that still use the older, narrower name.
+_saved_engram_ssd_offload = _saved_ssd_offload
 
 
 def _cluster_mtp(
@@ -909,7 +926,7 @@ def _create_cluster_plan(request: ClusterPlanRequest):
     )
     pipeline_model = with_mtp_head(model) if request.mtp else model
     head_bytes = model.mtp_weight_bytes if request.mtp else 0
-    engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
+    engram_ssd_offload = _saved_ssd_offload(request.model_path)
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
         if request.allocation != "balanced":
@@ -1235,7 +1252,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         mtp = _cluster_mtp(request.mtp, model, request.model_path)
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
+    engram_ssd_offload = _saved_ssd_offload(request.model_path)
 
     transports: tuple[Any, ...] = ()
     transport_error: str | None = None
