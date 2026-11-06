@@ -244,11 +244,12 @@ class _PreflightRejection:
 @dataclass
 class _AdmissionEstimate:
     """Single deterministic admission estimate shared by every preflight
-    path: ``current + kv_exact + transient`` is compared against both the
-    dynamic hard limit and the prefill safety cap. ``kv_exact`` is the
-    exact-shape resident KV (full + window-capped rotating + fixed state),
-    ``transient`` the floor-chunk charge including the session's observed
-    max chunk transient."""
+    path: ``current + max(kv_exact + transient - sampled_buffer_cache, 0)``
+    is compared against both the dynamic hard limit and the prefill safety
+    cap. ``kv_exact`` is the exact-shape resident KV (full + window-capped
+    rotating + fixed state), ``transient`` the floor-chunk charge including
+    the session's observed max chunk transient. The buffer-cache credit
+    keeps freed-but-resident pool bytes from being priced twice (#3147)."""
 
     kv_exact: int
     transient: int
@@ -12878,7 +12879,8 @@ class Scheduler:
     ) -> _AdmissionEstimate | None:
         """Deterministic admission estimate shared by every preflight path.
 
-        One formula: ``current + kv_exact + transient`` where
+        One formula: ``current + max(kv_exact + transient -
+        sampled_buffer_cache, 0)`` where
 
         - ``kv_exact`` is the exact-shape resident KV this prefill will
           allocate (full-attention layers linear in new tokens, sliding
@@ -12939,9 +12941,15 @@ class Scheduler:
         # is cleared or reused (#3147). Prefill allocations reuse it, so the
         # footprint grows only past the sampled cache size. Crediting it also
         # matches the worst case where the cache is cleared before prefill.
+        # The credit may only cover pool bytes the usage sample counts, so a
+        # sample stale after a clear cannot over-credit past current - active.
         pool_cache = max(
             0, int(getattr(self, "_last_mlx_cache_memory_bytes", 0) or 0)
         )
+        active_bytes = max(
+            0, int(getattr(self, "_last_mlx_active_memory_bytes", 0) or 0)
+        )
+        pool_cache = min(pool_cache, max(0, int(current) - active_bytes))
         charge = kv_exact + transient
         return _AdmissionEstimate(
             kv_exact=kv_exact,
@@ -13186,7 +13194,7 @@ class Scheduler:
 
         kv_growth = est.kv_exact
         min_transient = est.transient
-        estimated = int(current_usage_bytes) + kv_growth + min_transient
+        estimated = est.estimated
         if estimated - hot_cache_credit <= cap:
             return None
 

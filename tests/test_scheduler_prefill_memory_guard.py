@@ -1389,7 +1389,6 @@ def test_admission_credits_reclaimable_mlx_pool_residue():
     """
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True
-    scheduler._memory_abort_limit_bytes = 10**18  # keep safety cap out
     residue = 8 * 1024**3
     pool_cache = 8 * 1024**3
     with (
@@ -1410,10 +1409,15 @@ def test_admission_credits_reclaimable_mlx_pool_residue():
     limit = current + charge // 2
     scheduler._memory_hard_limit_bytes = limit
     scheduler._memory_hard_watermark_bytes = limit
+    # Production-like: the abort limit sits at the hard limit, so the safety
+    # cap (hard * margin) binds after the admission check.
+    scheduler._memory_abort_limit_bytes = limit
     with (
         patch("omlx.scheduler.mx.get_active_memory", return_value=0),
         patch("omlx.scheduler.mx.get_cache_memory", return_value=pool_cache),
         patch("omlx.scheduler.get_phys_footprint", return_value=residue),
     ):
-        # Red on current code: the residue and the full KV are both charged.
+        # Red on the parent commit: the residue and the full KV are both
+        # charged, on the route path and on the in-stream path alike.
         scheduler.preflight_or_raise(num_prompt_tokens=32768)
+        assert scheduler._preflight_memory_check(_make_request(32768)) is None
