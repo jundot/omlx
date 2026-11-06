@@ -2089,8 +2089,6 @@
   "chat.shortcut_stop": "Zastavit generování",
   "chat.shortcut_help": "Zobrazit tuto nápovědu",
   "chat.theme_label": "Motiv",
-  "chat.enhanced_readability": "Vylepšená čitelnost",
-  "chat.enhanced_readability_desc": "Zvyšuje kontrast textu a nastavuje minimální velikost písma na 12 px (kromě vzorců).",
   "chat.chat_history_label": "Historie chatů",
   "chat.clear_all_history": "Vymazat celou historii",
   "chat.download_chats": "Stáhnout chaty",

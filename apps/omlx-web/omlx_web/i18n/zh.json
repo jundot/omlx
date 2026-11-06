@@ -2089,8 +2089,6 @@
   "chat.shortcut_stop": "停止生成",
   "chat.shortcut_help": "显示此帮助",
   "chat.theme_label": "主题",
-  "chat.enhanced_readability": "增强可读性",
-  "chat.enhanced_readability_desc": "提升文本对比度，并将最小字号设为 12px（公式除外）。",
   "chat.chat_history_label": "聊天记录",
   "chat.clear_all_history": "清除所有历史",
   "chat.download_chats": "下载聊天记录",
