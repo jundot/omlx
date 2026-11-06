@@ -204,6 +204,28 @@ def test_qwen4_exp_model_file_checkpoints_resolve_to_vendored_module(tmp_path):
     assert module is qwen4_exp
 
 
+def test_qwen4_exp_custom_model_file_keeps_its_module(tmp_path):
+    """A qwen4_exp checkpoint with its own architecture file (not the stock
+    ``qwen4_exp.py``) keeps mlx-vlm's ``model_file`` route, so its custom
+    layers load. Trust Remote Code gates that import
+    (``ensure_model_code_trusted``).
+    """
+    assert compat.apply_mlx_vlm_qwen4_exp_compat_patch() in {True, False}
+    from mlx_vlm.models import qwen4_exp
+    from mlx_vlm.utils import get_model_and_args
+
+    (tmp_path / "custom_qwen4.py").write_text(
+        "class Model:\n    pass\n\n\nclass ModelConfig:\n    pass\n"
+    )
+    config = {"model_type": "qwen4_exp", "model_file": "custom_qwen4.py"}
+
+    module, model_type = get_model_and_args(config, model_path=tmp_path)
+
+    assert model_type == "qwen4_exp"
+    assert module is not qwen4_exp
+    assert hasattr(module, "ModelConfig")
+
+
 @pytest.mark.parametrize("quantized", [False, True])
 def test_qwen4_small_hyper_connection_fusion_fails_closed(quantized):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
