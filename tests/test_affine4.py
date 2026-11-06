@@ -192,6 +192,10 @@ def test_portable_attention_masks_sinks_and_dimensions(
         (1, 4, 8, 4, 512, 1025, mx.bfloat16, Affine4KVCache, True),
         (1, 4, 6, 8, 256, 1025, mx.bfloat16, Affine8KVCache, False),
         (1, 8, 8, 1, 64, 1025, mx.bfloat16, Affine8KVCache, True),
+        # Flint verify: 8 query heads per KV head over 6 rows run as two
+        # threadgroup chunks per KV head in one launch.
+        (1, 4, 8, 6, 128, 2049, mx.bfloat16, Affine8KVCache, True),
+        (2, 4, 8, 8, 128, 1025, mx.float16, Affine4KVCache, True),
     ],
 )
 def test_actual_native_matches_portable(

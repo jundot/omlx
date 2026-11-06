@@ -559,12 +559,16 @@ _MPP_ATTENTION_SOURCE = r"""
     threadgroup float query_scales[PaddedRows];
 
     int batch = int(group.y);
-    int kv_head = int(group.x);
+    // A KV head's query heads that do not fit one threadgroup split into
+    // Chunks threadgroups next to each other in x, so they stream the same
+    // K/V tiles together.
+    int kv_head = int(group.x) / Chunks;
+    int chunk = int(group.x) % Chunks;
     if (int(tid) < PaddedRows) {
         int row = int(tid);
         float maximum = 0.0f;
         if (row < ActiveRows) {
-            int head = kv_head * Repeats + row / QueryLength;
+            int head = kv_head * RepeatsTotal + chunk * Repeats + row / QueryLength;
             int position = row % QueryLength;
             for (int d = 0; d < Dim; ++d)
                 maximum = max(maximum, abs(float(queries[
@@ -577,7 +581,7 @@ _MPP_ATTENTION_SOURCE = r"""
     for (int i = int(tid); i < PaddedRows * Dim; i += 32 * Warps) {
         int row = i / Dim;
         if (row < ActiveRows) {
-            int head = kv_head * Repeats + row / QueryLength;
+            int head = kv_head * RepeatsTotal + chunk * Repeats + row / QueryLength;
             int position = row % QueryLength;
             q_tile[i] = half(queries[
                 batch * queries_strides[0] + head * queries_strides[1] +
@@ -617,7 +621,8 @@ _MPP_ATTENTION_SOURCE = r"""
         int(values_strides[2]),
         int(key_scales_strides[2]),
         int(value_scales_strides[2]),
-        mask + batch * mask_strides[0] + kv_head * Repeats * mask_strides[1],
+        mask + batch * mask_strides[0] +
+            (kv_head * RepeatsTotal + chunk * Repeats) * mask_strides[1],
         int(mask_strides[1]),
         int(mask_strides[2]),
         int(mask_strides[3]),
@@ -683,11 +688,12 @@ def _mpp_attention_kernel(
     warps: int,
     kv_heads: int,
     bits: int = _BITS,
+    chunks: int = 1,
 ):
     return mx.fast.metal_kernel(
         name=(
             f"affine{bits}_mpp_d{dim}_r{repeats}_l{query_length}_"
-            f"m{padded_rows}_w{warps}_h{kv_heads}"
+            f"m{padded_rows}_w{warps}_h{kv_heads}_c{chunks}"
         ),
         input_names=[
             "queries",
@@ -883,75 +889,63 @@ def _native_attention(
         return None
 
     try:
-        pass1 = _mpp_attention_kernel(*geometry, cache.key_codec.bits)
-        # Query heads that do not fit one threadgroup run as several launches.
-        chunks = []
-        for start in range(0, repeats, group):
-            stop = start + group
-            if has_mask and group < repeats:
-                chunk_mask = mx.broadcast_to(
-                    mask, (batch, query_heads, query_length, tokens)
-                ).reshape(batch, kv_heads, repeats, query_length, tokens)
-                chunk_mask = chunk_mask[:, :, start:stop].reshape(
-                    batch, kv_heads * group, query_length, tokens
-                )
-            else:
-                chunk_mask = mx.broadcast_to(
-                    mask, (batch, kv_heads * group, query_length, tokens)
-                )
-            partials, sums, maxs = pass1(
-                inputs=[
-                    rotated[:, :, start:stop].reshape(
-                        batch, kv_heads * group, query_length, dim
-                    ),
-                    keys_state.indices,
-                    keys_state.norms,
-                    values_state.indices,
-                    values_state.norms,
-                    valid_starts,
-                    valid_ends,
-                    chunk_mask,
-                    params,
-                ],
-                template=[
-                    ("Dim", dim),
-                    ("Repeats", group),
-                    ("QueryLength", query_length),
-                    ("PaddedRows", padded_rows),
-                    ("Warps", warps),
-                    ("NumKvHeads", kv_heads),
-                    ("Bits", cache.key_codec.bits),
-                    ("ValuesPerWord", cache.key_codec.values_per_word),
-                    ("Accumulator", accumulator),
-                    ("HasMask", has_mask),
-                ],
-                output_shapes=[
-                    (rows, blocks, dim),
-                    (rows, blocks),
-                    (rows, blocks),
-                ],
-                output_dtypes=[mx.float32, mx.float32, mx.float32],
-                grid=(kv_heads * 32, batch * warps, blocks),
-                threadgroup=(32, warps, 1),
-            )
-            chunk_sinks = (
-                mx.contiguous(row_sinks[:, :, start:stop]).reshape(-1)
-                if has_sinks
-                else row_sinks
-            )
-            chunks.append(
-                _mpp_reduce_kernel(dim)(
-                    inputs=[partials, sums, maxs, chunk_sinks, params],
-                    template=[("Dim", dim), ("HasSinks", has_sinks)],
-                    output_shapes=[(batch, kv_heads, group, query_length, dim)],
-                    output_dtypes=[mx.float32],
-                    grid=(rows * dim, 1, 1),
-                    threadgroup=(dim, 1, 1),
-                )[0]
-            )
-        rotated_output = (
-            mx.concatenate(chunks, axis=2) if len(chunks) > 1 else chunks[0]
+        # Query heads that do not fit one threadgroup (a multi-row verify)
+        # run as several threadgroups per KV head in one launch rather than
+        # one launch per chunk: each launch streams the whole cache, while
+        # neighbouring threadgroups share its tiles. Rows come out in
+        # (batch, kv_head, repeat, position) order either way.
+        chunks = repeats // group
+        pass1 = _mpp_attention_kernel(*geometry, cache.key_codec.bits, chunks)
+        all_rows = rows * chunks
+        partials, sums, maxs = pass1(
+            inputs=[
+                rotated.reshape(batch, query_heads, query_length, dim),
+                keys_state.indices,
+                keys_state.norms,
+                values_state.indices,
+                values_state.norms,
+                valid_starts,
+                valid_ends,
+                mx.broadcast_to(mask, (batch, query_heads, query_length, tokens)),
+                params,
+            ],
+            template=[
+                ("Dim", dim),
+                ("Repeats", group),
+                ("RepeatsTotal", repeats),
+                ("Chunks", chunks),
+                ("QueryLength", query_length),
+                ("PaddedRows", padded_rows),
+                ("Warps", warps),
+                ("NumKvHeads", kv_heads * chunks),
+                ("Bits", cache.key_codec.bits),
+                ("ValuesPerWord", cache.key_codec.values_per_word),
+                ("Accumulator", accumulator),
+                ("HasMask", has_mask),
+            ],
+            output_shapes=[
+                (all_rows, blocks, dim),
+                (all_rows, blocks),
+                (all_rows, blocks),
+            ],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+            grid=(kv_heads * chunks * 32, batch * warps, blocks),
+            threadgroup=(32, warps, 1),
         )
+        rotated_output = _mpp_reduce_kernel(dim)(
+            inputs=[
+                partials,
+                sums,
+                maxs,
+                mx.contiguous(row_sinks).reshape(-1) if has_sinks else row_sinks,
+                params,
+            ],
+            template=[("Dim", dim), ("HasSinks", has_sinks)],
+            output_shapes=[(batch, kv_heads, repeats, query_length, dim)],
+            output_dtypes=[mx.float32],
+            grid=(all_rows * dim, 1, 1),
+            threadgroup=(dim, 1, 1),
+        )[0]
         output = cache.value_codec._rotate_inverse(rotated_output)
         output = output.reshape(batch, query_heads, query_length, dim).astype(
             queries.dtype
