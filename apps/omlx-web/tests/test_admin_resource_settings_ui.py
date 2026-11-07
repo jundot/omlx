@@ -46,7 +46,7 @@ const source = fs.readFileSync('omlx_web/static/js/dashboard.js', 'utf8');
     for (const size of ['auto', '1536MB']) {
         const context = {
             localStorage: {getItem: () => null},
-            THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+            THEME_STORAGE_KEY: 'theme',
             window: {t: key => key}, navigator: {language: 'en'}, document: {},
             console,
             fetch: async () => ({ok: true, json: async () => ({
@@ -89,7 +89,7 @@ const setUrl = (href) => {
 };
 const context = {
     localStorage: {getItem: () => null},
-    THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+    THEME_STORAGE_KEY: 'theme',
     window: {t: key => key, location, history: {replaceState: (_s, _t, url) => setUrl(String(url))}},
     navigator: {language: 'en'}, document: {}, console, URL, URLSearchParams,
 };

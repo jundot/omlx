@@ -117,20 +117,6 @@
                                                     'statsNumberScale', "setStatsNumberScale('{value}')",
                                                     aria_label=t('settings.appearance.number_scale')) }}
                                 </div>
-                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <div>
-                                        <label class="text-sm text-neutral-700">{{ t('chat.enhanced_readability') }}</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('chat.enhanced_readability_desc') }}</p>
-                                    </div>
-                                    <button type="button" role="switch"
-                                            @click="setEnhancedReadability(!enhancedReadability)"
-                                            :aria-checked="enhancedReadability ? 'true' : 'false'"
-                                            :class="enhancedReadability ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                        <span :class="enhancedReadability ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
-                                    </button>
-                                </div>
                             </div>
                         </div>
 
@@ -2107,75 +2093,41 @@
                                 <div class="flex items-center gap-3 px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                     <i data-lucide="eye" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.theme.preview') }}</span>
+                                    <label title="{{ t('settings.theme.load_image_hint') }}"
+                                           class="ml-auto -my-2 inline-flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap px-3 py-1.5 rounded-full border border-neutral-300 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50 focus-within:ring-2 focus-within:ring-neutral-900">
+                                        <i data-lucide="image-up" class="w-3.5 h-3.5"></i>{{ t('settings.theme.load_image') }}
+                                        <input type="file" accept="image/png" class="sr-only" @change="loadThemeImage($event)">
+                                    </label>
+                                    <button type="button" @click="saveThemePreviewImage({{ version | tojson | forceescape }})"
+                                            :disabled="themeImageBusy"
+                                            title="{{ t('settings.theme.image_hint') }}"
+                                            class="-my-2 inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap px-3 py-1.5 rounded-full border border-neutral-300 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed">
+                                        <i data-lucide="image-down" class="w-3.5 h-3.5"></i>{{ t('settings.theme.save_image') }}
+                                    </button>
                                 </div>
+                                <template x-if="themeImageError">
+                                    <p class="px-4 pt-3 text-xs text-red-600" x-text="themeImageError"></p>
+                                </template>
                                 <div class="p-4 space-y-3">
                                     <div class="theme-previews">
                                         <template x-for="mode in ['light', 'dark']" :key="mode">
                                             <div class="min-w-0 space-y-2">
-                                                <div class="flex items-center gap-1.5 text-xs font-semibold text-neutral-500">
+                                                <div class="flex h-7 items-center gap-1.5 text-xs font-semibold text-neutral-500">
                                                     <i x-show="mode === 'light'" data-lucide="sun" class="w-3.5 h-3.5"></i>
                                                     <i x-show="mode === 'dark'" data-lucide="moon" class="w-3.5 h-3.5"></i>
                                                     <span x-text="window.t(mode === 'light' ? 'settings.theme.light' : 'settings.theme.dark')"></span>
+                                                    <button type="button" x-show="mode === 'dark'" @click="generateDarkCustomTheme()"
+                                                            title="{{ t('settings.theme.generate_dark_hint') }}"
+                                                            class="ml-auto inline-flex items-center gap-1 px-2.5 py-1 rounded-full border border-neutral-300 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50">
+                                                        <i data-lucide="wand-sparkles" class="w-3.5 h-3.5"></i>{{ t('settings.theme.generate_dark') }}
+                                                    </button>
                                                 </div>
-                                                <div class="theme-preview" :style="themePreviewStyle(mode)"
-                                                     @click="focusThemeToken(mode, $event)" aria-hidden="true">
-                                                    <div class="tp-accent" data-token="timeline-accent"></div>
-                                                    <div class="tp-nav" data-token="bg-primary">
-                                                        <span class="tp-logo" data-token="text-primary"></span>
-                                                        <span class="tp-brand" data-token="text-primary">oMLX</span>
-                                                        <span class="tp-version" data-token="text-muted">v{{ version }}</span>
-                                                        <span class="tp-tabs" data-token="bg-tertiary">
-                                                            <span class="tp-tab tp-tab--active" data-token="text-primary">{{ t('navbar.tab.status') }}</span>
-                                                            <span class="tp-tab" data-token="text-secondary">{{ t('navbar.tab.settings') }}</span>
-                                                        </span>
-                                                    </div>
-                                                    <div class="tp-body">
-                                                        <div class="tp-hero">
-                                                            <span class="tp-display" data-token="text-primary">Aa</span>
-                                                            <span class="min-w-0">
-                                                                <span class="tp-heading" data-token="text-primary">{{ t('settings.theme.heading') }}</span>
-                                                                <span class="tp-sub" data-token="text-tertiary">{{ t('settings.theme.preview_subtitle') }}</span>
-                                                            </span>
-                                                        </div>
-                                                        <div class="tp-card" data-token="border-faint">
-                                                            <div class="tp-row">
-                                                                <span class="tp-label" data-token="text-secondary">{{ t('settings.theme.preview_port') }}</span>
-                                                                <span class="tp-input" data-token="border-normal">8000</span>
-                                                            </div>
-                                                            <div class="tp-row tp-row--alt" data-token="bg-secondary">
-                                                                <span class="tp-code" data-token="code-bg">/v1/models</span>
-                                                                <span class="tp-link" data-token="link-color">{{ t('settings.theme.preview_link') }}</span>
-                                                            </div>
-                                                            <div class="tp-row">
-                                                                <span class="tp-meter" data-token="timeline-accent"><span class="tp-meter__fill"></span></span>
-                                                                <span class="tp-danger" data-token="text-danger">{{ t('settings.theme.preview_danger') }}</span>
-                                                            </div>
-                                                        </div>
-                                                        <div class="tp-badges">
-                                                            <span class="tp-badge tp-badge--success" data-token="success">{{ t('settings.theme.token.success') }}</span>
-                                                            <span class="tp-badge tp-badge--warning" data-token="warning">{{ t('settings.theme.token.warning') }}</span>
-                                                            <span class="tp-badge tp-badge--danger" data-token="danger">{{ t('settings.theme.token.danger') }}</span>
-                                                            <span class="tp-badge tp-badge--info" data-token="info">{{ t('settings.theme.token.info') }}</span>
-                                                        </div>
-                                                        <div class="tp-actions">
-                                                            <span class="tp-switch" data-token="switch-on"><span class="tp-switch__knob"></span></span>
-                                                            <span class="tp-btn tp-btn--hover" data-token="btn-primary-hover">{{ t('settings.theme.preview_hover') }}</span>
-                                                            <span class="tp-btn tp-btn--primary tp-btn--focus" data-token="btn-primary">{{ t('settings.save.button') }}</span>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                                <!-- Contrast checks -->
-                                                <ul class="space-y-0.5 text-caption">
-                                                    <template x-for="check in themeContrastChecks(mode)" :key="check.id">
-                                                        <li class="flex items-center justify-between gap-2">
-                                                            <span class="text-neutral-500" x-text="window.t('settings.theme.contrast.' + check.id)"></span>
-                                                            <span class="font-mono"
-                                                                  :class="check.ok ? 'text-neutral-700' : 'text-amber-700'"
-                                                                  :title="check.ok ? '' : window.t('settings.theme.contrast_low')"
-                                                                  x-text="check.ratio.toFixed(1) + ':1' + (check.ok ? '' : ' ⚠')"></span>
-                                                        </li>
-                                                    </template>
-                                                </ul>
+                                                <!-- Drawn by theme_preview.js, the same card the image export draws -->
+                                                <canvas class="theme-preview" aria-hidden="true" data-version="{{ version }}"
+                                                        x-effect="drawThemePreview($el, mode)"
+                                                        @click="focusThemeToken(mode, $event)"
+                                                        @mousemove="hoverThemePreview($el, mode, $event)"
+                                                        @mouseleave="hoverThemePreview($el, mode, null)"></canvas>
                                             </div>
                                         </template>
                                     </div>
@@ -2188,20 +2140,22 @@
                                 <summary class="cursor-pointer px-6 py-4 bg-neutral-100 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.theme.json.summary') }}</summary>
                                 <div class="px-6 py-4">
                                     <p class="text-xs text-neutral-500">{{ t('settings.theme.json.hint') }}</p>
-                                    <textarea x-model="customThemeJson" rows="5" spellcheck="false"
+                                    <textarea x-model="customThemeJson" x-ref="customThemeJsonField" rows="5" spellcheck="false"
                                               aria-label="{{ t('settings.theme.json.summary') }}"
                                               class="mt-2 w-full rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2 font-mono text-xs text-neutral-700"
                                               placeholder='{"light": {"bg-primary": "#ffffff"}, "dark": {}}'></textarea>
                                     <div class="mt-2 flex flex-wrap items-center gap-2">
                                         <button type="button" @click="copyCustomThemeJson()"
-                                                class="px-3 py-1.5 rounded-full border border-neutral-300 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50">
-                                            {{ t('settings.theme.json.copy') }}
+                                                class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-neutral-300 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50">
+                                            <i x-show="customThemeJsonCopied" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                            <span x-text="customThemeJsonCopied ? window.t('settings.theme.json.copied') : window.t('settings.theme.json.copy')">{{ t('settings.theme.json.copy') }}</span>
                                         </button>
                                         <button type="button" @click="importCustomThemeJson()"
                                                 class="px-3 py-1.5 rounded-full bg-neutral-900 text-white text-xs font-semibold hover:bg-neutral-800">
                                             {{ t('settings.theme.json.load') }}
                                         </button>
                                         <span x-show="customThemeJsonError" x-cloak class="text-xs text-red-600" x-text="customThemeJsonError"></span>
+                                        <span x-show="customThemeJsonCopyBlocked" x-cloak class="text-xs text-neutral-500">{{ t('settings.theme.json.copy_blocked') }}</span>
                                     </div>
                                 </div>
                             </details>
@@ -2215,9 +2169,17 @@
                                     <span x-show="customThemeError" x-cloak class="flex items-center gap-2 text-sm text-red-600">
                                         <i data-lucide="alert-circle" class="w-4 h-4 shrink-0"></i><span x-text="customThemeError"></span>
                                     </span>
-                                    <span x-show="!customThemeInputsValid" x-cloak class="flex items-center gap-2 text-sm text-red-600">
-                                        <i data-lucide="alert-circle" class="w-4 h-4 shrink-0"></i>{{ t('settings.theme.invalid') }}
-                                    </span>
+                                    <div x-show="!customThemeInputsValid" x-cloak role="status" class="text-sm text-red-600">
+                                        <span class="flex items-center gap-2">
+                                            <i data-lucide="alert-circle" class="w-4 h-4 shrink-0"></i>
+                                            <span x-text="window.t(themeContrastFailures.length ? 'settings.theme.contrast.failed' : 'settings.theme.invalid')"></span>
+                                        </span>
+                                        <ul class="mt-1 ml-6 space-y-0.5 text-xs">
+                                            <template x-for="failure in themeContrastFailures" :key="failure.mode + failure.foreground + failure.background">
+                                                <li x-text="themeContrastMessage(failure)"></li>
+                                            </template>
+                                        </ul>
+                                    </div>
                                 </div>
                                 <div class="flex flex-wrap items-center justify-between gap-2">
                                     <button type="button" @click="resetCustomTheme()"
@@ -2253,22 +2215,26 @@
                         <div class="space-y-4 min-w-0">
                             <template x-for="group in customThemeGroups" :key="group.id">
                                 <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                                    <div class="theme-token-row theme-token-row--head px-4 sm:px-6 bg-neutral-100 border-b border-neutral-200">
-                                        <span class="text-xs font-bold uppercase tracking-wider text-neutral-600"
+                                    <div class="theme-token-row theme-token-row--head bg-neutral-100">
+                                        <span class="theme-token-label text-xs font-bold uppercase tracking-wider text-neutral-600"
                                               x-text="window.t('settings.theme.group.' + group.id)"></span>
-                                        <span class="theme-token-cell theme-mode-head text-xs font-semibold"
-                                              :style="themeModeHeadStyle('light')">
-                                            <i data-lucide="sun" class="w-3.5 h-3.5"></i>{{ t('settings.theme.light') }}
-                                        </span>
-                                        <span class="theme-token-cell theme-mode-head text-xs font-semibold"
-                                              :style="themeModeHeadStyle('dark')">
-                                            <i data-lucide="moon" class="w-3.5 h-3.5"></i>{{ t('settings.theme.dark') }}
-                                        </span>
+                                        <div class="theme-mode-cell" :style="themeModeCellStyle('light', 'bg-tertiary')">
+                                            <span class="theme-token-cell theme-mode-head text-xs font-semibold"
+                                                  :style="themeModeHeadStyle('light')">
+                                                <i data-lucide="sun" class="w-3.5 h-3.5"></i>{{ t('settings.theme.light') }}
+                                            </span>
+                                        </div>
+                                        <div class="theme-mode-cell" :style="themeModeCellStyle('dark', 'bg-tertiary')">
+                                            <span class="theme-token-cell theme-mode-head text-xs font-semibold"
+                                                  :style="themeModeHeadStyle('dark')">
+                                                <i data-lucide="moon" class="w-3.5 h-3.5"></i>{{ t('settings.theme.dark') }}
+                                            </span>
+                                        </div>
                                     </div>
-                                    <div class="settings-rows px-4 sm:px-6">
+                                    <div class="theme-token-rows">
                                         <template x-for="token in group.tokens" :key="token">
                                             <div class="theme-token-row">
-                                                <div class="min-w-0">
+                                                <div class="theme-token-label min-w-0">
                                                     <div class="text-sm text-neutral-700" x-text="window.t('settings.theme.token.' + token)"></div>
                                                     <code class="text-caption text-neutral-400" x-text="'--' + token"></code>
                                                 </div>
@@ -2276,7 +2242,7 @@
                                                     <div class="theme-token-cell theme-mode-cell" :style="themeModeCellStyle(mode)">
                                                         <button type="button" @click="resetThemeToken(mode, token)"
                                                                 :style="themeTokenChanged(mode, token) ? '' : 'visibility: hidden'"
-                                                                class="p-1.5 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-colors"
+                                                                class="theme-cell-reset p-1.5 rounded-lg transition-colors"
                                                                 :title="window.t('settings.theme.reset_token')"
                                                                 :aria-label="window.t('settings.theme.reset_token')">
                                                             <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
@@ -2293,10 +2259,11 @@
                                                                @keydown.enter.prevent="normalizeThemeInput(mode, token)"
                                                                :placeholder="customThemeDefaults[mode][token]"
                                                                :aria-label="window.t('settings.theme.token.' + token) + ' · ' + window.t(mode === 'light' ? 'settings.theme.light' : 'settings.theme.dark')"
-                                                               :aria-invalid="themeTokenValid(mode, token) ? 'false' : 'true'"
+                                                               :aria-invalid="themeTokenFlagged(mode, token) ? 'true' : 'false'"
                                                                spellcheck="false" autocomplete="off" maxlength="7"
                                                                class="theme-hex-input px-2.5 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all"
-                                                               :class="themeTokenValid(mode, token) ? '' : 'theme-hex-input--invalid'">
+                                                               :class="themeTokenFlagged(mode, token) ? 'theme-hex-input--invalid' : ''"
+                                                               :style="'--theme-cell-danger:' + themeModeColor(mode, 'text-danger')">
                                                     </div>
                                                 </template>
                                             </div>
@@ -2310,6 +2277,25 @@
                 </div>
             </div>
             </div>
+
+            <dialog x-effect="showCustomThemeRestoreConfirm ? $el.showModal() : $el.close()" x-cloak
+                    class="dashboard-dialog fixed inset-0 z-[60] overflow-y-auto"
+                    aria-modal="true" aria-labelledby="theme-restore-title" aria-describedby="theme-restore-message"
+                    @keydown.tab="trapDialogFocus($event)" @cancel.prevent="cancelCustomThemeRestore()">
+                <div class="fixed inset-0 bg-black/50" @click="cancelCustomThemeRestore()"></div>
+                <div class="flex min-h-full items-center justify-center p-4">
+                    <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6" @click.stop>
+                        <h4 id="theme-restore-title" class="text-lg font-bold text-neutral-900 mb-3">{{ t('settings.theme.restore_defaults') }}</h4>
+                        <p id="theme-restore-message" class="text-sm text-neutral-600">{{ t('settings.theme.restore_confirm') }}</p>
+                        <div class="flex justify-end gap-3 mt-6">
+                            <button type="button" autofocus @click="cancelCustomThemeRestore()"
+                                    class="px-5 py-2.5 text-sm font-medium text-neutral-600 rounded-full hover:bg-neutral-100">{{ t('settings.global.reset_cancel') }}</button>
+                            <button type="button" @click="confirmCustomThemeRestore()"
+                                    class="px-5 py-2.5 text-sm font-medium text-white bg-neutral-900 rounded-full hover:bg-neutral-700">{{ t('settings.theme.restore_ok') }}</button>
+                        </div>
+                    </div>
+                </div>
+            </dialog>
 
             <dialog x-effect="showGlobalResetNotice ? $el.showModal() : $el.close()" x-cloak
                     class="dashboard-dialog fixed inset-0 z-[60] overflow-y-auto"

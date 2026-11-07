@@ -19,17 +19,28 @@ Where to use what:
 | Stylesheets | Semantic tokens, or palette entries for one-off marks |
 | Styles built in JS | `rgb(var(--palette-x) / alpha)` |
 
-Do not write hex or `rgb()` literals outside `theme.css`. The one exception is the Enhanced Readability block in `base.html`: its `[style*="color: #..."]` selectors match inline style text, so they keep the literal hex.
+Do not write hex or `rgb()` literals outside `theme.css`.
 
 Families outside Tailwind's palette:
 
 - `night-*`: dark mode surfaces and text.
-- `signal-red-*`: the readability red.
 - `mid-gray`: empty cells in the usage strip.
 
 ## Custom theme
 
-`ui.custom_theme` stores per-theme token overrides (`{"light": {"bg-primary": "#..."}, "dark": {...}}`), and `static/js/custom_theme.js` paints them before first paint. That file owns the token list and the contrast rules: the Theme Settings editor disables Apply when primary/secondary text, links or button text fall below 4.5:1. The server only checks that each value is `#rrggbb`.
+`ui.custom_theme` stores per-theme token overrides (`{"light": {"bg-primary": "#..."}, "dark": {...}}`), and `static/js/custom_theme.js` paints them before first paint. That file owns the token list and the contrast rules: the Theme Settings editor disables Apply, names the failing pairs and outlines the fields to change when primary/secondary text, links, button text (also on hover) or status badge text fall below 4.5:1 (WCAG 1.4.3 AA), or tertiary text, danger text, the focus ring, the switch or the accent fall below 3:1 (WCAG 1.4.11). Muted text and borders have no floor. The server only checks that each value is `#rrggbb`.
+
+### How the dark draft is generated
+
+**Generate dark from light** fills the dark column from the light one in OKLCH (`darkFromLight` in `custom_theme.js`); it only edits the draft, so Apply still runs the contrast check. The constants are calibrated so the stock light palette lands within about 0.03 OKLab ΔE of the stock dark one (text-muted is dimmer, about 0.06).
+
+1. Neutrals (surfaces, text, borders, controls, code background) invert their lightness, `1 - L`, through a piecewise-linear curve (0→0.23, 0.13→0.44, 0.3→0.62, 0.55→0.72, 0.8→0.95, 1→1), so the light order is kept and white lands near the stock dark surface.
+2. Neutrals keep their hue, with chroma capped at 0.012 so tints stay subtle; the switch ON track stops at L 0.72 because its knob stays white.
+3. Status fills keep their color unless darker than L 0.62; links, the timeline accent and danger text are lifted to at least L 0.71, like stock blue-600 → blue-400.
+4. A color outside sRGB keeps its lightness and hue and loses chroma until it fits.
+5. A foreground below its contrast floor on any of its backgrounds moves its lightness away from them in 0.01 steps until it passes.
+
+The Preview header's Save as image button writes both modes, every token's English name and exact hex, and the same palette as JSON in an `omlx-theme` `tEXt` chunk. The image is English-only so it can be handed to an agent or shared outside the dashboard. `theme_preview.js` draws the preview card for both: the Preview canvases in the UI language, the image with its fixed English labels, so the two never drift apart.
 
 ## Type
 
@@ -41,7 +52,7 @@ Families outside Tailwind's palette:
 | Large | `text-base`, `text-lg` | 16px, 18px | Emphasis, card titles |
 | Heading | `text-xl`, `text-2xl` | 20px, 24px | Page headings, stat figures |
 
-Do not use pixel sizes such as `text-[11px]`. The serving stat figures (`lg:text-[32px]`) are the only exception. Enhanced Readability raises `text-caption` and badge text to 12px.
+Do not use pixel sizes such as `text-[11px]`. The serving stat figures (`lg:text-[32px]`) are the only exception.
 
 ## Buttons
 
