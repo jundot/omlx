@@ -154,7 +154,12 @@ def apply() -> bool:
             if _is_mtp_batch_eligible(self):
                 policy = _batch_policy_for_next(self)
                 _batch_park_memory(self.model).tick()
-                if policy is not None and policy.needs_standard():
+                standard = policy is not None and policy.needs_standard()
+                sync = _cluster_mtp(model)
+                if sync is not None and policy is not None:
+                    # Rank zero decides from its timings; the other ranks follow.
+                    standard, policy.cur = sync.share_batch_plan(standard, policy.cur)
+                if standard:
                     if not _reconcile_mtp_batch_to_standard(self):
                         raise RuntimeError(
                             "Lightning MTP could not restore batch calibration state"
@@ -766,7 +771,9 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
 def _model_supports_batch_mtp(model: Any) -> bool:
     """Only validated model adapters opt into multi-request Lightning MTP."""
     if _cluster_mtp(model) is not None:
-        return False
+        hosts = (model, getattr(model, "_language_model", None), getattr(model, "language_model", None))
+        if not any(callable(getattr(h, "mtp_cluster_batch_ok", None)) and h.mtp_cluster_batch_ok() for h in hosts):
+            return False
     return any(
         getattr(host, "_omlx_mtp_multi_request", False) is True
         for host in (
@@ -931,6 +938,8 @@ class _MtpState:
     hist_offset: int = 0
     # A consumed priming context proves this request's hidden capture works.
     head_history_primed: bool = False
+    # Cluster: this cycle's verify tokens already came from rank zero (batched cycle).
+    cluster_inputs_shared: bool = False
     # Sampler for draft tokens (lazily resolved). For stochastic target
     # samplers this is a *sharper* distribution than the target (temp 0.6 /
     # top_p 0.95 / top_k 20) — the Leviathan/Chen acceptance ratio uses the
@@ -3662,9 +3671,15 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
                     ),
                 )
     _clip_to_shared_window(states)
-    depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
+    sync = _cluster_mtp(gen_batch.model)
     started = time.perf_counter()
     try:
+        if sync is not None:
+            # Rank zero's clipped verify tokens reach every rank before rows group by width.
+            for state in states:
+                _share_cycle_inputs(sync, state)
+                state.cluster_inputs_shared = True
+        depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
         advance(gen_batch, batch_state)
         per_row = {}
         for uid in gen_batch.uids:
@@ -3675,11 +3690,13 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
     finally:
         for state, (controller, depth) in zip(states, saved):
             state.controller, state.depth = controller, depth
+            state.cluster_inputs_shared = False
     elapsed = (
         policy.cycle_time_ms("mtp", started, time.perf_counter())
         if policy is not None
         else 0.0
     )
+    park = False
     if (
         policy is not None
         and not copied
@@ -3704,20 +3721,22 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
                 elapsed,
                 policy.cur,
             )
-        if policy.should_park():
-            if not _reconcile_mtp_batch_to_standard(gen_batch):
-                raise RuntimeError(
-                    "Lightning MTP could not restore batch parking state"
-                )
-            policy.park()
-            _batch_park_memory(gen_batch.model).parked(policy)
-            logger.info(
-                "Lightning MTP batch parked: rows=%d standard_ms=%.3f cooldown=%d",
-                len(states),
-                median(policy.standard),
-                policy.remaining,
-            )
-            _drop_mtp_batch_state(gen_batch, "batch-parked", log_stats=True)
+        park = policy.should_park()
+    if sync is not None and policy is not None:
+        # Every rank asks once per cycle: rank zero alone may have measured it.
+        park = sync.share_batch_park(park)
+    if park:
+        if not _reconcile_mtp_batch_to_standard(gen_batch):
+            raise RuntimeError("Lightning MTP could not restore batch parking state")
+        policy.park()
+        _batch_park_memory(gen_batch.model).parked(policy)
+        logger.info(
+            "Lightning MTP batch parked: rows=%d standard_ms=%.3f cooldown=%d",
+            len(states),
+            median(policy.standard) if policy.standard else 0.0,
+            policy.remaining,
+        )
+        _drop_mtp_batch_state(gen_batch, "batch-parked", log_stats=True)
     return result
 
 
@@ -4389,6 +4408,28 @@ def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
     return SparseDraftQ(ids, mx.zeros(ids.shape, dtype=mx.float32), vocab)
 
 
+_MISSING_CYCLE_INPUTS = "chain cycle entered without next_main / drafts"
+
+
+def _share_cycle_inputs(sync: Any, state: _MtpState) -> None:
+    """Every cluster rank verifies rank zero's tokens, or leaves MTP with it."""
+    import mlx.core as mx
+
+    follower = not sync.is_leader
+    ready = state.next_main is not None and state.drafts is not None
+    lead = ready and not follower
+    main_ids, shared_drafts, reason = sync.share_cycle_inputs(
+        state.next_main.tolist() if lead else None,
+        state.drafts.tolist() if lead else None,
+        fallback=None if ready or follower else _MISSING_CYCLE_INPUTS,
+    )
+    if reason:
+        raise _MtpStepFallback(reason)
+    if follower:
+        state.next_main = mx.array(main_ids, dtype=mx.uint32)
+        state.drafts = mx.array(shared_drafts, dtype=mx.uint32)
+
+
 def _run_verify_cycle_chain(
     gen_batch: Any,
     state: _MtpState,
@@ -4414,26 +4455,14 @@ def _run_verify_cycle_chain(
 
     import mlx.core as mx
 
-    missing = "chain cycle entered without next_main / drafts"
     sync = _cluster_mtp(gen_batch.model)
     follower = sync is not None and not sync.is_leader
     seed = None
-    if sync is not None:
-        # Every rank verifies rank zero's tokens, or leaves MTP with it.
-        ready = state.next_main is not None and state.drafts is not None
-        lead = ready and not follower
-        main_ids, shared_drafts, reason = sync.share_cycle_inputs(
-            state.next_main.tolist() if lead else None,
-            state.drafts.tolist() if lead else None,
-            fallback=None if ready or follower else missing,
-        )
-        if reason:
-            raise _MtpStepFallback(reason)
-        if follower:
-            state.next_main = mx.array(main_ids, dtype=mx.uint32)
-            state.drafts = mx.array(shared_drafts, dtype=mx.uint32)
+    if sync is not None and not state.cluster_inputs_shared:
+        _share_cycle_inputs(sync, state)
+    state.cluster_inputs_shared = False
     if state.next_main is None or state.drafts is None:
-        raise _MtpStepFallback(missing)
+        raise _MtpStepFallback(_MISSING_CYCLE_INPUTS)
 
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)

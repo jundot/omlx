@@ -1301,12 +1301,8 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         shareds = [{} for _ in range(b_n)]
         engram_ids = list(c.engram_layer_ids)
         stage = self._stage()
-        # Requests verify together only on one plain rank (DSparkMixin.mtp_shared_verify_rows).
-        together = (
-            not getattr(self, "_omlx_mtp_verify_only", False)
-            and self.pipeline_size == 1
-            and stage[0][1]._tensor_group is None
-        )
+        shared_rows = getattr(self, "mtp_shared_verify_rows", None)
+        together = callable(shared_rows) and shared_rows() > 0
         prefetch = getattr(self, "_engram_prefetch", None)
         with prefetch.forward() if prefetch is not None else nullcontext():
             first = self._next_engram(stage, -1)
@@ -1362,7 +1358,6 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             and b_n * r_n <= decode_fused.MAX_BATCH
             and inputs_embeds is None
             and not kwargs.get("_ced_prefill", False)
-            and self.pipeline_size == 1
             and self._stage()[0][1]._tensor_group is None
         ):
             return False
@@ -1396,6 +1391,8 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         h = self.embed(input_ids)
         h = mx.repeat(h[..., None, :], c.hc_mult, -2)
         pre = mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1])
+        if self.pipeline_rank < self.pipeline_size - 1:
+            h, pre = _receive_stage(h, pre, self.pipeline_rank + 1)
         shareds = [{} for _ in range(b_n)]
         captured = {}
         engram_ids = list(c.engram_layer_ids)

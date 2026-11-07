@@ -190,7 +190,8 @@ def _verify_rows_together(batch, batch_state, host, indices, replacements):
         bg._run_verify_cycle_chain(
             row,
             state,
-            verify_result=(logits[i : i + 1], hidden[i : i + 1], None, None),
+            # A verify-only cluster rank gets no hidden: it never drafts.
+            verify_result=(logits[i : i + 1], None if hidden is None else hidden[i : i + 1], None, None),
             verify_ms=verify_ms,
             draft_jobs=jobs,
         )

@@ -704,6 +704,108 @@ def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, 
         assert result[uid][:16] == want
 
 
+# Two pipeline ranks run batched Lightning MTP for two requests (rank 0 holds the head and
+# the DSpark target layers, rank 1 replays its cycles).
+_CLUSTER_MTP_BATCH_RANK = """
+import json
+import sys
+
+import mlx.core as mx
+
+group = mx.distributed.init(backend="ring", strict=True)
+sys.path.insert(0, sys.argv[1])
+import test_deepseek_v41_fused_decode as t
+from mlx_lm.generate import BatchGenerator
+from omlx.cluster.control_plane import RankControlPlane
+from omlx.cluster.mtp_sync import ClusterMtpSync
+from omlx.cluster.planner import PipelineAssignment, install_unequal_pipeline_plan
+from omlx.patches.mlx_lm_mtp import batch_generator
+
+batch_generator.apply()
+port, rank, limit = int(sys.argv[2]), group.rank(), 12
+prompts = [[3 + r + j for j in range(9)] for r in range(0, 18, 9)]
+
+def model():
+    return t.build(fmt="affine", vocab_size=4096, preserve_mtp=True, n_mtp_layers=1, dspark_block_size=3,
+                   dspark_noise_token_id=2, dspark_target_layer_ids=(3, 4), dspark_markov_rank=32)
+
+full = model()
+expected = []
+for prompt in prompts:
+    tokens, cache = [], full.make_cache()
+    full(mx.array([prompt[:-1]]), cache=cache)
+    ids = mx.array([prompt[-1:]])
+    for _ in range(limit):
+        token = int(mx.argmax(full(ids, cache=cache)[0, -1]).item())
+        tokens.append(token)
+        ids = mx.array([[token]])
+    expected.append(tokens)
+
+stage = model()
+plan = (PipelineAssignment("a", 0, 3, 5, 1, 0, 0, 1), PipelineAssignment("b", 1, 0, 3, 1, 0, 0, 1))
+with install_unequal_pipeline_plan(plan):
+    stage.pipeline(group)
+stage.configure_mtp(True, 2, verify_only=rank != 0)
+together, accepted = [], []
+real = type(stage).mtp_verify_rows
+def counted(self, inputs, row_caches):
+    together.append(int(inputs.shape[0]))
+    return real(self, inputs, row_caches)
+type(stage).mtp_verify_rows = counted
+share_result = ClusterMtpSync.share_cycle_result
+def recorded(self, *a):
+    out = share_result(self, *a)
+    accepted.append(out[0])
+    return out
+ClusterMtpSync.share_cycle_result = recorded
+
+def oracle_drafts(jobs):
+    # Rank 0 drafts each request's true next tokens, with a wrong last draft every third
+    # position, so cycles accept and reject.
+    for row, state, _, _, _ in jobs:
+        i = uids.index(state.uid)
+        done = len(row.tokens[0]) - len(prompts[i]) + len(state.queue)
+        ids = (expected[i][done : done + state.depth] + [0] * state.depth)[: state.depth]
+        if done % 3 == 0:
+            ids[-1] = (ids[-1] + 1) % 4096
+        state.drafts = mx.array(ids, dtype=mx.uint32)
+        state.draft_lps, state.draft_accept_lps = [], []
+if rank == 0:
+    batch_generator._dspark_draft_jobs = oracle_drafts
+
+with RankControlPlane(rank=rank, world_size=2, host="127.0.0.1", port=port, token="v41-mtp-batch") as plane:
+    stage._omlx_cluster_mtp = ClusterMtpSync(rank=rank, control_plane=plane)
+    gen = BatchGenerator(stage, max_tokens=limit, prefill_batch_size=len(prompts),
+                         sampler=lambda logits: mx.argmax(logits, -1))
+    result = {}
+    try:
+        uids = gen.insert(prompts)
+        for _ in range(8 * limit):
+            _, responses = gen.next()
+            for response in responses:
+                result.setdefault(response.uid, []).append(response.token)
+            if all(len(result.get(uid, [])) >= limit for uid in uids):
+                break
+    finally:
+        gen.close()
+assert [result[uid][:limit] for uid in uids] == expected, (result, expected)
+assert together and max(together) == len(prompts), together
+assert max(accepted) > 0 and min(accepted) < max(accepted), accepted
+print(json.dumps({"rank": rank, "ok": True, "together": len(together)}), flush=True)
+"""
+
+
+@pytest.mark.slow
+def test_cluster_mtp_verifies_several_requests_together(tmp_path):
+    """Pipeline ranks verify two requests' DSpark blocks in one forward, and each request
+    reproduces its own greedy tokens."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    run_two_ranks(tmp_path, _CLUSTER_MTP_BATCH_RANK, Path(__file__).parent, port)
+
 # One rank of the cluster decode test below.
 _CLUSTER_DECODE_RANK = """
 import json
