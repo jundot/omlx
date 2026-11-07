@@ -28,16 +28,33 @@
         'border-normal': ['border-scale-300'],
     };
     const SURFACES = ['bg-primary', 'bg-secondary', 'bg-tertiary'];
-    // [foreground, backgrounds]; each pair must reach CONTRAST_FLOOR.
-    const CONTRAST_RULES = [
-        ['text-primary', SURFACES],
-        ['text-secondary', SURFACES],
-        ['link-color', SURFACES],
-        ['btn-primary-text', ['btn-primary']],
-    ];
-    const CONTRAST_FLOOR = 4.5;
     const STATUS = ['success', 'warning', 'danger', 'info'];
-    // Not edited directly; resolved too so the previews can draw stock badges.
+    // How much of a status color its badge fill and line take, and how far its
+    // text moves toward black (light) or white (dark). declarations() paints
+    // these and badgeColors() computes them, so both read this one table.
+    const BADGE_TINT = {
+        light: { soft: 0.08, line: 0.3, text: 0.35, toward: 'black' },
+        dark: { soft: 0.15, line: 0.3, text: 0.35, toward: 'white' },
+    };
+    // [foreground, backgrounds, floor]; every pair must reach its floor before
+    // Apply. 4.5:1 is WCAG 1.4.3 AA for body text, Apple's minimum up to 17 pt;
+    // 3:1 is WCAG 1.4.11 for controls, focus and graphics, and AA for bold or
+    // large text. Muted text and borders have no floor: the stock theme draws
+    // placeholders and dividers below 3:1, as WCAG allows.
+    const CONTRAST_RULES = [
+        ['text-primary', SURFACES, 4.5],
+        ['text-secondary', SURFACES, 4.5],
+        ['link-color', SURFACES, 4.5],
+        ['btn-primary-text', ['btn-primary', 'btn-primary-hover'], 4.5],
+        ...STATUS.map(status => [`${status}-text`, [`${status}-soft`], 4.5]),
+        ['text-tertiary', SURFACES, 3],
+        ['text-danger', SURFACES, 3],
+        ['focus-ring-color', SURFACES, 3],
+        ['switch-on', SURFACES, 3],
+        ['timeline-accent', SURFACES, 3],
+    ];
+    // Not edited directly; resolved too so the previews and contrast checks can
+    // use the stock badges.
     const DERIVED = STATUS.flatMap(status => ['soft', 'line', 'text'].map(part => `${status}-${part}`));
     const TOKENS = GROUPS.flatMap(group => group.tokens);
     // Tokens are opaque: a translucent text color would make the contrast
@@ -61,27 +78,138 @@
         return '#' + byte(r) + byte(g) + byte(b);
     }
 
+    // sRGB byte <-> linear light.
+    function linear(c) {
+        const s = c / 255;
+        return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+    }
+
+    function gamma(c) {
+        const s = Math.max(0, c);
+        return 255 * (s <= 0.0031308 ? 12.92 * s : 1.055 * s ** (1 / 2.4) - 0.055);
+    }
+
     // WCAG 2 ratio; null when either color is not a valid hex.
     function contrast(fg, bg) {
         const pair = [rgb(fg), rgb(bg)];
         if (!pair[0] || !pair[1]) return null;
         const luminance = channels => {
-            const [r, g, b] = channels.map(c => {
-                const s = c / 255;
-                return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
-            });
+            const [r, g, b] = channels.map(linear);
             return 0.2126 * r + 0.7152 * g + 0.0722 * b;
         };
         const [hi, lo] = pair.map(luminance).sort((a, b) => b - a);
         return (hi + 0.05) / (lo + 0.05);
     }
 
+    // `colors` maps tokens, including the derived badge colors, to opaque hex.
     function contrastChecks(colors) {
-        return CONTRAST_RULES.flatMap(([foreground, backgrounds]) => backgrounds.map(background => ({
-            foreground,
-            background,
-            ratio: contrast(colors[foreground], colors[background]),
-        })));
+        return CONTRAST_RULES.flatMap(([foreground, backgrounds, floor]) => backgrounds.map(background => {
+            const ratio = contrast(colors[foreground], colors[background]);
+            return { foreground, background, ratio, floor, ok: ratio !== null && ratio >= floor };
+        }));
+    }
+
+    // A CSS rgb()/rgba() or hex color drawn over an opaque hex, as opaque hex.
+    function flatten(color, under) {
+        const hex = normalizeHex(color);
+        if (hex) return hex;
+        const [r, g, b, a = 1] = (String(color).match(/[\d.]+/g) || []).map(Number);
+        const base = rgb(under) || [0, 0, 0];
+        return toHex(...[r, g, b].map((c, i) => c * a + base[i] * (1 - a)));
+    }
+
+    // The badge fill, line and text a custom status color paints (see
+    // declarations()), flattened onto the page background.
+    function badgeColors(mode, hex, page) {
+        const tint = BADGE_TINT[mode];
+        const mix = (weight, other) => toHex(...rgb(hex).map((c, i) => c * weight + other[i] * (1 - weight)));
+        return {
+            soft: mix(tint.soft, rgb(page)),
+            line: mix(tint.line, rgb(page)),
+            text: mix(1 - tint.text, tint.toward === 'white' ? [255, 255, 255] : [0, 0, 0]),
+        };
+    }
+
+    // OKLCH (Ottosson's OKLab in polar form, hue in radians) so lightness steps
+    // look even; used only to generate a dark draft.
+    function oklch(hex) {
+        const [r, g, b] = rgb(hex).map(linear);
+        const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+        const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+        const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+        const A = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s;
+        const B = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s;
+        return [0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s, Math.hypot(A, B), Math.atan2(B, A)];
+    }
+
+    function oklchToLinear(L, C, h) {
+        const [A, B] = [C * Math.cos(h), C * Math.sin(h)];
+        const l = (L + 0.3963377774 * A + 0.2158037573 * B) ** 3;
+        const m = (L - 0.1055613458 * A - 0.0638541728 * B) ** 3;
+        const s = (L - 0.0894841775 * A - 1.2914855480 * B) ** 3;
+        return [
+            4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+            -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+            -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+        ];
+    }
+
+    // Out-of-gamut colors keep L and hue and lose chroma until sRGB fits.
+    function fromOklch([L, C, h]) {
+        const lightness = Math.min(1, Math.max(0, L));
+        const fits = chroma => oklchToLinear(lightness, chroma, h).every(v => v > -1e-4 && v < 1 + 1e-4);
+        let chroma = C;
+        if (!fits(C)) {
+            let [lo, hi] = [0, C];
+            for (let i = 0; i < 20; i++) [lo, hi] = fits((lo + hi) / 2) ? [(lo + hi) / 2, hi] : [lo, (lo + hi) / 2];
+            chroma = lo;
+        }
+        return toHex(...oklchToLinear(lightness, chroma, h).map(gamma));
+    }
+
+    // Dark draft from a light palette, calibrated on the stock themes
+    // (see "How the dark draft is generated" in docs/web-ui-design.md):
+    // neutrals invert their lightness through NEUTRAL_CURVE, accents keep their
+    // hue and only lighten, then a failing contrast pair walks its foreground's
+    // lightness away from the background until it passes.
+    const NEUTRAL_CURVE = [[0, 0.23], [0.13, 0.44], [0.3, 0.62], [0.55, 0.72], [0.8, 0.95], [1, 1]];
+    const NEUTRAL_MAX_CHROMA = 0.012;
+    // The switch knob stays white in dark mode, so the ON track stays mid-grey.
+    const SWITCH_MAX_L = 0.72;
+    // Status fills stay at stock's 500 shades; text-like accents reach the 400s.
+    const ACCENT_MIN_L = {
+        success: 0.62, warning: 0.62, danger: 0.62, info: 0.62,
+        'timeline-accent': 0.71, 'link-color': 0.71, 'text-danger': 0.71,
+    };
+
+    function darkFromLight(light) {
+        const dark = {};
+        for (const token of TOKENS) {
+            const [L, C, h] = oklch(light[token]);
+            if (token in ACCENT_MIN_L) {
+                dark[token] = fromOklch([Math.max(L, ACCENT_MIN_L[token]), C, h]);
+                continue;
+            }
+            const x = Math.min(1, Math.max(0, 1 - L));
+            const i = Math.max(1, NEUTRAL_CURVE.findIndex(([x1]) => x1 >= x));
+            const [[x0, y0], [x1, y1]] = [NEUTRAL_CURVE[i - 1], NEUTRAL_CURVE[i]];
+            const lightness = y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+            dark[token] = fromOklch([
+                token === 'switch-on' ? Math.min(lightness, SWITCH_MAX_L) : lightness,
+                Math.min(C, NEUTRAL_MAX_CHROMA),
+                h,
+            ]);
+        }
+        // Badge text is derived from the status color, so only editable pairs are nudged.
+        for (const [foreground, backgrounds, floor] of CONTRAST_RULES.filter(([fg]) => TOKENS.includes(fg))) {
+            let [L, C, h] = oklch(dark[foreground]);
+            const step = L >= oklch(dark[backgrounds[0]])[0] ? 0.01 : -0.01;
+            while (L > 0 && L < 1 && backgrounds.some(bg => contrast(dark[foreground], dark[bg]) < floor)) {
+                L += step;
+                dark[foreground] = fromOklch([L, C, h]);
+            }
+        }
+        return dark;
     }
 
     function sanitize(theme) {
@@ -107,11 +235,12 @@
         for (const channel of CHANNELS[token] || []) lines.push(`--${channel}: ${r} ${g} ${b};`);
         if (STATUS.includes(token)) {
             // The stock soft fills and lines are tints of the solid colour.
-            const tint = mode === 'dark' ? ['15%', '30%', 'white 35%'] : ['8%', '30%', 'black 35%'];
+            const tint = BADGE_TINT[mode];
+            const percent = value => `${Math.round(value * 100)}%`;
             const base = mode === 'dark' ? 'transparent' : 'var(--bg-primary)';
-            lines.push(`--${token}-soft: color-mix(in srgb, ${hex} ${tint[0]}, ${base});`);
-            lines.push(`--${token}-line: color-mix(in srgb, ${hex} ${tint[1]}, ${base});`);
-            lines.push(`--${token}-text: color-mix(in srgb, ${hex}, ${tint[2]});`);
+            lines.push(`--${token}-soft: color-mix(in srgb, ${hex} ${percent(tint.soft)}, ${base});`);
+            lines.push(`--${token}-line: color-mix(in srgb, ${hex} ${percent(tint.line)}, ${base});`);
+            lines.push(`--${token}-text: color-mix(in srgb, ${hex}, ${tint.toward} ${percent(tint.text)});`);
             // One channel per palette step keeps status.css's shade ladder.
             const pct = (light, dark) => (mode === 'dark' ? dark : light);
             const tintMix = (value, surface) => `color-mix(in srgb, ${hex} ${value}, ${surface})`;
@@ -229,8 +358,9 @@
     }
 
     const api = {
-        GROUPS, TOKENS, DERIVED, MODES, CONTRAST_RULES, CONTRAST_FLOOR,
-        normalizeHex, contrast, contrastChecks, sanitize, isEmpty, apply, defaults, css, declarations,
+        GROUPS, TOKENS, DERIVED, MODES, STATUS, CONTRAST_RULES,
+        normalizeHex, contrast, contrastChecks, flatten, badgeColors, sanitize, isEmpty, apply, defaults, css,
+        oklch, fromOklch, darkFromLight,
     };
     if (typeof window !== 'undefined') window.OmlxCustomTheme = api;
     if (typeof module !== 'undefined') module.exports = api;
