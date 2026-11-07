@@ -12,7 +12,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
 
 import mlx.core as mx
 
@@ -47,6 +47,13 @@ async def _close_engine_core(engine) -> bool:
             cancelled = True
     task.result()
     return cancelled
+
+
+def _common_prefix_length(a: Sequence[Any], b: Sequence[Any]) -> int:
+    return next(
+        (i for i, (x, y) in enumerate(zip(a, b)) if x != y),
+        min(len(a), len(b)),
+    )
 
 
 def _clear_teardown_references(
@@ -323,6 +330,61 @@ class BaseEngine(ABC):
         cache[key] = (suffix, persists)
         return suffix, persists
 
+    def _render_system_prefix_ids(
+        self,
+        head: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        chat_template_kwargs: Optional[Dict[str, Any]],
+    ) -> Optional[List[int]]:
+        """Return token ids the template renders ahead of the first user content."""
+        render = getattr(self, "_apply_chat_template", None)
+        if not callable(render):
+            return None
+        ids: Optional[List[int]] = None
+        try:
+            # Two probe users: the rendered texts agree up to the user content.
+            a, b = (
+                render(
+                    [dict(m) for m in head] + [{"role": "user", "content": probe}],
+                    tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                    is_partial=False,
+                    add_generation_prompt=False,
+                )
+                for probe in ("A", "B")
+            )
+            if isinstance(a, str) and isinstance(b, str):
+                n = _common_prefix_length(a, b)
+                if n:
+                    ids = list(self.tokenizer.encode(a[:n]))
+        except Exception as e:
+            logger.debug(f"System prefix calc failed: {e}")
+        return ids
+
+    def _specprefill_static_prefix_end(
+        self,
+        messages: List[Dict[str, Any]],
+        prompt_token_ids: Sequence[int],
+        tools: Optional[List[Dict[str, Any]]],
+        chat_template_kwargs: Optional[Dict[str, Any]],
+    ) -> int:
+        """Return how much of the prompt is system/developer/tool text and headers.
+
+        SpecPrefill uses this as a prefix length, so it is measured on the render.
+        Subtracting a render without the system messages comes out short when the
+        template adds a default system block to that render. Returns 0 unless a
+        system or developer message leads the conversation.
+        """
+        head = []
+        for message in messages:
+            if message.get("role") not in ("system", "developer"):
+                break
+            head.append(dict(message))
+        if not head or len(head) == len(messages):
+            return 0
+        ids = self._render_system_prefix_ids(head, tools, chat_template_kwargs)
+        return _common_prefix_length(prompt_token_ids, ids) if ids else 0
+
     def _system_prefix_ids(
         self,
         messages: List[Dict[str, Any]],
@@ -335,9 +397,6 @@ class BaseEngine(ABC):
         first time a block is seen: a one-off system prompt is not worth a
         shared snapshot.
         """
-        render = getattr(self, "_apply_chat_template", None)
-        if not callable(render):
-            return None
         head = []
         for message in messages:
             if message.get("role") not in ("system", "developer"):
@@ -360,28 +419,7 @@ class BaseEngine(ABC):
         cache.move_to_end(key)
         if cache[key] is not False:
             return cache[key]
-        ids: Optional[List[int]] = None
-        try:
-            # Two probe users: the rendered texts agree up to the user content.
-            a, b = (
-                render(
-                    [dict(m) for m in head] + [{"role": "user", "content": probe}],
-                    tools,
-                    chat_template_kwargs=chat_template_kwargs,
-                    is_partial=False,
-                    add_generation_prompt=False,
-                )
-                for probe in ("A", "B")
-            )
-            if isinstance(a, str) and isinstance(b, str):
-                n = next(
-                    (i for i, (x, y) in enumerate(zip(a, b)) if x != y),
-                    min(len(a), len(b)),
-                )
-                if n:
-                    ids = list(self.tokenizer.encode(a[:n]))
-        except Exception as e:
-            logger.debug(f"System prefix calc failed: {e}")
+        ids = self._render_system_prefix_ids(head, tools, chat_template_kwargs)
         cache[key] = ids
         return ids
 

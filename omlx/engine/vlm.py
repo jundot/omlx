@@ -4789,20 +4789,19 @@ class VLMBatchedEngine(BaseEngine):
         self,
         messages: list[dict[str, Any]],
         prompt: str | list[int],
+        template_tools: Any,
+        ct_kwargs: dict[str, Any] | None,
         kwargs: dict[str, Any],
     ) -> None:
-        """Compute the system-prompt token boundary and add it to ``kwargs``.
+        """Compute the static-prefix token boundary and add it to ``kwargs``.
 
-        SpecPrefill protects the system-prompt region from token dropping. The
-        boundary is derived by subtracting the non-system prompt token count
-        from the full prompt token count (system-only messages usually can't be
-        templated on their own). Shared by ``chat`` and ``stream_chat`` so the
-        non-streaming path protects the system prompt identically. No-op unless
-        the model has SpecPrefill enabled and the request has a system prompt.
+        SpecPrefill never drops tokens from the system/developer and tool
+        block ahead of the first turn. Shared by ``chat`` and ``stream_chat``.
+        No-op unless SpecPrefill is enabled and the request has a system or
+        developer message.
 
-        ``prompt`` is the already-tokenized VLM prompt (a list of token IDs,
-        per ``_process_chat_messages``), so the full-prompt count is just its
-        length rather than a re-encode.
+        ``prompt`` is usually token IDs from ``_process_chat_messages``. Image
+        turns render differently, so the boundary can only come out shorter.
         """
         specprefill_model_enabled = (
             getattr(self._model_settings, "specprefill_enabled", False)
@@ -4811,23 +4810,17 @@ class VLMBatchedEngine(BaseEngine):
         )
         if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
             return
-        non_system = [
-            m for m in messages if m.get("role") not in ("system", "developer")
-        ]
-        if len(non_system) < len(messages) and non_system:
-            try:
-                non_system_prompt = self._tokenizer.apply_chat_template(
-                    non_system,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                full_tokens = len(prompt)
-                non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
-                system_end = full_tokens - non_system_tokens
-                if system_end > 0:
-                    kwargs["specprefill_system_end"] = system_end
-            except Exception as e:
-                logger.debug(f"SpecPrefill: system_end calc failed: {e}")
+        try:
+            system_end = self._specprefill_static_prefix_end(
+                messages,
+                self._tokenizer.encode(prompt) if isinstance(prompt, str) else prompt,
+                template_tools,
+                ct_kwargs,
+            )
+            if system_end > 0:
+                kwargs["specprefill_system_end"] = system_end
+        except Exception as e:
+            logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
     async def generate(
         self,
@@ -5171,14 +5164,15 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
-        self._inject_specprefill_system_end(messages, prompt, kwargs)
+        template_tools = convert_tools_for_template(tools) if tools else None
+        self._inject_specprefill_system_end(
+            messages, prompt, template_tools, ct_kwargs, kwargs
+        )
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
-        system_prefix = self._system_prefix_ids(
-            messages, convert_tools_for_template(tools) if tools else None, ct_kwargs
-        )
+        system_prefix = self._system_prefix_ids(messages, template_tools, ct_kwargs)
         if system_prefix:
             kwargs["system_prefix_ids"] = system_prefix
 
@@ -5429,14 +5423,15 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         # SpecPrefill: protect the system-prompt region from token dropping.
-        self._inject_specprefill_system_end(messages, prompt, kwargs)
+        template_tools = convert_tools_for_template(tools) if tools else None
+        self._inject_specprefill_system_end(
+            messages, prompt, template_tools, ct_kwargs, kwargs
+        )
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
-        system_prefix = self._system_prefix_ids(
-            messages, convert_tools_for_template(tools) if tools else None, ct_kwargs
-        )
+        system_prefix = self._system_prefix_ids(messages, template_tools, ct_kwargs)
         if system_prefix:
             kwargs["system_prefix_ids"] = system_prefix
 
