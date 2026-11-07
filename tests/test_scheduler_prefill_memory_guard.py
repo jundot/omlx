@@ -1442,3 +1442,31 @@ def test_hot_cache_credit_excludes_the_request_own_cached_prefix():
     scheduler._memory_hard_watermark_bytes = limit
     with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError):
         scheduler.preflight_or_raise(num_prompt_tokens=32768, cached_tokens=cached)
+
+
+def test_route_preflight_admits_but_stream_check_rejects_with_real_cached_tokens():
+    """Route callers pass no cached_tokens, so route preflight credits the whole
+    hot cache. The in-stream check prices the real cached count and rejects, so
+    that backstop, not the route, is what stops an oversized cached request.
+    """
+    cached = 16384
+    scheduler = _hot_cache_credit_scheduler()
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est is not None
+    _set_held_hot_cache(scheduler, est.kv_exact)
+    limit = est.estimated - est.kv_exact
+    scheduler._memory_hard_limit_bytes = limit
+    scheduler._memory_hard_watermark_bytes = limit
+    request = _make_request(32768)
+    request.cached_tokens = cached
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)  # route: admits
+        rejection = scheduler._preflight_memory_check(request)  # stream: rejects
+    assert rejection is not None
