@@ -229,6 +229,13 @@
     }
     .usage-model-table td { white-space: nowrap; }
 
+    /* === Serving stats === */
+    /* Phones pair the stat tiles two per row; an odd count would leave a lone
+       half-width tile, so let the last one span the row. */
+    @media (max-width: 639px) {
+        .serving-stat-tile--wide { grid-column: 1 / -1; }
+    }
+
     /* === Dashboard layout grid (GridStack) === */
     /* GridStack insets every block by its 12px margin; pull the grid out by the
        same amount so Status lines up with the other tabs. */

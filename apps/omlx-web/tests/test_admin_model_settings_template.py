@@ -921,7 +921,7 @@ const ids = () => plain(app.servingStatTiles.map(tile => tile.id));
 
 app.dashLayout = context.DashboardLayout.defaultLayout();
 assert.deepEqual(ids(), ['requests', 'prefill_tokens', 'cached_tokens', 'cache_efficiency']);
-assert.equal(app.servingStatGridClass, 'sm:grid-cols-2 lg:grid-cols-4');
+assert.equal(app.servingStatGridClass, 'grid-cols-2 lg:grid-cols-4');
 
 app.dashEditing = true;
 app.dashDraft = { width: 'default', ...app._dashServingTileDraft(app.dashLayout.serving_stats_tiles) };
@@ -933,6 +933,7 @@ assert.equal(app.dashTileLocked('generated_tokens'), true);
 app.toggleDashTile('generated_tokens');
 assert.equal(app.dashTileChecked('generated_tokens'), false);
 app.toggleDashTile('cached_tokens');
+assert.equal(app.servingStatGridClass, 'grid-cols-2 lg:grid-cols-3');
 app.toggleDashTile('generated_tokens');
 assert.deepEqual(ids(), ['requests', 'prefill_tokens', 'cache_efficiency', 'generated_tokens']);
 
@@ -956,7 +957,7 @@ assert.deepEqual(ids(), ['requests']);
 assert.equal(app.dashTileLocked('requests'), true);
 app.toggleDashTile('requests');
 assert.deepEqual(ids(), ['requests']);
-assert.equal(app.servingStatGridClass, '');
+assert.equal(app.servingStatGridClass, 'grid-cols-1');
 
 // Values follow the stats scope.
 app.toggleDashTile('generated_tokens');
