@@ -380,7 +380,7 @@ class HarmonyStreamingParser:
                 content = _message_content_text(msg)
 
                 tool_calls.append({"name": name, "arguments": content})
-                logger.info(f"Extracted tool call: {name}, arguments={content}")
+                logger.info(f"Extracted tool call: {name}, arguments={content!r}")
 
         except Exception as e:
             logger.warning(f"Error extracting tool calls: {e}")
@@ -462,7 +462,9 @@ def parse_tool_calls_from_tokens(
 
         # Decode tokens for debugging
         decoded_text = encoding.decode(full_token_ids)
-        logger.info(f"parse_tool_calls input ({len(full_token_ids)} tokens): {decoded_text[:300]}...")
+        logger.info(
+            f"parse_tool_calls input ({len(full_token_ids)} tokens): {decoded_text[:300]!r}..."
+        )
 
         messages = encoding.parse_messages_from_completion_tokens(
             full_token_ids,
