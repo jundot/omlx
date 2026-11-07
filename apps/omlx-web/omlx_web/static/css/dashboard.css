@@ -724,16 +724,47 @@
     @media (max-width: 640px) { .theme-previews { grid-template-columns: minmax(0, 1fr); } }
     .theme-token-row {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) repeat(2, 11.5rem);
-        align-items: center;
-        gap: 0.75rem;
-        padding-block: 0.5rem;
+        grid-template-columns: minmax(0, 1fr) repeat(2, 13rem);
     }
-    .theme-token-row--head { padding-block: 0.625rem; }
+    .theme-token-label {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        padding: 0.5rem 0.75rem 0.5rem 1rem;
+    }
+    .theme-token-row--head .theme-token-label { padding-block: 0.625rem; }
+    @media (min-width: 640px) { .theme-token-label { padding-left: 1.5rem; } }
     .theme-token-cell { display: flex; align-items: center; justify-content: flex-end; gap: 0.375rem; }
+    /* Each mode is a full-height column in its own stock colors, ruled off from its neighbour. */
+    .theme-editor .theme-mode-cell {
+        background-color: var(--theme-cell-surface);
+        border-left: 1px solid rgb(var(--border-scale-200));
+        padding: 0.5rem 0.75rem;
+    }
+    .theme-token-row--head .theme-mode-cell { display: flex; justify-content: center; padding-block: 0.625rem; }
+    .theme-token-row--head > .theme-token-label { border-bottom: 1px solid rgb(var(--border-scale-200)); }
+    .theme-token-row--head > .theme-mode-cell { box-shadow: inset 0 -1px 0 var(--theme-cell-line); }
+    .theme-token-rows > .theme-token-row + .theme-token-row > .theme-token-label { border-top: 1px solid rgb(var(--border-scale-200)); }
+    .theme-token-rows > .theme-token-row + .theme-token-row > .theme-mode-cell {
+        box-shadow: inset 0 1px 0 var(--theme-cell-line);
+    }
+    .theme-editor .theme-mode-cell .theme-swatch { border-color: var(--theme-cell-border); }
+    .theme-editor .theme-mode-cell .theme-swatch:focus-within { outline-color: var(--theme-cell-ring); }
+    .theme-editor .theme-mode-cell .theme-hex-input:focus {
+        box-shadow: 0 0 0 2px var(--theme-cell-ring) !important;
+        border-color: var(--theme-cell-border) !important;
+    }
+    .theme-editor .theme-mode-cell .theme-cell-reset { color: var(--theme-cell-icon); }
+    .theme-editor .theme-mode-cell .theme-cell-reset:hover {
+        color: var(--theme-cell-icon-hover);
+        background-color: var(--theme-cell-hover);
+    }
     @media (max-width: 639px) {
         .theme-token-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .theme-token-row > :first-child { grid-column: 1 / -1; }
+        .theme-token-label + .theme-mode-cell,
+        .theme-token-label + template + .theme-mode-cell { border-left: 0; }
+        .theme-token-rows > .theme-token-row + .theme-token-row > .theme-mode-cell { box-shadow: none; }
         .theme-token-cell { justify-content: flex-start; }
     }
     .theme-swatch {
@@ -770,8 +801,8 @@
         color: var(--theme-cell-fg) !important;
     }
     .theme-editor .theme-mode-cell .theme-hex-input::placeholder { color: var(--theme-cell-placeholder); }
-    .theme-hex-input--invalid,
-    [data-theme="dark"] .theme-hex-input--invalid { border-color: var(--text-danger) !important; }
+    /* Outranks the column rule above and the dark `input:focus` rule. */
+    .theme-editor .theme-mode-cell .theme-hex-input.theme-hex-input--invalid { border-color: var(--theme-cell-danger) !important; }
 
     /* Drawn only from the tokens the editor sets inline. */
     .theme-preview {
