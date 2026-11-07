@@ -119,7 +119,8 @@
         generated_tokens: { label: 'status.stat.generated_tokens', field: 'total_completion_tokens' },
     };
     // Static class strings so Tailwind keeps them; indexed by tile count.
-    const SERVING_STAT_GRID_CLASSES = ['', '', 'sm:grid-cols-2', 'sm:grid-cols-2 lg:grid-cols-3', 'sm:grid-cols-2 lg:grid-cols-4'];
+    // Phones pair the tiles two per row; wider screens step up to three or four.
+    const SERVING_STAT_GRID_CLASSES = ['', 'grid-cols-1', 'grid-cols-2', 'grid-cols-2 lg:grid-cols-3', 'grid-cols-2 lg:grid-cols-4'];
     // Accuracy bench presets: benchmark -> samples, where 0 is the full
     // dataset. `standard` is the default selection; `full` is built from the
     // catalogue.
