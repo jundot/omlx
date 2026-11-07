@@ -996,6 +996,43 @@ class TestBenchmarkEngineSelection:
         assert len(engine.calls[0]["prompt"]) == 2049
         assert len(engine.calls[1]["prompt"]) == 1024
 
+    @pytest.mark.asyncio
+    async def test_pp_result_log_reports_decode_throughput(self, caplog):
+        """The PP result line is the only per-trial record in server.log,
+        so it must carry the decode rate the run already measured."""
+
+        class DecodingEngine(_FakeBenchEngine):
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=128,
+                    prompt_tokens=len(kwargs["prompt"]),
+                    cached_tokens=0,
+                    new_text="x",
+                    finished=True,
+                    finish_reason="length",
+                    prompt_tps=512.0,
+                    generation_tps=32.0,
+                )
+
+        run = BenchmarkRun(
+            bench_id="bench-pp-log",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=128,
+            ),
+        )
+
+        with (
+            caplog.at_level(logging.INFO),
+            patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()),
+        ):
+            await run_benchmark(run, _FakeBenchEnginePool(engine=DecodingEngine()))
+
+        messages = [record.getMessage() for record in caplog.records]
+        pp_result = next(m for m in messages if "[benchmark-pp-result]" in m)
+        assert "gen_tps=32.000" in pp_result
+
 
 # =============================================================================
 # Experimental feature detection tests
