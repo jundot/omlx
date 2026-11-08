@@ -1156,3 +1156,169 @@ def test_fp16_drafter_survives_activations_past_fp16_range():
     reference = _run_cycles(widened(mx.float32), plan)
     got = _run_cycles(widened(mx.float16), plan)
     assert got == reference
+
+
+def _stored_drafter(monkeypatch, tmp_path, seed=0):
+    monkeypatch.setenv("OMLX_DFLASH_CONTEXT_DIR", str(tmp_path))
+    monkeypatch.setenv("OMLX_DFLASH_CONTEXT_MIN", "8")
+    drafter = _tiny_drafter(seed)
+    drafter.store_namespace = "target|affine|8"
+    return drafter
+
+
+def test_prompt_window_survives_a_restart_through_the_context_store(
+    monkeypatch, tmp_path
+):
+    """A long prompt's window at its end goes to disk when the request
+    finishes; a new drafter (server restart) restores it for a prefix hit and
+    drafts like a drafter that saw the raw captures."""
+    raw = _captured(18, seed=21)
+    rows = lambda lo, hi: [layer[:, lo:hi] for layer in raw]  # noqa: E731
+    tokens = list(range(30, 60))
+
+    first = _stored_drafter(monkeypatch, tmp_path)
+    first.seed_request("a", rows(0, 13), position=0)
+    first.bind_uid("a", 1)
+    _draft_one(first, 1, rows(13, 14), 5)
+    # Decoded rows move the newest window past the prompt end.
+    for position in range(14, 16):
+        _draft_one(first, 1, rows(position, position + 1), 6)
+    first.release([1])
+    first.release_request("a", tokens)
+    first.context_store().flush()
+    assert len(first.context_store()) == 1
+
+    second = _stored_drafter(monkeypatch, tmp_path)
+    prompt = tokens[:14] + [1, 2]
+    # The in-memory kept context of the finished request is gone.
+    assert not second._kept
+    assert second.available_context(prompt, 14) == WINDOW - 1
+    assert second.available_context(prompt, 12) == WINDOW - 3
+    assert second.available_context([0] * 16, 14) == 0
+    assert second.prepare_request("b", prompt, 14) == WINDOW - 1
+    restored, start = second._request_restored["b"]
+    assert (start, restored.shape[1]) == (3, WINDOW - 1)
+    second.seed_request("b", rows(14, 15), position=14)
+    second.bind_uid("b", 2)
+    assert second._rows[2].end == 15
+    restored_drafts = _draft_one(second, 2, rows(15, 16), 7)
+
+    reference = _tiny_drafter()
+    reference.seed(9, rows(0, 15))
+    assert restored_drafts == _draft_one(reference, 9, rows(15, 16), 7)
+
+
+def test_context_store_skips_short_windows_and_other_namespaces(
+    monkeypatch, tmp_path
+):
+    """Prompts below the minimum length or with fewer than half a window of
+    rows are not stored; another target or KV format reads its own store."""
+    drafter = _stored_drafter(monkeypatch, tmp_path)
+    monkeypatch.setenv("OMLX_DFLASH_CONTEXT_MIN", "100")
+    drafter.seed_request("short", _captured(12, seed=22), position=0)
+    drafter.bind_uid("short", 1)
+    _draft_one(drafter, 1, _captured(1, seed=23), 5)
+    drafter.release_request("short", list(range(40)))
+    drafter.context_store().flush()
+    assert len(drafter.context_store()) == 0
+
+    monkeypatch.setenv("OMLX_DFLASH_CONTEXT_MIN", "8")
+    drafter.prepare_request("few", list(range(40)), 20)
+    drafter.seed_request("few", _captured(3, seed=24), position=20)
+    drafter.bind_uid("few", 2)
+    _draft_one(drafter, 2, _captured(1, seed=25), 5)
+    drafter.release_request("few", list(range(40)))
+
+    drafter.seed_request("long", _captured(12, seed=26), position=0)
+    drafter.bind_uid("long", 3)
+    _draft_one(drafter, 3, _captured(1, seed=27), 5)
+    drafter.release_request("long", list(range(40)))
+    drafter.context_store().flush()
+    assert len(drafter.context_store()) == 1
+
+    other = _stored_drafter(monkeypatch, tmp_path)
+    other.store_namespace = "target|bf16|None"
+    assert other.available_context(list(range(40)), 12) == 0
+    monkeypatch.setenv("OMLX_DFLASH_CONTEXT_STORE", "0")
+    off = _stored_drafter(monkeypatch, tmp_path)
+    assert off.context_store() is None
+
+
+def test_context_store_evicts_the_least_recently_used_entry(tmp_path):
+    from omlx.speculative.dflash.context_store import ContextStore
+
+    store = ContextStore(tmp_path, dtype=mx.float32, max_entries=2)
+    for base in (0, 100, 200):
+        store.save(list(range(base, base + 10)), mx.ones((1, 4, 3)) * base, 10)
+        store.flush()
+    assert len(store) == 2
+    assert store.lookup(list(range(10)), 8) is None
+    entry, take = store.lookup(list(range(200, 210)), 8)
+    assert (entry.start, take) == (6, 2)
+    assert store.load(entry, 8, 2).tolist() == [[[200.0] * 3] * 2]
+    # A restart reads the index back from the file names.
+    assert len(ContextStore(tmp_path, dtype=mx.float32)) == 2
+
+
+class _Blocks:
+    def __init__(self, n_blocks, size):
+        self.block_ids = list(range(1, n_blocks + 1))
+        self.num_tokens = n_blocks * size
+
+
+def _trim_scheduler(drafter, size):
+    freed = []
+    manager = SimpleNamespace(
+        allocated_blocks={
+            i: SimpleNamespace(token_count=size) for i in range(1, 100)
+        },
+        free_block=freed.append,
+    )
+    scheduler = SimpleNamespace(
+        model=SimpleNamespace(_omlx_drafter=drafter),
+        paged_cache_manager=manager,
+        config=SimpleNamespace(paged_cache_block_size=size, model_path="m"),
+        _turboquant_kv_scheme="affine8",
+        _turboquant_kv_bits=8.0,
+    )
+    return scheduler, freed
+
+
+def test_prefix_hit_without_drafter_context_recomputes_the_window(
+    monkeypatch, tmp_path
+):
+    """A hit inside the drafter window with nothing to restore drops the
+    blocks overlapping the window, so their prefill seeds the drafter; with a
+    stored context, or the switch off, the hit stays whole."""
+    drafter = _stored_drafter(monkeypatch, tmp_path)
+    drafter.store_namespace = None
+    prompt = list(range(100, 140))  # window 12: keep_from = 28
+    scheduler, freed = _trim_scheduler(drafter, 4)
+    request = SimpleNamespace(prompt_token_ids=prompt, request_id="r")
+
+    table = _Blocks(9, 4)  # 36 cached tokens
+    Scheduler._dflash_trim_for_context(scheduler, request, table)
+    assert table.num_tokens == 28 and freed == [9, 8]
+    assert drafter.store_namespace == "m|affine8|8.0"
+
+    # A stored window ending at the hit keeps it whole.
+    drafter.context_store().save(prompt, mx.ones((1, WINDOW - 1, HIDDEN)), 36)
+    drafter.context_store().flush()
+    table = _Blocks(9, 4)
+    Scheduler._dflash_trim_for_context(scheduler, request, table)
+    assert table.num_tokens == 36
+
+    # Short prompts and the switch keep their hits.
+    monkeypatch.setenv("OMLX_DFLASH_CONTEXT_MIN", "64")
+    table = _Blocks(9, 4)
+    Scheduler._dflash_trim_for_context(
+        scheduler, SimpleNamespace(prompt_token_ids=[0] * 40, request_id="s"), table
+    )
+    assert table.num_tokens == 36
+    monkeypatch.setenv("OMLX_DFLASH_CONTEXT_MIN", "8")
+    monkeypatch.setenv("OMLX_DFLASH_CONTEXT_RECOMPUTE", "0")
+    table = _Blocks(9, 4)
+    Scheduler._dflash_trim_for_context(
+        scheduler, SimpleNamespace(prompt_token_ids=[0] * 40, request_id="t"), table
+    )
+    assert table.num_tokens == 36

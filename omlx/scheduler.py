@@ -17,6 +17,7 @@ import gc
 import importlib
 import inspect
 import logging
+import os
 import threading
 import time
 from array import array
@@ -5936,7 +5937,77 @@ class Scheduler:
     def _dflash_bind_uid(self, request_id: str, uid: int) -> None:
         drafter = _block_drafter_for(self.model)
         if drafter is not None:
+            Scheduler._dflash_name_store(self, drafter)
             drafter.bind_uid(request_id, uid)
+
+    def _dflash_name_store(self, drafter: Any) -> None:
+        """Name the target and its KV format for the drafter's context store."""
+        if getattr(drafter, "store_namespace", "") is not None:
+            return
+        config = getattr(self, "config", None)
+        drafter.store_namespace = "|".join(
+            str(part)
+            for part in (
+                getattr(config, "model_path", "") or getattr(config, "model_name", ""),
+                getattr(self, "_turboquant_kv_scheme", None),
+                getattr(self, "_turboquant_kv_bits", None),
+            )
+        )
+
+    def _dflash_trim_for_context(self, request: "Request", block_table: Any) -> None:
+        """Re-prefill the drafter window of a prefix hit the drafter cannot restore.
+
+        The drafter attends the newest ``window`` prompt positions. A hit past
+        their start skips their prefill, so their layer captures exist only if
+        a finished request or the context store kept them. Otherwise drop the
+        cached blocks that overlap the window: the prefill of those tokens
+        (at most window + one block) seeds the drafter, and the context store
+        keeps the result for later hits of the same prefix.
+        """
+        if os.environ.get("OMLX_DFLASH_CONTEXT_RECOMPUTE", "1") == "0":
+            return
+        drafter = _block_drafter_for(self.model)
+        manager = getattr(self, "paged_cache_manager", None)
+        if (
+            drafter is None
+            or manager is None
+            or getattr(request, "vlm_extra_keys_for_cache", None)
+            or not hasattr(drafter, "available_context")
+        ):
+            return
+        from .speculative.dflash import context_store
+
+        prompt = request.prompt_token_ids
+        if len(prompt) < max(context_store.min_prompt_tokens(), drafter.window + 1):
+            return
+        keep_from = len(prompt) - drafter.window
+        cached = int(block_table.num_tokens)
+        if cached <= keep_from:
+            return
+        Scheduler._dflash_name_store(self, drafter)
+        needed = min(cached - keep_from, drafter.ring_slots)
+        have = drafter.available_context(prompt, cached)
+        if 2 * have >= needed:
+            return
+        while block_table.block_ids and block_table.num_tokens > keep_from:
+            last_block_id = block_table.block_ids.pop()
+            last_block = manager.allocated_blocks.get(last_block_id)
+            last_token_count = (
+                last_block.token_count
+                if last_block is not None and last_block.token_count > 0
+                else self.config.paged_cache_block_size
+            )
+            block_table.num_tokens = max(0, block_table.num_tokens - last_token_count)
+            manager.free_block(last_block_id)
+        logger.info(
+            "DFlash context for %s: drafter had %d of %d window rows; prefix hit "
+            "trimmed from %d to %d tokens to recompute them",
+            request.request_id,
+            have,
+            needed,
+            cached,
+            block_table.num_tokens,
+        )
 
     def _clear_request_admission_bookkeeping(self, request_id: str) -> None:
         _mtp_priming.release_request(getattr(self, "model", None), request_id)
@@ -11068,6 +11139,8 @@ class Scheduler:
                     0, block_table.num_tokens - last_token_count
                 )
                 self.paged_cache_manager.free_block(last_block_id)
+            if block_table and block_table.num_tokens > 0:
+                Scheduler._dflash_trim_for_context(self, request, block_table)
             if block_table and 0 < block_table.num_tokens < minimum_prefix:
                 logger.info(
                     "Request %s: cached prefix %d precedes complete image prefix %d",

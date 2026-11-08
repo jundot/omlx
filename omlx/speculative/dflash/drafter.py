@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import time
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
@@ -12,10 +14,13 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from ...patches.mlx_lm_mtp import batch_generator as bg
 from ...patches.qwen35_verify_qmm import set_verify_qmm_armed
-from . import kernels, selection, variants
+from . import context_store, kernels, selection, variants
+
+logger = logging.getLogger(__name__)
 
 # Finished requests whose drafter context stays available for prefix hits.
 _KEPT_REQUESTS = 8
@@ -51,6 +56,9 @@ class _RowContext:
     history: list[mx.array] = field(default_factory=list)
     history_len: int = 0
     history_end: int | None = None
+    # The first fed context of a long prompt (its window at the prompt end)
+    # and the position after it, for the on-disk context store.
+    snapshot: tuple[mx.array, int] | None = None
 
 
 @dataclass
@@ -138,8 +146,13 @@ class DFlashDrafter:
         self._uid_requests: dict[Any, str] = {}
         # Contexts of rows the batch released, until the scheduler names
         # their tokens, and of finished requests kept for prefix hits.
-        self._released: OrderedDict[Any, tuple[list[mx.array], int]] = OrderedDict()
+        self._released: OrderedDict[Any, tuple] = OrderedDict()
         self._kept: OrderedDict[str, _KeptContext] = OrderedDict()
+        # On-disk store of prompt-end contexts (context_store); opened on
+        # first use once ``store_namespace`` names the target and its cache.
+        self.store_namespace: str | None = None
+        self._store: context_store.ContextStore | None = None
+        self._store_failed = False
         # Row order of the generation batch whose ordinary decode step is
         # running, so a plain forward can be attributed to rows.
         self.scope_uids: tuple | None = None
@@ -276,6 +289,67 @@ class DFlashDrafter:
             if position is not None:
                 self._request_starts.setdefault(request_id, int(position))
 
+    def _kept_lookup(self, prefix: list[int], cached: int):
+        """The newest kept context covering the rows just before ``cached``."""
+        for key in reversed(self._kept):
+            kept = self._kept[key]
+            start = kept.end - int(kept.context.shape[1])
+            if not start < cached <= kept.end or kept.tokens[:cached] != prefix:
+                continue
+            return key, kept, min(self.ring_slots, cached - start)
+        return None
+
+    def context_store(self) -> context_store.ContextStore | None:
+        if self._store is not None or self._store_failed:
+            return self._store
+        if not context_store.store_enabled() or self.store_namespace is None:
+            return None
+        fc = self.model.encoder.fc if hasattr(self.model, "encoder") else self.model.fc
+        dtype = fc.scales.dtype if hasattr(fc, "scales") else fc.weight.dtype
+        if dtype not in context_store._BITS:
+            self._store_failed = True
+            return None
+        # The projection weights (and their load-time quantization) decide
+        # the rows; a slice of them names the drafter build.
+        probe = [fc.weight.reshape(-1)[:4096]]
+        if hasattr(fc, "scales"):
+            probe.append(fc.scales.reshape(-1)[:4096])
+        digest = hashlib.sha1()
+        for part in probe:
+            digest.update(np.array(part.view(mx.uint8)).tobytes())
+        parts = [
+            str(self.source_path),
+            self.store_namespace,
+            ",".join(map(str, self.target_layer_ids)),
+            str(self.window),
+            str(dtype),
+            digest.hexdigest(),
+        ]
+        try:
+            self._store = context_store.ContextStore(
+                context_store.namespace_dir(context_store.default_root(), parts),
+                dtype=dtype,
+            )
+        except OSError as exc:
+            logger.warning("DFlash context store unavailable: %r", exc)
+            self._store_failed = True
+        return self._store
+
+    def available_context(self, prompt_tokens: Sequence[int], cached: int) -> int:
+        """Rows ``prepare_request`` could restore just before ``cached``."""
+        cached = int(cached)
+        if cached <= 0:
+            return 0
+        prefix = list(prompt_tokens[:cached])
+        found = self._kept_lookup(prefix, cached)
+        best = 0 if found is None else found[2]
+        store = self.context_store()
+        if store is not None and best < min(self.ring_slots, cached):
+            hit = store.lookup(prefix, cached)
+            if hit is not None:
+                best = max(best, min(self.ring_slots, hit[1]))
+        return best
+
     def prepare_request(
         self, request_id: str, prompt_tokens: Sequence[int], cached: int
     ) -> int:
@@ -283,29 +357,47 @@ class DFlashDrafter:
 
         Cached tokens skip prefill, so the drafter never sees their layer
         captures. A kept request whose tokens match the first ``cached``
-        prompt tokens supplies the rows just before ``cached``. Returns the
-        number of restored rows. Only the first call per request counts: a
-        prefill resumed after a pause keeps what its first attempt captured.
+        prompt tokens supplies the rows just before ``cached``; the on-disk
+        store supplies them when it holds more. Returns the number of
+        restored rows. Only the first call per request counts: a prefill
+        resumed after a pause keeps what its first attempt captured.
         """
         cached = int(cached)
         if cached <= 0 or request_id in self._request_starts:
             return 0
         self._request_starts[request_id] = cached
         prefix = list(prompt_tokens[:cached])
-        for key in reversed(self._kept):
-            kept = self._kept[key]
-            start = kept.end - int(kept.context.shape[1])
-            if not start < cached <= kept.end or kept.tokens[:cached] != prefix:
-                continue
-            take = min(self.ring_slots, cached - start)
-            offset = cached - start
-            self._request_restored[request_id] = (
-                kept.context[:, offset - take : offset],
-                cached - take,
-            )
-            self._kept.move_to_end(key)
-            return take
-        return 0
+        found = self._kept_lookup(prefix, cached)
+        take = 0 if found is None else found[2]
+        store = self.context_store()
+        if store is not None and take < min(self.ring_slots, cached):
+            hit = store.lookup(prefix, cached)
+            if hit is not None and min(self.ring_slots, hit[1]) > take:
+                entry, rows = hit
+                rows = min(self.ring_slots, rows)
+                context = store.load(entry, cached, rows)
+                if context is not None:
+                    self._request_restored[request_id] = (context, cached - rows)
+                    logger.info(
+                        "DFlash context for %s: %d rows from the context store "
+                        "(cached %d, kept %d)",
+                        request_id,
+                        rows,
+                        cached,
+                        take,
+                    )
+                    return rows
+        if found is None:
+            return 0
+        key, kept, take = found
+        start = kept.end - int(kept.context.shape[1])
+        offset = cached - start
+        self._request_restored[request_id] = (
+            kept.context[:, offset - take : offset],
+            cached - take,
+        )
+        self._kept.move_to_end(key)
+        return take
 
     def bind_uid(self, request_id: str, uid: Any) -> None:
         self._request_uids[request_id] = uid
@@ -341,10 +433,14 @@ class DFlashDrafter:
             return
         row = self._rows.get(uid)
         if row is not None:
-            released = (row.history, row.history_end) if row.history else None
+            released = (
+                (row.history, row.history_end, row.snapshot) if row.history else None
+            )
         if released is None:
             return
-        history, end = released
+        history, end, snapshot = released
+        if snapshot is not None:
+            self._store_context(tokens, *snapshot)
         if end is None or end > len(tokens):
             return
         context = history[0] if len(history) == 1 else mx.concatenate(history, axis=1)
@@ -378,7 +474,7 @@ class DFlashDrafter:
             self._detach_cohort()
             # Keep the context only while its request can still claim it.
             if row.history and uid in self._uid_requests:
-                self._released[uid] = (row.history, row.history_end)
+                self._released[uid] = (row.history, row.history_end, row.snapshot)
                 while len(self._released) > _RELEASED_ROWS:
                     self._released.popitem(last=False)
 
@@ -407,11 +503,30 @@ class DFlashDrafter:
         if row.end is None or not int(context.shape[1]):
             return
         # A slice of the batched projection would keep the whole buffer.
-        row.history.append(mx.contiguous(context))
+        context = mx.contiguous(context)
+        if (
+            not row.history
+            and row.snapshot is None
+            and row.end >= context_store.min_prompt_tokens()
+            and 2 * int(context.shape[1]) >= self.ring_slots
+            and self.store_namespace is not None
+            and context_store.store_enabled()
+        ):
+            row.snapshot = (context, row.end)
+        row.history.append(context)
         row.history_end = row.end
         row.history_len += int(context.shape[1])
         while row.history_len - int(row.history[0].shape[1]) >= self.ring_slots:
             row.history_len -= int(row.history.pop(0).shape[1])
+
+    def _store_context(self, tokens: Sequence[int], context: mx.array, end: int) -> None:
+        store = self.context_store()
+        if store is None or end > len(tokens):
+            return
+        try:
+            store.save(tokens, context, end)
+        except Exception as exc:  # the store is an optimization only
+            logger.warning("DFlash context store save failed: %r", exc)
 
     def context_length(self, uid: Any) -> int:
         row = self._rows.get(uid)
