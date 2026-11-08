@@ -282,7 +282,7 @@
     </div>
     <!-- Footer: Active/Waiting totals -->
     <div x-show="stats.active_models.total_active_requests > 0 || stats.active_models.total_waiting_requests > 0"
-         class="px-6 py-3 bg-neutral-50 border-t border-neutral-100 flex items-center gap-3">
+         class="px-6 py-3 bg-neutral-50 border-t rounded-b-2xl border-neutral-100 flex items-center gap-3">
         <span x-show="stats.active_models.total_active_requests > 0"
               class="text-xs text-neutral-500">
             <span class="font-medium text-neutral-600" x-text="window.t('status.active_models.active') + ': ' + stats.active_models.total_active_requests"></span>
