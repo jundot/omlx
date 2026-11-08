@@ -3483,6 +3483,86 @@ class TestEnginePoolPrefillEviction:
         assert len(calls) == 1 and calls[0][1] is False
 
     @pytest.mark.asyncio
+    async def test_preflight_ladder_sheds_protected_hot_cache_when_first_pass_frees_none(
+        self,
+    ):
+        """#4213: the ladder must reach the protected pass. The first
+        release frees nothing because every block belongs to the user's
+        live batch. The second pass sheds them, and the request is
+        admitted instead of refused."""
+        gb = 1024**3
+        hot = [10 * gb]
+        phys = [50 * gb]
+        pool_bytes = [0]
+        calls = []
+
+        async def release(shortfall, *, allow_protected=False):
+            calls.append(allow_protected)
+            if not allow_protected:
+                return 0
+            hot[0] -= 6 * gb
+            phys[0] -= 6 * gb
+            return 6 * gb
+
+        class _Budget:
+            @property
+            def total_bytes(self):
+                return hot[0]
+
+        scheduler = MagicMock()
+        scheduler.requests = {}
+        scheduler._hot_cache_limit_factor = MagicMock(return_value=0.9)
+        scheduler._prefill_speed_priority = False
+        scheduler._memory_guard_tier = "balanced"
+        scheduler.release_moe_offload_slots = MagicMock(return_value=0)
+        scheduler._reclaim_prefill_headroom = MagicMock(return_value=0)
+
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=40 * gb,
+            target_cap_bytes=45 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="prefill_preflight",
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            pool_obj = _make_pool(ceiling=0)
+            pool_obj._entries = {
+                "idle-a": self._entry("idle-a", 20 * gb),
+                "target": self._entry(
+                    "target", 25 * gb, scheduler=scheduler, executor=executor
+                ),
+            }
+            pool_obj._current_model_memory = 30 * gb
+            pool_obj._scheduler_config.hot_cache_budget = _Budget()
+            pool_obj._process_memory_enforcer = SimpleNamespace(
+                release_hot_cache_for_prefill=release
+            )
+            unloaded = []
+
+            async def fake_unload(model_id):
+                unloaded.append(model_id)
+                pool_obj._entries[model_id].engine = None
+                phys[0] -= 20 * gb
+
+            pool_obj._unload_engine = fake_unload
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.mx.get_cache_memory",
+                    side_effect=lambda: pool_bytes[0],
+                ),
+                patch("omlx.engine_pool.get_phys_footprint", side_effect=lambda: phys[0]),
+            ):
+                admitted = await pool_obj._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is True
+        assert calls == [False, True]
+        assert unloaded == []
+        assert hot[0] == 4 * gb
+
+    @pytest.mark.asyncio
     async def test_recurring_headroom_pressure_escalates_to_bank_release(self):
         """A long prompt refills the buffer cache continuously, so the
         pooled reclaim can 'succeed' marginally on every pass and starve
