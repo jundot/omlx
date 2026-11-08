@@ -244,3 +244,51 @@ def test_scheduling_fallback_counts_a_miss(cached_scheduler, fallback):
     assert counters["prefix_tokens_saved"] == 0
     assert counters["prefix_tokens_matched"] == 0
     assert counters["prefix_tokens_requested"] == 9
+
+
+class _RecordingDrafter:
+    """Records the DFlash scheduler hooks a prefix hit triggers."""
+
+    window = 4
+    ring_slots = 3
+    target_layer_ids = [0]
+    store_namespace = "set"
+
+    def __init__(self):
+        self.prepared = []
+
+    def prepare_request(self, request_id, prompt_tokens, cached):
+        self.prepared.append((request_id, list(prompt_tokens), cached))
+        return 0
+
+    def available_context(self, prompt_tokens, cached):
+        return self.ring_slots
+
+    def bind_uid(self, request_id, uid):
+        pass
+
+    def release_request(self, request_id, tokens=None):
+        pass
+
+
+@pytest.mark.parametrize("prompt_length", [8, 9], ids=["exact-hit", "last-token"])
+def test_hit_leaving_one_token_lets_the_drafter_restore_context(
+    cached_scheduler, prompt_length
+):
+    """With every prompt token but the last cached, external prefill (where
+    the drafter restores the cached rows) is skipped; the drafter is still
+    asked for the context ending at the last cached position."""
+    scheduler, _ = cached_scheduler
+    drafter = _RecordingDrafter()
+    scheduler.model._omlx_drafter = drafter
+    request = Request(
+        request_id="hit",
+        prompt=list(range(prompt_length)),
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    scheduler.add_request(request)
+    scheduler._schedule_waiting()
+
+    assert request.cached_tokens == prompt_length - 1
+    assert drafter.prepared == [("hit", list(range(prompt_length)), prompt_length - 1)]
+    scheduler._do_external_prefill.assert_not_called()

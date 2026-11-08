@@ -13799,6 +13799,18 @@ class Scheduler:
             # restored KV. Commit metrics only after both guards have run.
             self._record_prefix_cache_result(request)
 
+            if (
+                request.specprefill_indices is None
+                and len(tokens_to_process) == 1
+                and cache_to_use is not None
+            ):
+                # An exact prefix hit leaves only the last prompt token, so it
+                # skips external prefill, where the drafter restores the
+                # context of cached tokens.
+                Scheduler._dflash_prepare_request(
+                    self, request, len(request.prompt_token_ids) - 1
+                )
+
             # External prefill: process tokens[0:N-1] outside BatchGenerator.
             # Only the last token goes to insert() for the first decode step.
             # SpecPrefill already handled its own prefill above, so skip for those.
