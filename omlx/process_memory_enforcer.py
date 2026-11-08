@@ -1236,11 +1236,17 @@ class ProcessMemoryEnforcer:
             release_free_malloc_memory()
         return freed
 
-    async def release_hot_cache_for_prefill(self, reserved_bytes: int) -> int:
+    async def release_hot_cache_for_prefill(
+        self, reserved_bytes: int, *, allow_protected: bool = False
+    ) -> int:
         """Shrink the hot cache until its reservation drops by ``reserved_bytes``.
 
-        Blocks of admitted or queued requests stay. Nothing is released when
-        the other blocks cannot cover the drop. Returns the actual drop.
+        Blocks of admitted or queued requests stay unless ``allow_protected``
+        is set. Their cached prefixes then shed in global LRU order too:
+        shedding costs those requests a re-prefill on their next turn, while
+        refusing costs the new request a hard 400 (#4213). Nothing is
+        released when even the sheddable blocks cannot cover the drop.
+        Returns the actual drop.
         """
         before = self._hot_cache_reserved_bytes()
         if before <= 0 or reserved_bytes <= 0:
@@ -1254,9 +1260,17 @@ class ProcessMemoryEnforcer:
             return 0
         protected = self._active_hot_cache_block_hashes()
         releasable = getattr(self._hot_cache_budget(), "releasable_bytes", None)
-        if callable(releasable) and releasable(protected) < excess:
+        if (
+            not allow_protected
+            and callable(releasable)
+            and releasable(protected) < excess
+        ):
             return 0
-        await asyncio.to_thread(self._release_hot_cache_blocks, excess, protected)
+        await asyncio.to_thread(
+            self._release_hot_cache_blocks,
+            excess,
+            set() if allow_protected else protected,
+        )
         released = max(0, before - self._hot_cache_reserved_bytes())
         if released > 0:
             self._propagate_memory_limit()

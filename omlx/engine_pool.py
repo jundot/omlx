@@ -3436,8 +3436,13 @@ class EnginePool:
     ) -> int:
         """Release hot cache for a prefill; return how far its target rose.
 
-        Skips requests the scheduler does not hold yet: their prefix blocks
-        are not protected (see ``Scheduler._releasable_hot_cache_credit``).
+        Route preflight runs before ``add_request``, so the requesting
+        request is not in the scheduler yet; the rung must not depend on
+        that. The first pass keeps active requests' cached prefixes; when
+        it frees nothing (a single-user workflow's hot cache is its own
+        live batch, so everything is protected, #4213) and the tier allows
+        it, a second pass sheds those prefixes oldest-first — the cost is
+        a re-prefill, refusing costs the request.
         """
         release = getattr(
             self._process_memory_enforcer, "release_hot_cache_for_prefill", None
@@ -3448,11 +3453,7 @@ class EnginePool:
             self._resolve_scheduler_from_engine(engine) if engine is not None else None
         )
         limit_factor = getattr(scheduler, "_hot_cache_limit_factor", None)
-        if (
-            not callable(release)
-            or not callable(limit_factor)
-            or request_id not in getattr(scheduler, "requests", {})
-        ):
+        if not callable(release) or not callable(limit_factor):
             return 0
         if (
             reason == "adaptive_prefill_throttle"
@@ -3464,14 +3465,17 @@ class EnginePool:
         if factor <= 0 or shortfall <= 0:
             return 0
         released = await release(int(shortfall / factor) + 1)
-        if released <= 0:
-            return 0
-        logger.info(
-            "Released %s of hot cache for prefill request %s on '%s'",
-            format_size(released),
-            request_id,
-            model_id,
-        )
+        if released <= 0 and getattr(scheduler, "_memory_guard_tier", "") != "safe":
+            released = await release(
+                int(shortfall / factor) + 1, allow_protected=True
+            )
+        if released > 0:
+            logger.info(
+                "Released %s of hot cache for prefill request %s on '%s'",
+                format_size(released),
+                request_id,
+                model_id,
+            )
         return int(released * factor)
 
     @staticmethod

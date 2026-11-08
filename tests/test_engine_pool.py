@@ -3101,7 +3101,7 @@ class TestEnginePoolPrefillEviction:
         ("case", "reason", "phys_gb", "pool_gb", "releases", "unloaded_expected"),
         [
             ("held", "prefill_preflight", 50, 0, True, []),
-            ("route", "prefill_preflight", 50, 0, False, ["idle-a"]),
+            ("route", "prefill_preflight", 50, 0, True, []),
             ("throttle", "adaptive_prefill_throttle", 50, 0, False, ["idle-a"]),
             ("pool", "prefill_preflight", 48, 8, False, []),
         ],
@@ -3110,14 +3110,16 @@ class TestEnginePoolPrefillEviction:
         self, case, reason, phys_gb, pool_gb, releases, unloaded_expected
     ):
         """Hot cache gives way before idle models, but only after the free
-        pool and only when the request would otherwise be rejected and its
-        prefix blocks are protected (#4213)."""
+        pool and only when the request would otherwise be rejected. The
+        route case gives way too: route preflight runs before the request
+        is registered, and its hot cache is shed the same as an in-flight
+        request's (#4213)."""
         gb = 1024**3
         hot = [10 * gb]
         phys = [phys_gb * gb]
         pool = [pool_gb * gb]
 
-        async def release(reserved_bytes):
+        async def release(reserved_bytes, *, allow_protected=False):
             hot[0] -= 6 * gb
             phys[0] -= 6 * gb
             return 6 * gb
@@ -3410,6 +3412,75 @@ class TestEnginePoolPrefillEviction:
         release_hot_cache.assert_not_awaited()
         pool_obj._unload_engine.assert_not_awaited()
         pool_obj._release_ane_prefill_for_headroom.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_preflight_gives_way_hot_cache_for_unregistered_request(self):
+        """#4213: the route-level give-way must not require the request to
+        be registered in the scheduler yet — route preflight runs before
+        ``add_request``, so the old membership guard made the hot-cache
+        rung dead code on exactly the path that rejects long prompts."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        scheduler = MagicMock()
+        scheduler.requests = {}
+        scheduler._hot_cache_limit_factor = MagicMock(return_value=0.9)
+        scheduler._prefill_speed_priority = False
+        scheduler._memory_guard_tier = "balanced"
+        release = AsyncMock(return_value=4 * gb)
+        pool._entries = {"target": self._entry("target", 25 * gb, scheduler=scheduler)}
+        pool._process_memory_enforcer = SimpleNamespace(
+            release_hot_cache_for_prefill=release
+        )
+
+        gain = await pool._release_hot_cache_for_prefill(
+            "target", "route-1", 4 * gb, "prefill_preflight"
+        )
+
+        assert gain == int(4 * gb * 0.9)
+        release.assert_awaited_once_with(int(4 * gb / 0.9) + 1)
+
+    @pytest.mark.asyncio
+    async def test_preflight_sheds_protected_hot_cache_when_default_pass_frees_none(
+        self,
+    ):
+        """#4213: when every hot-cache block belongs to the user's live
+        batch, the default pass frees nothing. In balanced and aggressive
+        tiers the helper takes a second, protected pass: shedding costs a
+        re-prefill, refusing costs the request. The safe tier keeps the
+        cache."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+        calls = []
+
+        async def release(shortfall, *, allow_protected=False):
+            calls.append((shortfall, allow_protected))
+            return 4 * gb if allow_protected else 0
+
+        scheduler = MagicMock()
+        scheduler.requests = {"req-1": object()}
+        scheduler._hot_cache_limit_factor = MagicMock(return_value=0.9)
+        scheduler._prefill_speed_priority = False
+        scheduler._memory_guard_tier = "balanced"
+        pool._entries = {"target": self._entry("target", 25 * gb, scheduler=scheduler)}
+        pool._process_memory_enforcer = SimpleNamespace(
+            release_hot_cache_for_prefill=release
+        )
+
+        gain = await pool._release_hot_cache_for_prefill(
+            "target", "req-1", 4 * gb, "prefill_preflight"
+        )
+        assert gain == int(4 * gb * 0.9)
+        assert calls[0][1] is False
+        assert calls[1] == (int(4 * gb / 0.9) + 1, True)
+
+        calls.clear()
+        scheduler._memory_guard_tier = "safe"
+        gain = await pool._release_hot_cache_for_prefill(
+            "target", "req-1", 4 * gb, "prefill_preflight"
+        )
+        assert gain == 0
+        assert len(calls) == 1 and calls[0][1] is False
 
     @pytest.mark.asyncio
     async def test_recurring_headroom_pressure_escalates_to_bank_release(self):
