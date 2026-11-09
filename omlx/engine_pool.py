@@ -4313,6 +4313,15 @@ class EnginePool:
                 return True
         return False
 
+    def _release_unloaded_memory(self, resident_size: int) -> None:
+        """Drop an unloaded engine's tracked size and bump the unload epoch.
+
+        Every unload path (MLX, Splash, cluster) calls this, so a waiting
+        admission sees each unload as freed memory.
+        """
+        self._current_model_memory = max(0, self._current_model_memory - resident_size)
+        self._unload_epoch += 1
+
     async def _unload_engine(self, model_id: str, *, local_only: bool = False) -> None:
         if model_id in self._unloading_models:
             raise ModelBusyError(model_id, "unload while teardown is in progress")
@@ -4447,10 +4456,7 @@ class EnginePool:
             # mx.get_active_memory() here would wait against an unrelated
             # gauge and then run emergency reclaim.
             gc.collect()
-            self._current_model_memory = max(
-                0,
-                self._current_model_memory - resident_size,
-            )
+            self._release_unloaded_memory(resident_size)
             kind = "distributed" if distributed else "Splash"
             logger.info(
                 f"Unloaded {kind} model: {model_id}, released its process "
@@ -4548,8 +4554,7 @@ class EnginePool:
             await self._metal_sync_clear_cache(model_id)
 
         # Release memory tracking AFTER barrier
-        self._current_model_memory = max(0, self._current_model_memory - resident_size)
-        self._unload_epoch += 1
+        self._release_unloaded_memory(resident_size)
 
         if settled:
             logger.info(

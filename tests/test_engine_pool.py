@@ -3726,6 +3726,80 @@ class TestExclusiveGroup:
         pool._settings_manager = MagicMock()
         assert pool._exclusive_group_for("model-a") is None
 
+    # ---- Splash members (external process) -------------------------------
+
+    @staticmethod
+    def _splash_member(pool, tmp_path, model_id, busy):
+        """Make ``model_id`` a resident Splash engine. ``busy[0]`` is its
+        has_active_requests() value. Returns the AsyncMock that replaces stop()."""
+        from tests.test_splash_engine import _engine as splash_engine
+
+        engine = splash_engine(tmp_path / "splash")
+        engine.has_active_requests = lambda: busy[0]
+        engine.stop = AsyncMock()
+        entry = pool._entries[model_id]
+        entry.engine = engine
+        entry.actual_size = entry.estimated_size
+        pool._current_model_memory += entry.estimated_size
+        return engine.stop
+
+    @pytest.mark.asyncio
+    async def test_busy_splash_member_makes_b_wait_then_unloads_its_process(
+        self, small_mock_model_dir, tmp_path, monkeypatch, caplog
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        pool.configure_swap_wait_timeout(5.0)
+        busy = [True]
+        stop = self._splash_member(pool, tmp_path, "model-a", busy)
+        epoch = pool._unload_epoch
+        with (
+            self._engines(),
+            caplog.at_level(logging.INFO, logger="omlx.engine_pool"),
+        ):
+            waiter = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.3)
+            assert not waiter.done()
+            assert pool._entries["model-a"].engine is not None
+            stop.assert_not_awaited()
+            busy[0] = False
+            await asyncio.wait_for(waiter, timeout=5.0)
+        stop.assert_awaited_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+        assert pool._unload_epoch == epoch + 1
+        assert "Admission for 'model-b' refused" in caplog.text
+        assert "Unloaded Splash model: model-a, released its process" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_quiet_pool_with_pinned_splash_model_fails_fast(
+        self, small_mock_model_dir, tmp_path, monkeypatch
+    ):
+        # model-a 1075 + model-b 2150 bytes do not fit under 2500.
+        pool = self._pool(small_mock_model_dir, monkeypatch, {}, ceiling=2500)
+        pool.configure_swap_wait_timeout(30.0)
+        pool._entries["model-a"].is_pinned = True
+        stop = self._splash_member(pool, tmp_path, "model-a", [False])
+        started = time.monotonic()
+        with self._engines():
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+        assert time.monotonic() - started < 2.0
+        stop.assert_not_awaited()
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_splash_unload_bumps_unload_epoch(
+        self, small_mock_model_dir, tmp_path, monkeypatch
+    ):
+        pool = self._pool(small_mock_model_dir, monkeypatch, {})
+        self._splash_member(pool, tmp_path, "model-a", [False])
+        epoch = pool._unload_epoch
+        await pool._unload_engine("model-a")
+        assert pool._unload_epoch == epoch + 1
+        assert pool._current_model_memory == 0
+
     # ---- draining (#1855) -------------------------------------------------
 
     @staticmethod
