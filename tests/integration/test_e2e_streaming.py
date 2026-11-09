@@ -8,6 +8,7 @@ using mock AsyncIterator without loading actual models.
 
 import json
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -4325,6 +4326,7 @@ class TestK2OptionalToolGrammar:
         engine._model = None
         engine._grammar_compiler = None
         engine._grammar_compiler_init_attempted = False
+        engine._grammar_compiler_lock = threading.Lock()
         engine.tokenizer.has_tool_calling = True
         engine.tokenizer.tool_call_start = "<ifm|tool_calls>"
         engine.tokenizer.tool_call_end = "</ifm|tool_calls>"
