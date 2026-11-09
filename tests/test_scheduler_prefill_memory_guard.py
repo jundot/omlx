@@ -1470,3 +1470,38 @@ def test_route_preflight_admits_but_stream_check_rejects_with_real_cached_tokens
         scheduler.preflight_or_raise(num_prompt_tokens=32768)  # route: admits
         rejection = scheduler._preflight_memory_check(request)  # stream: rejects
     assert rejection is not None
+
+
+def test_eviction_request_target_cap_excludes_hot_cache_credit():
+    """The ladder's gain is measured against the real limit.
+
+    The credit already assumes every releasable byte is gone, so a target
+    cap of limit + credit lets a release counted inside the credit count
+    twice: the ladder declared a fit, skipped idle eviction, and the route
+    re-check then rejected the request, having shed its hot cache for
+    nothing.
+    """
+    cached = 16384
+    scheduler = _hot_cache_credit_scheduler()
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=cached, current=0
+        )
+        prefix = int(scheduler.memory_monitor.estimate_resident_kv_bytes(cached))
+    assert est is not None and prefix > 0
+    held = prefix + prefix // 4
+    _set_held_hot_cache(scheduler, held)
+    limit = est.estimated - held + prefix // 2
+    scheduler._memory_hard_limit_bytes = limit
+    scheduler._memory_hard_watermark_bytes = limit
+    with patches[0], patches[1]:
+        request = scheduler.preflight_eviction_request(
+            num_prompt_tokens=32768, cached_tokens=cached, request_id="r1"
+        )
+    assert request is not None
+    assert request.reason == "prefill_preflight"
+    assert request.target_cap_bytes == scheduler._admission_limit_bytes()
