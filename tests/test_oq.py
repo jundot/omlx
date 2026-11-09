@@ -9048,3 +9048,165 @@ class TestGemma4AudioConfigSanitize:
         out = sanitize({"model." + key: mx.zeros((32, 128, 3, 3))})
         assert list(out) == [key]
         assert out[key].shape == (32, 3, 3, 128)
+
+
+# =============================================================================
+# Test VLM sanitizers that call super() (LFM3-Omni, #5129)
+# =============================================================================
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestLfm3OmniSanitize:
+    """LFM3-Omni's ``Model.sanitize`` calls ``super().sanitize()``.
+
+    oQ ran sanitize on a plain proxy object, so ``super()`` raised and oQ
+    wrote the checkpoint's own names. The loader renames
+    ``model.audio_encoder.*`` to ``audio_tower.*`` and then could not find the
+    per-layer bit settings oQ had saved under the old names.
+    """
+
+    CONFIG = {
+        "model_type": "lfm3_omni",
+        "architectures": ["Lfm3OmniForConditionalGeneration"],
+        "text_config": {
+            "model_type": "lfm3",
+            "num_hidden_layers": 2,
+            "layer_types": ["conv", "full_attention"],
+            "tie_word_embeddings": True,
+        },
+        "vision_config": {
+            "model_type": "lfm3_vl_vision",
+            "num_hidden_layers": 1,
+            "layer_types": ["conv"],
+        },
+        "audio_encoder_config": {
+            "text_config": {
+                "model_type": "lfm2",
+                "hidden_size": 768,
+                "num_hidden_layers": 1,
+                "layer_types": ["conv"],
+                "vocab_size": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 128000,
+                "norm_eps": 1e-05,
+                "conv_bias": False,
+                "conv_L_cache": 3,
+                "block_ff_dim": 2560,
+                "block_multiple_of": 256,
+                "block_ffn_dim_multiplier": 1.0,
+                "block_auto_adjust_ff_dim": True,
+            }
+        },
+        "depth_config": {
+            "model_type": "lfm3",
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+        },
+    }
+
+    # Checkpoint name -> (loader name, checkpoint shape, loader shape)
+    WEIGHTS = {
+        "model.audio_encoder.lfm.layers.2.self_attn.q_proj.weight": (
+            "audio_tower.lfm.layers.2.self_attn.q_proj.weight",
+            (16, 16),
+            (16, 16),
+        ),
+        "model.audio_encoder.lfm.layers.0.conv.conv.weight": (
+            "audio_tower.lfm.layers.0.conv.conv.weight",
+            (16, 1, 3),
+            (16, 3, 1),
+        ),
+        "model.language_model.layers.1.self_attn.q_proj.weight": (
+            "language_model.model.layers.1.self_attn.q_proj.weight",
+            (8, 8),
+            (8, 8),
+        ),
+        "model.audio_projector.linear_1.weight": (
+            "audio_projector.linear_1.weight",
+            (4, 4),
+            (4, 4),
+        ),
+    }
+
+    def test_sanitize_renames_audio_and_text(self):
+        pytest.importorskip("mlx_vlm.models.lfm3_omni")
+
+        sanitize = _build_model_sanitizer(self.CONFIG, text_only=False)
+        out = sanitize(
+            {name: mx.zeros(shape) for name, (_, shape, _) in self.WEIGHTS.items()}
+        )
+
+        assert {name: value.shape for name, value in out.items()} == {
+            target: loaded for target, _, loaded in self.WEIGHTS.values()
+        }
+
+    def test_streaming_discovery_uses_loader_names(self, tmp_path):
+        pytest.importorskip("mlx_vlm.models.lfm3_omni")
+        path = tmp_path / "model.safetensors"
+        _write_safetensors(
+            str(path),
+            {
+                name: np.zeros(shape, dtype=np.float16)
+                for name, (_, shape, _) in self.WEIGHTS.items()
+            },
+        )
+
+        sanitize = _build_model_sanitizer(self.CONFIG, text_only=False)
+        plan = _discover_sanitize_plan(sanitize, _LazyTensorIndex([str(path)]))
+
+        assert plan is not None
+        assert {name: tuple(info["shape"]) for name, info in plan.items()} == {
+            target: loaded for target, _, loaded in self.WEIGHTS.values()
+        }
+
+    def test_super_sanitize_keeps_proxy_attributes(self, monkeypatch):
+        pytest.importorskip("mlx_vlm.utils")
+        from types import SimpleNamespace
+
+        class _Cfg:
+            def __init__(self, **fields):
+                self.__dict__.update(fields)
+
+            @classmethod
+            def from_dict(cls, fields):
+                return cls(**fields)
+
+        class _BaseModel:
+            def sanitize(self, weights):
+                return {k.removeprefix("model."): v for k, v in weights.items()}
+
+        class _FakeModel(_BaseModel):
+            def __init__(self, config):
+                raise AssertionError("oQ must not build the model to sanitize")
+
+            def sanitize(self, weights):
+                # The proxy's audio sentinel and config must survive the
+                # switch to a model subclass.
+                assert self.audio_tower is not None
+                assert self.config.text_config.num_hidden_layers == 2
+                return super().sanitize(weights)
+
+        fake_module = SimpleNamespace(
+            Model=_FakeModel,
+            ModelConfig=_Cfg,
+            VisionConfig=_Cfg,
+            TextConfig=_Cfg,
+        )
+        monkeypatch.setattr(
+            "mlx_vlm.utils.get_model_and_args",
+            lambda config: (fake_module, None),
+        )
+
+        sanitize = _build_model_sanitizer(
+            {
+                "model_type": "fake_omni",
+                "architectures": ["FakeOmniForConditionalGeneration"],
+                "text_config": {"num_hidden_layers": 2},
+                "vision_config": {"hidden_size": 8},
+                "audio_config": {"hidden_size": 8},
+            },
+            text_only=False,
+        )
+
+        assert sanitize({"model.audio_tower.w": 1}) == {"audio_tower.w": 1}

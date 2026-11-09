@@ -4703,6 +4703,21 @@ def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype):
     return w_mx
 
 
+def _sanitize_uses_zero_arg_super(model_cls) -> bool:
+    """Return whether any ``sanitize`` in the model's MRO calls ``super()``.
+
+    Zero-argument ``super()`` compiles to a ``__class__`` closure cell, so the
+    cell is a reliable marker without running the method.
+    """
+    for klass in getattr(model_cls, "__mro__", ()):
+        method = klass.__dict__.get("sanitize")
+        method = getattr(method, "__func__", method)
+        code = getattr(method, "__code__", None)
+        if code is not None and "__class__" in code.co_freevars:
+            return True
+    return False
+
+
 def _build_model_sanitizer(
     config: dict,
     text_only: bool = False,
@@ -4868,6 +4883,7 @@ def _build_model_sanitizer(
             has_audio = config.get("audio_config") is not None
             _AUDIO_SENTINEL = object() if has_audio else None
             has_vision = config.get("vision_config") is not None
+            sanitize_uses_super = _sanitize_uses_zero_arg_super(model_module.Model)
 
             def _vlm_sanitize(weights):
                 class _Proxy:
@@ -4900,7 +4916,20 @@ def _build_model_sanitizer(
                             return attr.__get__(self, type(self))
                         return attr
 
-                proxy = _Proxy()
+                proxy_cls = _Proxy
+                if sanitize_uses_super:
+                    # LFM3-Omni's sanitize calls super().sanitize(), and Python
+                    # only accepts that when self is an instance of the model
+                    # class. A plain proxy made sanitize raise, so oQ wrote the
+                    # checkpoint's original names and the loader could not
+                    # find the per-layer bit settings. Subclass the model
+                    # without running its __init__ so nothing is allocated.
+                    proxy_cls = type(
+                        "_ModelProxy",
+                        (_Proxy, model_module.Model),
+                        {"__init__": lambda self: None},
+                    )
+                proxy = proxy_cls()
                 proxy.config = model_config
                 if has_vision:
                     # EmbeddingGemma 2 drops vision weights when vision_tower is None.
