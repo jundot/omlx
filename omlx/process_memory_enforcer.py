@@ -1244,8 +1244,10 @@ class ProcessMemoryEnforcer:
         Blocks of admitted or queued requests stay unless ``allow_protected``
         is set. Their cached prefixes then shed in global LRU order too:
         shedding costs those requests a re-prefill on their next turn, while
-        refusing costs the new request a hard 400 (#4213). Nothing is
-        released when even the sheddable blocks cannot cover the drop.
+        refusing costs the new request a hard 400 (#4213). Without
+        ``allow_protected`` nothing is released when the sheddable blocks
+        cannot cover the drop; with it the drop is taken from the protected
+        blocks as far as they reach.
         Returns the actual drop.
         """
         before = self._hot_cache_reserved_bytes()
