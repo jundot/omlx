@@ -85,6 +85,42 @@ class TestReasoningEffortChatTemplateKwargs:
         assert merged == {"reasoning_effort": 0.9}
         assert isinstance(merged["reasoning_effort"], float)
 
+    def test_none_effort_disables_thinking(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, "none") == {
+            "enable_thinking": False
+        }
+
+    def test_off_effort_disables_thinking(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, " Off ") == {
+            "enable_thinking": False
+        }
+
+    def test_none_effort_keeps_other_template_kwargs(self):
+        merged = merge_reasoning_effort_chat_template_kwargs(
+            {"preserve_thinking": True}, "none"
+        )
+
+        assert merged == {"preserve_thinking": True, "enable_thinking": False}
+
+    def test_explicit_enable_thinking_wins_over_none_effort(self):
+        merged = merge_reasoning_effort_chat_template_kwargs(
+            {"enable_thinking": True}, "none"
+        )
+
+        assert merged == {"enable_thinking": True, "reasoning_effort": "none"}
+
+    def test_explicit_template_effort_wins_over_none_effort(self):
+        merged = merge_reasoning_effort_chat_template_kwargs(
+            {"reasoning_effort": "low"}, "none"
+        )
+
+        assert merged == {"reasoning_effort": "low"}
+
+    def test_minimal_effort_still_forwarded(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, "minimal") == {
+            "reasoning_effort": "minimal"
+        }
+
 
 class TestCleanOutputText:
     """Tests for clean_output_text function."""
