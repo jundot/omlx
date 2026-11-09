@@ -2370,7 +2370,7 @@
   "usage.speed": "输出 tok/s",
   "usage.empty": "此范围内没有使用记录。历史记录自升级后开始。",
   "usage.heatmap": "按日期和小时的 Token 使用量",
-  "usage.heatmap_note": "00–23 时 · 绿色越深表示 Token 越多 · 夏令时重复的小时会合并",
+  "usage.heatmap_note": "00–23 时 · 绿色越浓表示 Token 越多 · 夏令时重复的小时会合并",
   "usage.unavailable": "使用历史不可用。推理正常继续。",
   "usage.delayed": "历史记录可能不完整：存储延迟或待处理缓冲区已溢出。",
   "usage.loading": "正在加载使用量…",
