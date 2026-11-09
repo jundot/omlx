@@ -44,6 +44,7 @@ from .pooling_delta import (
     POOLING_CACHE_DELTA_CLASS,
     POOLING_CACHE_DELTA_FORMAT_VERSION,
 )
+from ..settings import VALID_HOT_CACHE_EVICTION_POLICIES
 from .stats import PagedSSDCacheStats
 
 logger = logging.getLogger(__name__)
@@ -1594,11 +1595,29 @@ class _HotCacheBudgetEntry:
     size_bytes: int
 
 
-class SharedHotCacheBudget:
-    """Process-wide byte budget for hot cache entries across cache managers."""
+def _normalize_hot_eviction_policy(policy: str) -> str:
+    normalized = str(policy).strip().lower()
+    if normalized not in VALID_HOT_CACHE_EVICTION_POLICIES:
+        raise ValueError(
+            f"hot_cache_eviction_policy must be one of: "
+            f"{', '.join(VALID_HOT_CACHE_EVICTION_POLICIES)} (got {policy!r})"
+        )
+    return normalized
 
-    def __init__(self, max_bytes: int):
+
+class SharedHotCacheBudget:
+    """Process-wide byte budget for hot cache entries across cache managers.
+
+    Victims are chosen in global LRU order. Under ``chain_aware_lru`` an entry
+    is a candidate only if its owner reports it evictable (no hot child
+    builds on it), and entries the owner reports orphaned (parent no longer
+    hot, so unreachable) go first. The entry just being admitted can itself
+    be chosen; that is an admission refusal and is returned like any victim.
+    """
+
+    def __init__(self, max_bytes: int, eviction_policy: str = "lru"):
         self.max_bytes = max(0, int(max_bytes))
+        self.eviction_policy = _normalize_hot_eviction_policy(eviction_policy)
         self._entries: OrderedDict[tuple[int, bytes], _HotCacheBudgetEntry] = (
             OrderedDict()
         )
@@ -1675,6 +1694,42 @@ class SharedHotCacheBudget:
                     )
         return cleared
 
+    def _pick_victim_locked(
+        self,
+        protected_hashes: set[bytes] | None = None,
+        pending: dict[int, set[bytes]] | None = None,
+    ) -> tuple[int, bytes] | None:
+        """Return the key of the next entry to evict, or None. Caller holds _lock.
+
+        ``pending`` maps id(owner) -> hashes already chosen as victims in the
+        current loop. Owners drop victims only after the loop, so the chain
+        predicates must be told about them: otherwise a parent whose last
+        child was just chosen would still look protected.
+        """
+        protected_hashes = protected_hashes or set()
+        if self.eviction_policy != "chain_aware_lru":
+            for key, candidate in self._entries.items():
+                if candidate.block_hash not in protected_hashes:
+                    return key
+            return None
+        pending = pending or {}
+        first_leaf = None
+        for key, candidate in self._entries.items():
+            if candidate.block_hash in protected_hashes:
+                continue
+            owner = candidate.owner
+            owner_pending = pending.get(id(owner), set())
+            is_orphan = getattr(owner, "_hot_is_orphan", None)
+            if is_orphan is not None and is_orphan(candidate.block_hash, owner_pending):
+                return key
+            if first_leaf is None:
+                is_evictable = getattr(owner, "_hot_is_evictable", None)
+                if is_evictable is None or is_evictable(
+                    candidate.block_hash, owner_pending
+                ):
+                    first_leaf = key
+        return first_leaf
+
     def releasable_bytes(self, protected_hashes: set[bytes]) -> int:
         """Bytes ``shrink_to`` can free while keeping ``protected_hashes``."""
         with self._lock:
@@ -1699,19 +1754,15 @@ class SharedHotCacheBudget:
         protected_hashes = protected_hashes or set()
         victims: list[tuple[Any, bytes, int]] = []
 
+        pending: dict[int, set[bytes]] = {}
         with self._lock:
             while self._total_bytes > target_bytes and self._entries:
-                victim_key = None
-                victim = None
-                for key, candidate in self._entries.items():
-                    if candidate.block_hash not in protected_hashes:
-                        victim_key = key
-                        victim = candidate
-                        break
-                if victim_key is None or victim is None:
+                victim_key = self._pick_victim_locked(protected_hashes, pending)
+                if victim_key is None:
                     break
 
-                self._entries.pop(victim_key)
+                victim = self._entries.pop(victim_key)
+                pending.setdefault(victim_key[0], set()).add(victim.block_hash)
                 self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
                 victims.append((victim.owner, victim.block_hash, victim.size_bytes))
 
@@ -1742,13 +1793,25 @@ class SharedHotCacheBudget:
             )
             self._total_bytes += size_bytes
 
+            pending: dict[int, set[bytes]] = {}
             while self._total_bytes > self.max_bytes and self._entries:
-                victim_key, victim = self._entries.popitem(last=False)
-                if victim_key == key and not self._entries:
-                    self._entries[victim_key] = victim
+                victim_key = self._pick_victim_locked(pending=pending)
+                if victim_key is None:
                     break
+                if (
+                    victim_key == key
+                    and len(self._entries) == 1
+                    and self.eviction_policy != "chain_aware_lru"
+                ):
+                    # LRU keeps a lone oversized entry (historical behavior).
+                    break
+                victim = self._entries.pop(victim_key)
+                pending.setdefault(victim_key[0], set()).add(victim.block_hash)
                 self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
                 victims.append((victim.owner, victim.block_hash))
+                if victim_key == key:
+                    # Admission refused: nothing else could be evicted.
+                    break
 
         return victims
 
@@ -1787,6 +1850,7 @@ class PagedSSDCacheManager(CacheManager):
         hot_cache_only: bool = False,
         hot_cache_write_through: bool = False,
         hot_cache_budget: SharedHotCacheBudget | None = None,
+        hot_cache_eviction_policy: str = "lru",
         expected_model_name: str = "",
         expected_num_layers: int = 0,
         expected_block_size: int = 0,
@@ -1809,6 +1873,11 @@ class PagedSSDCacheManager(CacheManager):
             hot_cache_only: When True, skip directory init and writer thread.
                 All data is stored exclusively in the hot cache (RAM only).
                 No SSD I/O is performed.
+            hot_cache_eviction_policy: "lru" (default) or "chain_aware_lru".
+                The latter only evicts hot entries no other hot entry builds
+                on, orphans first, and refuses to admit a block rather than
+                break a cached chain. With a shared budget, the budget's
+                policy decides victims; this one supplies the predicates.
             hot_cache_write_through: When True (and hot cache is enabled, not
                 hot_cache_only), every saved block is retained in the hot cache
                 AND enqueued for immediate SSD persistence. Combines RAM-speed
@@ -1923,6 +1992,7 @@ class PagedSSDCacheManager(CacheManager):
             "errors": 0,
             "hot_cache_hits": 0,
             "hot_cache_evictions": 0,
+            "hot_cache_admission_refusals": 0,
             "hot_cache_promotions": 0,
             "hot_cache_promotion_failures": 0,
             "preload_calls": 0,
@@ -1944,6 +2014,13 @@ class PagedSSDCacheManager(CacheManager):
         self._hot_cache: OrderedDict[bytes, dict] = OrderedDict()
         self._hot_cache_total_bytes: int = 0
         self._hot_cache_lock = threading.Lock()
+        self._hot_eviction_policy = _normalize_hot_eviction_policy(
+            hot_cache_eviction_policy
+        )
+        # parent block hash -> number of hot entries whose parent it is.
+        # Maintained under _hot_cache_lock by _hot_link/_hot_unlink at every
+        # insertion/removal; read lock-free by the eviction predicates.
+        self._hot_children: dict[bytes, int] = {}
 
         # Track which block hashes are queued for background write
         self._pending_write_hashes: set = set()
@@ -2064,6 +2141,86 @@ class PagedSSDCacheManager(CacheManager):
             bool(getattr(meta, "tail_terminal", False)),
         )
 
+    # --- chain-aware eviction support -------------------------------------
+
+    @staticmethod
+    def _hot_entry_parent(entry: dict) -> bytes | None:
+        meta = entry.get("block_metadata")
+        parent = getattr(meta, "parent_hash", None)
+        return parent if isinstance(parent, (bytes, bytearray)) else None
+
+    def _hot_link(self, entry: dict) -> None:
+        """Count ``entry`` as a hot child of its parent. Caller holds the lock."""
+        parent = self._hot_entry_parent(entry)
+        if parent is not None:
+            self._hot_children[parent] = self._hot_children.get(parent, 0) + 1
+
+    def _hot_unlink(self, entry: dict) -> None:
+        """Undo ``_hot_link`` for a removed entry. Caller holds the lock."""
+        parent = self._hot_entry_parent(entry)
+        if parent is None:
+            return
+        remaining = self._hot_children.get(parent, 0) - 1
+        if remaining > 0:
+            self._hot_children[parent] = remaining
+        else:
+            self._hot_children.pop(parent, None)
+
+    @property
+    def _hot_chain_aware(self) -> bool:
+        return self._hot_eviction_policy == "chain_aware_lru"
+
+    def _hot_is_evictable(
+        self, block_hash: bytes, pending: set[bytes] | frozenset = frozenset()
+    ) -> bool:
+        """True unless another hot entry builds on this one (chain-aware only).
+
+        ``pending`` holds entries already chosen for eviction but not yet
+        removed (shared-budget loop); children among them do not protect.
+        Lock-free reads: called by SharedHotCacheBudget while it holds its own
+        lock, which must not nest with _hot_cache_lock.
+        """
+        if not self._hot_chain_aware:
+            return True
+        children = self._hot_children.get(block_hash, 0)
+        if children and pending:
+            for victim in pending:
+                entry = self._hot_cache.get(victim)
+                if entry is not None and self._hot_entry_parent(entry) == block_hash:
+                    children -= 1
+        return children <= 0
+
+    def _hot_is_orphan(
+        self, block_hash: bytes, pending: set[bytes] | frozenset = frozenset()
+    ) -> bool:
+        """True if the entry's parent is no longer hot, so lookups cannot reach it."""
+        if not self._hot_chain_aware:
+            return False
+        entry = self._hot_cache.get(block_hash)
+        if entry is None:
+            return False
+        parent = self._hot_entry_parent(entry)
+        return parent is not None and (parent not in self._hot_cache or parent in pending)
+
+    def _hot_pick_victim_locked(
+        self,
+        skip: set[bytes] | None = None,
+        skip_staging: bool = False,
+    ) -> bytes | None:
+        """Next local eviction victim in policy order. Caller holds the lock."""
+        skip = skip or set()
+        first_leaf = None
+        for block_hash, entry in self._hot_cache.items():
+            if block_hash in skip or (skip_staging and entry.get("staging")):
+                continue
+            if not self._hot_chain_aware:
+                return block_hash
+            if self._hot_is_orphan(block_hash):
+                return block_hash
+            if first_leaf is None and self._hot_is_evictable(block_hash):
+                first_leaf = block_hash
+        return first_leaf
+
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
         if entry.get("staging"):
@@ -2089,13 +2246,17 @@ class PagedSSDCacheManager(CacheManager):
                 old = self._hot_cache.pop(block_hash, None)
                 if old is not None:
                     self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
+                    self._hot_unlink(old)
                 self._hot_cache[block_hash] = entry
                 self._hot_cache_total_bytes += entry_size
+                self._hot_link(entry)
 
             victims = self._hot_cache_budget.put(self, block_hash, entry_size)
             for owner, victim_hash in victims:
                 evicted = owner._hot_cache_remove(victim_hash, update_budget=False)
                 if evicted is not None:
+                    if owner is self and victim_hash == block_hash:
+                        self._stats["hot_cache_admission_refusals"] += 1
                     owner._handle_hot_cache_eviction(victim_hash, evicted)
             return
 
@@ -2104,18 +2265,28 @@ class PagedSSDCacheManager(CacheManager):
             if block_hash in self._hot_cache:
                 old = self._hot_cache.pop(block_hash)
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
+                self._hot_unlink(old)
 
-            # Evict LRU entries until we have room
-            while (
-                self._hot_cache_total_bytes + entry_size > self._hot_cache_max_bytes
-                and self._hot_cache
-            ):
-                evicted_hash, evicted = self._hot_cache.popitem(last=False)
-                self._hot_cache_total_bytes -= self._hot_cache_entry_size(evicted)
-                evicted_entries.append((evicted_hash, evicted))
-
+            # Insert first, then evict: under chain_aware_lru the new entry is
+            # what protects its parent. The new entry is the most recently
+            # used, so plain LRU only reaches it once it is alone (and keeps
+            # it, as before); chain_aware_lru may refuse it.
             self._hot_cache[block_hash] = entry
             self._hot_cache_total_bytes += entry_size
+            self._hot_link(entry)
+            while self._hot_cache_total_bytes > self._hot_cache_max_bytes:
+                victim_hash = self._hot_pick_victim_locked()
+                if victim_hash is None:
+                    break
+                if victim_hash == block_hash and not self._hot_chain_aware:
+                    break
+                evicted = self._hot_cache.pop(victim_hash)
+                self._hot_cache_total_bytes -= self._hot_cache_entry_size(evicted)
+                self._hot_unlink(evicted)
+                evicted_entries.append((victim_hash, evicted))
+                if victim_hash == block_hash:
+                    self._stats["hot_cache_admission_refusals"] += 1
+                    break
 
         # Flush evicted entries to SSD outside the hot cache lock
         for evicted_hash, evicted in evicted_entries:
@@ -2220,6 +2391,7 @@ class PagedSSDCacheManager(CacheManager):
             old = self._hot_cache.pop(block_hash, None)
             if old:
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
+                self._hot_unlink(old)
         if old is not None and update_budget and self._hot_cache_budget is not None:
             self._hot_cache_budget.forget(self, block_hash)
         return old
@@ -3955,7 +4127,11 @@ class PagedSSDCacheManager(CacheManager):
             # Hot cache disabled: use temporary buffer + immediate SSD write
             cache_entry["staging"] = True
             with self._hot_cache_lock:
+                old_staging = self._hot_cache.pop(block_hash, None)
+                if old_staging is not None:
+                    self._hot_unlink(old_staging)
                 self._hot_cache[block_hash] = cache_entry
+                self._hot_link(cache_entry)
 
             # Track pending write
             with self._pending_write_hashes_lock:
@@ -5257,6 +5433,7 @@ class PagedSSDCacheManager(CacheManager):
         with self._hot_cache_lock:
             entries = list(self._hot_cache.items())
             self._hot_cache.clear()
+            self._hot_children.clear()
             self._hot_cache_total_bytes = 0
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
@@ -5300,18 +5477,14 @@ class PagedSSDCacheManager(CacheManager):
         evicted_entries: list[tuple[bytes, dict, int]] = []
         with self._hot_cache_lock:
             while self._hot_cache_total_bytes > target_bytes and self._hot_cache:
-                victim_hash = None
-                for block_hash in self._hot_cache:
-                    if block_hash in protected_hashes:
-                        continue
-                    if self._hot_cache[block_hash].get("staging"):
-                        continue
-                    victim_hash = block_hash
-                    break
+                victim_hash = self._hot_pick_victim_locked(
+                    skip=protected_hashes, skip_staging=True
+                )
                 if victim_hash is None:
                     break
 
                 evicted = self._hot_cache.pop(victim_hash)
+                self._hot_unlink(evicted)
                 size = self._hot_cache_entry_size(evicted)
                 self._hot_cache_total_bytes = max(0, self._hot_cache_total_bytes - size)
                 evicted_entries.append((victim_hash, evicted, size))
@@ -5613,6 +5786,7 @@ class PagedSSDCacheManager(CacheManager):
         # Clear hot cache and pending write buffer
         with self._hot_cache_lock:
             self._hot_cache.clear()
+            self._hot_children.clear()
             self._hot_cache_total_bytes = 0
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
