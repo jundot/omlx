@@ -2052,6 +2052,18 @@ class PagedSSDCacheManager(CacheManager):
             return self._hot_cache_budget.remaining_bytes
         return max(0, self._hot_cache_max_bytes - self._hot_cache_total_bytes)
 
+    # --- block lineage helpers (used by payload rewrites) -----------------
+
+    def get_block_lineage(self, block_hash: bytes) -> tuple[bytes | None, bool]:
+        """(parent_hash, tail_terminal) of a hot or SSD-indexed block."""
+        entry = self._hot_cache.get(block_hash)
+        meta = entry.get("block_metadata") if entry is not None else self._index.get(block_hash)
+        parent = getattr(meta, "parent_hash", None)
+        return (
+            parent if isinstance(parent, (bytes, bytearray)) else None,
+            bool(getattr(meta, "tail_terminal", False)),
+        )
+
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
         if entry.get("staging"):
