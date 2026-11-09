@@ -375,9 +375,8 @@ def _is_vlm_load(config: dict) -> bool:
     ``mlx_vlm.speculative.drafters.<type>`` lookup and fails.
     """
     model_type = str(config.get("model_type", "")).lower().replace("-", "_")
-    return model_type in VLM_NATIVE_TEXT_MODEL_TYPES or (
-        _has_vision_subconfig(config)
-        and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
+    return model_type in (VLM_NATIVE_TEXT_MODEL_TYPES | {"lfm3_audio"}) or (
+        _has_vision_subconfig(config) and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
     )
 
 
@@ -478,6 +477,14 @@ def _configure_minimax_shared_expert_layout(config: dict, oq_level: float) -> bo
     return True
 
 
+def _quant_text_config(config: dict) -> dict:
+    """Return the backbone config used by the quantization planner."""
+    text = config.get("text_config")
+    if not isinstance(text, dict) and config.get("model_type") == "lfm3_audio":
+        text = config.get("lfm")
+    return text if isinstance(text, dict) else {}
+
+
 def _normalize_sensitivity_map_override(
     config: dict,
     sensitivity_map_override: dict[int | str, float] | None,
@@ -493,15 +500,9 @@ def _normalize_sensitivity_map_override(
     if not isinstance(sensitivity_map_override, dict) or not sensitivity_map_override:
         raise ValueError("sensitivity_map_override must be a non-empty dict")
 
-    text_config = config.get("text_config")
+    text_config = _quant_text_config(config)
     num_layers = int(
-        config.get("num_hidden_layers")
-        or (
-            text_config.get("num_hidden_layers", 0)
-            if isinstance(text_config, dict)
-            else 0
-        )
-        or 0
+        config.get("num_hidden_layers") or text_config.get("num_hidden_layers", 0) or 0
     )
     if num_layers <= 0:
         raise ValueError(
@@ -638,6 +639,12 @@ def _is_token_embedding_tensor(path: str) -> bool:
     )
 
 
+def _is_lfm3_speech_module(path: str, config: dict) -> bool:
+    return config.get("model_type") in {"lfm3_audio", "lfm3_omni"} and path.split(
+        ".", 1
+    )[0] in {"audio_tower", "audio_projector", "depth_decoder", "codebook_embedding"}
+
+
 def universal_quant_predicate(
     path: str, module, config: dict, oq_level: int = 4
 ) -> bool | dict:
@@ -673,11 +680,15 @@ def universal_quant_predicate(
     if path in non_quantizable:
         return False
 
+    # Match mlx-vlm's LFM3 speech policy before applying sensitivity boosts.
+    if _is_lfm3_speech_module(path, config):
+        return False
+
     indexer_override = _indexer_q8_override(path, config)
     if indexer_override is not None:
         return indexer_override
 
-    tc = config.get("text_config", {})
+    tc = _quant_text_config(config)
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
     num_experts = (
         config.get("num_local_experts")
@@ -1048,6 +1059,7 @@ def _budgeted_shapes(named_shapes: dict[str, tuple], config: dict) -> dict[str, 
         if not _is_qwen4_exp_ngram_embedding_tensor(path, config)
         and not _is_vision_tensor(path)
         and not _is_audio_tensor(path)
+        and not _is_lfm3_speech_module(path, config)
     }
 
 
@@ -1123,7 +1135,7 @@ _GLOBAL_ATTENTION_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.self_attn\.[qkvo]_pro
 
 def _global_attention_layers(config: dict) -> set[int]:
     """Full-attention layers of a hybrid model (sliding or linear attention elsewhere)."""
-    text_config = config.get("text_config") or {}
+    text_config = _quant_text_config(config)
     layer_types = config.get("layer_types") or text_config.get("layer_types") or []
     if len(set(layer_types)) < 2:
         return set()
@@ -4144,7 +4156,7 @@ def estimate_bpw_and_size(
     # Build budget plan for accurate estimate (position-based sensitivity)
     _level_targets = _bpw_targets_for_level(oq_level)
     if _level_targets is not None:
-        tc = config.get("text_config", {})
+        tc = _quant_text_config(config)
         num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
         pos_sens = {}
         for i in range(num_layers):
@@ -4758,6 +4770,7 @@ def _build_model_sanitizer(
         any("ForConditionalGeneration" in a for a in architectures)
         or _has_vision_subconfig(config)
         or model_type in VLM_NATIVE_TEXT_MODEL_TYPES
+        or model_type == "lfm3_audio"
     ) and not (mlx_lm_text_only or (text_only and model_type != "glm5_next"))
 
     # Serving normally registers oMLX's vendored Qwen4 implementation before
@@ -4857,15 +4870,17 @@ def _build_model_sanitizer(
             model_config_cls = model_module.ModelConfig
             model_config = model_config_cls.from_dict(config)
 
-            vision_config = model_config.vision_config
+            vision_config = getattr(model_config, "vision_config", None)
             if isinstance(vision_config, dict):
                 vision_config = model_module.VisionConfig.from_dict(vision_config)
-            text_config = model_config.text_config
+            text_config = getattr(model_config, "text_config", None)
             if isinstance(text_config, dict):
                 text_config = model_module.TextConfig.from_dict(text_config)
 
-            model_config.vision_config = vision_config
-            model_config.text_config = text_config
+            if vision_config is not None:
+                model_config.vision_config = vision_config
+            if text_config is not None:
+                model_config.text_config = text_config
             # Gemma 4 E2B/E4B carry an audio tower; their sanitize reads
             # audio_config.subsampling_conv_channels, so leaving the dict in
             # place made sanitize raise and the build fall back to raw names.
@@ -5185,7 +5200,7 @@ def _holds_chat_template(path: Path) -> bool:
 
 
 def _copy_model_sidecars(
-    source: Path, output: Path, *, text_only: bool = False
+    source: Path, output: Path, *, text_only: bool = False, model_type: str = ""
 ) -> None:
     """Copy tokenizer/processor sidecar files needed to load the output.
 
@@ -5207,6 +5222,13 @@ def _copy_model_sidecars(
 
     for py_file in source.glob("*.py"):
         shutil.copy2(py_file, output / py_file.name)
+
+    # LFM3 speech decoding loads its codec separately from the model weights.
+    if not text_only and model_type in {"lfm3_audio", "lfm3_omni"}:
+        for name in ("audio_tokenizer", "audio_detokenizer"):
+            codec = source / name
+            if codec.is_dir():
+                shutil.copytree(codec, output / name)
 
 
 def _copy_bundled_drafts(source: Path, output: Path) -> None:
@@ -6171,6 +6193,10 @@ def _source_imatrix_signature(
         # Invalidate caches produced by the old independent-block walk, which
         # captured only q_proj in the shared-KV tail of E2B/E4B.
         signature["layer_walk"] = "gemma4_shared_kv_v1"
+    elif model_type.startswith(("lfm2", "lfm3")) or model_type == "gear":
+        # Older walks passed attention masks to convolution layers, so their
+        # captured activations cannot be reused.
+        signature["layer_walk"] = "conv_mask_v1"
     elif _is_qwen4_exp_config(config):
         signature["layer_walk"] = "qwen4_mtp_batch_positions_v1"
     elif str(config.get("model_type", "")).lower() == "deepseek_v41":
@@ -7045,6 +7071,11 @@ def quantize_oq_streaming(
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
+    if text_only and normalized_model_type in {"lfm3_audio", "lfm3_omni"}:
+        raise ValueError(
+            "oQ text-only conversion is not supported for LFM3 audio models; "
+            "disable text-only to retain the speech and vision components"
+        )
     mimo_multimodal = (
         normalized_model_type in {"mimo_v2", "mimo_v2_flash"}
         and _has_vision_subconfig(config)
@@ -7500,7 +7531,12 @@ def quantize_oq_streaming(
         preserve_mtp=preserve_mtp,
     )
     source_model_type = _stream_source_model_type(config)
-    if sanitize_fn is None and source_model_type in {"qwen4_exp", "glm5_next"}:
+    if sanitize_fn is None and source_model_type in {
+        "qwen4_exp",
+        "glm5_next",
+        "lfm3_audio",
+        "lfm3_omni",
+    }:
         raise RuntimeError(
             f"no model sanitizer for {source_model_type}: refusing to quantize on raw "
             "checkpoint keys (the recipe's tensor rules would not match)"
@@ -7540,6 +7576,11 @@ def quantize_oq_streaming(
                     f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors"
                 )
             except Exception as e2:
+                if source_model_type in {"lfm3_audio", "lfm3_omni"}:
+                    raise RuntimeError(
+                        f"{source_model_type} sanitize failed ({e2}); refusing to "
+                        "quantize on raw checkpoint keys"
+                    ) from e2
                 logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
@@ -7967,7 +8008,9 @@ def quantize_oq_streaming(
         with open(output / "oq_imatrix_report.json", "w") as f:
             json.dump(imatrix_report, f, indent=2, ensure_ascii=False)
 
-    _copy_model_sidecars(source, output, text_only=text_only)
+    _copy_model_sidecars(
+        source, output, text_only=text_only, model_type=config.get("model_type", "")
+    )
     for name in DECISION_SIDECAR_FILES:
         if (source / name).is_file():
             shutil.copy2(source / name, output / name)
@@ -8811,6 +8854,8 @@ def _is_recurrent_layer(layer) -> bool:
         return bool(layer.is_linear)
     if hasattr(layer, "is_global"):
         return not bool(layer.is_global)
+    if hasattr(layer, "is_attention_layer"):
+        return not bool(layer.is_attention_layer)
     return False
 
 
@@ -11805,7 +11850,7 @@ def _build_streaming_proxy_for_sensitivity(
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
 
-    _copy_model_sidecars(source, output)
+    _copy_model_sidecars(source, output, model_type=config.get("model_type", ""))
 
 
 def _measure_sensitivity_from_quantized_model(

@@ -13,7 +13,7 @@ No model download is required.
 
 # LFM3-Omni oQ sanitize tests
 
-Run `python -m pytest -q tests/test_oq.py -k Lfm3OmniSanitize` to check that oQ renames LFM3-Omni weights to the names mlx-vlm loads. The cases cover eager sanitize, streaming sanitize discovery, and a model whose `sanitize` calls `super()`. They use a small config and need no model download.
+Run `python -m pytest -q tests/test_oq.py -k 'Lfm3OmniSanitize or lfm3_codec_sidecars'` to check that oQ renames LFM3-Omni weights to the names mlx-vlm loads, keeps LFM3 speech modules in floating point, and copies the speech codec for multimodal output. The cases cover eager sanitize, streaming sanitize discovery, and text-only sidecars. They use a small config and need no model download.
 
 # Qwen3-ASR audio quantization tests
 

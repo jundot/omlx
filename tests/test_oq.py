@@ -7524,6 +7524,30 @@ class TestTextOnlyMultimodalMetadata:
         assert not (out / "preprocessor_config.json").exists()
         assert not (out / "processor_config.json").exists()
 
+    @pytest.mark.parametrize("model_type", ["lfm3_audio", "lfm3_omni", "other"])
+    @pytest.mark.parametrize("text_only", [True, False])
+    def test_lfm3_codec_sidecars(self, tmp_path, model_type, text_only):
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(tmp_path)
+        for name in ("audio_tokenizer", "audio_detokenizer"):
+            codec = src / name
+            codec.mkdir()
+            (codec / "config.json").write_text('{"test": true}')
+            (codec / "model.safetensors").write_bytes(b"codec weights")
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out, text_only=text_only, model_type=model_type)
+
+        for name in ("audio_tokenizer", "audio_detokenizer"):
+            copied = out / name
+            if model_type.startswith("lfm3_") and not text_only:
+                assert (copied / "config.json").read_text() == '{"test": true}'
+                assert (copied / "model.safetensors").read_bytes() == b"codec weights"
+            else:
+                assert not copied.exists()
+
     def test_multimodal_keeps_processor_sidecars(self, tmp_path):
         from omlx.oq import _copy_model_sidecars
 
@@ -9128,6 +9152,192 @@ class TestLfm3OmniSanitize:
             (4, 4),
         ),
     }
+
+    @pytest.mark.parametrize("model_type", ["lfm3_audio", "lfm3_omni"])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "audio_tower.lfm.layers.2.self_attn.q_proj",
+            "audio_projector.linear_1",
+            "depth_decoder.model.layers.2.self_attn.q_proj",
+            "codebook_embedding",
+        ],
+    )
+    @pytest.mark.parametrize("level", [2, 4, 6, 8])
+    def test_lfm3_speech_modules_stay_float(self, model_type, path, level):
+        config = {
+            "model_type": model_type,
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {path: {"bits": 8, "group_size": 64}},
+        }
+        assert universal_quant_predicate(path + ".weight", None, config, level) is False
+        assert (
+            universal_quant_predicate(
+                "language_model.model.layers.0.self_attn.q_proj", None, config, level
+            )
+            is not False
+        )
+
+    @pytest.mark.parametrize("model_type", ["lfm3_audio", "lfm3_omni"])
+    def test_speech_weights_do_not_change_backbone_budget(self, model_type):
+        from omlx.oq import _budgeted_shapes
+
+        backbone = {
+            "language_model.model.layers.0.feed_forward.w1": (1024, 1024),
+            "language_model.model.layers.0.feed_forward.w2": (1024, 1024),
+        }
+        speech = {
+            "audio_tower.lfm.layers.0.feed_forward.w1": (4096, 4096),
+            "audio_projector.linear_1": (1024, 1024),
+            "depth_decoder.model.layers.0.feed_forward.w1": (4096, 4096),
+            "codebook_embedding": (1024, 1024),
+        }
+        config = {"model_type": model_type}
+        assert _budgeted_shapes({**backbone, **speech}, config) == backbone
+
+    def test_audio_backbone_config_drives_sensitivity_and_attention(self):
+        from omlx.oq import _global_attention_layers
+
+        config = {
+            "model_type": "lfm3_audio",
+            "lfm": {
+                "num_hidden_layers": 3,
+                "layer_types": ["conv", "full_attention", "sliding_attention"],
+            },
+        }
+        assert _normalize_sensitivity_map_override(config, {1: 1.0}) == {1: 1.0}
+        with pytest.raises(ValueError, match="outside"):
+            _normalize_sensitivity_map_override(config, {3: 1.0})
+        assert _global_attention_layers(config) == {1}
+
+    @pytest.mark.parametrize("model_type", ["lfm3_audio", "lfm3_omni"])
+    @pytest.mark.parametrize("missing", [True, False])
+    def test_missing_sanitizer_does_not_write_raw_weights(
+        self, tmp_path, monkeypatch, model_type, missing
+    ):
+        source = tmp_path / "source"
+        source.mkdir()
+        config = {"model_type": model_type, "num_hidden_layers": 1}
+        (source / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(source / "model.safetensors"), {"x.weight": mx.ones((64, 64))}
+        )
+
+        def broken_sanitizer(weights):
+            raise ValueError("cannot sanitize")
+
+        monkeypatch.setattr(
+            "omlx.oq._build_model_sanitizer",
+            lambda *a, **k: None if missing else broken_sanitizer,
+        )
+        output = tmp_path / "out"
+        with pytest.raises(RuntimeError, match="refusing to quantize"):
+            quantize_oq_streaming(
+                str(source), str(output), 4, sensitivity_map_override={0: 1.0}
+            )
+        assert not list(output.glob("*.safetensors"))
+
+    @pytest.mark.parametrize("model_type", ["lfm3_audio", "lfm3_omni"])
+    def test_text_only_conversion_is_rejected_before_writing(
+        self, tmp_path, model_type
+    ):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.json").write_text(json.dumps({"model_type": model_type}))
+        output = tmp_path / "out"
+
+        with pytest.raises(ValueError, match="text-only.*LFM3"):
+            quantize_oq_streaming(str(source), str(output), 4, text_only=True)
+        assert not output.exists()
+
+    @pytest.mark.parametrize("with_architecture", [True, False])
+    def test_audio_only_sanitizer_renames_checkpoint_weights(self, with_architecture):
+        import copy
+
+        from omlx.oq import _is_vlm_load
+
+        audio_text = copy.deepcopy(self.CONFIG["audio_encoder_config"]["text_config"])
+        config = {
+            "model_type": "lfm3_audio",
+            "architectures": ["Lfm3AudioForConditionalGeneration"],
+            "lfm": copy.deepcopy(self.CONFIG["text_config"]),
+            "encoder": {
+                "lfm": audio_text,
+                "dim_conv": 16,
+                "dim_out": 768,
+                "dim_in": 128,
+                "sliding_window": 32,
+            },
+            "depthformer": copy.deepcopy(self.CONFIG["depth_config"]),
+        }
+        if not with_architecture:
+            config.pop("architectures")
+        assert _is_vlm_load(config)
+        sanitize = _build_model_sanitizer(config)
+        assert sanitize is not None
+        source = {
+            "encoder.lfm.lfm.layers.0.self_attn.q_proj.weight": mx.zeros((64, 64)),
+            "depthformer.model.layers.0.self_attn.q_proj.weight": mx.zeros((64, 64)),
+            "lfm.model.layers.0.self_attn.q_proj.weight": mx.zeros((64, 64)),
+        }
+        weights = sanitize(source)
+        assert set(weights) == {
+            "audio_tower.lfm.layers.0.self_attn.q_proj.weight",
+            "depth_decoder.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+        }
+        for name in weights:
+            decision = universal_quant_predicate(name, None, config, 4)
+            assert (decision is False) == (not name.startswith("language_model."))
+
+    @pytest.mark.parametrize(
+        "model_type", ["lfm2", "lfm3", "lfm3_audio", "lfm3_omni", "gear"]
+    )
+    def test_lfm_imatrix_cache_rejects_old_layer_walk(self, tmp_path, model_type):
+        from omlx.oq import OQImatrixData, _oqe_cache_matches, _source_imatrix_signature
+
+        signature = _source_imatrix_signature(
+            tmp_path,
+            {"model_type": model_type},
+            num_samples=4,
+            seq_length=8,
+            calib_dataset="code",
+        )
+        old = dict(signature, layer_walk="native_inputs_v1")
+        cache = OQImatrixData(entries={}, metadata=old, path=str(tmp_path / "old.npz"))
+        assert not _oqe_cache_matches(cache, signature)
+
+    def test_lfm3_calibration_matches_native_layer_walk(self):
+        from mlx_vlm.models.lfm3.config import ModelConfig
+        from mlx_vlm.models.lfm3.language import Lfm3Model
+
+        from omlx.oq import _layer_masks_for_model
+
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "lfm3",
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "vocab_size": 64,
+                "layer_types": ["conv", "full_attention", "sliding_attention"],
+                "sliding_window": 4,
+            }
+        )
+        model = Lfm3Model(config)
+        tokens = mx.array([[1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1]])
+        hidden = model.embed_tokens(tokens)
+        masks = _layer_masks_for_model(model, model.layers, hidden)
+        assert masks[0] is None
+        for layer, mask in zip(model.layers, masks):
+            hidden = _forward_layer(layer, hidden, mask, None)
+            assert hidden.shape == (2, 6, 32)
+        actual = model.embedding_norm(hidden)
+        expected = model(tokens)
+        assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
 
     def test_sanitize_renames_audio_and_text(self):
         pytest.importorskip("mlx_vlm.models.lfm3_omni")
