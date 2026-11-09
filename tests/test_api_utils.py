@@ -3637,6 +3637,12 @@ class TestDetectAndStripPartial:
         ]
         assert detect_and_strip_partial(messages) is False
 
+    def test_plain_string_messages_are_ignored(self):
+        """Prompt-only VLM formats render messages as strings, not dicts."""
+        messages = ["<OD>", "describe the picture"]
+        assert detect_and_strip_partial(messages) is False
+        assert messages == ["<OD>", "describe the picture"]
+
 
 class TestExtractTextContentPreservesNamePartial:
     """Tests that extract_text_content preserves name and partial fields."""

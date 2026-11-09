@@ -299,9 +299,14 @@ RERANKER_ARCHITECTURES = SUPPORTED_RERANKER_ARCHITECTURES | UNSUPPORTED_RERANKER
 # multimodal models (e.g., MiniCPM-o) won't trigger this.
 # Note: "whisper" and "qwen3_tts" were previously listed here but are now
 # handled as audio types (audio_stt / audio_tts) — see AUDIO_* sets below.
-UNSUPPORTED_MODEL_TYPES: set[str] = set()
 
-UNSUPPORTED_ARCHITECTURES: set[str] = set()
+# Florence-2 is an encoder-decoder VLM: its decoder cache is a
+# CacheList(SimpleKVCache, SimpleKVCache) that cannot be merged, so the
+# continuous-batching path can never reuse it. mlx-vlm ships the architecture,
+# which used to make oMLX load the checkpoint fine and fail on the first image
+# request with a 500. Skip it at scan time instead.
+UNSUPPORTED_ARCHITECTURES: set[str] = {"Florence2ForConditionalGeneration"}
+UNSUPPORTED_MODEL_TYPES: set[str] = {"florence2"}
 
 # ---------------------------------------------------------------------------
 # Audio model detection — dynamically loaded from mlx-audio when available

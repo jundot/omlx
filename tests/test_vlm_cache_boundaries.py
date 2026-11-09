@@ -69,6 +69,32 @@ def reused_tokens(tokens, ranges_a, ranges_b, hash_a, hash_b):
     return table.num_tokens if table else 0
 
 
+def test_prompt_only_messages_are_used_as_the_prompt():
+    """Prompt-only VLM formats have no chat template; the rendered string is it."""
+    engine = VLMBatchedEngine(model_name="prompt-only-test")
+    engine._processor = MagicMock()
+    engine._processor.image_token = "<image>"
+    engine._processor.apply_chat_template.side_effect = AssertionError(
+        "prompt-only formats must not run a chat template"
+    )
+    engine._vlm_model = MagicMock()
+    engine._vlm_model.config.model_type = "paligemma"
+    engine._vision_cache = None
+    engine._format_messages_for_vlm_template = MagicMock(
+        return_value=(["<image>describe"], [])
+    )
+    images = [Image.new("RGB", (4, 4), (1, 0, 0))]
+
+    with patch("mlx_vlm.utils.prepare_inputs") as prepare_inputs:
+        prepare_inputs.return_value = {
+            "input_ids": mx.array([[1, 2]]),
+            "pixel_values": mx.zeros((1, 1)),
+        }
+        engine._prepare_vision_inputs([{"role": "user", "content": "x"}], images)
+
+    assert prepare_inputs.call_args.kwargs["prompts"] == ["<image>describe"]
+
+
 @pytest.mark.parametrize("first_prefix_len", [10, 60])
 def test_grid_boundaries_ignore_rerendered_reasoning(first_prefix_len):
     full = [1] * 4 + [99] * 4 + [2] * 4 + [99] * 4 + [3] * 4
