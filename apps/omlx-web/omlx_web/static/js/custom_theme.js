@@ -348,7 +348,7 @@
 
     const api = {
         GROUPS, TOKENS, DERIVED, MODES, STATUS, CONTRAST_RULES,
-        normalizeHex, contrast, contrastChecks, flatten, badgeColors, sanitize, isEmpty, apply, defaults, css, declarations,
+        normalizeHex, contrast, contrastChecks, flatten, badgeColors, sanitize, isEmpty, apply, defaults, css,
         oklch, darkFromLight,
     };
     if (typeof window !== 'undefined') window.OmlxCustomTheme = api;
