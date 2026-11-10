@@ -369,6 +369,30 @@ class TestBatchedEngineInitialization:
         assert engine._engine is None
 
 
+class TestBatchedEngineAbortRequest:
+    @pytest.mark.asyncio
+    async def test_abort_request_only_reaches_owned_requests(self):
+        from omlx.engine.batched import BatchedEngine
+
+        core = MagicMock()
+        core._output_collectors = {"req-1": object(), "done": object()}
+        core._finished_at = {"done": 0.0}
+        core.abort_request = AsyncMock(return_value=True)
+        engine = BatchedEngine(model_name="test-model")
+        engine._engine = SimpleNamespace(engine=core)
+
+        assert await engine.abort_request("other") is False
+        assert await engine.abort_request("done") is False
+        core.abort_request.assert_not_awaited()
+
+        assert await engine.abort_request(
+            "req-1", reason="stop", error_code="admin_abort"
+        )
+        core.abort_request.assert_awaited_once_with(
+            "req-1", reason="stop", error_code="admin_abort"
+        )
+
+
 class TestBatchedEngineStreamingCleanup:
     """Tests for streaming generator cleanup paths."""
 

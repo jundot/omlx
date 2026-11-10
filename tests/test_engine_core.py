@@ -29,7 +29,11 @@ from omlx.engine_core import (
     EngineCore,
     _raise_request_output_error,
 )
-from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
+from omlx.exceptions import (
+    PrefillMemoryAbortedError,
+    PrefillMemoryExceededError,
+    RequestAbortedError,
+)
 from omlx.output_collector import RequestOutputCollector
 from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
@@ -586,6 +590,35 @@ class TestEngineCoreAbortRequest:
 
                 # stream_outputs' finally block should have cleaned up
                 assert request_id not in engine._output_collectors
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_admin_abort_ends_stream_with_request_aborted_error(
+        self, mock_model, mock_tokenizer
+    ):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+
+                request_id = await engine.add_request(prompt="Hello")
+                await engine.abort_request(
+                    request_id, reason="Stopped by admin", error_code="admin_abort"
+                )
+
+                outputs = []
+                with pytest.raises(RequestAbortedError, match="Stopped by admin"):
+                    async for output in engine.stream_outputs(request_id):
+                        outputs.append(output)
+                assert outputs[-1].finish_reason == "error"
+                assert outputs[-1].new_text == "\n\n[Error: Stopped by admin]"
+                assert request_id in engine.scheduler._pending_abort_ids
             finally:
                 await engine.stop()
                 engine.close()

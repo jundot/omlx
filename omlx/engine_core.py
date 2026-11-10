@@ -189,7 +189,7 @@ def _raise_request_output_error(output: RequestOutput) -> None:
             ),
             limit_bytes=int(limit_bytes) if limit_bytes is not None else None,
         )
-    if output.error_code == "model_unloading":
+    if output.error_code in ("model_unloading", "admin_abort"):
         raise RequestAbortedError(output.error, request_id=output.request_id)
     raise RuntimeError(output.error)
 
@@ -848,7 +848,13 @@ class EngineCore:
 
         return request_id
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
         """Abort a request.
 
         Uses deferred abort pattern: scheduler.abort_request() just enqueues
@@ -869,7 +875,7 @@ class EngineCore:
             )
             return False
 
-        # A client cancel keeps the computed prefix for a resend.
+        # A client cancel or an admin stop keeps the computed prefix for a resend.
         result = scheduler.abort_request(request_id, keep_cache=True)
 
         # Signal consumer with abort error so any waiting
@@ -877,14 +883,24 @@ class EngineCore:
         # Matches abort_all_requests() pattern.
         collector = self._output_collectors.get(request_id)
         if collector is not None:
-            collector.put(
-                RequestOutput(
+            if reason is None:
+                output = RequestOutput(
                     request_id=request_id,
                     finished=True,
                     finish_reason="abort",
                     error="Request aborted",
                 )
-            )
+            else:
+                # The client still listens; tell it why, as abort_all_requests does.
+                output = RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="error",
+                    new_text=f"\n\n[Error: {reason}]",
+                    error=reason,
+                    error_code=error_code,
+                )
+            collector.put(output)
         self._mark_request_finished(request_id)
         self._wake_engine_loop()
 
@@ -1534,7 +1550,13 @@ class AsyncEngineCore:
             **kwargs,
         )
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
         """Abort a request."""
         engine = getattr(self, "engine", None)
         if engine is None:
@@ -1543,7 +1565,9 @@ class AsyncEngineCore:
                 request_id,
             )
             return False
-        return await engine.abort_request(request_id)
+        return await engine.abort_request(
+            request_id, reason=reason, error_code=error_code
+        )
 
     async def abort_all_requests(
         self,
