@@ -11,6 +11,7 @@ projections the affine layouts of oQ2-oQ3 exports instead.
 import zlib
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -21,7 +22,7 @@ from omlx.patches.deepseek_v41 import decode_fused
 from omlx.patches.deepseek_v41.config import ModelConfig
 from omlx.patches.deepseek_v41.language import Block, LanguageModel
 from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan, OffloadedExpert
-from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+from omlx.patches.deepseek_v41.quantization import QuantizedProjection, pack_activation
 from tests.test_deepseek_v41 import run_two_ranks
 
 pytestmark = pytest.mark.skipif(
@@ -282,6 +283,34 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
               for start in range(0, batch, decode_fused.MAX_BATCH)]
     assert batches == [n for n in chunks for _ in model.layers] * 2
     assert attention["batched"] == len(batches)   # windows are full: request-batched attention
+
+
+def test_batched_attention_reads_each_requests_selected_rows():
+    """window_attention_bq hands the kernels each query's selected compressed rows. With
+    requests that hold their own arrays (one has no rows), several queries of one request,
+    different selection widths and slots without a row (-1, or past the request's rows),
+    every query gets split_attention's result bit for bit."""
+    rng = np.random.default_rng(7)
+    w, h, d, rd = 4, 8, 512, 64
+    c = SimpleNamespace(window_size=w, n_heads=h, head_dim=d, rope_head_dim=rd)
+    att = SimpleNamespace(attn_sink=mx.array(rng.normal(0, 1, h).astype(np.float32)))
+
+    def normal(*shape):
+        return mx.array(rng.normal(0, 1, shape).astype(np.float32)).astype(mx.bfloat16)
+
+    kvs = [pack_activation(normal(1, n, d), bits=4, group_size=16, e4m3_scale=True) for n in (9, 5, 0, 12)]
+    # (request, rows): request 0 has rows 0..8, request 2 has none.
+    queries = [(0, [5, 9]), (0, [0, 3, 8]), (0, [-1, 2, 7]), (1, [1, 4]), (2, []), (3, [-1, -1, 11])]
+    parts = [(kvs[r], mx.array(ids, mx.int32).reshape(1, 1, -1)) for r, ids in queries]
+    b_n = len(queries)
+    q = normal(b_n, h * d)
+    win = pack_activation(normal(b_n, w, d))
+    cos, sin = (mx.array(rng.normal(0, 1, (b_n, rd // 2)).astype(np.float32)) for _ in range(2))
+    got = decode_fused.window_attention_bq(att, q, win, parts, {}, cos, sin, c)
+    wi = mx.arange(w, dtype=mx.int32).reshape(1, 1, w)
+    for b, (kv, ids) in enumerate(parts):
+        alone = decode_fused.split_attention(q[b], win[b : b + 1], kv, wi, ids, att.attn_sink, cos[b], sin[b], c)
+        assert mx.array_equal(got[b], alone).item(), b
 
 
 def _aq(rng, nb, k):

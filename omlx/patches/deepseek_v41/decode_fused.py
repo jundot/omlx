@@ -560,37 +560,48 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
     window win[b] ([B, window_size, row bytes], oldest first) and to its compressed rows and
     selected indices parts[b] (None for a layer without compression). Per query the keys,
     their order and the arithmetic are attention_core's. memo (a dict that lives for the
-    forward) keeps the concatenated compressed rows for the layers that reuse a source
-    layer's arrays. Returns act_quant(o) [B, H*D]."""
+    forward) keeps the kernels' compressed rows for the layers that reuse a source layer's
+    arrays. Returns act_quant(o) [B, H*D]."""
     b_n, w = q.shape[0], c.window_size
     h, d = c.n_heads, c.head_dim
     if parts is not None:
-        # Layers that reuse a source layer's rows get the same arrays back: concatenate once.
+        # Layers that reuse a source layer's rows get the same arrays back: build once.
         # The entry holds those arrays, so an identity match can never be a recycled id().
         key = [a for p in parts for a in p]
         cat = memo.get("_batched_compressed")
         if cat is None or len(cat[0]) != len(key) or any(a is not b for a, b in zip(cat[0], key)):
             ncs = [int(p.shape[1]) for p, _ in parts]
             cs_ = [int(i.shape[-1]) for _, i in parts]
+            cmax = max(max(cs_), 1)
+            ci = mx.concatenate([mx.pad(i.reshape(1, -1).astype(mx.int32), [(0, 0), (0, cmax - i.shape[-1])], constant_values=-1)
+                                 if i.shape[-1] < cmax else i.reshape(1, -1).astype(mx.int32) for _, i in parts], 0)
             if all(p is parts[0][0] for p, _ in parts):
                 # One array for the block (compress_index_block): a query's indices stay below
                 # its own row count, so all queries can read the block's rows.
                 offs = [0] * b_n
                 pooled = parts[0][0].reshape(-1, parts[0][0].shape[-1]) if ncs[0] else _dummy(mx.uint8)
             else:
-                # Queries of one request share its rows: each distinct array enters once.
-                distinct, offs = [], []
-                for p, _ in parts:
-                    at = next((i for i, d in enumerate(distinct) if d is p), None)
-                    if at is None:
-                        at = len(distinct)
-                        distinct.append(p)
-                    offs.append(sum(int(d.shape[1]) for d in distinct[:at]))
-                rows = [d.reshape(-1, d.shape[-1]) for d in distinct if d.shape[1]]
+                # Each query's selected rows (slot j reads row j): whole arrays grow with the context.
+                # Consecutive queries of one request share a gather.
+                valid = (ci >= 0) & (ci < mx.array(ncs, mx.int32)[:, None])
+                slots = mx.where(valid, ci, 0)
+                rows, offs, total, r = [], [], 0, 0
+                while r < b_n:
+                    p, cnt = parts[r][0], cs_[r]
+                    end = r + 1
+                    while end < b_n and parts[end][0] is p and cs_[end] == cnt:
+                        end += 1
+                    if ncs[r] and cnt:
+                        rows.append(mx.take(p.reshape(-1, p.shape[-1]), slots[r:end, :cnt].reshape(-1), axis=0))
+                        offs += [total + j * cnt for j in range(end - r)]
+                        total += (end - r) * cnt
+                    else:
+                        offs += [total] * (end - r)
+                    r = end
+                ncs = [cs_[r] if ncs[r] else 0 for r in range(b_n)]
                 pooled = mx.concatenate(rows, 0) if rows else _dummy(mx.uint8)
-            cmax = max(max(cs_), 1)
-            ci = mx.concatenate([mx.pad(i.reshape(1, -1).astype(mx.int32), [(0, 0), (0, cmax - i.shape[-1])], constant_values=-1)
-                                 if i.shape[-1] < cmax else i.reshape(1, -1).astype(mx.int32) for _, i in parts], 0)
+                # Power-of-two lengths bound the cached aranges while the selection width grows.
+                ci = mx.where(valid, _arange_i32(1 << (cmax - 1).bit_length())[:cmax], -1)
             cat = (key, pooled, ncs, cs_, offs, ci, cmax)
             memo["_batched_compressed"] = cat
         _, pooled, ncs, cs_, offs, ci, cmax = cat
