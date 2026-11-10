@@ -272,3 +272,53 @@ def test_unmatched_audio_runs_key_from_first_audio_token_or_start(audio_token_id
     )
     assert [start for start, _ in ranges] == [1 if audio_token_id else 0]
     assert ranges[0][1] != other[0][1]
+
+
+def prepare_sound_clips_case(ids, clips):
+    # Nemotron-3 Nano Omni's processor exposes raw waveforms as
+    # ``sound_clips`` (issue #5122).
+    engine = VLMBatchedEngine(model_name="sound-clip-boundary-test")
+    engine._processor = MagicMock()
+    engine._processor.apply_chat_template.return_value = "prompt"
+    engine._vlm_model = MagicMock()
+    engine._vlm_model.config.model_type = "gemma4"
+    engine._vlm_model.config.sound_context_token_id = AUDIO
+    engine._vlm_model.get_input_embeddings.return_value = SimpleNamespace(
+        inputs_embeds=mx.zeros((1, len(ids), 1))
+    )
+    engine._vision_cache = None
+    messages = [{"role": "user", "content": "text"}]
+    engine._format_messages_for_vlm_template = MagicMock(return_value=(messages, []))
+
+    def prepare(processor, images=None, prompts=None, **kwargs):
+        return {"input_ids": mx.array([ids]), "sound_clips": clips}
+
+    with patch("mlx_vlm.utils.prepare_inputs", side_effect=prepare):
+        return engine._prepare_vision_inputs(
+            messages, [], audio=[(c, c.size) for c in clips]
+        )
+
+
+def test_sound_clips_request_is_not_dropped_as_text():
+    ids = [1] * 4 + [AUDIO] * 4 + [2] * 4
+    result = prepare_sound_clips_case(ids, [mx.zeros((16000,))])
+    assert result[1] is not None  # Text-only returns would drop the clip.
+
+
+def test_equal_length_sound_clips_do_not_share_cached_blocks():
+    # Both clips tokenize identically: placeholders depend only on length.
+    ids = [1] * 4 + [AUDIO] * 4 + [2] * 4
+    a = prepare_sound_clips_case(ids, [mx.zeros((16000,))])
+    b = prepare_sound_clips_case(ids, [mx.ones((16000,))])
+    assert a[4] == b[4] == 4
+    assert [start for start, _ in a[5]] == [4]
+    assert reused_tokens(ids, a[5], b[5], a[3], b[3]) == 4
+    assert reused_tokens(ids, a[5], a[5], a[3], a[3]) == 12
+
+
+def test_empty_sound_clips_publish_no_audio_keys():
+    # A present-but-empty clip list must not crash the cache-key branch.
+    ids = [1] * 4 + [AUDIO] * 4 + [2] * 4
+    result = prepare_sound_clips_case(ids, [])
+    assert result[0] == ids
+    assert result[5] == []
