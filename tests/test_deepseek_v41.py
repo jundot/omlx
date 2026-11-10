@@ -1621,6 +1621,7 @@ def test_tensor_parallel_ranks_match_single_process(tmp_path):
 # One tensor-parallel rank prefilling through mlx-lm's prompt loop with the
 # worker's cache-only routing, against the single-process scheduler CED path.
 _TENSOR_CED_RANK = """
+import importlib
 import json
 import sys
 
@@ -1628,7 +1629,7 @@ import mlx.core as mx
 import numpy as np
 
 group = mx.distributed.init(backend="ring", strict=True)
-from mlx_lm.generate import BatchGenerator, PromptProcessingBatch
+from mlx_lm.generate import BatchGenerator
 from omlx.cluster.inference_worker import _cache_only_prompt_prefill
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.patches.deepseek_v41 import language
@@ -1638,6 +1639,7 @@ from omlx.patches.deepseek_v41_mlx_lm import apply_deepseek_v41_mlx_lm_patch
 assert apply_deepseek_v41_mlx_lm_patch()
 from mlx_lm.models import deepseek_v41
 
+mlx_generate = importlib.import_module("mlx_lm.generate")
 prompt = np.random.default_rng(16).integers(3, 60, 13).tolist()
 full, _ = load(sys.argv[1], ced_prefill=True)
 lm = full.language_model
@@ -1665,19 +1667,33 @@ assert not model.language_model._config.a8_prefill
 assert model(mx.array([prompt[:7]]), cache=model.make_cache()).shape[1] == 7
 assert not ced_layers
 
+expected = reference - mx.logsumexp(reference)
+def check(got):
+    got = got.astype(mx.float32)
+    assert mx.allclose(got, expected, atol=1e-3, rtol=1e-3).item(), mx.abs(
+        got - expected
+    ).max()
+
 gen = BatchGenerator(model, max_tokens=1, prefill_step_size=7)
-with _cache_only_prompt_prefill(PromptProcessingBatch):
+with _cache_only_prompt_prefill(mlx_generate):
     gen.insert([prompt], max_tokens=[1])
     responses = []
     while not responses:
         responses = gen.next()[1]
 gen.close()
 assert ced_layers
-got = responses[0].logprobs.astype(mx.float32)
-expected = reference - mx.logsumexp(reference)
-assert mx.allclose(got, expected, atol=1e-3, rtol=1e-3).item(), mx.abs(
-    got - expected
-).max()
+check(responses[0].logprobs)
+
+# mlx-lm serves a seeded request through generate_step, outside the batch.
+ced_layers.clear()
+with _cache_only_prompt_prefill(mlx_generate):
+    steps = mlx_generate.generate_step(
+        mx.array(prompt), model, prefill_step_size=7, max_tokens=1
+    )
+    _, logprobs = next(steps)
+    steps.close()
+assert ced_layers
+check(logprobs)
 print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)
 """
 
@@ -1726,6 +1742,7 @@ def test_mlx_lm_tokenizer_gets_the_v41_protocol(tmp_path):
 # full and partial accepts both occur. Greedy output must equal plain decoding
 # of the whole model on both ranks.
 _MTP_RANK = """
+import importlib
 import json
 import sys
 
@@ -1734,7 +1751,7 @@ from contextlib import nullcontext
 import mlx.core as mx
 
 group = mx.distributed.init(backend="ring", strict=True)
-from mlx_lm.generate import BatchGenerator, PromptProcessingBatch
+from mlx_lm.generate import BatchGenerator
 from omlx.cluster.control_plane import RankControlPlane
 from omlx.cluster.inference_worker import _cache_only_prompt_prefill
 from omlx.cluster.mtp_sync import ClusterMtpSync
@@ -1819,7 +1836,11 @@ with (
         pipeline_parallel=pipeline,
     ),
     wait_for_pipeline_peers_on_host(model),
-    _cache_only_prompt_prefill(PromptProcessingBatch) if ced else nullcontext(),
+    (
+        _cache_only_prompt_prefill(importlib.import_module("mlx_lm.generate"))
+        if ced
+        else nullcontext()
+    ),
 ):
     model._omlx_cluster_mtp = ClusterMtpSync(rank=rank, control_plane=plane)
     gen = BatchGenerator(model, sampler=lambda lp: mx.argmax(lp, -1), max_tokens=limit)

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import tempfile
@@ -368,30 +370,55 @@ def _thinking_budget_token_to_piece(
 
 
 @contextmanager
-def _cache_only_prompt_prefill(batch_type: Any):
-    """Mark MLX-LM's prompt loop as cache-only prefill for models that ask.
+def _cache_only_prompt_prefill(mlx_generate: Any):
+    """Mark MLX-LM's prompt loops as cache-only prefill for models that ask.
 
     The single-Mac scheduler sends those chunks through ``_omlx_prefill`` and
     keeps the plain forward for every other call, such as Lightning MTP
-    history rebuilds.
+    history rebuilds. Batched requests prefill in ``PromptProcessingBatch``,
+    seeded ones in ``generate_step``. Its one-token decode steps are marked
+    too, and CED leaves them unchanged.
     """
 
-    original = batch_type.prompt
+    batch_type = mlx_generate.PromptProcessingBatch
+    original_prompt = batch_type.prompt
+    original_step = mlx_generate.generate_step
 
     def prompt(self: Any, tokens: Any) -> Any:
         scope = getattr(self.model, "_omlx_prompt_scope", None)
         if scope is None:
-            return original(self, tokens)
+            return original_prompt(self, tokens)
         with scope():
-            return original(self, tokens)
+            return original_prompt(self, tokens)
+
+    def generate_step(prompt: Any, model: Any, *args: Any, **kwargs: Any) -> Any:
+        steps = original_step(prompt, model, *args, **kwargs)
+        scope = getattr(model, "_omlx_prompt_scope", None)
+        if scope is None:
+            yield from steps
+            return
+        try:
+            while True:
+                # The scope is thread state, so the caller runs outside it.
+                with scope():
+                    try:
+                        step = next(steps)
+                    except StopIteration:
+                        return
+                yield step
+        finally:
+            steps.close()
 
     batch_type.prompt = prompt
+    mlx_generate.generate_step = generate_step
     try:
         yield
     finally:
-        # A prompt patch installed after this one stays in place.
+        # A patch installed after this one stays in place.
         if batch_type.prompt is prompt:
-            batch_type.prompt = original
+            batch_type.prompt = original_prompt
+        if mlx_generate.generate_step is generate_step:
+            mlx_generate.generate_step = original_step
 
 
 @contextmanager
@@ -724,6 +751,23 @@ def _prompt_cache_ssd_dir(
     if numerics:
         name += "-" + re.sub(r"[^A-Za-z0-9._-]", "_", numerics)
     return str(root / args.deployment_id / plan_hash / name)
+
+
+def _drop_other_numerics_snapshots(directory: str, rank: int) -> None:
+    """Delete this rank's snapshot directories of other numerics revisions.
+
+    No run restores them again, and each store bounds only its own directory.
+    """
+
+    current = Path(directory)
+    base = f"rank-{rank}"
+    for other in current.parent.glob(f"{base}*"):
+        if (
+            other != current
+            and other.is_dir()
+            and (other.name == base or other.name.startswith(base + "-"))
+        ):
+            shutil.rmtree(other, ignore_errors=True)
 
 
 def _release_metal_memory(reason: str) -> None:
@@ -1367,8 +1411,10 @@ def run_worker(args: argparse.Namespace) -> int:
 
     import mlx.core as mx
     import mlx_lm.server as mlx_server
-    from mlx_lm.generate import PromptProcessingBatch
     from mlx_lm.server import ModelProvider, ResponseGenerator, run
+
+    # Imported by name: the package's generate() function shadows the module.
+    mlx_generate = importlib.import_module("mlx_lm.generate")
 
     from omlx.patches.mlx_lm_pipeline_index import (
         apply_mlx_lm_pipeline_index_patch,
@@ -1700,15 +1746,18 @@ def run_worker(args: argparse.Namespace) -> int:
                     if args.control_host and args.control_port and args.control_token
                     else nullcontext(None)
                 )
+                ssd_cache_dir = _prompt_cache_ssd_dir(
+                    args, rank, numerics_revision_for_model(provider.model)
+                )
+                if ssd_cache_dir is not None:
+                    _drop_other_numerics_snapshots(ssd_cache_dir, rank)
                 with (
                     control_context as control_plane,
                     install_server_telemetry(
                         marker,
                         execution=execution,
                         assignment=assignment,
-                        ssd_cache_dir=_prompt_cache_ssd_dir(
-                            args, rank, numerics_revision_for_model(provider.model)
-                        ),
+                        ssd_cache_dir=ssd_cache_dir,
                         ssd_cache_persistent=bool(args.prompt_cache_ssd),
                         ssd_cache_max_bytes=execution.prompt_cache_ssd_max_bytes,
                         prefill_step_size=args.prefill_step_size,
@@ -1745,7 +1794,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         else nullcontext()
                     ),
                     (
-                        _cache_only_prompt_prefill(PromptProcessingBatch)
+                        _cache_only_prompt_prefill(mlx_generate)
                         if tensor_parallel_size > 1
                         else nullcontext()
                     ),

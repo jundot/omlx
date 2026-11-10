@@ -1613,7 +1613,10 @@ def _parsed_plan(deployment: ClusterDeployment, tmp_path):
 
 
 def test_prompt_cache_ssd_reaches_the_rank_and_scopes_its_directory(tmp_path):
-    from omlx.cluster.inference_worker import _prompt_cache_ssd_dir
+    from omlx.cluster.inference_worker import (
+        _drop_other_numerics_snapshots,
+        _prompt_cache_ssd_dir,
+    )
 
     deployment = _deployment()
     args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
@@ -1631,8 +1634,19 @@ def test_prompt_cache_ssd_reaches_the_rank_and_scopes_its_directory(tmp_path):
     assert rank1.endswith(f"{args.deployment_id}/{args.plan_hash}/rank-1")
     assert rank0 != rank1
     # CED prefill states never restore into a run without it.
+    args.state_dir = str(tmp_path / "state")
     ced = _prompt_cache_ssd_dir(args, rank=0, numerics="ced-prefill-1")
     assert ced.endswith("/rank-0-ced-prefill-1")
+    # Starting with CED drops rank 0's other revisions, not other ranks'.
+    plan_dir = Path(ced).parent
+    for name in ("rank-0", "rank-0-ced-prefill-1", "rank-1", "rank-10-ced-prefill-1"):
+        (plan_dir / name).mkdir(parents=True)
+    _drop_other_numerics_snapshots(ced, rank=0)
+    assert sorted(path.name for path in plan_dir.iterdir()) == [
+        "rank-0-ced-prefill-1",
+        "rank-1",
+        "rank-10-ced-prefill-1",
+    ]
 
 
 def test_prompt_cache_ssd_can_be_turned_off(tmp_path):

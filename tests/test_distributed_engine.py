@@ -475,8 +475,10 @@ def test_model_prefill_settings_reach_v41_tensor_parallel_ranks():
         return found.ced_prefill, found.a8_prefill
 
     tensor = replace(_deployment(), tensor_parallel_size=2)
-    # Unset, CED and A8 prefill stay on as on a single Mac.
-    assert execution(tensor, "deepseek_v41") == (True, True)
+    # Unset, CED is on and A8 off, as on a single Mac.
+    assert execution(tensor, "deepseek_v41") == (True, False)
+    saved = SimpleNamespace(a8_prefill_enabled=True)
+    assert execution(tensor, "deepseek_v41", saved) == (True, True)
     # Model settings leave the A8 threshold unchecked while A8 is off.
     off = SimpleNamespace(
         deepseek_v41_ced_prefill_enabled=False,
