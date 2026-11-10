@@ -2463,5 +2463,9 @@
   "cluster.v2.join.cleanup_forgotten": "Alte Bereinigung auf diesem Mac vergessen. Die Bereinigung auf dem entfernten Mac wurde nicht bestätigt.",
   "cluster.v2.join.forget_cleanup_error": "Diese Bereinigung konnte nicht vergessen werden.",
   "cluster.v2.membership.waiting_request": "Wartet darauf, dass dieser Mac seinen Code anzeigt und eine Kopplungsanfrage sendet.",
-  "cluster.v2.membership.add_device": "Diesen Mac hinzufügen"
+  "cluster.v2.membership.add_device": "Diesen Mac hinzufügen",
+  "models.image.title": "Bildgenerierung",
+  "models.image.recipe": "Ein PNG mit 1024 × 1024 Pixeln pro Anfrage. Festes Turbo-Verfahren mit acht Schritten. Ein optionaler Seed erlaubt die Wiederholung.",
+  "models.image.lifecycle": "Verwendet den Inferenz-API-Schlüssel. Es wird jeweils eine Anfrage verarbeitet. Bei einem Verbindungsabbruch wird die Anfrage nach Abschluss der laufenden GPU-Arbeit abgebrochen. Chatprofile und Sampling-Einstellungen gelten hier nicht.",
+  "models.image.invalid": "Das Bildmodellpaket muss repariert werden."
 }
