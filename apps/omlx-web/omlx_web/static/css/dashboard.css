@@ -801,8 +801,8 @@
         color: var(--theme-cell-fg) !important;
     }
     .theme-editor .theme-mode-cell .theme-hex-input::placeholder { color: var(--theme-cell-placeholder); }
-    .theme-hex-input--invalid,
-    [data-theme="dark"] .theme-hex-input--invalid { border-color: var(--text-danger) !important; }
+    /* Outranks the column rule above and the dark `input:focus` rule. */
+    .theme-editor .theme-mode-cell .theme-hex-input.theme-hex-input--invalid { border-color: var(--theme-cell-danger) !important; }
 
     /* Drawn only from the tokens the editor sets inline. */
     .theme-preview {
