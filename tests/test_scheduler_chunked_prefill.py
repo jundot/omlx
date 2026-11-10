@@ -180,6 +180,16 @@ def test_prefill_interrupts_mtp_cost_timing(chunked):
     assert abs(policy.cycle_time_ms("mtp", 2.025, 2.04) - 20) < 1e-6
 
 
+
+def test_prefill_chunk_forward_is_counted():
+    """step() reports ran_prefill_chunk from this counter (#5148)."""
+    scheduler, model = _make_recording_scheduler("qwen3_5_moe")
+    state = _make_prefill_state(scheduler, _make_request("counted"), n_remaining=8)
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        scheduler._step_prefill_chunk(state)
+    assert model.chunk_lengths == [8]
+    assert scheduler._prefill_forwards == 1
+
 def test_prefill_progress_keeps_memory_admission_waiting():
     scheduler, _ = _make_recording_scheduler("deepseek_v32")
     state = _make_prefill_state(scheduler, _make_request("active"), n_remaining=4096)

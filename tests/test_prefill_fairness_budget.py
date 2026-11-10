@@ -527,3 +527,93 @@ def test_disabled_fairness_keeps_chunk_before_admission(clock):
 
     assert events == ["inflight", "waiting"]
     assert "waiting" in scheduler.running
+
+
+def run_long_admission_step(scheduler, during_inflight=None, inflight_error=None):
+    """One uncontended step that admits "long" ahead of "inflight"."""
+
+    def advance(state):
+        if state.request.request_id == "inflight":
+            if during_inflight is not None:
+                during_inflight()
+            if inflight_error is not None:
+                raise inflight_error
+        state.tokens_processed += 4
+        return False
+
+    with (
+        patch.object(scheduler, "_step_prefill_chunk", side_effect=advance),
+        patch("omlx.scheduler.make_prompt_cache", return_value=[]),
+    ):
+        return scheduler.step()
+
+
+def test_held_request_stays_queued_during_inflight_chunk(clock):
+    """Other threads read the queues mid-step (memory enforcer, stats), so the
+    admitted request stays in prefilling while the in-flight chunk runs."""
+    scheduler = make_scheduler()
+    add_prefill(scheduler, "inflight")
+    scheduler.add_request(make_request("long", 20))
+    seen = {}
+
+    def during_inflight():
+        seen["prefilling"] = prefill_ids(scheduler)
+        seen["num_prefilling"] = scheduler.get_stats()["num_prefilling"]
+
+    run_long_admission_step(scheduler, during_inflight)
+
+    assert seen == {"prefilling": ["inflight", "long"], "num_prefilling": 2}
+
+
+def test_inflight_chunk_error_keeps_held_request(clock):
+    scheduler = make_scheduler()
+    add_prefill(scheduler, "inflight")
+    scheduler.add_request(make_request("long", 20))
+
+    with pytest.raises(KeyError):
+        run_long_admission_step(scheduler, inflight_error=KeyError("boom"))
+
+    assert "long" in prefill_ids(scheduler)
+    assert "long" in scheduler._prefill_states
+
+
+def test_held_request_is_not_packed_into_inflight_forward(clock):
+    """A held request cannot ride along as a packed companion either."""
+    scheduler = make_scheduler()
+    add_prefill(scheduler, "inflight")
+    long_request = make_request("long", 20)
+    # Unpacked admission, so its first chunk runs while it is admitted.
+    long_request.packed_prefill_excluded = True
+    scheduler.add_request(long_request)
+    companions = []
+
+    def plan_rows(state, later):
+        companions.append([request.request_id for request in later])
+        return []
+
+    with (
+        patch.object(Scheduler, "_packed_prefill_ready", return_value=True),
+        patch.object(Scheduler, "_packing_fits_contended_cap", return_value=True),
+        patch.object(scheduler, "_plan_prefill_rows", side_effect=plan_rows),
+    ):
+        run_long_admission_step(scheduler)
+
+    assert companions == [[]]
+    assert "long" in prefill_ids(scheduler)
+
+
+def test_step_reports_whether_a_prefill_chunk_ran(clock):
+    """EngineCore ends a burst only after a step that ran a chunk; a step that
+    held the prefill for decode reports none."""
+    scheduler = make_scheduler()
+    add_prefill(scheduler, "inflight")
+
+    def advance(state):
+        scheduler._prefill_forwards += 1
+        return False
+
+    with patch.object(scheduler, "_step_prefill_chunk", side_effect=advance):
+        assert scheduler.step().ran_prefill_chunk
+        scheduler.running["decoder"] = make_request("decoder")
+        scheduler._accrue_decode_debt(0.5)
+        assert not scheduler.step().ran_prefill_chunk

@@ -511,9 +511,10 @@ class EngineCore:
         scheduler.step() services aborts/admission/finish every step, so
         correctness is unchanged; the only cost is event-loop responsiveness,
         bounded by decode_burst_budget_s. Stops early when no work remains, a
-        request produces its first chunk or finishes, a prefill eviction needs
-        the (async) callback, or the budget elapses — the budget also ends the
-        burst when a slow prefill-chunk step lands, including the first one.
+        request produces its first chunk, a request finishes while a prefill
+        is queued, a prefill eviction needs the (async) callback, or the
+        budget elapses — the budget also ends the burst when a slow
+        prefill-chunk step lands, including the first one.
 
         Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
         """
@@ -534,11 +535,11 @@ class EngineCore:
         if budget <= 0:
             return outputs
         now = time.monotonic()
-        if now - started >= budget and getattr(self.scheduler, "prefilling", None):
+        if now - started >= budget and getattr(outputs[0], "ran_prefill_chunk", False):
             # A prefill chunk used the whole budget. Another step would run
             # another chunk, and requests queued on the executor (admission,
             # aborts) would wait for both, so hand control back now (#5148).
-            # Slow decode steps keep bursting.
+            # Slow decode-only steps keep bursting.
             return outputs
         deadline = now + budget
         while len(outputs) < max_steps:
@@ -554,8 +555,11 @@ class EngineCore:
                 break
             # A finished request's last output (finish reason, usage) would
             # otherwise wait for the rest of the burst, which can be a whole
-            # prefill chunk.
-            if last.finished_request_ids:
+            # prefill chunk when a prefill is queued or in flight.
+            if last.finished_request_ids and (
+                getattr(self.scheduler, "prefilling", None)
+                or getattr(self.scheduler, "waiting", None)
+            ):
                 break
             if (
                 not last.has_work  # throttled/idle: stop and let the loop wait

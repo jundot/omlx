@@ -2030,6 +2030,9 @@ class SchedulerOutput:
     prefill_eviction_request: PrefillEvictionRequest | None = None
     # Whether any work was done
     has_work: bool = False
+    # Whether this step ran a chunked-prefill forward. EngineCore ends a
+    # decode burst after a slow one so queued admissions run first.
+    ran_prefill_chunk: bool = False
 
 
 class _ResumedStopSequences:
@@ -2458,6 +2461,8 @@ class Scheduler:
         self._row_decode_acc: list[float] = [0.0, 0.0]
         self._prefill_hold_until: float = 0.0
         self._admit_prefill_next: bool = False
+        # Chunked-prefill forwards run so far; step() reports whether it ran one.
+        self._prefill_forwards: int = 0
         # Measured throughputs feeding the adaptive fairness constants.
         # Best-observed prefill tok/s sizes the contended chunk (stall-time
         # target): contended chunks only measure SLOWER, so a running max
@@ -7270,6 +7275,7 @@ class Scheduler:
         Returns, per plan, whether that request's prefill is complete.
         """
         interrupt_batch_timing(getattr(self, "batch_generator", None))
+        self._prefill_forwards = getattr(self, "_prefill_forwards", 0) + 1
         head = plans[0]
         processed_before = [plan.state.tokens_processed for plan in plans]
         kv_len = max(
@@ -7985,6 +7991,7 @@ class Scheduler:
         self,
         scheduled: "list[Request]",
         rejected: "list[RequestOutput]",
+        hold: "set[str] | frozenset[str]" = frozenset(),
     ) -> None:
         """Advance in-flight prefills until decode fairness requires a yield.
 
@@ -7999,6 +8006,8 @@ class Scheduler:
             rejected: Per-step rejected outputs. A chunked prefill that hits
                 the memory hard limit emits a finish_reason="error" entry
                 here so the engine can surface the failure to the client.
+            hold: Requests that already ran a chunk this step. They keep
+                their queue position but do not advance, alone or packed.
         """
         if not self.prefilling:
             return
@@ -8028,6 +8037,9 @@ class Scheduler:
             # _do_abort_request() between steps — just skip it.
             if state is None:
                 continue
+            if rid in hold:
+                still_prefilling.append(request)
+                continue
             if not self._prefill_gate_open():
                 still_prefilling.extendleft(reversed(pending_prefills[index:]))
                 break
@@ -8047,7 +8059,12 @@ class Scheduler:
                     done = [self._step_prefill_chunk(state)]
                 else:
                     plans = self._plan_prefill_rows(
-                        state, pending_prefills[index + 1 :]
+                        state,
+                        [
+                            later
+                            for later in pending_prefills[index + 1 :]
+                            if later.request_id not in hold
+                        ],
                     )
                     if len(plans) > 1:
                         try:
@@ -15812,6 +15829,7 @@ class Scheduler:
             SchedulerOutput with results of this step
         """
         output = SchedulerOutput()
+        prefill_forwards = getattr(self, "_prefill_forwards", 0)
 
         # Publish decode activity for cross-engine prefill fairness (a
         # count of 0 removes the entry, so idle engines never throttle a
@@ -15872,7 +15890,7 @@ class Scheduler:
 
             # A prefill that ran its first chunk during that admission waits
             # for the next step, so one step never runs two of its chunks.
-            held_back: list[Request] = []
+            hold: set[str] = set()
             if uncontended_admit:
                 for request in self.prefilling:
                     state = self._prefill_states.get(request.request_id)
@@ -15881,23 +15899,14 @@ class Scheduler:
                         and state is not None
                         and state.tokens_processed > 0
                     ):
-                        held_back.append(request)
-                if held_back:
-                    held_ids = {request.request_id for request in held_back}
-                    self.prefilling = deque(
-                        request
-                        for request in self.prefilling
-                        if request.request_id not in held_ids
-                    )
+                        hold.add(request.request_id)
 
             chunked_scheduled: list[Request] = []
             chunked_rejected: list[RequestOutput] = []
-            try:
-                if self.prefilling and prefill_gate_open:
-                    self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
-            finally:
-                if held_back:
-                    self.prefilling.extend(held_back)
+            if self.prefilling and prefill_gate_open:
+                self._advance_chunked_prefills(
+                    chunked_scheduled, chunked_rejected, hold=hold
+                )
 
             if not admit_first:
                 scheduled, rejected = self._schedule_waiting()
@@ -16137,6 +16146,9 @@ class Scheduler:
 
         self._publish_admin_snapshot()
 
+        output.ran_prefill_chunk = (
+            getattr(self, "_prefill_forwards", 0) != prefill_forwards
+        )
         return output
 
     def _publish_admin_snapshot(self) -> None:

@@ -2065,8 +2065,11 @@ class TestStepBurst:
         finally:
             engine.close()
 
-    def _run_timed_burst(self, engine, durations, outputs=None, prefilling=False):
-        """Run one burst where step i takes durations[i] seconds."""
+    def _run_timed_burst(
+        self, engine, durations, outputs=None, chunk_steps=(), prefilling=False
+    ):
+        """Run one burst where step i takes durations[i] seconds and the
+        steps in chunk_steps ran a prefill chunk."""
         clock = [100.0]
         calls = iter(range(len(durations)))
 
@@ -2075,7 +2078,9 @@ class TestStepBurst:
             clock[0] += durations[index]
             if outputs and outputs[index] is not None:
                 return outputs[index]
-            return SchedulerOutput(has_work=True)
+            output = SchedulerOutput(has_work=True)
+            output.ran_prefill_chunk = index in chunk_steps
+            return output
 
         engine.scheduler.step = MagicMock(side_effect=step)
         engine.scheduler.has_requests = MagicMock(return_value=True)
@@ -2084,33 +2089,56 @@ class TestStepBurst:
             return engine._step_burst()
 
     @pytest.mark.parametrize(
-        ("durations", "prefilling", "expected_steps"),
+        ("durations", "chunk_steps", "prefilling", "expected_steps"),
         [
-            ([3.0, 3.0, 3.0], True, 1),
-            ([0.12, 0.12, 0.12, 0.12], False, 2),
-            ([0.01, 0.01, 0.01, 0.01], False, 4),
-            ([0.01, 3.0, 3.0, 3.0], True, 2),
+            ([3.0, 3.0, 3.0], {0, 1, 2}, True, 1),
+            ([0.12, 0.12, 0.12, 0.12], (), False, 2),
+            ([0.12, 0.12, 0.12, 0.12], (), True, 2),
+            ([0.01, 0.01, 0.01, 0.01], (), False, 4),
+            ([0.01, 3.0, 3.0, 3.0], {1, 2, 3}, True, 2),
         ],
-        ids=["prefill_chunk", "slow_decode", "decode", "chunk_after_decode"],
+        ids=[
+            "prefill_chunk",
+            "slow_decode",
+            "slow_decode_with_queued_prefill",
+            "decode",
+            "chunk_after_decode",
+        ],
     )
     def test_prefill_chunk_over_budget_ends_burst(
-        self, mock_model, mock_tokenizer, durations, prefilling, expected_steps
+        self,
+        mock_model,
+        mock_tokenizer,
+        durations,
+        chunk_steps,
+        prefilling,
+        expected_steps,
     ):
         """A prefill chunk that alone spends the budget gets no second chunk in
         the same burst: admission queued on the executor waits for the whole
-        burst (#5148). Decode steps burst as before, and a chunk that lands
-        later in the burst still ends it."""
+        burst (#5148). Decode-only steps burst as before, even slow ones and
+        even while a prefill waits its turn, and a chunk that lands later in
+        the burst still ends it."""
         engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4, budget=0.1)
         try:
-            outs = self._run_timed_burst(engine, durations, prefilling=prefilling)
+            outs = self._run_timed_burst(
+                engine, durations, chunk_steps=chunk_steps, prefilling=prefilling
+            )
             assert len(outs) == expected_steps
             assert engine.scheduler.step.call_count == expected_steps
         finally:
             engine.close()
 
-    def test_finished_request_ends_burst(self, mock_model, mock_tokenizer):
+    @pytest.mark.parametrize(
+        ("prefilling", "expected_steps"),
+        [(True, 1), (False, 4)],
+        ids=["prefill_queued", "pure_decode"],
+    )
+    def test_finished_request_ends_burst_when_prefill_queued(
+        self, mock_model, mock_tokenizer, prefilling, expected_steps
+    ):
         """A finished request's last output is not held behind a prefill
-        chunk that the next step would run."""
+        chunk that a later step would run. Pure decode bursts are unchanged."""
         engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4, budget=0.1)
         finished = SchedulerOutput(
             has_work=True,
@@ -2119,10 +2147,13 @@ class TestStepBurst:
         )
         try:
             outs = self._run_timed_burst(
-                engine, [0.01, 3.0, 3.0], [finished, None, None], prefilling=True
+                engine,
+                [0.01] * 4,
+                [finished, None, None, None],
+                prefilling=prefilling,
             )
-            assert outs == [finished]
-            assert engine.scheduler.step.call_count == 1
+            assert outs[0] is finished
+            assert len(outs) == expected_steps
         finally:
             engine.close()
 
