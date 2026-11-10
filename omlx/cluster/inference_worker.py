@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import tempfile
@@ -21,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from ..cache.paged_ssd_cache import numerics_revision_for_model
 from .control_plane import RankControlPlane
 from .deployment import (
     decode_worker_contract,
@@ -367,6 +370,58 @@ def _thinking_budget_token_to_piece(
 
 
 @contextmanager
+def _cache_only_prompt_prefill(mlx_generate: Any):
+    """Mark MLX-LM's prompt loops as cache-only prefill for models that ask.
+
+    The single-Mac scheduler sends those chunks through ``_omlx_prefill`` and
+    keeps the plain forward for every other call, such as Lightning MTP
+    history rebuilds. Batched requests prefill in ``PromptProcessingBatch``,
+    seeded ones in ``generate_step``. Its one-token decode steps are marked
+    too, and CED leaves them unchanged.
+    """
+
+    batch_type = mlx_generate.PromptProcessingBatch
+    original_prompt = batch_type.prompt
+    original_step = mlx_generate.generate_step
+
+    def prompt(self: Any, tokens: Any) -> Any:
+        scope = getattr(self.model, "_omlx_prompt_scope", None)
+        if scope is None:
+            return original_prompt(self, tokens)
+        with scope():
+            return original_prompt(self, tokens)
+
+    def generate_step(prompt: Any, model: Any, *args: Any, **kwargs: Any) -> Any:
+        steps = original_step(prompt, model, *args, **kwargs)
+        scope = getattr(model, "_omlx_prompt_scope", None)
+        if scope is None:
+            yield from steps
+            return
+        try:
+            while True:
+                # The scope is thread state, so the caller runs outside it.
+                with scope():
+                    try:
+                        step = next(steps)
+                    except StopIteration:
+                        return
+                yield step
+        finally:
+            steps.close()
+
+    batch_type.prompt = prompt
+    mlx_generate.generate_step = generate_step
+    try:
+        yield
+    finally:
+        # A patch installed after this one stays in place.
+        if batch_type.prompt is prompt:
+            batch_type.prompt = original_prompt
+        if mlx_generate.generate_step is generate_step:
+            mlx_generate.generate_step = original_step
+
+
+@contextmanager
 def _sample_with_stated_parameters(mlx_server: Any):
     """Build request samplers that state their temperature and filters.
 
@@ -656,21 +711,63 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         mtp=getattr(args, "mtp", False),
         mtp_depth=getattr(args, "mtp_depth", 0),
         mtp_fixed_depth=getattr(args, "mtp_fixed_depth", False),
+        ced_prefill=getattr(args, "ced_prefill", False),
+        a8_prefill=getattr(args, "a8_prefill", False),
+        a8_prefill_min_tokens=getattr(args, "a8_prefill_min_tokens", 128),
     )
 
 
-def _prompt_cache_ssd_dir(args: argparse.Namespace, rank: int) -> str | None:
+def _tensor_shard_options(execution: ExecutionSettings) -> dict[str, Any]:
+    """Prefill paths DeepSeek V4.1's tensor-parallel loader builds a rank with.
+
+    The coordinator turns them on only for that model, so other model-owned
+    loaders get no options.
+    """
+
+    if not (execution.ced_prefill or execution.a8_prefill):
+        return {}
+    return {
+        "ced_prefill": execution.ced_prefill,
+        "a8_prefill": execution.a8_prefill,
+        "a8_prefill_min_tokens": execution.a8_prefill_min_tokens,
+    }
+
+
+def _prompt_cache_ssd_dir(
+    args: argparse.Namespace, rank: int, numerics: str | None = None
+) -> str | None:
     """Per-rank SSD directory for prompt-cache snapshots, or None when off.
 
     Kept beside the runtime markers and scoped by deployment, signed plan and
     rank, so a changed tensor split can never restore another shard layout.
+    The model's numerics revision (CED prefill) gets a directory of its own.
     """
 
     if not args.prompt_cache_ssd:
         return None
     root = Path(args.state_dir).expanduser() / "prompt-cache-ssd"
     plan_hash = str(getattr(args, "plan_hash", "") or "unplanned")
-    return str(root / args.deployment_id / plan_hash / f"rank-{rank}")
+    name = f"rank-{rank}"
+    if numerics:
+        name += "-" + re.sub(r"[^A-Za-z0-9._-]", "_", numerics)
+    return str(root / args.deployment_id / plan_hash / name)
+
+
+def _drop_other_numerics_snapshots(directory: str, rank: int) -> None:
+    """Delete this rank's snapshot directories of other numerics revisions.
+
+    No run restores them again, and each store bounds only its own directory.
+    """
+
+    current = Path(directory)
+    base = f"rank-{rank}"
+    for other in current.parent.glob(f"{base}*"):
+        if (
+            other != current
+            and other.is_dir()
+            and (other.name == base or other.name.startswith(base + "-"))
+        ):
+            shutil.rmtree(other, ignore_errors=True)
 
 
 def _release_metal_memory(reason: str) -> None:
@@ -1316,6 +1413,9 @@ def run_worker(args: argparse.Namespace) -> int:
     import mlx_lm.server as mlx_server
     from mlx_lm.server import ModelProvider, ResponseGenerator, run
 
+    # Imported by name: the package's generate() function shadows the module.
+    mlx_generate = importlib.import_module("mlx_lm.generate")
+
     from omlx.patches.mlx_lm_pipeline_index import (
         apply_mlx_lm_pipeline_index_patch,
     )
@@ -1517,6 +1617,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         },
                     ),
                     engram_ssd_offload=assignment.ssd_weight_bytes > 0,
+                    tensor_shard_options=_tensor_shard_options(execution),
                 ),
             ):
                 provider.load_default()
@@ -1645,13 +1746,18 @@ def run_worker(args: argparse.Namespace) -> int:
                     if args.control_host and args.control_port and args.control_token
                     else nullcontext(None)
                 )
+                ssd_cache_dir = _prompt_cache_ssd_dir(
+                    args, rank, numerics_revision_for_model(provider.model)
+                )
+                if ssd_cache_dir is not None:
+                    _drop_other_numerics_snapshots(ssd_cache_dir, rank)
                 with (
                     control_context as control_plane,
                     install_server_telemetry(
                         marker,
                         execution=execution,
                         assignment=assignment,
-                        ssd_cache_dir=_prompt_cache_ssd_dir(args, rank),
+                        ssd_cache_dir=ssd_cache_dir,
                         ssd_cache_persistent=bool(args.prompt_cache_ssd),
                         ssd_cache_max_bytes=execution.prompt_cache_ssd_max_bytes,
                         prefill_step_size=args.prefill_step_size,
@@ -1685,6 +1791,11 @@ def run_worker(args: argparse.Namespace) -> int:
                     (
                         _sample_with_stated_parameters(mlx_server)
                         if mtp_sync is not None
+                        else nullcontext()
+                    ),
+                    (
+                        _cache_only_prompt_prefill(mlx_generate)
+                        if tensor_parallel_size > 1
                         else nullcontext()
                     ),
                 ):
@@ -1796,6 +1907,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mtp", action="store_true")
     parser.add_argument("--mtp-depth", type=int, default=0)
     parser.add_argument("--mtp-fixed-depth", action="store_true")
+    parser.add_argument("--ced-prefill", action="store_true")
+    parser.add_argument("--a8-prefill", action="store_true")
+    parser.add_argument("--a8-prefill-min-tokens", type=int, default=128)
     return parser
 
 

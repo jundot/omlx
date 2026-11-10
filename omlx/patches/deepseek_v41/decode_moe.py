@@ -81,9 +81,10 @@ inline void fp8_decode4(uint p, thread float* v) {
 // ROWS rows of an MXFP8 matrix ([*, K] bytes as uint32, one e8m0 scale per 32) dotted with an
 // fp32 vector; each lane covers 8 contiguous values per step (MLX qmv_fast layout), x is
 // loaded once per step and reused for all ROWS rows. fp32 accumulation order is free.
+// The last step may cover fewer lanes (a tensor-parallel 1152-wide down projection).
 template <int K, int ROWS, typename W, typename S, typename X>
 inline void fp8_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % 32 == 0, "K must be a multiple of the 32-wide scale groups");
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float xv[8];
@@ -108,7 +109,7 @@ inline void fp8_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
 // from NB = 4 up (wo_b at NB = 8: 35 GB/s).
 template <int K, int ROWS, int NB, typename W, typename S, typename X>
 inline void fp8_rows_nb(W w, S s, uint row0, X x, uint XS, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % 32 == 0, "K must be a multiple of the 32-wide scale groups");
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float wv[ROWS][8], sc[ROWS];
@@ -193,7 +194,7 @@ inline void fp8_mma8(W w, S s, uint r0, X x, uint XS, uint lane, uint ks,
 template <int K, int ROWS, typename W, typename S, typename X>
 inline void fp4_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
     constexpr int NW = (K % 512 == 0) ? 2 : 1;      // uint32 words per lane per step
-    static_assert(K % (256 * NW) == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % 32 == 0, "K must be a multiple of the 32-wide scale groups");
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 8 * NW; k < uint(K); k += 256 * NW) {
         float xv[8 * NW];
@@ -264,7 +265,7 @@ inline void aff_w16(const device uchar* p, thread float* m) {
 // bias per GS values) dotted with an fp32 vector: scale * sum(q x) + bias * sum(x) per lane slice.
 template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff16_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 16 == 0, "K must be a multiple of 16 lanes x 16 values");
+    static_assert(K % GS == 0 && GS % 16 == 0, "K must be a multiple of whole 16-value groups");
     constexpr int NT = aff_terms16<BITS>();
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 16; k < uint(K); k += 512) {
@@ -284,7 +285,7 @@ inline void aff16_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* a
 // aff16_rows for NB vectors (x + v * XS) sharing each row's masked codes.
 template <int K, int ROWS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff16_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 16 == 0, "K must be a multiple of 16 lanes x 16 values");
+    static_assert(K % GS == 0 && GS % 16 == 0, "K must be a multiple of whole 16-value groups");
     constexpr int NT = aff_terms16<BITS>();
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
     for (uint k = lane * 16; k < uint(K); k += 512) {
@@ -341,7 +342,7 @@ inline void affine_codes8(const device uchar* p, thread float* q) {
 }
 template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff8_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 8 == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % GS == 0 && GS % 8 == 0, "K must be a multiple of whole 8-value groups");
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float xv[8], xs = 0.0f;
@@ -361,7 +362,7 @@ inline void aff8_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* ac
 // aff8_rows for NB vectors sharing each weight decode; per vector the arithmetic is aff8_rows'.
 template <int K, int ROWS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff8_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 8 == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % GS == 0 && GS % 8 == 0, "K must be a multiple of whole 8-value groups");
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float q[ROWS][8], sc[ROWS], bi[ROWS];
@@ -954,7 +955,9 @@ def supported(moe, x, config):
         and all(f is not None for f in formats)
         and formats[3] != MXFP4 and formats[4] != MXFP4 and formats[5] != MXFP4
         and config.n_activated_experts <= 31
-        and config.dim % 256 == 0 and config.moe_inter_dim % 256 == 0
+        and config.dim % 256 == 0
+        # The shared down projection splits its groups over two simdgroups.
+        and config.moe_inter_dim % (2 * formats[5][2]) == 0
     )
 
 

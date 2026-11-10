@@ -2127,6 +2127,14 @@ class TestEnginePoolAsync:
             engine_pool_module.quant_fast, "oq_a8_available", lambda: False
         )
         assert sig(off) == sig(on)
+        # DeepSeek V4.1 tensor-parallel ranks load A8 by their own hardware.
+        tensor = SimpleNamespace(tensor_parallel_size=2)
+        monkeypatch.setattr(
+            pool, "_distributed_deployment_for_entry", lambda entry: tensor
+        )
+        assert sig(off) == sig(on)
+        pool._entries["model-a"].config_model_type = "deepseek_v41"
+        assert sig(off) != sig(on)
 
     def test_oq_a8_toggle_changes_qwen4_exp_signature(
         self, pool_with_mock_engines, monkeypatch
