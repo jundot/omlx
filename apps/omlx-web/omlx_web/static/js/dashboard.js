@@ -353,7 +353,7 @@
             _aneTuningPollTimer: null,
             // Prefill Accelerator: paired Macs that can help the open model,
             // and its helper status (polled while the modal is open).
-            prefillHelper: { modelId: null, candidates: [], version: '', loading: false, status: null, busy: false, original: null, applied: false },
+            prefillHelper: { modelId: null, candidates: [], loading: false, status: null, busy: false, original: null, applied: false },
             _prefillHelperPollTimer: null,
             // Set while this Mac runs another Mac's prefill helper.
             prefillLending: null,
@@ -3110,7 +3110,6 @@
                 this.prefillHelper = {
                     modelId: model.id,
                     candidates: [],
-                    version: '',
                     loading: false,
                     status: model.prefill_helper || null,
                     busy: false,
@@ -3137,7 +3136,6 @@
                     if (resp.ok && this.prefillHelper.modelId === modelId) {
                         const data = await resp.json();
                         this.prefillHelper.candidates = data.devices || [];
-                        this.prefillHelper.version = data.version || '';
                     }
                 } catch (_) { /* network error */ }
                 if (this.prefillHelper.modelId === modelId) this.prefillHelper.loading = false;
@@ -3197,8 +3195,7 @@
                 if (!device.online) {
                     parts.push(window.t('modal.model_settings.prefill_helper_offline'));
                 } else if (!device.version_ok) {
-                    parts.push(window.t('modal.model_settings.prefill_helper_update')
-                        .replace('{version}', this.prefillHelper.version || ''));
+                    parts.push(window.t('modal.model_settings.prefill_helper_update'));
                 } else if (device.layers_fit > 0) {
                     parts.push(window.t('modal.model_settings.prefill_helper_fits')
                         .replace('{n}', device.layers_fit));
@@ -3314,6 +3311,8 @@
                             .replace('{size}', size(s.bytes));
                     case 'ready':
                     case 'working': {
+                        // No split beats this Mac alone over the measured link.
+                        if (s.layers === 0) return t('slow_link').replace('{name}', name);
                         let text = t(s.state).replace('{name}', name).replace('{n}', s.held ?? '');
                         if (s.last_prompt) {
                             text += ' · ' + t('last_prompt')

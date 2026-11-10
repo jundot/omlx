@@ -568,6 +568,13 @@ function clusterV2Wizard() {
             return Array.isArray(paired) ? paired : [];
         },
 
+        // Paired Macs that can share a model split. A helper daemon cannot.
+        splitDevices() {
+            return this.pairedDevices().filter(
+                (device) => !this.deviceHelperOnly(device),
+            );
+        },
+
         discoveredDevices() {
             const discovered = this.devicesPayload?.discovered;
             if (!Array.isArray(discovered)) return [];
@@ -1072,10 +1079,10 @@ function clusterV2Wizard() {
             // badge is driven by deploymentRuntimeState(), not by persistence.
             if (this.choosingModel && this.stage === 'plan') return 'plan';
             if (this.configuredDeployment()) return 'active';
-            if (this.stage === 'plan' && this.pairedDevices().length) {
+            if (this.stage === 'plan' && this.splitDevices().length) {
                 return 'plan';
             }
-            if (this.stage === 'checks' && this.pairedDevices().length) {
+            if (this.stage === 'checks' && this.splitDevices().length) {
                 return 'checks';
             }
             if (this.stage === 'purpose' && this.purposeAuto && this.helperRoleHost()) {
@@ -1299,7 +1306,8 @@ function clusterV2Wizard() {
         versionMismatches() {
             const self = this.selfDevice();
             if (!self || !self.version) return [];
-            return this.pairedDevices()
+            // A helper daemon has its own version number.
+            return this.splitDevices()
                 .filter(
                     (device) =>
                         !device.is_self &&
@@ -1335,7 +1343,19 @@ function clusterV2Wizard() {
         },
 
         deviceChipLabel(device) {
-            return device?.caps?.chip || window.t('cluster.v2.device.apple_silicon');
+            return (
+                device?.caps?.chip ||
+                window.t(
+                    this.deviceHelperOnly(device)
+                        ? 'cluster.v2.device.cuda_helper'
+                        : 'cluster.v2.device.apple_silicon',
+                )
+            );
+        },
+
+        // A helper daemon is only a Prefill Accelerator: no SSH, no split.
+        deviceHelperOnly(device) {
+            return device?.caps?.control === 'agent';
         },
 
         deviceLoopbackOnly(device) {
@@ -1369,10 +1389,9 @@ function clusterV2Wizard() {
         },
 
         combinedMemoryLabel() {
-            const total = this.allDevices().reduce(
-                (sum, device) => sum + (this.deviceRamGb(device) || 0),
-                0,
-            );
+            const total = this.allDevices()
+                .filter((device) => !this.deviceHelperOnly(device))
+                .reduce((sum, device) => sum + (this.deviceRamGb(device) || 0), 0);
             return total ? window.t('cluster.v2.device.combined').replace('{n}', String(total)) : '';
         },
 
@@ -1393,9 +1412,13 @@ function clusterV2Wizard() {
             }).catch(() => {});
         },
 
-        pairingStepOne() {
-            return window.t('cluster.v2.pairing.step1')
-                .replaceAll('{name}', this.deviceName(this.pairing.target))
+        pairingStepOne(device = this.pairing.target) {
+            // A helper daemon has no screen; its code is in its log.
+            const key = this.deviceHelperOnly(device)
+                ? 'cluster.v2.pairing.step1_helper'
+                : 'cluster.v2.pairing.step1';
+            return window.t(key)
+                .replaceAll('{name}', this.deviceName(device))
                 .replaceAll('{self}', this.deviceName(this.selfDevice()));
         },
 
@@ -1451,7 +1474,10 @@ function clusterV2Wizard() {
                     window.t('cluster.v2.toast.peer_joined').replace('{name}', this.deviceName(device)),
                 );
                 this.cancelPairing();
-                if (this.membershipPanelOpen) {
+                if (this.deviceHelperOnly(device)) {
+                    // A helper daemon has one purpose, so there is no choice.
+                    this.startAccelerator(device);
+                } else if (this.membershipPanelOpen) {
                     await this.refreshDevices();
                     const paired = this.pairedDevices().find(
                         (item) => item.node_id === device.node_id,
@@ -1473,8 +1499,11 @@ function clusterV2Wizard() {
                 }
             } catch (error) {
                 if (error?.status === 404 || error?.status === 409) {
-                    this.pairing.error =
-                        window.t('cluster.v2.pair.no_request');
+                    this.pairing.error = window.t(
+                        this.deviceHelperOnly(device)
+                            ? 'cluster.v2.pair.no_request_helper'
+                            : 'cluster.v2.pair.no_request',
+                    );
                 } else if (error?.status === 403 || error?.status === 429) {
                     this.pairing.error =
                         error.message ||
@@ -1900,10 +1929,13 @@ function clusterV2Wizard() {
             const name = this.acceleratorName();
             const t = (key) => window.t('cluster.v2.accelerator.' + key);
             const size = (bytes) => this.formatSizeBytes(Number(bytes || 0));
+            // A helper daemon answers on its control channel instead of SSH.
+            const helper = rows.some((row) => row.key === 'control');
             return rows.map((row) => {
                 let detail = row.detail || '';
-                if (row.key === 'ssh' && row.status === 'pass') {
-                    detail = t('ssh_ok').replace('{target}', row.detail);
+                let label = t('row_' + row.key);
+                if (['ssh', 'control'].includes(row.key) && row.status === 'pass') {
+                    detail = t(row.key + '_ok').replace('{target}', row.detail);
                 } else if (row.key === 'link') {
                     const mbps = Number(row.speed_mbps || 0);
                     const speed = mbps >= 1000 ? `${mbps / 1000} Gb` : `${mbps} Mb`;
@@ -1916,7 +1948,14 @@ function clusterV2Wizard() {
                         detail = t('link_ethernet_ok').replace('{speed}', speed);
                     } else {
                         const kind = row.detail === 'wifi' ? 'Wi-Fi' : (mbps ? ethernet : 'Ethernet');
-                        detail = t('link_slow').replace('{kind}', kind);
+                        detail = t(helper ? 'link_slow_helper' : 'link_slow').replace('{kind}', kind);
+                    }
+                } else if (row.key === 'version' && helper) {
+                    // The helper has its own version; an error text stays as is.
+                    label = t('row_version_helper');
+                    if (row.families) {
+                        detail = t(row.status === 'pass' ? 'version_ok_helper' : 'version_mismatch_helper')
+                            .replace('{version}', row.detail || '?');
                     }
                 } else if (row.key === 'version') {
                     detail = row.status === 'pass'
@@ -1925,6 +1964,10 @@ function clusterV2Wizard() {
                             .replaceAll('{name}', name)
                             .replace('{version}', row.detail || '?')
                             .replace('{expected}', row.expected || '?');
+                } else if (row.key === 'memory' && row.gpus) {
+                    detail = t('memory_detail_helper')
+                        .replace('{size}', size(row.bytes))
+                        .replace('{n}', row.gpus);
                 } else if (row.key === 'memory') {
                     detail = t('memory_detail').replace('{size}', size(row.bytes));
                 } else if (row.key === 'disk') {
@@ -1935,7 +1978,7 @@ function clusterV2Wizard() {
                 return {
                     key: row.key,
                     status: row.status,
-                    label: t('row_' + row.key),
+                    label,
                     detail,
                     fix: row.fix || '',
                 };
@@ -1952,7 +1995,7 @@ function clusterV2Wizard() {
             this.stage = 'checks';
             this.checks.started = true;
             this.checks.running = true;
-            const peers = this.pairedDevices();
+            const peers = this.splitDevices();
             await Promise.all([
                 ...peers.map((peer) => this.probePeer(peer)),
                 this.refreshDiscoveryHealth(),
@@ -2071,7 +2114,7 @@ function clusterV2Wizard() {
         },
 
         checkRows() {
-            const peers = this.pairedDevices();
+            const peers = this.splitDevices();
             const rows = [];
             const allPass = (list) => list.every(Boolean);
 
@@ -2130,6 +2173,7 @@ function clusterV2Wizard() {
                     const missing = this.allDevices().filter(
                         (device) =>
                             device.paired !== false &&
+                            !this.deviceHelperOnly(device) &&
                             !holders.has(device.node_id) &&
                             !device.is_self &&
                             !(this.selfDevice() && holders.has('127.0.0.1')),
@@ -2346,7 +2390,10 @@ function clusterV2Wizard() {
         // The paired Macs that will receive layers (this Mac included).
         planRoleDevices() {
             return this.allDevices().filter(
-                (device) => device.paired && this.deviceRamGb(device),
+                (device) =>
+                    device.paired &&
+                    !this.deviceHelperOnly(device) &&
+                    this.deviceRamGb(device),
             );
         },
 
@@ -2429,7 +2476,7 @@ function clusterV2Wizard() {
                     ssh: '127.0.0.1',
                 },
             ];
-            for (const peer of this.pairedDevices()) {
+            for (const peer of this.splitDevices()) {
                 hosts.push({
                     node_id: peer.node_id,
                     ssh: this.sshTargetFor(peer),
@@ -2517,7 +2564,7 @@ function clusterV2Wizard() {
                 (model?.locations || []).map((loc) => loc.node_id),
             );
             const total =
-                (this.selfDevice() ? 1 : 0) + this.pairedDevices().length;
+                (this.selfDevice() ? 1 : 0) + this.splitDevices().length;
             if (!total) return '';
             const have = Math.min(holders.size, total);
             if (have >= total) return t('cluster.v2.models.on_every_mac');
@@ -2798,7 +2845,7 @@ function clusterV2Wizard() {
                     accelerator: 'metal',
                 });
             }
-            for (const peer of this.pairedDevices()) {
+            for (const peer of this.splitDevices()) {
                 nodes.push({
                     node_id: peer.node_id,
                     capacity_bytes:
@@ -2968,7 +3015,7 @@ function clusterV2Wizard() {
             if (['jaccl', 'jaccl-ring', 'ring'].includes(serverBackend)) {
                 return serverBackend;
             }
-            const members = [this.selfDevice(), ...this.pairedDevices()].filter(
+            const members = [this.selfDevice(), ...this.splitDevices()].filter(
                 Boolean,
             );
             const allJaccl =
@@ -3005,7 +3052,7 @@ function clusterV2Wizard() {
                     rdma: [],
                 });
             }
-            for (const peer of this.pairedDevices()) {
+            for (const peer of this.splitDevices()) {
                 hosts.push({
                     node_id: peer.node_id,
                     ssh: this.sshTargetFor(peer),
@@ -3467,7 +3514,7 @@ function clusterV2Wizard() {
 
         membershipCandidates(deployment = this.configuredDeployment()) {
             const active = this.deploymentMemberIds(deployment);
-            return this.pairedDevices().filter(
+            return this.splitDevices().filter(
                 (device) => device?.node_id && !active.has(device.node_id),
             );
         },

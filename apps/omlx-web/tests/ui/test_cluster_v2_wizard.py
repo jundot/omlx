@@ -747,6 +747,64 @@ process.stdout.write(JSON.stringify({
     assert result["picked"] == "helper"
 
 
+def test_a_helper_daemon_pairs_by_its_log_code_and_never_joins_a_split():
+    result = _run_wizard(
+        """
+(async () => {
+const helper = {
+  node_id: 'gpu', friendly_name: 'gpu-box', version: '0.1.0', paired: true, addrs: [],
+  caps: { chip: '2x NVIDIA RTX A6000', ram_gb: 96, control: 'agent' },
+};
+component.devicesPayload = {
+  self: { node_id: 'node-a', version: '0.9.0', caps: { ram_gb: 256 }, addrs: [] },
+  paired: [
+    { node_id: 'node-b', version: '0.9.0', caps: { ram_gb: 128 }, addrs: [], paired: true },
+    helper,
+  ],
+  discovered: [],
+};
+const split = {
+  nodes: component.planNodes().map((node) => node.node_id),
+  hosts: component.inventoryHosts().map((host) => host.node_id),
+  mismatches: component.versionMismatches().length,
+};
+component.notify = () => {};
+component.formatSizeBytes = (bytes) => (bytes / 1024 ** 3).toFixed(1) + ' GB';
+component.apiFetch = async (url) => url.startsWith('/admin/api/prefill-helper/check')
+  ? { name: 'gpu-box', rows: [
+      { key: 'control', status: 'pass', detail: '192.168.1.230:8851' },
+      { key: 'version', status: 'pass', detail: '0.1.0', families: ['qwen4_exp'], fix: '' },
+      { key: 'memory', status: 'pass', bytes: 101786320896, gpus: 2 },
+    ] }
+  : {};
+component.pairing = { target: helper, code: '754901', busy: false, error: '' };
+const stepOne = component.pairingStepOne();
+await component.submitPairApproval(helper);
+await new Promise((resolve) => setTimeout(resolve));
+process.stdout.write(JSON.stringify({
+  split, stepOne, state: component.wizardState(),
+  rows: component.acceleratorRows().map((row) => [row.label, row.detail]),
+}));
+})();
+"""
+    )
+
+    # The helper takes no layers, and its own version is not a mismatch.
+    assert result["split"] == {
+        "nodes": ["node-a", "node-b"],
+        "hosts": ["node-a", "node-b"],
+        "mismatches": 0,
+    }
+    assert "in its log" in result["stepOne"]
+    # Approval goes to the accelerator checks without the purpose choice.
+    assert result["state"] == "accelerator"
+    assert result["rows"] == [
+        ["Control channel", "Reached 192.168.1.230:8851"],
+        ["Helper version", "0.1.0 works with this oMLX version"],
+        ["GPU memory for layers", "94.8 GB free (GPUs: 2)"],
+    ]
+
+
 def test_retry_loading_ownership_supersedes_retained_failure_marker():
     result = _run_wizard(
         """
