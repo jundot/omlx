@@ -2428,6 +2428,8 @@
   "settings.theme.preview_danger": "Unload",
   "settings.theme.preview_hover": "Hover",
   "settings.theme.preview_click_hint": "Click part of the preview to edit its color.",
+  "settings.theme.generate_dark": "Generate dark from light",
+  "settings.theme.generate_dark_hint": "Fill the dark column from the light colors. Review, then Apply.",
   "settings.theme.contrast.failed": "These colors are below their minimum contrast. Change the highlighted fields:",
   "settings.theme.contrast.pair": "{mode}: {foreground} on {background} is {ratio}:1, needs {floor}:1",
   "settings.theme.contrast.badge_text": "{status} badge text",

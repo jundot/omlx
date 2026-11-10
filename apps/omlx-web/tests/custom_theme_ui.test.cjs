@@ -68,3 +68,43 @@ test('contrast checks flag every pair below its floor', () => {
     assert.deepEqual(failed.map(check => [check.foreground, check.floor]),
         [...Array(3).fill(['link-color', 4.5]), ...Array(3).fill(['focus-ring-color', 3])]);
 });
+
+// Checks a generated dark palette the way the editor does: an unchanged status
+// keeps its stock badge, a changed one gets the tints it paints.
+function passes(colors) {
+    const stock = stockColors('dark');
+    const all = {...colors};
+    for (const status of theme.STATUS) {
+        const badge = colors[status] === stock[status]
+            ? {soft: theme.flatten(stock[`${status}-soft`], colors['bg-primary']), text: stock[`${status}-text`]}
+            : theme.badgeColors('dark', colors[status], colors['bg-primary']);
+        all[`${status}-soft`] = badge.soft;
+        all[`${status}-text`] = badge.text;
+    }
+    return theme.contrastChecks(all).every(check => check.ok);
+}
+
+test('the stock light palette generates an Apply-able dark close to stock dark', () => {
+    const light = stockColors('light');
+    const dark = stockColors('dark');
+    const generated = theme.darkFromLight(light);
+    assert.deepEqual(Object.keys(generated), theme.TOKENS);
+    for (const token of theme.TOKENS) {
+        assert.equal(theme.normalizeHex(generated[token]), generated[token], token);
+        const [a, b] = [generated[token], dark[token]].map(hex => {
+            const [L, C, h] = theme.oklch(hex);
+            return [L, C * Math.cos(h), C * Math.sin(h)];
+        });
+        assert.ok(Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) < 0.07, `${token}: ${generated[token]} vs ${dark[token]}`);
+    }
+    assert.ok(passes(generated));
+});
+
+test('a low-contrast generated foreground is nudged until it passes', () => {
+    const light = {
+        ...stockColors('light'),
+        'bg-primary': '#bbbbbb', 'bg-secondary': '#b5b5b5', 'bg-tertiary': '#afafaf',
+        'text-secondary': '#666666', 'link-color': '#3366aa',
+    };
+    assert.ok(passes(theme.darkFromLight(light)));
+});
