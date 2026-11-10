@@ -7470,8 +7470,7 @@
                     + ` --theme-cell-hover:${color('bg-tertiary')}; --theme-cell-ring:${color('focus-ring-color')};`;
             },
 
-            // The mode's tokens plus each status badge's fill, line and text as
-            // opaque hex on the page: what the preview draws and the contrast checks read.
+            // Tokens plus badge parts as opaque hex; read by the preview and the contrast checks.
             themeDrawColors(mode) {
                 const api = window.OmlxCustomTheme;
                 const stock = this.customThemeDefaults[mode];
@@ -7656,8 +7655,7 @@
                 }
             },
 
-            // Applies the theme a Save as image PNG carries. A theme with a pair below
-            // its contrast floor fills the fields but is not saved, as with Apply.
+            // A theme below a contrast floor fills the fields but is not saved.
             async loadThemeImage(event) {
                 const file = event.target.files?.[0];
                 event.target.value = '';
@@ -7680,13 +7678,12 @@
                 else this.themeImageError = window.t('settings.theme.image_review');
             },
 
-            // Both preview cards as one English PNG to share: every hex, plus the JSON in a text chunk.
             async saveThemePreviewImage(version) {
                 if (this.themeImageBusy) return;
                 this.themeImageError = '';
                 this.themeImageBusy = true;
                 try {
-                    // Load Inter explicitly, then wait: the image must look the same in every UI language.
+                    // The image uses Inter in every UI language, so load it before drawing.
                     if (document.fonts?.load) {
                         await Promise.all([300, 400, 500, 600, 700, 800].map(weight =>
                             document.fonts.load(`${weight} 11px Inter`).catch(() => {})));

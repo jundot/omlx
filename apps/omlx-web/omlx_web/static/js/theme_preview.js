@@ -1,15 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/*
- * Draws the theme preview card. Theme Settings draws it on a canvas per mode
- * in the UI language, and the shareable PNG draws the same card for both
- * modes, then a light table under the light card and a dark table under the
- * dark card. Each table has every token's English name, --token id, swatch and
- * exact hex for that mode. The same colors ride along as theme JSON in a PNG
- * text chunk.
- *
- * The image is English-only on purpose: it is handed to agents and shared as
- * a file, so it must not depend on the dashboard's UI language.
- */
+// Draws the theme preview card for Theme Settings (UI language) and for the
+// shareable PNG (fixed English, so the file reads the same anywhere).
 (function () {
     const KEYWORD = 'omlx-theme';
     const MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
@@ -85,9 +76,8 @@
         return (crc ^ 0xffffffff) >>> 0;
     }
 
-    // Inserts a tEXt chunk right after IHDR (8-byte signature + 25-byte IHDR).
-    // The JSON is ASCII (token ids and hex), so tEXt's Latin-1 is safe; use
-    // iTXt if the payload ever gains non-ASCII text.
+    // Inserts a tEXt chunk after IHDR (8-byte signature + 25-byte IHDR). tEXt is
+    // Latin-1; the JSON is ASCII token ids and hex.
     function withTextChunk(png, keyword, text) {
         const data = new TextEncoder().encode(`${keyword}\0${text}`);
         const chunk = new Uint8Array(12 + data.length);
@@ -103,8 +93,7 @@
         return out;
     }
 
-    // The text of the first tEXt chunk named `keyword`, or null when the bytes
-    // are not a PNG or carry no such chunk.
+    // Returns null when the bytes are not a PNG or carry no such chunk.
     function readTextChunk(png, keyword) {
         const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         if (png.length < 8 || signature.some((byte, i) => png[i] !== byte)) return null;
@@ -152,7 +141,7 @@
         return ctx.measureText(value).width;
     }
 
-    // Uses the context's current font; callers set it before measuring.
+    // Measures with the context's current font.
     function ellipsize(ctx, value, max) {
         if (ctx.measureText(value).width <= max) return value;
         let cut = value;
@@ -179,20 +168,13 @@
         return lines;
     }
 
-    // The card is laid out at 288x236 and scaled to fit, so the page preview
-    // and the image always draw the same thing.
+    // Card units; the page preview and the image scale the same layout.
     const CARD_W = 288;
     const CARD_H = 236;
     const WIDTH = PAD * 2 + CARD_W * CARD_ZOOM * 2 + GAP;
 
-    // c: the mode's tokens plus each status's soft, line and text colors.
-    // o.regions, when given, collects [x, y, w, h, token] for each part, last on top.
-    //
-    // NOTE for anyone editing this card, human or AI: click-to-edit only knows
-    // what hit() records. When you draw a new part or move one, add or update
-    // its hit() call with the same box, after anything it sits on. The tests
-    // check that every token has a region, not that a region matches what is
-    // drawn, so a stale box fails silently.
+    // o.regions collects [x, y, w, h, token] per part, topmost last. Keep each
+    // hit() box in step with what it draws: click-to-edit reads only these.
     function drawCard(ctx, c, o) {
         const { sans, labels } = o;
         const t = (value, x, y, style) => text(ctx, value, x, y, { font: sans, ...style });
@@ -328,14 +310,9 @@
         pill(ctx, 0.5, 0.5, CARD_W - 1, CARD_H - 1, 16, null, c['border-faint']);
     }
 
-    // One mode's table: a header, then each group's heading and its rows.
     const tableHeight = groups => HEAD_H
         + groups.reduce((height, group) => height + GROUP_H + group.tokens.length * ROW, 0);
 
-    // One table under one preview card: name, --token id and this mode's
-    // swatch and hex on one line, so the rows stay compact without squeezing
-    // the text. The light table sits under the light card and the dark table
-    // under the dark card, so the columns line up with the cards.
     function drawTable(ctx, theme, mode, groups, x, top, o) {
         const c = theme[mode];
         const width = CARD_W * CARD_ZOOM;
@@ -431,7 +408,6 @@
         return canvas;
     }
 
-    // Resolves to a PNG blob carrying the theme as JSON in the KEYWORD text chunk.
     async function png(options) {
         const canvas = render(options);
         const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
@@ -443,8 +419,7 @@
         return new Blob([withTextChunk(bytes, KEYWORD, json)], { type: 'image/png' });
     }
 
-    // Theme Settings' preview: the card scaled to the canvas width, sharp on
-    // HiDPI. Returns the click regions in card units; `hover` gets a dashed outline.
+    // Returns the click regions in card units.
     function drawPreview(canvas, colors, { mode, labels, sans, hover }) {
         canvas.style.aspectRatio = `${CARD_W} / ${CARD_H}`;
         const scale = canvas.clientWidth / CARD_W;
@@ -464,12 +439,11 @@
         return regions;
     }
 
-    // The topmost region under a point in card units.
     const regionAt = (regions, x, y) => regions.findLast(([rx, ry, w, h]) => x >= rx && x <= rx + w && y >= ry && y <= ry + h);
 
     const api = {
         KEYWORD, LABELS, GROUP_LABELS, TOKEN_LABELS, CARD_W,
-        png, drawCard, drawPreview, regionAt, withTextChunk, readTextChunk, crc32, tableHeight, wrap, ellipsize,
+        png, drawCard, drawPreview, regionAt, withTextChunk, readTextChunk, crc32,
     };
     if (typeof window !== 'undefined') window.OmlxThemePreview = api;
     if (typeof module !== 'undefined') module.exports = api;
