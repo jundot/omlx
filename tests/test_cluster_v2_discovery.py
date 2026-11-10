@@ -1381,6 +1381,22 @@ def test_address_health_requires_repeated_failures_and_recovers():
     assert service.address_health("peer")["192.0.2.1"]["state"] == "stale"
 
 
+def test_a_helper_daemon_names_itself_in_the_probe_reply():
+    """A manually added helper has no mDNS TXT; its probe reply carries caps."""
+    reply = {
+        "node_id": "helper",
+        "caps": {"chip": "2x NVIDIA RTX A6000", "ram_gb": 96.0, "control": "agent"},
+    }
+    service, _ = _service(prober=lambda *_: reply)
+    service._add_candidate("192.0.2.9", 8765, node_id="helper", if_type="manual")
+    service._probe_candidate("192.0.2.9", 8765)
+    caps = next(p for p in service.peers() if p.node_id == "helper").caps
+    assert (caps.chip, caps.control) == ("2x NVIDIA RTX A6000", "agent")
+    assert caps.to_dict()["control"] == "agent"
+    # Any other value is dropped, and a Mac's caps keep their key set.
+    assert "control" not in PeerCaps.from_dict({"control": "ssh"}).to_dict()
+
+
 def test_address_health_does_not_inherit_other_node_identity():
     service, _ = _service(prober=lambda *_: {"node_id": "other"})
     service._add_candidate("192.0.2.1", 8000, node_id="peer", if_type="manual")

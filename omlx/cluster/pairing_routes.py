@@ -75,8 +75,11 @@ class PairRequestBody(BaseModel):
     code_salt: str = Field(min_length=24, max_length=64)
     http_port: int | None = Field(default=None, ge=1, le=65535)
     addrs: list[str] = Field(default_factory=list, max_length=8)
-    ssh_public_key: str = Field(min_length=32, max_length=8192)
-    ssh_host_public_key: str = Field(min_length=32, max_length=8192)
+    # Absent for an agent-controlled peer (caps.control == "agent").
+    ssh_public_key: str | None = Field(default=None, min_length=32, max_length=8192)
+    ssh_host_public_key: str | None = Field(
+        default=None, min_length=32, max_length=8192
+    )
 
 
 class PairApproveBody(BaseModel):
@@ -206,13 +209,17 @@ def _send_invite(manager: PairingManager, node_id: str) -> bool:
         # A scope-less link-local or this Mac's own loopback cannot reach it.
         if ip.version == 4 and not ip.is_loopback:
             usable.append(str(ip))
+    invite: dict[str, Any] = {"node_id": manager.node_id}
+    if peer.caps.control == "agent":
+        # A helper daemon joins at the invite's source address and this port.
+        invite["http_port"] = manager.http_port
     for addr in sorted(
         usable, key=lambda ip: health.get(ip, {}).get("state") != "verified"
     ):
         try:
             manager._http_post(
                 f"http://{addr}:{peer.http_port}/api/cluster/pair/invited",
-                {"node_id": manager.node_id},
+                invite,
                 3.0,
             )
         except Exception:

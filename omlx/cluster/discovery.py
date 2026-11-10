@@ -638,9 +638,11 @@ class PeerCaps:
     jaccl: bool = False
     # The HTTP server binds only loopback, so peers cannot reach it.
     loopback_only: bool = False
+    # "agent": a helper daemon driven over its control channel, not SSH.
+    control: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        caps = {
             "chip": self.chip,
             "ram_gb": self.ram_gb,
             "backends": list(self.backends),
@@ -648,6 +650,9 @@ class PeerCaps:
             "jaccl": self.jaccl,
             "loopback_only": self.loopback_only,
         }
+        if self.control:
+            caps["control"] = self.control
+        return caps
 
     @classmethod
     def from_dict(cls, payload: Any) -> PeerCaps:
@@ -663,6 +668,7 @@ class PeerCaps:
             thunderbolt=bool(payload.get("thunderbolt")),
             jaccl=bool(payload.get("jaccl")),
             loopback_only=bool(payload.get("loopback_only")),
+            control="agent" if payload.get("control") == "agent" else "",
         )
 
 
@@ -1917,6 +1923,10 @@ class DiscoveryService:
             peer.cluster_name = str(result.get("cluster_name") or peer.cluster_name)
             if result.get("friendly_name"):
                 peer.friendly_name = str(result["friendly_name"])
+            if isinstance(result.get("caps"), dict):
+                # A helper daemon names itself here, so a manual add without
+                # mDNS still shows what it is.
+                peer.caps = PeerCaps.from_dict(result["caps"])
             peer.http_port = port
             peer.last_seen = now
             if not any(a["ip"] == ip for a in peer.addrs):
