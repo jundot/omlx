@@ -5032,6 +5032,8 @@ class LanguageModel(Qwen3_5LanguageModel):
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         return_hidden = bool(kwargs.get("return_hidden", False))
+        # Qwen4 owns verification; the inherited verifier assumes Qwen3.5 layers.
+        speculative_verify = bool(kwargs.pop("speculative_verify", False))
         drafter = getattr(self, "_omlx_drafter", None)
         scope = getattr(drafter, "scope_uids", None)
         observe = (
@@ -5045,7 +5047,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         )
         if observe:
             kwargs["capture_layer_ids"] = list(drafter.target_layer_ids)
-        mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
+        mtp_capture = return_hidden and not kwargs.get("capture_layer_ids")
         capture_verify = return_hidden and bool(kwargs.get("capture_layer_ids"))
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
@@ -5053,6 +5055,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         # reject, so they run the serial decode step rather than a verify forward.
         one_row_step = (
             mtp_capture
+            and not speculative_verify
             and inputs_embeds is None
             and tuple(inputs.shape) == (1, 1)
             and cache is not None
@@ -5060,7 +5063,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         )
         transaction = (
             start_speculative_cache(cache or [], inputs.shape[1])
-            if (mtp_capture and not one_row_step) or capture_verify
+            if speculative_verify or (mtp_capture and not one_row_step) or capture_verify
             else None
         )
         step = _MTP_ONE_ROW_STEP.set(True) if one_row_step else None

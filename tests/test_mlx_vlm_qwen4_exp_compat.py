@@ -1450,7 +1450,8 @@ def test_qwen4_dflash_failed_forward_aborts_cache(monkeypatch):
 @pytest.mark.parametrize(
     "method", ["speculative_verify_logits", "speculative_verify_hidden"]
 )
-def test_qwen4_native_verify_starts_only_one_transaction(monkeypatch, method):
+@pytest.mark.parametrize("window", [1, 2])
+def test_qwen4_native_verify_starts_only_one_transaction(monkeypatch, method, window):
     config = _tiny_config()
     model = qwen4_language.LanguageModel(config.text_config, config)
     cache = model.make_cache()
@@ -1458,10 +1459,13 @@ def test_qwen4_native_verify_starts_only_one_transaction(monkeypatch, method):
     start = MagicMock(wraps=qwen4_language.start_speculative_cache)
     monkeypatch.setattr(qwen4_language, "start_speculative_cache", start)
     args = (lambda logits: logits,) if method.endswith("logits") else ()
-    result = getattr(model, method)(mx.array([[4, 5]], dtype=mx.int32), cache, *args)
-    assert result[0].shape == (1, 2, 64)
+    tokens = mx.array([[4, 5]], dtype=mx.int32)[:, :window]
+    result = getattr(model, method)(tokens, cache, *args)
+    assert result[0].shape == (1, window, 64)
     start.assert_called_once()
-    model.rollback_speculative_cache(cache, result[2], 0, 2)
+    assert result[2].active
+    model.rollback_speculative_cache(cache, result[2], 0, window)
+    assert not result[2].active
 
 
 def test_qwen4_mtp_one_row_step_is_the_serial_decode_step():
