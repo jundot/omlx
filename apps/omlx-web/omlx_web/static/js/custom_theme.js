@@ -29,18 +29,13 @@
     };
     const SURFACES = ['bg-primary', 'bg-secondary', 'bg-tertiary'];
     const STATUS = ['success', 'warning', 'danger', 'info'];
-    // How much of a status color its badge fill and line take, and how far its
-    // text moves toward black (light) or white (dark). declarations() paints
-    // these and badgeColors() computes them, so both read this one table.
+    // Read by both declarations() and badgeColors().
     const BADGE_TINT = {
         light: { soft: 0.08, line: 0.3, text: 0.35, toward: 'black' },
         dark: { soft: 0.15, line: 0.3, text: 0.35, toward: 'white' },
     };
-    // [foreground, backgrounds, floor]; every pair must reach its floor before
-    // Apply. 4.5:1 is WCAG 1.4.3 AA for body text, Apple's minimum up to 17 pt;
-    // 3:1 is WCAG 1.4.11 for controls, focus and graphics, and AA for bold or
-    // large text. Muted text and borders have no floor: the stock theme draws
-    // placeholders and dividers below 3:1, as WCAG allows.
+    // [foreground, backgrounds, floor]: 4.5 is WCAG 1.4.3 AA, 3 is WCAG 1.4.11.
+    // Muted text and borders have no floor; stock draws them below 3:1.
     const CONTRAST_RULES = [
         ['text-primary', SURFACES, 4.5],
         ['text-secondary', SURFACES, 4.5],
@@ -53,8 +48,7 @@
         ['switch-on', SURFACES, 3],
         ['timeline-accent', SURFACES, 3],
     ];
-    // Not edited directly; resolved too so the previews and contrast checks can
-    // use the stock badges.
+    // Not edited directly; resolved too so the previews can draw stock badges.
     const DERIVED = STATUS.flatMap(status => ['soft', 'line', 'text'].map(part => `${status}-${part}`));
     const TOKENS = GROUPS.flatMap(group => group.tokens);
     // Tokens are opaque: a translucent text color would make the contrast
@@ -93,7 +87,6 @@
         return (hi + 0.05) / (lo + 0.05);
     }
 
-    // `colors` maps tokens, including the derived badge colors, to opaque hex.
     function contrastChecks(colors) {
         return CONTRAST_RULES.flatMap(([foreground, backgrounds, floor]) => backgrounds.map(background => {
             const ratio = contrast(colors[foreground], colors[background]);
@@ -110,8 +103,7 @@
         return toHex(...[r, g, b].map((c, i) => c * a + base[i] * (1 - a)));
     }
 
-    // The badge fill, line and text a custom status color paints (see
-    // declarations()), flattened onto the page background.
+    // A custom status color's badge parts, flattened onto the page.
     function badgeColors(mode, hex, page) {
         const tint = BADGE_TINT[mode];
         const mix = (weight, other) => toHex(...rgb(hex).map((c, i) => c * weight + other[i] * (1 - weight)));

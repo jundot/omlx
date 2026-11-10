@@ -29,7 +29,7 @@ Families outside Tailwind's palette:
 
 ## Custom theme
 
-`ui.custom_theme` stores per-theme token overrides (`{"light": {"bg-primary": "#..."}, "dark": {...}}`), and `static/js/custom_theme.js` paints them before first paint. That file owns the token list and the contrast rules: the Theme Settings editor disables Apply, names the failing pairs and outlines the fields to change when primary/secondary text, links, button text (also on hover) or status badge text fall below 4.5:1 (WCAG 1.4.3 AA), or tertiary text, danger text, the focus ring, the switch or the accent fall below 3:1 (WCAG 1.4.11). Muted text and borders have no floor. The server only checks that each value is `#rrggbb`.
+`ui.custom_theme` stores per-theme token overrides (`{"light": {"bg-primary": "#..."}, "dark": {...}}`), and `static/js/custom_theme.js` paints them before first paint. That file owns the token list and the contrast rules (`CONTRAST_RULES`, 4.5:1 for text and 3:1 for controls and accents): the Theme Settings editor disables Apply, names the failing pairs and outlines the fields to change. The server only checks that each value is `#rrggbb`.
 
 ## Type
 

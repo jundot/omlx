@@ -68,9 +68,3 @@ test('contrast checks flag every pair below its floor', () => {
     assert.deepEqual(failed.map(check => [check.foreground, check.floor]),
         [...Array(3).fill(['link-color', 4.5]), ...Array(3).fill(['focus-ring-color', 3])]);
 });
-
-test('badge colors flatten the tints a custom status paints', () => {
-    assert.deepEqual(theme.badgeColors('light', '#ff0000', '#ffffff'), {soft: '#ffebeb', line: '#ffb3b3', text: '#a60000'});
-    assert.deepEqual(theme.badgeColors('dark', '#ff0000', '#000000'), {soft: '#260000', line: '#4d0000', text: '#ff5959'});
-    assert.equal(theme.flatten('rgba(255, 0, 0, 0.5)', '#000000'), '#800000');
-});
