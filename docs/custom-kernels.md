@@ -33,7 +33,7 @@ omlx/custom_kernels/
 |---|---|---|
 | `attention` | attention over KV (sparse, block-mask, FA-256, decode SDPA) | GLM, DeepSeek V4/V4.1, Qwen3.5/3.6, Qwen4 |
 | `sparse_index` | choosing which KV blocks to attend to (indexer scores, top-k) | GLM, DeepSeek V4, Qwen4, MiniMax M3 |
-| `quant_matmul` | matmuls on quantized weights, MoE combine, ANE offload | Qwen3.5/3.6, GLM, DeepSeek V4/V4.1, MiMo, K2 |
+| `quant_matmul` | matmuls on quantized weights, MoE combine, ANE offload | Qwen3.5/3.6, GLM, DeepSeek V4/V4.1, MiMo, K2, MiniMax M3 |
 | `lowbit` | T5 (base-3 ternary) weights; 1-bit and 2-bit affine run on stock MLX | Bonsai T5 checkpoints |
 
 Each package has:
