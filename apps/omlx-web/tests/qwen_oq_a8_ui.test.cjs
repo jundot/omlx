@@ -19,13 +19,13 @@ const state = create();
 
 for (const config_model_type of [
     'qwen3_5', 'qwen3_5_moe', 'qwen3_6', 'qwen3_8', 'Qwen3-8',
-    'qwen4_exp', 'Qwen4-Exp', 'deepseek_v41',
+    'qwen4_exp', 'Qwen4-Exp', 'deepseek_v41', 'minimax_m3', 'minimax_m3_vl',
 ]) {
     assert.equal(state.isA8PrefillModel({config_model_type}), true);
 }
 for (const config_model_type of [
     '', 'qwen2', 'qwen3', 'qwen4', 'qwen4_exp_x', 'llama', 'gemma4', 'k2_horizon',
-    'deepseek_v4',
+    'deepseek_v4', 'minimax_m2',
 ]) {
     assert.equal(state.isA8PrefillModel({config_model_type}), false);
 }

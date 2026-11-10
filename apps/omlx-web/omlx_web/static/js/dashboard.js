@@ -3370,9 +3370,8 @@
 
             isA8PrefillModel(model) {
                 const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
-                // qwen4_exp (Qwen3.8-Flash-Next) and deepseek_v41 are exact
-                // matches: only those validated families have routed-expert A8.
-                return type === 'qwen4_exp' || type === 'deepseek_v41'
+                // Exact matches: only these validated families have routed-expert A8.
+                return ['qwen4_exp', 'deepseek_v41', 'minimax_m3', 'minimax_m3_vl'].includes(type)
                     || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 

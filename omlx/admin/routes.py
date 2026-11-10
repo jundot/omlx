@@ -417,7 +417,7 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
-    # INT8-activation (A8) prefill (Qwen3.5/3.6/3.8, Qwen3.8 Flash-Next, DeepSeek V4.1)
+    # A8 prefill (Qwen3.5/3.6/3.8, Qwen3.8 Flash-Next, DeepSeek V4.1, MiniMax M3)
     a8_prefill_enabled: bool | None = None
     a8_prefill_min_tokens: int | None = None
     # MoE expert offload (stream non-resident experts from the checkpoint)
@@ -3721,7 +3721,7 @@ def _validate_model_settings(entry, settings):
                 status_code=400,
                 detail=(
                     "A8 prefill is available only for Qwen3.5/3.6/3.8, "
-                    "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
+                    "Qwen3.8-Flash-Next, DeepSeek V4.1 and MiniMax M3 models."
                 ),
             )
         if settings.get("qwen35_ane_prefill_enabled"):
@@ -4058,7 +4058,7 @@ def _feature_problem(
         if not _oq_a8_model_supported(entry.config_model_type):
             return (
                 "A8 prefill is available only for Qwen3.5/3.6/3.8, "
-                "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
+                "Qwen3.8-Flash-Next, DeepSeek V4.1 and MiniMax M3 models."
             )
         if not _oq_a8_kernels_available() and not snapshot.get(
             "prefill_helper_node_id"

@@ -216,15 +216,19 @@ def a8_prefill_on(settings: Any) -> bool:
     return bool(_setting(settings, "a8_prefill_enabled"))
 
 
+_A8_EXACT_MODEL_TYPES = ("qwen4_exp", "deepseek_v41", "minimax_m3", "minimax_m3_vl")
+
+
 def oq_a8_model_supported(config_type: str | None) -> bool:
     """True for the model families the A8 prefill paths can route.
 
-    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) and
-    DeepSeek V4.1 match exactly: only those validated checkpoint families have
-    routed-expert A8, so a ``qwen4`` prefix would admit unvalidated models.
+    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``),
+    DeepSeek V4.1 and MiniMax M3/M3.1 match exactly: only those validated
+    checkpoint families have routed-expert A8, so a ``qwen4`` prefix would
+    admit unvalidated models.
     """
     config_type = str(config_type or "").lower().replace("-", "_")
-    return config_type in ("qwen4_exp", "deepseek_v41") or config_type.startswith(
+    return config_type in _A8_EXACT_MODEL_TYPES or config_type.startswith(
         ("qwen3_5", "qwen3_6", "qwen3_8")
     )
 
@@ -328,8 +332,9 @@ class ModelSettings:
             (zero lets Accelerate choose).
         qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
-        a8_prefill_enabled: Route eligible Qwen3.5/3.6/3.8 and DeepSeek V4.1
-            prefill matmuls through the INT8-activation (QxA8) tensor kernels.
+        a8_prefill_enabled: Route eligible Qwen3.5/3.6/3.8, DeepSeek V4.1 and
+            MiniMax M3 prefill matmuls through the INT8-activation (QxA8)
+            tensor kernels.
             Prefill only, and only a speed-up on hardware with native INT8
             tensor operations -- M5-series and newer. On anything older it
             applies only to a Prefill Accelerator Mac's layers. Off unless
@@ -338,7 +343,10 @@ class ModelSettings:
             Also covers the routed-expert gate/up of Qwen3.8-Flash-Next
             (affine Q4 / GS64 experts); the MTP draft layer and the down
             projection stay on the A16 path. DeepSeek V4.1 covers its affine
-            GS64 routed experts, shared expert and dense projections.
+            GS64 routed experts, shared expert and dense projections. MiniMax
+            M3/M3.1 covers its affine GS64 routed experts (NVFP4 experts stay
+            on the A16 path), shared expert and dense projections except the
+            sparse-attention indexer.
             Mutually exclusive with qwen35_ane_prefill_enabled.
         a8_prefill_min_tokens: Shortest sequence routed to the kernels.
         moe_expert_offload_enabled: Stream MoE expert weights from the
