@@ -29,7 +29,7 @@ _SOURCE = r"""
     }
     if (lane == 0) for (int q = 0; q < NQ; ++q) y[q * N + row] = sum[q];
 """
-MAX_ROWS = 8
+MAX_ROWS = 16
 
 
 @cache

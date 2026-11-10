@@ -825,6 +825,21 @@ def test_engram_gate_matches_official(expected):
     np.testing.assert_array_equal(actual[:, 1], h[:, 1])
 
 
+def test_engram_dedupes_prefill_rows_but_not_request_batches():
+    """Rows of several requests (batched decode, shared verify blocks, up to DECODE_ROWS)
+    stay one per request; a single request's prefill chunk dedupes repeated tuples."""
+    from omlx.patches.deepseek_v41.storage import DECODE_ROWS, dedupe_tuple_ids
+
+    rng = np.random.default_rng(5)
+    batch = rng.integers(0, 97, (DECODE_ROWS, 1, 24))
+    batch[1] = batch[0]
+    assert dedupe_tuple_ids(batch)[1] is None
+    chunk = rng.integers(0, 97, (1, 12, 24))
+    chunk[0, 1] = chunk[0, 0]
+    unique, inverse = dedupe_tuple_ids(chunk)
+    assert unique.shape[0] == 11 and inverse is not None
+
+
 def test_prefill_engram_dedupe_matches_undeduped(monkeypatch):
     from mlx.nn import Module
 

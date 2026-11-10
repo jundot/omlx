@@ -9,7 +9,7 @@ import numpy as np
 
 from .gemv import mxfp8_gemv_each
 from .quantization import QuantizedProjection, quantize_activation
-from .storage import dedupe_tuple_ids
+from .storage import DECODE_ROWS, dedupe_tuple_ids
 
 
 def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
@@ -135,15 +135,16 @@ class NgramHash:
 
 
 # Inputs of up to this many rows (batched decode, MTP verify) are projected row by row.
-_ROWWISE_ROWS = 8
-
-
 def _project_each(p, flat):
     """p applied to each row of flat ([count, k]) on its own, with one weight read for all
     rows (mxfp8_gemv_each), or None if p is not an MXFP8 projection."""
     if not (isinstance(p, QuantizedProjection) and p.mode == "mxfp8" and p.group_size == 32):
         return None
-    return mxfp8_gemv_each(quantize_activation(flat) if p.quantize_input else flat, p.weight, p.scales)
+    x = quantize_activation(flat) if p.quantize_input else flat
+    parts = [mxfp8_gemv_each(x[i : i + 8], p.weight, p.scales) for i in range(0, x.shape[0], 8)]
+    if any(part is None for part in parts):
+        return None
+    return parts[0] if len(parts) == 1 else mx.concatenate(parts, 0)
 
 
 class Engram(nn.Module):
@@ -169,7 +170,8 @@ class Engram(nn.Module):
         ids_host, inverse = dedupe_tuple_ids(ids_np)
         rows = self.embed(mx.array(ids_host)).flatten(-2)
         count = math.prod(ids_np.shape[:-1]) if ids_np.ndim >= 2 else 1
-        if 1 < count <= _ROWWISE_ROWS:
+        requests = ids_np.shape[0] if ids_np.ndim >= 2 else 1
+        if 1 < count <= 8 or (requests > 1 and count <= DECODE_ROWS):
             # Decode-sized inputs (one token for each of B requests, or an MTP verify block
             # of one request): project each row on its own, exactly as a single-token
             # decode does. A multi-row quantized_matmul runs a different MLX kernel whose
