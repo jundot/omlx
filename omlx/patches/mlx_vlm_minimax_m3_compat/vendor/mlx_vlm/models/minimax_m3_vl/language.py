@@ -13,6 +13,8 @@ from mlx_lm.models.switch_layers import (
     _scatter_unsort,
 )
 
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
+from omlx.patches.m5_gather_qmm import split_gate_up_swiglu_oai
 from omlx.patches.mlx_vlm_minimax_m3_compat import a8
 from omlx.patches.qwen35_oq_a8 import _PREPARED_ATTR as _A8_PREPARED
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
@@ -895,6 +897,47 @@ class MiniMaxScaledSwitchGLU(SwitchGLU):
 
         return x.squeeze(-2)
 
+    def weighted_sum(
+        self, x: mx.array, indices: mx.array, scores: mx.array
+    ) -> Optional[mx.array]:
+        """``sum_k scores[..., k] * self(x, indices)[..., k, :]`` of a prefill
+        chunk on the tensor units, or None.
+
+        The gate/up kernel reads the token rows in place and applies the
+        activation, and the weighted sum reads the sorted down outputs, so the
+        replicated rows, the two projections and the unsorted outputs are
+        never written.
+        """
+        # A row-exact verify keeps the unfused path: this sum rounds differently.
+        if (
+            x.ndim != 3
+            or x.shape[1] <= _SPARSE_COMPACT_MAX_QUERIES
+            or self.training
+            or is_row_exact_armed()
+            or indices.shape[-1] not in quant_fast.moe_weighted_sum_top_ks()
+        ):
+            return None
+        act = self.activation
+        routed = split_gate_up_swiglu_oai(
+            self.gate_proj,
+            self.up_proj,
+            x,
+            indices,
+            alpha=act.alpha,
+            limit=act.limit,
+            beta=act.beta,
+            expert_scales=(self.gate_scale, self.up_scale),
+        )
+        if routed is None:
+            return None
+        hidden, idx, inv_order = routed
+        y = self.down_proj(hidden, idx, sorted_indices=True)
+        return quant_fast.moe_weighted_sum(
+            mx.contiguous(y),
+            mx.contiguous(inv_order.astype(mx.uint32)),
+            mx.contiguous(scores.astype(mx.float32)),
+        )
+
 
 class _FusedProjections:
     """Same-format quantized projections concatenated along the output rows."""
@@ -1608,7 +1651,11 @@ class MiniMaxSparseMoeBlock(nn.Module):
             inds = mx.concatenate([inds, shared_inds], axis=-1)
             scores = mx.concatenate([scores, shared_scores], axis=-1)
 
-        y = _combine_routed(self.switch_mlp(x, inds), scores)
+        y = None
+        if self.routed_expert_scales and self.sharding_group is None:
+            y = self.switch_mlp.weighted_sum(x, inds, scores)
+        if y is None:
+            y = _combine_routed(self.switch_mlp(x, inds), scores)
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)

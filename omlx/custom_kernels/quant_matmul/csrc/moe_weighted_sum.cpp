@@ -66,7 +66,10 @@ class MoeWeightedSumPrimitive : public Primitive {
       return true;
     }
     const int topk = scores.shape(-1);
-    if ((topk != 6 && topk != 8 && topk != 10) ||
+    if (std::find(
+            std::begin(kMoeWeightedSumTopKs),
+            std::end(kMoeWeightedSumTopKs),
+            topk) == std::end(kMoeWeightedSumTopKs) ||
         x_sorted.shape(0) != scores.size() ||
         inv_order.size() != scores.size()) {
       return true;

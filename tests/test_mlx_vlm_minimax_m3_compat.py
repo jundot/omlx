@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
+import omlx.patches.m5_gather_qmm as m5
+from omlx import oq
 from omlx.cache.paged_ssd_cache import numerics_revision_for_model
+from omlx.custom_kernels.nax import is_nax_available
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
 
 def test_minimax_m3_compat_installs_vendor_modules():
@@ -602,6 +606,110 @@ def test_minimax_a8_tags_and_declines(monkeypatch):
     assert a8.routed(switch, x, inds) is None  # below min_tokens
     object.__setattr__(switch, a8._ROUTED, 128)
     assert a8.routed(switch, x.astype(mx.float32), inds) is None
+
+
+def _nax_weighted_sum_ready() -> bool:
+    mx = pytest.importorskip("mlx.core")
+    return bool(
+        mx.metal.is_available()
+        and is_nax_available()
+        and 4 in quant_fast.moe_weighted_sum_top_ks()
+    )
+
+
+@pytest.mark.skipif(
+    not _nax_weighted_sum_ready(), reason="needs M5 NAX and the top-4 weighted sum"
+)
+def test_minimax_prefill_weighted_sum_tracks_the_unfused_experts(monkeypatch):
+    """A prefill chunk takes the sorted-row route: the same float32 weighted
+    sum as the unfused experts, rounded once. Short calls and wrapped
+    projections decline."""
+    mx = pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_vlm.models.minimax_m3_vl import language
+
+    monkeypatch.setattr(mx, "gather_qmm", mx.gather_qmm)
+    monkeypatch.setattr(m5, "_original_gather_qmm", m5._original_gather_qmm)
+    m5.apply_m5_gather_qmm_workaround()
+
+    args = _tiny_text_config(
+        pack_shared_expert=False,
+        routed_expert_scales=True,
+        use_routing_bias=True,
+        num_local_experts=8,
+        num_experts_per_tok=4,
+    )
+    block = language.MiniMaxSparseMoeBlock(args)
+    switch = block.switch_mlp
+    keys = mx.random.split(mx.random.key(11), 8)
+    for i, name in enumerate(("gate_proj", "up_proj", "down_proj")):
+        switch[name].weight = mx.random.normal(switch[name].weight.shape, key=keys[i])
+    block.gate.weight = mx.random.normal(block.gate.weight.shape, key=keys[3])
+    block.set_dtype(mx.bfloat16)
+    nn.quantize(
+        block,
+        class_predicate=lambda path, m: (
+            {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+            if path.startswith("switch_mlp.") and hasattr(m, "to_quantized")
+            else False
+        ),
+    )
+    for i, name in enumerate(("gate_scale", "up_scale", "down_scale")):
+        switch[name] = mx.random.uniform(0.02, 0.2, (8,), key=keys[4 + i])
+    block.eval()
+
+    tokens = 96  # 48 rows per expert
+    x = (mx.random.normal((1, tokens, 64), key=keys[7]) * 0.6).astype(mx.bfloat16)
+    inds = mx.argpartition(
+        -mx.random.uniform(shape=(1, tokens, 8), key=keys[0]), kth=3, axis=-1
+    )[..., :4]
+    scores = mx.random.uniform(0.1, 1.0, (1, tokens, 4), key=keys[1])
+
+    got = switch.weighted_sum(x, inds, scores)
+    assert got is not None
+    ref = language._combine_routed(switch(x, inds), scores)
+    assert got.shape == ref.shape and got.dtype == ref.dtype
+    got, ref = got.astype(mx.float32), ref.astype(mx.float32)
+    peak = mx.abs(ref).max().item()
+    assert peak > 0.1
+    # The float32 sum runs in another order.
+    # Allow one bf16 ulp, or float32 rounding where the terms cancel.
+    assert mx.all(mx.abs(got - ref) <= mx.abs(ref) * 2.0**-7 + peak * 1e-5).item()
+
+    short = language._SPARSE_COMPACT_MAX_QUERIES
+    assert switch.weighted_sum(x[:, :short], inds[:, :short], scores[:, :short]) is None
+
+    calls = []
+    weighted_sum = language.MiniMaxScaledSwitchGLU.weighted_sum
+
+    def spy(self, *call_args):
+        out = weighted_sum(self, *call_args)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(language.MiniMaxScaledSwitchGLU, "weighted_sum", spy)
+    routed = block(x).astype(mx.float32)
+    monkeypatch.setattr(
+        language.MiniMaxScaledSwitchGLU, "weighted_sum", lambda *a: None
+    )
+    unfused = block(x).astype(mx.float32)
+    assert calls == [True]
+    peak = mx.abs(unfused).max().item()
+    assert mx.abs(routed - unfused).max().item() <= 2.0**-6 * peak
+
+    # oQ calibration wraps the projections to observe their inputs.
+    seen = []
+    collector = SimpleNamespace(collect_switch=lambda name, *a: seen.append(name))
+    switch.gate_proj = oq._ImatrixCaptureWrapper(switch.gate_proj, "gate", collector)
+    assert weighted_sum(switch, x, inds, scores) is None
+    mx.eval(switch(x, inds))
+    assert seen == ["gate"]
 
 
 def test_minimax_unpack_sanitizer_keeps_shared_expert_separate():
