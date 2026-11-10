@@ -53,6 +53,9 @@ def _make_mock_sts_engine(output_wav: bytes = None) -> MagicMock:
 def _make_mock_pool(sts_engine=None, model_id: str = "deepfilternet") -> MagicMock:
     """Build a mock EnginePool that returns the given STS engine."""
     pool = MagicMock()
+    # Startup and shutdown reset boundary snapshots under this dir. A bare
+    # mock attribute would materialize MagicMock/ directories in CWD.
+    pool._scheduler_config.paged_ssd_cache_dir = None
     pool.get_engine = AsyncMock(return_value=sts_engine or _make_mock_sts_engine())
     pool.get_entry = MagicMock(return_value=MagicMock(
         model_type="audio_sts",

@@ -131,3 +131,6 @@ tq_batch_memory.md
 .claude/
 issues.md
 clusterPlan.md
+
+# Test artifact: cache directories materialized by MagicMock-backed paths
+MagicMock/

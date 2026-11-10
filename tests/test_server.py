@@ -44,6 +44,19 @@ from omlx.server import (
 from omlx.settings import GlobalSettings
 
 
+def _mock_pool() -> MagicMock:
+    """Mock EnginePool for server tests.
+
+    Server startup resets boundary snapshots under
+    ``_scheduler_config.paged_ssd_cache_dir``. Left as an auto-mock, that
+    path materializes MagicMock/ directories in the working tree, so pin
+    it to None (SSD cache off).
+    """
+    pool = MagicMock()
+    pool._scheduler_config.paged_ssd_cache_dir = None
+    return pool
+
+
 class TestBoundarySnapshotLifecycle:
     def test_reset_helper_uses_engine_pool_cache_dir(self, tmp_path):
         from types import SimpleNamespace
@@ -855,7 +868,7 @@ class TestModelFallback:
 
     def _setup_pool(self, found_model=None):
         """Create a mock engine pool."""
-        pool = MagicMock()
+        pool = _mock_pool()
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
 
         if found_model:
@@ -927,7 +940,7 @@ class TestModelFallback:
         self._state.global_settings.model.model_fallback = False
         self._state.default_model = "default-model"
 
-        pool = MagicMock()
+        pool = _mock_pool()
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
         pool.get_engine = AsyncMock(
             side_effect=ModelUnavailableError("broken-model", "cached failure")
@@ -959,7 +972,7 @@ class TestGetEngineLLMTypeValidation:
             yield
 
     def _pool_returning(self, engine):
-        pool = MagicMock()
+        pool = _mock_pool()
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
         pool.get_engine = AsyncMock(return_value=engine)
         self._state.engine_pool = pool
@@ -1079,7 +1092,7 @@ class TestGetMaxContextWindow:
         )
 
     def _mount_pool(self, entries: dict):
-        pool = MagicMock()
+        pool = _mock_pool()
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
         pool.get_entry.side_effect = lambda mid: entries.get(mid)
         self._state.engine_pool = pool
@@ -1521,7 +1534,7 @@ def test_responses_reasoning_cache_policy(
     )
     engine.start = AsyncMock()
     engine.count_chat_tokens.return_value = 128
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1605,7 +1618,7 @@ def _anthropic_preflight_kwargs(monkeypatch, body, model_type="qwen3_5"):
     )
     engine.start = AsyncMock()
     engine.count_chat_tokens.return_value = 128
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1727,7 +1740,7 @@ def test_chat_completion_returns_token_logprobs(
             )
 
     engine.stream_chat = stream_chat
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1826,7 +1839,7 @@ def test_chat_routes_reuse_final_prepared_prompt(
         yield output
 
     engine.stream_chat = stream_chat
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1930,7 +1943,7 @@ def served_vlm_engine(monkeypatch):
 
     engine.chat = chat
     engine.stream_chat = stream_chat
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -2022,7 +2035,7 @@ def test_ignore_eos_reaches_the_engine(
 
     engine.stream_chat = streamed
     engine.stream_generate = streamed
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()

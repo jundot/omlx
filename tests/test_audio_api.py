@@ -43,6 +43,9 @@ def _make_engine_entry(
 def _make_pool(entries: list) -> MagicMock:
     """Build a mock EnginePool with the given entries."""
     pool = MagicMock()
+    # Startup and shutdown reset boundary snapshots under this dir. A bare
+    # mock attribute would materialize MagicMock/ directories in CWD.
+    pool._scheduler_config.paged_ssd_cache_dir = None
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
