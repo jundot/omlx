@@ -511,9 +511,9 @@ class EngineCore:
         scheduler.step() services aborts/admission/finish every step, so
         correctness is unchanged; the only cost is event-loop responsiveness,
         bounded by decode_burst_budget_s. Stops early when no work remains, a
-        request produces its first chunk, a request finishes while a prefill
-        is queued, a prefill eviction needs the (async) callback, or the
-        budget elapses — the budget also ends the burst when a slow
+        request produces its first chunk, a request finishes while a chunked
+        prefill is in flight, a prefill eviction needs the (async) callback,
+        or the budget elapses — the budget also ends the burst when a slow
         prefill-chunk step lands, including the first one.
 
         Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
@@ -555,10 +555,9 @@ class EngineCore:
                 break
             # A finished request's last output (finish reason, usage) would
             # otherwise wait for the rest of the burst, which can be a whole
-            # prefill chunk when a prefill is queued or in flight.
-            if last.finished_request_ids and (
-                getattr(self.scheduler, "prefilling", None)
-                or getattr(self.scheduler, "waiting", None)
+            # prefill chunk while a prefill is in flight.
+            if last.finished_request_ids and getattr(
+                self.scheduler, "prefilling", None
             ):
                 break
             if (

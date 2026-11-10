@@ -2066,7 +2066,13 @@ class TestStepBurst:
             engine.close()
 
     def _run_timed_burst(
-        self, engine, durations, outputs=None, chunk_steps=(), prefilling=False
+        self,
+        engine,
+        durations,
+        outputs=None,
+        chunk_steps=(),
+        prefilling=False,
+        waiting=False,
     ):
         """Run one burst where step i takes durations[i] seconds and the
         steps in chunk_steps ran a prefill chunk."""
@@ -2085,6 +2091,7 @@ class TestStepBurst:
         engine.scheduler.step = MagicMock(side_effect=step)
         engine.scheduler.has_requests = MagicMock(return_value=True)
         engine.scheduler.prefilling = deque([object()] if prefilling else [])
+        engine.scheduler.waiting = deque([object()] if waiting else [])
         with patch("omlx.engine_core.time.monotonic", side_effect=lambda: clock[0]):
             return engine._step_burst()
 
@@ -2096,6 +2103,7 @@ class TestStepBurst:
             ([0.12, 0.12, 0.12, 0.12], (), True, 2),
             ([0.01, 0.01, 0.01, 0.01], (), False, 4),
             ([0.01, 3.0, 3.0, 3.0], {1, 2, 3}, True, 2),
+            ([0.05, 0.05, 0.05, 0.05], {0, 1, 2, 3}, True, 3),
         ],
         ids=[
             "prefill_chunk",
@@ -2103,6 +2111,7 @@ class TestStepBurst:
             "slow_decode_with_queued_prefill",
             "decode",
             "chunk_after_decode",
+            "fast_chunks",
         ],
     )
     def test_prefill_chunk_over_budget_ends_burst(
@@ -2130,15 +2139,16 @@ class TestStepBurst:
             engine.close()
 
     @pytest.mark.parametrize(
-        ("prefilling", "expected_steps"),
-        [(True, 1), (False, 4)],
-        ids=["prefill_queued", "pure_decode"],
+        ("prefilling", "waiting", "expected_steps"),
+        [(True, False, 1), (False, False, 4), (False, True, 4)],
+        ids=["prefill_in_flight", "pure_decode", "decode_with_waiting"],
     )
-    def test_finished_request_ends_burst_when_prefill_queued(
-        self, mock_model, mock_tokenizer, prefilling, expected_steps
+    def test_finished_request_ends_burst_while_prefilling(
+        self, mock_model, mock_tokenizer, prefilling, waiting, expected_steps
     ):
         """A finished request's last output is not held behind a prefill
-        chunk that a later step would run. Pure decode bursts are unchanged."""
+        chunk that a later step would run. Bursts with nothing prefilling are
+        unchanged, even with requests waiting."""
         engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4, budget=0.1)
         finished = SchedulerOutput(
             has_work=True,
@@ -2151,6 +2161,7 @@ class TestStepBurst:
                 [0.01] * 4,
                 [finished, None, None, None],
                 prefilling=prefilling,
+                waiting=waiting,
             )
             assert outs[0] is finished
             assert len(outs) == expected_steps

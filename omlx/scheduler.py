@@ -6556,6 +6556,10 @@ class Scheduler:
             return 0
         if not self._decode_contention():
             return 0
+        return Scheduler._contended_chunk_size(self)
+
+    def _contended_chunk_size(self) -> int:
+        """Chunk size used while a decode contends with this prefill."""
         tps = self._prefill_tps_best
         if tps and tps > 0.0:
             cap = int(_DECODE_STALL_TARGET_MS / 1000.0 * tps)
@@ -7991,7 +7995,7 @@ class Scheduler:
         self,
         scheduled: "list[Request]",
         rejected: "list[RequestOutput]",
-        hold: "set[str] | frozenset[str]" = frozenset(),
+        first: "set[str] | frozenset[str]" = frozenset(),
     ) -> None:
         """Advance in-flight prefills until decode fairness requires a yield.
 
@@ -8006,8 +8010,10 @@ class Scheduler:
             rejected: Per-step rejected outputs. A chunked prefill that hits
                 the memory hard limit emits a finish_reason="error" entry
                 here so the engine can surface the failure to the client.
-            hold: Requests that already ran a chunk this step. They keep
-                their queue position but do not advance, alone or packed.
+            first: Short requests admitted ahead of the in-flight chunk.
+                They run first, so they finish their prefill before a
+                full-width head chunk (a longer chunk never packs behind
+                them uncontended).
         """
         if not self.prefilling:
             return
@@ -8028,6 +8034,8 @@ class Scheduler:
             # These chunks finish their requests; behind a longer head they
             # would wait for its whole prefill, so they run first.
             pending_prefills.sort(key=lambda request: not too_short_to_pack(request))
+        if first:
+            pending_prefills.sort(key=lambda request: request.request_id not in first)
 
         for index, request in enumerate(pending_prefills):
             rid = request.request_id
@@ -8036,9 +8044,6 @@ class Scheduler:
             # State missing means the request was aborted and cleaned up by
             # _do_abort_request() between steps — just skip it.
             if state is None:
-                continue
-            if rid in hold:
-                still_prefilling.append(request)
                 continue
             if not self._prefill_gate_open():
                 still_prefilling.extendleft(reversed(pending_prefills[index:]))
@@ -8059,12 +8064,7 @@ class Scheduler:
                     done = [self._step_prefill_chunk(state)]
                 else:
                     plans = self._plan_prefill_rows(
-                        state,
-                        [
-                            later
-                            for later in pending_prefills[index + 1 :]
-                            if later.request_id not in hold
-                        ],
+                        state, pending_prefills[index + 1 :]
                     )
                     if len(plans) > 1:
                         try:
@@ -15863,7 +15863,7 @@ class Scheduler:
         try:
             # Alternate open prefill opportunities so neither admissions nor in-flight chunks starve.
             admit_first = False
-            uncontended_admit = False
+            already_prefilling: set[str] | None = None
             prefill_gate_open = self._prefill_gate_open() if self.prefilling else True
             if (
                 self._decode_fairness
@@ -15872,40 +15872,40 @@ class Scheduler:
                 and prefill_gate_open
             ):
                 if not self._decode_contention():
-                    # Nothing decodes, so admitting first stalls no one, and
-                    # a short request that starts decoding here shrinks the
-                    # in-flight chunk. Admitting after the chunk makes it
-                    # wait one more whole chunk (#5148).
-                    admit_first = uncontended_admit = True
+                    # Nothing decodes. Requests that fit in one contended
+                    # chunk prefill ahead of the in-flight chunk, which then
+                    # shrinks while they decode; after it they would wait a
+                    # whole chunk (#5148). Longer ones keep their turn.
+                    limit = Scheduler._contended_chunk_size(self)
+                    if all(
+                        request.num_prompt_tokens <= limit for request in self.waiting
+                    ):
+                        admit_first = True
+                        already_prefilling = {
+                            request.request_id for request in self.prefilling
+                        }
                 else:
                     admit_first = self._admit_prefill_next
                     self._admit_prefill_next = not admit_first
-            already_prefilling = (
-                {request.request_id for request in self.prefilling}
-                if uncontended_admit
-                else set()
-            )
             if admit_first:
                 scheduled, rejected = self._schedule_waiting()
-
-            # A prefill that ran its first chunk during that admission waits
-            # for the next step, so one step never runs two of its chunks.
-            hold: set[str] = set()
-            if uncontended_admit:
-                for request in self.prefilling:
-                    state = self._prefill_states.get(request.request_id)
-                    if (
-                        request.request_id not in already_prefilling
-                        and state is not None
-                        and state.tokens_processed > 0
-                    ):
-                        hold.add(request.request_id)
+            # Short requests admitted above that wait to pack (their first
+            # chunk runs in _advance_chunked_prefills) go ahead of the head.
+            short_first = (
+                {
+                    request.request_id
+                    for request in self.prefilling
+                    if request.request_id not in already_prefilling
+                }
+                if already_prefilling is not None
+                else set()
+            )
 
             chunked_scheduled: list[Request] = []
             chunked_rejected: list[RequestOutput] = []
             if self.prefilling and prefill_gate_open:
                 self._advance_chunked_prefills(
-                    chunked_scheduled, chunked_rejected, hold=hold
+                    chunked_scheduled, chunked_rejected, first=short_first
                 )
 
             if not admit_first:

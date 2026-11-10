@@ -276,11 +276,13 @@ Run `python -m pytest -q apps/omlx-cuda-helper/tests` for the Linux helper. `tes
 
 # Mid-prefill admission tests
 
-Run `python -m pytest -q tests/test_engine_core.py tests/test_prefill_fairness_budget.py tests/test_scheduler_chunked_prefill.py -k "over_budget or finished_request_ends or breaks_on_budget or uncontended_short or uncontended_long or held_request or inflight_chunk_error or prefill_chunk_ran or disabled_fairness_keeps or forward_is_counted"` to check how fast a request that arrives during a long chunked prefill gets in and out.
+Run `python -m pytest -q tests/test_engine_core.py tests/test_prefill_fairness_budget.py tests/test_scheduler_chunked_prefill.py -k "breaks_on_budget or over_budget_ends_burst or ends_burst_while_prefilling or uncontended_short or uncontended_long or uncontended_mixed or disabled_fairness_keeps_chunk or prefill_chunk_ran or forward_is_counted or short_first_request"` to check how fast a request that arrives during a long chunked prefill gets in and out.
 
-- A step that ran a prefill chunk and spent the whole burst budget ends the executor burst, so the new request's `add_request` runs after that chunk instead of after a second one. `step()` reports this as `ran_prefill_chunk`, counted at the chunk forward.
-- Decode-only steps keep bursting, including ones slower than the budget and ones taken while a prefill waits its turn. The in-loop deadline still ends a burst when a chunk lands later in it.
-- A request that finishes while a prefill is queued or waiting ends the burst, so its last output is not held behind the next chunk. Pure decode bursts are unchanged.
-- With decode fairness on and nothing decoding, `step()` admits a short waiting request before the in-flight chunk. That chunk shrinks to the contended size, and the in-flight prefill keeps advancing.
-- A long request admitted that way runs only its first chunk in that step. It stays in `prefilling` the whole time (other threads read the queues), is not packed into the in-flight forward, and is kept if that chunk raises.
+- A step that ran a prefill chunk and spent the whole burst budget ends the executor burst, so the new request's `add_request` runs after that chunk instead of after a second one. `step()` reports this as `ran_prefill_chunk`, counted once per chunk forward, packed or not.
+- Decode-only steps keep bursting, including ones slower than the budget and ones taken while a prefill waits its turn. Fast chunk steps keep bursting. The in-loop deadline still ends a burst when a chunk lands later in it.
+- A request that finishes while a chunked prefill is in flight ends the burst, so its last output is not held behind the next chunk. Bursts with nothing prefilling are unchanged, even with requests waiting.
+- With decode fairness on and nothing decoding, `step()` admits waiting requests ahead of the in-flight chunk only when each fits in one contended chunk.
+  - A short request that prefills inline starts decoding, and the in-flight chunk shrinks.
+  - A short request that takes the packed path prefills before the head, and the head's full chunk does not pack behind it.
+- A long waiting request, or a mix of short and long ones, keeps the chunk-first order, whatever the in-flight request's progress.
 - With decode fairness off, the order stays chunk first.
