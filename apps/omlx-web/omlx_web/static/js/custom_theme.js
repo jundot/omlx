@@ -167,11 +167,8 @@
         return toHex(...oklchToLinear(lightness, chroma, h).map(gamma));
     }
 
-    // Dark draft from a light palette, calibrated on the stock themes
-    // (see "How the dark draft is generated" in docs/web-ui-design.md):
-    // neutrals invert their lightness through NEUTRAL_CURVE, accents keep their
-    // hue and only lighten, then a failing contrast pair walks its foreground's
-    // lightness away from the background until it passes.
+    // Calibrated on the stock themes; see "How the dark draft is generated" in
+    // docs/web-ui-design.md.
     const NEUTRAL_CURVE = [[0, 0.23], [0.13, 0.44], [0.3, 0.62], [0.55, 0.72], [0.8, 0.95], [1, 1]];
     const NEUTRAL_MAX_CHROMA = 0.012;
     // The switch knob stays white in dark mode, so the ON track stays mid-grey.
@@ -360,7 +357,7 @@
     const api = {
         GROUPS, TOKENS, DERIVED, MODES, STATUS, CONTRAST_RULES,
         normalizeHex, contrast, contrastChecks, flatten, badgeColors, sanitize, isEmpty, apply, defaults, css, declarations,
-        oklch, fromOklch, darkFromLight,
+        oklch, darkFromLight,
     };
     if (typeof window !== 'undefined') window.OmlxCustomTheme = api;
     if (typeof module !== 'undefined') module.exports = api;

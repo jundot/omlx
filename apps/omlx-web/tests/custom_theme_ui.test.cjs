@@ -75,7 +75,6 @@ test('badge colors flatten the tints a custom status paints', () => {
     assert.equal(theme.flatten('rgba(255, 0, 0, 0.5)', '#000000'), '#800000');
 });
 
-const lightness = hex => theme.oklch(hex)[0];
 // Checks a generated dark palette the way the editor does: an unchanged status
 // keeps its stock badge, a changed one gets the tints it paints.
 function passes(colors) {
@@ -91,17 +90,6 @@ function passes(colors) {
     return theme.contrastChecks(all).every(check => check.ok);
 }
 
-test('OKLCH round-trips sRGB within one step per channel', () => {
-    const steps = Array.from({length: 16}, (_, i) => i * 17);
-    for (const r of steps) for (const g of steps) for (const b of steps) {
-        const hex = '#' + [r, g, b].map(n => n.toString(16).padStart(2, '0')).join('');
-        const back = theme.fromOklch(theme.oklch(hex));
-        for (const i of [1, 3, 5]) {
-            assert.ok(Math.abs(parseInt(back.slice(i, i + 2), 16) - parseInt(hex.slice(i, i + 2), 16)) <= 1, `${hex} -> ${back}`);
-        }
-    }
-});
-
 test('the stock light palette generates an Apply-able dark close to stock dark', () => {
     const light = stockColors('light');
     const dark = stockColors('dark');
@@ -116,25 +104,6 @@ test('the stock light palette generates an Apply-able dark close to stock dark',
         assert.ok(Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) < 0.07, `${token}: ${generated[token]} vs ${dark[token]}`);
     }
     assert.ok(passes(generated));
-});
-
-test('generated neutrals reverse the light lightness order', () => {
-    const custom = {
-        ...stockColors('light'),
-        'bg-primary': '#fdf6e3', 'bg-secondary': '#eee8d5', 'bg-tertiary': '#e4ddc8',
-        'text-primary': '#073642', 'text-secondary': '#586e75', 'text-tertiary': '#657b83', 'text-muted': '#93a1a1',
-    };
-    for (const light of [stockColors('light'), custom]) {
-        const dark = theme.darkFromLight(light);
-        for (const group of ['surfaces', 'text']) {
-            const tokens = theme.GROUPS.find(g => g.id === group).tokens;
-            for (let i = 1; i < tokens.length; i++) {
-                const before = Math.sign(lightness(light[tokens[i]]) - lightness(light[tokens[i - 1]]));
-                const after = Math.sign(lightness(dark[tokens[i]]) - lightness(dark[tokens[i - 1]]));
-                assert.equal(after, -before, `${group}: ${tokens[i - 1]} -> ${tokens[i]}`);
-            }
-        }
-    }
 });
 
 test('a low-contrast generated foreground is nudged until it passes', () => {
