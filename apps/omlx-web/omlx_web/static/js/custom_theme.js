@@ -28,15 +28,26 @@
         'border-normal': ['border-scale-300'],
     };
     const SURFACES = ['bg-primary', 'bg-secondary', 'bg-tertiary'];
-    // [foreground, backgrounds]; each pair must reach CONTRAST_FLOOR.
-    const CONTRAST_RULES = [
-        ['text-primary', SURFACES],
-        ['text-secondary', SURFACES],
-        ['link-color', SURFACES],
-        ['btn-primary-text', ['btn-primary']],
-    ];
-    const CONTRAST_FLOOR = 4.5;
     const STATUS = ['success', 'warning', 'danger', 'info'];
+    // Read by both declarations() and badgeColors().
+    const BADGE_TINT = {
+        light: { soft: 0.08, line: 0.3, text: 0.35, toward: 'black' },
+        dark: { soft: 0.15, line: 0.3, text: 0.35, toward: 'white' },
+    };
+    // [foreground, backgrounds, floor]: 4.5 is WCAG 1.4.3 AA, 3 is WCAG 1.4.11.
+    // Muted text and borders have no floor; stock draws them below 3:1.
+    const CONTRAST_RULES = [
+        ['text-primary', SURFACES, 4.5],
+        ['text-secondary', SURFACES, 4.5],
+        ['link-color', SURFACES, 4.5],
+        ['btn-primary-text', ['btn-primary', 'btn-primary-hover'], 4.5],
+        ...STATUS.map(status => [`${status}-text`, [`${status}-soft`], 4.5]),
+        ['text-tertiary', SURFACES, 3],
+        ['text-danger', SURFACES, 3],
+        ['focus-ring-color', SURFACES, 3],
+        ['switch-on', SURFACES, 3],
+        ['timeline-accent', SURFACES, 3],
+    ];
     // Not edited directly; resolved too so the previews can draw stock badges.
     const DERIVED = STATUS.flatMap(status => ['soft', 'line', 'text'].map(part => `${status}-${part}`));
     const TOKENS = GROUPS.flatMap(group => group.tokens);
@@ -77,11 +88,30 @@
     }
 
     function contrastChecks(colors) {
-        return CONTRAST_RULES.flatMap(([foreground, backgrounds]) => backgrounds.map(background => ({
-            foreground,
-            background,
-            ratio: contrast(colors[foreground], colors[background]),
-        })));
+        return CONTRAST_RULES.flatMap(([foreground, backgrounds, floor]) => backgrounds.map(background => {
+            const ratio = contrast(colors[foreground], colors[background]);
+            return { foreground, background, ratio, floor, ok: ratio !== null && ratio >= floor };
+        }));
+    }
+
+    // A CSS rgb()/rgba() or hex color drawn over an opaque hex, as opaque hex.
+    function flatten(color, under) {
+        const hex = normalizeHex(color);
+        if (hex) return hex;
+        const [r, g, b, a = 1] = (String(color).match(/[\d.]+/g) || []).map(Number);
+        const base = rgb(under) || [0, 0, 0];
+        return toHex(...[r, g, b].map((c, i) => c * a + base[i] * (1 - a)));
+    }
+
+    // A custom status color's badge parts, flattened onto the page.
+    function badgeColors(mode, hex, page) {
+        const tint = BADGE_TINT[mode];
+        const mix = (weight, other) => toHex(...rgb(hex).map((c, i) => c * weight + other[i] * (1 - weight)));
+        return {
+            soft: mix(tint.soft, rgb(page)),
+            line: mix(tint.line, rgb(page)),
+            text: mix(1 - tint.text, tint.toward === 'white' ? [255, 255, 255] : [0, 0, 0]),
+        };
     }
 
     function sanitize(theme) {
@@ -107,11 +137,12 @@
         for (const channel of CHANNELS[token] || []) lines.push(`--${channel}: ${r} ${g} ${b};`);
         if (STATUS.includes(token)) {
             // The stock soft fills and lines are tints of the solid colour.
-            const tint = mode === 'dark' ? ['15%', '30%', 'white 35%'] : ['8%', '30%', 'black 35%'];
+            const tint = BADGE_TINT[mode];
+            const percent = value => `${Math.round(value * 100)}%`;
             const base = mode === 'dark' ? 'transparent' : 'var(--bg-primary)';
-            lines.push(`--${token}-soft: color-mix(in srgb, ${hex} ${tint[0]}, ${base});`);
-            lines.push(`--${token}-line: color-mix(in srgb, ${hex} ${tint[1]}, ${base});`);
-            lines.push(`--${token}-text: color-mix(in srgb, ${hex}, ${tint[2]});`);
+            lines.push(`--${token}-soft: color-mix(in srgb, ${hex} ${percent(tint.soft)}, ${base});`);
+            lines.push(`--${token}-line: color-mix(in srgb, ${hex} ${percent(tint.line)}, ${base});`);
+            lines.push(`--${token}-text: color-mix(in srgb, ${hex}, ${tint.toward} ${percent(tint.text)});`);
             // One channel per palette step keeps status.css's shade ladder.
             const pct = (light, dark) => (mode === 'dark' ? dark : light);
             const tintMix = (value, surface) => `color-mix(in srgb, ${hex} ${value}, ${surface})`;
@@ -229,8 +260,8 @@
     }
 
     const api = {
-        GROUPS, TOKENS, DERIVED, MODES, CONTRAST_RULES, CONTRAST_FLOOR,
-        normalizeHex, contrast, contrastChecks, sanitize, isEmpty, apply, defaults, css, declarations,
+        GROUPS, TOKENS, DERIVED, MODES, STATUS, CONTRAST_RULES,
+        normalizeHex, contrast, contrastChecks, flatten, badgeColors, sanitize, isEmpty, apply, defaults, css, declarations,
     };
     if (typeof window !== 'undefined') window.OmlxCustomTheme = api;
     if (typeof module !== 'undefined') module.exports = api;

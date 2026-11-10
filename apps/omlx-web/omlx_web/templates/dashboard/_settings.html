@@ -2164,18 +2164,6 @@
                                                         </div>
                                                     </div>
                                                 </div>
-                                                <!-- Contrast checks -->
-                                                <ul class="space-y-0.5 text-caption">
-                                                    <template x-for="check in themeContrastChecks(mode)" :key="check.id">
-                                                        <li class="flex items-center justify-between gap-2">
-                                                            <span class="text-neutral-500" x-text="window.t('settings.theme.contrast.' + check.id)"></span>
-                                                            <span class="font-mono"
-                                                                  :class="check.ok ? 'text-neutral-700' : 'text-amber-700'"
-                                                                  :title="check.ok ? '' : window.t('settings.theme.contrast_low')"
-                                                                  x-text="check.ratio.toFixed(1) + ':1' + (check.ok ? '' : ' ⚠')"></span>
-                                                        </li>
-                                                    </template>
-                                                </ul>
                                             </div>
                                         </template>
                                     </div>
@@ -2215,9 +2203,17 @@
                                     <span x-show="customThemeError" x-cloak class="flex items-center gap-2 text-sm text-red-600">
                                         <i data-lucide="alert-circle" class="w-4 h-4 shrink-0"></i><span x-text="customThemeError"></span>
                                     </span>
-                                    <span x-show="!customThemeInputsValid" x-cloak class="flex items-center gap-2 text-sm text-red-600">
-                                        <i data-lucide="alert-circle" class="w-4 h-4 shrink-0"></i>{{ t('settings.theme.invalid') }}
-                                    </span>
+                                    <div x-show="!customThemeInputsValid" x-cloak role="status" class="text-sm text-red-600">
+                                        <span class="flex items-center gap-2">
+                                            <i data-lucide="alert-circle" class="w-4 h-4 shrink-0"></i>
+                                            <span x-text="window.t(themeContrastFailures.length ? 'settings.theme.contrast.failed' : 'settings.theme.invalid')"></span>
+                                        </span>
+                                        <ul class="mt-1 ml-6 space-y-0.5 text-xs">
+                                            <template x-for="failure in themeContrastFailures" :key="failure.mode + failure.foreground + failure.background">
+                                                <li x-text="themeContrastMessage(failure)"></li>
+                                            </template>
+                                        </ul>
+                                    </div>
                                 </div>
                                 <div class="flex flex-wrap items-center justify-between gap-2">
                                     <button type="button" @click="resetCustomTheme()"
@@ -2297,10 +2293,10 @@
                                                                @keydown.enter.prevent="normalizeThemeInput(mode, token)"
                                                                :placeholder="customThemeDefaults[mode][token]"
                                                                :aria-label="window.t('settings.theme.token.' + token) + ' · ' + window.t(mode === 'light' ? 'settings.theme.light' : 'settings.theme.dark')"
-                                                               :aria-invalid="themeTokenValid(mode, token) ? 'false' : 'true'"
+                                                               :aria-invalid="themeTokenFlagged(mode, token) ? 'true' : 'false'"
                                                                spellcheck="false" autocomplete="off" maxlength="7"
                                                                class="theme-hex-input px-2.5 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all"
-                                                               :class="themeTokenValid(mode, token) ? '' : 'theme-hex-input--invalid'"
+                                                               :class="themeTokenFlagged(mode, token) ? 'theme-hex-input--invalid' : ''"
                                                                :style="'--theme-cell-danger:' + themeModeColor(mode, 'text-danger')">
                                                     </div>
                                                 </template>

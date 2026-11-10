@@ -37,12 +37,34 @@ test('muted leaves text-neutral-400 on the tertiary channel', () => {
     assert.match(theme.css({light: {'text-tertiary': '#555555'}, dark: {}}), /--text-scale-400: 85 85 85;/);
 });
 
-test('contrast checks flag every pair below the floor', () => {
-    assert.equal(theme.contrast('#000000', '#ffffff').toFixed(1), '21.0');
-    const checks = theme.contrastChecks({
-        'bg-primary': '#ffffff', 'bg-secondary': '#ffffff', 'bg-tertiary': '#ffffff',
-        'text-primary': '#000000', 'text-secondary': '#000000', 'link-color': '#777777',
-        'btn-primary': '#000000', 'btn-primary-text': '#ffffff',
-    });
-    assert.deepEqual(checks.filter(c => c.ratio < theme.CONTRAST_FLOOR).map(c => c.foreground), Array(3).fill('link-color'));
+// The stock tokens as opaque hex, flattened onto the page like the editor does.
+function stockColors(mode) {
+    const palette = Object.fromEntries([...themeCss.matchAll(/--(palette-[\w-]+):\s*([\d ]+);/g)]
+        .map(m => [m[1], m[2].trim().split(/\s+/).map(Number)]));
+    const block = selector => {
+        const start = themeCss.indexOf(`${selector} {`);
+        return Object.fromEntries([...themeCss.slice(start, themeCss.indexOf('\n}', start)).matchAll(/--([\w-]+):\s*([^;]+);/g)]
+            .map(m => [m[1], m[2].trim()]));
+    };
+    const values = { ...block(':root'), ...(mode === 'dark' ? block('[data-theme="dark"]') : {}) };
+    const css = token => {
+        const m = /^rgb\(var\(--(palette-[\w-]+)\)(?:\s*\/\s*([\d.]+))?\)$/.exec(values[token]);
+        return `rgba(${palette[m[1]].join(', ')}, ${m[2] ?? 1})`;
+    };
+    const colors = Object.fromEntries(theme.TOKENS.map(token => [token, theme.flatten(css(token), '#000000')]));
+    for (const token of theme.DERIVED) colors[token] = theme.flatten(css(token), colors['bg-primary']);
+    return colors;
+}
+
+test('the stock theme meets every contrast floor', () => {
+    for (const mode of theme.MODES) {
+        assert.deepEqual(theme.contrastChecks(stockColors(mode)).filter(check => !check.ok), [], mode);
+    }
+});
+
+test('contrast checks flag every pair below its floor', () => {
+    const colors = {...stockColors('light'), 'link-color': '#777777', 'focus-ring-color': '#bbbbbb'};
+    const failed = theme.contrastChecks(colors).filter(check => !check.ok);
+    assert.deepEqual(failed.map(check => [check.foreground, check.floor]),
+        [...Array(3).fill(['link-color', 4.5]), ...Array(3).fill(['focus-ring-color', 3])]);
 });

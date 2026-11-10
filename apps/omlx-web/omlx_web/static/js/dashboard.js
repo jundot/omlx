@@ -92,10 +92,6 @@
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models', 'theme']);
-    // settings.theme.contrast.<label> for each contrast-rule foreground.
-    const THEME_CONTRAST_LABELS = {
-        'text-primary': 'text', 'text-secondary': 'secondary', 'link-color': 'link', 'btn-primary-text': 'button',
-    };
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
     const DASHBOARD_DOWNLOADER_SOURCES = new Set(['hf', 'ms', 'recommended']);
@@ -7448,8 +7444,8 @@
 
             get customThemeInputsValid() {
                 return ['light', 'dark'].every(mode =>
-                    window.OmlxCustomTheme.TOKENS.every(token => this.themeTokenValid(mode, token))
-                    && this.themeContrastChecks(mode).every(check => check.ok));
+                    window.OmlxCustomTheme.TOKENS.every(token => this.themeTokenValid(mode, token)))
+                    && this.themeContrastFailures.length === 0;
             },
 
             // Column chrome uses stock colors so editing a surface never flips a column.
@@ -7489,16 +7485,53 @@
             // The only contrast check: the server stores any #rrggbb it gets.
             themeContrastChecks(mode) {
                 const api = window.OmlxCustomTheme;
+                const stock = this.customThemeDefaults[mode];
                 const colors = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor(mode, token)]));
-                const lowest = {};
-                for (const { foreground, ratio } of api.contrastChecks(colors)) {
-                    lowest[foreground] = Math.min(lowest[foreground] ?? Infinity, ratio);
+                const page = colors['bg-primary'];
+                for (const status of api.STATUS) {
+                    const badge = colors[status] === stock[status]
+                        ? { soft: api.flatten(stock[`${status}-soft`], page), text: api.flatten(stock[`${status}-text`], page) }
+                        : api.badgeColors(mode, colors[status], page);
+                    colors[`${status}-soft`] = badge.soft;
+                    colors[`${status}-text`] = badge.text;
                 }
-                return Object.entries(lowest).map(([foreground, ratio]) => ({
-                    id: THEME_CONTRAST_LABELS[foreground],
-                    ratio,
-                    ok: ratio >= api.CONTRAST_FLOOR,
-                }));
+                return api.contrastChecks(colors);
+            },
+
+            // The lowest failing pair per foreground, in both modes, with the token to fix.
+            get themeContrastFailures() {
+                return ['light', 'dark'].flatMap(mode => {
+                    const lowest = {};
+                    for (const check of this.themeContrastChecks(mode)) {
+                        if (!check.ok && !(lowest[check.foreground]?.ratio <= check.ratio)) lowest[check.foreground] = check;
+                    }
+                    // A status badge's text is derived; its status color is the field to change.
+                    const field = token => window.OmlxCustomTheme.STATUS.find(status => token === `${status}-text`) || token;
+                    return Object.values(lowest).map(check => ({ ...check, mode, token: field(check.foreground) }));
+                });
+            },
+
+            themeContrastLabel(token) {
+                const status = token.match(/^(\w+)-(soft|text)$/);
+                if (status && window.OmlxCustomTheme.STATUS.includes(status[1])) {
+                    return window.t(`settings.theme.contrast.badge_${status[2]}`)
+                        .replace('{status}', window.t(`settings.theme.token.${status[1]}`));
+                }
+                return window.t(`settings.theme.token.${token}`);
+            },
+
+            themeContrastMessage(failure) {
+                return window.t('settings.theme.contrast.pair')
+                    .replace('{mode}', window.t(`settings.theme.${failure.mode}`))
+                    .replace('{foreground}', this.themeContrastLabel(failure.foreground))
+                    .replace('{background}', this.themeContrastLabel(failure.background))
+                    .replace('{ratio}', failure.ratio.toFixed(2))
+                    .replace('{floor}', String(failure.floor));
+            },
+
+            themeTokenFlagged(mode, token) {
+                return !this.themeTokenValid(mode, token) || this.themeContrastFailures
+                    .some(failure => failure.mode === mode && failure.token === token);
             },
 
             normalizeThemeInput(mode, token) {
