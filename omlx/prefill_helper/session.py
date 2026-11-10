@@ -76,7 +76,25 @@ class PrefillHelperSession:
     def _work(self, start: int, end: int) -> float:
         return max(sum(self.work[start:end]), 1e-6)
 
-    def pick_layers(self) -> int:
+    def _link_seconds(self, k: int) -> float:
+        """Seconds per token the link needs to carry a split at ``k``; 0 until
+        a chunk measured it."""
+        rate = getattr(self.client, "link_bps", None)
+        sizes = getattr(self.client, "token_bytes", None)
+        if not rate or not sizes:
+            return 0.0
+        # A layer no job has used yet costs about what the measured ones do.
+        known = [size for layer, size in sizes.items() if layer >= 0]
+        typical = sum(known) / len(known) if known else 0.0
+        state = sum(sizes.get(layer, typical) for layer in range(k))
+        return (sizes.get(-1, 0.0) + state) / rate
+
+    def pick_layers(self, grid: list[int] | None = None) -> int:
+        """Layers the next job uses; 0 leaves the prompt on this Mac.
+
+        ``grid`` is the prompt's chunk sizes. With it the choice also counts
+        the wait for the first chunk, during which this Mac is idle.
+        """
         if self.fixed_layers:
             return min(self.fixed_layers, self.layers)
         helper, host = self.unit_helper, self.unit_host
@@ -84,12 +102,21 @@ class PrefillHelperSession:
             # Until both Macs are timed the helper, usually the faster Mac,
             # takes all it holds; its first chunk times both.
             return self.layers
-        return min(
-            range(1, self.layers + 1),
-            key=lambda k: max(
-                helper * self._work(0, k), host * self._work(k, len(self.work))
-            ),
-        )
+        tokens, first = (sum(grid), grid[0]) if grid else (1, 0)
+
+        def seconds(k: int, compute: float) -> float:
+            mine, link = compute * self._work(0, k), self._link_seconds(k)
+            # The helper, the link and this Mac work on different chunks at
+            # once, so the slowest of the three sets the speed. Before that,
+            # the first chunk has to be computed there and carried here.
+            pace = max(mine, host * self._work(k, len(self.work)), link)
+            return first * (mine + link) + tokens * pace
+
+        best = min(range(1, self.layers + 1), key=lambda k: seconds(k, helper))
+        alone = tokens * host * self._work(0, len(self.work))
+        # Only the link takes the helper out. A helper that timed slow keeps
+        # a job, so its next chunks can correct the estimate.
+        return 0 if seconds(best, 0.0) > alone else best
 
     def observe(self, layers: int, tokens: int, helper_s: float, host_s: float) -> None:
         """Fold one chunk's timings into the per-unit estimates."""
@@ -133,7 +160,10 @@ class PrefillHelperSession:
         if stale is not None:
             # A retried request must not leave its old job holding the queue.
             stale.cancel()
-        layers = self.pick_layers()
+        layers = self.pick_layers(grid)
+        if not layers:
+            # Every split is slower than this Mac alone (a slow link).
+            return None
         wanted = None
         if capture is not None:
             below = [i for i in capture[0] if i < layers]

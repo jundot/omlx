@@ -62,7 +62,7 @@ from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
-from ..prefill_helper.adapters import adapter_for as stage_adapter_for
+from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
@@ -2506,7 +2506,7 @@ class VLMBatchedEngine(BaseEngine):
         await self._engine.engine.start()
 
         scheduler = self._engine.engine.scheduler
-        stage_adapter = stage_adapter_for(self.model_type)
+        stage_adapter = stage_adapter_for(self.model_type, "vlm", self._model_name)
         if stage_adapter is not None:
             self._prefill_helper = PrefillHelperManager(
                 model_path=self._model_name,

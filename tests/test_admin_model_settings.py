@@ -556,6 +556,21 @@ async def test_oq_a8_choice_is_kept_without_native_int8_kernels():
 
 
 @pytest.mark.asyncio
+async def test_prefill_helper_choice_needs_a_model_that_gets_a_helper():
+    """A text-only qwen3_5 conversion runs on an engine without a helper."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    settings = ModelSettings()
+    request = admin_routes.ModelSettingsRequest(prefill_helper_node_id="m5")
+    with patch.object(admin_routes, "prepare_prefill_helper"):
+        await _update_settings(pool, settings, request)
+        assert settings.prefill_helper_node_id is None
+        entry.engine_type = "vlm"
+        await _update_settings(pool, settings, request)
+    assert settings.prefill_helper_node_id == "m5"
+
+
+@pytest.mark.asyncio
 async def test_qwen4_ple_ssd_offload_is_persisted_for_qwen4_only():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen4_exp"

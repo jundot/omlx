@@ -26,9 +26,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .. import __version__
 from ..cluster.identity import get_node_identity
+from ..cluster.pairing import get_pairing_manager
 from ..cluster.registry import default_devices_path
+from . import agent
 from . import launcher as default_launcher
 from .adapter import StageAdapter
 from .client import HelperClient
@@ -63,8 +64,22 @@ class _CancelledError(Exception):
     """The helper choice changed while its files were being prepared."""
 
 
-def helper_budget(info: dict) -> int:
-    """Bytes the helper may hold, from its ``remote_info``."""
+def transport_for(node_id: str) -> Any:
+    """What drives a paired device: SSH for a Mac, the control channel for a
+    helper daemon. Both modules offer the same functions."""
+    try:
+        key = get_pairing_manager().control_key(node_id)
+    except RuntimeError:
+        # No pairing manager, so no helper daemon was ever paired here.
+        key = None
+    return agent if key is not None else default_launcher
+
+
+def helper_budget(info: dict) -> list[int]:
+    """Bytes the helper may hold on each of its GPUs, from its ``remote_info``."""
+    if "budgets" in info:
+        # A helper daemon reports the free memory of each GPU itself.
+        return [int(b) for b in info["budgets"]]
     budget = int(info["budget"])
     if info.get("memory"):
         budget = min(budget, int(info["memory"]) - _OS_BYTES)
@@ -74,7 +89,7 @@ def helper_budget(info: dict) -> int:
         lending = info.get("lending") or {}
         freed = int(float(lending.get("active_gib") or 0) * 2**30)
         budget = min(budget, int(info["available"]) + freed)
-    return budget
+    return [budget]
 
 
 def copy_plan(size: int, free: int, copies: list[dict]) -> dict:
@@ -97,13 +112,22 @@ def copy_plan(size: int, free: int, copies: list[dict]) -> dict:
     return {"kind": kind, "delete": [], "left": free - size}
 
 
-def fit_layers(shared: int, per_layer: list[int], budget: int, limit: int) -> int:
-    """How many leading layers fit in a helper's memory budget."""
-    held, used = 0, shared + _RESERVE_BYTES
-    for size in per_layer[:limit]:
-        if used + size > budget:
+def fit_layers(
+    shared: int, per_layer: list[int], budgets: list[int], limit: int
+) -> int:
+    """How many leading layers fit in a helper's memory, one GPU after another.
+
+    The GPU with the most room comes first and also holds the tensors outside
+    the layers; the helper places its stages the same way, on at most two GPUs.
+    """
+    held, layers = 0, per_layer[:limit]
+    for index, budget in enumerate(sorted(budgets, reverse=True)[:2]):
+        start, used = held, _RESERVE_BYTES + (shared if index == 0 else 0)
+        while held < len(layers) and used + layers[held] <= budget:
+            used, held = used + layers[held], held + 1
+        if held == start:
+            # The layers stay in order, so a GPU that holds none ends the chain.
             break
-        used, held = used + size, held + 1
     return held
 
 
@@ -117,14 +141,14 @@ def _with_time_left(status: dict[str, Any]) -> dict[str, Any]:
 def held_layers(
     adapter: StageAdapter,
     model_path: str,
-    budget: int,
+    budgets: list[int],
     name: str,
     fixed: int | None = None,
 ) -> int:
     """Layers the helper holds: as many as fit, or the fixed number."""
     shared, per_layer = adapter.memory_plan(model_path)
     limit = adapter.split_limit(len(per_layer))
-    held = fit_layers(shared, per_layer, budget, limit)
+    held = fit_layers(shared, per_layer, budgets, limit)
     if fixed is not None:
         if fixed > limit:
             raise _PermanentError(
@@ -149,8 +173,10 @@ def this_host() -> dict | None:
     return {"node_id": identity.node_id, "name": identity.friendly_name}
 
 
-def _reach(launcher: Any, node_id: str, report: Callable[..., None]) -> tuple:
-    """The helper Mac and its ``remote_info``, if it runs this oMLX."""
+def _reach(
+    launcher: Any, node_id: str, report: Callable[..., None], adapter: StageAdapter
+) -> tuple:
+    """The helper and its ``remote_info``, if it can serve this family."""
     try:
         target = launcher.resolve_target(node_id)
     except launcher.LaunchError as error:
@@ -158,11 +184,9 @@ def _reach(launcher: Any, node_id: str, report: Callable[..., None]) -> tuple:
     forget_host(node_id)
     report("connecting", name=target.name, link=target.link)
     info = launcher.remote_info(target, host=this_host())
-    if info.get("version") != __version__:
-        raise _PermanentError(
-            f"{target.name} runs oMLX {info.get('version')}; update it to "
-            f"{__version__}."
-        )
+    problem = launcher.incompatible(info, adapter, target.name)
+    if problem is not None:
+        raise _PermanentError(problem)
     return target, info
 
 
@@ -238,12 +262,13 @@ class FilePrep:
         adapter: StageAdapter,
         node_id: str,
         layers: int | None,
-        launcher: Any = default_launcher,
+        launcher: Any = None,
         after: FilePrep | None = None,
         launch: dict[str, Any] | None = None,
         check_only: bool = False,
     ):
-        self.model_path, self.adapter, self.launcher = model_path, adapter, launcher
+        self.model_path, self.adapter = model_path, adapter
+        self.launcher = launcher or transport_for(node_id)
         self.check_only = check_only
         self.node_id, self.layers, self._after = node_id, layers, after
         self._launch, self._sealed = launch, False
@@ -327,7 +352,7 @@ class FilePrep:
         try:
             if self._cancel.is_set():
                 raise _CancelledError
-            target, info = _reach(self.launcher, self.node_id, self._set)
+            target, info = _reach(self.launcher, self.node_id, self._set, self.adapter)
             held = held_layers(
                 self.adapter,
                 self.model_path,
@@ -389,7 +414,7 @@ def prepare(
     restart: bool = False,
     launch: dict[str, Any] | None = None,
     check_only: bool = False,
-    launcher: Any = default_launcher,
+    launcher: Any = None,
 ) -> None:
     """Start, keep or cancel the file copy (and with ``launch`` the helper)."""
     key = str(Path(model_path).expanduser())
@@ -449,7 +474,7 @@ class PrefillHelperManager:
         language_model: Any,
         attach: Callable[[PrefillHelperSession | None], None],
         chunk_tokens: int,
-        launcher: Any = default_launcher,
+        launcher: Any = None,
         connect: Callable[..., HelperClient] = HelperClient,
         speeds_path: Path | None = None,
     ):
@@ -605,7 +630,7 @@ class PrefillHelperManager:
         self._set(state, node_id=self.node_id, **fields)
 
     def _start(self) -> None:
-        launcher = self.launcher
+        launcher = self.launcher or transport_for(self.node_id)
         self._set("connecting", node_id=self.node_id)
         prep = _take_prep(self.model_path)
         adopted = None
@@ -615,7 +640,7 @@ class PrefillHelperManager:
         if adopted is not None:
             target, info, held, process = adopted
         else:
-            target, info = _reach(launcher, self.node_id, self._report)
+            target, info = _reach(launcher, self.node_id, self._report, self.adapter)
             held = held_layers(
                 self.adapter,
                 self.model_path,
@@ -648,6 +673,9 @@ class PrefillHelperManager:
             process.stop()
             raise
         self._process = process
+        # A helper daemon counts what it really loads and may hold fewer
+        # layers than this Mac's estimate from the file sizes.
+        held = min(held, int(client.info.get("layers") or held))
         saved = self._saved_speeds()
         self._session = PrefillHelperSession(
             client,

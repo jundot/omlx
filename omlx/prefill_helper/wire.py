@@ -97,9 +97,8 @@ def send(
             sock.sendall(memoryview(data).cast("B"))
 
 
-def recv(
-    sock: socket.socket,
-) -> tuple[dict[str, Any], dict[str, tuple[np.ndarray, str]]]:
+def recv_header(sock: socket.socket) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """A frame's meta and the specs of the arrays that follow it."""
     size = bytearray(4)
     _recv_exact(sock, memoryview(size))
     (length,) = struct.unpack("<I", size)
@@ -108,13 +107,26 @@ def recv(
     header = bytearray(length)
     _recv_exact(sock, memoryview(header))
     parsed = json.loads(header)
+    return parsed["meta"], parsed["arrays"]
+
+
+def recv_arrays(
+    sock: socket.socket, specs: list[dict[str, Any]]
+) -> dict[str, tuple[np.ndarray, str]]:
     arrays = {}
-    for spec in parsed["arrays"]:
+    for spec in specs:
         data = np.empty(spec["shape"], np.dtype(spec["np"]))
         if data.nbytes:
             _recv_exact(sock, memoryview(data).cast("B"))
         arrays[spec["name"]] = (data, spec["dtype"])
-    return parsed["meta"], arrays
+    return arrays
+
+
+def recv(
+    sock: socket.socket,
+) -> tuple[dict[str, Any], dict[str, tuple[np.ndarray, str]]]:
+    meta, specs = recv_header(sock)
+    return meta, recv_arrays(sock, specs)
 
 
 def _digest(token: bytes, label: bytes, nonce: bytes) -> bytes:

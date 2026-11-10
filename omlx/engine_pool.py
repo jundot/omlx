@@ -83,7 +83,7 @@ from .model_settings import (
 )
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
-from .prefill_helper.adapters import adapter_for as prefill_stage_adapter
+from .prefill_helper.adapters import adapter_for_model as prefill_stage_adapter
 from .prefill_helper.lending import lending_note
 from .prefill_helper.manager import prepare as prepare_prefill_helper
 from .scheduler import SchedulerConfig
@@ -2411,7 +2411,9 @@ class EnginePool:
         """Start the chosen Prefill Accelerator while this Mac loads the model."""
         node_id = getattr(settings, "prefill_helper_node_id", None)
         model_type = (entry.config_model_type or "").replace("-", "_").lower()
-        adapter = prefill_stage_adapter(model_type)
+        adapter = prefill_stage_adapter(
+            entry.config_model_type, entry.engine_type, entry.model_path
+        )
         if node_id is None or adapter is None:
             return False
         prepare_prefill_helper(
