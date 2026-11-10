@@ -2390,6 +2390,9 @@ private struct AccelerationSection: View {
                                   defaultValue: "INT8 Activation Prefill",
                                   comment: "Row label for the oQ INT8-activation prefill kernels"),
                     sublabel: a8PrefillSublabel,
+                    warning: String(localized: "settings.experimental.qwen_oq_a8.quality_warning",
+                                    defaultValue: "May reduce quality",
+                                    comment: "Warning on the INT8 prefill row: INT8 activations can lower output quality"),
                     isLast: !vm.a8PrefillEnabled) {
                     RowSwitch(isOn: vm.bindProfile($vm.a8PrefillEnabled))
                         .disabled(vm.a8PrefillConflictReason != nil)

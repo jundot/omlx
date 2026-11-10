@@ -1103,7 +1103,11 @@ def test_speed_badges_follow_what_the_model_runs_with(monkeypatch):
     def keys(**kwargs):
         return [flag["key"] for flag in _setting_feature_flags(**kwargs)]
 
-    on = ModelSettings()
+    # A8 stays off until saved on, even with a helper.
+    assert keys(
+        model_settings=ModelSettings(), model_type="deepseek_v41", helper_a8=True
+    ) == ["ced_prefill"]
+    on = ModelSettings(a8_prefill_enabled=True)
     # Without INT8 kernels here, A8 runs only on a helper's layers.
     assert keys(model_settings=on, model_type="deepseek_v41") == ["ced_prefill"]
     assert keys(model_settings=on, model_type="deepseek_v41", helper_a8=True) == [
@@ -1283,7 +1287,7 @@ class TestFilterUploadedSettings:
         ):
             assert key not in out
 
-    def test_a_model_type_keeps_its_family_and_reports_default_on_toggles(self):
+    def test_a_model_type_keeps_its_family_and_reports_resolved_toggles(self):
         settings = self._settings(
             deepseek_v41_engram_ssd_offload=True,
             qwen4_ple_ssd_offload=True,
@@ -1291,8 +1295,8 @@ class TestFilterUploadedSettings:
             gpu_power_limit_w=60,
         )
         out = _filter_uploaded_settings(settings, "deepseek_v41")
-        # Unset A8 and CED are on, so the run reports them as on.
-        assert out["a8_prefill_enabled"] is True
+        # Unset A8 reports off and unset CED reports on.
+        assert out["a8_prefill_enabled"] is False
         assert out["deepseek_v41_ced_prefill_enabled"] is True
         assert out["deepseek_v41_engram_ssd_offload"] is True
         assert "qwen4_ple_ssd_offload" not in out

@@ -1484,6 +1484,7 @@
   "modal.model_settings.qwen_ane_tune_test": "Test",
   "modal.model_settings.qwen_ane_tune_throughput": "Prompt tok/s",
   "modal.model_settings.qwen_oq_a8": "INT8 Activation Prefill",
+  "modal.model_settings.qwen_oq_a8_quality_badge": "品質低下の可能性",
   "modal.model_settings.qwen_oq_a8_hint": "対応する Qwen・DeepSeek V4.1 モデルで、INT8 アクティベーションを使って prefill を実行します。M5 以降とネイティブカーネルが必要です。出力品質が変わる場合があり、ANE prefill とは併用できません。モデルの再読み込み後に適用されます。",
   "modal.model_settings.qwen_oq_a8_helper_only": "This Mac has no INT8 tensor units, so only the layers on the Prefill Accelerator Mac use INT8 activations.",
   "modal.model_settings.qwen_oq_a8_min_tokens": "Minimum prompt tokens",

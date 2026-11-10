@@ -26,7 +26,7 @@ Measured on an M3 Ultra (512 GB) with an M5 Max over Thunderbolt 5, for a 64K-to
 
 The 64 GB column keeps the helper to the layers a 64 GB M5 Max can hold, on the same GPU. A helper holding fewer layers takes a smaller share of each chunk, so models with large layers gain less from a smaller Mac.
 
-DeepSeek V4.1 and Qwen3.8 ran the helper's layers with INT8 Activation Prefill, which is on by default. It changes numerics as it does on a single M5-series Mac. Greedy output matched the helper-off output on the tested prompts for DeepSeek V4.1 (INT8), GLM-5.3, and Qwen3.8 with 16-bit activations on the helper. MiniMax split and whole-model caches were identical on a partial checkpoint.
+DeepSeek V4.1 and Qwen3.8 ran the helper's layers with INT8 Activation Prefill turned on. It changes numerics as it does on a single M5-series Mac. Greedy output matched the helper-off output on the tested prompts for DeepSeek V4.1 (INT8), GLM-5.3, and Qwen3.8 with 16-bit activations on the helper. MiniMax split and whole-model caches were identical on a partial checkpoint.
 
 ## Requirements
 
@@ -64,7 +64,7 @@ The Cluster tab's Prefill Accelerator checks report which of these the Macs use.
 
 **Layers on the helper** is **Auto** by default: each prompt is split by the measured speed of both Macs, and the measurements are kept per model and Mac so a restarted helper splits its first prompt the same way. A fixed number is available for testing.
 
-**INT8 Activation Prefill** and DeepSeek V4.1 **CED prefill** are on unless turned off in the model's settings. On a Mac without INT8 tensor units (M4 and earlier), INT8 Activation Prefill applies only to the helper's layers, and changing it restarts the helper without reloading the model.
+DeepSeek V4.1 **CED prefill** is on unless turned off in the model's settings. **INT8 Activation Prefill** is off unless turned on there. On a Mac without INT8 tensor units (M4 and earlier), INT8 Activation Prefill applies only to the helper's layers, and changing it restarts the helper without reloading the model.
 
 ## How it works
 

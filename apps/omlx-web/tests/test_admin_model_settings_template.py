@@ -456,6 +456,7 @@ def test_a8_prefill_toggle_is_gated_to_supported_models():
     )
     assert 'x-if="showsA8Prefill(selectedModel)"' in section
     assert "modelSettings.a8_prefill_enabled" in section
+    assert "modal.model_settings.qwen_oq_a8_quality_badge" in section
     # The detail controls only appear once the feature is on.
     assert 'x-show="modelSettings.a8_prefill_enabled"' in section
     assert "modelSettings.a8_prefill_min_tokens" in section
