@@ -7521,7 +7521,6 @@
                     .replace('{floor}', String(failure.floor));
             },
 
-            // Invalid hex, or the foreground of a pair below its contrast floor.
             themeTokenFlagged(mode, token) {
                 return !this.themeTokenValid(mode, token) || this.themeContrastFailures
                     .some(failure => failure.mode === mode && failure.token === token);
