@@ -92,10 +92,6 @@
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models', 'theme']);
-    // settings.theme.contrast.<label> for each contrast-rule foreground.
-    const THEME_CONTRAST_LABELS = {
-        'text-primary': 'text', 'text-secondary': 'secondary', 'link-color': 'link', 'btn-primary-text': 'button',
-    };
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
     const DASHBOARD_DOWNLOADER_SOURCES = new Set(['hf', 'ms', 'recommended']);
@@ -151,6 +147,8 @@
             customThemeError: '',
             customThemeJson: '',
             customThemeJsonError: '',
+            themeImageError: '',
+            themeImageBusy: false,
             customThemeJsonCopied: false,
             customThemeJsonCopyBlocked: false,
             showCustomThemeRestoreConfirm: false,
@@ -7452,8 +7450,8 @@
 
             get customThemeInputsValid() {
                 return ['light', 'dark'].every(mode =>
-                    window.OmlxCustomTheme.TOKENS.every(token => this.themeTokenValid(mode, token))
-                    && this.themeContrastChecks(mode).every(check => check.ok));
+                    window.OmlxCustomTheme.TOKENS.every(token => this.themeTokenValid(mode, token)))
+                    && this.themeContrastFailures.length === 0;
             },
 
             // Column chrome uses stock colors so editing a surface never flips a column.
@@ -7467,39 +7465,69 @@
                 return `background:${color('bg-primary')}; border-color:${color('border-normal')}; color:${color('text-secondary')};`;
             },
 
-            themeModeCellStyle(mode) {
+            themeModeCellStyle(mode, surface = 'bg-primary') {
                 const color = token => this.themeModeColor(mode, token);
                 return `--theme-cell-bg:${color('bg-primary')}; --theme-cell-fg:${color('text-primary')};`
-                    + ` --theme-cell-border:${color('border-normal')}; --theme-cell-placeholder:${color('text-muted')};`;
+                    + ` --theme-cell-border:${color('border-normal')}; --theme-cell-placeholder:${color('text-muted')};`
+                    + ` --theme-cell-surface:${color(surface)}; --theme-cell-line:${color('border-faint')};`
+                    + ` --theme-cell-icon:${color('text-tertiary')}; --theme-cell-icon-hover:${color('text-primary')};`
+                    + ` --theme-cell-hover:${color('bg-tertiary')}; --theme-cell-ring:${color('focus-ring-color')};`;
             },
 
-            // Edited tokens also carry their derived channels and status tints.
-            themePreviewStyle(mode) {
+            // Tokens plus badge parts as opaque hex; read by the preview and the contrast checks.
+            themeDrawColors(mode) {
                 const api = window.OmlxCustomTheme;
                 const stock = this.customThemeDefaults[mode];
-                const lines = api.DERIVED.map(token => `--${token}: ${stock[token]};`);
-                for (const token of api.TOKENS) {
-                    const color = this.themeTokenColor(mode, token);
-                    lines.push(...(color === stock[token]
-                        ? [`--${token}: ${color};`]
-                        : api.declarations(mode, token, color)));
+                const colors = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor(mode, token)]));
+                const page = colors['bg-primary'];
+                for (const status of api.STATUS) {
+                    const badge = colors[status] === stock[status]
+                        ? Object.fromEntries(['soft', 'line', 'text'].map(part => [part, api.flatten(stock[`${status}-${part}`], page)]))
+                        : api.badgeColors(mode, colors[status], page);
+                    for (const [part, color] of Object.entries(badge)) colors[`${status}-${part}`] = color;
                 }
-                return lines.join(' ');
+                return colors;
             },
 
             // The only contrast check: the server stores any #rrggbb it gets.
             themeContrastChecks(mode) {
-                const api = window.OmlxCustomTheme;
-                const colors = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor(mode, token)]));
-                const lowest = {};
-                for (const { foreground, ratio } of api.contrastChecks(colors)) {
-                    lowest[foreground] = Math.min(lowest[foreground] ?? Infinity, ratio);
+                return window.OmlxCustomTheme.contrastChecks(this.themeDrawColors(mode));
+            },
+
+            // The lowest failing pair per foreground, in both modes, with the token to fix.
+            get themeContrastFailures() {
+                return ['light', 'dark'].flatMap(mode => {
+                    const lowest = {};
+                    for (const check of this.themeContrastChecks(mode)) {
+                        if (!check.ok && !(lowest[check.foreground]?.ratio <= check.ratio)) lowest[check.foreground] = check;
+                    }
+                    // A status badge's text is derived; its status color is the field to change.
+                    const field = token => window.OmlxCustomTheme.STATUS.find(status => token === `${status}-text`) || token;
+                    return Object.values(lowest).map(check => ({ ...check, mode, token: field(check.foreground) }));
+                });
+            },
+
+            themeContrastLabel(token) {
+                const status = token.match(/^(\w+)-(soft|text)$/);
+                if (status && window.OmlxCustomTheme.STATUS.includes(status[1])) {
+                    return window.t(`settings.theme.contrast.badge_${status[2]}`)
+                        .replace('{status}', window.t(`settings.theme.token.${status[1]}`));
                 }
-                return Object.entries(lowest).map(([foreground, ratio]) => ({
-                    id: THEME_CONTRAST_LABELS[foreground],
-                    ratio,
-                    ok: ratio >= api.CONTRAST_FLOOR,
-                }));
+                return window.t(`settings.theme.token.${token}`);
+            },
+
+            themeContrastMessage(failure) {
+                return window.t('settings.theme.contrast.pair')
+                    .replace('{mode}', window.t(`settings.theme.${failure.mode}`))
+                    .replace('{foreground}', this.themeContrastLabel(failure.foreground))
+                    .replace('{background}', this.themeContrastLabel(failure.background))
+                    .replace('{ratio}', failure.ratio.toFixed(2))
+                    .replace('{floor}', String(failure.floor));
+            },
+
+            themeTokenFlagged(mode, token) {
+                return !this.themeTokenValid(mode, token) || this.themeContrastFailures
+                    .some(failure => failure.mode === mode && failure.token === token);
             },
 
             normalizeThemeInput(mode, token) {
@@ -7516,8 +7544,50 @@
                 this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
             },
 
+            // Redrawn by x-effect whenever a color it reads changes, and on resize.
+            drawThemePreview(canvas, mode) {
+                const preview = window.OmlxThemePreview;
+                if (!canvas._resize) {
+                    canvas._resize = new ResizeObserver(() => this.drawThemePreview(canvas, mode));
+                    canvas._resize.observe(canvas);
+                }
+                const status = Object.fromEntries(window.OmlxCustomTheme.STATUS.map(name => [name, window.t(`settings.theme.token.${name}`)]));
+                canvas._regions = preview.drawPreview(canvas, this.themeDrawColors(mode), {
+                    mode,
+                    sans: getComputedStyle(document.body).fontFamily,
+                    hover: canvas._hover,
+                    labels: {
+                        ...preview.LABELS,
+                        version: canvas.dataset.version,
+                        heading: window.t('settings.theme.heading'),
+                        subtitle: window.t('settings.theme.preview_subtitle'),
+                        port: window.t('settings.theme.preview_port'),
+                        link: window.t('settings.theme.preview_link'),
+                        danger: window.t('settings.theme.preview_danger'),
+                        hover: window.t('settings.theme.preview_hover'),
+                        save: window.t('settings.save.button'),
+                        tabStatus: window.t('navbar.tab.status'),
+                        tabSettings: window.t('navbar.tab.settings'),
+                        status,
+                    },
+                });
+            },
+
+            themePreviewRegion(canvas, event) {
+                const scale = window.OmlxThemePreview.CARD_W / canvas.clientWidth;
+                return window.OmlxThemePreview.regionAt(canvas._regions || [], event.offsetX * scale, event.offsetY * scale);
+            },
+
+            hoverThemePreview(canvas, mode, event) {
+                const region = event && this.themePreviewRegion(canvas, event);
+                if (region === canvas._hover) return;
+                canvas._hover = region;
+                canvas.style.cursor = region ? 'pointer' : '';
+                this.drawThemePreview(canvas, mode);
+            },
+
             focusThemeToken(mode, event) {
-                const token = event.target.closest('[data-token]')?.dataset.token;
+                const token = this.themePreviewRegion(event.currentTarget, event)?.[4];
                 const field = token && document.getElementById(`theme-token-${mode}-${token}`);
                 if (!field) return;
                 field.focus();
@@ -7564,6 +7634,13 @@
                 this.fillCustomThemeDraft();
             },
 
+            // Fills the dark fields only; Apply still runs the contrast check.
+            generateDarkCustomTheme() {
+                const api = window.OmlxCustomTheme;
+                const light = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor('light', token)]));
+                this.customThemeDraft.dark = api.darkFromLight(light);
+            },
+
             // The full palette, so an agent sees every token, not only the overrides.
             async copyCustomThemeJson() {
                 const theme = { light: {}, dark: {} };
@@ -7589,6 +7666,61 @@
                         this.$refs.customThemeJsonField.focus();
                         this.$refs.customThemeJsonField.select();
                     });
+                }
+            },
+
+            // Fills the fields only; Apply still runs the contrast check.
+            async loadThemeImage(event) {
+                const file = event.target.files?.[0];
+                event.target.value = '';
+                if (!file) return;
+                const preview = window.OmlxThemePreview;
+                const api = window.OmlxCustomTheme;
+                this.themeImageError = '';
+                let theme = null;
+                try {
+                    theme = api.sanitize(JSON.parse(preview.readTextChunk(new Uint8Array(await file.arrayBuffer()), preview.KEYWORD)));
+                } catch (error) {
+                    console.debug('No theme in the image:', error);
+                }
+                if (!theme || api.isEmpty(theme)) {
+                    this.themeImageError = window.t('settings.theme.image_no_theme');
+                    return;
+                }
+                this.fillCustomThemeDraft(theme);
+            },
+
+            async saveThemePreviewImage(version) {
+                if (this.themeImageBusy) return;
+                this.themeImageError = '';
+                this.themeImageBusy = true;
+                try {
+                    // The image uses Inter in every UI language, so load it before drawing.
+                    if (document.fonts?.load) {
+                        await Promise.all([300, 400, 500, 600, 700, 800].map(weight =>
+                            document.fonts.load(`${weight} 11px Inter`).catch(() => {})));
+                    }
+                    if (document.fonts?.ready) await document.fonts.ready;
+                    const blob = await window.OmlxThemePreview.png({
+                        theme: { light: this.themeDrawColors('light'), dark: this.themeDrawColors('dark') },
+                        groups: window.OmlxCustomTheme.GROUPS,
+                        version,
+                    });
+                    const link = document.createElement('a');
+                    const now = new Date();
+                    const pad = value => String(value).padStart(2, '0');
+                    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}`;
+                    link.href = URL.createObjectURL(blob);
+                    link.download = `omlx-theme-${stamp}.png`;
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+                } catch (error) {
+                    console.error('Failed to save the theme image:', error);
+                    this.themeImageError = window.t('settings.theme.image_failed');
+                } finally {
+                    this.themeImageBusy = false;
                 }
             },
 
