@@ -2445,7 +2445,7 @@
   "settings.theme.json.hint": "Copy the full palette for an agent to edit, then paste its reply and load it into the fields.",
   "settings.theme.json.copy": "Copy theme JSON",
   "settings.theme.json.copied": "Copied",
-  "settings.theme.json.copy_blocked": "Copy blocked by the browser. The JSON is selected, press ⌘C.",
+  "settings.theme.json.copy_blocked": "Copy blocked by the browser. The JSON is selected, so copy it from the field.",
   "settings.theme.json.load": "Load into editor",
   "settings.theme.json.invalid": "That is not a valid theme JSON.",
   "settings.global.reset_failed": "Načtení výchozích nastavení se nezdařilo.",
