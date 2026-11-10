@@ -62,7 +62,7 @@ def _make_fixture(monkeypatch, drafter_returns_uid):
 
     request = SimpleNamespace(
         request_id="req-long-text",
-        sampling_params=SimpleNamespace(seed=None, max_tokens=1024),
+        sampling_params=SimpleNamespace(seed=None, max_tokens=1024, logprobs=False),
         num_prompt_tokens=32768,  # long enough to have been chunk-prefilled
         rope_deltas=0.0,
         cached_tokens=0,
@@ -171,7 +171,9 @@ def test_insert_prefilled_forwards_logits_processors_to_route(monkeypatch):
 def _make_route_request():
     return SimpleNamespace(
         request_id="req-grammar",
-        sampling_params=SimpleNamespace(max_tokens=64, stop_token_ids=None),
+        sampling_params=SimpleNamespace(
+            max_tokens=64, stop_token_ids=None, logprobs=False
+        ),
         rope_deltas=0.0,
     )
 

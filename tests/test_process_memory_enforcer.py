@@ -281,6 +281,12 @@ def mock_engine_pool():
     return pool
 
 
+@pytest.fixture(autouse=True)
+def _empty_image_decode_cache():
+    # Leftover images from other tests add a usage read to each pressure tick.
+    images.clear_image_decode_cache()
+
+
 @pytest.fixture
 def enforcer(mock_engine_pool):
     """Create an enforcer with a fixed 10GB ceiling.
@@ -644,6 +650,37 @@ class TestCurrentUsageTelemetry:
             ),
         ):
             assert enforcer._get_hard_limit_bytes() == 48 * 1024**3
+
+    @pytest.mark.asyncio
+    async def test_poll_loop_picks_up_runtime_metal_cap_raise(self, mock_engine_pool):
+        """A raised iogpu.wired_limit_mb reaches the scheduler without a restart."""
+        enforcer = _make_enforcer(mock_engine_pool)
+        enforcer._prefill_memory_guard = True
+        enforcer._effective_metal_cap_bytes = 8 * 1024**3
+        # _make_enforcer pins the breakdown, so expose the cached cap through it.
+        enforcer._get_ceiling_breakdown = lambda: {
+            "static": 0,
+            "dynamic": 0,
+            "metal_cap": enforcer._get_effective_metal_cap_bytes(),
+            "hard_limit": 10 * 1024**3,
+        }
+        scheduler = MagicMock(spec=[])
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        mock_engine_pool._entries = {"model-a": _make_entry("model-a", engine=engine)}
+
+        with patch.object(
+            pme, "get_effective_metal_cap_bytes", return_value=12 * 1024**3
+        ):
+            await enforcer._check_and_enforce()
+        assert scheduler._memory_metal_cap_bytes == 12 * 1024**3
+
+        with patch.object(
+            pme, "get_effective_metal_cap_bytes", return_value=16 * 1024**3
+        ) as reader:
+            await enforcer._check_and_enforce()
+        reader.assert_not_called()
+        assert scheduler._memory_metal_cap_bytes == 12 * 1024**3
 
 
 class TestDisabledWhenCeilingZero:
@@ -1045,6 +1082,67 @@ class TestDynamicCeilingReserve:
             result = enforcer._get_dynamic_ceiling()
 
         assert result == 64 * self.GB - tier_reserve_bytes("balanced", 64 * self.GB)
+
+    def _read_sequence(self, mock_engine_pool, samples):
+        """Dynamic ceilings for successive (phys, free, now) reads."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="safe"
+        )
+        ceilings = []
+        for phys, free, now in samples:
+            with (
+                patch("omlx.settings.get_system_memory", return_value=64 * self.GB),
+                patch(
+                    "omlx.process_memory_enforcer.get_phys_footprint",
+                    return_value=phys * self.GB,
+                ),
+                patch(
+                    "omlx.process_memory_enforcer.get_macos_vm_stats",
+                    return_value={**self.STATS, "free": free * self.GB},
+                ),
+                patch("omlx.process_memory_enforcer.time.monotonic", return_value=now),
+            ):
+                ceilings.append(enforcer._get_dynamic_ceiling())
+        return ceilings
+
+    def test_released_memory_counts_until_vm_stat_frees_it(self, mock_engine_pool):
+        """A Metal cache clear drops phys before vm_stat raises free (#4213)."""
+        ceilings = self._read_sequence(
+            mock_engine_pool,
+            [(40, 10, 0.0), (25, 10, 0.5), (25, 18, 0.8), (25, 25, 1.2)],
+        )
+        assert ceilings == [ceilings[0]] * 4
+
+    def test_release_credit_is_spent_and_expires(self, mock_engine_pool):
+        ceilings = self._read_sequence(
+            mock_engine_pool,
+            [
+                (40, 10, 0.0),
+                # Another app takes 4 GB of free memory.
+                (40, 6, 0.2),
+                # oMLX releases 10 GB, then allocates 6 GB of it again.
+                (30, 6, 0.4),
+                (36, 6, 0.6),
+                # A later release does not extend the first one's window.
+                (35, 6, 1.6),
+                (35, 6, 2.5),
+            ],
+        )
+        base = 54 * self.GB - tier_reserve_bytes("safe", 64 * self.GB)
+        assert ceilings == [
+            base,
+            base - 4 * self.GB,
+            base - 4 * self.GB,
+            base - 4 * self.GB,
+            base - 4 * self.GB,
+            base - 8 * self.GB,
+        ]
+
+    def test_free_rise_seen_before_release_adds_no_credit(self, mock_engine_pool):
+        ceilings = self._read_sequence(
+            mock_engine_pool, [(40, 10, 0.0), (40, 20, 0.3), (30, 20, 0.6)]
+        )
+        assert ceilings[2] == ceilings[0]
 
 
 class TestDynamicCeilingCustom:
@@ -3272,7 +3370,6 @@ class TestPressureReclaimGrace:
 async def test_image_cache_reclaimed_before_model_eviction(
     mock_engine_pool, initial_usage
 ):
-    images.clear_image_decode_cache()
     buffer = io.BytesIO()
     Image.new("RGB", (120, 120), "red").save(buffer, format="PNG")
     source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
@@ -3299,7 +3396,6 @@ async def test_image_cache_reclaimed_before_model_eviction(
 
 
 async def test_image_cache_reclaim_remeasures_retained_request_memory(mock_engine_pool):
-    images.clear_image_decode_cache()
     buffer = io.BytesIO()
     Image.new("RGB", (120, 120), "blue").save(buffer, format="PNG")
     source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()

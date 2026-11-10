@@ -362,6 +362,10 @@ class ClefModel:
         self.backbone = DecisionBackbone(model_path, trust_remote_code)
         self.head: JointSchemaHead | None = None
 
+    @property
+    def has_vision(self) -> bool:
+        return self.backbone.has_vision
+
     def load(self) -> None:
         self.backbone.load()
         path = Path(self.model_path)

@@ -73,12 +73,15 @@ def _sync_and_clear_cache(stream=None):
         # (for example, during teardown before that thread submits work). On
         # some MLX builds mx.synchronize raises "There is no Stream(gpu, 0) in
         # current thread" in that case; swallow it since there is nothing to
-        # drain.
+        # drain. Any other error is a failed command buffer, and MLX clears it
+        # on raise, so swallowing it would hide the discarded results.
         target = stream if stream is not None else _default_generation_stream
         try:
             mx.synchronize(target)
         except RuntimeError as exc:
             exit_if_gpu_submissions_ignored(exc)
+            if "no Stream" not in str(exc):
+                raise
         try:
             mx.synchronize()  # default stream
             mx.clear_cache()

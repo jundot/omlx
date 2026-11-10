@@ -10,12 +10,15 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
+import omlx.engine_pool as engine_pool_module
 from omlx.engine_pool import (
     EngineEntry,
     EnginePool,
     VLMBatchedEngine,
+    _is_metal_out_of_memory,
     _qwen35_cpu_share_estimated_bytes,
 )
 from omlx.exceptions import (
@@ -31,6 +34,7 @@ from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     Qwen4ExpResidencyEstimate,
 )
 from omlx.scheduler import PrefillEvictionRequest, SchedulerConfig
+from tests.test_cluster_engine_pool import _deployment
 
 
 def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
@@ -104,6 +108,12 @@ class TestEnginePoolInit:
         assert pool.model_count == 2
         assert "model-a" in pool.get_model_ids()
         assert "model-b" in pool.get_model_ids()
+
+    def test_discover_models_missing_sole_dir(self, tmp_path):
+        """A sole unavailable model dir is skipped instead of failing startup."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(tmp_path / "missing"))
+        assert pool.model_count == 0
 
     def test_discover_models_with_pinned(self, small_mock_model_dir):
         """Test model discovery with pinned models."""
@@ -449,6 +459,91 @@ class TestEnginePoolErrors:
             with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
                 asyncio.run(pool.get_engine("model-a"))
             assert pool._entries["model-a"].engine is mock_engine
+
+    def test_moe_offload_fit_leaves_prompt_reserve(self, small_mock_model_dir):
+        """The residency hint is sized by admission arithmetic against the
+        prompt line (ceiling x headroom) less other loaded models and the
+        prompt reserve. Same fixture as above: size = 75 * capacity - 400
+        bytes, capacity floored at 8."""
+        experts = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for field, width in (("weight", 4), ("scales", 1)):
+                experts[f"model.layers.0.mlp.switch_glu.{proj}.{field}"] = mx.zeros(
+                    (32, 5, width), dtype=mx.uint8
+                )
+        mx.save_safetensors(
+            str(small_mock_model_dir / "model-a" / "model.safetensors"), experts
+        )
+        pool = _make_pool()
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.estimated_size = 2000
+        settings = ModelSettings()
+        assert pool.moe_offload_fit(entry, settings, 2000)["status"] == "unknown"
+
+        pool._process_memory_enforcer = SimpleNamespace(_prefill_headroom_safety=0.9)
+        # Line 1800. Budget 1100 = capacity 20 = 64%, since 65% rounds to
+        # capacity 21 (1175 bytes). Another loaded model's 75 bytes -> 60%.
+        for reserve, others, expected in (
+            (700, 0, {"status": "fit", "max_percent": 64, "bytes": 1100}),
+            (700, 75, {"status": "fit", "max_percent": 60, "bytes": 1025}),
+            (1700, 0, {"status": "no_fit", "max_percent": None, "bytes": 0}),
+            (-300, 0, {"status": "resident", "max_percent": None, "bytes": 0}),
+        ):
+            pool._current_model_memory = others
+            with patch("omlx.engine_pool._MOE_OFFLOAD_PROMPT_RESERVE", reserve):
+                fit = pool.moe_offload_fit(entry, settings, 2000)
+                # A loaded entry carries its offload-adjusted runtime size.
+                entry.engine = MagicMock()
+                entry.runtime_estimated_size = 500
+                pool._current_model_memory = others + 500
+                assert pool.moe_offload_fit(entry, settings, 2000) == fit
+                entry.engine = entry.runtime_estimated_size = None
+            assert fit == {**expected, "reserve_bytes": reserve}
+        assert settings.moe_expert_offload_enabled is False
+
+    def test_moe_offload_fit_prefers_resident_table(self, tmp_path):
+        """A Qwen4 PLE table the load forces to mmap shrinks larger percents.
+        The hint keeps the table where the settings put it when that fits,
+        and falls back to the forced mmap only when nothing else does."""
+        entry = EngineEntry(
+            model_id="qwen4",
+            model_path=str(tmp_path),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="qwen4_exp",
+            estimated_size=2700,
+        )
+        pool = _make_pool()
+        pool._process_memory_enforcer = SimpleNamespace(_prefill_headroom_safety=0.9)
+
+        def status(entry, p, *, ceiling=None, log_decision=True):
+            pct = round(p.moe_expert_offload_resident_fraction * 100)
+            if not p.moe_expert_offload_enabled:
+                pct = 100
+            resident, mmap = 1700 + 10 * pct, 200 + 10 * pct
+            forced = resident > 1800 >= mmap
+            return p.qwen4_ple_ssd_offload or forced, forced, (resident, mmap)
+
+        def size(entry, p, **_):
+            enabled, _, (resident, mmap) = status(entry, p)
+            return mmap if enabled else resident
+
+        # Line 1800; the table is forced above 10%.
+        with (
+            patch.object(pool, "_qwen4_ple_offload_status", status),
+            patch.object(pool, "_entry_runtime_resident_size", size),
+        ):
+            for reserve, requested, expected in (
+                (0, False, (10, 1800)),
+                (300, False, (95, 1150)),
+                (1700, False, (None, 0)),
+                (700, True, (90, 1100)),
+            ):
+                settings = ModelSettings(qwen4_ple_ssd_offload=requested)
+                with patch("omlx.engine_pool._MOE_OFFLOAD_PROMPT_RESERVE", reserve):
+                    fit = pool.moe_offload_fit(entry, settings, 2000)
+                assert (fit["max_percent"], fit["bytes"]) == expected
 
     def test_missing_model_path_removes_unloaded_entry(self, small_mock_model_dir):
         """A deleted model directory is removed and reported as not found."""
@@ -897,13 +992,14 @@ class TestQwenCpuShareMemoryEstimate:
         )
         pool._entries[entry.model_id] = entry
         settings = ModelSettings()
-        off = pool._engine_runtime_signature("v41", settings)
-        settings.deepseek_v41_ced_prefill_enabled = True
+        # Unset means on.
         on = pool._engine_runtime_signature("v41", settings)
-        assert off != on
         assert dict(on)["deepseek_v41_ced_prefill_enabled"] == "True"
         settings.deepseek_v41_ced_prefill_enabled = False
-        assert pool._engine_runtime_signature("v41", settings) == off
+        off = pool._engine_runtime_signature("v41", settings)
+        assert off != on
+        settings.deepseek_v41_ced_prefill_enabled = True
+        assert pool._engine_runtime_signature("v41", settings) == on
 
     def test_qwen4_wide_decode_setting_changes_engine_signature(self, tmp_path):
         from omlx.model_settings import ModelSettings
@@ -924,6 +1020,22 @@ class TestQwenCpuShareMemoryEstimate:
         on = pool._engine_runtime_signature("qwen4", settings)
         assert off != on
         assert dict(on)["qwen4_gdn_decode_wide_proj"] == "True"
+
+    def test_activation_fp16_setting_changes_engine_signature(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        pool = _make_pool(ceiling=500)
+        entry = EngineEntry(
+            model_id="m", model_path=str(tmp_path), model_type="llm",
+            engine_type="batched", estimated_size=100,
+        )
+        pool._entries[entry.model_id] = entry
+        settings = ModelSettings()
+        off = pool._engine_runtime_signature("m", settings)
+        settings.activation_fp16_enabled = True
+        on = pool._engine_runtime_signature("m", settings)
+        assert off != on
+        assert dict(on)["activation_fp16_enabled"] == "True"
 
     @pytest.mark.asyncio
     async def test_v41_live_admission_keeps_viable_mmap_fallback(self, tmp_path):
@@ -1175,6 +1287,33 @@ class TestVLMFallback:
         assert entry.model_type == "llm"
         assert entry.engine_type == "batched"
         assert entry.engine is mock_batched_engine
+
+    @pytest.mark.asyncio
+    async def test_cluster_deployment_runs_a_vlm_checkpoint_distributed(
+        self, small_mock_model_dir
+    ):
+        """A coordinator holding a VLM checkpoint serves it through its ranks."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = entry.engine_type = "vlm"
+        deployment = _deployment(entry.model_path)
+        pool._cluster_registry = SimpleNamespace(get_for_model=lambda _: deployment)
+        distributed = MagicMock()
+        distributed.start = AsyncMock()
+
+        with (
+            patch(
+                "omlx.engine.distributed.DistributedBatchedEngine",
+                return_value=distributed,
+            ) as cls,
+            patch("omlx.engine_pool.VLMBatchedEngine") as local,
+        ):
+            await pool._load_engine("model-a")
+
+        assert entry.engine is distributed
+        assert cls.call_args.kwargs["vision_checkpoint"] is True
+        local.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_vlm_failure_still_raises(self, small_mock_model_dir):
@@ -1527,6 +1666,65 @@ class TestEnginePoolAsync:
         assert pool.current_model_memory > 0
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("startup_fails", [False, True])
+    async def test_cancelled_startup_drains_loader_before_stopping(
+        self, pool_with_mock_engines, startup_fails
+    ):
+        pool = pool_with_mock_engines
+        entry = pool.get_entry("model-a")
+        loop = asyncio.get_running_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        loading, release_loader = asyncio.Event(), threading.Event()
+        core_task = None
+        startup_settled = False
+
+        async def start():
+            nonlocal core_task, startup_settled
+            # BatchedEngine starts its core before loading a SpecPrefill draft.
+            core_task = asyncio.create_task(asyncio.Event().wait())
+            loading.set()
+            await loop.run_in_executor(executor, release_loader.wait, 5)
+            startup_settled = True
+            if startup_fails:
+                raise RuntimeError("draft startup failed")
+
+        async def stop():
+            assert startup_settled
+            core_task.cancel()
+            await asyncio.gather(core_task, return_exceptions=True)
+
+        engine = MagicMock(
+            start=AsyncMock(side_effect=start), stop=AsyncMock(side_effect=stop)
+        )
+        task = asyncio.create_task(pool.get_engine("model-a"))
+        try:
+            with (
+                patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+                patch.object(pool, "_schedule_failed_load_reclaim") as reclaim,
+            ):
+                await asyncio.wait_for(loading.wait(), 2)
+                for _ in range(2):
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    assert not task.done()
+                    assert entry.is_loading and pool._lock.locked()
+                    engine.stop.assert_not_awaited()
+                release_loader.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 2)
+            engine.stop.assert_awaited_once()
+            assert core_task.done()
+            reclaim.assert_called_once()
+            assert entry.engine is None and not entry.is_loading
+            assert not entry.load_failed
+            assert pool.current_model_memory == 0
+            assert not pool._lock.locked()
+        finally:
+            release_loader.set()
+            await asyncio.gather(task, return_exceptions=True)
+            executor.shutdown(wait=True)
+
+    @pytest.mark.asyncio
     async def test_load_failure_is_cached_until_discovery_refresh(
         self, pool_with_mock_engines, small_mock_model_dir
     ):
@@ -1730,6 +1928,55 @@ class TestEnginePoolAsync:
         )
 
     @pytest.mark.asyncio
+    async def test_minimax_bundled_dspark_is_charged_and_takes_the_mtp_depth(
+        self, pool_with_mock_engines, small_mock_model_dir
+    ):
+        pool = pool_with_mock_engines
+        pool._scheduler_config.max_num_seqs = 8
+        entry = pool.get_entry("model-a")
+        entry.config_model_type = "minimax_m3_vl"
+        draft_path = small_mock_model_dir / "model-a" / "dspark"
+        draft_path.mkdir()
+        text_config = {
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "num_hidden_layers": 2,
+            "sliding_window": 32,
+            "dflash_config": {"target_layer_ids": [1, 3]},
+        }
+        (draft_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["DSparkMiniMaxDraftModel"],
+                    "text_config": text_config,
+                }
+            )
+        )
+        (draft_path / "model-dspark-00001.safetensors").write_bytes(b"0" * 1000)
+        settings = ModelSettings(mtp_enabled=True, mtp_adaptive_max_depth=3)
+        # Per window token: two layers' K/V, the projected row and two captures.
+        row_bytes = 32 * 2 * (2 * 2 * 2 * 16 + 64 + 2 * 64)
+        assert pool._entry_runtime_resident_size(
+            entry, settings
+        ) - pool._entry_runtime_resident_size(entry, ModelSettings()) == (
+            1000 + 8 * row_bytes
+        )
+
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            patch("omlx.engine_pool.load_minimax_dspark_drafter") as load,
+        ):
+            await pool.get_engine("model-a", runtime_settings=settings)
+
+        assert load.call_args.args[0] == draft_path
+        assert load.call_args.args[2:] == (3, False)
+        engine.set_dflash_drafter.assert_called_once_with(load.return_value)
+
+    @pytest.mark.asyncio
     async def test_dflash_drafter_failure_reuses_requested_variant_while_leased(
         self, pool_with_mock_engines
     ):
@@ -1857,7 +2104,7 @@ class TestEnginePoolAsync:
         assert second is base_engine
         base_engine.stop.assert_not_awaited()
 
-    def test_oq_a8_forces_a_separate_engine(self, pool_with_mock_engines):
+    def test_oq_a8_forces_a_separate_engine(self, pool_with_mock_engines, monkeypatch):
         """The patch replaces MLP.__call__ process-wide, registers process-wide
         projection backends, and caches a plan on every module it classifies;
         none of that can be undone in place, so a change here has to land on a
@@ -1865,25 +2112,44 @@ class TestEnginePoolAsync:
         from omlx.model_settings import ModelSettings
 
         pool = pool_with_mock_engines
-        off = ModelSettings(qwen35_oq_a8_enabled=False)
-        on = ModelSettings(qwen35_oq_a8_enabled=True)
-        other_floor = ModelSettings(
-            qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=1024
-        )
+        off = ModelSettings(a8_prefill_enabled=False)
+        on = ModelSettings(a8_prefill_enabled=True)
+        other_floor = ModelSettings(a8_prefill_enabled=True, a8_prefill_min_tokens=1024)
 
         sig = lambda s: pool._engine_runtime_signature("model-a", s)  # noqa: E731
+        monkeypatch.setattr(
+            engine_pool_module.quant_fast, "oq_a8_available", lambda: True
+        )
         assert sig(off) != sig(on)
         assert sig(on) != sig(other_floor)
+        # Without INT8 tensor units only a Prefill Accelerator Mac uses it.
+        monkeypatch.setattr(
+            engine_pool_module.quant_fast, "oq_a8_available", lambda: False
+        )
+        assert sig(off) == sig(on)
+        # DeepSeek V4.1 tensor-parallel ranks load A8 by their own hardware.
+        tensor = SimpleNamespace(tensor_parallel_size=2)
+        monkeypatch.setattr(
+            pool, "_distributed_deployment_for_entry", lambda entry: tensor
+        )
+        assert sig(off) == sig(on)
+        pool._entries["model-a"].config_model_type = "deepseek_v41"
+        assert sig(off) != sig(on)
 
-    def test_oq_a8_toggle_changes_qwen4_exp_signature(self, pool_with_mock_engines):
+    def test_oq_a8_toggle_changes_qwen4_exp_signature(
+        self, pool_with_mock_engines, monkeypatch
+    ):
         """Flash-Next reloads on the same toggle, so routed-expert tags never
         outlive an OFF request (OFF -> ON -> OFF -> ON each get a new engine)."""
         from omlx.model_settings import ModelSettings
 
         pool = pool_with_mock_engines
         pool._entries["model-a"].config_model_type = "qwen4_exp"
+        monkeypatch.setattr(
+            engine_pool_module.quant_fast, "oq_a8_available", lambda: True
+        )
         sig = lambda enabled: pool._engine_runtime_signature(  # noqa: E731
-            "model-a", ModelSettings(qwen35_oq_a8_enabled=enabled)
+            "model-a", ModelSettings(a8_prefill_enabled=enabled)
         )
         assert sig(False) != sig(True)
         assert sig(True) == sig(True)
@@ -1894,8 +2160,8 @@ class TestEnginePoolAsync:
         from omlx.model_settings import ModelSettings
 
         pool = pool_with_mock_engines
-        a = ModelSettings(qwen35_oq_a8_enabled=False, qwen35_oq_a8_min_tokens=512)
-        b = ModelSettings(qwen35_oq_a8_enabled=False, qwen35_oq_a8_min_tokens=2048)
+        a = ModelSettings(a8_prefill_enabled=False, a8_prefill_min_tokens=512)
+        b = ModelSettings(a8_prefill_enabled=False, a8_prefill_min_tokens=2048)
         assert pool._engine_runtime_signature(
             "model-a", a
         ) == pool._engine_runtime_signature("model-a", b)
@@ -3819,6 +4085,30 @@ class TestResolveModelId:
         result = pool.resolve_model_id("omlx/MODEL-B", settings_manager=None)
         assert result == "model-b"
 
+    def test_claude_tier_alias_never_shadows_models_or_aliases(
+        self, small_mock_model_dir
+    ):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
+        settings_manager.get_all_settings.return_value = {
+            "model-a": ModelSettings(model_alias="claude-haiku"),
+        }
+        tiers = {
+            "claude-sonnet": "model-b",
+            "claude-haiku": "model-b",
+            "model-a": "model-b",
+        }
+
+        def resolve(name):
+            return pool.resolve_model_id(name, settings_manager, tiers)
+
+        assert resolve("claude-sonnet") == "model-b"
+        assert resolve("omlx/claude-sonnet") == "model-b"
+        assert resolve("claude-haiku") == "model-a"
+        assert resolve("model-a") == "model-a"
+
 class TestMemorySettleBarrier:
     """Tests for memory settle barrier in _unload_engine()."""
 
@@ -5522,3 +5812,23 @@ async def test_local_cluster_removal_preserves_busy_guard_and_scope(busy):
     else:
         await pool.prepare_cluster_reload("test-model", local_only=True)
         pool._unload_engine.assert_awaited_once_with("test-model", local_only=True)
+
+
+class TestIsMetalOutOfMemory:
+    """``_is_metal_out_of_memory`` walks the cause chain of a failed load."""
+
+    def test_cause_cycles_terminate(self):
+        exc = ImportError("VoxtralProcessor requires the PyTorch library")
+        exc.__cause__ = exc
+        a, b = RuntimeError("a"), RuntimeError("b")
+        a.__cause__, b.__cause__ = b, a
+
+        assert _is_metal_out_of_memory(exc) is False
+        assert _is_metal_out_of_memory(a) is False
+
+    def test_out_of_memory_found_down_the_chain(self):
+        oom = RuntimeError("[METAL] Command buffer execution failed: Insufficient Memory")
+        outer = RuntimeError("load failed")
+        outer.__cause__ = oom
+
+        assert _is_metal_out_of_memory(outer) is True

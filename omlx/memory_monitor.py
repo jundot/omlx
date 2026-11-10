@@ -281,6 +281,7 @@ class MemoryMonitor:
         # KV storage width; may be fractional with TurboQuant.
         self._dtype_size: float = 2
         self._prefill_dtype_size: float = 2
+        self._affine_prefill: bool = False
         self._kv_bytes_per_token_override: float | None = None
         # SDPA score-matrix width = model compute/activation dtype, distinct from
         # _dtype_size (which the scheduler may override to a fractional TurboQuant
@@ -294,8 +295,8 @@ class MemoryMonitor:
         # full-attention formula. Empty for non-hybrid models.
         self._rotating_layer_specs: tuple[tuple[int, int], ...] = ()
         self._prefill_memory_profile: PrefillMemoryProfile | None = None
-        # Fixed-shape ANE prefill I/O surfaces (issue #2841); set via
-        # set_model_info, 0 unless the Qwen ANE prefill backend is attached.
+        # ANE program weights the driver wires during prefill (issue #2841);
+        # set via set_model_info, 0 unless the Qwen ANE backend is attached.
         self._ane_prefill_transient_bytes: int = 0
         # Fixed per-sequence recurrent state (GDN/Mamba ArraysCache),
         # measured once from a live cache after the first prefill chunk.
@@ -468,10 +469,10 @@ class MemoryMonitor:
         return 0
 
     def clear_ane_prefill_transient(self) -> None:
-        """Stop reserving ANE prefill I/O surfaces after the banks are shed.
+        """Stop reserving ANE prefill memory after the banks are shed.
 
         The reservation is snapshotted at load; once the runtime headroom
-        rung releases the banks the surfaces are gone, so keeping the term
+        rung releases the banks the programs are gone, so keeping the term
         would make every later admission pass pause for memory that can no
         longer be reclaimed. The next load re-prices it via set_model_info.
         """
@@ -495,6 +496,7 @@ class MemoryMonitor:
         prefill_memory_profile: PrefillMemoryProfile | None = None,
         ane_prefill_transient_bytes: int = 0,
         prefill_dtype_size: Optional[float] = None,
+        affine_prefill: bool = False,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -530,6 +532,8 @@ class MemoryMonitor:
                 Defaults to ``dtype_size``. A cache that is quantized after
                 prefill holds the full-width KV, and briefly both copies,
                 before it shrinks to ``dtype_size``.
+            affine_prefill: Reserve one unpacked FP32 layer and bounded
+                attention scores for incremental signed-affine prefill.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
@@ -540,6 +544,7 @@ class MemoryMonitor:
             if prefill_dtype_size is not None and prefill_dtype_size > 0
             else dtype_size
         )
+        self._affine_prefill = affine_prefill
         self._score_dtype_size = (
             compute_dtype_size
             if compute_dtype_size and compute_dtype_size > 0
@@ -563,9 +568,8 @@ class MemoryMonitor:
             if count > 0 and window > 0
         )
         self._prefill_memory_profile = prefill_memory_profile
-        # ANE prefill I/O surfaces are dirtied by the first long prompt, on
-        # top of the KV+SDPA peak, so admission must price them or the hard
-        # watermark aborts the request mid-prefill (issue #2841).
+        # The ANE driver wires the program weights outside phys_footprint
+        # during prefill, on top of the KV+SDPA peak (issue #2841).
         self._ane_prefill_transient_bytes = max(int(ane_prefill_transient_bytes), 0)
         # A new model's fixed state must be re-measured; a stale value from
         # the previous model would silently mis-charge admission.
@@ -895,7 +899,7 @@ class MemoryMonitor:
         # raised false-positive 400s on small prompts.
         eff_chunk = min(chunk_size, new_tokens)
         full_kv_len = new_tokens + max(cached_tokens, 0)
-        attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
+        attn = self.estimate_chunk_transient_bytes(eff_chunk, full_kv_len)
 
         # KV growth attributable to this request: only the new tokens.
         # The cached portion is already counted in the caller's current-usage
@@ -965,7 +969,19 @@ class MemoryMonitor:
                     gathered_core=gathered_core,
                 )
             return profile.estimate_prefill_transient_bytes(n_tokens, kv_len)
-        return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
+        transient = self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
+        if self._affine_prefill and n_tokens > 0 and kv_len > 0:
+            from .affine4 import _MAX_SCORE_ELEMENTS
+
+            heads = self._num_attention_heads or self._num_kv_heads or 0
+            kv_heads = self._num_kv_heads or 0
+            dim = self._head_dim or 0
+            rows = max(1, _MAX_SCORE_ELEMENTS // max(1, heads * kv_len))
+            scores = heads * min(n_tokens, rows) * kv_len * 4
+            unpacked_kv = 2 * kv_heads * kv_len * dim * 4
+            query_and_output = 2 * heads * n_tokens * dim * 4
+            transient = max(transient, unpacked_kv + scores + query_and_output)
+        return transient
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """
@@ -2093,7 +2109,7 @@ def estimate_mla_kv_bytes_per_token(
 
 
 def _ane_prefill_transient_bytes(model: Any) -> int:
-    """ANE prefill I/O surface bytes for ``model``, 0 when not attached.
+    """ANE prefill program weight bytes for ``model``, 0 when not attached.
 
     Defensive: the ANE patch is optional at runtime, so any import or lookup
     failure leaves the KV+SDPA estimate unchanged (issue #2841).

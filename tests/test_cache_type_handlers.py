@@ -25,6 +25,9 @@ from omlx.cache.type_handlers import (
     SizedArraysCache,
 )
 from omlx.cache.type_registry import CacheTypeRegistry
+from omlx.patches.mlx_vlm_minimax_m3_compat import (
+    apply_mlx_vlm_minimax_m3_compat_patch,
+)
 
 
 class TestCacheTypeEnum:
@@ -406,6 +409,9 @@ class TestMiniMaxM3CacheHandlers:
 
     def test_restored_single_caches_merge_and_extract_for_batch_requests(self):
         mx = pytest.importorskip("mlx.core")
+        # Upstream mlx-vlm also ships minimax_m3_vl. Importing it first would
+        # shadow the vendored package for the rest of the worker.
+        apply_mlx_vlm_minimax_m3_compat_patch()
         language = pytest.importorskip("mlx_vlm.models.minimax_m3_vl.language")
         handler = MiniMaxM3KVCacheHandler()
 

@@ -133,6 +133,12 @@
         </div>
     </div>
     <div class="px-6 py-4 space-y-3">
+        <div x-show="stats.runtime_cache?.ssd_cache_unavailable" x-cloak
+             class="px-4 py-2.5 bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-xl flex items-center gap-2">
+            <i data-lucide="alert-triangle" class="w-4 h-4 shrink-0"></i>
+            <span class="min-w-0 break-words"
+                  x-text="window.t('status.runtime_cache.ssd_unavailable').replace('{path}', stats.runtime_cache?.ssd_cache_dir || '')"></span>
+        </div>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
             <div>
                 <div class="text-neutral-400 mb-1">{{ t('status.runtime_cache.active_base_path') }}</div>
@@ -222,13 +228,13 @@
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
                                 <td class="px-3 py-2 text-right">
                                     <span x-show="!m.has_sub_block_cache" x-text="formatNumber(m.indexed_blocks || 0) + ' blocks'"></span>
-                                    <span x-show="m.has_sub_block_cache" class="font-medium text-amber-600" x-text="m.indexed_blocks_display + ' tks'"></span>
+                                    <span x-show="m.has_sub_block_cache" class="font-medium text-amber-700" x-text="m.indexed_blocks_display + ' tks'"></span>
                                 </td>
                             </template>
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
                                 <td class="px-3 py-2 text-right">
                                     <span x-show="m.has_sub_block_cache"
-                                          class="text-amber-600"
+                                          class="text-amber-700"
                                           x-text="window.t('status.active_models.cached_tokens').replace('{count}', (m.last_partial_tokens_skipped || m.indexed_blocks_display || ('<' + (m.block_size || '?'))))">
                                     </span>
                                     <span x-show="!m.has_sub_block_cache" class="text-neutral-400">-</span>

@@ -274,9 +274,7 @@ def test_auto_transport_falls_back_before_coordinator_deadline(
 
     def connect(stream, address):
         if threading.current_thread() is worker_thread and address[1] == port:
-            attempts.append(address)
-            if error_number == errno.ETIMEDOUT:
-                threading.Event().wait(stream.gettimeout())
+            attempts.append(stream.gettimeout())
             raise OSError(error_number, "Injected direct connection failure")
         return original_connect(stream, address)
 
@@ -319,8 +317,8 @@ def test_auto_transport_falls_back_before_coordinator_deadline(
     assert not thread.is_alive()
     assert failures == []
     assert proxy.process.poll() is not None
-    if error_number in (errno.EACCES, errno.EPERM):
-        assert len(attempts) == 1
+    # A probe that times out holds at most half of the 2s budget.
+    assert attempts == [1.0]
 
 
 def test_transport_fallback_preserves_overall_connection_budget(monkeypatch):

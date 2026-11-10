@@ -23,7 +23,7 @@ struct ScreenHeader: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(eyebrow)
-                .font(.omlxText(11, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
                 .foregroundStyle(theme.textSecondary)
                 .textCase(.uppercase)
                 .kerning(0.6)
@@ -104,7 +104,7 @@ struct HintLine: View {
                 .font(.system(size: 11))
                 .foregroundStyle(theme.textTertiary)
             Text(text)
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -140,7 +140,7 @@ struct FooterBar<Actions: View>: View {
                 }
                 if let error, hasError {
                     Text(error)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.redDot)
                 }
             }

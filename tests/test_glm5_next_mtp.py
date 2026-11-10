@@ -591,6 +591,8 @@ def _record_runtime_applies(monkeypatch):
         ("glm5_next", ["glm5_next_vlm_runtime"]),
         ("qwen3_5", ["qwen35_vlm_runtime"]),
         ("qwen3_5_moe", ["qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"]),
+        # MiniCPM-V 4.7 wraps a Qwen3.5 MoE (or dense Qwen3.5) language model.
+        ("minicpmv4_7", ["qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"]),
         # qwen4_exp runs its own MTP and subclasses the qwen3_5 classes these
         # patches rebind, so the sweep must not reach it.
         ("qwen4_exp", []),
@@ -648,6 +650,12 @@ def test_rollback_refuses_when_the_capture_is_short(applied, config, monkeypatch
         )
 
     assert sparse.trimmed == [], "no layer may be trimmed once the capture is short"
+
+
+@pytest.mark.parametrize("nax", [False, True])
+def test_row_exact_verify_only_without_nax(applied, monkeypatch, nax):
+    monkeypatch.setattr(applied, "nax_sparse_mla_available", lambda: nax)
+    assert bg._row_exact_verify(make_host(mtp_layers=1)) is not nax
 
 
 @pytest.mark.parametrize("layer_idx", [0, 3])
@@ -744,7 +752,8 @@ def make_host(dtype=mx.float32, *, mtp_layers=0, **overrides):
 
 
 @pytest.mark.parametrize("size", [2, 4])
-@pytest.mark.parametrize("depth", [1, 3, 7])
+# Block 2 leaves rows mid-window; block 8 completes two kpool windows per row.
+@pytest.mark.parametrize("depth", [1, 7])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_vector_restore_and_continuation_match_scalar(size, depth, dtype):
     mx.random.seed(349)
@@ -1454,7 +1463,7 @@ _CYCLES = [
 
 def _native_indexer_available() -> bool:
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast
 
         return bool(
             fast.has_symbol("dsa_indexer_scores")

@@ -65,8 +65,9 @@ brew update && brew upgrade omlx
 # 作为后台服务运行（崩溃时自动重启）
 brew services start omlx
 
-# 可选：MCP（Model Context Protocol）支持
+# 可选：MCP（Model Context Protocol）支持，安装后重启以加载
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
+omlx restart
 ```
 
 ### 从源码安装
@@ -76,7 +77,7 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 make install                # 以 editable 模式安装（含 Web UI 和原生自定义内核）
 # 没有完整 Xcode 时，用 make install-no-kernels 安装不含内核的版本
-make mcp                    # 可选：添加 MCP（Model Context Protocol）支持
+make mcp                    # 可选：添加 MCP 支持，重启 `omlx serve` 后加载
 ```
 
 需要 macOS 15.0+ (Sequoia)、Python 3.11–3.13 和 Apple Silicon（M1/M2/M3/M4/M5）。
@@ -195,7 +196,7 @@ brew services info omlx     # 查看状态
 
 ### 模型下载器
 
-在管理后台中直接搜索和下载 HuggingFace 上的 MLX 模型。浏览模型卡片、查看文件大小，一键下载。
+在管理后台中直接搜索和下载 HuggingFace 上的 MLX、GGUF 或所有格式的模型。浏览模型卡片后选择要下载的文件：MLX 检查点始终下载所需文件，GGUF 会一并下载其视觉投影器。
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX 模型下载器" width="720">
@@ -236,7 +237,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 文本嵌入 |
 | `POST /v1/rerank` | 文档重排序 |
-| `POST /v1/systemone` | 决策模型的类型化判断 (TypeSafe System One) |
+| `POST /v1/systemone` | 决策模型或聊天模型的类型化判断 (TypeSafe System One) |
 | `GET /v1/models` | 列出可用模型 |
 | `POST /tokenize`, `POST /detokenize` | 兼容 vLLM 的分词器 API（也可通过 `/v1` 访问） |
 
@@ -279,7 +280,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | 类型 | 模型 |
 |------|------|
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm) 支持的所有模型 |
-| VLM | Qwen3.5 系列、GLM-4V、Pixtral 及其他 [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) 模型 |
+| VLM | Qwen3.5 系列、GLM-4V、Pixtral 及其他 [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) 模型 |
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
 | 嵌入 | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | 重排序 | ModernBERT、XLM-RoBERTa |
@@ -406,12 +407,14 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ## 致谢
 
 - [MLX](https://github.com/ml-explore/mlx) 和 [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Apple Silicon 上的视觉语言模型推理
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) - Apple Silicon 上的视觉语言模型推理
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX 从 vllm-mlx v0.1.0 起步，经过大幅演进，增加了多模型服务、分层 KV 缓存、完整分页缓存支持的 VLM、管理后台和 macOS 菜单栏应用
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 应用包的便携 Python 环境分层
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon 嵌入模型支持
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon 上的块扩散推测解码 (Block diffusion speculative decoding)
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP 的验证形态 Metal 内核由 Youssof Altoukhi 的 MTPLX 提供支持，同时也启发了 depth-k 流水线设计
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) - 融合 GDN 验证预处理内核改编自 mlx-serve 对 mlxfast-challenge qwen35_packed_gdn_prework 内核的移植，Qwen4 的融合 GDN decode 与 prefill 内核改编自 mlx-serve 的 MIT 开源 `transformer.zig`；Qwen4 QSA 的 128 位 K/V 暂存改编自 mlx-serve 的 MIT 开源 `msv_attn_p256` 内核
-- [Splash](https://github.com/incoai/splash) - 验证形态线性内核采用 Splash 的 bf16 `0x4300 | q` 权重操作数与分组输入求和（来自其 Apache-2.0 开源的 `linear_q4_sgmatrix.metal`），张量运算验证注意力借鉴了 Splash `paged_attention_tile.h` 的分块设计
+- [Splash](https://github.com/incoai/splash) - 验证形态线性内核采用 Splash 的 bf16 `0x4300 | q` 权重操作数与分组输入求和（来自其 Apache-2.0 开源的 `linear_q4_sgmatrix.metal`），张量运算验证注意力借鉴了 Splash `paged_attention_tile.h` 的分块设计，GGUF 的分词器按照 Splash Apache-2.0 开源的 `install/gguf.py` 从文件头生成
 - [SiliconScope](https://github.com/kennss/SiliconScope) - 菜单栏统计信息的设计和渲染方法参考了 Kennt Kim 的 SiliconScope，这也启发了高能效重渲染门禁机制
+- [m5gpu](https://github.com/beamivalice/m5gpu) - GPU 功率限制使用了 beamivalice 的 m5gpu 所记录的 AGX GPU 功率目标（`SetMaxGPUAbsolutePower` 与 `AbsoluteTarget`，以及用于解除的 `-1000`）
+- [ming-tts-serve](https://github.com/sbusso/ming-tts-serve) - Ming-3.0-tts 的流水线解码循环参考了 Stéphane Busso 的 ming-tts-serve，融合 DiT 内核改编自 ming-tts-serve 采用 MIT 许可的 `ming_fused.zig`

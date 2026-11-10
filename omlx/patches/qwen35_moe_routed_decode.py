@@ -15,9 +15,8 @@ same arithmetic in two launches after the router:
    the gate rows and the matching up rows of one expert with MLX's
    ``qmv_fast`` lane partition and add order, rounds both to the activation
    dtype, then applies MLX's ``Sigmoid`` and the two multiplies of the
-   compiled ``swiglu`` in its order. The gate row follows MLX's ``qmv`` for
-   a one-row output; its threadgroup comes first in the grid, so its long
-   serial K walk overlaps the expert rows.
+   compiled ``swiglu`` in its order. The gate row follows MLX's ordinary
+   one-row QMV dispatch; its threadgroup comes first in the grid.
 2. down with the combine. Simdgroup ``j`` of a threadgroup runs the stock
    ``qmv_fast`` or ``qmv`` work of selected expert ``j`` for
    the threadgroup's rows, one more simdgroup the shared expert's. Each row
@@ -37,10 +36,11 @@ dependent launches instead of four. Other shapes run the softmax and top-k
 as their own launch (``qwen35_moe_router.softmax_topk_row``).
 
 The result is bit-identical to the composed path. The quantized dot products
-reuse the MLX 0.32.2 transcription in ``moe_verify_gather`` (4, 5, 6 and
+reuse the MLX 0.32.4 transcription in ``moe_verify_gather`` (4, 5, 6 and
 8 bits; group size 32, 64 or 128), one instantiation per weight format. MLX
-picks ``qmv_fast`` when N % 8 == 0 and K is a multiple of its kernel block
-(512 for 4/5-bit, 256 for 6/8-bit weights) and ``qmv`` otherwise.
+picks ``qmv_fast`` when K is a multiple of its kernel block
+(512 for 4/5-bit, 256 for 6/8-bit weights) and ``qmv`` otherwise. Gathered
+expert projections also require N % 8 == 0; shared projections do not.
 Routed experts are taken where gate+up takes ``qmv_fast``: one bf16 or fp16
 token, top-k 8 or 10, affine experts with scales in the activation dtype
 (Qwen3.5/3.6-35B-A3B: hidden 2048, intermediate 512; Qwen3.8-Flash-Next: 2560
@@ -591,7 +591,11 @@ def _mlx_format(layer, k: int, n: int) -> _Format | None:
     or None when the packed shape does not match."""
     if layer["weight"].shape[-2:] != (n, k * layer.bits // 32) or k % layer.group_size:
         return None
-    return _Format(layer.bits, layer.group_size, qmv_fast_layout(k, n, layer.bits))
+    return _Format(
+        layer.bits,
+        layer.group_size,
+        qmv_fast_layout(k, n, layer.bits, gathered=layer["weight"].ndim == 3),
+    )
 
 
 def _address(a: mx.array) -> int:

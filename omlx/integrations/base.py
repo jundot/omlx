@@ -10,6 +10,20 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import requests
+
+
+def bracket_host(host: str) -> str:
+    """Return ``host`` in URL-authority form, bracketing bare IPv6 literals.
+
+    ``http://::1:8000`` is not a valid URL (requests rejects it with
+    InvalidURL); the RFC 3986 form is ``http://[::1]:8000``. IPv4 literals,
+    hostnames, and already-bracketed literals pass through unchanged.
+    """
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
 
 @dataclass(frozen=True)
 class IntegrationContext:
@@ -19,6 +33,8 @@ class IntegrationContext:
     port: int
     api_key: str = ""
     model: str = ""
+    # Server default model from /health, for tools that need a starting model.
+    default_model: str = ""
     opus_model: str | None = None
     sonnet_model: str | None = None
     haiku_model: str | None = None
@@ -37,7 +53,7 @@ class IntegrationContext:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return f"http://{bracket_host(self.host)}:{self.port}"
 
     @property
     def openai_base_url(self) -> str:
@@ -52,6 +68,60 @@ class IntegrationContext:
         return self.model_type == "vlm"
 
 
+def chat_models(
+    ctx: IntegrationContext, *, prefer_public_inventory: bool = False
+) -> dict[str, dict]:
+    """Return served chat models and their metadata, in server order."""
+    # An aliased model sits under both keys; list its display id once.
+    status_models = {
+        info.get("model_alias") or model_id: info
+        for model_id, info in ctx.models_status_map.items()
+    }
+    models = status_models
+    if not models and ctx.model:
+        models = {ctx.model: ctx.models_status_map.get(ctx.model, {})}
+    if prefer_public_inventory or not status_models:
+        # Status needs a key that /v1/models may not (e.g. under
+        # allow_unauthenticated_inference), so ask for the inventory once.
+        headers = {"Authorization": f"Bearer {ctx.auth_token}"} if ctx.api_key else {}
+        try:
+            resp = requests.get(f"{ctx.base_url}/v1/models", headers=headers, timeout=5)
+            resp.raise_for_status()
+            public_models = {}
+            for model in resp.json().get("data", []):
+                if not model.get("id") or model.get("model_type") not in (
+                    "llm",
+                    "vlm",
+                    None,
+                ):
+                    continue
+                model_id = model["id"]
+                info = {**model, **status_models.get(model_id, {})}
+                if info.get("max_context_window") is None:
+                    info["max_context_window"] = model.get("max_model_len")
+                public_models[model_id] = info
+            if prefer_public_inventory or public_models:
+                models = public_models
+        except Exception:
+            pass
+
+    chat: dict[str, dict] = {}
+    for model_id, info in models.items():
+        # Records without a type (no status metadata) stay in.
+        if info.get("is_hidden"):
+            continue
+        model_type = info.get("model_type") or None
+        if model_type and model_type not in ("llm", "vlm"):
+            continue
+        chat[model_id] = info
+    return chat
+
+
+def chat_model_ids(ctx: IntegrationContext) -> list[str]:
+    """Return the served chat model ids, in server order."""
+    return list(chat_models(ctx))
+
+
 @dataclass
 class Integration:
     """Base integration definition."""
@@ -64,7 +134,7 @@ class Integration:
 
     # Whether `omlx launch <tool>` must interactively pick a model. Tools
     # that configure one model into their config need a pick; tools that
-    # register the server's whole model catalog (dsh) do not, and resolve
+    # register the server's whole model catalog (dsh, Codex) do not, and resolve
     # their optional default from `--model` / the saved per-tool setting.
     requires_model_selection: bool = True
 

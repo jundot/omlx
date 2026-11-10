@@ -60,6 +60,7 @@ PEER_RECORD_FIELDS = {
 # Module A/B endpoints + the pre-existing planner/activate API only).
 ALLOWED_ENDPOINTS = {
     "/api/cluster/pair/join/cleanup",
+    "/api/cluster/pair/invite",
 
 
     "/admin/api/cluster/forget",
@@ -673,6 +674,77 @@ process.stdout.write(JSON.stringify({ loading, ready }));
     assert "data-cluster-v2-activation-progress" in template
     assert "data-cluster-v2-activation-progress-bar" in template
     assert '<i data-lucide="check" class="w-3 h-3"></i>' not in template
+
+
+def test_prefill_accelerator_reopens_for_a_mac_in_use_and_ends_at_its_checks():
+    result = _run_wizard(
+        """
+(async () => {
+component.devicesPayload = { paired: [{ node_id: 'm5', friendly_name: 'M5max' }] };
+component.devicesLoaded = true;
+component.deploymentsLoaded = true;
+// An old record says this Mac helps M5max; its model using M5max wins.
+component.helperRole = { active: false, helps: { node_id: 'm5', name: 'M5max' } };
+let check;
+component.apiFetch = (url) => url === '/admin/api/models'
+  ? Promise.resolve({ models: [{ settings: { prefill_helper_node_id: 'm5' } }] })
+  : new Promise((resolve) => { check = resolve; });
+await component.restoreAccelerator();
+const reopened = [component.wizardState(), component.accelerator.nodeId];
+const running = component.wizardSteps().map((step) => step.state);
+check({ rows: [{ key: 'ssh', status: 'pass' }, { key: 'disk', status: 'warn' }] });
+await new Promise((resolve) => setTimeout(resolve));
+const ready = component.wizardSteps().map((step) => step.state);
+// Change setup leaves the screen until the page loads again.
+component.choosePurpose();
+await component.restoreAccelerator();
+process.stdout.write(JSON.stringify({
+  reopened, running, ready, changed: component.wizardState(),
+}));
+})();
+"""
+    )
+
+    assert result == {
+        "reopened": ["accelerator", "m5"],
+        "running": ["done", "done", "active"],
+        "ready": ["done"] * 3,
+        "changed": "purpose",
+    }
+
+
+def test_a_helper_mac_shows_whom_it_helps_until_setup_changes():
+    result = _run_wizard(
+        """
+component.devicesPayload = { paired: [{ node_id: 'm3', friendly_name: 'HJKmac' }] };
+component.helperRole = { active: false, helps: { node_id: 'm3', name: 'HJKmac' } };
+const idle = [component.wizardState(), component.helperRoleText()];
+component.helperRole = {
+  active: true, host: 'HJKmac', layers: 28, model: '/m/MiniMax',
+  helps: { node_id: 'm3', name: 'HJKmac' },
+};
+const busy = component.helperRoleText();
+const steps = component.wizardSteps().map((step) => step.state);
+component.choosePurpose(true);
+const afterPairing = component.wizardState();
+component.choosePurpose();
+const changed = component.wizardState();
+component.startAccelerator({ node_id: 'm3' });
+process.stdout.write(JSON.stringify({
+  idle, busy, steps, afterPairing, changed, picked: component.wizardState(),
+}));
+"""
+    )
+
+    assert result["idle"][0] == "helper"
+    assert result["idle"][1].startswith("It starts when HJKmac loads")
+    assert result["busy"] == "Helping HJKmac with long prompts: 28 layers of MiniMax."
+    assert result["steps"] == ["done"] * 3
+    # The chooser that opens after pairing yields; Change setup does not.
+    assert result["afterPairing"] == "helper"
+    assert result["changed"] == "purpose"
+    # Picking Prefill Accelerator for the Mac it helps shows the helper side.
+    assert result["picked"] == "helper"
 
 
 def test_retry_loading_ownership_supersedes_retained_failure_marker():
@@ -1306,6 +1378,21 @@ def test_show_code_instead_posts_the_best_reachable_address():
     assert re.search(
         r"JSON\.stringify\(\{ coordinator_addr: coordinatorAddr \}\)", javascript
     )
+
+
+def test_loopback_only_macs_explain_the_bind_instead_of_offering_pairing():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "device?.caps?.loopback_only" in javascript
+    # This Mac: a banner, because peers can never reach it.
+    assert 'x-show="deviceLoopbackOnly(selfDevice())"' in template
+    assert "cluster.v2.loopback.self_notice" in template
+    # Other Macs: every pairing entry point is disabled with the reason shown.
+    assert ':disabled="deviceLoopbackOnly(device)"' in template
+    assert ':disabled="join.busy || deviceLoopbackOnly(device)"' in template
+    assert ':disabled="pairing.busy || deviceLoopbackOnly(device)"' in template
+    assert template.count("cluster.v2.loopback.peer_notice") == 2
 
 
 def test_expired_join_offers_start_again_not_a_dead_end():
@@ -2741,9 +2828,10 @@ def test_membership_pairing_waits_for_the_selected_macs_request():
             console.log(JSON.stringify({missing, calls, open: component.membershipPanelOpen, target: component.pairing.target.node_id}));
         })();
     """)
-    assert result["missing"]["calls"] == 0
+    # Only the invite to that Mac; nothing is approved before its request.
+    assert result["missing"]["calls"] == 1
     assert result["missing"]["error"]
-    assert result["calls"] == []
+    assert result["calls"] == ["/api/cluster/pair/invite"]
     assert result["open"] is True
     assert result["target"] == "new"
 

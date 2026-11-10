@@ -160,4 +160,29 @@ final class UpdateControllerPrefsTests: XCTestCase {
         XCTAssertEqual(saved?["autoNotify"] as? Bool, false)
         XCTAssertNil(saved?["autoDownload"])
     }
+
+    /// The legacy `autoDownload` key was the old background download toggle.
+    /// A saved `false` keeps it off, and prefs without either key default to on.
+    func testBackgroundDownloadHonorsLegacyKeyAndDefaultsOn() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omlx-update-prefs-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let legacy = dir.appendingPathComponent("legacy.json")
+        try Data(
+            #"{"channel":"stable","autoCheck":true,"autoDownload":false}"#.utf8
+        ).write(to: legacy)
+        XCTAssertFalse(UpdateController(storeURL: legacy, currentVersion: "0.0.0").backgroundDownload)
+
+        let current = dir.appendingPathComponent("current.json")
+        try Data(
+            #"{"channel":"stable","autoCheck":true,"autoNotify":false}"#.utf8
+        ).write(to: current)
+        let controller = UpdateController(storeURL: current, currentVersion: "0.0.0")
+        XCTAssertTrue(controller.backgroundDownload)
+
+        controller.backgroundDownload = false
+        XCTAssertFalse(UpdateController(storeURL: current, currentVersion: "0.0.0").backgroundDownload)
+    }
 }

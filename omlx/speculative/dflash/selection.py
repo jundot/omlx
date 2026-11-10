@@ -37,6 +37,40 @@ def sample_positions(logits: mx.array, samplers: list) -> list[tuple]:
     return out
 
 
+def select_markov(markov, logits, anchors, samplers) -> list[tuple]:
+    """DSpark proposals: each position adds the Markov transition from the
+    previously chosen token, left to right.
+
+    Every row gets one lazy ``(1,)`` token per position, so a row whose depth
+    controller verifies a shorter prefix never evaluates the steps behind it.
+    """
+    batch = len(samplers)
+    prev = anchors.reshape(-1)
+    tokens, accepts = [], [[] for _ in range(batch)]
+    for step in range(logits.shape[1]):
+        step_logits = markov.apply_step_logits(logits[:, step], prev)
+        if all(sampler is None for sampler in samplers):
+            prev = mx.argmax(step_logits, axis=-1)
+        else:
+            lp = step_logits - mx.logsumexp(step_logits, axis=-1, keepdims=True)
+            picks = []
+            for index, sampler in enumerate(samplers):
+                if sampler is None:
+                    picks.append(mx.argmax(step_logits[index : index + 1], axis=-1))
+                    continue
+                token, accept_lp = bg._sample_draft_with_logprobs(
+                    sampler, lp[index : index + 1]
+                )
+                picks.append(token.reshape(1))
+                accepts[index].append(accept_lp.reshape(-1))
+            prev = mx.concatenate(picks)
+        tokens.append(prev)
+    return [
+        ([token[index : index + 1] for token in tokens], accepts[index])
+        for index in range(batch)
+    ]
+
+
 def sample_candidates(scores: mx.array, sampler) -> tuple[mx.array, mx.array]:
     """Draw from ``sampler``'s filters applied to candidate scores ``(1, C)``.
 

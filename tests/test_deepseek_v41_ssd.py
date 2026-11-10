@@ -86,10 +86,12 @@ def test_legacy_anchor_and_invalid_metadata():
 @pytest.mark.parametrize("block_size", [3, 4])
 @pytest.mark.parametrize("engram", [False, True])
 @pytest.mark.parametrize("extend_prefix", [False, True])
-@pytest.mark.parametrize("decoder_replay", [False, True])
+@pytest.mark.parametrize("decoder_replay", [False, True, "skip"])
 def test_real_ssd_reopen_full_and_partial_prefix(
     tmp_path, block_size, engram, extend_prefix, decoder_replay
 ):
+    """With "skip", every boundary but the last skips its decoder tail, so
+    partial prefixes restore the replay slots and replay them."""
     apply_patch()
     mx.random.seed(18)
     cfg_args = (
@@ -143,11 +145,15 @@ def test_real_ssd_reopen_full_and_partial_prefix(
         prefix = open_prefix(ssd)
         assert not prefix._gdn_split_layout_supported(["DeepseekV41Cache"] * len(model.layers))
         for end in range(block_size, 13, block_size):
+            following = block_size if decoder_replay == "skip" and end < 12 else 0
             mx.eval(
                 model._omlx_prefill(
-                    mx.array([tokens[end - block_size : end]]), cache=state
+                    mx.array([tokens[end - block_size : end]]),
+                    cache=state,
+                    next_prefill_tokens=following,
                 )
             )
+            assert state[3].has_pending() == bool(following)
             assert store.save("probe", end, state, extract, block_size=block_size)
         _wait_empty(lambda: store._pending_writes)
         snapshots = {
@@ -205,18 +211,21 @@ def test_real_ssd_reopen_full_and_partial_prefix(
                 assert cache.cache[2].dtype == mx.uint8
                 assert cache.cache[3].dtype == mx.uint8
             actual = model(mx.array([[20, 21]]), cache=restored)
-            if decoder_replay:
-                # Replay approximates each chunk boundary. Compare restoration
-                # with the identical uncached execution, not full-depth prefill.
-                fresh_cache = model.make_cache()
-                for start in range(0, count, block_size):
-                    model._omlx_prefill(
-                        mx.array([tokens[start : start + block_size]]),
-                        cache=fresh_cache,
-                    )
-                fresh = model(mx.array([[20, 21]]), cache=fresh_cache)
-            else:
-                fresh = model(mx.array([tokens[:count] + [20, 21]]))[:, -2:]
+            # Compare restoration with the identical uncached execution, not a
+            # one-shot prefill. Replay approximates each chunk boundary. Without
+            # replay, prefill attention over more than 8 queries runs on simdgroup
+            # matrices (kernels.packed_sparse_attention), so one-shot and chunked
+            # outputs differ in the last bits, and DeepSeek-V4.1-Flash-1017 rounds
+            # that output to FP8 (act_quant(o)): on some GPUs a code moves by one
+            # step (8e-4 on these logits). test_chunk_boundaries_and_late_join
+            # compares chunked with one-shot prefill on one kernel.
+            fresh_cache = model.make_cache()
+            for start in range(0, count, block_size):
+                model._omlx_prefill(
+                    mx.array([tokens[start : start + block_size]]),
+                    cache=fresh_cache,
+                )
+            fresh = model(mx.array([[20, 21]]), cache=fresh_cache)
             np.testing.assert_allclose(actual, fresh, atol=1e-5)
     finally:
         store.shutdown()

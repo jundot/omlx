@@ -157,6 +157,11 @@ class RequestOutputCollector:
                 else existing.generated_until
             ),
             tool_calls=new.tool_calls,  # Preserve tool_calls for Harmony models
+            logprobs=(
+                (existing.logprobs or []) + (new.logprobs or [])
+                if existing.logprobs or new.logprobs
+                else None
+            ),
             cached_tokens=new.cached_tokens,
             error=new.error or existing.error,
             error_code=new.error_code or existing.error_code,

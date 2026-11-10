@@ -33,6 +33,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "cache_reasoning_output",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
+    "gpu_power_limit_w",
     "reasoning_parser",
     "guided_grammar_enabled",
     "guided_grammar",
@@ -44,6 +45,7 @@ UNIVERSAL_PROFILE_FIELDS = (
 # Model-specific fields — eligible for per-model profiles only (never templates).
 MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_kv_enabled",
+    "turboquant_kv_scheme",
     "turboquant_kv_bits",
     "turboquant_skip_last",
     "qwen35_ane_prefill_enabled",
@@ -63,8 +65,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_cpu_gdn_fraction",
     "qwen35_ane_prefill_cpu_threads",
     "qwen35_ane_prefill_cpu_shared_resource",
-    "qwen35_oq_a8_enabled",
-    "qwen35_oq_a8_min_tokens",
+    "a8_prefill_enabled",
+    "a8_prefill_min_tokens",
     "moe_expert_offload_enabled",
     "moe_expert_offload_resident_fraction",
     "dflash_enabled",
@@ -106,6 +108,12 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "deepseek_v41_engram_ssd_offload",
         # Architecture-level prefill strategy; explicit per model.
         "deepseek_v41_ced_prefill_enabled",
+        # Which other Mac helps depends on this setup, not on the model.
+        "prefill_helper_node_id",
+        "prefill_helper_layers",
+        # Only meaningful for checkpoints that carry bfloat16 leaves; the
+        # dashboard gates it per model, so a profile must not carry it over.
+        "activation_fp16_enabled",
         # Gain and memory cost depend on the checkpoint's GDN recipe.
         "qwen4_gdn_decode_wide_proj",
         # Which engine serves the model depends on what this Mac has installed.
@@ -123,6 +131,26 @@ UNIVERSAL_FIELDS_SET = frozenset(UNIVERSAL_PROFILE_FIELDS)
 PROFILE_FIELDS_SET = UNIVERSAL_FIELDS_SET | frozenset(MODEL_SPECIFIC_PROFILE_FIELDS)
 
 
+# Fields renamed after a release; stored records and uploaded recipes may
+# still carry the old names.
+RENAMED_FIELDS = {
+    "qwen35_oq_a8_enabled": "a8_prefill_enabled",
+    "qwen35_oq_a8_min_tokens": "a8_prefill_min_tokens",
+}
+
+
+def rename_legacy_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """Return ``data`` with old field names replaced; a current name wins."""
+    if not data.keys() & RENAMED_FIELDS.keys():
+        return data
+    renamed = {}
+    for key, value in data.items():
+        current = RENAMED_FIELDS.get(key, key)
+        if current == key or current not in data:
+            renamed[current] = value
+    return renamed
+
+
 def _filter_and_sanitize(
     data: dict[str, Any], allowed: frozenset[str]
 ) -> dict[str, Any]:
@@ -132,6 +160,7 @@ def _filter_and_sanitize(
     inputs); under snapshot apply an unset field must be absent, so both are
     dropped on save and when overlaying stored (possibly legacy) records.
     """
+    data = rename_legacy_fields(data)
     return {
         k: v for k, v in data.items() if k in allowed and v is not None and v != ""
     }

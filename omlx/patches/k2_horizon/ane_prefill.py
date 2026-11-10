@@ -139,7 +139,7 @@ def _matmul(x, part):
 
 class PrefillMLP:
     def __init__(self, reference, *, cut, width=TILE):
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
 
         if fast._ext is None or not hasattr(fast._ext, "ane_compile_program"):
             raise RuntimeError("K2 ANE prefill requires the native ANE extension")
@@ -213,7 +213,7 @@ class PrefillMLP:
         return x, planar, count
 
     def finish(self, prepared, *, alongside=None):
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
 
         x, planar, count = prepared
         gpu = self._gpu(x)

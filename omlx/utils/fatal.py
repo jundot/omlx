@@ -31,3 +31,12 @@ def exit_if_gpu_submissions_ignored(error: Exception) -> None:
     """Exit when Metal rejects further GPU submissions from this process."""
     if "kIOGPUCommandBufferCallbackErrorSubmissionsIgnored" in str(error):
         fatal_exit(f"Metal GPU submissions disabled: {error}")
+
+
+def is_command_buffer_error(error: BaseException) -> bool:
+    """Whether ``error`` reports a failed Metal command buffer.
+
+    MLX clears the stored error when it raises it, so a handler that drops
+    this error leaves the engine running on results the GPU discarded.
+    """
+    return "Command buffer execution failed" in str(error)

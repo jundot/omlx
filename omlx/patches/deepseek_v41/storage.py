@@ -6,6 +6,7 @@ Copies leave the mapping under the lock, so close cannot invalidate a live view.
 Resident tables retain their packed bytes; prefetch workers only copy CPU rows.
 """
 
+import ctypes
 import fcntl
 import json
 import math
@@ -37,11 +38,77 @@ SAFETENSORS_NUMPY_DTYPES = {
     "F8_E8M0FNU": "u1",
 }
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-PAGE_PREFETCH_MIN_ROWS = 128
 PAGE_IO_WORKERS = 48
 _PAGE_IO_POOL = ThreadPoolExecutor(
     max_workers=PAGE_IO_WORKERS, thread_name_prefix="v41-page-io"
 )
+
+
+# Rows per positional read, and the largest hole read through instead of split.
+# On a cold SSD one read across a hole up to 64KiB is faster than two reads.
+ROW_BATCH_ROWS = 256
+ROW_BATCH_MAX_GAP = 65536
+ROW_READ_RETRY_SECONDS = 60.0
+
+# mincore observes the file cache without faulting the mapping into memory.
+_MINCORE = ctypes.CDLL(None).mincore
+_MINCORE.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
+_MINCORE.restype = ctypes.c_int
+
+
+def _read_row_runs(fd, rows, base, row_bytes):
+    """Copy rows in input order, one positional read per run of nearby rows."""
+    unique, inverse = np.unique(rows, return_inverse=True)
+    index = np.arange(unique.size)
+    first = np.ones(unique.size, dtype=bool)
+    first[1:] = (np.diff(unique) - 1) * row_bytes > ROW_BATCH_MAX_GAP
+    run = np.maximum.accumulate(np.where(first, index, 0))
+    first |= (index - run) % ROW_BATCH_ROWS == 0
+    run = np.maximum.accumulate(np.where(first, index, 0))
+    # Byte offset of each row inside the read of its run.
+    inner = ((unique - unique[run]) * row_bytes).tolist()
+    starts = np.flatnonzero(first)
+    stops = np.append(starts[1:], unique.size)
+    runs = list(
+        zip(
+            starts.tolist(),
+            stops.tolist(),
+            (base + unique[starts] * row_bytes).tolist(),
+            ((unique[stops - 1] - unique[starts] + 1) * row_bytes).tolist(),
+        )
+    )
+    packed = np.empty((unique.size, row_bytes), dtype=np.uint8)
+    target = memoryview(packed).cast("B")
+
+    def copy(group):
+        for low, high, offset, length in group:
+            data = os.pread(fd, length, offset)
+            while len(data) < length:
+                more = os.pread(fd, length - len(data), offset + len(data))
+                if not more:
+                    raise ValueError("Truncated Engram rows")
+                data += more
+            if length == (high - low) * row_bytes:
+                target[low * row_bytes : high * row_bytes] = data
+                continue
+            data = memoryview(data)
+            for row in range(low, high):
+                start = inner[row]
+                target[row * row_bytes : (row + 1) * row_bytes] = data[
+                    start : start + row_bytes
+                ]
+
+    # Bound the queue as well as the active reads. The caller holds _lock;
+    # drain every worker, including on error, before close can release fd.
+    futures = []
+    try:
+        for worker in range(min(PAGE_IO_WORKERS, len(runs))):
+            futures.append(_PAGE_IO_POOL.submit(copy, runs[worker::PAGE_IO_WORKERS]))
+    finally:
+        wait(futures)
+    for future in futures:
+        future.result()
+    return packed[inverse]
 
 
 def _resident_buffer(shape, dtype):
@@ -77,6 +144,8 @@ class TensorFile:
             self._file_size = os.fstat(self._file.fileno()).st_size
             self._seen_pages = None
             self._last_rearm = 0.0
+            # Per tensor: weights can leave the file cache while scales stay.
+            self._row_reads_until = {}
             # Engram hashes select sparse rows throughout the table. Whole-tensor
             # resident reads use readinto below and do not use this mapping.
             if hasattr(self._mapping, "madvise"):
@@ -140,21 +209,49 @@ class TensorFile:
                 if rows.size and (rows.min() < 0 or rows.max() >= view.shape[0]):
                     raise IndexError("Engram row outside table")
                 gather_start = None
+                gather_rows = rows.size
+                copied = None
                 row_bytes = (end - start) // view.shape[0] if view.shape[0] else 0
-                if (
-                    rows.size > PAGE_PREFETCH_MIN_ROWS
-                    and 0 < row_bytes <= PAGE_SIZE
-                    and self._prefetch_pages(rows, self._start + start, row_bytes)
-                ):
-                    gather_start = time.perf_counter()
-                copied = view[rows]  # Advanced indexing already copies the rows.
+                if rows.size and 0 < row_bytes <= PAGE_SIZE:
+                    base = self._start + start
+                    flat = rows.reshape(-1)
+                    fresh, cold = self._unseen_rows(flat, base, row_bytes)
+                    # Wide reads gather warm rows from the mapping only while
+                    # their pages are still cached. Narrow mixed reads read all.
+                    if flat.size > PAGE_IO_WORKERS * ROW_BATCH_ROWS:
+                        if self._warm_evicted(key, flat[~cold], base, row_bytes):
+                            cold[:] = True
+                    elif cold.any():
+                        cold[:] = True
+                    if cold.any():
+                        exact = (
+                            _read_row_runs(
+                                self._file.fileno(), flat[cold], base, row_bytes
+                            )
+                            .view(dt)
+                            .reshape((-1,) + view.shape[1:])
+                        )
+                        if cold.all():
+                            copied = exact
+                        else:
+                            copied = np.empty((flat.size,) + view.shape[1:], dtype=dt)
+                            copied[cold] = exact
+                            gather_rows = int(np.count_nonzero(~cold))
+                            gather_start = time.perf_counter()
+                            copied[~cold] = view[flat[~cold]]
+                        copied = copied.reshape(rows.shape + view.shape[1:])
+                        self._seen_pages[fresh] = 1
+                    else:
+                        gather_start = time.perf_counter()
+                if copied is None:
+                    copied = view[rows]  # Advanced indexing already copies the rows.
                 if gather_start is not None:
                     elapsed = time.perf_counter() - gather_start
                     now = time.monotonic()
                     # As in Qwen4-Exp, a slow warm gather can indicate eviction.
                     # This only changes I/O scheduling, never the selected rows.
                     if (
-                        elapsed > 0.0005 + 2e-6 * rows.size
+                        elapsed > 0.0005 + 2e-6 * gather_rows
                         and now - self._last_rearm >= 60
                     ):
                         self._seen_pages = None
@@ -162,50 +259,48 @@ class TensorFile:
                 return copied, dtype
             return np.array(view, copy=True), dtype
 
-    def _prefetch_pages(self, rows, base, row_bytes):
-        """Read unseen pages concurrently before gathering from the mmap."""
-        if self._seen_pages is None:
-            self._seen_pages = np.zeros(
-                (self._file_size + PAGE_SIZE - 1) // PAGE_SIZE, dtype=np.uint8
-            )
-        offsets = base + rows.reshape(-1) * row_bytes
+    def _warm_evicted(self, key, rows, base, row_bytes):
+        """Sample warm rows; one uncached page keeps the key on reads for a while."""
+        now = time.monotonic()
+        if now < self._row_reads_until.get(key, 0.0):
+            return True
+        count = min(rows.size, PAGE_IO_WORKERS)
+        offsets = (
+            base + rows[np.linspace(0, rows.size - 1, count, dtype=np.intp)] * row_bytes
+        )
         pages = np.unique(
             np.concatenate(
                 (offsets // PAGE_SIZE, (offsets + row_bytes - 1) // PAGE_SIZE)
             )
         )
-        fresh = pages[self._seen_pages[pages] == 0]
-        if not fresh.size:
-            return True
-        fd = self._file.fileno()
-
-        def touch(group):
-            for page in group:
-                offset = int(page) * PAGE_SIZE
-                remaining = min(PAGE_SIZE, self._file_size - offset)
-                while remaining:
-                    data = os.pread(fd, remaining, offset)
-                    if not data:
-                        raise ValueError("Truncated Engram page")
-                    offset += len(data)
-                    remaining -= len(data)
-
-        # Bound the queue as well as the active reads. The caller holds _lock;
-        # drain every worker, including on error, before close can release fd.
-        futures = []
-        try:
-            for group in np.array_split(fresh, min(PAGE_IO_WORKERS, fresh.size)):
-                futures.append(_PAGE_IO_POOL.submit(touch, group))
-        finally:
-            wait(futures)
-        for future in futures:
-            future.result()
-        self._seen_pages[fresh] = 1
+        address = np.frombuffer(self._mapping, dtype=np.uint8, count=1).ctypes.data
+        state = ctypes.c_ubyte()
+        for page in pages.tolist():
+            if (
+                _MINCORE(address + page * PAGE_SIZE, PAGE_SIZE, ctypes.byref(state))
+                or not state.value & 1
+            ):
+                self._row_reads_until[key] = now + ROW_READ_RETRY_SECONDS
+                return True
         return False
+
+    def _unseen_rows(self, rows, base, row_bytes):
+        """Unseen pages and a mask of rows touching any of those pages."""
+        if self._seen_pages is None:
+            self._seen_pages = np.zeros(
+                (self._file_size + PAGE_SIZE - 1) // PAGE_SIZE, dtype=np.uint8
+            )
+        offsets = base + rows.reshape(-1) * row_bytes
+        first = offsets // PAGE_SIZE
+        last = (offsets + row_bytes - 1) // PAGE_SIZE
+        cold = (self._seen_pages[first] == 0) | (self._seen_pages[last] == 0)
+        pages = np.unique(np.concatenate((first[cold], last[cold])))
+        return pages[self._seen_pages[pages] == 0], cold
 
     def close(self):
         with self._lock:
             self._seen_pages = None
+            self._row_reads_until.clear()
             if self._mapping is not None:
                 self._mapping.close()
                 self._mapping = None
@@ -224,6 +319,52 @@ def decode_array(raw, dtype):
             raise ValueError("NaN E8M0 scale in checkpoint")
         return mx.array(np.exp2(raw.astype(np.float32) - 127))
     return mx.array(raw)
+
+
+def decode_rows(data, shape, bits, group_size, scaled):
+    """bf16 rows of shape ``shape + (dim,)`` from packed table rows.
+
+    ``data`` holds ``(raw, dtype)`` for the weight, then scales and biases.
+    """
+    values = decode_array(*data[0])
+    if bits is not None:
+        values = mx.dequantize(
+            values,
+            decode_array(*data[1]),
+            decode_array(*data[2]),
+            bits=bits,
+            group_size=group_size,
+            mode="affine",
+        )
+    elif scaled:
+        scales = decode_array(*data[1])
+        values = (values.reshape(values.shape[0], -1, 32) * scales[..., None]).reshape(
+            values.shape
+        )
+    return values.reshape(*shape, values.shape[-1]).astype(mx.bfloat16)
+
+
+# Engram inputs of several requests with at most this many rows (batched decode, verify
+# blocks) are projected row by row in input order.
+DECODE_ROWS = 16
+
+
+def dedupe_tuple_ids(ids):
+    """Unique Engram 24-id tuples for wide prefill rows, and their inverse.
+
+    Decode/verify rows stay in input order; wide prefill rows can repeat the
+    same (ngram, head) tuple, so embedding and wkv work would be duplicated.
+    Returns the original ids with no inverse when every tuple is unique.
+    """
+    host = np.asarray(ids, dtype=np.int64)
+    rows = host.shape[0] * host.shape[1] if host.ndim == 3 else 0
+    if host.ndim != 3 or rows <= 8 or (host.shape[0] > 1 and rows <= DECODE_ROWS):
+        return host, None
+    flat = host.reshape(-1, host.shape[-1])
+    unique, inverse = np.unique(flat, axis=0, return_inverse=True)
+    if unique.shape[0] == flat.shape[0]:
+        return host, None
+    return unique, inverse.reshape(host.shape[:-1])
 
 
 class DiskEngramEmbedding(nn.Module):
@@ -318,6 +459,11 @@ class DiskEngramEmbedding(nn.Module):
                     result.append((raw[rows], dtype))
             return result
 
+    def read_packed(self, host):
+        """Packed rows of ``host`` and the ``decode_rows`` settings for them."""
+        settings = (self._bits, self._group_size, self._scale_key is not None)
+        return self._read_rows(host), settings
+
     def __call__(self, indices):
         host = np.asarray(indices).astype(np.int64)
         pending, self._prefetched = self._prefetched, None
@@ -328,22 +474,9 @@ class DiskEngramEmbedding(nn.Module):
                 data = self._read_rows(host)
         else:
             data = self._read_rows(host)
-        values = decode_array(*data[0])
-        if self._bits is not None:
-            values = mx.dequantize(
-                values,
-                decode_array(*data[1]),
-                decode_array(*data[2]),
-                bits=self._bits,
-                group_size=self._group_size,
-                mode="affine",
-            )
-        elif self._scale_key is not None:
-            scales = decode_array(*data[1])
-            values = (
-                values.reshape(values.shape[0], -1, 32) * scales[..., None]
-            ).reshape(values.shape)
-        return values.reshape(*host.shape, values.shape[-1]).astype(mx.bfloat16)
+        return decode_rows(
+            data, host.shape, self._bits, self._group_size, self._scale_key is not None
+        )
 
     def close(self):
         with self._lock:
@@ -354,11 +487,13 @@ class DiskEngramEmbedding(nn.Module):
                 self._scales.close()
 
 
-PREFETCH_BYTES = 16 * 1024 * 1024
+# Include packed rows and their IDs for wider prefill chunks. Only one read
+# remains pending per model; larger gathers still use the synchronous path.
+PREFETCH_BYTES = 64 * 1024 * 1024
 
 
 class EngramPrefetch:
-    """One pending CPU read per model, drained at each forward boundary."""
+    """One pending CPU read per forward, plus an optional next-chunk carry."""
 
     def __init__(self):
         self._executor = ThreadPoolExecutor(
@@ -367,24 +502,64 @@ class EngramPrefetch:
         self._pending = None
         self._closed = False
 
+    def has_pending(self) -> bool:
+        return self._pending is not None
+
     def submit(self, embed, ids):
-        self.drain()
         if self._closed:
             raise RuntimeError("Engram prefetch is closed")
+        host = np.asarray(ids, dtype=np.int64).copy()
         if not isinstance(embed, DiskEngramEmbedding) or embed._resident is not None:
             return
-        host = np.asarray(ids, dtype=np.int64).copy()
+        host, _ = dedupe_tuple_ids(host)
+        # A carry read activated by a previous chunk is already exactly the
+        # rows this layer consumes; leave it in place instead of re-reading.
+        pending = embed._prefetched
+        if pending is not None and np.array_equal(pending[0], host):
+            return
+        self.drain()
         if embed.selected_bytes(host.size) + host.nbytes > PREFETCH_BYTES:
             return
         future = self._executor.submit(embed._read_rows, host)
         embed._prefetched = (host, future)
-        self._pending = (embed, future)
+        self._pending = (embed, future, host)
+
+    def submit_carry(self, embed, ids):
+        """Start a next-chunk read without installing it on the embed.
+
+        The row data stays owned by this manager until ``activate()``; the
+        active forward's own ``_prefetched`` slot remains untouched.
+        """
+        if self._closed:
+            raise RuntimeError("Engram prefetch is closed")
+        if self._pending is not None:
+            raise ValueError("Engram carry prefetch already pending")
+        host = np.asarray(ids, dtype=np.int64).copy()
+        if not isinstance(embed, DiskEngramEmbedding) or embed._resident is not None:
+            return False
+        host, _ = dedupe_tuple_ids(host)
+        if embed.selected_bytes(host.size) + host.nbytes > PREFETCH_BYTES:
+            return False
+        future = self._executor.submit(embed._read_rows, host)
+        self._pending = (embed, future, host)
+        return True
+
+    def activate(self) -> bool:
+        """Install a completed next-chunk carry as the active embed read."""
+        pending = self._pending
+        if pending is None:
+            return False
+        embed, future, host = pending
+        embed._prefetched = (host, future)
+        return True
 
     def drain(self):
         pending, self._pending = self._pending, None
         if pending is not None:
-            embed, future = pending
-            embed._prefetched = None
+            embed, future, _ = pending
+            installed = embed._prefetched
+            if installed is not None and installed[1] is future:
+                embed._prefetched = None
             if not future.cancel():
                 future.result()
 

@@ -30,6 +30,8 @@
                                         <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : 'unknown') + ')'"></option>
                                     </template>
                                 </select>
+                                <p x-show="benchGpuPowerLimit(ctxBenchModelId)" x-cloak class="text-xs text-amber-700 mt-1.5"
+                                   x-text="window.t('bench.config.gpu_power_limit_note').replace('{watts}', () => benchGpuPowerLimit(ctxBenchModelId))"></p>
                             </div>
 
                             <!-- Target context window -->
@@ -77,7 +79,7 @@
                             <!-- Warning callout -->
                             <div class="bg-amber-50 border border-amber-200 rounded-xl px-5 py-4">
                                 <div class="flex items-start gap-3">
-                                    <i data-lucide="alert-triangle" class="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5"></i>
+                                    <i data-lucide="alert-triangle" class="w-5 h-5 text-amber-700 flex-shrink-0 mt-0.5"></i>
                                     <div class="text-sm text-amber-900 space-y-1">
                                         <p class="font-semibold">{{ t('ctx_bench.warning.title') }}</p>
                                         <p>{{ t('ctx_bench.warning.long_time') }}</p>

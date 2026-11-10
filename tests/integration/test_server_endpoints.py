@@ -882,6 +882,67 @@ class TestResponsesEndpoint:
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
 
+    def test_harmony_history_drops_reasoning_content(self, tmp_path):
+        from omlx.server import app, _server_state
+
+        engine = RecordingResponsesEngine(outputs=[MockGenerationOutput(text="Done.")])
+        pool = MockEnginePool(llm_engine=engine)
+
+        def tool_turn(call_id, reasoning, text=None):
+            summary = [{"type": "summary_text", "text": reasoning}]
+            items = [{"type": "reasoning", "summary": summary}]
+            if text:
+                content = [{"type": "output_text", "text": text}]
+                items.append(
+                    {"type": "message", "role": "assistant", "content": content}
+                )
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "f",
+                    "arguments": "{}",
+                }
+            )
+            items.append(
+                {"type": "function_call_output", "call_id": call_id, "output": "ok"}
+            )
+            return items
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_store = _server_state.responses_store
+        try:
+            _server_state.engine_pool = pool
+            _server_state.default_model = "test-model"
+            _server_state.responses_store = ResponseStore(
+                state_dir=tmp_path / "response-state"
+            )
+            client = TestClient(app)
+
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "test-model",
+                    "input": [
+                        {"type": "message", "role": "user", "content": "List."},
+                        *tool_turn("call_1", "First call."),
+                        *tool_turn("call_2", "Second call.", text="Let me check."),
+                    ],
+                },
+            )
+            assert response.status_code == 200
+
+            messages = engine.recorded_messages[-1]
+            tool_turns = [msg for msg in messages if msg.get("tool_calls")]
+            assert len(tool_turns) == 2
+            assert tool_turns[1]["content"] == "Let me check."
+            assert not any("reasoning_content" in msg for msg in messages)
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.responses_store = original_store
+
 
 class TestModelsStatusEndpoint:
     """Tests for the /v1/models/status endpoint."""
@@ -991,6 +1052,30 @@ class TestCompletionEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "choices" in data
+
+    @pytest.mark.parametrize(
+        "prompt", ["Only prompt", ["First prompt", "Second prompt"]]
+    )
+    def test_completion_request_id_header(self, client, mock_llm_engine, prompt):
+        """The header names the engine request; a list prompt has no single one."""
+        mock_llm_engine.generate = AsyncMock(
+            return_value=MockGenerationOutput(text="Generated response.")
+        )
+
+        response = client.post(
+            "/v1/completions", json={"model": "test-model", "prompt": prompt}
+        )
+
+        assert response.status_code == 200
+        ids = [
+            call.kwargs.get("_request_id")
+            for call in mock_llm_engine.generate.call_args_list
+        ]
+        if isinstance(prompt, list):
+            assert ids == [None, None]
+            assert "x-omlx-request-id" not in response.headers
+        else:
+            assert ids == [response.headers["x-omlx-request-id"]]
 
     def test_completion_includes_cached_tokens_on_cache_hit(
         self, client, mock_llm_engine
@@ -1456,6 +1541,45 @@ class TestChatCompletionEndpoint:
             assert manager.calls == []
             assert recorded_count_tools == [None]
             assert "tools" not in recorded_chat_kwargs[0]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "text,reasoning_tokens",
+    [("<think>Need to reason.</think>Hello!", 3), ("Just an answer.", 0)],
+)
+def test_chat_usage_reports_reasoning_tokens(
+    client, mock_llm_engine, stream, text, reasoning_tokens
+):
+    output = MockGenerationOutput(text=text, new_text=text)
+    payload = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+    if stream:
+
+        async def stream_chat(messages, **kwargs):
+            yield output
+
+        mock_llm_engine.stream_chat = stream_chat
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+    else:
+        mock_llm_engine.chat = AsyncMock(return_value=output)
+
+    response = client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        usage = next(event["usage"] for event in events if event.get("usage"))
+    else:
+        usage = response.json()["usage"]
+    assert usage["completion_tokens_details"]["reasoning_tokens"] == reasoning_tokens
 
 
 class TestAnthropicMessagesEndpoint:
@@ -1958,6 +2082,12 @@ class TestSystemOneEndpoint:
         },
     }
 
+    @pytest.fixture(autouse=True)
+    def _decision_entry(self, mock_engine_pool):
+        mock_engine_pool._entries["test-clef-model"] = SimpleNamespace(
+            engine_type="decision"
+        )
+
     def test_systemone_response_shape(self, client, mock_decision_engine):
         video = "data:video/mp4;base64,AAAA"
         response = client.post(
@@ -2017,12 +2147,17 @@ class TestSystemOneEndpoint:
         assert str(error) in response.text
         assert mock_engine_pool.release_calls == ["test-clef-model"]
 
-    def test_systemone_rejects_non_decision_model(self, client):
+    def test_systemone_with_chat_model(self, client, mock_llm_engine, mock_engine_pool):
+        TestDecisionsEndpoint._letter_chat(mock_llm_engine)
         response = client.post(
             "/v1/systemone", json={**self._BODY, "model": "test-model"}
         )
-        assert response.status_code == 400
-        assert "not a decision model" in response.text
+
+        assert response.status_code == 200
+        answers = response.json()["answers"]
+        assert answers["urgent"] == {"type": "noul", "noul": 0.7311}
+        assert answers["team"]["probabilities"] == {"billing": 0.7311, "tech": 0.2689}
+        assert mock_engine_pool.release_calls == ["test-model"]
 
     @pytest.mark.parametrize(
         "change",
@@ -3080,45 +3215,382 @@ def test_structured_output_keeps_lone_surrogate_escape(client, mock_llm_engine, 
     assert content == model_text
 
 
-@pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
-def test_nonstream_thinking_length_channels(client, mock_llm_engine, api):
-    mock_llm_engine.chat = AsyncMock(
-        return_value=MockGenerationOutput(
-            text="<think>unfinished", finish_reason="length"
-        )
-    )
-    body = {"model": "test-model", "max_tokens": 64}
-    if api == "responses":
-        body["input"] = "Reply OK"
-    else:
-        body["messages"] = [{"role": "user", "content": "Reply OK"}]
-    response = client.post(f"/v1/{api}", json=body)
-    assert response.status_code == 200, response.text
-    data = response.json()
+def _nonstream_channels(api: str, data: dict[str, Any]) -> tuple[str, str]:
+    """Return (content, reasoning) from a non-streaming response body."""
     if api == "chat/completions":
         message = data["choices"][0]["message"]
-        content = message.get("content") or ""
-        reasoning = message.get("reasoning_content") or ""
-        assert data["choices"][0]["finish_reason"] == "length"
-    elif api == "messages":
+        return message.get("content") or "", message.get("reasoning_content") or ""
+    if api == "messages":
         content = "".join(b["text"] for b in data["content"] if b["type"] == "text")
         reasoning = "".join(
             b["thinking"] for b in data["content"] if b["type"] == "thinking"
         )
-        assert data["stop_reason"] == "max_tokens"
+        return content, reasoning
+    content = "".join(
+        b["text"]
+        for item in data["output"]
+        if item["type"] == "message"
+        for b in item["content"]
+        if b["type"] == "output_text"
+    )
+    reasoning = "".join(
+        b["text"]
+        for item in data["output"]
+        if item["type"] == "reasoning"
+        for b in item["summary"]
+    )
+    return content, reasoning
+
+
+def _nonstream_body(api: str) -> dict[str, Any]:
+    body: dict[str, Any] = {"model": "test-model", "max_tokens": 64}
+    if api == "responses":
+        body["input"] = "Reply OK"
     else:
-        content = "".join(
-            b["text"]
-            for item in data["output"]
-            if item["type"] == "message"
-            for b in item["content"]
-            if b["type"] == "output_text"
+        body["messages"] = [{"role": "user", "content": "Reply OK"}]
+    return body
+
+
+@pytest.mark.parametrize("prompt_opened", [False, True])
+@pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
+def test_nonstream_thinking_length_channels(
+    client, mock_llm_engine, monkeypatch, api, prompt_opened
+):
+    if prompt_opened:
+        monkeypatch.setattr(
+            "omlx.server.prompt_opens_thinking", lambda *args, **kwargs: (True, "")
         )
-        reasoning = "".join(
-            b["text"]
-            for item in data["output"]
-            if item["type"] == "reasoning"
-            for b in item["summary"]
+    mock_llm_engine.chat = AsyncMock(
+        return_value=MockGenerationOutput(
+            text="unfinished" if prompt_opened else "<think>unfinished",
+            finish_reason="length",
         )
+    )
+    response = client.post(f"/v1/{api}", json=_nonstream_body(api))
+    assert response.status_code == 200, response.text
+    data = response.json()
+    if api == "chat/completions":
+        assert data["choices"][0]["finish_reason"] == "length"
+    elif api == "messages":
+        assert data["stop_reason"] == "max_tokens"
+    content, reasoning = _nonstream_channels(api, data)
     assert content == ""
     assert reasoning == "unfinished"
+
+
+class _PromptOpensThinkingTokenizer(MockTokenizer):
+    """Chat template that ends the generation prompt with ``<think>``.
+
+    GLM-5.3 always does this and Qwen3.x does it with thinking enabled. The
+    decoded completion text then starts inside the reasoning body, because
+    the scheduler adds its synthetic opener only to the first streamed chunk.
+    """
+
+    think_start = "<think>"
+    think_end = "</think>"
+    think_start_id = 999
+    think_end_id = 998
+    unk_token_id = -1
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return {
+            self.think_start: self.think_start_id,
+            self.think_end: self.think_end_id,
+        }.get(token, self.unk_token_id)
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        ids = super().encode(text)
+        if text.rstrip().endswith(self.think_start):
+            ids.append(self.think_start_id)
+        return ids
+
+    def apply_chat_template(
+        self, messages: list[dict], tokenize: bool = False, **kwargs
+    ) -> str:
+        return super().apply_chat_template(messages) + "\nassistant:<think>"
+
+
+@pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
+@pytest.mark.parametrize(
+    "prompt_opens, text, finish_reason, expected",
+    [
+        # A length-terminated reply that never reached </think> must stay
+        # reasoning, matching the streaming path. v0.7.1 already does that;
+        # with several blocks, cut off or stopped, it still reports the
+        # first one as the answer.
+        (True, "unfinished", "length", ("", "unfinished")),
+        (
+            True,
+            "first</think>answer<think>second",
+            "length",
+            ("answer", "first\nsecond"),
+        ),
+        (True, "done</think>answer", "stop", ("answer", "done")),
+        (
+            True,
+            "first</think>answer<think>second</think>more",
+            "stop",
+            ("answermore", "first\nsecond"),
+        ),
+        # An opener the engine already emitted is not doubled.
+        (True, "<think>echoed</think>answer", "stop", ("answer", "echoed")),
+        # A template that leaves no block open keeps tag-free text as content.
+        (False, "unfinished", "length", ("unfinished", "")),
+    ],
+)
+def test_nonstream_prompt_opened_thinking_channels(
+    client, mock_llm_engine, api, prompt_opens, text, finish_reason, expected
+):
+    if prompt_opens:
+        mock_llm_engine._tokenizer = _PromptOpensThinkingTokenizer()
+    mock_llm_engine.chat = AsyncMock(
+        return_value=MockGenerationOutput(text=text, finish_reason=finish_reason)
+    )
+    response = client.post(f"/v1/{api}", json=_nonstream_body(api))
+    assert response.status_code == 200, response.text
+    assert _nonstream_channels(api, response.json()) == expected
+
+
+class _PreserveThinkingTokenizer(_PromptOpensThinkingTokenizer):
+    """Qwen3.6+ style template: opens ``<think>`` unless thinking is off.
+
+    Templates like this advertise ``preserve_thinking``, so the pool entry
+    carries ``preserve_thinking_default=True``. With ``enable_thinking``
+    false the generation prompt closes the block, the scheduler adds no
+    opener, and the model writes its answer directly.
+    """
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        ids = MockTokenizer.encode(self, text)
+        if text.rstrip().endswith(self.think_end):
+            ids += [self.think_start_id, self.think_end_id]
+        elif text.rstrip().endswith(self.think_start):
+            ids.append(self.think_start_id)
+        return ids
+
+    def apply_chat_template(
+        self,
+        messages: list[dict],
+        tokenize: bool = False,
+        enable_thinking: bool | None = None,
+        **kwargs,
+    ) -> str:
+        prompt = MockTokenizer.apply_chat_template(self, messages) + "\nassistant:"
+        if enable_thinking is False:
+            return prompt + "<think>\n\n</think>\n\n"
+        return prompt + "<think>\n"
+
+
+def _responses_stream_channels(text: str) -> tuple[tuple[str, str], tuple[str, str]]:
+    """Return streamed (content, reasoning) deltas and the final output split.
+
+    Whitespace is stripped: the scheduler's synthetic opener ends in a newline.
+    """
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in text.splitlines()
+        if line.startswith("data: ")
+    ]
+    deltas = tuple(
+        "".join(e.get("delta", "") for e in events if e.get("type") == kind).strip()
+        for kind in (
+            "response.output_text.delta",
+            "response.reasoning_summary_text.delta",
+        )
+    )
+    final = next(
+        e["response"]
+        for e in events
+        if e.get("type") in ("response.completed", "response.incomplete")
+    )
+    return deltas, tuple(
+        part.strip() for part in _nonstream_channels("responses", final)
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["complete", "stream"])
+@pytest.mark.parametrize(
+    "enable_thinking, finish_reason, expected",
+    [
+        # Thinking off closes the block in the prompt, so the reply is the
+        # answer even though the template preserves thinking by default.
+        (False, "stop", ("Paris.", "")),
+        (False, "length", ("Paris.", "")),
+        # Control: thinking on opens the block, so a reply cut off before
+        # </think> stays reasoning.
+        (None, "length", ("", "Paris.")),
+    ],
+)
+def test_responses_preserve_thinking_model_follows_rendered_prompt(
+    client,
+    mock_engine_pool,
+    mock_llm_engine,
+    stream,
+    enable_thinking,
+    finish_reason,
+    expected,
+):
+    """Responses stream and complete reply split by the rendered prompt.
+
+    A preserve-thinking template is not evidence that the prompt opened a
+    thinking block; the scheduler decides from the rendered prompt tail, and
+    both Responses paths must follow the same detector.
+    """
+    from omlx.engine_pool import EngineEntry
+
+    mock_engine_pool._entries["test-model"] = EngineEntry(
+        model_id="test-model",
+        model_path="/models/test-model",
+        model_type="llm",
+        engine_type="batched",
+        estimated_size=1,
+        preserve_thinking_default=True,
+    )
+    mock_llm_engine._tokenizer = _PreserveThinkingTokenizer()
+
+    def output(kwargs, *, streamed):
+        ct_kwargs = kwargs.get("chat_template_kwargs") or {}
+        text = "Paris."
+        # The scheduler's synthetic opener rides on the first streamed chunk
+        # only when the rendered prompt leaves the block open.
+        new_text = (
+            "<think>\n" + text
+            if streamed and ct_kwargs.get("enable_thinking") is not False
+            else text
+        )
+        return MockGenerationOutput(
+            text=text,
+            new_text=new_text,
+            prompt_tokens=3,
+            completion_tokens=2,
+            finish_reason=finish_reason,
+            finished=True,
+        )
+
+    async def chat(messages, **kwargs):
+        return output(kwargs, streamed=False)
+
+    async def stream_chat(messages, **kwargs):
+        yield output(kwargs, streamed=True)
+
+    mock_llm_engine.chat = chat
+    mock_llm_engine.stream_chat = stream_chat
+
+    body: dict[str, Any] = {
+        "model": "test-model",
+        "input": "Reply with exactly: Paris.",
+        "max_output_tokens": 2,
+        "store": False,
+        "stream": stream,
+    }
+    if enable_thinking is not None:
+        body["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+    response = client.post("/v1/responses", json=body)
+    assert response.status_code == 200, response.text
+    if stream:
+        deltas, final = _responses_stream_channels(response.text)
+        assert deltas == expected
+        assert final == expected
+    else:
+        assert _nonstream_channels("responses", response.json()) == expected
+
+
+class TestCacheStoreHeader:
+    """X-oMLX-Cache-Store: off forwards skip_cache_store to the engine."""
+
+    @staticmethod
+    def _record(mock_llm_engine):
+        recorded: list[dict[str, Any]] = []
+
+        async def chat(messages, **kwargs):
+            recorded.append(kwargs)
+            return MockGenerationOutput(text="Chat response.")
+
+        async def stream_chat(messages, **kwargs):
+            recorded.append(kwargs)
+            yield MockGenerationOutput(
+                text="Hi", new_text="Hi", finished=True, finish_reason="stop"
+            )
+
+        async def generate(prompt, **kwargs):
+            recorded.append(kwargs)
+            return MockGenerationOutput(text="Generated response.")
+
+        async def stream_generate(prompt, **kwargs):
+            recorded.append(kwargs)
+            yield MockGenerationOutput(
+                text="Hi", new_text="Hi", finished=True, finish_reason="stop"
+            )
+
+        mock_llm_engine.chat = chat
+        mock_llm_engine.stream_chat = stream_chat
+        mock_llm_engine.generate = generate
+        mock_llm_engine.stream_generate = stream_generate
+        return recorded
+
+    @pytest.mark.parametrize("value", ["off", "OFF", " off "])
+    def test_off_skips_cache_store(self, value):
+        from starlette.datastructures import Headers
+
+        from omlx.server import _cache_store_kwargs
+
+        request = SimpleNamespace(headers=Headers({"x-omlx-cache-store": value}))
+        assert _cache_store_kwargs(request) == {"skip_cache_store": True}
+
+    @pytest.mark.parametrize(
+        "headers", [{}, {"x-omlx-cache-store": "on"}, {"x-omlx-cache-store": "false"}]
+    )
+    def test_other_values_keep_default(self, headers):
+        from starlette.datastructures import Headers
+
+        from omlx.server import _cache_store_kwargs
+
+        request = SimpleNamespace(headers=Headers(headers))
+        assert _cache_store_kwargs(request) == {}
+        assert _cache_store_kwargs(None) == {}
+
+    @pytest.mark.parametrize(
+        "path,body",
+        [
+            (
+                "/v1/chat/completions",
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                },
+            ),
+            (
+                "/v1/chat/completions",
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                },
+            ),
+            (
+                "/v1/messages",
+                {
+                    "model": "test-model",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "Hi"}],
+                },
+            ),
+            ("/v1/responses", {"model": "test-model", "input": "Hi"}),
+            ("/v1/completions", {"model": "test-model", "prompt": "Hi"}),
+            (
+                "/v1/completions",
+                {"model": "test-model", "prompt": "Hi", "stream": True},
+            ),
+        ],
+    )
+    def test_header_reaches_engine(self, client, mock_llm_engine, path, body):
+        recorded = self._record(mock_llm_engine)
+
+        response = client.post(path, json=body, headers={"X-oMLX-Cache-Store": "off"})
+        assert response.status_code == 200
+        assert recorded and recorded[-1].get("skip_cache_store") is True
+
+        recorded.clear()
+        response = client.post(path, json=body)
+        assert response.status_code == 200
+        assert recorded and "skip_cache_store" not in recorded[-1]

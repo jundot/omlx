@@ -1,5 +1,6 @@
 /*
- * Web UI color tokens. Every color the web UI draws is defined in this file.
+ * Web UI color tokens. The palette and the light semantic values live here;
+ * dashboard.css supplies the dark values of the neutral utility channels.
  * Palette entries are "R G B" channels so `rgb(var(--palette-x) / <alpha>)`
  * and Tailwind's opacity modifiers keep working. The semantic tokens below
  * name roles and refer to the palette; stylesheets and templates refer to
@@ -18,10 +19,27 @@
     --palette-neutral-800: 38 38 38;
     --palette-neutral-900: 23 23 23;
     --palette-neutral-950: 10 10 10;
+
+    /* Neutral utility channels; the dark values are in dashboard.css. */
+    --text-scale-300: var(--palette-neutral-300);
+    --text-scale-400: var(--palette-neutral-500);
+    --text-scale-500: var(--palette-neutral-500);
+    --text-scale-600: var(--palette-neutral-600);
+    --text-scale-700: var(--palette-neutral-700);
+    --text-scale-800: var(--palette-neutral-800);
+    --text-scale-900: var(--palette-neutral-900);
+    --surface-scale-white: var(--palette-white);
+    --surface-scale-50: var(--palette-neutral-50);
+    --surface-scale-100: var(--palette-neutral-100);
+    --surface-scale-200: var(--palette-neutral-200);
+    --border-scale-100: var(--palette-neutral-100);
+    --border-scale-200: var(--palette-neutral-200);
+    --border-scale-300: var(--palette-neutral-300);
     /* zinc */
     --palette-zinc-200: 228 228 231;
     --palette-zinc-300: 212 212 216;
     --palette-zinc-400: 161 161 170;
+    --palette-zinc-450: 148 148 154;
     --palette-zinc-500: 113 113 122;
     --palette-zinc-600: 82 82 91;
     --palette-zinc-700: 63 63 70;
@@ -238,41 +256,47 @@
     --palette-signal-red-600: 217 45 32;
     /* mid-gray */
     --palette-mid-gray: 128 128 128;
-    /* fabric-ink */
-    --palette-fabric-ink-450: 17 19 31;
-    --palette-fabric-ink-500: 17 19 26;
-    --palette-fabric-ink-550: 15 18 27;
-    --palette-fabric-ink-600: 16 21 34;
-    --palette-fabric-ink-700: 8 15 25;
-    --palette-fabric-ink-725: 8 13 22;
-    --palette-fabric-ink-750: 8 12 20;
-    --palette-fabric-ink-775: 10 13 20;
-    --palette-fabric-ink-800: 11 13 18;
-    --palette-fabric-ink-950: 2 6 15;
-    /* fabric-lime */
-    --palette-fabric-lime-300: 183 243 74;
-    --palette-fabric-lime-600: 118 185 0;
-    --palette-fabric-lime-800: 74 112 0;
 
     /* Surfaces, text, borders and controls */
     --bg-primary: rgb(var(--palette-white));
-    --bg-secondary: rgb(var(--palette-slate-50));
-    --bg-tertiary: rgb(var(--palette-slate-100));
+    --bg-secondary: rgb(var(--palette-neutral-50));
+    --bg-tertiary: rgb(var(--palette-neutral-100));
     --text-primary: rgb(var(--palette-slate-900));
     --text-secondary: rgb(var(--palette-slate-600));
     --text-tertiary: rgb(var(--palette-slate-500));
     --text-muted: rgb(var(--palette-slate-400));
     --border-faint: rgb(var(--palette-slate-200));
     --border-normal: rgb(var(--palette-slate-300));
-    --code-bg: rgb(var(--palette-gray-100));
+    --code-bg: rgb(var(--palette-neutral-100));
     --link-color: rgb(var(--palette-blue-600));
     --btn-primary: rgb(var(--palette-neutral-900));
-    --btn-primary-hover: rgb(var(--palette-zinc-800));
+    --btn-primary-hover: rgb(var(--palette-neutral-800));
     --btn-primary-text: rgb(var(--palette-white));
     --text-danger: rgb(var(--palette-red-500));
     --bg-danger-hover: rgb(var(--palette-red-500) / 0.1);
     --timeline-accent: rgb(var(--palette-blue-500));
     --focus-ring-color: rgb(var(--palette-neutral-900));
+    --switch-on: rgb(var(--palette-black));
+    /* Status roles. `--<role>-text` is text on the soft fill, unlike
+       `--text-danger`, which is destructive text on the page surfaces. */
+    --success: rgb(var(--palette-green-500));
+    --success-soft: rgb(var(--palette-green-50));
+    --success-line: rgb(var(--palette-green-200));
+    --success-text: rgb(var(--palette-green-700));
+    --warning: rgb(var(--palette-amber-500));
+    --warning-soft: rgb(var(--palette-amber-50));
+    --warning-line: rgb(var(--palette-amber-200));
+    --warning-text: rgb(var(--palette-amber-700));
+    --danger: rgb(var(--palette-red-500));
+    --danger-soft: rgb(var(--palette-red-50));
+    --danger-line: rgb(var(--palette-red-200));
+    --danger-text: rgb(var(--palette-red-700));
+    --info: rgb(var(--palette-blue-500));
+    --info-soft: rgb(var(--palette-blue-50));
+    --info-line: rgb(var(--palette-blue-200));
+    --info-text: rgb(var(--palette-blue-700));
+    --text-success: var(--success-text);
+    color-scheme: light;
 }
 
 [data-theme="dark"] {
@@ -281,19 +305,37 @@
     --bg-tertiary: rgb(var(--palette-night-700));
     --text-primary: rgb(var(--palette-night-50));
     --text-secondary: rgb(var(--palette-zinc-400));
-    --text-tertiary: rgb(var(--palette-zinc-500));
-    --text-muted: rgb(var(--palette-zinc-600));
+    --text-tertiary: rgb(var(--palette-zinc-450));
+    --text-muted: rgb(var(--palette-zinc-450));
     --border-faint: rgb(var(--palette-zinc-700));
     --border-normal: rgb(var(--palette-zinc-600));
     --code-bg: rgb(var(--palette-zinc-800));
     --link-color: rgb(var(--palette-blue-400));
     --btn-primary: rgb(var(--palette-neutral-200));
-    --btn-primary-hover: rgb(var(--palette-neutral-300));
+    --btn-primary-hover: rgb(var(--palette-zinc-300));
     --btn-primary-text: rgb(var(--palette-zinc-900));
     --text-danger: rgb(var(--palette-red-400));
     --bg-danger-hover: rgb(var(--palette-red-500) / 0.2);
     --timeline-accent: rgb(var(--palette-blue-400));
     --focus-ring-color: rgb(var(--palette-night-50));
+    --switch-on: rgb(var(--palette-zinc-400));
+    --success: rgb(var(--palette-green-500));
+    --success-soft: rgb(var(--palette-green-500) / 0.15);
+    --success-line: rgb(var(--palette-green-500) / 0.3);
+    --success-text: rgb(var(--palette-green-400));
+    --warning: rgb(var(--palette-amber-500));
+    --warning-soft: rgb(var(--palette-amber-500) / 0.15);
+    --warning-line: rgb(var(--palette-amber-500) / 0.3);
+    --warning-text: rgb(var(--palette-amber-400));
+    --danger: rgb(var(--palette-red-500));
+    --danger-soft: rgb(var(--palette-red-500) / 0.15);
+    --danger-line: rgb(var(--palette-red-500) / 0.3);
+    --danger-text: rgb(var(--palette-red-300));
+    --info: rgb(var(--palette-blue-500));
+    --info-soft: rgb(var(--palette-blue-500) / 0.15);
+    --info-line: rgb(var(--palette-blue-500) / 0.3);
+    --info-text: rgb(var(--palette-blue-300));
+    color-scheme: dark;
 }
 
 /* === Native select controls ===

@@ -13,6 +13,7 @@ import inspect
 import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -51,6 +52,26 @@ NEMOTRON_H = TensorStrategy(
     name="nemotron_h",
     model_types=("nemotron_h",),
     source="oMLX adapter derived from Exo's attention/Mamba/MoE strategy",
+)
+GLM5_NEXT = TensorStrategy(
+    name="glm5_next",
+    model_types=("glm5_next",),
+    source="oMLX adapter for the vendored GLM-5.3 KDA, sparse MLA and MoE layers",
+)
+QWEN3_5 = TensorStrategy(
+    name="qwen3_5",
+    model_types=("qwen3_5", "qwen3_5_moe"),
+    source="MLX-LM's Qwen3.5 shard() per layer, with the lm_head kept whole",
+)
+MINISTRAL3 = TensorStrategy(
+    name="ministral3",
+    model_types=("ministral3",),
+    source="MLX-LM's Ministral 3 shard() per layer, with the lm_head split once",
+)
+MUSE_SPARK = TensorStrategy(
+    name="muse_spark",
+    model_types=("muse_spark",),
+    source="oMLX adapter for MLX-LM's Muse Spark attention and experts",
 )
 
 
@@ -620,6 +641,248 @@ def _shard_nemotron_h(
         )
 
 
+def _glm5_rows(path: str, weight: Any) -> Any:
+    # Per-expert NVFP4 tensor scales stay whole: every rank keeps every expert.
+    if path.endswith("global_scale"):
+        return None
+    return -1 if path.endswith("bias") else max(weight.ndim - 2, 0)
+
+
+def _glm5_columns(path: str, weight: Any) -> Any:
+    if path.endswith(("bias", "global_scale")):
+        return None
+    return -1
+
+
+def _sum_outputs(module: Any, group: Any, mx: Any) -> None:
+    """Make ``module`` all-sum its output and keep its type.
+
+    The fused decode paths and the cache factory read attributes of the
+    attention and MLP modules, so a wrapper module cannot replace them.
+    """
+
+    base = type(module)
+
+    class Summed(base):  # type: ignore[misc, valid-type]
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            output = base.__call__(self, *args, **kwargs)
+            return mx.distributed.all_sum(output, group=group)
+
+    Summed.__name__ = Summed.__qualname__ = base.__name__
+    module.__class__ = Summed
+
+
+def _shard_glm5_mlp(mlp: Any, group: Any) -> None:
+    from mlx.nn.layers.distributed import shard_inplace
+
+    shard_inplace(mlp.gate_proj, _glm5_rows, group=group)
+    shard_inplace(mlp.up_proj, _glm5_rows, group=group)
+    shard_inplace(mlp.down_proj, _glm5_columns, group=group)
+
+
+@_register(GLM5_NEXT)
+def _shard_glm5_next(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    # Projections are sliced in place: the model calls its quantized matmul
+    # kernels on them directly, which would skip a sharded linear's all_sum.
+    from mlx.nn.layers.distributed import shard_inplace
+
+    layers = list(model.layers)
+    size = int(group.size())
+    rank = int(group.rank())
+    total = len(layers)
+    for index, layer in enumerate(layers):
+        mx.eval(layer.parameters())
+        attention = layer.self_attn
+        if "bias" in attention.o_proj:
+            raise ValueError("GLM-5.3 tensor parallelism needs a bias-free o_proj")
+        if layer.is_linear:
+            _require_divisible(attention.num_heads, size, "linear attention heads")
+            heads = attention.num_heads // size
+            width = heads * attention.head_dim
+            gate = attention.forget_gate
+            for projection in (
+                attention.q_proj,
+                attention.k_proj,
+                attention.v_proj,
+                attention.b_proj,
+                attention.g_b_proj,
+                gate.f_b_proj,
+            ):
+                shard_inplace(projection, _glm5_rows, group=group)
+            shard_inplace(attention.o_proj, _glm5_columns, group=group)
+            # The short conv runs over q|k|v channels.
+            channels = mx.concatenate(
+                [
+                    mx.arange(start + rank * width, start + (rank + 1) * width)
+                    for start in range(0, 3 * attention.qkv_dim, attention.qkv_dim)
+                ]
+            )
+            attention.conv1d.weight = mx.contiguous(attention.conv1d.weight[channels])
+            gate.A_log = mx.contiguous(mx.split(gate.A_log, size)[rank])
+            gate.dt_bias = mx.contiguous(mx.split(gate.dt_bias, size)[rank])
+            attention.num_heads = gate.num_heads = heads
+            attention.qkv_dim = gate.qkv_dim = width
+            attention.conv_dim = attention.conv1d.groups = 3 * width
+        else:
+            _require_divisible(attention.num_heads, size, "attention heads")
+            heads = attention.num_heads // size
+            shard_inplace(attention.q_b_proj, _glm5_rows, group=group)
+            shard_inplace(attention.o_proj, _glm5_columns, group=group)
+            for projection in (attention.embed_q, attention.unembed_out):
+                projection.apply(lambda w: mx.contiguous(mx.split(w, size)[rank]))
+            attention.num_heads = heads
+        # The latent projections, the indexer and the router stay replicated.
+        _sum_outputs(attention, group, mx)
+
+        mlp = layer.mlp
+        if hasattr(mlp, "switch_mlp"):
+            switch = mlp.switch_mlp
+            shard_inplace(switch.gate_proj, _glm5_rows, group=group)
+            shard_inplace(switch.up_proj, _glm5_rows, group=group)
+            shard_inplace(switch.down_proj, _glm5_columns, group=group)
+            if mlp.shared_experts is not None:
+                _shard_glm5_mlp(mlp.shared_experts, group)
+        else:
+            _shard_glm5_mlp(mlp, group)
+        _sum_outputs(mlp, group, mx)
+        mx.eval(layer.parameters())
+        mx.clear_cache()
+        _emit(
+            progress,
+            strategy=GLM5_NEXT.name,
+            layer=index,
+            loaded=index + 1,
+            total=total,
+        )
+
+
+def _shard_layers(
+    layers: list[Any],
+    shard_layer: Callable[[Any], None],
+    mx: Any,
+    progress: ProgressCallback | None,
+    strategy: TensorStrategy,
+) -> None:
+    total = len(layers)
+    for index, layer in enumerate(layers):
+        mx.eval(layer.parameters())
+        shard_layer(layer)
+        mx.eval(layer.parameters())
+        mx.clear_cache()
+        _emit(
+            progress,
+            strategy=strategy.name,
+            layer=index,
+            loaded=index + 1,
+            total=total,
+        )
+
+
+def _shard_vocab_head(
+    owner: Any,
+    vocab_size: int,
+    group: Any,
+    mx: Any,
+    shard_linear: Callable[..., Any] | None = None,
+) -> None:
+    """Split an untied lm_head over the vocabulary, as MLX-LM's shard() does.
+
+    The model's forward then gathers the logits over ``sharding_group``.
+    ``shard_linear`` is the model's own splitter, if it has one.
+    """
+    from mlx.nn.layers import distributed
+
+    split = shard_linear or distributed.shard_linear
+    _require_divisible(int(vocab_size), int(group.size()), "vocabulary")
+    mx.eval(owner.lm_head.parameters())
+    owner.lm_head = split(owner.lm_head, "all-to-sharded", group=group)
+    owner.sharding_group = group
+    mx.eval(owner.lm_head.parameters())
+
+
+@_register(QWEN3_5)
+def _shard_qwen3_5(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    # MLX-LM's shard() on a view with one layer and tied embeddings shards only
+    # that layer. The lm_head stays whole: Lightning MTP drafts on rank zero
+    # alone, and a vocabulary-split head needs every rank to gather its logits.
+    tied = SimpleNamespace(args=SimpleNamespace(tie_word_embeddings=True))
+
+    def shard_layer(layer: Any) -> None:
+        type(model).shard(SimpleNamespace(language_model=tied, layers=[layer]), group)
+
+    _shard_layers(list(model.layers), shard_layer, mx, progress, QWEN3_5)
+
+
+@_register(MINISTRAL3)
+def _shard_ministral3(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    # MLX-LM's shard() splits the lm_head once and then each layer, so the
+    # head is split here and each layer through a one-layer view. Its splitter
+    # also handles FP8 linears.
+    from mlx_lm.models.ministral3 import _shard_linear
+
+    if not model.args.tie_word_embeddings:
+        _shard_vocab_head(model, model.args.vocab_size, group, mx, _shard_linear)
+    tied = SimpleNamespace(tie_word_embeddings=True)
+
+    def shard_layer(layer: Any) -> None:
+        view = SimpleNamespace(args=tied, model=SimpleNamespace(layers=[layer]))
+        type(model).shard(view, group)
+
+    _shard_layers(list(model.model.layers), shard_layer, mx, progress, MINISTRAL3)
+
+
+@_register(MUSE_SPARK)
+def _shard_muse_spark(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    from mlx.nn.layers.distributed import shard_linear
+    from mlx_lm.models.muse_spark import shard_experts_inplace
+
+    size = int(group.size())
+    _require_divisible(model.args.text.num_key_value_heads, size, "KV heads")
+    _shard_vocab_head(model, model.args.text.vocab_size, group, mx)
+
+    def shard_layer(layer: Any) -> None:
+        attention = layer.self_attn
+        q_dim = attention.n_heads * attention.head_dim
+        kv_dim = attention.n_kv_heads * attention.head_dim
+        attention.qkvg_proj = shard_linear(
+            attention.qkvg_proj,
+            "all-to-sharded",
+            segments=[q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim],
+            group=group,
+        )
+        attention.o_proj = shard_linear(attention.o_proj, "sharded-to-all", group=group)
+        attention.n_heads //= size
+        attention.n_kv_heads //= size
+        # The MoE sums the expert outputs over the group.
+        layer.mlp.sharding_group = group
+        experts = layer.mlp.experts
+        shard_experts_inplace(experts.gate_proj, "all-to-sharded", group)
+        shard_experts_inplace(experts.down_proj, "sharded-to-all", group)
+        shard_experts_inplace(experts.up_proj, "all-to-sharded", group)
+
+    _shard_layers(list(model.layers), shard_layer, mx, progress, MUSE_SPARK)
+
+
 def apply_tensor_strategy(
     model: Any,
     group: Any,
@@ -645,7 +908,11 @@ def apply_tensor_strategy(
 
 
 __all__ = [
+    "GLM5_NEXT",
+    "MINISTRAL3",
+    "MUSE_SPARK",
     "NEMOTRON_H",
+    "QWEN3_5",
     "QWEN3_NEXT",
     "TensorStrategy",
     "apply_tensor_strategy",

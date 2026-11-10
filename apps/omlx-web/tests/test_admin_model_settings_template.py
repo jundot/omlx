@@ -32,7 +32,7 @@ def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
 
     turboquant = _section(
         html,
-        "<!-- TurboQuant KV Cache -->",
+        "<!-- KV Cache Compression -->",
         "<!-- Advanced Settings -->",
     )
     lightning_mtp = _section(
@@ -56,6 +56,42 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
 
 
+def test_kv_compression_dashboard_state_and_profile_serialization():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise dashboard state")
+    root = Path(__file__).resolve().parents[1]
+    script = """
+const assert = require('node:assert/strict');
+globalThis.localStorage = {getItem: () => null};
+globalThis.window = {t: key => key};
+""" + _dashboard_script() + """
+const app = dashboard();
+const legacy = app.buildModelSettingsState({}, {turboquant_kv_enabled: true, turboquant_kv_bits: 2.5});
+assert.equal(legacy.turboquant_kv_scheme, 'turboquant');
+assert.equal(legacy.turboquant_kv_bits, 2.5);
+const settings = {turboquant_kv_enabled: true, turboquant_kv_scheme: 'affine4', turboquant_kv_bits: 4};
+app.modelSettings = app.buildModelSettingsState({}, settings);
+app.profileFields = {universal: [], model_specific: ['turboquant_kv_enabled', 'turboquant_kv_scheme', 'turboquant_kv_bits']};
+assert.deepEqual(app.formValuesForProfile(), settings);
+for (const model of [{is_paroquant: true}, {config_model_type: 'diffusion_gemma'}]) {
+    const state = app.buildModelSettingsState(model, settings);
+    assert.equal(state.turboquant_kv_enabled, false);
+    assert.equal(state.turboquant_kv_scheme, 'turboquant');
+    assert.equal(state.turboquant_kv_bits, 4);
+}
+// Turning compression off must keep the affine bit width the server validates.
+for (const [scheme, bits] of [['affine8', 8], ['affine4', 4], ['turboquant', 4]]) {
+    const off = app.buildModelSettingsState({}, {turboquant_kv_enabled: false, turboquant_kv_scheme: scheme, turboquant_kv_bits: 8});
+    const payload = app.buildModelSettingsPayload(off);
+    assert.equal(payload.turboquant_kv_scheme, scheme);
+    assert.equal(payload.turboquant_kv_bits, bits);
+}
+"""
+    result = subprocess.run([node], input=script, cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_reasoning_effort_has_presets_and_custom_input():
     """Common strings stay convenient while model-specific values remain usable."""
     html = _model_settings_template()
@@ -76,6 +112,12 @@ def test_reasoning_effort_has_presets_and_custom_input():
 
     assert 'x-for="value in selectedModel?.reasoning_effort_options || []"' in section
     assert ':value="value" x-text="value"' in section
+    # x-model runs before x-for adds the options, so each option binds its own selection.
+    assert ':selected="value === entry.value"' in section
+    assert (
+        ':selected="!selectedModel?.reasoning_effort_options?.includes(entry.value)"'
+        in section
+    )
     assert "!selectedModel?.reasoning_effort_custom && !entry.custom" in section
 
 
@@ -141,6 +183,15 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.reasoning_parser",
         "modal.model_settings.specprefill",
         "modal.model_settings.dflash",
+        "modal.model_settings.kv_compression",
+        "modal.model_settings.kv_compression_hint",
+        "modal.model_settings.kv_compression_format",
+        "modal.model_settings.kv_compression_turboquant",
+        "modal.model_settings.kv_compression_affine4",
+        "modal.model_settings.kv_compression_affine4_hint",
+        "modal.model_settings.kv_compression_affine8",
+        "modal.model_settings.kv_compression_affine8_hint",
+        "modal.model_settings.vlm_mtp_compression_conflict",
         "modal.model_settings.qwen_ane",
         "modal.model_settings.qwen_ane_hint",
         "modal.model_settings.qwen_ane_prompt_block",
@@ -383,19 +434,32 @@ def test_embedding_audio_toggle_is_outside_the_llm_only_list():
     assert 'x-show="modelSettings.embedding_audio_enabled"' in section
 
 
-def test_oq_a8_toggle_is_gated_to_qwen35_models():
-    """The kernels only exist for this checkpoint family, so the UI hides them."""
+def test_embedding_context_window_is_in_basic_settings():
+    """Embedding requests use max_context_window as their default max_length."""
+    basic = _section(
+        _model_settings_template(),
+        '<section id="ms-basic"',
+        "<!-- Generation defaults (LLM/VLM only) -->",
+    )
+    row = _section(basic, "<!-- Embedding context window -->", "</label>")
+    assert "x-show=\"selectedModel?.model_type === 'embedding'\"" in row
+    assert 'x-model.number="modelSettings.max_context_window"' in row
+
+
+def test_a8_prefill_toggle_is_gated_to_supported_models():
+    """The kernels only exist for the validated families, so the UI hides them."""
     html = _model_settings_template()
     section = _section(
         html,
-        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- INT8-activation (A8) prefill kernels -->",
         "<!-- Memory Saving -->",
     )
-    assert 'x-if="isQwenOqA8Model(selectedModel)"' in section
-    assert "modelSettings.qwen35_oq_a8_enabled" in section
+    assert 'x-if="showsA8Prefill(selectedModel)"' in section
+    assert "modelSettings.a8_prefill_enabled" in section
+    assert "modal.model_settings.qwen_oq_a8_quality_badge" in section
     # The detail controls only appear once the feature is on.
-    assert 'x-show="modelSettings.qwen35_oq_a8_enabled"' in section
-    assert "modelSettings.qwen35_oq_a8_min_tokens" in section
+    assert 'x-show="modelSettings.a8_prefill_enabled"' in section
+    assert "modelSettings.a8_prefill_min_tokens" in section
 
 
 def test_qwen4_wide_decode_is_a_qwen4_acceleration_setting():
@@ -405,7 +469,7 @@ def test_qwen4_wide_decode_is_a_qwen4_acceleration_setting():
     row = _section(
         acceleration,
         "<!-- Qwen4 Extended Fused Decode -->",
-        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- INT8-activation (A8) prefill kernels -->",
     )
     assert 'x-show="modelSettings.qwen4_gdn_decode_wide_proj_supported"' in row
     assert "modelSettings.qwen4_gdn_decode_wide_proj =" in row
@@ -413,7 +477,7 @@ def test_qwen4_wide_decode_is_a_qwen4_acceleration_setting():
     js = _dashboard_script()
     supported = js.split("qwen4_gdn_decode_wide_proj_supported:", 1)[1]
     assert "=== 'qwen4_exp'" in supported.split("\n", 2)[1]
-    assert "!!this.modelSettings.qwen4_gdn_decode_wide_proj," in js
+    assert "!!ms.qwen4_gdn_decode_wide_proj," in js
     assert "globalSettings.server.qwen4_gdn_decode_wide_proj" not in js
     global_html = (root / "omlx_web/templates/dashboard/_settings.html").read_text()
     assert "qwen4_gdn_decode_wide_proj" not in global_html
@@ -430,7 +494,7 @@ def test_oq_a8_offers_no_kernel_choice():
     html = _model_settings_template()
     section = _section(
         html,
-        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- INT8-activation (A8) prefill kernels -->",
         "<!-- Memory Saving -->",
     )
     assert "modelSettings.qwen35_oq_a8_variant" not in section
@@ -438,13 +502,13 @@ def test_oq_a8_offers_no_kernel_choice():
 
 def test_oq_a8_settings_are_registered_in_the_dashboard_script():
     js = _dashboard_script()
-    for field in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
+    for field in ("a8_prefill_enabled", "a8_prefill_min_tokens"):
         # Profile-field registry, modal defaults, server load, and save payload.
         assert js.count(field) >= 4, field
-    assert "validateQwenOqA8Settings()" in js
+    assert "validateA8PrefillSettings()" in js
     # The modal has to explain the ANE clash itself rather than let the save
     # come back as a bare 400 with the toggle already flipped.
-    validator = js.split("validateQwenOqA8Settings()", 1)[1].split("},", 1)[0]
+    validator = js.split("validateA8PrefillSettings()", 1)[1].split("},", 1)[0]
     assert "qwen35_ane_prefill_enabled" in validator
     # The tile must not leak into any of those four places, not even as a
     # hidden default the modal never renders.
@@ -501,8 +565,8 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
         missing = set(english) - set(catalog)
         assert not missing, f"{path.name} is missing {sorted(missing)}"
         if path.name == "zh.json":
-            # Simplified Chinese carries its own labels; every other locale
-            # keeps the English fallback until its own translation lands.
+            # Simplified Chinese carries its own labels; untranslated locales
+            # keep the English fallback until their own translation lands.
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "开"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "关"
             continue
@@ -510,6 +574,10 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
             # Czech carries its own labels (ZAP/VYP), same exemption as zh.
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "ZAP"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "VYP"
+            continue
+        if path.name == "de.json":
+            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "EIN"
+            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "AUS"
             continue
         for key, value in english.items():
             assert (
@@ -521,7 +589,7 @@ def test_moe_expert_offload_toggle_blocks_speculative_decoding():
     """Offload is incompatible with speculative verification paths."""
     html = _model_settings_template()
     section = _section(
-        html, "<!-- MoE Expert Offload -->", "<!-- TurboQuant KV Cache -->"
+        html, "<!-- MoE Expert Offload -->", "<!-- KV Cache Compression -->"
     )
     assert "modelSettings.moe_expert_offload_enabled" in section
     assert "modelSettings.moe_expert_offload_resident_percent" in section
@@ -616,6 +684,26 @@ test('Focus refresh updates clean forms and preserves edits made while fetching'
     await state.refreshOpenModelSettings();
     assert.equal(state.modelSettings.temperature, 0.3);
     assert.equal(opened, 1);
+});
+
+test('Save sends only fields edited since the modal opened', async () => {
+    let body;
+    const state = setup(async (url, options) => {
+        body = JSON.parse(options.body);
+        return {ok: true, json: async () => ({})};
+    });
+    state.loadModels = async () => {};
+    state.modelSettings = state.buildModelSettingsState(state.selectedModel, {
+        temperature: 0.5, mtp_enabled: true, mtp_adaptive_max_depth: 5,
+        chat_template_kwargs: {enable_thinking: false}, forced_ct_kwargs: ['enable_thinking'],
+    });
+    state._modelSettingsBaseline = JSON.stringify(state.modelSettings);
+    state.modelSettings.temperature = 0.9;
+    state.modelSettings.ctKwargEntries = [];
+    await state.saveModelSettings();
+    assert.deepEqual(body, {
+        temperature: 0.9, chat_template_kwargs: null, forced_ct_kwargs: null, mtp_fixed_depth: null,
+    });
 });
 
 test('Apply response cannot replace another model editor', async () => {
@@ -826,6 +914,7 @@ const context = {
 vm.createContext(context);
 vm.runInContext(fs.readFileSync('omlx_web/static/js/dashboard_layout.js', 'utf8'), context);
 context.DashboardLayout = context.window.DashboardLayout;
+vm.runInContext(fs.readFileSync('omlx_web/static/js/count_format.js', 'utf8'), context);
 vm.runInContext(fs.readFileSync('omlx_web/static/js/dashboard.js', 'utf8'), context);
 const app = context.dashboard();
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -874,14 +963,27 @@ assert.equal(app.servingStatGridClass, '');
 app.toggleDashTile('generated_tokens');
 app.toggleDashTile('cache_efficiency');
 app.stats = { ...app.stats, total_completion_tokens: 1234, cache_efficiency: 50 };
-app.alltimeStats = { ...app.alltimeStats, total_completion_tokens: 98765 };
+app.alltimeStats = { ...app.alltimeStats, total_completion_tokens: 104166321 };
 const tile = id => app.servingStatTiles.find(t => t.id === id);
 assert.equal(tile('generated_tokens').value, app.formatNumber(1234));
 assert.equal(tile('generated_tokens').label, 'status.stat.generated_tokens');
 assert.equal(tile('cache_efficiency').value, '50.0');
 assert.equal(tile('cache_efficiency').unit, '%');
 app.statsScope = 'alltime';
-assert.equal(tile('generated_tokens').value, app.formatNumber(98765));
+assert.equal(tile('generated_tokens').value, app.formatNumber(104166321));
+
+// Exact digits skip every compact unit.
+app.statsNumberScale = 'exact';
+assert.equal(tile('generated_tokens').value, '104,166,321');
+app.statsScope = 'session';
+assert.equal(tile('generated_tokens').value, '1,234');
+assert.equal(tile('cache_efficiency').value, '50.0');
+
+// The picker persists the choice and reflects it in the segmented control.
+app.statsNumberScale = 'compact';
+app.setStatsNumberScale('exact');
+assert.equal(context.window.omlxCount.scale(), 'exact');
+assert.equal(app.statsNumberScale, 'exact');
 """
     result = subprocess.run(
         [node, "-e", script],
@@ -891,3 +993,70 @@ assert.equal(tile('generated_tokens').value, app.formatNumber(98765));
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_model_settings_header_wraps_only_below_sm():
+    header = _section(_model_settings_template(), "<!-- Title bar;", "</h4>")
+    actions = _section(
+        _model_settings_template(), "</h4>", '<i data-lucide="x"'
+    )
+    assert "max-sm:flex-wrap" in header
+    assert "flex-shrink-0 max-sm:flex-shrink" in actions
+    assert "max-sm:justify-end max-sm:ml-auto" in actions
+    assert "max-sm:absolute max-sm:right-2" in actions
+
+
+def test_gpu_power_limit_row_follows_thinking_budget():
+    html = _model_settings_template()
+    after_budget = _section(
+        html, "<!-- Thinking Budget -->", "<!-- Limit Tool Result Tokens -->"
+    )
+    row = after_budget.split("<!-- GPU Power Limit -->", 1)[1]
+    assert 'x-model.number="modelSettings.gpu_power_limit_w"' in row
+    assert 'min="2"' in row
+    # Unsupported GPUs can still turn an existing limit off.
+    assert (
+        ':disabled="!modelSettings.gpu_power_limit_supported'
+        ' && !modelSettings.enableGpuPowerLimit"'
+    ) in row
+
+    js = _dashboard_script()
+    # Profile serialization, preset apply, server load, and save payload.
+    assert js.count("gpu_power_limit_w") >= 4
+    # Off sends 0, which the server stores as no limit.
+    payload = js.split("gpu_power_limit_w: ms.enableGpuPowerLimit", 1)[1]
+    assert payload.split("\n", 3)[2].strip() == ": 0,"
+    # Out-of-range values get the range message instead of a raw 422 list.
+    save = js.split("async saveModelSettings()", 1)[1].split("async ", 1)[0]
+    assert "this.validateGpuPowerLimit()" in save
+    assert "Array.isArray(data.detail)" in save
+
+
+def test_speed_benches_say_the_gpu_power_limit_does_not_apply():
+    root = Path(__file__).resolve().parents[1] / "omlx_web/templates/dashboard"
+    for name in ("_bench.html", "_bench_context.html"):
+        html = (root / name).read_text()
+        assert "bench.config.gpu_power_limit_note" in html, name
+
+
+def test_reranker_context_window_is_in_basic_settings():
+    """Reranker requests use max_context_window as their default max_length,
+    the same knob embeddings already expose."""
+    basic = _section(
+        _model_settings_template(),
+        '<section id="ms-basic"',
+        "<!-- Generation defaults (LLM/VLM only) -->",
+    )
+    row = _section(basic, "<!-- Reranker context window -->", "</label>")
+    assert "x-show=\"selectedModel?.model_type === 'reranker'\"" in row
+    assert 'x-model.number="modelSettings.max_context_window"' in row
+    assert "t('modal.model_settings.reranker_context_window_hint')" in row
+
+
+def test_reranker_context_window_i18n_key_exists_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx_web/i18n"
+    key = "modal.model_settings.reranker_context_window_hint"
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        assert key in catalog, f"{path.name} is missing {key}"

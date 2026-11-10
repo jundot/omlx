@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 
 import mlx.core as mx
+from mlx_vlm.models.switch_layers import EXPERT_WEIGHT_SUFFIXES
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ def apply() -> bool:
                 # only .weight is stacked and the per-expert scales/biases
                 # survive as orphan keys -> "Received N parameters not in model".
                 for n in ("gate_proj", "up_proj", "down_proj"):
-                    for suffix in ("weight", "scales", "biases"):
+                    for suffix in EXPERT_WEIGHT_SUFFIXES:
                         first_key = f"{prefix}.experts.0.{n}.{suffix}"
                         if first_key not in weights:
                             continue

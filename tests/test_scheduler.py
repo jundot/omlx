@@ -29,11 +29,13 @@ from unittest.mock import MagicMock, call, patch
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import BatchKVCache, CacheList, KVCache
+from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer, SPMStreamingDetokenizer
 
 import omlx.scheduler as scheduler_module
 from omlx.adapter import output_parser as output_parser_module
 from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
 from omlx.cache.stats import PrefixCacheStats
+from omlx.exceptions import InvalidRequestError
 from omlx.models.vlm import VLMModelAdapter
 from omlx.patches.deepseek_v41 import output_parser as dsv41_output_parser
 from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
@@ -51,6 +53,7 @@ from omlx.scheduler import (
     _StoreCacheGate,
     _VLMMTPDecodeState,
 )
+from omlx.utils import metal_sync
 
 
 def test_boundary_snapshot_provider_removes_failed_promotion(tmp_path):
@@ -342,9 +345,12 @@ class TestSchedulerInitialization:
 
         assert scheduler.config.max_num_seqs == 64
 
-    def test_llama4_effective_cap_is_serial(self, mock_model, mock_tokenizer):
-        """Llama 4 uses ChunkedKVCache layers that are serialized for now."""
-        mock_model.config.model_type = "llama4"
+    @pytest.mark.parametrize("model_type", ["llama4", "unlimited-ocr"])
+    def test_serial_model_effective_cap_is_one(
+        self, mock_model, mock_tokenizer, model_type
+    ):
+        """Llama 4 and Unlimited-OCR caches cannot join a multi-row batch."""
+        mock_model.config.model_type = model_type
         scheduler = Scheduler(
             model=mock_model,
             tokenizer=mock_tokenizer,
@@ -352,6 +358,24 @@ class TestSchedulerInitialization:
         )
 
         assert scheduler._effective_max_num_seqs() == 1
+
+    def test_serial_model_type_reads_module_attributes(self):
+        """nn.Module subclasses dict, so model_type is read as an attribute."""
+        import mlx.nn as nn
+
+        class Llama4(nn.Module):  # mlx-lm Model keeps its ModelArgs as .args
+            def __init__(self):
+                super().__init__()
+                self.args = SimpleNamespace(model_type="llama4")
+
+        class Adapter(nn.Module):  # VLMModelAdapter exposes the VLM config
+            @property
+            def config(self):
+                return SimpleNamespace(model_type="unlimited-ocr")
+
+        assert scheduler_module._serial_model_type(Llama4()) == "llama4"
+        assert scheduler_module._serial_model_type(Adapter()) == "unlimited-ocr"
+        assert scheduler_module._serial_model_type(nn.Linear(2, 2)) is None
 
     def test_init_falls_back_when_paged_ssd_cache_unavailable(
         self, mock_model, mock_tokenizer, tmp_path, monkeypatch, caplog
@@ -496,6 +520,21 @@ class TestSchedulerAddRequest:
 
         with pytest.raises(ValueError, match="already exists"):
             scheduler.add_request(request)
+
+    def test_add_request_rejects_empty_prompt(self, mock_model, mock_tokenizer):
+        """An empty prompt is refused at admission, not by insert() in step()."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="empty",
+            prompt=[],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+        with pytest.raises(InvalidRequestError, match="at least one token"):
+            scheduler.add_request(request)
+
+        assert "empty" not in scheduler.requests
+        assert not scheduler.waiting
 
     def test_add_multiple_requests(self, mock_model, mock_tokenizer):
         """Test adding multiple requests."""
@@ -858,7 +897,8 @@ class TestSchedulerAddRequest:
 
         scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
-            block_table
+            block_table,
+            promote_to_hot_cache=True,
         )
 
     def test_add_request_hot_cache_only_ignores_pressure_bypass(
@@ -896,7 +936,8 @@ class TestSchedulerAddRequest:
 
         scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
-            block_table
+            block_table,
+            promote_to_hot_cache=True,
         )
         scheduler._current_usage_bytes.assert_not_called()
 
@@ -1138,7 +1179,8 @@ class TestSchedulerAddRequest:
     def test_admission_freshness_gate_skips_tail_not_covering_the_prompt(
         self, mock_model, mock_tokenizer
     ):
-        """A store longer than the prompt cannot serve it from a tail block."""
+        """A store longer than the prompt cannot serve it from a tail block,
+        unless the store also writes a shared prefix tail the prompt covers."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler.block_aware_cache = MagicMock()
         scheduler.config.paged_cache_block_size = 2048
@@ -1162,6 +1204,8 @@ class TestSchedulerAddRequest:
 
         assert scheduler._should_defer_for_cache_freshness(request) is False
         assert request.request_id not in scheduler._cache_freshness_waits
+        scheduler._inflight_store_info["req-prev"].shared_prefix_len = 900
+        assert scheduler._should_defer_for_cache_freshness(request) is True
         future.result.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -1633,6 +1677,36 @@ class TestSchedulerAbortRequest:
         scheduler._ensure_batch_generator = MagicMock()
         scheduled, _ = scheduler._schedule_waiting()
         assert scheduled == [request]
+
+    def test_specprefill_deferred_while_plain_request_decoding(
+        self, mock_model, mock_tokenizer
+    ):
+        """The model-wide offset RoPE must not reach live decode rows."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        plain = Request(
+            request_id="plain",
+            prompt="Hi",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+        )
+        scheduler.running["plain"] = plain
+        scheduler.requests["plain"] = plain
+
+        spec = Request(
+            request_id="sp",
+            prompt="Long prompt",
+            sampling_params=SamplingParams(),
+        )
+        spec.specprefill_indices = [0, 1, 2]
+        scheduler.requests["sp"] = spec
+        scheduler.waiting.append(spec)
+
+        scheduled, _ = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert list(scheduler.waiting) == [spec]
 
     def test_abort_nonexistent_request(self, mock_model, mock_tokenizer):
         """Test aborting a non-existent request is silently ignored."""
@@ -2254,7 +2328,7 @@ class TestSchedulerStatistics:
         self, mock_model, mock_tokenizer, offload
     ):
         """On a 24 GB host without NAX, the wide qwen4 step needs offload."""
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         mock_model.config.model_type = "qwen4_exp_text"
         with (
@@ -2910,14 +2984,7 @@ class TestSchedulerXtcSpecialTokens:
 class TestSyncAndClearCache:
     """Tests for module-level _sync_and_clear_cache() helper (#300, #888)."""
 
-    @pytest.mark.parametrize(
-        "message",
-        [
-            "There is no Stream(gpu, 0) in current thread.",
-            "kIOGPUCommandBufferCallbackErrorTimeout",
-        ],
-    )
-    def test_swallows_generation_stream_thread_error(self, message):
+    def test_swallows_generation_stream_thread_error(self):
         """generation_stream sync failing must not break cache clear.
 
         Reproduces #888: on some MLX builds mx.synchronize(generation_stream)
@@ -2933,7 +3000,7 @@ class TestSyncAndClearCache:
 
         def fake_gen_sync(stream):
             calls.append(("gen_sync", stream))
-            raise RuntimeError(message)
+            raise RuntimeError("There is no Stream(gpu, 0) in current thread.")
 
         def fake_default_sync():
             calls.append(("default_sync",))
@@ -2956,6 +3023,34 @@ class TestSyncAndClearCache:
         assert calls[0][0] == "gen_sync"
         assert ("default_sync",) in calls
         assert ("clear_cache",) in calls
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "00000003:kIOGPUCommandBufferCallbackErrorHang",
+            "00000005:kIOGPUCommandBufferCallbackErrorInnocentVictim",
+            "00000002:kIOGPUCommandBufferCallbackErrorTimeout",
+        ],
+    )
+    def test_raises_generation_stream_command_buffer_error(self, code):
+        """A failed engine-stream buffer must reach the caller (#4224).
+
+        MLX clears the stored error when it raises, so a swallowed error
+        lets the engine keep decoding on results the GPU discarded.
+        """
+        error = RuntimeError(f"[METAL] Command buffer execution failed: ({code}).")
+
+        def synchronize(*args):
+            if args:
+                raise error
+
+        with (
+            patch.object(metal_sync.mx, "synchronize", side_effect=synchronize),
+            patch.object(metal_sync.mx, "clear_cache") as clear,
+            pytest.raises(RuntimeError, match=code),
+        ):
+            metal_sync._sync_and_clear_cache("engine-stream")
+        clear.assert_not_called()
 
     @pytest.mark.parametrize("stage", ["generation", "default", "clear"])
     def test_terminal_gpu_error_exits_before_further_cleanup(self, stage):
@@ -3708,6 +3803,46 @@ class TestSchedulerBoundarySnapshots:
         assert provider.tail_terminal_token_count == (7 if not persists else None)
         assert 4 in provider
 
+    def test_boundary_override_keeps_system_prefix_tail_for_its_own_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """Only the side store picks the system-prefix tail as its terminal."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        request = Request(
+            request_id="req-system-tail",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.generation_prompt_start = 7
+        request.system_prefix_end = 6
+        scheduler.requests[request.request_id] = request
+        raw = {4: object(), 6: object(), 7: object()}
+        extracted = {tc: [{"state": (tc,)}] for tc in raw}
+
+        def extract(raw_cache):
+            for tc, obj in raw.items():
+                if raw_cache is obj:
+                    return extracted[tc], f"config-{tc}"
+            raise AssertionError("unexpected raw cache")
+
+        def override(snapshots, tokens, **kwargs):
+            scheduler._boundary_cache_snapshots[request.request_id] = {
+                tc: raw[tc] for tc in snapshots
+            }
+            with patch.object(scheduler, "_extract_cache_states", side_effect=extract):
+                tokens, _, _, provider = scheduler._get_boundary_store_override(
+                    request.request_id, tokens, **kwargs
+                )
+            return len(tokens), provider.tail_terminal_token_count, 4 in provider
+
+        assert override((4, 6, 7), list(range(9))) == (7, 7, True)
+        assert override((4, 6, 7), list(range(6)), system_tail=True) == (6, 6, False)
+        # A requeue store before the marker keeps the aligned prefix only.
+        assert override(
+            (4, 6), list(range(9)), stop_at_generation_prompt=False
+        ) == (4, None, False)
+
     def test_boundary_override_prefers_aligned_snapshot_past_tail(
         self, mock_model, mock_tokenizer
     ):
@@ -3990,6 +4125,38 @@ class TestSchedulerBoundarySnapshots:
         recorded = scheduler._boundary_cache_snapshots[request.request_id]
         assert set(recorded) == {3}
         assert recorded[3] == snapshot_cache
+
+    @pytest.mark.parametrize(
+        "prompt,gen_start,expected",
+        [
+            ([1, 2, 3, 4, 5, 6, 7, 8, 9], 7, 6),
+            # The user text merged into the last prefix token: keep the LCP.
+            ([1, 2, 3, 4, 5, 9, 8, 9], 6, 5),
+            # The prefix reaches the generation prompt: nothing is shared.
+            ([1, 2, 3, 4, 5, 6, 7], 6, 0),
+            # On the block grid: the boundary snapshot already covers it.
+            ([1, 2, 3, 4, 9, 9, 9], 6, 0),
+            # A template that moves the system block shares only a few tokens.
+            ([1, 9, 9, 9, 9, 9, 9, 9], 6, 0),
+        ],
+    )
+    def test_resolve_system_prefix_end(
+        self, mock_model, mock_tokenizer, prompt, gen_start, expected
+    ):
+        """The shared prefix ends at the token LCP, off the grid, before the marker."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        request = Request(
+            request_id="req-system", prompt="hello", sampling_params=SamplingParams()
+        )
+        request.prompt_token_ids = prompt
+        request.generation_prompt_start = gen_start
+        request.system_prefix_ids = [1, 2, 3, 4, 5, 6]
+        scheduler._resolve_system_prefix_end(request)
+        assert request.system_prefix_end == expected
 
     def test_resolve_generation_prompt_start_requires_exact_suffix_match(
         self, mock_model, mock_tokenizer
@@ -4370,7 +4537,7 @@ class TestSchedulerArraysCacheBlockAlignment:
     """ArraysCache boundaries must match the effective prefill chunk."""
 
     @pytest.mark.parametrize("nested", [False, True])
-    def test_deepseek_v41_subclass_uses_2048_boundaries(
+    def test_deepseek_v41_subclass_uses_8192_boundaries(
         self, mock_tokenizer, tmp_path, nested
     ):
         model = self._hybrid_model(model_type="deepseek_v41")
@@ -4390,9 +4557,9 @@ class TestSchedulerArraysCacheBlockAlignment:
         )
         try:
             assert scheduler._model_has_arrays_cache()
-            assert scheduler._qwen35_prefill_floor == 0
-            assert scheduler.config.paged_cache_block_size == 2048
-            assert scheduler._prefill_step_size_for_progress(0, 9216) == 2048
+            assert scheduler._qwen35_prefill_floor == 8192
+            assert scheduler.config.paged_cache_block_size == 8192
+            assert scheduler._prefill_step_size_for_progress(0, 9216) == 8192
         finally:
             scheduler.shutdown()
 
@@ -4458,11 +4625,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):
@@ -4502,11 +4669,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             ),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):
@@ -4544,11 +4711,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=native_available,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=symbol_available,
             ),
         ):
@@ -4576,11 +4743,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):
@@ -4628,11 +4795,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):
@@ -4840,6 +5007,23 @@ class TestPeriodicClearGating:
         # No limit → 2 GiB absolute floor
         scheduler._memory_limit_bytes = 0
         assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
+
+    def test_early_kv_growth_waits_for_the_deferred_clear(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """One early-grown bank at a time: the next waits for the #435-delayed clear."""
+        from omlx.patches import vlm_batch_kv_capacity as capacity
+
+        monkeypatch.setattr(capacity, "_early_growth", {"allowed": False, "grown": True})
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._pace_early_kv_growth()
+        assert scheduler._deferred_clear_at == (
+            scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+        )
+        assert capacity._early_growth == {"allowed": False, "grown": False}
+        scheduler._deferred_clear_at = None
+        scheduler._pace_early_kv_growth()
+        assert capacity._early_growth["allowed"] is True
 
 
 class TestExtractCacheStatesCacheList:
@@ -5417,6 +5601,29 @@ class TestSpecPrefillCaches:
             scheduler.set_specprefill_draft_model(object())
 
             assert not hasattr(scheduler, "_specprefill_static_prefix_kv_cache")
+        finally:
+            scheduler.shutdown()
+
+    def test_draft_settings_are_scoring_defaults(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        try:
+            scheduler.set_specprefill_draft_model(
+                object(), keep_pct=0.4, threshold=100352
+            )
+            request = Request(
+                request_id="sp-defaults",
+                prompt=[1, 2, 3],
+                sampling_params=SamplingParams(max_tokens=8),
+            )
+            request.prompt_token_ids = [1, 2, 3]
+            request._specprefill_enabled = True
+            with patch(
+                "omlx.specprefill.policy.plan_specprefill_scoring", return_value=None
+            ) as plan:
+                scheduler._try_specprefill_scoring(request)
+
+            assert plan.call_args.kwargs["default_threshold"] == 100352
+            assert plan.call_args.kwargs["default_keep_pct"] == 0.4
         finally:
             scheduler.shutdown()
 
@@ -7039,6 +7246,47 @@ class TestOutputParserSmoke:
         assert "<channel|>" not in full_stream
         assert full_stream == "<think>\nreasoning</think>\nanswer"
 
+    def test_gemma4_session_reports_one_logprob_per_token(self, mock_model):
+        mock_model.config.model_type = "gemma4"
+        tokens = {11: "<|channel>", 12: "thought\n", 13: "r", 14: "<channel|>"}
+        tokens.update({15: "answer", 16: "<turn|>"})
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=self._GemmaTokenizer(tokens),
+            config=SchedulerConfig(model_name="google/gemma-4b"),
+        )
+        request = Request(
+            request_id="gemma-req",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=6, logprobs=True, top_logprobs=2),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        def response(token):
+            logits = mx.where(mx.arange(32) == token, 4.0, -4.0)
+            row = (logits - mx.logsumexp(logits)).astype(mx.bfloat16)
+            finish = "length" if token == 16 else None
+            return SimpleNamespace(
+                uid=99, token=token, finish_reason=finish, logprobs=row
+            )
+
+        outputs, _ = scheduler._process_batch_responses([response(t) for t in tokens])
+
+        entries = [entry for output in outputs for entry in output.logprobs or []]
+        assert [entry.token_id for entry in entries] == list(tokens)
+        assert entries[4].text == "answer"
+        for entry in entries:
+            assert entry.logprob == pytest.approx(-0.0104, abs=0.002)
+            assert [alt.token_id for alt in entry.top][0] == entry.token_id
+            assert len(entry.top) == 2
+
     def test_gemma4_prefilled_thought_after_tool_response(self, mock_model):
         """Tool continuations open the thought channel in the prompt.
 
@@ -7184,7 +7432,8 @@ class TestOutputParserSmoke:
         assert outputs[-1].new_token_ids == []
         assert outputs[-1].output_token_ids == []
 
-    def test_parser_stop_sets_finish_reason(self, mock_model):
+    @pytest.mark.parametrize("ignore_eos", [False, True])
+    def test_parser_stop_sets_finish_reason(self, mock_model, ignore_eos):
         tokenizer = self._GemmaTokenizer({11: "<|return|>"})
         scheduler = Scheduler(
             model=mock_model,
@@ -7196,7 +7445,7 @@ class TestOutputParserSmoke:
         request = Request(
             request_id="parser-stop-req",
             prompt="prompt",
-            sampling_params=SamplingParams(max_tokens=5),
+            sampling_params=SamplingParams(max_tokens=5, ignore_eos=ignore_eos),
             prompt_token_ids=[1, 2, 3],
             num_prompt_tokens=3,
             status=RequestStatus.RUNNING,
@@ -7208,14 +7457,21 @@ class TestOutputParserSmoke:
         scheduler.request_id_to_uid[request.request_id] = 99
 
         responses = [
-            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": token, "finish_reason": None})()
+            for token in (11, 12)
         ]
 
         outputs, finished_ids = scheduler._process_batch_responses(responses)
 
-        assert finished_ids == {"parser-stop-req"}
-        assert outputs[-1].finished is True
-        assert outputs[-1].finish_reason == "stop"
+        if ignore_eos:
+            # The latched parser stop neither ends the row nor drops tokens.
+            assert finished_ids == set()
+            assert outputs[-1].finished is False
+            assert request.output_token_ids == [11, 12]
+        else:
+            assert finished_ids == {"parser-stop-req"}
+            assert outputs[-1].finished is True
+            assert outputs[-1].finish_reason == "stop"
 
     def test_deepseek_v4_tool_block_end_stops_batch_row(self, mock_model):
         mock_model.config.model_type = "deepseek_v4"
@@ -7957,6 +8213,49 @@ class TestStopStringOutputBuffer:
         assert outputs[-1].output_text == expected
         assert outputs[-1].finish_reason == "stop"
         assert sum(output.finished for output in outputs) == 1
+
+    @pytest.mark.parametrize("terminal_reason", ["length", "stop"])
+    def test_deepseek_v41_calls_without_outer_close(
+        self, mock_model, monkeypatch, terminal_reason
+    ):
+        from omlx.patches.deepseek_v41 import output_parser
+
+        scheduler = self._setup(mock_model)
+        request = scheduler.running["stop-output"]
+        request.sampling_params.stop = []
+        tokenizer = scheduler.tokenizer
+        pieces = [
+            "Prose.\n\n",
+            '<｜DSML｜ calls>\n<｜DSML｜ invoke name="get">\n',
+            '<｜DSML｜ parameter name="city" string="true">Seoul</｜DSML｜ parameter>\n',
+            "</｜DSML｜ invoke>\n",
+        ]
+        tokenizer.pieces = {**tokenizer.pieces, **dict(enumerate(pieces, 100))}
+        scheduler._build_state_machine(request)
+        monkeypatch.setattr(
+            output_parser,
+            "create_streaming_detokenizer",
+            lambda tokenizer, model_path: _StopSequenceDetokenizer(tokenizer),
+        )
+        session = output_parser.DeepSeekV41OutputParserSession(tokenizer)
+        scheduler._output_parser_sessions[request.request_id] = session
+        scheduler._get_output_parser_session = lambda request_id: session
+        responses = [self._response(100 + i) for i in range(len(pieces))]
+        if terminal_reason == "stop":
+            responses.append(self._response(tokenizer.eos_token_id, "stop"))
+        else:
+            responses[-1].finish_reason = "length"
+
+        outputs, _ = scheduler._process_batch_responses(responses)
+
+        if terminal_reason == "stop":
+            assert outputs[-1].finish_reason == "tool_calls"
+            assert [call["name"] for call in outputs[-1].tool_calls] == ["get"]
+            assert outputs[-1].output_text == "Prose.\n\n"
+        else:
+            assert outputs[-1].finish_reason == "length"
+            assert not outputs[-1].tool_calls
+            assert outputs[-1].output_text == "".join(pieces)
 
     def test_partial_stop_prefix_is_flushed_on_eos(self, mock_model):
         scheduler = self._setup(mock_model)
@@ -8929,6 +9228,36 @@ def test_external_prefill_keeps_image_prefix_atomic(mock_model, mock_tokenizer):
     ] == [8, 12]
 
 
+def test_external_prefill_keeps_full_chunks_without_snapshots(
+    mock_model, mock_tokenizer
+):
+    """Layouts the prefix cache never stores are not cut at block boundaries."""
+    from mlx_vlm.models.cache import RotatingKVCache
+
+    scheduler = Scheduler(
+        model=mock_model,
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(prefill_step_size=8, paged_cache_block_size=4),
+    )
+    scheduler.block_aware_cache = MagicMock()
+    scheduler._model_has_unreconstructible_cache = lambda: True
+    request = Request(
+        request_id="no-snapshots",
+        prompt=list(range(13)),
+        sampling_params=SamplingParams(),
+    )
+    request.prompt_token_ids = list(range(13))
+    request.num_prompt_tokens = 13
+    request.benchmark_trace = True
+    scheduler._do_external_prefill(
+        request,
+        request.prompt_token_ids,
+        [RotatingKVCache(max_size=16)],
+        vlm_embeds=(mx.zeros((1, 13, 8)), {}, 0),
+    )
+    assert request.benchmark_prefill_chunks == [8, 4]
+
+
 @pytest.mark.parametrize("on_ssd", [True, False])
 def test_first_image_boundary_reached_during_decode(mock_model, mock_tokenizer, on_ssd):
     from mlx_vlm.models.cache import CacheList, PoolingCache, RotatingKVCache
@@ -8960,3 +9289,23 @@ def test_first_image_boundary_reached_during_decode(mock_model, mock_tokenizer, 
         _, layers = scheduler._boundary_cache_snapshots[request.request_id][8]
         assert layers[0]["pooling_delta_ranges"]["1"] == [0, 2]
         assert layers[0]["state"][1][2].shape[1] == 2
+
+
+def test_token_bytes_follow_the_detokenizer_vocab():
+    class Vocab:
+        def __init__(self, tokens):
+            self.tokens = tokens
+
+        def __len__(self):
+            return len(self.tokens)
+
+        def convert_ids_to_tokens(self, ids):
+            return [self.tokens[i] for i in ids]
+
+    # U+0120 and U+00EC are the byte-level BPE spellings of 0x20 and 0xEC.
+    for detokenizer in (
+        SPMStreamingDetokenizer(Vocab(["\u2581hi", "<0xEC>"])),
+        BPEStreamingDetokenizer(Vocab(["\u0120hi", "\u00ec"])),
+    ):
+        assert scheduler_module._token_bytes(detokenizer, None, 0) == b" hi"
+        assert scheduler_module._token_bytes(detokenizer, None, 1) == b"\xec"

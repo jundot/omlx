@@ -19,23 +19,46 @@ const state = create();
 
 for (const config_model_type of [
     'qwen3_5', 'qwen3_5_moe', 'qwen3_6', 'qwen3_8', 'Qwen3-8',
-    'qwen4_exp', 'Qwen4-Exp',
+    'qwen4_exp', 'Qwen4-Exp', 'deepseek_v41', 'minimax_m3', 'minimax_m3_vl',
 ]) {
-    assert.equal(state.isQwenOqA8Model({config_model_type}), true);
+    assert.equal(state.isA8PrefillModel({config_model_type}), true);
 }
 for (const config_model_type of [
     '', 'qwen2', 'qwen3', 'qwen4', 'qwen4_exp_x', 'llama', 'gemma4', 'k2_horizon',
+    'deepseek_v4', 'minimax_m2',
 ]) {
-    assert.equal(state.isQwenOqA8Model({config_model_type}), false);
+    assert.equal(state.isA8PrefillModel({config_model_type}), false);
 }
-assert.equal(state.isQwenOqA8Model(null), false);
+assert.equal(state.isA8PrefillModel(null), false);
 
-state.modelSettings.qwen35_oq_a8_enabled = true;
+// Hidden where the kernels cannot run, unless already on.
+assert.equal(state.showsA8Prefill({config_model_type: 'qwen3_5', a8_prefill_supported: false}), false);
+assert.equal(state.showsA8Prefill({config_model_type: 'qwen3_5', a8_prefill_supported: true}), true);
+assert.equal(state.showsA8Prefill({
+    config_model_type: 'qwen3_5',
+    a8_prefill_supported: false,
+    settings: {a8_prefill_enabled: true},
+}), true);
+assert.equal(state.showsA8Prefill({config_model_type: 'llama', a8_prefill_supported: true}), false);
+
+// A8 is off until saved on.
+const flash = {id: 'flash', config_model_type: 'qwen4_exp', a8_prefill_supported: true};
+assert.equal(state.buildModelSettingsState(flash, {}).a8_prefill_enabled, false);
+assert.equal(state.buildModelSettingsState(flash, {a8_prefill_enabled: true}).a8_prefill_enabled, true);
+// A Prefill Accelerator Mac shows the toggle where the kernels cannot run here.
+state.selectedModel = {config_model_type: 'deepseek_v41', a8_prefill_supported: false};
+state.modelSettings.prefill_helper_node_id = 'm5';
+assert.equal(state.showsA8Prefill(state.selectedModel), true);
+state.modelSettings.prefill_helper_node_id = '';
+assert.equal(state.showsA8Prefill(state.selectedModel), false);
+state.selectedModel = flash;
+
+state.modelSettings.a8_prefill_enabled = true;
 state.modelSettings.qwen35_ane_prefill_enabled = true;
-assert.equal(state.validateQwenOqA8Settings(), 'js.error.ane_oq_a8_conflict');
+assert.equal(state.validateA8PrefillSettings(), 'js.error.ane_oq_a8_conflict');
 state.modelSettings.qwen35_ane_prefill_enabled = false;
-assert.equal(state.validateQwenOqA8Settings(), null);
-console.log('Architecture-only visibility and ANE conflict checks passed');
+assert.equal(state.validateA8PrefillSettings(), null);
+console.log('oQ A8 visibility and ANE conflict checks passed');
 
 (async () => {
     const app = create();
@@ -54,6 +77,8 @@ console.log('Architecture-only visibility and ANE conflict checks passed');
         await app.saveModelSettings();
         assert.equal(payload.mtp_adaptive_max_depth, depth);
         assert.equal(payload.mtp_fixed_depth, null);
+        // A hidden A8 toggle is not sent, so it stays unset.
+        assert.equal('a8_prefill_enabled' in payload, false);
         const restored = app.buildModelSettingsState(app.selectedModel, payload);
         assert.equal(restored.mtp_adaptive_max_depth, String(depth));
     }
@@ -62,8 +87,8 @@ console.log('Architecture-only visibility and ANE conflict checks passed');
     // Qwen3.8-Flash-Next (qwen4_exp): the same toggle and floor are saved and restored.
     const app = create();
     app.loadModels = async () => {};
-    app.selectedModel = {id: 'flash', config_model_type: 'qwen4_exp'};
-    assert.equal(app.isQwenOqA8Model(app.selectedModel), true);
+    app.selectedModel = {id: 'flash', config_model_type: 'qwen4_exp', a8_prefill_supported: true};
+    assert.equal(app.isA8PrefillModel(app.selectedModel), true);
     let payload;
     context.fetch = async (_url, init) => {
         payload = JSON.parse(init.body);
@@ -71,14 +96,14 @@ console.log('Architecture-only visibility and ANE conflict checks passed');
     };
     context.alert = message => { throw Error(message); };
     app.modelSettings = app.buildModelSettingsState(
-        app.selectedModel, {qwen35_oq_a8_enabled: true, qwen35_oq_a8_min_tokens: 256});
-    assert.equal(app.modelSettings.qwen35_oq_a8_enabled, true);
-    assert.equal(app.modelSettings.qwen35_oq_a8_min_tokens, 256);
+        app.selectedModel, {a8_prefill_enabled: true, a8_prefill_min_tokens: 256});
+    assert.equal(app.modelSettings.a8_prefill_enabled, true);
+    assert.equal(app.modelSettings.a8_prefill_min_tokens, 256);
     await app.saveModelSettings();
-    assert.equal(payload.qwen35_oq_a8_enabled, true);
-    assert.equal(payload.qwen35_oq_a8_min_tokens, 256);
+    assert.equal(payload.a8_prefill_enabled, true);
+    assert.equal(payload.a8_prefill_min_tokens, 256);
     const restored = app.buildModelSettingsState(app.selectedModel, payload);
-    assert.equal(restored.qwen35_oq_a8_enabled, true);
-    assert.equal(restored.qwen35_oq_a8_min_tokens, 256);
+    assert.equal(restored.a8_prefill_enabled, true);
+    assert.equal(restored.a8_prefill_min_tokens, 256);
     console.log('qwen4_exp oQ A8 toggle and minimum-token round-trip passed');
 }).catch(error => {console.error(error); process.exitCode = 1});

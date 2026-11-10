@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the DeepSeek V4 monkey-patch (PR 1192 port)."""
 
+import importlib
 import inspect
 import json
-import os
-import subprocess
 import sys
-import textwrap
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -285,55 +282,28 @@ class TestBatchCacheConversion:
         assert len(result) == 1
         assert isinstance(result[0], BatchPoolingCache)
 
-    @pytest.mark.parametrize("patch_order", ("scheduler-first", "deepseek-first"))
-    def test_deepseek_patch_preserves_mixed_model_owned_conversion(
-        self, patch_order
-    ):
-        if patch_order == "scheduler-first":
-            patch_setup = (
-                "import omlx.scheduler\n            apply_deepseek_v4_patch()"
-            )
-        else:
-            patch_setup = (
-                "apply_deepseek_v4_patch()\n            import omlx.scheduler"
-            )
-        script = textwrap.dedent(f"""
-            import importlib
-
-            from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
-            from omlx.patches.mlx_vlm_qwen4_exp_compat import (
-                apply_mlx_vlm_qwen4_exp_compat_patch,
-            )
-
-            {patch_setup}
-            apply_mlx_vlm_qwen4_exp_compat_patch()
-
-            from mlx_lm.models.cache import BatchPoolingCache, CacheList, PoolingCache
-            from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
-
-            class Model:
-                layers = (object(),)
-
-                def make_cache(self):
-                    return [CacheList(PoolingCache(4), QSAKVCache())]
-
-            generate = importlib.import_module("mlx_lm.generate")
-            caches = generate._merge_caches([Model().make_cache()])
-            assert isinstance(caches[0].caches[0], BatchPoolingCache)
-            assert isinstance(caches[0].caches[1], BatchQSAKVCache)
-            """)
-        env = dict(os.environ)
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-        result = subprocess.run(
-            [sys.executable, "-B", "-c", script],
-            cwd=Path(__file__).resolve().parents[1],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
+    def test_deepseek_patch_preserves_mixed_model_owned_conversion(self, applied_patch):
+        # The scheduler installs its _merge_caches on import.
+        import omlx.scheduler  # noqa: F401
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
         )
 
-        assert result.returncode == 0, result.stderr
+        apply_mlx_vlm_qwen4_exp_compat_patch()
+
+        from mlx_lm.models.cache import BatchPoolingCache, CacheList, PoolingCache
+        from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
+
+        class Model:
+            layers = (object(),)
+
+            def make_cache(self):
+                return [CacheList(PoolingCache(4), QSAKVCache())]
+
+        generate = importlib.import_module("mlx_lm.generate")
+        caches = generate._merge_caches([Model().make_cache()])
+        assert isinstance(caches[0].caches[0], BatchPoolingCache)
+        assert isinstance(caches[0].caches[1], BatchQSAKVCache)
 
 
 class TestTokenizerPatch:
@@ -1349,6 +1319,65 @@ class TestDeepseekV4SwitchGLU:
         assert y.dtype == mx.bfloat16
         assert projection_input_dtypes == [mx.float16, mx.float16, mx.float16]
 
+    @pytest.mark.parametrize("tokens", [7, 16])
+    def test_affine_gate_up_with_mxfp4_down_runs_in_float16(
+        self, applied_patch, monkeypatch, tokens
+    ):
+        # oQ3.5e of an MXFP4 source keeps the source down projection next to
+        # affine gate/up projections, whose metadata sanitize stores as float16.
+        mx = pytest.importorskip("mlx.core")
+        from omlx.patches.deepseek_v4 import switch_layers
+
+        mx.random.seed(17)
+        layer = switch_layers.SwitchGLU(
+            input_dims=64,
+            hidden_dims=64,
+            num_experts=4,
+            bias=False,
+        )
+        for name in ("up_proj", "gate_proj"):
+            projection = getattr(layer, name).to_quantized(
+                group_size=64,
+                bits=3,
+                mode="affine",
+            )
+            projection.scales = projection.scales.astype(mx.float16)
+            projection.biases = projection.biases.astype(mx.float16)
+            setattr(layer, name, projection)
+        layer.down_proj = layer.down_proj.to_quantized(
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+        )
+
+        projection_input_dtypes = []
+        original_call = switch_layers.QuantizedSwitchLinear.__call__
+
+        def record_projection_input(projection, value, *args, **kwargs):
+            projection_input_dtypes.append(value.dtype)
+            return original_call(projection, value, *args, **kwargs)
+
+        monkeypatch.setattr(
+            switch_layers.QuantizedSwitchLinear,
+            "__call__",
+            record_projection_input,
+        )
+
+        x = mx.random.normal((1, tokens, 64), dtype=mx.bfloat16)
+        indices = mx.array(
+            [[[0, 1, 2, 3, 0, 1]] * tokens],
+            dtype=mx.int32,
+        )
+
+        # 16 tokens reach the sorted route, where the MXFP4 block kernel
+        # rejects float32 input.
+        y = layer(x, indices)
+        mx.eval(y)
+
+        assert y.shape == (1, tokens, 6, 64)
+        assert y.dtype == mx.bfloat16
+        assert projection_input_dtypes == [mx.float16, mx.float16, mx.float16]
+
     def test_shared_expert_uses_configured_swiglu_limit(self, applied_patch):
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
 
@@ -1386,17 +1415,17 @@ class TestDeepseekV4SwitchGLU:
         from omlx.patches.deepseek_v4 import switch_layers
 
         monkeypatch.setattr(
-            switch_layers.glm_fast,
+            switch_layers.quant_fast,
             "has_symbol",
-            lambda name: name == "glm_moe_weighted_sum",
+            lambda name: name == "moe_weighted_sum",
         )
 
         def fail_weighted_sum(*args, **kwargs):
             raise AssertionError("DeepSeek V4 must not use fused weighted sum")
 
         monkeypatch.setattr(
-            switch_layers.glm_fast,
-            "glm_moe_weighted_sum",
+            switch_layers.quant_fast,
+            "moe_weighted_sum",
             fail_weighted_sum,
             raising=False,
         )
@@ -1467,7 +1496,7 @@ class TestDeepseekV4CompressedNativeAttention:
     ):
         import mlx.core as mx
 
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         layer = dsv4.CompressedAttention(self._attention_config(dsv4), 0)
@@ -1604,7 +1633,7 @@ class TestDeepseekV4CompressedNativeAttention:
     ):
         import mlx.core as mx
 
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         mx.random.seed(41)
@@ -1631,8 +1660,8 @@ class TestDeepseekV4CompressedNativeAttention:
         )
         pooled_mask = pooled_positions <= offset + query_rows
         scale = 512**-0.5
-        if not fast.has_symbol("deepseek_v4_sparse_attention"):
-            pytest.skip("deepseek_v4_sparse_attention native kernel is unavailable")
+        if not fast.has_symbol("compressed_sparse_attention"):
+            pytest.skip("compressed_sparse_attention native kernel is unavailable")
 
         previous = dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
         try:
@@ -2440,7 +2469,7 @@ class TestAffineBlockRouteThreshold:
 
         from omlx.patches.deepseek_v4 import switch_layers as sl
 
-        monkeypatch.setattr(sl.glm_fast, "has_symbol", lambda name: True)
+        monkeypatch.setattr(sl.quant_fast, "has_symbol", lambda name: True)
         linear = self._linear()
         below = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES - 1, 1, 64), dtype=mx.bfloat16)
         at = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES, 1, 64), dtype=mx.bfloat16)

@@ -31,7 +31,8 @@ struct LogsScreen: View {
                 case .raw: LogRawPane(vm: vm)
                 }
             }
-            .frame(minHeight: 360, idealHeight: 480, maxHeight: .infinity)
+            // 346, not 360: keeps the header's top inset at the default window height.
+            .frame(minHeight: 346, idealHeight: 480, maxHeight: .infinity)
             .padding(.horizontal, 14)
             .padding(.bottom, 8)
 
@@ -170,37 +171,79 @@ private struct LogTable: View {
     @Environment(AppServices.self) private var services
     @Environment(\.omlxTheme) private var theme
     @State private var position = ScrollPosition(idType: Int.self)
+    /// Detail card height, kept across selections and launches.
+    @AppStorage("logs.detailHeight") private var savedDetailHeight: Double = 220
+    /// Live height during a drag; saved once the drag ends.
+    @State private var dragHeight: Double?
+    @State private var dragStartHeight: Double?
+
+    private static let handleHeight: CGFloat = 12
+    private static let minDetailHeight: Double = 120
+    private static let minListHeight: Double = 160
 
     var body: some View {
-        VStack(spacing: 8) {
-            if let row = vm.selectedRow {
-                LogDetailCard(row: row, onOpen: { services.requestedSection = $0 },
-                              onClose: { vm.selectedRowID = nil })
-            }
-
+        GeometryReader { geometry in
             VStack(spacing: 0) {
-                LogColumnHeader()
-                Divider().overlay(theme.groupBorder)
-                if vm.rows.isEmpty {
-                    if !vm.isLoading {
-                        Text(vm.emptyMessage)
-                            .font(.omlxText(13))
-                            .foregroundStyle(theme.textTertiary)
-                            .padding(.vertical, 36)
-                    }
-                    Spacer(minLength: 0)
-                } else {
-                    rowList
+                if let row = vm.selectedRow {
+                    LogDetailCard(row: row, onOpen: { services.requestedSection = $0 },
+                                  onClose: { vm.selectedRowID = nil })
+                        .frame(height: clampedDetailHeight(dragHeight ?? savedDetailHeight,
+                                                           total: geometry.size.height))
+                    SplitHandle()
+                        .frame(height: Self.handleHeight)
+                        .gesture(
+                            // Global space: the handle moves with the card, so
+                            // a local translation would shrink as it moves.
+                            DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                                .onChanged { value in
+                                    let start = dragStartHeight ?? clampedDetailHeight(
+                                        savedDetailHeight, total: geometry.size.height)
+                                    dragStartHeight = start
+                                    dragHeight = clampedDetailHeight(
+                                        start + value.translation.height,
+                                        total: geometry.size.height)
+                                }
+                                .onEnded { _ in
+                                    if let dragHeight { savedDetailHeight = dragHeight }
+                                    dragHeight = nil
+                                    dragStartHeight = nil
+                                }
+                        )
                 }
+                listPane
             }
-            .frame(maxWidth: .infinity, minHeight: 200, maxHeight: .infinity)
-            .background(theme.codeBg)
-            .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
-                    .strokeBorder(theme.groupBorder, lineWidth: 0.5)
-            )
         }
+    }
+
+    private func clampedDetailHeight(_ height: Double, total: CGFloat) -> Double {
+        let upper = max(Self.minDetailHeight,
+                        Double(total - Self.handleHeight) - Self.minListHeight)
+        return min(max(height, Self.minDetailHeight), upper)
+    }
+
+    private var listPane: some View {
+        VStack(spacing: 0) {
+            LogColumnHeader()
+            Divider().overlay(theme.groupBorder)
+            if vm.rows.isEmpty {
+                if !vm.isLoading {
+                    Text(vm.emptyMessage)
+                        .font(.omlxText(DesignTokens.FontSize.body))
+                        .foregroundStyle(theme.textTertiary)
+                        .padding(.vertical, 36)
+                }
+                Spacer(minLength: 0)
+            } else {
+                rowList
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(theme.codeBg)
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
+                .strokeBorder(theme.groupBorder, lineWidth: 0.5)
+        )
     }
 
     private var rowList: some View {
@@ -230,6 +273,26 @@ private struct LogTable: View {
     }
 }
 
+/// Drag area between the detail card and the list. The capsule marks it, and
+/// the pointer turns into the row-resize arrows.
+private struct SplitHandle: View {
+    @Environment(\.omlxTheme) private var theme
+    @State private var hovering = false
+
+    var body: some View {
+        Capsule()
+            .fill(theme.textTertiary.opacity(hovering ? 0.9 : 0.45))
+            .frame(width: 36, height: 4)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+            .pointerStyle(.rowResize)
+            .accessibilityLabel(String(localized: "logs.detail.resize",
+                                       defaultValue: "Resize log entry",
+                                       comment: "Accessibility label of the handle that resizes the log detail card"))
+    }
+}
+
 private struct LogColumnHeader: View {
     @Environment(\.omlxTheme) private var theme
 
@@ -248,7 +311,7 @@ private struct LogColumnHeader: View {
                         comment: "Logs table column header: the log message"))
             Spacer(minLength: 0)
         }
-        .font(.omlxText(12, weight: .semibold))
+        .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
         .foregroundStyle(theme.textTertiary)
         .lineLimit(1)
         .padding(.horizontal, 12)
@@ -268,7 +331,7 @@ private struct LogRowView: View {
     var body: some View {
         HStack(spacing: 8) {
             Text(Self.clockTime(record.time))
-                .font(.omlxMono(12))
+                .font(.omlxMono(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.textTertiary)
                 .frame(width: LogColumn.time, alignment: .leading)
                 .help(record.level == nil
@@ -279,7 +342,7 @@ private struct LogRowView: View {
             LevelBadge(level: record.level)
                 .frame(width: LogColumn.level, alignment: .leading)
             Text(record.module)
-                .font(.omlxMono(12))
+                .font(.omlxMono(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.textSecondary)
                 .truncationMode(.middle)
                 .frame(width: LogColumn.module, alignment: .leading)
@@ -323,7 +386,7 @@ private struct LogRowView: View {
 
     private var message: some View {
         Text(record.firstLine)
-            .font(.omlxText(13))
+            .font(.omlxText(DesignTokens.FontSize.body))
             .foregroundStyle(theme.text)
             .truncationMode(.tail)
     }
@@ -353,7 +416,7 @@ private struct LevelBadge: View {
     var body: some View {
         let color = tint
         Text(level?.rawValue ?? "-")
-            .font(.omlxMono(12, weight: .semibold))
+            .font(.omlxMono(DesignTokens.FontSize.callout, weight: .semibold))
             .foregroundStyle(color)
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
@@ -381,7 +444,7 @@ private struct CountBadge: View {
 
     var body: some View {
         Text(text)
-            .font(.omlxText(12, weight: .semibold))
+            .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
             .foregroundStyle(tint ?? theme.textTertiary)
             .padding(.horizontal, 4)
             .background((tint?.opacity(0.16) ?? theme.controlBg),
@@ -406,7 +469,7 @@ private struct LogMemoryChips: View {
                 .background(theme.controlBg, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
             }
         }
-        .font(.omlxText(12))
+        .font(.omlxText(DesignTokens.FontSize.callout))
         .fixedSize()
     }
 }
@@ -445,14 +508,14 @@ private struct LogDetailCard: View {
                 Text(String(localized: "logs.detail.title",
                             defaultValue: "Entry",
                             comment: "Title of the card that shows one log record in full"))
-                    .font(.omlxText(12, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
                 Text(row.record.time)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.textSecondary)
                 LevelBadge(level: row.record.level)
                 Text(row.record.module)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.textTertiary)
                     .lineLimit(1)
                 Spacer(minLength: 8)
@@ -465,10 +528,10 @@ private struct LogDetailCard: View {
                 .keyboardShortcut(.escape, modifiers: [])
             }
 
+            // Fills the card, so dragging the split divider shows more lines.
             LogTextView(text: row.record.message, followTail: false, edgeKey: String(row.id),
                         fgColor: NSColor(theme.text), bgColor: NSColor(theme.inputBg))
-                // About one line of height per record line; longer records scroll inside.
-                .frame(height: min(200, 24 + 15 * CGFloat(row.record.lineCount)))
+                .frame(minHeight: 40, maxHeight: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: theme.rowRadius, style: .continuous))
 
             if let memory = LogParser.memoryGuard(String(row.record.firstLine)) {
@@ -485,7 +548,7 @@ private struct LogDetailCard: View {
                         onOpen(.server)
                     }
                 }
-                .font(.omlxText(12))
+                .font(.omlxText(DesignTokens.FontSize.callout))
                 .buttonStyle(.link)
             }
 
@@ -493,7 +556,7 @@ private struct LogDetailCard: View {
                 Text(String(localized: "logs.detail.occurrences",
                             defaultValue: "Occurrences (\(row.times.count))",
                             comment: "Heading above the list of times a repeated log line appeared; the placeholder is how many times"))
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
                     .foregroundStyle(theme.textSecondary)
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 3) {
@@ -505,13 +568,13 @@ private struct LogDetailCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .frame(maxHeight: 96)
-                .font(.omlxMono(12))
+                .font(.omlxMono(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.textTertiary)
                 if row.times.count > LogParser.occurrenceLimit {
                     Text(String(localized: "logs.detail.occurrences_more",
                                 defaultValue: "…and \(row.times.count - LogParser.occurrenceLimit) more",
                                 comment: "Line under the occurrence list when the list is capped; the placeholder is how many occurrences are not listed"))
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textTertiary)
                 }
             }
@@ -539,7 +602,7 @@ private struct LogRawPane: View {
                         fgColor: NSColor(theme.text), bgColor: NSColor(theme.codeBg))
             if vm.rawText.isEmpty && !vm.isLoading {
                 Text(vm.emptyMessage)
-                    .font(.omlxText(13))
+                    .font(.omlxText(DesignTokens.FontSize.body))
                     .foregroundStyle(theme.textTertiary)
                     .padding(.vertical, 36)
             }

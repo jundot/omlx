@@ -65,8 +65,9 @@ brew update && brew upgrade omlx
 # バックグラウンドサービスとして実行（クラッシュ時に自動再起動）
 brew services start omlx
 
-# オプション: MCP（Model Context Protocol）サポート
+# オプション: MCP（Model Context Protocol）サポート。読み込むには再起動
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
+omlx restart
 ```
 
 ### ソースからインストール
@@ -76,7 +77,7 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 make install                # Web UIとネイティブカスタムカーネルを含むeditableインストール
 # フルXcodeがない場合は make install-no-kernels でカーネルなしでインストール
-make mcp                    # オプション: MCP（Model Context Protocol）サポートを追加
+make mcp                    # オプション: MCP サポートを追加。`omlx serve` の再起動で読み込み
 ```
 
 macOS 15.0+（Sequoia）、Python 3.11–3.13、Apple Silicon（M1/M2/M3/M4/M5）が必要です。
@@ -191,7 +192,7 @@ Claude Codeで小さなコンテキストモデルを実行するため、トー
 
 ### モデルダウンロード
 
-管理画面からHuggingFaceのMLXモデルを直接検索してダウンロードします。モデルカードの確認、ファイルサイズの確認、ワンクリックダウンロードが可能です。
+管理画面からHuggingFaceのモデルをMLX、GGUF、またはすべての形式で直接検索してダウンロードします。モデルカードを確認してからダウンロードするファイルを選べます。MLXチェックポイントは必要なファイルを常にダウンロードし、GGUFはvision projectorも一緒にダウンロードします。
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX モデルダウンロード" width="720">
@@ -232,7 +233,7 @@ OpenAIとAnthropic APIのドロップイン代替です。ストリーミング�
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | テキストエンベディング |
 | `POST /v1/rerank` | ドキュメントリランキング |
-| `POST /v1/systemone` | Decision モデルによる型付き判定 (TypeSafe System One) |
+| `POST /v1/systemone` | Decision モデルまたはチャットモデルによる型付き判定 (TypeSafe System One) |
 | `GET /v1/models` | 利用可能なモデル一覧 |
 | `POST /tokenize`, `POST /detokenize` | vLLM 互換トークナイザー API（`/v1` 配下でも利用可） |
 
@@ -273,7 +274,7 @@ mlx-lmで利用可能なすべての関数呼び出し形式、JSONスキーマ�
 | タイプ | モデル |
 |------|------|
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm)がサポートするすべてのモデル |
-| VLM | Qwen3.5シリーズ、GLM-4V、Pixtralおよびその他の[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)モデル |
+| VLM | Qwen3.5シリーズ、GLM-4V、Pixtralおよびその他の[mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm)モデル |
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
 | エンベディング | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | リランカー | ModernBERT、XLM-RoBERTa |
@@ -397,7 +398,7 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ## 謝辞
 
 - [MLX](https://github.com/ml-explore/mlx)と[mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Apple Siliconでのビジョン言語モデル推論
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) - Apple Siliconでのビジョン言語モデル推論
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLXはvllm-mlx v0.1.0からスタートし、マルチモデルサービング、階層型KVキャッシュ、完全なページドキャッシュ対応のVLM、管理画面、macOSメニューバーアプリへと大きく進化しました
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOSアプリバンドルのためのポータブルPython環境レイヤリング
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon向けエンベディングモデルサポート

@@ -1,6 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from omlx.patches.deepseek_v4.switch_layers import install_nvfp4_global_scales
+
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
 from .language import LanguageModel
@@ -163,7 +165,8 @@ class Model(nn.Module):
         out = {f"language_model.{k}": v for k, v in lang.items()}
         out.update({f"vision_model.{k}": v for k, v in vis.items()})
         out.update(other)
-        return out
+        # MTP sanitize maps nextn layers to their actual mtp.* module paths.
+        return install_nvfp4_global_scales(self, out)
 
     @property
     def layers(self):

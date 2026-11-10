@@ -14,9 +14,10 @@ import SwiftUI
 
 struct ModelsScreen: View {
     @Environment(AppServices.self) private var services
-    @State private var vm = ModelsScreenVM()
+    private var vm: ModelsScreenVM { services.models }
 
     var body: some View {
+        @Bindable var vm = vm
         VStack(alignment: .leading, spacing: 0) {
             ActiveModelsSection(
                 models: vm.activeModels,
@@ -27,6 +28,8 @@ struct ModelsScreen: View {
                 models: vm.libraryModels,
                 isModelLoaded: { id in vm.activeModels.contains(where: { $0.id == id }) },
                 deletingID: vm.deletingID,
+                updates: vm,
+                onCheckUpdates: { Task { await vm.checkForUpdates(client: services.client) } },
                 onLoad: { id in vm.load(id: id, client: services.client) },
                 onUnload: { id in vm.unload(id: id, client: services.client) },
                 onOpenSettings: { id in services.modelDetailID = id },
@@ -38,6 +41,19 @@ struct ModelsScreen: View {
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
+        .sheet(item: $vm.updateTarget) { target in
+            ModelCardSheet(
+                target: target,
+                client: services.client,
+                onDownload: { repo, files in
+                    Task {
+                        if await vm.startUpdate(repo: repo, files: files, client: services.client) {
+                            services.requestedSection = .downloads
+                        }
+                    }
+                }
+            )
+        }
         .confirmationDialog(
             String(localized: "models.delete.confirm_title",
                    defaultValue: "Delete this model from disk?",
@@ -60,9 +76,15 @@ struct ModelsScreen: View {
                           comment: "Generic cancel button"),
                    role: .cancel) { vm.pendingRemoveID = nil }
         } message: { id in
-            Text(String(localized: "models.delete.confirm_message",
-                        defaultValue: "The model files will be permanently removed from disk and unloaded if currently running.",
-                        comment: "Body text inside the delete-model confirmation dialog explaining the impact"))
+            if vm.allModels.first(where: { $0.id == id })?.isInHFCache == true {
+                Text(String(localized: "models.delete.confirm_message_hf_cache",
+                            defaultValue: "This model is in the shared Hugging Face cache. Other apps that use the cache will need to download it again.",
+                            comment: "Body text inside the delete-model confirmation dialog when the model lives in the shared Hugging Face cache"))
+            } else {
+                Text(String(localized: "models.delete.confirm_message",
+                            defaultValue: "The model files will be permanently removed from disk and unloaded if currently running.",
+                            comment: "Body text inside the delete-model confirmation dialog explaining the impact"))
+            }
         }
     }
 }
@@ -93,7 +115,7 @@ private struct ActiveModelsSection: View {
                     Text(String(localized: "models.active.empty",
                                 defaultValue: "No models loaded",
                                 comment: "Empty-state message shown when no models are currently loaded"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 14)
@@ -108,14 +130,14 @@ private struct ActiveModelsSection: View {
                                     .foregroundStyle(theme.textSecondary)
                             }
                             Text(m.displayTitle)
-                                .font(.omlxText(13, weight: .medium))
+                                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                                 .foregroundStyle(theme.text)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                             Spacer(minLength: 8)
                             ActiveBadge(model: m)
                             Text(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.textSecondary)
                                 .frame(minWidth: 60, alignment: .trailing)
                             Button {
@@ -165,6 +187,8 @@ private struct LibrarySection: View {
     let models: [ModelDTO]
     let isModelLoaded: (String) -> Bool
     let deletingID: String?
+    let updates: ModelsScreenVM
+    let onCheckUpdates: () -> Void
     let onLoad: (String) -> Void
     let onUnload: (String) -> Void
     let onOpenSettings: (String) -> Void
@@ -183,7 +207,30 @@ private struct LibrarySection: View {
                                     comment: "Section heading for the on-disk model library"),
                       subtitle: String(localized: "models.library.subtitle",
                                        defaultValue: "Models: \(models.count) · \(formatBytes(totalSize)) on disk",
-                                       comment: "Subtitle for the Model Library section. Placeholders: model count, total bytes on disk"))
+                                       comment: "Subtitle for the Model Library section. Placeholders: model count, total bytes on disk")) {
+            Button(action: onCheckUpdates) {
+                HStack(spacing: 5) {
+                    if updates.isCheckingUpdates {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                    Text(String(localized: "models.updates.check", defaultValue: "Check for updates"))
+                }
+            }
+            .buttonStyle(.omlx(.normal, size: .small))
+            .disabled(updates.isCheckingUpdates || models.isEmpty)
+        }
+
+        if let status = updates.updateStatus {
+            Text(status)
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
+                .foregroundStyle(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 28)
+                .padding(.bottom, 4)
+        }
 
         ListGroup {
             if models.isEmpty {
@@ -192,12 +239,12 @@ private struct LibrarySection: View {
                         Text(String(localized: "models.library.empty.title",
                                     defaultValue: "No models discovered",
                                     comment: "Empty-state title shown when no models have been discovered on disk"))
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.callout))
                             .foregroundStyle(theme.textTertiary)
                         Text(String(localized: "models.library.empty.sub",
                                     defaultValue: "Use the Downloads screen to fetch a model from Hugging Face.",
                                     comment: "Empty-state subtitle directing the user to the Downloads screen"))
-                            .font(.omlxText(11))
+                            .font(.omlxText(DesignTokens.FontSize.subheadline))
                             .foregroundStyle(theme.textTertiary)
                     }
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -228,14 +275,44 @@ private struct LibrarySection: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 4) {
                                     Text(m.displayTitle)
-                                        .font(.omlxText(13, weight: .medium))
+                                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                                         .foregroundStyle(theme.text)
                                         .lineLimit(1)
                                         .truncationMode(.tail)
                                     CopyIconButton(value: m.id)
+                                    if m.isInHFCache {
+                                        StatusPill(status: .custom(
+                                            color: theme.textTertiary,
+                                            label: String(localized: "models.library.hf_cache.badge",
+                                                          defaultValue: "HF cache",
+                                                          comment: "Badge on a library model found in the shared Hugging Face cache"),
+                                            fillBg: true))
+                                            .help(String(localized: "models.library.hf_cache.help",
+                                                         defaultValue: "Found in the Hugging Face cache. Other apps that use this cache will need to download it again after you delete it.",
+                                                         comment: "Tooltip on the HF cache badge in the model library"))
+                                    }
+                                    ForEach((m.externalEngines ?? []).filter(\.compatible)) { engine in
+                                        StatusPill(status: .custom(
+                                            color: theme.accent,
+                                            label: engine.label,
+                                            fillBg: true))
+                                            .help(String(localized: "models.library.external_engine.help",
+                                                         defaultValue: "\(engine.label) can serve this model. Turn it on in the model's Advanced settings.",
+                                                         comment: "Tooltip on the external engine badge in the model library; placeholder is the engine name"))
+                                    }
+                                    if m.isGGUF {
+                                        StatusPill(status: .custom(
+                                            color: theme.textTertiary,
+                                            label: "GGUF",
+                                            fillBg: true))
+                                            .help(String(localized: "models.library.gguf.help",
+                                                         defaultValue: "A GGUF file, served by an external engine",
+                                                         comment: "Tooltip on the GGUF badge in the model library"))
+                                    }
                                 }
+                                updateBadge(for: m)
                                 Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
-                                    .font(.omlxMono(11))
+                                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                     .foregroundStyle(theme.textSecondary)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
@@ -300,6 +377,23 @@ private struct LibrarySection: View {
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func updateBadge(for model: ModelDTO) -> some View {
+        if let update = updates.update(for: model.id) {
+            Button { updates.showUpdate(for: model.id) } label: {
+                StatusPill(status: .custom(
+                    color: .yellow,
+                    label: String(localized: "models.updates.available", defaultValue: "Update available"),
+                    fillBg: true))
+            }
+            .buttonStyle(.plain)
+            .help(String(localized: "models.updates.details",
+                         defaultValue: "\(update.files) files · \(formatBytes(update.size))"))
+            .accessibilityLabel(String(localized: "models.updates.preview_label",
+                                       defaultValue: "Review update for \(model.displayTitle)"))
         }
     }
 

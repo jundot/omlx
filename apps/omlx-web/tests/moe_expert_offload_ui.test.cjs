@@ -4,7 +4,7 @@ const vm = require('vm');
 const assert = require('assert/strict');
 const path = require('path');
 const root = path.resolve(__dirname, '..');
-const context = {localStorage: {getItem: () => null}, window: {t: k => k}, console,
+const context = {localStorage: {getItem: () => null}, window: {t: k => k}, console, URLSearchParams,
     alert: message => {throw Error(message)}};
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js'), 'utf8'), context);
@@ -71,6 +71,28 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
         assert.equal(app.modelSettings[percent], settled);
         assert.equal(payload[fraction], settled / 100);
     }
+    const fitUrls = [];
+    context.fetch = async url => {
+        fitUrls.push(url);
+        return {ok: true, json: async () => ({status: 'fit', max_percent: 35, bytes: 7.2 * 1024 ** 3, reserve_bytes: 4 * 1024 ** 3})};
+    };
+    const query = mtp => `/admin/api/models/v41/moe-offload-fit?mtp_enabled=${mtp}&qwen4_ple_ssd_offload=false&deepseek_v41_engram_ssd_offload=false`;
+    await app.loadMoeOffloadFit();
+    await app.loadMoeOffloadFit();
+    assert.deepEqual(fitUrls, [query(false)], 'unchanged edits must not refetch');
+    app.modelSettings.mtp_enabled = true;
+    await app.loadMoeOffloadFit();
+    assert.deepEqual(fitUrls, [query(false), query(true)], 'unsaved size flags are sent');
+    assert.equal(app.moeOffloadFitText(), 'modal.model_settings.moe_expert_offload_fit');
+    app.modelSettings.mtp_enabled = false;
+    app.applyMoeOffloadFit();
+    context.fetch = async (_, init) => {
+        payload = JSON.parse(init.body);
+        return {ok: true, json: async () => ({})};
+    };
+    await app.saveModelSettings();
+    assert.equal(payload[fraction], 0.35, 'the hint applies its percent as the resident fraction');
+    assert.ok(offload.includes('x-effect="loadMoeOffloadFit()"'));
     assert.match(offload, /<input type="number" min="5" max="95" step="any" inputmode="decimal"/);
     assert.ok(offload.includes('@input="onMoeExpertOffloadResidentPercent()"'));
     assert.ok(offload.includes('@blur="onMoeExpertOffloadResidentBlur()"'));

@@ -16,7 +16,7 @@ import mlx.nn as nn  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 
 from omlx.exceptions import InvalidRequestError  # noqa: E402
-from omlx.models import clef, d3, decision, openjev  # noqa: E402
+from omlx.models import clef, d1, d3, decision, openjev  # noqa: E402
 from omlx.models.decision import (  # noqa: E402
     DecisionBackbone,
     DecisionContextLengthError,
@@ -844,6 +844,89 @@ def test_clef_and_openjev_reject_videos(model_class):
     }
     with pytest.raises(DecisionRequestError, match="videos"):
         model.encode(request)
+
+
+# --------------------------------------------------------------------------
+# LiquidAI d1
+
+
+@pytest.fixture(scope="module")
+def tiny_d1():
+    from mlx_vlm.models import d1_lfm3_vl
+
+    config = d1_lfm3_vl.ModelConfig.from_dict(
+        {
+            "model_type": "lfm3_vl",
+            "d1_attention": "set",
+            "d1_set_size": 16,
+            "projector_hidden_size": 64,
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 6,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 512,
+                "layer_types": [
+                    "conv",
+                    "full_attention",
+                    "conv",
+                    "sliding_attention",
+                    "conv",
+                    "full_attention",
+                ],
+                "sliding_window": 8,
+            },
+            "vision_config": {
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "layer_types": ["conv", "full_attention"],
+            },
+        }
+    )
+    model = d1_lfm3_vl.Model(config)
+    mx.eval(model.parameters())
+    model.eval()
+    wrapper = d1.D1Model("unused")
+    wrapper.model = model
+    return wrapper
+
+
+def test_d1_layer_steps_match_mlx_vlm_forward(tiny_d1):
+    ids = list(range(10, 40))
+    question = [-1] * 18 + [1] * 6 + [2] * 6
+    full = np.array(tiny_d1.model.d1_hidden(ids, 18, question))
+    for chunk in (len(ids), 7, 1):
+        steps = tiny_d1._hidden(ids, 18, question, [], lambda chunk=chunk: chunk)
+        counts = []
+        try:
+            while True:
+                counts.append(next(steps))
+        except StopIteration as stop:
+            hidden = np.array(stop.value)
+        assert sum(counts) == len(ids)
+        assert np.array_equal(hidden, full)
+
+
+def test_d1_rejects_media_instructions_and_videos():
+    from mlx_vlm.models.d1_lfm3_vl.api import SystemOneApi
+
+    model = d1.D1Model("unused")
+    model._requests = SystemOneApi()
+    spoken = {"type": "noul", "instructions": {"type": "audio", "path": "/etc/hosts"}}
+    with pytest.raises(DecisionRequestError, match="not media"):
+        model.encode({"state": "s", "questions": {"q": spoken}})
+    with pytest.raises(DecisionRequestError, match="videos"):
+        model.encode(
+            {
+                "state": "s",
+                "videos": ["data:video/mp4;base64,AA=="],
+                "questions": {"q": {"type": "noul", "instructions": "?"}},
+            }
+        )
 
 
 # --------------------------------------------------------------------------

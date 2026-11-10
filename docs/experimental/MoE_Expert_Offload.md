@@ -34,6 +34,17 @@ with a resident-fraction field accepting 5% to 95%, including fractional percent
 
 Toggling triggers an engine reload (it is a load-time transform).
 
+In the web dashboard, **Fit to memory** under the field offers the largest whole percent that leaves about 4 GB for prompts. It uses the same size estimate as load admission. The target is the prompt admission line, (memory ceiling - hot cache) x memory-guard tier headroom, less the models already loaded and that 4 GB. Clicking it fills the field. When even 5% leaves less than 4 GB, a short notice replaces it. If a larger percent only fits because the load would move a Qwen4-Exp PLE or DeepSeek V4.1 Engram table to SSD, the hint keeps the table resident at a lower percent when one fits. `GET /admin/api/models/{model_id}/moe-offload-fit` returns the same value.
+
+Measured on an M3 Ultra with the ceiling held at 12 GiB (balanced tier), each model loaded at the suggested percent and sent one 16K-token prompt:
+
+| model | suggested | loaded | 16K-token prompt | peak |
+|---|---:|---:|---|---:|
+| gemma-4-26b-a4b-it-4bit | 33% | 8.3 GB | served | 11.4 GB |
+| Qwen3.6-35B-A3B-MLX-4bit | 28% | 7.7 GB | served | 10.0 GB |
+
+The prompt line here is 11.9 GB. Prompt memory depends on the model and the prompt length, so 4 GB is a starting point rather than a guarantee. Longer prompts or several concurrent requests need a lower percent.
+
 Missing experts are read by 12 threads, with at most 48 experts' reads in flight, which bounds the host memory the pipeline holds ahead of the slot writes. In decode, when a step's reads are slow, the GPU stays busy while they finish: it computes the resident routes, stays clocked for the rest of the read, and dispatches each layer's output as soon as it is built. Steps whose reads arrive within 0.5 ms keep the serial order: read, then compute. None of this changes what is computed.
 
 ## Performance
@@ -263,7 +274,7 @@ GLM-5.2 and GLM-5.3 (`model_type: glm_moe_dsa`: 78 layers, the first 3 dense,
 256 routed experts, top-8, one shared expert) run their routed experts
 through oMLX's own GLM SwitchGLU, which fuses the gate and up projections at
 load and, on sorted calls, returns the routes already weighted and summed by
-the native `glm_moe_weighted_sum` kernel. The adapter in
+the native `moe_weighted_sum` kernel. The adapter in
 `omlx/patches/glm_moe_dsa/moe_offload.py` keeps that module and its kernels:
 each projection's parameters are replaced by resident slots before lazy
 weights materialize, expert ids are translated to slot ids, and the module's
@@ -351,3 +362,10 @@ MTP depth up to 3. Fixed depth 3 was slower (15.0 tok/s) because longer
 verify windows route to more distinct experts, so keep the adaptive
 controller. Checkpoints without MTP weights, or with MTP disabled, load
 exactly as before.
+
+With the native custom kernels built and Lightning MTP off, missing experts
+are read straight into a fixed pool of MLX buffers (about 110 MB) instead of
+being copied through Python bytes. Reads that find the pool full, and builds
+without the kernels, use the bytes path. On an M3 Ultra at 25% residency with
+the experts in page cache, decode went from 19.4 to 21.2 tok/s (+9%) with a
+2.7k prompt and from 19.6 to 20.9 tok/s (+7%) at 8k, with identical output.

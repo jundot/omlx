@@ -8,11 +8,12 @@ When TurboQuantKVCache is detected, routes attention to:
     from one unpack of each token (``_mma_mse_attention``)
   - Other decode (L=1): cache.decode_attention() — Metal kernel, no dequant
   - Other decode-shaped multi-row (1 < L <= 15, causal; MTP verify): a fused
-    2-pass kernel that unpacks each KV token once and scores all L rows
-    against it (MSE codecs, issue #2215); outside its envelope the L rows
-    are folded into the GQA repeat dimension so the codecs' decode kernels
-    apply, with the causal tail mask injected between key scoring and the
-    value weighted sum — one lazy pass over the KV, no dequantize
+    2-pass kernel that unpacks each KV token once per group of up to 4 rows
+    and scores the group against it (MSE codecs, issue #2215); outside its
+    envelope the L rows are folded into the GQA repeat dimension so the
+    codecs' decode kernels apply, with the causal tail mask injected between
+    key scoring and the value weighted sum - one lazy pass over the KV, no
+    dequantize
   - Prefill (L>1): tiled quantized attention first for long contexts;
     cache.prefill_attention() first for short contexts; then dequantized SDPA
 """
@@ -39,10 +40,9 @@ _DECODE_MULTIROW_MAX_Q_LEN = 15
 _MAX_FOLDED_REPEATS = 24
 # Softmax-denominator floor, matching turboquant's quantized_attention.
 _STATS_EPS = 1e-6
-# Fused multi-row verify kernel envelope. Register arrays scale with QRows
-# (q + o accumulators per row), so cap the rows; the adaptive MTP controller
-# tops out at depth 3 (L=4). Below the token floor the fold path is already
-# sub-0.2ms and the 2-pass block split has too few tokens per block.
+# Fused multi-row verify kernel envelope.
+# Register arrays scale with QRows, so wider verify windows run in groups of this size.
+# Below the token floor the fallbacks are cheap and 2-pass blocks get too few tokens.
 _FUSED_MULTIROW_MAX_Q_ROWS = 4
 _FUSED_MULTIROW_MIN_TOKENS = 2048
 
@@ -95,7 +95,9 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
         auto simd_lid = thread_index_in_simdgroup;
         auto gqa_idx = thread_position_in_threadgroup.y;
 
+        // Buffer capacity sets the strides; row_end is the visible prefix.
         auto token_count = key_norms_shape[2];
+        int visible = row_end[0];
         auto kv_heads = key_norms_shape[1];
         auto bh = batch_idx * kv_heads + kv_head_idx;
         auto bqh = batch_idx * kv_heads * RepeatCount
@@ -132,7 +134,7 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
         {"int v_bit_off = v_bit_start & 7;" if v_misaligned else ""}
 
         // KV loop: unpack each token once, score all QRows rows against it
-        for (int t = block_idx; t < (int)token_count; t += Blocks) {{
+        for (int t = block_idx; t < visible; t += Blocks) {{
             U kn = static_cast<U>(k_nm[t]);
             auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth)
                 + k_byte_base;
@@ -145,9 +147,9 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
             U v_el[v_per_thread];
             {v_lines}
 
-            // Row r sits at global position token_count - QRows + r; token
-            // t is invisible to rows r < t - (token_count - QRows).
-            int first_row = t - (int)token_count + QRows;
+            // Row r sits at global position visible - QRows + r.
+            // Token t is invisible to rows r < t - (visible - QRows).
+            int first_row = t - visible + QRows;
             for (int r = 0; r < QRows; r++) {{
                 U dot = 0;
                 for (int i = 0; i < qk_per_thread; i++)
@@ -188,6 +190,7 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
             "val_norms",
             "val_packed",
             "val_codebook",
+            "row_end",
         ],
         output_names=["out_acc", "out_sums", "out_maxs"],
         source=source,
@@ -199,9 +202,11 @@ def _fused_multirow_mse_attention(
 ):
     """Run MTP verify attention through the fused multi-row kernel.
 
-    Returns None when the states/codecs are outside the kernel envelope
-    (non-MSE codecs, fractional bits, mismatched dims); the caller falls
-    back to the fold / one-shot paths.
+    Rows run in groups of ``_FUSED_MULTIROW_MAX_Q_ROWS``, each over the same
+    packed buffers with its own causal end, so a wide verify window never
+    unpacks the KV into dense arrays. Returns None when the states/codecs are
+    outside the kernel envelope (non-MSE codecs, fractional bits, mismatched
+    dims); the caller falls back to the fold / one-shot paths.
     """
     from mlx_vlm import turboquant as _tq
 
@@ -237,9 +242,9 @@ def _fused_multirow_mse_attention(
     if pass1 is None or pass2 is None:
         return None
 
+    keys_full, values_full = _full_states(real_cache, keys_state, values_state, total)
     grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
     q_rot = key_codec.prepare_queries(grouped)
-    q_rot_flat = q_rot.reshape(B * n_kv_heads * n_repeats * L, D)
 
     # Same block split table as turboquant's 2-pass decode dispatch.
     if total <= 8192:
@@ -251,44 +256,50 @@ def _fused_multirow_mse_attention(
     else:
         num_blocks = 512
 
-    n_rows = B * n_q_heads * L
-    out_acc, out_sums, out_maxs = pass1(
-        inputs=[
-            q_rot_flat,
-            keys_state.norms,
-            keys_state.indices,
-            key_codec.codebook,
-            values_state.norms,
-            values_state.indices,
-            value_codec.codebook,
-        ],
-        template=[
-            ("Dim", D),
-            ("RepeatCount", n_repeats),
-            ("QRows", L),
-            ("Blocks", num_blocks),
-            ("KPackedWidth", keys_state.indices.shape[-1]),
-            ("VPackedWidth", values_state.indices.shape[-1]),
-        ],
-        grid=(n_kv_heads * 32, B * n_repeats, num_blocks),
-        threadgroup=(32, n_repeats, 1),
-        output_shapes=[
-            (n_rows * num_blocks, D),
-            (n_rows * num_blocks,),
-            (n_rows * num_blocks,),
-        ],
-        output_dtypes=[mx.float32, mx.float32, mx.float32],
-    )
-    out = pass2(
-        inputs=[out_acc, out_sums, out_maxs],
-        template=[("Dim", D), ("Blocks", num_blocks)],
-        grid=(n_rows * 1024, 1, 1),
-        threadgroup=(1024, 1, 1),
-        output_shapes=[(n_rows, D)],
-        output_dtypes=[mx.float32],
-    )[0]
+    outs = []
+    for start in range(0, L, _FUSED_MULTIROW_MAX_Q_ROWS):
+        end = min(L, start + _FUSED_MULTIROW_MAX_Q_ROWS)
+        rows = end - start
+        n_rows = B * n_q_heads * rows
+        out_acc, out_sums, out_maxs = pass1(
+            inputs=[
+                q_rot[..., start:end, :].reshape(n_rows, D),
+                keys_full.norms,
+                keys_full.indices,
+                key_codec.codebook,
+                values_full.norms,
+                values_full.indices,
+                value_codec.codebook,
+                mx.array([total - L + end], dtype=mx.int32),
+            ],
+            template=[
+                ("Dim", D),
+                ("RepeatCount", n_repeats),
+                ("QRows", rows),
+                ("Blocks", num_blocks),
+                ("KPackedWidth", keys_full.indices.shape[-1]),
+                ("VPackedWidth", values_full.indices.shape[-1]),
+            ],
+            grid=(n_kv_heads * 32, B * n_repeats, num_blocks),
+            threadgroup=(32, n_repeats, 1),
+            output_shapes=[
+                (n_rows * num_blocks, D),
+                (n_rows * num_blocks,),
+                (n_rows * num_blocks,),
+            ],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
+        out = pass2(
+            inputs=[out_acc, out_sums, out_maxs],
+            template=[("Dim", D), ("Blocks", num_blocks)],
+            grid=(n_rows * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(n_rows, D)],
+            output_dtypes=[mx.float32],
+        )[0]
+        outs.append(out.reshape(B, n_kv_heads, n_repeats, rows, D))
 
-    out_rotated = out.reshape(B, n_kv_heads, n_repeats, L, D)
+    out_rotated = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=3)
     output = value_codec._rotate_inverse(out_rotated)
     return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
 
@@ -463,6 +474,80 @@ def _mma_mse_attention_kernel():
     )
 
 
+# Turboquant's decode pass 2 with attention sinks: a sink is one extra logit
+# per query head in the softmax denominator with no value row. Row r of the
+# partials belongs to query head (r / L) % H (rows are B x heads x L).
+_SINK_REDUCE_SOURCE = """
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int elem_per_thread = Dim / BD;
+    typedef float U;
+
+    thread U o[elem_per_thread] = {};
+    threadgroup U outputs[BN * BD];
+
+    auto head_idx = threadgroup_position_in_grid.x;
+    auto simd_gid = simdgroup_index_in_threadgroup;
+    auto simd_lid = thread_index_in_simdgroup;
+    const U sink = static_cast<U>(sinks[(int(head_idx) / L) % H]);
+
+    U max_score = -INFINITY;
+    U sum_exp_score = 0;
+    for (int b = simd_gid; b < Blocks; b += BN) {
+        U block_max = maxs[head_idx * Blocks + b];
+        U block_sum = sums[head_idx * Blocks + b];
+        U new_max = max(max_score, block_max);
+        U factor = fast::exp(max_score - new_max);
+        U block_factor = fast::exp(block_max - new_max);
+        sum_exp_score = sum_exp_score * factor + block_sum * block_factor;
+        for (int i = 0; i < elem_per_thread; i++) {
+            o[i] = o[i] * factor +
+                partials[(head_idx * Blocks + b) * Dim +
+                         simd_lid * elem_per_thread + i] * block_factor;
+        }
+        max_score = new_max;
+    }
+
+    threadgroup U sg_maxs[BN];
+    threadgroup U sg_sums[BN];
+    if (simd_lid == 0) {
+        sg_maxs[simd_gid] = max_score;
+        sg_sums[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U sg_max = sg_maxs[simd_lid];
+    U new_max = max(simd_max(sg_max), sink);
+    U factor = fast::exp(sg_max - new_max);
+    U total_sum = simd_sum(sg_sums[simd_lid] * factor) + fast::exp(sink - new_max);
+    U my_factor = fast::exp(max_score - new_max);
+
+    for (int i = 0; i < elem_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = o[i] * my_factor;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+        o[i] = total_sum > 0 ? o[i] / total_sum : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        for (int i = 0; i < elem_per_thread; i++)
+            out[head_idx * Dim + simd_gid * elem_per_thread + i] =
+                static_cast<U>(o[i]);
+    }
+"""
+
+
+@cache
+def _sink_reduce_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_tq_mse_sdpa_2pass2_sinks",
+        input_names=["partials", "sums", "maxs", "sinks"],
+        output_names=["out"],
+        source=_SINK_REDUCE_SOURCE,
+    )
+
+
 def _mma_blocks(total: int) -> int:
     # Half of turboquant's 2-pass decode split, measured best on M4 Max.
     if total <= 8192:
@@ -488,13 +573,26 @@ def _full_state(cache_state, state, total):
     return state
 
 
-def _mma_mse_attention(real_cache, queries, keys, values, scale, starts=None):
+def _full_states(real_cache, keys_state, values_state, total):
+    """``_full_state`` for K and V; the kernels stride both by the key capacity."""
+    keys_full = _full_state(real_cache.keys, keys_state, total)
+    values_full = _full_state(real_cache.values, values_state, total)
+    if keys_full.norms.shape[2] != values_full.norms.shape[2]:
+        return keys_state, values_state
+    return keys_full, values_full
+
+
+def _mma_mse_attention(
+    real_cache, queries, keys, values, scale, starts=None, sinks=None
+):
     """Decode and causal verify attention over MSE states.
 
     ``starts`` holds each row's first key column for a left-padded batch
     whose rows end at the same column; without it only one sequence is
-    accepted. Returns None outside the kernel's envelope (other codecs,
-    bit widths that straddle packed words, odd head dims).
+    accepted. ``sinks`` (one logit per query head) join the softmax
+    denominator in the reduction pass. Returns None outside the kernel's
+    envelope (other codecs, bit widths that straddle packed words, odd head
+    dims).
     """
     from mlx_vlm import turboquant as _tq
 
@@ -538,10 +636,7 @@ def _mma_mse_attention(real_cache, queries, keys, values, scale, starts=None):
     total = keys_state.norms.shape[2]
     if total < L:
         return None
-    keys_full = _full_state(real_cache.keys, keys_state, total)
-    values_full = _full_state(real_cache.values, values_state, total)
-    if keys_full.norms.shape[2] != values_full.norms.shape[2]:
-        keys_full, values_full = keys_state, values_state
+    keys_full, values_full = _full_states(real_cache, keys_state, values_state, total)
     n_repeats = n_q_heads // n_kv_heads
     rows = n_repeats * L
     grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
@@ -580,14 +675,24 @@ def _mma_mse_attention(real_cache, queries, keys, values, scale, starts=None):
         ],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
-    out = _tq._fused_mse_decode_2pass_2_kernel()(
-        inputs=[out_acc, out_sums, out_maxs],
-        template=[("Dim", D), ("Blocks", num_blocks)],
-        grid=(n_rows * 1024, 1, 1),
-        threadgroup=(1024, 1, 1),
-        output_shapes=[(n_rows, D)],
-        output_dtypes=[mx.float32],
-    )[0]
+    if sinks is None:
+        out = _tq._fused_mse_decode_2pass_2_kernel()(
+            inputs=[out_acc, out_sums, out_maxs],
+            template=[("Dim", D), ("Blocks", num_blocks)],
+            grid=(n_rows * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(n_rows, D)],
+            output_dtypes=[mx.float32],
+        )[0]
+    else:
+        out = _sink_reduce_kernel()(
+            inputs=[out_acc, out_sums, out_maxs, sinks],
+            template=[("Dim", D), ("Blocks", num_blocks), ("L", L), ("H", n_q_heads)],
+            grid=(n_rows * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(n_rows, D)],
+            output_dtypes=[mx.float32],
+        )[0]
     output = value_codec._rotate_inverse(out.reshape(B, n_kv_heads, n_repeats, L, D))
     return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
 
@@ -626,13 +731,14 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
 
     MTP verify would otherwise fall into the prefill fallbacks, which
     re-dequantize or chunk-scan the whole cache with per-chunk eval syncs
-    on every verify cycle (issue #2127 class). MSE-codec states take the
-    fused multi-row kernel (one KV unpack shared across the L rows, issue
-    #2215); other codecs fold the L rows into the repeat dimension so the
-    L==1 decode kernels stay applicable (repeat count is a kernel template
-    parameter), with the causal tail mask applied on the raw scores before
-    the value weighted sum. Returns None when the states don't fit; the
-    caller falls back to the generic paths.
+    on every verify cycle (issue #2127 class). Above the token floor,
+    MSE-codec states take the fused multi-row kernel (one KV unpack per group
+    of up to 4 rows, issue #2215). Other states fold the L rows into the
+    repeat dimension so the L==1 decode kernels stay applicable (repeat count
+    is a kernel template parameter), with the causal tail mask applied on the
+    raw scores before the value weighted sum; folds past the register knee
+    run one-shot quantized_attention instead. Returns None when the states
+    don't fit; the caller falls back to the generic paths.
     """
     from mlx_vlm.turboquant import TurboQuantSplitState
 
@@ -653,7 +759,7 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
     total = _state_length(keys_state)
     if total < L:
         return None
-    if L <= _FUSED_MULTIROW_MAX_Q_ROWS and total > _FUSED_MULTIROW_MIN_TOKENS:
+    if total > _FUSED_MULTIROW_MIN_TOKENS:
         try:
             result = _fused_multirow_mse_attention(
                 real_cache, queries, keys_state, values_state, scale, total
@@ -757,6 +863,12 @@ def _left_padded_batch_attention(real_cache, queries, keys, values, scale, mask)
     and row b starts at ``left_padding[b]``, so the MMA kernel reads
     ``left_padding`` instead. Returns None for verify rows outside its envelope.
     """
+    from ..affine4 import Affine4KVCache, Affine8KVCache
+
+    if isinstance(real_cache, (Affine4KVCache, Affine8KVCache)):
+        return real_cache.attention(
+            queries, keys_state=keys, values_state=values, scale=scale, mask=mask
+        )
     out = _mma_mse_attention(
         real_cache, queries, keys, values, scale, starts=real_cache.left_padding
     )
@@ -896,10 +1008,28 @@ def apply_turboquant_attention_patch() -> bool:
             real_cache = cache._cache
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+            from ..affine4 import Affine4KVCache, Affine8KVCache
+
+            if isinstance(real_cache, (Affine4KVCache, Affine8KVCache)):
+                return real_cache.attention(
+                    queries,
+                    keys_state=keys,
+                    values_state=values,
+                    scale=scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
             if sinks is not None:
-                # TurboQuant's quantized kernels do not implement attention
-                # sinks. Preserve correctness by falling back to MLX's
-                # sink-aware SDPA over dequantized states.
+                # Only the MMA kernel's reduction implements attention sinks.
+                # Elsewhere preserve correctness by falling back to MLX's
+                # sink-aware SDPA over dequantized states (it re-reads the
+                # whole cache every step, so long decodes slow down).
+                if queries.shape[-2] == 1 and mask is None:
+                    result = _mma_mse_attention(
+                        real_cache, queries, keys, values, scale, sinks=sinks
+                    )
+                    if result is not None:
+                        return result
                 dequantized_keys, dequantized_values = real_cache.dequantize(
                     keys_state=keys,
                     values_state=values,

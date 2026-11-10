@@ -81,6 +81,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     struct CacheSettings: Codable, Equatable, Sendable {
         let enabled: Bool
         let ssdCacheDir: String?
+        let ssdCacheUnavailable: Bool?
         let ssdCacheMaxSize: String?
         let hotCacheOnly: Bool?
         let hotCacheMaxSize: String?
@@ -107,6 +108,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let apiKeySet: Bool
         let apiKey: String?
         let skipApiKeyVerification: Bool?
+        let allowUnauthenticatedInference: Bool?
         let subKeys: [SubKeyDTO]?
     }
 
@@ -172,6 +174,10 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let opusModel: String?
         let sonnetModel: String?
         let haikuModel: String?
+        /// Annotates the configured tier models with Anthropic family
+        /// metadata (anthropic_family_tier) for Claude Desktop. Optional so
+        /// older servers that omit the key still decode (nil = disabled).
+        let desktopEnabled: Bool?
     }
 
     struct IntegrationsSettings: Codable, Equatable, Sendable {
@@ -275,6 +281,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var claudeCodeOpusModel: String? = nil
     var claudeCodeSonnetModel: String? = nil
     var claudeCodeHaikuModel: String? = nil
+    /// This field (`claude_code_desktop_enabled` on the wire via
+    /// `convertToSnakeCase`): Claude Desktop tier-alias toggle.
+    var claudeCodeDesktopEnabled: Bool? = nil
 
     // Other integrations (PR 9)
     var integrationsCodexModel: String? = nil
@@ -307,6 +316,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
 
     // Auth (PR 9)
     var skipApiKeyVerification: Bool? = nil
+    var allowUnauthenticatedInference: Bool? = nil
     /// Update the configured API key. Server applies and persists via
     /// /admin/api/global-settings (`api_key` field). Only valid when an
     /// admin session is already authenticated — first-time setup still

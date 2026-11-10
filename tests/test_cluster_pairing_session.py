@@ -6,6 +6,7 @@ import io
 import json
 import socket
 import stat
+import time
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -50,6 +51,18 @@ def test_restart_can_complete_approval_with_original_code(tmp_path):
     assert "code" not in saved["attempt"]
     assert "cancel_token" not in saved["attempt"]
     assert saved["withdrawals"] == []
+
+
+def test_join_completes_without_a_dashboard_asking_for_approval(tmp_path):
+    coordinator, joiner, _, enrollments, _ = _loopback_pair(tmp_path)
+    joiner.join_watch_s = 0.01
+    shown = joiner.ui_session.begin("coordinator:8000")
+    coordinator.approve(joiner.node_id, shown["code"])
+    deadline = time.monotonic() + 10
+    while joiner.ui_session.snapshot()["state"] != "approved":
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    assert len(enrollments) == 2
 
 
 def test_cancel_offline_survives_restart_and_allows_other_peer(tmp_path):

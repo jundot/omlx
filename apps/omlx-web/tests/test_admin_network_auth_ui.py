@@ -11,6 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 NETWORK_AUTH_I18N_KEYS = {
     "settings.auth.skip_verification_warning",
+    "settings.auth.keyless_inference",
+    "settings.auth.keyless_inference_hint",
+    "settings.auth.keyless_inference_confirm",
     "js.error.api_key_required_network",
 }
 

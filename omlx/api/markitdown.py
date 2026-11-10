@@ -500,7 +500,8 @@ def parse_file_part(part: dict[str, Any], *, max_file_size_mb: int) -> MarkItDow
             status_code=400,
         )
 
-    if not mime_type:
+    # Browser MIME types come from OS file associations, so the extension decides.
+    if mime_type not in SUPPORTED_ATTACHMENT_MIME_TYPES:
         mime_type = _mime_type_for_extension(extension)
 
     return MarkItDownFile(filename=filename, mime_type=mime_type, data=data)
@@ -813,12 +814,6 @@ def _validate_supported_file(filename: str, mime_type: str) -> None:
     if extension not in SUPPORTED_ATTACHMENT_EXTENSIONS:
         raise MarkItDownRequestError(
             "Unsupported attachment type. "
-            "Supported formats are PDF, DOCX, PPTX, TXT, and MD.",
-            status_code=400,
-        )
-    if mime_type and mime_type not in SUPPORTED_ATTACHMENT_MIME_TYPES:
-        raise MarkItDownRequestError(
-            "Unsupported attachment MIME type. "
             "Supported formats are PDF, DOCX, PPTX, TXT, and MD.",
             status_code=400,
         )

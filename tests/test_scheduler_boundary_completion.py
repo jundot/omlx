@@ -286,7 +286,7 @@ def _tiny_rotating_model():
     )
 
 
-def _run_through_scheduler(scheduler, tokens, marker, request_id):
+def _run_through_scheduler(scheduler, tokens, marker, request_id, system_end=0):
     """Serve one request end to end: prefix lookup, prefill, decode, store."""
     request = Request(
         request_id=request_id,
@@ -295,6 +295,7 @@ def _run_through_scheduler(scheduler, tokens, marker, request_id):
     )
     scheduler.add_request(request)
     request.generation_prompt_start = marker
+    request.system_prefix_end = system_end
     for _ in range(50):
         scheduler.step()
         if request_id not in scheduler.requests:
@@ -336,7 +337,8 @@ def test_prefill_tail_reuse_matches_cold_forward(
 ):
     """Tail blocks stored by the scheduler restore the same state a cold forward
     produces, for GDN (embedded and sidecar) and rotating layouts on both
-    prefill paths, across a repeat, an extended prompt, and a second turn."""
+    prefill paths, across a repeat, an extended prompt, a second turn, and a
+    request that shares only the system prefix."""
     mx.random.seed(7)
     if kind == "gdn":
         model = _tiny_hybrid_model()
@@ -395,6 +397,26 @@ def test_prefill_tail_reuse_matches_cold_forward(
         request = _run_through_scheduler(scheduler, second, 13, "turn-2")
         assert request.cached_tokens == 7
         _assert_restored_matches_cold(model, scheduler, prefix, second + [7, 8], 13)
+
+        # Fan-out on a system prefix shorter than a block (a root tail), then
+        # on one whose user turn crosses a boundary. The shared tail survives
+        # the other conversation's later turns.
+        for system in ([20, 21, 22], [20, 21, 22, 23, 24, 25]):
+            n = len(system)
+            other = system + [26, 27, 28, 29]
+            _run_through_scheduler(
+                scheduler, other, len(other) - 1, f"a-{n}", system_end=n
+            )
+            turn = system + [30, 31, 0, 29]
+            for i, extra in enumerate(([], [9, 10, 11, 29], [12, 13, 14, 29])):
+                turn = turn + extra
+                request = _run_through_scheduler(
+                    scheduler, turn, len(turn) - 1, f"b-{n}-{i}", system_end=n
+                )
+                if i == 0:
+                    assert request.cached_tokens == n
+            probe = system + [15, 16, 29]
+            _assert_restored_matches_cold(model, scheduler, prefix, probe, n)
     finally:
         scheduler.shutdown()
 

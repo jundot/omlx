@@ -25,7 +25,9 @@ from omlx.admin.benchmark import (
     _generate_prompt,
     _load_bench_corpus,
     _log_ane_benchmark_trace,
+    _prefill_helper_details,
     _run_batch_test,
+    _setting_feature_flags,
     _run_single_test,
     _upload_model_name,
     _upload_model_repo,
@@ -772,6 +774,9 @@ class _FakeBenchEnginePool:
     def get_loaded_model_ids(self):
         return []
 
+    def get_entry(self, model_id):
+        return SimpleNamespace(config_model_type="llama")
+
     async def get_engine(self, model_id, force_lm=False):
         self.force_lm_values.append(force_lm)
         return self._engine
@@ -1041,6 +1046,21 @@ class TestDeriveFeatureFlags:
             {"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"}
         ]
 
+    @pytest.mark.parametrize("bits", [4, 8])
+    def test_affine_formats_have_their_own_feature_label(self, bits):
+        settings = SimpleNamespace(
+            turboquant_kv_enabled=True,
+            turboquant_kv_scheme=f"affine{bits}",
+            turboquant_kv_bits=bits,
+        )
+        assert _detect_experimental_features(settings) == [f"affine{bits}"]
+        assert _derive_feature_flags(settings) == [
+            {
+                "key": f"affine{bits}_kv_{bits}bit",
+                "label": f"Affine{bits} KV {bits}-bit",
+            }
+        ]
+
     def test_qwen_ane_prefill_is_reported_as_acceleration(self):
         settings = SimpleNamespace(qwen35_ane_prefill_enabled=True)
         assert _derive_feature_flags(settings) == [
@@ -1074,6 +1094,63 @@ class TestDeriveFeatureFlags:
         assert _derive_feature_flags(SimpleNamespace()) == []
 
 
+def test_speed_badges_follow_what_the_model_runs_with(monkeypatch):
+    from omlx.admin import benchmark as bench
+    from omlx.model_settings import ModelSettings
+
+    monkeypatch.setattr(bench.quant_fast, "oq_a8_available", lambda: False)
+
+    def keys(**kwargs):
+        return [flag["key"] for flag in _setting_feature_flags(**kwargs)]
+
+    # A8 stays off until saved on, even with a helper.
+    assert keys(
+        model_settings=ModelSettings(), model_type="deepseek_v41", helper_a8=True
+    ) == ["ced_prefill"]
+    on = ModelSettings(a8_prefill_enabled=True)
+    # Without INT8 kernels here, A8 runs only on a helper's layers.
+    assert keys(model_settings=on, model_type="deepseek_v41") == ["ced_prefill"]
+    assert keys(model_settings=on, model_type="deepseek_v41", helper_a8=True) == [
+        "a8_prefill",
+        "ced_prefill",
+    ]
+    off = ModelSettings(
+        a8_prefill_enabled=False, deepseek_v41_ced_prefill_enabled=False
+    )
+    assert keys(model_settings=off, model_type="deepseek_v41", helper_a8=True) == []
+    assert keys(model_settings=on, model_type="llama", helper_a8=True) == []
+
+
+def test_prefill_helper_details_only_while_it_helps():
+    status = {
+        "state": "ready",
+        "name": "M5max",
+        "node_id": "node",
+        "device": "Apple M5 Max",
+        "memory": 128 << 30,
+        "held": 28,
+        "link": "thunderbolt",
+    }
+    from omlx.prefill_helper.manager import PrefillHelperManager
+
+    manager = MagicMock(spec=PrefillHelperManager, fixed_layers=None, a8_min_tokens=128)
+    manager.status.side_effect = lambda: status
+    engine = SimpleNamespace(prefill_helper=manager)
+    # Hardware only: the Mac's name and node id stay local.
+    assert _prefill_helper_details(engine) == {
+        "helper": "Apple M5 Max",
+        "helper_memory_gb": 128,
+        "layers": 28,
+        "split": "auto",
+        "link": "thunderbolt",
+        "a8": True,
+    }
+    status["state"] = "connecting"
+    assert _prefill_helper_details(engine) is None
+    # An engine without a helper manager (a mock answers any attribute).
+    assert _prefill_helper_details(MagicMock()) is None
+
+
 class TestFilterUploadedSettings:
     """Allowlist projection — a denylist would ship every future field."""
 
@@ -1081,6 +1158,10 @@ class TestFilterUploadedSettings:
         from omlx.model_settings import ModelSettings
 
         return ModelSettings(**overrides)
+
+    def test_kv_compression_scheme_is_preserved(self):
+        settings = self._settings(turboquant_kv_enabled=True, turboquant_kv_scheme="affine4")
+        assert _filter_uploaded_settings(settings)["turboquant_kv_scheme"] == "affine4"
 
     def test_performance_fields_are_kept(self):
         out = _filter_uploaded_settings(
@@ -1117,16 +1198,16 @@ class TestFilterUploadedSettings:
     def test_shareable_performance_fields_are_kept(self):
         out = _filter_uploaded_settings(
             self._settings(
-                qwen35_oq_a8_enabled=True,
-                qwen35_oq_a8_min_tokens=64,
+                a8_prefill_enabled=True,
+                a8_prefill_min_tokens=64,
                 moe_expert_offload_enabled=True,
                 moe_expert_offload_resident_fraction=0.5,
                 dflash_draft_window_size=4096,
                 dflash_block_size=8,
             )
         )
-        assert out["qwen35_oq_a8_enabled"] is True
-        assert out["qwen35_oq_a8_min_tokens"] == 64
+        assert out["a8_prefill_enabled"] is True
+        assert out["a8_prefill_min_tokens"] == 64
         assert out["moe_expert_offload_enabled"] is True
         assert out["moe_expert_offload_resident_fraction"] == 0.5
         assert out["dflash_draft_window_size"] == 4096
@@ -1206,6 +1287,24 @@ class TestFilterUploadedSettings:
         ):
             assert key not in out
 
+    def test_a_model_type_keeps_its_family_and_reports_resolved_toggles(self):
+        settings = self._settings(
+            deepseek_v41_engram_ssd_offload=True,
+            qwen4_ple_ssd_offload=True,
+            activation_fp16_enabled=True,
+            gpu_power_limit_w=60,
+        )
+        out = _filter_uploaded_settings(settings, "deepseek_v41")
+        # Unset A8 reports off and unset CED reports on.
+        assert out["a8_prefill_enabled"] is False
+        assert out["deepseek_v41_ced_prefill_enabled"] is True
+        assert out["deepseek_v41_engram_ssd_offload"] is True
+        assert "qwen4_ple_ssd_offload" not in out
+        assert out["activation_fp16_enabled"] is True and out["gpu_power_limit_w"] == 60
+        other = _filter_uploaded_settings(settings, "llama")
+        assert "a8_prefill_enabled" not in other
+        assert not [k for k in other if k.startswith(("deepseek_v41_", "qwen4_"))]
+
     def test_grammar_body_is_dropped_but_the_toggle_is_kept(self):
         out = _filter_uploaded_settings(
             self._settings(
@@ -1239,16 +1338,21 @@ class TestFilterUploadedSettings:
     def test_non_settings_object_returns_none(self):
         assert _filter_uploaded_settings(SimpleNamespace()) is None
 
-    def test_oversized_snapshot_falls_back_to_accelerator_flags(self):
+    @pytest.mark.parametrize("scheme", ["turboquant", "affine4"])
+    def test_oversized_snapshot_falls_back_to_accelerator_flags(self, scheme):
         # The fallback keeps every accelerator toggle, disabled ones included:
         # knowing a feature was off is as useful as knowing it was on.
-        settings = self._settings(mtp_enabled=True, turboquant_kv_enabled=True)
+        settings = self._settings(
+            mtp_enabled=True, turboquant_kv_enabled=True, turboquant_kv_scheme=scheme
+        )
         with patch("omlx.admin.benchmark._MAX_UPLOADED_SETTINGS_BYTES", 10):
             out = _filter_uploaded_settings(settings)
         assert out == {
             "dflash_enabled": False,
             "specprefill_enabled": False,
             "turboquant_kv_enabled": True,
+            "turboquant_kv_scheme": scheme,
+            "turboquant_kv_bits": 4,
             "mtp_enabled": True,
             "vlm_mtp_enabled": False,
             "qwen35_ane_prefill_enabled": False,

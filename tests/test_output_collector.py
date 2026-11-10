@@ -360,6 +360,7 @@ class TestRequestOutputCollectorMergeOutputs:
             new_text="Hello ",
             output_token_ids=[100, 101],
             completion_tokens=2,
+            logprobs=["lp100", "lp101"],
         )
         new = RequestOutput(
             request_id="test-001",
@@ -367,11 +368,13 @@ class TestRequestOutputCollectorMergeOutputs:
             new_text="world",
             output_token_ids=[100, 101, 102],
             completion_tokens=3,
+            logprobs=["lp102"],
         )
 
         result = collector._merge_outputs(existing, new)
 
         assert result.new_token_ids == [100, 101, 102]
+        assert result.logprobs == ["lp100", "lp101", "lp102"]
         assert result.new_text == "Hello world"
         assert result.output_token_ids == [100, 101, 102]  # Uses latest
         assert result.completion_tokens == 3  # Uses latest

@@ -18,8 +18,13 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten
+from mlx_embeddings.models.siglip import Model as Siglip
+from mlx_embeddings.models.siglip import ModelArgs as SiglipArgs
+from mlx_embeddings.models.siglip import TextConfig as SiglipTextConfig
+from mlx_embeddings.models.siglip import VisionConfig as SiglipVisionConfig
 from mlx_vlm.models.embedding_gemma2 import Model as EmbeddingGemma2
 from mlx_vlm.models.embedding_gemma2 import ModelConfig as EmbeddingGemma2Config
+from PIL import Image
 from safetensors.numpy import save_file
 
 from omlx.api.embedding_models import (
@@ -106,6 +111,14 @@ class TestEmbeddingModels:
         """Test max_length must be a positive integer."""
         with pytest.raises(ValueError, match="greater than 0"):
             EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", max_length=0)
+
+    def test_embedding_request_rejects_non_positive_dimensions(self):
+        """dimensions=0 returned the full-length vector and -1 silently
+        truncated from the end; both must fail validation like max_length."""
+        with pytest.raises(ValueError, match="greater than 0"):
+            EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", dimensions=0)
+        with pytest.raises(ValueError, match="greater than 0"):
+            EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", dimensions=-1)
 
     def test_embedding_request_items_input(self):
         """Test EmbeddingRequest with structured items."""
@@ -598,6 +611,31 @@ class TestEmbeddingCompileFallback:
             model.embed(["test"])
 
         assert generate.call_args.kwargs["max_length"] == 40960
+
+    def test_eager_usage_counts_tokens_left_after_truncation(self):
+        """generate() returns no mask, so usage is counted from the text."""
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = MagicMock()
+        model.processor = MagicMock(spec=["encode"])
+        model.processor.encode.side_effect = lambda text, add_special_tokens: (
+            text.split()
+        )
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6], [0.1, 0.2]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        texts = [" ".join(["w"] * 100), "a b c"]
+        with patch("mlx_embeddings.generate", return_value=mock_outputs):
+            truncated = model.embed(texts, max_length=8)
+            full = model.embed(texts, max_length=8, truncation=False)
+
+        assert truncated.total_tokens == 8 + 3
+        assert full.total_tokens == 100 + 3
 
     def test_default_max_length_uses_tokenizer_config_fallback(self):
         """Tokenizer model_max_length is used when model config lacks a limit."""
@@ -2512,82 +2550,108 @@ class TestMlxVlmEmbeddingGemma2:
         assert "audio_kwargs" not in processor.apply_chat_template.call_args.kwargs
 
 
-class TestEmbeddingGemma2ImageLayout:
-    """PIL channel-layout guard for mlx-vlm EmbeddingGemma 2 (#2346)."""
 
-    @pytest.fixture(scope="class")
-    def processor(self):
-        pytest.importorskip(
-            "mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2"
+class TestSiglipEmbedding:
+    """SigLIP embeds text and images with separate towers."""
+
+    class MockTokenizer:
+        """Pads to max_length and records the call kwargs."""
+
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, texts, **kwargs):
+            self.calls.append(kwargs)
+            length = kwargs["max_length"]
+            encoded = [[3 + len(word) % 20 for word in t.split()] + [1] for t in texts]
+            input_ids = [ids + [0] * (length - len(ids)) for ids in encoded]
+            mask = [[1] * len(ids) + [0] * (length - len(ids)) for ids in encoded]
+            return {"input_ids": mx.array(input_ids), "attention_mask": mx.array(mask)}
+
+    class MockProcessor:
+        """Like SiglipProcessor, __call__ takes images first."""
+
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+        def __call__(self, images=None, text=None, **kwargs):
+            raise AssertionError("text reached the processor's images argument")
+
+        @staticmethod
+        def image_processor(images, return_tensors):
+            pixels = [np.asarray(img, dtype=np.float32) / 127.5 - 1 for img in images]
+            return {"pixel_values": np.stack(pixels).transpose(0, 3, 1, 2)}
+
+    @staticmethod
+    def _image(color):
+        return Image.new("RGB", (32, 32), color)
+
+    def _uri(self, color):
+        buffer = io.BytesIO()
+        self._image(color).save(buffer, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    def _load(self, tmp_path):
+        args = SiglipArgs(
+            text_config=SiglipTextConfig(
+                vocab_size=32,
+                max_position_embeddings=8,
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=1,
+            ),
+            vision_config=SiglipVisionConfig(
+                image_size=32,
+                patch_size=16,
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=1,
+            ),
         )
-        from omlx.patches.embedding_gemma2_image_layout import (
-            apply_embedding_gemma2_image_layout_patch,
-        )
+        siglip = Siglip(args)
+        mx.eval(siglip.parameters())
+        tokenizer = self.MockTokenizer()
+        model = MLXEmbeddingModel(str(tmp_path))
+        with patch(
+            "mlx_embeddings.load", return_value=(siglip, self.MockProcessor(tokenizer))
+        ):
+            model.load()
+        return model, siglip, tokenizer
 
-        apply_embedding_gemma2_image_layout_patch()
-        from mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2 import (
-            EmbeddingGemma2ImageProcessor,
-        )
-
-        return EmbeddingGemma2ImageProcessor()
-
-    def test_one_pixel_tall_image_embeds_at_full_patch_width(self, processor):
-        """1-px-tall RGB must not collapse to 256-wide single-channel patches."""
-        from PIL import Image
-
-        out = processor.preprocess([Image.new("RGB", (900, 1), (5, 5, 5))])
-        assert out["pixel_values"].shape[-1] == 768
-
-    def test_nested_pil_batch_is_forced_to_hwc(self, processor):
-        """The HF processor chain hands preprocess a nested [[PIL]] list."""
-        from PIL import Image
-
-        out = processor.preprocess([[Image.new("RGB", (900, 1), (5, 5, 5))]])
-        assert out["pixel_values"].shape[-1] == 768
-
-    def test_landscape_orientation_keeps_width_on_x_axis(self, processor):
-        from PIL import Image
-
-        image = Image.new("RGB", (900, 3))
-        pixels = image.load()
-        for x in range(900):
-            for y in range(3):
-                pixels[x, y] = (x // 4, y * 70, 0)
-        positions = processor.preprocess([image])["image_position_ids"]
-        # Patch grid: 13440/16 wide, 3 stays under one 16-px patch row.
-        assert positions[..., 0].max() > positions[..., 1].max()
-
-    def test_portrait_and_landscape_are_not_interchangeable(self, processor):
-        from PIL import Image
-
-        wide = processor.preprocess([Image.new("RGB", (900, 3))])[
-            "image_position_ids"
+    def test_text_and_image_items_use_their_own_tower(self, tmp_path):
+        model, siglip, tokenizer = self._load(tmp_path)
+        texts = ["a red square", "a blue circle"]
+        items = [
+            {"text": texts[0]},
+            {"image": self._uri("red")},
+            {"text": texts[1]},
+            {"image": self._uri("blue")},
         ]
-        tall = processor.preprocess([Image.new("RGB", (3, 900))])[
-            "image_position_ids"
+
+        output = model.embed(items)
+
+        assert [(c["padding"], c["max_length"]) for c in tokenizer.calls] == [
+            ("max_length", 8)
         ]
-        assert wide[..., 0].max() == tall[..., 1].max()
-        assert wide[..., 1].max() == tall[..., 0].max()
-
-    def test_explicit_input_format_is_not_overridden(self, processor):
-        """Callers passing input_data_format keep control (e.g. numpy FIRST)."""
-        import numpy as np
-        from PIL import Image
-
-        image = Image.new("RGB", (8, 8), (1, 2, 3))
-        with_channel = processor.preprocess(
-            [image], input_data_format="channels_last"
+        tokens = tokenizer(texts, max_length=8)
+        text = siglip.get_text_features(input_ids=tokens["input_ids"])
+        pixels = self.MockProcessor.image_processor(
+            [self._image("red"), self._image("blue")], return_tensors="np"
+        )["pixel_values"]
+        image = siglip.get_image_features(pixel_values=mx.array(pixels))
+        text = np.array(text / mx.linalg.norm(text, axis=-1, keepdims=True))
+        image = np.array(image / mx.linalg.norm(image, axis=-1, keepdims=True))
+        np.testing.assert_allclose(
+            np.array(output.embeddings),
+            np.stack([text[0], image[0], text[1], image[1]]),
+            atol=1e-5,
         )
-        default = processor.preprocess([image])
-        np.testing.assert_array_equal(
-            np.asarray(with_channel["pixel_values"]),
-            np.asarray(default["pixel_values"]),
-        )
+        assert output.total_tokens == int(tokens["attention_mask"].sum())
 
-    def test_non_pil_input_still_uses_layout_inference(self, processor):
-        """numpy arrays keep the old behaviour — only PIL gets forced HWC."""
-        import numpy as np
+    def test_text_and_image_in_one_item_is_rejected(self, tmp_path):
+        model, _, _ = self._load(tmp_path)
 
-        array_hwc = np.full((8, 8, 3), 7, dtype=np.uint8)
-        out = processor.preprocess([array_hwc])
-        assert out["pixel_values"].shape[-1] == 768
+        with pytest.raises(ValueError, match="separately"):
+            model.embed([{"text": "a red square", "image": self._uri("red")}])

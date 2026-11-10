@@ -811,11 +811,11 @@ def manual_rope(x, positions, dims, base=10000.0, scale=1.0):
         positions: (L,) position indices
         dims: number of dimensions to rotate
         base: RoPE base frequency
-        scale: position scale divisor
+        scale: position multiplier, as in mx.fast.rope
     """
     half = dims // 2
     inv_freq = 1.0 / (base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims))
-    scaled_pos = positions.astype(mx.float32) / scale
+    scaled_pos = positions.astype(mx.float32) * scale
     angles = scaled_pos[:, None] * inv_freq[None, :]
     cos_a = mx.cos(angles)[None, None, :, :]
     sin_a = mx.sin(angles)[None, None, :, :]
@@ -980,6 +980,7 @@ def sparse_prefill(
     step_size: int = 2048,
     position_offset: int = 0,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    kickoff_index: Optional[int] = None,
 ) -> mx.array:
     """Prefill model cache with selected tokens at their original positions.
 
@@ -995,6 +996,8 @@ def sparse_prefill(
         cache: list of KVCache from make_prompt_cache()
         step_size: chunk size for processing
         position_offset: added to positions for RoPE (e.g. system prompt cache)
+        kickoff_index: token index that BatchGenerator processes later; the
+            sliding-window tail merge leaves it out
 
     Returns:
         logits from the last selected token
@@ -1019,6 +1022,8 @@ def sparse_prefill(
     if max_rotating_size > 0:
         tail_start = max(0, M - max_rotating_size)
         tail_indices = set(range(tail_start, M))
+        if kickoff_index is not None:
+            tail_indices.discard(kickoff_index)
         existing = set(selected_indices.tolist())
         merged = sorted(existing | tail_indices)
         selected_indices = mx.array(merged)

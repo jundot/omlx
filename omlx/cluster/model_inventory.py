@@ -102,7 +102,8 @@ def engine_pool_model_inventory(pool: Any) -> list[dict[str, Any]]:
         model_type = item.get("model_type", "llm")
         if not isinstance(model_path, str) or not model_path:
             continue
-        if model_type not in _CLUSTER_MODEL_TYPES:
+        # GGUF models run on an external engine, never across the cluster.
+        if model_type not in _CLUSTER_MODEL_TYPES or item.get("model_format") == "gguf":
             continue
         estimated_size = item.get("estimated_size", 0)
         if (

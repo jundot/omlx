@@ -268,7 +268,7 @@ private struct MemoryLifecycleSection: View {
                             .foregroundStyle(theme.warningText)
                         VStack(alignment: .leading, spacing: 6) {
                             Text(warning)
-                                .font(.omlxText(11))
+                                .font(.omlxText(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.text)
                                 .fixedSize(horizontal: false, vertical: true)
                             CodeChip(value: vm.wiredLimitCommand)
@@ -348,7 +348,12 @@ private struct CacheSection: View {
                               comment: "Row label for the SSD cache directory field"),
                 sublabel: String(localized: "performance.cache.ssd_dir.sub",
                                  defaultValue: "Where cold-spillover blocks live. Empty = base_path/cache.",
-                                 comment: "Sublabel for the SSD cache directory")
+                                 comment: "Sublabel for the SSD cache directory"),
+                warning: vm.ssdCacheUnavailable
+                    ? String(localized: "performance.cache.ssd_dir.unavailable",
+                             defaultValue: "Not available when the server started. SSD cache is off until the server restarts.",
+                             comment: "Warning under the SSD cache directory when it was unavailable at server start")
+                    : nil
             ) {
                 TextInput(
                     text: $vm.ssdCacheDir,

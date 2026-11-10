@@ -298,3 +298,41 @@ class TestCountChatTokens:
         count = engine.count_chat_tokens(messages, tools)
 
         assert count == 7
+
+
+class TestGetRerankMaxLength:
+    """get_rerank_max_length() mirrors get_embedding_max_length but must not
+    consult the LLM-oriented global sampling default: only an explicit request
+    or the model's own per-model max_context_window override applies."""
+
+    def test_request_value_wins(self):
+        from omlx.server import get_rerank_max_length
+
+        with patch("omlx.server.get_model_settings_for_request") as gm:
+            assert get_rerank_max_length("m", 1024) == 1024
+            gm.assert_not_called()
+
+    def test_per_model_override_applies(self):
+        from omlx.server import get_rerank_max_length
+
+        settings = ModelSettings(max_context_window=4096)
+        with patch(
+            "omlx.server.get_model_settings_for_request", return_value=settings
+        ):
+            assert get_rerank_max_length("m") == 4096
+
+    def test_no_override_defers_to_model_default(self):
+        """None lets the reranker resolve its own declared model_max_length."""
+        from omlx.server import get_rerank_max_length
+
+        with patch(
+            "omlx.server.get_model_settings_for_request",
+            return_value=ModelSettings(max_context_window=None),
+        ):
+            assert get_rerank_max_length("m") is None
+
+    def test_missing_settings_defers_to_model_default(self):
+        from omlx.server import get_rerank_max_length
+
+        with patch("omlx.server.get_model_settings_for_request", return_value=None):
+            assert get_rerank_max_length("m") is None

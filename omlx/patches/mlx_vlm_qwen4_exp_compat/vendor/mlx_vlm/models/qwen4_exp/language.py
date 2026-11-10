@@ -29,8 +29,11 @@ from omlx.memory_monitor import (
 )
 
 from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
+from omlx.patches.vlm_batch_kv_capacity import _ladder_capacity, _roll_logical_prefix
 from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
+
+from omlx.patches.vlm_batch_kv_capacity import install_capacity_methods
 
 from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from mlx_vlm.models.cache import ArraysCache
@@ -57,6 +60,10 @@ from .qsa_fast import (
 from . import attn_fused, hc_fused
 
 logger = logging.getLogger(__name__)
+
+# This package carries its own BatchKVCache class, which the stock-class
+# capacity patch (#4312) does not reach.
+install_capacity_methods(BatchKVCache)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
@@ -191,6 +198,14 @@ def _append_indexer_positions(
 ) -> mx.array:
     if cached is None:
         return position_ids
+    cached, position_ids = _promote_indexer_positions(cached, position_ids)
+    return mx.concatenate([cached, position_ids], axis=-1)
+
+
+def _promote_indexer_positions(
+    cached: mx.array, position_ids: mx.array
+) -> tuple[mx.array, mx.array]:
+    """Broadcast 2-D text positions up to the other side's 3-D MRoPE rank."""
     if cached.ndim == 3 and position_ids.ndim == 2:
         position_ids = mx.broadcast_to(
             position_ids[None],
@@ -203,7 +218,7 @@ def _append_indexer_positions(
             "QSA position IDs must be 2-D text positions or 3-D MRoPE positions, "
             f"got cached={cached.shape} and current={position_ids.shape}."
         )
-    return mx.concatenate([cached, position_ids], axis=-1)
+    return cached, position_ids
 
 
 class _QSAIndexerCache:
@@ -724,33 +739,68 @@ class BatchQSAKVCache:
     # The bank grows by this many blocks at a time.
     pooled_bank_step = 256
 
+    # Raw keys and positions live in a buffer that grows on the batch KV
+    # capacity ladder with this minimum grain, so an append writes in place.
+    index_step = 1024
+
+    # True while the backing buffers are wider than ``index_offset``.
+    _index_capacity_managed = False
+
     def __init__(self, left_padding):
         self.kv_cache = BatchKVCache(left_padding)
         self.index_keys = None
         self.index_position_ids = None
         self.index_offset = 0
 
-    # ``index_keys`` / ``index_position_ids`` behave as plain attributes.
-    # Assigning either from outside (merge, state, cache restore, tests) drops
-    # the bank; the methods below that keep each row's content in place
-    # relative to its first real token write the backing fields instead.
+    # ``index_keys`` / ``index_position_ids`` behave as plain exact-width
+    # attributes. Assigning either from outside (merge, state, cache restore,
+    # tests) adopts the array as is and drops the bank; the methods below that
+    # keep each row's content in place relative to its first real token write
+    # the backing fields instead.
     @property
     def index_keys(self):
-        return self._index_keys
+        keys = self._index_keys
+        if keys is None or not self._index_capacity_managed:
+            return keys
+        return keys[:, : self.index_offset]
 
     @index_keys.setter
     def index_keys(self, value):
+        self._release_index_capacity()
         self._index_keys = value
         self._pooled_bank = None
 
     @property
     def index_position_ids(self):
-        return self._index_position_ids
+        positions = self._index_position_ids
+        if positions is None or not self._index_capacity_managed:
+            return positions
+        return positions[..., : self.index_offset]
 
     @index_position_ids.setter
     def index_position_ids(self, value):
+        self._release_index_capacity()
         self._index_position_ids = value
         self._pooled_bank = None
+
+    def _release_index_capacity(self):
+        """Cut a capacity buffer to its logical prefix before a plain set.
+
+        Keys and positions are assigned one at a time, so the partner that is
+        not assigned yet must already be exact-width.
+        """
+        if not self._index_capacity_managed:
+            return
+        self._index_capacity_managed = False
+        self._index_keys = self._index_keys[:, : self.index_offset]
+        self._index_position_ids = self._index_position_ids[..., : self.index_offset]
+
+    def _adopt_index_capacity(self, keys, positions, length: int) -> None:
+        """Take capacity buffers whose first ``length`` columns are the bank."""
+        self._index_keys = keys
+        self._index_position_ids = positions
+        self._index_capacity_managed = True
+        self.index_offset = length
 
     @property
     def keys(self):
@@ -779,19 +829,54 @@ class BatchQSAKVCache:
         return self.kv_cache.update_and_fetch(keys, values)
 
     def update_indexer(self, keys: mx.array, position_ids: mx.array):
-        if self.index_keys is None:
+        cached_keys = self.index_keys
+        cached_positions = self.index_position_ids
+        if cached_keys is None:
             self.index_keys = keys
             self.index_position_ids = position_ids
-        else:
-            if keys.dtype != self._index_keys.dtype:
-                # concatenate promotes; blocks pooled at the old dtype differ.
-                self._pooled_bank = None
-            # An append keeps every row's content in place: the bank stays.
-            self._index_keys = mx.concatenate([self._index_keys, keys], axis=1)
-            self._index_position_ids = _append_indexer_positions(
-                self._index_position_ids, position_ids
+            self.index_offset = self.index_keys.shape[1]
+            return self.index_keys, self.index_position_ids
+        cached_positions, position_ids = _promote_indexer_positions(
+            cached_positions, position_ids
+        )
+        if (
+            cached_keys.dtype != keys.dtype
+            or cached_positions.dtype != position_ids.dtype
+        ):
+            # concatenate promotes; blocks pooled at the old key dtype differ.
+            bank = self._pooled_bank if cached_keys.dtype == keys.dtype else None
+            self.index_keys = mx.concatenate([cached_keys, keys], axis=1)
+            self.index_position_ids = mx.concatenate(
+                [cached_positions, position_ids], axis=-1
             )
-        self.index_offset = self.index_keys.shape[1]
+            self._pooled_bank = bank
+            self.index_offset = self.index_keys.shape[1]
+            return self.index_keys, self.index_position_ids
+
+        # An append keeps every row's content in place: the bank stays.
+        start = int(cached_keys.shape[1])
+        end = start + int(keys.shape[1])
+        if (
+            not self._index_capacity_managed
+            or cached_positions.shape[:-1] != self._index_position_ids.shape[:-1]
+            or end > int(self._index_keys.shape[1])
+        ):
+            capacity = _ladder_capacity(end, self.index_step)
+            new_keys = mx.zeros(
+                (cached_keys.shape[0], capacity, cached_keys.shape[-1]),
+                dtype=cached_keys.dtype,
+            )
+            new_positions = mx.zeros(
+                (*cached_positions.shape[:-1], capacity),
+                dtype=cached_positions.dtype,
+            )
+            if start:
+                new_keys[:, :start] = cached_keys
+                new_positions[..., :start] = cached_positions
+            self._adopt_index_capacity(new_keys, new_positions, start)
+        self._index_keys[:, start:end] = keys
+        self._index_position_ids[..., start:end] = position_ids
+        self.index_offset = end
         return self.index_keys, self.index_position_ids
 
     def prepare(self, **kwargs):
@@ -906,42 +991,64 @@ class BatchQSAKVCache:
         if right_padding is None or self.index_keys is None:
             return
         # Rolling the right padding into the left keeps each row's content in
-        # place relative to its first real token, so the bank stays.
-        self._index_keys = dynamic_roll(self._index_keys, right_padding, axis=1)
+        # place relative to its first real token, so the bank stays. Only the
+        # logical prefix rolls; a capacity buffer keeps its width.
+        length = int(self.index_keys.shape[1])
+        max_shift = max(right_padding.tolist())
+        self._index_keys = _roll_logical_prefix(
+            self._index_keys, right_padding, length, axis=1, max_shift=max_shift
+        )
         if self._index_position_ids.ndim == 3:
-            self._index_position_ids = dynamic_roll(
-                self._index_position_ids, right_padding[None], axis=2
+            self._index_position_ids = _roll_logical_prefix(
+                self._index_position_ids,
+                right_padding[None],
+                length,
+                axis=2,
+                max_shift=max_shift,
             )
         else:
-            self._index_position_ids = dynamic_roll(
-                self._index_position_ids, right_padding, axis=1
+            self._index_position_ids = _roll_logical_prefix(
+                self._index_position_ids,
+                right_padding,
+                length,
+                axis=1,
+                max_shift=max_shift,
             )
 
     def make_mask(self, *args, **kwargs):
         return self.kv_cache.make_mask(*args, **kwargs)
 
     def filter(self, batch_indices):
-        min_left = int(self.left_padding[batch_indices].min().item())
+        width_before = self.kv_cache._idx
         self.kv_cache.filter(batch_indices)
+        # The KV bank drops the common left padding in place or by compacting.
+        min_left = width_before - self.kv_cache._idx
         if self.index_keys is None:
             return
-        self._index_keys = self._index_keys[batch_indices]
-        if self._index_position_ids.ndim == 3:
-            self._index_position_ids = self._index_position_ids[:, batch_indices]
-        else:
-            self._index_position_ids = self._index_position_ids[batch_indices]
-        if min_left > 0:
-            self._index_keys = self._index_keys[:, min_left:]
-            self._index_position_ids = self._index_position_ids[..., min_left:]
-            self.index_offset -= min_left
+        kept = (
+            batch_indices.tolist()
+            if isinstance(batch_indices, mx.array)
+            else list(batch_indices)
+        )
+        keys, positions = self.index_keys, self.index_position_ids
+        width = self.index_offset
+        length = width - min_left
+        # Survivors are copied once, straight onto the ladder the next append
+        # would regrow to.
+        capacity = _ladder_capacity(length + 1, self.index_step)
+        new_keys = mx.zeros((len(kept), capacity, keys.shape[-1]), keys.dtype)
+        shape = list(positions.shape)
+        shape[-2], shape[-1] = len(kept), capacity
+        new_positions = mx.zeros(shape, dtype=positions.dtype)
+        for row, old in enumerate(kept):
+            new_keys[row : row + 1, :length] = keys[old : old + 1, min_left:width]
+            new_positions[..., row : row + 1, :length] = positions[
+                ..., old : old + 1, min_left:width
+            ]
+        self._adopt_index_capacity(new_keys, new_positions, length)
         # Banks are anchored at each row's first real token, so the min_left
         # shift leaves them valid; they follow their rows.
         if self._pooled_bank is not None:
-            kept = (
-                batch_indices.tolist()
-                if isinstance(batch_indices, mx.array)
-                else list(batch_indices)
-            )
             self._pooled_bank = self._pooled_bank.select(kept)
 
     @staticmethod
@@ -1044,16 +1151,34 @@ class BatchQSAKVCache:
         target = max(self.index_offset, other.index_offset)
         left = self._pad_index(self, target, sample_keys, sample_positions)
         right = self._pad_index(other, target, sample_keys, sample_positions)
-        index_keys = mx.concatenate([left[0], right[0]], axis=0)
         position_axis = 1 if sample_positions.ndim == 3 else 0
-        index_position_ids = mx.concatenate(
-            [left[1], right[1]], axis=position_axis
-        )
-
         self.kv_cache.extend(other.kv_cache)
-        self._index_keys = index_keys
-        self._index_position_ids = index_position_ids
-        self.index_offset = target
+        if left[0].dtype == right[0].dtype and left[1].dtype == right[1].dtype:
+            # Join straight onto the capacity ladder the next append would
+            # regrow to, instead of an exact-width bank it copies again.
+            rows = int(left[0].shape[0])
+            capacity = _ladder_capacity(target + 1, self.index_step)
+            index_keys = mx.zeros(
+                (rows + int(right[0].shape[0]), capacity, left[0].shape[-1]),
+                dtype=left[0].dtype,
+            )
+            shape = list(left[1].shape)
+            shape[position_axis] += int(right[1].shape[position_axis])
+            shape[-1] = capacity
+            index_position_ids = mx.zeros(shape, dtype=left[1].dtype)
+            index_keys[:rows, :target] = left[0]
+            index_keys[rows:, :target] = right[0]
+            index_position_ids[..., :rows, :target] = left[1]
+            index_position_ids[..., rows:, :target] = right[1]
+            self._adopt_index_capacity(index_keys, index_position_ids, target)
+        else:
+            # concatenate promotes; pooled blocks keep their own dtype.
+            self._index_capacity_managed = False
+            self._index_keys = mx.concatenate([left[0], right[0]], axis=0)
+            self._index_position_ids = mx.concatenate(
+                [left[1], right[1]], axis=position_axis
+            )
+            self.index_offset = target
         # Left-padding to the join width keeps every row's content in place
         # relative to its first real token, so both sides' banks stay valid.
         if self._pooled_bank is not None:
@@ -1065,6 +1190,9 @@ class BatchQSAKVCache:
         cache = QSAKVCache()
         base = self.kv_cache.extract(idx)
         cache.keys, cache.values, cache.offset = base.keys, base.values, base.offset
+        # Caller-sized copy, as in QSAKVCache.extract: its first append rounds
+        # to one step instead of doubling the row.
+        cache._geometric_capacity_managed = False
         if self.index_keys is not None:
             padding = int(self.left_padding[idx].item())
             cache.index_keys = mx.contiguous(
@@ -1179,11 +1307,13 @@ class BatchQSAKVCache:
         if trimmed and self._pooled_bank is not None:
             for row in range(len(self._pooled_bank.blocks)):
                 self._pooled_bank.drop_tail(row, trimmed)
-        # Slice the physical arrays like the singleton trim does:
-        # update_indexer concatenates onto them and re-derives index_offset
-        # from shape[1], so stale draft columns would otherwise fossilize
-        # and desync the indexer from the KV by the trimmed amount.
-        if trimmed and self.index_keys is not None:
+        # Cut an exact-width bank like the singleton trim, or stale draft columns
+        # desync the indexer from the KV. A capacity buffer is read via index_offset.
+        if (
+            trimmed
+            and self._index_keys is not None
+            and not self._index_capacity_managed
+        ):
             self._index_keys = self._index_keys[:, : self.index_offset]
             self._index_position_ids = self._index_position_ids[
                 ..., : self.index_offset
@@ -1788,12 +1918,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and isinstance(cache.offset, int)
             and position_embeddings is None
             and not target_verify
-            and self._batch_one_text_position_ids(position_ids, x.shape[1])
+            and qwen4_gathered_prefill_route(
+                x.shape[1], cache.offset, self.indexer.token_budget
+            )
         ):
             return False
-        return qwen4_gathered_prefill_route(
-            x.shape[1], cache.offset, self.indexer.token_budget
-        )
+        # Last: rank-three positions are compared on the host (a GPU sync),
+        # which one-row decode steps, never routed here, must not pay.
+        return self._batch_one_text_position_ids(position_ids, x.shape[1])
 
     def _gathered_text_decode_eligible(
         self,
@@ -1898,31 +2030,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 projection(x) for projection in (self.q_proj, self.k_proj, self.v_proj)
             )
         )
-        queries, gate = mx.split(
-            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
-            2,
-            axis=-1,
-        )
-        gate = gate.reshape(batch, length, -1)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        keys = self.k_norm(
-            keys.reshape(batch, length, self.num_key_value_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        values = values.reshape(
-            batch, length, self.num_key_value_heads, self.head_dim
-        ).transpose(0, 2, 1, 3)
-
         past_len = cache.offset
         text_position_ids, rotary_position_ids = _split_text_mrope_positions(
             position_ids, batch, length, past_len
         )
-        queries, keys = self.rotary_emb.apply_rotary(
-            queries,
-            keys,
-            rotary_position_ids,
-            unsqueeze_dim=1,
+        queries, keys, values, gate, _ = self._prepare_projected_qkv(
+            q_proj_output, keys, values, cache, rotary_position_ids, None, None
         )
-        keys, values = cache.update_and_fetch(keys, values)
 
         projected = (
             _target_verify_linear(self.indexer.index_qk_proj, x)
@@ -2012,39 +2126,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             self.k_proj(x),
             self.v_proj(x),
         )
-        queries, gate = mx.split(
-            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
-            2,
-            axis=-1,
-        )
-        gate = gate.reshape(batch, length, -1)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        new_keys = self.k_norm(
-            new_keys.reshape(
-                batch,
-                length,
-                self.num_key_value_heads,
-                self.head_dim,
-            )
-        ).transpose(0, 2, 1, 3)
-        new_values = new_values.reshape(
-            batch,
-            length,
-            self.num_key_value_heads,
-            self.head_dim,
-        ).transpose(0, 2, 1, 3)
-
         past_len = cache.offset
         text_position_ids, rotary_position_ids = _split_text_mrope_positions(
             position_ids, batch, length, past_len
         )
-        queries, new_keys = self.rotary_emb.apply_rotary(
-            queries,
-            new_keys,
-            rotary_position_ids,
-            unsqueeze_dim=1,
+        queries, keys, values, gate, _ = self._prepare_projected_qkv(
+            q_proj_output, new_keys, new_values, cache, rotary_position_ids, None, None
         )
-        keys, values = cache.update_and_fetch(new_keys, new_values)
 
         projected = self.indexer.index_qk_proj(x).reshape(
             batch,
@@ -2139,31 +2227,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         q_proj_output, new_keys, new_values = _target_verify_linears(
             (self.q_proj, self.k_proj, self.v_proj), x
         )
-        queries, gate = mx.split(
-            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
-            2,
-            axis=-1,
-        )
-        gate = gate.reshape(batch, length, -1)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        new_keys = self.k_norm(
-            new_keys.reshape(batch, length, self.num_key_value_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        new_values = new_values.reshape(
-            batch, length, self.num_key_value_heads, self.head_dim
-        ).transpose(0, 2, 1, 3)
-
         past_len = cache.offset
         text_position_ids, rotary_position_ids = _split_text_mrope_positions(
             position_ids, batch, length, past_len
         )
-        queries, new_keys = self.rotary_emb.apply_rotary(
-            queries,
-            new_keys,
-            rotary_position_ids,
-            unsqueeze_dim=1,
+        queries, keys, values, gate, _ = self._prepare_projected_qkv(
+            q_proj_output, new_keys, new_values, cache, rotary_position_ids, None, None
         )
-        keys, values = cache.update_and_fetch(new_keys, new_values)
 
         projected = _target_verify_linear(self.indexer.index_qk_proj, x).reshape(
             batch,
@@ -2713,9 +2783,8 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             return 0
         return rows
 
-    def _fused_projections_ready(self, x: mx.array, position_ids: Optional[mx.array]) -> bool:
-        """Whether ``_fused_prologue`` runs these rows: the grouped projection
-        launch takes the four projections and the kernels this layout."""
+    def _prep_ready(self, x: mx.array, pos_ndim: int) -> bool:
+        """Whether ``attn_fused.prep_qk`` computes these q/k norms and MRoPE."""
         rotary = self.rotary_emb
         return (
             rotary.position_selector is not None
@@ -2723,6 +2792,99 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and self.q_norm.group_size is None
             and self.k_norm.group_size is None
             and self.q_norm.eps == self.k_norm.eps
+            and attn_fused.prep_ready(
+                x.dtype,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+                rotary.dim,
+                pos_ndim,
+            )
+        )
+
+    def _prepare_projected_qkv(
+        self,
+        q_proj_output,
+        keys,
+        values,
+        cache,
+        position_ids,
+        position_embeddings,
+        mask,
+    ):
+        """``Qwen3_5Attention._prepare_projected_qkv`` with the q/k norms and
+        MRoPE of a batch-one call in one ``attn_fused.prep_qk`` launch (same
+        bits); other calls take the base."""
+        batch, length, _ = q_proj_output.shape
+        offset = getattr(cache, "offset", None)
+        rope_positions = position_ids
+        if rope_positions is None and isinstance(offset, int):
+            # The base's positions for an integer cache offset.
+            rope_positions = mx.tile(
+                mx.expand_dims(mx.arange(offset, offset + length), axis=0), (3, 1, 1)
+            )
+        if not (
+            batch == 1
+            and position_embeddings is None
+            and isinstance(offset, int)
+            and rope_positions is not None
+            and self._prep_ready(q_proj_output, rope_positions.ndim)
+        ):
+            return super()._prepare_projected_qkv(
+                q_proj_output,
+                keys,
+                values,
+                cache,
+                position_ids,
+                position_embeddings,
+                mask,
+            )
+        _, gate = mx.split(
+            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
+            2,
+            axis=-1,
+        )
+        gate = gate.reshape(batch, length, -1)
+        values = values.reshape(batch, length, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
+        queries, keys = self._prep_qk(
+            q_proj_output.reshape(length, -1), keys.reshape(length, -1), rope_positions
+        )
+        if isinstance(mask, mx.array):
+            # The base trims an array mask to the keys this call sees.
+            if hasattr(cache, "_idx") and hasattr(cache, "left_padding"):
+                kv_seq_len = int(cache._idx) + length
+            else:
+                kv_seq_len = length + offset + 1
+            mask = mask[..., :kv_seq_len]
+        keys, values = cache.update_and_fetch(keys, values)
+        return queries, keys, values, gate, mask
+
+    def _prep_qk(self, q_out: mx.array, k_out: mx.array, rope_positions: mx.array):
+        """``attn_fused.prep_qk`` of projected rows [R, ...]: (queries, keys)."""
+        rotary = self.rotary_emb
+        return attn_fused.prep_qk(
+            q_out,
+            k_out,
+            self.q_norm._scale(),
+            self.k_norm._scale(),
+            self.q_norm.eps,
+            rope_positions,
+            rotary.inv_freq,
+            rotary.position_selector,
+            heads=self.num_attention_heads,
+            kv_heads=self.num_key_value_heads,
+            rotary_dim=rotary.dim,
+            rope_scale=rotary.attention_scaling,
+        )
+
+    def _fused_projections_ready(self, x: mx.array, position_ids: Optional[mx.array]) -> bool:
+        """Whether ``_fused_prologue`` runs these rows: the grouped projection
+        launch takes the four projections and the kernels this layout."""
+        rotary = self.rotary_emb
+        return (
+            self._prep_ready(x, 3 if position_ids is None else position_ids.ndim)
             and attn_fused.ready(
                 x.dtype,
                 self.num_attention_heads,
@@ -2765,21 +2927,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         else:
             index_positions = rope_positions = position_ids
         q_out = q_out.reshape(rows, -1)
-        rotary = self.rotary_emb
-        queries, keys = attn_fused.prep_qk(
-            q_out,
-            k_out.reshape(rows, -1),
-            self.q_norm._scale(),
-            self.k_norm._scale(),
-            self.q_norm.eps,
-            rope_positions,
-            rotary.inv_freq,
-            rotary.position_selector,
-            heads=self.num_attention_heads,
-            kv_heads=self.num_key_value_heads,
-            rotary_dim=rotary.dim,
-            rope_scale=rotary.attention_scaling,
-        )
+        queries, keys = self._prep_qk(q_out, k_out.reshape(rows, -1), rope_positions)
         return q_out, index_out, v_out, queries, keys, index_positions
 
     def _fused_output(self, output: mx.array, rows: int) -> mx.array:
@@ -2927,7 +3075,7 @@ class Qwen4ExpGatedResidual(nn.Module):
             and not target_verify
             and hyper_input.ndim == 3
             and hyper_input.shape[:2] == (1, 1)
-            and hyper_input.dtype == mx.bfloat16
+            and hyper_input.dtype == self.hc_norm.weight.dtype
             and not get_mtp_runtime().enabled
         ):
             return compiled_forward(hyper_input)
@@ -2940,7 +3088,7 @@ class Qwen4ExpGatedResidual(nn.Module):
             getattr(self, "_omlx_exact_hybrid_projection", False)
             and not target_verify
             and hyper_input.shape == (1, 1, 10240)
-            and hyper_input.dtype == mx.bfloat16
+            and hyper_input.dtype == self.hc_norm.weight.dtype
             and not get_mtp_runtime().enabled
         ):
             from .hc_projection import hybrid_projection
@@ -3767,6 +3915,76 @@ class DiskBackedShardedEmbedding(nn.Module):
         self.__prefix = value
 
 
+# Shards one windowed-gather launch may read: 3 buffers each (packed weight,
+# scales, biases) plus the indices, the window's row offsets and 2 outputs
+# stay within Metal's 31 buffer arguments.
+_SHARD_WINDOW_MAX = 9
+
+_SHARD_GATHER_KERNELS: dict[int, Any] = {}
+
+
+def _shard_gather_kernel(window: int):
+    """Copy each index's packed row, scales and biases from the one of
+    ``window`` consecutive shards that holds it (row offsets in ``offsets``)."""
+
+    kernel = _SHARD_GATHER_KERNELS.get(window)
+    if kernel is None:
+        select = "\n".join(
+            f"        {'if' if k == 0 else 'else if'} "
+            f"({f'row < offsets[{k + 1}]' if k < window - 1 else 'true'}) "
+            f"{{ w = w{k}; sc = s{k}; bi = b{k}; local = row - offsets[{k}]; }}"
+            for k in range(window)
+        )
+        source = f"""
+        uint n = thread_position_in_grid.x;
+        uint rows = threads_per_grid.x;
+        int64_t row = idx[n];
+        const device uint32_t* w;
+        const device T* sc;
+        const device T* bi;
+        int64_t local;
+{select}
+        for (int j = 0; j < WORDS; ++j) {{
+            packed[n * WORDS + j] = w[local * WORDS + j];
+        }}
+        for (int g = 0; g < GROUPS; ++g) {{
+            sb[n * GROUPS + g] = sc[local * GROUPS + g];
+            sb[(rows + n) * GROUPS + g] = bi[local * GROUPS + g];
+        }}
+"""
+        names = [f"{kind}{k}" for kind in ("w", "s", "b") for k in range(window)]
+        kernel = mx.fast.metal_kernel(
+            name=f"omlx_qwen4_ple_shard_gather_{window}",
+            input_names=["idx", "offsets", *names],
+            output_names=["packed", "sb"],
+            source=source,
+        )
+        _SHARD_GATHER_KERNELS[window] = kernel
+    return kernel
+
+
+def _buffer_address(a: mx.array) -> int:
+    return np.frombuffer(memoryview(a), dtype=np.uint8).ctypes.data
+
+
+def _bound_rows(a: mx.array) -> mx.array:
+    """The leading rows of ``a`` for a launch that indexes all of ``a`` from
+    the bound pointer, or ``a`` itself when that view would not alias it.
+
+    MLX adds each newly bound array's whole data size to a per-command-buffer
+    count and commits the buffer past its cap (50 Mi elements on Max and Ultra
+    GPUs), so a gather over whole PLE shards (50M elements each) ends a command
+    buffer. A view of the first rows at the same address reads the same bytes
+    and counts only itself; eight or more elements keep it a device buffer
+    (MLX passes smaller inputs by value).
+    """
+    view = a[: max(1, -(-8 // a.shape[-1]))]
+    mx.eval(view)
+    if memoryview(view).c_contiguous and _buffer_address(view) == _buffer_address(a):
+        return view
+    return a
+
+
 class ShardedEmbedding(nn.Module):
     """Embedding kept in checkpoint-sized row shards to avoid a 100 GB join."""
 
@@ -3788,10 +4006,16 @@ class ShardedEmbedding(nn.Module):
         self.shard_offsets = tuple(offsets)
         self.dims = dims
 
-    def __call__(self, indices: mx.array) -> mx.array:
+    def __call__(
+        self, indices: mx.array, column_ranges: tuple | None = None
+    ) -> mx.array:
         fused = getattr(self, "fused", None)
         if fused is not None:
             return fused(indices) * self.weight_scale
+        if column_ranges is not None:
+            values = self._windowed_lookup(indices, column_ranges)
+            if values is not None:
+                return values * self.weight_scale
 
         flat = indices.reshape(-1)
         # One tiny host sync avoids scheduling gathers against all 128 giant
@@ -3822,6 +4046,125 @@ class ShardedEmbedding(nn.Module):
         inverse[order] = np.arange(order.size)
         values = mx.take(values, mx.array(inverse.astype(np.int32)), axis=0)
         return (values * self.weight_scale).reshape(*indices.shape, self.dims)
+
+    def _windowed_lookup(
+        self, indices: mx.array, column_ranges: tuple
+    ) -> mx.array | None:
+        """The rows of ``indices`` without a host sync, or None.
+
+        Column ``c`` of ``indices`` holds rows in ``column_ranges[c]``, which
+        spans a few consecutive shards, so one launch per column picks each
+        row's shard on the device and copies its packed row, scales and
+        biases. One ``mx.dequantize`` of the gathered rows then gives the
+        values each shard's lookup gives.
+        """
+
+        layout = getattr(self, "_window_layout", None)
+        if layout is None:
+            layout = self._window_layout = self._uniform_affine_layout()
+            self._window_offsets = {}
+        if (
+            not layout
+            or not indices.size
+            or indices.shape[-1] != len(column_ranges)
+            or mx.default_device() != mx.gpu
+        ):
+            return None
+        windows = []
+        for low, high in column_ranges:
+            start = bisect_right(self.shard_offsets, low) - 1
+            stop = bisect_right(self.shard_offsets, high - 1)
+            if stop - start > _SHARD_WINDOW_MAX:
+                return None
+            windows.append((start, stop))
+
+        words, groups = layout
+        first = self.shards[0]
+        rows = indices.size // len(column_ranges)
+        columns = mx.contiguous(
+            indices.reshape(rows, len(column_ranges)).astype(mx.int64).T
+        )
+        offset_arrays = self._window_offsets
+        # Shard index -> (weight, then the weight, scales and biases views the
+        # launches bind); a replaced shard is bound anew.
+        bound = getattr(self, "_bound_shards", None)
+        if bound is None:
+            bound = self._bound_shards = {}
+        packed, scales, biases = [], [], []
+        for column, (start, stop) in enumerate(windows):
+            views = []
+            for index in range(start, stop):
+                shard = self.shards[index]
+                entry = bound.get(index)
+                if entry is None or entry[0] is not shard.weight:
+                    entry = bound[index] = (
+                        shard.weight,
+                        *(_bound_rows(a) for a in (shard.weight, shard.scales, shard.biases)),
+                    )
+                views.append(entry[1:])
+            offsets = offset_arrays.get((start, stop))
+            if offsets is None:
+                offsets = offset_arrays[start, stop] = mx.array(
+                    self.shard_offsets[start : stop + 1], dtype=mx.int64
+                )
+            gathered = _shard_gather_kernel(stop - start)(
+                inputs=[
+                    columns[column],
+                    offsets,
+                    *(view[0] for view in views),
+                    *(view[1] for view in views),
+                    *(view[2] for view in views),
+                ],
+                template=[
+                    ("T", first.scales.dtype),
+                    ("WORDS", words),
+                    ("GROUPS", groups),
+                ],
+                grid=(rows, 1, 1),
+                threadgroup=(min(rows, 64), 1, 1),
+                output_shapes=[(rows, words), (2, rows, groups)],
+                output_dtypes=[first.weight.dtype, first.scales.dtype],
+            )
+            packed.append(gathered[0])
+            scales.append(gathered[1][0])
+            biases.append(gathered[1][1])
+        values = mx.dequantize(
+            mx.stack(packed, axis=1).reshape(-1, words),
+            scales=mx.stack(scales, axis=1).reshape(-1, groups),
+            biases=mx.stack(biases, axis=1).reshape(-1, groups),
+            group_size=first.group_size,
+            bits=first.bits,
+            mode=first.mode,
+        )
+        return values.reshape(*indices.shape, self.dims)
+
+    def _uniform_affine_layout(self) -> tuple[int, int] | bool:
+        """(packed words, groups) per row when every shard is an affine
+        QuantizedEmbedding of one layout, else False."""
+
+        shards = self.shards
+        if not shards or not all(
+            type(shard) is nn.QuantizedEmbedding for shard in shards
+        ):
+            return False
+        first = shards[0]
+        if first.mode != "affine" or getattr(first, "biases", None) is None:
+            return False
+        words, groups = first.weight.shape[1], first.scales.shape[1]
+        for shard in shards:
+            if (
+                shard.weight.ndim != 2
+                or shard.weight.shape[1] != words
+                or shard.scales.shape[1:] != (groups,)
+                or shard.biases is None
+                or shard.biases.shape != shard.scales.shape
+                or (shard.group_size, shard.bits, shard.mode)
+                != (first.group_size, first.bits, first.mode)
+                or (shard.weight.dtype, shard.scales.dtype, shard.biases.dtype)
+                != (first.weight.dtype, first.scales.dtype, first.biases.dtype)
+            ):
+                return False
+        return words, groups
 
     def fuse_quantized_shards(
         self, load_sources: Callable[[], list | None] | None = None
@@ -4002,6 +4345,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         self.ngram_heads_vocab_sizes = mx.array(head_vocab_sizes, dtype=mx.int64)
         self.ngram_heads_offsets = mx.array(head_offsets, dtype=mx.int64)
+        # Rows each head's indices fall in (the sharded lookup picks shards
+        # per head on the device).
+        self._head_row_ranges = tuple(
+            (offset, offset + size)
+            for offset, size in zip(head_offsets, head_vocab_sizes)
+        )
         divisor = config.make_ngram_vocab_size_divisible_by
         padded_vocab_size = math.ceil(total_vocab_size / divisor) * divisor
         embedding_args = (
@@ -4096,7 +4445,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             cache.update_window(3, token_history, self.context_len)
 
         ngram_ids = self._ngram_indices(token_history, input_ids.shape[1])
-        embeddings = self.ngram_embedding(ngram_ids)
+        if type(self.ngram_embedding) is ShardedEmbedding:
+            embeddings = self.ngram_embedding(ngram_ids, self._head_row_ranges)
+        else:
+            embeddings = self.ngram_embedding(ngram_ids)
         return embeddings.reshape(*embeddings.shape[:-2], -1)
 
 

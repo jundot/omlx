@@ -91,7 +91,7 @@ def test_real_checkpoint_prefill_selects_ratio128_attention_policy(
 ):
     import mlx.core as mx
 
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.attention import fast
     from omlx.utils.model_loading import load_text_model
 
     model_path = _configured_checkpoint(
@@ -99,9 +99,9 @@ def test_real_checkpoint_prefill_selects_ratio128_attention_policy(
         expect_sub4=not expect_native,
     )
     if expect_native:
-        assert fast.has_symbol("deepseek_v4_sparse_attention"), (
+        assert fast.has_symbol("compressed_sparse_attention"), (
             "The high-bit integration lane requires the compiled "
-            "deepseek_v4_sparse_attention kernel."
+            "compressed_sparse_attention kernel."
         )
 
     model = tokenizer = cache = logits = last_logits = None
@@ -114,7 +114,7 @@ def test_real_checkpoint_prefill_selects_ratio128_attention_policy(
         ratio128_helper_calls = 0
         ratio128_native_calls = 0
         original_sparse = dsv4._sparse_pooled_attention
-        original_native = fast.deepseek_v4_sparse_attention
+        original_native = fast.compressed_sparse_attention
 
         def sparse_spy(*args, **kwargs):
             nonlocal ratio128_helper_calls
@@ -152,7 +152,7 @@ def test_real_checkpoint_prefill_selects_ratio128_attention_policy(
             )
 
         monkeypatch.setattr(dsv4, "_sparse_pooled_attention", sparse_spy)
-        monkeypatch.setattr(fast, "deepseek_v4_sparse_attention", native_spy)
+        monkeypatch.setattr(fast, "compressed_sparse_attention", native_spy)
         monkeypatch.setattr(
             dsv4,
             "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED",

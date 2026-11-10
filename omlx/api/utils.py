@@ -9,6 +9,7 @@ import re
 from typing import Any, List
 
 from .openai_models import Message
+from .thinking import extract_thinking
 
 # Model families whose chat templates consume message.reasoning_content directly.
 _NATIVE_REASONING_MODEL_TYPES = {
@@ -21,8 +22,11 @@ _NATIVE_REASONING_MODEL_TYPES = {
     # Muse Glimmer's chat template renders history reasoning_content into
     # <|start|>assistant to=self<|message|> blocks.
     "muse_glimmer",
+    "muse_spark",
     # K2 requires a reasoning field for every assistant turn.
     "k2_horizon",
+    # GLM-5.3's chat template renders history reasoning_content into <think> blocks.
+    "glm5_next",
 }
 
 
@@ -178,8 +182,6 @@ def clean_output_text(text: str) -> str:
     if not text:
         return text
     text = SPECIAL_TOKENS_PATTERN.sub("", text)
-    from .thinking import extract_thinking
-
     _, content = extract_thinking(text)
     return content.strip()
 
@@ -690,12 +692,44 @@ def _rewrite_user_content_with_note(
     return rewritten
 
 
+# Claude Code sends this marker with a new N on every request.
+# Nothing reads it, and it breaks prefix reuse, so it is stripped.
+_TOTAL_TOKENS_MARKER_RE = re.compile(
+    r"\n{0,2}<total_tokens>\d+ tokens left</total_tokens>"
+)
+
+
+def _strip_client_budget_markers(text: str) -> str:
+    """Remove Claude Code per-request token-budget markers from system text."""
+    if "<total_tokens>" not in text:
+        return text
+
+    return _TOTAL_TOKENS_MARKER_RE.sub("", text)
+
+
+def _drop_client_budget_markers(messages: list[dict]) -> list[dict]:
+    """Strip budget markers from system content and drop marker-only messages."""
+    kept: list[dict] = []
+    for msg in messages:
+        if _is_system_role(msg.get("role")):
+            content = msg.get("content")
+            if isinstance(content, str) and "<total_tokens>" in content:
+                stripped = _strip_client_budget_markers(content)
+                if not stripped.strip():
+                    continue
+                msg = {**msg, "content": stripped}
+        kept.append(msg)
+    return kept
+
+
 def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | None:
     """Move unsupported non-leading system runs into adjacent safe user text.
 
     This keeps the native chat template/tool rendering path intact while making
-    volatile tail notes cache-friendly. It deliberately refuses tool-call
-    boundaries and multimodal user content, where changing roles is too risky.
+    volatile tail notes cache-friendly. A note after a tool result becomes its
+    own user turn, the same shape as text sent next to an Anthropic
+    tool_result. It deliberately refuses positions between a tool call and its
+    results and multimodal user content, where changing roles is too risky.
     """
     rewritten: list[dict] = []
     seen_non_system = False
@@ -726,12 +760,12 @@ def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | No
             continue
 
         note = _format_system_note(parts)
+        prev_msg = rewritten[-1] if rewritten else None
         next_msg = messages[i] if i < len(messages) else None
         next_role = next_msg.get("role") if next_msg is not None else None
+        before_assistant_turn = next_msg is None or next_role == "assistant"
 
-        if _is_safe_user_note_target(rewritten[-1] if rewritten else None) and (
-            next_msg is None or next_role == "assistant"
-        ):
+        if _is_safe_user_note_target(prev_msg) and before_assistant_turn:
             rewritten[-1] = _rewrite_user_content_with_note(
                 rewritten[-1],
                 note,
@@ -740,7 +774,7 @@ def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | No
             continue
 
         if _is_safe_user_note_target(next_msg):
-            if _message_has_tool_calls(rewritten[-1] if rewritten else None):
+            if _message_has_tool_calls(prev_msg):
                 return None
             rewritten.append(
                 _rewrite_user_content_with_note(
@@ -751,6 +785,10 @@ def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | No
             )
             seen_non_system = True
             i += 1
+            continue
+
+        if prev_msg and prev_msg.get("role") == "tool" and before_assistant_turn:
+            rewritten.append({"role": "user", "content": note})
             continue
 
         return None
@@ -773,7 +811,7 @@ def prepare_system_messages_for_template(
     native reminder role. Unsupported placements or templates then use the
     configured strict or user-note fallback.
     """
-    messages = [dict(msg) for msg in messages]
+    messages = _drop_client_budget_markers([dict(msg) for msg in messages])
     if unsupported_mid_system_policy not in {"strict", "user_note_safe"}:
         unsupported_mid_system_policy = "strict"
 
@@ -803,6 +841,9 @@ def prepare_system_messages_for_template(
                 relocated = None
             if relocated is not None:
                 messages = [dict(msg) for msg in relocated]
+        # The engine renders later system messages in place wherever they are.
+        if getattr(tokenizer, "_omlx_supports_mid_system_messages", None) is True:
+            return _merge_consecutive_system_messages(messages)
 
     placements = _mid_system_placement_kinds(messages)
     if not placements:
@@ -884,6 +925,36 @@ def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
     return [merged_system] + non_system
 
 
+def _sort_tool_messages_by_call_order(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Sort each run of tool messages into the preceding assistant's tool_calls order."""
+    ordered: list[dict[str, Any]] = []
+    call_order: dict[str, int] = {}
+    run: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        run.sort(key=lambda m: call_order.get(m.get("tool_call_id", ""), float("inf")))
+        ordered.extend(run)
+        run.clear()
+
+    for msg in messages:
+        if msg.get("role") == "tool":
+            run.append(msg)
+            continue
+        flush()
+        if msg.get("role") == "assistant":
+            call_order = {
+                call.get("id"): index
+                for index, call in enumerate(msg.get("tool_calls") or [])
+                if call.get("id")
+            }
+        ordered.append(msg)
+
+    flush()
+    return ordered
+
+
 def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
     """Merge consecutive messages with the same mergeable role.
 
@@ -959,8 +1030,6 @@ def _apply_reasoning_reconstruction(
         text = content if isinstance(content, str) else ""
         if isinstance(content, list):
             text = _extract_text_from_content_list(content)
-        from .thinking import extract_thinking
-
         inline_reasoning, inline_content = extract_thinking(text)
         if inline_reasoning:
             return inline_content, inline_reasoning
@@ -968,6 +1037,10 @@ def _apply_reasoning_reconstruction(
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
         text = _extract_text_from_content_list(content)
+    # Clients may echo the same reasoning inline and as a field. Keep one copy.
+    inline_reasoning, inline_content = extract_thinking(text)
+    if inline_reasoning and inline_reasoning.strip() == reasoning.strip():
+        return (inline_content, reasoning) if native else (text, None)
     if native:
         return text, reasoning
     return f"<think>\n{reasoning}\n</think>\n\n{text}", None
@@ -1157,6 +1230,7 @@ def extract_text_content(
     processed_messages = _drop_void_assistant_messages(processed_messages)
     if consolidate_system_messages:
         processed_messages = _consolidate_system_messages(processed_messages)
+    processed_messages = _sort_tool_messages_by_call_order(processed_messages)
     return _merge_consecutive_roles(processed_messages)
 
 
@@ -1335,6 +1409,7 @@ def extract_multimodal_content(
     processed_messages = _drop_void_assistant_messages(processed_messages)
     if consolidate_system_messages:
         processed_messages = _consolidate_system_messages(processed_messages)
+    processed_messages = _sort_tool_messages_by_call_order(processed_messages)
     return _merge_consecutive_roles(processed_messages)
 
 

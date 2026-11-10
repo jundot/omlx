@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx_vlm.models.cache import RotatingKVCache
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ class PrefillReadyRotatingKVCache(RotatingKVCache):
 
 
 def restore_bonsai_quantized_modules(model: nn.Module) -> int:
-    """Keep oMLX's quantized module and kernel paths after VLM loading."""
+    """Rebind mlx-vlm 1-bit modules to the stock MLX quantized modules."""
     from mlx_vlm.quantization.one_bit import OneBitEmbedding, OneBitLinear
 
     restored = 0
@@ -69,16 +70,6 @@ def restore_bonsai_quantized_modules(model: nn.Module) -> int:
     for _, module in model.named_modules():
         replacement = replacements.get(type(module))
         if replacement is not None:
-            if restored == 0:
-                from ..patches.bonsai_qmv import (
-                    apply_bonsai_construct_patch,
-                    apply_bonsai_qmv_patch,
-                )
-                from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
-
-                apply_bonsai_t5_load_patch()
-                apply_bonsai_construct_patch()
-                apply_bonsai_qmv_patch()
             # Both classes store the same packed tensors and quantization fields.
             # Rebinding preserves loaded weights, frozen parameters, and aliases.
             module.__class__ = replacement
@@ -139,6 +130,8 @@ class VLMModelAdapter(nn.Module):
         # Step-scoped proof (see set_step_rope_deltas): covers every adapter
         # call of the bound step and is cleared by the next bind.
         self._qwen4_step_text_positions = False
+        # Full prompt ids for the next prefill call (see bind_prefill_prompt_ids).
+        self._prefill_prompt_ids: Optional[List[int]] = None
 
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
@@ -571,15 +564,50 @@ class VLMModelAdapter(nn.Module):
         if hook is not None:
             hook(next_ids, current_ids)
 
+    def prefetch_engram(self, next_ids: mx.array, current_ids: mx.array, cache=None) -> None:
+        """Forward the next-chunk Engram notice to DeepSeek V4.1."""
+        hook = getattr(self._language_model, "prefetch_engram", None)
+        if hook is not None:
+            hook(next_ids, current_ids, cache=cache)
+
     def ple_gathers_ahead(self) -> bool:
         """Whether the language model gathers PLE rows one prefill chunk ahead."""
         probe = getattr(self._language_model, "ple_gathers_ahead", None)
         return bool(probe()) if probe is not None else False
 
-    def _omlx_prefill(self, input_ids, cache=None, **kwargs):
-        """Forward the scheduler's cache-only contract to DeepSeek V4.1."""
+    def bind_prefill_prompt_ids(self, prompt_ids: Optional[List[int]]) -> None:
+        """Bind the full prompt ids of the request whose prefill call runs next.
+
+        Unlimited-OCR fixes its R-SWA or DASH prompt boundary from
+        ``language_model._prompt_ids`` at cache offset 0. Its
+        ``get_input_embeddings`` stores them on the shared language model, so a
+        request encoded later can replace them before this request's first chunk.
+        """
+        self._prefill_prompt_ids = prompt_ids
+
+    def _set_language_prompt_ids(self, cache: Optional[List[Any]]) -> None:
+        prompt_ids = self._prefill_prompt_ids
+        self._prefill_prompt_ids = None
+        if not hasattr(self._language_model, "_prompt_ids"):
+            return
+        # Only the first prefill chunk sets the boundary. Every other call
+        # clears ids stored by another request's get_input_embeddings.
+        offset = getattr(cache[0], "offset", None) if cache else None
+        first_chunk = isinstance(offset, int) and offset == 0
+        # A numpy array, like upstream: nn.Module keeps lists as child items.
+        self._language_model._prompt_ids = (
+            np.asarray(prompt_ids) if first_chunk and prompt_ids is not None else None
+        )
+
+    def _omlx_prefill(self, input_ids, cache=None, next_prefill_tokens=0, **kwargs):
+        """Forward the scheduler's cache-only contract to DeepSeek V4.1.
+
+        ``next_prefill_tokens`` is the size of the request's next prefill chunk
+        (0 when none follows).
+        """
         if self.model_type == "deepseek_v41":
             kwargs["_ced_prefill"] = True
+            kwargs["next_prefill_tokens"] = next_prefill_tokens
         return self(input_ids, cache=cache, **kwargs)
 
     def __call__(
@@ -614,6 +642,7 @@ class VLMModelAdapter(nn.Module):
         prefill_text_positions = self._qwen4_text_prefill_positions
         step_text_positions = self._qwen4_step_text_positions
         self._qwen4_text_prefill_positions = False
+        self._set_language_prompt_ids(cache)
         # Layer captures (block drafter prefill seeds) also need the full
         # output object rather than bare logits.
         return_hidden = bool(kwargs.get("return_hidden", False)) or bool(

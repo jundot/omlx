@@ -30,7 +30,12 @@ from pathlib import Path
 
 import yaml
 
-from omlx.integrations.base import Integration, IntegrationContext, backup_then_write
+from omlx.integrations.base import (
+    Integration,
+    IntegrationContext,
+    backup_then_write,
+    chat_model_ids,
+)
 from omlx.integrations.macapp import find_mac_app
 from omlx.utils.install import get_cli_command_prefix
 
@@ -682,55 +687,10 @@ class DshIntegration(Integration):
         )
 
     def _fetch_models(self, ctx: IntegrationContext) -> list[dict]:
-        """Build the route's model list from the launcher's pre-fetched status.
-
-        The launcher already fetched ``/v1/models/status`` and passes its map
-        on the context, so a launch never fetches the model status twice; the
-        inventory is only requested when that map came back empty.
-        """
-        status_map = ctx.models_status_map
-        # Display ids in server order: an aliased model sits under both keys.
-        ids = list(
-            dict.fromkeys(
-                info.get("model_alias") or m_id for m_id, info in status_map.items()
-            )
-        )
-        if not ids:
-            # The launcher's status fetch failed (e.g. a 401 under
-            # allow_unauthenticated_inference, where /v1/models/status needs
-            # a key but /v1/models does not): ask for the inventory once.
-            import requests
-
-            headers = (
-                {"Authorization": f"Bearer {ctx.auth_token}"} if ctx.api_key else {}
-            )
-            try:
-                resp = requests.get(
-                    f"{ctx.base_url}/v1/models", headers=headers, timeout=5
-                )
-                resp.raise_for_status()
-                ids = [
-                    m["id"]
-                    for m in resp.json().get("data", [])
-                    if m.get("id") and m.get("model_type") in ("llm", "vlm", None)
-                ]
-            except Exception:
-                ids = []
-        if not ids and ctx.model:
-            ids = [ctx.model]
-
+        """Build the route's model list from the launcher's pre-fetched status."""
         models: list[dict] = []
-        for m_id in ids:
-            info = status_map.get(m_id, {})
-            # Chat models only (matches the launcher's picker): embedding /
-            # audio models on the server stay out of the route, hidden models
-            # stay out as they do from /v1/models, and records without a type
-            # — status metadata missing — stay in.
-            if info.get("is_hidden"):
-                continue
-            model_type = info.get("model_type") or None
-            if model_type and model_type not in ("llm", "vlm"):
-                continue
+        for m_id in chat_model_ids(ctx):
+            info = ctx.models_status_map.get(m_id, {})
             entry: dict = {"id": m_id, "name": m_id, "input": ["text"]}
             context_window = info.get("max_context_window")
             if isinstance(context_window, int) and context_window > 0:

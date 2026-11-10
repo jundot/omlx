@@ -43,10 +43,11 @@ class RerankRequest(BaseModel):
     is used. Other rerankers ignore it.
     """
 
-    top_n: int | None = None
+    top_n: int | None = Field(default=None, gt=0)
     """
     Number of top results to return.
-    If not specified, returns all documents.
+    If not specified, returns all documents. Must be positive: 0 would
+    return an empty result and negative values silently drop results.
     """
 
     max_length: int | None = Field(default=None, gt=0)

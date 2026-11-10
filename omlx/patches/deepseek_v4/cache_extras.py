@@ -1007,6 +1007,12 @@ class BatchPoolingCache(_BaseCache):
             self.prev_win_kv = self.prev_win_kv[batch_indices]
             self.prev_win_gate = self.prev_win_gate[batch_indices]
         self._prev_valid = [self._prev_valid[i] for i in idx_list]
+        # Pooled rows are right-padded to the widest row. Columns past the longest *remaining* row are padding for every
+        # remaining row (e.g. a long request finished and left a short one): drop them, so a request left alone holds
+        # exactly the pooled rows it would hold had it never been batched. Every path benefits: the stock path stops
+        # masking dead columns, and the decode-consistent exact paths (which attend every column) stay correct.
+        if self._pool_buf is not None:
+            self._pool_extent = min(self._pool_extent, max(self._pool_lengths, default=0))
 
     def extend(self, other):
         # Merge the remainder buffers

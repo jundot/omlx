@@ -126,22 +126,33 @@ struct AppConfig: Sendable, Equatable, Codable {
         }
     }
 
-    static func httpURL(host: String, port: Int, path: String = "") -> URL? {
+    static func httpURL(host: String, port: Int, path: String = "", scheme: String = "http") -> URL? {
         let urlHost = normalizedURLHost(host)
         let urlPath = path.isEmpty ? "" : (path.hasPrefix("/") ? path : "/" + path)
         if urlHost.contains(":") {
             let escapedHost = urlHost.replacingOccurrences(of: "%", with: "%25")
-            return URL(string: "http://[\(escapedHost)]:\(port)\(urlPath)")
+            return URL(string: "\(scheme)://[\(escapedHost)]:\(port)\(urlPath)")
         }
 
         var comps = URLComponents()
-        comps.scheme = "http"
+        comps.scheme = scheme
         comps.host = urlHost
         comps.port = port
         if !urlPath.isEmpty {
             comps.path = urlPath
         }
         return comps.url
+    }
+
+    /// The `ws://` form of `httpURL` (`wss://` when `scheme` is `https`), for WebSocket endpoints.
+    static func webSocketURL(host: String, port: Int, path: String,
+                             query: [URLQueryItem] = [], scheme: String = "http") -> URL? {
+        guard let url = httpURL(host: host, port: port, path: path, scheme: scheme),
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.scheme = scheme.lowercased() == "https" ? "wss" : "ws"
+        if !query.isEmpty { components.queryItems = query }
+        return components.url
     }
 
     var baseURL: URL? {

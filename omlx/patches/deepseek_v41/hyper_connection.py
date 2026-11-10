@@ -204,85 +204,112 @@ def fused_hc_pre_norm(x, pre, weight, eps):
     )[0]
 
 
-_PROJECTION_WARP_SOURCE = r"""
-    const uint row = threadgroup_position_in_grid.x;
-    const uint block = threadgroup_position_in_grid.y;
+# RM rows per threadgroup share each fn load, and each of the NT / 32
+# simdgroups multiplies one contiguous K slice on 8x8 fp32 simdgroup matrices.
+# The slice partials and squares are summed in threadgroup memory.
+_PROJECTION_SOURCE = r"""
+    constexpr int NSG = NT / 32;
+    constexpr int RT = RM / 8;
+    constexpr int KS = K / NSG;
     const uint lane = thread_index_in_simdgroup;
-    float sums[12];
-    for (uint j = 0; j < 12; ++j) sums[j] = 0.0f;
-    float square = 0.0f;
-    for (uint k = lane; k < D; k += 32) {
-        const float value = float(x[row * D + k]);
-        square = fma(value, value, square);
-        for (uint j = 0; j < 12; ++j)
-            sums[j] = fma(value, fn[(block * 12 + j) * D + k], sums[j]);
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint tid = thread_position_in_threadgroup.x;
+    const int row0 = int(threadgroup_position_in_grid.x) * RM;
+    int rows = 1;
+    for (int dim = 0; dim + 2 < x_ndim; ++dim) rows *= x_shape[dim];
+    threadgroup float part[NSG][RM][24];
+    threadgroup float square_part[NSG][RM];
+
+    // This lane's two elements of an 8x8 matrix: (fm, fc) and (fm, fc + 1).
+    const short qid = short(lane / 4);
+    const short fm = (qid & 4) + short((lane / 2) % 4);
+    const short fc = (qid & 2) * 2 + short(lane % 2) * 2;
+    bool valid[RT];
+    const device T* xa[RT];
+    for (int t = 0; t < RT; ++t) {
+        const int row = row0 + t * 8 + fm;
+        valid[t] = row < rows;
+        xa[t] = x + (size_t)(valid[t] ? row : row0) * K + fc;
     }
-    const float inv = rsqrt(simd_sum(square) / float(D) + eps[0]);
-    for (uint j = 0; j < 12; ++j) {
-        const float value = simd_sum(sums[j]);
-        if (lane == 0) y[row * 24 + block * 12 + j] = value * inv;
+    // B[k][n] = fn[n][k].
+    const device float* fb = fn + fc * K + fm;
+    simdgroup_matrix<float, 8, 8> a, b0, b1, b2;
+    simdgroup_matrix<float, 8, 8> c[RT][3];
+    float square[RT];
+    for (int t = 0; t < RT; ++t) {
+        square[t] = 0.0f;
+        for (int j = 0; j < 3; ++j) c[t][j] = simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    const int k_begin = int(sg) * KS;
+    for (int k0 = k_begin; k0 < k_begin + KS; k0 += 8) {
+        reinterpret_cast<thread float2&>(b0.thread_elements()) =
+            float2(fb[k0], fb[K + k0]);
+        reinterpret_cast<thread float2&>(b1.thread_elements()) =
+            float2(fb[8 * K + k0], fb[9 * K + k0]);
+        reinterpret_cast<thread float2&>(b2.thread_elements()) =
+            float2(fb[16 * K + k0], fb[17 * K + k0]);
+        for (int t = 0; t < RT; ++t) {
+            const float2 value = valid[t]
+                ? float2(*(const device vec<T, 2>*)(xa[t] + k0)) : float2(0.0f);
+            square[t] = fma(value.x, value.x, square[t]);
+            square[t] = fma(value.y, value.y, square[t]);
+            reinterpret_cast<thread float2&>(a.thread_elements()) = value;
+            simdgroup_multiply_accumulate(c[t][0], a, b0, c[t][0]);
+            simdgroup_multiply_accumulate(c[t][1], a, b1, c[t][1]);
+            simdgroup_multiply_accumulate(c[t][2], a, b2, c[t][2]);
+        }
+    }
+    for (int t = 0; t < RT; ++t) {
+        // Lane bits 0 and 3 select the column, so these lanes share row fm.
+        float total = square[t];
+        total += simd_shuffle_xor(total, 1);
+        total += simd_shuffle_xor(total, 8);
+        if ((lane & 9) == 0) square_part[sg][t * 8 + fm] = total;
+        for (int j = 0; j < 3; ++j)
+            simdgroup_store(c[t][j], &part[sg][t * 8][j * 8], 24);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int o = int(tid); o < RM * 24; o += NT) {
+        const int m = o / 24, j = o % 24;
+        if (row0 + m >= rows) continue;
+        float value = 0.0f, total = 0.0f;
+        for (int s = 0; s < NSG; ++s) {
+            value += part[s][m][j];
+            total += square_part[s][m];
+        }
+        y[(row0 + m) * 24 + j] = value * rsqrt(total / float(K) + eps[0]);
     }
 """
 
-_PROJECTION_SOURCE = r"""
-    const uint row = threadgroup_position_in_grid.x;
-    const uint block = threadgroup_position_in_grid.y;
-    const uint tid = thread_position_in_threadgroup.x;
-    const uint lane = thread_index_in_simdgroup;
-    const uint sg = simdgroup_index_in_threadgroup;
-    threadgroup float scratch[13 * 8];
-    float sums[12];
-    for (uint j = 0; j < 12; ++j) sums[j] = 0.0f;
-    float square = 0.0f;
-    for (uint k = tid; k < D; k += 256) {
-        const float value = float(x[row * D + k]);
-        square = fma(value, value, square);
-        for (uint j = 0; j < 12; ++j)
-            sums[j] = fma(value, fn[(block * 12 + j) * D + k], sums[j]);
-    }
-    for (uint j = 0; j < 12; ++j) {
-        const float value = simd_sum(sums[j]);
-        if (lane == 0) scratch[j * 8 + sg] = value;
-    }
-    const float sq = simd_sum(square);
-    if (lane == 0) scratch[96 + sg] = sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-        float q = lane < 8 ? scratch[96 + lane] : 0.0f;
-        q = simd_sum(q);
-        const float inv = rsqrt(q / float(D) + eps[0]);
-        for (uint j = 0; j < 12; ++j) {
-            float value = lane < 8 ? scratch[j * 8 + lane] : 0.0f;
-            value = simd_sum(value);
-            if (lane == 0) y[row * 24 + block * 12 + j] = value * inv;
-        }
-    }
-"""
+# Rows per threadgroup and threads (simdgroups x 32) of the projection.
+_ROWS, _THREADS = 16, 512
+# Widths the K slices split evenly (8 columns per simdgroup step).
+PROJECTION_WIDTH_MULTIPLE = 8 * _THREADS // 32
 
 
 @cache
-def _projection_kernel(warp=False):
+def _projection_kernel():
     return mx.fast.metal_kernel(
-        name=(
-            "deepseek_v41_hc_projection_warp" if warp else "deepseek_v41_hc_projection"
-        ),
+        name="deepseek_v41_hc_projection_tiled",
         input_names=["x", "fn", "eps"],
         output_names=["y"],
-        source=_PROJECTION_WARP_SOURCE if warp else _PROJECTION_SOURCE,
+        source=_PROJECTION_SOURCE,
+        header="#include <metal_simdgroup_matrix>\n",
     )
 
 
 def fused_hc_projection(x, fn, eps):
-    """Project BF16 residual streams with FP32 weights and accumulators."""
+    """Project BF16 residual streams with FP32 weights and accumulators.
+
+    The stream width (4 x dim) must be a multiple of PROJECTION_WIDTH_MULTIPLE.
+    """
     width = x.shape[-1] * 4
     rows = x.size // width
-    # Small batches need more warps to occupy the GPU.
-    threads = 32 if rows >= 1024 else 256
-    return _projection_kernel(warp=threads == 32)(
+    return _projection_kernel()(
         inputs=[x, fn, mx.array([eps], mx.float32)],
-        template=[("D", width)],
-        grid=(rows * threads, 2, 1),
-        threadgroup=(threads, 1, 1),
+        template=[("T", x.dtype), ("K", width), ("RM", _ROWS), ("NT", _THREADS)],
+        grid=((rows + _ROWS - 1) // _ROWS * _THREADS, 1, 1),
+        threadgroup=(_THREADS, 1, 1),
         output_shapes=[(*x.shape[:-2], 24)],
         output_dtypes=[mx.float32],
     )[0]

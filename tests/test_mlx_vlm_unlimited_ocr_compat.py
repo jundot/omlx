@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for the vendored Unlimited-OCR mlx-vlm compatibility layer."""
+"""Regression tests for the Unlimited-OCR mlx-vlm compatibility layer."""
 
 from __future__ import annotations
 
+from pathlib import Path
 
-def test_unlimited_ocr_compat_installs_vendor_module():
+
+def test_unlimited_ocr_compat_uses_upstream_module():
     from omlx.patches.mlx_vlm_unlimited_ocr_compat import (
         apply_mlx_vlm_unlimited_ocr_compat_patch,
     )
 
     apply_mlx_vlm_unlimited_ocr_compat_patch()
 
+    import mlx_vlm
     import mlx_vlm.models.unlimited_ocr as unlimited_ocr
 
+    upstream = Path(mlx_vlm.__file__).parent / "models" / "unlimited_ocr"
+    assert Path(unlimited_ocr.__file__).parent == upstream
     assert hasattr(unlimited_ocr, "Model")
     assert hasattr(unlimited_ocr, "ModelConfig")
     assert hasattr(unlimited_ocr, "RingSlidingKVCache")
@@ -73,6 +78,10 @@ def test_unlimited_ocr_prompt_uses_single_image_token():
     ]
     listed = get_message_json("unlimited-ocr", parts, num_images=1)
     assert listed == {"role": "user", "content": "<image>document parsing."}
+
+    # The model card's own prompt already carries the token: keep just that one.
+    card = get_message_json("unlimited-ocr", "<image>document parsing.", num_images=1)
+    assert card == {"role": "user", "content": "<image>document parsing."}
 
 
 def test_unlimited_ocr_prompt_leaves_other_models_untouched():

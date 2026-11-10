@@ -21,9 +21,9 @@ For most models, **oQ4e** is the place to start.
 | oQ2 | 2 | about 2.8 to 3.0 | Very large MoE models that do not fit otherwise |
 | oQ2.5 | 2 | about 3.1 to 3.3 | Large MoE models, with some expert layers lifted to 3-bit |
 | oQ2.7 | 2 | about 3.25 to 3.35 | Same as oQ2.5 with more 3-bit expert layers |
-| oQ3 | 3 | about 3.5 to 3.7 | When memory is tight |
+| oQ3 | 3 | about 3.6 to 3.8 | When memory is tight |
 | oQ3.5 | 3 | about 3.8 to 4.0 | oQ3 with 4-bit expert down projections |
-| oQ4 | 4 | about 4.6 to 4.7 | Recommended default |
+| oQ4 | 4 | about 4.7 to 4.8 | Recommended default |
 | oQ5 | 5 | about 5.5 to 5.7 | Higher quality |
 | oQ6 | 6 | about 6.5 to 6.7 | Very close to the original |
 | oQ8 | 8 | about 8.5 | Every quantized tensor at 8-bit |
@@ -59,11 +59,11 @@ The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix`
 
 - **Output head and embeddings:** 8-bit when the size budget allows.
 - **MoE routers:** kept at full precision. Shared-expert gates are 8-bit.
-- **Vision and audio encoders:** not quantized.
+- **Vision and audio encoders:** not quantized, and not counted in the size budget.
 - **Norms and recurrent state parameters** (SSM and linear attention): not quantized.
-- **Attention and other sensitive projections:** extra bits where the measurement says so.
+- **Attention and other sensitive projections:** extra bits where the measurement says so. In dense models that mix full attention with sliding or linear attention, the full-attention projections get one bit above the base from oQ3 up.
 - **Routed experts:** stay at the base bits, because they are most of the model and the most expensive to raise. oQ3.5 gives their down projections one extra bit, and oQ2.5 and oQ2.7 raise whole expert layers to 3-bit.
-- **MTP heads** (with **Preserve MTP weights**): kept, with the small connecting layers at full precision and the rest at 4-bit or more.
+- **MTP heads** (with **Preserve MTP weights**): kept, with the small connecting layers at full precision and the rest at the base bits and at least 4-bit. The head is planned after the rest of the model, so the other layers get the same bits as in a build without the head. Budget left under the size cap raises the head further.
 
 Every model ends up with its own bit layout, because the plan follows that model's measurements.
 
@@ -84,6 +84,7 @@ Sample selection uses a fixed seed, so repeated runs on the same model see the s
 | Enhanced quantization (oQe) | Uses the imatrix when rounding. Recommended |
 | Text Only | Leaves out the vision encoder of a vision-language model and writes a text-only model |
 | Preserve MTP weights | Keeps the MTP heads so Lightning MTP works after quantization. Adds `-mtp` to the name |
+| Keep original Engram tables | DeepSeek V4.1 only. Copies the Engram tables in their original FP8 storage instead of 4-bit. The output is larger on disk, and memory use with SSD N-gram Offload stays the same. Adds `-ngram` to the name |
 | Combine other model's MTP head | Grafts an MTP head from another checkpoint of the same architecture, or a Gemma 4 assistant model, into the output |
 | Non-quant weight dtype | bfloat16 (default) or float16 for unquantized weights and quantization scales. float16 adds `-fp16` to the name |
 | Sensitivity Model | Measures sensitivity on an already quantized copy of the model to use about 4x less memory |
@@ -110,7 +111,7 @@ Models that are already MLX-quantized cannot be used as a source.
 
 Some models have their own rules:
 
-- **DeepSeek V4.1:** oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit.
+- **DeepSeek V4.1:** oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit unless Keep original Engram tables is on.
 - **DeepSeek V4:** float16 output is not supported.
 
 ## Benchmarks
@@ -139,6 +140,10 @@ Measured with the refit added in [#4385](https://github.com/jundot/omlx/pull/438
 | Qwen3.6-35B-A3B | 82.68 (67 GB) | 81.58 | 82.68 (16 GB) | 82.79 | 83.05 (20 GB) |
 
 The refit also brings the output distribution closer to the original model's: the KL divergence from the original drops by 12% to 15% on general text for both models at both levels.
+
+Muse Spark Open output uses the checkpoint layout of mlx-lm's own Muse Spark model (mlx-lm 0.32.2 and later). That layout stores q, k, v and the attention output gate as one projection, so oQ gives the four one bit width per layer. oQ also keeps the LM head in BF16, because mlx-lm's model gives wrong logits with a quantized LM head.
+
+Muse Spark Open NVFP4 checkpoints keep their NVFP4 routed experts unchanged at oQ4 and above, together with the per-expert tensor scales. oQ quantizes only the other BF16 tensors (attention, the first and last MoE layers, and embeddings). At oQ3 and below, oQ requantizes the routed experts and folds each expert's tensor scale into its weights, so the output is a plain affine checkpoint that mlx-lm also loads.
 
 ## Acknowledgments
 

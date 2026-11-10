@@ -14,9 +14,9 @@ import secrets
 import shlex
 import subprocess
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .ssh_policy import apply_cluster_ssh_policy, cluster_ssh_options
@@ -241,8 +241,9 @@ def detect_transports(
     """Detect available transports for a set of cluster hosts.
 
     Uses MLX's ``extract_connectivity`` and ``check_rdma`` to discover
-    Thunderbolt topology and RDMA availability. Degrades gracefully to
-    Ethernet when Thunderbolt is not available.
+    Thunderbolt topology and RDMA availability. Reports Ethernet only when
+    both probes ran and found no fast link. A failed probe returns an empty
+    tuple, which callers read as an unknown link.
 
     Args:
         hosts: List of SSH hostnames for the cluster nodes.
@@ -267,6 +268,7 @@ def detect_transports(
 
     transports: list[TransportInfo] = []
     physical_edges: set[tuple[int, int]] = set()
+    probe_failed = False
 
     # Try Thunderbolt connectivity
     try:
@@ -300,8 +302,7 @@ def detect_transports(
                             )
                         )
     except Exception:
-        # Thunderbolt detection failed — degrade to Ethernet
-        pass
+        probe_failed = True
 
     # Check RDMA
     try:
@@ -335,11 +336,9 @@ def detect_transports(
                     )
                 )
     except Exception:
-        # RDMA detection failed — skip
-        pass
+        probe_failed = True
 
-    # If no transports detected, assume Ethernet
-    if not transports:
+    if not transports and not probe_failed:
         for i, _host in enumerate(hosts):
             for j, peer_host in enumerate(hosts):
                 if i == j:
@@ -1045,9 +1044,10 @@ def assess_link(
 # Two hosts can carry these at once without being able to reach each other:
 # loopback is per-host, and a 169.254 address means DHCP failed, so unrelated
 # Macs agree on the subnet and on nothing else.
+_SELF_ASSIGNED_NETWORK = ipaddress.ip_network("169.254.0.0/16")
 _UNROUTABLE_NETWORKS = (
     ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
+    _SELF_ASSIGNED_NETWORK,
 )
 
 # Which shared link to prefer when hosts have several. RDMA over Thunderbolt
@@ -1059,6 +1059,8 @@ _LINK_KIND_RANK = {"rdma": 3, "thunderbolt": 2, "ethernet": 1}
 _IFCONFIG_HEADER = re.compile(
     r"^(?P<name>[^\s:]+):\s+flags=[0-9a-fA-F]+<(?P<flags>[^>]*)>"
 )
+# "1000baseT", "2500Base-T", "10Gbase-T", "100baseTX" in an ifconfig media line.
+_MEDIA_SPEED = re.compile(r"(\d+)(G?)base", re.IGNORECASE)
 _HARDWARE_PORT = re.compile(r"^Hardware Port:\s*(?P<port>.+)$")
 _HARDWARE_DEVICE = re.compile(r"^Device:\s*(?P<device>\S+)$")
 
@@ -1089,6 +1091,15 @@ class HostInterfaces:
     addresses: tuple[InterfaceAddress, ...] = ()
     rdma_interfaces: frozenset[str] = frozenset()
     thunderbolt_interfaces: frozenset[str] = frozenset()
+    wifi_interfaces: frozenset[str] = frozenset()
+    # Up interfaces holding only a self-assigned 169.254 address, which never
+    # appear in ``addresses``.
+    self_assigned_interfaces: frozenset[str] = frozenset()
+    # IPv6 link-local address per up interface. A Thunderbolt Bridge left on
+    # DHCP has one, and it routes when scoped to the interface.
+    link_local_addresses: Mapping[str, str] = field(default_factory=dict)
+    # Negotiated Ethernet speed per up interface, in Mbit/s.
+    media_speeds: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1160,14 +1171,15 @@ def _interface_address(interface: str, fields: list[str]) -> InterfaceAddress | 
     return InterfaceAddress(interface, str(address), prefix_length)
 
 
-def parse_interface_addresses(output: str) -> tuple[InterfaceAddress, ...]:
-    """Routable IPv4 addresses per interface, from ``ifconfig -a`` output.
+def _up_inet_lines(
+    output: str, keyword: str = "inet"
+) -> Iterator[tuple[str, list[str]]]:
+    """``(interface, fields)`` for each ``keyword`` line of an up interface.
 
     Addresses on a down interface are dropped: ifconfig keeps listing them, and
     a rank told to bind one gets the same EADDRNOTAVAIL as a stale address.
     """
 
-    addresses: list[InterfaceAddress] = []
     interface = ""
     is_up = False
     for line in output.splitlines():
@@ -1180,20 +1192,62 @@ def parse_interface_addresses(output: str) -> tuple[InterfaceAddress, ...]:
             is_up = header is not None and "UP" in header.group("flags").split(",")
             continue
         fields = line.split()
-        if not interface or not is_up or len(fields) < 2 or fields[0] != "inet":
-            continue
+        if interface and is_up and len(fields) >= 2 and fields[0] == keyword:
+            yield interface, fields
+
+
+def parse_interface_addresses(output: str) -> tuple[InterfaceAddress, ...]:
+    """Routable IPv4 addresses per interface, from ``ifconfig -a`` output."""
+
+    addresses: list[InterfaceAddress] = []
+    for interface, fields in _up_inet_lines(output):
         entry = _interface_address(interface, fields)
         if entry is not None:
             addresses.append(entry)
     return tuple(addresses)
 
 
-def parse_thunderbolt_interfaces(output: str) -> frozenset[str]:
-    """Interface names macOS calls Thunderbolt, from ``-listallhardwareports``.
+def parse_self_assigned_interfaces(output: str) -> frozenset[str]:
+    """Up interfaces holding a self-assigned 169.254 address, from ``ifconfig -a``.
 
-    A shared subnet says nothing about which cable carries it. This is what
-    separates the Thunderbolt link from the office LAN when both are routable.
+    A Thunderbolt Bridge left on its default DHCP setting gets only this, and
+    nothing can route it: MLX's ring connects without a source address, so the
+    kernel sends 169.254 traffic out of the primary interface.
     """
+
+    interfaces: set[str] = set()
+    for interface, fields in _up_inet_lines(output):
+        with suppress(ValueError):
+            if ipaddress.IPv4Address(fields[1]) in _SELF_ASSIGNED_NETWORK:
+                interfaces.add(interface)
+    return frozenset(interfaces)
+
+
+def parse_link_local_addresses(output: str) -> dict[str, str]:
+    """IPv6 link-local address per up interface, from ``ifconfig -a``."""
+
+    addresses: dict[str, str] = {}
+    for interface, fields in _up_inet_lines(output, "inet6"):
+        address = fields[1].partition("%")[0]
+        with suppress(ValueError):
+            if ipaddress.IPv6Address(address).is_link_local:
+                addresses.setdefault(interface, address)
+    return addresses
+
+
+def parse_media_speeds(output: str) -> dict[str, int]:
+    """Negotiated Ethernet speed in Mbit/s per up interface, from ``ifconfig -a``."""
+
+    speeds: dict[str, int] = {}
+    for interface, fields in _up_inet_lines(output, "media:"):
+        match = _MEDIA_SPEED.search(" ".join(fields))
+        if match is not None:
+            speeds[interface] = int(match[1]) * (1000 if match[2] else 1)
+    return speeds
+
+
+def _hardware_port_devices(output: str, port_prefix: str) -> frozenset[str]:
+    """Devices of the hardware ports named ``port_prefix``*, from ``networksetup``."""
 
     interfaces: set[str] = set()
     port = ""
@@ -1205,10 +1259,26 @@ def parse_thunderbolt_interfaces(output: str) -> frozenset[str]:
             continue
         match = _HARDWARE_DEVICE.match(line)
         if match is not None:
-            if port.startswith("Thunderbolt"):
+            if port.startswith(port_prefix):
                 interfaces.add(match.group("device"))
             port = ""
     return frozenset(interfaces)
+
+
+def parse_thunderbolt_interfaces(output: str) -> frozenset[str]:
+    """Interface names macOS calls Thunderbolt, from ``-listallhardwareports``.
+
+    A shared subnet says nothing about which cable carries it. This is what
+    separates the Thunderbolt link from the office LAN when both are routable.
+    """
+
+    return _hardware_port_devices(output, "Thunderbolt")
+
+
+def parse_wifi_interfaces(output: str) -> frozenset[str]:
+    """Interface names macOS calls Wi-Fi, from ``-listallhardwareports``."""
+
+    return _hardware_port_devices(output, "Wi-Fi")
 
 
 def parse_linux_ip_addresses(output: str) -> tuple[InterfaceAddress, ...]:
@@ -1263,20 +1333,24 @@ def probe_host_interfaces(ssh_hostname: str) -> HostInterfaces:
     already know the name of.
     """
 
-    addresses = parse_interface_addresses(_read(ssh_hostname, ["ifconfig", "-a"]))
+    ifconfig = _read(ssh_hostname, ["ifconfig", "-a"])
+    addresses = parse_interface_addresses(ifconfig)
     if not addresses:
         addresses = parse_linux_ip_addresses(
             _read(ssh_hostname, ["ip", "-o", "-4", "address", "show", "up"])
         )
+    ports = _read(ssh_hostname, ["networksetup", "-listallhardwareports"])
     return HostInterfaces(
         host=ssh_hostname,
         addresses=addresses,
         rdma_interfaces=frozenset(
             device.removeprefix("rdma_") for device in _rdma_devices(ssh_hostname)
         ),
-        thunderbolt_interfaces=parse_thunderbolt_interfaces(
-            _read(ssh_hostname, ["networksetup", "-listallhardwareports"])
-        ),
+        thunderbolt_interfaces=parse_thunderbolt_interfaces(ports),
+        wifi_interfaces=parse_wifi_interfaces(ports),
+        self_assigned_interfaces=parse_self_assigned_interfaces(ifconfig),
+        link_local_addresses=parse_link_local_addresses(ifconfig),
+        media_speeds=parse_media_speeds(ifconfig),
     )
 
 
@@ -1400,6 +1474,48 @@ def shared_link_addresses(
             )
         )
     return links[0]
+
+
+def link_warnings(
+    source: HostInterfaces, peer: HostInterfaces, link: SharedLink
+) -> tuple[str, ...]:
+    """What to fix about the path two hosts were given, when it is not Thunderbolt.
+
+    A Thunderbolt cable left on its self-assigned address is skipped, and the
+    pair then talks over whatever else they share, often Wi-Fi.
+    """
+
+    if link.kind in ("thunderbolt", "rdma"):
+        return ()
+    on_wifi = link.ok and (
+        link.source.interface in source.wifi_interfaces
+        or link.peer.interface in peer.wifi_interfaces
+    )
+    stranded = [
+        sorted(host.self_assigned_interfaces & host.thunderbolt_interfaces)
+        for host in (source, peer)
+    ]
+    if all(stranded):
+        if on_wifi:
+            instead = " The cluster uses Wi-Fi instead."
+        elif link.ok:
+            instead = f" The cluster uses {link.source.interface} instead."
+        else:
+            instead = ""
+        return (
+            f"{source.host} ({', '.join(stranded[0])}) and {peer.host} "
+            f"({', '.join(stranded[1])}) are connected by Thunderbolt, but it has "
+            "only a self-assigned 169.254 address, which the cluster cannot use."
+            f"{instead} Give the Thunderbolt link a manual IPv4 address on both "
+            "Macs, for example 10.10.0.1 and 10.10.0.2 with subnet mask "
+            "255.255.255.0.",
+        )
+    if on_wifi:
+        return (
+            f"{source.host} and {peer.host} reach each other over Wi-Fi. Model "
+            "copies and every decode step cross it, so both are slow.",
+        )
+    return ()
 
 
 def _pair_link_speed(

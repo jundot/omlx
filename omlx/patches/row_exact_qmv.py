@@ -4,8 +4,8 @@
 Stock ``quantized_matmul`` switches kernels with the row count (``qmv_fast``
 or ``qmv`` at one row, ``qmv_wide`` and then tiled qmm for more), so a
 speculative verify row and the serial decode step for the same token get
-different bits from the same projection. Here every row runs MLX 0.32.2's
-one-row ``qmv_fast`` (N a multiple of 8, K of the kernel block: 512 for
+different bits from the same projection. Here every row runs MLX 0.32.4's
+one-row ``qmv_fast`` (K of the kernel block: 512 for
 4/5-bit, 256 for 6/8-bit weights) or ``qmv`` traversal, transcribed in
 ``moe_verify_gather``, so row ``r`` of the output equals
 ``quantized_matmul(x[r:r+1])`` bit for bit.

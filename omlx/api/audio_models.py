@@ -9,7 +9,7 @@ These models define the request and response schemas for:
 
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AudioTranscriptionRequest(BaseModel):
@@ -39,11 +39,13 @@ class AudioSpeechRequest(BaseModel):
     response_format: Optional[str] = "wav"
     ref_audio: Optional[str] = None
     ref_text: Optional[str] = None
-    temperature: Optional[float] = None
-    top_k: Optional[int] = None
-    top_p: Optional[float] = None
-    repetition_penalty: Optional[float] = None
-    max_tokens: Optional[int] = None
+    # Sampling params must be non-negative and max_tokens positive; negative
+    # values otherwise flow silently into the TTS engine's sampler.
+    temperature: Optional[float] = Field(default=None, ge=0)
+    top_k: Optional[int] = Field(default=None, ge=0)
+    top_p: Optional[float] = Field(default=None, ge=0)
+    repetition_penalty: Optional[float] = Field(default=None, ge=0)
+    max_tokens: Optional[int] = Field(default=None, gt=0)
     stream: Optional[bool] = False
     streaming_interval: Optional[float] = None
 

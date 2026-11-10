@@ -237,6 +237,14 @@ class TestModelSettingsPreserveThinking:
             "{%- if reasoning_effort not in ['high', 'low', 'no_think'] %}",
             ["low", "high"],
         ),
+        # Muse Spark Open checks the keys of a level-to-strength map.
+        (
+            "{%- set reasoning_effort_map = "
+            "{'low': 8, 'medium': 32, 'high': 256, 'xhigh': 512} -%}"
+            "{%- if not (reasoning_effort is string and "
+            "reasoning_effort in reasoning_effort_map) -%}",
+            ["low", "medium", "high", "xhigh"],
+        ),
     ],
 )
 def test_detect_reasoning_effort_reads_the_accepted_levels(tmp_path, template, levels):

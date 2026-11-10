@@ -70,6 +70,9 @@ class _FakePool:
     def splash_target(self, model_id, model_settings):
         return None, ""
 
+    def splash_draft_to_download(self, model_id, model_settings):
+        return None
+
     @staticmethod
     def _clear_load_failure(entry):
         entry.load_failed = False
@@ -88,10 +91,10 @@ def client(tmp_path, monkeypatch):
     state = _FakeServerState()
 
     # Patch the module-level getters
-    admin_routes._get_settings_manager = lambda: mgr
-    admin_routes._get_engine_pool = lambda: pool
-    admin_routes._get_server_state = lambda: state
-    admin_routes._get_global_settings = lambda: None
+    monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: mgr)
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(admin_routes, "_get_server_state", lambda: state)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: None)
 
     # Bypass auth
     async def _fake_require_admin():
@@ -108,7 +111,105 @@ def client(tmp_path, monkeypatch):
     return TestClient(app), mgr
 
 
+class TestKVCompressionSettings:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"turboquant_kv_scheme": "invalid"},
+            {"turboquant_kv_scheme": "affine4", "turboquant_kv_bits": 8},
+            {"turboquant_kv_scheme": "affine8", "turboquant_kv_bits": 4},
+        ],
+    )
+    def test_invalid_settings_do_not_mutate_or_persist(self, client, payload):
+        c, mgr = client
+        original = ModelSettings(temperature=0.5)
+        mgr.set_settings("model-a", original)
+        saved = mgr.settings_file.read_bytes()
+        r = c.put(
+            "/admin/api/models/model-a/settings",
+            json={"temperature": 0.2, "is_default": True, **payload},
+        )
+        assert r.status_code in (400, 422), r.text
+        assert "turboquant_kv_" in r.text
+        assert mgr.get_settings("model-a") == original
+        assert mgr.settings_file.read_bytes() == saved
+
+    def test_partial_updates_validate_merged_settings(self, client):
+        c, mgr = client
+        mgr.set_settings("model-a", ModelSettings(turboquant_kv_bits=3))
+        url = "/admin/api/models/model-a/settings"
+        assert c.put(url, json={"turboquant_kv_scheme": "affine4"}).status_code == 400
+        assert c.put(url, json={"turboquant_kv_bits": 4}).status_code == 200
+        r = c.put(url, json={
+            "turboquant_kv_enabled": True,
+            "turboquant_kv_scheme": "affine4",
+        })
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["turboquant_kv_scheme"] == "affine4"
+        assert c.put(url, json={"turboquant_kv_bits": 3}).status_code == 400
+        r = c.put(url, json={"temperature": 0.25})
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["turboquant_kv_scheme"] == "affine4"
+        assert r.json()["settings"]["turboquant_kv_bits"] == 4
+        assert mgr.get_settings("model-a").turboquant_kv_enabled is True
+        r = c.put(url, json={"turboquant_kv_scheme": "turboquant", "turboquant_kv_bits": 2.5})
+        assert r.status_code == 200, r.text
+        assert mgr.get_settings("model-a").turboquant_kv_bits == 2.5
+
+    @pytest.mark.parametrize("enable_compression", [False, True])
+    def test_vlm_mtp_conflict_is_rejected_in_both_directions(
+        self, client, enable_compression
+    ):
+        c, mgr = client
+        original = ModelSettings(
+            turboquant_kv_scheme="affine4",
+            turboquant_kv_bits=4,
+            turboquant_kv_enabled=not enable_compression,
+            vlm_mtp_enabled=enable_compression,
+            vlm_mtp_draft_model="drafter",
+        )
+        mgr.set_settings("model-a", original)
+        field = "turboquant_kv_enabled" if enable_compression else "vlm_mtp_enabled"
+        r = c.put("/admin/api/models/model-a/settings", json={field: True})
+        assert r.status_code == 400, r.text
+        assert "KV cache compression" in r.json()["detail"]
+        assert mgr.get_settings("model-a") == original
+        r = c.put("/admin/api/models/model-a/settings", json={
+            "turboquant_kv_enabled": enable_compression,
+            "vlm_mtp_enabled": not enable_compression,
+        })
+        assert r.status_code == 200, r.text
+
+
 class TestProfileRoutes:
+    def test_affine_profile_roundtrip(self, client):
+        c, mgr = client
+        scheme, bits = "affine8", 8
+        settings = {
+            "turboquant_kv_enabled": True,
+            "turboquant_kv_scheme": scheme,
+            "turboquant_kv_bits": bits,
+        }
+        r = c.post("/admin/api/models/model-a/profiles", json={
+            "name": "affine", "display_name": scheme.title(), "settings": settings,
+        })
+        assert r.status_code == 200, r.text
+        assert r.json()["profile"]["settings"] == settings
+        assert "turboquant_kv_scheme" in c.get("/admin/api/profile-fields").json()["model_specific"]
+        r = c.post("/admin/api/models/model-a/profiles/affine/apply")
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["turboquant_kv_scheme"] == scheme
+        assert mgr.get_settings("model-a").turboquant_kv_bits == bits
+
+    def test_invalid_kv_profile_does_not_persist(self, client):
+        c, mgr = client
+        settings = {"turboquant_kv_scheme": "affine8", "turboquant_kv_bits": 4}
+        r = c.post("/admin/api/models/model-a/profiles", json={
+            "name": "bad", "display_name": "Bad", "settings": settings,
+        })
+        assert r.status_code in (400, 422), r.text
+        assert mgr.list_profiles("model-a") == []
+
     def test_list_profiles_empty(self, client):
         c, _ = client
         r = c.get("/admin/api/models/model-a/profiles")
@@ -320,6 +421,7 @@ class TestProfileRoutes:
                     "guided_grammar": 'root ::= "YES"',
                     "max_tool_result_tokens": 4096,
                     "turboquant_kv_enabled": True,
+                    "turboquant_kv_scheme": "affine4",
                     "specprefill_enabled": True,
                     "dflash_enabled": True,
                     "mtp_enabled": True,
@@ -344,6 +446,8 @@ class TestProfileRoutes:
         # output parsing), so its settings are preserved.
         assert settings["max_tool_result_tokens"] == 4096
         assert settings["turboquant_kv_enabled"] is False
+        assert settings["turboquant_kv_scheme"] == "turboquant"
+        assert settings["turboquant_kv_bits"] == 4
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False
         assert settings["mtp_enabled"] is False
@@ -652,6 +756,7 @@ class TestModelsResponseActiveProfile:
                 "guided_grammar": 'root ::= "YES"',
                 "max_tool_result_tokens": 4096,
                 "turboquant_kv_enabled": True,
+                "turboquant_kv_scheme": "affine4",
                 "specprefill_enabled": True,
                 "dflash_enabled": True,
                 "mtp_enabled": True,
@@ -670,6 +775,8 @@ class TestModelsResponseActiveProfile:
         # Tool calling works on the diffusion lane; setting preserved.
         assert settings["max_tool_result_tokens"] == 4096
         assert settings["turboquant_kv_enabled"] is False
+        assert settings["turboquant_kv_scheme"] == "turboquant"
+        assert settings["turboquant_kv_bits"] == 4
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False
         assert settings["mtp_enabled"] is False
@@ -968,21 +1075,18 @@ class TestExposeAsModelAPI:
 
 
 @pytest.mark.parametrize("operation", ["create", "update", "apply"])
-@pytest.mark.parametrize("reason", ["hardware", "architecture", "conflict", "floor"])
+@pytest.mark.parametrize("reason", ["architecture", "conflict", "floor"])
 def test_a8_profile_validation_preserves_settings(
     client, monkeypatch, operation, reason
 ):
     c, mgr = client
     entry = admin_routes._get_engine_pool().get_entry("model-a")
     entry.config_model_type = "llama" if reason == "architecture" else "qwen3_5"
-    monkeypatch.setattr(
-        admin_routes, "_oq_a8_kernels_available", lambda: reason != "hardware"
-    )
-    settings = {"qwen35_oq_a8_enabled": True}
+    settings = {"a8_prefill_enabled": True}
     if reason == "conflict":
         settings["qwen35_ane_prefill_enabled"] = True
     if reason == "floor":
-        settings["qwen35_oq_a8_min_tokens"] = 0
+        settings["a8_prefill_min_tokens"] = 0
     mgr.set_settings("model-a", ModelSettings())
     if operation != "create":
         mgr.save_profile(
@@ -1009,11 +1113,11 @@ def test_a8_profile_apply_checks_merged_ane_conflict(client, monkeypatch):
     admin_routes._get_engine_pool().get_entry("model-a").config_model_type = "qwen3_5"
     monkeypatch.setattr(admin_routes, "_oq_a8_kernels_available", lambda: True)
     mgr.set_settings("model-a", ModelSettings(qwen35_ane_prefill_enabled=True))
-    mgr.save_profile("model-a", "a8", "A8", "", settings={"qwen35_oq_a8_enabled": True})
+    mgr.save_profile("model-a", "a8", "A8", "", settings={"a8_prefill_enabled": True})
     response = c.post("/admin/api/models/model-a/profiles/a8/apply")
     assert response.status_code == 400
     assert mgr.get_settings("model-a").qwen35_ane_prefill_enabled
-    assert not mgr.get_settings("model-a").qwen35_oq_a8_enabled
+    assert not mgr.get_settings("model-a").a8_prefill_enabled
 
 
 @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_6_moe", "qwen3_8"])
@@ -1028,13 +1132,13 @@ def test_a8_profile_roundtrip_supported_architectures(client, monkeypatch, model
             json={
                 "name": "a8",
                 "display_name": "A8",
-                "settings": {"qwen35_oq_a8_enabled": True},
+                "settings": {"a8_prefill_enabled": True},
             },
         ).status_code
         == 200
     )
     assert c.post(url + "/a8/apply").status_code == 200
-    assert mgr.get_settings("model-a").qwen35_oq_a8_enabled
+    assert mgr.get_settings("model-a").a8_prefill_enabled
 
 
 @pytest.mark.parametrize("operation", ["settings", "create", "update"])
@@ -1868,7 +1972,6 @@ class TestSettingsSnapshotRoutes:
         assert settings["guided_grammar_enabled"] is True
         assert settings["guided_grammar"] == 'root ::= "YES"'
         assert "guided_grammar" not in r.json()["applied"]
-
 
     def test_cache_reasoning_output_round_trips_through_put(self, client):
         c, mgr = client

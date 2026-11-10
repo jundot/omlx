@@ -337,8 +337,11 @@ struct AccuracyQueueItem: Codable, Equatable, Sendable {
 /// run is in flight.
 struct AccuracyQueueStatus: Codable, Sendable {
     let running: Bool
-    let currentModel: String
-    let currentBenchId: String
+    /// Null when no run is in flight (idle, or right after a cancel).
+    /// Non-optional here made every idle poll fail to decode, so the VM
+    /// kept its last "running" snapshot forever after Cancel.
+    let currentModel: String?
+    let currentBenchId: String?
     let lastProgress: AccuracyProgressDTO?
     let phase: String?
     let queue: [AccuracyQueueItem]
@@ -407,8 +410,9 @@ struct AccuracyResultDTO: Codable, Equatable, Sendable, Identifiable {
 struct AccuracyResultsResponse: Codable, Sendable {
     let results: [AccuracyResultDTO]
     let running: Bool
-    let currentModel: String
-    let currentBenchId: String
+    /// Null when no run is in flight — see AccuracyQueueStatus.
+    let currentModel: String?
+    let currentBenchId: String?
 }
 
 // =============================================================================

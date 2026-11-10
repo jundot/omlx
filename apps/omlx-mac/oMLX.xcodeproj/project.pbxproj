@@ -27,6 +27,7 @@
 		2BB00000000000000000000B /* StatusPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000B /* StatusPill.swift */; };
 		2BB00000000000000000000C /* CodeChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000C /* CodeChip.swift */; };
 		2BB00000000000000000000D /* ScreenScaffold.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000D /* ScreenScaffold.swift */; };
+		2BB00000000000000000000E /* CountFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000E /* CountFormat.swift */; };
 		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
 		3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000002 /* MenubarStatsPoller.swift */; };
 		3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */; };
@@ -135,7 +136,29 @@
 		DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000113 /* PerformanceScreenVMTests.swift */; };
 		DBB000000000000000000114 /* UpdateInstallerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000114 /* UpdateInstallerTests.swift */; };
 		DBB000000000000000000115 /* AppUpdaterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000115 /* AppUpdaterTests.swift */; };
+		DBB000000000000000000116 /* CountFormatTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000116 /* CountFormatTests.swift */; };
 		EBB000000000000000000001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = ECC000000000000000000001 /* MarkdownUI */; };
+		FAB000000000000000000001 /* AskAISettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000001 /* AskAISettings.swift */; };
+		FAB000000000000000000002 /* GlobalHotKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000002 /* GlobalHotKey.swift */; };
+		FAB000000000000000000003 /* HotKeyRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000003 /* HotKeyRecorder.swift */; };
+		FAB000000000000000000004 /* ChatCompletionStream.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000004 /* ChatCompletionStream.swift */; };
+		FAB000000000000000000005 /* AskAIConversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000005 /* AskAIConversation.swift */; };
+		FAB000000000000000000006 /* AskAIInputView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000006 /* AskAIInputView.swift */; };
+		FAB000000000000000000007 /* AskAIMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000007 /* AskAIMarkdown.swift */; };
+		FAB000000000000000000008 /* AskAIPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000008 /* AskAIPanel.swift */; };
+		FAB000000000000000000009 /* AskAIPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000009 /* AskAIPanelView.swift */; };
+		FAB00000000000000000000A /* AskAIController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC00000000000000000000A /* AskAIController.swift */; };
+		FAB00000000000000000000B /* AskAIScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC00000000000000000000B /* AskAIScreen.swift */; };
+		FAB00000000000000000000C /* AskAITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC00000000000000000000C /* AskAITests.swift */; };
+		FAB00000000000000000000D /* AskAIImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC00000000000000000000D /* AskAIImage.swift */; };
+		FAB00000000000000000000E /* TalkAIController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC00000000000000000000E /* TalkAIController.swift */; };
+		FAB00000000000000000000F /* TalkAIPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC00000000000000000000F /* TalkAIPanel.swift */; };
+		FAB000000000000000000010 /* RealtimeVoiceClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000010 /* RealtimeVoiceClient.swift */; };
+		FAB000000000000000000011 /* VoiceAudio.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000011 /* VoiceAudio.swift */; };
+		FAB000000000000000000012 /* MicrophoneAccess.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000012 /* MicrophoneAccess.swift */; };
+		FAB000000000000000000013 /* PromptPlaceholders.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000013 /* PromptPlaceholders.swift */; };
+		FAB000000000000000000014 /* AskAIToolRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000014 /* AskAIToolRunner.swift */; };
+		FAB000000000000000000015 /* ScreenCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000015 /* ScreenCapture.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -160,6 +183,7 @@
 		1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonRuntime.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcess.swift; sourceTree = "<group>"; };
 		2CC000000000000000000001 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000E /* CountFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CountFormat.swift; sourceTree = "<group>"; };
 		2CC000000000000000000002 /* Squircle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Squircle.swift; sourceTree = "<group>"; };
 		2CC000000000000000000003 /* Glass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Glass.swift; sourceTree = "<group>"; };
 		2CC000000000000000000004 /* Button.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Button.swift; sourceTree = "<group>"; };
@@ -281,6 +305,28 @@
 		DCC000000000000000000113 /* PerformanceScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceScreenVMTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000114 /* UpdateInstallerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateInstallerTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000115 /* AppUpdaterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdaterTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000116 /* CountFormatTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CountFormatTests.swift; sourceTree = "<group>"; };
+		FAC000000000000000000001 /* AskAISettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAISettings.swift; sourceTree = "<group>"; };
+		FAC000000000000000000002 /* GlobalHotKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalHotKey.swift; sourceTree = "<group>"; };
+		FAC000000000000000000003 /* HotKeyRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotKeyRecorder.swift; sourceTree = "<group>"; };
+		FAC000000000000000000004 /* ChatCompletionStream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatCompletionStream.swift; sourceTree = "<group>"; };
+		FAC000000000000000000005 /* AskAIConversation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIConversation.swift; sourceTree = "<group>"; };
+		FAC000000000000000000006 /* AskAIInputView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIInputView.swift; sourceTree = "<group>"; };
+		FAC000000000000000000007 /* AskAIMarkdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIMarkdown.swift; sourceTree = "<group>"; };
+		FAC000000000000000000008 /* AskAIPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIPanel.swift; sourceTree = "<group>"; };
+		FAC000000000000000000009 /* AskAIPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIPanelView.swift; sourceTree = "<group>"; };
+		FAC00000000000000000000A /* AskAIController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIController.swift; sourceTree = "<group>"; };
+		FAC00000000000000000000B /* AskAIScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIScreen.swift; sourceTree = "<group>"; };
+		FAC00000000000000000000C /* AskAITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAITests.swift; sourceTree = "<group>"; };
+		FAC00000000000000000000D /* AskAIImage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIImage.swift; sourceTree = "<group>"; };
+		FAC00000000000000000000E /* TalkAIController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TalkAIController.swift; sourceTree = "<group>"; };
+		FAC00000000000000000000F /* TalkAIPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TalkAIPanel.swift; sourceTree = "<group>"; };
+		FAC000000000000000000010 /* RealtimeVoiceClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeVoiceClient.swift; sourceTree = "<group>"; };
+		FAC000000000000000000011 /* VoiceAudio.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceAudio.swift; sourceTree = "<group>"; };
+		FAC000000000000000000012 /* MicrophoneAccess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicrophoneAccess.swift; sourceTree = "<group>"; };
+		FAC000000000000000000013 /* PromptPlaceholders.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PromptPlaceholders.swift; sourceTree = "<group>"; };
+		FAC000000000000000000014 /* AskAIToolRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIToolRunner.swift; sourceTree = "<group>"; };
+		FAC000000000000000000015 /* ScreenCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCapture.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -352,6 +398,8 @@
 				DCC000000000000000000113 /* PerformanceScreenVMTests.swift */,
 				DCC000000000000000000114 /* UpdateInstallerTests.swift */,
 				DCC000000000000000000115 /* AppUpdaterTests.swift */,
+				DCC000000000000000000116 /* CountFormatTests.swift */,
+				FAC00000000000000000000C /* AskAITests.swift */,
 			);
 			path = oMLXTests;
 			sourceTree = "<group>";
@@ -368,6 +416,7 @@
 				7EE000000000000000000003 /* Updater */,
 				6EE000000000000000000001 /* AppView */,
 				AEE000000000000000000001 /* Welcome */,
+				FAE000000000000000000001 /* AskAI */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -437,6 +486,7 @@
 				2CC000000000000000000001 /* Theme.swift */,
 				2CC000000000000000000002 /* Squircle.swift */,
 				2CC000000000000000000003 /* Glass.swift */,
+				2CC00000000000000000000E /* CountFormat.swift */,
 				2EE000000000000000000002 /* Components */,
 			);
 			path = Theme;
@@ -504,6 +554,7 @@
 				6CC000000000000000000012 /* ContextBenchScreen.swift */,
 				6CC00000000000000000000F /* NetworkScreen.swift */,
 				6CC000000000000000000010 /* PerformanceScreen.swift */,
+				FAC00000000000000000000B /* AskAIScreen.swift */,
 				DCC000000000000000000102 /* ModelCardSheet.swift */,
 			);
 			path = Screens;
@@ -590,6 +641,32 @@
 				ACC000000000000000000001 /* WelcomeWindow.swift */,
 			);
 			path = Welcome;
+			sourceTree = "<group>";
+		};
+		FAE000000000000000000001 /* AskAI */ = {
+			isa = PBXGroup;
+			children = (
+				FAC000000000000000000001 /* AskAISettings.swift */,
+				FAC000000000000000000002 /* GlobalHotKey.swift */,
+				FAC000000000000000000003 /* HotKeyRecorder.swift */,
+				FAC000000000000000000004 /* ChatCompletionStream.swift */,
+				FAC000000000000000000005 /* AskAIConversation.swift */,
+				FAC000000000000000000006 /* AskAIInputView.swift */,
+				FAC000000000000000000007 /* AskAIMarkdown.swift */,
+				FAC000000000000000000008 /* AskAIPanel.swift */,
+				FAC000000000000000000009 /* AskAIPanelView.swift */,
+				FAC00000000000000000000A /* AskAIController.swift */,
+				FAC00000000000000000000D /* AskAIImage.swift */,
+				FAC00000000000000000000E /* TalkAIController.swift */,
+				FAC00000000000000000000F /* TalkAIPanel.swift */,
+				FAC000000000000000000010 /* RealtimeVoiceClient.swift */,
+				FAC000000000000000000011 /* VoiceAudio.swift */,
+				FAC000000000000000000012 /* MicrophoneAccess.swift */,
+				FAC000000000000000000013 /* PromptPlaceholders.swift */,
+				FAC000000000000000000014 /* AskAIToolRunner.swift */,
+				FAC000000000000000000015 /* ScreenCapture.swift */,
+			);
+			path = AskAI;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -690,6 +767,26 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				FAB000000000000000000001 /* AskAISettings.swift in Sources */,
+				FAB000000000000000000002 /* GlobalHotKey.swift in Sources */,
+				FAB000000000000000000003 /* HotKeyRecorder.swift in Sources */,
+				FAB000000000000000000004 /* ChatCompletionStream.swift in Sources */,
+				FAB000000000000000000005 /* AskAIConversation.swift in Sources */,
+				FAB000000000000000000006 /* AskAIInputView.swift in Sources */,
+				FAB000000000000000000007 /* AskAIMarkdown.swift in Sources */,
+				FAB000000000000000000008 /* AskAIPanel.swift in Sources */,
+				FAB000000000000000000009 /* AskAIPanelView.swift in Sources */,
+				FAB00000000000000000000A /* AskAIController.swift in Sources */,
+				FAB00000000000000000000D /* AskAIImage.swift in Sources */,
+				FAB00000000000000000000E /* TalkAIController.swift in Sources */,
+				FAB00000000000000000000F /* TalkAIPanel.swift in Sources */,
+				FAB000000000000000000010 /* RealtimeVoiceClient.swift in Sources */,
+				FAB000000000000000000011 /* VoiceAudio.swift in Sources */,
+				FAB000000000000000000012 /* MicrophoneAccess.swift in Sources */,
+				FAB000000000000000000013 /* PromptPlaceholders.swift in Sources */,
+				FAB000000000000000000014 /* AskAIToolRunner.swift in Sources */,
+				FAB000000000000000000015 /* ScreenCapture.swift in Sources */,
+				FAB00000000000000000000B /* AskAIScreen.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD1 /* oMLXApp.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */,
 				AAD9D51D2FE2842C00FAEA05 /* ModelsScreenVM.swift in Sources */,
@@ -709,6 +806,7 @@
 				2BB000000000000000000009 /* Row.swift in Sources */,
 				2BB00000000000000000000A /* SectionHeader.swift in Sources */,
 				2BB00000000000000000000D /* ScreenScaffold.swift in Sources */,
+				2BB00000000000000000000E /* CountFormat.swift in Sources */,
 				2BB00000000000000000000B /* StatusPill.swift in Sources */,
 				AAD9D5172FE283D100FAEA05 /* ServerScreenVM.swift in Sources */,
 				2BB00000000000000000000C /* CodeChip.swift in Sources */,
@@ -823,6 +921,8 @@
 				DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */,
 				DBB000000000000000000114 /* UpdateInstallerTests.swift in Sources */,
 				DBB000000000000000000115 /* AppUpdaterTests.swift in Sources */,
+				DBB000000000000000000116 /* CountFormatTests.swift in Sources */,
+				FAB00000000000000000000C /* AskAITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

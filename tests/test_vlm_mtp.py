@@ -962,6 +962,41 @@ def test_moe_vlm_runtime_sanitize_stacks_per_expert_backbone():
     assert not any(f"{pfx}.experts." in k for k in result)
 
 
+def test_moe_vlm_runtime_sanitize_stacks_nvfp4_global_scales():
+    """mlx-vlm keeps ModelOpt NVFP4 global scales as separate keys; per-expert
+    ones must be stacked with the weights or strict load_weights fails."""
+    from mlx_vlm.quantization.checkpoint import transform_quantized_weights
+
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_runtime
+
+    class FakeModel:
+        pass
+
+    qwen35_moe_vlm_runtime._patch_vlm_outer_model_sanitize(
+        SimpleNamespace(Model=FakeModel)
+    )
+
+    pfx_in = "model.language_model.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            key = f"{pfx_in}.experts.{e}.{proj}"
+            weights[f"{key}.weight"] = mx.zeros((32, 32), dtype=mx.uint8)
+            weights[f"{key}.weight_scale"] = mx.zeros((32, 4), dtype=mx.uint8)
+            weights[f"{key}.weight_scale_2"] = mx.array(0.5, dtype=mx.float32)
+            weights[f"{key}.input_scale"] = mx.array(1.0, dtype=mx.float32)
+    weights, _ = transform_quantized_weights(
+        weights, {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}
+    )
+
+    result = FakeModel.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.model.layers.0.mlp"
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        assert result[f"{pfx}.switch_mlp.{proj}.weight_scale_2"].shape == (2,)
+    assert not any(f"{pfx}.experts." in k for k in result)
+
+
 # ---------------------------------------------------------------------------
 # _call_backbone return format tests
 # ---------------------------------------------------------------------------

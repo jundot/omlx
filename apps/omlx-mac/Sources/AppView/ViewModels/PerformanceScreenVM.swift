@@ -21,6 +21,7 @@ final class PerformanceScreenVM {
     var hotCacheOnly: Bool = false
     var hotCacheMaxSize: String = ""
     var ssdCacheDir: String = ""
+    private(set) var ssdCacheUnavailable: Bool = false
     var ssdCacheMaxSize: String = ""
     var initialCacheBlocksText: String = ""
 
@@ -206,6 +207,7 @@ final class PerformanceScreenVM {
                 self.loadedHotCacheMaxSize = hotCacheMaxSize
                 self.ssdCacheDir = cache.ssdCacheDir ?? ""
                 self.loadedSsdCacheDir = cache.ssdCacheDir ?? ""
+                self.ssdCacheUnavailable = cache.ssdCacheUnavailable ?? false
                 self.ssdCacheMaxSize = cache.ssdCacheMaxSize ?? ""
                 self.loadedSsdCacheMaxSize = cache.ssdCacheMaxSize ?? ""
                 self.initialCacheBlocksText = cache.initialCacheBlocks.map { String($0) } ?? ""

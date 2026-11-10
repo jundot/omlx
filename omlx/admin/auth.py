@@ -6,14 +6,23 @@ and API key verification for admin panel access.
 """
 
 import hashlib
+import ipaddress
 import logging
+import math
 import os
 import secrets
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import HTTPException, Request
 from fastapi.responses import RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from starlette.requests import HTTPConnection
+
+from ..utils.network import is_loopback_bind_host
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +230,101 @@ def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
     return False
 
 
+# Wrong API keys allowed per remote client before each lockout.
+KEY_FAILURES_PER_LOCKOUT = 8
+KEY_FIRST_LOCKOUT_SECONDS = 30
+KEY_REPEAT_LOCKOUT_SECONDS = 300
+_MAX_TRACKED_CLIENTS = 4096
+
+
+@dataclass(slots=True)
+class _KeyFailures:
+    failures: int = 0
+    locked_before: bool = False
+    locked_until: float = 0.0
+
+
+# Insertion order is least recently failed first.
+_key_failures: dict[str, _KeyFailures] = {}
+_key_failures_lock = threading.Lock()
+
+
+class KeyLockout(HTTPException):
+    """Raised while a client is locked out after repeated wrong API keys."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(
+            status_code=429,
+            detail=f"Too many wrong API keys. Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def _client_key(conn: HTTPConnection) -> str | None:
+    """Return the failure-budget key for a client, or None for this machine."""
+    host = getattr(getattr(conn, "client", None), "host", None)
+    if not isinstance(host, str):
+        return "unknown"
+    # A peer with the local socket address is this machine on a LAN-IP bind.
+    server = getattr(conn, "scope", {}).get("server") or (None,)
+    if is_loopback_bind_host(host) or host == server[0]:
+        return None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    # Count an IPv4 client the same on IPv4 and dual-stack sockets.
+    return str(getattr(address, "ipv4_mapped", None) or address)
+
+
+def check_api_key(conn: HTTPConnection, verify: Callable[[], bool]) -> bool:
+    """Run one API key comparison under the client's failure budget.
+
+    Every endpoint that accepts an API key calls this, so all of them share
+    one budget per client. A locked-out client gets KeyLockout before the
+    key is compared. Clients on this machine are not limited.
+    """
+    client = _client_key(conn)
+    if client is None:
+        return verify()
+    with _key_failures_lock:
+        now = time.monotonic()
+        state = _key_failures.get(client)
+        if state is not None and state.locked_until > now:
+            raise KeyLockout(math.ceil(state.locked_until - now))
+        if verify():
+            _key_failures.pop(client, None)
+            return True
+        if state is None:
+            if len(_key_failures) >= _MAX_TRACKED_CLIENTS:
+                # Drop active lockouts only when no other entry is left.
+                oldest = next(
+                    (k for k, v in _key_failures.items() if v.locked_until <= now),
+                    next(iter(_key_failures)),
+                )
+                del _key_failures[oldest]
+            state = _key_failures[client] = _KeyFailures()
+        else:
+            _key_failures[client] = _key_failures.pop(client)
+        state.failures += 1
+        if state.failures >= KEY_FAILURES_PER_LOCKOUT:
+            seconds = (
+                KEY_REPEAT_LOCKOUT_SECONDS
+                if state.locked_before
+                else KEY_FIRST_LOCKOUT_SECONDS
+            )
+            state.failures = 0
+            state.locked_before = True
+            state.locked_until = now + seconds
+            logger.warning(
+                "Locked out %s for %ds after %d wrong API keys",
+                client,
+                seconds,
+                KEY_FAILURES_PER_LOCKOUT,
+            )
+        return False
+
+
 def validate_api_key(api_key: str) -> tuple[bool, str]:
     """Validate API key format requirements.
 
@@ -324,7 +428,7 @@ async def require_admin(request: Request) -> bool:
         gs = _get_global_settings() if _get_global_settings is not None else None
         main_key = gs.auth.api_key if gs is not None else None
         # Main key only: sub keys are for the inference API.
-        if main_key and verify_api_key(token, main_key):
+        if main_key and check_api_key(request, lambda: verify_api_key(token, main_key)):
             return True
         logger.warning("Rejected admin API key (fp=%s)", fingerprint_key(token))
         raise HTTPException(

@@ -465,6 +465,10 @@ def test_attention_patch_preserves_sinks_with_dequant_fallback(monkeypatch):
         calls["sdpa_key_shape"] = keys.shape
         return mx.zeros_like(queries)
 
+    from omlx.patches import turboquant_attention as tq_attention
+
+    # Codecs outside the MMA kernel's envelope take the dequantize fallback.
+    monkeypatch.setattr(tq_attention, "_mma_mse_attention", lambda *a, **k: None)
     monkeypatch.setattr(TurboQuantKVCache, "decode_attention", fail_decode)
     monkeypatch.setattr(TurboQuantKVCache, "dequantize", spy_dequantize)
     monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", fake_sdpa)
@@ -676,26 +680,32 @@ def test_decode_multirow_matches_dequantize_reference(q_len, monkeypatch):
     assert mx.abs(ref_nomask - ref).max().item() > 1e-3
 
 
-@pytest.mark.parametrize("q_len", [2, 3, 4])
+@pytest.mark.parametrize("q_len", [2, 4, 5, 8, 15])
 def test_fused_multirow_kernel_matches_dequantize_reference(q_len, monkeypatch):
-    """Above the token floor, MSE-codec MTP verify outside the MMA kernel's
-    envelope takes the fused multi-row kernel (one KV unpack shared across
-    rows, issue #2215). Its output must match the dequantize+SDPA reference
-    with the causal tail mask, and the dispatcher must route to it
-    bit-exactly."""
+    """Above the token floor, 3-bit MTP verify (outside the MMA kernel's
+    envelope) takes the fused multi-row kernel in groups of up to 4 rows
+    (issue #2215). Wide context-copy windows must stay on it rather than
+    unpacking the whole cache every cycle (issue #4866). The output must
+    match the dequantize+SDPA reference with the causal tail mask, and the
+    dispatcher must route to it bit-exactly."""
     from omlx.patches import turboquant_attention as tq_attention
 
     monkeypatch.setattr(tq_attention, "_mma_mse_attention", lambda *a, **k: None)
     mx.random.seed(0)
     B, n_q, n_kv, D = 1, 16, 2, 256
-    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 512
+    # Off a 256-token step boundary, so the buffers outgrow the prefix.
+    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 500
     fp_cache = KVCache()
     fp_cache.update_and_fetch(
-        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
-        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T - q_len, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T - q_len, D)).astype(mx.float16),
     )
-    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
-    ks, vs = tq.state
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=3.0)
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((B, n_kv, q_len, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, q_len, D)).astype(mx.float16),
+    )
+    assert tq.keys.norms.shape[2] > tq.offset == T
     queries = mx.random.normal((B, n_q, q_len, D)).astype(mx.float16)
     scale = D**-0.5
 
@@ -839,6 +849,63 @@ def test_mma_attention_reads_step_allocated_buffers():
     out = tq_attention._mma_mse_attention(tq, queries, ks, vs, D**-0.5)
     ref = _mma_reference(tq, queries, ks, vs, D**-0.5)
     assert mx.abs(out.astype(mx.float32) - ref).max().item() < 5e-3
+
+
+@pytest.mark.parametrize("tokens", [37, 3000])
+@pytest.mark.parametrize("sink_shift", [-4.0, 0.0, 6.0])
+def test_mma_attention_applies_sinks(tokens, sink_shift):
+    """Sinks add one value-less logit per query head to the denominator; the
+    reduction pass must match MLX's sink-aware SDPA over dequantized states,
+    including sinks that dominate every score."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(4)
+    n_q, n_kv, D = 32, 4, 128
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, n_kv, tokens, D)).astype(mx.float16),
+        mx.random.normal((1, n_kv, tokens, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    queries = mx.random.normal((1, n_q, 1, D)).astype(mx.float16)
+    sinks = (mx.random.normal((n_q,)) + sink_shift).astype(mx.float16)
+    scale = D**-0.5
+
+    out = tq_attention._mma_mse_attention(tq, queries, ks, vs, scale, sinks=sinks)
+    assert out is not None
+    dk, dv = tq.dequantize(keys_state=ks, values_state=vs)
+    ref = mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, sinks=sinks
+    )
+    assert mx.abs(out.astype(mx.float32) - ref).max().item() < 5e-3
+
+
+def test_attention_patch_routes_sink_decode_to_mma(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    mx.random.seed(5)
+    D = 128
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 64, D)).astype(mx.float16),
+        mx.random.normal((1, 2, 64, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+
+    def fail_dequantize(*args, **kwargs):
+        raise AssertionError("sink decode must not dequantize the cache")
+
+    monkeypatch.setattr(TurboQuantKVCache, "dequantize", fail_dequantize)
+    queries = mx.random.normal((1, 8, 1, D)).astype(mx.float16)
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=D**-0.5, mask=None, sinks=mx.zeros((8,))
+    )
+    assert out.shape == queries.shape
 
 
 def test_mma_attention_declines_straddling_bits_and_batches():

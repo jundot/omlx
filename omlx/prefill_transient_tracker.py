@@ -13,7 +13,7 @@ from the global PrefillProgressTracker which feeds the admin dashboard.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +24,13 @@ class _TransientHistory:
     samples: int = 0
     last_delta_bytes: int = 0
     last_n_tokens: int = 0
+    # Request that measured the last sample when the EWMA rejected it.
+    outlier_owner: str | None = None
     observed_max_bytes: int = 0
     flat_overhead_bytes: int = 0
     reclaim_debt_bytes: int = 0
+    # Chunk width -> largest growth beyond the static profile at that width.
+    width_overhead_bytes: dict[int, int] = field(default_factory=dict)
 
 
 class PrefillTransientTracker:
@@ -91,6 +95,7 @@ class PrefillTransientTracker:
         *,
         floor_sample: bool = False,
         gathered_core: bool = False,
+        request_id: str | None = None,
     ) -> None:
         """Record one chunk observation.
 
@@ -140,6 +145,7 @@ class PrefillTransientTracker:
                 )
 
         per_token = transient_bytes / n_tokens
+        history.outlier_owner = None
         if history.samples == 0:
             history.ewma_per_token = per_token
         elif per_token > history.ewma_per_token * self._EWMA_OUTLIER_RATIO:
@@ -147,8 +153,9 @@ class PrefillTransientTracker:
             # the running rate is more likely a noisy phys_footprint()
             # delta (see _record_chunk_transient's docstring on
             # buffer-pool-driven noise) than a real per-token cost jump.
-            # last_delta_bytes/last_n_tokens below still record it raw for
-            # diagnostics — only the accumulated EWMA is protected.
+            # last_delta_bytes/last_n_tokens below still record it raw to
+            # protect the owner's next chunk.
+            history.outlier_owner = request_id
             logger.debug(
                 "PrefillTransientTracker(%s): rejected %.1f-byte/token "
                 "outlier from EWMA (current %.1f, ratio limit %.1fx)",
@@ -188,6 +195,13 @@ class PrefillTransientTracker:
         # growth beyond both that repayment and the static profile is overhead.
         reallocated = min(history.reclaim_debt_bytes, max(0, delta_bytes))
         history.reclaim_debt_bytes -= reallocated
+        if representative and delta_bytes >= 0:
+            # Whatever it repaid, the chunk's growth past the static profile is
+            # what a chunk this wide allocates.
+            widths = history.width_overhead_bytes
+            widths[n_tokens] = max(
+                widths.get(n_tokens, 0), delta_bytes - max(0, static_bytes)
+            )
         residual = delta_bytes - reallocated - max(0, static_bytes)
         if residual <= noise or not representative:
             return
@@ -217,12 +231,25 @@ class PrefillTransientTracker:
                 history.reclaim_debt_bytes + int(reclaimed_bytes),
             )
 
-    def flat_overhead_charge_for(self, gathered_core: bool) -> int:
+    def flat_overhead_charge_for(self, gathered_core: bool, n_tokens: int = 0) -> int:
         history = self._history(gathered_core)
         # Retained pool growth is already present in the scheduler's current
         # physical-footprint reading. Charging it again double-counts it.
         # Only the portion actually reclaimed can be reallocated next chunk.
-        return min(history.flat_overhead_bytes, history.reclaim_debt_bytes)
+        charge = min(history.flat_overhead_bytes, history.reclaim_debt_bytes)
+        # A chunk's overhead grows with its width (Qwen3.8-Flash-Next: about
+        # 140 MB at 32 tokens, 1 GB at 2048, 2.9 GB at 8192), so a chunk is
+        # charged at most the largest overhead measured up to the nearest
+        # width at or above its own.
+        widths = history.width_overhead_bytes
+        wider = [width for width in widths if width >= n_tokens]
+        if n_tokens > 0 and wider:
+            nearest = min(wider)
+            charge = min(
+                charge,
+                max(bytes_ for width, bytes_ in widths.items() if width <= nearest),
+            )
+        return charge
 
     def predict(
         self,
@@ -256,6 +283,10 @@ class PrefillTransientTracker:
     def last_n_tokens_for(self, gathered_core: bool) -> int:
         """Return the latest measured width for the selected regime."""
         return self._history(gathered_core).last_n_tokens
+
+    def outlier_owner_for(self, gathered_core: bool) -> str | None:
+        """Return the request that measured an EWMA-rejected last sample."""
+        return self._history(gathered_core).outlier_owner
 
     def observed_max_bytes_for(self, gathered_core: bool) -> int:
         """Return the floor-size maximum for the selected regime."""

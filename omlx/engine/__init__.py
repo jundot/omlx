@@ -7,7 +7,7 @@ Provides multiple engine implementations:
 - VLMBatchedEngine: Vision-language model engine with image support
 - EmbeddingEngine: Batch embedding generation using mlx-embeddings
 - RerankerEngine: Document reranking using SequenceClassification models
-- DecisionEngine: Typed decisions for /v1/systemone (Clef, OpenJev, Decision 3.0)
+- DecisionEngine: Typed decisions for /v1/systemone (Clef, OpenJev, Decision 3.0, d1)
 
 Also re-exports core engine components for backwards compatibility.
 """

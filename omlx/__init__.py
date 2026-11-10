@@ -12,7 +12,15 @@ Features:
 - Tiered cache (GPU + paged SSD offloading)
 """
 
+import os
+import sys
+
 from omlx._version import __version__
+
+# Apple's Metal driver reads this once, when the process creates its GPU device,
+# and relaxes the compute preemption timeout behind ImpactingInteractivity kills.
+if sys.platform == "darwin":
+    os.environ.setdefault("AGX_RELAX_CDM_CTXSTORE_TIMEOUT", "1")
 
 _LAZY = {
     "Request": "omlx.request",

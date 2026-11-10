@@ -4,7 +4,7 @@
 import pytest
 import mlx.core as mx
 
-fast = pytest.importorskip("omlx.custom_kernels.decode_fast.fast")
+fast = pytest.importorskip("omlx.custom_kernels.attention.fast")
 
 @pytest.mark.skipif(
     not fast.NATIVE_AVAILABLE, reason="native extension not built"

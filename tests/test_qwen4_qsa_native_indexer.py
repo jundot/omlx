@@ -10,7 +10,8 @@ import math
 import mlx.core as mx
 import pytest
 
-from omlx.custom_kernels.glm_moe_dsa import fast
+from omlx.custom_kernels.attention import fast as attention_fast
+from omlx.custom_kernels.sparse_index import fast
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 
@@ -20,7 +21,7 @@ qsa_fast = importlib.import_module("mlx_vlm.models.qwen4_exp.qsa_fast")
 
 def _native_available() -> bool:
     return fast.is_native_available() and fast.has_symbol(
-        "qwen4_qsa_indexer_scores"
+        "qsa_indexer_scores"
     )
 
 
@@ -40,10 +41,6 @@ def _topk_sets(scores, topk):
     return mx.sort(indices.astype(mx.int32), axis=-1)
 
 
-def test_qwen4_qsa_symbol_is_part_of_the_extension_abi():
-    assert "qwen4_qsa_indexer_scores" in fast.NATIVE_SYMBOLS
-
-
 def test_qwen4_qsa_production_geometry_routes_to_native_abi(monkeypatch):
     monkeypatch.setattr(qsa_fast, "_NATIVE_SCORE_MIN_ROWS", 0)
     q = mx.zeros((1, 7, 4, 128), dtype=mx.bfloat16)
@@ -56,7 +53,7 @@ def test_qwen4_qsa_production_geometry_routes_to_native_abi(monkeypatch):
 
     monkeypatch.setattr(fast, "is_native_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
-    monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", scores)
+    monkeypatch.setattr(fast, "qsa_indexer_scores", scores)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_PROVEN", False)
 
@@ -91,7 +88,7 @@ def test_qwen4_native_dispatch_rejection_latches_to_portable(monkeypatch):
 
     monkeypatch.setattr(fast, "is_native_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
-    monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", reject)
+    monkeypatch.setattr(fast, "qsa_indexer_scores", reject)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_PROVEN", False)
 
@@ -172,7 +169,7 @@ def test_qwen4_qsa_native_scores_and_topk_match_fp32_reference(dtype):
     k = (mx.random.normal((1, 1, 521, 128)) * 0.25).astype(dtype)
     mask_q_offset = 2048
 
-    actual = fast.qwen4_qsa_indexer_scores(
+    actual = fast.qsa_indexer_scores(
         q,
         k,
         mask_ratio=4,
@@ -200,7 +197,7 @@ def test_qwen4_qsa_native_fuses_exact_float32_pooled_causal_sentinel():
     q = mx.ones((1, 4, 5, 128), dtype=mx.bfloat16)
     k = mx.ones((1, 1, 11, 128), dtype=mx.bfloat16)
     offset = 8
-    actual = fast.qwen4_qsa_indexer_scores(
+    actual = fast.qsa_indexer_scores(
         q,
         k,
         mask_ratio=4,
@@ -224,7 +221,7 @@ def test_qwen4_qsa_native_fuses_exact_float32_pooled_causal_sentinel():
 )
 def test_qwen4_qsa_native_abi_rejects_nonproduction_geometry():
     with pytest.raises(ValueError, match="expected q"):
-        fast.qwen4_qsa_indexer_scores(
+        fast.qsa_indexer_scores(
             mx.zeros((1, 3, 8, 128), dtype=mx.bfloat16),
             mx.zeros((1, 1, 16, 128), dtype=mx.bfloat16),
             mask_q_offset=64,
@@ -242,7 +239,7 @@ def fake_native_scores(monkeypatch):
 
     monkeypatch.setattr(fast, "is_native_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
-    monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", scores)
+    monkeypatch.setattr(fast, "qsa_indexer_scores", scores)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_PROVEN", True)
     return seen
@@ -281,7 +278,7 @@ def fake_native_topk(monkeypatch):
 
     monkeypatch.setattr(fast, "is_native_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
-    monkeypatch.setattr(fast, "qwen4_qsa_topk_indices", topk)
+    monkeypatch.setattr(fast, "qsa_topk_indices", topk)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_TOPK_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_TOPK_PROVEN", True)
     return seen
@@ -312,9 +309,9 @@ def fake_native_sparse_attention(monkeypatch):
         seen.append(queries.shape)
         return mx.zeros((1, queries.shape[2], 24, 256), dtype=queries.dtype)
 
-    monkeypatch.setattr(fast, "is_native_available", lambda: True)
-    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
-    monkeypatch.setattr(fast, "qwen4_qsa_sparse_gqa_attention", attention)
+    monkeypatch.setattr(attention_fast, "is_native_available", lambda: True)
+    monkeypatch.setattr(attention_fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(attention_fast, "sparse_gqa_attention", attention)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_MAIN_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_MAIN_PROVEN", True)
     return seen

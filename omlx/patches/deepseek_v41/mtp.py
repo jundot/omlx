@@ -3,7 +3,8 @@
 
 import mlx.core as mx
 
-from . import growth
+from . import decode_fused, growth
+from .head import project_logits
 
 
 class AcceptanceDepthController:
@@ -34,17 +35,30 @@ class AcceptanceDepthController:
 class DSparkMixin:
     _omlx_mtp_multi_request = True
 
-    def _omlx_prefill(self, input_ids, cache=None, **kwargs):
+    def _omlx_prefill(self, input_ids, cache=None, next_prefill_tokens=0, **kwargs):
         """Scheduler cache-only entry; normal forward retains full logits."""
-        return self(input_ids, cache=cache, _ced_prefill=True, **kwargs)
+        return self(
+            input_ids,
+            cache=cache,
+            _ced_prefill=True,
+            next_prefill_tokens=next_prefill_tokens,
+            **kwargs,
+        )
 
     @property
     def args(self):
         return self._config
 
-    def configure_mtp(self, enabled, depth=5):
-        if enabled and not self._config.preserve_mtp:
+    def configure_mtp(self, enabled, depth=5, *, verify_only=False):
+        """Arm DSpark decoding.
+
+        ``verify_only`` is a cluster rank without the draft head: it runs the
+        verify forwards and rollbacks rank zero chose, but never captures
+        target taps or drafts.
+        """
+        if enabled and not verify_only and not self._config.preserve_mtp:
             raise ValueError("DSpark decoding requires preserved MTP weights")
+        self._omlx_mtp_verify_only = bool(enabled and verify_only)
         self._omlx_mtp_decode_enabled = bool(enabled)
         self._omlx_dspark_decode_enabled = bool(enabled)
         self._omlx_mtp_chain = True
@@ -52,6 +66,12 @@ class DSparkMixin:
         self._omlx_mtp_rowwise_unsupported = True
         self._omlx_mtp_independent_verify = True
         self._omlx_mtp_depth = max(1, min(depth, self._config.dspark_block_size))
+        # One-token decode then runs the kernels of verify blocks (decode_fused), so a
+        # verified draft gets the logits that decoding it alone gives.
+        for layer in getattr(self, "layers", ()):
+            # A pipeline stage holds None in place of other ranks' layers.
+            if layer is not None:
+                object.__setattr__(layer, "_omlx_verify_exact", bool(enabled))
 
     def make_mtp_depth_controller(self, depth):
         return AcceptanceDepthController(depth)
@@ -72,6 +92,17 @@ class DSparkMixin:
         self.dspark_append_context(main_hidden, cache)
         return proposal_forward(self, anchor_ids, cache, draft_length)
 
+    def dspark_hidden(self, main_hidden, anchor_ids, cache, *, draft_length=None):
+        """dspark_forward without the vocabulary head: the last stage's normed input."""
+        from .dspark import proposal_hidden
+
+        self.dspark_append_context(main_hidden, cache)
+        return proposal_hidden(self, anchor_ids, cache, draft_length)
+
+    def dspark_logits(self, hidden):
+        """The DSpark vocabulary head of dspark_hidden outputs (any number of rows)."""
+        return project_logits(self.mtp[-1].norm(hidden), self.head.weight)
+
     def dspark_markov(self, token_ids):
         return self.mtp[-1].markov_head(token_ids)
 
@@ -87,6 +118,46 @@ class DSparkMixin:
         from ..mlx_lm_mtp.deepseek_v4_dspark import take_primed
 
         return take_primed(self, cache, main_token)
+
+    def mtp_shared_verify_rows(self):
+        """Rows one mtp_verify_rows forward holds, or 0 when requests cannot verify together
+        (layers off the fused kernels, tensor ranks). Pipeline ranks vote on the first call,
+        which every rank's batch generator makes at the same step."""
+        if self._stage()[0][1]._tensor_group is not None:
+            return 0
+        return decode_fused.MAX_BATCH if self._stages_decode_fused() else 0
+
+    def mtp_cluster_batch_ok(self):
+        """Whether cluster ranks may run batched Lightning MTP: pipeline ranks verify the
+        requests' blocks together (mtp_verify_rows); tensor ranks do not."""
+        return self._stage()[0][1]._tensor_group is None
+
+    def mtp_verify_rows_ok(self, row_caches, width):
+        """Whether mtp_verify_rows can verify these requests' blocks of `width` tokens."""
+        if len(row_caches) < 2:
+            return False
+        merged = [type(row_caches[0][i]).merge([rc[i] for rc in row_caches]) for i in range(len(row_caches[0]))]
+        ids = mx.zeros((len(row_caches), width), mx.int32)
+        return self._batched_verify_ok(ids, merged, merged[0].make_mask(width), None, {})
+
+    def mtp_verify_rows(self, inputs, row_caches):
+        """Verify B requests' MTP blocks (inputs: [B, R]) in one forward.
+
+        row_caches holds each request's cache. Returns (logits [B, R, V], DSpark target
+        hidden [B, R, taps * dim], the requests' advanced caches): each request's cache
+        and rollback record are those of its own verify forward, so mtp_partial_rollback
+        then runs on each request alone.
+        """
+        merged = [type(row_caches[0][i]).merge([rc[i] for rc in row_caches]) for i in range(len(row_caches[0]))]
+        logits, hidden = self(inputs, cache=merged, return_hidden=True, n_confirmed=1)
+        stashes = merged[0]._mtp_row_stashes
+        merged[0]._mtp_row_stashes = None
+        out = []
+        for r, stash in enumerate(stashes):
+            rc = [item.extract(r) for item in merged]
+            rc[0]._mtp_draft_stash = stash
+            out.append(rc)
+        return logits, hidden, out
 
     def mtp_partial_rollback(self, cache, accepted, num_drafts):
         if not 0 <= accepted <= num_drafts:
@@ -145,9 +216,11 @@ class DSparkMixin:
         target_verify = kwargs.pop("target_verify", False)
         n_confirmed = kwargs.pop("n_confirmed", 0)
         verify = bool(target_verify or n_confirmed)
-        active = getattr(self, "_omlx_dspark_decode_enabled", False)
+        verify_only = getattr(self, "_omlx_mtp_verify_only", False)
+        active = getattr(self, "_omlx_dspark_decode_enabled", False) and not verify_only
         capture_dspark = kwargs.pop("return_dspark_hidden", False)
-        capture = return_hidden or bool(capture_dspark)
+        # A verify-only rank may not hold the target layers the taps come from.
+        capture = (return_hidden or bool(capture_dspark)) and not verify_only
         if kwargs.get("_ced_prefill", False) and self._config.ced_prefill:
             if input_ids.shape[0] != 1:
                 raise ValueError("CED scheduler prefill requires one request row")
@@ -155,12 +228,24 @@ class DSparkMixin:
                 raise ValueError("CED prefill cannot supply full hidden/verify states")
         prime = active and not capture and not verify and input_ids.shape[0] == 1
         verify_states = None
+        rows = input_ids.shape[0]
         if verify:
-            if input_ids.shape[0] != 1 or inputs_embeds is not None:
-                raise ValueError("DSpark verification requires one text decode row")
-            before = cache[0].size()
-            snapshots = [(list(c.cache), c.left_padding, c.lengths) for c in cache]
-            verify_states = [{} for _ in cache]
+            if inputs_embeds is not None:
+                raise ValueError("DSpark verification requires text decode rows")
+            if rows == 1:
+                before = cache[0].size()
+                snapshots = [(list(c.cache), c.left_padding, c.lengths) for c in cache]
+                verify_states = [{} for _ in cache]
+            else:
+                # Several requests' blocks in one forward: each row keeps the rollback
+                # record its own verify forward would leave (see mtp_verify_rows).
+                row_caches = [[c.extract(r) for c in cache] for r in range(rows)]
+                before = [rc[0].size() for rc in row_caches]
+                snapshots = [
+                    [(list(c.cache), c.left_padding, c.lengths) for c in rc]
+                    for rc in row_caches
+                ]
+                verify_states = [[{} for _ in cache] for _ in range(rows)]
         result = self._forward(
             input_ids,
             cache=cache,
@@ -168,14 +253,26 @@ class DSparkMixin:
             token_types=token_types,
             return_dspark_hidden=capture or prime,
             mtp_verify_states=verify_states,
+            _dspark_prime=prime,
             **kwargs,
         )
-        if verify:
+        if verify and rows == 1:
             cache[0]._mtp_draft_stash = (input_ids, snapshots, before, verify_states)
+        elif verify:
+            cache[0]._mtp_row_stashes = [
+                (input_ids[r : r + 1], snapshots[r], before[r], verify_states[r])
+                for r in range(rows)
+            ]
         if prime:
             logits, hidden = result
             # The draft ring retains one window; reset across omitted spans
             # using the existing absolute-position prompt-capture contract.
-            capture_prompt(self, input_ids[:, -hidden.shape[1] :], hidden, cache)
+            # A chunk that skipped its decoder layers returns no hidden. The
+            # rows may start before input_ids when a skipped window was replayed;
+            # the capture only reads their count.
+            if hidden is not None:
+                capture_prompt(self, hidden[..., 0], hidden, cache)
             return logits
+        if verify_only and return_hidden:
+            return result, None
         return result

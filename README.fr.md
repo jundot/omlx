@@ -66,8 +66,9 @@ brew update && brew upgrade omlx
 # Lancer en service en arrière-plan (redémarre automatiquement en cas de crash)
 brew services start omlx
 
-# Optionnel : support MCP (Model Context Protocol)
+# Optionnel : support MCP (Model Context Protocol), puis redémarrer pour le charger
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
+omlx restart
 ```
 
 ### Depuis les sources
@@ -77,7 +78,7 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 make install                # Installation editable avec l'interface web et les kernels natifs
 # Sans Xcode complet : make install-no-kernels installe sans les kernels
-make mcp                    # Optionnel : ajoute le support MCP (Model Context Protocol)
+make mcp                    # Optionnel : support MCP, redémarrer `omlx serve` pour le charger
 ```
 
 Nécessite macOS 15.0+ (Sequoia), Python 3.11–3.13, et Apple Silicon (M1/M2/M3/M4/M5).
@@ -191,7 +192,7 @@ Chattez directement avec n'importe quel modèle chargé depuis le panneau d'admi
 
 ### Téléchargement de modèles
 
-Recherchez et téléchargez des modèles MLX depuis HuggingFace directement dans le tableau de bord. Parcourez les fiches modèles, vérifiez les tailles de fichiers, et téléchargez en un clic.
+Recherchez et téléchargez des modèles depuis HuggingFace directement dans le tableau de bord, en MLX, en GGUF ou dans tous les formats. Parcourez les fiches modèles, puis choisissez les fichiers à télécharger : un checkpoint MLX garde les fichiers nécessaires, et un GGUF entraîne son projecteur de vision.
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX Model Downloader" width="720">
@@ -232,7 +233,7 @@ Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'us
 | `POST /v1/messages` | API Messages Anthropic |
 | `POST /v1/embeddings` | Embeddings texte |
 | `POST /v1/rerank` | Reranking de documents |
-| `POST /v1/systemone` | Décisions typées avec les modèles de décision (TypeSafe System One) |
+| `POST /v1/systemone` | Décisions typées avec les modèles de décision ou de chat (TypeSafe System One) |
 | `GET /v1/models` | Lister les modèles disponibles |
 | `POST /tokenize`, `POST /detokenize` | API de tokenisation compatible vLLM (aussi sous `/v1`) |
 
@@ -273,7 +274,7 @@ Les modèles sont auto-détectés par type. Vous pouvez aussi télécharger des 
 | Type | Modèles |
 |------|--------|
 | LLM | Tout modèle supporté par [mlx-lm](https://github.com/ml-explore/mlx-lm) |
-| VLM | Série Qwen3.5, GLM-4V, Pixtral, et autres modèles [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) |
+| VLM | Série Qwen3.5, GLM-4V, Pixtral, et autres modèles [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
@@ -400,7 +401,7 @@ Les contributions sont les bienvenues ! Voir le [Guide de contribution](docs/CON
 ## Remerciements
 
 - [MLX](https://github.com/ml-explore/mlx) et [mlx-lm](https://github.com/ml-explore/mlx-lm) par Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) — inférence de modèles vision-langage sur Apple Silicon
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) — inférence de modèles vision-langage sur Apple Silicon
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) — oMLX a démarré à partir de vllm-mlx v0.1.0 et a considérablement évolué avec le service multi-modèles, le cache KV à plusieurs niveaux, le support VLM avec cache paginé complet, un panneau d'admin, et une app dans la barre de menus macOS
 - [venvstacks](https://venvstacks.lmstudio.ai) — couches d'environnements Python portables pour le bundle de l'app macOS
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) — support des modèles d'embedding sur Apple Silicon

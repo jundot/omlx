@@ -40,6 +40,9 @@ import mlx.core as mx
 # Nemotron-H pipeline path. Duplicating it is how the MiniMax port acquired
 # ``cache[-1].keys``, which does not exist on MiniMax's second cache family.
 from omlx.cluster.pipeline_compat import _cache_dependency
+from omlx.patches.mlx_vlm_minimax_m3_compat import (
+    apply_mlx_vlm_minimax_m3_compat_patch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +222,9 @@ def _pipelined_call(
 def apply_minimax_m3_pipeline_patch() -> bool:
     """Give the vendored MiniMax model mlx-lm's pipelining contract."""
 
+    # Upstream mlx-vlm also ships minimax_m3_vl. Without the compat patch this
+    # import would load and patch that copy instead of the vendored one.
+    apply_mlx_vlm_minimax_m3_compat_patch()
     try:
         from mlx_lm.models.pipeline import PipelineMixin
         from mlx_vlm.models.minimax_m3_vl.language import (

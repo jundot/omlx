@@ -32,6 +32,7 @@ from omlx.cluster.discovery import (
     decode_wassup,
     encode_hello,
     encode_wassup,
+    interface_link,
 )
 from omlx.cluster.identity import NodeIdentity
 from omlx.cluster.registry import DeviceRegistry
@@ -160,7 +161,15 @@ def test_wassup_codec_roundtrip():
         "nonce": 7,
         "node_id": "node-1",
         "http_port": 8000,
+        "loopback_only": False,
     }
+    assert decode_wassup(encode_wassup(7, "node-1", 8000, True))["loopback_only"]
+    # Older peers do not send the flag.
+    legacy = (
+        b"OMLXW"
+        + json.dumps({"nonce": 7, "node_id": "node-1", "http_port": 8000}).encode()
+    )
+    assert decode_wassup(legacy)["loopback_only"] is False
 
 
 def test_wassup_codec_rejects_garbage():
@@ -200,6 +209,7 @@ def test_hello_from_same_cluster_sets_multicast_ok_and_replies_wassup():
         "nonce": 123,
         "node_id": "aaaa-node",
         "http_port": 8000,
+        "loopback_only": False,
     }
     assert sock.sent[0][1] == ("fe80::99", 53413)
 
@@ -260,6 +270,22 @@ def test_wassup_creates_peer_and_candidate():
     assert peers[0].http_port == 8000
     assert peers[0].addrs == [{"ip": "fe80::99", "if_type": "unknown"}]
     assert ("fe80::99", 8000) in service._candidates
+
+
+def test_loopback_only_peer_is_marked_from_wassup_reply():
+    sock = FakeSocket()
+    loopback, _ = _service(
+        "bbbb-node",
+        socket_factory=lambda: sock,
+        config=DiscoveryConfig(caps=PeerCaps(loopback_only=True)),
+    )
+    loopback._handle_hello(42, loopback._cluster_hash, ("fe80::1", 53413), sock)
+    service, _ = _service("aaaa-node")
+    _announce_nonce(service)
+
+    service._handle_wassup(decode_wassup(sock.sent[0][0]), ("fe80::99", 53413))
+
+    assert service.peers()[0].to_dict()["caps"]["loopback_only"] is True
 
 
 def test_wassup_with_unknown_nonce_is_ignored():
@@ -717,6 +743,49 @@ def test_link_classification():
     assert _classify_link("10.0.0.1", "unknown", 0.050) == "wifi"
 
 
+def test_interface_link_names_the_local_port_of_a_direct_route(monkeypatch):
+    routes = {
+        "192.168.2.2": "  interface: bridge0\n",
+        "192.168.1.9": "  interface: en1\n",
+        "192.168.1.30": "  interface: en0\n",
+        # Through a router the far side's link is unknown.
+        "10.9.9.9": "    gateway: 192.168.1.1\n  interface: en0\n",
+    }
+    ports = (
+        "Hardware Port: Ethernet\nDevice: en0\n\n"
+        "Hardware Port: Wi-Fi\nDevice: en1\n\n"
+        "Hardware Port: Thunderbolt Bridge\nDevice: bridge0\n"
+    )
+
+    def run(argv, **kwargs):
+        return SimpleNamespace(
+            stdout=ports if argv[0].endswith("networksetup") else routes[argv[-1]]
+        )
+
+    monkeypatch.setattr("omlx.cluster.discovery.subprocess.run", run)
+    monkeypatch.setattr("omlx.cluster.discovery.sys.platform", "darwin")
+    monkeypatch.setattr("omlx.cluster.discovery._link_cache", {})
+    monkeypatch.setattr("omlx.cluster.discovery._port_cache", [0.0, None])
+    assert [interface_link(ip) for ip in routes] == ["tb", "wifi", "ethernet", None]
+
+
+def test_a_mac_shows_its_fastest_verified_link_not_the_last_probed(monkeypatch):
+    links = {"10.0.1.5": "tb", "10.0.0.5": "wifi"}
+    monkeypatch.setattr("omlx.cluster.discovery.interface_link", links.get)
+    service, _ = _service(
+        "aaaa-node",
+        prober=lambda ip, port, timeout: {
+            "node_id": "bbbb-node",
+            "version": "0.6.1",
+            "cluster_name": "omlx",
+        },
+    )
+    for ip in links:
+        service.add_manual(ip, 8000)
+        service.probe_candidate_now(ip, 8000)
+    assert service.peers()[0].link == "tb"
+
+
 # -- mDNS -----------------------------------------------------------------------
 
 
@@ -742,7 +811,9 @@ def test_mdns_service_creates_peer_from_txt():
             b"name": b"studio-b",
             b"ver": b"0.6.1",
             b"cl": b"omlx",
-            b"caps": json.dumps({"chip": "M3 Ultra", "ram_gb": 96}).encode(),
+            b"caps": json.dumps(
+                {"chip": "M3 Ultra", "ram_gb": 96, "loopback_only": True}
+            ).encode(),
         }
 
         def parsed_addresses(self):
@@ -754,6 +825,7 @@ def test_mdns_service_creates_peer_from_txt():
     assert peer.node_id == "bbbb-node"
     assert peer.friendly_name == "studio-b"
     assert peer.caps.chip == "M3 Ultra"
+    assert peer.caps.loopback_only is True
     assert peer.addrs == [{"ip": "10.0.0.7", "if_type": "mdns"}]
     assert ("10.0.0.7", 8000) in service._candidates
 
@@ -991,7 +1063,14 @@ def test_mdns_announce_publishes_spec_txt_record():
     assert info.properties["cl"] == "omlx"
     assert info.properties["ver"]
     caps = json.loads(info.properties["caps"])
-    assert set(caps) == {"chip", "ram_gb", "backends", "thunderbolt", "jaccl"}
+    assert set(caps) == {
+        "chip",
+        "ram_gb",
+        "backends",
+        "thunderbolt",
+        "jaccl",
+        "loopback_only",
+    }
     service.stop()
 
 

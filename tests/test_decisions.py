@@ -15,6 +15,7 @@ from pydantic import ValidationError  # noqa: E402
 
 from omlx.api import decisions  # noqa: E402
 from omlx.api.decisions_models import DecisionRequest  # noqa: E402
+from omlx.api.systemone_models import SystemOneRequest  # noqa: E402
 
 VOCAB = 256
 # Next-token logit of every non-letter token in the fake engine.
@@ -498,3 +499,101 @@ def test_systemone_translation_round_trip():
             "confidence": 0.8,
         },
     ]
+
+
+def _systemone(**questions):
+    return SystemOneRequest.model_validate(
+        {"model": "m", "state": "Checkout is down.", "questions": questions}
+    )
+
+
+def test_systemone_noul_reads_out_the_predicate_prompt():
+    engine = _FakeChatEngine(lambda text, letters: [0.0, -1.0])
+    predicate = {"type": "predicate", "name": "p", "instructions": "Urgent?"}
+    _run(engine, _request(questions=[predicate]))
+    request = _systemone(
+        p={"type": "noul", "instructions": "Urgent?"},
+        d={"type": "noul", "instructions": "Urgent?", "criteria": {"true": "Down."}},
+    )
+    _run(engine, decisions.decisions_request(request))
+
+    assert engine.calls[1]["messages"] == engine.calls[0]["messages"]
+    assert "A. Yes: Down.\n" in engine.calls[2]["messages"][0]["content"]
+
+
+def test_systemone_answers_skip_the_refusal_check():
+    # Letters without the next-token mass are a refusal in /v1/decisions.
+    engine = _FakeChatEngine(
+        lambda text, letters: [-float(i) for i in range(len(letters))],
+        background=0.0,
+    )
+    request = _systemone(
+        urgent={"type": "noul", "instructions": "Urgent?"},
+        team={
+            "type": "choice",
+            "instructions": "Team?",
+            "criteria": {"a": None, "b": None},
+        },
+        severity={
+            "type": "score",
+            "instructions": "Severity?",
+            "criteria": ["low", "high"],
+        },
+        only={"type": "choice", "criteria": {"x": None}},
+    )
+
+    def run(engine):
+        decision_request = decisions.decisions_request(request)
+        result = asyncio.run(
+            decisions.decide(engine, decision_request, False, require_answer=False)
+        )
+        return decisions.systemone_answers(request, result["answers"])
+
+    answers = run(engine)
+
+    assert answers["urgent"] == {"type": "noul", "noul": 0.7311}
+    assert answers["team"]["probabilities"] == {"a": 0.7311, "b": 0.2689}
+    assert answers["severity"]["legend"] == {"0": "low", "1": "high"}
+    assert answers["severity"]["probabilities"] == {"0": 0.7311, "1": 0.2689}
+    assert answers["only"]["probabilities"] == {"x": 1.0}
+
+    masked = _FakeChatEngine(lambda text, letters: [-np.inf] * len(letters))
+    with pytest.raises(decisions.DecisionsRequestError):
+        run(masked)
+
+
+@pytest.mark.parametrize("kind", ["choice", "score"])
+def test_systemone_large_questions_compose_multiple_rounds(kind):
+    count = 677
+    target = np.linspace(0.0, 3.0, count)
+    values = [f"v{i}" for i in range(count)]
+    criteria = dict.fromkeys(values) if kind == "choice" else values
+    request = _systemone(pick={"type": kind, "criteria": criteria})
+
+    def scores(text, letters):
+        indices = re.findall(r"^[A-Z]\. v(\d+)$", text, flags=re.M)
+        return [target[int(i)] for i in indices]
+
+    engine = _FakeChatEngine(scores, background=0.0)
+    result = asyncio.run(
+        decisions.decide(
+            engine, decisions.decisions_request(request), False, require_answer=False
+        )
+    )
+    answer = decisions.systemone_answers(request, result["answers"])["pick"]
+    expected = np.exp(target - target.max())
+    expected /= expected.sum()
+
+    assert list(answer["probabilities"].values()) == pytest.approx(expected, abs=1e-4)
+    if kind == "choice":
+        assert list(answer["probabilities"]) == values
+        assert answer["choice"] == values[-1]
+    else:
+        assert list(answer["legend"].values()) == values
+        assert answer["score"] == pytest.approx(
+            np.dot(np.arange(count), expected), abs=1e-4
+        )
+    assert result["cached_tokens"] == len(engine.calls)
+    assert result["input_tokens"] == sum(
+        len(call["messages"][0]["content"]) for call in engine.calls
+    )

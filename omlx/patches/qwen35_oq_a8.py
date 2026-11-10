@@ -81,7 +81,7 @@ def _is_q8_linear(module: Any) -> bool:
 
 def _kernels_available() -> bool:
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
     except ImportError:
         return False
     return fast.oq_a8_available()
@@ -144,7 +144,8 @@ _Q8_TILE_N = 64
 def _variant_for_bits(bits: int) -> int:
     # Q4 and Q5 are autotuned independently: Q5 reads a second plane per
     # weight row and costs more registers, so the best tile need not match.
-    return _DEFAULT_VARIANT_Q5 if bits == 5 else _DEFAULT_VARIANT_Q4
+    # Q6 reads the same three-word window as Q5.
+    return _DEFAULT_VARIANT_Q5 if bits in (5, 6) else _DEFAULT_VARIANT_Q4
 
 
 def classify_linear(linear: Any) -> OqA8Plan | None:
@@ -208,7 +209,7 @@ def _plan_for(bits: int, n: int, packed: bool = False) -> OqA8Plan | None:
         packed=packed,
     )
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     # N must tile exactly; the kernel refuses partial column tiles so the
     # weight decoder can stay bounds-check free.
@@ -301,12 +302,12 @@ def stage_a(
     rebuilt on every prefill, which uses temporary activation memory without
     changing the checkpoint.
     """
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     if layout == _LAYOUT_NATURAL:
-        qa, sa, ra = fast.qwen35_oq_a8_stage_a_natural(x, act_mode)
+        qa, sa, ra = fast.oq_a8_stage_a_natural(x, act_mode)
     else:
-        qa, sa, ra = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
+        qa, sa, ra = fast.oq_a8_stage_a_v8(x, act_mode)
     return StageA(qa=qa, sa=sa, ra=ra, act_mode=act_mode, layout=layout)
 
 
@@ -323,10 +324,10 @@ def apply_plan(linear: Any, stage: StageA, plan: OqA8Plan) -> mx.array:
             f"Stage-A layout {stage.layout} does not match the projection's "
             f"plan ({plan.layout}); quantize once per kernel layout."
         )
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     weight, scales, biases = _prepared_weights(linear)
-    return fast.qwen35_oq_a8_qmm_t(
+    return fast.oq_a8_qmm_t(
         stage.qa,
         stage.sa,
         stage.ra,
@@ -439,7 +440,7 @@ def oq_a8_gdn_projections(
 # Model-side routing
 # --------------------------------------------------------------------------
 #
-# Routed only for a model whose ``qwen35_oq_a8_enabled`` setting says so. Two
+# Routed only for a model whose ``a8_prefill_enabled`` setting says so. Two
 # entry points carry essentially all of the routable work in this checkpoint:
 # the SwiGLU MLP, and the linear-attention input projections.
 #

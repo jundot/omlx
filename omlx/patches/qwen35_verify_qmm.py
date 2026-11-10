@@ -50,16 +50,16 @@ from the unrouted path (the token is still trunk-verified — the divergence
 class is the same as any kernel change).
 
 Supported: 4-bit and 8-bit affine, group_size in {32, 64, 128}, bf16/fp16
-activations, M in 3..6, K % 64 == 0, N % 4 == 0. The mma path takes 4-bit
-and 5-bit affine, M in 7..24, K % 256 == 0, N % 16 == 0. Everything else falls back to
-stock.
+activations, M in 3..6, K % 64 == 0, N % 4 == 0.
+The mma path takes 2-, 3-, 4-, 5-, 6- and 8-bit affine, M in 7..24.
+It needs K % 256 == 0 and N % 16 == 0. Everything else falls back to stock.
 
 Blocks of four to eight rows (DFlash and Lightning MTP verifies) take
-``sg8`` instead: bf16 rows, 4- or 5-bit weights, N >= 1024. Each lane builds its simdgroup-matrix
+``sg8`` instead: bf16 or fp16 rows, 2- to 6-bit weights, N >= 1024. Each lane builds its simdgroup-matrix
 operands in registers from one packed word per 32 inputs (bf16 ``128 + q``,
 exact), so no threadgroup dequant tile is needed; the group fold removes
 ``128 * sum(x)`` and applies scale and bias. The verifier's projection tuples
-share one launch (``vk_group_sg8``, mixed bit widths allowed) and the dense
+share one launch (``vk_group_sg8``, mixed 4/5-bit widths allowed) and the dense
 MLP's gate/up/SiLU is one launch (``vk_swiglu_sg8``).
 
 The armed verifier also fuses each residual add with the next RMSNorm
@@ -71,6 +71,10 @@ from __future__ import annotations
 
 import logging
 import threading
+
+from omlx.custom_kernels.nax import is_nax_available
+
+from . import m1_verify_mma, m1_verify_qmv
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +93,8 @@ _MIN_ROUTE_N = 16384
 # The mma path wins from much smaller N because stock qmm reads the weights
 # more than once (qmv_wide tiles) or wastes half a 32-row tile at these M.
 _MIN_MMA_ROUTE_N = 4096
+# On NAX GPUs stock MLX's tensor-unit qmm wins at 24 rows; mma still wins at 16.
+_NAX_MMA_MAX_ROWS = 16
 # Draft k/v and conv projections (N 1024..1280) also gain from sg8.
 _MIN_SG8_ROUTE_N = 1024
 _SG8_MIN_ROWS = 4
@@ -438,18 +444,30 @@ def _build_mma_kernel(
                     B_tile[sg_id][(dq_k * 8 + ki) * BN + dq_n] = T(float(nib) * s + b);
                 }"""
     else:
-        # MLX 5-bit affine: eight values per five little-endian bytes.
-        unpack = """
+        # MLX affine packs eight values into ``bits`` little-endian bytes.
+        load = {
+            2: "uint64_t packed = uint64_t(*(const device ushort*)wb);",
+            6: "const device ushort* wh = (const device ushort*)wb;\n"
+            "                uint64_t packed = uint64_t(wh[0]) | (uint64_t(wh[1]) << 16)"
+            " | (uint64_t(wh[2]) << 32);",
+            8: "uint2 w2 = *(const device uint2*)wb;\n"
+            "                uint64_t packed = uint64_t(w2.x) | (uint64_t(w2.y) << 32);",
+        }.get(
+            bits,
+            "uint64_t packed = 0;\n"
+            '                _Pragma("unroll")\n'
+            f"                for (int i = 0; i < {bits}; ++i) "
+            "packed |= uint64_t(wb[i]) << (8 * i);",
+        )
+        unpack = f"""
                 const device uchar* wb = ((const device uchar*)w_q)
-                    + (n_global * K_by_8 + (k_base >> 3)) * 5;
-                uint64_t packed = uint64_t(wb[0]) | (uint64_t(wb[1]) << 8)
-                    | (uint64_t(wb[2]) << 16) | (uint64_t(wb[3]) << 24)
-                    | (uint64_t(wb[4]) << 32);
+                    + (long(n_global) * K_by_8 + (k_base >> 3)) * {bits};
+                {load}
                 _Pragma("unroll")
-                for (int ki = 0; ki < 8; ++ki) {
-                    uint32_t nib = uint32_t((packed >> (ki * 5)) & 0x1Fu);
+                for (int ki = 0; ki < 8; ++ki) {{
+                    uint32_t nib = uint32_t((packed >> (ki * {bits})) & {(1 << bits) - 1}u);
                     B_tile[sg_id][(dq_k * 8 + ki) * BN + dq_n] = T(float(nib) * s + b);
-                }"""
+                }}"""
 
     decl = "\n        ".join(
         f"simdgroup_matrix<T, 8, 8> a{r};"
@@ -576,8 +594,9 @@ def _operand_bits(pair: str, half: bool) -> str:
 
 def _sg8_source(mats: int, half: bool = False) -> str:
     pair4 = _operand_bits("((wds[0] >> (4 * j)) & 0x000F000Fu)", half)
-    pair5 = _operand_bits(
-        "((wds[0] >> (5 * j)) & 0x1Fu) | (((wds[1] >> (5 * j)) & 0x1Fu) << 16)", half
+    pair_split = _operand_bits(
+        "((wds[0] >> (BITS * j)) & MASK) | (((wds[1] >> (BITS * j)) & MASK) << 16)",
+        half,
     )
     names = [("w_q", "scales", "biases"), ("w_q2", "scales2", "biases2")][:mats]
     decl = "\n".join(
@@ -653,19 +672,24 @@ def _sg8_source(mats: int, half: bool = False) -> str:
         if (BITS == 4) {{
             wds[0] = ((const device uint*)(wg + qd * 16))[fn >> 1];
         }} else {{
-            // 40 bits from byte 5 i of the 20-byte block, split at value 4.
-            const device uint* wp = (const device uint*)(wg + qd * 20);
-            uint at = (fn >> 1) * 5;
-            ulong v = (ulong(wp[at / 4 + 1]) << 32) | ulong(wp[at / 4]);
+            // Pack i holds eight values in BITS bytes at byte BITS * i.
+            // Read the second word only when the pack reaches it.
+            // The last pack of a row then stays inside the block.
+            const device uint* wp = (const device uint*)(wg + qd * 4 * BITS);
+            uint at = (fn >> 1) * BITS;
+            ulong v = ulong(wp[at / 4]);
+            if ((at % 4) * 8 + 8 * BITS > 32)
+                v |= ulong(wp[at / 4 + 1]) << 32;
             v >>= (at % 4) * 8;
             wds[0] = uint(v);
-            wds[1] = uint(v >> 20);
+            wds[1] = uint(v >> (4 * BITS));
         }}
     }};
+    constexpr uint MASK = (1u << BITS) - 1u;
     auto operand_pair = [&](thread uint* wds, int j) {{
         if (BITS == 4)
             return {pair4};
-        return {pair5};
+        return {pair_split};
     }};
 {decl}
     for (int g = g_begin; g < g_begin + PER; ++g) {{
@@ -775,9 +799,14 @@ def _sg8_geometry(K: int, N: int) -> tuple[int, int]:
 def sg8_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
     import mlx.core as mx
 
+    # On M1-class GPUs the M1 kernels beat sg8 inside their row windows; the
+    # fused swiglu path keys off this check, so it falls back per-linear.
+    if _m1_route(M, K, N, bits, group_size, dtype):
+        return False
     nsg, ct = _sg8_geometry(int(K), int(N))
     return (
-        int(bits) in (4, 5)
+        # The operand holds 128 + q exactly only up to 7-bit codes.
+        int(bits) in (2, 3, 4, 5, 6)
         and int(group_size) in (32, 64, 128)
         and dtype in (mx.bfloat16, mx.float16)
         # Two or three rows stay on split-K, which is faster there in context.
@@ -922,11 +951,11 @@ def mma_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> b
     import mlx.core as mx
 
     return (
-        int(bits) in (4, 5)
+        int(bits) in (2, 3, 4, 5, 6, 8)
         and int(group_size) in (32, 64, 128)
         and dtype in (mx.bfloat16, mx.float16)
         # Above 24 rows stock qmm fills its 32-row tile and wins.
-        and 7 <= int(M) <= 24
+        and 7 <= int(M) <= (_NAX_MMA_MAX_ROWS if is_nax_available() else 24)
         and int(K) % (_MMA_BK * _MMA_NSG) == 0
         and int(N) % _MMA_BN == 0
         and int(N) >= _MIN_MMA_ROUTE_N
@@ -1164,6 +1193,15 @@ def sg8_group_eligible(linears, x) -> bool:
     rows = x.shape[0] * x.shape[1]
     K = x.shape[2]
     first = linears[0]
+    if any(
+        isinstance(linear, nn.QuantizedLinear)
+        and _m1_route(
+            rows, K, linear.scales.shape[0], linear.bits, linear.group_size, x.dtype
+        )
+        for linear in linears
+    ):
+        # Per-linear calls let the M1 route take the large projections.
+        return False
     for linear in linears:
         if not (
             isinstance(linear, nn.QuantizedLinear)
@@ -1289,7 +1327,14 @@ def _patch_verify_swiglu() -> None:
                 x.reshape(batch * length, K), gate, up, group_sums_for(x)
             )
             hidden = hidden.reshape(batch, length, -1)
-            if down.group_size == _SUM_GROUP:
+            if down.group_size == _SUM_GROUP and sg8_eligible(
+                batch * length,
+                hidden.shape[-1],
+                down.scales.shape[0],
+                down.bits,
+                down.group_size,
+                hidden.dtype,
+            ):
                 register_group_sums(hidden, group_sums(hidden))
             return self._linear(down, hidden)
         return original(self, feed_forward, x)
@@ -1485,9 +1530,21 @@ def _patch_verify_layer_flush() -> None:
     Qwen3_5BatchInvariantForward._model = _model
 
 
+def _m1_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
+    """M1-class kernel for a verify projection ("m1", "m1_mma") or None."""
+    if m1_verify_qmv.eligible(rows, K, N, bits, group_size, dtype):
+        return "m1"
+    if m1_verify_mma.eligible(rows, K, N, bits, group_size, dtype):
+        return "m1_mma"
+    return None
+
+
 def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
-    """Kernel an armed verify projection runs ("sg8", "mma" or "vk"), or None
-    for the stock qmm."""
+    """Kernel an armed verify projection runs ("m1", "m1_mma", "sg8", "mma" or
+    "vk"), or None for the stock qmm."""
+    m1 = _m1_route(rows, K, N, bits, group_size, dtype)
+    if m1:
+        return m1
     if sg8_eligible(rows, K, N, bits, group_size, dtype):
         return "sg8"
     if mma_eligible(rows, K, N, bits, group_size, dtype):
@@ -1495,6 +1552,29 @@ def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
     if rows <= 6 and vk_eligible(rows, K, N, bits, group_size, dtype):
         return "vk"
     return None
+
+
+def run_route(layer, x2, route: str, *, sums=None):
+    """``layer`` applied to the (rows, K) input ``x2`` through the ``route`` kernel.
+
+    Returns None when the route cannot read the layer's scales dtype.
+    """
+    if route in ("m1", "m1_mma") and layer.scales.dtype != x2.dtype:
+        return None
+    args = (x2, layer.weight, layer.scales, layer.biases)
+    if route == "m1":
+        return m1_verify_qmv.m1_qmm(*args, bits=layer.bits, group_size=layer.group_size)
+    if route == "m1_mma":
+        return m1_verify_mma.m1_mma_qmm(
+            *args, bits=layer.bits, group_size=layer.group_size
+        )
+    if route == "sg8":
+        return vk_qmm_sg8(
+            *args, group_size=layer.group_size, bits=layer.bits, sums=sums
+        )
+    if route == "mma":
+        return vk_qmm_mma(*args, group_size=layer.group_size, bits=layer.bits)
+    return vk_qmm(*args, bits=layer.bits, group_size=layer.group_size)
 
 
 def takes_verify_route(layer, rows: int, dtype) -> bool:
@@ -1523,7 +1603,6 @@ def apply_verify_qmm_patch() -> bool:
     if _QL_PATCHED:
         return True
 
-    import mlx.core as mx
     import mlx.nn as nn
 
     cls = nn.QuantizedLinear
@@ -1553,35 +1632,9 @@ def apply_verify_qmm_patch() -> bool:
             return orig_call(self, x)
         try:
             # Batched verify rows (requests x block) share one weight pass.
-            x2 = x.reshape(rows, K)
-            if route == "sg8":
-                y = vk_qmm_sg8(
-                    x2,
-                    self.weight,
-                    self.scales,
-                    self.biases,
-                    group_size=self.group_size,
-                    bits=self.bits,
-                    sums=group_sums_for(x),
-                )
-            elif route == "mma":
-                y = vk_qmm_mma(
-                    x2,
-                    self.weight,
-                    self.scales,
-                    self.biases,
-                    group_size=self.group_size,
-                    bits=self.bits,
-                )
-            else:
-                y = vk_qmm(
-                    x2,
-                    self.weight,
-                    self.scales,
-                    self.biases,
-                    bits=self.bits,
-                    group_size=self.group_size,
-                )
+            y = run_route(self, x.reshape(rows, K), route, sums=group_sums_for(x))
+            if y is None:
+                return orig_call(self, x)
             if hasattr(self, "bias"):
                 y = y + self.bias
             return y.reshape(batch, length, N)
@@ -1595,5 +1648,8 @@ def apply_verify_qmm_patch() -> bool:
     _patch_verify_grouped_linears()
     _patch_verify_layer_flush()
     _QL_PATCHED = True
-    logger.info("MTP verify qmm patch applied (rows 2..6 split-K, 7..8 sg8, 9..24 mma)")
+    logger.info(
+        "MTP verify qmm patch applied (rows 2..6 split-K, 7..8 sg8, 9..24 mma%s)",
+        "; M1: qmv 2..4, mma 5..16" if m1_verify_qmv.enabled() else "",
+    )
     return True

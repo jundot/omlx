@@ -164,6 +164,21 @@ def test_wsdpa_topk_route_activates_only_after_output_evaluates(monkeypatch):
     assert wsdpa.wsdpa_prefill_route_active(topk=True)
 
 
+def test_wsdpa_topk_route_activates_after_tensor_unit_output(monkeypatch):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    q = mx.zeros((1, 64, 16, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 16, 512), dtype=mx.bfloat16)
+    pooled = mx.zeros((1, 3, 512), dtype=mx.bfloat16)
+    topk = mx.zeros((1, 16, 2), dtype=mx.uint32)
+    sinks = mx.zeros((64,), dtype=mx.bfloat16)
+    monkeypatch.setattr(wsdpa, "sparse_topk_attention_nax", lambda *args: q)
+
+    out = wsdpa.wsdpa_topk_prefill(q, kv, pooled, topk, sinks, 1.0, 0, 128, 4)
+
+    assert out is q
+    assert wsdpa.wsdpa_prefill_route_active(topk=True)
+
+
 def test_wsdpa_topk_first_evaluation_failure_keeps_route_inactive(monkeypatch):
     wsdpa = _reset_wsdpa(monkeypatch)
     q = mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16)

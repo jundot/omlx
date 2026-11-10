@@ -18,10 +18,12 @@ from typing import Any, Callable, Dict, Optional
 
 from .model_profiles import (
     MODEL_SPECIFIC_PROFILE_FIELDS,
+    RENAMED_FIELDS,
     UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
     filter_universal_fields,
     normalize_turboquant_kv_bits,
+    rename_legacy_fields,
     slugify_profile_api_name,
     validate_profile_name,
     utcnow,
@@ -30,7 +32,7 @@ from .model_profiles import (
 logger = logging.getLogger(__name__)
 
 # Current settings file format version
-SETTINGS_VERSION = 1
+SETTINGS_VERSION = 2
 
 # The Lightning MTP runtime clamps deeper requests to this global ceiling.
 # Keep API validation and runtime normalization on the same contract.
@@ -53,6 +55,12 @@ def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -
         raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
     if not settings.get("moe_expert_offload_enabled"):
         return
+    # Offload slots live outside the module tree, so the recast leaves them bf16.
+    if settings.get("activation_fp16_enabled"):
+        raise ValueError(
+            "MoE expert offload cannot be combined with the float16 activation "
+            "recast; disable one of them first."
+        )
     # VLM MTP and DFlash have no offload-aware draft path at all.
     if any(settings.get(key) for key in ("vlm_mtp_enabled", "dflash_enabled")):
         raise ValueError(
@@ -118,6 +126,19 @@ def validate_ane_prefill(settings: dict, model_type: str | None) -> None:
                 raise ValueError(f"K2 ANE prefill cannot be combined with {name}.")
 
 
+def validate_kv_compression_settings(scheme: str, bits: float) -> None:
+    """Validate the persisted KV cache format and bit depth."""
+    affine_bits = {"affine4": 4, "affine8": 8}
+    if scheme not in ("turboquant", *affine_bits):
+        raise ValueError(
+            "turboquant_kv_scheme must be 'turboquant', 'affine4', or 'affine8'"
+        )
+    if scheme in affine_bits and bits != affine_bits[scheme]:
+        raise ValueError(f"{scheme} requires turboquant_kv_bits={affine_bits[scheme]}")
+    if bits not in (2, 2.5, 3, 3.5, 4, 6, 8):
+        raise ValueError("turboquant_kv_bits must be one of 2, 2.5, 3, 3.5, 4, 6, 8")
+
+
 def vlm_mtp_processor_conflicts(data: dict) -> list:
     """Names of settings that need per-request logits processors and
     therefore cannot combine with ``vlm_mtp_enabled``.
@@ -166,7 +187,7 @@ def resolve_vlm_mtp_conflicts(data: dict) -> tuple:
 
 
 def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
-    """Clear ``qwen35_oq_a8_enabled`` when ANE prefill is also on.
+    """Clear ``a8_prefill_enabled`` when ANE prefill is also on.
 
     Both wrap ``Qwen3_5MLP.__call__`` and claim the same projections, so
     enabling both leaves whichever patched last in charge -- with the other
@@ -175,15 +196,77 @@ def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
     dicts that predate the exclusivity rule so ``__post_init__`` does not
     reject the whole blob.
     """
-    if not (data.get("qwen35_oq_a8_enabled") and data.get("qwen35_ane_prefill_enabled")):
+    if not (data.get("a8_prefill_enabled") and data.get("qwen35_ane_prefill_enabled")):
         return data, []
     resolved = dict(data)
-    resolved["qwen35_oq_a8_enabled"] = False
+    resolved.pop("a8_prefill_enabled")
     return resolved, ["qwen35_ane_prefill_enabled"]
+
+
+def _setting(settings: Any, name: str) -> Any:
+    if settings is None:
+        return None
+    if isinstance(settings, dict):
+        return settings.get(name)
+    return getattr(settings, name, None)
+
+
+def a8_prefill_on(settings: Any) -> bool:
+    """A8 prefill only when it was saved on: it changes numerics."""
+    return bool(_setting(settings, "a8_prefill_enabled"))
+
+
+_A8_EXACT_MODEL_TYPES = ("qwen4_exp", "deepseek_v41", "minimax_m3", "minimax_m3_vl")
+
+
+def oq_a8_model_supported(config_type: str | None) -> bool:
+    """True for the model families the A8 prefill paths can route.
+
+    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``),
+    DeepSeek V4.1 and MiniMax M3/M3.1 match exactly: only those validated
+    checkpoint families have routed-expert A8, so a ``qwen4`` prefix would
+    admit unvalidated models.
+    """
+    config_type = str(config_type or "").lower().replace("-", "_")
+    return config_type in _A8_EXACT_MODEL_TYPES or config_type.startswith(
+        ("qwen3_5", "qwen3_6", "qwen3_8")
+    )
+
+
+def ced_prefill_on(settings: Any) -> bool:
+    """DeepSeek V4.1 CED prefill unless it was saved off."""
+    return _setting(settings, "deepseek_v41_ced_prefill_enabled") is not False
 
 
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
+_LEGACY_TURBOQUANT_PROFILE_FIELDS = frozenset(
+    {"turboquant_kv_enabled", "turboquant_kv_bits"}
+)
+
+
+def _validate_profile_kv_settings(
+    base: "ModelSettings | None", settings: dict
+) -> None:
+    """Validate a profile's KV format when it sets one."""
+    if not settings.keys() & {"turboquant_kv_scheme", "turboquant_kv_bits"}:
+        return
+    base = base or ModelSettings()
+    validate_kv_compression_settings(
+        settings.get("turboquant_kv_scheme", base.turboquant_kv_scheme),
+        settings.get("turboquant_kv_bits", base.turboquant_kv_bits),
+    )
+
+
+def _profile_settings_with_legacy_kv_scheme(settings: dict) -> dict:
+    """Restore TurboQuant semantics for profiles saved before scheme selection."""
+    if "turboquant_kv_scheme" in settings or not (
+        settings.keys() & _LEGACY_TURBOQUANT_PROFILE_FIELDS
+    ):
+        return settings
+    normalized = dict(settings)
+    normalized["turboquant_kv_scheme"] = "turboquant"
+    return normalized
 
 
 @dataclass
@@ -212,11 +295,14 @@ class ModelSettings:
         enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
         thinking_budget_enabled: Whether a thinking token budget is active.
         thinking_budget_tokens: Max tokens for thinking/reasoning.
+        gpu_power_limit_w: System-wide GPU power cap in watts while this model
+            generates (None = no cap).
         reasoning_parser: xgrammar builtin name: "qwen", "harmony", "llama", etc.
         guided_grammar_enabled: Whether a default guided grammar is active.
         guided_grammar: Default EBNF grammar for constrained decoding.
-        turboquant_kv_enabled: Enable TurboQuant KV cache compression.
-        turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
+        turboquant_kv_enabled: Enable KV cache compression.
+        turboquant_kv_scheme: Cache format: "turboquant", "affine4", or "affine8".
+        turboquant_kv_bits: Cache bit depth (2/2.5/3/3.5/4/6/8); affine formats require their named depth.
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
         qwen35_ane_prefill_enabled: Enable ANE/GPU prompt processing for a
             supported model. Model metadata selects the implementation.
@@ -246,17 +332,23 @@ class ModelSettings:
             (zero lets Accelerate choose).
         qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
-        qwen35_oq_a8_enabled: Route eligible Qwen3.5/3.6/3.8 prefill matmuls
-            through the oQ mixed-bit INT8-activation (QxA8) tensor kernels.
+        a8_prefill_enabled: Route eligible Qwen3.5/3.6/3.8, DeepSeek V4.1 and
+            MiniMax M3 prefill matmuls through the INT8-activation (QxA8)
+            tensor kernels.
             Prefill only, and only a speed-up on hardware with native INT8
-            tensor operations -- M5-series and newer. On anything older the
-            kernels do not load and the setting is refused. Decode is
-            unaffected. Changes numerics: activations are quantized to INT8.
+            tensor operations -- M5-series and newer. On anything older it
+            applies only to a Prefill Accelerator Mac's layers. Off unless
+            saved on. Decode is unaffected. Changes numerics: activations
+            are quantized to INT8.
             Also covers the routed-expert gate/up of Qwen3.8-Flash-Next
             (affine Q4 / GS64 experts); the MTP draft layer and the down
-            projection stay on the A16 path.
+            projection stay on the A16 path. DeepSeek V4.1 covers its affine
+            GS64 routed experts, shared expert and dense projections. MiniMax
+            M3/M3.1 covers its affine GS64 routed experts (NVFP4 experts stay
+            on the A16 path), shared expert and dense projections except the
+            sparse-attention indexer.
             Mutually exclusive with qwen35_ane_prefill_enabled.
-        qwen35_oq_a8_min_tokens: Shortest sequence routed to the kernels.
+        a8_prefill_min_tokens: Shortest sequence routed to the kernels.
         moe_expert_offload_enabled: Stream MoE expert weights from the
             checkpoint on demand instead of keeping them all resident (fits
             models larger than memory; costs decode speed). Requires reload.
@@ -346,7 +438,17 @@ class ModelSettings:
     # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
-    deepseek_v41_ced_prefill_enabled: bool = False
+    # None (never saved) means on; only a saved False turns it off.
+    deepseek_v41_ced_prefill_enabled: Optional[bool] = None
+    # Prefill Accelerator: the paired Mac (cluster node id) that runs the
+    # first layers of each prompt chunk, and how many (None picks them from
+    # measured speed). Applied without reloading the model.
+    prefill_helper_node_id: Optional[str] = None
+    prefill_helper_layers: Optional[int] = None
+    # Recast the checkpoint's bfloat16 leaves (scales, norms, embeddings) to
+    # float16 after load, so the forward runs on the GPU's native float16 path
+    # instead of the emulated bfloat16 one. Quantized payloads are untouched.
+    activation_fp16_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
@@ -355,14 +457,16 @@ class ModelSettings:
     )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
+    gpu_power_limit_w: Optional[int] = None
     reasoning_parser: Optional[str] = (
         None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
     )
     guided_grammar_enabled: bool = False
     guided_grammar: Optional[str] = None
 
-    # TurboQuant KV cache (mlx-vlm backend)
+    # KV cache compression
     turboquant_kv_enabled: bool = False
+    turboquant_kv_scheme: str = "turboquant"
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
     turboquant_skip_last: bool = (
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
@@ -402,8 +506,9 @@ class ModelSettings:
     # The kernel reads the checkpoint's own packed weight stream, so a routed
     # projection costs no extra weight memory and the module's arrays stay
     # readable by the decode path.
-    qwen35_oq_a8_enabled: bool = False
-    qwen35_oq_a8_min_tokens: int = 128
+    # None (never saved) means off.
+    a8_prefill_enabled: Optional[bool] = None
+    a8_prefill_min_tokens: int = 128
 
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool = False
@@ -494,17 +599,22 @@ class ModelSettings:
         # The ddtree verify mode was removed; stored settings run as adaptive.
         if self.dflash_verify_mode == "ddtree":
             self.dflash_verify_mode = "adaptive"
-        if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
-            raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
+        if a8_prefill_on(self) and self.a8_prefill_min_tokens < 1:
+            raise ValueError("a8_prefill_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping
         # Qwen3_5MLP.__call__, so enabling both leaves whichever patched last
         # in charge and the other silently inert -- with different numerics
         # depending on which won. Rejected at construction time so the clash
         # surfaces in the admin UI / API rather than as a silent no-op.
-        if self.qwen35_oq_a8_enabled and self.qwen35_ane_prefill_enabled:
+        if self.a8_prefill_enabled and self.qwen35_ane_prefill_enabled:
             raise ValueError(
-                "qwen35_oq_a8_enabled and qwen35_ane_prefill_enabled cannot "
+                "a8_prefill_enabled and qwen35_ane_prefill_enabled cannot "
                 "both be True; choose one Qwen3.5 prefill accelerator per model"
+            )
+        # Legacy TurboQuant bit values stay loadable; see normalize_turboquant_kv_bits.
+        if self.turboquant_kv_scheme != "turboquant":
+            validate_kv_compression_settings(
+                self.turboquant_kv_scheme, self.turboquant_kv_bits
             )
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
@@ -518,7 +628,7 @@ class ModelSettings:
             )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
-        # or with TurboQuant (which mutates the same cache objects).
+        # or with KV compression (which mutates the same cache objects).
         if self.vlm_mtp_enabled:
             conflicts = [
                 ("dflash_enabled", self.dflash_enabled),
@@ -578,7 +688,9 @@ class ModelSettings:
         valid_fields = {f.name for f in fields(cls)}
 
         # Filter to only valid keys
-        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        filtered_data = {
+            k: v for k, v in rename_legacy_fields(data).items() if k in valid_fields
+        }
 
         return cls(**filtered_data)
 
@@ -755,6 +867,7 @@ class ModelSettingsManager:
             self._settings = {}
 
             for model_id, model_data in models_data.items():
+                model_data = rename_legacy_fields(model_data)
                 # Settings saved before the vlm_mtp exclusivity rule may
                 # combine vlm_mtp_enabled with processor-backed settings;
                 # __post_init__ would raise and the except below would drop
@@ -774,9 +887,9 @@ class ModelSettingsManager:
                 )
                 if prefill_conflicts:
                     logger.warning(
-                        "Model '%s': qwen35_oq_a8_enabled disabled on load; it "
+                        "Model '%s': a8_prefill_enabled disabled on load; it "
                         "cannot be combined with %s. Unset that setting to "
-                        "re-enable the oQ A8 prefill kernels.",
+                        "re-enable A8 prefill.",
                         model_id,
                         ", ".join(prefill_conflicts),
                     )
@@ -1039,6 +1152,20 @@ class ModelSettingsManager:
                         del settings["ttl_seconds"]
                         changed = True
                         model_changed = True
+                    if settings and settings.keys() & RENAMED_FIELDS.keys():
+                        profile["settings"] = settings = rename_legacy_fields(settings)
+                        changed = True
+                    if settings:
+                        normalized = _profile_settings_with_legacy_kv_scheme(settings)
+                        if normalized is not settings:
+                            profile["settings"] = normalized
+                            changed = True
+                            model_changed = True
+                            logger.info(
+                                "Migrated legacy TurboQuant profile '%s' for model '%s'",
+                                name,
+                                model_id,
+                            )
                     current_api_name = profile.get("api_name")
                     if current_api_name:
                         try:
@@ -1374,6 +1501,7 @@ class ModelSettingsManager:
         validate_profile_name(name)
         filtered = filter_profile_fields(settings or {})
         with self._lock:
+            _validate_profile_kv_settings(self._settings.get(model_id), filtered)
             per_model = self._profiles.setdefault(model_id, {})
             if name in per_model:
                 raise ValueError(
@@ -1451,6 +1579,9 @@ class ModelSettingsManager:
                 profile["description"] = description
             if settings is not None:
                 profile["settings"] = filter_profile_fields(settings)
+                _validate_profile_kv_settings(
+                    self._settings.get(model_id), profile["settings"]
+                )
             if source_template is not None:
                 profile["source_template"] = source_template or None
             if expose_as_model is not None:

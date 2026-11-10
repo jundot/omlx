@@ -436,6 +436,28 @@ def test_unpair_revokes_everything(tmp_path):
     assert joiner.paired_devices() == []
 
 
+def test_forget_route_unpairs_through_the_real_manager(tmp_path, monkeypatch):
+    from omlx.cluster import routes
+
+    coordinator, joiner, _, _, _ = _loopback_pair(tmp_path)
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator.approve("join-node", code)
+    joiner.complete_join(joiner.poll_join("coordinator.local:8080"))
+    monkeypatch.setattr(pairing_routes, "_manager", lambda: coordinator)
+    monkeypatch.setattr(
+        routes, "get_cluster_registry", lambda: SimpleNamespace(list=lambda: [])
+    )
+    app = FastAPI()
+    app.include_router(routes.router)
+
+    response = TestClient(app).delete("/admin/api/cluster/forget?node_id=join-node")
+
+    assert response.status_code == 200
+    assert response.json()["forgotten_node_ids"] == ["join-node"]
+    assert coordinator.paired_devices() == []
+
+
 def test_unpair_unknown_device_fails_closed(tmp_path):
     coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator")
     with pytest.raises(PairingStateError, match="unknown device"):
@@ -645,6 +667,24 @@ def test_approval_requires_coordinator_ssh_material(tmp_path):
 
     assert coordinator.paired_devices() == []
     assert [row["node_id"] for row in coordinator.pending_requests()] == ["join-node"]
+
+
+def test_missing_ssh_host_key_asks_for_remote_login(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    joiner._ssh_host_key_provider = lambda: None
+    joiner.start_join()
+
+    with pytest.raises(PairingRequestError, match="Remote Login"):
+        joiner.request_join("coordinator.local:8080")
+
+    joiner._ssh_host_key_provider = lambda: _test_public_key("host-join-node")
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator._ssh_host_key_provider = lambda: None
+
+    with pytest.raises(EnrollmentDriveError, match="Remote Login"):
+        coordinator.approve("join-node", code)
+    assert coordinator.paired_devices() == []
 
 
 def test_default_enrollment_requires_key_and_verified_address(monkeypatch):
@@ -939,6 +979,40 @@ def _client(tmp_path):
 def _restore_manager_getter():
     yield
     pairing_routes.set_pairing_manager_getter(None)
+
+
+def test_an_invite_only_asks_the_other_mac_to_show_its_code(tmp_path, monkeypatch):
+    client, manager, clock = _client(tmp_path)
+    host = SimpleNamespace(
+        node_id="host-node",
+        friendly_name="Studio",
+        paired=False,
+        http_port=8000,
+        addrs=[{"ip": "127.0.0.1"}, {"ip": "fe80::1"}, {"ip": "10.0.0.2"}],
+    )
+    service = SimpleNamespace(peers=lambda: [host], address_health=lambda node: {})
+    monkeypatch.setattr(pairing_routes, "discovery_service_or_none", lambda: service)
+    sent = []
+    manager._http_post = lambda url, payload, timeout: sent.append((url, payload))
+    assert client.post("/api/cluster/pair/invite", json={"node_id": "host-node"}).json()
+    # Loopback and scope-less link-local addresses cannot reach the other Mac.
+    assert sent == [
+        ("http://10.0.0.2:8000/api/cluster/pair/invited", {"node_id": "coord-node"})
+    ]
+
+    invited = "/api/cluster/pair/invited"
+    assert client.post(invited, json={"node_id": "stranger"}).status_code == 404
+    assert client.post(invited, json={"node_id": "host-node"}).status_code == 202
+    assert client.get("/api/cluster/pair/invite").json() == {
+        "invite": {"node_id": "host-node", "name": "Studio"}
+    }
+    # Nothing joins until this Mac's user asks for the code.
+    assert manager.ui_session.snapshot()["state"] == "idle"
+    client.delete("/api/cluster/pair/invite")
+    assert client.get("/api/cluster/pair/invite").json() == {"invite": None}
+    client.post(invited, json={"node_id": "host-node"})
+    clock.now += CODE_TTL_SECONDS + 1
+    assert client.get("/api/cluster/pair/invite").json() == {"invite": None}
 
 
 def test_endpoints_full_flow(tmp_path, monkeypatch):

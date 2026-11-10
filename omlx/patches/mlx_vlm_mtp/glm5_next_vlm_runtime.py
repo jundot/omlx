@@ -352,8 +352,10 @@ def _verify_qmm_may_route(g5_lang: Any, attn: Any, inputs: mx.array) -> bool:
     then runs them one by one, e.g. GLM-5.3's layer 40 with a 5-bit v_proj),
     while the fused step's grouped matmuls are never routed. Those blocks
     keep the reference body, so the verify values do not depend on the path.
+    A row-exact verify keeps the fused step, whose grouped projections then
+    run every row with its decode step's arithmetic.
     """
-    if getattr(attn, "_fused_ready", False):
+    if getattr(attn, "_fused_ready", False) or g5_lang._row_exact_armed():
         return False
     return g5_lang.verify_qmm_routed(inputs.shape[0] * inputs.shape[1])
 
@@ -394,12 +396,18 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
             and x.shape[0] == 1
             and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
         ):
-            shape = (x.shape, x.dtype)
+            # One trace per row-exact mode (see Glm5NextDecoderLayer.__call__).
+            exact = g5_lang._row_exact_armed()
+            shape = (x.shape, x.dtype, exact)
             if x.shape[1] > 1 and shape not in self._ffn_eager_shapes:
                 # Kernel self-checks cannot evaluate their canaries inside a
                 # compiled trace, so each verify shape runs eagerly once.
                 self._ffn_eager_shapes.add(shape)
                 return self._ffn_block(x)
+            if exact:
+                if self._ffn_rc is None:
+                    self._ffn_rc = mx.compile(self._ffn_block)
+                return self._ffn_rc(x)
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
@@ -531,7 +539,6 @@ def _patch_language_model(g5_lang: Any) -> None:
     create_attention_mask = g5_lang.create_attention_mask
 
     original_init = cls.__init__
-    original_call = cls.__call__
     original_sanitize = cls.sanitize
 
     def __init__(self, args, config=None):

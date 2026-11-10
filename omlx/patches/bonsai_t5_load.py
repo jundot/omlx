@@ -13,14 +13,10 @@ Patch 1 – Module.load_weights
   Weights stay in t5 uint8 format in memory (~23% less RAM than 2-bit).
 
 Patch 2 – mx.quantized_matmul
-  mlx_vlm (Qwen3.5 and similar) calls mx.quantized_matmul DIRECTLY, bypassing
-  QuantizedLinear.__call__ and our bonsai_qmv inference patch.  This wrapper
-  intercepts all calls: for uint8 t5 weights it routes all M through the fast
-  bonsai_t5_qmv (M=1) / bonsai_t5_qmv_wide (M≥2) Metal kernels.  The wide
-  kernel tiles M into groups of ≤5 in one dispatch — no float weight
-  materialisation at any batch size.  Non-t5 calls (uint32) pass through
-  unchanged.  A dequant+matmul fallback fires only when the native extension
-  is unavailable.
+  QuantizedLinear.__call__ and mlx_vlm's direct calls both reach mx.quantized_matmul.
+  For uint8 t5 weights it uses t5_qmv / t5_qmv_wide up to M=16 and t5_qmm above.
+  Non-t5 calls (uint32) pass through unchanged.
+  A dequant+matmul fallback runs only when the native extension is unavailable.
 
 Patch 3 - mlx_lm.utils.infer_quant_config
   mlx-lm infers bits from the packed width of weights that the quantization
@@ -38,18 +34,14 @@ import mlx.nn as nn
 import mlx_lm.utils as mlx_lm_utils
 from mlx.utils import tree_flatten, tree_unflatten
 
-from omlx.custom_kernels.bonsai.fast import (
-    _dequant_1bit,
-    bonsai_q1_affine_qmv,
-    bonsai_qmv_wide,
-    bonsai_t5_qmv,
-    bonsai_t5_qmv_wide,
-    bonsai_t5_qmm,
+from omlx.custom_kernels.lowbit.fast import (
+    t5_qmv,
+    t5_qmv_wide,
+    t5_qmm,
     has_native,
 )
 
-# M threshold below which qmv kernels are used; above this bonsai_t5_qmm is used.
-# Must match _T5_PREFILL_THRESHOLD in bonsai_qmv.py.
+# M threshold below which qmv kernels are used; above this t5_qmm is used.
 _T5_PREFILL_THRESHOLD = 16
 
 logger = logging.getLogger(__name__)
@@ -173,7 +165,7 @@ def _t5_quantized_matmul(
     *,
     stream=None,
 ):
-    """mx.quantized_matmul replacement that handles t5 uint8 and 1-bit weights.
+    """mx.quantized_matmul replacement that handles t5 uint8 weights.
 
     When *w* is uint8 (t5 base-3 packed):
       - M=1: route to qmv_fast Metal kernel (single-vector decode).
@@ -181,27 +173,8 @@ def _t5_quantized_matmul(
         weight byte once across all M vectors — no float weight materialisation).
       The dequant+matmul fallback below is only reached when the native extension
       is unavailable.
-    When *bits* is 1: stock mlx accepts the op but its metallib ships no b_1
-    kernels, so dispatch dies with "Unable to load kernel".  This path exists
-    because mlx-vlm model code (fused projections, as_linear) calls
-    mx.quantized_matmul directly, bypassing the patched QuantizedLinear.
     For all other weight dtypes the original C function is called unchanged.
     """
-    # 1-bit affine: route around the missing stock kernels.
-    if bits == 1 and mode == "affine" and w.dtype == mx.uint32 and transpose:
-        M = x.shape[-2] if x.ndim >= 2 else 1
-        if has_native() and M == 1:
-            return bonsai_q1_affine_qmv(
-                x, w, scales.astype(x.dtype), biases.astype(x.dtype)
-            )
-        if has_native() and 2 <= M <= 5:
-            return bonsai_qmv_wide(x, w, scales, biases, bits=1)
-        # Prefill / no native ext: dequantize to x.dtype and matmul.
-        w_fp = _dequant_1bit(
-            w, scales, biases, x.dtype, 64 if group_size is None else group_size
-        )
-        return x @ w_fp.T
-
     # Normal path: uint32 weights → native MLX kernel (the common case).
     if w.dtype != mx.uint8:
         return _original_quantized_matmul(
@@ -226,12 +199,12 @@ def _t5_quantized_matmul(
     if has_native() and M <= _T5_PREFILL_THRESHOLD:
         # scales dtype coercion is handled by the C++ ensure_dtype layer.
         if M >= 2:
-            return bonsai_t5_qmv_wide(x, w, scales)
-        return bonsai_t5_qmv(x, w, scales)
+            return t5_qmv_wide(x, w, scales)
+        return t5_qmv(x, w, scales)
 
     if has_native():
         x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
-        out_flat = bonsai_t5_qmm(x_flat, w, scales)
+        out_flat = t5_qmm(x_flat, w, scales)
         out = out_flat.reshape(x.shape[:-1] + (w.shape[0],))
         if not transpose:
             return out.mT

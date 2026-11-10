@@ -847,6 +847,8 @@ class PairingManager:
       install/retract steps; defaults drive ``omlx/cluster/ssh_keys.py``.
     * ``http_post`` / ``http_get`` — joiner-side transport; loopback fakes
       in tests, urllib in production.
+    * ``join_watch_s`` — how often a join awaiting approval asks the
+      coordinator in the background; ``None`` leaves it to dashboard polls.
     """
 
     def __init__(
@@ -868,8 +870,10 @@ class PairingManager:
         http_get: Callable[[str, float], Any] | None = None,
         clock: Callable[[], float] = time.time,
         audit: PairingAuditLog | Callable[..., Any] | None = None,
+        join_watch_s: float | None = None,
     ) -> None:
         self.base_path = Path(base_path) if base_path is not None else DEFAULT_BASE_PATH
+        self.join_watch_s = join_watch_s
         self._identity = (
             dict(identity)
             if identity is not None
@@ -955,10 +959,19 @@ class PairingManager:
             "caps": _pairing_caps(self._caps_provider() if self._caps_provider else {}),
             "addrs": addresses,
             "ssh_public_key": normalize_ssh_public_key(self._ssh_key_provider() or ""),
-            "ssh_host_public_key": normalize_ssh_public_key(
-                self._ssh_host_key_provider() or ""
-            ),
+            "ssh_host_public_key": self._local_ssh_host_key(),
         }
+
+    def _local_ssh_host_key(self) -> str:
+        host_key = self._ssh_host_key_provider()
+        if not host_key:
+            # macOS creates host keys when sshd first accepts a connection.
+            raise PairingRequestError(
+                "This Mac has no SSH host key yet. Turn on Remote Login in "
+                "System Settings > General > Sharing. If it is already on, run "
+                "ssh localhost once in Terminal to create the key, then retry."
+            )
+        return normalize_ssh_public_key(host_key)
 
     def _record_audit(
         self, event: str, *, node_id: str = "", detail: dict[str, Any] | None = None
@@ -1009,9 +1022,7 @@ class PairingManager:
         validate_pairing_code(code)
         caps = self._caps_provider() if self._caps_provider else {}
         ssh_public_key = normalize_ssh_public_key(self._ssh_key_provider() or "")
-        ssh_host_public_key = normalize_ssh_public_key(
-            self._ssh_host_key_provider() or ""
-        )
+        ssh_host_public_key = self._local_ssh_host_key()
         code_salt = secrets.token_bytes(16)
         return {
             "node_id": self.node_id,
@@ -1692,6 +1703,7 @@ def configure_pairing_manager(
     *,
     registry: Any = None,
     enrollment_store: Any = None,
+    join_watch_s: float | None = 2.0,
     **kwargs: Any,
 ) -> PairingManager:
     """Create the process-wide manager at server startup.
@@ -1706,6 +1718,7 @@ def configure_pairing_manager(
             registry,
             enrollment_store,
             base_path=base_path,
+            join_watch_s=join_watch_s,
             **kwargs,
         )
         return _configured_manager

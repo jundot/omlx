@@ -283,7 +283,7 @@
                                             <code class="px-2.5 py-1 rounded-md bg-neutral-900 text-white text-xs truncate" x-text="recWiredCommand()"></code>
                                             <button type="button" @click="copyWiredLimitCommand(recWiredCommand())"
                                                     class="p-1.5 rounded-lg transition-colors"
-                                                    :class="wiredLimitCopied ? 'text-green-600' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                                    :class="wiredLimitCopied ? 'text-green-700' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
                                                     :title="wiredLimitCopied ? window.t('models.recommend.unlock.copied') : window.t('models.recommend.unlock.copy')">
                                                 <i x-show="!wiredLimitCopied" data-lucide="copy" class="w-4 h-4"></i>
                                                 <i x-show="wiredLimitCopied" data-lucide="check" class="w-4 h-4"></i>

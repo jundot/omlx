@@ -22,9 +22,14 @@
 
     <!-- Color tokens: every color the web UI draws (static/css/theme.css) -->
     <link rel="stylesheet" href="{{ static('css/theme.css') }}">
+    <!-- Custom theme: the saved token overrides, applied before first paint -->
+    <script>window._customTheme = {{ custom_theme() | tojson }};</script>
+    <script src="{{ static('js/custom_theme.js') }}"></script>
 
     <!-- Tailwind CSS (pre-compiled) -->
     <link rel="stylesheet" href="{{ static('css/tailwind.css') }}">
+    <!-- Status roles, on every page after the utilities they replace -->
+    <link rel="stylesheet" href="{{ static('css/status.css') }}">
 
     <!-- Alpine.js -->
     <script defer src="/admin/static/js/alpine.min.js"></script>
@@ -45,9 +50,9 @@
     </script>
 
     <script>
-        // Apply Enhanced Readability immediately so non-chat pages (dashboard,
-        // status) honor the saved toggle on first paint. The chat page also
-        // syncs this in Alpine (setEnhancedReadability).
+        // Apply Enhanced Readability immediately so every page honors the saved
+        // setting on first paint. The dashboard settings page and theme menu
+        // update it in Alpine (setEnhancedReadability).
         (function() {
             if (localStorage.getItem('omlx-enhanced-readability') === 'on') {
                 document.documentElement.setAttribute('data-enhanced-readability', '');
@@ -110,14 +115,6 @@
         input:focus, select:focus, textarea:focus {
             outline: none;
             box-shadow: 0 0 0 2px rgb(var(--palette-black) / 0.1);
-        }
-
-        /* Clear keyboard focus indicator (complements the enhanced-readability
-           contrast boost). Visible on :focus-visible only, so mouse users see
-           no extra chrome while keyboard users always see where focus is. */
-        :focus-visible {
-            outline: 2px solid var(--focus-ring-color) !important;
-            outline-offset: 2px;
         }
 
         dialog.dashboard-dialog {
@@ -197,6 +194,13 @@
             color: var(--text-primary) !important;
         }
         [data-enhanced-readability] ::placeholder { color: var(--text-primary) !important; opacity: 1 !important; }
+        /* Keyboard focus ring. Text fields and selects are excluded: browsers
+           match :focus-visible on them for mouse focus too, and they already
+           show focus with their own border or shadow. */
+        [data-enhanced-readability] :focus-visible:not(textarea, select, input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="submit"])) {
+            outline: 2px solid var(--focus-ring-color) !important;
+            outline-offset: 2px;
+        }
         /* Font-size floor: lift all <12px text to 12px. KaTeX is intentionally
            excluded (its font-size stays untouched, preserving 1.21em scaling).
            Tailwind arbitrary-value classes MUST use the escaped form

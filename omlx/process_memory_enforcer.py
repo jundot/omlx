@@ -32,6 +32,7 @@ import inspect
 import logging
 import subprocess
 import time
+from collections import deque
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
@@ -130,6 +131,24 @@ _EMERGENCY_OVER_CEILING_POLLS = 2
 _HOT_CACHE_RESERVATION_SLACK_BYTES = 512 * 1024**2
 # Longest a prefill waits for released dirty hot-cache blocks to reach SSD.
 _HOT_CACHE_WRITE_WAIT_S = 5.0
+# Released memory counts toward the dynamic ceiling until vm_stat reports it.
+# vm_stat lags phys_footprint by up to 0.9 s after a 15 GB Metal cache clear.
+_RELEASE_CREDIT_WINDOW_S = 2.0
+
+
+def _spend(ledger: deque[list[float]], amount: float) -> float:
+    """Take ``amount`` from the oldest ledger entries and return the rest."""
+    while amount > 0 and ledger:
+        used = min(amount, ledger[0][1])
+        ledger[0][1] -= used
+        amount -= used
+        if ledger[0][1] <= 0:
+            ledger.popleft()
+    return amount
+
+
+# Re-reading the Metal cap shells out to sysctl, so do it at most this often.
+_METAL_CAP_RESAMPLE_INTERVAL_S = 60.0
 
 
 def _format_gb(b: int) -> str:
@@ -472,10 +491,17 @@ class ProcessMemoryEnforcer:
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
         self._metal_wired_limit_request: int = 0
-        # Cached Metal cap used by the background poll loop. Reading the Apple
-        # default cap falls back to mx.device_info(), so keep it out of active
-        # decode ticks once the enforcer is running.
+        # Cached Metal cap. The poll loop re-reads it at most every
+        # _METAL_CAP_RESAMPLE_INTERVAL_S.
         self._effective_metal_cap_bytes: int | None = None
+        # Last (time, oMLX usage, free + inactive) a dynamic ceiling read saw.
+        self._last_release_sample: tuple[float, int, int] | None = None
+        # [expires_at, bytes] of releases vm_stat does not show as free yet.
+        self._release_credits: deque[list[float]] = deque()
+        # [expires_at, bytes] of free-memory rises seen before their release.
+        self._early_free_rises: deque[list[float]] = deque()
+        # Monotonic time of the last poll-loop re-read of the Metal cap.
+        self._metal_cap_resampled_at: float = 0.0
         # Engine types we've already complained about in
         # ``_propagate_memory_limit``'s "scheduler unreachable" path.
         # Prevents the per-poll warning from spamming logs while keeping
@@ -683,7 +709,8 @@ class ProcessMemoryEnforcer:
             there.
             Speculative and purgeable pages are subsets of free /
             inactive, so we deliberately do not add them (would double
-            count).
+            count). Memory oMLX just released counts until vm_stat reports
+            it as free, so a Metal cache clear does not dip the ceiling.
 
         VM stats failure: falls back to psutil_compat.virtual_memory().available
         (= roughly free + inactive on macOS, similar elsewhere). On macOS that
@@ -733,11 +760,48 @@ class ProcessMemoryEnforcer:
                 own_cpu = max(0, omlx_usage - get_graphics_footprint())
                 anon_active = stats["active"] - file_active - own_cpu
                 terms["other_apps"] = int(max(0, anon_active) * ratio)
-        reclaimable = terms["free"] + terms["inactive"] + terms["other_apps"]
+        terms["released"] = self._release_credit(
+            terms["omlx"], terms["free"] + terms["inactive"]
+        )
+        reclaimable = (
+            terms["free"] + terms["inactive"] + terms["other_apps"] + terms["released"]
+        )
         # Other apps may already hold the reserve. Stay at 1 byte rather than
         # 0, which callers read as "guard disabled".
         terms["dynamic"] = max(1, terms["omlx"] + reclaimable - reserve)
         return terms
+
+    def _release_credit(self, usage: int, free: int) -> int:
+        """Bytes oMLX released that vm_stat does not count as free yet.
+
+        A drop in oMLX usage adds credit for the window unless free memory
+        already rose by as much. A later rise in free memory or in oMLX usage
+        spends credit, oldest first. Other apps' allocations never add credit.
+        """
+        now = time.monotonic()
+        last = self._last_release_sample
+        self._last_release_sample = (now, usage, free)
+        credits, early = self._release_credits, self._early_free_rises
+        for ledger in (credits, early):
+            while ledger and ledger[0][0] <= now:
+                ledger.popleft()
+        # An older sample cannot tell a lagging release from a settled one.
+        if last is None or now - last[0] > _RELEASE_CREDIT_WINDOW_S:
+            return 0
+        expires = now + _RELEASE_CREDIT_WINDOW_S
+        dropped = last[1] - usage
+        risen = free - last[2]
+        if risen > 0:
+            unmatched = _spend(credits, risen)
+            if unmatched > 0:
+                early.append([expires, unmatched])
+        if dropped > 0:
+            unseen = _spend(early, dropped)
+            if unseen > 0:
+                credits.append([expires, unseen])
+        elif dropped < 0:
+            _spend(credits, -dropped)
+        return int(sum(credit for _, credit in credits))
 
     def _get_hard_limit_bytes(self) -> int:
         """Final hard ceiling = min(static, dynamic, metal_cap).
@@ -988,7 +1052,7 @@ class ProcessMemoryEnforcer:
         return self._over_ceiling_polls >= _EMERGENCY_OVER_CEILING_POLLS
 
     def _refresh_effective_metal_cap_bytes(self) -> int:
-        """Refresh the cached effective Metal cap outside the poll hot path."""
+        """Re-read the effective Metal cap into the cache."""
         self._effective_metal_cap_bytes = get_effective_metal_cap_bytes()
         return self._effective_metal_cap_bytes
 
@@ -997,6 +1061,21 @@ class ProcessMemoryEnforcer:
         if self._effective_metal_cap_bytes is None:
             return self._refresh_effective_metal_cap_bytes()
         return self._effective_metal_cap_bytes
+
+    def _resample_metal_cap_if_due(self) -> None:
+        """Re-sample the cached Metal cap so a runtime sysctl raise lands (#4849)."""
+        now = time.monotonic()
+        if now - self._metal_cap_resampled_at < _METAL_CAP_RESAMPLE_INTERVAL_S:
+            return
+        self._metal_cap_resampled_at = now
+        previous = self._effective_metal_cap_bytes
+        current = self._refresh_effective_metal_cap_bytes()
+        if previous and current and current != previous:
+            logger.info(
+                "Memory guard: kernel Metal cap changed at runtime, %s -> %s",
+                _format_gb(previous),
+                _format_gb(current),
+            )
 
     def _has_active_requests(self) -> bool:
         """Best-effort active-request detection without touching MLX."""
@@ -1670,6 +1749,9 @@ class ProcessMemoryEnforcer:
         """
         # Always propagate so the scheduler sees the latest ceiling /
         # admission_paused, even when usage stays below the soft mark.
+        if self._prefill_memory_guard:
+            # Re-read first so a changed cap reaches the schedulers in this tick.
+            self._resample_metal_cap_if_due()
         self._propagate_memory_limit()
 
         ceiling = self._get_hard_limit_bytes()

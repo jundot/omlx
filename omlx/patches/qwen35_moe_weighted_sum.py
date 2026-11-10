@@ -30,12 +30,12 @@ _MIN_TOKENS = 1024
 
 def _native_weighted_sum():
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
     except Exception:
         return None
-    if not fast.has_symbol("qwen35_moe_weighted_sum"):
+    if not fast.has_symbol("moe_weighted_sum"):
         return None
-    return fast.qwen35_moe_weighted_sum
+    return fast.moe_weighted_sum
 
 
 def _target_verify_arg(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
@@ -143,7 +143,7 @@ def _call_shared_expert(self: Any, x: mx.array, target_verify: bool) -> mx.array
 def _fast_moe(self: Any, x: mx.array, target_verify: bool) -> mx.array:
     weighted_sum = _native_weighted_sum()
     if weighted_sum is None:
-        raise RuntimeError("qwen35_moe_weighted_sum native kernel is unavailable")
+        raise RuntimeError("moe_weighted_sum native kernel is unavailable")
 
     gates = self.gate(x)
     gates = mx.softmax(gates, axis=-1, precise=True)

@@ -155,6 +155,11 @@ def is_harmony_model(model_name: str, config: dict[str, Any] | None = None) -> b
     return False
 
 
+def is_mimo_tool_template(template: Any) -> bool:
+    """Whether the template writes qwen3_coder calls with no newline (MiMo, #4933)."""
+    return isinstance(template, str) and "<tool_call><function=" in template
+
+
 def is_gemma4_model(model_name: str, config: dict[str, Any] | None = None) -> bool:
     """
     Check if the model is a Gemma 4 model.

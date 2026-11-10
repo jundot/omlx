@@ -4,11 +4,11 @@ These rules cover the web UI in `apps/omlx-web/omlx_web`. Colors and type steps 
 
 ## Colors
 
-Every color is defined in `apps/omlx-web/omlx_web/static/css/theme.css`, which `base.html` loads before `tailwind.css` and the page stylesheets.
+The palette and the light semantic colors are defined in `apps/omlx-web/omlx_web/static/css/theme.css`, which `base.html` loads before `tailwind.css`; `dashboard.css` supplies the dark values of the neutral utility channels.
 
 - Palette entries are named `--palette-<family>-<step>` and hold `R G B` channels, so both `rgb(var(--palette-blue-500))` and `rgb(var(--palette-blue-500) / 0.2)` work.
-- Semantic tokens name a role and point at the palette: `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--text-primary` ... `--text-muted`, `--border-faint`, `--border-normal`, `--code-bg`, `--link-color`, `--btn-primary*`, `--text-danger`, `--bg-danger-hover`, `--timeline-accent`, `--focus-ring-color`.
-- `[data-theme="dark"]` in the same file gives the dark values of the semantic tokens. `dashboard.css` maps light utilities such as `.bg-white` or `.text-neutral-900` to dark values under the same selector.
+- Semantic tokens name a role and point at the palette: `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--text-primary` ... `--text-muted`, `--border-faint`, `--border-normal`, `--code-bg`, `--link-color`, `--btn-primary*`, `--switch-on`, `--text-danger`, `--bg-danger-hover`, `--timeline-accent`, `--focus-ring-color`. The status roles are `--success`, `--warning`, `--danger` and `--info`, each with `-soft`, `-line`, `-text` shades; `status.css` maps the badge/notice/dot utilities to them on every page.
+- `[data-theme="dark"]` in the same file gives the dark values of the semantic tokens. The neutral utilities (`bg-white`, `text-neutral-*`, `border-neutral-*`) resolve through the `*-scale-*` channels: light values in `theme.css`, dark values in `dashboard.css`.
 - `tailwind.config.js` resolves Tailwind's color utilities through the palette, so `bg-neutral-100` and `bg-neutral-100/50` read `theme.css` too.
 
 Where to use what:
@@ -26,7 +26,21 @@ Families outside Tailwind's palette:
 - `night-*`: dark mode surfaces and text.
 - `signal-red-*`: the readability red.
 - `mid-gray`: empty cells in the usage strip.
-- `fabric-ink-*`, `fabric-lime-*`: the cluster fabric diagram only.
+
+## Custom theme
+
+`ui.custom_theme` stores per-theme token overrides (`{"light": {"bg-primary": "#..."}, "dark": {...}}`), and `static/js/custom_theme.js` paints them before first paint. That file owns the token list and the contrast rules (`CONTRAST_RULES`, 4.5:1 for text and 3:1 for controls and accents): the Theme Settings editor disables Apply, names the failing pairs and outlines the fields to change. The server only checks that each value is `#rrggbb`.
+
+### How the dark draft is generated
+
+**Generate dark from light** fills the dark column from the light one in OKLCH (`darkFromLight` in `custom_theme.js`). It only edits the draft, so Apply still runs the contrast check. The constants are calibrated so the stock light palette lands close to the stock dark one.
+
+1. Neutrals invert their lightness (`1 - L`) through `NEUTRAL_CURVE`, keep their hue and cap chroma at 0.012. The switch ON track stops at L 0.72 because its knob stays white.
+2. Status fills keep their color unless darker than L 0.62; links, the accent and danger text are lifted to at least L 0.71.
+3. A color outside sRGB loses chroma until it fits.
+4. A foreground below its contrast floor steps its lightness away from its backgrounds until it passes.
+
+The Preview header's Save as image button writes both modes, every token's English name and exact hex, and the same palette as JSON in an `omlx-theme` `tEXt` chunk. The image is English-only so it can be handed to an agent or shared outside the dashboard. `theme_preview.js` draws the preview card for both: the Preview canvases in the UI language, the image with its fixed English labels, so the two never drift apart.
 
 ## Type
 
@@ -51,7 +65,7 @@ Segmented items, menu rows, option cards and plain text links are not buttons fo
 ## Choice controls
 
 - Pick one of a few values: the `.segmented` control in `dashboard.css`. `ui.segmented` in `templates/components/ui.html` renders it for plain text items. Inside a card or a table row, add `segmented--sm`. Items that need icons, `x-for` or extra attributes use the classes directly: `segmented__item` on each button and `segmented__item--active` on the selected one.
-- On and off: the switch below. The track is 44x24, black when on and `bg-neutral-200` when off. Dark mode colors come from `dashboard.css`.
+- On and off: the switch below. The track is 44x24, black when on and `bg-neutral-200` when off. Dark mode colors come from the `--switch-on` token.
 
 ```html
 <button type="button" role="switch"

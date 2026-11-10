@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -41,21 +41,29 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[mcp]"
-          python -m pip install pytest pytest-asyncio pytest-xdist
+          # pytest 9.2 ignores xdist 3.8's loadgroup node id suffix, so the gpu group runs in parallel.
+          python -m pip install "pytest<9.2" pytest-asyncio pytest-xdist
+
+      # xdist workers share one Harmony vocab cache file. Parallel cold downloads can read it half written.
+      - name: Warm the Harmony vocab cache
+        run: python -c "from openai_harmony import load_harmony_encoding; load_harmony_encoding('HarmonyGptOss')"
 
       - name: Run unit tests
         run: >-
           python -m pytest tests/ apps/omlx-web/tests apps/omlx-mac/Tests/python
           -m "not slow and not integration"
-          -n 3 --dist loadgroup
+          -n 3 --dist loadgroup --no-loadscope-reorder
           --durations=50 --junitxml=test-results.xml
 
       - name: Run web UI script tests
         run: >-
           node --test
+          apps/omlx-web/tests/custom_theme_ui.test.cjs
           apps/omlx-web/tests/deepseek_v41_offload_ui.test.cjs
+          apps/omlx-web/tests/hf_repo_id_ui.test.cjs
           apps/omlx-web/tests/moe_expert_offload_ui.test.cjs
           apps/omlx-web/tests/qwen_oq_a8_ui.test.cjs
+          apps/omlx-web/tests/theme_preview.test.cjs
           apps/omlx-web/tests/usage_history_ui.test.cjs
 
       # The server must import and start without the apps.

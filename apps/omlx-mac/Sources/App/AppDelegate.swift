@@ -20,7 +20,7 @@
 //                                         • install POSIX SignalHandlers
 //                                         • flip to .accessory next tick
 //                                           (Dock icon hides; menubar stays)
-//   applicationWillTerminate        → await server.stop(timeout: 10)
+//   applicationWillTerminate        → server.reapSync(timeout: 8)
 //
 // Dock-icon toggle
 //   Any time an in-app NSWindow becomes main → .regular (Dock icon shows).
@@ -68,6 +68,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func requestQuit() {
         explicitQuitRequested = true
         NSApp.terminate(nil)
+    }
+
+    /// Quits for real and opens this bundle again after the process exits,
+    /// for permissions that apply only to a new process.
+    func relaunch() {
+        // Gives up after 60 s, so a quit that never happens does not reopen the app later.
+        let script = """
+            i=0; while /bin/kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null && [ $i -lt 300 ]; \
+            do /bin/sleep 0.2; i=$((i+1)); done; \
+            /bin/kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null || /usr/bin/open "$0"
+            """
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = ["-c", script, Bundle.main.bundlePath]
+        do {
+            try helper.run()
+        } catch {
+            NSLog("oMLX: relaunch helper failed to start: \(error)")
+            return
+        }
+        requestQuit()
     }
 
     /// Cmd-Q / Dock → Quit path: hide every titled window AND set
@@ -161,6 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: UserDefaults.didChangeNotification,
             object: UserDefaults.standard
         )
+        services.relaunchApp = { [weak self] in self?.relaunch() }
         services.updates.setTerminateForUpdate { [weak self] in
             if let self {
                 self.requestQuit()
@@ -179,6 +201,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSLog("oMLX: CLI shim setup failed — \(error)")
             }
             startControlServer()
+            services.askAI.start(services: services) { [weak self] in
+                guard let self else { return }
+                self.services.requestedSection = .askAI
+                self.presentAppView()
+            }
         }
 
         let config = AppConfig.load()
@@ -515,23 +542,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Graceful stop. SIGKILL fallback is inside ServerProcess.stop().
-        // We can't await indefinitely here — AppKit will eventually time
-        // us out — so we run a short synchronous reap as belt-and-suspenders
-        // (SignalHandlers also covers most external-kill paths).
         NotificationCenter.default.removeObserver(self)
         controlServer?.stop()
         controlServer = nil
-
-        guard let server else { return }
-        let group = DispatchGroup()
-        group.enter()
-        Task { @MainActor in
-            await server.stop(timeout: 8)
-            group.leave()
-        }
-        _ = group.wait(timeout: .now() + 9)
-        server.reapSync(timeout: 1)
+        services.askAI.shutdown()
+        // Reap synchronously. An async stop needs the main actor, which this
+        // method blocks until it returns.
+        server?.reapSync(timeout: 8)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -540,11 +557,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Intercept terminate so Cmd-Q / Dock → Quit *only* close the window.
-    /// The single real-quit path is the menubar status item's "Quit oMLX",
-    /// which routes through `requestQuit()` to set the explicit flag.
+    /// Real quits are the menubar status item's "Quit oMLX", which routes
+    /// through `requestQuit()` to set the explicit flag, and system logout,
+    /// restart, or shutdown.
     ///
     /// Notes:
-    /// - We always cancel terminate when the explicit flag isn't set.
+    /// - We always cancel any other terminate.
     ///   SwiftUI's Window scene appears to dismiss the window before
     ///   `applicationShouldTerminate` runs, so a "no visible windows"
     ///   guard fires when we'd really want to keep cancelling.
@@ -555,9 +573,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   `.accessory`.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if explicitQuitRequested { return .terminateNow }
+        // Cancelling this quit also cancels the logout, restart, or shutdown.
+        if Self.isSystemQuitEvent(NSAppleEventManager.shared().currentAppleEvent) {
+            return .terminateNow
+        }
         // Same close path used by the SwiftUI Cmd-Q command in oMLXApp.swift.
         hideWindowsAndDropDockIcon()
         return .terminateCancel
+    }
+
+    /// True for the quit event that macOS sends on logout, restart, or
+    /// shutdown. Dock Quit and AppleScript `quit` send no quit reason.
+    /// System Settings' Quit & Reopen after a privacy change sends
+    /// kAEReallyLogOut too.
+    nonisolated static func isSystemQuitEvent(_ event: NSAppleEventDescriptor?) -> Bool {
+        guard let event,
+              event.eventClass == AEEventClass(kCoreEventClass),
+              event.eventID == AEEventID(kAEQuitApplication)
+        else { return false }
+        // The reason arrives as an attribute, but AERegistry.h documents it
+        // as a parameter, so accept both.
+        let keyword = AEKeyword(kAEQuitReason)
+        guard let reason = event.attributeDescriptor(forKeyword: keyword)
+            ?? event.paramDescriptor(forKeyword: keyword)
+        else { return false }
+        let systemReasons = [
+            OSType(kAEQuitAll), OSType(kAEShutDown),
+            OSType(kAERestart), OSType(kAEReallyLogOut),
+        ]
+        return systemReasons.contains(reason.typeCodeValue)
     }
 
     private func startControlServer() {

@@ -49,6 +49,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var anePrefillMlpFractions: [Double]? = nil
     var anePrefillSharedFractions: [Double]? = nil
     var embeddingAudioSupported: Bool? = nil
+    /// True when the model can hold a spoken conversation on /v1/realtime.
+    var realtimeVoice: Bool? = nil
     /// External engines that could serve this model, with why not when they
     /// cannot. Empty for models only oMLX's own engines run.
     var externalEngines: [ExternalEngineOption]? = nil
@@ -66,6 +68,28 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let qwen4PleSsdOffloadForced: Bool?
     let qwen4PleResidentBytes: Int64?
     let qwen4PleMmapBytes: Int64?
+    /// DeepSeek V4.1 Engram counterpart of the Qwen4 PLE fields above.
+    var deepseekV41EngramSsdOffloadSupported: Bool? = nil
+    var deepseekV41EngramSsdOffloadForced: Bool? = nil
+    var deepseekV41EngramResidentBytes: Int64? = nil
+    var deepseekV41EngramMmapBytes: Int64? = nil
+    var moeExpertOffloadSupported: Bool? = nil
+    /// True on M1/M2 for checkpoints that still carry bfloat16 leaves.
+    var activationFp16Supported: Bool? = nil
+    /// True for families whose MTP draft head stays resident while experts stream.
+    var moeOffloadAllowsMtp: Bool? = nil
+    /// True when this Mac can run the Qwen INT8 activation prefill kernels.
+    var a8PrefillSupported: Bool? = nil
+    /// True when this Mac's GPU accepts a power cap.
+    var gpuPowerLimitSupported: Bool? = nil
+    /// True for families another Mac can help prefill (Prefill Accelerator).
+    var prefillHelperSupported: Bool? = nil
+    /// The helper's state while the model is loaded; nil otherwise.
+    var prefillHelper: PrefillHelperStatusDTO? = nil
+    /// "hf_cache" for models found in the shared Hugging Face Hub cache.
+    var sourceType: String? = nil
+    /// "gguf" for a GGUF file, which only an external engine serves.
+    var modelFormat: String? = nil
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -81,6 +105,9 @@ extension ModelDTO {
         }
         return actualSizeFormatted ?? estimatedSizeFormatted ?? ""
     }
+
+    var isInHFCache: Bool { sourceType == "hf_cache" }
+    var isGGUF: Bool { modelFormat == "gguf" }
 }
 
 /// One entry of `external_engines` in GET /admin/api/models.
@@ -89,6 +116,8 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
     let label: String
     let compatible: Bool
     let reason: String?
+    /// Hugging Face repo of the draft the engine lacks, when one provides it.
+    var draftRepo: String? = nil
 }
 
 struct ModelSettingsDTO: Codable, Equatable, Sendable {
@@ -106,8 +135,15 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let maxToolResultTokens: Int?
     let enableThinking: Bool?
     let qwen4PleSsdOffload: Bool?
+    var qwen4GdnDecodeWideProj: Bool? = nil
+    var activationFp16Enabled: Bool? = nil
+    var deepseekV41EngramSsdOffload: Bool? = nil
+    var deepseekV41CedPrefillEnabled: Bool? = nil
+    var prefillHelperNodeId: String? = nil
+    var prefillHelperLayers: Int? = nil
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
+    var gpuPowerLimitW: Int? = nil
     let reasoningParser: String?
     let ttlSeconds: Int?
     let isPinned: Bool?
@@ -126,8 +162,13 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // and override the request's `chat_template_kwargs`).
     let chatTemplateKwargs: [String: AnyCodable]?
     let forcedCtKwargs: [String]?
+    var guidedGrammarEnabled: Bool? = nil
+    var guidedGrammar: String? = nil
+    var moeExpertOffloadEnabled: Bool? = nil
+    var moeExpertOffloadResidentFraction: Double? = nil
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
+    let turboquantKvScheme: String?
     let turboquantKvBits: Double?
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillSharedFraction: Double? = nil
@@ -148,8 +189,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let qwen35AnePrefillCpuThreads: Int?
     let qwen35AnePrefillCpuSharedResource: Bool?
     // Experimental: oQ mixed-bit INT8-activation prefill kernels
-    let qwen35OqA8Enabled: Bool?
-    let qwen35OqA8MinTokens: Int?
+    let a8PrefillEnabled: Bool?
+    let a8PrefillMinTokens: Int?
     // Experimental: IndexCache (DSA models only)
     let indexCacheFreq: Int?
     // Experimental: SpecPrefill
@@ -192,9 +233,16 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var ttlSeconds: Int? = nil
     var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
     var qwen4PleSsdOffload: Bool? = nil
+    var qwen4GdnDecodeWideProj: Bool? = nil
+    var activationFp16Enabled: Bool? = nil
+    var deepseekV41EngramSsdOffload: Bool? = nil
+    var deepseekV41CedPrefillEnabled: Bool? = nil
+    var prefillHelperNodeId: String?? = nil // .some(nil) sends JSON null (off).
+    var prefillHelperLayers: Int?? = nil // .some(nil) sends JSON null (auto).
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
+    var gpuPowerLimitW: Int? = nil // 0 turns the limit off.
     var forceSampling: Bool? = nil
     var isPinned: Bool? = nil
     var isFavorite: Bool? = nil
@@ -209,6 +257,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var forcedCtKwargs: [String]? = nil
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool? = nil
+    var turboquantKvScheme: String? = nil
     var turboquantKvBits: Double? = nil
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillSharedFraction: Double? = nil
@@ -229,8 +278,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var qwen35AnePrefillCpuThreads: Int? = nil
     var qwen35AnePrefillCpuSharedResource: Bool? = nil
     // Experimental: oQ mixed-bit INT8-activation prefill kernels
-    var qwen35OqA8Enabled: Bool? = nil
-    var qwen35OqA8MinTokens: Int? = nil
+    var a8PrefillEnabled: Bool? = nil
+    var a8PrefillMinTokens: Int? = nil
     // Experimental: IndexCache
     var indexCacheFreq: Int? = nil
     // Experimental: SpecPrefill
@@ -255,6 +304,17 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var vlmMtpEnabled: Bool? = nil
     var vlmMtpDraftModel: String? = nil
     var vlmMtpDraftBlockSize: Int? = nil
+}
+
+/// GET /admin/api/models/{id}/generation_config: the sampling values a new
+/// model starts with plus the native context window. Absent keys have no
+/// recommendation.
+struct GenerationConfigDTO: Decodable, Equatable, Sendable {
+    var maxContextWindow: Int? = nil
+    var temperature: Double? = nil
+    var topP: Double? = nil
+    var topK: Int? = nil
+    var repetitionPenalty: Double? = nil
 }
 
 /// Body for POST /admin/api/models/{id}/settings/recipe.
@@ -329,4 +389,82 @@ struct SimpleStatusResponse: Codable, Sendable {
     let status: String?
     let message: String?
     let success: Bool?
+}
+
+// MARK: - Prefill Accelerator
+
+/// GET /admin/api/prefill-helper/models/{id}, also `prefill_helper` in the
+/// model list. `state` is off, connecting, needs_files, copying, starting,
+/// ready, working, offline, stopped, error or unloaded.
+struct PrefillHelperStatusDTO: Codable, Equatable, Sendable {
+    struct LastPrompt: Codable, Equatable, Sendable {
+        let tokens: Int
+        let seconds: Double
+    }
+
+    let state: String
+    var name: String? = nil
+    var nodeId: String? = nil
+    var link: String? = nil
+    var held: Int? = nil
+    var layers: Int? = nil
+    var reason: String? = nil
+    var path: String? = nil
+    var bytes: Int64? = nil
+    var free: Int64? = nil
+    var done: Int64? = nil
+    var secondsLeft: Int? = nil
+    var onBattery: Bool? = nil
+    var lastPrompt: LastPrompt? = nil
+    /// needs_files only: make_room or low_space, the disk left after copying
+    /// and the older copies make_room deletes first.
+    var prompt: String? = nil
+    var left: Int64? = nil
+    var delete: [Copy]? = nil
+
+    struct Copy: Codable, Equatable, Sendable {
+        let name: String
+        let bytes: Int64
+    }
+}
+
+/// GET /admin/api/prefill-helper/candidates?model_id=: paired Macs and
+/// whether each can help the model.
+struct PrefillHelperCandidatesDTO: Codable, Equatable, Sendable {
+    struct Device: Codable, Equatable, Sendable, Identifiable {
+        let nodeId: String
+        let name: String
+        var chip: String? = nil
+        var ramGb: Int? = nil
+        let online: Bool
+        var reason: String? = nil
+        var link: String? = nil
+        var version: String? = nil
+        var versionOk: Bool? = nil
+        var layersFit: Int? = nil
+        var onBattery: Bool? = nil
+        /// What the Mac helps now, when it is another model.
+        var lending: Lending? = nil
+
+        struct Lending: Codable, Equatable, Sendable {
+            var host: String? = nil
+            var model: String? = nil
+        }
+
+        var id: String { nodeId }
+        var usable: Bool { online && versionOk == true && (layersFit ?? 0) > 0 }
+    }
+
+    let version: String
+    let devices: [Device]
+}
+
+/// GET /admin/api/prefill-helper/lending: the helper this Mac runs for
+/// another Mac, if any.
+struct PrefillLendingDTO: Codable, Equatable, Sendable {
+    let active: Bool
+    var host: String? = nil
+    var model: String? = nil
+    var layers: Int? = nil
+    var activeGib: Double? = nil
 }

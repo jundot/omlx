@@ -166,7 +166,9 @@ class ParkMemory:
     per row as rows are added) for what is left of that park. The park runs
     on one clock per model, counted in batched decode steps of any cohort,
     so cohorts that come and go neither restart nor extend it: once it
-    expires, the next cohort measures MTP again. A cohort where MTP held up
+    expires, the next cohort measures MTP again, and if MTP loses again it
+    parks for the doubled cooldown the verdict recorded, so the backoff
+    grows across cohorts as it does within one. A cohort where MTP held up
     for 32 measured decisions clears the verdicts it contradicts (those at
     its row count or fewer).
     """
@@ -184,16 +186,15 @@ class ParkMemory:
         if policy.fixed:
             return
         rows = len(policy.uids)
-        live = [
-            verdict
-            for k, verdict in self._verdicts.items()
-            if k <= rows and verdict[0] > self.clock
-        ]
-        if live:
-            policy.start_parked(
-                max(until for until, _ in live) - self.clock,
-                next_cooldown=max(cooldown for _, cooldown in live),
-            )
+        verdicts = [verdict for k, verdict in self._verdicts.items() if k <= rows]
+        if not verdicts:
+            return
+        until = max(until for until, _ in verdicts)
+        cooldown = max(cooldown for _, cooldown in verdicts)
+        if until > self.clock:
+            policy.start_parked(until - self.clock, next_cooldown=cooldown)
+        else:
+            policy.cooldown = cooldown
 
     def parked(self, policy):
         self._verdicts[len(policy.uids)] = (

@@ -554,6 +554,40 @@ async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_vlm_preflight_chat_reuses_prepared_prompt(monkeypatch):
+    """A prepared prompt replaces the render and encode, not the image budget."""
+    from omlx.engine.vlm import _IMAGE_TOKEN_UPPER_BOUND_FALLBACK, VLMBatchedEngine
+
+    scheduler = _make_scheduler()
+    engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
+    engine._apply_chat_template = MagicMock()
+
+    seen: dict = {}
+
+    def _capture(num_prompt_tokens, **kwargs):
+        seen["num_prompt_tokens"] = num_prompt_tokens
+
+    scheduler.preflight_or_raise = _capture  # type: ignore[assignment]
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "image_url", "image_url": {"url": _TINY_PNG_DATA_URI}},
+            ],
+        }
+    ]
+    await engine.preflight_chat(
+        messages=messages, _prepared_prompt=("hello", list(range(1000)))
+    )
+
+    engine._apply_chat_template.assert_not_called()
+    engine._tokenizer.encode.assert_not_called()
+    assert seen["num_prompt_tokens"] == 1000 + _IMAGE_TOKEN_UPPER_BOUND_FALLBACK
+
+
+@pytest.mark.asyncio
 async def test_vlm_preflight_chat_strips_images_before_template(monkeypatch):
     """Modern HF chat templates (Qwen2.5-VL, Gemma-Vision, Llama-3.2-Vision)
     render image content parts as literal placeholder strings inline with
@@ -1082,7 +1116,7 @@ class TestRejectionMessageNamesBindingCeiling:
             "(dynamic ceiling 32.00 GB - hot cache 8.00 GB - safety margin 1.92 GB)"
             in rej.message
         )
-        assert "only 24.00 GB is reclaimable right now" in rej.message
+        assert "oMLX itself uses 8.00 GB of that" in rej.message
         assert "lower hot_cache_max_size" in rej.message
 
     def test_static_binding_falls_back_to_generic_advice(self, monkeypatch):

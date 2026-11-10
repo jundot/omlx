@@ -9,18 +9,18 @@ import pytest
 
 
 def _require_q4_kernel():
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
-    if not fast.has_symbol("qwen35_q4_affine_qmm_t"):
-        pytest.skip("qwen35_q4_affine_qmm_t native kernel unavailable")
+    if not fast.has_symbol("affine_q4_qmm_t"):
+        pytest.skip("affine_q4_qmm_t native kernel unavailable")
     return fast
 
 
 def _require_qmm_kernels(bits):
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     for bit in bits:
-        name = f"qwen35_q{bit}_affine_qmm_t"
+        name = f"affine_q{bit}_qmm_t"
         if not fast.has_symbol(name):
             pytest.skip(f"{name} native kernel unavailable")
     return fast
@@ -69,7 +69,7 @@ def test_qwen35_q_affine_qmm_matches_mlx_quantized_matmul(bits):
         bits=bits,
         mode="affine",
     )
-    got = getattr(fast, f"qwen35_q{bits}_affine_qmm_t")(x, weight, scales, biases, 8)
+    got = getattr(fast, f"affine_q{bits}_qmm_t")(x, weight, scales, biases, 8)
     mx.eval(ref, got)
 
     diff = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32))
@@ -97,13 +97,13 @@ def test_qwen35_q4_mlp_patch_routes_prefill_and_skips_decode(monkeypatch):
     mx.eval(y_ref)
 
     calls = {"count": 0}
-    orig_qmm = fast.qwen35_q4_affine_qmm_t
+    orig_qmm = fast.affine_q4_qmm_t
 
     def spy(*args, **kwargs):
         calls["count"] += 1
         return orig_qmm(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy)
+    monkeypatch.setattr(fast, "affine_q4_qmm_t", spy)
     assert apply_qwen35_q4_mlp_patch() is True
     y = mlp(x)
     mx.eval(y)
@@ -135,8 +135,8 @@ def test_qwen35_mixed_bit_mlp_patch_routes_5_bit_down_proj(monkeypatch):
     mx.eval(y_ref)
 
     calls = {4: 0, 5: 0}
-    orig_q4 = fast.qwen35_q4_affine_qmm_t
-    orig_q5 = fast.qwen35_q5_affine_qmm_t
+    orig_q4 = fast.affine_q4_qmm_t
+    orig_q5 = fast.affine_q5_qmm_t
 
     def spy_q4(*args, **kwargs):
         calls[4] += 1
@@ -146,8 +146,8 @@ def test_qwen35_mixed_bit_mlp_patch_routes_5_bit_down_proj(monkeypatch):
         calls[5] += 1
         return orig_q5(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy_q4)
-    monkeypatch.setattr(fast, "qwen35_q5_affine_qmm_t", spy_q5)
+    monkeypatch.setattr(fast, "affine_q4_qmm_t", spy_q4)
+    monkeypatch.setattr(fast, "affine_q5_qmm_t", spy_q5)
     assert apply_qwen35_q4_mlp_patch() is True
 
     y = mlp(x)
@@ -333,7 +333,7 @@ def test_qwen35_qmm_routing_uses_stock_nax_availability(
     expected,
 ):
     import omlx.patches.qwen35_q4_mlp as q4patch
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     linear = nn.QuantizedLinear(
         256,
@@ -394,13 +394,13 @@ def test_qwen35_q4_mlp_patch_prechecks_down_proj_before_gate_up(monkeypatch):
 
     x = mx.random.normal((1, 32, 256)).astype(mx.bfloat16)
     calls = {"count": 0}
-    orig_qmm = fast.qwen35_q4_affine_qmm_t
+    orig_qmm = fast.affine_q4_qmm_t
 
     def spy(*args, **kwargs):
         calls["count"] += 1
         return orig_qmm(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy)
+    monkeypatch.setattr(fast, "affine_q4_qmm_t", spy)
     assert apply_qwen35_q4_mlp_patch() is True
     y = mlp(x)
     mx.eval(y)
@@ -424,13 +424,13 @@ def test_qwen35_q4_prefill_linear_patch_routes_supported_only(monkeypatch):
 
     x = mx.random.normal((1, 32, 256)).astype(mx.bfloat16)
     calls = {"count": 0}
-    orig_qmm = fast.qwen35_q4_affine_qmm_t
+    orig_qmm = fast.affine_q4_qmm_t
 
     def spy(*args, **kwargs):
         calls["count"] += 1
         return orig_qmm(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy)
+    monkeypatch.setattr(fast, "affine_q4_qmm_t", spy)
     module = qwen35_lang.Qwen3_5Attention.__new__(qwen35_lang.Qwen3_5Attention)
     nn.Module.__init__(module)
     module.q_proj = supported
@@ -501,7 +501,7 @@ def test_qwen35_q8_backend_offered_below_a16_floor(monkeypatch):
     monkeypatch.setattr(q4patch, "_PREFILL_LINEAR_BACKEND", backend)
     monkeypatch.setattr(
         fast,
-        "qwen35_q8_affine_qmm_t",
+        "affine_q8_qmm_t",
         lambda *a, **k: native.append(a[0].shape[-2]),
     )
     module = qwen35_lang.Qwen3_5Attention.__new__(qwen35_lang.Qwen3_5Attention)
@@ -696,7 +696,7 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
     mx.eval(y_attn_ref, y_gdn_ref)
 
     calls = {"count": 0}
-    orig_qmm = fast.qwen35_q4_affine_qmm_t
+    orig_qmm = fast.affine_q4_qmm_t
 
     def spy(*args, **kwargs):
         calls["count"] += 1
@@ -704,7 +704,7 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
 
     try:
         monkeypatch.setattr(q4patch, "_LM_LINEAR_PATCHED", False)
-        monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy)
+        monkeypatch.setattr(fast, "affine_q4_qmm_t", spy)
         assert q4patch.apply_qwen35_q4_lm_prefill_linear_patch() is True
 
         y_attn = attn(x)
@@ -918,6 +918,22 @@ def _install_muse_qmm_spy(monkeypatch):
 
     monkeypatch.setattr(q4patch, "_linear_qmm", spy)
     return calls
+
+
+def test_muse_glimmer_q4_patch_leaves_module_to_vendored_load(monkeypatch):
+    from omlx.patches import mlx_vlm_muse_glimmer_compat as muse_compat
+    from omlx.patches import qwen35_q4_mlp as q4patch
+
+    # Other VLMs start before any Muse load; upstream muse_glimmer must not
+    # be cached ahead of the vendored module.
+    monkeypatch.setattr(muse_compat, "_APPLIED", False)
+    monkeypatch.setattr(q4patch, "_MUSE_PATCHED", False)
+    monkeypatch.setattr(q4patch, "_has_native_qmm", lambda: True)
+    for name in [m for m in sys.modules if m.startswith("mlx_vlm.models.muse_glimmer")]:
+        monkeypatch.delitem(sys.modules, name)
+
+    assert q4patch.apply_muse_glimmer_q4_prefill_patch() is False
+    assert "mlx_vlm.models.muse_glimmer" not in sys.modules
 
 
 def test_muse_glimmer_q4_mlp_patch_matches_bf16_reference(monkeypatch):

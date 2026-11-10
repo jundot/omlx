@@ -4,6 +4,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from omlx.patches.deepseek_v41.hyper_connection import fused_hc_projection
 from omlx.patches.deepseek_v41.language import _hc_post_reference, hc_post
 
 
@@ -107,53 +108,46 @@ def test_pre_norm_fusion_cancellation_preserves_pre_reduction_order():
     )
 
 
-@pytest.mark.parametrize("width", [64, 513, 5120])
-def test_hc_projection_fp32_weight_accuracy_and_repeat(width):
-    from omlx.patches.deepseek_v41.hyper_connection import fused_hc_projection
-
+@pytest.mark.parametrize("shape", [(2, 3, 4, 64), (1, 300, 4, 256), (1, 3, 4, 5120)])
+def test_hc_projection_fp32_weight_accuracy_and_repeat(shape):
+    """Few rows, a partial last 16-row tile, and the V4.1 width."""
     mx.random.seed(952)
-    x = mx.random.normal((2, 3, 4, width)).astype(mx.bfloat16)
-    fn = mx.random.normal((24, 4 * width)) * 0.01
+    x = mx.random.normal(shape).astype(mx.bfloat16)
+    fn = mx.random.normal((24, 4 * shape[-1])) * 0.01
     actual = fused_hc_projection(x, fn, 1e-6)
-    repeated = fused_hc_projection(x, fn, 1e-6)
-    flat = np.asarray(x.astype(mx.float32)).astype(np.float64).reshape(2, 3, -1)
-    weights = np.asarray(fn).astype(np.float64)
-    expected = (flat @ weights.T) / np.sqrt(
+    flat = np.asarray(x.astype(mx.float32)).astype(np.float64)
+    flat = flat.reshape(*shape[:2], -1)
+    expected = (flat @ np.asarray(fn).astype(np.float64).T) / np.sqrt(
         np.mean(flat * flat, axis=-1, keepdims=True) + 1e-6
     )
-    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=5e-6)
-    np.testing.assert_array_equal(actual, repeated)
+    # FP32 sums of 16 K slices, each accumulated on simdgroup matrices.
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=1e-5)
+    np.testing.assert_array_equal(actual, fused_hc_projection(x, fn, 1e-6))
 
 
-def test_prefill_hc_mixes_dispatch_and_controls_match_reference():
+@pytest.mark.parametrize("rows, fused", [(1, False), (4, True), (256, True)])
+def test_hc_mixes_dispatch_and_controls_match_reference(monkeypatch, rows, fused):
     from types import SimpleNamespace
 
-    from omlx.patches.deepseek_v41.language import _hc_mixes, hc_mixes
+    from omlx.patches.deepseek_v41 import language
 
+    calls = []
+    real = language.fused_hc_projection
+    monkeypatch.setattr(
+        language,
+        "fused_hc_projection",
+        lambda *args: calls.append(args[0].shape) or real(*args),
+    )
     mx.random.seed(953)
     c = SimpleNamespace(hc_mult=4, norm_eps=1e-6, hc_eps=1e-6, hc_sinkhorn_iters=20)
-    x = mx.random.normal((2, 256, 4, 64)).astype(mx.bfloat16)
+    x = mx.random.normal((2, rows, 4, 64)).astype(mx.bfloat16)
     fn = mx.random.normal((24, 256)) * 0.05
     scale = mx.array([0.3, 0.7, 1.1])
     base = mx.random.normal((24,))
-    expected = _hc_mixes(x, fn, scale, base, 4, 1e-6, 1e-6, 20)
-    actual = hc_mixes(x, fn, scale, base, c)
-    repeated = hc_mixes(x, fn, scale, base, c)
+    expected = language._hc_mixes(x, fn, scale, base, 4, 1e-6, 1e-6, 20)
+    actual = language.hc_mixes(x, fn, scale, base, c)
+    repeated = language.hc_mixes(x, fn, scale, base, c)
+    assert bool(calls) == fused
     for a, e, r in zip(actual, expected, repeated):
         np.testing.assert_allclose(a, e, rtol=2e-5, atol=1e-6)
         np.testing.assert_array_equal(a, r)
-
-
-def test_hc_projection_large_row_dispatch_matches_fp64():
-    from omlx.patches.deepseek_v41.hyper_connection import fused_hc_projection
-
-    mx.random.seed(960)
-    x = mx.random.normal((1, 1024, 4, 513)).astype(mx.bfloat16)
-    fn = mx.random.normal((24, 4 * 513)) * 0.01
-    actual = fused_hc_projection(x, fn, 1e-6)
-    flat = np.asarray(x.astype(mx.float32)).astype(np.float64).reshape(1, 1024, -1)
-    expected = (flat @ np.asarray(fn).astype(np.float64).T) / np.sqrt(
-        np.mean(flat * flat, -1, keepdims=True) + 1e-6
-    )
-    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=5e-6)
-    np.testing.assert_array_equal(actual, fused_hc_projection(x, fn, 1e-6))

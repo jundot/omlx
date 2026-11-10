@@ -3,8 +3,9 @@
 
 Builds a tiny Qwen3.5-style hybrid model (gated-delta-net + full attention) with
 identical weights on every rank, records the stock mlx-lm forward BEFORE oMLX's MTP
-patch is applied, then pipelines the same model and checks that the pipelined forward
-(prefill chunks + single-token decode, with caches) reproduces it on every rank.
+patch is applied, then pipelines (``pipeline``) or tensor-shards (``tensor``) the same
+model and checks that the split forward (prefill chunks + single-token decode, with
+caches) reproduces it on every rank.
 """
 
 import json
@@ -60,15 +61,19 @@ def main() -> int:
     for ref, got in zip(reference, patched_single):
         assert mx.allclose(ref, got, atol=1e-4).item(), "patched forward drifted"
 
-    model.model.pipeline(group)
-    assert model.model.pipeline_size == group.size()
+    if sys.argv[1] == "tensor":
+        from omlx.cluster.tensor_strategies import apply_tensor_strategy
+
+        assert apply_tensor_strategy(model, group, mx_module=mx) == "qwen3_5"
+    else:
+        model.model.pipeline(group)
+        assert model.model.pipeline_size == group.size()
     cache = model.make_cache()
-    assert len(cache) == len(model.model.pipeline_layers)
     for ref, chunk in zip(reference, steps):
         out = model(chunk, cache=cache)
         mx.eval(out)
         assert mx.allclose(ref, out, atol=1e-4).item(), (
-            f"rank {group.rank()}: pipelined logits differ, max abs "
+            f"rank {group.rank()}: split logits differ, max abs "
             f"{mx.abs(ref - out).max().item()}"
         )
     print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)

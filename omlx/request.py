@@ -73,6 +73,11 @@ class SamplingParams:
     frequency_penalty: float = 0.0
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
+    # Forced-length generation (benchmark use): when True the model's own
+    # EOS/EOT/generation_config stop tokens do not end generation — only
+    # max_tokens does. Request-level stop strings / stop_token_ids still
+    # stop as usual.
+    ignore_eos: bool = False
 
     # Logprobs settings (memory optimization: disabled by default)
     logprobs: bool = False  # Whether to return logprobs
@@ -153,6 +158,8 @@ class Request:
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
+    # Ordinary prefix reuse awaiting scheduling validation; None once recorded.
+    pending_prefix_cache_tokens: int | None = None
 
     # Memory-pressure requeue. The first ``requeued_output_tokens`` outputs
     # are folded into ``prompt_token_ids`` so re-admission prefills them;
@@ -253,6 +260,10 @@ class Request:
     generation_prompt_start: int = 0  # Token index where the generation prompt starts
     generation_prompt_persists: bool = False  # History keeps the generation prompt
 
+    # Rendered leading system block; a shared tail snapshot ends where it does.
+    system_prefix_ids: Optional[List[int]] = None
+    system_prefix_end: int = 0  # Token index where the shared system prefix ends
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
     generation_overflow_retries: int = 0  # Per-request __next_prime retry counter
@@ -318,6 +329,17 @@ class Request:
 
 
 @dataclass
+class TokenLogprob:
+    """Log probability of one generated token or of one alternative to it."""
+
+    token_id: int
+    text: str
+    token_bytes: List[int]
+    logprob: float
+    top: List["TokenLogprob"] = field(default_factory=list)
+
+
+@dataclass
 class RequestOutput:
     """
     Output for a single request after a generation step.
@@ -351,6 +373,8 @@ class RequestOutput:
 
     # Tool calls (for Harmony and other models with tool calling support)
     tool_calls: Optional[List[Dict[str, str]]] = None
+    # One entry per token in new_token_ids when the request asked for logprobs.
+    logprobs: Optional[List[TokenLogprob]] = None
     # Prefix cache stats
     cached_tokens: int = 0
     # Error message (set when engine encounters an unrecoverable error)

@@ -145,6 +145,28 @@ class TestLoadOptiqVisionSidecar:
         assert nn.Module.load_weights is original
         assert captured["items"] == root_weights
 
+    def test_index_listed_sidecar_is_left_to_native_loader(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        model_dir = _build_model_dir(
+            tmp_path,
+            sidecar_keys=["vision_tower.weight"],
+        )
+        weight_map = {"vision_tower.weight": "optiq/optiq_vision.safetensors"}
+        (model_dir / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+        captured, original = _capture_load_weights(monkeypatch)
+        native_weights = [("vision_tower.weight", object())]
+
+        with _load_optiq_vision_sidecar_on_load(model_dir):
+            nn.Module.load_weights(object(), native_weights)
+
+        assert nn.Module.load_weights is original
+        assert captured["items"] == native_weights
+
     def test_rejects_duplicate_model_weight(self, tmp_path: Path, monkeypatch):
         duplicate = "vision_tower.blocks.0.attn.qkv.weight"
         model_dir = _build_model_dir(

@@ -65,8 +65,9 @@ brew update && brew upgrade omlx
 # 백그라운드 서비스로 실행 (크래시 시 자동 재시작)
 omlx start
 
-# 선택사항: MCP (Model Context Protocol) 지원
+# 선택사항: MCP (Model Context Protocol) 지원, 설치 후 재시작해야 적용
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
+omlx restart
 ```
 
 ### 소스에서 설치
@@ -76,7 +77,7 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 make install                # 웹 UI와 네이티브 커스텀 커널까지 editable 설치
 # 전체 Xcode가 없다면 make install-no-kernels 로 커널 없이 설치
-make mcp                    # 선택: MCP (Model Context Protocol) 지원 추가
+make mcp                    # 선택: MCP 지원 추가, `omlx serve` 재시작 후 적용
 ```
 
 macOS 15.0+ (Sequoia), Python 3.11–3.13, Apple Silicon (M1/M2/M3/M4/M5)이 필요합니다.
@@ -224,7 +225,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행할 수 있도록 토큰 �
 
 ### 모델 다운로드
 
-관리자 대시보드에서 HuggingFace의 MLX 모델을 직접 검색하고 다운로드합니다. 모델 카드 확인, 파일 크기 확인, 원클릭 다운로드가 가능합니다.
+관리자 대시보드에서 HuggingFace 모델을 MLX, GGUF 또는 전체 형식으로 직접 검색하고 다운로드합니다. 모델 카드를 확인한 뒤 받을 파일을 고를 수 있으며, MLX 체크포인트는 필요한 파일을 항상 받고 GGUF는 vision projector를 함께 받습니다.
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX 모델 다운로드" width="720">
@@ -265,7 +266,7 @@ OpenAI 및 Anthropic API를 그대로 대체합니다. 스트리밍 사용량 �
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 텍스트 임베딩 |
 | `POST /v1/rerank` | 문서 리랭킹 |
-| `POST /v1/systemone` | Decision 모델의 타입별 판단 (TypeSafe System One) |
+| `POST /v1/systemone` | Decision 모델 또는 채팅 모델의 타입별 판단 (TypeSafe System One) |
 | `GET /v1/models` | 사용 가능한 모델 목록 |
 | `POST /tokenize`, `POST /detokenize` | vLLM 호환 토크나이저 API (`/v1` 경로도 지원) |
 
@@ -306,7 +307,7 @@ mlx-lm에서 사용 가능한 모든 함수 호출 형식, JSON 스키마 검증
 | 유형 | 모델 |
 |------|------|
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm)이 지원하는 모든 모델 |
-| VLM | Qwen3.5 시리즈, GLM-4V, Pixtral 및 기타 [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) 모델 |
+| VLM | Qwen3.5 시리즈, GLM-4V, Pixtral 및 기타 [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) 모델 |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | 임베딩 | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | 리랭커 | ModernBERT, XLM-RoBERTa |
@@ -441,7 +442,7 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ## 감사의 말
 
 - [MLX](https://github.com/ml-explore/mlx)와 [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Apple Silicon에서의 비전-언어 모델 추론
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) - Apple Silicon에서의 비전-언어 모델 추론
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX는 vllm-mlx v0.1.0에서 시작하여 멀티 모델 서빙, 계층형 KV 캐시, 페이지드 캐시를 완전 지원하는 VLM, 관리자 패널, macOS 메뉴 바 앱으로 크게 발전했습니다
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 앱 번들을 위한 포터블 Python 환경 레이어링
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon을 위한 임베딩 모델 지원
@@ -449,3 +450,5 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP의 verify-shape Metal 커널은 Youssof Altoukhi의 MTPLX를 기반으로 하며, depth-k 파이프라인도 여기서 영감을 받았습니다
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) - fused GDN verify prework 커널은 mlx-serve가 포팅한 mlxfast-challenge의 qwen35_packed_gdn_prework 커널을 바탕으로 수정되었고, Qwen4의 fused GDN decode·prefill 커널은 mlx-serve의 MIT 라이선스 `transformer.zig`를 바탕으로 수정되었습니다
 - [SiliconScope](https://github.com/kennss/SiliconScope) - 메뉴 바 통계의 디자인과 렌더링 방식은 Kennt Kim의 SiliconScope에서 가져왔으며, 에너지 효율적인 리렌더 게이팅도 여기서 영감을 받았습니다
+- [m5gpu](https://github.com/beamivalice/m5gpu) - GPU 전력 제한은 beamivalice의 m5gpu가 정리한 AGX GPU 전력 목표값(`SetMaxGPUAbsolutePower`와 `AbsoluteTarget`, 해제값 `-1000`)을 사용합니다
+- [ming-tts-serve](https://github.com/sbusso/ming-tts-serve) - Ming-3.0-tts의 파이프라인 디코드 루프는 Stéphane Busso의 ming-tts-serve 설계를 따르며, fused DiT 커널은 ming-tts-serve의 MIT 라이선스 `ming_fused.zig`에서 가져왔습니다

@@ -76,6 +76,7 @@ class TestVLMEngineSpecPrefillForwarding:
             completion_tokens=2,
             finish_reason="stop",
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
             first_token_at=None,
         )

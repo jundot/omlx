@@ -62,17 +62,31 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(events, ["detach", "remove temporary files"])
     }
 
-    // MARK: - Staged-app signature verification
-
-    private func makeUpdater() -> AppUpdater {
-        AppUpdater(
-            dmgURL: URL(fileURLWithPath: "/tmp/unused.dmg"),
-            version: "test",
+    func testStalledDownloadResumesFromTheBytesOnDisk() async throws {
+        let payload = Data((0..<600_000).map { UInt8(truncatingIfNeeded: $0 &* 31) })
+        RangeStubProtocol.payload = payload
+        RangeStubProtocol.ranges = []
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RangeStubProtocol.self]
+        let dest = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omlx-update-test-\(UUID().uuidString).dmg")
+        defer { try? FileManager.default.removeItem(at: dest) }
+        let updater = AppUpdater(
+            dmgURL: URL(string: "https://stub.test/oMLX.dmg")!,
+            version: "9.9.9",
+            allowsMeteredNetwork: true,
             onProgress: { _ in },
             onError: { _ in },
             onReady: {}
         )
+
+        try await updater.downloadDMG(to: dest, configuration: config)
+
+        XCTAssertEqual(RangeStubProtocol.ranges, [nil, "bytes=250000-"])
+        XCTAssertEqual(try Data(contentsOf: dest), payload)
     }
+
+    // MARK: - Staged-app signature verification
 
     /// Builds a minimal .app bundle (plist + tiny executable) at path.
     private func makeAppBundle(at appURL: URL) throws {
@@ -124,7 +138,7 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(codesign(["-f", "-s", "-", appURL.path]), 0, "test setup: ad-hoc sign failed")
 
         XCTAssertThrowsError(
-            try makeUpdater().verifyAppSignature(at: appURL.path)
+            try AppUpdater.verifyAppSignature(at: appURL.path)
         ) { error in
             guard case AppUpdater.UpdateError.signatureInvalid = error else {
                 return XCTFail("expected signatureInvalid, got \(error)")
@@ -139,11 +153,37 @@ final class AppUpdaterTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: appURL) }
 
         XCTAssertThrowsError(
-            try makeUpdater().verifyAppSignature(at: appURL.path)
+            try AppUpdater.verifyAppSignature(at: appURL.path)
         ) { error in
             guard case AppUpdater.UpdateError.signatureInvalid = error else {
                 return XCTFail("expected signatureInvalid, got \(error)")
             }
         }
+    }
+}
+
+/// Serves `payload` with `Range` support and ends the first response after 250,000 bytes.
+private final class RangeStubProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var payload = Data()
+    nonisolated(unsafe) static var ranges: [String?] = []
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func stopLoading() {}
+
+    override func startLoading() {
+        let range = request.value(forHTTPHeaderField: "Range")
+        Self.ranges.append(range)
+        let start = range.flatMap { Int($0.dropFirst(6).dropLast()) } ?? 0
+        let body = Self.payload[start...]
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: start > 0 ? 206 : 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["ETag": "\"v1\"", "Content-Length": "\(body.count)"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.ranges.count == 1 ? body.prefix(250_000) : body)
+        client?.urlProtocolDidFinishLoading(self)
     }
 }

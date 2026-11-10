@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Request-local V4.1 DSML framing with opaque reasoning content."""
 
+from contextlib import suppress
+
 from ...adapter.output_parser import (
     OutputParserFinalizeResult,
     OutputParserTokenResult,
@@ -20,9 +22,13 @@ class DeepSeekV41OutputParserSession:
         self._state = "content"
         self._stopped = False
         self._calls = []
+        self._ended_by_eos = False
 
     def notify_prefilled_thought(self):
         self._state = "reasoning"
+
+    def notify_finish_reason(self, finish_reason):
+        self._ended_by_eos = finish_reason == "stop"
 
     def _consume(self, final=False):
         output = []
@@ -31,7 +37,15 @@ class DeepSeekV41OutputParserSession:
                 end = self._buffer.find(tool_call_end)
                 if end < 0:
                     if final:
-                        output.append(self._buffer)
+                        # EOS can follow the last invoke without the outer close.
+                        # A length stop keeps the unfinished envelope as text.
+                        if self._ended_by_eos:
+                            with suppress(ValueError, AssertionError):
+                                self._calls = parse_tool_call(
+                                    self._buffer[len(tool_call_start) :]
+                                )
+                        if not self._calls:
+                            output.append(self._buffer)
                         self._buffer = ""
                     break
                 cutoff = end + len(tool_call_end)

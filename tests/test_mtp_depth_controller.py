@@ -390,6 +390,71 @@ def test_losing_speculation_builds_exit_streak():
     del picks
 
 
+def _stale_dip_at_depth_zero():
+    # Flash-Next story analog: a run of rejects dropped the acceptance EMA
+    # well below the content's true rate and the controller settled at depth
+    # 0. Depth 0 drafts nothing, so p cannot recover there on its own. The
+    # exit margin is the loop tax measured on Flash-Next (1.00-1.10).
+    c = _DepthController(3, exit_margin=1.04)
+    c._warmup = []
+    c.t = {0: 13.3, 1: 18.2, 2: 24.0, 3: 28.0}
+    c.t_age = {d: 0.0 for d in c.t}
+    c.p = [0.3, 0.3, 0.3]
+    c.cur = 0
+    return c
+
+
+def _drive(controller, cycles, p_by_depth, ms_by_depth, seed=0):
+    """Like _simulate_with_zero, but records should_exit after every cycle
+    (the real loop checks it after each emit)."""
+    rng = random.Random(seed)
+    exits = []
+    for _ in range(cycles):
+        depth = controller.cur
+        accepted = 0
+        for j in range(depth):
+            if rng.random() < p_by_depth[j]:
+                accepted += 1
+            else:
+                break
+        controller.observe(depth, accepted, ms_by_depth[depth])
+        exits.append(controller.should_exit())
+    return exits
+
+
+def test_stale_losing_verdict_at_depth_zero_is_remeasured_before_exit():
+    # The true acceptance (0.62) makes depth 1 beat the plain step by ~20%,
+    # but the stale EMA says otherwise. Handing off on that verdict is the
+    # depth-0 trap: re-measure a speculative depth first. Acceptance is
+    # random, so assert a rate over many draws (before the gate every draw
+    # parked; with it most recover).
+    ms = {0: 13.3, 1: 18.2, 2: 24.0, 3: 28.0}
+    parked = 0
+    for seed in range(50):
+        c = _stale_dip_at_depth_zero()
+        exits = _drive(c, 120, p_by_depth=[0.62, 0.6, 0.55], ms_by_depth=ms, seed=seed)
+        parked += any(exits)
+    assert parked <= 10
+
+
+def test_confirmation_probe_runs_a_speculative_depth():
+    c = _stale_dip_at_depth_zero()
+    ms = {0: 13.3, 1: 18.2, 2: 24.0, 3: 28.0}
+    _drive(c, c.EXIT_STREAK, p_by_depth=[0.62, 0.6, 0.55], ms_by_depth=ms)
+    assert c.cur >= 1
+    assert not c.should_exit()
+
+
+def test_confirmed_losing_speculation_still_exits():
+    # The re-measurement agrees that speculation loses: exit as before,
+    # only a confirmation burst later.
+    c = _stale_dip_at_depth_zero()
+    ms = {0: 13.3, 1: 18.2, 2: 24.0, 3: 28.0}
+    exits = _drive(c, 80, p_by_depth=[0.2, 0.2, 0.2], ms_by_depth=ms)
+    assert any(exits)
+    assert exits.index(True) <= c.EXIT_STREAK + c.EXIT_CONFIRM + 2
+
+
 def test_winning_speculation_never_exits():
     # code analogs: clear speculative wins keep the exit streak at zero.
     c = _DepthController(3)

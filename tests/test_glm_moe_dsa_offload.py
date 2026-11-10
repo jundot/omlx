@@ -148,8 +148,8 @@ def kernels(request, monkeypatch):
     from omlx.patches.glm_moe_dsa import kernels as k
 
     if request.param == "fallback":
-        monkeypatch.setattr(k, "_native_fast", None)
-    elif not k.fast.has("glm_moe_weighted_sum"):
+        monkeypatch.setattr(k, "_native_modules", ())
+    elif not k.fast.has("moe_weighted_sum"):
         pytest.skip("native GLM kernels are not built here")
     return request.param
 
@@ -316,9 +316,10 @@ def test_wrap_and_release_return_descriptors_to_baseline(tmp_path, reference):
     cycle()  # settle one-time allocations (pools, lazy imports)
     gc.collect()
     baseline = open_fds()
-    for _ in range(10):
+    for _ in range(3):
         cycle()
-        gc.collect()
+    # One collection releases every cycle's store; a leaked descriptor stays.
+    gc.collect()
     assert open_fds() == baseline
 
 

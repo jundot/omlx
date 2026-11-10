@@ -19,7 +19,7 @@ git checkout -b fix/describe-the-change
 make dev        # Editable install with dev tools and the native custom kernels
 ```
 
-`make dev` builds the native custom kernels, which needs full Xcode with the Metal toolchain. Use `make dev-no-kernels` on a machine without it.
+`make dev` builds the native custom kernels, which needs full Xcode with the Metal toolchain. Use `make dev-no-kernels` on a machine without it. See [Custom kernels](custom-kernels.md) for how the kernels are laid out and how to add one.
 
 See [Development](../README.md#development) for the other `make` targets and app builds, and [installation instructions](../README.md#from-source) for native kernel requirements.
 

@@ -113,7 +113,7 @@ _DECODE_SELECT_SOURCE = r"""
     const uint sg = simdgroup_index_in_threadgroup;
     threadgroup atomic_uint hist[256];
     threadgroup uint decided[2];
-    threadgroup uint sg_ties[TG / 32];
+    threadgroup uint sg_counts[PER][TG / 32];
 
     // Thread tid holds blocks tid, tid + TG, ... (slots past n are never counted).
     uint keys[PER];
@@ -175,47 +175,46 @@ _DECODE_SELECT_SOURCE = r"""
     const uint threshold = prefix;
     const uint skip =
         atomic_load_explicit(&hist[threshold & 255u], memory_order_relaxed) - remaining;
+
+    // Bit j of `hits`: block j * TG + tid is selected. Ties rank by block
+    // index: chunk j holds blocks [j * TG, (j + 1) * TG), and the simdgroups'
+    // tie counts of every chunk meet in threadgroup memory at once.
+    uint hits = 0;
+    if (skip == 0) {
+        for (uint j = 0; j < PER; ++j) {
+            hits |= uint(j * TG + tid < n && keys[j] >= threshold) << j;
+        }
+    } else {
+        uint ties = 0;
+        for (uint j = 0; j < PER; ++j) {
+            const uint tie = uint(j * TG + tid < n && keys[j] == threshold);
+            ties |= tie << j;
+            const uint simd_ties = simd_sum(tie);
+            if (lane == 0) {
+                sg_counts[j][sg] = simd_ties;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint carry = 0;
+        for (uint j = 0; j < PER; ++j) {
+            const uint v = sg_counts[j][lane];
+            const uint before = simd_shuffle(simd_prefix_exclusive_sum(v), sg);
+            const uint tie = (ties >> j) & 1u;
+            const uint rank = carry + before + simd_prefix_exclusive_sum(tie);
+            hits |= uint(j * TG + tid < n && (keys[j] > threshold || (tie && rank >= skip))) << j;
+            carry += simd_sum(v);
+        }
+    }
 """
 
 _DECODE_SELECT_MASK_EPILOGUE = r"""
-    if (skip == 0) {
-        for (uint j = 0; j < PER; ++j) {
-            const uint e = j * TG + tid;
-            if (e < n) {
-                const bool hit = keys[j] >= threshold;
-                for (uint r = 0; r < R; ++r) {
-                    mask[e * R + r] = hit;
-                }
+    for (uint j = 0; j < PER; ++j) {
+        const uint e = j * TG + tid;
+        if (e < n) {
+            const bool hit = (hits >> j) & 1u;
+            for (uint r = 0; r < R; ++r) {
+                mask[e * R + r] = hit;
             }
-        }
-    } else {
-        // Rank ties by block index: prefix counts in chunks of TG blocks.
-        uint carry = 0;
-        for (uint j = 0; j < PER; ++j) {
-            const uint e = j * TG + tid;
-            const uint tie = (e < n && keys[j] == threshold) ? 1u : 0u;
-            const uint rank_in_simd = simd_prefix_exclusive_sum(tie);
-            const uint simd_ties = simd_sum(tie);
-            if (lane == 0) {
-                sg_ties[sg] = simd_ties;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint before = 0;
-            uint chunk = 0;
-            for (uint s = 0; s < TG / 32; ++s) {
-                const uint v = sg_ties[s];
-                before += s < sg ? v : 0u;
-                chunk += v;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (e < n) {
-                const bool hit =
-                    keys[j] > threshold || (tie && carry + before + rank_in_simd >= skip);
-                for (uint r = 0; r < R; ++r) {
-                    mask[e * R + r] = hit;
-                }
-            }
-            carry += chunk;
         }
     }
     // The incomplete tail block is always visible.
@@ -226,51 +225,31 @@ _DECODE_SELECT_MASK_EPILOGUE = r"""
 
 _DECODE_SELECT_TOKENS_EPILOGUE = r"""
     // Winning blocks in increasing index order, each widened to its R tokens,
-    // then the tail tokens: prefix counts over chunks of TG blocks rank the
-    // ties (as above) and place the winners.
-    threadgroup uint sg_hits[TG / 32];
-    uint tie_carry = 0;
-    uint hit_carry = 0;
+    // then the tail tokens: the simdgroups' hit counts of every chunk place
+    // the winners (after the tie ranking's reads of the counts).
+    if (skip != 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     for (uint j = 0; j < PER; ++j) {
-        const uint e = j * TG + tid;
-        const uint tie = (e < n && keys[j] == threshold) ? 1u : 0u;
-        const uint tie_rank = simd_prefix_exclusive_sum(tie);
-        const uint simd_ties = simd_sum(tie);
+        const uint simd_hits = simd_sum((hits >> j) & 1u);
         if (lane == 0) {
-            sg_ties[sg] = simd_ties;
+            sg_counts[j][sg] = simd_hits;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint tie_before = 0;
-        uint tie_chunk = 0;
-        for (uint s = 0; s < TG / 32; ++s) {
-            const uint v = sg_ties[s];
-            tie_before += s < sg ? v : 0u;
-            tie_chunk += v;
-        }
-        const uint hit = (e < n && (keys[j] > threshold
-            || (tie && tie_carry + tie_before + tie_rank >= skip))) ? 1u : 0u;
-        const uint hit_rank = simd_prefix_exclusive_sum(hit);
-        const uint simd_hits = simd_sum(hit);
-        if (lane == 0) {
-            sg_hits[sg] = simd_hits;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint hit_before = 0;
-        uint hit_chunk = 0;
-        for (uint s = 0; s < TG / 32; ++s) {
-            const uint v = sg_hits[s];
-            hit_before += s < sg ? v : 0u;
-            hit_chunk += v;
-        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint carry = 0;
+    for (uint j = 0; j < PER; ++j) {
+        const uint v = sg_counts[j][lane];
+        const uint before = simd_shuffle(simd_prefix_exclusive_sum(v), sg);
+        const uint hit = (hits >> j) & 1u;
+        const uint rank = carry + before + simd_prefix_exclusive_sum(hit);
         if (hit) {
-            const uint slot = (hit_carry + hit_before + hit_rank) * R;
+            const uint e = j * TG + tid;
             for (uint r = 0; r < R; ++r) {
-                tokens[slot + r] = int(e * R + r);
+                tokens[rank * R + r] = int(e * R + r);
             }
         }
-        tie_carry += tie_chunk;
-        hit_carry += hit_chunk;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        carry += simd_sum(v);
     }
     if (tid < TAIL) {
         tokens[K * R + tid] = int(n * R + tid);
@@ -300,7 +279,9 @@ def _decode_block_selection(
         or not 0 < block_topk < blocks
     ):
         return None
-    per_thread = 8
+    # As few keys per thread as the bank needs: each slot costs every radix
+    # pass a loop step and every tie-ranking chunk its barriers.
+    per_thread = 1
     while per_thread * _DECODE_SELECT_THREADS < blocks:
         per_thread *= 2
     if per_thread > _DECODE_SELECT_MAX_PER_THREAD:
@@ -405,8 +386,9 @@ def decode_block_selection_tokens(
 # transcribed, except that a partition first ballots its mask bytes 32 at a
 # time and then visits only the selected keys, in the same increasing order:
 # same partitions, same visiting order, same float operations, same bits.
-# The partition count is MLX's rule for the GPU class; only the 'd' class is
-# transcribed (and verified), other GPUs keep MLX.
+# The partition count is MLX's rule for the GPU class, transcribed (and
+# verified) for the 'd' class and, above 8192 keys, the 's' class (below that
+# MLX's own kernel is as fast there); other GPUs keep MLX.
 _DECODE_SDPA_DISABLED = False
 _DECODE_SDPA_KERNELS: list = []
 _DECODE_SDPA_VALIDATED: set[tuple] = set()
@@ -553,15 +535,22 @@ def _gpu_class() -> str:
 
 
 def _two_pass_blocks(n_simds: int, keys: int) -> int | None:
-    """MLX 0.32.2's sdpa_vector_2pass partition count; None where not transcribed."""
+    """MLX 0.32's sdpa_vector_2pass partition count; None where not transcribed."""
 
-    if _gpu_class() != "d" or n_simds < 6:
-        return None
-    if keys < 16384:
-        return 128
-    if keys < 65536:
-        return 512
-    return 1024
+    gpu = _gpu_class()
+    if gpu == "d" and n_simds >= 6:
+        if keys < 16384:
+            return 128
+        if keys < 65536:
+            return 512
+        return 1024
+    if gpu == "s" and n_simds > 4 and keys > 8192:
+        if keys <= 32768:
+            return 256
+        if keys <= 65536:
+            return 512
+        return 1024
+    return None
 
 
 def masked_decode_sdpa(
@@ -810,17 +799,17 @@ def _native_indexer_scores(
         return None
 
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast
 
         if not fast.is_native_available() or not fast.has_symbol(
-            "qwen4_qsa_indexer_scores"
+            "qsa_indexer_scores"
         ):
             _NATIVE_QSA_SCORE_DISABLED = True
             return None
         # The caller's [B,M,H,D] view transposes back to the GEMM-friendly
         # [B,H,M,D] ABI. The native wrapper only copies when the resulting
         # view is not row-contiguous (for example an offset query chunk).
-        scores = fast.qwen4_qsa_indexer_scores(
+        scores = fast.qsa_indexer_scores(
             queries.transpose(0, 2, 1, 3),
             pooled_keys[:, None],
             mask_ratio=compress_ratio,
@@ -859,14 +848,14 @@ def _native_topk_indices(scores: mx.array, topk: int) -> mx.array | None:
     if scores.shape[1] < _NATIVE_TOPK_MIN_ROWS:
         return None
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast
 
         if not fast.is_native_available() or not fast.has_symbol(
-            "qwen4_qsa_topk_indices"
+            "qsa_topk_indices"
         ):
             _NATIVE_QSA_TOPK_DISABLED = True
             return None
-        indices = fast.qwen4_qsa_topk_indices(scores, topk=topk).astype(mx.int32)
+        indices = fast.qsa_topk_indices(scores, topk=topk).astype(mx.int32)
         if not _NATIVE_QSA_TOPK_PROVEN:
             mx.eval(indices)
             _NATIVE_QSA_TOPK_PROVEN = True
@@ -911,15 +900,15 @@ def _native_sparse_gqa_attention(
     if queries.shape[2] < _NATIVE_MAIN_MIN_ROWS:
         return None
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         if not fast.is_native_available() or not fast.has_symbol(
-            "qwen4_qsa_sparse_gqa_attention"
+            "sparse_gqa_attention"
         ):
             _NATIVE_QSA_MAIN_DISABLED = True
             return None
         native_blocks = mx.contiguous(selected_blocks.astype(mx.uint32)[:, None])
-        output = fast.qwen4_qsa_sparse_gqa_attention(
+        output = fast.sparse_gqa_attention(
             queries,
             keys,
             values,
@@ -1014,7 +1003,7 @@ def _decode_qsa_sdpa(
     """
 
     try:
-        from omlx.custom_kernels.decode_fast import fast
+        from omlx.custom_kernels.attention import fast
 
         extension = getattr(fast, "_ext", None)
         supported = getattr(extension, "sdpa_decode_supported", None)
@@ -1237,10 +1226,10 @@ def contiguous_causal_gathered_qsa(
             and not _NATIVE_QSA_MAIN_DISABLED
         ):
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
+                from omlx.custom_kernels.attention import fast
 
                 if fast.is_native_available() and fast.has_symbol(
-                    "qwen4_qsa_sparse_gqa_attention"
+                    "sparse_gqa_attention"
                 ):
                     query_chunk = max(
                         query_chunk, _native_causal_query_chunk(key_tokens)

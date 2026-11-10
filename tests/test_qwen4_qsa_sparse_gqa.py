@@ -7,7 +7,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.custom_kernels.glm_moe_dsa import fast
+from omlx.custom_kernels.attention import fast
 from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
@@ -17,12 +17,8 @@ from mlx_vlm.models.qwen4_exp import qsa_fast, qsa_nax  # noqa: E402
 
 def _native_available() -> bool:
     return fast.is_native_available() and fast.has_symbol(
-        "qwen4_qsa_sparse_gqa_attention"
+        "sparse_gqa_attention"
     )
-
-
-def test_qwen4_sparse_gqa_symbol_is_part_of_extension_abi():
-    assert "qwen4_qsa_sparse_gqa_attention" in fast.NATIVE_SYMBOLS
 
 
 def test_qwen4_sparse_gqa_route_forwards_compact_blocks_and_transposes(monkeypatch):
@@ -58,7 +54,7 @@ def test_qwen4_sparse_gqa_route_forwards_compact_blocks_and_transposes(monkeypat
         )
         return mx.zeros(q.shape, dtype=q.dtype)
 
-    monkeypatch.setattr(fast, "qwen4_qsa_sparse_gqa_attention", native)
+    monkeypatch.setattr(fast, "sparse_gqa_attention", native)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_MAIN_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_MAIN_PROVEN", False)
 
@@ -178,7 +174,7 @@ def test_qwen4_sparse_gqa_native_matches_fp32_gather_reference(
         axis=0,
     )[None]
 
-    native = fast.qwen4_qsa_sparse_gqa_attention(
+    native = fast.sparse_gqa_attention(
         queries,
         keys,
         values,
@@ -236,7 +232,7 @@ def test_qwen4_sparse_gqa_native_masks_future_blocks_in_first_chunk():
         (1, query_tokens, 512),
     )
 
-    native = fast.qwen4_qsa_sparse_gqa_attention(
+    native = fast.sparse_gqa_attention(
         queries,
         keys,
         values,
@@ -364,7 +360,7 @@ def test_nax_attention_matches_native_and_fp64_reference(
     sel_mx = mx.array(sel)[None]
 
     got = qsa_nax.sparse_gqa_attention(q, k, v, sel_mx, q_offset=q_offset)
-    native = fast.qwen4_qsa_sparse_gqa_attention(
+    native = fast.sparse_gqa_attention(
         q,
         k,
         v,
@@ -405,7 +401,7 @@ def test_rows_past_kl_are_never_consumed(kl_mod):
     k, v = kbuf[:, :, :kl], vbuf[:, :, :kl]
     sel = mx.array(_selections(rng, lq, q_offset))[None]
     got = qsa_nax.sparse_gqa_attention(q, k, v, sel, q_offset=q_offset)
-    native = fast.qwen4_qsa_sparse_gqa_attention(
+    native = fast.sparse_gqa_attention(
         q, k, v, mx.contiguous(sel.astype(mx.uint32)[:, None]), 256**-0.5, q_offset,
         key_tile=64, dimension_tile=64,
     ).transpose(0, 2, 1, 3)

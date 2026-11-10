@@ -295,7 +295,7 @@ def test_vlm_fused_projection_views_cross_execution_threads():
 
 @pytest.mark.parametrize("bits,dtype", [(4, mx.bfloat16), (5, mx.float16)])
 @pytest.mark.parametrize("batch,length", [(1, 3), (2, 6), (16, 2)])
-def test_vlm_fused_short_block_matches_verifier_without_copying_views(
+def test_vlm_fused_short_block_matches_native_references_without_copying_views(
     monkeypatch, bits, dtype, batch, length
 ):
     from mlx_vlm.models import fast_ops
@@ -311,7 +311,12 @@ def test_vlm_fused_short_block_matches_verifier_without_copying_views(
     verifier = Qwen3_5BatchInvariantForward()
     x = mx.random.normal((batch, length, 512)).astype(dtype)
     indices = mx.random.randint(0, 8, (batch, length, 6))
-    expected_head = glu(x, indices)
+    # Use real one-token decode: mlx-vlm's short-block helpers still copy
+    # the pre-0.32.4 QMV bias-sum arithmetic.
+    expected_head = mx.concatenate(
+        [glu(x[:, i : i + 1], indices[:, i : i + 1]) for i in range(length)],
+        axis=1,
+    )
     expected_verify = verifier._switch_glu(glu, x, indices)
     mx.eval(expected_head, expected_verify)
 

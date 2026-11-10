@@ -531,6 +531,7 @@ def test_devices_enriches_paired_row_from_discovery_record(_configured_stores):
         "backends": ["jaccl"],
         "thunderbolt": True,
         "jaccl": True,
+        "loopback_only": False,
     }
     assert row["version"] == "1.2.3"
     assert row["link"] == "tb"

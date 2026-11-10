@@ -878,3 +878,41 @@ class TestCompletionsStreamThinkPrefixParity:
                 )
                 return
         raise AssertionError("create_completion not found in server.py")
+
+
+class TestResolveThinkClosePattern:
+    ENCODE = {"\n": [198], "\n\n": [271]}
+
+    def _make_scheduler(self, template_text):
+        scheduler = MagicMock(spec=Scheduler)
+        scheduler._resolve_think_close_pattern = (
+            Scheduler._resolve_think_close_pattern.__get__(scheduler, Scheduler)
+        )
+        scheduler._get_chat_template_text = MagicMock(return_value=template_text)
+        tokenizer = MagicMock()
+        tokenizer.think_end = "</think>"
+        tokenizer.encode = lambda text, add_special_tokens=False: self.ENCODE[text]
+        scheduler.tokenizer = tokenizer
+        return scheduler
+
+    def test_qwen_template_skips_bare_history_literal(self):
+        template = (
+            "{%- if '</think>' in content %}\n"
+            "{{- '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' }}\n"
+            "{{- '<think>\\n\\n</think>\\n\\n' }}\n"
+        )
+        scheduler = self._make_scheduler(template)
+        assert scheduler._resolve_think_close_pattern() == ([198], [271])
+
+    def test_bare_close_template_still_resolves_bare(self):
+        template = (
+            "{%- set content = content.split('</think>')[-1] %}\n"
+            "{{- '<think>' + reasoning + '</think>' + content }}\n"
+        )
+        scheduler = self._make_scheduler(template)
+        assert scheduler._resolve_think_close_pattern() == (None, None)
+
+    def test_parser_marker_is_used_instead_of_tokenizer_marker(self):
+        template = "{{ '<channel|>' }} {{ '\\n<channel|>\\n\\n' }}"
+        scheduler = self._make_scheduler(template)
+        assert scheduler._resolve_think_close_pattern("<channel|>") == ([198], [271])

@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import platform
+import random
 import re
 import secrets
 import shlex
@@ -567,10 +568,15 @@ def _remote_deployment_worker_pids(
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        return None, f"remote worker scan response was invalid: {exc}"
+        # A scan script that dies on the peer explains why only on stderr.
+        detail = (completed.stderr.strip() or completed.stdout.strip())[:200]
+        suffix = f": {detail}" if detail else ""
+        return None, f"remote worker scan response was invalid ({exc}){suffix}"
     pids = payload.get("pids")
     if payload.get("returncode") != 0 or not isinstance(pids, list):
-        return None, "remote worker process table could not be read"
+        detail = completed.stderr.strip()[:200]
+        suffix = f": {detail}" if detail else ""
+        return None, f"remote worker process table could not be read{suffix}"
     if any(
         isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in pids
     ):
@@ -593,6 +599,53 @@ def _rank_marker_matches(
     return not (
         plan_hash is not None and recorded is not None and recorded != plan_hash
     )
+
+
+def _reap_stale_remote_workers(
+    deployment: ClusterDeployment,
+    *,
+    kill_grace: float = 5.0,
+    runner: SSHRunner = subprocess.run,
+) -> None:
+    """Kill peer rank workers that an earlier launch of this deployment left.
+
+    Call before the launch spawns a rank. A deployment ID is stable across
+    reloads, so every live worker with this ID is stale at that point.
+    """
+
+    failures: list[str] = []
+    for host in deployment.hosts:
+        if host.ssh in _LOOPBACK_SSH_TARGETS:
+            continue
+        pids, scan_error = _remote_deployment_worker_pids(
+            host.ssh,
+            deployment.deployment_id,
+            runner=runner,
+        )
+        if scan_error:
+            raise DistributedLaunchError(
+                f"could not scan {host.node_id} for stale rank workers of "
+                f"{deployment.deployment_id}: {scan_error}"
+            )
+        for pid in pids or ():
+            if _kill_remote_pid(host.ssh, pid, grace=kill_grace, runner=runner):
+                logger.warning(
+                    "Reaped stale remote rank worker pid %d of deployment %s on %s",
+                    pid,
+                    deployment.deployment_id,
+                    host.node_id,
+                )
+            else:
+                failures.append(
+                    f"stale rank worker pid {pid} on {host.node_id} survived SIGKILL"
+                )
+    if failures:
+        raise DistributedLaunchError(
+            f"previous launch of {deployment.deployment_id} left rank workers "
+            "that could not be killed: "
+            + "; ".join(failures)
+            + f". {_REBOOT_REQUIRED_GUIDANCE}"
+        )
 
 
 def _sweep_rank_processes(
@@ -952,6 +1005,11 @@ def reap_orphaned_launches(
     return report
 
 
+# Below the macOS ephemeral range (49152-65535), which bind(0) and outbound
+# source ports draw from after the reservation is released.
+_SAFE_PORT_RANGE = (20000, 46000)
+
+
 def _available_launch_ports(
     deployment: ClusterDeployment,
 ) -> tuple[int, int]:
@@ -965,28 +1023,22 @@ def _available_launch_ports(
     )
     if not 1 <= collective_count <= 1024:
         raise ValueError("collective port span is out of range")
+    low, high = _SAFE_PORT_RANGE
 
     for _ in range(128):
         listeners: list[socket.socket] = []
         try:
-            first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            first.bind(("127.0.0.1", 0))
-            listeners.append(first)
-            collective_port = int(first.getsockname()[1])
-            if collective_port + collective_count - 1 > 65535:
-                continue
-            for port in range(
-                collective_port + 1,
-                collective_port + collective_count,
-            ):
+            candidate = random.randint(low, high - collective_count)
+            for port in range(candidate, candidate + collective_count):
                 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 listener.bind(("127.0.0.1", port))
                 listeners.append(listener)
+            # The held span listeners keep the API port out of the span.
             api_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            api_listener.bind(("127.0.0.1", 0))
+            api_listener.bind(("127.0.0.1", random.randint(low, high)))
             listeners.append(api_listener)
             api_port = int(api_listener.getsockname()[1])
-            return api_port, collective_port
+            return api_port, candidate
         except OSError:
             continue
         finally:
@@ -1305,6 +1357,20 @@ def build_mlx_launch_argv(
         argv.append("--sampling-rank-only")
     if deployment.execution.async_overlap:
         argv.append("--async-overlap")
+    if deployment.execution.mtp:
+        argv.extend(["--mtp", "--mtp-depth", str(deployment.execution.mtp_depth)])
+        if deployment.execution.mtp_fixed_depth:
+            argv.append("--mtp-fixed-depth")
+    if deployment.execution.ced_prefill:
+        argv.append("--ced-prefill")
+    if deployment.execution.a8_prefill:
+        argv.extend(
+            [
+                "--a8-prefill",
+                "--a8-prefill-min-tokens",
+                str(deployment.execution.a8_prefill_min_tokens),
+            ]
+        )
     if deployment.trust_remote_code:
         argv.append("--trust-remote-code")
     return argv
@@ -2722,6 +2788,7 @@ class DistributedJobSupervisor:
                 self.deployment,
                 python_executable=self.python_executable,
             )
+        _reap_stale_remote_workers(self.deployment)
         # A deployment ID and plan hash are stable across reloads. Remove the
         # prior launch's gate before any rank can mistake it for this launch's
         # release signal.
@@ -3380,8 +3447,13 @@ class DistributedJobSupervisor:
             f"distributed worker reported {event_type}: {reason or 'unknown failure'}"
         )
         if event_type == "rank_exit":
-            # A rank that fails before its marker exists leaves only stderr.
-            lines = tuple(self._stderr)[-20:]
+            # A rank that fails before its marker exists leaves only launcher
+            # output. Remote ranks run under ``ssh -tt``, so their stderr
+            # arrives on the launcher's stdout.
+            stdout = [
+                line for line in self._stdout if not line.startswith(_EVENT_PREFIX)
+            ]
+            lines = tuple(self._stderr)[-20:] + tuple(stdout[-20:])
             if lines:
                 detail += "\n" + "\n".join(lines)
         return detail

@@ -593,6 +593,33 @@ def test_import_mtplx_sidecar_renames_when_keys_align(tmp_path):
     assert index["weight_map"]["mtp.fc.weight"] == GEMMA4_ASSISTANT_MTP_SHARD
 
 
+@pytest.mark.parametrize(
+    "marker",
+    [
+        # OptiQ copies the HF head and ships no runtime contract file.
+        {"mtp_policy": "optiq-int4-prequantized-gs64"},
+        {"mtplx_mtp_norm_encoding": "delta"},
+    ],
+)
+def test_import_mtplx_sidecar_shifts_zero_centered_head_norms(tmp_path, marker):
+    out = _write_qwen_mtplx_sidecar_model(tmp_path, sidecar_rel="optiq/mtp.safetensors")
+    config = json.loads((out / "config.json").read_text())
+    config.update(marker)
+    (out / "config.json").write_text(json.dumps(config))
+    if "mtp_policy" in marker:
+        (out / MTPLX_RUNTIME_FILE).unlink()
+
+    result = import_mtplx_sidecar(out)
+
+    # Keys align, but the shifted head needs a written shard, not a rename.
+    assert result["merge_mode"] == "remap"
+    merged = mx.load(str(out / GEMMA4_ASSISTANT_MTP_SHARD))
+    for key, value in merged.items():
+        expected = 2.0 if value.ndim == 1 else 1.0
+        assert mx.all(value == expected).item(), key
+    assert (out / "optiq" / "mtp.safetensors").exists()
+
+
 def test_import_mtplx_sidecar_resolves_mtp_file_override(tmp_path):
     # Official MTPLX exports keep the side-car at mtp/weights.safetensors,
     # declared via mlx_lm_extra_tensors.mtp_file, and pre-calibration

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from omlx import gguf
 from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
@@ -28,7 +29,9 @@ from omlx.model_discovery import (
     format_size,
     is_helper_config_model_type,
     is_helper_model_config,
+    is_realtime_voice_model,
     model_directory_access_error,
+    model_display_name,
 )
 
 
@@ -374,12 +377,13 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
-    def test_detect_cohere2_moe_as_vlm_without_vision_config(self, tmp_path):
-        """Cohere2 MoE is text-only but implemented by mlx-vlm."""
-        config = {
-            "model_type": "cohere2_moe",
-            "architectures": ["Cohere2MoeForCausalLM"],
-        }
+    @pytest.mark.parametrize(
+        "model_type,architecture",
+        [("cohere2_moe", "Cohere2MoeForCausalLM"), ("flint", "FlintForCausalLM")],
+    )
+    def test_detect_native_text_model_as_vlm(self, tmp_path, model_type, architecture):
+        """Text-only families implemented by mlx-vlm route to the VLM engine."""
+        config = {"model_type": model_type, "architectures": [architecture]}
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
@@ -427,13 +431,15 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
-    def test_detect_muse_glimmer_as_vlm(self, tmp_path):
-        """Meta Muse Glimmer 30B is served by mlx-vlm."""
+    @pytest.mark.parametrize("family", ["MuseGlimmer", "MuseSpark"])
+    def test_detect_muse_family_as_vlm(self, tmp_path, family):
+        """Meta Muse Glimmer and Muse Spark are served by mlx-vlm."""
+        model_type = "muse_glimmer" if family == "MuseGlimmer" else "muse_spark"
         config = {
-            "model_type": "muse_glimmer",
-            "architectures": ["MuseGlimmerForConditionalGeneration"],
-            "vision_config": {"model_type": "muse_glimmer_vision"},
-            "text_config": {"model_type": "muse_glimmer_text"},
+            "model_type": model_type,
+            "architectures": [f"{family}ForConditionalGeneration"],
+            "vision_config": {"model_type": f"{model_type}_vision"},
+            "text_config": {"model_type": f"{model_type}_text"},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
@@ -634,6 +640,39 @@ class TestDetectModelType:
         )
         assert detect_model_type(model_dir) == "decision"
         assert decision_kind(model_dir) == "d3"
+
+    def test_detect_d1_by_d1model_on_lfm3_config(self, tmp_path):
+        """LiquidAI d1 shares lfm3_vl / lfm3_omni configs with the LFM3 chat models."""
+        vision = {"hidden_size": 1024, "num_hidden_layers": 14}
+        chat = tmp_path / "LFM3-VL-2B"
+        d1_vl = tmp_path / "d1-2B"
+        d1_omni = tmp_path / "d1-Omni-2B"
+        configs = {
+            chat: {
+                "model_type": "lfm3_vl",
+                "architectures": ["Lfm3VlForConditionalGeneration"],
+                "vision_config": vision,
+            },
+            d1_vl: {
+                "model_type": "lfm3_vl",
+                "architectures": ["D1Model"],
+                "vision_config": vision,
+            },
+            d1_omni: {
+                "model_type": "lfm3_omni",
+                "auto_map": {"AutoModel": "modeling_d1_lfm3_omni.D1Model"},
+                "vision_config": vision,
+            },
+        }
+        for path, config in configs.items():
+            path.mkdir()
+            (path / "config.json").write_text(json.dumps(config))
+
+        assert detect_model_type(chat) == "vlm"
+        assert decision_kind(chat) is None
+        for path in (d1_vl, d1_omni):
+            assert detect_model_type(path) == "decision"
+            assert decision_kind(path) == "d1"
 
     def test_detect_openjev_by_helper_or_directory_name(self, tmp_path):
         config = {
@@ -843,6 +882,44 @@ class TestDetectModelType:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_lfm3_text_model_as_vlm_native_text(self, tmp_path):
+        """LFM3 text checkpoints load through mlx-vlm; mlx-lm has no lfm3."""
+        config = {
+            "model_type": "lfm3",
+            "architectures": ["Lfm3ForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_lfm3_audio_as_vlm_not_audio_sts(self, tmp_path):
+        """LFM3-Audio has no vision config and is served by mlx-vlm, not mlx-audio STS."""
+        config = {
+            "model_type": "lfm3_audio",
+            "architectures": ["Lfm3AudioForConditionalGeneration"],
+            "audio_config": {"model_type": "lfm3_audio_encoder"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_qwen3_omni_as_vlm(self, tmp_path):
+        """Qwen3-Omni ships an empty top-level vision_config and loads in mlx-vlm."""
+        config = {
+            "model_type": "qwen3_omni_moe",
+            "architectures": ["Qwen3OmniMoeForConditionalGeneration"],
+            "vision_config": {},
+            "enable_audio_output": True,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_thinker_only_qwen3_omni_is_not_a_voice_model(self):
+        assert is_realtime_voice_model("qwen3_omni_moe", {"enable_audio_output": True})
+        assert not is_realtime_voice_model(
+            "qwen3_omni_moe", {"enable_audio_output": False}
+        )
+        assert is_realtime_voice_model("lfm3_audio", {})
+        assert not is_realtime_voice_model("qwen3_vl_moe", {})
 
     def test_detect_lfm_audio_architecture_as_sts(self, tmp_path):
         """mlx-audio LFM STS remains classified via LFM2AudioModel architecture."""
@@ -2453,3 +2530,227 @@ def test_deepseek_v4_flat_vision_config(tmp_path, vision_layers, expected):
         config["vision_n_layers"] = vision_layers
     (tmp_path / "config.json").write_text(json.dumps(config))
     assert detect_model_type(tmp_path) == expected
+
+
+QWEN_GGUF = {
+    "general.architecture": "qwen35",
+    "general.sampling.temp": 0.6,
+    "general.sampling.top_k": 20,
+    "qwen35.block_count": 65,
+    "qwen35.nextn_predict_layers": 1,
+    "qwen35.context_length": 262144,
+    "qwen35.embedding_length": 5120,
+    "qwen35.attention.head_count": 24,
+    "qwen35.attention.head_count_kv": 4,
+    "qwen35.attention.key_length": 256,
+    "qwen35.full_attention_interval": 4,
+    "tokenizer.ggml.tokens": ["a", "b", "c"],
+    "tokenizer.chat_template": "{{ messages }}",
+}
+PROJECTOR_GGUF = {
+    "general.architecture": "clip",
+    "general.type": "mmproj",
+    "clip.projector_type": "qwen3vl_merger",
+}
+
+
+class TestGgufDiscovery:
+
+    def test_split_variant_with_separately_named_table(self, tmp_path, write_gguf):
+        repo = tmp_path / "models" / "Vardaan97" / "Flash-Next-Splash-GGUF"
+        prefix = "Qwen3.8-Flash-Next-UD-Q4_K_XL"
+        names = [f"{prefix}-{index:05d}-of-00005.gguf" for index in range(1, 5)]
+        names.append("Qwen3.8-Flash-Next-ple8-table-00005-of-00005.gguf")
+        for name in reversed(names):
+            write_gguf(repo / "Q4-PLE8" / name, {"general.architecture": "qwen4exp"})
+        write_gguf(repo / "mmproj-BF16.gguf", PROJECTOR_GGUF)
+
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+
+        assert set(models) == {f"{prefix}-Q4-PLE8"}
+        model = models[f"{prefix}-Q4-PLE8"]
+        info = gguf.source_info(model.model_path)
+        assert info["source_parts"] == [f"Q4-PLE8/{name}" for name in names]
+        assert info["projectors"] == ["mmproj-BF16.gguf"]
+        for name in names:
+            assert (
+                Path(model.model_path) / "split" / name
+            ).resolve() == repo / "Q4-PLE8" / name
+
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ["Flash-Next-body-00001-of-00002.gguf"],
+            [
+                "Flash-Next-body-00001-of-00002.gguf",
+                "Other-body-00001-of-00002.gguf",
+                "Flash-Next-ple8-table-00002-of-00002.gguf",
+            ],
+        ],
+        ids=["missing", "duplicate"],
+    )
+    def test_mixed_prefix_split_needs_one_complete_set(
+        self, tmp_path, write_gguf, names
+    ):
+        repo = tmp_path / "models" / "repo"
+        for name in names:
+            write_gguf(repo / "Q4-PLE8" / name, {"general.architecture": "qwen4exp"})
+        assert gguf.find_models(repo) == []
+        assert discover_models(tmp_path / "models", tmp_path / "gguf") == {}
+
+    def test_repository_name_ending_in_ple_is_not_a_variant(self, tmp_path, write_gguf):
+        repo = tmp_path / "models" / "owner" / "Qwen3.8-Flash-Next-PLE8"
+        for part in (1, 2):
+            write_gguf(repo / f"Flash-Next-Q4-{part:05d}-of-00002.gguf", QWEN_GGUF)
+        write_gguf(repo / "mmproj-BF16.gguf", PROJECTOR_GGUF)
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        assert set(models) == {"Flash-Next-Q4"}
+        info = gguf.source_info(models["Flash-Next-Q4"].model_path)
+        assert info["directory"] == str(repo)
+        assert info["projectors"] == ["mmproj-BF16.gguf"]
+
+    @pytest.mark.parametrize(
+        "parts, complete",
+        [
+            ([(1, 2), (2, 2)], True),
+            ([(1, 2)], False),
+            ([(1, 2), (3, 2)], False),
+            ([(1, 2), (2, 3)], False),
+        ],
+    )
+    def test_split_variant_requires_every_part(
+        self, tmp_path, write_gguf, parts, complete
+    ):
+        repo = tmp_path / "models" / "ISTA-DASLab" / "Flash-Next-GGUF"
+        for index, count in parts:
+            part = write_gguf(
+                repo / "Q2_0" / f"Flash-Next-Q2_0-{index:05d}-of-{count:05d}.gguf",
+                {"general.architecture": "qwen4exp"},
+            )
+            # AppleDouble sidecar an exFAT or SMB volume keeps beside each file.
+            (part.parent / f"._{part.name}").write_bytes(b"\0" * 8)
+        write_gguf(repo / "MTP" / "draft.gguf", {})
+        write_gguf(repo / "other" / "Flash-Next-Q2_0-00001-of-00001.gguf", {})
+        write_gguf(repo / "mmproj-BF16.gguf", PROJECTOR_GGUF)
+
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+
+        assert set(models) == ({"Flash-Next-Q2_0"} if complete else set())
+        assert [model.model_id for model in gguf.find_models(repo)] == (
+            ["Flash-Next-Q2_0"] if complete else []
+        )
+        if complete:
+            model = models["Flash-Next-Q2_0"]
+            info = gguf.source_info(model.model_path)
+            assert info["directory"] == str(repo)
+            assert info["source_parts"] == [
+                f"Q2_0/Flash-Next-Q2_0-{part:05d}-of-00002.gguf" for part in (1, 2)
+            ]
+            assert info["projectors"] == ["mmproj-BF16.gguf"]
+
+    def test_split_variant_beside_a_checkpoint_stays_in_its_org_folder(
+        self, tmp_path, write_gguf
+    ):
+        org = tmp_path / "models" / "unsloth"
+        for part in (1, 2):
+            write_gguf(
+                org / "UD-Q4_K_XL" / f"Q-UD-Q4_K_XL-{part:05d}-of-00002.gguf",
+                QWEN_GGUF,
+            )
+        (org / "Tiny-4bit").mkdir()
+        (org / "Tiny-4bit" / "config.json").write_text('{"model_type": "llama"}')
+        (org / "Tiny-4bit" / "model.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+
+        assert sorted(models) == ["Q-UD-Q4_K_XL", "Tiny-4bit"]
+
+    def test_gguf_folder_lists_one_model_per_gguf(self, tmp_path, write_gguf):
+        models_dir = tmp_path / "models"
+        repo = models_dir / "unsloth" / "Q-GGUF"
+        write_gguf(repo / "Q-UD-Q4_K_M.gguf", QWEN_GGUF, size=4000)
+        write_gguf(repo / "Q-Q8_0.gguf", QWEN_GGUF, size=8000)
+        write_gguf(repo / "Q-BF16-00001-of-00002.gguf", QWEN_GGUF, size=9000)
+        write_gguf(repo / "Q-BF16-00002-of-00002.gguf", {}, size=9000)
+        write_gguf(repo / "X-00001-of-00003.gguf", QWEN_GGUF)
+        write_gguf(repo / "mmproj-F16.gguf", PROJECTOR_GGUF, size=500)
+        write_gguf(repo / "mmproj-BF16.gguf", PROJECTOR_GGUF, size=500)
+        write_gguf(repo / "imatrix_unsloth.gguf", {"general.type": "imatrix"})
+        write_gguf(repo / "MTP" / "mtp-Q.gguf", QWEN_GGUF)
+        # GGUF repos ship a config.json without the safetensors it describes.
+        (repo / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+        gguf_root = tmp_path / "base" / "gguf"
+
+        models = discover_models(models_dir, gguf_root)
+
+        assert sorted(models) == ["Q-BF16", "Q-Q8_0", "Q-UD-Q4_K_M"]
+        model = models["Q-UD-Q4_K_M"]
+        assert (model.model_format, model.engine_type, model.config_model_type) == (
+            "gguf",
+            "vlm",
+            "qwen3_5",
+        )
+        assert model.source_path == str(repo / "Q-UD-Q4_K_M.gguf")
+        name = model_display_name(
+            model.model_id,
+            model.model_path,
+            [models_dir],
+            source_path=model.source_path,
+        )
+        assert name == "unsloth/Q-UD-Q4_K_M"
+        assert model.estimated_size == 4000 + 500
+        assert models["Q-BF16"].estimated_size == 18000 + 500
+        folder = Path(model.model_path)
+        assert folder.parent == gguf_root
+        config = json.loads((folder / "config.json").read_text())
+        assert config["text_config"]["num_hidden_layers"] == 64
+        assert config["text_config"]["vocab_size"] == 3
+        assert config["vision_config"]["projector_type"] == "qwen3vl_merger"
+        links = sorted(path.name for path in folder.iterdir() if path.is_symlink())
+        assert links == ["Q-UD-Q4_K_M.gguf", "mmproj-BF16.gguf", "mmproj-F16.gguf"]
+        generation = json.loads((folder / "generation_config.json").read_text())
+        assert generation == {"temperature": 0.6, "top_k": 20}
+
+        # Without a folder root GGUF repos are skipped, never taken for checkpoints.
+        assert discover_models(models_dir) == {}
+
+    def test_hf_cache_gguf_of_any_architecture(self, tmp_path, write_gguf):
+        hub = tmp_path / "hub"
+        repo = hub / "models--bartowski--Llama-GGUF"
+        (repo / "refs").mkdir(parents=True)
+        (repo / "refs" / "main").write_text("c" * 40)
+        snapshot = repo / "snapshots" / ("c" * 40)
+        snapshot.mkdir(parents=True)
+        blob = write_gguf(repo / "blobs" / "abc", {"general.architecture": "llama"})
+        (snapshot / "Llama-Q4_K_M.gguf").symlink_to(blob)
+
+        models = discover_models(hub, tmp_path / "gguf")
+
+        model = models["Llama-Q4_K_M"]
+        assert (model.source_type, model.source_repo_id) == (
+            "hf_cache",
+            "bartowski/Llama-GGUF",
+        )
+        # Named <owner>/<file>: the repo holds other GGUFs too.
+        name = model_display_name(
+            model.model_id,
+            model.model_path,
+            [hub],
+            source_repo_id=model.source_repo_id,
+            source_path=model.source_path,
+        )
+        assert name == "bartowski/Llama-Q4_K_M"
+        assert (model.model_type, model.config_model_type) == ("llm", "llama")
+        link = Path(model.model_path) / "Llama-Q4_K_M.gguf"
+        assert link.resolve() == blob.resolve()
+
+
+def test_splash_package_is_skipped_with_its_replacement(tmp_path, caplog):
+    package = tmp_path / "incoai" / "Qwen3.8-27B-Splash"
+    (package / "tokenizer").mkdir(parents=True)
+    (package / "tokenizer" / "config.json").write_text("{}")
+    manifest = {"format": {"name": "splash-packed-q4"}, "model": "Qwen3.8-27B"}
+    (package / "manifest.json").write_text(json.dumps(manifest))
+
+    assert discover_models(tmp_path, tmp_path / "gguf") == {}
+    assert "mlx-community/Qwen3.8-27B-4bit holds the same weights" in caplog.text

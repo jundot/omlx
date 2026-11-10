@@ -414,6 +414,40 @@ class TestCompileWithStructuralTag:
         tag_arg = compiler.compile_structural_tag.call_args[0][0]
         assert tag_arg["format"]["elements"][1] == user_fmt
 
+    @requires_xgrammar
+    def test_harmony_final_ends_on_return_stop_token(self):
+        """gpt-oss uses <|return|> as EOS, so the final message must end on it."""
+        xgr = pytest.importorskip("xgrammar")
+
+        vocab = [
+            "<|start|>", "<|channel|>", "<|message|>", "<|end|>", "<|return|>",
+            "assistant", "analysis", "final", "Ok", '{"', "name", '":"', "A", '"}',
+        ]
+        ret = vocab.index("<|return|>")
+        compiler = xgr.GrammarCompiler(xgr.TokenizerInfo(vocab, stop_token_ids=[ret]))
+        fmt = {
+            "type": "json_schema",
+            "json_schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        }
+        matcher = xgr.GrammarMatcher(self._call(compiler, fmt, "harmony"))
+        output = [
+            "<|channel|>", "analysis", "<|message|>", "Ok", "<|end|>",
+            "<|start|>", "assistant", "<|channel|>", "final", "<|message|>",
+            '{"', "name", '":"', "A", '"}',
+        ]
+        for token in output:
+            assert matcher.accept_token(vocab.index(token)), token
+
+        bitmask = np.full((1, 1), -1, dtype=np.int32)
+        matcher.fill_next_token_bitmask(bitmask)
+        assert not (bitmask[0, 0] >> vocab.index("<|end|>")) & 1
+        assert matcher.accept_token(ret)
+        assert matcher.is_terminated()
+
 
 class TestCompileBareGrammar:
     """Tests for _compile_bare_grammar."""
@@ -470,6 +504,21 @@ class TestCompileGrammarForRequest:
     def test_returns_none_when_no_grammar_requested(self):
         engine = _make_engine()
         assert self._call(engine) is None
+
+    def test_plain_text_does_not_build_the_grammar_compiler(self):
+        """No format requested: the lazy xgrammar build must not run."""
+        from omlx.server import _compile_grammar_for_request
+
+        touched = []
+
+        class Engine:
+            @property
+            def grammar_compiler(self):
+                touched.append(True)
+                return None
+
+        assert _compile_grammar_for_request(Engine()) is None
+        assert touched == []
 
     def test_raises_when_no_compiler_and_structured_outputs(self):
         from fastapi import HTTPException

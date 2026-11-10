@@ -197,10 +197,10 @@ the full raw gate/up result and two subsequent concatenations before the q4 down
 projection. Extensions built before this fused primitive retain the compatible
 raw merge path automatically.
 
-The combined GPU suffix is retained alongside the original gate/up tensors so
-decode and every fallback remain unchanged. The dual path also owns two input
-and two output surfaces per accelerated layer. This deliberately spends memory
-to avoid per-request weight preparation and to keep both ANEs ready.
+The GPU suffix reads the remaining gate and up rows in place from the checkpoint tensors through a split-row qmm, so decode and every fallback use the same weights without a second copy. A combined copy is kept only when the M5 packed projections later replace those layers. Procedures of one bank share their fixed-shape input and output surfaces by size, because a bank evaluates one procedure at a time and each dispatch reads its output before the next one packs its input. Per-layer fallback programs still own their surfaces.
+
+The ANE driver wires the INT8 program weights while a prefill runs and releases them several seconds after it ends. This memory is outside the process footprint, so the prefill memory guard reserves it (about 7 GiB for the default 64 MLP / 48 GDN layout on a 27B). On an M3 Ultra with `Qwen3.8-27B-oQ8e-mtp` at the default settings, enabling ANE now adds about 0.2 GiB to the process footprint after load. Before the shared surfaces and in-place suffix it added 18.2 GiB: 10 GiB of per-procedure surfaces, 5.3 GiB of suffix copies, and 2.4 GiB of freed staging blocks that malloc kept resident.
+
 When CPU sharing is enabled, model admission additionally reserves the eager
 FP16 gate/up and GDN rows, the down-projection GPU suffix, and bounded
 materialization scratch. This projected size participates in the normal memory
@@ -242,8 +242,8 @@ scheduler-aligned rechecks.
 
 The 16K and 32K output hashes matched the GPU path exactly. The 4K output was
 stable across ANE rechecks but differed from GPU, which is consistent with the
-approximate INT8 ANE prefix. Peak memory increased by about 4.15 GB, and eager
-load time increased from 3.35 to about 27-29 seconds on the test system.
+approximate INT8 ANE prefix. Eager load time increased from 3.35 to about
+27-29 seconds on the test system.
 Token-generation throughput was unchanged because decode remains on the GPU.
 
 ## M3 Ultra reference result

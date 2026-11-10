@@ -31,6 +31,7 @@ from omlx.prefill.packed import (
     PackedBatch,
     PackedRow,
     PackedRows,
+    _wrap_mixer,
     install_packed_prefill,
     packed_min_row_tokens,
     run_packed_prefill,
@@ -1633,6 +1634,83 @@ def test_external_prefill_announces_the_next_chunk_to_the_model():
     assert model.seen == [([10, 11, 12, 13], []), ([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]
 
 
+def test_external_prefill_announces_engram_next_chunk_to_the_model():
+    """Engram lookahead is told every chunk's successor, and the final chunk
+    still gets an empty successor so its carry can be activated."""
+    import types
+
+    class EngramLookaheadModel(_RecordingModel):
+        def __init__(self):
+            super().__init__("vlm")
+            self.seen = []
+
+        def prefetch_engram(self, next_ids, current_ids, cache=None):
+            self.seen.append(
+                (next_ids.tolist()[0], current_ids.tolist()[0], cache)
+            )
+
+    model = EngramLookaheadModel()
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(prefill_step_size=4, paged_cache_block_size=0),
+    )
+    tokens = list(range(10, 21))  # 10 prefill tokens, the last goes to the generator
+    request = _make_request("engram-lookahead-external", n_tokens=11)
+    cache = [types.SimpleNamespace(state=mx.array([0]))]
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        scheduler._do_external_prefill(request, tokens, cache)
+    assert model.chunk_lengths == [4, 4, 2]
+    assert model.seen == [
+        ([10, 11, 12, 13], [], cache),
+        ([14, 15, 16, 17], [10, 11, 12, 13], cache),
+        ([18, 19], [14, 15, 16, 17], cache),
+        ([], [18, 19], cache),
+    ]
+
+
+def test_step_prefill_chunk_announces_engram_next_chunk_to_the_model():
+    """Chunked prefill passes the Engram successor through every step, with
+    an empty successor on the final step."""
+
+    class EngramLookaheadModel(_RecordingModel):
+        def __init__(self):
+            super().__init__("vlm")
+            self.seen = []
+
+        def prefetch_engram(self, next_ids, current_ids, cache=None):
+            self.seen.append(
+                (next_ids.tolist()[0], current_ids.tolist()[0], cache)
+            )
+
+    model = EngramLookaheadModel()
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            prefill_step_size=4, chunked_prefill=True, paged_cache_block_size=0
+        ),
+    )
+    request = _make_request("engram-lookahead-chunked", n_tokens=11)
+    state = _make_prefill_state(scheduler, request, n_remaining=10)
+    state.tokens_remaining = mx.arange(10, 20, dtype=mx.int32)[None]
+    cache = state.cache
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        while not scheduler._step_prefill_chunk(state):
+            pass
+    assert model.chunk_lengths == [4, 4, 2]
+    assert model.seen == [
+        ([10, 11, 12, 13], [], cache),
+        ([14, 15, 16, 17], [10, 11, 12, 13], cache),
+        ([18, 19], [14, 15, 16, 17], cache),
+        ([], [18, 19], cache),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Packed prefill
 # ---------------------------------------------------------------------------
@@ -1902,6 +1980,22 @@ def _assert_same_cache(actual, expected):
     for a, b in zip(actual, expected):
         assert a.shape == b.shape
         assert mx.array_equal(a, b).item()
+
+
+def test_packed_wrapper_follows_a_later_patch_of_an_inherited_call():
+    """Qwen4 GDN inherits __call__; a patch of the base class applied after
+    the packed wrapper (the GDN prework decode) must still reach it."""
+
+    class Base:
+        def __call__(self, inputs, mask=None, cache=None):
+            return "original"
+
+    class Child(Base):
+        pass
+
+    _wrap_mixer(Child, lambda x, cache: None, x_arg="inputs")
+    Base.__call__ = lambda self, inputs, mask=None, cache=None: "patched"
+    assert Child()(mx.zeros((1, 2))) == "patched"
 
 
 @pytest.mark.parametrize(
@@ -2458,9 +2552,8 @@ def test_packed_rows_emit_their_own_boundary_snapshots(monkeypatch):
     "chunked, contended, min_row, cap_fits, excluded, packed",
     [
         (True, False, 1, True, False, True),
-        # Decode fairness chunks prompts under contention even when chunked
-        # prefill is off, so those prompts pack too.
-        (False, True, 1, True, False, True),
+        # Fairness alone does not make a lone short prompt resumable.
+        (False, True, 1, True, False, False),
         (False, False, 1, True, False, False),
         (True, False, 64, True, False, False),
         # The resumable path holds the last token back: 2 tokens < 3.
@@ -2516,11 +2609,109 @@ def test_packed_rows_activate_their_own_priming_slot_for_tail_snapshots(monkeypa
         state.boundary_enabled = True
         state.block_size = 64
         state.tail_at = 5
-    _advance(scheduler)
-    for request_id in ("a", "b"):
         # The prefill end (8 tokens) is off the 64-token grid: an end tail.
-        scheduler._prefill_states[request_id].end_tail = True
-    _advance(scheduler)
+        state.end_tail = True
+    # Each row runs its generation prompt right after the pack and finishes.
+    assert _advance(scheduler) == (["a", "b"], [])
     tails = [i for i, event in enumerate(events) if event[0] == "tail"]
     assert [events[i][1] for i in tails] == ["a", "b", "a", "b"]
     assert all(events[i - 1] == ("activate", events[i][1]) for i in tails)
+
+
+@pytest.mark.parametrize(
+    "n_tokens, peer, packed",
+    [
+        # Four prefill tokens and the held-back last one fit the 4-token chunk.
+        (5, None, False),
+        (6, None, True),
+        (3, "waiting", True),
+        (3, "prefilling", True),
+    ],
+)
+def test_fairness_packs_a_short_prompt_only_with_a_possible_companion(
+    monkeypatch, n_tokens, peer, packed
+):
+    sched = _make_scheduler(chunked_prefill=False, step_size=4)
+    sched._packed_min_row_tokens = 1
+    monkeypatch.setattr(Scheduler, "_packed_prefill_ready", lambda self: True)
+    monkeypatch.setattr(Scheduler, "_decode_contention", lambda self: True)
+    monkeypatch.setattr(Scheduler, "_packing_fits_contended_cap", lambda self: True)
+    monkeypatch.setattr(sched, "_prefill_step_size_for_progress", lambda *args: 4)
+    req = _make_request("short", n_tokens=n_tokens)
+    sched.add_request(req)
+    companion = _make_request("companion", n_tokens=3)
+    if peer == "waiting":
+        sched.add_request(companion)
+    elif peer == "prefilling":
+        sched.prefilling.append(companion)
+        sched._prefill_states[companion.request_id] = _make_prefill_state(
+            sched, companion, 2
+        )
+
+    def begin(request, tokens, cache):
+        return _make_prefill_state(sched, request, len(tokens) - 1)
+
+    aborted = _PrefillAbortedError([], 0)
+    with (
+        patch.object(sched, "_begin_prefill", side_effect=begin),
+        patch.object(sched, "_step_prefill_chunk"),
+        patch.object(sched, "_do_external_prefill", side_effect=aborted) as external,
+    ):
+        sched._schedule_waiting()
+    assert (req in sched.prefilling) is packed
+    assert external.called is not packed
+
+
+def test_contended_prefill_runs_its_generation_prompt_in_the_same_step(monkeypatch):
+    scheduler = _make_packed_scheduler(step_size=512)
+    monkeypatch.setattr(Scheduler, "_contended_prefill_cap", lambda self: 192)
+    chunks = []
+    run = Scheduler._run_prefill_chunks
+
+    def record(self, plans):
+        chunks.append([(plan.state.request.request_id, plan.tokens) for plan in plans])
+        return run(self, plans)
+
+    monkeypatch.setattr(Scheduler, "_run_prefill_chunks", record)
+    _, state = _stage_prefill(scheduler, "a", 101)
+    state.boundary_enabled = True
+    state.block_size = 128
+    state.tail_at = 96
+    # Decode does not wait between the chunk that stops at the generation
+    # prompt and the 4 prompt tokens after it.
+    assert _advance(scheduler) == (["a"], [])
+    assert chunks == [[("a", 96)], [("a", 4)]]
+
+
+def test_a_guard_pause_before_the_generation_prompt_keeps_the_pack(monkeypatch):
+    scheduler = _make_packed_scheduler()
+    forwards = _record_packed_forwards(monkeypatch)
+    eviction = PrefillEvictionRequest(
+        request_id="a",
+        model_id="test",
+        current_bytes=1,
+        target_cap_bytes=1,
+        predicted_transient_bytes=1,
+        requested_tokens=3,
+        reason="adaptive_prefill_throttle",
+    )
+    plan = Scheduler._plan_prefill_chunk
+
+    def plan_with_guard(self, state, **kwargs):
+        if state.tokens_processed == 5 and kwargs.get("guarded", True):
+            raise _PrefillEvictionNeeded(eviction)
+        return plan(self, state, **kwargs)
+
+    monkeypatch.setattr(Scheduler, "_plan_prefill_chunk", plan_with_guard)
+    states = []
+    for request_id in ("a", "b"):
+        _, state = _stage_prefill(scheduler, request_id, 9)
+        state.boundary_enabled = True
+        state.block_size = 64
+        state.tail_at = 5
+        states.append(state)
+    # Both rows keep the packed chunk and leave the prompt tail to a later step.
+    assert _advance(scheduler) == ([], [])
+    assert forwards == [[("a", 5), ("b", 5)]]
+    assert scheduler._packed_prefill_disabled is None
+    assert [state.tokens_processed for state in states] == [5, 5]

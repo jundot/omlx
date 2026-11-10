@@ -333,6 +333,36 @@ class TestFlatOverhead:
         assert t.flat_overhead_bytes_for(False) == 400 * self.MB
         assert t.flat_overhead_bytes_for(True) == 0
 
+    def test_chunk_is_charged_the_overhead_measured_up_to_its_width(self):
+        t = PrefillTransientTracker("qwen4")
+        # Qwen3.8-Flash-Next prefill chunks on an M5 Max: width, growth, static.
+        for width, delta, static in (
+            (8192, 5130, 2220),
+            (2048, 1580, 605),
+            (32, 148, 9),
+        ):
+            t.observe_flat_overhead(
+                width,
+                delta * self.MB,
+                static_bytes=static * self.MB,
+                gathered_core=True,
+            )
+        t.record_flat_reclaim(8192 * self.MB)
+        assert t.flat_overhead_charge_for(True) == 2910 * self.MB
+        assert t.flat_overhead_charge_for(True, 32) == 139 * self.MB
+        assert t.flat_overhead_charge_for(True, 1024) == 975 * self.MB
+        assert t.flat_overhead_charge_for(True, 4096) == 2910 * self.MB
+        # Wider than any measured chunk: the largest overhead still applies.
+        assert t.flat_overhead_charge_for(True, 16384) == 2910 * self.MB
+
+        # A narrower chunk that grew more raises the charge of wider ones.
+        t.observe_flat_overhead(
+            512, 1200 * self.MB, static_bytes=140 * self.MB, gathered_core=True
+        )
+        assert t.flat_overhead_charge_for(True, 1024) == 1060 * self.MB
+        assert t.flat_overhead_charge_for(True, 32) == 139 * self.MB
+        assert t.flat_overhead_charge_for(False, 32) == 0
+
 
 class TestPoolReleaseAccounting:
     def test_repeated_releases_accumulate_without_exceeding_observed_overhead(self):

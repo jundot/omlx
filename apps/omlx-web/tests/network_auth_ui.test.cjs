@@ -8,11 +8,12 @@ const source = fs.readFileSync(
 );
 function fixture(defaults, defaultsOK = true) {
     const requests = [];
+    const win = {t: key => key, location: {reload() {}}, confirm: () => true};
     const create = vm.runInNewContext(source + '\n dashboard;', {
         URL, console,
         localStorage: {getItem: () => null},
         THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
-        window: {t: key => key, location: {reload() {}}}, navigator: {language: 'en'}, document: {},
+        window: win, navigator: {language: 'en'}, document: {},
         setTimeout: () => {},
         fetch: async (url, options) => {
             if (url.endsWith('/defaults')) {
@@ -26,7 +27,7 @@ function fixture(defaults, defaultsOK = true) {
     state.globalSettings.model.model_dirs = ['/tmp/models'];
     state.loadStats = async () => {};
     state.loadModels = async () => {};
-    return {state, requests};
+    return {state, requests, win};
 }
 
 test('loopback classification matches the backend fixtures', () => {
@@ -78,6 +79,24 @@ test('expanded and mapped IPv6 loopback preserve local no-auth mode', async () =
     }
 });
 
+test('keyless inference turns on only after the warning is accepted', async () => {
+    const {state, requests, win} = fixture();
+    const prompts = [];
+    for (const accepted of [false, true]) {
+        win.confirm = message => { prompts.push(message); return accepted; };
+        state.toggleUnauthenticatedInference();
+        assert.equal(state.globalSettings.auth.allow_unauthenticated_inference, accepted);
+    }
+    assert.deepEqual(prompts, Array(2).fill('settings.auth.keyless_inference_confirm'));
+    state.globalSettings.server.host = '0.0.0.0';
+    state.globalSettings.auth.api_key = 'test-key';
+    await state.saveGlobalSettings();
+    assert.equal(requests[0].allow_unauthenticated_inference, true);
+    assert.equal(requests[0].skip_api_key_verification, false);
+    state.toggleUnauthenticatedInference();
+    assert.equal(prompts.length, 2);
+    assert.equal(state.globalSettings.auth.allow_unauthenticated_inference, false);
+});
 
 test('reset stages defaults and preserves paths and credentials until Save', async () => {
     const defaults = JSON.parse(JSON.stringify(fixture().state.globalSettings));
@@ -195,4 +214,20 @@ test('the rate reaches the progress line and both queue templates', () => {
     );
     assert.ok(template.split('x-text="formatProgress(task)"').length - 1 >= 2);
     assert.ok(template.split('formatSpeed(task)').length - 1 >= 2);
+});
+
+test('the ETA joins the progress line only while it is known', () => {
+    const {state, win} = fixture();
+    win.t = key => (key === 'models.queue.eta' ? '{time} left' : key);
+    assert.equal(state.formatEta(9000), '2h 30m left');
+    assert.equal(state.formatEta(125), '2m 5s left');
+    assert.equal(state.formatEta(42), '42s left');
+    const task = {
+        progress: 9,
+        downloaded_size: 536870912,
+        total_size: 1073741824,
+        speed_bps: 45298483.2,
+    };
+    assert.ok(state.formatProgress({...task, eta_seconds: 42}).endsWith('MB/s \u00b7 42s left'));
+    assert.ok(state.formatProgress({...task, eta_seconds: null}).endsWith('MB/s'));
 });

@@ -90,3 +90,30 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
     app.oqSelectedModelPath = 'llama';
     assert.ok(app.oqAvailableLevels().includes(8));
 }
+
+(async () => {
+    // A separate context keeps this fetch stub away from the modal test above.
+    const oqContext = {localStorage: {getItem: () => null}, window: {t: k => k}, console};
+    vm.createContext(oqContext);
+    vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js'), 'utf8'), oqContext);
+    const app = oqContext.dashboard();
+    app.oqModels = [
+        {path: 'v41', model_type: 'deepseek_v41'},
+        {path: 'llama', model_type: 'llama'},
+    ];
+    const payloads = [];
+    oqContext.fetch = async (_url, init) => {
+        payloads.push(JSON.parse(init.body));
+        return {ok: false, json: async () => ({detail: 'stop'})};
+    };
+    app.oqPreserveNgram = true;
+    for (const model of ['v41', 'llama']) {
+        app.oqSelectedModelPath = model;
+        await app.startOQQuantization();
+    }
+    assert.deepEqual(payloads.map(p => p.preserve_ngram_table), [true, false]);
+    const html = fs.readFileSync(path.join(root,
+        'omlx_web/templates/dashboard/_models.html'), 'utf8');
+    assert.match(html.match(/x-effect="([^"\n]*oqApplyModelPolicy[^"\n]*)"/)[1], /oqPreserveNgram/);
+    console.log('PASS: Engram toggle reaches the oQ start payload for DeepSeek V4.1 only');
+})().catch(error => {console.error(error); process.exitCode = 1});

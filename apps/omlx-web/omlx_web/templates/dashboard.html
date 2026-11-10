@@ -8,7 +8,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="min-h-screen bg-white flex flex-col" x-data="dashboard()" x-init="init()">
+<div class="min-h-screen bg-white flex flex-col" x-data="dashboard()">
     <!-- Navigation Bar -->
     {% include "dashboard/_navbar.html" %}
 
@@ -22,6 +22,14 @@
         </div>
 
         <div class="mx-auto px-4 sm:px-6 py-6 sm:py-10 relative z-10" :class="mainTab === 'status' ? dashboardWidthClass : 'max-w-7xl'">
+            <!-- This Mac runs another Mac's Prefill Accelerator helper. -->
+            <div x-show="prefillLending" x-cloak
+                 class="mb-6 bg-amber-50 border border-amber-200 rounded-2xl px-5 py-4 flex items-center justify-between gap-4">
+                <p class="text-sm text-amber-900" x-text="prefillLendingText()"></p>
+                <button type="button" @click="stopPrefillLending()"
+                        class="flex-shrink-0 px-4 py-1.5 text-sm font-medium rounded-full bg-amber-600 text-white hover:bg-amber-700">{{ t('dashboard.prefill_lending_stop') }}</button>
+            </div>
+
             <!-- Status Main Tab -->
             {% include "dashboard/_status.html" %}
 
@@ -104,10 +112,12 @@
 {% block scripts %}
 <script src="{{ static('js/purify.min.js') }}"></script>
 <script src="{{ static('js/marked.umd.js') }}"></script>
+<script src="{{ static('js/count_format.js') }}"></script>
 <script src="{{ static('js/usage.js') }}"></script>
 <script src="{{ static('js/cluster_v2.js') }}"></script>
 <script src="{{ static('js/gridstack-all.js') }}"></script>
 <script src="{{ static('js/dashboard_layout.js') }}"></script>
 <script src="{{ static('js/logs.js') }}"></script>
+<script src="{{ static('js/theme_preview.js') }}"></script>
 <script src="{{ static('js/dashboard.js') }}"></script>
 {% endblock %}

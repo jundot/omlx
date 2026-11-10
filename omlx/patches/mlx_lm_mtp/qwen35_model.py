@@ -52,6 +52,8 @@ import logging
 from types import SimpleNamespace
 from typing import Any, Optional
 
+from mlx_lm.models.base import gather_last_axis
+
 from . import prompt_priming
 
 logger = logging.getLogger(__name__)
@@ -569,6 +571,9 @@ def _patch_text_model(q35: Any) -> None:
             out = self.model.embed_tokens.as_linear(normed)
         else:
             out = self.lm_head(normed)
+            # Tensor parallelism splits the lm_head over the vocabulary.
+            if self.sharding_group is not None:
+                out = gather_last_axis(out, self.sharding_group)
         if observe:
             drafter.observe(scope, captured)
             return out

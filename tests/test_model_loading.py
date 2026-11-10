@@ -7,6 +7,7 @@ import sys
 import types
 from unittest.mock import MagicMock
 
+import mlx_lm.utils as mlx_lm_utils
 import pytest
 
 from omlx.utils import model_loading
@@ -461,6 +462,24 @@ class TestVlmMtpPreLoadDispatch:
         attach_mock.assert_called_once_with(False)
         assert calls == ["attach=False", "sanitize", "runtime"]
 
+    def test_vlm_attach_follows_weights_outside_mtp_branch(self, tmp_path, monkeypatch):
+        # MiniCPM-V 4.7 builds its language model from the patched Qwen3.5
+        # MoE classes but is not an MTP-compatible model_type. Without a
+        # reset it reuses the attach flag of the previous VLM load.
+        _, _, runtime_mock, attach_mock = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "minicpmv4_7", "vision_config": {}, '
+            '"text_config": {"model_type": "qwen3_5_moe_text", '
+            '"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=False)
+
+        maybe_apply_pre_load_patches(path, for_vlm=True)
+
+        attach_mock.assert_called_once_with(False)
+        runtime_mock.assert_not_called()
+
     def test_vlm_patches_skipped_when_not_for_vlm(self, tmp_path, monkeypatch):
         # BatchedEngine / LLM loader paths must NOT touch
         # mlx-vlm classes even when the model declares MTP heads. for_vlm
@@ -628,7 +647,8 @@ class TestVlmMtpPreLoadDispatch:
 
     def test_gemma4_without_mtp_heads_skips_mtp_patches(self, tmp_path, monkeypatch):
         # Plain gemma4 VLMs (no merged assistant) must stay untouched by
-        # the MTP dispatch — no declared heads, no runtime patch.
+        # the MTP dispatch — no declared heads, no runtime patch. The attach
+        # flag is still reset so a previous load cannot leak into this one.
         calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
             monkeypatch
         )
@@ -641,7 +661,7 @@ class TestVlmMtpPreLoadDispatch:
         maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
 
         runtime_mock.assert_not_called()
-        attach_mock.assert_not_called()
+        attach_mock.assert_called_once_with(False)
         assert "runtime" not in calls
 
     def test_qwen36_moe_vlm_sanitize_when_no_mtp_heads(self, tmp_path, monkeypatch):
@@ -662,7 +682,7 @@ class TestVlmMtpPreLoadDispatch:
 
         sanitize_mock.assert_called_once()
         runtime_mock.assert_not_called()
-        assert calls == ["sanitize"]
+        assert calls == ["attach=False", "sanitize"]
 
     def test_qwen36_moe_vlm_sanitize_skipped_without_for_vlm(
         self, tmp_path, monkeypatch
@@ -1131,6 +1151,40 @@ class TestExpandPerLayerQuantKeys:
             assert (
                 cfg[config_key]["language_model.mtp.0.block.self_attn." + half] is False
             )
+
+
+def test_mlx_lm_load_config_drops_minimax_expert_global_scale_flags(monkeypatch):
+    # Cluster ranks load MiniMax M3.1 NVFP4 experts through mlx-lm.
+    switch = "language_model.model.layers.3.block_sparse_moe.switch_mlp.gate_proj"
+    monkeypatch.setattr(
+        mlx_lm_utils,
+        "load_config",
+        lambda _model_path: {
+            "model_type": "minimax_m3_vl",
+            "text_config": {"n_shared_experts": 1},
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "mode": "affine",
+                switch: {
+                    "bits": 4,
+                    "group_size": 16,
+                    "mode": "nvfp4",
+                    "global_scale": True,
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(model_loading, "_MLX_LM_LOAD_CONFIG_PATCHED", False)
+
+    model_loading._patch_mlx_lm_load_config()
+    config = mlx_lm_utils.load_config("unused")
+
+    spec = {"bits": 4, "group_size": 16, "mode": "nvfp4"}
+    assert config["quantization"][switch] == spec
+    assert config["quantization"][f"inner.{switch}"] == spec
+    assert config["text_config"]["routed_expert_scales"] is True
+    assert config["text_config"]["pack_shared_expert"] is False
 
 
 class TestMaterializeLazyState:

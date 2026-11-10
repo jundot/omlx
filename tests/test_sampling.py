@@ -26,6 +26,7 @@ from omlx.utils.sampling import (
     categorical_sampling,
     make_sampler,
     make_shared_sampler,
+    select_logprobs,
 )
 
 
@@ -388,3 +389,28 @@ def test_no_repeat_ngram_matches_reference(dtype):
         assert {i for i, b in enumerate(banned) if b} == expected
         kept = mx.logical_not(mx.isinf(out))
         assert mx.array_equal(mx.where(kept, out, 0), mx.where(kept, logits, 0)).item()
+
+
+@pytest.mark.parametrize(
+    ("dtype", "tol"), [(mx.bfloat16, 0.07), (mx.float16, 0.01), (mx.float32, 1e-5)]
+)
+def test_select_logprobs_reads_batch_rows_on_host(dtype, tol):
+    rng = np.random.default_rng(0)
+    logits = mx.array(
+        np.stack([rng.permutation(64) * 0.25 - 8 for _ in range(3)]), dtype=dtype
+    )
+    rows = list(logits - mx.logsumexp(logits, axis=-1, keepdims=True))
+    mx.eval(rows)
+    ref = logits.astype(mx.float32)
+    ref = np.array(ref - mx.logsumexp(ref, axis=-1, keepdims=True))
+
+    chosen, top = select_logprobs(rows[1], 5, 3)
+
+    assert chosen == pytest.approx(ref[1, 5], abs=tol)
+    assert [token for token, _ in top] == np.argsort(-ref[1])[:3].tolist()
+    assert [value for _, value in top] == pytest.approx(
+        np.sort(ref[1])[::-1][:3], abs=tol
+    )
+    assert select_logprobs(rows[1], 5, 0)[1] == []
+    forced = mx.array([-float("inf"), 0.0, -float("inf")])
+    assert select_logprobs(forced, 1, 3) == (0.0, [(1, 0.0)])

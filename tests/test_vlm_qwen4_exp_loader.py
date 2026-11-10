@@ -100,7 +100,6 @@ async def test_only_qwen4_exp_loader_defers_parameter_eval_to_materialize(
 
     monkeypatch.setattr(vlm_utils, "load", stop_after_load)
     monkeypatch.setattr(vlm_module, "_patch_video_processor_bug", lambda: None)
-    monkeypatch.setattr(vlm_module, "_patch_torch_free_image_processor", lambda: None)
     monkeypatch.setattr(vlm_module, "apply_pixtral_torch_free_patch", lambda: None)
     monkeypatch.setattr(
         model_loading, "maybe_apply_pre_load_patches", lambda *a, **k: None

@@ -11,6 +11,19 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import pytest
 
+import omlx.patches.qwen35_fa256_attention as patch
+
+_needs_metal = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+# The real gate, kept before the fixture below replaces it on the module.
+_m1_gate = patch._m1_sdpa_enabled
+
+
+@pytest.fixture(autouse=True)
+def _steel_route_only(monkeypatch):
+    # These tests exercise the steel-kernel route; on M1 hosts the chunked
+    # MLX SDPA route (M1 section at the end of this file) would intercept first.
+    monkeypatch.setattr(patch, "_m1_sdpa_enabled", lambda: False)
+
 
 def _qkv(q_len=128, kv_len=None, dtype=mx.bfloat16):
     kv_len = q_len if kv_len is None else kv_len
@@ -120,7 +133,7 @@ def test_vlm_patch_routes_and_passes_through(monkeypatch):
 
     monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
     monkeypatch.setattr(
-        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+        patch._attention_fast, "fa256_supports_dispatch_budget", lambda: True
     )
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
 
@@ -161,7 +174,7 @@ def test_kernel_failure_keeps_registered_bounded_route(monkeypatch):
         patch, "_native_kernel", lambda: MagicMock(side_effect=RuntimeError("boom"))
     )
     monkeypatch.setattr(
-        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+        patch._attention_fast, "fa256_supports_dispatch_budget", lambda: True
     )
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
     bounded = MagicMock(return_value="bounded")
@@ -190,7 +203,7 @@ def test_dispatch_budget_uses_auto_calibration(monkeypatch):
 
     monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
     monkeypatch.setattr(
-        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+        patch._attention_fast, "fa256_supports_dispatch_budget", lambda: True
     )
     monkeypatch.setattr(patch, "_auto_dispatch_budget", lambda *a, **k: 777)
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
@@ -218,7 +231,7 @@ def test_dispatch_budget_zeroed_on_old_extension(monkeypatch):
 
     monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
     monkeypatch.setattr(
-        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: False
+        patch._attention_fast, "fa256_supports_dispatch_budget", lambda: False
     )
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
 
@@ -237,27 +250,16 @@ def test_apply_skips_on_nax_gpu(monkeypatch):
     assert patch.apply_qwen35_fa256_attention_patch() is False
 
 
-def test_qwen_native_symbols_are_not_registered_on_glm_extension():
-    from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-
-    assert not glm_fast.has_symbol("qwen35_fa256_attention")
-    assert not glm_fast.has_symbol("qwen35_q4_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_q5_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_q6_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_q8_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_moe_weighted_sum")
-
-
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
 def test_native_fa256_matches_mlx_reference_small():
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.attention import fast
 
-    if not fast.has_symbol("qwen35_fa256_attention"):
-        pytest.skip("native qwen35_fa256_attention is unavailable")
+    if not fast.has_symbol("fa256_attention"):
+        pytest.skip("native fa256_attention is unavailable")
 
     q, k, v = _qkv(128)
     scale = 1.0 / math.sqrt(256)
-    out = fast.qwen35_fa256_attention(q, k, v, scale, causal=True)
+    out = fast.fa256_attention(q, k, v, scale, causal=True)
     ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal")
     mx.eval(out, ref)
 
@@ -273,14 +275,14 @@ def test_native_fa256_matches_mlx_reference_small():
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
 def test_auto_dispatch_budget_calibrates_within_clamp():
     import omlx.patches.qwen35_fa256_attention as patch
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.attention import fast
 
-    if not fast.has_symbol("qwen35_fa256_attention"):
-        pytest.skip("native qwen35_fa256_attention is unavailable")
+    if not fast.has_symbol("fa256_attention"):
+        pytest.skip("native fa256_attention is unavailable")
     if not fast.fa256_supports_dispatch_budget():
         pytest.skip("extension predates chunked dispatch")
 
-    budget = patch._auto_dispatch_budget(fast.qwen35_fa256_attention, 32, 8)
+    budget = patch._auto_dispatch_budget(fast.fa256_attention, 32, 8)
     assert patch._MIN_AUTO_BUDGET <= budget <= patch._MAX_AUTO_BUDGET
 
 
@@ -297,19 +299,19 @@ def test_native_fa256_chunked_matches_single_dispatch(q_len, kv_len):
     # The dispatch budget splits the key axis into separately dispatched
     # chunks combined by logsumexp weights (issue #2225); the result must
     # match the single-dispatch kernel up to combine rounding.
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.attention import fast
 
-    if not fast.has_symbol("qwen35_fa256_attention"):
-        pytest.skip("native qwen35_fa256_attention is unavailable")
+    if not fast.has_symbol("fa256_attention"):
+        pytest.skip("native fa256_attention is unavailable")
     if not fast.fa256_supports_dispatch_budget():
         pytest.skip("extension predates chunked dispatch")
 
     q, k, v = _qkv(q_len, kv_len)
     scale = 1.0 / math.sqrt(256)
-    single = fast.qwen35_fa256_attention(q, k, v, scale, causal=True, dispatch_budget=0)
+    single = fast.fa256_attention(q, k, v, scale, causal=True, dispatch_budget=0)
     # Budget forcing ~8 chunks for these shapes.
     budget = (24 * q_len * kv_len) // 8
-    chunked = fast.qwen35_fa256_attention(
+    chunked = fast.fa256_attention(
         q, k, v, scale, causal=True, dispatch_budget=budget
     )
     mx.eval(single, chunked)
@@ -317,3 +319,120 @@ def test_native_fa256_chunked_matches_single_dispatch(q_len, kv_len):
     diff = mx.max(mx.abs(single.astype(mx.float32) - chunked.astype(mx.float32))).item()
     assert not mx.isnan(chunked.astype(mx.float32)).any().item()
     assert diff < 5e-3
+
+
+# --- M1 route: query-chunked MLX SDPA ---------------------------------------
+
+
+def _reference(q, k, v, scale):
+    """Dense end-aligned causal attention in fp32 (GQA by head repeat)."""
+    q32, k32, v32 = (t.astype(mx.float32) for t in (q, k, v))
+    rep = q.shape[1] // k.shape[1]
+    k32 = mx.repeat(k32, rep, axis=1)
+    v32 = mx.repeat(v32, rep, axis=1)
+    scores = (q32 * scale) @ k32.transpose(0, 1, 3, 2)
+    q_len, kv_len = q.shape[2], k.shape[2]
+    rows = mx.arange(q_len)[:, None] + (kv_len - q_len)
+    cols = mx.arange(kv_len)[None, :]
+    scores = mx.where(cols <= rows, scores, -mx.inf)
+    return mx.softmax(scores, axis=-1) @ v32
+
+
+@_needs_metal
+@pytest.mark.parametrize(
+    "q_len,kv_len,rows",
+    [(256, 1024, 64), (200, 777, 64), (128, 128, 32), (96, 2048, 96)],
+)
+@pytest.mark.parametrize("heads", [(8, 2), (6, 1)])
+def test_chunked_sdpa_matches_dense_causal(q_len, kv_len, rows, heads):
+    hq, hkv = heads
+    mx.random.seed(0)
+    q = mx.random.normal((1, hq, q_len, 256)).astype(mx.float16)
+    k = mx.random.normal((1, hkv, kv_len, 256)).astype(mx.float16)
+    v = mx.random.normal((1, hkv, kv_len, 256)).astype(mx.float16)
+    scale = 256**-0.5
+    out = patch._m1_chunked_sdpa(q, k, v, scale, rows)
+    ref = _reference(q, k, v, scale)
+    assert out.shape == q.shape
+    assert mx.max(mx.abs(out.astype(mx.float32) - ref)).item() < 2e-2
+
+
+def test_query_rows_respect_work_budget_and_floor():
+    # 2048-row chunk, 24 q heads: shrinks with depth, never below 64 rows
+    assert patch._m1_query_rows(24, 2048, 16384) == 256
+    assert patch._m1_query_rows(24, 2048, 32768) == 128
+    assert patch._m1_query_rows(24, 2048, 65536) == 64
+    assert patch._m1_query_rows(24, 2048, 98304) == 64
+    # ~128k keys: even 64 rows exceed the max dispatch work -> steel kernel
+    assert patch._m1_query_rows(24, 2048, 131072) == 0
+    # 16-head MoE layout keeps the M1 route a little deeper
+    assert patch._m1_query_rows(16, 2048, 131072) == 64
+    # short calls run in one dispatch
+    assert patch._m1_query_rows(24, 512, 4096) == 512
+
+
+def test_route_follows_the_gpu_generation(monkeypatch):
+    from omlx.utils import hardware
+
+    gate = _m1_gate.__wrapped__
+    monkeypatch.setattr(hardware, "get_apple_gpu_generation", lambda: 13)
+    assert gate()
+    monkeypatch.setattr(hardware, "get_apple_gpu_generation", lambda: 15)
+    assert not gate()
+
+
+@_needs_metal
+def test_d512_route_shape_gates(monkeypatch):
+    monkeypatch.setattr(patch, "_m1_sdpa_enabled", lambda: True)
+    q = mx.zeros((1, 16, 64, 512), dtype=mx.float16)
+    short = mx.zeros((1, 2, 1024, 512), dtype=mx.float16)
+    # below the key threshold, wrong head_dim, array mask, sinks: not routed
+    assert patch._m1_d512_attention(q, short, short, None, 0.04, "causal", None) is None
+    q256 = mx.zeros((1, 16, 64, 256), dtype=mx.float16)
+    k256 = mx.zeros((1, 2, 40000, 256), dtype=mx.float16)
+    assert (
+        patch._m1_d512_attention(q256, k256, k256, None, 0.04, "causal", None) is None
+    )
+    monkeypatch.setattr(patch, "_M1_D512_MIN_KV", 256)
+    k = mx.zeros((1, 2, 300, 512), dtype=mx.float16)
+    assert (
+        patch._m1_d512_attention(q, k, k, None, 0.04, mx.zeros((64, 300)), None) is None
+    )
+    assert (
+        patch._m1_d512_attention(q, k, k, None, 0.04, "causal", mx.zeros((16,))) is None
+    )
+    monkeypatch.setattr(patch, "_m1_sdpa_enabled", lambda: False)
+    assert patch._m1_d512_attention(q, k, k, None, 0.04, "causal", None) is None
+
+
+@_needs_metal
+def test_d512_route_matches_dense_causal(monkeypatch):
+    monkeypatch.setattr(patch, "_m1_sdpa_enabled", lambda: True)
+    monkeypatch.setattr(patch, "_M1_D512_MIN_KV", 256)
+    monkeypatch.setattr(patch, "_M1_SDPA_WORK", 16 * 32 * 300)  # force several blocks
+    mx.random.seed(3)
+    q = mx.random.normal((1, 16, 96, 512)).astype(mx.float16)
+    k = mx.random.normal((1, 2, 300, 512)).astype(mx.float16)
+    out = patch._m1_d512_attention(q, k, k, None, 512**-0.5, "causal", None)
+    assert out is not None and out.shape == q.shape
+    ref = _reference(q, k, k, 512**-0.5)
+    assert mx.max(mx.abs(out.astype(mx.float32) - ref)).item() < 2e-2
+
+
+@_needs_metal
+def test_chunked_sdpa_blocks_share_one_scratch_size(monkeypatch):
+    # Blocks of different sizes leave MLX's buffer cache holding GBs of
+    # scratch it cannot reuse; every block must see the same key length.
+    seen = []
+    real = mx.fast.scaled_dot_product_attention
+
+    def spy(q, k, v, **kwargs):
+        seen.append((k.shape, kwargs["mask"].shape if hasattr(kwargs["mask"], "shape") else None))
+        return real(q, k, v, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", spy)
+    q = mx.random.normal((1, 8, 256, 64)).astype(mx.float16)
+    k = mx.random.normal((1, 2, 4096, 64)).astype(mx.float16)
+    patch._m1_chunked_sdpa(q, k, k, 0.125, 64)
+    assert len(seen) == 4
+    assert len(set(seen)) == 1

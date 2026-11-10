@@ -835,7 +835,7 @@ def _unfused_combine(moe, x):
 
 @pytest.mark.parametrize("T", [4, 96])
 def test_moe_fused_combine_matches_unfused_combine(T):
-    """Top-8 routing combines through glm_moe_weighted_sum (sorted prefill)."""
+    """Top-8 routing combines through moe_weighted_sum (sorted prefill)."""
     moe, x = _quantized_moe(_load_patch_module(), T)
     assert moe._fused_combine
     out = moe(x)

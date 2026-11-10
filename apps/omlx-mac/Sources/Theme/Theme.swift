@@ -347,3 +347,24 @@ extension Font {
         .system(size: size, weight: weight, design: .monospaced)
     }
 }
+
+// MARK: - Type ramp
+
+/// Font sizes for `.omlxText`, `.omlxMono` and `.omlxDisplay`.
+/// Each step is the point size of the macOS text style it is named after.
+enum DesignTokens {
+    enum FontSize {
+        /// Footnote, caption 1 and caption 2.
+        static let caption: CGFloat = 10
+        static let subheadline: CGFloat = 11
+        static let callout: CGFloat = 12
+        /// Body and headline.
+        static let body: CGFloat = 13
+        static let title3: CGFloat = 15
+        static let title2: CGFloat = 17
+        static let title1: CGFloat = 22
+        static let largeTitle: CGFloat = 26
+        /// Welcome hero. No macOS text style is this large.
+        static let hero: CGFloat = 48
+    }
+}

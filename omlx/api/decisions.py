@@ -25,17 +25,28 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
+from pydantic import ValidationError
 
 from ..models.decision import round4
-from ..models.openjev import choice_confidence, compose_groups, score_confidence
+from ..models.openjev import (
+    choice_confidence,
+    compose_groups,
+    description_text,
+    score_confidence,
+)
 from .decisions_models import (
     ChoiceQuestion,
+    DecisionChoiceOption,
     DecisionInputImage,
+    DecisionInputMessage,
+    DecisionInputText,
     DecisionRequest,
+    DecisionScoreLevel,
     PredicateQuestion,
     ScoreQuestion,
     choice_key,
 )
+from .systemone_models import SystemOneRequest
 
 LETTERS = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
 PREDICATE_OPTIONS = [
@@ -211,14 +222,16 @@ async def _readout(
     return _Readout((weights / weights.sum()).tolist(), *tokens)
 
 
-async def _answer_question(
+async def _readout_options(
     chat: Callable,
     parts: list[dict],
     multimodal: bool,
     letter_ids: list[list[int]],
-    question: Any,
-) -> tuple[dict, list[_Readout]]:
-    instructions, options = question_options(question)
+    instructions: str,
+    options: list[tuple[str, str]],
+    require_answer: bool = True,
+) -> tuple[list[float] | None, list[_Readout]]:
+    """Compose group probabilities until the winners fit in one readout."""
     groups = option_groups(len(options))
     readouts = [
         await _readout(
@@ -228,12 +241,12 @@ async def _answer_question(
             letter_ids,
             instructions,
             [options[i] for i in group],
-            require_answer=len(groups) == 1,
+            require_answer=require_answer and len(groups) == 1,
         )
         for group in groups
     ]
     if any(r.probs is None for r in readouts):
-        return {"type": "refusal", "name": question.name}, readouts
+        return None, readouts
     if len(readouts) == 1:
         probs = readouts[0].probs
     else:
@@ -242,14 +255,34 @@ async def _answer_question(
             options[group[int(np.argmax(p))]]
             for group, p in zip(groups, parts_probs, strict=True)
         ]
-        final = await _readout(
-            chat, parts, multimodal, letter_ids, instructions, winners
+        final_probs, final_readouts = await _readout_options(
+            chat, parts, multimodal, letter_ids, instructions, winners, require_answer
         )
-        readouts.append(final)
-        if final.probs is None:
-            return {"type": "refusal", "name": question.name}, readouts
-        probs = compose_groups(parts_probs, final.probs)
-    return build_answer(question, probs), readouts
+        readouts.extend(final_readouts)
+        if final_probs is None:
+            return None, readouts
+        probs = compose_groups(parts_probs, final_probs)
+    return probs, readouts
+
+
+async def _answer_question(
+    chat: Callable,
+    parts: list[dict],
+    multimodal: bool,
+    letter_ids: list[list[int]],
+    question: Any,
+    require_answer: bool = True,
+) -> tuple[dict, list[_Readout]]:
+    instructions, options = question_options(question)
+    probs, readouts = await _readout_options(
+        chat, parts, multimodal, letter_ids, instructions, options, require_answer
+    )
+    answer = (
+        {"type": "refusal", "name": question.name}
+        if probs is None
+        else build_answer(question, probs)
+    )
+    return answer, readouts
 
 
 def build_answer(question: Any, probs: list[float]) -> dict:
@@ -289,11 +322,13 @@ async def decide(
     request: DecisionRequest,
     multimodal: bool,
     prepare: Callable[[list[dict]], dict] | None = None,
+    require_answer: bool = True,
 ) -> dict:
     """Answer every question with a chat model; returns answers and tokens.
 
     ``prepare`` checks the messages of each readout before it runs and
-    returns extra ``engine.chat`` kwargs.
+    returns extra ``engine.chat`` kwargs. ``require_answer=False`` skips the
+    letter-mass check.
     """
     parts = input_parts(request)
     if not multimodal and any(p["type"] == "image_url" for p in parts):
@@ -306,7 +341,9 @@ async def decide(
         return await engine.chat(messages=messages, **kwargs)
 
     async def answer(question):
-        return await _answer_question(chat, parts, multimodal, letter_ids, question)
+        return await _answer_question(
+            chat, parts, multimodal, letter_ids, question, require_answer
+        )
 
     # The first readout fills the prefix cache for the shared input.
     first = await answer(request.questions[0])
@@ -422,4 +459,99 @@ def from_systemone(request: DecisionRequest, answers: dict) -> list[dict]:
                     "confidence": answer["confidence"],
                 }
             )
+    return result
+
+
+def decisions_request(request: SystemOneRequest) -> DecisionRequest:
+    """Decisions request for a System One request to a chat model."""
+    if request.videos:
+        raise DecisionsRequestError("this model does not take videos")
+    # model_construct skips the Decisions API limits, which System One lacks.
+    questions = []
+    for name, question in request.questions.items():
+        criteria = question.criteria
+        instructions = description_text(question.instructions) or name
+        if question.type == "score":
+            if not isinstance(criteria, list) or not criteria:
+                raise DecisionsRequestError(
+                    "score criteria must be a non-empty array of levels"
+                )
+            levels = [DecisionScoreLevel(label=description_text(c)) for c in criteria]
+            questions.append(
+                ScoreQuestion.model_construct(
+                    type="score", name=name, instructions=instructions, levels=levels
+                )
+            )
+            continue
+        if question.type == "choice":
+            if not isinstance(criteria, dict) or not criteria:
+                raise DecisionsRequestError(
+                    "choice criteria must be a non-empty map of option to "
+                    "description or null"
+                )
+            options = [(key, description_text(desc)) for key, desc in criteria.items()]
+        else:
+            if criteria is not None and not isinstance(criteria, dict):
+                raise DecisionsRequestError("noul criteria must be an object")
+            criteria = criteria or {}
+            # Same prompt as a predicate; criteria replace the option texts.
+            options = [
+                (value, description_text(criteria.get(side)) or default)
+                for (value, default), side in zip(
+                    PREDICATE_OPTIONS, ("true", "false"), strict=True
+                )
+            ]
+        choices = [DecisionChoiceOption(value=v, description=d) for v, d in options]
+        questions.append(
+            ChoiceQuestion.model_construct(
+                type="choice", name=name, instructions=instructions, choices=choices
+            )
+        )
+    text = description_text(request.state)
+    content: Any = text
+    if request.images:
+        try:
+            images = [
+                DecisionInputImage(type="input_image", image_url=url)
+                for url in request.images
+            ]
+        except ValidationError as e:
+            raise DecisionsRequestError(
+                "images must be base64 data URLs (data:image/...)"
+            ) from e
+        text_part = DecisionInputText(type="input_text", text=text)
+        content = [DecisionInputMessage(content=[*images, text_part])]
+    return DecisionRequest.model_construct(
+        model=request.model, input=content, questions=questions
+    )
+
+
+def systemone_answers(request: SystemOneRequest, answers: list[dict]) -> dict:
+    """System One answers from the answers to :func:`decisions_request`."""
+    result = {}
+    for (name, question), answer in zip(
+        request.questions.items(), answers, strict=True
+    ):
+        if answer["type"] == "refusal":
+            raise DecisionsRequestError(
+                f"the model gives no finite option score for question {name!r}"
+            )
+        probs = [p["probability"] for p in answer["probabilities"]]
+        if question.type == "noul":
+            result[name] = {"type": "noul", "noul": probs[0]}
+        elif question.type == "choice":
+            result[name] = {
+                "type": "choice",
+                "choice": answer["choice"],
+                "confidence": answer["confidence"],
+                "probabilities": dict(zip(question.criteria, probs, strict=True)),
+            }
+        else:
+            result[name] = {
+                "type": "score",
+                "score": answer["score"],
+                "confidence": answer["confidence"],
+                "legend": {str(i): level for i, level in enumerate(question.criteria)},
+                "probabilities": {str(i): p for i, p in enumerate(probs)},
+            }
     return result

@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 import mlx.core as mx
 
+from . import gguf
 from .engine import BaseEngine, BatchedEngine
 from .engine.decision import DecisionEngine
 from .engine.embedding import EmbeddingEngine
@@ -43,8 +44,12 @@ from .engine.splash import (
     SplashTarget,
     find_splash_binary,
     resolve_splash_target,
+    splash_draft_to_download,
     splash_memory_estimate,
     splash_repo_id,
+)
+from .engine.splash import (
+    scan_ssd_cache as scan_splash_ssd_cache,
 )
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
@@ -63,20 +68,28 @@ from .exceptions import (
 )
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
-    discover_models,
+    detect_model_type,
     format_size,
     is_realtime_stt_model,
 )
+from .custom_kernels.quant_matmul import fast as quant_fast
 from .model_settings import (
+    ModelSettings,
+    a8_prefill_on,
+    ced_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
+from .prefill_helper.adapters import adapter_for as prefill_stage_adapter
+from .prefill_helper.lending import lending_note
+from .prefill_helper.manager import prepare as prepare_prefill_helper
 from .scheduler import SchedulerConfig
 from .settings import get_settings as get_global_settings
 from .speculative.dflash import context_bytes_per_row, load_dflash_drafter
-from .utils.fatal import exit_if_gpu_submissions_ignored
+from .utils.fatal import exit_if_gpu_submissions_ignored, is_command_buffer_error
 from .utils.generation_config import SAMPLING_SETTING_KEYS, load_sampling_defaults
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.model_loading import (
@@ -88,6 +101,14 @@ from .utils.model_loading import (
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
+
+
+def _gguf_model_root() -> Path | None:
+    """Where GGUF model folders are generated; None before settings load."""
+    try:
+        return get_global_settings().base_path / "gguf"
+    except RuntimeError:
+        return None
 
 
 def _touch_gpu() -> None:
@@ -108,9 +129,56 @@ def _touch_gpu() -> None:
 # with a resident model still lets the GPU reach its idle power state.
 _GPU_KEEP_WARM_IDLE_WINDOW_S = 300.0
 
+# Claude Desktop tier alias slots. When ``ClaudeCodeSettings.desktop_enabled``
+# is set, oMLX exposes these slot IDs as derived (non-persisted) model IDs
+# that resolve at runtime to the models configured in the Claude Code tiers.
+# Each entry maps the public slot ID to the tier attribute name on the
+# Claude Code settings object (``opus_model`` / ``sonnet_model`` /
+# ``haiku_model``).
+CLAUDE_DESKTOP_TIER_SLOTS: tuple[tuple[str, str], ...] = (
+    ("claude-opus", "opus"),
+    ("claude-sonnet", "sonnet"),
+    ("claude-haiku", "haiku"),
+)
+
+# Anthropic family tier label exposed per slot in /v1/models metadata.
+CLAUDE_DESKTOP_TIER_FAMILY: dict[str, str] = {
+    "claude-opus": "opus",
+    "claude-sonnet": "sonnet",
+    "claude-haiku": "haiku",
+}
+
+
+def build_claude_tier_aliases(claude_code_settings) -> dict[str, str]:
+    """Build slot-ID -> tier-model map from Claude Code settings.
+
+    Returns an empty dict when ``desktop_enabled`` is falsy. Tiers with no
+    configured model (None/empty) are omitted, so their slot is neither
+    exposed nor resolved. Duck-typed on purpose: anything exposing
+    ``desktop_enabled`` / ``<tier>_model`` attributes works.
+    """
+    if claude_code_settings is None or not getattr(
+        claude_code_settings, "desktop_enabled", False
+    ):
+        return {}
+    aliases: dict[str, str] = {}
+    for slot_id, tier in CLAUDE_DESKTOP_TIER_SLOTS:
+        target = getattr(claude_code_settings, f"{tier}_model", None)
+        if target:
+            aliases[slot_id] = target
+    return aliases
+
+
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+# Prompt room the expert-offload residency hint keeps below the prompt line.
+# Measured on 30B-class MoE: about a 16K-token prompt.
+_MOE_OFFLOAD_PROMPT_RESERVE = 4 * 1024**3
+_MOE_OFFLOAD_PERCENTS = range(5, 96)
+# Cluster ranks load the text model through mlx-lm, so a VLM-classified
+# checkpoint is served text-only while its deployment is active.
+_CLUSTER_ENGINE_TYPES = frozenset({"batched", "vlm"})
 
 
 def _positive_int(value: object) -> int:
@@ -242,7 +310,11 @@ def _settled_phys_footprint() -> int:
 
 
 def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
-    while exc is not None:
+    # Track visited exceptions: a cause chain can loop (an exception raised
+    # ``from`` itself), and this runs on the event loop during a failed load.
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
         text = str(exc)
         if (
             "kIOGPUCommandBufferCallbackErrorOutOfMemory" in text
@@ -309,6 +381,7 @@ class EngineEntry:
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
+    realtime_voice: bool = False  # Its model type and config allow /v1/realtime
     thinking_default: bool | None = (
         None  # True if model thinks by default, False if not, None if unknown
     )
@@ -324,6 +397,8 @@ class EngineEntry:
     source_type: str = "local"
     source_repo_id: str | None = None
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+    model_format: str | None = None  # "gguf": served by an external engine only
+    source_path: str | None = None  # The GGUF file a generated folder links to
     engine: (
         BaseEngine
         | EmbeddingEngine
@@ -500,7 +575,7 @@ class EnginePool:
             deployment = getattr(entry.engine, "deployment", None)
             return deployment if isinstance(deployment, ClusterDeployment) else None
         registry = self._cluster_registry
-        if registry is None or entry.engine_type != "batched":
+        if registry is None or entry.engine_type not in _CLUSTER_ENGINE_TYPES:
             return None
         return registry.get_for_model(entry.model_path)
 
@@ -530,13 +605,18 @@ class EnginePool:
         *,
         base_size: int | None = None,
         include_ane_reservation: bool = True,
+        log_decision: bool = True,
     ) -> int:
-        """Include Engram runtime storage and optional K2 ANE reservations."""
+        """Include Engram runtime storage and optional K2 ANE reservations.
+
+        ``log_decision=False`` sizes hypothetical settings without logging or
+        recording forced offload decisions.
+        """
 
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
-        if getattr(runtime_settings, "external_engine", None):
+        if self.external_engine_id(entry.model_id, runtime_settings):
             # Splash plans its own budget; none of the MLX reservations apply.
             target, _ = self.splash_target(entry.model_id, runtime_settings)
             if target is not None:
@@ -544,7 +624,7 @@ class EnginePool:
                 limit = self._splash_admission_target()
                 return min(wanted, limit) if limit > 0 else wanted
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
-            entry, runtime_settings
+            entry, runtime_settings, log_decision=log_decision
         )
         if qwen4_estimate is not None:
             base = min(
@@ -554,7 +634,7 @@ class EnginePool:
                 else qwen4_estimate.resident_bytes,
             )
         v41_offload, _, v41_estimate = self._deepseek_v41_engram_offload_status(
-            entry, runtime_settings
+            entry, runtime_settings, log_decision=log_decision
         )
         if v41_estimate is not None:
             base = (
@@ -568,12 +648,13 @@ class EnginePool:
             # retain the quantized estimate. One additional model-sized charge
             # is conservative and lets normal admission produce useful errors.
             extra = entry.estimated_size
-            logger.warning(
-                "Could not determine Qwen CPU-share geometry for %s; "
-                "reserving one additional model-sized memory allowance",
-                entry.model_id,
-            )
-        if extra > 0:
+            if log_decision:
+                logger.warning(
+                    "Could not determine Qwen CPU-share geometry for %s; "
+                    "reserving one additional model-sized memory allowance",
+                    entry.model_id,
+                )
+        if extra > 0 and log_decision:
             logger.info(
                 "Qwen CPU sharing adds %s to the projected memory for %s",
                 format_size(extra),
@@ -631,6 +712,14 @@ class EnginePool:
             entry.config_model_type, entry.engine_type
         ):
             extra += self._dflash_drafter_estimated_bytes(drafter_id, runtime_settings)
+        elif getattr(runtime_settings, "mtp_enabled", False) and (
+            entry.config_model_type in ("minimax_m3", "minimax_m3_vl")
+        ):
+            # Lightning MTP loads MiniMax's bundled DSpark draft, which takes
+            # neither the DFlash quantization nor the window setting.
+            dspark_path = bundled_dspark_path(entry.model_path)
+            if dspark_path is not None:
+                extra += self._dflash_drafter_estimated_bytes(str(dspark_path), None)
         return base + extra
 
     def _dflash_drafter_estimated_bytes(
@@ -679,6 +768,104 @@ class EnginePool:
         footprint = int(estimate.resident_bytes / 1.05)
         return footprint > line >= estimate.mmap_bytes
 
+    def moe_offload_fit(
+        self, entry: EngineEntry, settings: object | None, ceiling: int
+    ) -> dict:
+        """Largest expert residency percent that leaves prompt room.
+
+        The budget is the scheduler's prompt line, (ceiling - hot cache) x
+        tier headroom, less other loaded models and
+        ``_MOE_OFFLOAD_PROMPT_RESERVE``. ``status`` is ``unknown`` (no line),
+        ``resident`` (no offload needed), ``fit`` or ``no_fit``.
+        """
+        result = {
+            "status": "unknown",
+            "max_percent": None,
+            "bytes": 0,
+            "reserve_bytes": _MOE_OFFLOAD_PROMPT_RESERVE,
+        }
+        enforcer = getattr(self, "_process_memory_enforcer", None)
+        headroom = getattr(enforcer, "_prefill_headroom_safety", None)
+        if not isinstance(headroom, (int, float)) or not 0 < headroom <= 1:
+            return result
+        if ceiling <= 0 or self._distributed_deployment_for_entry(entry) is not None:
+            return result
+        if self.external_engine_id(entry.model_id, settings):
+            return result
+        # Prompts are admitted under min(headroom, hard watermark).
+        ratio = min(headroom, getattr(enforcer, "_hard_threshold", headroom))
+        hot_cache = int(getattr(self._scheduler_config, "hot_cache_max_size", 0) or 0)
+        others = self._current_model_memory
+        if entry.engine is not None:
+            others -= self._entry_resident_size(entry)
+        budget = (
+            int((ceiling - hot_cache) * ratio) - others - _MOE_OFFLOAD_PROMPT_RESERVE
+        )
+        # A loaded entry's runtime size already includes its offload, so start
+        # from the checkpoint like a fresh load does.
+        base = entry.estimated_size
+        if entry.text_only_size and entry.engine_type == "batched":
+            base = entry.text_only_size
+
+        def probe(percent: int | None, table_on_ssd: bool = False) -> object:
+            p = copy.copy(settings) if settings is not None else ModelSettings()
+            p.moe_expert_offload_enabled = percent is not None
+            if percent is not None:
+                p.moe_expert_offload_resident_fraction = percent / 100
+            if table_on_ssd:
+                p.qwen4_ple_ssd_offload = True
+                p.deepseek_v41_engram_ssd_offload = True
+            return p
+
+        def table_forced(p: object) -> bool:
+            """Whether the load would move a PLE or Engram table to mmap itself."""
+            _, ple, _ = self._qwen4_ple_offload_status(entry, p, log_decision=False)
+            _, engram, _ = self._deepseek_v41_engram_offload_status(
+                entry, p, log_decision=False
+            )
+            return (ple and not getattr(p, "qwen4_ple_ssd_offload", False)) or (
+                engram and not getattr(p, "deepseek_v41_engram_ssd_offload", False)
+            )
+
+        def fit_size(p: object, allow_forced: bool = False) -> int | None:
+            size = self._entry_runtime_resident_size(
+                entry, p, base_size=base, log_decision=False
+            )
+            if size > budget or (not allow_forced and table_forced(p)):
+                return None
+            return size
+
+        def largest(fits) -> tuple[int, int] | None:
+            best = None
+            lo, hi = 0, len(_MOE_OFFLOAD_PERCENTS)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                fitted = fits(_MOE_OFFLOAD_PERCENTS[mid])
+                if fitted is None:
+                    hi = mid
+                else:
+                    best, lo = (_MOE_OFFLOAD_PERCENTS[mid], fitted), mid + 1
+            return best
+
+        if fit_size(probe(None)) is not None:
+            result["status"] = "resident"
+            return result
+        # Sizes grow with the percent until a table is forced to mmap, then
+        # drop and grow again. Prefer the table where the settings put it;
+        # else take the largest percent the forced mmap fits.
+        best = largest(lambda pc: fit_size(probe(pc)))
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if best is None and model_type in ("qwen4_exp", "deepseek_v41"):
+            mmap = largest(lambda pc: fit_size(probe(pc, True), allow_forced=True))
+            if mmap is not None and table_forced(probe(mmap[0])):
+                best = mmap
+        if best is None:
+            result["status"] = "no_fit"
+        else:
+            result["status"] = "fit"
+            result["max_percent"], result["bytes"] = best
+        return result
+
     def _log_offload_decision_once(
         self,
         model_id: str,
@@ -712,6 +899,7 @@ class EnginePool:
         settings: object | None,
         *,
         ceiling: int | None = None,
+        log_decision: bool = True,
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
 
@@ -764,19 +952,20 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        self._log_offload_decision_once(
-            entry.model_id,
-            "qwen4_ple_ssd_offload",
-            forced,
-            "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
-            "room to serve prompts under the %.1fGB memory ceiling (mmap "
-            "needs %.1fGB). Decode will be roughly 2.5x slower than a "
-            "resident load.",
-            entry.model_id,
-            estimate.resident_bytes / 1e9,
-            ceiling / 1e9,
-            estimate.mmap_bytes / 1e9,
-        )
+        if log_decision:
+            self._log_offload_decision_once(
+                entry.model_id,
+                "qwen4_ple_ssd_offload",
+                forced,
+                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
+                "room to serve prompts under the %.1fGB memory ceiling (mmap "
+                "needs %.1fGB). Decode will be roughly 2.5x slower than a "
+                "resident load.",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -808,6 +997,7 @@ class EnginePool:
         settings: object | None,
         *,
         ceiling: int | None = None,
+        log_decision: bool = True,
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced DeepSeek V4.1 Engram mmap mode for this process."""
 
@@ -854,18 +1044,19 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        self._log_offload_decision_once(
-            entry.model_id,
-            "deepseek_v41_engram_ssd_offload",
-            forced,
-            "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
-            "no room to serve prompts under the %.1fGB memory ceiling (mmap "
-            "needs %.1fGB).",
-            entry.model_id,
-            estimate.resident_bytes / 1e9,
-            ceiling / 1e9,
-            estimate.mmap_bytes / 1e9,
-        )
+        if log_decision:
+            self._log_offload_decision_once(
+                entry.model_id,
+                "deepseek_v41_engram_ssd_offload",
+                forced,
+                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB "
+                "leaves no room to serve prompts under the %.1fGB memory "
+                "ceiling (mmap needs %.1fGB).",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
         requested = bool(
             settings is not None
             and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
@@ -1113,6 +1304,10 @@ class EnginePool:
         if mtp_active:
             add("mtp_adaptive_max_depth", data.get("mtp_adaptive_max_depth"))
             add("mtp_fixed_depth", data.get("mtp_fixed_depth"))
+        add(
+            "activation_fp16_enabled",
+            bool(data.get("activation_fp16_enabled", False)),
+        )
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
@@ -1126,7 +1321,7 @@ class EnginePool:
             add("deepseek_v41_engram_ssd_offload", v41_offload)
             add(
                 "deepseek_v41_ced_prefill_enabled",
-                getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
+                ced_prefill_on(settings),
             )
             factor = yarn_factor(
                 entry.config_model_type,
@@ -1139,6 +1334,7 @@ class EnginePool:
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
         if turboquant_active:
+            add("turboquant_kv_scheme", data.get("turboquant_kv_scheme", "turboquant"))
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
@@ -1146,10 +1342,21 @@ class EnginePool:
         # process-wide projection backends, and caches a prepared plan and
         # metadata on every module it classifies. None of that can be undone
         # in place, so a change here has to land on a fresh engine.
-        oq_a8_active = bool(data.get("qwen35_oq_a8_enabled", False))
-        add("qwen35_oq_a8_enabled", oq_a8_active)
+        # Without INT8 tensor units here, A8 only reaches a Prefill Accelerator
+        # Mac's layers, which follow it without reloading this model. DeepSeek
+        # V4.1 tensor-parallel ranks load A8 by their own hardware, so it reloads.
+        deployment = (
+            self._distributed_deployment_for_entry(entry) if entry is not None else None
+        )
+        rank_a8 = (
+            deployment is not None
+            and deployment.tensor_parallel_size > 1
+            and entry.config_model_type == "deepseek_v41"
+        )
+        oq_a8_active = a8_prefill_on(data) and (quant_fast.oq_a8_available() or rank_a8)
+        add("a8_prefill_enabled", oq_a8_active)
         if oq_a8_active:
-            add("qwen35_oq_a8_min_tokens", data.get("qwen35_oq_a8_min_tokens", 128))
+            add("a8_prefill_min_tokens", data.get("a8_prefill_min_tokens", 128))
 
         ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
         model_type = entry.config_model_type if entry else None
@@ -1347,10 +1554,8 @@ class EnginePool:
             dirs = [Path(d) for d in model_dirs]
         self._model_dirs = dirs
 
-        if len(dirs) == 1:
-            discovered = discover_models(dirs[0])
-        else:
-            discovered = discover_models_from_dirs(dirs)
+        gguf_root = _gguf_model_root()
+        discovered = discover_models_from_dirs(dirs, gguf_root)
 
         pinned_set = set(pinned_models or [])
 
@@ -1373,6 +1578,7 @@ class EnginePool:
                     estimated_size=info.estimated_size,
                     text_only_size=getattr(info, "text_only_size", 0),
                     config_model_type=getattr(info, "config_model_type", ""),
+                    realtime_voice=getattr(info, "realtime_voice", False),
                     thinking_default=getattr(info, "thinking_default", None),
                     preserve_thinking_default=getattr(
                         info, "preserve_thinking_default", None
@@ -1382,6 +1588,8 @@ class EnginePool:
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
                     is_helper=getattr(info, "is_helper", False),
+                    model_format=getattr(info, "model_format", None),
+                    source_path=getattr(info, "source_path", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -1400,6 +1608,13 @@ class EnginePool:
         ]
         for mid in stale:
             del self._entries[mid]
+        if gguf_root is not None:
+            # Loaded models keep their folder until they unload.
+            in_use = [
+                *(entry.model_path for entry in self._entries.values()),
+                *(info.model_path for info in discovered.values()),
+            ]
+            gguf.prune_model_folders(gguf_root, {Path(path).name for path in in_use})
 
         # Warn about pinned models not found
         found_models = set(self._entries.keys())
@@ -1565,10 +1780,10 @@ class EnginePool:
         if not matches:
             raise ModelNotFoundError(model_path, list(self._entries.keys()))
         model_id, entry = self._select_cluster_path_match(matches)
-        if entry.engine_type != "batched":
+        if entry.engine_type not in _CLUSTER_ENGINE_TYPES:
             raise ValueError(
                 f"Model '{model_id}' is a {entry.model_type} model. "
-                "Distributed cluster inference currently supports text LLM "
+                "Distributed cluster inference supports text generation "
                 "models only."
             )
         return model_id
@@ -1603,11 +1818,11 @@ class EnginePool:
         ]
         if exact:
             model_id, entry = self._select_cluster_path_match(exact)
-            if entry.engine_type != "batched":
+            if entry.engine_type not in _CLUSTER_ENGINE_TYPES:
                 raise ValueError(
                     f"Model '{model_id}' is already registered as "
                     f"{entry.model_type}; stop or remove that local model "
-                    "before activating it as a text cluster model."
+                    "before activating it as a cluster model."
                 )
             return model_id, False
 
@@ -1633,7 +1848,8 @@ class EnginePool:
         self._entries[model_id] = EngineEntry(
             model_id=model_id,
             model_path=str(path),
-            model_type="llm",
+            # Matches the local entry, so media input is refused the same way.
+            model_type="vlm" if detect_model_type(path) == "vlm" else "llm",
             engine_type="batched",
             estimated_size=int(estimated_size),
             config_model_type=str(config.get("model_type") or ""),
@@ -1715,7 +1931,12 @@ class EnginePool:
     ) -> None:
         """Drop stale unloaded entries whose backing model directory vanished."""
         model_path = Path(entry.model_path)
-        if model_path.exists() and (model_path / "config.json").exists():
+        source = entry.source_path
+        if (
+            model_path.exists()
+            and (model_path / "config.json").exists()
+            and (source is None or Path(source).exists())
+        ):
             return
 
         if entry.engine is None:
@@ -1766,14 +1987,23 @@ class EnginePool:
                 return mid
         return None
 
-    def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
+    def resolve_model_id(
+        self,
+        model_id_or_alias: str,
+        settings_manager,
+        claude_tier_aliases: dict[str, str] | None = None,
+    ) -> str:
         """Resolve a model alias to its actual model_id (directory name).
 
         Tries exact match in _entries first, then case-insensitive match,
         then active cluster deployment IDs, exposed profile model IDs, and
-        model settings aliases. If those fail and input contains a provider
-        prefix (e.g. "omlx/my-model"), strips the prefix and retries. Returns
-        the original string if no match is found.
+        model settings aliases. Claude Desktop tier aliases (derived at
+        runtime from the Claude Code tier models, passed via
+        ``claude_tier_aliases``) resolve AFTER exact directory matches and
+        custom ``model_alias`` entries, so a real model or user alias with
+        the same name always wins. If those fail and input contains a
+        provider prefix (e.g. "omlx/my-model"), strips the prefix and
+        retries. Returns the original string if no match is found.
         """
         if model_id_or_alias in self._entries:
             return model_id_or_alias
@@ -1814,6 +2044,13 @@ class EnginePool:
                 if ms.model_alias and ms.model_alias == model_id_or_alias:
                     return mid
 
+        # Claude Desktop tier aliases are derived at runtime and resolve only
+        # after exact directory matches and custom aliases.
+        if claude_tier_aliases:
+            tier_target = claude_tier_aliases.get(model_id_or_alias)
+            if tier_target is not None:
+                return tier_target
+
         # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
         if "/" in model_id_or_alias:
             stripped = model_id_or_alias.split("/", 1)[1]
@@ -1826,6 +2063,10 @@ class EnginePool:
                 for mid, ms in all_settings.items():
                     if ms.model_alias and ms.model_alias == stripped:
                         return mid
+            if claude_tier_aliases:
+                tier_target = claude_tier_aliases.get(stripped)
+                if tier_target is not None:
+                    return tier_target
 
         return model_id_or_alias
 
@@ -1938,6 +2179,19 @@ class EnginePool:
             self._splash_draft_candidates(model_settings),
         )
 
+    def splash_draft_to_download(
+        self, model_id: str, model_settings: object | None
+    ) -> str | None:
+        """The DFlash2 draft repo ``model_id`` lacks for Splash, or None."""
+        entry = self._entries.get(model_id)
+        if entry is None:
+            return None
+        return splash_draft_to_download(
+            entry.model_path,
+            get_global_settings().integrations.splash_path,
+            self._splash_draft_candidates(model_settings),
+        )
+
     def _splash_sizing_context(
         self, entry: EngineEntry, model_settings: object | None
     ) -> int | None:
@@ -2011,23 +2265,47 @@ class EnginePool:
             get_settings = getattr(self._settings_manager, "get_settings", None)
             if callable(get_settings):
                 settings = get_settings(model_id)
-        if getattr(settings, "external_engine", None):
+        if self.external_engine_id(model_id, settings):
             await asyncio.to_thread(
                 find_splash_binary, get_global_settings().integrations.splash_path
             )
 
-    def _external_engine_for(
+    async def external_engine_problem(
+        self, model_id: str, model_settings: object | None
+    ) -> str:
+        """Why no external engine can serve ``model_id``; empty when one can."""
+        await self._check_splash_launcher(model_id, model_settings)
+        _, reason = self.splash_target(model_id, model_settings)
+        return reason
+
+    def external_engine_id(
+        self, model_id: str, model_settings: object | None
+    ) -> str | None:
+        """The external engine that serves ``model_id``, else None.
+
+        A GGUF, which no in-process engine loads, falls back to the default
+        external engine when its settings pick none.
+        """
+        engine_id = getattr(model_settings, "external_engine", None)
+        if engine_id:
+            return engine_id
+        entry = self._entries.get(model_id)
+        if entry is not None and entry.model_format == "gguf":
+            return next(iter(EXTERNAL_ENGINES))
+        return None
+
+    def _selected_splash_target(
         self,
         entry: EngineEntry,
         model_settings: object | None,
         effective_type: str,
-    ) -> SplashEngine | None:
-        """The external engine the model's settings select, else None.
+    ) -> SplashTarget | None:
+        """The Splash target the model's settings select, else None.
 
         A model that cannot run on its selected engine fails to load with the
         reason instead of falling back to MLX, since the user asked for it.
         """
-        engine_id = getattr(model_settings, "external_engine", None)
+        engine_id = self.external_engine_id(entry.model_id, model_settings)
         if not engine_id:
             return None
         if engine_id not in EXTERNAL_ENGINES:
@@ -2043,6 +2321,18 @@ class EnginePool:
             raise ModelLoadingError(
                 entry.model_id, f"Splash cannot serve '{entry.model_id}': {reason}"
             )
+        return target
+
+    def _external_engine_for(
+        self,
+        entry: EngineEntry,
+        model_settings: object | None,
+        effective_type: str,
+    ) -> SplashEngine | None:
+        """The external engine the model's settings select, else None."""
+        target = self._selected_splash_target(entry, model_settings, effective_type)
+        if target is None:
+            return None
         logger.info(
             "Serving %s through %s %s (%s)",
             entry.model_id,
@@ -2067,6 +2357,26 @@ class EnginePool:
         # Only an explicit limit goes to Splash; otherwise Splash fits the
         # context to its budget and the server adopts what it planned.
         requested_context = getattr(model_settings, "max_context_window", None)
+        budget = self._splash_memory_budget(entry, model_settings, target)
+        if requested_context and budget < splash_memory_estimate(
+            entry.model_path,
+            target.draft_path,
+            requested_context,
+            integrations.splash_kv_format,
+        ):
+            # The budget cannot hold the explicit limit (the room under the
+            # memory limit shrank, or splash_max_memory_gb is small), and
+            # Splash refuses to start on a limit it cannot hold. Without it
+            # Splash fits the context to the budget, and the server still
+            # caps prompts at the configured limit.
+            logger.warning(
+                "Splash: a %.1fGB budget cannot hold the %d-token context of "
+                "%s; letting Splash fit the context to the budget",
+                budget / 1024**3,
+                requested_context,
+                entry.model_id,
+            )
+            requested_context = None
         return SplashEngine(
             model_name=entry.model_path,
             model_id=entry.model_id,
@@ -2075,9 +2385,7 @@ class EnginePool:
             log_dir=settings.logging.get_log_dir(settings.base_path) / "splash",
             options=SplashOptions(
                 max_context=requested_context,
-                max_memory_bytes=self._splash_memory_budget(
-                    entry, model_settings, target
-                ),
+                max_memory_bytes=budget,
                 kv_format=integrations.splash_kv_format,
                 ane_prefill=integrations.splash_ane_prefill,
                 cache_disk_bytes=cache_disk_bytes,
@@ -2098,6 +2406,30 @@ class EnginePool:
             except Exception:  # noqa: BLE001
                 logger.debug("external process memory read failed", exc_info=True)
         return total
+
+    def _start_prefill_helper_early(self, entry: Any, settings: Any) -> bool:
+        """Start the chosen Prefill Accelerator while this Mac loads the model."""
+        node_id = getattr(settings, "prefill_helper_node_id", None)
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        adapter = prefill_stage_adapter(model_type)
+        if node_id is None or adapter is None:
+            return False
+        prepare_prefill_helper(
+            entry.model_path,
+            adapter,
+            node_id,
+            getattr(settings, "prefill_helper_layers", None),
+            launch={
+                "model_type": model_type,
+                "warm_tokens": self._scheduler_config.prefill_step_size,
+                "a8_min_tokens": (
+                    int(getattr(settings, "a8_prefill_min_tokens", 128))
+                    if a8_prefill_on(settings)
+                    else None
+                ),
+            },
+        )
+        return True
 
     def _validate_llm_engine_ready(self, model_id: str, engine: object | None) -> None:
         if engine is None:
@@ -2558,6 +2890,9 @@ class EnginePool:
             runtime_load_settings = (
                 load_settings if ngram_admission_override else runtime_settings
             )
+            # Without a Splash target the size below falls back to the files'
+            # in-process footprint, so report why Splash cannot serve first.
+            self._selected_splash_target(entry, load_settings, entry.engine_type)
             admission_size = self._entry_runtime_resident_size(
                 entry,
                 load_settings,
@@ -2716,6 +3051,7 @@ class EnginePool:
                             f"({failure_label}: {format_size(failure_current)}, "
                             f"{admission_kind}: {format_size(admission_size)}). "
                             f"{advice or DEFAULT_CEILING_ADVICE}."
+                            f"{lending_note()}"
                         ),
                     )
 
@@ -2780,6 +3116,36 @@ class EnginePool:
         self._lease_release_tasks.add(task)
         task.add_done_callback(self._finish_lease_release_task)
         await asyncio.shield(task)
+
+    async def clear_splash_ssd_cache(self, cache_root: Path) -> int:
+        """Stop idle Splash writers before deleting their persistent cache."""
+        async with self._lock:
+            entries = [
+                entry
+                for entry in self._entries.values()
+                if isinstance(entry.engine, SplashEngine) and entry.engine.ssd_cache_dir
+            ]
+            for entry in entries:
+                if (
+                    entry.is_loading
+                    or entry.pending_unload_reason
+                    or not self._entry_is_quiescent(entry)
+                ):
+                    raise ModelBusyError(entry.model_id, "delete Splash SSD cache")
+            roots = {cache_root}
+            reason = "delete Splash SSD cache"
+            for entry in entries:
+                roots.add(entry.engine.ssd_cache_dir.parent)
+                # The ready-engine fast path bypasses the pool lock.
+                entry.pending_unload_reason = reason
+            try:
+                for entry in entries:
+                    await self._unload_engine(entry.model_id)
+                return sum(scan_splash_ssd_cache(root, clear=True)[0] for root in roots)
+            finally:
+                for entry in entries:
+                    if entry.pending_unload_reason == reason:
+                        entry.pending_unload_reason = None
 
     async def unload_if_idle_unpinned(self, model_id: str) -> bool:
         """Unload a loaded engine only when it is idle and not pinned."""
@@ -3026,9 +3392,9 @@ class EnginePool:
                         continue
                     if not ane_release_attempted:
                         # Last rung before giving up: shed the requesting
-                        # model's own ANE prefill banks. They hold the packed
-                        # weight blobs mapped into the native programs (~13 GB
-                        # for a 27B at the default fractions) and are purely
+                        # model's own ANE prefill banks. The ANE driver wires
+                        # their program weights during prefill (~7 GiB for a
+                        # 27B at the default fractions) and they are purely
                         # an accelerator — the per-module failure-latch
                         # fallback serves the same modules on GPU — so at
                         # long context the trade is a slower-but-unthrottled
@@ -3236,12 +3602,10 @@ class EnginePool:
     ) -> int:
         """Release the requesting model's ANE prefill banks; report bytes freed.
 
-        The compiled banks keep the packed weight blobs mapped into the
-        native ANE programs for the model's whole residency, so a config
-        tuned at a short calibration length silently competes with the KV
-        cache at long context — on a 27B at mlp 0.35 / gdn 0.45 the banks
-        hold ~13 GB, which is the difference between full 2048-token prefill
-        chunks and the guard throttling to the floor. Shedding them is safe:
+        The ANE driver wires the banks' program weights during every
+        prefill (about 7 GiB on a 27B at the default split), which the
+        admission estimate reserves on top of the KV cache at long context.
+        Shedding them is safe:
         the release latches every sliced module through the existing
         per-module failure flags, so the dispatch sites fall back to stock
         GPU compute exactly as they do after a warmup failure. The banks are
@@ -3311,8 +3675,8 @@ class EnginePool:
             )
             return 0
         freed = max(0, before - get_phys_footprint())
-        # The load-time admission reservation priced these I/O surfaces; drop
-        # it so later passes stop pausing for memory that no longer exists.
+        # The load-time admission reservation priced these program weights;
+        # drop it so later passes stop pausing for memory that no longer exists.
         # The next load re-prices it from the rebuilt banks.
         monitor = getattr(getattr(core, "scheduler", None), "memory_monitor", None)
         if monitor is not None and hasattr(monitor, "clear_ane_prefill_transient"):
@@ -3389,7 +3753,7 @@ class EnginePool:
         try:
             await loop.run_in_executor(get_mlx_executor(), sync_clear)
         except RuntimeError as e:
-            if "Command buffer execution failed" not in str(e):
+            if not is_command_buffer_error(e):
                 raise
             exit_if_gpu_submissions_ignored(e)
             # A failed prefill can leave this error pending. MLX clears it when
@@ -3698,6 +4062,42 @@ class EnginePool:
         self._failed_load_reclaim_tasks.add(task)
         task.add_done_callback(self._finish_failed_load_reclaim_task)
 
+    @staticmethod
+    async def _start_engine(engine) -> None:
+        """Drain startup before stopping an engine whose acquisition was cancelled."""
+        if isinstance(engine, SplashEngine):
+            # Splash stops its subprocess when readiness is cancelled; do not
+            # defer that cleanup until its startup timeout expires.
+            await engine.start()
+            return
+        task = asyncio.create_task(engine.start())
+        cancelled = False
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+        finally:
+            if cancelled:
+                # start() can own a running core while awaiting a loader thread.
+                # Keep that thread alive until startup settles, then stop the
+                # unregistered engine before _load_engine clears is_loading.
+                with suppress(Exception, asyncio.CancelledError):
+                    task.result()
+                stop_task = asyncio.create_task(engine.stop())
+                try:
+                    while not stop_task.done():
+                        with suppress(asyncio.CancelledError):
+                            await asyncio.shield(stop_task)
+                    stop_task.result()
+                except Exception:
+                    logger.warning(
+                        "Error stopping engine after cancelled startup", exc_info=True
+                    )
+                raise asyncio.CancelledError
+        task.result()
+
     async def _load_engine(
         self,
         model_id: str,
@@ -3791,7 +4191,7 @@ class EnginePool:
 
             # An external engine replaces every in-process engine.
             engine = self._external_engine_for(entry, model_settings, effective_type)
-            deployment = deployment if effective_type == "batched" else None
+            deployment = deployment if effective_type in _CLUSTER_ENGINE_TYPES else None
             # Decision models never decode, so speculative decoding settings
             # saved for the same checkpoint do not apply.
             if (
@@ -3868,6 +4268,8 @@ class EnginePool:
                             model_settings, "enable_thinking", None
                         ),
                         model_settings=model_settings,
+                        vision_checkpoint=entry.model_type == "vlm",
+                        config_model_type=entry.config_model_type,
                     )
                     logger.info(
                         "Distributed inference enabled for %s: ranks=%d "
@@ -3928,8 +4330,11 @@ class EnginePool:
 
             if isinstance(engine, SplashEngine):
                 self._starting_external[model_id] = engine
+            early_helper = hasattr(
+                type(engine), "prefill_helper"
+            ) and self._start_prefill_helper_early(entry, model_settings)
             try:
-                await engine.start()
+                await self._start_engine(engine)
             except Exception as start_error:
                 if isinstance(engine, SplashEngine):
                     # start() already stopped Splash; its error carries the
@@ -3962,7 +4367,7 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
                     try:
-                        await engine.start()
+                        await self._start_engine(engine)
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"LM load failed (force_lm=True): {start_error}; "
@@ -3998,7 +4403,7 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
                     try:
-                        await engine.start()
+                        await self._start_engine(engine)
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"VLM load failed: {start_error}; "
@@ -4015,6 +4420,9 @@ class EnginePool:
                     raise
             finally:
                 self._starting_external.pop(model_id, None)
+                if early_helper and getattr(engine, "prefill_helper", None) is None:
+                    # No loaded model will take the started helper over.
+                    prepare_prefill_helper(entry.model_path, None, None, None)
 
             # Check if memory enforcer requested abort during loading
             if entry.abort_loading:
@@ -4095,6 +4503,35 @@ class EnginePool:
                     drafter = None
                 if drafter is not None:
                     engine.set_dflash_drafter(drafter)
+
+            # MiniMax M3.1 bundles its DSpark draft in dspark/; Lightning MTP
+            # runs it through the same block-drafter verify path.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "mtp_enabled", False)
+                and entry.config_model_type in ("minimax_m3", "minimax_m3_vl")
+                and hasattr(engine, "set_dflash_drafter")
+            ):
+                dspark_path = bundled_dspark_path(entry.model_path)
+                fixed = getattr(model_settings, "mtp_fixed_depth", None)
+                depth = fixed or getattr(model_settings, "mtp_adaptive_max_depth", None)
+                if dspark_path is not None:
+                    try:
+                        drafter = await asyncio.get_running_loop().run_in_executor(
+                            get_mlx_executor(),
+                            load_minimax_dspark_drafter,
+                            dspark_path,
+                            engine.vlm_model,
+                            depth,
+                            bool(fixed),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"MiniMax DSpark drafter load raised for {model_id}: "
+                            f"{e} -- Lightning MTP stays off"
+                        )
+                    else:
+                        engine.set_dflash_drafter(drafter)
 
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.
@@ -4207,6 +4644,10 @@ class EnginePool:
                 f"full model: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
+        except asyncio.CancelledError:
+            if not load_completed:
+                self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            raise
         except Exception as exc:
             # A failed load can leave tens of GB of just-loaded weights
             # reachable only through the propagating exception's traceback
@@ -4360,6 +4801,8 @@ class EnginePool:
                     "realtime_stt": is_realtime_stt_model(
                         e.model_type, e.config_model_type
                     ),
+                    # d1 decision checkpoints share lfm3_omni but run on the decision engine.
+                    "realtime_voice": e.engine_type == "vlm" and e.realtime_voice,
                     "model_context_length": e.model_context_length,
                     "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,
@@ -4367,6 +4810,8 @@ class EnginePool:
                     "reasoning_efforts": e.reasoning_efforts,
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
+                    "model_format": e.model_format,
+                    "source_path": e.source_path,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
             )

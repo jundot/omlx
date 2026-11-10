@@ -381,7 +381,7 @@ def test_qwen4_decode_sdpa_fails_closed_when_native_shape_is_rejected(monkeypatc
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
 
-    from omlx.custom_kernels.decode_fast import fast
+    from omlx.custom_kernels.attention import fast
 
     q = mx.random.normal((1, 4, 1, 8))
     k = mx.random.normal((1, 2, 9, 8))
@@ -408,7 +408,7 @@ def test_qwen4_decode_sdpa_uses_native_only_after_capability_accepts(monkeypatch
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
 
-    from omlx.custom_kernels.decode_fast import fast
+    from omlx.custom_kernels.attention import fast
 
     q = mx.random.normal((1, 24, 1, 256)).astype(mx.bfloat16)
     k = mx.random.normal((1, 2, 2051, 256)).astype(mx.bfloat16)
@@ -697,6 +697,38 @@ def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
     )
 
 
+def test_qwen4_decode_rows_never_read_back_rank_three_positions(monkeypatch):
+    """A one-row step never takes gathered prefill, so the host comparison of
+    its rank-three positions (a GPU sync per step) is never made."""
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    cache = _crossover_cache(config, attention)
+    checked = []
+
+    def broadcast_check(position_ids, length):
+        checked.append(length)
+        return True
+
+    monkeypatch.setattr(language, "_broadcast_text_mrope_position_ids", broadcast_check)
+    row = mx.random.normal((1, 1, config.hidden_size))
+    row_planes = mx.full((3, 1, 1), cache.offset, dtype=mx.int32)
+    assert not attention._gathered_text_prefill_eligible(
+        row, "causal", cache, row_planes, None, False
+    )
+    assert checked == []
+
+    wide = mx.random.normal((1, 16, config.hidden_size))
+    wide_planes = mx.broadcast_to(
+        (cache.offset + mx.arange(16, dtype=mx.int32))[None, None], (3, 1, 16)
+    )
+    assert attention._gathered_text_prefill_eligible(
+        wide, "causal", cache, wide_planes, None, False
+    )
+    assert checked == [16]
+
+
 def test_qwen4_trim_keeps_pooled_index_prefix_exact():
     """trim() clamps the pooled frontier instead of re-pooling every block."""
     config = _tiny_text_config()
@@ -898,8 +930,11 @@ def _require_selection(result):
 @pytest.mark.parametrize(
     "key_len",
     [
-        2052,  # 513 blocks: one above the budget
+        2052,  # 513 blocks: one above the budget, 1 per thread
         2055,  # three-token tail
+        4096,  # 1024 blocks: largest bank held 1 per thread
+        4100,  # 1025 blocks: 2 per thread
+        8197,  # 2049 blocks, one-token tail: 4 per thread
         24003,  # 24K decode
         32768,  # 8192 blocks: largest bank held 8 per thread
         32773,  # 8193 blocks, one-token tail: 16 per thread
@@ -970,7 +1005,7 @@ def test_pipeline_limit_keeps_the_kernel_for_smaller_banks(monkeypatch):
     actual, scores = select(2055)
     assert actual is not None
     assert mx.array_equal(actual, _official_mask(scores, 2055)).item()
-    assert launches == [16, 8]
+    assert launches == [16, 1]
 
 
 def test_block_scores_round_like_maximum_sum_divide():
@@ -1098,8 +1133,7 @@ def test_decode_steps_match_the_ops_path_bit_for_bit(monkeypatch, key_len):
         mx.eval(fast, ops)
         assert mx.array_equal(fast.view(mx.uint16), ops.view(mx.uint16)).item(), step
     assert ran["mask"] == 6
-    if qsa_fast._gpu_class() == "d":
-        assert ran["sdpa"] == 6
+    assert ran["sdpa"] == (6 if qsa_fast._two_pass_blocks(12, key_len + 1) else 0)
     for fast_state, ops_state in zip(fast_cache.state, ops_cache.state):
         assert mx.array_equal(fast_state, ops_state).item()
     pooled = fast_cache._pooled_index_offset
@@ -1109,21 +1143,27 @@ def test_decode_steps_match_the_ops_path_bit_for_bit(monkeypatch, key_len):
     ).item()
 
 
-@pytest.mark.skipif(
-    qsa_fast._gpu_class() != "d",
-    reason="MLX's two-pass partition count is transcribed for 'd'-class GPUs only",
-)
 @pytest.mark.parametrize(
     "key_len",
     [
         2052,
-        16383,  # last 128-partition length
-        16384,  # first 512-partition length
-        65536,  # first 1024-partition length
+        8192,  # 's': MLX's own kernel through 8192 keys
+        8193,  # 's': first 256-partition length
+        16383,  # 'd': last 128-partition length
+        16384,  # 'd': first 512-partition length
+        32768,  # 's': last 256-partition length
+        32769,  # 's': first 512-partition length
+        65536,  # 'd': first 1024-partition length; 's': last 512
+        65537,  # 's': first 1024-partition length
     ],
 )
 @pytest.mark.parametrize("kind", ["qsa", "sparse_head", "all"])
 def test_masked_decode_sdpa_matches_mlx_bit_for_bit(key_len, kind):
+    if qsa_fast._two_pass_blocks(12, key_len) is None:
+        assert qsa_fast._gpu_class() != "d" and not (
+            qsa_fast._gpu_class() == "s" and key_len > 8192
+        )
+        pytest.skip("MLX's own kernel runs this length on this GPU class")
     rng = np.random.default_rng(key_len)
     capacity = key_len + 777
     # Cache-shaped views: a prefix of a larger buffer, as update_and_fetch returns.
@@ -1168,7 +1208,7 @@ def _official_gathered_tokens(head_scores: mx.array, key_len: int) -> mx.array:
     return tokens
 
 
-@pytest.mark.parametrize("key_len", [2052, 32770, 65539])
+@pytest.mark.parametrize("key_len", [2052, 4100, 8197, 32770, 65539])
 @pytest.mark.parametrize("kind", ["normal", "cutoff_ties", "specials"])
 def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
     blocks = key_len // RATIO

@@ -16,6 +16,8 @@ import omlx.admin.routes as admin_routes
 import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
 import omlx.utils.network as network
 from omlx.admin.routes import GlobalSettingsRequest
+from omlx.scheduler import SchedulerConfig
+from omlx.server import _server_state
 from omlx.settings import GlobalSettings
 from omlx.utils.network import (
     detect_server_aliases,
@@ -836,12 +838,7 @@ class TestApplyCacheSettingsRuntimeGdn:
 
         with patch.object(_server_state, "engine_pool", pool):
             success, _message = asyncio.run(
-                admin_routes._apply_cache_settings_runtime(
-                    None,
-                    None,
-                    None,
-                    gs,
-                )
+                admin_routes._apply_cache_settings_runtime(None, gs)
             )
 
         assert success is True
@@ -1356,3 +1353,35 @@ def test_gdn_storage_alias_only_rebuilds_on_policy_change(alias, split):
         asyncio.run(admin_routes.update_global_settings(request, is_admin=True))
         apply_cache.assert_awaited_once()
         assert gs.cache.gdn_ssd_split_enabled is split
+
+
+def test_unavailable_ssd_cache_dir_stays_off_on_save(tmp_path):
+    not_a_dir = tmp_path / "not-a-dir"
+    not_a_dir.write_text("")
+    gs = GlobalSettings(base_path=tmp_path / "omlx")
+    gs.cache.ssd_cache_dir = str(not_a_dir / "cache")
+    gs.cache.ssd_cache_max_size = "1GB"
+    gs.ensure_directories()
+    gs.save = MagicMock()
+
+    # The dashboard sends the configured dir back. It is not a dir change.
+    request = GlobalSettingsRequest(ssd_cache_dir=gs.cache.ssd_cache_dir)
+    with (
+        _patched_global_settings(gs),
+        patch.object(
+            admin_routes,
+            "_apply_cache_settings_runtime",
+            new_callable=AsyncMock,
+            return_value=(True, "applied"),
+        ) as apply_cache,
+    ):
+        asyncio.run(admin_routes.update_global_settings(request, is_admin=True))
+    apply_cache.assert_not_awaited()
+
+    pool = MagicMock()
+    pool._scheduler_config = SchedulerConfig(paged_ssd_cache_dir="/tmp/cache")
+    pool.get_loaded_model_ids.return_value = []
+    with patch.object(_server_state, "engine_pool", pool):
+        asyncio.run(admin_routes._apply_cache_settings_runtime(None, gs))
+    assert pool._scheduler_config.paged_ssd_cache_dir is None
+    assert pool._scheduler_config.paged_ssd_cache_max_size == 0

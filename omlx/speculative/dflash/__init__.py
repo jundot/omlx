@@ -24,6 +24,7 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten, tree_map
 from mlx_vlm.speculative.drafters import load_drafter
 from mlx_vlm.utils import get_model_path
 
@@ -33,6 +34,8 @@ from .drafter import DFlashDrafter
 from .variants import apply_partial_rope, load_mask_embedding
 
 logger = logging.getLogger(__name__)
+
+_FP16_MAX = 65504.0
 
 
 def resolve_block_size(
@@ -70,6 +73,8 @@ def context_bytes_per_row(config: dict, window: int | None = None) -> int:
     while it decodes without drafting it queues up to a window of raw layer
     captures. bf16 throughout.
     """
+    # A draft bundled with a VLM checkpoint (MiniMax DSpark) nests its config.
+    config = config.get("text_config") or config
     hidden = int(config["hidden_size"])
     heads = int(config.get("num_attention_heads") or 1)
     head_dim = int(config.get("head_dim") or hidden // heads)
@@ -107,6 +112,52 @@ def quantize_drafter(model: nn.Module, *, bits: int, group_size: int) -> int:
     return quantized
 
 
+def _target_float_dtype(target_model: Any):
+    """Float dtype of the target's token embedding (its scales when quantized)."""
+    language_model = getattr(target_model, "language_model", target_model)
+    inner = getattr(language_model, "model", language_model)
+    embed = getattr(inner, "embed_tokens", None)
+    for name in ("scales", "weight"):
+        value = getattr(embed, name, None)
+        if isinstance(value, mx.array) and mx.issubdtype(value.dtype, mx.floating):
+            return value.dtype
+    return None
+
+
+def match_target_dtype(model: nn.Module, target_model: Any) -> int:
+    """Cast a bf16 drafter's floating parameters to an fp16 target's dtype.
+
+    The drafter's activations follow its own parameters (quantization scales
+    included), so a bf16 checkpoint next to an fp16 target computes in bf16.
+    An M1 GPU (applegpu_g13) has no bf16 ALUs and runs that at about half the
+    fp16 rate, and the drafter then reads the target's fp16 hidden states in a
+    narrower mantissa than the target produced them. Parameters that do not
+    fit fp16 leave the drafter unchanged. Returns the number of cast arrays.
+    """
+    if _target_float_dtype(target_model) != mx.float16:
+        return 0
+    params = [
+        p for _, p in tree_flatten(model.parameters()) if p.dtype == mx.bfloat16
+    ]
+    if not params:
+        return 0
+    peak = mx.max(mx.stack([mx.abs(p).max().astype(mx.float32) for p in params]))
+    if not bool(peak <= _FP16_MAX):
+        logger.warning(
+            "DFlash drafter kept in bf16: a parameter exceeds the fp16 range"
+        )
+        return 0
+    model.update(
+        tree_map(
+            lambda p: p.astype(mx.float16)
+            if isinstance(p, mx.array) and p.dtype == mx.bfloat16
+            else p,
+            model.parameters(),
+        )
+    )
+    return len(params)
+
+
 def load_dflash_drafter(
     path: str,
     target_model: Any,
@@ -129,6 +180,9 @@ def load_dflash_drafter(
     model, kind = load_drafter(path, kind="dflash")
     if kind != "dflash":
         raise ValueError(f"{path} resolved to drafter kind {kind!r}, expected 'dflash'")
+    cast = match_target_dtype(model, target_model)
+    if cast:
+        logger.info("DFlash drafter cast to fp16 to match the target: %d arrays", cast)
     if quant_enabled and not getattr(model.config, "quantization", None):
         count = quantize_drafter(model, bits=quant_bits, group_size=quant_group_size)
         logger.info(
