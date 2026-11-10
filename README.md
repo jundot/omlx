@@ -174,8 +174,9 @@ checklist.
 A paired Mac can also speed up prefill without splitting the model: the
 [Prefill Accelerator](docs/experimental/prefill-accelerator.md) runs the first
 layers of long prompts on the other Mac while the model, its cache and
-decoding stay on this one (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next and
-MiniMax M3).
+decoding stay on this one (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next,
+Qwen3.8 27B and MiniMax M3). The helper can also be a Linux machine with
+NVIDIA GPUs running [omlx-cuda-helper](apps/omlx-cuda-helper/README.md).
 
 ### Vision-Language Models
 
@@ -479,7 +480,8 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel, and Qwen4's fused GDN decode and prefill kernels are adapted from mlx-serve's MIT-licensed `transformer.zig`; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel, and Qwen4's fused GDN decode and prefill kernels are adapted from mlx-serve's MIT-licensed `transformer.zig`; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel; the Linux Prefill Accelerator helper's routed-expert CUDA kernels and two of its MLX CUDA patches are adapted from mlx-serve's MIT-licensed kernels and patches
+- [TensorFold](https://github.com/ashhart/TensorFold) - The Linux Prefill Accelerator helper's sparse-attention CUDA kernels for MiniMax M3 and GLM-5.3 (index scores, block selection, attention) are adapted from TensorFold's Apache-2.0 kernels
 - [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`, and a GGUF's tokenizer is derived from its header as Splash's Apache-2.0 `install/gguf.py` derives it; Splash itself can also serve supported models as an external engine
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
 - [m5gpu](https://github.com/beamivalice/m5gpu) - The GPU power limit writes the AGX GPU power target that m5gpu by beamivalice documented (`SetMaxGPUAbsolutePower` with `AbsoluteTarget`, and `-1000` to remove it)

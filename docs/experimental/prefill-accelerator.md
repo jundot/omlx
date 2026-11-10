@@ -14,6 +14,7 @@ It suits a large model that fits on one Mac with fast memory (good for decoding)
 | GLM-5.3 Flash | `glm5_next` | Works with a DFlash drafter |
 | Qwen3.8 Flash-Next | `qwen4_exp` | PLE rows are read on this Mac and sent with each chunk |
 | MiniMax M3 / M3.1 | `minimax_m3_vl` | Works with the DSpark drafter |
+| Qwen3.8 27B (Qwen3.5 architecture) | `qwen3_5` | Checkpoints served by the VLM engine. With a context window above the native one, prompts stay on this Mac when the helper holds an attention layer |
 
 Measured on an M3 Ultra (512 GB) with an M5 Max over Thunderbolt 5, for a 64K-token prompt:
 
@@ -65,6 +66,54 @@ The Cluster tab's Prefill Accelerator checks report which of these the Macs use.
 **Layers on the helper** is **Auto** by default: each prompt is split by the measured speed of both Macs, and the measurements are kept per model and Mac so a restarted helper splits its first prompt the same way. A fixed number is available for testing.
 
 DeepSeek V4.1 **CED prefill** is on unless turned off in the model's settings. **INT8 Activation Prefill** is off unless turned on there. On a Mac without INT8 tensor units (M4 and earlier), INT8 Activation Prefill applies only to the helper's layers, and changing it restarts the helper without reloading the model.
+
+## Linux helper with NVIDIA GPUs
+
+`omlx-cuda-helper` (`apps/omlx-cuda-helper/`) turns a Linux machine with NVIDIA GPUs into a helper. This Mac uses it like a helper Mac: choose it under **Prefill Accelerator** in the model's settings. Its README covers the build and the options. What differs from a helper Mac:
+
+- **No SSH and no oMLX on the helper.** The helper is a small daemon without a UI. Pair it in the Cluster tab with the 6-digit code it prints in its log; this Mac then drives it over a control channel that the pairing key protects. In the Cluster tab it has no Join button, because it can only be a prefill helper.
+- **Compatibility is per model family**, not per oMLX version. The checks list the families the helper serves and name the side to update when they disagree.
+- **Two GPUs run as a pipeline.** Each GPU holds a range of layers. GPU memory decides how many layers the helper takes, and with it the speedup.
+- **INT8 Activation Prefill** does not apply to the helper's layers.
+- **The link matters more.** The checks warn below 5 GbE. **Auto** measures the link and what each layer sends, uses fewer layers on a slow link, and keeps a prompt on this Mac when the transfer alone would take longer than prefilling here.
+- **A direct Ethernet cable** to the helper is used when it is faster than the network both machines share. It needs no addresses (the helper is reached at its IPv6 link-local address), but discovery and pairing run on the shared network, so the helper stays on it too.
+
+Setup:
+
+1. On the Linux machine, build the MLX wheel and start the helper (`omlx-cuda-helper serve`).
+2. In the Cluster tab, press **Pair** on the helper and type the code from its log.
+3. Run the Prefill Accelerator checks (control channel, link, model families, GPU memory, free disk).
+4. Choose the helper in the model's settings. Missing model files are copied over the control channel to the helper's models folder.
+
+Measured on an M3 Ultra (512 GB) with two RTX A6000 (48 GB each) over a 500 Mbit/s link, for a 32K-token prompt with **Auto**:
+
+| Model | Layers that fit | Layers Auto used | This Mac alone | With the helper | Sent per token |
+|---|---|---|---|---|---|
+| Qwen3.8 27B oQ4e | 63 of 64 | 37 | 405 tok/s | 724 tok/s | 75 KB |
+| GLM-5.3 Flash oQ4e | 21 of 45 | 21 | 561 tok/s | 866 tok/s | 60 KB |
+| MiniMax M3.1 Flash oQ4e | 21 of 60 | 21 | 327 tok/s | 473 tok/s | 63 KB |
+| Qwen3.8 Flash-Next oQ4e | 47 of 48 | 11 | 1,387 tok/s | 1,527 tok/s | 35 KB |
+| DeepSeek V4.1 Flash oQ3e | 7 of 40 | 4 | 1,119 tok/s | 1,007 tok/s | 45 KB |
+
+The helper's GPUs were idle most of the time in every run: on this link the transfer, or the layers that stay on this Mac, set the speed. A fixed layer count above what Auto picks is slower on a link like this (Qwen3.8 Flash-Next with all 47 layers: about 720 tok/s). DeepSeek V4.1 fits only 7 layers on these GPUs and was slower with the helper on this link; leave the helper off for it unless the link is faster.
+
+### Numerics
+
+A helper Mac runs the same Metal kernels as this Mac. The Linux helper computes in the same 16-bit float type, but CUDA and Metal do not add up every sum in the same order, so each layer matches this Mac's result to rounding noise, not bit for bit. Models with discrete steps (expert routing, sparse attention block selection) can turn that noise into a different continuation.
+
+Measured with greedy decoding on 8 prompts per model (a generated log with an open question, the same log with 20 values to look up, documentation and source code to summarize, each at 8K and 32K tokens), with the helper holding as many layers as fit:
+
+| Model | Helper layers | First-token KL, median (max) | Top token changed | Same 64-token continuation | Lookups right of 40, off / on |
+|---|---|---|---|---|---|
+| Qwen3.8 27B oQ4e | 63 of 64 | 0.0009 (0.008) | 0 of 8 | 6 of 8 | 40 / 40 |
+| GLM-5.3 Flash oQ4e | 21 of 45 | 0.006 (0.03) | 0 of 8 | 0 of 8 | 39 / 40 |
+| Qwen3.8 Flash-Next oQ4e | 47 of 48 | 0.007 (0.03) | 1 of 8 | 6 of 8 | 40 / 40 |
+| MiniMax M3.1 Flash oQ4e | 21 of 60 | 0.006 (0.14) | 2 of 8 | 3 of 8 | 40 / 40 |
+| DeepSeek V4.1 Flash oQ3e | 7 of 40 | 0.05 (0.46) | 1 of 8 | 2 of 8 | 40 / 40 |
+
+KL is taken over the first token's 20 most likely tokens. With the helper off, two runs of a prompt are identical. GLM-5.3 answered with reasoning text, which diverges early. The answers to the lookup questions did not get worse in any run.
+
+The same kind of difference appears on this Mac alone when a kernel path changes: with MiniMax M3.1, switching this Mac's prefill attention to its other implementation in the same 21 layers gave a first-token KL of up to 0.11, a different top token in 2 of 8 prompts and the same continuation in 2 of 8. DeepSeek V4.1 moves the most; its expert layers quantize their inputs, which amplifies small differences. Use a helper Mac when the output has to match this Mac's own.
 
 ## How it works
 
