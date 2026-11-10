@@ -29,7 +29,7 @@
         tabStatus: 'Dashboard',
         tabSettings: 'Settings',
         status: { success: 'Success', warning: 'Warning', danger: 'Error', info: 'Info' },
-        hint: 'Every color above is its exact hex value. This PNG also carries the theme as JSON in its "omlx-theme" text chunk: choose Load image in Theme Settings to apply it.',
+        hint: 'Every color above is its exact hex value. This PNG also carries the theme as JSON in its "omlx-theme" text chunk: choose Load image in Theme Settings to load it into the editor.',
     };
     const GROUP_LABELS = {
         surfaces: 'Surfaces',

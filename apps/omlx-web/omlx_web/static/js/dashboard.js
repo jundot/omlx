@@ -7655,7 +7655,7 @@
                 }
             },
 
-            // A theme below a contrast floor fills the fields but is not saved.
+            // Fills the fields only; Apply still runs the contrast check.
             async loadThemeImage(event) {
                 const file = event.target.files?.[0];
                 event.target.value = '';
@@ -7674,8 +7674,6 @@
                     return;
                 }
                 this.fillCustomThemeDraft(theme);
-                if (this.customThemeInputsValid) await this.applyCustomTheme();
-                else this.themeImageError = window.t('settings.theme.image_review');
             },
 
             async saveThemePreviewImage(version) {
