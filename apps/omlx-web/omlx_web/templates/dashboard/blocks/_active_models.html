@@ -208,6 +208,11 @@
                                 <span x-show="pp.elapsed != null" class="text-caption text-neutral-400" x-text="formatDurationShort(pp.elapsed)"></span>
                                 <span x-show="pp.speed > 0" class="text-caption text-neutral-400"
                                       x-text="'(' + pp.speed.toFixed(0) + ' tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' left' : '') + ')'"></span>
+                                <button x-show="m.request_abort" @click="abortRequest(m.id, pp.request_id)"
+                                        :title="window.t('status.active_models.stop_request')"
+                                        class="p-0.5 rounded text-neutral-300 hover:text-red-500 hover:bg-red-50 transition-all">
+                                    <i data-lucide="circle-stop" class="w-3 h-3"></i>
+                                </button>
                             </div>
                         </template>
                     </div>
@@ -228,6 +233,11 @@
                                 <span x-show="gen.last_activity_age_seconds >= 3" class="text-caption text-neutral-400 whitespace-nowrap" x-text="formatActivityAge(gen.last_activity_age_seconds)"></span>
                                 <span x-show="gen.elapsed_seconds != null" class="text-caption text-neutral-400 whitespace-nowrap"
                                       x-text="formatDurationShort(gen.elapsed_seconds)"></span>
+                                <button x-show="m.request_abort" @click="abortRequest(m.id, gen.request_id)"
+                                        :title="window.t('status.active_models.stop_request')"
+                                        class="p-0.5 rounded text-neutral-300 hover:text-red-500 hover:bg-red-50 transition-all">
+                                    <i data-lucide="circle-stop" class="w-3 h-3"></i>
+                                </button>
                             </div>
                         </template>
                     </div>
@@ -258,6 +268,11 @@
                                 <span class="text-caption text-amber-700 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
                                 <span class="text-caption text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
                                 <span x-show="wait.prompt_tokens > 0" class="text-caption text-neutral-400" x-text="window.t('status.active_models.waiting_prompt_tokens').replace('{count}', formatTokenCount(wait.prompt_tokens))"></span>
+                                <button x-show="m.request_abort" @click="abortRequest(m.id, wait.request_id)"
+                                        :title="window.t('status.active_models.stop_request')"
+                                        class="p-0.5 rounded text-neutral-300 hover:text-red-500 hover:bg-red-50 transition-all">
+                                    <i data-lucide="circle-stop" class="w-3 h-3"></i>
+                                </button>
                             </div>
                         </template>
                     </div>

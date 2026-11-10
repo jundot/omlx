@@ -1728,6 +1728,25 @@
                 }
             },
 
+            async abortRequest(modelId, requestId) {
+                try {
+                    const response = await fetch(
+                        `/admin/api/models/${encodeURIComponent(modelId)}/requests/${encodeURIComponent(requestId)}/abort`,
+                        { method: 'POST' },
+                    );
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else if (!response.ok && response.status !== 404) {
+                        // 404 means the request finished before the click landed.
+                        const data = await response.json();
+                        alert(data.detail || window.t('js.error.stop_request_failed'));
+                    }
+                } catch (err) {
+                    console.error('Failed to stop request:', err);
+                    alert(window.t('js.error.stop_request_failed'));
+                }
+            },
+
             // ===== Profiles / Templates =====
             formValuesForProfile() {
                 const ms = this.modelSettings;

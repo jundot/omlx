@@ -1662,6 +1662,25 @@ class BatchedEngine(BaseEngine):
             return self._engine.get_cache_stats()
         return None
 
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        """Abort one live request; False when it is unknown or already finished."""
+        core = self._engine.engine if self._engine else None
+        if (
+            core is None
+            or request_id not in core._output_collectors
+            or request_id in core._finished_at
+        ):
+            return False
+        return await core.abort_request(
+            request_id, reason=reason, error_code=error_code
+        )
+
     async def abort_all_requests(
         self,
         *,

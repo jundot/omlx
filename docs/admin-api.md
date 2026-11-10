@@ -55,6 +55,7 @@ The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The reque
 |---|---|
 | `GET /admin/api/models` | Discovered models with load state, size, and settings |
 | `POST /admin/api/models/{model_id}/load`, `.../unload` | Load or unload a model |
+| `POST /admin/api/models/{model_id}/requests/{request_id}/abort` | Stop one waiting, prefilling, or generating request and keep the model loaded |
 | `POST /admin/api/reload` | Rescan the model directories |
 | `PUT /admin/api/models/{model_id}/settings` | Update per-model settings (sampling, context, aliases, acceleration) |
 | `POST /admin/api/models/{model_id}/settings/reset` | Reset per-model settings |
