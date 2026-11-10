@@ -488,7 +488,7 @@ def _filter_uploaded_settings(
 def _setting_feature_flags(
     model_settings: Any, model_type: str | None, *, helper_a8: bool = False
 ) -> list[dict]:
-    """Speed features that are on by default or belong to one model family.
+    """Speed features this model runs with.
 
     A8 counts only where it runs: on this Mac's kernels or the helper's layers.
     """
