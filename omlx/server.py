@@ -3891,7 +3891,7 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
         # blocks below, and the latter runs with or without a settings manager,
         # so they are built here rather than inside the settings guard.
         physical_ids = set(model_types)
-        image_ids = {model_id for model_id, kind in model_types.items() if kind == "image"}
+        image_ids = {mid for mid, kind in model_types.items() if kind == "image"}
         existing_ids = {m.id for m in models}
         if settings_manager:
             for profile in settings_manager.list_exposed_profile_models():
