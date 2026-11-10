@@ -703,6 +703,32 @@ class TestVlmMtpPreLoadDispatch:
         runtime_mock.assert_not_called()
         assert calls == []
 
+    def test_qwen4_dflash_installs_dispatch_with_native_mtp_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        self._stub_patches(monkeypatch)
+        qwen4 = MagicMock()
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_vlm_qwen4_exp_compat", qwen4)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen4_exp", "vision_config": {}, '
+            '"text_config": {"num_hidden_layers": 48}}',
+        )
+        settings = types.SimpleNamespace(
+            mtp_enabled=False, dflash_enabled=True, dflash_draft_model="paired-dflash2"
+        )
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        dispatch = sys.modules["omlx.patches.mlx_lm_mtp"]
+        dispatch.apply_mlx_lm_mtp_patch.assert_called_once()
+        assert all(
+            call.args == (False,) for call in dispatch.set_mtp_active.call_args_list
+        )
+        qwen4.configure_qwen4_exp_runtime.assert_called_once_with(
+            path, mode="resident", mtp_enabled=False
+        )
+
 
 class TestSpeculativeBackendLog:
     @staticmethod
