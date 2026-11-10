@@ -15845,23 +15845,59 @@ class Scheduler:
         try:
             # Alternate open prefill opportunities so neither admissions nor in-flight chunks starve.
             admit_first = False
+            uncontended_admit = False
             prefill_gate_open = self._prefill_gate_open() if self.prefilling else True
             if (
                 self._decode_fairness
                 and self.prefilling
                 and self.waiting
-                and self._decode_contention()
                 and prefill_gate_open
             ):
-                admit_first = self._admit_prefill_next
-                self._admit_prefill_next = not admit_first
+                if not self._decode_contention():
+                    # Nothing decodes, so admitting first stalls no one, and
+                    # a short request that starts decoding here shrinks the
+                    # in-flight chunk. Admitting after the chunk makes it
+                    # wait one more whole chunk (#5148).
+                    admit_first = uncontended_admit = True
+                else:
+                    admit_first = self._admit_prefill_next
+                    self._admit_prefill_next = not admit_first
+            already_prefilling = (
+                {request.request_id for request in self.prefilling}
+                if uncontended_admit
+                else set()
+            )
             if admit_first:
                 scheduled, rejected = self._schedule_waiting()
 
+            # A prefill that ran its first chunk during that admission waits
+            # for the next step, so one step never runs two of its chunks.
+            held_back: list[Request] = []
+            if uncontended_admit:
+                for request in self.prefilling:
+                    state = self._prefill_states.get(request.request_id)
+                    if (
+                        request.request_id not in already_prefilling
+                        and state is not None
+                        and state.tokens_processed > 0
+                    ):
+                        held_back.append(request)
+                if held_back:
+                    held_ids = {request.request_id for request in held_back}
+                    self.prefilling = deque(
+                        request
+                        for request in self.prefilling
+                        if request.request_id not in held_ids
+                    )
+
             chunked_scheduled: list[Request] = []
             chunked_rejected: list[RequestOutput] = []
-            if self.prefilling and prefill_gate_open:
-                self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
+            try:
+                if self.prefilling and prefill_gate_open:
+                    self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
+            finally:
+                if held_back:
+                    self.prefilling.extend(held_back)
 
             if not admit_first:
                 scheduled, rejected = self._schedule_waiting()

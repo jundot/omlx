@@ -435,3 +435,95 @@ def test_cancel_after_admission_turn_preserves_inflight_prefill(clock):
     assert "cancelled" not in scheduler._prefill_states
     assert prefill_ids(scheduler) == ["inflight"]
     assert "decoder" in scheduler.running
+
+
+def test_uncontended_short_request_is_admitted_before_inflight_chunk(clock):
+    """With nothing decoding, a short request that arrives mid-prefill is
+    admitted before the in-flight chunk, which then shrinks to share the GPU
+    with its decode instead of running at full width first (#5148)."""
+    scheduler = make_scheduler(prefill_step_size=4096)
+    add_prefill(scheduler, "inflight")
+    waiting = make_request("waiting", 3)
+    scheduler.add_request(waiting)
+    events = []
+    chunk_sizes = []
+
+    def advance(state):
+        events.append("inflight")
+        chunk_sizes.append(
+            scheduler._prefill_step_size_for_progress(state.tokens_processed, 8192)
+        )
+        clock.now += 0.5
+        scheduler._accrue_decode_debt(0.5)
+        return False
+
+    def forward(tokens, **kwargs):
+        events.append("waiting")
+        clock.now += 0.01
+
+    scheduler.model.side_effect = forward
+    with (
+        patch.object(scheduler, "_step_prefill_chunk", side_effect=advance),
+        patch("omlx.scheduler.make_prompt_cache", return_value=[]),
+    ):
+        scheduler.step()
+        assert events == ["waiting", "inflight"]
+        assert chunk_sizes[0] < 4096
+        assert "waiting" in scheduler.running
+        assert not scheduler.waiting
+        # The in-flight prefill keeps advancing once the debt is repaid.
+        scheduler._repay_decode_debt(scheduler._decode_time_owed_s)
+        scheduler.step()
+
+    assert events == ["waiting", "inflight", "inflight"]
+    assert prefill_ids(scheduler) == ["inflight"]
+
+
+def test_uncontended_long_request_runs_one_chunk_in_its_admission_step(clock):
+    """A long request admitted ahead of the in-flight chunk already ran its
+    first chunk, so that step does not advance it a second time."""
+    scheduler = make_scheduler()
+    add_prefill(scheduler, "inflight")
+    scheduler.add_request(make_request("long", 20))
+    events = []
+
+    def advance(state):
+        events.append(state.request.request_id)
+        state.tokens_processed += 4
+        clock.now += 0.5
+        return False
+
+    with (
+        patch.object(scheduler, "_step_prefill_chunk", side_effect=advance),
+        patch("omlx.scheduler.make_prompt_cache", return_value=[]),
+    ):
+        scheduler.step()
+        assert events == ["long", "inflight"]
+        assert prefill_ids(scheduler) == ["inflight", "long"]
+        scheduler.step()
+
+    assert events == ["long", "inflight", "inflight", "long"]
+    assert prefill_ids(scheduler) == ["inflight", "long"]
+
+
+def test_disabled_fairness_keeps_chunk_before_admission(clock):
+    """Without decode fairness the chunk does not shrink, so admitting first
+    would gain nothing; the order stays chunk first."""
+    scheduler = make_scheduler(decode_fairness=False)
+    add_prefill(scheduler, "inflight")
+    scheduler.add_request(make_request("waiting", 3))
+    events = []
+
+    def advance(state):
+        events.append("inflight")
+        return False
+
+    scheduler.model.side_effect = lambda tokens, **kwargs: events.append("waiting")
+    with (
+        patch.object(scheduler, "_step_prefill_chunk", side_effect=advance),
+        patch("omlx.scheduler.make_prompt_cache", return_value=[]),
+    ):
+        scheduler.step()
+
+    assert events == ["inflight", "waiting"]
+    assert "waiting" in scheduler.running

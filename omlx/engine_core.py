@@ -511,13 +511,14 @@ class EngineCore:
         scheduler.step() services aborts/admission/finish every step, so
         correctness is unchanged; the only cost is event-loop responsiveness,
         bounded by decode_burst_budget_s. Stops early when no work remains, a
-        request produces its first chunk, a prefill eviction needs the (async)
-        callback, or the budget elapses —
-        the budget also ends the burst when a slow prefill-chunk step lands.
+        request produces its first chunk or finishes, a prefill eviction needs
+        the (async) callback, or the budget elapses — the budget also ends the
+        burst when a slow prefill-chunk step lands, including the first one.
 
         Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
         """
         max_steps = self.config.decode_burst_max_steps
+        started = time.monotonic()
         outputs = [self.scheduler.step()]
         if max_steps <= 1:
             return outputs
@@ -532,7 +533,14 @@ class EngineCore:
         )
         if budget <= 0:
             return outputs
-        deadline = time.monotonic() + budget
+        now = time.monotonic()
+        if now - started >= budget and getattr(self.scheduler, "prefilling", None):
+            # A prefill chunk used the whole budget. Another step would run
+            # another chunk, and requests queued on the executor (admission,
+            # aborts) would wait for both, so hand control back now (#5148).
+            # Slow decode steps keep bursting.
+            return outputs
+        deadline = now + budget
         while len(outputs) < max_steps:
             last = outputs[-1]
             # Also release the first chunk of a request admitted mid-burst.
@@ -543,6 +551,11 @@ class EngineCore:
                 and item.completion_tokens == len(item.new_token_ids)
                 for item in last.outputs
             ):
+                break
+            # A finished request's last output (finish reason, usage) would
+            # otherwise wait for the rest of the burst, which can be a whole
+            # prefill chunk.
+            if last.finished_request_ids:
                 break
             if (
                 not last.has_work  # throttled/idle: stop and let the loop wait
