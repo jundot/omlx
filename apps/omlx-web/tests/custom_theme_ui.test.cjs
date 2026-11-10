@@ -4,6 +4,7 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const WEB = path.join(__dirname, '..', 'omlx_web');
 const theme = require(path.join(WEB, 'static/js/custom_theme.js'));
@@ -107,4 +108,24 @@ test('a low-contrast generated foreground is nudged until it passes', () => {
         'text-secondary': '#666666', 'link-color': '#3366aa',
     };
     assert.ok(passes(theme.darkFromLight(light)));
+});
+
+test('loading partial JSON keeps the other draft colors', () => {
+    const source = fs.readFileSync(path.join(WEB, 'static/js/dashboard.js'), 'utf8');
+    const state = vm.runInNewContext(source + '\n dashboard;', {
+        localStorage: {getItem: () => null},
+        THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+        window: {t: key => key, OmlxCustomTheme: theme}, navigator: {language: 'en'}, document: {},
+    })();
+    const stock = color => Object.fromEntries(theme.TOKENS.map(token => [token, color]));
+    state.customThemeDefaults = {light: stock('#eeeeee'), dark: stock('#111111')};
+    state.fillCustomThemeDraft();
+    state.customThemeDraft.light['bg-primary'] = '#fafafa';
+    state.customThemeDraft.dark['link-color'] = '#88aaff';
+    state.customThemeJson = JSON.stringify({light: {'text-primary': '#222222'}});
+    state.importCustomThemeJson();
+    assert.equal(state.customThemeDraft.light['text-primary'], '#222222');
+    assert.equal(state.customThemeDraft.light['bg-primary'], '#fafafa');
+    assert.equal(state.customThemeDraft.dark['link-color'], '#88aaff');
+    assert.equal(state.customThemeDraft.dark['text-primary'], '#111111');
 });
