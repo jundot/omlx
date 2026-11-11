@@ -4282,7 +4282,10 @@ class TestDownloadSpeed:
             side_effect=self._growing_activity(),
         ):
             poll = start_poll(monkeypatch, downloader, task, model_dir)
-            await asyncio.sleep(0.05)
+            # A loaded runner can stretch the 10 ms ticks; ETA warmup is 10 s.
+            deadline = time.monotonic() + 2.0
+            while task.speed_bps == 0 and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
             observed_speed = task.speed_bps
             observed_eta = task.eta_seconds()
             task.status = DownloadStatus.COMPLETED

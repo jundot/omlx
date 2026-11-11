@@ -23,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import AsyncIterator, Optional
 
+import anyio
 from fastapi import (
     APIRouter,
     File,
@@ -1125,15 +1126,18 @@ async def realtime_voice(websocket: WebSocket, model: str | None = None) -> None
             await send_error("server_error", str(exc))
             await websocket.close(code=1011)
     finally:
-        try:
-            if session is not None:
-                await session.close()
-        finally:
+        # A cancelled handler would drop the backend close queued on the
+        # engine thread.
+        with anyio.CancelScope(shield=True):
             try:
-                if limiter is not None:
-                    limiter.release(gpu_limit)
+                if session is not None:
+                    await session.close()
             finally:
-                await pool.release_engine(resolved_model)
+                try:
+                    if limiter is not None:
+                        limiter.release(gpu_limit)
+                finally:
+                    await pool.release_engine(resolved_model)
 
 
 async def _run_realtime_voice(
