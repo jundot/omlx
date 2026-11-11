@@ -189,7 +189,7 @@ def _raise_request_output_error(output: RequestOutput) -> None:
             ),
             limit_bytes=int(limit_bytes) if limit_bytes is not None else None,
         )
-    if output.error_code == "model_unloading":
+    if output.error_code in ("model_unloading", "admin_abort"):
         raise RequestAbortedError(output.error, request_id=output.request_id)
     raise RuntimeError(output.error)
 
@@ -511,13 +511,15 @@ class EngineCore:
         scheduler.step() services aborts/admission/finish every step, so
         correctness is unchanged; the only cost is event-loop responsiveness,
         bounded by decode_burst_budget_s. Stops early when no work remains, a
-        request produces its first chunk, a prefill eviction needs the (async)
-        callback, or the budget elapses —
-        the budget also ends the burst when a slow prefill-chunk step lands.
+        request produces its first chunk, a request finishes while a chunked
+        prefill is in flight, a prefill eviction needs the (async) callback,
+        or the budget elapses — the budget also ends the burst when a slow
+        prefill-chunk step lands, including the first one.
 
         Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
         """
         max_steps = self.config.decode_burst_max_steps
+        started = time.monotonic()
         outputs = [self.scheduler.step()]
         if max_steps <= 1:
             return outputs
@@ -532,7 +534,12 @@ class EngineCore:
         )
         if budget <= 0:
             return outputs
-        deadline = time.monotonic() + budget
+        now = time.monotonic()
+        if now - started >= budget and getattr(outputs[0], "ran_prefill_chunk", False):
+            # A chunk that spent the whole budget hands control back, so queued
+            # admissions and aborts do not wait for a second chunk (#5148).
+            return outputs
+        deadline = now + budget
         while len(outputs) < max_steps:
             last = outputs[-1]
             # Also release the first chunk of a request admitted mid-burst.
@@ -542,6 +549,13 @@ class EngineCore:
                 item.new_token_ids
                 and item.completion_tokens == len(item.new_token_ids)
                 for item in last.outputs
+            ):
+                break
+            # A finished request's last output (finish reason, usage) would
+            # otherwise wait for the rest of the burst, which can be a whole
+            # prefill chunk while a prefill is in flight.
+            if last.finished_request_ids and getattr(
+                self.scheduler, "prefilling", None
             ):
                 break
             if (
@@ -848,7 +862,13 @@ class EngineCore:
 
         return request_id
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
         """Abort a request.
 
         Uses deferred abort pattern: scheduler.abort_request() just enqueues
@@ -869,7 +889,7 @@ class EngineCore:
             )
             return False
 
-        # A client cancel keeps the computed prefix for a resend.
+        # A client cancel or an admin stop keeps the computed prefix for a resend.
         result = scheduler.abort_request(request_id, keep_cache=True)
 
         # Signal consumer with abort error so any waiting
@@ -877,14 +897,24 @@ class EngineCore:
         # Matches abort_all_requests() pattern.
         collector = self._output_collectors.get(request_id)
         if collector is not None:
-            collector.put(
-                RequestOutput(
+            if reason is None:
+                output = RequestOutput(
                     request_id=request_id,
                     finished=True,
                     finish_reason="abort",
                     error="Request aborted",
                 )
-            )
+            else:
+                # The client still listens; tell it why, as abort_all_requests does.
+                output = RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="error",
+                    new_text=f"\n\n[Error: {reason}]",
+                    error=reason,
+                    error_code=error_code,
+                )
+            collector.put(output)
         self._mark_request_finished(request_id)
         self._wake_engine_loop()
 
@@ -1534,7 +1564,13 @@ class AsyncEngineCore:
             **kwargs,
         )
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
         """Abort a request."""
         engine = getattr(self, "engine", None)
         if engine is None:
@@ -1543,7 +1579,9 @@ class AsyncEngineCore:
                 request_id,
             )
             return False
-        return await engine.abort_request(request_id)
+        return await engine.abort_request(
+            request_id, reason=reason, error_code=error_code
+        )
 
     async def abort_all_requests(
         self,

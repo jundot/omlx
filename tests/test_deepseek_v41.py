@@ -825,6 +825,21 @@ def test_engram_gate_matches_official(expected):
     np.testing.assert_array_equal(actual[:, 1], h[:, 1])
 
 
+def test_engram_dedupes_prefill_rows_but_not_request_batches():
+    """Rows of several requests (batched decode, shared verify blocks, up to DECODE_ROWS)
+    stay one per request; a single request's prefill chunk dedupes repeated tuples."""
+    from omlx.patches.deepseek_v41.storage import DECODE_ROWS, dedupe_tuple_ids
+
+    rng = np.random.default_rng(5)
+    batch = rng.integers(0, 97, (DECODE_ROWS, 1, 24))
+    batch[1] = batch[0]
+    assert dedupe_tuple_ids(batch)[1] is None
+    chunk = rng.integers(0, 97, (1, 12, 24))
+    chunk[0, 1] = chunk[0, 0]
+    unique, inverse = dedupe_tuple_ids(chunk)
+    assert unique.shape[0] == 11 and inverse is not None
+
+
 def test_prefill_engram_dedupe_matches_undeduped(monkeypatch):
     from mlx.nn import Module
 
@@ -1618,6 +1633,106 @@ def test_tensor_parallel_ranks_match_single_process(tmp_path):
     run_two_ranks(tmp_path, _TENSOR_RANK, target)
 
 
+# One tensor-parallel rank prefilling through mlx-lm's prompt loop with the
+# worker's cache-only routing, against the single-process scheduler CED path.
+_TENSOR_CED_RANK = """
+import importlib
+import json
+import sys
+
+import mlx.core as mx
+import numpy as np
+
+group = mx.distributed.init(backend="ring", strict=True)
+from mlx_lm.generate import BatchGenerator
+from omlx.cluster.inference_worker import _cache_only_prompt_prefill
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
+from omlx.patches.deepseek_v41 import language
+from omlx.patches.deepseek_v41.loading import load
+from omlx.patches.deepseek_v41_mlx_lm import apply_deepseek_v41_mlx_lm_patch
+
+assert apply_deepseek_v41_mlx_lm_patch()
+from mlx_lm.models import deepseek_v41
+
+mlx_generate = importlib.import_module("mlx_lm.generate")
+prompt = np.random.default_rng(16).integers(3, 60, 13).tolist()
+full, _ = load(sys.argv[1], ced_prefill=True)
+lm = full.language_model
+cache = lm.make_cache()
+for a, b in ((0, 7), (7, 12)):
+    lm._omlx_prefill(mx.array([prompt[a:b]]), cache=cache)
+reference = lm(mx.array([prompt[12:]]), cache=cache)[0, -1].astype(mx.float32)
+full.close()
+
+ced_layers = []
+block_call = language.Block.__call__
+def counted(self, *args, ced_tail=None, **kwargs):
+    if ced_tail is not None:
+        ced_layers.append(self)
+    return block_call(self, *args, ced_tail=ced_tail, **kwargs)
+language.Block.__call__ = counted
+
+# Only rank 0 has INT8 tensor units, so neither rank runs A8.
+quant_fast.oq_a8_available = lambda: group.rank() == 0
+model = deepseek_v41.load_tensor_shard(
+    sys.argv[1], group, ced_prefill=True, a8_prefill=True
+)
+assert not model.language_model._config.a8_prefill
+# A plain forward, such as a Lightning MTP history rebuild, keeps every row.
+assert model(mx.array([prompt[:7]]), cache=model.make_cache()).shape[1] == 7
+assert not ced_layers
+
+expected = reference - mx.logsumexp(reference)
+def check(got):
+    got = got.astype(mx.float32)
+    assert mx.allclose(got, expected, atol=1e-3, rtol=1e-3).item(), mx.abs(
+        got - expected
+    ).max()
+
+gen = BatchGenerator(model, max_tokens=1, prefill_step_size=7)
+with _cache_only_prompt_prefill(mlx_generate):
+    gen.insert([prompt], max_tokens=[1])
+    responses = []
+    while not responses:
+        responses = gen.next()[1]
+gen.close()
+assert ced_layers
+check(responses[0].logprobs)
+
+# mlx-lm serves a seeded request through generate_step, outside the batch.
+ced_layers.clear()
+with _cache_only_prompt_prefill(mlx_generate):
+    steps = mlx_generate.generate_step(
+        mx.array(prompt), model, prefill_step_size=7, max_tokens=1
+    )
+    _, logprobs = next(steps)
+    steps.close()
+assert ced_layers
+check(logprobs)
+print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)
+"""
+
+
+@pytest.mark.slow
+def test_tensor_parallel_ranks_run_ced_prefill(tmp_path):
+    from omlx.patches.deepseek_v41.convert import convert
+
+    source, _ = write_checkpoint(
+        tmp_path,
+        moe_inter_dim=64,
+        o_lora_rank=32,
+        n_layers=6,
+        compress_ratios=(0, 2, 2, 1, 1, 1),
+        kv_source_layers=(1, 3),
+        index_source_layers=(1, 3, 4, 5),
+    )
+    target = tmp_path / "converted"
+    convert(source, target)
+    pack_split_projections(target)
+
+    run_two_ranks(tmp_path, _TENSOR_CED_RANK, target)
+
+
 def test_mlx_lm_tokenizer_gets_the_v41_protocol(tmp_path):
     from mlx_lm.utils import load_tokenizer
 
@@ -1642,14 +1757,18 @@ def test_mlx_lm_tokenizer_gets_the_v41_protocol(tmp_path):
 # full and partial accepts both occur. Greedy output must equal plain decoding
 # of the whole model on both ranks.
 _MTP_RANK = """
+import importlib
 import json
 import sys
+
+from contextlib import nullcontext
 
 import mlx.core as mx
 
 group = mx.distributed.init(backend="ring", strict=True)
 from mlx_lm.generate import BatchGenerator
 from omlx.cluster.control_plane import RankControlPlane
+from omlx.cluster.inference_worker import _cache_only_prompt_prefill
 from omlx.cluster.mtp_sync import ClusterMtpSync
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment, install_unequal_pipeline_plan
@@ -1666,13 +1785,17 @@ assert apply_deepseek_v41_mlx_lm_patch() and mlx_lm_mtp.apply_mlx_lm_mtp_patch()
 from mlx_lm.models import deepseek_v41
 
 target, port, oracle = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "oracle"
-pipeline = sys.argv[4] == "pipeline"
+pipeline, ced = sys.argv[4] == "pipeline", sys.argv[5] == "ced"
 rank, depth, limit = group.rank(), 3, 20
 prompt = [5, 9, 13, 2, 40, 7, 33, 21, 8, 17, 44, 3]
 
-full, _ = load(target)
+full, _ = load(target, ced_prefill=ced)
 cache = full.language_model.make_cache()
-logits = full.language_model(mx.array([prompt]), cache=cache)
+if ced:
+    full.language_model._omlx_prefill(mx.array([prompt[:-1]]), cache=cache)
+    logits = full.language_model(mx.array([prompt[-1:]]), cache=cache)
+else:
+    logits = full.language_model(mx.array([prompt]), cache=cache)
 reference = []
 for _ in range(limit):
     token = mx.argmax(logits[:, -1], -1)
@@ -1690,7 +1813,7 @@ if pipeline:
     with install_unequal_pipeline_plan(plan):
         model = deepseek_v41.load_pipeline_stage(target, group)
 else:
-    model = deepseek_v41.load_tensor_shard(target, group)
+    model = deepseek_v41.load_tensor_shard(target, group, ced_prefill=ced)
 
 cycles, accepted = [], []
 original = bg._run_verify_cycle_chain
@@ -1728,6 +1851,11 @@ with (
         pipeline_parallel=pipeline,
     ),
     wait_for_pipeline_peers_on_host(model),
+    (
+        _cache_only_prompt_prefill(importlib.import_module("mlx_lm.generate"))
+        if ced
+        else nullcontext()
+    ),
 ):
     model._omlx_cluster_mtp = ClusterMtpSync(rank=rank, control_plane=plane)
     gen = BatchGenerator(model, sampler=lambda lp: mx.argmax(lp, -1), max_tokens=limit)
@@ -1753,27 +1881,48 @@ print(json.dumps({"rank": rank, "ok": True, "cycles": len(cycles)}), flush=True)
 
 @pytest.mark.slow
 @pytest.mark.parametrize(
-    ("drafts", "split"),
-    [("head", "pipeline"), ("oracle", "pipeline"), ("oracle", "tensor")],
+    ("drafts", "split", "ced"),
+    [
+        ("head", "pipeline", False),
+        ("oracle", "pipeline", False),
+        ("oracle", "tensor", False),
+        ("oracle", "tensor", True),
+    ],
 )
-def test_cluster_lightning_mtp_matches_greedy_decoding(tmp_path, drafts, split):
+def test_cluster_lightning_mtp_matches_greedy_decoding(tmp_path, drafts, split, ced):
     import socket
 
     from omlx.patches.deepseek_v41.convert import convert
 
     tensor = {"moe_inter_dim": 64, "o_lora_rank": 32} if split == "tensor" else {}
+    # CED needs the midpoint layer to start the ratio-1 half; the DSpark targets
+    # follow it, as on released checkpoints.
+    layout = (
+        dict(
+            n_layers=8,
+            compress_ratios=(0, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0),
+            kv_source_layers=(1, 4),
+            index_source_layers=(1, 4, 6),
+            candidate_source_layer=4,
+            dspark_target_layer_ids=(5, 6, 7),
+        )
+        if ced
+        else dict(
+            compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
+            dspark_target_layer_ids=(2, 3, 4),
+        )
+    )
     source, _ = write_checkpoint(
         tmp_path,
         **tensor,
+        **layout,
         preserve_mtp=True,
         n_mtp_layers=3,
         dspark_block_size=3,
         dspark_noise_token_id=2,
-        dspark_target_layer_ids=(2, 3, 4),
         dspark_n_routed_experts=2,
         dspark_n_activated_experts=1,
         dspark_markov_rank=32,
-        compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
     )
     target = tmp_path / "converted"
     convert(source, target, preserve_mtp=True)
@@ -1782,4 +1931,5 @@ def test_cluster_lightning_mtp_matches_greedy_decoding(tmp_path, drafts, split):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    run_two_ranks(tmp_path, _MTP_RANK, target, port, drafts, split)
+    mode = "ced" if ced else "full"
+    run_two_ranks(tmp_path, _MTP_RANK, target, port, drafts, split, mode)

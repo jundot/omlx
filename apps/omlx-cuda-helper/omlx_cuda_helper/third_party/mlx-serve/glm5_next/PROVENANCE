@@ -1,0 +1,16 @@
+Sources adapted from mlx-serve (https://github.com/ddalcu/mlx-serve), MIT,
+Copyright (c) 2026 David Dalcu, at commit 9191fbdf. License: ../LICENSE.
+
+moe_prefill_header.cu    from src/kernels/moe/moe_prefill_cuda_header.cu
+moe_prefill_gate_up.cu   from src/kernels/moe/moe_prefill_cuda_gu.cu
+moe_prefill_down.cu      from src/kernels/moe/moe_prefill_cuda.cu
+
+Changes: the fp4/fp8 expert formats (code table, uint8 block scales) are
+replaced by MLX affine codes of 4 or 8 bits with bf16 scales and biases, 64
+weights a group; a weight is code * scale + bias computed in float and
+rounded once to bf16, which is what a Metal quantized matmul multiplies by.
+The gate/up launch clamps both projections before silu(gate) * up and has no
+per-expert gate scale. The launch geometry and the tensor-core main loop are
+unchanged. The weighted top-k sum of GLM-5.3 is not taken from mlx-serve.
+Each mma.m16n8k16 step starts from a zero accumulator and its result is
+added to the running sum with a correctly rounded float add.

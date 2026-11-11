@@ -11,10 +11,14 @@ with earlier source layers.
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import mlx.core as mx
 
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.patches.deepseek_v41.config import ModelConfig
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.loading import load
@@ -67,6 +71,10 @@ def pipeline_stage_starts(config: dict[str, Any]) -> tuple[int, ...]:
     return ModelConfig.from_dict(config).pipeline_stage_starts()
 
 
+# Set while mlx-lm's prompt loop runs on this thread (see _omlx_prompt_scope).
+_prompt_pass = threading.local()
+
+
 class Model(_LoadedModel):
     """A loaded stage, presented the way mlx-lm serves a model."""
 
@@ -81,9 +89,33 @@ class Model(_LoadedModel):
         **kwargs: Any,
     ) -> Any:
         # Lightning MTP verify forwards add return_hidden and n_confirmed.
+        if (
+            getattr(_prompt_pass, "active", False)
+            and not kwargs
+            and inputs.shape[0] == 1
+        ):
+            # A prompt chunk only fills the cache, like the single-Mac
+            # scheduler's _omlx_prefill chunks.
+            kwargs["_ced_prefill"] = True
         return self.language_model(
             inputs, cache=cache, skip_logits=skip_logits, **kwargs
         )
+
+    @contextmanager
+    def _omlx_prompt_scope(self) -> Iterator[None]:
+        """Mark this thread's forwards as mlx-lm prompt-loop chunks."""
+
+        previous = getattr(_prompt_pass, "active", False)
+        _prompt_pass.active = True
+        try:
+            yield
+        finally:
+            _prompt_pass.active = previous
+
+    @property
+    def _omlx_one_prompt_prefill(self) -> bool:
+        # CED runs on one request row; batching prompts would drop it.
+        return bool(self.language_model._config.ced_prefill)
 
     def mtp_forward(
         self,
@@ -163,14 +195,36 @@ def load_pipeline_stage(
     return _as_cluster_rank(model, group)
 
 
-def load_tensor_shard(model_path: Any, group: Any) -> Model:
+def load_tensor_shard(
+    model_path: Any,
+    group: Any,
+    *,
+    ced_prefill: bool = False,
+    a8_prefill: bool = False,
+    a8_prefill_min_tokens: int = 128,
+) -> Model:
     """This rank's tensor-parallel slice of a converted checkpoint, text model only."""
 
+    if a8_prefill:
+        # Replicated projections (wq_a, wkv, the indexer) must give every rank
+        # the same state, so A8 runs only when every rank has INT8 tensor units.
+        votes = mx.distributed.all_sum(
+            mx.array(int(quant_fast.oq_a8_available())), group=group, stream=mx.cpu
+        )
+        a8_prefill = int(votes.item()) == group.size()
+        if not a8_prefill:
+            logger.warning(
+                "DeepSeek V4.1 A8 prefill off on every rank: a rank has no "
+                "INT8 tensor units"
+            )
     # Every rank reads every Engram row, so the tables stay on SSD.
     model, _ = load(
         model_path,
         tensor=group,
         engram_ssd_offload=True,
+        ced_prefill=ced_prefill,
+        a8_prefill=a8_prefill,
+        a8_prefill_min_tokens=a8_prefill_min_tokens,
         mtp_head=is_mtp_active() and group.rank() == 0,
     )
     return _as_cluster_rank(model, group)

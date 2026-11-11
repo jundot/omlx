@@ -488,7 +488,7 @@ def _filter_uploaded_settings(
 def _setting_feature_flags(
     model_settings: Any, model_type: str | None, *, helper_a8: bool = False
 ) -> list[dict]:
-    """Speed features that are on by default or belong to one model family.
+    """Speed features this model runs with.
 
     A8 counts only where it runs: on this Mac's kernels or the helper's layers.
     """
@@ -2246,9 +2246,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             metrics["system_metrics"] = _sample_window(run, window_start)
             logger.info(
                 "[benchmark-pp-result] pp=%d processing_tps=%.3f "
-                "ttft_ms=%.3f e2e_ms=%.3f cached_tokens=%d",
+                "gen_tps=%.3f ttft_ms=%.3f e2e_ms=%.3f cached_tokens=%d",
                 pp_len,
                 float(metrics.get("processing_tps", 0.0) or 0.0),
+                float(metrics.get("gen_tps", 0.0) or 0.0),
                 float(metrics.get("ttft_ms", 0.0) or 0.0),
                 float(metrics.get("e2e_latency_s", 0.0) or 0.0) * 1000.0,
                 int(metrics.get("cached_tokens", 0) or 0),

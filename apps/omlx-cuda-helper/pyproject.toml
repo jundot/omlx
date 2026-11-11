@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omlx-cuda-helper"
+version = "0.1.0"
+description = "Prefill Accelerator helper for oMLX on Linux with NVIDIA GPUs"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "numpy",
+    # mDNS announce so the oMLX Cluster tab finds this helper.
+    "zeroconf>=0.131.0",
+    # DeepSeek V4.1 hashes n-grams of the tokenizer's compressed token ids.
+    "tokenizers",
+]
+
+[project.optional-dependencies]
+# The GPU workers need the patched MLX CUDA wheel built by mlx-build/.
+dev = ["pytest"]
+
+[project.scripts]
+omlx-cuda-helper = "omlx_cuda_helper.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["omlx_cuda_helper*"]
+
+[tool.setuptools.package-data]
+# Kernel sources borrowed from other projects, with their licenses.
+omlx_cuda_helper = ["third_party/**/*"]

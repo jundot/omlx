@@ -140,7 +140,7 @@ private struct ConfigurationSection: View {
             }
 
             Row(label: String(localized: "bench.context.row.priority.label",
-                              defaultValue: "Prefill Priority",
+                              defaultValue: "Long Prompt Handling",
                               comment: "Row label for the prefill priority segmented control on the Context Bench screen"),
                 sublabel: String(localized: "bench.context.row.priority.sub",
                                  defaultValue: "Mirrors the global setting and saves immediately — serving uses the same mode, so the measured value stays valid",
@@ -157,7 +157,7 @@ private struct ConfigurationSection: View {
                                        comment: "Prefill priority option that favors the largest context")),
                         (value: "speed",
                          label: String(localized: "prefill_priority.option.speed",
-                                       defaultValue: "Speed",
+                                       defaultValue: "Full Speed",
                                        comment: "Prefill priority option that favors prefill speed")),
                     ],
                     icons: ["arrow.up.left.and.arrow.down.right", "speedometer"]

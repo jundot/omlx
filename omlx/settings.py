@@ -28,7 +28,7 @@ import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from .config import parse_size
 
@@ -329,6 +329,10 @@ class ModelSettings:
         )
 
 
+ConcurrentPriority = Literal["prefill", "balanced", "decode"]
+CONCURRENT_PRIORITIES: tuple[str, ...] = get_args(ConcurrentPriority)
+
+
 @dataclass
 class SchedulerSettings:
     """Scheduler configuration settings."""
@@ -344,15 +348,22 @@ class SchedulerSettings:
     #   "speed" — never shrink; keep full-size steps and only admit prompts
     #     that fit at full speed (smaller effective context limit).
     prefill_priority: str = "context"
-    # When True (default), prefill yields GPU time to running decodes:
-    # prompts are force-chunked under contention, chunks are capped while
-    # any engine decodes, and each chunk accrues a decode time debt repaid
-    # before the next chunk runs. Off restores the pre-fairness behavior.
-    decode_fairness: bool = True
+    # How prefill shares the GPU with running decodes:
+    #   "prefill" - no decode fairness; prefill runs to completion.
+    #   "balanced" (default) - fairness with the adaptive debt ratio.
+    #   "decode" - fairness with the fixed debt ratio.
+    concurrent_priority: str = "balanced"
+
+    @property
+    def decode_fairness(self) -> bool:
+        return self.concurrent_priority != "prefill"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return asdict(self)
+        data = asdict(self)
+        # Older builds read only this switch after a downgrade.
+        data["decode_fairness"] = self.decode_fairness
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SchedulerSettings:
@@ -369,12 +380,18 @@ class SchedulerSettings:
         prefill_priority = data.get("prefill_priority", "context")
         if prefill_priority not in ("context", "speed"):
             prefill_priority = "context"
+        concurrent_priority = data.get("concurrent_priority")
+        if concurrent_priority not in CONCURRENT_PRIORITIES:
+            # Older settings stored only the decode_fairness switch.
+            concurrent_priority = (
+                "balanced" if data.get("decode_fairness", True) else "prefill"
+            )
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
-            decode_fairness=bool(data.get("decode_fairness", True)),
+            concurrent_priority=concurrent_priority,
         )
 
 
@@ -1981,6 +1998,7 @@ class GlobalSettings:
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
+            adaptive_decode_share=self.scheduler.concurrent_priority == "balanced",
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

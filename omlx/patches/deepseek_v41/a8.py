@@ -11,6 +11,7 @@ MXFP8 weight is converted to INT8 codes on every A8 call, so no second copy
 stays resident.
 """
 
+import dataclasses
 from functools import partial
 
 import mlx.core as mx
@@ -25,7 +26,7 @@ from ..m5_gather_qmm_a8 import (
     sorted_gather_qmm_a8,
     sorted_gather_qmm_a8_mx,
 )
-from ..qwen35_oq_a8 import _plan_for, apply_plan, stage_a
+from ..qwen35_oq_a8 import _ACT_MODE_G64, _plan_for, apply_plan, stage_a
 
 # (plan, min_tokens) on each tagged dense projection.
 _PLAN = "_omlx_a8_plan"
@@ -89,12 +90,18 @@ def _tokens(x, min_tokens, dtype):
     return tokens
 
 
-def tag_dense_a8(language_model, min_tokens) -> int:
+def tag_dense_a8(language_model, min_tokens, skip=(), group_scales=False) -> int:
     """Attach an A8 plan to every eligible dense projection of the backbone
-    layers. Returns how many were tagged; the draft stages are not visited."""
+    layers, except modules whose name ends with one of ``skip``. Returns how
+    many were tagged; the draft stages are not visited.
+
+    ``group_scales=True`` scales the activations of affine projections per
+    GS64 group instead of per row, as MXFP8 and Q8 projections always do."""
     tagged = 0
     for layer in language_model.layers:
-        for _, module in layer.named_modules():
+        for name, module in layer.named_modules():
+            if name.endswith(skip):
+                continue
             if _mx(module, "mxfp8", 2):
                 n, k = module.weight.shape[0], module.scales.shape[-1] * 32
                 if mx_shape_supported(n, k):
@@ -105,6 +112,8 @@ def tag_dense_a8(language_model, min_tokens) -> int:
                 continue
             plan = _plan_for(module.bits, module.weight.shape[0])
             if plan is not None:
+                if group_scales:
+                    plan = dataclasses.replace(plan, act_mode=_ACT_MODE_G64)
                 object.__setattr__(module, _PLAN, (plan, min_tokens))
                 tagged += 1
     return tagged

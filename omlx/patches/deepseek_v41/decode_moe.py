@@ -81,9 +81,10 @@ inline void fp8_decode4(uint p, thread float* v) {
 // ROWS rows of an MXFP8 matrix ([*, K] bytes as uint32, one e8m0 scale per 32) dotted with an
 // fp32 vector; each lane covers 8 contiguous values per step (MLX qmv_fast layout), x is
 // loaded once per step and reused for all ROWS rows. fp32 accumulation order is free.
+// The last step may cover fewer lanes (a tensor-parallel 1152-wide down projection).
 template <int K, int ROWS, typename W, typename S, typename X>
 inline void fp8_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % 32 == 0, "K must be a multiple of the 32-wide scale groups");
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float xv[8];
@@ -108,7 +109,7 @@ inline void fp8_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
 // from NB = 4 up (wo_b at NB = 8: 35 GB/s).
 template <int K, int ROWS, int NB, typename W, typename S, typename X>
 inline void fp8_rows_nb(W w, S s, uint row0, X x, uint XS, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % 32 == 0, "K must be a multiple of the 32-wide scale groups");
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float wv[ROWS][8], sc[ROWS];
@@ -193,7 +194,7 @@ inline void fp8_mma8(W w, S s, uint r0, X x, uint XS, uint lane, uint ks,
 template <int K, int ROWS, typename W, typename S, typename X>
 inline void fp4_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
     constexpr int NW = (K % 512 == 0) ? 2 : 1;      // uint32 words per lane per step
-    static_assert(K % (256 * NW) == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % 32 == 0, "K must be a multiple of the 32-wide scale groups");
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 8 * NW; k < uint(K); k += 256 * NW) {
         float xv[8 * NW];
@@ -264,7 +265,7 @@ inline void aff_w16(const device uchar* p, thread float* m) {
 // bias per GS values) dotted with an fp32 vector: scale * sum(q x) + bias * sum(x) per lane slice.
 template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff16_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 16 == 0, "K must be a multiple of 16 lanes x 16 values");
+    static_assert(K % GS == 0 && GS % 16 == 0, "K must be a multiple of whole 16-value groups");
     constexpr int NT = aff_terms16<BITS>();
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 16; k < uint(K); k += 512) {
@@ -284,7 +285,7 @@ inline void aff16_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* a
 // aff16_rows for NB vectors (x + v * XS) sharing each row's masked codes.
 template <int K, int ROWS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff16_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 16 == 0, "K must be a multiple of 16 lanes x 16 values");
+    static_assert(K % GS == 0 && GS % 16 == 0, "K must be a multiple of whole 16-value groups");
     constexpr int NT = aff_terms16<BITS>();
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
     for (uint k = lane * 16; k < uint(K); k += 512) {
@@ -341,7 +342,7 @@ inline void affine_codes8(const device uchar* p, thread float* q) {
 }
 template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff8_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 8 == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % GS == 0 && GS % 8 == 0, "K must be a multiple of whole 8-value groups");
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float xv[8], xs = 0.0f;
@@ -361,7 +362,7 @@ inline void aff8_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* ac
 // aff8_rows for NB vectors sharing each weight decode; per vector the arithmetic is aff8_rows'.
 template <int K, int ROWS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff8_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 8 == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % GS == 0 && GS % 8 == 0, "K must be a multiple of whole 8-value groups");
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float q[ROWS][8], sc[ROWS], bi[ROWS];
@@ -438,6 +439,125 @@ inline void aff_mma8(W w, S s, B b, uint r0, X x, uint XS, uint lane, uint ks,
             float t = 0.0f;
             for (int q = 0; q < KS; ++q) t += red[q * 64 + fm * 8 + fn + e];
             tile[fm * 8 + fn + e] = t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// fp8_mma8 / aff_mma8 for 9..16 vectors: each weight fragment is decoded once and multiplied
+// into two column tiles (vectors 0..7 -> tile0, 8..15 -> tile1). Each tile keeps the 8-vector
+// helper's per-vector arithmetic, so a vector gets the same value as from fp8_mma8 / aff_mma8.
+// red holds 2 * KS * 64 floats. Every simdgroup of the threadgroup must call it.
+template <int K, int KS, int NB, typename W, typename S, typename X>
+inline void fp8_mma16(W w, S s, uint r0, X x, uint XS, uint lane, uint ks,
+                      threadgroup float* red, threadgroup float* tile0, threadgroup float* tile1) {
+    constexpr int G = K / 32;
+    static_assert(K % 32 == 0 && G % KS == 0 && NB > 8 && NB <= 16, "K split must cover whole scale groups");
+    constexpr int GPS = G / KS;
+    const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
+    const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
+    simdgroup_matrix<float, 8, 8> part0, part1, a, b0, b1;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const device uchar* wrow = reinterpret_cast<const device uchar*>(w + size_t(r0 + fm) * (K / 4));
+    const auto srow = s + size_t(r0 + fm) * G;
+    const bool v2 = int(fn + 8) < NB, v3 = int(fn + 9) < NB;
+    const auto x0 = x + size_t(fn) * XS, x1 = x + size_t(fn + 1) * XS;
+    const auto x2 = x + size_t(v2 ? fn + 8 : 0) * XS, x3 = x + size_t(v3 ? fn + 9 : 0) * XS;
+    for (int g = int(ks) * GPS; g < int(ks + 1) * GPS; ++g) {
+        const uint base = uint(g) * 32;
+        const uint2 wb = *reinterpret_cast<const device uint2*>(wrow + base + 4 * fn);
+        const uint xo = base + 4 * fm;
+        const float4 xa = float4(x0[xo], x0[xo + 1], x0[xo + 2], x0[xo + 3]);
+        const float4 xb = float4(x1[xo], x1[xo + 1], x1[xo + 2], x1[xo + 3]);
+        const float4 xc = v2 ? float4(x2[xo], x2[xo + 1], x2[xo + 2], x2[xo + 3]) : float4(0.0f);
+        const float4 xd = v3 ? float4(x3[xo], x3[xo + 1], x3[xo + 2], x3[xo + 3]) : float4(0.0f);
+        part0.thread_elements()[0] = 0.0f; part0.thread_elements()[1] = 0.0f;
+        part1.thread_elements()[0] = 0.0f; part1.thread_elements()[1] = 0.0f;
+        float wx[4], wy[4];
+        fp8_decode4(wb.x, wx); fp8_decode4(wb.y, wy);
+        for (int j = 0; j < 4; ++j) {
+            a.thread_elements()[0] = wx[j];
+            a.thread_elements()[1] = wy[j];
+            b0.thread_elements()[0] = xa[j];
+            b0.thread_elements()[1] = xb[j];
+            b1.thread_elements()[0] = xc[j];
+            b1.thread_elements()[1] = xd[j];
+            simdgroup_multiply_accumulate(part0, a, b0, part0);
+            simdgroup_multiply_accumulate(part1, a, b1, part1);
+        }
+        const float sc = e8m0(srow[g]) * 256.0f;
+        acc[0] += part0.thread_elements()[0] * sc;
+        acc[1] += part0.thread_elements()[1] * sc;
+        acc[2] += part1.thread_elements()[0] * sc;
+        acc[3] += part1.thread_elements()[1] * sc;
+    }
+    for (int e = 0; e < 4; ++e) red[(e / 2) * (KS * 64) + ks * 64 + fm * 8 + fn + e % 2] = acc[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) {
+        for (int e = 0; e < 4; ++e) {
+            float t = 0.0f;
+            for (int q = 0; q < KS; ++q) t += red[(e / 2) * (KS * 64) + q * 64 + fm * 8 + fn + e % 2];
+            (e < 2 ? tile0 : tile1)[fm * 8 + fn + e % 2] = t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+template <int K, int KS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
+inline void aff_mma16(W w, S s, B b, uint r0, X x, uint XS, uint lane, uint ks,
+                      threadgroup float* red, threadgroup float* tile0, threadgroup float* tile1) {
+    constexpr int G = K / GS;
+    static_assert(GS % 32 == 0 && G % KS == 0 && NB > 8 && NB <= 16, "K split must cover whole groups");
+    constexpr int GPS = G / KS;
+    const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
+    const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
+    simdgroup_matrix<float, 8, 8> part0, part1, a, b0, b1;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const device uchar* wrow = reinterpret_cast<const device uchar*>(w + size_t(r0 + fm) * (K * BITS / 32));
+    const bool v2 = int(fn + 8) < NB, v3 = int(fn + 9) < NB;
+    const auto x0 = x + size_t(fn) * XS, x1 = x + size_t(fn + 1) * XS;
+    const auto x2 = x + size_t(v2 ? fn + 8 : 0) * XS, x3 = x + size_t(v3 ? fn + 9 : 0) * XS;
+    for (int g = int(ks) * GPS; g < int(ks + 1) * GPS; ++g) {
+        part0.thread_elements()[0] = 0.0f; part0.thread_elements()[1] = 0.0f;
+        part1.thread_elements()[0] = 0.0f; part1.thread_elements()[1] = 0.0f;
+        float xs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int sb = 0; sb < GS / 32; ++sb) {
+            const uint base = uint(g) * GS + uint(sb) * 32;
+            float q[8], xa[4], xb[4], xc[4], xd[4];
+            affine_codes8<BITS>(wrow + (base + 4 * fn) * BITS / 8, q);
+            for (int j = 0; j < 4; ++j) {
+                xa[j] = float(x0[base + 4 * fm + j]);
+                xb[j] = float(x1[base + 4 * fm + j]);
+                xc[j] = v2 ? float(x2[base + 4 * fm + j]) : 0.0f;
+                xd[j] = v3 ? float(x3[base + 4 * fm + j]) : 0.0f;
+                xs[0] += xa[j]; xs[1] += xb[j]; xs[2] += xc[j]; xs[3] += xd[j];
+            }
+            for (int j = 0; j < 4; ++j) {
+                a.thread_elements()[0] = q[j];
+                a.thread_elements()[1] = q[j + 4];
+                b0.thread_elements()[0] = xa[j];
+                b0.thread_elements()[1] = xb[j];
+                b1.thread_elements()[0] = xc[j];
+                b1.thread_elements()[1] = xd[j];
+                simdgroup_multiply_accumulate(part0, a, b0, part0);
+                simdgroup_multiply_accumulate(part1, a, b1, part1);
+            }
+        }
+        for (int e = 0; e < 4; ++e) {
+            xs[e] += simd_shuffle_xor(xs[e], 2u); xs[e] += simd_shuffle_xor(xs[e], 4u); xs[e] += simd_shuffle_xor(xs[e], 16u);
+        }
+        const size_t gi = size_t(r0 + fm) * G + g;
+        const float sc = float(s[gi]), bi = float(b[gi]);
+        acc[0] = fma(sc, part0.thread_elements()[0], fma(bi, xs[0], acc[0]));
+        acc[1] = fma(sc, part0.thread_elements()[1], fma(bi, xs[1], acc[1]));
+        acc[2] = fma(sc, part1.thread_elements()[0], fma(bi, xs[2], acc[2]));
+        acc[3] = fma(sc, part1.thread_elements()[1], fma(bi, xs[3], acc[3]));
+    }
+    for (int e = 0; e < 4; ++e) red[(e / 2) * (KS * 64) + ks * 64 + fm * 8 + fn + e % 2] = acc[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) {
+        for (int e = 0; e < 4; ++e) {
+            float t = 0.0f;
+            for (int q = 0; q < KS; ++q) t += red[(e / 2) * (KS * 64) + q * 64 + fm * 8 + fn + e % 2];
+            (e < 2 ? tile0 : tile1)[fm * 8 + fn + e % 2] = t;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -646,10 +766,10 @@ _UP_NB = r"""
                 hblock[b][sg * 4 + lane] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
             }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg < uint(NB)) {
-            const float v = hblock[sg][lane];
-            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hqs[sg * INTER + rb * 32 + lane] = act_quant_value(v, s);
+        for (uint v = sg; v < uint(NB); v += 8) {
+            const float y = hblock[v][lane];
+            const float s = act_scale(max(simd_max(abs(y)), 1e-4f));
+            hqs[v * INTER + rb * 32 + lane] = act_quant_value(y, s);
         }
     }
 """
@@ -691,22 +811,30 @@ _UP_NB_MMA = r"""
             hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = act_quant_value(v, s);
         }
     } else {
-        // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups
-        threadgroup float red[4][2 * 64], tg_g[4][64], tg_u[4][64];
+        // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups,
+        // one column tile per 8 tokens
+        constexpr int CT = (NB + 7) / 8, NB0 = NB < 8 ? NB : 8, NB16 = NB > 8 ? NB : 9;
+        threadgroup float red[4][CT * 2 * 64], tg_g[CT][4][64], tg_u[CT][4][64];
         const uint t = sg / 2, ks = sg % 2, r0 = rb * 32 + t * 8;
-        S1_MMA8(DIM, 2, NB, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[t]);
-        S3_MMA8(DIM, 2, NB, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[t]);
+        if (CT > 1) {
+            S1_MMA16(DIM, 2, NB16, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[0][t], tg_g[CT - 1][t]);
+            S3_MMA16(DIM, 2, NB16, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[0][t], tg_u[CT - 1][t]);
+        } else {
+            S1_MMA8(DIM, 2, NB0, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[0][t]);
+            S3_MMA8(DIM, 2, NB0, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[0][t]);
+        }
         for (uint i = tid; i < uint(32 * NB); i += 256) {
             const uint r = i % 32, b = i / 32;
-            float gate = float(bfloat16_t(tg_g[r / 8][(r % 8) * 8 + b])), up = float(bfloat16_t(tg_u[r / 8][(r % 8) * 8 + b]));
+            const uint e = (r % 8) * 8 + b % 8;
+            float gate = float(bfloat16_t(tg_g[b / 8][r / 8][e])), up = float(bfloat16_t(tg_u[b / 8][r / 8][e]));
             if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
             hblock[b][r] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg < uint(NB)) {
-            const float v = hblock[sg][lane];
-            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hqs[sg * INTER + rb * 32 + lane] = act_quant_value(v, s);
+        for (uint v = sg; v < uint(NB); v += 8) {
+            const float y = hblock[v][lane];
+            const float s = act_scale(max(simd_max(abs(y)), 1e-4f));
+            hqs[v * INTER + rb * 32 + lane] = act_quant_value(y, s);
         }
     }
 """
@@ -744,13 +872,15 @@ _DOWN_S_NB = r"""
 
 # _DOWN_S_NB on simdgroup matrices: one 8-row tile per threadgroup, K split over 2 simdgroups.
 _DOWN_S_NB_MMA = r"""
-    threadgroup float red[2 * 64], tile[64];
+    constexpr int CT = (NB + 7) / 8, NB0 = NB < 8 ? NB : 8, NB16 = NB > 8 ? NB : 9;
+    threadgroup float red[CT * 2 * 64], tile[CT][64];
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
     const uint r0 = threadgroup_position_in_grid.x * 8;
-    S2_MMA8(INTER, 2, NB, sw2, ss2, sb2, r0, hqs, uint(INTER), lane, sg, red, tile);
+    if (CT > 1) S2_MMA16(INTER, 2, NB16, sw2, ss2, sb2, r0, hqs, uint(INTER), lane, sg, red, tile[0], tile[CT - 1]);
+    else S2_MMA8(INTER, 2, NB0, sw2, ss2, sb2, r0, hqs, uint(INTER), lane, sg, red, tile[0]);
     for (uint i = tid; i < uint(8 * NB); i += 64) {
         const uint r = i % 8, b = i / 8;
-        out[b * DIM + r0 + r] = bfloat16_t(partial[b * DIM + r0 + r] + float(bfloat16_t(tile[r * 8 + b])));
+        out[b * DIM + r0 + r] = bfloat16_t(partial[b * DIM + r0 + r] + float(bfloat16_t(tile[b / 8][r * 8 + b % 8])));
     }
 """
 
@@ -805,22 +935,26 @@ def format_macros(roles):
             rows = f"{helper}_rows<K_, R_, {bits}, {gs}>(w_, s_, b_, r0_, x_, l_, acc_)"
             nb = f"{helper}_rows_nb<K_, R_, NB_, {bits}, {gs}>(w_, s_, b_, r0_, x_, xs_, l_, acc_)"
             mma = f"aff_mma8<K_, KS_, NB_, {bits}, {gs}>(w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, tile_)"
+            mma16 = f"aff_mma16<K_, KS_, NB_, {bits}, {gs}>(w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, t0_, t1_)"
         elif mode == "mxfp8":
             wpr, spr = "((K_) / 4)", "((K_) / 32)"
             rows = "fp8_rows<K_, R_>(w_, s_, r0_, x_, l_, acc_)"
             nb = "fp8_rows_nb<K_, R_, NB_>(w_, s_, r0_, x_, xs_, l_, acc_)"
             mma = "fp8_mma8<K_, KS_, NB_>(w_, s_, r0_, x_, xs_, l_, ks_, red_, tile_)"
+            mma16 = "fp8_mma16<K_, KS_, NB_>(w_, s_, r0_, x_, xs_, l_, ks_, red_, t0_, t1_)"
         else:
             wpr, spr = "((K_) / 8)", "((K_) / 32)"
             rows = "fp4_rows<K_, R_>(w_, s_, r0_, x_, l_, acc_)"
             nb = "static_assert(false, \"no MXFP4 multi-vector rows\")"
             mma = "static_assert(false, \"no MXFP4 matrix rows\")"
+            mma16 = mma
         lines += [
             f"#define {role}_WPR(K_) {wpr}",
             f"#define {role}_SPR(K_) {spr}",
             f"#define {role}_ROWS(K_, R_, w_, s_, b_, r0_, x_, l_, acc_) {rows}",
             f"#define {role}_ROWS_NB(K_, R_, NB_, w_, s_, b_, r0_, x_, xs_, l_, acc_) {nb}",
             f"#define {role}_MMA8(K_, KS_, NB_, w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, tile_) {mma}",
+            f"#define {role}_MMA16(K_, KS_, NB_, w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, t0_, t1_) {mma16}",
         ]
     return "\n".join(lines) + "\n"
 
@@ -954,7 +1088,9 @@ def supported(moe, x, config):
         and all(f is not None for f in formats)
         and formats[3] != MXFP4 and formats[4] != MXFP4 and formats[5] != MXFP4
         and config.n_activated_experts <= 31
-        and config.dim % 256 == 0 and config.moe_inter_dim % 256 == 0
+        and config.dim % 256 == 0
+        # The shared down projection splits its groups over two simdgroups.
+        and config.moe_inter_dim % (2 * formats[5][2]) == 0
     )
 
 

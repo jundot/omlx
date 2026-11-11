@@ -359,7 +359,9 @@ class DeviceRegistry:
             if existing.get(flag) or incoming.get(flag) or flag in existing:
                 merged[flag] = bool(existing.get(flag)) or bool(incoming.get(flag))
         for key, value in incoming.items():
-            if key not in merged and value:
+            # "control" is set at pairing only; an announcement must not turn
+            # a paired Mac into a helper-only device.
+            if key not in merged and value and key != "control":
                 merged[key] = value
         return merged
 

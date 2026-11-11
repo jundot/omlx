@@ -92,12 +92,13 @@ from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
-from ..prefill_helper.adapters import adapter_for as stage_adapter_for
+from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.routes import helper_status as prefill_helper_status
 from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
 from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_KV_FORMATS,
+    ConcurrentPriority,
     SubKeyEntry,
     burst_decode_env,
 )
@@ -417,7 +418,7 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
-    # INT8-activation (A8) prefill (Qwen3.5/3.6/3.8, Qwen3.8 Flash-Next, DeepSeek V4.1)
+    # A8 prefill (Qwen3.5/3.6/3.8, Qwen3.8 Flash-Next, DeepSeek V4.1, MiniMax M3)
     a8_prefill_enabled: bool | None = None
     a8_prefill_min_tokens: int | None = None
     # MoE expert offload (stream non-resident experts from the checkpoint)
@@ -743,6 +744,8 @@ class GlobalSettingsRequest(BaseModel):
     embedding_batch_size: int | None = None
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
+    concurrent_priority: ConcurrentPriority | None = None
+    # Older on/off form of concurrent_priority.
     decode_fairness: bool | None = None
 
     # Cache settings
@@ -2610,7 +2613,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "paroquant_reason": paroquant_reason,
             "activation_fp16_supported": activation_fp16_supported,
             "prefill_helper_supported": stage_adapter_for(
-                (model_info.get("config_model_type") or "").replace("-", "_").lower()
+                model_info.get("config_model_type"),
+                model_info.get("engine_type"),
+                model_info.get("model_path"),
             )
             is not None,
             "prefill_helper": _prefill_helper_status(model_id),
@@ -2700,6 +2705,40 @@ async def unload_model(
 
     logger.info("Manually unloaded model: %s", model_id)
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
+
+
+@router.post("/api/models/{model_id}/requests/{request_id}/abort")
+async def abort_model_request(
+    model_id: str,
+    request_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Stop one waiting, prefilling or generating request; the model stays loaded."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    if entry.engine is None:
+        raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+    abort = getattr(entry.engine, "abort_request", None)
+    if not callable(abort):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model cannot stop a single request: {model_id}",
+        )
+
+    found = await abort(
+        request_id,
+        reason="Request stopped by the server admin",
+        error_code="admin_abort",
+    )
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Request not found: {request_id}")
+    logger.info("Admin stopped request %s on %s", request_id, model_id)
+    return {"status": "ok", "model_id": model_id, "request_id": request_id}
 
 
 async def _require_admin_or_bearer(request: Request) -> bool:
@@ -3028,7 +3067,7 @@ async def update_model_settings(
         )
     if "prefill_helper_node_id" in sent:
         supported = stage_adapter_for(
-            (entry.config_model_type or "").replace("-", "_").lower()
+            entry.config_model_type, entry.engine_type, entry.model_path
         )
         current_settings.prefill_helper_node_id = (
             (request.prefill_helper_node_id or None) if supported else None
@@ -3721,7 +3760,7 @@ def _validate_model_settings(entry, settings):
                 status_code=400,
                 detail=(
                     "A8 prefill is available only for Qwen3.5/3.6/3.8, "
-                    "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
+                    "Qwen3.8-Flash-Next, DeepSeek V4.1 and MiniMax M3 models."
                 ),
             )
         if settings.get("qwen35_ane_prefill_enabled"):
@@ -4058,7 +4097,7 @@ def _feature_problem(
         if not _oq_a8_model_supported(entry.config_model_type):
             return (
                 "A8 prefill is available only for Qwen3.5/3.6/3.8, "
-                "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
+                "Qwen3.8-Flash-Next, DeepSeek V4.1 and MiniMax M3 models."
             )
         if not _oq_a8_kernels_available() and not snapshot.get(
             "prefill_helper_node_id"
@@ -4742,6 +4781,7 @@ def _global_settings_response(global_settings):
             "embedding_batch_size": global_settings.scheduler.embedding_batch_size,
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
             "prefill_priority": global_settings.scheduler.prefill_priority,
+            "concurrent_priority": global_settings.scheduler.concurrent_priority,
             "decode_fairness": global_settings.scheduler.decode_fairness,
         },
         "cache": {
@@ -5265,10 +5305,20 @@ async def update_global_settings(
         runtime_applied.append("prefill_priority")
         logger.info(f"Prefill priority set to '{value}'")
 
-    # Apply decode fairness setting (Live)
-    if request.decode_fairness is not None:
-        enabled = bool(request.decode_fairness)
-        global_settings.scheduler.decode_fairness = enabled
+    # Apply concurrent request priority setting (Live)
+    concurrent_priority = request.concurrent_priority
+    if concurrent_priority is None and request.decode_fairness is not None:
+        current = global_settings.scheduler.concurrent_priority
+        if not request.decode_fairness:
+            concurrent_priority = "prefill"
+        elif current == "prefill":
+            concurrent_priority = "balanced"
+        else:
+            concurrent_priority = current
+    if concurrent_priority is not None:
+        global_settings.scheduler.concurrent_priority = concurrent_priority
+        enabled = concurrent_priority != "prefill"
+        adaptive = concurrent_priority == "balanced"
         from ..server import _server_state
 
         pool = _server_state.engine_pool
@@ -5276,6 +5326,7 @@ async def update_global_settings(
             pool_config = getattr(pool, "_scheduler_config", None)
             if pool_config is not None:
                 pool_config.decode_fairness = enabled
+                pool_config.adaptive_decode_share = adaptive
             for mid, entry in pool._entries.items():
                 if entry is None or entry.engine is None:
                     continue
@@ -5290,13 +5341,13 @@ async def update_global_settings(
                 )
                 if scheduler is not None:
                     scheduler._decode_fairness = enabled
+                    scheduler._adaptive_decode_share = adaptive
                     scheduler._decode_time_owed_s = 0.0
                     if hasattr(scheduler, "config"):
                         scheduler.config.decode_fairness = enabled
-        runtime_applied.append("decode_fairness")
-        logger.info(
-            f"Decode fairness {'enabled' if enabled else 'disabled'}"
-        )
+                        scheduler.config.adaptive_decode_share = adaptive
+        runtime_applied.append("concurrent_priority")
+        logger.info(f"Concurrent request priority set to '{concurrent_priority}'")
 
     if request.hot_cache_max_size is not None:
         try:
@@ -7257,6 +7308,13 @@ def _build_active_models_data() -> dict:
         if is_loaded and effective_ttl is not None and idle_seconds is not None:
             ttl_remaining_seconds = max(0.0, effective_ttl - idle_seconds)
 
+        # Cluster rows come from rank zero's sample and carry no engine id.
+        request_abort = (
+            entry is not None
+            and callable(getattr(entry.engine, "abort_request", None))
+            and not model_info.get("cluster")
+        )
+
         models.append(
             {
                 "id": model_id,
@@ -7281,6 +7339,7 @@ def _build_active_models_data() -> dict:
                 "activities": activities,
                 "prefilling": prefilling,
                 "generating": generating,
+                "request_abort": request_abort,
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "cluster": (

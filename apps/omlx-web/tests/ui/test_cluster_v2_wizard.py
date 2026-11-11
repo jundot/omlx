@@ -82,12 +82,6 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/runtime",
     "/admin/api/cluster/deployments",
     "/admin/api/cluster/replan",
-    "/admin/api/cluster/diagnostics",
-    "/admin/api/cluster/join-keys",
-    "/admin/api/cluster/join-status",
-    "/admin/api/cluster/cuda-fabric/verify",
-    "/admin/api/cluster/rdma-links",
-    "/admin/api/cluster/rdma-links/verify",
 }
 
 
@@ -713,6 +707,36 @@ process.stdout.write(JSON.stringify({
     }
 
 
+def test_a_paired_helper_daemon_reopens_before_any_model_uses_it():
+    result = _run_wizard(
+        """
+(async () => {
+const reopen = async (...paired) => {
+  const page = clusterV2Wizard();
+  page.devicesPayload = { paired };
+  page.devicesLoaded = true;
+  page.deploymentsLoaded = true;
+  page.apiFetch = (url) => url === '/admin/api/models'
+    ? Promise.resolve({ models: [] })
+    : new Promise(() => {});
+  await page.restoreAccelerator();
+  return [page.wizardState(), page.accelerator?.nodeId || null];
+};
+const agent = { control: 'agent' };
+const helper = await reopen(
+  { node_id: 'old', caps: agent, state: 'dead' }, { node_id: 'gpu', caps: agent },
+);
+const mac = await reopen({ node_id: 'm5', friendly_name: 'M5max' });
+process.stdout.write(JSON.stringify({ helper, mac }));
+})();
+"""
+    )
+
+    # The helper that answers comes first. A paired Mac may also split a
+    # model, so it stays on the device cards.
+    assert result == {"helper": ["accelerator", "gpu"], "mac": ["device_card", None]}
+
+
 def test_a_helper_mac_shows_whom_it_helps_until_setup_changes():
     result = _run_wizard(
         """
@@ -745,6 +769,64 @@ process.stdout.write(JSON.stringify({
     assert result["changed"] == "purpose"
     # Picking Prefill Accelerator for the Mac it helps shows the helper side.
     assert result["picked"] == "helper"
+
+
+def test_a_helper_daemon_pairs_by_its_log_code_and_never_joins_a_split():
+    result = _run_wizard(
+        """
+(async () => {
+const helper = {
+  node_id: 'gpu', friendly_name: 'gpu-box', version: '0.1.0', paired: true, addrs: [],
+  caps: { chip: '2x NVIDIA RTX A6000', ram_gb: 96, control: 'agent' },
+};
+component.devicesPayload = {
+  self: { node_id: 'node-a', version: '0.9.0', caps: { ram_gb: 256 }, addrs: [] },
+  paired: [
+    { node_id: 'node-b', version: '0.9.0', caps: { ram_gb: 128 }, addrs: [], paired: true },
+    helper,
+  ],
+  discovered: [],
+};
+const split = {
+  nodes: component.planNodes().map((node) => node.node_id),
+  hosts: component.inventoryHosts().map((host) => host.node_id),
+  mismatches: component.versionMismatches().length,
+};
+component.notify = () => {};
+component.formatSizeBytes = (bytes) => (bytes / 1024 ** 3).toFixed(1) + ' GB';
+component.apiFetch = async (url) => url.startsWith('/admin/api/prefill-helper/check')
+  ? { name: 'gpu-box', rows: [
+      { key: 'control', status: 'pass', detail: '192.168.1.230:8851' },
+      { key: 'version', status: 'pass', detail: '0.1.0', families: ['qwen4_exp'], fix: '' },
+      { key: 'memory', status: 'pass', bytes: 101786320896, gpus: 2 },
+    ] }
+  : {};
+component.pairing = { target: helper, code: '754901', busy: false, error: '' };
+const stepOne = component.pairingStepOne();
+await component.submitPairApproval(helper);
+await new Promise((resolve) => setTimeout(resolve));
+process.stdout.write(JSON.stringify({
+  split, stepOne, state: component.wizardState(),
+  rows: component.acceleratorRows().map((row) => [row.label, row.detail]),
+}));
+})();
+"""
+    )
+
+    # The helper takes no layers, and its own version is not a mismatch.
+    assert result["split"] == {
+        "nodes": ["node-a", "node-b"],
+        "hosts": ["node-a", "node-b"],
+        "mismatches": 0,
+    }
+    assert "in its log" in result["stepOne"]
+    # Approval goes to the accelerator checks without the purpose choice.
+    assert result["state"] == "accelerator"
+    assert result["rows"] == [
+        ["Control channel", "Reached 192.168.1.230:8851"],
+        ["Helper version", "0.1.0 works with this oMLX version"],
+        ["GPU memory for layers", "94.8 GB free (GPUs: 2)"],
+    ]
 
 
 def test_retry_loading_ownership_supersedes_retained_failure_marker():
@@ -1300,7 +1382,6 @@ def test_cluster_v2_is_the_sole_dashboard_flow():
     assert dashboard.count('{% include "dashboard/_cluster_v2.html" %}') == 1
     assert "clusterLegacyView" not in dashboard + template
     assert "Advanced (legacy)" not in dashboard + template
-    assert "data-cluster-v2-advanced-tools" in template
     # cluster_v2.js loads before dashboard.js so the factory exists when
     # Alpine initializes x-data="clusterV2Wizard()".
     scripts = dashboard.index("js/cluster_v2.js"), dashboard.index("js/dashboard.js")
@@ -1469,56 +1550,25 @@ component.roleOptions = roles;
 """ % json.dumps(str(FIXTURES / "node_roles.json"))
 
 
-def test_advanced_cuda_tools_use_selected_pair_and_one_time_join_contract():
+def test_cuda_guide_pairs_windows_with_a_mac_address_the_pc_can_reach():
     result = _run_wizard(
         """
-Object.assign(global.window, {
-  location: { hostname: '192.168.1.20', protocol: 'http:', port: '8000' },
-});
-global.setTimeout = () => 0;
-const calls = [];
-const nodes = [
-  { node_id: 'cuda-a', hostname: 'CUDA A', ssh: 'cuda-a.local' },
-  { node_id: 'cuda-b', hostname: 'CUDA B', ssh: 'cuda-b.local' },
-  { node_id: 'cuda-c', hostname: 'CUDA C', ssh: 'cuda-c.local' },
-];
-component.apiFetch = async (url, options = {}) => {
-  calls.push({ url, method: options.method || 'GET', body: options.body || null });
-  if (url.endsWith('/join-status')) return { join_keys: [], nodes };
-  if (url.endsWith('/join-keys')) return {
-    command: 'curl secure | sh', join_id: 'a'.repeat(16),
-    expires_at: Date.now() / 1000 + 1800,
-  };
-  if (url.endsWith('/cuda-fabric/verify')) return { verified: true };
-  throw new Error('unexpected URL ' + url);
-};
-(async () => {
-  await component.toggleAdvancedTools();
-  component.cudaJoin.controllerIp = '192.168.1.20';
-  await component.generateCudaJoinCommand();
-  component.cudaFabricMemberA = 'cuda-a';
-  component.cudaFabricMemberB = 'cuda-c';
-  await component.verifyCudaFabric();
-  const verify = calls.find((call) => call.url.endsWith('/cuda-fabric/verify'));
-  process.stdout.write(JSON.stringify({
-    command: component.cudaJoin.command,
-    joined: component.cudaNodes().length,
-    verify: JSON.parse(verify.body),
-    methods: calls.map((call) => call.method),
-  }));
-})().catch((error) => { console.error(error); process.exit(1); });
+component.devicesPayload = { self: { http_port: 8000, addrs: [
+  { ip: '10.0.1.1' }, { ip: 'fe80::1%en0' }, { ip: '192.168.1.30' },
+] } };
+component.cudaGuideOs = 'windows';
+const command = () => component.cudaGuideSteps().at(-1).command;
+global.window.location = { hostname: '127.0.0.1', port: '8000' };
+const local = command();
+global.window.location = { hostname: '192.168.2.1', port: '8000' };
+const lan = command();
+process.stdout.write(JSON.stringify({ local, lan }));
 """,
     )
-
-    assert result["command"] == "curl secure | sh"
-    assert result["joined"] == 3
-    assert result["verify"] == {
-        "hosts": [
-            {"node_id": "cuda-a", "ssh": "cuda-a.local"},
-            {"node_id": "cuda-c", "ssh": "cuda-c.local"},
-        ]
-    }
-    assert "POST" in result["methods"]
+    # A bridge or Thunderbolt address usually ends in .1.
+    assert "--pair 192.168.1.30:8000" in result["local"]
+    # The address the page was opened at reaches this Mac.
+    assert "--pair 192.168.2.1:8000" in result["lan"]
 
 
 def test_plan_step_has_a_per_node_role_picker_with_defaults_unchanged():

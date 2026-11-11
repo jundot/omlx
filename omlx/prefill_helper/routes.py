@@ -22,7 +22,7 @@ from fastapi import APIRouter, HTTPException
 from .. import __version__
 from ..cluster.registry import get_device_registry
 from . import launcher
-from .adapters import adapter_for
+from .adapters import adapter_for_model
 from .lending import active_lending, forget_host, recorded_host
 from .manager import (
     computer_name,
@@ -31,6 +31,7 @@ from .manager import (
     helper_budget,
     prepare,
     this_host,
+    transport_for,
 )
 
 router = APIRouter(prefix="/admin/api/prefill-helper", tags=["prefill-helper"])
@@ -60,8 +61,11 @@ def _saved_settings(model_id: str) -> Any:
 
 
 def _adapter(entry: Any) -> Any:
-    model_type = getattr(entry, "config_model_type", "") or ""
-    return adapter_for(model_type.replace("-", "_").lower())
+    return adapter_for_model(
+        getattr(entry, "config_model_type", None),
+        getattr(entry, "engine_type", None),
+        getattr(entry, "model_path", None),
+    )
 
 
 def prepare_unloaded(entry: Any, settings: Any) -> None:
@@ -94,9 +98,10 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
         "chip": caps.get("chip"),
         "ram_gb": caps.get("ram_gb"),
     }
+    transport = transport_for(device["node_id"])
     try:
-        target = launcher.resolve_target(device["node_id"])
-        info = launcher.remote_info(target)
+        target = transport.resolve_target(device["node_id"])
+        info = transport.remote_info(target)
     except launcher.LaunchError as error:
         return {**row, "online": False, "reason": str(error)}
     except (OSError, subprocess.SubprocessError, ValueError) as error:
@@ -119,7 +124,7 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
         "link": target.link,
         "device": info.get("device"),
         "version": info.get("version"),
-        "version_ok": info.get("version") == __version__,
+        "version_ok": transport.incompatible(info, adapter, row["name"]) is None,
         "layers_fit": held,
         "budget": info.get("budget"),
         "on_battery": bool(info.get("on_battery")),
@@ -157,44 +162,60 @@ def _check(node_id: str) -> dict:
     # This Mac is that Mac's host now, not its helper.
     forget_host(node_id)
     rows = []
+    transport = transport_for(node_id)
     try:
-        target = launcher.resolve_target(node_id)
+        target = transport.resolve_target(node_id)
     except (launcher.LaunchError, OSError, subprocess.SubprocessError) as error:
-        rows.append({"key": "ssh", "status": "fail", "detail": str(error)})
+        rows.append({"key": transport.VIA, "status": "fail", "detail": str(error)})
         return {"node_id": node_id, "name": device["friendly_name"], "rows": rows}
-    rows.append({"key": "ssh", "status": "pass", "detail": target.ssh_target})
+    rows.append({"key": transport.VIA, "status": "pass", "detail": target.endpoint})
     fast = (
         target.link in ("thunderbolt", "rdma")
         or (target.speed_mbps or 0) >= _FULL_SPEED_MBPS
     )
-    rows.append(
-        {
-            "key": "link",
-            "status": "pass" if fast else "warn",
-            "detail": target.link,
-            "speed_mbps": target.speed_mbps,
-            "fix": " ".join(target.warnings),
-        }
-    )
+    link = {
+        "key": "link",
+        "status": "pass" if fast else "warn",
+        "detail": target.link,
+        "speed_mbps": target.speed_mbps,
+        "fix": " ".join(target.warnings),
+    }
+    rows.append(link)
     try:
-        info = launcher.remote_info(target, host=this_host())
+        info = transport.remote_info(target, host=this_host())
     except (launcher.LaunchError, OSError, subprocess.SubprocessError) as error:
         rows.append({"key": "version", "status": "fail", "detail": str(error)})
         return {"node_id": node_id, "name": target.name, "rows": rows}
-    version = info.get("version")
-    rows.append(
-        {
-            "key": "version",
-            "status": "pass" if version == __version__ else "fail",
-            "detail": version,
-            "expected": __version__,
-        }
-    )
-    rows.append({"key": "memory", "status": "pass", "bytes": helper_budget(info)})
+    theirs = info.get("link_mbps")
+    if theirs and target.speed_mbps and theirs < target.speed_mbps:
+        # A helper daemon reports the speed of its own end; the slower end
+        # sets the speed of the link.
+        link["speed_mbps"] = theirs
+        if theirs < _FULL_SPEED_MBPS:
+            link["status"] = "warn"
+    problem = transport.incompatible(info, None, target.name)
+    version = {
+        "key": "version",
+        "status": "pass" if problem is None else "fail",
+        "detail": info.get("version"),
+    }
+    if "contracts" in info:
+        # A helper daemon has its own version; the model families it can
+        # serve decide, not an equal version.
+        version.update(families=sorted(info["contracts"]), fix=problem or "")
+    else:
+        version["expected"] = __version__
+    rows.append(version)
+    budgets = helper_budget(info)
+    memory = {"key": "memory", "status": "pass", "bytes": sum(budgets)}
+    if "budgets" in info:
+        memory["gpus"] = len(budgets)
+    rows.append(memory)
     rows.append({"key": "disk", "status": "pass", "bytes": info.get("disk_free")})
-    rows.append(
-        {"key": "power", "status": "warn" if info.get("on_battery") else "pass"}
-    )
+    if "on_battery" in info:
+        rows.append(
+            {"key": "power", "status": "warn" if info["on_battery"] else "pass"}
+        )
     return {"node_id": node_id, "name": target.name, "rows": rows}
 
 
@@ -207,11 +228,12 @@ async def check(node_id: str) -> dict:
 def _copies(node_id: str, delete: str | None = None) -> dict:
     if not get_device_registry().is_paired(node_id):
         raise HTTPException(status_code=404, detail="This Mac is not paired.")
+    transport = transport_for(node_id)
     try:
-        target = launcher.resolve_target(node_id)
+        target = transport.resolve_target(node_id)
         if delete:
-            launcher.delete_copies(target, [delete])
-        return launcher.list_copies(target)
+            transport.delete_copies(target, [delete])
+        return transport.list_copies(target)
     except (launcher.LaunchError, OSError, subprocess.SubprocessError) as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 

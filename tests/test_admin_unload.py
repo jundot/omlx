@@ -166,3 +166,32 @@ async def test_unload_abort_after_json_keepalive_started_keeps_409_body():
             "code": None,
         }
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("found", [True, False])
+async def test_admin_abort_stops_one_request_or_returns_404(found):
+    entry = MagicMock()
+    entry.engine.abort_request = AsyncMock(return_value=found)
+    pool = MagicMock()
+    pool.get_entry.return_value = entry
+
+    with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
+        if found:
+            response = await admin_routes.abort_model_request(
+                "model-a", "req-1", is_admin=True
+            )
+            assert response["status"] == "ok"
+        else:
+            with pytest.raises(HTTPException) as exc_info:
+                await admin_routes.abort_model_request(
+                    "model-a", "req-1", is_admin=True
+                )
+            assert exc_info.value.status_code == 404
+
+    entry.engine.abort_request.assert_awaited_once_with(
+        "req-1",
+        reason="Request stopped by the server admin",
+        error_code="admin_abort",
+    )
+    pool.request_unload.assert_not_called()

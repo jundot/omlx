@@ -4,6 +4,7 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const WEB = path.join(__dirname, '..', 'omlx_web');
 const theme = require(path.join(WEB, 'static/js/custom_theme.js'));
@@ -37,12 +38,94 @@ test('muted leaves text-neutral-400 on the tertiary channel', () => {
     assert.match(theme.css({light: {'text-tertiary': '#555555'}, dark: {}}), /--text-scale-400: 85 85 85;/);
 });
 
-test('contrast checks flag every pair below the floor', () => {
-    assert.equal(theme.contrast('#000000', '#ffffff').toFixed(1), '21.0');
-    const checks = theme.contrastChecks({
-        'bg-primary': '#ffffff', 'bg-secondary': '#ffffff', 'bg-tertiary': '#ffffff',
-        'text-primary': '#000000', 'text-secondary': '#000000', 'link-color': '#777777',
-        'btn-primary': '#000000', 'btn-primary-text': '#ffffff',
-    });
-    assert.deepEqual(checks.filter(c => c.ratio < theme.CONTRAST_FLOOR).map(c => c.foreground), Array(3).fill('link-color'));
+// The stock tokens as opaque hex, flattened onto the page like the editor does.
+function stockColors(mode) {
+    const palette = Object.fromEntries([...themeCss.matchAll(/--(palette-[\w-]+):\s*([\d ]+);/g)]
+        .map(m => [m[1], m[2].trim().split(/\s+/).map(Number)]));
+    const block = selector => {
+        const start = themeCss.indexOf(`${selector} {`);
+        return Object.fromEntries([...themeCss.slice(start, themeCss.indexOf('\n}', start)).matchAll(/--([\w-]+):\s*([^;]+);/g)]
+            .map(m => [m[1], m[2].trim()]));
+    };
+    const values = { ...block(':root'), ...(mode === 'dark' ? block('[data-theme="dark"]') : {}) };
+    const css = token => {
+        const m = /^rgb\(var\(--(palette-[\w-]+)\)(?:\s*\/\s*([\d.]+))?\)$/.exec(values[token]);
+        return `rgba(${palette[m[1]].join(', ')}, ${m[2] ?? 1})`;
+    };
+    const colors = Object.fromEntries(theme.TOKENS.map(token => [token, theme.flatten(css(token), '#000000')]));
+    for (const token of theme.DERIVED) colors[token] = theme.flatten(css(token), colors['bg-primary']);
+    return colors;
+}
+
+test('the stock theme meets every contrast floor', () => {
+    for (const mode of theme.MODES) {
+        assert.deepEqual(theme.contrastChecks(stockColors(mode)).filter(check => !check.ok), [], mode);
+    }
+});
+
+test('contrast checks flag every pair below its floor', () => {
+    const colors = {...stockColors('light'), 'link-color': '#777777', 'focus-ring-color': '#bbbbbb'};
+    const failed = theme.contrastChecks(colors).filter(check => !check.ok);
+    assert.deepEqual(failed.map(check => [check.foreground, check.floor]),
+        [...Array(3).fill(['link-color', 4.5]), ...Array(3).fill(['focus-ring-color', 3])]);
+});
+
+// Checks a generated dark palette the way the editor does: an unchanged status
+// keeps its stock badge, a changed one gets the tints it paints.
+function passes(colors) {
+    const stock = stockColors('dark');
+    const all = {...colors};
+    for (const status of theme.STATUS) {
+        const badge = colors[status] === stock[status]
+            ? {soft: theme.flatten(stock[`${status}-soft`], colors['bg-primary']), text: stock[`${status}-text`]}
+            : theme.badgeColors('dark', colors[status], colors['bg-primary']);
+        all[`${status}-soft`] = badge.soft;
+        all[`${status}-text`] = badge.text;
+    }
+    return theme.contrastChecks(all).every(check => check.ok);
+}
+
+test('the stock light palette generates an Apply-able dark close to stock dark', () => {
+    const light = stockColors('light');
+    const dark = stockColors('dark');
+    const generated = theme.darkFromLight(light);
+    assert.deepEqual(Object.keys(generated), theme.TOKENS);
+    for (const token of theme.TOKENS) {
+        assert.equal(theme.normalizeHex(generated[token]), generated[token], token);
+        const [a, b] = [generated[token], dark[token]].map(hex => {
+            const [L, C, h] = theme.oklch(hex);
+            return [L, C * Math.cos(h), C * Math.sin(h)];
+        });
+        assert.ok(Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) < 0.07, `${token}: ${generated[token]} vs ${dark[token]}`);
+    }
+    assert.ok(passes(generated));
+});
+
+test('a low-contrast generated foreground is nudged until it passes', () => {
+    const light = {
+        ...stockColors('light'),
+        'bg-primary': '#bbbbbb', 'bg-secondary': '#b5b5b5', 'bg-tertiary': '#afafaf',
+        'text-secondary': '#666666', 'link-color': '#3366aa',
+    };
+    assert.ok(passes(theme.darkFromLight(light)));
+});
+
+test('loading partial JSON keeps the other draft colors', () => {
+    const source = fs.readFileSync(path.join(WEB, 'static/js/dashboard.js'), 'utf8');
+    const state = vm.runInNewContext(source + '\n dashboard;', {
+        localStorage: {getItem: () => null},
+        THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+        window: {t: key => key, OmlxCustomTheme: theme}, navigator: {language: 'en'}, document: {},
+    })();
+    const stock = color => Object.fromEntries(theme.TOKENS.map(token => [token, color]));
+    state.customThemeDefaults = {light: stock('#eeeeee'), dark: stock('#111111')};
+    state.fillCustomThemeDraft();
+    state.customThemeDraft.light['bg-primary'] = '#fafafa';
+    state.customThemeDraft.dark['link-color'] = '#88aaff';
+    state.customThemeJson = JSON.stringify({light: {'text-primary': '#222222'}});
+    state.importCustomThemeJson();
+    assert.equal(state.customThemeDraft.light['text-primary'], '#222222');
+    assert.equal(state.customThemeDraft.light['bg-primary'], '#fafafa');
+    assert.equal(state.customThemeDraft.dark['link-color'], '#88aaff');
+    assert.equal(state.customThemeDraft.dark['text-primary'], '#111111');
 });

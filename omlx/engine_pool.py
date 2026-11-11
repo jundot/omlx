@@ -83,7 +83,7 @@ from .model_settings import (
 )
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
-from .prefill_helper.adapters import adapter_for as prefill_stage_adapter
+from .prefill_helper.adapters import adapter_for_model as prefill_stage_adapter
 from .prefill_helper.lending import lending_note
 from .prefill_helper.manager import prepare as prepare_prefill_helper
 from .scheduler import SchedulerConfig
@@ -1343,8 +1343,17 @@ class EnginePool:
         # metadata on every module it classifies. None of that can be undone
         # in place, so a change here has to land on a fresh engine.
         # Without INT8 tensor units here, A8 only reaches a Prefill Accelerator
-        # Mac's layers, which follow it without reloading this model.
-        oq_a8_active = a8_prefill_on(data) and quant_fast.oq_a8_available()
+        # Mac's layers, which follow it without reloading this model. DeepSeek
+        # V4.1 tensor-parallel ranks load A8 by their own hardware, so it reloads.
+        deployment = (
+            self._distributed_deployment_for_entry(entry) if entry is not None else None
+        )
+        rank_a8 = (
+            deployment is not None
+            and deployment.tensor_parallel_size > 1
+            and entry.config_model_type == "deepseek_v41"
+        )
+        oq_a8_active = a8_prefill_on(data) and (quant_fast.oq_a8_available() or rank_a8)
         add("a8_prefill_enabled", oq_a8_active)
         if oq_a8_active:
             add("a8_prefill_min_tokens", data.get("a8_prefill_min_tokens", 128))
@@ -2402,7 +2411,9 @@ class EnginePool:
         """Start the chosen Prefill Accelerator while this Mac loads the model."""
         node_id = getattr(settings, "prefill_helper_node_id", None)
         model_type = (entry.config_model_type or "").replace("-", "_").lower()
-        adapter = prefill_stage_adapter(model_type)
+        adapter = prefill_stage_adapter(
+            entry.config_model_type, entry.engine_type, entry.model_path
+        )
         if node_id is None or adapter is None:
             return False
         prepare_prefill_helper(
@@ -4260,6 +4271,7 @@ class EnginePool:
                         ),
                         model_settings=model_settings,
                         vision_checkpoint=entry.model_type == "vlm",
+                        config_model_type=entry.config_model_type,
                     )
                     logger.info(
                         "Distributed inference enabled for %s: ranks=%d "

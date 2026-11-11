@@ -466,6 +466,31 @@ def test_model_lightning_mtp_runs_only_when_the_plan_holds_the_head():
     assert not unplanned._supervisor.deployment.execution.mtp
 
 
+def test_model_prefill_settings_reach_v41_tensor_parallel_ranks():
+    def execution(deployment, model_type, settings=None):
+        engine = DistributedBatchedEngine(
+            deployment, model_settings=settings, config_model_type=model_type
+        )
+        found = engine._supervisor.deployment.execution
+        return found.ced_prefill, found.a8_prefill
+
+    tensor = replace(_deployment(), tensor_parallel_size=2)
+    # Unset, CED is on and A8 off, as on a single Mac.
+    assert execution(tensor, "deepseek_v41") == (True, False)
+    saved = SimpleNamespace(a8_prefill_enabled=True)
+    assert execution(tensor, "deepseek_v41", saved) == (True, True)
+    # Model settings leave the A8 threshold unchecked while A8 is off.
+    off = SimpleNamespace(
+        deepseek_v41_ced_prefill_enabled=False,
+        a8_prefill_enabled=False,
+        a8_prefill_min_tokens=0,
+    )
+    assert execution(tensor, "deepseek_v41", off) == (False, False)
+    # Other models and pipeline stages do not read them.
+    assert execution(tensor, "qwen3_5_moe") == (False, False)
+    assert execution(_deployment(), "deepseek_v41") == (False, False)
+
+
 @pytest.mark.asyncio
 async def test_distributed_generate_translates_backend_completion():
     def handler(request):

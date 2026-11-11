@@ -798,8 +798,7 @@ final class ModelSettingsScreenVM {
                 self.turboquantKvScheme = s?.turboquantKvScheme ?? "turboquant"
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
                 self.qwen35AnePrefillSharedFraction = s?.qwen35AnePrefillSharedFraction.map { String($0) } ?? "1"
-                // Unset means on unless ANE prefill takes the same projections.
-                self.a8PrefillEnabled = s?.a8PrefillEnabled ?? !(s?.qwen35AnePrefillEnabled ?? false)
+                self.a8PrefillEnabled = s?.a8PrefillEnabled ?? false
                 self.a8PrefillMinTokens = s?.a8PrefillMinTokens.map(String.init) ?? "128"
                 self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
                 self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
@@ -1354,10 +1353,10 @@ final class ModelSettingsScreenVM {
     }
 
     var isA8PrefillModel: Bool {
-        // qwen4_exp (Qwen3.8-Flash-Next) and DeepSeek V4.1 match exactly: only
-        // those validated families have routed-expert A8, not every qwen4*.
+        // Exact matches: only these validated families have routed-expert A8.
         if isQwen4Exp || isDeepseekV41 { return true }
         let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+        if type == "minimax_m3" || type == "minimax_m3_vl" { return true }
         return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
     }
 
@@ -1840,7 +1839,7 @@ final class ModelSettingsScreenVM {
                     out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
                 }
             }
-            // A hidden A8 row stays unset (on) rather than saved.
+            // A hidden A8 row stays unset rather than saved.
             if showsA8Prefill {
                 putBool(ProfileSettingsKey.a8PrefillEnabled, a8PrefillEnabled)
                 if a8PrefillEnabled {

@@ -81,6 +81,7 @@ def progressive_sharded_load(
     trust_remote_code: bool = False,
     progress: ProgressCallback | None = None,
     engram_ssd_offload: bool = False,
+    tensor_shard_options: dict[str, Any] | None = None,
     utils_module: Any = None,
     mx_module: Any = None,
 ) -> Any:
@@ -134,7 +135,9 @@ def progressive_sharded_load(
             tensor_loader = getattr(own_format, "load_tensor_shard", None)
             if tensor_loader is None:
                 raise ValueError("this model supports pipeline parallelism only")
-            model = tensor_loader(model_path, tensor_group)
+            model = tensor_loader(
+                model_path, tensor_group, **(tensor_shard_options or {})
+            )
         else:
             model = stage_loader(
                 model_path,
@@ -288,6 +291,7 @@ def install_progressive_loader(
     *,
     progress: ProgressCallback | None = None,
     engram_ssd_offload: bool = False,
+    tensor_shard_options: dict[str, Any] | None = None,
 ) -> Any:
     """Install the loader only around ``ModelProvider.load_default()``."""
 
@@ -299,6 +303,7 @@ def install_progressive_loader(
             **kwargs,
             progress=progress,
             engram_ssd_offload=engram_ssd_offload,
+            tensor_shard_options=tensor_shard_options,
         )
 
     server_module.sharded_load = load

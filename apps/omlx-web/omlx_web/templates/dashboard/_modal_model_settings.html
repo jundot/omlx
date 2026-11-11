@@ -776,7 +776,10 @@
                             <div class="px-4 py-3.5 space-y-4">
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
-                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_oq_a8') }}</span>
+                                        <div class="flex flex-wrap items-center gap-2">
+                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_oq_a8') }}</span>
+                                            <span class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('modal.model_settings.qwen_oq_a8_quality_badge') }}</span>
+                                        </div>
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_oq_a8_hint') }}</p>
                                         <p x-show="selectedModel?.a8_prefill_supported !== true && modelSettings.prefill_helper_node_id" class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_oq_a8_helper_only') }}</p>
                                     </div>

@@ -11,6 +11,7 @@ projections the affine layouts of oQ2-oQ3 exports instead.
 import zlib
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -21,7 +22,7 @@ from omlx.patches.deepseek_v41 import decode_fused
 from omlx.patches.deepseek_v41.config import ModelConfig
 from omlx.patches.deepseek_v41.language import Block, LanguageModel
 from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan, OffloadedExpert
-from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+from omlx.patches.deepseek_v41.quantization import QuantizedProjection, pack_activation
 from tests.test_deepseek_v41 import run_two_ranks
 
 pytestmark = pytest.mark.skipif(
@@ -128,9 +129,20 @@ def shared_build():
     return get
 
 
-@pytest.mark.parametrize("fmt,tiles", [("mxfp", False), ("affine", False), ("affine", True)])
-def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles):
-    model = verify_exact(build(fmt=fmt)) if tiles else build(fmt=fmt)
+# 384 is a tensor-parallel expert slice: its down projection ends in a part-lane step.
+@pytest.mark.parametrize(
+    "fmt,tiles,inter",
+    [
+        ("mxfp", False, 256),
+        ("affine", False, 256),
+        ("affine", True, 256),
+        ("mxfp", False, 384),
+        ("affine", True, 384),
+    ],
+)
+def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles, inter):
+    model = build(fmt=fmt, moe_inter_dim=inter)
+    model = verify_exact(model) if tiles else model
     c = model._config
     decode_fused._window_idx.cache_clear()
     assert all(decode_fused.supported(layer, c) for layer in model.layers)
@@ -214,6 +226,8 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
         for i, layer in enumerate(model.layers):
             layer.ffn.experts = OffloadedExpert(layer.ffn.experts, plan, f"language_model.layers.{i}.ffn.experts")
         assert not decode_fused.supported(model.layers[0], c)
+        # Requests then verify one by one, so the batch policy must not cap their depth.
+        assert model.mtp_shared_verify_rows() == 0
         cache = model.make_cache()
         mx.eval(model(mx.array([[1, 2, 3, 4, 5]]), cache=cache))
         assert mx.isfinite(model(mx.array([[6]]), cache=cache)).all().item()
@@ -224,14 +238,15 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
 @pytest.mark.parametrize("batch", [3, 8, 17])   # odd: a tile lane holds half a vector pair
 def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
-    """On the row kernels (below decode_moe.MMA_MIN_BATCH requests, and in MTP verify blocks),
-    B single-token requests through decode_block_nb give each request the logits it gets
+    """On the row kernels (below decode_moe.MMA_MIN_BATCH requests without the drafter), B
+    single-token requests through decode_block_nb give each request the logits it gets
     decoding alone (per-request arithmetic is the single-request kernels')."""
     from omlx.patches.deepseek_v41 import decode_moe
     from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 
     monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
-    model = verify_exact(build(fmt=fmt))   # affine batches always run on matrix tiles
+    # Affine batches always run on matrix tiles; so do MXFP8 ones once the drafter verifies.
+    model = verify_exact(build(fmt=fmt)) if fmt == "affine" else build(fmt=fmt)
     batches = []
     real = decode_fused.decode_block_nb
 
@@ -281,6 +296,34 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
     assert attention["batched"] == len(batches)   # windows are full: request-batched attention
 
 
+def test_batched_attention_reads_each_requests_selected_rows():
+    """window_attention_bq hands the kernels each query's selected compressed rows. With
+    requests that hold their own arrays (one has no rows), several queries of one request,
+    different selection widths and slots without a row (-1, or past the request's rows),
+    every query gets split_attention's result bit for bit."""
+    rng = np.random.default_rng(7)
+    w, h, d, rd = 4, 8, 512, 64
+    c = SimpleNamespace(window_size=w, n_heads=h, head_dim=d, rope_head_dim=rd)
+    att = SimpleNamespace(attn_sink=mx.array(rng.normal(0, 1, h).astype(np.float32)))
+
+    def normal(*shape):
+        return mx.array(rng.normal(0, 1, shape).astype(np.float32)).astype(mx.bfloat16)
+
+    kvs = [pack_activation(normal(1, n, d), bits=4, group_size=16, e4m3_scale=True) for n in (9, 5, 0, 12)]
+    # (request, rows): request 0 has rows 0..8, request 2 has none.
+    queries = [(0, [5, 9]), (0, [0, 3, 8]), (0, [-1, 2, 7]), (1, [1, 4]), (2, []), (3, [-1, -1, 11])]
+    parts = [(kvs[r], mx.array(ids, mx.int32).reshape(1, 1, -1)) for r, ids in queries]
+    b_n = len(queries)
+    q = normal(b_n, h * d)
+    win = pack_activation(normal(b_n, w, d))
+    cos, sin = (mx.array(rng.normal(0, 1, (b_n, rd // 2)).astype(np.float32)) for _ in range(2))
+    got = decode_fused.window_attention_bq(att, q, win, parts, {}, cos, sin, c)
+    wi = mx.arange(w, dtype=mx.int32).reshape(1, 1, w)
+    for b, (kv, ids) in enumerate(parts):
+        alone = decode_fused.split_attention(q[b], win[b : b + 1], kv, wi, ids, att.attn_sink, cos[b], sin[b], c)
+        assert mx.array_equal(got[b], alone).item(), b
+
+
 def _aq(rng, nb, k):
     from omlx.patches.deepseek_v41.quantization import quantize_activation
 
@@ -318,7 +361,7 @@ def test_batched_fp8_mma_projection_within_fp32_summation_of_exact(
         assert np.all(np.abs(got - exact) <= bound + half_ulp)
 
 
-@pytest.mark.parametrize("nb", [4, 8])
+@pytest.mark.parametrize("nb", [4, 8, 13])
 def test_batched_mma_kernels_match_rows_kernels(monkeypatch, nb):
     """Each simdgroup-matrix kernel (wq_b+RoPE, wo_a+act_quant, MoE shared expert) agrees with
     its fp8_rows_nb counterpart up to summation rounding; MoE routing is untouched."""
@@ -360,6 +403,40 @@ def test_batched_mma_kernels_match_rows_kernels(monkeypatch, nb):
     out_rows, idx_rows, _ = decode_moe.fused_decode_moe_nb(blk.ffn, x, c)
     np.testing.assert_array_equal(idx_mma, idx_rows)
     np.testing.assert_allclose(out_mma.astype(mx.float32), out_rows.astype(mx.float32), rtol=2**-6, atol=1e-5)
+
+
+@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
+def test_second_column_tile_matches_an_eight_vector_tile(shared_build, fmt):
+    """Matrix-tile kernels run vectors 8..15 as a second column tile: every vector gets bit
+    for bit what an 8-vector call gives it, so a request's rows do not depend on where they
+    sit in a batch (batched decode and shared verify rely on it)."""
+    from omlx.patches.deepseek_v41 import decode_moe
+
+    model = shared_build(fmt=fmt)
+    c = model._config
+    blk = model.layers[0]
+    att = blk.attn
+    rng = np.random.default_rng(43)
+    x = _aq(rng, 16, c.dim)
+    halves = (slice(0, 8), slice(8, 16))
+    wide = decode_fused.gemv_fp8_nb(x, att.wq_a, att.wkv, mma=True)
+    for half in halves:
+        part = decode_fused.gemv_fp8_nb(x[half], att.wq_a, att.wkv, mma=True)
+        assert all(mx.array_equal(w[half], p).item() for w, p in zip(wide, part))
+    qrq = _aq(rng, 16, c.q_lora_rank)
+    cos = mx.array(rng.normal(0, 1, (16, c.rope_head_dim // 2)).astype(np.float32))
+    sin = mx.array(rng.normal(0, 1, (16, c.rope_head_dim // 2)).astype(np.float32))
+    wide = decode_fused.wqb_rope_nb(att, qrq, cos, sin, c, True)
+    for half in halves:
+        assert mx.array_equal(wide[half], decode_fused.wqb_rope_nb(att, qrq[half], cos[half], sin[half], c, True)).item()
+    oq = _aq(rng, 16, c.n_heads * c.head_dim)
+    wide = decode_fused.woa_nb(att, oq, c, True)
+    for half in halves:
+        assert mx.array_equal(wide[half], decode_fused.woa_nb(att, oq[half], c, True)).item()
+    h = mx.array(rng.normal(0, 1, (16, c.dim)).astype(np.float32)).astype(mx.bfloat16)
+    wide = decode_moe.fused_decode_moe_nb(blk.ffn, h, c, mma=True)[0]
+    for half in halves:
+        assert mx.array_equal(wide[half], decode_moe.fused_decode_moe_nb(blk.ffn, h[half], c, mma=True)[0]).item()
 
 
 def test_small_batches_keep_rows_kernels(monkeypatch, shared_build):
@@ -407,7 +484,7 @@ def test_paired_weight_decoders_are_exact():
 
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-@pytest.mark.parametrize("nb", [3, 8])
+@pytest.mark.parametrize("nb", [3, 8, 16])
 def test_batched_moe_matches_single_token_moe(monkeypatch, shared_build, nb, fmt):
     """Without matrix tiles, each token of the batched MoE gets the single-token kernels'
     output, routing indices and weights bit for bit, also when tokens share experts: the
@@ -432,7 +509,7 @@ def test_batched_moe_matches_single_token_moe(monkeypatch, shared_build, nb, fmt
     assert shared
 
 
-@pytest.mark.parametrize("batch", [2, 8])
+@pytest.mark.parametrize("batch", [2, 8, 13])
 def test_batched_engram_projects_each_request_like_a_single_request(batch):
     """Batched decode feeds Engram one row per request. Each row gets the one-row arithmetic
     (mxfp8_gemv_each, as when the request decodes alone); a B-row quantized_matmul rounds its
@@ -458,6 +535,7 @@ def test_batched_engram_projects_each_request_like_a_single_request(batch):
     packed, scales = mx.quantize(weight, group_size=32, bits=8, mode="mxfp8")[:2]
     engram.wkv = QuantizedProjection(packed, scales, 8, "mxfp8")
     ids = rng.integers(0, 97, (batch, 1, 3 * 8))
+    ids[-1] = ids[0]   # requests can share an n-gram: their rows must stay one per request
     # Engram computes in fp32 and returns h's dtype: fp32 h keeps every projection bit visible.
     h = mx.array(rng.normal(0, 1, (batch, 1, c.hc_mult, c.dim)).astype(np.float32))
     batched = engram(h, ids)
@@ -503,6 +581,50 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
     assert verified[0].size() == accepted_only[0].size()
     nxt = mx.array([[tokens[accepted + 1]]])
     assert mx.array_equal(model(nxt, cache=verified), model(nxt, cache=accepted_only)).item()
+
+
+@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
+def test_requests_verified_together_match_their_batched_decode(fmt):
+    """mtp_verify_rows gives each request bit for bit the logits that decoding the same
+    requests token by token as a batch gives, and after rolling back to the same accepted
+    count the caches continue exactly like that batch's."""
+    from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
+
+    model = verify_exact(build(fmt=fmt, vocab_size=4096, dspark_target_layer_ids=(2, 3, 4)))
+    rng = np.random.default_rng(37)
+    # One request with a full window, one still filling it; different positions.
+    prompts = [rng.integers(3, 60, 11).tolist(), rng.integers(3, 60, 3).tolist()]
+    blocks = [rng.integers(3, 60, 3).tolist() for _ in prompts]
+
+    def prefilled():
+        caches = []
+        for prompt in prompts:
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt]), cache=cache))
+            caches.append(cache)
+        return caches
+
+    def batch(rows):
+        return [DeepseekV41Cache.merge([rc[i] for rc in rows]) for i in range(len(rows[0]))]
+
+    def decode(cache, column):
+        return model(mx.array([[block[column]] for block in blocks]), cache=cache)[:, -1]
+
+    sequential, accepted_only = batch(prefilled()), batch(prefilled())
+    expected = [decode(sequential, j) for j in range(3)]
+    together = prefilled()
+    assert model.mtp_verify_rows_ok(together, 3)
+    logits, hidden, together = model.mtp_verify_rows(mx.array(blocks), together)
+    assert hidden.shape == (2, 3, 3 * model._config.dim)
+    for j, want in enumerate(expected):
+        assert mx.array_equal(logits[:, j], want).item(), f"row {j}"
+    for cache in together:
+        assert model.mtp_partial_rollback(cache, 1, 2)
+    for j in range(2):
+        decode(accepted_only, j)
+    together = batch(together)
+    assert all(a.size() == b.size() for a, b in zip(together, accepted_only))
+    assert mx.array_equal(decode(together, 2), decode(accepted_only, 2)).item()
 
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
@@ -557,6 +679,172 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch, fmt):
     assert calls and max(calls) > 1, "verify blocks must take the fused path"
     assert result[:24] == expected
 
+
+@pytest.mark.parametrize("count", [2, 8])   # 8: the policy caps the depth below the drafts'
+def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, count):
+    """Requests decoding with DSpark verify their blocks in one forward and each
+    reproduces its own greedy decoding token for token."""
+    from mlx_lm.generate import BatchGenerator
+
+    from omlx.patches.mlx_lm_mtp import batch_generator
+
+    batch_generator.apply()
+    # Affine projections run on matrix tiles alone and in a batch, so each request's greedy
+    # tokens are its single-request ones (batched MXFP8 rows round like batched decode).
+    model = build(
+        fmt="affine",
+        vocab_size=4096,
+        preserve_mtp=True,
+        n_mtp_layers=1,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(2, 3, 4),
+        dspark_markov_rank=32,
+    )
+    prompts = [[3 + r + j for j in range(9)] for r in range(0, 9 * count, 9)]
+    model.configure_mtp(True, 3)
+    # A fixed depth keeps the batch policy from timing-based parking.
+    model._omlx_mtp_depth_fixed = True
+    expected = []
+    for prompt in prompts:
+        tokens, cache = [], model.make_cache()
+        for s in range(0, len(prompt) - 1, 4):
+            model(mx.array([prompt[s : min(s + 4, len(prompt) - 1)]]), cache=cache)
+        ids = mx.array([prompt[-1:]])
+        for _ in range(16):
+            token = int(mx.argmax(model(ids, cache=cache)[0, -1]).item())
+            tokens.append(token)
+            ids = mx.array([[token]])
+        expected.append(tokens)
+    together = []
+    real = type(model).mtp_verify_rows
+
+    def counted(self, inputs, row_caches):
+        together.append(inputs.shape)
+        return real(self, inputs, row_caches)
+
+    monkeypatch.setattr(type(model), "mtp_verify_rows", counted)
+    generator = BatchGenerator(
+        model, max_tokens=16, prefill_step_size=4, prefill_batch_size=count,
+        sampler=lambda logits: mx.argmax(logits, -1),
+    )
+    result = {}
+    try:
+        uids = generator.insert(prompts)
+        for _ in range(96):
+            _, responses = generator.next()
+            for response in responses:
+                result.setdefault(response.uid, []).append(response.token)
+            if all(len(result.get(uid, [])) >= 16 for uid in uids):
+                break
+    finally:
+        generator.close()
+    assert together and max(shape[0] for shape in together) == count, "the requests must verify in one forward"
+    for uid, want in zip(uids, expected):
+        assert result[uid][:16] == want
+
+
+# Two pipeline ranks run batched Lightning MTP for two requests (rank 0 holds the head and
+# the DSpark target layers, rank 1 replays its cycles).
+_CLUSTER_MTP_BATCH_RANK = """
+import json
+import sys
+
+import mlx.core as mx
+
+group = mx.distributed.init(backend="ring", strict=True)
+sys.path.insert(0, sys.argv[1])
+import test_deepseek_v41_fused_decode as t
+from mlx_lm.generate import BatchGenerator
+from omlx.cluster.control_plane import RankControlPlane
+from omlx.cluster.mtp_sync import ClusterMtpSync
+from omlx.cluster.planner import PipelineAssignment, install_unequal_pipeline_plan
+from omlx.patches.mlx_lm_mtp import batch_generator
+
+batch_generator.apply()
+port, rank, limit = int(sys.argv[2]), group.rank(), 12
+prompts = [[3 + r + j for j in range(9)] for r in range(0, 18, 9)]
+
+def model():
+    return t.build(fmt="affine", vocab_size=4096, preserve_mtp=True, n_mtp_layers=1, dspark_block_size=3,
+                   dspark_noise_token_id=2, dspark_target_layer_ids=(3, 4), dspark_markov_rank=32)
+
+full = model()
+expected = []
+for prompt in prompts:
+    tokens, cache = [], full.make_cache()
+    full(mx.array([prompt[:-1]]), cache=cache)
+    ids = mx.array([prompt[-1:]])
+    for _ in range(limit):
+        token = int(mx.argmax(full(ids, cache=cache)[0, -1]).item())
+        tokens.append(token)
+        ids = mx.array([[token]])
+    expected.append(tokens)
+
+stage = model()
+plan = (PipelineAssignment("a", 0, 3, 5, 1, 0, 0, 1), PipelineAssignment("b", 1, 0, 3, 1, 0, 0, 1))
+with install_unequal_pipeline_plan(plan):
+    stage.pipeline(group)
+stage.configure_mtp(True, 2, verify_only=rank != 0)
+together, accepted = [], []
+real = type(stage).mtp_verify_rows
+def counted(self, inputs, row_caches):
+    together.append(int(inputs.shape[0]))
+    return real(self, inputs, row_caches)
+type(stage).mtp_verify_rows = counted
+share_result = ClusterMtpSync.share_cycle_result
+def recorded(self, *a):
+    out = share_result(self, *a)
+    accepted.append(out[0])
+    return out
+ClusterMtpSync.share_cycle_result = recorded
+
+def oracle_drafts(jobs):
+    # Rank 0 drafts each request's true next tokens, with a wrong last draft every third
+    # position, so cycles accept and reject.
+    for row, state, _, _, _ in jobs:
+        i = uids.index(state.uid)
+        done = len(row.tokens[0]) - len(prompts[i]) + len(state.queue)
+        ids = (expected[i][done : done + state.depth] + [0] * state.depth)[: state.depth]
+        if done % 3 == 0:
+            ids[-1] = (ids[-1] + 1) % 4096
+        state.drafts = mx.array(ids, dtype=mx.uint32)
+        state.draft_lps, state.draft_accept_lps = [], []
+if rank == 0:
+    batch_generator._dspark_draft_jobs = oracle_drafts
+
+with RankControlPlane(rank=rank, world_size=2, host="127.0.0.1", port=port, token="v41-mtp-batch") as plane:
+    stage._omlx_cluster_mtp = ClusterMtpSync(rank=rank, control_plane=plane)
+    gen = BatchGenerator(stage, max_tokens=limit, prefill_batch_size=len(prompts),
+                         sampler=lambda logits: mx.argmax(logits, -1))
+    result = {}
+    try:
+        uids = gen.insert(prompts)
+        for _ in range(8 * limit):
+            _, responses = gen.next()
+            for response in responses:
+                result.setdefault(response.uid, []).append(response.token)
+            if all(len(result.get(uid, [])) >= limit for uid in uids):
+                break
+    finally:
+        gen.close()
+assert [result[uid][:limit] for uid in uids] == expected, (result, expected)
+assert together and max(together) == len(prompts), together
+assert max(accepted) > 0 and min(accepted) < max(accepted), accepted
+print(json.dumps({"rank": rank, "ok": True, "together": len(together)}), flush=True)
+"""
+
+
+@pytest.mark.slow
+def test_cluster_mtp_verifies_several_requests_together(tmp_path):
+    """Pipeline ranks verify two requests' DSpark blocks in one forward, and each request
+    reproduces its own greedy tokens."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    run_two_ranks(tmp_path, _CLUSTER_MTP_BATCH_RANK, Path(__file__).parent, port)
 
 # One rank of the cluster decode test below.
 _CLUSTER_DECODE_RANK = """
@@ -625,9 +913,10 @@ def tensor_run(model):
     # Each block sums its attention output, then its MoE output.
     return mx.concatenate(sums[0::2]), block.sum_ranks(one), block.sum_ranks(both)
 
-full = t.build(n_heads=16, moe_inter_dim=512)
+# 384-wide slices, as 2304-wide experts split over two ranks: not a multiple of 256.
+full = t.build(n_heads=16, moe_inter_dim=768)
 reference = tensor_run(full)
-model = t.build(n_heads=8, o_groups=1, moe_inter_dim=256)
+model = t.build(n_heads=8, o_groups=1, moe_inter_dim=384)
 model.load_weights(
     [(k, tensor_slice(k, v, group.rank(), group.size())) for k, v in tree_flatten(full.parameters())],
     strict=True,

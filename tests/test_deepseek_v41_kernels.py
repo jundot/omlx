@@ -537,7 +537,9 @@ def test_batched_decode_templates_do_not_depend_on_positions(monkeypatch):
     """The selected index count and block count grow with the position until
     index_topk. They reach the batched decode attention kernels as meta, so each
     kernel keeps one template, and every meta row carries the batch-wide slice
-    strides. Only launches are inspected, so this runs without Metal."""
+    strides. The compressed-row buffer holds the selected rows only, so it stops
+    growing with the context. Only launches are inspected, so this runs without
+    Metal."""
     templates = {}
 
     def fake_kernel(name, formats=()):
@@ -547,6 +549,7 @@ def test_batched_decode_templates_do_not_depend_on_positions(monkeypatch):
                 meta, ci = np.array(kw["inputs"][5]), kw["inputs"][4]
                 assert (meta[:, 6] == ci.shape[1]).all()
                 assert (meta[:, 7] == kw["grid"][1]).all()
+                assert kw["inputs"][2].shape[0] == meta[:, 1].sum()
             shapes = zip(kw["output_shapes"], kw["output_dtypes"])
             return [mx.zeros(s, t) for s, t in shapes]
 

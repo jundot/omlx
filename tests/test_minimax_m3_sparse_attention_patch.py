@@ -6,6 +6,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from omlx.custom_kernels.nax import is_nax_available
+
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
@@ -287,11 +289,14 @@ def test_short_calls_fuse_mlp_gate_and_up_bit_exactly(language, monkeypatch, mod
     separate = [mlp(x) for x in xs]
     mx.eval(separate)
     monkeypatch.undo()
+    # An A8 prefill cache would keep the unfused arrays alive.
+    object.__setattr__(mlp.gate_proj, language._A8_PREPARED, (mlp.gate_proj.weight,))
     fused = [mlp(x) for x in xs]
     mx.eval(fused)
 
     groups = mlp.__dict__["_omlx_fused_projections"]
     assert [group.names for group in groups] == [("gate_proj", "up_proj")]
+    assert language._A8_PREPARED not in mlp.gate_proj.__dict__
     for a, b in zip(separate, fused):
         assert mx.array_equal(a, b).item()
 
@@ -1031,3 +1036,81 @@ def test_small_l_sparse_attention_staging_changes_no_bit(language, monkeypatch, 
         for values in (v, v_rows):
             assert mx.array_equal(attend(values, keep, mx.array(pad)), outs[0]).item()
             assert mx.array_equal(attend(values, None, None), outs[1]).item()
+
+
+needs_nax = pytest.mark.skipif(not is_nax_available(), reason="needs M5 tensor units")
+
+
+def _msa_inputs(q_start, length, total, seed=0):
+    keys = mx.random.split(mx.random.key(seed), 5)
+    iq = mx.random.normal((1, 4, length, 128), key=keys[0]).astype(mx.bfloat16)
+    ik = mx.random.normal((1, 1, total, 128), key=keys[1]).astype(mx.bfloat16)
+    q = mx.random.normal((1, 64, length, 128), key=keys[2]).astype(mx.bfloat16)
+    k = mx.random.normal((1, 4, total, 128), key=keys[3]).astype(mx.bfloat16)
+    v = mx.random.normal((1, 4, total, 128), key=keys[4]).astype(mx.bfloat16)
+    return iq, ik, q, k, v
+
+
+@needs_nax
+@pytest.mark.parametrize("q_start,length", [(2048, 96), (3001, 200)])
+def test_nax_msa_block_scores_match_the_fallback(
+    language, monkeypatch, q_start, length
+):
+    """Masked block max scores agree to fp32 rounding, and the top-k blocks
+    equal those of the reference path."""
+    from mlx_vlm.models.minimax_m3_vl import msa, msa_nax
+
+    iq, ik, *_ = _msa_inputs(q_start, length, q_start + length)
+    scale = 128**-0.5
+    scores = msa_nax.block_scores(iq, ik, q_start, scale)
+    s = (iq.astype(mx.float32) @ ik.astype(mx.float32).swapaxes(-1, -2)) * scale
+    kpos, qpos = mx.arange(ik.shape[2]), q_start + mx.arange(length)
+    s = mx.where(kpos[None, :] <= qpos[:, None], s, -mx.inf)
+    blocks = -(-ik.shape[2] // 128)
+    pad = blocks * 128 - ik.shape[2]
+    s = mx.pad(s, [(0, 0), (0, 0), (0, 0), (0, pad)], constant_values=-np.inf)
+    ref = s.reshape(1, 4, length, blocks, 128).max(axis=-1)
+    finite = np.isfinite(np.array(ref))
+    assert (np.isfinite(np.array(scores)) == finite).all()
+    np.testing.assert_allclose(
+        np.array(scores)[finite], np.array(ref)[finite], rtol=1e-4, atol=1e-4
+    )
+
+    args = (iq, ik, q_start, scale, 128, 16, 0, 1)
+    nax = msa.build_grouped_msa_topk(*args)
+    monkeypatch.setattr(msa_nax, "block_scores", lambda *a: None)
+    monkeypatch.setattr(msa, "_build_grouped_msa_topk_native", lambda *a: None)
+    assert mx.array_equal(nax, msa.build_grouped_msa_topk(*args)).item()
+
+
+@needs_nax
+@pytest.mark.parametrize("q_start,length,total", [(2048, 256, 2304), (2085, 200, 2282)])
+def test_nax_msa_attention_matches_float_reference(language, q_start, length, total):
+    """Selected-block attention within bf16 error of an fp32 reference, also
+    for a chunk off the block grid whose key range stops before its last
+    queries (keys at or past ``total`` are never attended)."""
+    from mlx_vlm.models.minimax_m3_vl import msa, msa_nax
+
+    scale = 128**-0.5
+    iq, ik, q, k, v = _msa_inputs(q_start, length, total, seed=1)
+    q2k = msa.build_grouped_msa_topk(iq, ik, q_start, scale, 128, 16, 0, 1)[0]
+    out = msa_nax.sparse_attention(q, k, v, q2k, q_start=q_start, scale=scale)[0]
+
+    blocks = -(-total // 128)
+    kpos, qpos = mx.arange(total), q_start + mx.arange(length)
+    selected = mx.put_along_axis(
+        mx.zeros((4, length, blocks + 1), dtype=mx.bool_),
+        mx.where(q2k >= 0, q2k, blocks),
+        mx.array(True),
+        axis=-1,
+    )[..., :blocks]
+    mask = selected[:, :, kpos // 128] & (kpos[None, None, :] <= qpos[None, :, None])
+    qg = q[0].astype(mx.float32).reshape(4, 16, length, 128)
+    s = (qg @ k[0].astype(mx.float32)[:, None].swapaxes(-1, -2)) * scale
+    p = mx.softmax(mx.where(mask[:, None], s, -mx.inf), axis=-1)
+    ref = p @ v[0].astype(mx.float32)[:, None]
+    ref = ref.reshape(64, length, 128).transpose(1, 0, 2)
+
+    err = out.astype(mx.float32) - ref
+    assert mx.sqrt((err * err).mean()).item() < 1e-4
+    assert mx.abs(err).max().item() < 4e-3

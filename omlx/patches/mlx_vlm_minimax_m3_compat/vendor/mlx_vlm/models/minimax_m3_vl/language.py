@@ -13,6 +13,10 @@ from mlx_lm.models.switch_layers import (
     _scatter_unsort,
 )
 
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
+from omlx.patches.m5_gather_qmm import split_gate_up_swiglu_oai
+from omlx.patches.mlx_vlm_minimax_m3_compat import a8
+from omlx.patches.qwen35_oq_a8 import _PREPARED_ATTR as _A8_PREPARED
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 from omlx.patches.qwen35_verify_sdpa_split import row_exact_causal_sdpa
 
@@ -23,7 +27,7 @@ from ..base import (
 )
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
-from . import decode_kernels
+from . import decode_kernels, msa_nax
 from .moe_rows import scaled_switch_glu
 from .msa import (
     build_grouped_msa_topk,
@@ -858,6 +862,8 @@ class MiniMaxScaledSwitchGLU(SwitchGLU):
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         y = scaled_switch_glu(self, x, indices)
+        if y is None:
+            y = a8.routed(self, x, indices)
         if y is not None:
             return y
         x = mx.expand_dims(x, (-2, -3))
@@ -890,6 +896,47 @@ class MiniMaxScaledSwitchGLU(SwitchGLU):
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
+
+    def weighted_sum(
+        self, x: mx.array, indices: mx.array, scores: mx.array
+    ) -> Optional[mx.array]:
+        """``sum_k scores[..., k] * self(x, indices)[..., k, :]`` of a prefill
+        chunk on the tensor units, or None.
+
+        The gate/up kernel reads the token rows in place and applies the
+        activation, and the weighted sum reads the sorted down outputs, so the
+        replicated rows, the two projections and the unsorted outputs are
+        never written.
+        """
+        # A row-exact verify keeps the unfused path: this sum rounds differently.
+        if (
+            x.ndim != 3
+            or x.shape[1] <= _SPARSE_COMPACT_MAX_QUERIES
+            or self.training
+            or is_row_exact_armed()
+            or indices.shape[-1] not in quant_fast.moe_weighted_sum_top_ks()
+        ):
+            return None
+        act = self.activation
+        routed = split_gate_up_swiglu_oai(
+            self.gate_proj,
+            self.up_proj,
+            x,
+            indices,
+            alpha=act.alpha,
+            limit=act.limit,
+            beta=act.beta,
+            expert_scales=(self.gate_scale, self.up_scale),
+        )
+        if routed is None:
+            return None
+        hidden, idx, inv_order = routed
+        y = self.down_proj(hidden, idx, sorted_indices=True)
+        return quant_fast.moe_weighted_sum(
+            mx.contiguous(y),
+            mx.contiguous(inv_order.astype(mx.uint32)),
+            mx.contiguous(scores.astype(mx.float32)),
+        )
 
 
 class _FusedProjections:
@@ -951,6 +998,8 @@ def _fuse_projections(module, names) -> List[_FusedProjections]:
             rows = proj["weight"].shape[0]
             for k in keys:
                 proj[k] = buffers[k][start : start + rows]
+            # The A8 prefill cache holds the replaced arrays.
+            proj.__dict__.pop(_A8_PREPARED, None)
             start += rows
             ends.append(start)
         mx.eval([proj[k] for proj in projs for k in keys])
@@ -994,7 +1043,11 @@ def _project(module, names, x: mx.array, unfused=None) -> dict:
     for name in names:
         if name not in out:
             proj = module[name]
-            out[name] = proj(x) if unfused is None else unfused(proj, x)
+            if unfused is not None:
+                out[name] = unfused(proj, x)
+                continue
+            y = a8.dense(proj, x)
+            out[name] = proj(x) if y is None else y
     return out
 
 
@@ -1199,6 +1252,11 @@ class MiniMaxAttention(nn.Module):
                 else None
             ),
         )[0]
+        out = msa_nax.sparse_attention(
+            queries, keys, values, q2k, q_start=q_start, scale=self.scale
+        )
+        if out is not None:
+            return out.transpose(0, 2, 1, 3)
         q = queries[0].transpose(1, 0, 2)
         k = keys[0].transpose(1, 0, 2)
         v = values[0].transpose(1, 0, 2)
@@ -1593,7 +1651,11 @@ class MiniMaxSparseMoeBlock(nn.Module):
             inds = mx.concatenate([inds, shared_inds], axis=-1)
             scores = mx.concatenate([scores, shared_scores], axis=-1)
 
-        y = _combine_routed(self.switch_mlp(x, inds), scores)
+        y = None
+        if self.routed_expert_scales and self.sharding_group is None:
+            y = self.switch_mlp.weighted_sum(x, inds, scores)
+        if y is None:
+            y = _combine_routed(self.switch_mlp(x, inds), scores)
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)

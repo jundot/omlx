@@ -550,7 +550,7 @@ class TestConvertToolsForTemplate:
 
     @pytest.mark.parametrize("render_properties", [False, True])
     def test_schema_key_order_does_not_change_rendered_tools(self, render_properties):
-        """Equivalent JSON object orders must produce the same prompt prefix."""
+        """Reordered schema keywords must produce the same prompt prefix."""
         from jinja2 import Environment, StrictUndefined
 
         schema = {
@@ -572,11 +572,17 @@ class TestConvertToolsForTemplate:
             "anyOf": [{"type": "string"}, {"type": "number"}],
         }
 
-        def reverse_object_keys(value):
+        def reverse_object_keys(value, in_properties=False):
+            # Property names keep their order: it is part of the tool definition.
             if isinstance(value, dict):
+                items = list(value.items())
+                if not in_properties:
+                    items.reverse()
                 return {
-                    key: reverse_object_keys(child)
-                    for key, child in reversed(list(value.items()))
+                    key: reverse_object_keys(
+                        child, in_properties=key == "properties" and not in_properties
+                    )
+                    for key, child in items
                 }
             if isinstance(value, list):
                 return [reverse_object_keys(child) for child in value]
@@ -606,6 +612,9 @@ class TestConvertToolsForTemplate:
         assert template.render(tools=converted) == template.render(tools=reordered)
         assert [json.dumps(tools), json.dumps(reordered_tools)] == originals
         parameters = converted[0]["function"]["parameters"]
+        assert list(parameters) == ["type", "properties", "required", "anyOf"]
+        assert list(parameters["properties"]) == ["query", "filters"]
+        assert list(parameters["properties"]["query"]) == ["type", "description"]
         assert parameters["required"] == ["query", "filters"]
         assert [item["type"] for item in parameters["anyOf"]] == ["string", "number"]
 
