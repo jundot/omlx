@@ -1705,10 +1705,13 @@ def test_recovery_candidate_unclosed_envelope_3153_is_payload():
         ('<tool_call>write(content="hel', True),
         ("<tool_call>\nread\n<arg_key>path</arg_key>", True),
         ("<tool_call>  edit", True),
+        # MiniCPM5's opener ends at "name=", so the name follows a quote.
+        ('<function name="write"><param name="content">hel', True),
     ],
 )
 def test_declared_tool_name_is_call_evidence_only_in_call_position(text, is_payload):
-    f = ToolCallStreamFilter(_make_tokenizer(), tools=["read", "write", "edit", "bash"])
+    tokenizer = _make_tokenizer_with_end("<function name=", "</function>")
+    f = ToolCallStreamFilter(tokenizer, tools=["read", "write", "edit", "bash"])
     f.feed(text)
     f.finish()
 
