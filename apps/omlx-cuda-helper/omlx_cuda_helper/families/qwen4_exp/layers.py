@@ -384,6 +384,7 @@ class MoE:
         self.combine = None
         self.gather = None
         self.swiglu = None
+        self.expert_kernel = False
 
     @staticmethod
     def _bank(w: Weights, names: tuple[str, ...]) -> tuple:
@@ -440,6 +441,31 @@ class MoE:
                 self.swiglu = kernels.swiglu
             else:
                 kernels.logger.warning("SwiGLU kernel differs; using the reference")
+        widths = ((self.gate_up, x.shape[1]), (self.down, self.inner))
+        if (
+            dtype == mx.bfloat16
+            and self.swiglu is not None
+            and all(kernels.expert_gemm_fits(bank, width) for bank, width in widths)
+        ):
+            self.expert_kernel = self._experts_match(dtype)
+
+    def _experts_match(self, dtype: mx.Dtype) -> bool:
+        """Whether the expert kernel path gives the bits of gather_qmm.
+
+        Enough routes for the sorted gather, and one expert with more rows
+        than a launch block holds at once.
+        """
+        tokens, count = 256, self.gate_up[0].shape[0]
+        x = mx.random.normal((1, tokens, self.router.weight.shape[1])).astype(dtype)
+        others = mx.random.randint(1, count, (1, tokens, self.top_k - 1))
+        chosen = mx.concatenate([mx.zeros((1, tokens, 1), mx.int32), others], -1)
+        self.expert_kernel = False
+        want = self.experts(x, chosen)[0]
+        self.expert_kernel = True
+        if mx.array_equal(self.experts(x, chosen)[0], want).item():
+            return True
+        kernels.logger.warning("Expert kernel differs; using gather_qmm")
+        return False
 
     @staticmethod
     def _gather(x: mx.array, bank: tuple, experts: mx.array) -> mx.array:
@@ -487,6 +513,15 @@ class MoE:
         order = mx.argsort(flat)
         ids = flat[order].astype(mx.uint32)
         rows = x.reshape(x.shape[1], -1)
+        # gather_qmm takes its sorted expert kernel, whose sums this kernel
+        # reproduces, from four routes an expert on.
+        if self.expert_kernel and ids.shape[0] >= 4 * self.gate_up[0].shape[0]:
+            # Each route reads its token's row; gate, up and SwiGLU in one launch.
+            src = (order // k).astype(mx.uint32)
+            offsets = kernels.expert_offsets(ids, self.gate_up[0].shape[0])
+            hidden = kernels.expert_gemm(rows, self.gate_up, offsets, src, swiglu=True)
+            y = kernels.expert_gemm(hidden, self.down, offsets)
+            return y[:, None], mx.argsort(order)
         if self.gather is not None:
             routed = self.gather(rows, (order // k).astype(mx.uint32))[:, None]
         else:

@@ -17,6 +17,7 @@ from omlx_cuda_helper.families.qwen4_exp.attention import Attention  # noqa: E40
 from omlx_cuda_helper.families.qwen4_exp.layers import (  # noqa: E402
     GatedDeltaNet,
     HyperConnection,
+    MoE,
 )
 from omlx_cuda_helper.families.qwen4_exp.ops import Weights  # noqa: E402
 from omlx_cuda_helper.families.qwen4_exp.stage import load_stage  # noqa: E402
@@ -135,6 +136,8 @@ def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry():
         "linear_key_head_dim": 128,
         "linear_value_head_dim": 128,
         "output_gate_type": "sigmoid",
+        "num_experts_per_tok": 10,
+        "moe_intermediate_size": 640,
     }
     shapes = {
         "self_attn.q_proj.weight": (12288, 2560),
@@ -172,7 +175,28 @@ def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry():
     connection.enable_kernels()
     linear = GatedDeltaNet(weights.at("gdn"), text)
     linear.enable_kernels()
+    # Eight experts of the checkpoint's widths, 4-bit in groups of 64.
+    bank = {"router": (8, 2560), "shared_expert_gate": (1, 2560)}
+    bank.update({f"shared_expert.{n}_proj": (640, 2560) for n in ("gate", "up")})
+    bank["shared_expert.down_proj"] = (2560, 640)
+    for name, shape in (("gate", (8, 640, 2560)), ("up", (8, 640, 2560))):
+        bank[f"switch_mlp.{name}_proj"] = shape
+    bank["switch_mlp.down_proj"] = (8, 2560, 640)
+    arrays = {}
+    for name, shape in bank.items():
+        dense = (0.02 * mx.random.normal(shape)).astype(mx.bfloat16)
+        if name.startswith("switch_mlp"):
+            packed = mx.quantize(dense, group_size=64, bits=4)
+            for part, value in zip(("weight", "scales", "biases"), packed):
+                arrays[f"{name}.{part}"] = value
+        else:
+            arrays[f"{name}.weight"] = dense
+    arrays["gate.weight"] = arrays.pop("router.weight")
+    config = {"quantization": {"group_size": 64, "bits": 4, "mode": "affine"}}
+    moe = MoE(Weights(arrays, config, ""), text)
+    moe.enable_kernels()
     assert attention.fused_prep and attention.selection is not None
     assert attention.kernel is not None
     assert connection.fused and connection.write is kernels.hc_write
     assert linear.fused and linear.recurrence is kernels.gated_delta
+    assert moe.expert_kernel
