@@ -73,7 +73,8 @@ dependencies = [
     "tqdm>=4.66.0",
     "pyyaml>=6.0",
     "itsdangerous>=2.0",
-    "jinja2>=3.0",
+    # transformers 5.22.2 refuses to render chat templates with older jinja2.
+    "jinja2>=3.1.6",
     # mlx-lm 0.31.3 imports rich from mlx_lm.cli_ui for chat/lora entrypoints.
     "rich>=13.0.0",
     "sentencepiece",
