@@ -14,6 +14,8 @@ Note: Uses pytest-asyncio for async tests.
 
 import asyncio
 import concurrent.futures
+import threading
+import time
 import weakref
 from collections import deque
 from types import SimpleNamespace
@@ -1745,6 +1747,41 @@ class TestGlobalMLXExecutor:
             f"Expected concurrent execution (max_concurrent >= 2), got {max_concurrent}. "
             f"Per-engine executors should allow parallel step() calls."
         )
+
+    @pytest.mark.asyncio
+    async def test_two_hop_admission_lands_before_next_prefill_chunk(
+        self, mock_model, mock_tokenizer
+    ):
+        """VLM prompt prep queued behind a chunk gets its add in before the next one."""
+        started = threading.Event()
+        chunks = 0
+        added_after: list[int] = []
+
+        def chunk_step():
+            nonlocal chunks
+            started.set()
+            time.sleep(0.1)
+            chunks += 1
+            return SchedulerOutput(has_work=True, ran_prefill_chunk=True)
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine.scheduler.step = chunk_step
+            engine.scheduler.has_requests = lambda: True
+            engine.scheduler.add_request = lambda request: added_after.append(chunks)
+            try:
+                await engine.start()
+                while not started.is_set():
+                    await asyncio.sleep(0.005)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(engine._mlx_executor, lambda: None)
+                await engine.add_request("hello")
+            finally:
+                await engine.stop()
+                engine.close()
+
+        assert added_after == [1]
 
 
 class TestEngineCoreCloseReleasesSSDManager:
