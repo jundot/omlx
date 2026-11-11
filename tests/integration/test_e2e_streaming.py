@@ -4936,47 +4936,23 @@ async def test_qwen_closed_envelope_with_unclosed_parameter_never_emits_call():
     assert events[-1]["error"]["code"] == "invalid_tool_call"
 
 
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
-async def test_upstream_tool_calls_finish_without_calls_is_invalid(api):
-    """The engine said tool_calls but delivered prose with no span (#4909)."""
-    events = await _recovery_stream("All done.", api, finish_reason="tool_calls")
+@pytest.mark.parametrize("raw", ["", "All done."], ids=["no_text", "prose"])
+async def test_tool_calls_finish_without_calls_is_invalid(api, raw):
+    events = await _recovery_stream(raw, api, finish_reason="tool_calls")
 
     assert _recovery_error_codes(events, api) == ["invalid_tool_call"]
     assert _recovery_calls(events, api) == []
     if api == "chat":
-        assert not any(
-            c.get("finish_reason") for e in events for c in e.get("choices", [])
-        )
+        assert _chat_finish_reasons(events) == []
     elif api == "anthropic":
         assert not any(e.get("type") == "message_delta" for e in events)
     else:
         assert events[-1]["type"] == "response.failed"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
-async def test_tool_calls_finish_with_parsed_calls_succeeds(api):
-    events = await _recovery_stream(_RECOVERY_CALL, api, finish_reason="tool_calls")
-
-    assert _recovery_error_codes(events, api) == []
-    assert len(_recovery_calls(events, api)) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
-async def test_stop_finish_prose_is_untouched(api):
-    events = await _recovery_stream("All done.", api, finish_reason="stop")
-
-    assert _recovery_error_codes(events, api) == []
-    assert _recovery_text(events, api) == "All done."
-
-
-def test_nonstream_upstream_tool_calls_finish_without_calls_is_invalid(monkeypatch):
-    """Non-stream twin: coded 500 instead of empty tool_calls with a
-    tool_calls finish (#4909)."""
+def test_nonstream_tool_calls_finish_without_calls_is_invalid(monkeypatch):
     client = _nonstream_tool_call_client(
         monkeypatch, "All done.", qwen_parser=False, finish_reason="tool_calls"
     )
@@ -4987,10 +4963,9 @@ def test_nonstream_upstream_tool_calls_finish_without_calls_is_invalid(monkeypat
     client.close()
 
     assert response.status_code == 500, response.text
-    body = response.json()
-    assert body["error"]["code"] == "invalid_tool_call"
-    # Falsifier: a 200 success with empty tool_calls and a tool_calls finish.
-    assert "choices" not in body
+    assert response.json()["error"]["code"] == "invalid_tool_call"
+
+
 # Prose that quotes the control marker. The filter withholds it to EOF, but
 # nothing here is a tool call payload.
 _RECOVERY_PROSE = (

@@ -2551,21 +2551,12 @@ def extract_tool_calls_with_thinking(
                 tool_calls = [
                     tc for tc in tool_calls if tc.function.name in valid_names
                 ]
-        if not tool_calls:
-            tool_calls = None
-            tool_calls_from_thinking = False
+                if not tool_calls:
+                    tool_calls = None
+                    tool_calls_from_thinking = False
 
-    if (
-        tools
-        and finish_reason == "tool_calls"
-        and not tool_calls
-        and not parse_errors
-    ):
-        # The engine reported a tool-call finish, but no parser produced a
-        # call or an error: the span was consumed and dropped upstream, or
-        # the generic parser has no error channel. Without a signal the
-        # client sees finish_reason=tool_calls with an empty tool_calls
-        # array and cannot tell it from a prose answer (#4909).
+    if tools and finish_reason == "tool_calls" and not tool_calls and not parse_errors:
+        # A remote backend can consume the call span and still report this finish.
         parse_errors = ("malformed",)
 
     return ToolCallExtraction(
