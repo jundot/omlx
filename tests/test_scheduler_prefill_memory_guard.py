@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 
+from omlx import memory_monitor as mm
 from omlx.cache.paged_cache import PagedCacheManager
 from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
 from omlx.cache.prefix_cache import BlockAwarePrefixCache
@@ -22,6 +23,23 @@ from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import MemoryMonitor
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig
+
+
+@pytest.fixture(autouse=True)
+def _clear_bounded_sdpa_routes():
+    """Price every prefill below with no bounded SDPA route installed.
+
+    ``_SDPA_TILED_PREFILL_HEAD_DIMS`` is a process-wide table and
+    ``apply_sdpa256_attention_patch()`` only ever adds to it, so a worker
+    that earlier ran the patch prices head_dim=256 prefill at the bounded
+    route (~6.96 GiB rather than ~13 GiB) and the unpriced-fallback
+    expectations below fail. These tests never install a route, so clear
+    on both sides: setup keeps an earlier test from leaking in, teardown
+    keeps this module from leaking out.
+    """
+    mm._SDPA_TILED_PREFILL_HEAD_DIMS.clear()
+    yield
+    mm._SDPA_TILED_PREFILL_HEAD_DIMS.clear()
 
 
 class _ModelConfig:
