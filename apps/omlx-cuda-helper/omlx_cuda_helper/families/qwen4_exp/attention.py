@@ -112,15 +112,28 @@ class Attention:
 
         self._head_sum = _head_sum(self.index_heads, self.index_dim)
         self.kernel: kernels.SparseAttention | None = None
+        self.selection: kernels.BlockSelection | None = None
+        self.fused_prep = False
 
     def enable_kernels(self) -> None:
-        """Use the gathered-attention kernels if they reproduce ``_gathered``."""
-        if self.heads // self.kv_heads > 32 or self.head_dim > 1024:
-            # The kernels run one warp per query head and one thread per dim.
-            return
+        """Use the prep, selection and attention kernels that reproduce the ops."""
         dtype = self.q_proj.weight.dtype
+        geometry = (self.heads, self.kv_heads, self.head_dim, self.index_heads)
+        half = self.inv_freq.shape[0]
+        if kernels.qsa_prep_fits(*geometry, self.index_dim, half, dtype):
+            self.fused_prep = self._prepares_like(dtype)
+        if kernels.BlockSelection.fits(self.index_heads, self.index_dim, dtype):
+            selection = kernels.BlockSelection(
+                self.index_heads, self.index_dim, self.ratio, self.top_k
+            )
+            if self._selects_like(selection, dtype):
+                self.selection = selection
+        if not kernels.SparseAttention.fits(
+            self.heads, self.kv_heads, self.head_dim, dtype
+        ):
+            return
         kernel = kernels.SparseAttention(
-            self.heads, self.kv_heads, self.head_dim, self.ratio, self.top_k, dtype
+            self.heads, self.kv_heads, self.head_dim, self.ratio, self.top_k
         )
         # Rows around the point where a query stops taking every block, so
         # short selections, every tail length and full selections all occur.
@@ -142,6 +155,58 @@ class Attention:
         got = kernel(queries, keys, values, selected, total - rows + 1)
         if kernels.close(got, want, "QSA attention"):
             self.kernel = kernel
+
+    def _prepares_like(self, dtype: mx.Dtype) -> bool:
+        """Whether ``_prepare_fused`` gives what ``prepare`` gives."""
+        rows, past = 64, 1000
+        widths = (
+            self.q_proj.weight.shape[0],
+            self.k_proj.weight.shape[0],
+            self.v_proj.weight.shape[0],
+            self.index_proj.weight.shape[0],
+        )
+        outs = [mx.random.normal((1, rows, w)).astype(dtype) for w in widths]
+        positions = mx.arange(past, past + rows, dtype=mx.int32)
+        want = self.prepare(*outs, positions)
+        got = self._prepare_fused(*outs, past)
+        names = ("queries", "gate", "keys", "values", "index keys", "index queries")
+        return all(
+            kernels.close(a, b, f"QSA {name}") for a, b, name in zip(got, want, names)
+        )
+
+    def _prepare_fused(
+        self,
+        q_out: mx.array,
+        k_out: mx.array,
+        v_out: mx.array,
+        index: mx.array,
+        past: int,
+    ) -> tuple[mx.array, ...]:
+        """``prepare`` in one launch for rows at positions ``past`` on."""
+        rows = q_out.shape[1]
+        gate = q_out.reshape(1, rows, self.heads, 2, -1)[..., 1, :].reshape(1, rows, -1)
+        queries, keys, values, index_keys, index_queries = kernels.qsa_prep(
+            self, q_out, k_out, v_out, index, past
+        )
+        return queries, gate, keys, values, index_keys, index_queries
+
+    def _selects_like(self, selection: kernels.BlockSelection, dtype) -> bool:
+        """Whether ``selection`` picks exactly what ``_select`` picks.
+
+        Small integer inputs give sums that do not depend on their order and
+        many tied scores, and rows on both sides of ``top_k`` complete blocks.
+        """
+        ratio, blocks = self.ratio, self.top_k + 64
+        rows = 72 * ratio
+        bank = mx.random.randint(-1, 2, (1, blocks, self.index_dim)).astype(dtype)
+        shape = (rows, self.index_heads, self.index_dim)
+        queries = mx.random.randint(-1, 2, shape).astype(dtype)
+        first = (self.top_k - 8) * ratio
+        got = selection(queries, bank, first)
+        if mx.array_equal(got, self._select(queries, bank, first)).item():
+            return True
+        kernels.logger.warning("QSA selection kernel differs; using the reference")
+        return False
 
     def parameters(self) -> list[mx.array]:
         linears = (self.q_proj, self.k_proj, self.v_proj, self.o_proj, self.index_proj)
@@ -205,6 +270,8 @@ class Attention:
         if blocks <= self.top_k:
             first = mx.arange(blocks, dtype=mx.int32)[None]
             return mx.broadcast_to(first, (rows, blocks))
+        if self.selection is not None:
+            return self.selection(index_queries, pooled, first_visible)
         scores = self._block_scores(index_queries, pooled)
         complete = (first_visible + mx.arange(rows, dtype=mx.int32)) // self.ratio
         scores = mx.where(mx.arange(blocks)[None] < complete[:, None], scores, -mx.inf)
@@ -361,13 +428,12 @@ class Attention:
         _, rows, _ = x.shape
         past = cache.offset
         positions = mx.arange(past, past + rows, dtype=mx.int32)
-        queries, gate, keys, values, index_keys, index_queries = self.prepare(
-            self.q_proj(x),
-            self.k_proj(x),
-            self.v_proj(x),
-            self.index_proj(x),
-            positions,
-        )
+        outs = (self.q_proj(x), self.k_proj(x), self.v_proj(x), self.index_proj(x))
+        if self.fused_prep:
+            prepared = self._prepare_fused(*outs, past)
+        else:
+            prepared = self.prepare(*outs, positions)
+        queries, gate, keys, values, index_keys, index_queries = prepared
         cache.append(keys, values, index_keys, positions[None])
 
         total = past + rows

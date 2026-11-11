@@ -414,7 +414,7 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon 上的块扩散推测解码 (Block diffusion speculative decoding)
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP 的验证形态 Metal 内核由 Youssof Altoukhi 的 MTPLX 提供支持，同时也启发了 depth-k 流水线设计
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) - 融合 GDN 验证预处理内核改编自 mlx-serve 对 mlxfast-challenge qwen35_packed_gdn_prework 内核的移植，Qwen4 的融合 GDN decode 与 prefill 内核改编自 mlx-serve 的 MIT 开源 `transformer.zig`；Qwen4 QSA 的 128 位 K/V 暂存改编自 mlx-serve 的 MIT 开源 `msv_attn_p256` 内核；Linux Prefill Accelerator helper 的 routed expert CUDA 内核和两个 MLX CUDA 补丁改编自 mlx-serve 的 MIT 开源内核与补丁
-- [TensorFold](https://github.com/ashhart/TensorFold) - Linux Prefill Accelerator helper 的 MiniMax M3 与 GLM-5.3 稀疏注意力 CUDA 内核（index score、块选择、attention）改编自 TensorFold 的 Apache-2.0 内核
+- [TensorFold](https://github.com/ashhart/TensorFold) - Linux Prefill Accelerator helper 的 MiniMax M3 与 GLM-5.3 稀疏注意力 CUDA 内核（index score、块选择、attention）以及 Qwen3.8 Flash-Next 的 QSA attention 与 Gated DeltaNet 递归内核改编自 TensorFold 的 Apache-2.0 内核
 - [Splash](https://github.com/incoai/splash) - 验证形态线性内核采用 Splash 的 bf16 `0x4300 | q` 权重操作数与分组输入求和（来自其 Apache-2.0 开源的 `linear_q4_sgmatrix.metal`），张量运算验证注意力借鉴了 Splash `paged_attention_tile.h` 的分块设计，GGUF 的分词器按照 Splash Apache-2.0 开源的 `install/gguf.py` 从文件头生成
 - [SiliconScope](https://github.com/kennss/SiliconScope) - 菜单栏统计信息的设计和渲染方法参考了 Kennt Kim 的 SiliconScope，这也启发了高能效重渲染门禁机制
 - [m5gpu](https://github.com/beamivalice/m5gpu) - GPU 功率限制使用了 beamivalice 的 m5gpu 所记录的 AGX GPU 功率目标（`SetMaxGPUAbsolutePower` 与 `AbsoluteTarget`，以及用于解除的 `-1000`）

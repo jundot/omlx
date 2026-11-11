@@ -79,6 +79,8 @@ class HyperConnection:
         self.inject = w.float32("block_inject_weight")
         self.mix = _stream_mixer(self.streams, self.hidden)
         self.square_sums = None
+        self.fused = False
+        self.write = write
 
     def parameters(self) -> list[mx.array]:
         linears = (self.down, self.up)
@@ -86,11 +88,34 @@ class HyperConnection:
         return own + [a for layer in linears for a in layer.parameters()]
 
     def enable_kernels(self) -> None:
+        """Take the square sums kernel, then the fused norm and mix kernels
+        if they reproduce the block input and the write gates."""
         dtype = self.down.weight.dtype
         self.square_sums = checked_square_sums(self.scale, self.eps, dtype)
+        if self.square_sums is None or not kernels.hc_fits(
+            self.streams, self.hidden, dtype
+        ):
+            return
+        h = mx.random.normal((1, 64, self.streams * self.hidden)).astype(dtype)
+        want = self(h)
+        self.fused = True
+        got = self(h)
+        self.fused = kernels.close(got[0], want[0], "HC input") and kernels.close(
+            got[1], want[1], "HC gates"
+        )
+        branch = mx.random.normal((1, 64, self.hidden)).astype(dtype)
+        if self.fused and kernels.close(
+            kernels.hc_write(h, branch, want[1]), write(h, branch, want[1]), "HC write"
+        ):
+            self.write = kernels.hc_write
 
     def __call__(self, h: mx.array) -> tuple[mx.array, mx.array]:
         """(block input [1, L, hidden], write gates [1, L, streams])."""
+        if self.fused:
+            normed, dots = kernels.hc_norm(h, self.scale, self.inject, self.eps)
+            mix = nn.silu(self.down(normed) / self.streams)
+            up = self.up(mix)
+            return kernels.hc_mix(up, normed, self.streams), self.gates(dots, h.dtype)
         normed = stream_norm(h, self.scale, self.eps, self.square_sums)
         mix = nn.silu(self.down(normed) / self.streams)
         return self.mix(self.up(mix), normed), self.write_gates(normed)
@@ -101,9 +126,12 @@ class HyperConnection:
         They read the inject weights without their 16-bit rounding and take
         their sigmoid in float32, as the host kernel does.
         """
-        raw = (normed.astype(mx.float32) @ self.inject.T).astype(normed.dtype)
-        raw = (raw / self.streams).astype(mx.float32)
-        return 2 * mx.sigmoid(raw).astype(normed.dtype)
+        return self.gates(normed.astype(mx.float32) @ self.inject.T, normed.dtype)
+
+    def gates(self, dots: mx.array, dtype: mx.Dtype) -> mx.array:
+        """Write gates from the float32 products of the streams and inject."""
+        raw = (dots.astype(dtype) / self.streams).astype(mx.float32)
+        return 2 * mx.sigmoid(raw).astype(dtype)
 
 
 def write(h: mx.array, branch: mx.array, inject: mx.array) -> mx.array:
@@ -146,6 +174,8 @@ class GatedDeltaNet:
         self.out = w.linear("out_proj")
         self.taps = w["conv1d.weight"][..., 0].astype(mx.float32)
         self.conv = depthwise_conv
+        self.recurrence = mx.fast.gated_delta_update
+        self.fused = False
         self.decay = mx.exp(w["A_log"].astype(mx.float32))
         self.dt_bias = w["dt_bias"]
         self.norm_weight = w["norm.weight"]
@@ -156,14 +186,55 @@ class GatedDeltaNet:
         return own + [a for layer in linears for a in layer.parameters()]
 
     def enable_kernels(self) -> None:
-        self.conv = checked_conv(self.taps, 1, self.qkv.weight.dtype) or self.conv
+        """Take the conv and recurrence kernels that match their references."""
+        dtype = self.qkv.weight.dtype
+        self.conv = checked_conv(self.taps, 1, dtype) or self.conv
+        # Three staged step blocks, the last one partial, from a nonzero state.
+        steps, keys = 80, (1, 80, self.key_heads, self.key_dim)
+        q, k = (mx.random.normal(keys) for _ in range(2))
+        q = (
+            q * mx.rsqrt(mx.sum(q * q, -1, keepdims=True)) * self.key_dim**-0.5
+        ).astype(dtype)
+        k = (k * mx.rsqrt(mx.sum(k * k, -1, keepdims=True))).astype(dtype)
+        v = mx.random.normal((1, steps, self.value_heads, self.value_dim)).astype(dtype)
+        gamma = mx.exp(-0.1 * mx.random.uniform(shape=(1, steps, self.value_heads)))
+        beta = mx.sigmoid(mx.random.normal((1, steps, self.value_heads))).astype(dtype)
+        state = 0.1 * mx.random.normal(
+            (1, self.value_heads, self.value_dim, self.key_dim)
+        )
+        if not kernels.gdn_fits(q, v, gamma, beta):
+            return
+        got = kernels.gated_delta(q, k, v, gamma, beta, state)
+        want = mx.fast.gated_delta_update(q, k, v, gamma, beta, state)
+        if kernels.close(got[0], want[0], "GDN output") and kernels.close(
+            got[1], want[1], "GDN state"
+        ):
+            self.recurrence = kernels.gated_delta
+        if kernels.gdn_glue_fits(self):
+            self.fused = self._glue_matches(dtype)
+
+    def _glue_matches(self, dtype: mx.Dtype) -> bool:
+        """Whether the prework and finish kernels reproduce the plain ops."""
+        width = self.qkv.weight.shape[0]
+        qkv = mx.random.normal((1, 64, width)).astype(dtype)
+        state = mx.random.normal((1, self.taps.shape[1] - 1, width)).astype(dtype)
+        y = mx.random.normal((1, 64, self.value_heads, self.value_dim)).astype(dtype)
+        z = mx.random.normal((1, 64, self.value_heads * self.value_dim)).astype(dtype)
+        want = [*self.prework(qkv, state), self.finish(y, z)]
+        self.fused = True
+        got = [*self.prework(qkv, state), self.finish(y, z)]
+        names = ("GDN q", "GDN k", "GDN v", "GDN window", "GDN norm and gate")
+        return all(kernels.close(a, b, n) for a, b, n in zip(got, want, names))
 
     def prework(self, qkv: mx.array, state: mx.array | None) -> tuple[mx.array, ...]:
         """(q, k, v, next conv window) from the projected rows [1, rows, C]."""
-        rows = qkv.shape[1]
+        rows, window = qkv.shape[1], self.taps.shape[1] - 1
         if state is None:
-            window = self.taps.shape[1] - 1
             state = mx.zeros((1, window, qkv.shape[-1]), dtype=qkv.dtype)
+        if self.fused:
+            q, k, v = kernels.gdn_prework(qkv, state, self.taps, self.key_heads)
+            tail = mx.concatenate([state, qkv[:, -window:]], axis=1)
+            return q, k, v, tail[:, -window:]
         conv_in = mx.concatenate([state, qkv], axis=1)
         conv_out = nn.silu(self.conv(conv_in, self.taps, 1))
         keys = self.key_heads * self.key_dim
@@ -182,6 +253,11 @@ class GatedDeltaNet:
 
     def finish(self, y: mx.array, z: mx.array) -> mx.array:
         """The recurrence output normalized and gated, [1, rows, value width]."""
+        if self.fused:
+            z = z.reshape(y.shape)
+            return kernels.gdn_finish(
+                y, z, self.norm_weight, self.eps, self.sigmoid_gate
+            )
         squares = mx.square(y.astype(mx.float32))
         inverse = mx.rsqrt(mx.mean(squares, axis=-1, keepdims=True) + self.eps)
         gate = _sigmoid_gate if self.sigmoid_gate else _silu_gate
@@ -191,7 +267,7 @@ class GatedDeltaNet:
     def __call__(self, x: mx.array, cache: list) -> mx.array:
         q, k, v, cache[0] = self.prework(self.qkv(x), cache[0])
         gamma, beta = self.gates(self.a(x), self.b(x))
-        y, cache[1] = mx.fast.gated_delta_update(q, k, v, gamma, beta, cache[1])
+        y, cache[1] = self.recurrence(q, k, v, gamma, beta, cache[1])
         return self.out(self.finish(y, self.z(x)))
 
 
@@ -294,6 +370,7 @@ class MoE:
 
     def __init__(self, w: Weights, text: dict[str, Any]):
         self.top_k = text["num_experts_per_tok"]
+        self.inner = text["moe_intermediate_size"]
         self.normalize = text.get("norm_topk_prob", True)
         self.router = w.linear("gate")
         self.shared_gate = w.linear("shared_expert.gate_proj")
@@ -305,6 +382,8 @@ class MoE:
         self.gate_up = self._bank(banks, ("gate_proj", "up_proj"))
         self.down = self._bank(banks, ("down_proj",))
         self.combine = None
+        self.gather = None
+        self.swiglu = None
 
     @staticmethod
     def _bank(w: Weights, names: tuple[str, ...]) -> tuple:
@@ -336,7 +415,8 @@ class MoE:
         ]
 
     def enable_kernels(self) -> None:
-        """Use the combine kernel if it adds expert rows like ``stacked_sum``."""
+        """Use the combine kernel if it adds expert rows like ``stacked_sum``
+        and the row gather and SwiGLU kernels if they equal their ops."""
         k, dtype = self.top_k, self.router.weight.dtype
         y = mx.random.normal((64 * k, 1, self.router.weight.shape[1])).astype(dtype)
         positions = mx.argsort(mx.random.uniform(shape=(64 * k,)))
@@ -346,6 +426,20 @@ class MoE:
             kernels.combine_experts(y, positions, scores), want, "MoE sum"
         ):
             self.combine = kernels.combine_experts
+        x = mx.random.normal((64, self.router.weight.shape[1])).astype(dtype)
+        src = mx.random.randint(0, 64, (64 * k,)).astype(mx.uint32)
+        if x.shape[1] * dtype.size % 16:
+            return
+        if mx.array_equal(kernels.gather_rows(x, src), x[src]).item():
+            self.gather = kernels.gather_rows
+        else:
+            kernels.logger.warning("Row gather kernel differs; using the reference")
+        both = mx.random.normal((64, 1, 2 * self.inner)).astype(dtype)
+        if dtype == mx.bfloat16 and self.inner % 8 == 0:
+            if mx.array_equal(kernels.swiglu(both), self._swiglu(both)).item():
+                self.swiglu = kernels.swiglu
+            else:
+                kernels.logger.warning("SwiGLU kernel differs; using the reference")
 
     @staticmethod
     def _gather(x: mx.array, bank: tuple, experts: mx.array) -> mx.array:
@@ -365,6 +459,11 @@ class MoE:
             mode=quant.get("mode", "affine"),
             sorted_indices=True,
         )
+
+    @staticmethod
+    def _swiglu(both: mx.array) -> mx.array:
+        inner = both.shape[-1] // 2
+        return nn.silu(both[..., :inner]) * both[..., inner:]
 
     def route(self, logits: mx.array) -> tuple[mx.array, mx.array]:
         """(expert ids, weights) [1, rows, top_k] from the router logits."""
@@ -387,10 +486,13 @@ class MoE:
         flat = chosen.reshape(-1)
         order = mx.argsort(flat)
         ids = flat[order].astype(mx.uint32)
-        routed = x.reshape(x.shape[1], 1, -1)[order // k]
+        rows = x.reshape(x.shape[1], -1)
+        if self.gather is not None:
+            routed = self.gather(rows, (order // k).astype(mx.uint32))[:, None]
+        else:
+            routed = rows[order // k][:, None]
         both = self._gather(routed, self.gate_up, ids)
-        inner = both.shape[-1] // 2
-        hidden = nn.silu(both[..., :inner]) * both[..., inner:]
+        hidden = (self.swiglu or self._swiglu)(both)
         return self._gather(hidden, self.down, ids), mx.argsort(order)
 
     def combined(self, y: mx.array, positions: mx.array, scores: mx.array) -> mx.array:
@@ -446,6 +548,6 @@ class Layer:
         if self.ple is not None:
             h = h + self.ple(h, tokens, rows, cache)
         mixed, inject = self.attn_hc(h)
-        h = write(h, self.mixer(mixed, cache), inject)
+        h = self.attn_hc.write(h, self.mixer(mixed, cache), inject)
         mixed, inject = self.mlp_hc(h)
-        return write(h, self.mlp(mixed), inject)
+        return self.mlp_hc.write(h, self.mlp(mixed), inject)
