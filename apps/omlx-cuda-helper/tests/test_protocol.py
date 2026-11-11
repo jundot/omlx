@@ -10,6 +10,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -279,5 +280,40 @@ def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
             agent.remote_info(stranger)
     finally:
         supervisor.stop()
+        control.stop()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_just_paired_helper_gets_time_to_take_its_key(monkeypatch):
+    pytest.importorskip("omlx")
+    from omlx.prefill_helper import agent, launcher
+
+    root = Path(tempfile.mkdtemp(prefix="och-", dir="/tmp"))
+    key = bytes(range(32))
+    state = State(root / "state", name="nvidia1")
+    supervisor = Supervisor(None, root / "run")
+    control = ControlServer(state, ModelStore(root / "models"), supervisor, {})
+    control.start()
+    me = SimpleNamespace(node_id="studio")
+    monkeypatch.setattr(agent, "get_node_identity", lambda: me)
+    target = agent.AgentTarget(
+        state.node_id,
+        "nvidia1",
+        "127.0.0.1",
+        "ethernet",
+        control.port,
+        key,
+        paired_at=time.time(),
+    )
+    # The helper polls for its key and saves it a moment after the approval.
+    host = {"cluster_key": key.hex(), "name": "Studio"}
+    threading.Timer(1.0, state.save_host, ("studio", host)).start()
+    try:
+        agent._connect(target).close()
+        # Long after the pairing, a refusal is final.
+        stale = replace(target, key=bytes(32), paired_at=0.0)
+        with pytest.raises(launcher.LaunchError, match="did not accept"):
+            agent._connect(stale)
+    finally:
         control.stop()
         shutil.rmtree(root, ignore_errors=True)

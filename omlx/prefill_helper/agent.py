@@ -15,6 +15,7 @@ import json
 import os
 import secrets
 import socket
+import time
 import urllib.request
 import zlib
 from collections.abc import Callable, Iterator
@@ -45,6 +46,8 @@ _STOP_TIMEOUT_S = 15.0
 _CHUNK_BYTES = 16 << 20
 # A probe of a link the helper may not be on ends this fast.
 _LINK_PROBE_TIMEOUT_S = 2.0
+# A helper takes its pairing key by polling this Mac every 2 s after approval.
+_KEY_PICKUP_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,8 @@ class AgentTarget:
     warnings: tuple[str, ...] = ()
     # Negotiated speed of this Mac's interface toward the helper, in Mbit/s.
     speed_mbps: int | None = None
+    # When this Mac paired with it, as wall-clock seconds.
+    paired_at: float = 0.0
 
     @property
     def endpoint(self) -> str:
@@ -136,6 +141,7 @@ def resolve_target(node_id: str) -> AgentTarget:
                 control_port=control_port,
                 key=key,
                 speed_mbps=speed,
+                paired_at=float(device.get("paired_at") or 0.0),
             )
         )
     raise LaunchError(f"{device['friendly_name']} does not answer.")
@@ -189,7 +195,26 @@ def _fastest_link(target: AgentTarget) -> AgentTarget:
     return target
 
 
+class _RefusedError(Exception):
+    """The helper did not take this Mac's key."""
+
+
 def _connect(target: AgentTarget, timeout: float = 10.0) -> socket.socket:
+    # Right after the pairing the helper may not have taken its key yet.
+    retry_until = target.paired_at + _KEY_PICKUP_S
+    while True:
+        try:
+            return _connect_once(target, timeout)
+        except _RefusedError as error:
+            if time.time() >= retry_until:
+                raise LaunchError(
+                    f"{target.name} did not accept this Mac: {error}. Pair it "
+                    "again in the Cluster tab."
+                ) from error
+        time.sleep(0.5)
+
+
+def _connect_once(target: AgentTarget, timeout: float) -> socket.socket:
     try:
         sock = socket.create_connection(
             (target.address, target.control_port), timeout=timeout
@@ -217,10 +242,7 @@ def _connect(target: AgentTarget, timeout: float = 10.0) -> socket.socket:
             )
     except (OSError, wire.ProtocolError) as error:
         sock.close()
-        raise LaunchError(
-            f"{target.name} did not accept this Mac: {error}. Pair it again "
-            "in the Cluster tab."
-        ) from error
+        raise _RefusedError(str(error)) from error
     except BaseException:
         sock.close()
         raise
