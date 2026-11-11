@@ -1033,12 +1033,6 @@ def test_manager_blocks_what_a_retry_cannot_fix(tmp_path):
 
 
 def test_manager_retries_a_helper_that_does_not_answer(tmp_path, monkeypatch):
-    """An unreachable helper is retried, not reported as a permanent error.
-
-    It is asleep, unplugged, or off the network for a moment (after a host
-    wake) and answers again later; only the user can fix version, memory,
-    disk, and pairing problems (issue #5166).
-    """
     monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (0.05,))
     attached = []
     fake = _FakeLauncher(None)

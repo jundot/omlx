@@ -181,8 +181,7 @@ def _reach(
     try:
         target = launcher.resolve_target(node_id)
     except UnreachableError:
-        # Asleep, unplugged, or off the network: let the retry loop back off
-        # instead of giving up until the user presses Retry (issue #5166).
+        # Asleep, unplugged, or off the network: retried with backoff.
         raise
     except launcher.LaunchError as error:
         raise _PermanentError(str(error)) from error

@@ -124,9 +124,7 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
         except (OSError, subprocess.SubprocessError):
             continue
     if target is None:
-        raise UnreachableError(
-            f"{device['friendly_name']} does not answer over SSH."
-        )
+        raise UnreachableError(f"{device['friendly_name']} does not answer over SSH.")
     local, peer = probe_host_interfaces("localhost"), probe_host_interfaces(target)
     link = shared_link_addresses(local, peer)
     cable = None if link.kind in _FAST_LINKS else thunderbolt_link_local(local, peer)
