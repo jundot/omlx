@@ -71,6 +71,22 @@ def _valid_transport_request_id(value: Any) -> bool:
     return all(character in allowed for character in value)
 
 
+def _unwrap_double_encoded_arguments(arguments: str) -> str:
+    """Unwrap arguments that rank zero JSON-encoded twice (DeepSeek V4.1)."""
+
+    try:
+        decoded = json.loads(arguments)
+    except (TypeError, ValueError):
+        return arguments
+    if not isinstance(decoded, str):
+        return arguments
+    try:
+        inner = json.loads(decoded)
+    except (TypeError, ValueError):
+        return arguments
+    return decoded if isinstance(inner, dict) else arguments
+
+
 def _reasoning_effort_retry_payloads(
     payload: dict[str, Any], detail: str
 ) -> list[dict[str, Any]]:
@@ -899,6 +915,8 @@ raise SystemExit(2)
                     arguments = json.dumps(arguments, ensure_ascii=False)
                 except (TypeError, ValueError):
                     continue
+            else:
+                arguments = _unwrap_double_encoded_arguments(arguments)
             normalized.append(
                 {
                     "id": item.get("id"),

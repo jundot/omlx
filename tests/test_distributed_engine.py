@@ -688,6 +688,160 @@ async def test_distributed_stream_chat_preserves_structured_tool_calls():
     assert outputs[-1].cached_tokens == 2
 
 
+# Arguments as rank zero sends them for DeepSeek V4.1: encoded twice.
+_DOUBLE_ENCODED_PATH_ARGS = json.dumps('{"path": "src"}')
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (_DOUBLE_ENCODED_PATH_ARGS, '{"path": "src"}'),
+        ('{"path": "src"}', '{"path": "src"}'),
+        ({"path": "src"}, '{"path": "src"}'),
+        (json.dumps("hello"), json.dumps("hello")),
+        (json.dumps("[1, 2]"), json.dumps("[1, 2]")),
+        ("not json", "not json"),
+    ],
+)
+def test_normalize_backend_tool_calls_unwraps_only_double_encoded_objects(
+    arguments, expected
+):
+    normalized = DistributedBatchedEngine._normalize_backend_tool_calls(
+        [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "list_directory", "arguments": arguments},
+            }
+        ]
+    )
+
+    assert normalized == [
+        {"id": "call_1", "name": "list_directory", "arguments": expected}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_unwraps_double_encoded_rank_zero_tool_arguments():
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_ls",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "list_directory",
+                                        "arguments": _DOUBLE_ENCODED_PATH_ARGS,
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "total_tokens": 14,
+                },
+            },
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat(
+            [{"role": "user", "content": "List src."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_directory",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert output.finish_reason == "tool_calls"
+    assert output.tool_calls == [
+        {"id": "call_ls", "name": "list_directory", "arguments": '{"path": "src"}'}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_unwraps_double_encoded_tool_arguments():
+    events = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_ls",
+                                "type": "function",
+                                "function": {
+                                    "name": "list_directory",
+                                    "arguments": _DOUBLE_ENCODED_PATH_ARGS,
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+        {
+            "choices": [],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17},
+        },
+    ]
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=content,
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "List src."}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "list_directory",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert outputs[-1].finish_reason == "tool_calls"
+    assert outputs[-1].tool_calls == [
+        {"id": "call_ls", "name": "list_directory", "arguments": '{"path": "src"}'}
+    ]
+
+
 @pytest.mark.asyncio
 async def test_distributed_stream_waits_for_usage_before_final_output():
     events = [
