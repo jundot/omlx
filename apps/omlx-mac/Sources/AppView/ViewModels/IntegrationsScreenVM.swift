@@ -1,13 +1,17 @@
+import AppKit
 import SwiftUI
 
 @MainActor
 @Observable
 final class IntegrationsScreenVM {
-    enum Field: Sendable {
-        case claudeMode, opusModel, sonnetModel, haikuModel
+    enum Field: Hashable, Sendable {
+        case claudeMode, opusModel, sonnetModel, haikuModel, desktopEnabled
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
-        case hermesModel, copilotModel, dshModel
+        case hermesModel, copilotModel, dshModel, vibeModel
         case mcpConfig
+        case splashPath, splashLimits, splashKvFormat, splashAnePrefill
+        case markitdownEnabled, markitdownExposeModel, markitdownMaxFileSize
+        case markitdownMaxFiles, markitdownPdfProcessingEngine
     }
 
     // Claude Code
@@ -15,16 +19,44 @@ final class IntegrationsScreenVM {
     var opusModel: String = ""
     var sonnetModel: String = ""
     var haikuModel: String = ""
+    var desktopEnabled: Bool = false
 
     // Other integrations
     var codexModel: String = ""
     var opencodeModel: String = ""
     var openclawModel: String = ""
     var piModel: String = ""
+    var vibeModel: String = ""
     var openclawToolsProfile: String = "coding"
     var hermesModel: String = ""
     var copilotModel: String = ""
     var dshModel: String = ""
+
+    // External engines: Splash
+    private(set) var splash: GlobalSettingsDTO.SplashStatus?
+    /// Path saved in settings; empty when the server detects the launcher.
+    private(set) var splashPathSetting: String = ""
+    var splashPathDraft: String = ""
+    var editingSplashPath = false
+    var splashKvFormat: String = "int8"
+    var splashAnePrefill = true
+    /// Whole GB as text; empty means automatic.
+    var splashMaxMemoryGb: String = ""
+    var splashSsdCacheGb: String = ""
+    private var splashLimitsLoaded = ("", "")
+
+    // MarkItDown
+    var markitdownEnabled = true
+    var markitdownExposeModel = false
+    var markitdownMaxFileSizeText = "25"
+    var markitdownMaxFilesText = "5"
+    var markitdownPdfProcessingEngine = "markitdown"
+    private var markitdownLoaded = (
+        enabled: true, exposeModel: false, maxFileSizeMb: 25,
+        maxFilesPerRequest: 5, pdfProcessingEngine: "markitdown"
+    )
+    private(set) var savingMarkitdownFields: Set<Field> = []
+    private(set) var markitdownOcrModels: [String] = []
 
     // MCP
     var mcpConfigPath: String = ""
@@ -58,10 +90,55 @@ final class IntegrationsScreenVM {
         return out
     }
 
+    var markitdownModelVisible: Bool {
+        get { markitdownEnabled && markitdownExposeModel }
+        set {
+            if markitdownEnabled { markitdownExposeModel = newValue }
+        }
+    }
+
+    var isSavingMarkitdownVisibility: Bool {
+        savingMarkitdownFields.contains(.markitdownEnabled)
+            || savingMarkitdownFields.contains(.markitdownExposeModel)
+    }
+
+    var markitdownOcrModelMissing: Bool {
+        markitdownPdfProcessingEngine != "markitdown"
+            && !availableModels.contains(markitdownPdfProcessingEngine)
+    }
+
+    var markitdownPdfOptions: [(String, String)] {
+        var options = [("markitdown", "MarkItDown")]
+        if markitdownOcrModelMissing {
+            options.append((markitdownPdfProcessingEngine, markitdownPdfProcessingEngine))
+        }
+        options += markitdownOcrModels.map { ($0, $0) }
+        return options
+    }
+
+    var markitdownPdfWarning: String? {
+        guard markitdownPdfProcessingEngine == "markitdown" || markitdownOcrModelMissing else { return nil }
+        let warning = String(localized: "integrations.markitdown.pdf_processing_markitdown_warning",
+                             defaultValue: "Scanned or image-only PDFs will fail when MarkItDown is selected, and PDFs with tables may not be processed correctly.",
+                             comment: "Warning when PDFs are processed by MarkItDown without OCR")
+        guard markitdownOcrModelMissing else { return warning }
+        let missing = String(localized: "integrations.markitdown.pdf_processing_missing_model",
+                             defaultValue: "The selected OCR model is unavailable. PDFs use MarkItDown until the model is available again or you select another engine.",
+                             comment: "Warning when the configured PDF OCR model is unavailable")
+        return "\(missing)\n\(warning)"
+    }
+
     /// Composed `omlx launch claude` command. Claude tier selections are
     /// persisted in settings, so the launcher reads them without extra flags.
     var claudeLaunchCommand: String {
         "\(cliCommandPrefix) launch claude"
+    }
+
+    /// Composed `omlx launch claude_desktop` command. Launches Claude Desktop
+    /// pointed at the oMLX gateway. Mirrors `claudeDesktopCommand` in
+    /// `omlx/admin/static/js/dashboard.js`.
+    var claudeDesktopLaunchCommand: String {
+        "\(cliCommandPrefix) launch claude_desktop"
     }
 
     /// Env-var recipe that runs the real `claude` binary directly. Mirrors
@@ -103,11 +180,46 @@ final class IntegrationsScreenVM {
     }
     var hermesCommand: String   { "\(cliCommandPrefix) launch hermes" }
     var piCommand: String       { "\(cliCommandPrefix) launch pi" }
+    var vibeCommand: String {
+        let command = "\(cliCommandPrefix) launch vibe"
+        return vibeModel.isEmpty ? command : "\(command) --model \(Self.shellQuote(vibeModel))"
+    }
     var copilotCommand: String  { "\(cliCommandPrefix) launch copilot" }
     var dshCommand: String      { "\(cliCommandPrefix) launch dsh" }
 
     var hasPendingMCPChanges: Bool {
         mcpConfigPath.trimmingCharacters(in: .whitespaces) != mcpConfigLoaded
+    }
+
+    /// Show the path field when no launcher was found or the user edits it.
+    var showsSplashPathField: Bool {
+        editingSplashPath || splash?.available != true
+    }
+
+    var hasPendingSplashLimits: Bool {
+        (Self.trimmed(splashMaxMemoryGb), Self.trimmed(splashSsdCacheGb)) != splashLimitsLoaded
+    }
+
+    func beginEditingSplashPath() {
+        splashPathDraft = splashPathSetting.isEmpty ? (splash?.path ?? "") : splashPathSetting
+        editingSplashPath = true
+    }
+
+    func chooseSplashLauncher() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = true
+        panel.prompt = String(localized: "integrations.splash.browse.prompt",
+                              defaultValue: "Select",
+                              comment: "NSOpenPanel button label for choosing the Splash launcher")
+        panel.message = String(localized: "integrations.splash.browse.message",
+                               defaultValue: "Choose the splash or splash-m1 launcher.",
+                               comment: "NSOpenPanel message for choosing the Splash launcher")
+        if panel.runModal() == .OK, let url = panel.url {
+            splashPathDraft = url.path
+        }
     }
 
     func bind<T: Equatable>(
@@ -133,17 +245,35 @@ final class IntegrationsScreenVM {
                 self.opusModel       = cc.opusModel ?? ""
                 self.sonnetModel     = cc.sonnetModel ?? ""
                 self.haikuModel      = cc.haikuModel ?? ""
+                self.desktopEnabled  = cc.desktopEnabled ?? false
             }
             if let it = settings.integrations {
                 self.codexModel           = it.codexModel ?? ""
                 self.opencodeModel        = it.opencodeModel ?? ""
                 self.openclawModel        = it.openclawModel ?? ""
                 self.piModel              = it.piModel ?? ""
+                self.vibeModel            = it.vibeModel ?? ""
                 self.openclawToolsProfile = it.openclawToolsProfile ?? "coding"
                 self.hermesModel          = it.hermesModel ?? ""
                 self.copilotModel         = it.copilotModel ?? ""
                 self.dshModel             = it.dshModel ?? ""
+                self.splashPathSetting    = it.splashPath ?? ""
+                self.splashKvFormat       = it.splashKvFormat ?? "int8"
+                self.splashAnePrefill     = it.splashAnePrefill ?? true
+                self.splashMaxMemoryGb    = Self.gigabytesText(it.splashMaxMemoryGb)
+                self.splashSsdCacheGb     = Self.gigabytesText(it.splashSsdCacheGb)
+                self.splashLimitsLoaded   = (self.splashMaxMemoryGb, self.splashSsdCacheGb)
             }
+            self.markitdownEnabled = settings.integrations?.markitdownEnabled ?? true
+            self.markitdownExposeModel = settings.integrations?.markitdownExposeModel ?? false
+            let maxFileSize = settings.integrations?.markitdownMaxFileSizeMb ?? 25
+            let maxFiles = settings.integrations?.markitdownMaxFilesPerRequest ?? 5
+            self.markitdownMaxFileSizeText = String(maxFileSize)
+            self.markitdownMaxFilesText = String(maxFiles)
+            self.markitdownPdfProcessingEngine = settings.integrations?.markitdownPdfProcessingEngine ?? "markitdown"
+            self.markitdownLoaded = (markitdownEnabled, markitdownExposeModel, maxFileSize,
+                                    maxFiles, markitdownPdfProcessingEngine)
+            self.splash = settings.externalEngines?.splash
             if let mcp = settings.mcp {
                 let path = mcp.configPath ?? ""
                 self.mcpConfigPath = path
@@ -151,8 +281,7 @@ final class IntegrationsScreenVM {
             }
 
             // Available models
-            let models = try await client.listModels().models
-            self.availableModels = models.map { $0.id }
+            try await refreshModels(client: client)
 
             // Stats — host/port/api_key/cli_prefix for the command builders.
             // Failure here is non-fatal: the screen still works against the
@@ -172,35 +301,144 @@ final class IntegrationsScreenVM {
     }
 
     func save(_ field: Field, client: OMLXClient) async {
+        guard !savingMarkitdownFields.contains(field) else { return }
         var patch = GlobalSettingsPatch()
         switch field {
         case .claudeMode:           patch.claudeCodeMode = claudeMode
         case .opusModel:            patch.claudeCodeOpusModel = opusModel
         case .sonnetModel:          patch.claudeCodeSonnetModel = sonnetModel
         case .haikuModel:           patch.claudeCodeHaikuModel = haikuModel
+        case .desktopEnabled:       patch.claudeCodeDesktopEnabled = desktopEnabled
         case .codexModel:           patch.integrationsCodexModel = codexModel
         case .opencodeModel:        patch.integrationsOpencodeModel = opencodeModel
         case .openclawModel:        patch.integrationsOpenclawModel = openclawModel
         case .piModel:              patch.integrationsPiModel = piModel
+        case .vibeModel:            patch.integrationsVibeModel = vibeModel
         case .openclawToolsProfile: patch.integrationsOpenclawToolsProfile = openclawToolsProfile
         case .hermesModel:          patch.integrationsHermesModel = hermesModel
         case .copilotModel:         patch.integrationsCopilotModel = copilotModel
         case .dshModel:             patch.integrationsDshModel = dshModel
         case .mcpConfig:
             patch.mcpConfig = mcpConfigPath.trimmingCharacters(in: .whitespaces)
+        case .splashPath:
+            patch.splashPath = Self.trimmed(splashPathDraft)
+        case .splashKvFormat:       patch.splashKvFormat = splashKvFormat
+        case .splashAnePrefill:     patch.splashAnePrefill = splashAnePrefill
+        case .splashLimits:
+            guard let memory = Self.gigabytesPatch(splashMaxMemoryGb, minimum: 1),
+                  let ssd = Self.gigabytesPatch(splashSsdCacheGb, minimum: 0) else {
+                self.lastError = String(localized: "integrations.splash.limits.invalid",
+                                        defaultValue: "Enter whole gigabytes, or leave the field empty for automatic.",
+                                        comment: "Error when a Splash memory or SSD cache size is not a whole number")
+                return
+            }
+            patch.splashMaxMemoryGb = memory
+            patch.splashSsdCacheGb = ssd
+        case .markitdownEnabled:
+            guard !isSavingMarkitdownVisibility, markitdownEnabled != markitdownLoaded.enabled else { return }
+            patch.markitdownEnabled = markitdownEnabled
+        case .markitdownExposeModel:
+            guard markitdownEnabled, !isSavingMarkitdownVisibility,
+                  markitdownExposeModel != markitdownLoaded.exposeModel else { return }
+            patch.markitdownExposeModel = markitdownExposeModel
+        case .markitdownMaxFileSize, .markitdownMaxFiles:
+            let text = field == .markitdownMaxFileSize ? markitdownMaxFileSizeText : markitdownMaxFilesText
+            guard let value = Int(Self.trimmed(text)), value > 0 else {
+                self.lastError = String(localized: "integrations.markitdown.limits.invalid",
+                                        defaultValue: "Enter a whole number greater than zero.",
+                                        comment: "Error when a MarkItDown file limit is not a positive integer")
+                return
+            }
+            if field == .markitdownMaxFileSize {
+                if value == markitdownLoaded.maxFileSizeMb {
+                    lastError = nil
+                    return
+                }
+                patch.markitdownMaxFileSizeMb = value
+            } else {
+                if value == markitdownLoaded.maxFilesPerRequest {
+                    lastError = nil
+                    return
+                }
+                patch.markitdownMaxFilesPerRequest = value
+            }
+        case .markitdownPdfProcessingEngine:
+            guard markitdownPdfProcessingEngine != markitdownLoaded.pdfProcessingEngine else { return }
+            patch.markitdownPdfProcessingEngine = markitdownPdfProcessingEngine
         }
+        switch field {
+        case .markitdownEnabled, .markitdownExposeModel, .markitdownMaxFileSize,
+             .markitdownMaxFiles, .markitdownPdfProcessingEngine:
+            savingMarkitdownFields.insert(field)
+        default:
+            break
+        }
+        defer { savingMarkitdownFields.remove(field) }
         do {
             _ = try await client.updateGlobalSettings(patch)
             self.lastError = nil
             switch field {
             case .mcpConfig:
                 self.mcpConfigLoaded = mcpConfigPath.trimmingCharacters(in: .whitespaces)
+            case .splashPath:
+                self.editingSplashPath = false
+                // Reload for the launcher status the server resolved.
+                await load(client: client)
+            case .splashLimits:
+                self.splashLimitsLoaded = (Self.trimmed(splashMaxMemoryGb), Self.trimmed(splashSsdCacheGb))
+            case .markitdownEnabled:
+                if let value = patch.markitdownEnabled { markitdownLoaded.enabled = value }
+                try await refreshModels(client: client)
+            case .markitdownExposeModel:
+                if let value = patch.markitdownExposeModel { markitdownLoaded.exposeModel = value }
+                try await refreshModels(client: client)
+            case .markitdownMaxFileSize:
+                if let value = patch.markitdownMaxFileSizeMb {
+                    markitdownLoaded.maxFileSizeMb = value
+                    markitdownMaxFileSizeText = String(value)
+                }
+            case .markitdownMaxFiles:
+                if let value = patch.markitdownMaxFilesPerRequest {
+                    markitdownLoaded.maxFilesPerRequest = value
+                    markitdownMaxFilesText = String(value)
+                }
+            case .markitdownPdfProcessingEngine:
+                if let value = patch.markitdownPdfProcessingEngine { markitdownLoaded.pdfProcessingEngine = value }
             default:
                 break
             }
         } catch {
+            switch field {
+            case .markitdownEnabled: markitdownEnabled = markitdownLoaded.enabled
+            case .markitdownExposeModel: markitdownExposeModel = markitdownLoaded.exposeModel
+            case .markitdownPdfProcessingEngine: markitdownPdfProcessingEngine = markitdownLoaded.pdfProcessingEngine
+            default: break
+            }
             self.lastError = error.omlxDescription
         }
+    }
+
+    private func refreshModels(client: OMLXClient) async throws {
+        let models = try await client.listModels().models
+        availableModels = models.map { $0.id }
+        markitdownOcrModels = models.filter { ($0.configModelType ?? "").lowercased().contains("ocr") }.map { $0.id }
+    }
+
+    private static func trimmed(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func gigabytesText(_ value: Double?) -> String {
+        guard let value else { return "" }
+        return String(Int(value))
+    }
+
+    /// `.null` for an empty field, the value for whole GB, nil when invalid.
+    private static func gigabytesPatch(_ text: String, minimum: Int) -> PatchOptionalInt? {
+        let value = trimmed(text)
+        if value.isEmpty { return .null }
+        guard let gigabytes = Int(value), gigabytes >= minimum else { return nil }
+        return .value(gigabytes)
     }
 
     // MARK: - Shell helpers

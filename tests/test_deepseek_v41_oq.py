@@ -8,7 +8,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.patches.deepseek_v41.oq import quantize_engram, source_budget
+from omlx.patches.deepseek_v41.oq import copy_engram, quantize_engram, source_budget
 from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding, EngramPrefetch
 
 
@@ -58,6 +58,95 @@ def _declared_format(path):
     with open(path, "rb") as handle:
         length = struct.unpack("<Q", handle.read(8))[0]
         return json.loads(handle.read(length)).get("__metadata__")
+
+
+def _write_raw_safetensors(path, tensors):
+    """Write (dtype, shape, bytes) entries under their safetensors dtype tags."""
+    header, offset = {}, 0
+    for key, (dtype, shape, data) in tensors.items():
+        header[key] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + len(data)],
+        }
+        offset += len(data)
+    encoded = json.dumps(header).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    body = b"".join(data for _, _, data in tensors.values())
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + body)
+
+
+def _tensor_bytes(path, key):
+    data = path.read_bytes()
+    length = struct.unpack("<Q", data[:8])[0]
+    start, end = json.loads(data[8 : 8 + length])[key]["data_offsets"]
+    return data[8 + length + start : 8 + length + end]
+
+
+def test_copied_fp8_engram_keeps_source_bytes_and_rows(tmp_path):
+    rng = np.random.default_rng(3)
+    rows, width = 40, 64
+    values = rng.integers(0, 256, (rows, width), dtype=np.uint8)
+    values[(values & 0x7F) == 0x7F] = 0  # E4M3 NaN encodings
+    scales = rng.integers(118, 136, (rows, width // 32), dtype=np.uint8)
+    source = {
+        "layers.1.engram.embed.weight": ("F8_E4M3", values.shape, values.tobytes()),
+        "layers.1.engram.embed.scale": ("F8_E8M0", scales.shape, scales.tobytes()),
+        "layers.1.attn_norm.weight": ("BF16", (width,), bytes(2 * width)),
+    }
+    _write_raw_safetensors(tmp_path / "source.safetensors", source)
+    table = {
+        "weight_file": "source.safetensors",
+        "weight_key": "layers.1.engram.embed.weight",
+        "scale_key": "layers.1.engram.embed.scale",
+    }
+    module = "language_model.layers.1.engram.embed"
+    spec = copy_engram(
+        tmp_path,
+        tmp_path / "engram.safetensors",
+        table,
+        module_name=module,
+        chunk_bytes=100,
+    )
+
+    assert spec == {
+        "weight_file": "engram.safetensors",
+        "weight_key": f"{module}.weight",
+        "scale_file": "engram.safetensors",
+        "scale_key": f"{module}.scales",
+        "group_size": 32,
+        "mode": "mxfp8",
+    }
+    copied = tmp_path / "engram.safetensors"
+    assert _declared_format(copied) == {"format": "mlx"}
+    assert _tensor_bytes(copied, spec["weight_key"]) == values.tobytes()
+    assert _tensor_bytes(copied, spec["scale_key"]) == scales.tobytes()
+    original = DiskEngramEmbedding(
+        tmp_path / "source.safetensors", table["weight_key"], table["scale_key"]
+    )
+    exported = DiskEngramEmbedding(copied, spec["weight_key"], spec["scale_key"])
+    try:
+        ids = mx.array([[0, 7, 39], [12, 12, 3]])
+        np.testing.assert_array_equal(
+            original(ids).astype(mx.float32), exported(ids).astype(mx.float32)
+        )
+    finally:
+        original.close()
+        exported.close()
+    budget = source_budget(
+        tmp_path,
+        {},
+        dict.fromkeys(source, "source.safetensors"),
+        preserve_mtp=False,
+        engram_bits=None,
+    )
+    assert budget["engram"] == {
+        "logical_parameters": rows * width,
+        "tensor_bytes": len(values.tobytes()) + len(scales.tobytes()),
+        "effective_bpw": 8.25,
+        "precision": "source",
+    }
+    assert budget["remaining_weights"]["tensor_bytes"] == 2 * width
 
 
 def test_exported_shards_declare_mlx_format(tmp_path):
@@ -345,6 +434,79 @@ def test_unified_index_engram_and_mixed_shard_offload(tmp_path, monkeypatch):
         resident.close()
 
 
+def test_preserved_ngram_table_changes_only_engram_shards(tmp_path):
+    from mlx.utils import tree_flatten
+    from test_deepseek_v41 import write_checkpoint
+
+    from omlx.patches.deepseek_v41.loading import load
+    from omlx.patches.deepseek_v41.oq import quantize
+    from omlx.patches.deepseek_v41.residency import deepseek_v41_residency_estimate
+
+    source, original = write_checkpoint(
+        tmp_path,
+        vision=False,
+        engram_layer_ids=(1, 3),
+        engram_num_embeddings=(72, 204),
+        engram_vocab_size=5,
+        engram_max_ngram_size=4,
+        engram_n_heads=2,
+        engram_head_dim=32,
+        engram_compressed_vocab_size=64,
+    )
+    outputs = {}
+    for preserve in (False, True):
+        outputs[preserve] = tmp_path / f"preserve-{preserve}"
+        quantize(
+            source,
+            outputs[preserve],
+            enhanced=True,
+            target_bpw=32,
+            hard_cap_bpw=32,
+            preserve_ngram_table=preserve,
+        )
+    configs = {
+        preserve: json.loads((path / "config.json").read_text())["omlx_deepseek_v41"]
+        for preserve, path in outputs.items()
+    }
+    maps = {
+        preserve: json.loads((path / "model.safetensors.index.json").read_text())[
+            "weight_map"
+        ]
+        for preserve, path in outputs.items()
+    }
+    tables = configs[True]["engram_tables"]
+    table_files = {table["weight_file"] for table in tables.values()}
+    assert table_files == {
+        table["weight_file"] for table in configs[False]["engram_tables"].values()
+    }
+    assert configs[True]["quantized_modules"] == configs[False]["quantized_modules"]
+    assert {k: v for k, v in maps[True].items() if v not in table_files} == {
+        k: v for k, v in maps[False].items() if v not in table_files
+    }
+    for name in set(maps[True].values()) - table_files:
+        assert (outputs[True] / name).read_bytes() == (
+            outputs[False] / name
+        ).read_bytes()
+
+    report = configs[True]["quantization_report"]
+    assert report["engram"]["precision"] == "source"
+    estimate = deepseek_v41_residency_estimate(outputs[True])
+    assert estimate.engram_bytes == report["engram"]["tensor_bytes"]
+    expected = dict(tree_flatten(original.parameters()))
+    model, _ = load(outputs[True], engram_ssd_offload=True)
+    try:
+        for layer, rows in ((1, 72), (3, 204)):
+            ids = mx.arange(rows)
+            np.testing.assert_array_equal(
+                model.language_model.layers[layer].engram.embed(ids).astype(mx.float32),
+                expected[f"language_model.layers.{layer}.engram.embed.weight"][ids]
+                .astype(mx.bfloat16)
+                .astype(mx.float32),
+            )
+    finally:
+        model.close()
+
+
 @pytest.mark.parametrize("bits", [2, 3, 4, 6, 8])
 @pytest.mark.parametrize("rank", [2, 3])
 def test_requantize_projection_uses_weighted_oq_arithmetic(bits, rank):
@@ -473,7 +635,7 @@ def test_official_oq3_streams_affine_weights_and_unified_engram(
         spec = config["omlx_deepseek_v41"]
         assert spec["quantized_modules"][name]["bits"] == 3
         assert spec["quantized_modules"][name]["quantize_input"] is False
-        assert all(table["bits"] == 3 for table in spec["engram_tables"].values())
+        assert all(table["bits"] == 4 for table in spec["engram_tables"].values())
         assert spec["engram_in_index"]
         assert not (output / "conversion.inprogress.json").exists()
         assert not (output / "engram").exists()
@@ -501,9 +663,9 @@ def test_ui_source_filter_excludes_converted_v41():
     )
 
 
-@pytest.mark.parametrize("level", [3, 4])
+@pytest.mark.parametrize("level", [2.5, 3, 4])
 def test_v41_estimate_uses_independent_engram_budget(tmp_path, level):
-    from omlx.oq import estimate_bpw_and_size
+    from omlx.oq import _OQ_BPW_TARGETS, estimate_bpw_and_size
 
     source = tmp_path / "source"
     source.mkdir()
@@ -519,19 +681,24 @@ def test_v41_estimate_uses_independent_engram_budget(tmp_path, level):
         json.dumps({"weight_map": {k: "model.safetensors" for k in weights}})
     )
     result = estimate_bpw_and_size(str(source), level)
-    assert result["engram_size_bytes"] == 8192 * level // 8 + 8192 // 32 * 4
+    assert result["engram_size_bytes"] == 8192 * 4 // 8 + 8192 // 32 * 4
     assert result["remaining_size_bytes"] == (
-        math.ceil(4096 * 3.7 / 8) if level == 3 else 8192
+        math.ceil(4096 * _OQ_BPW_TARGETS[level][1] / 8) if level < 4 else 8192
     )
     assert (
         result["output_size_bytes"]
         == result["engram_size_bytes"] + result["remaining_size_bytes"]
     )
     assert result["memory_streaming_bytes"] > 0
+    kept = estimate_bpw_and_size(str(source), level, preserve_ngram_table=True)
+    # The BF16 fixture table keeps its stored bytes; nothing else moves.
+    assert kept["engram_size_bytes"] == 8192 * 2
+    assert kept["remaining_size_bytes"] == result["remaining_size_bytes"]
 
 
+@pytest.mark.parametrize("level", [2.5, 3])
 def test_official_oq3_reuses_signed_imatrix_and_applies_real_plan(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, level
 ):
     from test_deepseek_v41 import write_checkpoint
 
@@ -571,7 +738,7 @@ def test_official_oq3_reuses_signed_imatrix_and_applies_real_plan(
         oq.quantize_oq_streaming(
             str(source),
             str(output),
-            3,
+            level,
             enhanced=True,
             target_bpw=32,
             hard_cap_bpw=32,
@@ -589,7 +756,8 @@ def test_official_oq3_reuses_signed_imatrix_and_applies_real_plan(
             == report["calibration"]["tensor_bytes"]
         )
         saved = json.loads((output / "config.json").read_text())["omlx_deepseek_v41"]
-        assert saved["quantized_modules"][name]["bits"] in (3, 4, 6, 8)
+        assert saved["quantized_modules"][name]["bits"] in (2, 3, 4, 6, 8)
+        assert all(table["bits"] == 4 for table in saved["engram_tables"].values())
 
 
 def test_expert_requantization_cancellation_does_not_process_remaining_experts():

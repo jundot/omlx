@@ -367,7 +367,7 @@ def test_prompt_priming_window_slides(runtime, monkeypatch):
     invalidating the context."""
     from omlx.patches.mlx_lm_mtp import prompt_priming
 
-    monkeypatch.setenv("OMLX_INKLING_MTP_PRIME_WINDOW", "8")
+    monkeypatch.setattr(runtime, "_PRIME_WINDOW", 8)
     model = _mtp_language_model()
     cache = model.make_cache()
     ids = mx.array([[(i * 3 + 1) % 128 for i in range(18)]])

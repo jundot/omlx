@@ -11,27 +11,21 @@ necessary FLOPs (measured 39-48 ms per layer-call at L=2048, head_dim=512).
 This module computes the identical math with a single fused Metal kernel that
 visits only visible rows (fp32 online softmax in fixed row order, sink in the
 denominator). Any setup/runtime failure permanently falls back to the stock
-path; OMLX_DSV4_WSDPA=0 disables the kernel outright.
+path.
 """
 
 import logging
-import os
 
 import mlx.core as mx
 
+from .sparse_attention_nax import sparse_topk_attention_nax
+
 logger = logging.getLogger(__name__)
 
-_ENABLED = os.environ.get("OMLX_DSV4_WSDPA", "1") == "1"
 _kernel = None
 _broken = False
 _ready = False
 _topk_ready = False
-
-
-def _wsdpa_route_enabled(*, topk: bool = False) -> bool:
-    if _broken or not _ENABLED:
-        return False
-    return not topk or _TOPK_ENABLED
 
 
 def wsdpa_prefill_route_active(*, topk: bool = False) -> bool:
@@ -41,7 +35,7 @@ def wsdpa_prefill_route_active(*, topk: bool = False) -> bool:
     Setup/dispatch failures set ``_broken`` before returning to stock attention,
     and this live predicate then makes the memory profile price that fallback.
     """
-    if not _wsdpa_route_enabled(topk=topk):
+    if _broken:
         return False
     return _topk_ready if topk else _ready
 
@@ -134,7 +128,7 @@ _SOURCE = """
 
 def _get_kernel():
     global _kernel, _broken
-    if not _wsdpa_route_enabled():
+    if _broken:
         return None
     if _kernel is None:
         try:
@@ -155,7 +149,6 @@ def _get_kernel():
 
 
 _KERNEL_TOPK = None
-_TOPK_ENABLED = os.environ.get("OMLX_DSV4_WSDPA_TOPK", "1") == "1"
 
 _SOURCE_TOPK = """
     // q:      [H, L, D]  bf16 (contiguous)
@@ -248,7 +241,7 @@ _SOURCE_TOPK = """
 
 def _get_topk_kernel():
     global _KERNEL_TOPK, _broken
-    if not _wsdpa_route_enabled(topk=True):
+    if _broken:
         return None
     if _KERNEL_TOPK is None:
         try:
@@ -348,7 +341,16 @@ def wsdpa_topk_prefill(
     native/stock path whenever shapes or dtypes are not the exact prefill case.
     """
     global _broken, _topk_ready
-    if isinstance(offset, mx.array) or not _wsdpa_route_enabled(topk=True):
+    if not isinstance(offset, mx.array):
+        # M5 tensor-unit kernel; None keeps the kernel below. Its buffers fit
+        # the same low-memory profile, so a dispatch also proves the route.
+        out = sparse_topk_attention_nax(
+            q, kv, pooled, topk, sinks, scale, offset, window, ratio
+        )
+        if out is not None:
+            _topk_ready = True
+            return out
+    if isinstance(offset, mx.array) or _broken:
         return None
     if (
         q.dtype != mx.bfloat16

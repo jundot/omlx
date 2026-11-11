@@ -3,18 +3,19 @@
 
 An extension built with a nanobind whose ABI tag differs from the mlx
 wheel's imports cleanly and lists every symbol, but rejects every mlx
-array at call time. ``_verify_abi`` must catch that once at import and
+array at call time. ``verify_abi`` must catch that once at import and
 disable the native symbols instead of letting each routed call raise.
 """
 
 import pytest
 
-from omlx.custom_kernels.bonsai import fast as bonsai_fast
-from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
-from omlx.custom_kernels.qwen35_prefill import fast as qwen35_fast
+from omlx.custom_kernels import _loader
+from omlx.custom_kernels.attention import fast as attention_fast
+from omlx.custom_kernels.lowbit import fast as lowbit_fast
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
+from omlx.custom_kernels.sparse_index import fast as index_fast
 
-ALL_FAST = (qwen35_fast, glm_fast, minimax_fast, bonsai_fast)
+ALL_FAST = (attention_fast, index_fast, quant_fast, lowbit_fast)
 
 
 class _MismatchedExt:
@@ -36,33 +37,29 @@ class _LegacyExt:
     """A build predating the probe symbol: assumed compatible."""
 
 
-@pytest.mark.parametrize("fast", ALL_FAST, ids=lambda m: m.__name__)
-def test_mismatched_build_is_disabled_with_import_error(fast):
-    ext, err = fast._verify_abi(_MismatchedExt(), None)
+def test_mismatched_build_is_disabled_with_import_error():
+    ext, err = _loader.verify_abi(_MismatchedExt(), None, "pkg")
     assert ext is None
     assert isinstance(err, TypeError)
 
 
-@pytest.mark.parametrize("fast", ALL_FAST, ids=lambda m: m.__name__)
-def test_healthy_build_passes_through(fast):
+def test_healthy_build_passes_through():
     ext = _HealthyExt()
-    out, err = fast._verify_abi(ext, None)
+    out, err = _loader.verify_abi(ext, None, "pkg")
     assert out is ext
     assert err is None
 
 
-@pytest.mark.parametrize("fast", ALL_FAST, ids=lambda m: m.__name__)
-def test_legacy_build_without_probe_passes_through(fast):
+def test_legacy_build_without_probe_passes_through():
     ext = _LegacyExt()
-    out, err = fast._verify_abi(ext, None)
+    out, err = _loader.verify_abi(ext, None, "pkg")
     assert out is ext
     assert err is None
 
 
-@pytest.mark.parametrize("fast", ALL_FAST, ids=lambda m: m.__name__)
-def test_missing_extension_passes_through(fast):
+def test_missing_extension_passes_through():
     sentinel = ImportError("no native build")
-    out, err = fast._verify_abi(None, sentinel)
+    out, err = _loader.verify_abi(None, sentinel, "pkg")
     assert out is None
     assert err is sentinel
 
@@ -75,6 +72,19 @@ def test_local_build_probe_is_healthy(fast):
     import mlx.core as mx
 
     assert fast._ext.abi_probe(mx.zeros((3,))) == 3
+
+
+def test_native_symbols_live_in_one_package():
+    """Each native kernel is bound by exactly one method package."""
+    built = [fast for fast in ALL_FAST if fast.is_native_available()]
+    if len(built) < len(ALL_FAST):
+        pytest.skip("native builds unavailable")
+    owners = {}
+    for fast in built:
+        for name in dir(fast._ext):
+            if not name.startswith("_") and name != "abi_probe":
+                owners.setdefault(name, []).append(fast.__name__)
+    assert {name: mods for name, mods in owners.items() if len(mods) > 1} == {}
 
 
 class _FoldAwareExt:
@@ -110,16 +120,16 @@ class _NoScoresExt:
 
 
 def test_mask_fold_probe_detects_fold_aware_build():
-    assert glm_fast._probe_mask_fold(_FoldAwareExt()) is True
+    assert index_fast._probe_mask_fold(_FoldAwareExt()) is True
 
 
 def test_mask_fold_probe_rejects_pre_fold_build():
-    assert glm_fast._probe_mask_fold(_PreFoldExt()) is False
+    assert index_fast._probe_mask_fold(_PreFoldExt()) is False
 
 
 def test_mask_fold_probe_handles_missing_symbol_and_ext():
-    assert glm_fast._probe_mask_fold(_NoScoresExt()) is False
-    assert glm_fast._probe_mask_fold(None) is False
+    assert index_fast._probe_mask_fold(_NoScoresExt()) is False
+    assert index_fast._probe_mask_fold(None) is False
 
 
 def test_pre_fold_build_keeps_historical_call_signature(monkeypatch):
@@ -141,8 +151,8 @@ def test_pre_fold_build_keeps_historical_call_signature(monkeypatch):
         P = keys.shape[2]
         return mx.zeros((B, H, L, P), dtype=queries.dtype)
 
-    monkeypatch.setattr(glm_fast, "_ext", type("E", (), {"dsa_indexer_scores": staticmethod(old_scores)})())
-    monkeypatch.setattr(glm_fast, "_EXT_MASK_FOLD", False)
+    monkeypatch.setattr(index_fast, "_ext", type("E", (), {"dsa_indexer_scores": staticmethod(old_scores)})())
+    monkeypatch.setattr(index_fast, "_EXT_MASK_FOLD", False)
 
     H, D, L, P = 64, 128, 64, 512
     q = mx.zeros((1, H, L, D), dtype=mx.bfloat16)
@@ -150,7 +160,7 @@ def test_pre_fold_build_keeps_historical_call_signature(monkeypatch):
     weights = mx.zeros((1, L, H), dtype=mx.bfloat16)
 
     ratio, q_off = 4, 256
-    out = glm_fast.dsa_indexer_scores(
+    out = index_fast.dsa_indexer_scores(
         q, keys, weights, causal=False, mask_ratio=ratio, mask_q_offset=q_off
     )
     assert len(calls) == 1
@@ -177,15 +187,15 @@ def test_fold_aware_build_receives_mask_kwargs(monkeypatch):
         P = keys.shape[2]
         return mx.zeros((B, H, L, P), dtype=queries.dtype)
 
-    monkeypatch.setattr(glm_fast, "_ext", type("E", (), {"dsa_indexer_scores": staticmethod(new_scores)})())
-    monkeypatch.setattr(glm_fast, "_EXT_MASK_FOLD", True)
+    monkeypatch.setattr(index_fast, "_ext", type("E", (), {"dsa_indexer_scores": staticmethod(new_scores)})())
+    monkeypatch.setattr(index_fast, "_EXT_MASK_FOLD", True)
 
     H, D, L, P = 64, 128, 64, 512
     q = mx.zeros((1, H, L, D), dtype=mx.bfloat16)
     keys = mx.zeros((1, 1, P, D), dtype=mx.bfloat16)
     weights = mx.zeros((1, L, H), dtype=mx.bfloat16)
 
-    glm_fast.dsa_indexer_scores(
+    index_fast.dsa_indexer_scores(
         q, keys, weights, causal=False, mask_ratio=4, mask_q_offset=256
     )
     assert seen.get("mask_ratio") == 4

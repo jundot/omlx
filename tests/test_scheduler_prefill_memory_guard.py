@@ -15,6 +15,9 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 
+from omlx.cache.paged_cache import PagedCacheManager
+from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+from omlx.cache.prefix_cache import BlockAwarePrefixCache
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import MemoryMonitor
 from omlx.request import Request, SamplingParams
@@ -456,10 +459,66 @@ def test_rejection_releases_block_aware_cache_when_present():
 
     scheduler._release_paged_cache_for_request("req-leak")
 
-    # When block_aware_cache is present it owns the cleanup chain
-    # (release_cache → paged_cache_manager.delete_block_table).
+    # When block_aware_cache is present, release_cache owns the cleanup.
     block_aware_cache.release_cache.assert_called_once_with("req-leak")
     paged_cache_manager.delete_block_table.assert_not_called()
+
+
+def test_rejection_after_cache_hit_releases_prefix_blocks(tmp_path):
+    """A rejected cache hit must not pin its prefix blocks (#4213).
+
+    fetch_cache records the hit only in the paged manager. A pinned block
+    keeps its hash after the hot-cache-only tier drops its payload, so the
+    next store deduplicates against it and each turn regains one block.
+    """
+    paged = PagedCacheManager(
+        block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=tmp_path / "unused",
+        max_size_bytes=100 * 1024**2,
+        hot_cache_max_bytes=10 * 1024**2,
+        hot_cache_only=True,
+    )
+    cache = BlockAwarePrefixCache(
+        model=SimpleNamespace(layers=[object()]),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+    )
+    scheduler = _make_scheduler()
+    scheduler.block_aware_cache = cache
+    scheduler.paged_cache_manager = paged
+    tokens = list(range(12))
+    keys = mx.ones((1, 1, 12, 1))
+    kv = [{"state": (keys, keys), "meta_state": (12,), "class_name": "KVCache"}]
+
+    def finish(request_id):
+        table = paged.get_block_table(request_id)
+        paged.release_for_eviction(table.block_ids)
+        cache.clear_request_entry(request_id)
+
+    def restored_tokens(request_id):
+        table, _ = cache.fetch_cache(request_id, tokens)
+        restored = table is not None and cache.reconstruct_cache(table) is not None
+        if table is not None and not restored:
+            paged.delete_block_table(request_id)
+        return table.num_tokens if restored else 0
+
+    try:
+        cache.store_cache("first", tokens, kv)
+        finish("first")
+        assert restored_tokens("rejected") == 12
+        scheduler._release_paged_cache_for_request("rejected")
+        blocks = paged.allocated_blocks.values()
+        assert all(b.ref_count == 0 for b in blocks if not b.is_null)
+
+        ssd.clear_hot_cache()
+        assert restored_tokens("reprefill") == 0
+        cache.store_cache("reprefill", tokens, kv)
+        finish("reprefill")
+        assert restored_tokens("next") == 12
+    finally:
+        ssd.close()
 
 
 def test_rejection_releases_paged_cache_when_no_prefix_cache():
@@ -929,8 +988,6 @@ def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
         "native_indexer_eligible",
         lambda **kwargs: True,
     )
-    monkeypatch.setattr(wsdpa, "_ENABLED", True)
-    monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
     monkeypatch.setattr(wsdpa, "_broken", False)
     monkeypatch.setattr(wsdpa, "_ready", False)
     monkeypatch.setattr(wsdpa, "_topk_ready", False)
@@ -1182,7 +1239,7 @@ def test_qwen4_admission_prices_the_gathered_route():
     )
 
 
-def test_qwen4_pricing_tracks_execution_route(monkeypatch):
+def test_qwen4_pricing_tracks_execution_route():
     from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -1191,7 +1248,6 @@ def test_qwen4_pricing_tracks_execution_route(monkeypatch):
         QSAQuantizedKVCache,
     )
 
-    monkeypatch.delenv("OMLX_QWEN4_GATHERED_MIN_QUERY", raising=False)
     scheduler = _make_scheduler()
     _attach_qwen4_profile(scheduler)
     route = scheduler._qwen4_text_gathered_pricing
@@ -1280,3 +1336,43 @@ def test_qwen4_image_request_preflight_admits_at_gathered_price():
     ):
         rejection = scheduler._preflight_memory_check(request)
     assert rejection is None
+
+
+@pytest.mark.parametrize(
+    "hard,abort,usage,reclaimed,raises,reclaims",
+    [
+        (200, 300, 250, 250, False, 0),  # Dynamic hard limit is not the abort cap.
+        (400, 300, 300, 300, False, 0),  # At the physical cap is allowed.
+        (400, 300, 301, 300, False, 1),  # Reclaim restores the physical bound.
+        (400, 300, 301, 301, True, 1),
+        (200, 0, 201, 201, True, 1),  # Before propagation, use the hard limit.
+    ],
+)
+def test_post_prefill_guard_uses_stable_physical_cap(
+    hard, abort, usage, reclaimed, raises, reclaims
+):
+    scheduler = SimpleNamespace(
+        _memory_limit_bytes=100,
+        _memory_hard_limit_bytes=hard,
+        _memory_abort_limit_bytes=abort,
+        _prefill_speed_priority=False,
+        _current_usage_bytes=MagicMock(return_value=usage),
+        _reclaim_prefill_headroom=MagicMock(return_value=reclaimed),
+    )
+
+    def check():
+        Scheduler._check_post_prefill_memory(
+            scheduler,
+            request_id="row",
+            chunk_tokens=4,
+            processed_tokens=4,
+            total_tokens=8,
+            loop_label="test",
+        )
+
+    if raises:
+        with pytest.raises(RuntimeError, match="Memory limit exceeded.*after reclaim"):
+            check()
+    else:
+        check()
+    assert scheduler._reclaim_prefill_headroom.call_count == reclaims

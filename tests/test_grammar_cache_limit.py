@@ -147,6 +147,7 @@ def test_explicit_limit_still_wins(fake_xgrammar):
 _CALL_SITE_PROBE = """
 import importlib
 import sys
+import threading
 import types
 from importlib.machinery import ModuleSpec
 
@@ -209,6 +210,8 @@ else:
 engine = engine_class.__new__(engine_class)
 engine._grammar_compiler = None
 engine._grammar_compiler_init_attempted = False
+# #5140 calls the property from worker threads; ``__init__`` is skipped here.
+engine._grammar_compiler_lock = threading.Lock()
 engine._tokenizer = _Tokenizer()
 engine._model_name = "test-model"
 if kind == "vlm":

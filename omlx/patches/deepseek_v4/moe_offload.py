@@ -6,7 +6,7 @@ through this package's own :class:`~omlx.patches.deepseek_v4.switch_layers
 .SwitchGLU`, which the common adapter cannot wrap: it is not the stock
 mlx-lm module, and its forward carries native Metal fast paths (the
 ``deepseek_*_gather_qmm`` block kernels, the gate/up pair kernels and the
-native ``glm_moe_weighted_sum``). Re-implementing that forward would fork
+native ``moe_weighted_sum``). Re-implementing that forward would fork
 it, so this adapter keeps the module and swaps what it computes on.
 
 Each projection's parameters are replaced, before lazy weights materialize,
@@ -32,7 +32,6 @@ unavailable.
 from __future__ import annotations
 
 import logging
-import os
 from concurrent.futures import wait
 from pathlib import Path
 
@@ -40,7 +39,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ...custom_kernels.glm_moe_dsa import fast as glm_fast
+from ...custom_kernels.quant_matmul import fast as quant_fast
 from ...scheduler import _sync_and_clear_cache
 from ..moe_expert_offload import (
     _DTYPES,
@@ -122,6 +121,7 @@ class _SlotCache:
         self.n_experts = glu[_PROJS[0]]["weight"].shape[0]
         self.capacity = min(capacity, self.n_experts)
         self.resident: dict[str, list] = {}
+        self.global_scales: dict[str, mx.array] = {}
         for proj in _PROJS:
             lin = glu[proj]
             arrays = []
@@ -130,6 +130,11 @@ class _SlotCache:
                 slots = mx.zeros((self.capacity, *src.shape[1:]), dtype=src.dtype)
                 setattr(lin, field, slots)  # drops the lazy full-size array
                 arrays.append(slots)
+            if "global_scale" in lin:
+                # ModelOpt NVFP4 tensor scales are tiny: keep all, slot a copy.
+                self.global_scales[proj] = lin["global_scale"]
+                lin.global_scale = mx.ones((self.capacity,), dtype=mx.float32)
+                arrays += [self.global_scales[proj], lin["global_scale"]]
             self.resident[proj] = arrays
         self.slot_of: dict[int, int] = {}  # expert id -> slot, LRU ordered
         self.free = list(range(self.capacity))
@@ -211,6 +216,8 @@ class _SlotCache:
                     self.map[victim] = -1
                 for (proj, field, _), plan, raw in raws:
                     self.glu[proj][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
+                for proj, scale in self.global_scales.items():
+                    self.glu[proj]["global_scale"][slot] = scale[e]
                 self.slot_of[e] = slot
                 self.map[e] = slot
                 self.misses += 1
@@ -288,7 +295,7 @@ class OffloadedSwitchGLU(nn.Module):
             and scores.shape[-1] in (6, 8)
             and scores.dtype == mx.float32
             and y.dtype in (mx.float16, mx.bfloat16)
-            and glm_fast.has_symbol("glm_moe_weighted_sum")
+            and quant_fast.has_symbol("moe_weighted_sum")
         ):
             y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         return y
@@ -324,8 +331,8 @@ def apply_deepseek_v4_moe_expert_offload(
     """Wrap every covered DeepSeek V4 SwitchGLU; returns the number wrapped.
 
     Same contract as ``apply_moe_expert_offload``: runs before lazy weights
-    materialize, honors the kill switch, and skips (with a logged reason)
-    any module the checkpoint does not cover.
+    materialize and skips (with a logged reason) any module the checkpoint
+    does not cover.
 
     ``mtp_resident`` keeps the embedded MTP draft head's experts fully
     resident (glm5_next Lightning MTP + offload): the head is one decoder
@@ -333,8 +340,6 @@ def apply_deepseek_v4_moe_expert_offload(
     experts would add SSD latency to every draft step. With the flag off,
     the head wraps like any other layer, exactly as before.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
-        return 0
     targets = list(_iter_deepseek_v4_switch_glus(model))
     if not targets:
         return 0

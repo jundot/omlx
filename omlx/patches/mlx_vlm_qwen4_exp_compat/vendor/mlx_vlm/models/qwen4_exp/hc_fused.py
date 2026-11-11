@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Metal kernels for Qwen4 hyper-connection inputs.
 
-Decode (at most 16 BF16 rows) fuses per-stream RMS norm, down/inject
+Decode (at most 16 BF16 or FP16 rows) fuses per-stream RMS norm, down/inject
 projections with activation, and the up projection with stream mixing.
 Prefill fuses the stream norm, silu(down / HC), and the mixing/inject
 epilogue around the down/up projections; on GPUs with tensor units (M5) those
 projections run in hc_prefill_nax's kernels with the epilogues folded in
 (bit-identical to the MLX matmul path), elsewhere on MLX's quantized matmul.
 Both need four streams and affine group-size-32 or -64 projections with 4/5/6/8-bit
-weights. FP32 epilogues can round differently from the canonical BF16
-operations.
+weights. FP32 epilogues can round differently from the canonical 16-bit
+operations. The rows, norm weight and projection scales share one dtype.
 
 A pending residual write (previous block's branch times its injection gate)
 can be applied inside the stream norm, which also stores the written
@@ -19,15 +19,13 @@ Each kernel specialization is evaluated once to catch lazy compilation errors.
 A failure falls back for the current call only; the NAX prefill projections
 instead fall back to MLX for the process after a failure or a bitwise
 mismatch on first use. Later evaluation errors propagate.
-Disable with OMLX_QWEN4_HC_FUSED=0. OMLX_QWEN4_HC_FUSED_WRITE=0 keeps the
-decode residual writes eager and stops deferring each layer's tail write into
-the next hyper-connection norm. OMLX_QWEN4_HC_DECODE_V2=0 restores the
-three-launch decode kernels (norm, down/inject, up/mix) in place of the
-two-launch ones; both produce the same bits.
+Where the geometry allows, small decode batches take two launches in place of
+the three-launch kernels (norm, down/inject, up/mix); both produce the same bits.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 from itertools import chain
 from operator import is_
@@ -36,7 +34,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from . import hc_prefill_nax
-from .hc_projection import _HEADER, env_enabled
+from .hc_projection import _HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +43,16 @@ MAX_ROWS = 16
 # traversal is the same for every group size, only the scale/bias index moves.
 _GROUP_SIZES = (32, 64)
 _SUPPORTED_BITS = (4, 5, 6, 8)
-_DISABLED = not env_enabled("OMLX_QWEN4_HC_FUSED")
-_WRITE_DISABLED = not env_enabled("OMLX_QWEN4_HC_FUSED_WRITE")
+_DTYPES = (mx.bfloat16, mx.float16)
+# Tests flip the flags below to reach the reference paths.
+_DISABLED = False
+_WRITE_DISABLED = False
 # Prefill rows on the tensor units (hc_prefill_nax): three dispatches instead of
-# six, bit-identical. Disable with OMLX_QWEN4_HC_NAX_PREFILL=0.
-_NAX_DISABLED = not env_enabled("OMLX_QWEN4_HC_NAX_PREFILL")
+# six, bit-identical.
+_NAX_DISABLED = False
 _NAX_AVAILABLE: bool | None = None
 _NAX_BROKEN = False
-_DECODE_V2 = env_enabled("OMLX_QWEN4_HC_DECODE_V2")
+_DECODE_V2 = True
 _KERNELS: dict[str, object] = {}
 _VALIDATED: set[tuple] = set()
 _FAILURE_LOGGED = False
@@ -587,7 +587,7 @@ inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
     float sum = 0.0f;
     if (bits == 4) {
         for (int i = 0; i < N; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 16.0f;
             xt[i + 2] = x[i + 2] / 256.0f;
@@ -595,8 +595,8 @@ inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
         }
     } else if (bits == 5) {
         for (int i = 0; i < N; i += 8) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3]
-                + x[i + 4] + x[i + 5] + x[i + 6] + x[i + 7];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3])
+                + float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 32.0f;
             xt[i + 2] = x[i + 2] / 4.0f;
@@ -608,7 +608,7 @@ inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
         }
     } else if (bits == 6) {
         for (int i = 0; i < N; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 64.0f;
             xt[i + 2] = x[i + 2] / 16.0f;
@@ -657,7 +657,7 @@ def write_enabled() -> bool:
     return not (_DISABLED or _WRITE_DISABLED)
 
 
-def _quantized_ok(projection) -> bool:
+def _quantized_ok(projection, dtype) -> bool:
     return (
         type(projection) is nn.QuantizedLinear
         and getattr(projection, "group_size", None) in _GROUP_SIZES
@@ -668,8 +668,8 @@ def _quantized_ok(projection) -> bool:
         and projection.weight.dtype == mx.uint32
         and isinstance(getattr(projection, "scales", None), mx.array)
         and isinstance(getattr(projection, "biases", None), mx.array)
-        and projection.scales.dtype == mx.bfloat16
-        and projection.biases.dtype == mx.bfloat16
+        and projection.scales.dtype == dtype
+        and projection.biases.dtype == dtype
     )
 
 
@@ -690,7 +690,7 @@ def _rows_of(hyper_input) -> int | None:
     if not (
         isinstance(hyper_input, mx.array)
         and hyper_input.ndim == 3
-        and hyper_input.dtype == mx.bfloat16
+        and hyper_input.dtype in _DTYPES
     ):
         return None
     return hyper_input.shape[0] * hyper_input.shape[1]
@@ -706,7 +706,6 @@ def compatible(module, hyper_input) -> bool:
     shape = hyper_input.shape
     return (
         len(shape) == 3
-        and hyper_input.dtype == mx.bfloat16
         and 1 <= shape[0] * shape[1] <= MAX_ROWS
         and _layout_compatible(module, hyper_input)
     )
@@ -724,15 +723,17 @@ def prefill_compatible(module, hyper_input) -> bool:
 
 
 def _layout_compatible(module, hyper_input) -> bool:
-    if not _static_layout_compatible(module):
+    if _static_layout_dtype(module) != hyper_input.dtype:
         return False
     if hyper_input.shape[2] != module.hc_count * module.hidden_size:
         return _ineligible(f"input width {hyper_input.shape[2]}")
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 
 
-def _static_layout_compatible(module) -> bool:
-    """Cached per module; any reassigned child, weight, scale or bias re-checks.
+def _static_layout_dtype(module):
+    """The module's compute dtype, or False for an unsupported layout.
+
+    Cached per module; any reassigned child, weight, scale or bias re-checks.
 
     The key is the identity of every value of the module and of its child
     modules, compared with ``is`` (``id()`` raises an audit event per call).
@@ -741,18 +742,19 @@ def _static_layout_compatible(module) -> bool:
     """
     cached = module.__dict__.get("_omlx_hc_layout")
     if cached is not None:
-        children, refs, ok = cached
+        children, refs, dtype = cached
         current = tuple(chain(dict.values(module), *map(dict.values, children)))
         if len(current) == len(refs) and all(map(is_, current, refs)):
-            return ok
-    ok = _check_static_layout(module)
+            return dtype
+    dtype = _check_static_layout(module)
     children = [value for value in dict.values(module) if isinstance(value, nn.Module)]
     refs = tuple(chain(dict.values(module), *map(dict.values, children)))
-    module.__dict__["_omlx_hc_layout"] = (children, refs, ok)
-    return ok
+    module.__dict__["_omlx_hc_layout"] = (children, refs, dtype)
+    return dtype
 
 
-def _check_static_layout(module) -> bool:
+def _check_static_layout(module):
+    """The hc_norm weight dtype when the whole layout is supported, else False."""
     if hasattr(module, "input_inject_weight"):
         return _ineligible("combined input projection layout")
     hc_count = getattr(module, "hc_count", None)
@@ -775,22 +777,24 @@ def _check_static_layout(module) -> bool:
         norm is not None
         and getattr(norm, "group_size", None) == hidden
         and isinstance(getattr(norm, "weight", None), mx.array)
-        and norm.weight.dtype == mx.bfloat16
+        and norm.weight.dtype in _DTYPES
         and norm.weight.shape == (hc_count * hidden,)
     ):
         return _ineligible("hc_norm layout")
+    dtype = norm.weight.dtype
     if not (
-        _quantized_ok(getattr(module, "input_mix_weight_down", None))
-        and _quantized_ok(getattr(module, "input_mix_weight_up", None))
+        _quantized_ok(getattr(module, "input_mix_weight_down", None), dtype)
+        and _quantized_ok(getattr(module, "input_mix_weight_up", None), dtype)
     ):
         return _ineligible(
-            "projection quantisation (need affine group-size-32/64 4/5/6/8-bit with bf16 scales)"
+            "projection quantisation (need affine group-size-32/64 4/5/6/8-bit "
+            "with scales in the hc_norm dtype)"
         )
     if "block_inject_weight" in module and not _quantized_ok(
-        module.block_inject_weight
+        module.block_inject_weight, dtype
     ):
         return _ineligible("block_inject_weight quantisation")
-    return True
+    return dtype
 
 
 def _eps_array(module) -> mx.array:
@@ -910,14 +914,24 @@ def _pack_factor(bits: int) -> int:
     return 8 if bits == 5 else (4 if bits == 6 else 32 // bits)
 
 
-# Two-launch decode geometry, tuned on an 80-core M5 Ultra; none of it changes an
-# output bit. Down rows per simdgroup: 1 for one or two rows (more threadgroups),
-# 2 above. From 7 rows on, the per-row threadgroups re-read the weights more
+# Two-launch decode geometry, tuned on an 80-core M5 Ultra and a 40-core M5 Max
+# (GPU class 's'); none of it changes an output bit. Down rows per simdgroup: 1
+# for one or two rows (more threadgroups), 2 above; on the M5 Max 2 from two rows
+# and 4 from four. Up rows per threadgroup: 32; on the M5 Max 128 from two rows, a
+# quarter of the threadgroups, each combining the slice sums once for four times
+# the rows. From 7 rows on, the per-row threadgroups re-read the weights more
 # often than the three-launch kernels, which are then as fast or faster.
 _V2_MAX_ROWS = 6
-_V2_UP_OUTPUTS = 32
 _V2_UP_THREADS = 320
 _TG_MEMORY_BYTES = 32768
+
+
+@functools.lru_cache(maxsize=None)
+def _gpu_class() -> str:
+    try:
+        return str(mx.device_info().get("architecture", ""))[-1:]
+    except Exception:
+        return ""
 
 
 def _up_chunks(bits: int, lowrank: int) -> int:
@@ -925,7 +939,13 @@ def _up_chunks(bits: int, lowrank: int) -> int:
 
 
 def _down_rps(rows: int) -> int:
+    if _gpu_class() == "s":
+        return 1 if rows == 1 else (2 if rows < 4 else 4)
     return 1 if rows <= 2 else 2
+
+
+def _up_outputs(rows: int) -> int:
+    return 128 if rows > 1 and _gpu_class() == "s" else 32
 
 
 def _down_row_groups(lowrank: int, inject: bool, rps: int) -> int:
@@ -945,7 +965,7 @@ def _decode_v2(rows: int, hc: int, hidden: int, lowrank: int, up_bits: int, inje
         and lowrank % (8 * rps) == 0
         and -(-hidden // 256) <= _down_row_groups(lowrank, inject, rps)
         and hidden * 2 + 32 <= _TG_MEMORY_BYTES
-        and lowrank * 2 + _V2_UP_OUTPUTS * (chunks + 1) * 4 <= _TG_MEMORY_BYTES
+        and lowrank * 2 + _up_outputs(rows) * (chunks + 1) * 4 <= _TG_MEMORY_BYTES
         and chunks <= _V2_UP_THREADS
     )
 
@@ -1014,6 +1034,7 @@ def _kernel_up_mix(normed, parts, rows, hc, hidden, lowrank, dtype, up, inject: 
     """(mixed, inj): slice-sum combine and activations, then the up projection and stream mix."""
     chunks = _up_chunks(up.bits, lowrank)
     threads = chunks * (_V2_UP_THREADS // chunks)
+    outputs = _up_outputs(rows)
     return _kernel(
         "omlx_qwen4_hc_decode_up",
         ["xn", "parts", "up_w", "up_s", "up_b"],
@@ -1031,10 +1052,10 @@ def _kernel_up_mix(normed, parts, rows, hc, hidden, lowrank, dtype, up, inject: 
             ("HC", hc),
             ("H", hidden),
             ("INJ", int(inject)),
-            ("NO", _V2_UP_OUTPUTS),
+            ("NO", outputs),
             ("TGS", threads),
         ],
-        grid=(threads, hc * hidden // _V2_UP_OUTPUTS, rows),
+        grid=(threads, hc * hidden // outputs, rows),
         threadgroup=(threads, 1, 1),
         output_shapes=[(rows, hidden), (rows, hc)],
         output_dtypes=[dtype, dtype],

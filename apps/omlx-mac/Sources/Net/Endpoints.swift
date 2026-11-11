@@ -30,6 +30,17 @@ enum AdminAPI {
     static func modelSettingsReset(_ id: String) -> String { "\(modelSettings(id))/reset" }
     static func modelSettingsOptimal(_ id: String) -> String { "\(modelSettings(id))/optimal" }
     static func modelSettingsRecipe(_ id: String) -> String { "\(modelSettings(id))/recipe" }
+    static func importMtplx(_ id: String) -> String { "\(models)/\(id)/import-mtplx" }
+    // Prefill Accelerator (needs the server's cluster setting on).
+    static let prefillHelper = "\(prefix)/prefill-helper"
+    static let prefillHelperCandidates = "\(prefillHelper)/candidates"
+    static func prefillHelperStatus(_ id: String) -> String { "\(prefillHelper)/models/\(id)" }
+    static func prefillHelperAction(_ id: String, _ action: String) -> String {
+        "\(prefillHelper)/models/\(id)/\(action)"
+    }
+    static let prefillLending = "\(prefillHelper)/lending"
+    static let prefillLendingStop = "\(prefillHelper)/lending/stop"
+    static func modelGenerationConfig(_ id: String) -> String { "\(models)/\(id)/generation_config" }
     static let reloadModels    = "\(prefix)/reload"
 
     static func modelProfiles(_ id: String) -> String { "\(models)/\(id)/profiles" }
@@ -52,6 +63,8 @@ enum AdminAPI {
     static let presetsRefresh  = "\(prefix)/presets/refresh"
 
     static let hfTasks         = "\(prefix)/hf/tasks"
+    static let hfModels        = "\(prefix)/hf/models"
+    static let hfUpdates       = "\(prefix)/hf/updates"
     static let hfDownload      = "\(prefix)/hf/download"
     static func hfCancel(_ taskId: String) -> String { "\(prefix)/hf/cancel/\(taskId)" }
     static func hfRetry(_ taskId: String) -> String  { "\(prefix)/hf/retry/\(taskId)" }

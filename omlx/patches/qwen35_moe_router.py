@@ -20,8 +20,7 @@ Only short rows route here (decode and spec-verify widths); prefill keeps
 the composed chain, whose cost amortizes over the chunk.
 
 One-row decode also folds the combine ``(y * scores).sum(-2) +
-sigmoid(shared_gate) * shared`` (five launches) into one bit-identical launch;
-OMLX_QWEN35_MOE_COMBINE_FUSED=0 keeps the composed ops.
+sigmoid(shared_gate) * shared`` (five launches) into one bit-identical launch.
 
 ``softmax_topk_row`` runs the precise softmax and the top-k of one row in
 one launch for the fused routed decode: one simdgroup reproduces MLX's
@@ -32,8 +31,7 @@ selection packs each probability with its expert index into one integer
 key and keeps each lane's three largest keys at hand, so a selection is one
 simd_max; ``TOPK_HEADER`` exports it for launches that fold the routing in.
 ``softmax_topk_rows`` runs that source verbatim for each row of a verify
-window in one launch. OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD=0 keeps the two
-launches.
+window in one launch.
 
 ``router_gemv`` runs the bias-free bf16 or fp16 gate linear of one row with MLX's
 one-row gemv arithmetic (per-lane column order, shuffle-down tree) but one
@@ -42,13 +40,12 @@ threadgroups, so the logits are bit-identical and the 2.6 MB weight read
 spreads over the whole GPU. A verify window's rows share one launch with
 one simdgroup per (expert, row), each row keeping the one-row arithmetic;
 the simdgroups of one expert are adjacent, so its weight row is fetched
-once. OMLX_QWEN35_MOE_ROUTER_GEMV=0 keeps ``nn.Linear``.
+once.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from functools import wraps
 
 import mlx.core as mx
@@ -59,12 +56,8 @@ _KERNEL = None
 _ENGAGED_LOGGED = False
 _MAX_ROWS = 8
 _COMBINE_KERNEL = None
-_COMBINE_DISABLED = os.environ.get(
-    "OMLX_QWEN35_MOE_COMBINE_FUSED", "1"
-).strip().lower() in {"0", "false", "no", "off"}
 # Top-k widths whose k-sum order was checked against mlx's reduction.
 _COMBINE_TOP_K = (8, 10)
-_SOFTMAX_FOLD_DISABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD", "1") == "0"
 _SOFTMAX_TOPK_KERNEL = None
 
 # MLX 0.32.2 block softmax (precise: float accumulation, 4 reads per thread)
@@ -401,7 +394,6 @@ def fused_router_topk(probs, top_k: int):
     return inds, scores
 
 
-_GEMV_DISABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTER_GEMV", "1") == "0"
 _GEMV_KERNEL = None
 _GEMV_SIMDGROUPS = 4
 
@@ -472,14 +464,9 @@ def router_gemv(weight):
     that gemv's: 64 < K < 16 * N and K % 128 == 0 (no guarded tail).
     Several input rows (a verify window, at most ``_MAX_ROWS``) run in one
     launch, each row with that one-row arithmetic.
-    OMLX_QWEN35_MOE_ROUTER_GEMV=0 returns None.
     """
     global _GEMV_KERNEL
-    if (
-        _GEMV_DISABLED
-        or weight.ndim != 2
-        or weight.dtype not in (mx.bfloat16, mx.float16)
-    ):
+    if weight.ndim != 2 or weight.dtype not in (mx.bfloat16, mx.float16):
         return None
     n, k = weight.shape
     if not 64 < k < 16 * n or k % 128 or n % _GEMV_SIMDGROUPS:
@@ -530,11 +517,10 @@ def softmax_topk_eligible(logits, max_rows: int = _MAX_ROWS) -> bool:
     """Whether ``softmax_topk_rows`` reproduces the routing of ``logits``
     ([..., NE], 1..``max_rows`` rows), so a launch may run its source:
     bf16 or fp16 rows of MLX's single-row block softmax with whole simdgroups
-    (NE % 128 == 0, NE <= 4096), unless OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD=0."""
+    (NE % 128 == 0, NE <= 4096)."""
     ne = logits.shape[-1]
     return (
-        not _SOFTMAX_FOLD_DISABLED
-        and logits.size // ne <= max_rows
+        logits.size // ne <= max_rows
         and ne % 128 == 0
         and ne <= 4096
         and logits.dtype in (mx.bfloat16, mx.float16)
@@ -666,10 +652,10 @@ def fused_moe_combine(routed, scores, shared, gate):
     One row only: ``routed`` [..., k, H], ``scores`` [..., k], ``shared``
     [..., H], ``gate`` [..., 1], all bf16 or all fp16, k in _COMBINE_TOP_K.
     Each row is reduced in mlx's one-row col_reduce_small order. Returns None
-    when the operands are outside that layout or the kill switch is set.
+    when the operands are outside that layout.
     """
     global _COMBINE_KERNEL
-    if _COMBINE_DISABLED or routed.ndim < 2:
+    if routed.ndim < 2:
         return None
     shape = routed.shape
     lead = shape[:-2]

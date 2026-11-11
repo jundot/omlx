@@ -25,7 +25,6 @@ floating-point summation order).
 
 from __future__ import annotations
 
-import os
 import threading
 from functools import lru_cache
 from typing import Optional
@@ -34,14 +33,6 @@ import mlx.core as mx
 
 from omlx.custom_kernels.nax import is_nax_available
 from omlx.utils.nax_attention import nax_mixed_head_dim_attention, uses_key_passes
-
-# Kill switch for A/B comparisons: OMLX_FAST_ATTENTION=0 keeps MLX's default
-# SDPA routing everywhere.
-_ENABLED = os.environ.get("OMLX_FAST_ATTENTION", "1").strip().lower() not in {
-    "0",
-    "false",
-    "off",
-}
 
 
 @lru_cache(maxsize=1)
@@ -120,8 +111,7 @@ def mixed_head_dim_sdpa(
     """
     qk_dim, v_dim = queries.shape[-1], values.shape[-1]
     if (
-        not _ENABLED
-        or qk_dim <= v_dim
+        qk_dim <= v_dim
         or queries.shape[2] <= 8
         or not _nax_available()
         or qk_dim not in (64, 72, 80, 96, 128, 192, 256)
@@ -237,7 +227,7 @@ def window_query_padding(num_queries: int, *, block: int = 128) -> int:
     padded queries with ``query_len=num_queries``. 0 when no padding is needed
     or the blocked path does not run for this many queries.
     """
-    if not _ENABLED or num_queries < 2 * block:
+    if num_queries < 2 * block:
         return 0
     return (-num_queries) % block
 
@@ -279,8 +269,7 @@ def blocked_sliding_window_attention(
     S = keys.shape[2]
     prefix = S - L
     if (
-        not _ENABLED
-        or B != 1
+        B != 1
         or window <= 0
         or prefix < 0
         or L < 2 * block

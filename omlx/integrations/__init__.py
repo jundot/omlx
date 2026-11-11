@@ -2,6 +2,7 @@
 
 from omlx.integrations.base import Integration, IntegrationContext
 from omlx.integrations.claude import ClaudeCodeIntegration
+from omlx.integrations.claude_desktop_app import ClaudeDesktopAppIntegration
 from omlx.integrations.codex import CodexIntegration
 from omlx.integrations.codex_app import CodexAppIntegration
 from omlx.integrations.copilot import CopilotIntegration
@@ -10,15 +11,18 @@ from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.pi import PiIntegration
+from omlx.integrations.vibe import VibeIntegration
 
 INTEGRATIONS: dict[str, Integration] = {
     "claude": ClaudeCodeIntegration(),
+    "claude_desktop": ClaudeDesktopAppIntegration(),
     "codex": CodexIntegration(),
     "codex_app": CodexAppIntegration(),
     "opencode": OpenCodeIntegration(),
     "openclaw": OpenClawIntegration(),
     "hermes": HermesIntegration(),
     "pi": PiIntegration(),
+    "vibe": VibeIntegration(),
     "copilot": CopilotIntegration(),
     "dsh": DshIntegration(),
 }
@@ -38,6 +42,7 @@ __all__ = [
     "Integration",
     "IntegrationContext",
     "ClaudeCodeIntegration",
+    "ClaudeDesktopAppIntegration",
     "CodexAppIntegration",
     "CopilotIntegration",
     "DshIntegration",

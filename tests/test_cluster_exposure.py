@@ -37,8 +37,7 @@ def test_server_uses_one_startup_snapshot_for_routes_and_bonjour():
     assert "_register_cluster_routes()" in source
     assert "Depends(require_distributed_inference_enabled)" in source
     assert (
-        "_server_state.global_settings is not None\n"
-        "        and distributed_inference_enabled()"
+        "_server_state.global_settings is not None and distributed_inference_enabled()"
     ) in source
 
 

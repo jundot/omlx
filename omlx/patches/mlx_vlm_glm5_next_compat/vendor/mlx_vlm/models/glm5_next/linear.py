@@ -5,6 +5,9 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from omlx.patches.mlx_vlm_glm5_next_compat.decode_kernels import rows_gemv
+from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
+
 
 def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
     bits = int(getattr(linear, "bits", 0) or 0)
@@ -19,9 +22,9 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
 
     try:
         from omlx.patches.qwen35_q4_mlp import _is_supported_affine_linear
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
 
-        name = f"qwen35_q{bits}_affine_qmm_t"
+        name = f"affine_q{bits}_qmm_t"
         if not fast.has_symbol(name) or not _is_supported_affine_linear(linear, x):
             return None
         # The tile indexes x as row-major packed and ignores its strides, so a
@@ -40,8 +43,15 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
 
 
 def linear_forward(linear: nn.Module, x: mx.array) -> mx.array:
-    """Use oMLX's affine prefill tile when it is supported and profitable."""
-    if isinstance(linear, nn.QuantizedLinear):
+    """Use oMLX's affine prefill tile when it is supported and profitable.
+    A row-exact verify block runs a float projection's rows with the
+    one-row gemv arithmetic of their decode steps."""
+    if type(linear) is nn.Linear:
+        if "bias" not in linear and is_row_exact_armed():
+            out = rows_gemv(x, linear.weight)
+            if out is not None:
+                return out
+    elif isinstance(linear, nn.QuantizedLinear):
         if (
             "bias" in linear
             and getattr(linear, "mode", None) == "affine"
@@ -86,9 +96,9 @@ def fused_quantized_matmul(
         and x.shape[-1] % 64 == 0
     ):
         try:
-            from omlx.custom_kernels.qwen35_prefill import fast
+            from omlx.custom_kernels.quant_matmul import fast
 
-            name = f"qwen35_q{bits}_affine_qmm_t"
+            name = f"affine_q{bits}_qmm_t"
             if fast.has_symbol(name) and fast.qmm_supports_group_size(group_size):
                 # The tile ignores the input's strides. See _native_qmm.
                 x = mx.contiguous(x)

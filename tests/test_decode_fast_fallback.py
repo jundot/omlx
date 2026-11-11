@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
-from omlx.custom_kernels.decode_fast import fast
+from omlx.custom_kernels.attention import fast
 
 
 @pytest.mark.parametrize("fallback", ["missing", "unsupported", "forced"])

@@ -7,10 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from omlx.admin import ane_tuning
-from omlx.custom_kernels.qwen35_prefill import fast
+from omlx.custom_kernels.quant_matmul import ane as fast
 from omlx.model_settings import ModelSettings
 
-_REAL_BANK_COMPILER_AVAILABLE = fast.qwen35_ane_bank_compiler_available
+_REAL_BANK_COMPILER_AVAILABLE = fast.ane_bank_compiler_available
 
 
 @pytest.fixture(autouse=True)
@@ -23,8 +23,8 @@ def _clear_runs(monkeypatch):
     # run_tuning preflights the compiler probes; the pipeline tests here drive
     # a mocked measurement stack on runners without the extension, so pretend
     # the compiler exists. Unavailable-path tests re-stub the probes.
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
-    monkeypatch.setattr(fast, "qwen35_ane_bank_compiler_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_bank_compiler_available", lambda: True)
     yield
     ane_tuning._runs.clear()
 
@@ -214,7 +214,7 @@ def test_profile_refinement_reads_only_native_profile_keys():
     """
     import inspect
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     source = inspect.getsource(ane_tuning._profile_refinement)
     used = set(re.findall(r'\.get\("([a-z0-9_]+_ns|operations)"', source))
@@ -593,7 +593,7 @@ def test_required_mlp_execution_cannot_be_masked_by_gdn():
 def test_ane_execution_is_unknown_without_the_profiler():
     """Zero counters prove nothing when the profiler never ran.
 
-    qwen35_ane_profile_set_enabled() can return False, and the import is
+    ane_profile_set_enabled() can return False, and the import is
     wrapped in a bare except, so the counters are zero regardless of what the
     hardware did. Treating that as an idle ANE would reject working candidates.
     """
@@ -676,6 +676,23 @@ async def test_measure_rejects_candidate_whose_ane_never_executed(monkeypatch):
     assert "never executed" in message
     # The message must be actionable: name the chunk size to use.
     assert "sequence_length=2048" in message
+
+
+@pytest.mark.asyncio
+async def test_idle_gdn_branch_is_not_blamed_on_chunk_size(monkeypatch):
+    """MLP ran on the same chunks, so the chunk width cannot be the cause."""
+    pool = _measure_env(monkeypatch, trace=_trace(mlp_ops=126, gdn_ops=0))
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", sequence_length=2048, repeats=1)
+    )
+    candidate = ane_tuning._Candidate("MLP 50%", True, 0.5, True, 0.5)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await ane_tuning._measure_candidate(run, pool, ModelSettings(), candidate)
+
+    message = str(excinfo.value)
+    assert "mlp=378, gdn=0" in message
+    assert "set sequence_length" not in message
 
 
 @pytest.mark.asyncio
@@ -819,6 +836,74 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
     }
 
 
+@pytest.mark.asyncio
+async def test_failed_refinement_keeps_the_verified_prediction(monkeypatch):
+    monkeypatch.setattr(
+        ane_tuning, "_fraction_grid", lambda: [0.4, 0.45, 0.5, 0.53, 0.6]
+    )
+    operations = 192
+
+    async def measure(run, pool, settings, candidate):
+        if candidate.label == "Profile-refined optimum":
+            raise RuntimeError("A required ANE branch never executed")
+        tps = 125.0 if candidate.enabled else 100.0
+        return {
+            **ane_tuning._empty_result(candidate),
+            "processing_tps": tps,
+            "samples": [tps],
+            # Rebalances the 0.5 prediction to 0.35, so the refine slot runs.
+            "_profile": {
+                "mlp": {
+                    "operations": operations,
+                    "ane0_eval_ns": 19.0e6 * operations,
+                    "ane1_eval_ns": 19.0e6 * operations,
+                    "gpu_completion_ns": 10.0e6 * operations,
+                }
+            },
+        }
+
+    async def calibrate(run, engine, settings):
+        return ane_tuning._CalibrationChoice(
+            mlp_fraction=0.5,
+            cpu_fraction=0.0,
+            cpu_down_fraction=0.0,
+            gdn_enabled=False,
+            gdn_fraction=None,
+            cpu_enabled=False,
+            cpu_threads=8,
+            cpu_shared_resource=False,
+        )
+
+    monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+
+    async def get_engine(*args, **kwargs):
+        return object()
+
+    pool = SimpleNamespace(
+        _settings_manager=SimpleNamespace(
+            get_settings=lambda model_id: ModelSettings()
+        ),
+        get_loaded_model_ids=lambda: [],
+        get_engine=get_engine,
+    )
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", repeats=1)
+    )
+
+    await ane_tuning.run_tuning(run, pool)
+    snapshot = ane_tuning.run_snapshot(run)
+
+    assert run.status == "completed"
+    assert snapshot["results"][ane_tuning._REFINE_SLOT]["state"] == "failed"
+    assert snapshot["recommendation"]["enabled"] is True
+    assert snapshot["recommendation"]["mlp_fraction"] == 0.5
+    assert snapshot["recommendation"]["processing_tps"] == 125.0
+    assert snapshot["termination_reason"].startswith(
+        "Skipped Profile-refined optimum after it failed: RuntimeError"
+    )
+
+
 @pytest.mark.parametrize(
     ("gpu_tps", "tuned_tps", "expected"),
     [
@@ -950,10 +1035,10 @@ def test_unavailable_bank_compiler_yields_gpu_only_verdict(monkeypatch):
     import asyncio
     from unittest.mock import MagicMock
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: False)
-    monkeypatch.setattr(fast, "qwen35_ane_bank_compiler_available", lambda: False)
+    monkeypatch.setattr(fast, "ane_available", lambda: False)
+    monkeypatch.setattr(fast, "ane_bank_compiler_available", lambda: False)
 
     run = ane_tuning.create_run(ane_tuning.ANETuningRequest(model_id="m"))
     pool = MagicMock()
@@ -973,16 +1058,16 @@ def test_unavailable_bank_compiler_yields_gpu_only_verdict(monkeypatch):
 
 
 def test_bank_compiler_available_matches_serving_probe(monkeypatch):
-    """The tuner guard and qwen35_ane_compile_linear_bank's own gate must
+    """The tuner guard and ane_compile_linear_bank's own gate must
     agree: a False probe is exactly the condition under which the compile
     call raises."""
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: False)
+    monkeypatch.setattr(fast, "ane_available", lambda: False)
     monkeypatch.setattr(
-        fast, "qwen35_ane_bank_compiler_available", _REAL_BANK_COMPILER_AVAILABLE
+        fast, "ane_bank_compiler_available", _REAL_BANK_COMPILER_AVAILABLE
     )
-    assert fast.qwen35_ane_bank_compiler_available() is False
+    assert fast.ane_bank_compiler_available() is False
     with pytest.raises(RuntimeError, match="procedure-bank compiler"):
-        fast.qwen35_ane_compile_linear_bank([], 2048, 0)
+        fast.ane_compile_linear_bank([], 2048, 0)
 
 
 @pytest.mark.asyncio

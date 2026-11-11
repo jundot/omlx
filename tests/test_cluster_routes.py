@@ -109,6 +109,7 @@ def _approval_for(payload: dict) -> str:
             execution_profile=payload.get("execution_profile", "balanced"),
             tensor_parallel_size=payload.get("tensor_parallel_size", 1),
             target_context_tokens=payload.get("target_context_tokens", 8192),
+            mtp=payload.get("mtp", False),
         )
     )
     return routes._placement_signature(plan.to_dict())
@@ -689,6 +690,85 @@ def test_cluster_plan_route_uses_downloaded_model_headers(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["model"]["source"] == "/models/example"
+
+
+def test_new_cluster_plans_follow_the_saved_lightning_mtp_setting(monkeypatch):
+    from omlx.cluster.planner import ModelLayout, PlanningError
+
+    head = ModelLayout("/models/draft", 0, (1,), mtp_weight_bytes=1)
+    plain = ModelLayout("/models/plain", 0, (1,))
+    saved = {}
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {"id": "draft", "model_path": "/models/draft", "model_type": "llm"}
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: SimpleNamespace(mtp_enabled=saved[model_id]),
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+
+    # Like a single Mac, a checkpoint with a head starts with MTP on.
+    assert routes._cluster_mtp(None, head, "/models/draft") is True
+    saved["draft"] = False
+    assert routes._cluster_mtp(None, head, "/models/draft") is False
+    assert routes._cluster_mtp(True, head, "/models/draft") is True
+    assert routes._cluster_mtp(None, plain, "/models/plain") is False
+    with pytest.raises(PlanningError, match="no Lightning MTP head"):
+        routes._cluster_mtp(True, plain, None)
+
+
+def test_cluster_plan_follows_the_saved_engram_ssd_offload_setting(monkeypatch):
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(4 * gib,) * 4,
+            tensor_parallel_ssd_layer_bytes=(0, 3 * gib, 0, 0),
+            supports_pipeline=True,
+        ),
+    )
+    saved = {"v41": True}
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [{"id": "v41", "model_path": "/models/v41", "model_type": "llm"}]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: SimpleNamespace(
+            deepseek_v41_engram_ssd_offload=saved[model_id]
+        ),
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+    body = {
+        "model_path": "/models/v41",
+        "nodes": [
+            {"node_id": "local", "capacity_bytes": 128 * gib, "reserve_bytes": 2 * gib}
+        ],
+    }
+
+    offloaded = _client().post("/admin/api/cluster/plan", json=body)
+    saved["v41"] = False
+    resident = _client().post("/admin/api/cluster/plan", json=body)
+
+    assert offloaded.status_code == resident.status_code == 200
+    assert offloaded.json()["assignments"][0]["ssd_weight_bytes"] == 3 * gib
+    assert resident.json()["assignments"][0]["ssd_weight_bytes"] == 0
+    assert (
+        offloaded.json()["placement_signature"]
+        != resident.json()["placement_signature"]
+    )
 
 
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
@@ -1729,6 +1809,87 @@ def test_a_thunderbolt_pair_without_rdma_falls_back_to_the_ring_out_loud(monkeyp
     assert "studio.local" in body["backend_reason"]
     assert "ring" in body["backend_reason"]
     assert all(host["rdma"] == [] for host in body["hosts"])
+    (warning,) = body["warnings"]
+    assert warning.startswith("The cluster uses the TCP ring instead of JACCL")
+    assert "studio.local reports no RDMA device" in warning
+
+
+_RDMA_MAC_PORTS = """\
+Hardware Port: Wi-Fi
+Device: en1
+
+Hardware Port: Thunderbolt 1
+Device: en2
+
+Hardware Port: Thunderbolt Bridge
+Device: bridge0
+"""
+_IBV_DEVICES = """\
+    device                 node GUID
+    ------              ----------------
+    rdma_en2            0000000000000000
+"""
+
+
+def _rdma_mac_ifconfig(index, *, on_bridge):
+    """ifconfig -a of a Mac with RDMA on and a Thunderbolt cable in en2."""
+
+    port = "" if on_bridge else f"\tinet 192.168.0.{index} netmask 0xfffffffc\n"
+    bridge = f"\tinet 10.10.0.{index} netmask 0xffffff00\n" if on_bridge else ""
+    flags = "8863<UP,BROADCAST,RUNNING,MULTICAST>" if on_bridge else "8822<BROADCAST>"
+    return (
+        "en2: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST>\n"
+        f"\tstatus: active\n{port}"
+        f"bridge0: flags={flags} mtu 1500\n"
+        f"\tmember: en2 flags=3<LEARNING,DISCOVER>\n{bridge}"
+    )
+
+
+@pytest.mark.parametrize("on_bridge", [True, False])
+def test_rdma_needs_the_thunderbolt_port_addressed_not_the_bridge(
+    monkeypatch, on_bridge
+):
+    """The reporter's layout falls back out loud; MLX's own layout runs JACCL."""
+
+    from omlx.cluster import transport
+
+    readings = {
+        host: _rdma_mac_ifconfig(index, on_bridge=on_bridge)
+        for index, host in enumerate(("127.0.0.1", "studio.local"), start=1)
+    }
+    monkeypatch.setattr(
+        transport,
+        "_read",
+        lambda host, command: (
+            readings[host] if command[0] == "ifconfig" else _RDMA_MAC_PORTS
+        ),
+    )
+    # Only the RDMA device probe still runs a command.
+    monkeypatch.setattr(
+        transport.subprocess,
+        "run",
+        lambda command, **_: SimpleNamespace(
+            returncode=0, stdout=_IBV_DEVICES, stderr=""
+        ),
+    )
+    monkeypatch.setattr(
+        routes, "verify_link_reachability", lambda link: (True, link.reason)
+    )
+
+    body = (
+        _client()
+        .get("/admin/api/cluster/fabric", params={"hosts": "127.0.0.1,studio.local"})
+        .json()
+    )
+
+    if on_bridge:
+        assert body["backend"] == "ring" and body["fell_back"] is True
+        (warning,) = body["warnings"]
+        assert "over bridge0, which is not an RDMA device" in warning
+        assert "Turn the Thunderbolt Bridge off" in warning
+    else:
+        assert body["backend"] == "jaccl" and body["warnings"] == []
+        assert body["rdma"]["rows"] == [[None, "rdma_en2"], ["rdma_en2", None]]
 
 
 def test_macs_that_share_no_subnet_get_no_address_and_a_reason(monkeypatch):
@@ -1749,6 +1910,54 @@ def test_macs_that_share_no_subnet_get_no_address_and_a_reason(monkeypatch):
     assert not body["ok"]
     assert all(host["ips"] == [] for host in body["hosts"])
     assert "share no subnet" in body["backend_reason"]
+
+
+def test_a_thunderbolt_cable_the_cluster_cannot_use_is_named_before_activation(
+    monkeypatch,
+):
+    from dataclasses import replace
+
+    def mac(name, address):
+        return replace(
+            _interfaces(name, [("en1", address, 24)], thunderbolt={"bridge0"}),
+            wifi_interfaces=frozenset({"en1"}),
+            self_assigned_interfaces=frozenset({"bridge0"}),
+        )
+
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": mac("127.0.0.1", "192.168.4.21"),
+            "studio.local": mac("studio.local", "192.168.4.22"),
+        },
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+
+    proposal = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_size_bytes": 40 * 1024**3,
+                "layer_count": 32,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * 1024**3}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {"node_id": "node-0", "ssh": "127.0.0.1", "ips": ["10.0.0.1"]},
+                    {"node_id": "node-1", "ssh": "studio.local", "ips": ["10.0.0.2"]},
+                ],
+            },
+        )
+        .json()
+    )
+
+    # The cluster still runs, over Wi-Fi, and says what to fix first.
+    assert proposal["backend"] == "ring"
+    (warning,) = [w for w in proposal["warnings"] if "169.254" in w]
+    assert "self-assigned 169.254" in warning and "Wi-Fi" in warning
 
 
 def test_one_host_is_not_a_fabric():
@@ -1858,6 +2067,60 @@ def test_autoconfigure_activates_on_discovered_addresses_not_supplied_ones(
         [None, "rdma_en4"],
         ["rdma_en5", None],
     ]
+
+
+def test_autoconfigure_lightning_mtp_plan_is_the_one_activation_recomputes(
+    monkeypatch,
+):
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(2 * gib,) * 8,
+            supports_pipeline=True,
+            mtp_weight_bytes=gib,
+        ),
+    )
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces("127.0.0.1", [("en4", "10.0.1.1", 30)]),
+            "studio.local": _interfaces("studio.local", [("en5", "10.0.1.2", 30)]),
+        },
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+
+    body = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_path": "/models/draft",
+                "strategy": "pipeline",
+                "mtp": True,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * gib}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {"node_id": "node-0", "ssh": "127.0.0.1", "ips": ["10.0.1.1"]},
+                    {"node_id": "node-1", "ssh": "studio.local", "ips": ["10.0.1.2"]},
+                ],
+            },
+        )
+        .json()
+    )
+
+    activation = body["activation"]
+    assert activation["mtp"] is True
+    # Placing ranks rebuilds the plan; it must still carry the head.
+    assert activation["approved_placement"] == _approval_for(activation)
 
 
 def test_autoconfigure_uses_verified_ethernet_when_rdma_is_unreachable(
@@ -2447,7 +2710,7 @@ def test_forget_member_preserves_other_pairings_or_leaves_cluster(monkeypatch, n
 
     manager = SimpleNamespace(
         node_id="self",
-        list_paired=lambda: [{"node_id": node} for node in sorted(peers)],
+        paired_devices=lambda: [{"node_id": node} for node in sorted(peers)],
         unpair=lambda node: peers.remove(node),
     )
     monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
@@ -2477,7 +2740,7 @@ def test_forget_member_does_not_unpair_when_local_teardown_fails(monkeypatch, st
     removed = []
     manager = SimpleNamespace(
         node_id="self",
-        list_paired=lambda: [{"node_id": "offline"}],
+        paired_devices=lambda: [{"node_id": "offline"}],
         unpair=removed.append,
     )
     deployment = SimpleNamespace(
@@ -2511,7 +2774,7 @@ def test_forget_member_maps_pairing_errors(monkeypatch):
         raise PairingStateError("approval is already in progress")
 
     manager = SimpleNamespace(
-        node_id="self", list_paired=lambda: [{"node_id": "busy"}], unpair=unpair
+        node_id="self", paired_devices=lambda: [{"node_id": "busy"}], unpair=unpair
     )
     monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
     monkeypatch.setattr(

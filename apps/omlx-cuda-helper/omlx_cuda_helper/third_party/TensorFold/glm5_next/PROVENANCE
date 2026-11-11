@@ -1,0 +1,18 @@
+Sources adapted from TensorFold (https://github.com/ashhart/TensorFold),
+Apache-2.0, Copyright 2026 TensorFold contributors, at commit 33ada77c3.
+License and notice: ../LICENSE, ../NOTICE.
+
+index_scores.cu   from zig/kernels/cuda/glm_index_scores.cuh (tf_glm_index_scores)
+index_header.cu   from zig/kernels/cuda/common/cp_async.cuh, common/qmm_frag.cuh
+                  and glm_index_scores.cuh (the cp.async, ldmatrix and mma
+                  wrappers and the tile layout)
+
+Changes: the kernel is the body of an mx.fast.cuda_kernel instead of a
+precompiled function. Sizes come from the input shapes and template
+arguments. The head weights arrive already scaled, and the dot products are
+not scaled. Each score is rounded once to bf16, and a pooled window that is
+not complete at the query position gets the bf16 value of -1e30 instead of
+-inf, which is what the oMLX host hands its top-k selection. Paged key
+storage is dropped.
+Each tensor-core step sums its 16 products from zero and the sum is added
+to the float32 accumulator rounded to nearest.

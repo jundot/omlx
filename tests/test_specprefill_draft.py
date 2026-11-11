@@ -82,6 +82,7 @@ class _DraftCache:
         self.preloads: list[Any] = []
         self.reconstructions: list[Any] = []
         self.stores: list[tuple[str, list[int], list[Any], Any]] = []
+        self.hot_cache_flags: list[tuple[str, bool]] = []
 
     def fetch_cache(self, request_id: str, tokens: list[int]) -> tuple[Any, list[int]]:
         self.fetches.append((request_id, list(tokens)))
@@ -93,8 +94,11 @@ class _DraftCache:
         self.preloads.append(block_table)
         return block_table.num_tokens
 
-    def reconstruct_cache(self, block_table: Any) -> Any:
+    def reconstruct_cache(
+        self, block_table: Any, promote_to_hot_cache: bool = True
+    ) -> Any:
         self.reconstructions.append(block_table)
+        self.hot_cache_flags.append(("reconstruct", promote_to_hot_cache))
         return self.reconstructed_cache
 
     def store_cache(
@@ -104,8 +108,10 @@ class _DraftCache:
         cache_data: list[Any],
         model_cache_config: Any = None,
         boundary_snapshots: dict[int, list[Any]] | None = None,
+        hot_cache_write_back: bool = True,
     ) -> None:
         self.stores.append((request_id, list(tokens), cache_data, model_cache_config))
+        self.hot_cache_flags.append(("store", hot_cache_write_back))
 
 
 def _request_and_plan() -> tuple[Request, Any]:
@@ -141,6 +147,7 @@ def _run(
     extract_cache_states: (
         Callable[[list[Any]], tuple[list[dict[str, Any]], Any]] | None
     ) = None,
+    use_hot_cache: bool = True,
 ) -> tuple[_Tracker, _Logger, dict[str, Any]]:
     tracker = _Tracker()
     logger = _Logger()
@@ -181,6 +188,7 @@ def _run(
             extract_cache_states=extract_cache_states or (lambda cache: ([], None)),
             sync_and_clear_cache=lambda: trace["syncs"].append(stream),
             log=logger,
+            use_hot_cache=use_hot_cache,
         )
     trace["selected_indices"] = selected_indices
     trace["stream"] = stream
@@ -241,6 +249,23 @@ def test_reconstructed_cache_is_scored_and_stored():
             model_cache_config,
         )
     ]
+    assert draft_cache.hot_cache_flags == [("reconstruct", True), ("store", True)]
+
+
+def test_memory_pressure_keeps_draft_cache_out_of_hot_cache():
+    request, plan = _request_and_plan()
+    draft_cache = _DraftCache(SimpleNamespace(num_tokens=3), ["reconstructed"])
+
+    _run(
+        request,
+        plan,
+        draft_cache=draft_cache,
+        extract_cache_states=lambda cache: ([{"state": "value"}], None),
+        use_hot_cache=False,
+    )
+
+    assert draft_cache.preloads == []
+    assert draft_cache.hot_cache_flags == [("reconstruct", False), ("store", False)]
 
 
 def test_cache_fetch_error_falls_back_to_uncached_scoring():
@@ -341,7 +366,7 @@ class _ReconstructingCache(_DraftCache):
         super().__init__(block_table=SimpleNamespace(num_tokens=16))
         self.reconstruct_calls = 0
 
-    def reconstruct_cache(self, block_table: Any) -> Any:
+    def reconstruct_cache(self, block_table: Any, **kw: Any) -> Any:
         self.reconstruct_calls += 1
         return [_RecurrentLayer() for _ in range(2)]
 

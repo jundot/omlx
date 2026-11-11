@@ -1,15 +1,30 @@
 """Checkpoint-free Metal numerical and sparse-addressing gates."""
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
+from omlx.patches.deepseek_v41 import (
+    activation,
+    decode_fused,
+    decode_layer,
+    hyper_connection,
+    kernels,
+    routing,
+)
+from omlx.patches.deepseek_v41.gemv import mxfp8_gemv
 from omlx.patches.deepseek_v41.kernels import (
     packed_index_scores,
     packed_sparse_attention,
 )
 from omlx.patches.deepseek_v41.language import candidate_block_ids, sparse_attention
-from omlx.patches.deepseek_v41.quantization import pack_activation, unpack_activation
+from omlx.patches.deepseek_v41.quantization import (
+    pack_activation,
+    quantize_activation,
+    unpack_activation,
+)
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
@@ -99,11 +114,14 @@ def test_index_scores_packed_candidates_and_causal(
         )
     actual = packed_index_scores(q, keys, weights, 263, 2, candidates)
     expanded = unpack_activation(keys, 4, dtype=mx.float32)
-    expected = mx.sum(
-        mx.maximum(mx.einsum("bshd,btd->bsht", q.astype(mx.float32), expanded), 0)
-        * weights[..., None],
-        -2,
+    # DeepSeek-V4.1-Flash-1017 Indexer rounding points, in the activation dtype R:
+    # R(q.k), R(relu(.) * w), then an fp32 head sum stored as R.
+    rnd = lambda v: v.astype(dtype).astype(mx.float32)
+    terms = rnd(
+        mx.maximum(rnd(mx.einsum("bshd,btd->bsht", q.astype(mx.float32), expanded)), 0)
+        * weights[..., None]
     )
+    expected, magnitude = rnd(mx.sum(terms, -2)), mx.sum(mx.abs(terms), -2)
     valid = mx.arange(n) < ((263 + mx.arange(length) + 1) // 2)[:, None]
     expected = mx.where(valid, expected, -float("inf"))
     if candidates is not None:
@@ -111,7 +129,18 @@ def test_index_scores_packed_candidates_and_causal(
         expected = mx.where(
             (candidates >= 0) & (candidates < n), expected, -float("inf")
         )
-    np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-5)
+        magnitude = mx.take_along_axis(magnitude, mx.clip(candidates, 0, n - 1), -1)
+    # Free orders (the q.k dot and the head sum) can move each R rounding by one ulp.
+    eps = float(np.finfo(np.float32).eps) if dtype == mx.float32 else (
+        2.0**-10 if dtype == mx.float16 else 2.0**-7
+    )
+    actual, expected = np.asarray(actual), np.asarray(expected)
+    finite = np.isfinite(expected)
+    np.testing.assert_array_equal(np.isfinite(actual), finite)
+    np.testing.assert_array_less(
+        np.abs(actual - expected)[finite],
+        (2 * eps * np.asarray(magnitude) + 3e-5)[finite],
+    )
 
 
 def test_candidate_block_ids_preserve_latest_and_partial_blocks():
@@ -445,4 +474,287 @@ def test_sinkhorn_fused_exact(length, iters, eps):
     zeros = mx.zeros_like(comb)
     np.testing.assert_array_equal(
         sinkhorn(zeros, eps, iters), sinkhorn_reference(zeros, eps, iters)
+    )
+
+
+def test_kernel_templates_do_not_depend_on_token_counts(monkeypatch):
+    """Each distinct template compiles a new Metal pipeline. Selection counts,
+    tile counts and row counts change with prompt length and causal key count,
+    so they must reach the kernels as runtime data."""
+    templates = {}
+
+    def record(module, factory):
+        make = getattr(module, factory)
+
+        def wrapped(*args, **kwargs):
+            kernel = make(*args, **kwargs)
+            key = (module.__name__, factory, args, tuple(sorted(kwargs.items())))
+
+            def call(**call_kwargs):
+                templates.setdefault(key, set()).add(tuple(call_kwargs["template"]))
+                return kernel(**call_kwargs)
+
+            return call
+
+        monkeypatch.setattr(module, factory, wrapped)
+
+    record(kernels, "_topk_kernel")
+    record(kernels, "_topk_merge_kernel")
+    record(activation, "_kernel")
+    record(hyper_connection, "_sinkhorn_kernel")
+    record(hyper_connection, "_post_kernel")
+    record(routing, "_kernel")
+
+    mx.random.seed(509)
+    for count in (100, 101, 129):
+        # Two 1024-wide tiles: one tile sort, then one grouped merge.
+        values, ids = kernels._tile_topk(mx.random.normal((1, 2, 1500)), count)
+        assert values.shape == ids.shape == (1, 2, count)
+    for rows in (1, 3, 7):
+        x = mx.random.normal((1, rows, 128)).astype(mx.bfloat16)
+        activation.quantize_fp8_activation(x)
+        activation.quantize_swiglu_activation(x, x, None, mx.bfloat16, 0.0)
+        activation.quantize_paired_swiglu_activation(
+            mx.concatenate([x, x], -1), None, mx.bfloat16, 0.0
+        )
+        comb = mx.softmax(mx.random.normal((1, rows, 4, 4)), -1)
+        hyper_connection.sinkhorn(comb, 1e-6, 20)
+        hyper_connection.fused_hc_post(
+            x,
+            mx.random.normal((1, rows, 4, 128)).astype(mx.bfloat16),
+            mx.ones((1, rows, 4)),
+            comb,
+        )
+        routed = mx.random.normal((6 * rows, 1, 128)).astype(mx.bfloat16)
+        inverse = mx.arange(6 * rows, dtype=mx.uint32)
+        assert routing.combine_sorted_experts(routed, inverse, x) is not None
+
+    assert len(templates) == 8
+    assert {key: len(seen) for key, seen in templates.items() if len(seen) != 1} == {}
+
+
+def test_batched_decode_templates_do_not_depend_on_positions(monkeypatch):
+    """The selected index count and block count grow with the position until
+    index_topk. They reach the batched decode attention kernels as meta, so each
+    kernel keeps one template, and every meta row carries the batch-wide slice
+    strides. The compressed-row buffer holds the selected rows only, so it stops
+    growing with the context. Only launches are inspected, so this runs without
+    Metal."""
+    templates = {}
+
+    def fake_kernel(name, formats=()):
+        def launch(**kw):
+            templates.setdefault(name, set()).add(tuple(kw["template"]))
+            if name == "attn_scores_bq":
+                meta, ci = np.array(kw["inputs"][5]), kw["inputs"][4]
+                assert (meta[:, 6] == ci.shape[1]).all()
+                assert (meta[:, 7] == kw["grid"][1]).all()
+                assert kw["inputs"][2].shape[0] == meta[:, 1].sum()
+            shapes = zip(kw["output_shapes"], kw["output_dtypes"])
+            return [mx.zeros(s, t) for s, t in shapes]
+
+        return launch
+
+    monkeypatch.setattr(decode_layer, "kernel", fake_kernel)
+    w, h, d, rd = 128, 8, 512, 64
+    c = SimpleNamespace(window_size=w, n_heads=h, head_dim=d, rope_head_dim=rd)
+    with mx.stream(mx.cpu):
+        for position in range(128, 2200, 64):
+            # Requests at different positions select different index counts.
+            rows = [(p + 1) // 4 for p in (position, position + 7, 3 * position)]
+            parts = [
+                (
+                    mx.zeros((1, n, d // 2 + d // 16), mx.uint8),
+                    mx.zeros((1, 1, min(512, n)), mx.int32),
+                )
+                for n in rows
+            ]
+            decode_fused.window_attention_bq(
+                SimpleNamespace(attn_sink=mx.zeros((h,))),
+                mx.zeros((3, h * d), mx.bfloat16),
+                mx.zeros((3, w, d + d // 32), mx.uint8),
+                parts,
+                {},
+                mx.zeros((3, rd // 2)),
+                mx.zeros((3, rd // 2)),
+                c,
+            )
+
+    assert {name: len(seen) for name, seen in templates.items()} == {
+        "attn_scores_bq": 1,
+        "attn_pv_bq": 1,
+        "o_merge_bq": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "n,k", [(1280, 5120), (512, 5120), (5120, 2304), (4096, 1280), (32768, 1280)]
+)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_mxfp8_gemv_matches_quantized_matmul(n, k, dtype):
+    mx.random.seed(n + k)
+    weight, scales = mx.quantize(
+        mx.random.normal((n, k)) * 0.02, group_size=32, bits=8, mode="mxfp8"
+    )
+    for rows in (1, 2, 4, 5):
+        x = mx.random.normal((1, rows, k)).astype(dtype)
+        actual = mxfp8_gemv(x, weight, scales)
+        # Wide or short single rows and two-row blocks stay on MLX's kernels.
+        if (rows == 1 and (n > 8192 or k < 4096)) or rows == 2:
+            assert actual is None
+            continue
+        expected = mx.quantized_matmul(
+            x, weight, scales, group_size=32, bits=8, mode="mxfp8"
+        )
+        np.testing.assert_array_equal(
+            actual.astype(mx.float32), expected.astype(mx.float32)
+        )
+    # Rows spread over a batch axis are separate MLX GEMVs.
+    assert mxfp8_gemv(mx.zeros((5, 1, k), dtype), weight, scales) is None
+
+
+@pytest.mark.parametrize("width,distinct", [(4096, 0), (70000, 0), (9000, 3)])
+def test_radix_selection_matches_tile_selection(width, distinct):
+    rng = np.random.default_rng(width)
+    if distinct:
+        # Few distinct scores overflow the gathered threshold bin.
+        data = rng.integers(0, distinct, (1, 3, width)).astype(np.float32)
+    else:
+        data = rng.normal(size=(1, 3, width)).astype(np.float32)
+    data[0, 0, :700] = -np.inf
+    data[0, 1, ::3] = 0.0
+    data[0, 1, 1::3] = -0.0
+    scores = mx.array(data)
+    for count in (1, 512, 2048):
+        _, expected = kernels._tile_topk(scores, count)
+        actual = kernels._radix_topk(scores, count)
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(actual), -1), np.sort(np.asarray(expected), -1)
+        )
+
+
+@pytest.mark.parametrize("width,distinct", [(7, 0), (2048, 0), (4096, 4), (9000, 0)])
+def test_index_select_matches_selection_pipelines(width, distinct):
+    """Decode / verify selection: the tile top-k + sort pipeline (packed_index_topk) and the
+    argsort pipeline over candidates (Indexer), ties to the lower position, -inf as -1."""
+    rng = np.random.default_rng(width + distinct)
+    if distinct:
+        data = rng.integers(0, distinct, (1, 4, width)).astype(np.float32)
+    else:
+        data = rng.normal(size=(1, 4, width)).astype(np.float32)
+    data[0, 0, : width * 4 // 5] = -np.inf   # fewer finite scores than selected
+    data[0, 1, ::3] = 0.0
+    data[0, 1, 1::3] = -0.0
+    scores = mx.array(data)
+    candidates = np.sort(rng.choice(10 * width, width, replace=False)).astype(np.int32)
+    candidates = mx.array(np.broadcast_to(candidates, (1, 4, width)).copy())
+    for count in (1, 512, 2048):
+        c = min(count, width)
+        values, ids = kernels._tile_topk(scores, c)
+        expected = mx.sort(mx.where(values > -float("inf"), ids, -1), axis=-1)
+        if c < count:
+            expected = mx.concatenate([mx.full((1, 4, count - c), -1, mx.int32), expected], -1)
+        assert mx.array_equal(kernels.index_select(scores, count), expected).item()
+        order = mx.argsort(-scores, axis=-1)[..., :c].astype(mx.int32)
+        valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
+        expected = mx.sort(mx.where(valid, mx.take_along_axis(candidates, order, -1), -1), axis=-1)
+        assert mx.array_equal(kernels.index_select(scores, c, candidates), expected).item()
+
+
+def test_deep_prefill_index_selection_matches_full_scores():
+    mx.random.seed(4401)
+    start, length, ratio = 16384, 37, 4
+    q = mx.random.normal((1, length, 8, 64)).astype(mx.bfloat16)
+    keys = pack_activation(mx.random.normal((1, 4200, 64)), 4)
+    weights = mx.random.normal((1, length, 8))
+    scores = packed_index_scores(q, keys, weights, start, ratio)
+    order = mx.argsort(-scores, axis=-1)[..., :512].astype(mx.int32)
+    valid = mx.take_along_axis(scores, order, -1) > -float("inf")
+    expected = mx.sort(mx.where(valid, order, -1), axis=-1)
+    actual, blocks = kernels.packed_index_topk(q, keys, weights, start, ratio, 512)
+    np.testing.assert_array_equal(actual, expected)
+    assert blocks.shape == (1, length, 0)
+
+
+@pytest.mark.parametrize(
+    "ratio,tied,width,length",
+    [
+        (1, False, 4103, 37),
+        (2, False, 4103, 37),
+        (2, True, 4103, 37),
+        (1, False, 65539, 257),  # More than one 64 MiB score group.
+    ],
+)
+def test_deep_prefill_candidate_source_matches_full_scores(
+    monkeypatch, ratio, tied, width, length
+):
+    """Radix source selection shares scores with exact candidate-block selection."""
+    mx.random.seed(7103)
+    start = (width - 7) * ratio - 1
+    q = quantize_activation(
+        mx.random.normal((1, length, 32, 128)).astype(mx.bfloat16), bits=4
+    )
+    keys = pack_activation(mx.random.normal((1, width, 128)).astype(mx.bfloat16), 4)
+    weights = mx.zeros((1, length, 32)) if tied else mx.random.normal((1, length, 32))
+    scores = packed_index_scores(q, keys, weights, start, ratio)
+    order = mx.argsort(-scores, axis=-1)[..., :512].astype(mx.int32)
+    valid = mx.take_along_axis(scores, order, -1) > -float("inf")
+    expected = mx.sort(mx.where(valid, order, -1), -1)
+    lengths = (mx.arange(start + 1, start + length + 1) // ratio)[None, :, None]
+    expected_blocks = mx.sort(candidate_block_ids(scores, lengths, 512, 8), -1)
+    calls = []
+    original = kernels._radix_topk
+
+    def tracked(scores, count):
+        calls.append(scores.nbytes)
+        return original(scores, count)
+
+    monkeypatch.setattr(kernels, "_radix_topk", tracked)
+    actual, blocks = kernels.packed_index_topk(
+        q, keys, weights, start, ratio, 512, block_count=512, block_size=8
+    )
+    assert calls and max(calls) <= 64 << 20
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(blocks, expected_blocks)
+
+
+@pytest.mark.skipif(not kernels.nax_indexer_available(), reason="needs M5 tensor units")
+@pytest.mark.parametrize("key_start", [0, 40])
+def test_nax_index_scores_match_reference_rounding(monkeypatch, key_start):
+    """Prefill source-key scores on the tensor units keep the reference rounding
+    points and the causal mask, also for a key slice that starts late."""
+    rng = np.random.default_rng(16)
+    length, heads, dim, n, start, ratio = 70, 32, 128, 300, 263, 2
+    q = quantize_activation(
+        mx.array(rng.normal(size=(1, length, heads, dim)).astype(np.float32)).astype(
+            mx.bfloat16
+        ),
+        bits=4,
+    )
+    keys = pack_activation(mx.array(rng.normal(size=(1, n, dim)).astype(np.float32)), 4)
+    weights = mx.array(rng.normal(size=(1, length, heads)).astype(np.float32)) / heads
+    calls = []
+    original = kernels._nax_index_scores
+    monkeypatch.setattr(
+        kernels, "_nax_index_scores", lambda *a: calls.append(1) or original(*a)
+    )
+    part = keys[:, key_start:]
+    actual = packed_index_scores(q, part, weights, start, ratio, key_start=key_start)
+    assert calls
+    expanded = unpack_activation(part, 4, dtype=mx.float32)
+    rnd = lambda v: v.astype(mx.bfloat16).astype(mx.float32)  # noqa: E731
+    terms = rnd(
+        mx.maximum(rnd(mx.einsum("bshd,btd->bsht", q.astype(mx.float32), expanded)), 0)
+        * weights[..., None]
+    )
+    expected, magnitude = rnd(mx.sum(terms, -2)), mx.sum(mx.abs(terms), -2)
+    rows = mx.arange(n - key_start) + key_start
+    valid = rows < ((start + mx.arange(length) + 1) // ratio)[:, None]
+    expected = np.asarray(mx.where(valid, expected, -float("inf")))
+    actual = np.asarray(actual)
+    finite = np.isfinite(expected)
+    np.testing.assert_array_equal(np.isfinite(actual), finite)
+    np.testing.assert_array_less(
+        np.abs(actual - expected)[finite],
+        (2 * 2.0**-7 * np.asarray(magnitude) + 3e-5)[finite],
     )

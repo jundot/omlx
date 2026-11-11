@@ -178,6 +178,7 @@ def serve_command(args):
 
     from ._version import __version__
     from . import process_title
+    from .integrations.base import bracket_host
     from .settings import burst_decode_env, init_settings
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
 
@@ -189,8 +190,8 @@ def serve_command(args):
         build_number = None
 
     # Print version banner
-    print(f"\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
-    print(f"\033[33m├─ https://github.com/jundot/omlx\033[0m")
+    print("\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
+    print("\033[33m├─ https://github.com/jundot/omlx\033[0m")
     if build_number:
         print(f"\033[33m├─ Version: {__version__}\033[0m")
         print(f"\033[33m└─ Build: {build_number}\033[0m")
@@ -319,7 +320,7 @@ def serve_command(args):
             print(f"Warning: skipping {h}, it is not assigned to any local interface")
             bind_hosts.remove(h)
     for h in bind_hosts:
-        print(f"Binding server at http://{h}:{settings.server.port}")
+        print(f"Binding server at http://{bracket_host(h)}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = (
         "debug" if settings.server.log_level == "trace" else settings.server.log_level
@@ -346,6 +347,10 @@ def serve_command(args):
         )
         serve_sockets.append(extra_cfg.bind_socket())
 
+    # Read by omlx.server at import time.
+    if getattr(args, "headless", False):
+        os.environ["OMLX_HEADLESS"] = "1"
+
     try:
         # Import server and config after the port is known to be available.
         from .server import init_server
@@ -368,43 +373,14 @@ def serve_command(args):
             print(f"MCP config: {mcp_config}")
             os.environ["OMLX_MCP_CONFIG"] = mcp_config
 
-        # Determine paged SSD cache directory
-        # Priority: --no-cache > CLI arg > settings file
-        if args.no_cache:
-            paged_ssd_cache_dir = None
-        elif args.paged_ssd_cache_dir:
-            # CLI argument takes precedence
-            paged_ssd_cache_dir = args.paged_ssd_cache_dir
-        elif settings.cache.enabled:
-            # Use settings file value (resolved path or default)
-            paged_ssd_cache_dir = str(
-                settings.cache.get_ssd_cache_dir(settings.base_path)
-            )
-        else:
-            # Cache explicitly disabled in settings
-            paged_ssd_cache_dir = None
-
-        # Build scheduler config for BatchedEngine
+        # Build scheduler config for BatchedEngine. Settings already include
+        # the CLI args and leave the SSD cache dir unset when it is off.
         scheduler_config = settings.to_scheduler_config()
-        # Set paged SSD cache options
-        scheduler_config.paged_ssd_cache_dir = paged_ssd_cache_dir
-        # Determine cache max size: CLI arg > settings (with auto resolution)
+        if args.no_cache:
+            scheduler_config.paged_ssd_cache_dir = None
+        paged_ssd_cache_dir = scheduler_config.paged_ssd_cache_dir
         if paged_ssd_cache_dir:
-            if (
-                args.paged_ssd_cache_max_size
-                and args.paged_ssd_cache_max_size.lower() != "auto"
-            ):
-                # CLI argument specified explicitly
-                cache_max_size_bytes = parse_size(args.paged_ssd_cache_max_size)
-            else:
-                # Resolve the initial automatic budget from disk space and existing cache.
-                cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(
-                    settings.base_path
-                )
-            scheduler_config.paged_ssd_cache_max_size = cache_max_size_bytes
-            scheduler_config.paged_ssd_cache_auto_size = (
-                args.paged_ssd_cache_max_size or settings.cache.ssd_cache_max_size
-            ).lower() == "auto"
+            cache_max_size_bytes = scheduler_config.paged_ssd_cache_max_size
         else:
             scheduler_config.paged_ssd_cache_max_size = 0
             cache_max_size_bytes = 0
@@ -444,6 +420,11 @@ def serve_command(args):
                 print(f"Hot cache: {hot_display} (in-memory)")
         else:
             print("Mode: Multi-model serving (continuous batching, no cache)")
+            if settings.cache.is_ssd_cache_dir_unavailable():
+                print(
+                    "paged SSD cache: off until restart, directory unavailable: "
+                    f"{settings.cache.unavailable_ssd_cache_dir}"
+                )
 
         # Set MLX buffer cache limit high to prevent the allocator from
         # immediately releasing Metal buffers when the cache is full.
@@ -469,7 +450,7 @@ def serve_command(args):
         )
 
         for h in bind_hosts:
-            print(f"Starting server at http://{h}:{settings.server.port}")
+            print(f"Starting server at http://{bracket_host(h)}:{settings.server.port}")
         try:
             uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)
         except KeyboardInterrupt:
@@ -490,6 +471,7 @@ def launch_command(args, extra_args: list[str] | None = None):
     import requests
 
     from .integrations import IntegrationContext, get_integration, list_integrations
+    from .integrations.base import bracket_host
     from .settings import GlobalSettings
 
     def _optional_str(value) -> str | None:
@@ -522,9 +504,22 @@ def launch_command(args, extra_args: list[str] | None = None):
     connect_host = (
         first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
     )
+    base_url = f"http://{bracket_host(connect_host)}:{port}"
+
+    # Claude Desktop resolves tier aliases server-side, so it needs no
+    # launch-time model — but it does need the desktop switch. The toggle
+    # lives in the dashboard; the CLI only points the user there.
+    if tool_name == "claude_desktop" and not bool(
+        getattr(getattr(settings, "claude_code", None), "desktop_enabled", False)
+    ):
+        print("Claude Desktop mode is not enabled in oMLX settings.")
+        print(
+            "Enable it in the oMLX dashboard (Integrations → Claude Desktop) "
+            "and re-run this command."
+        )
+        sys.exit(1)
 
     # Check if oMLX server is running
-    base_url = f"http://{connect_host}:{port}"
     try:
         resp = requests.get(f"{base_url}/health", timeout=3)
         resp.raise_for_status()
@@ -532,6 +527,10 @@ def launch_command(args, extra_args: list[str] | None = None):
         print(f"oMLX server is not running at {base_url}")
         print("Start the server first: omlx start")
         sys.exit(1)
+    try:
+        default_model = _optional_str(resp.json().get("default_model")) or ""
+    except (ValueError, AttributeError):
+        default_model = ""
 
     # Get API key: CLI args > settings.json > empty
     api_key = getattr(args, "api_key", None) or settings.auth.api_key or ""
@@ -568,14 +567,17 @@ def launch_command(args, extra_args: list[str] | None = None):
         pass
 
     # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
-    # prompt interactively so the user's selection is honoured.
+    # prompt interactively so the user's selection is honoured. Integrations
+    # that resolve models server-side (requires_model_selection=False) skip
+    # this block.
     model = args.model
     if not model and not integration.requires_model_selection:
         # The integration registers the server's whole model catalog, so
         # there is nothing to pick here; the optional per-tool default (or
         # --model) only seeds the tool's own default model.
+        setting_tool = "codex" if tool_name == "codex_app" else tool_name
         model = (
-            _optional_str(getattr(settings.integrations, f"{tool_name}_model", None))
+            _optional_str(getattr(settings.integrations, f"{setting_tool}_model", None))
             or ""
         )
     if not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
@@ -672,6 +674,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         port=port,
         api_key=api_key,
         model=model,
+        default_model=default_model,
         opus_model=opus_model if tool_name == "claude" else None,
         sonnet_model=sonnet_model if tool_name == "claude" else None,
         haiku_model=haiku_model if tool_name == "claude" else None,
@@ -857,7 +860,7 @@ def diagnose_menubar() -> int:
 
     mac_ver = platform.mac_ver()[0] or "unknown"
     print(f"macOS:          {mac_ver}")
-    print(f"Bundle ID:      app.omlx")
+    print("Bundle ID:      app.omlx")
 
     app_path = Path("/Applications/oMLX.app")
     print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")
@@ -1245,7 +1248,7 @@ Example directory structure:
         type=str,
         choices=["off", "safe", "balanced", "aggressive"],
         default=None,
-        help="Memory guard tier, or 'off' to disable the guard. The tier sets how much memory stays free for other apps: safe keeps about 20%% of RAM (6-16 GB), balanced about 8%% (3-8 GB), aggressive 2%% (1.5-4 GB) and may compress other apps' memory. Passing a tier also turns the guard on. (default: balanced)",
+        help="Memory guard tier, or 'off' to disable the guard. The tier sets how much memory stays free for other apps: safe keeps about 20%% of RAM (6-16 GB), balanced about 8%% (3-8 GB) and may compress a quarter of other apps' memory, aggressive 2%% (1.5-4 GB) and may compress half of it. Passing a tier also turns the guard on. (default: balanced)",
     )
     serve_parser.add_argument(
         "--memory-guard-gb",
@@ -1363,14 +1366,21 @@ Example directory structure:
         default=None,
         help="API key for authentication (required for non-loopback binds)",
     )
+    serve_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Serve the inference and admin APIs without the web UI. "
+        "Not saved to settings; same as OMLX_HEADLESS=1",
+    )
 
     # Launch command
     launch_parser = subparsers.add_parser(
         "launch",
         help="Launch an external tool with oMLX integration",
         description=(
-            "Configure and launch external coding tools (Claude Code, Copilot, "
-            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, DeepSeek "
+            "Configure and launch external coding tools (Claude Code, Claude Desktop, "
+            "Copilot, Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, Mistral Vibe, "
+            "DeepSeek "
             "Harness) to use the running oMLX server."
         ),
     )
@@ -1378,8 +1388,8 @@ Example directory structure:
         "tool",
         type=str,
         help=(
-            "Tool to launch: claude, copilot, codex, codex_app, opencode, "
-            "openclaw, hermes, pi, dsh, or 'list' to show available"
+            "Tool to launch: claude, claude_desktop, copilot, codex, codex_app, opencode, "
+            "openclaw, hermes, pi, vibe, dsh, or 'list' to show available"
         ),
     )
     launch_parser.add_argument(

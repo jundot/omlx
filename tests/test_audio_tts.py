@@ -8,10 +8,14 @@ All unit tests run with mocked TTSEngine and EnginePool — mlx-audio is not
 required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
+import asyncio
 import base64
 import io
 import struct
+import threading
 import wave
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import mlx.core as mx
@@ -96,6 +100,7 @@ def server_tts_client():
         mock_state.global_settings = None
         mock_state.distributed_inference_enabled = False
         mock_state.process_memory_enforcer = None
+        mock_state.gpu_power_limiter = None
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
@@ -482,6 +487,21 @@ class TestTTSEndpointErrors:
         )
         assert response.status_code >= 500
 
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_invalid_request_from_model_returns_400(self, server_tts_client, stream):
+        from omlx.exceptions import InvalidRequestError
+
+        client, mock_pool = server_tts_client
+        mock_pool.get_engine.return_value.synthesize = AsyncMock(
+            side_effect=InvalidRequestError("voice cannot be combined")
+        )
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "ming", "input": "Hi", "stream": stream},
+        )
+        assert response.status_code == 400
+        assert "voice cannot be combined" in response.json()["error"]["message"]
+
     def test_missing_model_field_returns_error(self, server_tts_client):
         """Request without 'model' field returns 4xx."""
         client, _ = server_tts_client
@@ -748,6 +768,87 @@ class TestTTSStreaming:
 
 
 # ---------------------------------------------------------------------------
+# LFM3-Audio / LFM3-Omni speech on the VLM engine
+# ---------------------------------------------------------------------------
+
+
+class TestTTSLFM3Speech:
+    def test_vlm_engine_speech_serves_speech(self, server_tts_client):
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        client, mock_pool = server_tts_client
+        engine = MagicMock(spec=VLMBatchedEngine)
+        engine.speech.synthesize = AsyncMock(return_value=DUMMY_WAV)
+        mock_pool.get_engine.return_value = engine
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "lfm3", "input": "Hi", "voice": "male", "language": "ko"},
+        )
+        assert response.status_code == 200
+        kwargs = engine.speech.synthesize.call_args.kwargs
+        assert (kwargs["voice"], kwargs["language"]) == ("male", "ko")
+
+    def test_vlm_engine_without_speech_is_rejected(self, server_tts_client):
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        client, mock_pool = server_tts_client
+        engine = MagicMock(spec=VLMBatchedEngine)
+        engine.speech = None
+        mock_pool.get_engine.return_value = engine
+        response = client.post("/v1/audio/speech", json={"model": "vl", "input": "Hi"})
+        assert response.status_code == 400
+
+    def test_speech_runs_on_engine_executor_and_keeps_engine_active(self):
+        from omlx.engine.lfm3_speech import LFM3Speech
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        engine = VLMBatchedEngine(model_name="lfm3-audio")
+        executor = ThreadPoolExecutor(1, thread_name_prefix="mlx-engine-test")
+        engine._engine = SimpleNamespace(_mlx_executor=executor, engine=None)
+        speech = LFM3Speech(engine)
+        seen = {}
+
+        def run(*args, **kwargs):
+            seen["thread"] = threading.current_thread().name
+            seen["active"] = engine.has_active_requests()
+            return SimpleNamespace(text="hi", prompt_tokens=1, generation_tokens=1)
+
+        try:
+            with patch.object(LFM3Speech, "_run", side_effect=run):
+                asyncio.run(speech.transcribe("clip.wav"))
+            assert seen["thread"].startswith("mlx-engine-test")
+            assert seen["active"] is True
+            assert engine.has_active_requests() is False
+
+            with patch.object(LFM3Speech, "_run", side_effect=RuntimeError("boom")):
+                with pytest.raises(RuntimeError, match="boom"):
+                    asyncio.run(speech.transcribe("clip.wav"))
+            assert engine.has_active_requests() is False
+        finally:
+            executor.shutdown()
+
+    def test_tts_prompt_names_the_locale_and_voice(self):
+        from omlx.engine.lfm3_speech import tts_prompt
+
+        assert tts_prompt(None, None) == (
+            "Perform TTS in American English using a female voice."
+        )
+        assert tts_prompt("en-GB", "male") == (
+            "Perform TTS in British English using a male voice."
+        )
+        assert tts_prompt("ko", "Female") == (
+            "Perform TTS in Korean using a female voice."
+        )
+        assert tts_prompt("japanese", None) == (
+            "Perform TTS in Japanese using a female voice."
+        )
+        with pytest.raises(ValueError, match="voice"):
+            tts_prompt("en", "alloy")
+        with pytest.raises(ValueError, match="language"):
+            tts_prompt("xx", None)
+
+
+# ---------------------------------------------------------------------------
 # TestTTSModelAliasResolution
 # ---------------------------------------------------------------------------
 
@@ -774,6 +875,7 @@ class TestTTSModelAliasResolution:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
@@ -806,6 +908,7 @@ class TestTTSModelAliasResolution:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
@@ -1204,6 +1307,7 @@ class TestTTSVoiceCloneEndpoint:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
@@ -1480,6 +1584,203 @@ class TestTTSGenParamsEndpoint:
         call_kwargs = synthesize.call_args.kwargs
         assert call_kwargs.get("temperature") is None
         assert call_kwargs.get("top_k") is None
+
+
+# ---------------------------------------------------------------------------
+# Ming-3.0 decode loop patch
+# ---------------------------------------------------------------------------
+
+
+def _tiny_ming3_model(stop_bias):
+    """Random-weight Ming-3.0 model with mlx-audio's real decode modules."""
+    bm = pytest.importorskip("mlx_audio.tts.models.bailingmm.bailingmm")
+    import mlx.nn as nn
+
+    mx.random.seed(7)
+    hidden = 32
+    args = bm.Qwen2ModelArgs.from_dict(
+        {
+            "model_type": "qwen2",
+            "hidden_size": hidden,
+            "num_hidden_layers": 2,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 16,
+        }
+    )
+    model = bm.Model.__new__(bm.Model)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(model_path=None)
+    model.ming3 = True
+    model.patch_size = model.history_patch_size = 1
+    model.latent_dim = 4
+    model.llm_args = args
+    model.model = bm.MingQwen2ForCausalLM(args, {})
+    dit = {"hidden_size": 64, "depth": 2, "num_heads": 4}
+    model.linear_proj_audio = bm.Aggregator(in_channels=4, llm_input_dim=hidden, **dit)
+    model.flowloss = bm.FlowLoss(
+        z_channels=4, llm_cond_dim=hidden, ming3_sampling=True, **dit
+    )
+    model.stop_head = nn.Linear(hidden, 2)
+    model.stop_head.bias = mx.array(stop_bias)
+    model.set_dtype(mx.bfloat16)
+    prompt = mx.random.normal((1, 6, hidden)).astype(mx.bfloat16)
+    model._prepare_input_embed = lambda **_: (None, prompt)
+    return model
+
+
+class TestMing3Patches:
+    @pytest.mark.parametrize(
+        "stop_bias, max_steps, temperature, expected_len",
+        [
+            ([20.0, -20.0], 9, 0.0, 9),
+            ([-20.0, 20.0], 9, 0.0, 5),
+            ([20.0, -20.0], 1, 0.0, 1),
+            ([20.0, -20.0], 6, 0.5, 6),
+        ],
+    )
+    def test_pipelined_loop_matches_eager_loop(
+        self, stop_bias, max_steps, temperature, expected_len
+    ):
+        from omlx.patches.mlx_audio_ming3 import apply_ming3_patches
+
+        bm = pytest.importorskip("mlx_audio.tts.models.bailingmm.bailingmm")
+        assert apply_ming3_patches()
+        eager = bm.Model.sample._omlx_original
+        model = _tiny_ming3_model(stop_bias)
+
+        def run(sample):
+            mx.random.seed(0)
+            steps = sample(
+                model, "p", "t", max_decode_steps=max_steps, temperature=temperature
+            )
+            return [(mx.array(latent), last) for latent, last in steps]
+
+        expected = run(eager)
+        actual = run(bm.Model.sample)
+        assert len(actual) == len(expected) == expected_len
+        for (got, got_last), (want, want_last) in zip(actual, expected):
+            assert got_last == want_last
+            assert mx.array_equal(got, want).item()
+
+    @pytest.mark.parametrize(
+        "cfg, temperature", [(2.0, 0.0), (2.0, 0.5), (1.0, 0.5), (0.0, 0.0)]
+    )
+    def test_tiny_compiled_flow_matches_eager_flow(self, cfg, temperature):
+        from omlx.patches.mlx_audio_ming3 import apply_ming3_patches
+
+        tiny_flow = pytest.importorskip("mlx_audio.tts.models.lingv3_tts.flow")
+        assert apply_ming3_patches()
+        mx.random.seed(5)
+        dit = {"hidden_size": 64, "depth": 2, "num_heads": 4, "mlp_ratio": 4}
+        flow = tiny_flow.FlowLoss(latent_dim=4, hidden_size=32, config=dit)
+        flow.set_dtype(mx.bfloat16)
+        hidden = mx.random.normal((1, 1, 32)).astype(mx.bfloat16)
+        history = mx.random.normal((1, 1, 4))
+
+        def run(sample):
+            mx.random.seed(0)
+            kwargs = {"cfg": cfg, "temperature": temperature, "steps": 10}
+            return sample(flow, hidden, history, **kwargs)
+
+        want = run(tiny_flow.FlowLoss.sample._omlx_original)
+        got = run(tiny_flow.FlowLoss.sample)
+        assert got.dtype == want.dtype == mx.float32
+        assert mx.array_equal(got, want).item()
+
+    def test_tiny_fused_flow_tracks_eager_flow(self):
+        from omlx.patches.mlx_audio_ming3 import _STATE_ATTR, apply_ming3_patches
+
+        tiny_flow = pytest.importorskip("mlx_audio.tts.models.lingv3_tts.flow")
+        assert apply_ming3_patches()
+        mx.random.seed(5)
+        dit = {"hidden_size": 1024, "depth": 1, "num_heads": 16, "mlp_ratio": 4}
+        flow = tiny_flow.FlowLoss(latent_dim=64, hidden_size=32, config=dit)
+        flow.set_dtype(mx.bfloat16)
+        hidden = mx.random.normal((1, 1, 32)).astype(mx.bfloat16)
+        history = mx.random.normal((1, 1, 64))
+
+        def run(sample):
+            mx.random.seed(0)
+            return sample(flow, hidden, history, cfg=2.0, temperature=0.5, steps=10)
+
+        want = run(tiny_flow.FlowLoss.sample._omlx_original)
+        got = run(tiny_flow.FlowLoss.sample)
+        assert getattr(flow, _STATE_ATTR).fused
+        err = (mx.abs(got - want).max() / mx.abs(want).max()).item()
+        assert err < 5e-2
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "오늘은 날씨가 정말 좋아서 우리는 공원에 가서 산책을 하고 맛있는 "
+            "점심을 먹었습니다. 저녁에는 친구들과 함께 영화를 보기로 했습니다.",
+            "今日はとても天気が良かったので、私たちは公園まで歩いて行きました。"
+            "夕方には友達と一緒に映画を見る予定です。",
+        ],
+    )
+    def test_korean_and_japanese_text_is_split(self, text):
+        from omlx.patches.mlx_audio_ming3 import apply_ming3_patches
+
+        bm = pytest.importorskip("mlx_audio.tts.models.bailingmm.bailingmm")
+        assert apply_ming3_patches()
+        assert len(bm._split_fragments(text, 24)) > 1
+
+    # The official checkpoint stores rotary inv_freq in f32, mlx-community's in bf16.
+    @pytest.mark.parametrize("table_dtype", [mx.float32, mx.bfloat16])
+    def test_fused_dit_kernels_match_mlx_modules(self, table_dtype):
+        from omlx.patches import ming3_dit_kernels as fused
+        from omlx.patches.mlx_audio_ming3 import _CachedRope
+
+        bm = pytest.importorskip("mlx_audio.tts.models.bailingmm.bailingmm")
+        mx.random.seed(0)
+        dit = bm.DiT(
+            in_channels=64, hidden_size=1024, depth=1, num_heads=16, llm_cond_dim=32
+        )
+        dit.set_dtype(mx.bfloat16)
+        dit.rotary_embed.inv_freq = dit.rotary_embed.inv_freq.astype(table_dtype)
+        assert fused.cfm_supported(dit)
+
+        def rel(got, want):
+            got, want = got.astype(mx.float32), want.astype(mx.float32)
+            return (mx.abs(got - want).max() / mx.abs(want).max()).item()
+
+        # CFM rows (CFG batch 2 x seq 3) and aggregator rows (1 x 2).
+        for batch, seq_len in ((2, 3), (1, 2)):
+            rope = _CachedRope(dit.rotary_embed, seq_len)
+            x = mx.random.normal((batch, seq_len, 1024)).astype(mx.bfloat16)
+            want = dit.blocks[0](x, None, rope)
+            assert (
+                rel(fused.dit_block(dit.blocks[0], x, rope.cos, rope.sin), want) < 2e-2
+            )
+
+        h = mx.random.normal((2, 3, 1024)).astype(mx.bfloat16)
+        y = mx.random.normal((1, 1, 64)).astype(mx.bfloat16)
+        dts = mx.full((10,), 0.0625, dtype=mx.bfloat16)
+        sqs = mx.abs(dts) ** 0.5
+        sde = mx.random.normal((10, 1, 1, 64)).astype(mx.bfloat16)
+        pred, null_pred = mx.split(dit.final_layer(h)[:, -1:, :], 2, axis=0)
+        want = y + dts[3] * (pred + (pred - null_pred) * 2.0)
+        want = want + (0.25 * sqs[3]) * sde[3]
+        shift = mx.array(0.25, dtype=mx.bfloat16)
+        got = fused.cfm_final(h, dit.final_layer, y, dts, sqs, sde, shift, 3, 2.0)
+        assert rel(got, want) < 2e-2
+
+    def test_builtin_voice_with_instructions_is_request_error(self):
+        from omlx.exceptions import InvalidRequestError
+        from omlx.patches.mlx_audio_ming3 import apply_ming3_patches
+
+        bm = pytest.importorskip("mlx_audio.tts.models.bailingmm.bailingmm")
+        assert apply_ming3_patches()
+        with pytest.raises(InvalidRequestError):
+            bm.Model.generate(
+                SimpleNamespace(ming3=True),
+                text="Hi.",
+                voice="UK_George",
+                instruct="Calm.",
+            )
 
 
 # ---------------------------------------------------------------------------

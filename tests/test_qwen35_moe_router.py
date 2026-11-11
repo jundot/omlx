@@ -99,6 +99,7 @@ def test_verifier_routes_short_moe_blocks_through_fused_router(
             shared_expert_intermediate_size=64,
             num_experts=512,
             num_experts_per_tok=10,
+            norm_topk_prob=True,
         )
     )
     model.set_dtype(mx.bfloat16)
@@ -162,15 +163,16 @@ def test_fused_combine_sigmoid_matches_every_gate_encoding(dtype):
     scores = mx.softmax(mx.random.normal((1, 1, 10)), axis=-1).astype(dtype)
     shared = mx.random.normal((1, 1, 64)).astype(dtype)
     gates = mx.arange(0, 65536, dtype=mx.uint32).astype(mx.uint16).view(dtype)
+    # The gate enters only elementwise ops: one broadcast call gives each gate's bits.
+    expected = _composed_combine(routed, scores, shared, gates.reshape(-1, 1, 1, 1))
     for start in range(0, gates.size, 2048):
         chunk = [gates[i].reshape(1, 1, 1) for i in range(start, start + 2048)]
         actual = mx.stack([fused_moe_combine(routed, scores, shared, g) for g in chunk])
-        expected = mx.stack([_composed_combine(routed, scores, shared, g) for g in chunk])
-        mx.eval(actual, expected)
-        assert _same_bits(actual, expected)
+        mx.eval(actual)
+        assert _same_bits(actual, expected[start : start + 2048])
 
 
-def test_fused_combine_declines_other_layouts(monkeypatch):
+def test_fused_combine_declines_other_layouts():
     from omlx.patches import qwen35_moe_router as router
 
     def operands(rows=1, top_k=10, dtype=mx.bfloat16):
@@ -184,8 +186,6 @@ def test_fused_combine_declines_other_layouts(monkeypatch):
     assert router.fused_moe_combine(*operands(rows=2)) is None  # verify rows stay composed
     assert router.fused_moe_combine(*operands(top_k=7)) is None
     assert router.fused_moe_combine(*operands(dtype=mx.float32)) is None
-    monkeypatch.setattr(router, "_COMBINE_DISABLED", True)
-    assert router.fused_moe_combine(*operands()) is None
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -206,6 +206,7 @@ def test_one_row_moe_block_matches_composed_combine(monkeypatch, seed):
             shared_expert_intermediate_size=128,
             num_experts=32,
             num_experts_per_tok=10,
+            norm_topk_prob=True,
         )
     )
     block.set_dtype(mx.bfloat16)
@@ -224,7 +225,7 @@ def test_one_row_moe_block_matches_composed_combine(monkeypatch, seed):
     )
     x = mx.random.normal((1, 1, 2560)).astype(mx.bfloat16)
     with monkeypatch.context() as off:
-        off.setattr(router, "_COMBINE_DISABLED", True)
+        off.setattr(router, "fused_moe_combine", lambda *a: calls.append(a[0].shape))
         expected = block(x)
         mx.eval(expected)
     actual = block(x)

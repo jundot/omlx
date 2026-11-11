@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from mlx_vlm.models.switch_layers import SwitchGLU
 
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.patches import m5_gather_qmm_a8 as a8
 from omlx.patches import m5_gather_qmm_nax as nax
 from omlx.patches import qwen35_moe_gate_up as gate_up
@@ -22,13 +23,9 @@ E, H, INTER, TOPK = 16, 256, 128, 10
 
 def _a8_ready() -> bool:
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
 
-        return (
-            bool(fast.oq_a8_available())
-            and nax.enabled()
-            and a8._get_kernel() is not None
-        )
+        return bool(fast.oq_a8_available()) and a8._get_kernel() is not None
     except Exception:
         return False
 
@@ -89,11 +86,11 @@ def _contract_reference(problem):
     ``Sa[m] * (Qa[m] @ dequantize(W)[e].T)`` with Stage A's own ``Qa``/``Sa``.
     Equal to ``Sa * sum_g (Sw_g * acc_g + Bw_g * Ra_g)`` up to float32 order."""
     x, wq, s, b, idx, rmap = problem
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     # Plain Stage A: the kernel's ``_v8`` variant permutes the K slots of every
     # group into the order its fragment loads expect (the sum is unchanged).
-    qa, sa, _ = fast.qwen35_oq_a8_quantize(x, 0)
+    qa, sa, _ = fast.oq_a8_quantize(x, 0)
     qa = qa.reshape(qa.shape[0], -1)  # [T, 1, K] -> [T, K]
     wd = mx.dequantize(
         wq, s.astype(mx.float32), b.astype(mx.float32), group_size=GROUP, bits=4
@@ -125,7 +122,8 @@ def _assert_close_to_contract(out, ref):
         256,  # G = 4: staged
         320,  # G = 5: scalar loads
         2560,  # G = 40: Qwen3.8-Flash-Next, staged, 10 KiB per tile
-        4352,  # G = 68: above the staging limit, scalar loads
+        5120,  # G = 80: DeepSeek V4.1, staged, 20 KiB per tile
+        5376,  # G = 84: above the staging limit, scalar loads
     ],
 )
 def test_checkpoint_layout_metadata_matches_the_contract(K, dtype):
@@ -182,6 +180,238 @@ def test_failed_canary_declines_to_a16(monkeypatch):
     assert _run(problem) is None
 
 
+def _v41_reference(
+    x, gate, up, idx, rmap, bits, act, limit, rw, dequant=None, oai=None
+):
+    """The DeepSeek V4.1 A8 contract in float32: Stage A codes times their row
+    or GS64 scales, against the dequantized experts, then the clamped,
+    route-weighted SwiGLU (or the plain projection when ``up`` is None).
+    ``dequant`` maps a packed operand to float weights (default: affine).
+    ``oai`` = ``(alpha, beta, (gate scales, up scales))`` is the MiniMax
+    SwiGLU-OAI instead."""
+    qa, sa, _ = quant_fast.oq_a8_quantize(x, act)
+    tokens, k_dim = x.shape[0], x.shape[-1]
+    scale = sa.reshape(tokens, -1, 1) if act else sa.reshape(tokens, 1, 1)
+    xa = (qa.reshape(tokens, -1, GROUP).astype(mx.float32) * scale).reshape(
+        tokens, k_dim
+    )
+
+    def project(packed):
+        if dequant is not None:
+            wd = dequant(packed)
+        else:
+            wq, s, b = packed
+            wd = mx.dequantize(
+                wq,
+                s.astype(mx.float32),
+                b.astype(mx.float32),
+                group_size=GROUP,
+                bits=bits,
+            )
+        idx_np = np.array(idx)
+        out = np.zeros((idx_np.shape[0], wd.shape[1]), np.float32)
+        for e in np.unique(idx_np):
+            rows = np.nonzero(idx_np == e)[0]
+            out[rows] = np.array(xa[rmap[mx.array(rows)]] @ wd[int(e)].T)
+        return out
+
+    if up is None:
+        return project(gate)
+    g, u = project(gate), project(up)
+    if oai is None:
+        g, u = np.minimum(g, limit), np.clip(u, -limit, limit)
+        return g / (1 + np.exp(-g)) * u * np.array(rw)[:, None]
+    alpha, beta, (gs, us) = oai
+    g = np.minimum(g * np.array(gs)[np.array(idx)][:, None], limit)
+    u = np.clip(u * np.array(us)[np.array(idx)][:, None], -limit, limit)
+    return g / (1 + np.exp(-alpha * g)) * (u + beta)
+
+
+@needs_a8
+@pytest.mark.parametrize("bits", [2, 3])
+@pytest.mark.parametrize("group_scales", [False, True])
+@pytest.mark.parametrize("swiglu", [False, True])
+def test_deepseek_v41_variants_match_the_contract(bits, group_scales, swiglu):
+    """Q2/Q3 codes in K order, row or GS64 activation scales, and the split,
+    clamped and route-weighted SwiGLU of DeepSeek V4.1 routed experts."""
+    tokens, idx, rmap = _routes("partial_tiles", 100, TOPK, E, 3)
+
+    def quant(seed, rows, k_dim):
+        w = mx.random.normal((E, rows, k_dim), key=mx.random.key(seed)) * 0.05
+        return mx.quantize(w.astype(mx.bfloat16), group_size=GROUP, bits=bits)
+
+    x = (mx.random.normal((tokens, 1, H), key=mx.random.key(5)) * 0.6).astype(
+        mx.bfloat16
+    )
+    gate = quant(11, INTER if swiglu else 2 * INTER, H)
+    up = quant(12, INTER, H) if swiglu else None
+    rw = mx.random.uniform(0.2, 1.5, idx.shape, key=mx.random.key(13))
+    kw = {"up": up, "swiglu_limit": 1.0, "route_weights": rw} if swiglu else {}
+    out = a8.sorted_gather_qmm_a8(
+        x,
+        *gate,
+        idx,
+        rmap,
+        group_size=GROUP,
+        bits=bits,
+        swiglu=swiglu,
+        group_scales=group_scales,
+        **kw,
+    )
+    assert out is not None
+    ref = _v41_reference(x, gate, up, idx, rmap, bits, int(group_scales), 1.0, rw)
+    _assert_close_to_contract(out, ref)
+
+
+def _e4m3_to_int8_reference(codes, scales):
+    """``mxfp8_to_int8`` in NumPy: codes rescaled to each 32-code group's
+    largest exponent, rounded half to even, and the matching E8M0 scales."""
+    groups = codes.reshape(*codes.shape[:-1], -1, 32).astype(np.int32)
+    e = (groups >> 3) & 15
+    mant = (groups & 7) + np.where(e > 0, 8, 0)
+    eh = np.maximum(e, 1)
+    emax = eh.max(-1, keepdims=True)
+    q = np.rint(mant * 2.0 ** (eh - emax + 3)) * np.where(groups & 0x80, -1, 1)
+    s8 = np.clip(scales.astype(np.int32) + emax[..., 0] - 13, 0, 254)
+    return q.reshape(codes.shape).astype(np.int8), s8.astype(np.uint8)
+
+
+def test_mxfp8_to_int8_rescales_each_group_to_its_largest_exponent():
+    """Exact above Emax - 3, ties to even below, subnormal-only and zero
+    groups included; the dequantized value moves by at most half a step."""
+    rng = np.random.default_rng(0)
+    codes = rng.integers(0, 256, (48, 256)).astype(np.uint8)
+    codes[(codes & 0x7F) == 0x7F] = 0x7E  # E4M3FN NaN
+    codes[0, :32] = rng.integers(0, 8, 32)  # subnormal codes only
+    codes[1, 32:64] = 0
+    # Emax 15 with exponents 11 and 10: halves and quarters that tie.
+    codes[2, :32] = [0x78, 0x59, 0x5B, 0x5D, 0x52, 0x56, 0xD9, 0xD2] * 4
+    scales = rng.integers(100, 140, (48, 8)).astype(np.uint8)
+    w8, s8 = a8.mxfp8_to_int8(mx.array(codes.view(np.uint32)), mx.array(scales))
+    q_ref, s_ref = _e4m3_to_int8_reference(codes, scales)
+    np.testing.assert_array_equal(np.array(w8).view(np.int8), q_ref)
+    np.testing.assert_array_equal(np.array(s8), s_ref)
+    assert np.abs(q_ref.astype(np.int32)).max() <= 120
+
+
+def _mx_operand(fmt, seed, rows, k_dim):
+    """MXFP4 codes, or MXFP8 codes converted to INT8, with E8M0 scales."""
+    w = mx.random.normal((E, rows, k_dim), key=mx.random.key(seed)) * 0.05
+    bits, mode = (4, "mxfp4") if fmt == a8._FMT_MXFP4 else (8, "mxfp8")
+    wq, s = mx.quantize(w.astype(mx.bfloat16), group_size=32, bits=bits, mode=mode)
+    return a8.mxfp8_to_int8(wq, s) if fmt == a8._FMT_INT8 else (wq, s)
+
+
+def _mx_dequantize(fmt):
+    def dequant(packed):
+        wq, s = packed
+        if fmt == a8._FMT_MXFP4:
+            return mx.dequantize(wq, s, group_size=32, bits=4, mode="mxfp4").astype(
+                mx.float32
+            )
+        q = wq.view(mx.int8).astype(mx.float32)
+        scale = mx.power(2.0, s.astype(mx.float32) - 127)
+        return (q.reshape(*s.shape, 32) * scale[..., None]).reshape(q.shape)
+
+    return dequant
+
+
+@needs_a8
+@pytest.mark.parametrize("fmt", [a8._FMT_MXFP4, a8._FMT_INT8])
+@pytest.mark.parametrize("group_scales", [False, True])
+@pytest.mark.parametrize("swiglu", [False, True])
+@pytest.mark.parametrize("bm", [None, 128])
+def test_mx_formats_match_the_contract(fmt, group_scales, swiglu, bm):
+    """MXFP4 and converted MXFP8 codes with per-32 E8M0 scales, under every
+    DeepSeek V4.1 epilogue and the dense tile height."""
+    tokens, idx, rmap = _routes("partial_tiles", 100, TOPK, E, 3)
+    x = (mx.random.normal((tokens, 1, H), key=mx.random.key(5)) * 0.6).astype(
+        mx.bfloat16
+    )
+    gate = _mx_operand(fmt, 11, INTER if swiglu else 2 * INTER, H)
+    up = _mx_operand(fmt, 12, INTER, H) if swiglu else None
+    rw = mx.random.uniform(0.2, 1.5, idx.shape, key=mx.random.key(13))
+    kw = {"up": up, "swiglu_limit": 1.0, "route_weights": rw} if swiglu else {}
+    out = a8.sorted_gather_qmm_a8_mx(
+        x,
+        *gate,
+        idx,
+        rmap,
+        fmt=fmt,
+        swiglu=swiglu,
+        group_scales=group_scales,
+        bm=bm,
+        **kw,
+    )
+    assert out is not None
+    ref = _v41_reference(
+        x,
+        gate,
+        up,
+        idx,
+        rmap,
+        None,
+        int(group_scales),
+        1.0,
+        rw,
+        dequant=_mx_dequantize(fmt),
+    )
+    _assert_close_to_contract(out, ref)
+
+
+@needs_a8
+@pytest.mark.parametrize("bits", [2, 3])
+def test_swiglu_oai_matches_the_contract(bits):
+    """The MiniMax M3 epilogue: gate and up times their expert's scale,
+    clamped, then gate * sigmoid(alpha * gate) * (up + beta)."""
+    tokens, idx, rmap = _routes("partial_tiles", 100, TOPK, E, 3)
+    x = (mx.random.normal((tokens, 1, H), key=mx.random.key(5)) * 0.6).astype(
+        mx.bfloat16
+    )
+    w = mx.random.normal((2, E, INTER, H), key=mx.random.key(11)) * 0.05
+    gate, up = (mx.quantize(w[i].astype(mx.bfloat16), bits=bits) for i in (0, 1))
+    scales = tuple(mx.random.uniform(0.5, 2.0, (2, E), key=mx.random.key(14)))
+    out = a8.sorted_gather_qmm_a8(
+        x,
+        *gate,
+        idx,
+        rmap,
+        group_size=GROUP,
+        bits=bits,
+        up=up,
+        swiglu=True,
+        swiglu_limit=1.0,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        expert_scales=scales,
+    )
+    assert out is not None
+    oai = (1.702, 1.0, scales)
+    _assert_close_to_contract(
+        out, _v41_reference(x, gate, up, idx, rmap, bits, 0, 1.0, None, oai=oai)
+    )
+
+
+@needs_a8
+def test_mx_staging_holds_384_scale_groups():
+    """K = 12288 (the MiniMax M3 dense MLP down in MXFP8) stages 64 rows x 384
+    E8M0 scales in threadgroup memory."""
+    k_dim = 12288
+    assert k_dim // 32 == a8._STAGE_MAX_MX_GROUPS
+    tokens, idx, rmap = _routes("uniform", 40, 2, E, 3)
+    x = (mx.random.normal((tokens, 1, k_dim), key=mx.random.key(5)) * 0.6).astype(
+        mx.bfloat16
+    )
+    w = _mx_operand(a8._FMT_INT8, 11, 64, k_dim)
+    out = a8.sorted_gather_qmm_a8_mx(
+        x, *w, idx, rmap, fmt=a8._FMT_INT8, group_scales=True
+    )
+    assert out is not None
+    dequant = _mx_dequantize(a8._FMT_INT8)
+    ref = _v41_reference(x, w, None, idx, rmap, None, 1, 0.0, None, dequant=dequant)
+    _assert_close_to_contract(out, ref)
+
+
 def _operands(bits=4, group=64, dtype=mx.bfloat16, transposed_metadata=False):
     E, N, K, M = 4, 128, 256, 16
     x = mx.zeros((M, 1, K), dtype=dtype)
@@ -193,9 +423,10 @@ def _operands(bits=4, group=64, dtype=mx.bfloat16, transposed_metadata=False):
     return x, w, s, s, idx, rmap
 
 
-def test_supports_accepts_affine_q4_gs64_checkpoint_layout():
-    x, w, s, b, idx, rmap = _operands()
-    assert a8.supports(x, w, s, b, idx, 64, 4, "affine", rmap)
+@pytest.mark.parametrize("bits", [2, 3, 4])
+def test_supports_accepts_affine_gs64_checkpoint_layout(bits):
+    x, w, s, b, idx, rmap = _operands(bits=bits)
+    assert a8.supports(x, w, s, b, idx, 64, bits, "affine", rmap)
 
 
 @pytest.mark.parametrize(
@@ -218,7 +449,6 @@ def test_supports_declines_unsupported_layouts(kwargs):
 
 @pytest.fixture(autouse=True)
 def _restore_call_patch(monkeypatch):
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_A8", raising=False)
     monkeypatch.setattr(a8, "_warned", set())
     orig = getattr(SwitchGLU, "_omlx_gate_up_original_call", SwitchGLU.__call__)
     yield
@@ -502,7 +732,7 @@ def test_mtp_draft_head_is_excluded_by_identity(variant):
 
 def test_other_model_families_are_not_tagged():
     """Only families whose routed Gate+Up was measured are opted in, although
-    other Qwen MoE models can enable ``qwen35_oq_a8_enabled``."""
+    other Qwen MoE models can enable ``a8_prefill_enabled``."""
 
     class _OtherFamily(_Backbone):
         pass
@@ -514,7 +744,7 @@ def test_other_model_families_are_not_tagged():
 
 
 def test_the_per_model_a8_setting_tags_the_routed_modules(monkeypatch):
-    """``apply_qwen35_oq_a8_patch`` (called for ``qwen35_oq_a8_enabled``) is the
+    """``apply_qwen35_oq_a8_patch`` (called for ``a8_prefill_enabled``) is the
     only place that opts a model in, with the model's own ``min_tokens``."""
     monkeypatch.setattr(qwen35_oq_a8, "_kernels_available", lambda: True)
     monkeypatch.setattr(qwen35_oq_a8, "_MLP_PATCHED", True)

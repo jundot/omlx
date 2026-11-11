@@ -7,10 +7,13 @@ from pathlib import Path
 
 import pytest
 
+from omlx.model_profiles import filter_profile_fields, rename_legacy_fields
 from omlx.model_settings import (
     SETTINGS_VERSION,
     ModelSettings,
     ModelSettingsManager,
+    a8_prefill_on,
+    ced_prefill_on,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
 )
@@ -75,6 +78,11 @@ class TestModelSettings:
             ModelSettings(moe_expert_offload_resident_fraction=0.0)
         with pytest.raises(ValueError, match="resident_fraction"):
             ModelSettings(moe_expert_offload_resident_fraction=1.5)
+
+    def test_moe_expert_offload_rejects_fp16_recast(self):
+        """The recast cannot reach the offload slots, so the combo is rejected."""
+        with pytest.raises(ValueError, match="float16 activation recast"):
+            ModelSettings(moe_expert_offload_enabled=True, activation_fp16_enabled=True)
 
     def test_guided_grammar_defaults(self):
         """Test guided grammar defaults to disabled."""
@@ -198,7 +206,6 @@ class TestModelSettings:
         assert settings.temperature == 0.8
         assert settings.chat_template_kwargs == {"reasoning_effort": "high"}
 
-
     def test_ttl_seconds_default(self):
         """Test ttl_seconds defaults to None."""
         settings = ModelSettings()
@@ -260,6 +267,62 @@ class TestModelSettings:
         """Default bit depth = 4."""
         settings = ModelSettings()
         assert settings.turboquant_kv_bits == 4
+
+    @pytest.mark.parametrize(
+        "scheme,bits",
+        [("unknown", 4), ("affine4", 8), ("affine8", 4)],
+    )
+    def test_invalid_kv_compression_rejected(self, scheme, bits):
+        with pytest.raises(ValueError, match="turboquant_kv_"):
+            ModelSettings(
+                turboquant_kv_enabled=True,
+                turboquant_kv_scheme=scheme,
+                turboquant_kv_bits=bits,
+            )
+
+    @pytest.mark.parametrize(
+        "scheme,bits", [("turboquant", 4), ("affine4", 4), ("affine8", 8)]
+    )
+    def test_kv_compression_save_load(self, tmp_path, scheme, bits):
+        manager = ModelSettingsManager(tmp_path)
+        settings = ModelSettings(
+            turboquant_kv_enabled=True,
+            turboquant_kv_scheme=scheme,
+            turboquant_kv_bits=bits,
+        )
+        manager.set_settings("model", settings)
+        restored = ModelSettingsManager(tmp_path).get_settings("model")
+        assert restored == settings
+        assert restored.to_dict()["turboquant_kv_scheme"] == scheme
+
+    def test_legacy_kv_compression_file_load(self, tmp_path):
+        manager = ModelSettingsManager(tmp_path)
+        manager.settings_file.write_text(json.dumps({
+            "version": 1,
+            "models": {"model": {"turboquant_kv_enabled": True, "turboquant_kv_bits": 2.5}},
+        }))
+        restored = ModelSettingsManager(tmp_path).get_settings("model")
+        assert restored.turboquant_kv_scheme == "turboquant"
+        assert restored.turboquant_kv_bits == 2.5
+        assert restored.turboquant_kv_enabled is True
+
+    def test_invalid_legacy_turboquant_bits_keep_other_settings(self, tmp_path):
+        manager = ModelSettingsManager(tmp_path)
+        manager.settings_file.write_text(json.dumps({
+            "version": 1,
+            "models": {
+                "model": {
+                    "model_alias": "fast",
+                    "is_pinned": True,
+                    "turboquant_kv_enabled": True,
+                    "turboquant_kv_bits": 5,
+                }
+            },
+        }))
+        restored = ModelSettingsManager(tmp_path).get_settings("model")
+        assert restored.model_alias == "fast"
+        assert restored.is_pinned is True
+        assert restored.turboquant_kv_bits == 5
 
     def test_turboquant_kv_bits_roundtrip(self):
         original = ModelSettings(turboquant_kv_bits=2.5)
@@ -358,6 +421,35 @@ class TestModelSettingsManager:
             assert settings.temperature == 0.7
             assert settings.is_pinned is True
             assert settings.is_default is True
+
+    def test_initial_settings_keep_unreadable_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text("{not json")
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            assert manager.add_initial_settings({"new": {"top_k": 20}}) == []
+            assert settings_file.read_text() == "{not json"
+
+    def test_initial_settings_keep_records_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            old = {"temperature": 0.2, "future_field": True}
+            broken = {"mtp_enabled": True, "dflash_enabled": True}
+            settings_file.write_text(
+                json.dumps({"version": 1, "models": {"old": old, "broken": broken}})
+            )
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            added = manager.add_initial_settings(
+                {"old": {"top_k": 1}, "broken": {"top_k": 1}, "new": {"top_k": 20}}
+            )
+
+            assert added == ["new"]
+            models = json.loads(settings_file.read_text())["models"]
+            assert models["old"] == old
+            assert models["broken"] == broken
+            assert models["new"]["top_k"] == 20
 
     def test_set_settings(self):
         """Test setting and saving settings."""
@@ -801,11 +893,19 @@ class TestVlmMtpProcessorExclusivity:
 # --------------------------------------------------------------------------
 
 
-def test_oq_a8_defaults_to_off():
-    """It changes inference numerics, so it must be opt-in."""
+def test_ced_is_on_until_saved_off_and_a8_off_until_saved_on():
+    """CED stays on unless saved off. A8 changes numerics, so it runs only
+    when saved on."""
     settings = ModelSettings()
-    assert settings.qwen35_oq_a8_enabled is False
-    assert settings.qwen35_oq_a8_min_tokens == 128
+    assert settings.a8_prefill_enabled is None and not a8_prefill_on(settings)
+    assert settings.deepseek_v41_ced_prefill_enabled is None
+    assert ced_prefill_on(settings) and ced_prefill_on(None)
+    assert settings.a8_prefill_min_tokens == 128
+    assert a8_prefill_on({"a8_prefill_enabled": True})
+    assert not a8_prefill_on({"a8_prefill_enabled": False})
+    assert not ced_prefill_on({"deepseek_v41_ced_prefill_enabled": False})
+    # Unset values are not written, so they stay distinguishable.
+    assert "a8_prefill_enabled" not in settings.to_dict()
 
 
 def test_oq_a8_and_ane_prefill_cannot_both_be_enabled():
@@ -813,10 +913,10 @@ def test_oq_a8_and_ane_prefill_cannot_both_be_enabled():
     whichever patches first rather than two accelerators stacking. Constructing
     the combination has to raise so the clash reaches the caller."""
     with pytest.raises(ValueError, match="cannot"):
-        ModelSettings(qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True)
+        ModelSettings(a8_prefill_enabled=True, qwen35_ane_prefill_enabled=True)
 
     # Either one alone is fine.
-    assert ModelSettings(qwen35_oq_a8_enabled=True).qwen35_oq_a8_enabled is True
+    assert ModelSettings(a8_prefill_enabled=True).a8_prefill_enabled is True
     assert (
         ModelSettings(qwen35_ane_prefill_enabled=True).qwen35_ane_prefill_enabled
         is True
@@ -829,25 +929,25 @@ def test_prefill_conflict_resolution_keeps_ane_and_reports_it():
     than turning the losing accelerator off and saying so."""
     resolved, conflicts = resolve_qwen35_prefill_conflicts(
         {
-            "qwen35_oq_a8_enabled": True,
+            "a8_prefill_enabled": True,
             "qwen35_ane_prefill_enabled": True,
             "max_tokens": 4096,
         }
     )
-    assert resolved["qwen35_oq_a8_enabled"] is False
+    assert "a8_prefill_enabled" not in resolved
     assert resolved["qwen35_ane_prefill_enabled"] is True
     assert resolved["max_tokens"] == 4096
     assert conflicts == ["qwen35_ane_prefill_enabled"]
     # The resolved dict has to be constructible -- that is the whole point.
-    assert ModelSettings.from_dict(resolved).qwen35_oq_a8_enabled is False
+    assert not a8_prefill_on(ModelSettings.from_dict(resolved))
 
 
 def test_prefill_conflict_resolution_leaves_clean_dicts_alone():
     for data in (
         {},
-        {"qwen35_oq_a8_enabled": True},
+        {"a8_prefill_enabled": True},
         {"qwen35_ane_prefill_enabled": True},
-        {"qwen35_oq_a8_enabled": False, "qwen35_ane_prefill_enabled": True},
+        {"a8_prefill_enabled": False, "qwen35_ane_prefill_enabled": True},
     ):
         resolved, conflicts = resolve_qwen35_prefill_conflicts(data)
         assert conflicts == []
@@ -865,9 +965,9 @@ def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
                 "version": SETTINGS_VERSION,
                 "models": {
                     "clash/model": {
-                        "qwen35_oq_a8_enabled": True,
+                        "a8_prefill_enabled": True,
                         "qwen35_ane_prefill_enabled": True,
-                        "qwen35_oq_a8_min_tokens": 512,
+                        "a8_prefill_min_tokens": 512,
                     }
                 },
             }
@@ -876,9 +976,39 @@ def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
     manager = ModelSettingsManager(tmp_path)
     settings = manager.get_settings("clash/model")
     assert settings.qwen35_ane_prefill_enabled is True
-    assert settings.qwen35_oq_a8_enabled is False
+    assert not a8_prefill_on(settings)
     # The rest of the blob survives the downgrade.
-    assert settings.qwen35_oq_a8_min_tokens == 512
+    assert settings.a8_prefill_min_tokens == 512
+
+
+def test_old_a8_setting_names_still_load(tmp_path):
+    """Earlier releases stored the setting as qwen35_oq_a8_*; the rename must
+    not turn a saved opt-in off in settings, profiles or uploaded recipes."""
+    legacy = {"qwen35_oq_a8_enabled": True, "qwen35_oq_a8_min_tokens": 512}
+    current = {"a8_prefill_enabled": True, "a8_prefill_min_tokens": 512}
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps({"version": SETTINGS_VERSION, "models": {"m": legacy}})
+    )
+    profile = {
+        "name": "fast",
+        "display_name": "Fast",
+        "created_at": "2026-06-01T00:00:00+00:00",
+        "updated_at": "2026-06-01T00:00:00+00:00",
+        "settings": dict(legacy),
+    }
+    profiles_file = tmp_path / "model_profiles.json"
+    profiles_file.write_text(
+        json.dumps({"version": 1, "profiles": {"m": {"fast": profile}}})
+    )
+
+    settings = ModelSettingsManager(tmp_path).get_settings("m")
+    assert (settings.a8_prefill_enabled, settings.a8_prefill_min_tokens) == (True, 512)
+    persisted = json.loads(profiles_file.read_text())["profiles"]["m"]["fast"]
+    assert persisted["settings"] == current
+    assert filter_profile_fields(legacy) == current
+    # A record holding both names keeps the current one.
+    both = {"qwen35_oq_a8_enabled": True, "a8_prefill_enabled": False}
+    assert rename_legacy_fields(both) == {"a8_prefill_enabled": False}
 
 
 def test_oq_a8_exposes_no_kernel_choice():
@@ -899,36 +1029,36 @@ def test_a_stale_saved_variant_is_ignored_rather_than_fatal():
     """
     restored = ModelSettings.from_dict(
         {
-            "qwen35_oq_a8_enabled": True,
+            "a8_prefill_enabled": True,
             "qwen35_oq_a8_variant": 706,
-            "qwen35_oq_a8_min_tokens": 512,
+            "a8_prefill_min_tokens": 512,
         }
     )
-    assert restored.qwen35_oq_a8_enabled is True
-    assert restored.qwen35_oq_a8_min_tokens == 512
+    assert restored.a8_prefill_enabled is True
+    assert restored.a8_prefill_min_tokens == 512
     assert not hasattr(restored, "qwen35_oq_a8_variant")
 
 
 @pytest.mark.parametrize("value", [0, -1])
 def test_oq_a8_rejects_non_positive_min_tokens(value):
-    with pytest.raises(ValueError, match="qwen35_oq_a8_min_tokens"):
-        ModelSettings(qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=value)
+    with pytest.raises(ValueError, match="a8_prefill_min_tokens"):
+        ModelSettings(a8_prefill_enabled=True, a8_prefill_min_tokens=value)
 
 
 def test_oq_a8_round_trips_through_dict():
     settings = ModelSettings(
-        qwen35_oq_a8_enabled=True,
-        qwen35_oq_a8_min_tokens=1024,
+        a8_prefill_enabled=True,
+        a8_prefill_min_tokens=1024,
     )
     restored = ModelSettings.from_dict(settings.to_dict())
-    assert restored.qwen35_oq_a8_enabled is True
-    assert restored.qwen35_oq_a8_min_tokens == 1024
+    assert restored.a8_prefill_enabled is True
+    assert restored.a8_prefill_min_tokens == 1024
 
 
 def test_oq_a8_is_a_model_specific_profile_field():
     """Never a template field: it is tied to one checkpoint's quantization."""
     from omlx.model_profiles import MODEL_SPECIFIC_PROFILE_FIELDS, UNIVERSAL_FIELDS_SET
 
-    for name in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
+    for name in ("a8_prefill_enabled", "a8_prefill_min_tokens"):
         assert name in MODEL_SPECIFIC_PROFILE_FIELDS
         assert name not in UNIVERSAL_FIELDS_SET

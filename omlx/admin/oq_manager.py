@@ -88,6 +88,7 @@ class QuantTask:
     imatrix_num_samples: int = 128
     imatrix_seq_length: int = 512
     mtp_assistant_model_path: str = ""
+    preserve_ngram_table: bool = False
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -185,7 +186,11 @@ class OQManager:
         """Scan all model dirs. Returns (source_models, all_models)."""
 
         def _scan() -> tuple[list[dict], list[dict]]:
-            from ..model_discovery import _resolve_hf_cache_entry
+            from ..model_discovery import (
+                _is_readable_dir,
+                _iter_readable_entries,
+                _resolve_hf_cache_entry,
+            )
             from ..oq import estimate_memory, validate_quantizable
             from ..utils.model_loading import (
                 _checkpoint_has_mtp_weights,
@@ -199,8 +204,13 @@ class OQManager:
             for model_dir in self._model_dirs:
                 if not model_dir.exists():
                     continue
-                for subdir in sorted(model_dir.iterdir()):
-                    if not subdir.is_dir():
+                # Hidden entries (.Trashes, .Spotlight-V100, ...) can be
+                # unreadable without Full Disk Access; skip them like
+                # discover_models does so one entry can't fail the whole scan.
+                for subdir in _iter_readable_entries(model_dir, "model directory"):
+                    if not _is_readable_dir(
+                        subdir, "model entry"
+                    ) or subdir.name.startswith("."):
                         continue
                     candidates = []
                     if (subdir / "config.json").exists():
@@ -217,8 +227,13 @@ class OQManager:
                                 )
                             )
                         else:
-                            for child in sorted(subdir.iterdir()):
-                                if child.is_dir() and (child / "config.json").exists():
+                            for child in _iter_readable_entries(subdir, "model group"):
+                                if child.name.startswith("."):
+                                    continue
+                                if (
+                                    _is_readable_dir(child, "model group entry")
+                                    and (child / "config.json").exists()
+                                ):
                                     candidates.append((child, child.name, None))
 
                     for path, display_name, source_repo_id in candidates:
@@ -303,6 +318,7 @@ class OQManager:
         imatrix_num_samples: int = 128,
         imatrix_seq_length: int = 512,
         mtp_assistant_model_path: str = "",
+        preserve_ngram_table: bool = False,
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -312,10 +328,12 @@ class OQManager:
             dtype: Target fp dtype for non-quantized weights and quant
                 scales/biases. "bfloat16" (default) or "float16".
             mtp_assistant_model_path: Optional checkpoint whose MTP head is
-                merged into the output. A gemma4_assistant donor uses the
+                merged into the output. A Gemma 4 assistant donor uses the
                 assistant merge; any other donor grafts its native
                 Qwen3.5/3.6 mtp.* head (same-geometry, same-tokenizer
                 pairs only). Validated at submission.
+            preserve_ngram_table: Keep DeepSeek V4.1 Engram tables in their
+                original FP8 storage instead of 4-bit affine.
 
         Returns:
             The created QuantTask.
@@ -324,6 +342,7 @@ class OQManager:
             ValueError: On invalid inputs or output conflict.
         """
         from ..oq import (
+            GEMMA4_ASSISTANT_TYPES,
             OQ_DTYPES,
             OQ_LEVELS,
             _validate_oq_dtype_for_model,
@@ -349,6 +368,11 @@ class OQManager:
             config = json.load(f)
         if config.get("model_type") == "deepseek_v41":
             _validate_v41_oq_settings(oq_level, dtype, group_size)
+        elif preserve_ngram_table:
+            raise ValueError(
+                "Keeping the original Engram tables is only available for "
+                "DeepSeek V4.1"
+            )
         _validate_oq_dtype_for_model(config, dtype)
 
         source_size = _safetensors_size(source)
@@ -378,7 +402,7 @@ class OQManager:
                 )
             with open(assistant / "config.json") as f:
                 assistant_config = json.load(f)
-            if assistant_config.get("model_type") == "gemma4_assistant":
+            if assistant_config.get("model_type") in GEMMA4_ASSISTANT_TYPES.values():
                 validate_gemma4_assistant_pair(config, assistant_config)
             else:
                 validate_mtp_donor_pair(source, assistant)
@@ -396,6 +420,7 @@ class OQManager:
             dtype,
             preserve_mtp=preserve_mtp,
             enhanced=enhanced,
+            preserve_ngram_table=preserve_ngram_table,
         )
         if mtp_assistant_model_path and not output_name.endswith("-mtp"):
             output_name += "-mtp"
@@ -414,6 +439,7 @@ class OQManager:
                 and task.oq_level == oq_level
                 and task.dtype == dtype
                 and task.enhanced == enhanced
+                and task.preserve_ngram_table == preserve_ngram_table
                 and task.status in _ACTIVE_STATUSES
             ):
                 raise ValueError(
@@ -421,6 +447,9 @@ class OQManager:
                     f"{'e' if enhanced else ''} "
                     f"({dtype}) is already in progress"
                 )
+            # A failed job removes its output directory.
+            if task.output_path == str(output_path) and task.status in _ACTIVE_STATUSES:
+                raise ValueError(f"Another quantization is writing to {output_path}")
 
         if enhanced:
             if imatrix_num_samples < 1:
@@ -460,6 +489,7 @@ class OQManager:
             imatrix_num_samples=imatrix_num_samples,
             imatrix_seq_length=imatrix_seq_length,
             mtp_assistant_model_path=mtp_assistant_model_path,
+            preserve_ngram_table=preserve_ngram_table,
         )
         self._tasks[task_id] = task
 
@@ -639,6 +669,7 @@ class OQManager:
                     imatrix_strict=task.imatrix_strict,
                     imatrix_num_samples=task.imatrix_num_samples,
                     imatrix_seq_length=task.imatrix_seq_length,
+                    preserve_ngram_table=task.preserve_ngram_table,
                 )
 
                 if task_id in self._cancelled:

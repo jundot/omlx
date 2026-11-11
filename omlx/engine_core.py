@@ -20,6 +20,7 @@ import os
 import threading
 import time
 import uuid
+import weakref
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import (
@@ -36,9 +37,11 @@ from typing import (
 
 import mlx.core as mx
 
+from .custom_kernels.quant_matmul.fast import share_command_queue
 from .exceptions import (
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
+    RequestAbortedError,
     describe_ceiling_binding,
 )
 from .model_registry import get_registry
@@ -49,6 +52,7 @@ from .utils.fatal import (
     FATAL_TEARDOWN_TIMEOUT_S,
     exit_if_gpu_submissions_ignored,
     fatal_exit,
+    is_command_buffer_error,
 )
 from .utils.hardware import format_bytes
 from .utils.metal_sync import clear_thread_streams
@@ -185,16 +189,71 @@ def _raise_request_output_error(output: RequestOutput) -> None:
             ),
             limit_bytes=int(limit_bytes) if limit_bytes is not None else None,
         )
+    if output.error_code in ("model_unloading", "admin_abort"):
+        raise RequestAbortedError(output.error, request_id=output.request_id)
     raise RuntimeError(output.error)
 
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_engines_on_own_queues: "weakref.WeakSet[EngineCore]" = weakref.WeakSet()
+_warned_own_queues = False
+
+
+def _note_engine_on_own_queue(engine: "EngineCore") -> None:
+    """Warn once when two live engines submit on separate Metal queues."""
+    global _warned_own_queues
+    _engines_on_own_queues.add(engine)
+    live = sum(1 for e in _engines_on_own_queues if not e._closed)
+    if _warned_own_queues or live < 2:
+        return
+    _warned_own_queues = True
+    logger.warning(
+        "Loaded models submit GPU work on separate Metal command queues "
+        "because the native quant_matmul extension is missing or predates "
+        "share_command_queue. Running several models at once can then hang "
+        "the GPU (#4224). Rebuild the native kernels with `make kernels`."
+    )
+
+
+def _teardown_sync_and_clear_cache(stream: Any = None) -> None:
+    """Drain and clear the Metal pool past errors a GPU reset left behind.
+
+    MLX raises an encoder's stored command-buffer error once and then clears
+    it, so the given stream and the thread's default stream need at most one
+    retry each.
+    """
+    for attempt in range(3):
+        try:
+            _sync_and_clear_cache(stream)
+            return
+        except RuntimeError as exc:
+            if attempt == 2 or not is_command_buffer_error(exc):
+                raise
+            logger.warning("Dropping a pending Metal error during teardown: %s", exc)
+
+
+def _drop_pending_gpu_errors(stream: Any) -> None:
+    """Raise and log errors a GPU reset left on this thread's streams.
+
+    Later teardown syncs then run to completion. No buffer lock is taken, so
+    this does not wait on an in-flight store worker.
+    """
+    for sync in (lambda: mx.synchronize(stream), mx.synchronize):
+        try:
+            sync()
+        except RuntimeError as exc:
+            exit_if_gpu_submissions_ignored(exc)
+            if "no Stream" in str(exc):
+                continue
+            if not is_command_buffer_error(exc):
+                raise
+            logger.warning("Dropping a pending Metal error during teardown: %s", exc)
 
 
 def _final_engine_thread_reclaim(stream: Any) -> None:
     """Drop Python cycles and reclaim MLX buffers on the engine worker thread."""
     gc.collect()
-    _sync_and_clear_cache(stream)
+    _teardown_sync_and_clear_cache(stream)
     gc.collect()
     clear_thread_streams()
 
@@ -202,7 +261,7 @@ def _final_engine_thread_reclaim(stream: Any) -> None:
 def _final_global_mlx_thread_reclaim() -> None:
     """Reclaim MLX state before the process-wide worker thread exits."""
     gc.collect()
-    _sync_and_clear_cache()
+    _teardown_sync_and_clear_cache()
     gc.collect()
     clear_thread_streams()
 
@@ -385,6 +444,14 @@ class EngineCore:
         model = None
         tokenizer = None
 
+        # Engine streams submit to one Metal command queue. Busy engines on
+        # separate queues can trip a GPU firmware lockup (#4224).
+        queue = self._mlx_executor.submit(
+            share_command_queue, self._mlx_stream
+        ).result()
+        if queue is None:
+            _note_engine_on_own_queue(self)
+
         logger.debug(f"Engine {self._engine_id} initialized")
 
     async def start(self) -> None:
@@ -444,13 +511,15 @@ class EngineCore:
         scheduler.step() services aborts/admission/finish every step, so
         correctness is unchanged; the only cost is event-loop responsiveness,
         bounded by decode_burst_budget_s. Stops early when no work remains, a
-        request produces its first chunk, a prefill eviction needs the (async)
-        callback, or the budget elapses —
-        the budget also ends the burst when a slow prefill-chunk step lands.
+        request produces its first chunk, a request finishes while a chunked
+        prefill is in flight, a prefill eviction needs the (async) callback,
+        or the budget elapses — the budget also ends the burst when a slow
+        prefill-chunk step lands, including the first one.
 
         Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
         """
         max_steps = self.config.decode_burst_max_steps
+        started = time.monotonic()
         outputs = [self.scheduler.step()]
         if max_steps <= 1:
             return outputs
@@ -465,7 +534,12 @@ class EngineCore:
         )
         if budget <= 0:
             return outputs
-        deadline = time.monotonic() + budget
+        now = time.monotonic()
+        if now - started >= budget and getattr(outputs[0], "ran_prefill_chunk", False):
+            # A chunk that spent the whole budget hands control back, so queued
+            # admissions and aborts do not wait for a second chunk (#5148).
+            return outputs
+        deadline = now + budget
         while len(outputs) < max_steps:
             last = outputs[-1]
             # Also release the first chunk of a request admitted mid-burst.
@@ -475,6 +549,13 @@ class EngineCore:
                 item.new_token_ids
                 and item.completion_tokens == len(item.new_token_ids)
                 for item in last.outputs
+            ):
+                break
+            # A finished request's last output (finish reason, usage) would
+            # otherwise wait for the rest of the burst, which can be a whole
+            # prefill chunk while a prefill is in flight.
+            if last.finished_request_ids and getattr(
+                self.scheduler, "prefilling", None
             ):
                 break
             if (
@@ -490,8 +571,8 @@ class EngineCore:
     async def _engine_loop(self) -> None:
         """Main engine loop - runs scheduler steps on the MLX executor.
 
-        All scheduler steps run on _mlx_executor (single-worker thread) to
-        guarantee that MLX GPU operations are never concurrent.  VLM vision
+        All scheduler steps run on _mlx_executor (single-worker thread), so
+        this engine's MLX GPU operations are never concurrent.  VLM vision
         encoding also runs on the same executor, so inline scheduler.step()
         on the event loop would race with vision mx.eval() and segfault.
         """
@@ -666,6 +747,7 @@ class EngineCore:
         specprefill_system_end: Optional[int] = None,
         generation_prompt_text: Optional[str] = None,
         generation_prompt_persists: bool = False,
+        system_prefix_ids: Optional[List[int]] = None,
         skip_cache_store: bool = False,
         preserve_reasoning: bool = False,
         benchmark_trace: bool = False,
@@ -731,6 +813,8 @@ class EngineCore:
         if generation_prompt_text:
             request.generation_prompt_text = generation_prompt_text
             request.generation_prompt_persists = bool(generation_prompt_persists)
+        if system_prefix_ids:
+            request.system_prefix_ids = system_prefix_ids
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)
@@ -778,7 +862,13 @@ class EngineCore:
 
         return request_id
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
         """Abort a request.
 
         Uses deferred abort pattern: scheduler.abort_request() just enqueues
@@ -799,21 +889,32 @@ class EngineCore:
             )
             return False
 
-        result = scheduler.abort_request(request_id)
+        # A client cancel or an admin stop keeps the computed prefix for a resend.
+        result = scheduler.abort_request(request_id, keep_cache=True)
 
         # Signal consumer with abort error so any waiting
         # stream_outputs() / generate() can exit gracefully.
         # Matches abort_all_requests() pattern.
         collector = self._output_collectors.get(request_id)
         if collector is not None:
-            collector.put(
-                RequestOutput(
+            if reason is None:
+                output = RequestOutput(
                     request_id=request_id,
                     finished=True,
                     finish_reason="abort",
                     error="Request aborted",
                 )
-            )
+            else:
+                # The client still listens; tell it why, as abort_all_requests does.
+                output = RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="error",
+                    new_text=f"\n\n[Error: {reason}]",
+                    error=reason,
+                    error_code=error_code,
+                )
+            collector.put(output)
         self._mark_request_finished(request_id)
         self._wake_engine_loop()
 
@@ -1259,17 +1360,25 @@ class EngineCore:
 
         self.scheduler._engine_teardown = teardown
 
+        def drain_gpu_errors() -> None:
+            _drop_pending_gpu_errors(self._mlx_stream)
+
         # Both shutdown() and deep_reset() touch the engine stream (directly
         # or via _drain_pending_async_removes / _do_abort_request). The
         # stream is bound to the engine's executor thread, so dispatch both
         # through the executor. Rejection cannot safely move MLX cleanup
-        # onto the close caller's thread.
-        for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
+        # onto the close caller's thread. Errors a GPU reset left on the
+        # stream are drained first so the two steps do not stop on them.
+        for fn in (
+            drain_gpu_errors,
+            self.scheduler.shutdown,
+            self.scheduler.deep_reset,
+        ):
             fn_name = getattr(fn, "__name__", repr(fn))
             try:
                 teardown.set_phase(fn_name)
                 self._mlx_executor.submit(fn).result(
-                    timeout=teardown.remaining(mlx=fn_name == "deep_reset")
+                    timeout=teardown.remaining(mlx=fn_name != "shutdown")
                 )
             except concurrent.futures.TimeoutError:
                 fatal_exit(
@@ -1455,7 +1564,13 @@ class AsyncEngineCore:
             **kwargs,
         )
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
         """Abort a request."""
         engine = getattr(self, "engine", None)
         if engine is None:
@@ -1464,7 +1579,9 @@ class AsyncEngineCore:
                 request_id,
             )
             return False
-        return await engine.abort_request(request_id)
+        return await engine.abort_request(
+            request_id, reason=reason, error_code=error_code
+        )
 
     async def abort_all_requests(
         self,

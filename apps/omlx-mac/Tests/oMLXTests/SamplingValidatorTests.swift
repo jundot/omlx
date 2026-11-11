@@ -70,7 +70,7 @@ final class SamplingValidatorTests: XCTestCase {
         XCTAssertThrowsError(try SamplingValidator.minP("-0.01").get())
     }
 
-    // MARK: - Top K (Z+)
+    // MARK: - Top K (0 = off, otherwise Z+)
 
     func testTopKEmptyIsNil() throws {
         XCTAssertNil(try SamplingValidator.topK("").get())
@@ -81,12 +81,16 @@ final class SamplingValidatorTests: XCTestCase {
         XCTAssertEqual(try SamplingValidator.topK("20").get(), 20)
     }
 
-    func testTopKRejectsZero() {
-        XCTAssertThrowsError(try SamplingValidator.topK("0").get())
+    func testTopKAcceptsZeroAsOff() throws {
+        // 0 is how the server, the web dashboard and mlx-lm's sampler spell
+        // "no top-k filter"; the app used to be the one place that refused it.
+        XCTAssertEqual(try SamplingValidator.topK("0").get(), 0)
+        XCTAssertEqual(try SamplingValidator.topK(" 0 ").get(), 0)
     }
 
     func testTopKRejectsNegative() {
         XCTAssertThrowsError(try SamplingValidator.topK("-3").get())
+        XCTAssertThrowsError(try SamplingValidator.topK("-1").get())
     }
 
     func testTopKRejectsFloat() {

@@ -41,6 +41,7 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_vlm.models.switch_layers import EXPERT_WEIGHT_SUFFIXES
 
 logger = logging.getLogger(__name__)
 
@@ -452,7 +453,7 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
 
     def _stack_per_expert(weights, prefix, num_experts):
         for n in ("gate_proj", "up_proj", "down_proj"):
-            for suffix in ("weight", "scales", "biases"):
+            for suffix in EXPERT_WEIGHT_SUFFIXES:
                 key0 = f"{prefix}.experts.0.{n}.{suffix}"
                 if key0 not in weights:
                     continue

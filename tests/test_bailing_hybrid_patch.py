@@ -7,7 +7,16 @@ import sys
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
+from mlx.utils import tree_flatten
+from mlx_lm.generate import BatchGenerator
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+from mlx_lm.utils import load_model
+
+from omlx.oq import quantize_oq_streaming
+from omlx.patches.mlx_lm_mtp import batch_generator, set_mtp_active, set_mtp_depth
+from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
 
 def _minimal_config(**overrides):
@@ -498,6 +507,33 @@ def test_sanitize_converts_block_fp8_weights_to_affine_runtime_layout():
     assert mx.allclose(restored, expected, rtol=2e-2, atol=5e-3)
 
 
+def test_sanitize_dequantizes_fp8_kv_b_proj_before_mla_split():
+    bailing_hybrid = _load_patch_module()
+    config = _minimal_config(
+        quantization_config={"quant_method": "fp8", "weight_block_size": [128, 128]}
+    )
+    model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(config))
+    kv_b_key = "model.layers.1.attention.kv_b_proj.weight"
+    fp8 = mx.to_fp8(mx.linspace(-1.0, 1.0, 16 * 8).reshape(16, 8))
+
+    sanitized = model.sanitize(
+        {kv_b_key: fp8, f"{kv_b_key}_scale_inv": mx.array([[0.5]], dtype=mx.float32)}
+    )
+    expected = (mx.from_fp8(fp8, dtype=mx.float32) * 0.5).reshape(2, 8, 8)
+
+    assert not any(key.endswith("weight_scale_inv") for key in sanitized)
+    assert mx.allclose(
+        sanitized["model.layers.1.attention.embed_q.weight"].astype(mx.float32),
+        expected[:, :4].swapaxes(-1, -2),
+        atol=5e-3,
+    )
+    assert mx.allclose(
+        sanitized["model.layers.1.attention.unembed_out.weight"].astype(mx.float32),
+        expected[:, 4:],
+        atol=5e-3,
+    )
+
+
 def test_sanitize_stacks_fp8_expert_weights_and_sidecars():
     bailing_hybrid = _load_patch_module()
     config = _minimal_config(
@@ -637,6 +673,7 @@ def test_bailing_mixed_fp4_config_adds_routed_expert_overrides():
     config = _minimal_config(
         num_hidden_layers=3,
         first_k_dense_replace=1,
+        num_nextn_predict_layers=1,
         quantization_config={
             "quant_method": "fp8",
             "weight_block_size": [128, 128],
@@ -651,14 +688,9 @@ def test_bailing_mixed_fp4_config_adds_routed_expert_overrides():
     assert quantization["bits"] == 8
     assert "model.layers.0.mlp.switch_mlp.gate_proj" not in quantization
     expected = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-    for layer_idx in (1, 2):
+    for base in ("model.layers.1", "model.layers.2", "mtp.0"):
         for projection in ("gate_proj", "up_proj", "down_proj"):
-            assert (
-                quantization[
-                    f"model.layers.{layer_idx}.mlp.switch_mlp.{projection}"
-                ]
-                == expected
-            )
+            assert quantization[f"{base}.mlp.switch_mlp.{projection}"] == expected
 
 
 def test_fp8_checkpoint_loads_strictly_as_quantized_model(tmp_path):
@@ -802,3 +834,165 @@ def test_bailing_hybrid_is_discovered_as_llm(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(_minimal_config()))
 
     assert detect_model_type(tmp_path) == "llm"
+
+
+@pytest.fixture
+def mtp_active():
+    set_mtp_active(True)
+    yield
+    set_mtp_active(False)
+    set_mtp_depth(1)
+
+
+def _mtp_config(**overrides):
+    return _minimal_config(
+        num_hidden_layers=4, num_nextn_predict_layers=1, **overrides
+    )
+
+
+def _checkpoint_weights(model, config):
+    """Model parameters in the published layout that ``sanitize`` consumes."""
+    nextn = f"model.layers.{config['num_hidden_layers']}."
+    weights = {
+        key.replace("mtp.0.", nextn): value
+        for key, value in tree_flatten(model.parameters())
+    }
+    checkpoint = {}
+    for key, value in weights.items():
+        if ".mlp.switch_mlp." in key:
+            for expert in range(value.shape[0]):
+                checkpoint[key.replace("switch_mlp", f"experts.{expert}")] = value[
+                    expert
+                ]
+        elif ".mlp.gate.gate_proj." in key:
+            checkpoint[key.replace("gate.gate_proj", "gate")] = value
+        elif key.endswith("attention.embed_q.weight"):
+            wv = weights[key.replace("embed_q", "unembed_out")]
+            checkpoint[key.replace("embed_q", "kv_b_proj")] = mx.concatenate(
+                [value.swapaxes(-1, -2), wv], axis=1
+            ).reshape(-1, value.shape[1])
+        elif not key.endswith("attention.unembed_out.weight"):
+            checkpoint[key] = value
+    return checkpoint
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 2])
+def test_mtp_partial_rollback_matches_decoding_only_accepted_tokens(accepted):
+    bailing_hybrid = _load_patch_module()
+    mx.random.seed(11)
+    model = bailing_hybrid.Model(
+        bailing_hybrid.ModelArgs.from_dict(_mtp_config(head_dim=32))
+    )
+    prompt = mx.array([[3, 5, 7, 9, 11]])
+    tokens = [13, 17, 19, 23, 29]  # confirmed, three drafts, next step
+    verified, reference = model.make_cache(), model.make_cache()
+    for cache in (verified, reference):
+        mx.eval(model(prompt, cache=cache))
+
+    model(mx.array([tokens[:4]]), cache=verified, return_hidden=True, n_confirmed=1)
+    assert model.mtp_partial_rollback(verified, accepted, 3)
+    model(mx.array([tokens[: accepted + 1]]), cache=reference)
+
+    step = mx.array([[tokens[accepted + 1]]])
+    assert mx.allclose(
+        model(step, cache=verified), model(step, cache=reference), atol=1e-4
+    )
+
+
+def test_mtp_head_loads_from_nextn_layer(mtp_active):
+    bailing_hybrid = _load_patch_module()
+    config = _mtp_config()
+    args = bailing_hybrid.ModelArgs.from_dict(config)
+    source = bailing_hybrid.Model(args)
+    checkpoint = _checkpoint_weights(source, config)
+
+    model = bailing_hybrid.Model(args)
+    model.load_weights(list(model.sanitize(dict(checkpoint)).items()), strict=True)
+    expected = dict(tree_flatten(source.parameters()))
+    loaded = dict(tree_flatten(model.parameters()))
+    assert loaded.keys() == expected.keys()
+    assert all(mx.array_equal(loaded[key], expected[key]) for key in expected)
+
+    # Published exports may declare the nextn layer without its weights.
+    stripped = bailing_hybrid.Model(args)
+    weights = {
+        k: v for k, v in checkpoint.items() if not k.startswith("model.layers.4.")
+    }
+    stripped.load_weights(list(stripped.sanitize(weights).items()), strict=True)
+    assert not hasattr(stripped, "mtp")
+    assert stripped._omlx_mtp_decode_enabled is False
+
+
+def test_lightning_mtp_generation_matches_greedy_decoding(mtp_active, monkeypatch):
+    bailing_hybrid = _load_patch_module()
+    batch_generator.apply()
+    set_mtp_depth(3, fixed=True)
+    mx.random.seed(5)
+    model = bailing_hybrid.Model(
+        bailing_hybrid.ModelArgs.from_dict(_mtp_config(head_dim=32))
+    )
+    rollbacks = []
+    real_rollback = bailing_hybrid.Model.mtp_partial_rollback
+
+    def counted(self, cache, accepted, num_drafts):
+        rollbacks.append(accepted)
+        return real_rollback(self, cache, accepted, num_drafts)
+
+    monkeypatch.setattr(bailing_hybrid.Model, "mtp_partial_rollback", counted)
+    prompt = [3, 4, 5, 6, 7, 8, 9, 10, 11]
+    expected, cache = [], model.make_cache()
+    # The generator prefills prompt[:-1] in steps of 4.
+    for start in range(0, len(prompt) - 1, 4):
+        model(mx.array([prompt[start : min(start + 4, len(prompt) - 1)]]), cache=cache)
+    ids = mx.array([prompt[-1:]])
+    for _ in range(24):
+        token = int(mx.argmax(model(ids, cache=cache)[0, -1]).item())
+        expected.append(token)
+        ids = mx.array([[token]])
+
+    generator = BatchGenerator(
+        model,
+        max_tokens=24,
+        prefill_step_size=4,
+        sampler=lambda logits: mx.argmax(logits, -1),
+    )
+    result = []
+    try:
+        generator.insert([prompt])
+        for _ in range(96):
+            _, responses = generator.next()
+            result.extend(response.token for response in responses)
+            if len(result) >= 24:
+                break
+    finally:
+        generator.close()
+
+    assert rollbacks, "verify cycles must reject and roll back random drafts"
+    assert result[:24] == expected
+
+
+def test_oq_preserves_ling_mtp_head(tmp_path, mtp_active):
+    bailing_hybrid = _load_patch_module()
+    config = _mtp_config(hidden_size=64, intermediate_size=128)
+    source_model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(config))
+    source = tmp_path / "source"
+    source.mkdir()
+    mx.save_safetensors(
+        str(source / "model.safetensors"), _checkpoint_weights(source_model, config)
+    )
+    (source / "config.json").write_text(json.dumps(config))
+
+    output = tmp_path / "oQ4"
+    quantize_oq_streaming(
+        str(source),
+        str(output),
+        4,
+        enhanced=False,
+        preserve_mtp=True,
+        sensitivity_map_override={i: i + 1.0 for i in range(4)},
+    )
+    maybe_apply_pre_load_patches(str(output))
+    set_mtp_active(True)
+    model, _ = load_model(output, strict=True)
+    assert type(model.mtp[0].eh_proj) is nn.Linear
+    assert isinstance(model.mtp[0].mlp.switch_mlp.gate_proj, QuantizedSwitchLinear)

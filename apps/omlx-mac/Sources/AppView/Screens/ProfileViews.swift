@@ -125,7 +125,7 @@ struct ProfileGroup: View {
                                  comment: "Button in profile chip-group header that saves the working profile as a new named profile"),
                           systemImage: "plus")
                         .labelStyle(.titleAndIcon)
-                        .font(.omlxText(11, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .medium))
                 }
                 .buttonStyle(.omlx(.plain, size: .small))
                 .overlay(
@@ -193,7 +193,7 @@ struct ProfileGroup: View {
             if isEditing {
                 TextField("", text: $renameText)
                     .textFieldStyle(.plain)
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
                     .foregroundStyle(isActive ? .white : theme.text)
                     .fixedSize(horizontal: true, vertical: false)
                     .focused($renameFieldFocused)
@@ -214,7 +214,7 @@ struct ProfileGroup: View {
                     }
             } else {
                 Text(displayNames[name] ?? name)
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
                     .foregroundStyle(isActive ? .white : theme.text)
             }
         }
@@ -372,7 +372,7 @@ struct ActiveProfileBanner: View {
                 .foregroundStyle(theme.textSecondary)
         case .defaults:
             Text(String(localized: "profile.banner.defaults.subtitle",
-                        defaultValue: "Using server defaults · edit any field to start a working profile",
+                        defaultValue: "Changes save to this model automatically",
                         comment: "Profile banner subtitle when no profile is assigned"))
                 .font(.omlxText(11.5))
                 .foregroundStyle(theme.textSecondary)
@@ -447,7 +447,7 @@ struct SaveAsPopover: View {
             Text(String(localized: "profile.save_as.title",
                         defaultValue: "Save current profile as",
                         comment: "Lead label inside the Save-as popover for naming a new profile"))
-                .font(.omlxText(12, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
             Segmented(
                 selection: $scope,
@@ -596,7 +596,7 @@ struct ProfileDetailCard: View {
                         .fill(isWorking ? theme.amberDot : scopeColor)
                         .frame(width: 6, height: 6)
                     Text(subtitleText)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                 }
             }
@@ -610,7 +610,7 @@ struct ProfileDetailCard: View {
                 }
                 if showUpdate, let onUpdateFromWorking {
                     Button(String(localized: "profile.detail.action.update_with_working",
-                                  defaultValue: "Update with working",
+                                  defaultValue: "Update with Current Settings",
                                   comment: "Profile detail card button that writes the current working edits into this named profile")) { onUpdateFromWorking() }
                         .buttonStyle(.omlx(.normal, size: .small))
                 }
@@ -691,7 +691,7 @@ struct ProfileDetailCard: View {
         let hasPenalty = ["repetition_penalty", "presence_penalty"].contains { s[$0] != nil }
         let behaviorKeys = [
             "enable_thinking", "thinking_budget_enabled", "max_tool_result_tokens",
-            "force_sampling", "is_pinned",
+            "gpu_power_limit_w", "force_sampling", "is_pinned",
         ]
         let hasBehavior = behaviorKeys.contains { s[$0] != nil }
         // Per-model "Advanced" surface — fields from
@@ -721,7 +721,7 @@ struct ProfileDetailCard: View {
                 Text(String(localized: "profile.detail.empty",
                             defaultValue: "This profile doesn't override any settings.",
                             comment: "Placeholder text in the profile detail card when no settings are set"))
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.textTertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 10)
@@ -854,6 +854,16 @@ struct ProfileDetailCard: View {
                                        comment: "Behavior chip: cap on tool result tokens"),
                          on: v > 0)
             }
+            if let v = s["gpu_power_limit_w"].flatMap({ intOf($0) }) {
+                flagChip(label: v > 0
+                         ? String(localized: "profile.detail.behavior.gpu_power_limit.on",
+                                  defaultValue: "GPU \(v) W",
+                                  comment: "Behavior chip when a GPU power limit is set; placeholder is the watt value")
+                         : String(localized: "profile.detail.behavior.gpu_power_limit.off",
+                                  defaultValue: "GPU power limit",
+                                  comment: "Behavior chip label when the GPU power limit is off"),
+                         on: v > 0)
+            }
             if let v = s["force_sampling"].flatMap({ boolOf($0) }) {
                 flagChip(label: String(localized: "profile.detail.behavior.force_sampling",
                                        defaultValue: "Force sampling",
@@ -950,9 +960,14 @@ struct ProfileDetailCard: View {
     }
 
     private func turboquantLabel(_ s: [String: AnyCodable], on: Bool) -> String {
-        let baseName = String(localized: "profile.detail.acceleration.turboquant",
-                              defaultValue: "TurboQuant KV",
-                              comment: "Acceleration chip base name for TurboQuant KV-cache compression")
+        let scheme = s["turboquant_kv_scheme"]?.value as? String ?? "turboquant"
+        let baseName = scheme == "affine4"
+            ? "Affine4 KV"
+            : scheme == "affine8" ? "Affine8 KV" : String(
+                localized: "profile.detail.acceleration.turboquant",
+                defaultValue: "TurboQuant KV",
+                comment: "Acceleration chip base name for TurboQuant KV-cache compression"
+            )
         guard on else { return baseName }
         let bits = doubleOf(s["turboquant_kv_bits"])
         let skip = intOf(s["turboquant_skip_last"]) ?? 0
@@ -971,11 +986,13 @@ struct ProfileDetailCard: View {
                      comment: "TurboQuant skip-last-N suffix; placeholder is the layer count")
             : nil
         let parts = [bitsText, skipText].compactMap { $0 }
-        return parts.isEmpty
-            ? baseName
-            : String(localized: "profile.detail.acceleration.turboquant.with_parts",
-                     defaultValue: "TurboQuant KV · \(parts.joined(separator: " / "))",
-                     comment: "TurboQuant chip with detail suffix; placeholder is the joined detail parts")
+        guard !parts.isEmpty else { return baseName }
+        if scheme == "turboquant" {
+            return String(localized: "profile.detail.acceleration.turboquant.with_parts",
+                          defaultValue: "TurboQuant KV · \(parts.joined(separator: " / "))",
+                          comment: "TurboQuant chip with detail suffix; placeholder is the joined detail parts")
+        }
+        return "\(baseName) · \(parts.joined(separator: " / "))"
     }
 
     private func dflashLabel(_ s: [String: AnyCodable], on: Bool) -> String {
@@ -995,11 +1012,10 @@ struct ProfileDetailCard: View {
 
     private func dflashQuantLabel(_ s: [String: AnyCodable]) -> String {
         let w = intOf(s["dflash_draft_quant_weight_bits"]) ?? 4
-        let a = intOf(s["dflash_draft_quant_activation_bits"]) ?? 8
         let g = intOf(s["dflash_draft_quant_group_size"]) ?? 64
         return String(localized: "profile.detail.acceleration.dflash_quant",
-                      defaultValue: "Drafter quant · W\(w)/A\(a) G\(g)",
-                      comment: "DFlash drafter quantization chip; placeholders are weight bits, activation bits, group size")
+                      defaultValue: "Drafter quant · W\(w) G\(g)",
+                      comment: "DFlash drafter quantization chip; placeholders are weight bits, group size")
     }
 
     private func specprefillLabel(_ s: [String: AnyCodable], on: Bool) -> String {
@@ -1062,7 +1078,7 @@ struct ProfileDetailCard: View {
                     .controlSize(.small)
                     if exposeAsModel, let exposedModelId {
                         Text(exposedModelId)
-                            .font(.omlxMono(11))
+                            .font(.omlxMono(DesignTokens.FontSize.subheadline))
                             .foregroundStyle(theme.textTertiary)
                             .lineLimit(1)
                             .truncationMode(.middle)
@@ -1087,7 +1103,7 @@ struct ProfileDetailCard: View {
     @ViewBuilder
     private func sectionTitle(_ s: String) -> some View {
         Text(s)
-            .font(.omlxText(10, weight: .heavy))
+            .font(.omlxText(DesignTokens.FontSize.caption, weight: .heavy))
             .kerning(0.9)
             .textCase(.uppercase)
             .foregroundStyle(theme.textTertiary)

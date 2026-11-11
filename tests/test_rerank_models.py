@@ -71,6 +71,16 @@ class TestRerankRequest:
         req = RerankRequest(model="m", query="q", documents=["a", "b", "c"], top_n=2)
         assert req.top_n == 2
 
+    def test_top_n_must_be_positive(self):
+        """top_n=0 returned an empty 200 and -1 silently dropped results;
+        both must fail validation like max_length does (same error shape
+        FastAPI surfaces as 422 "greater_than")."""
+        with pytest.raises(ValidationError) as exc_info:
+            RerankRequest(model="m", query="q", documents=["a", "b"], top_n=0)
+        assert exc_info.value.errors()[0]["type"] == "greater_than"
+        with pytest.raises(ValidationError):
+            RerankRequest(model="m", query="q", documents=["a", "b"], top_n=-1)
+
     def test_missing_model_rejected(self):
         with pytest.raises(ValidationError):
             RerankRequest(query="q", documents=["d"])  # type: ignore[call-arg]

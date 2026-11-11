@@ -137,9 +137,9 @@ def _probe_native_indexer_kernels() -> None:
     patch time instead.
     """
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        from omlx.custom_kernels.sparse_index import fast as index_fast
 
-        have = glm_fast.has_symbol("dsa_indexer_scores") and glm_fast.has_symbol(
+        have = index_fast.has_symbol("dsa_indexer_scores") and index_fast.has_symbol(
             "dsa_topk_indices"
         )
     except Exception:

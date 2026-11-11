@@ -66,6 +66,9 @@ logger = logging.getLogger(__name__)
 
 CODE_DIGITS = 6
 CODE_TTL_SECONDS = 10 * 60
+# How long the status poll hands an approved helper daemon its wrapped key.
+# The daemon polls every few seconds.
+AGENT_KEY_PACKAGE_SECONDS = 60
 MAX_CODE_ATTEMPTS = 3
 LOCKOUT_SECONDS = 10 * 60
 PBKDF2_ITERATIONS = 210_000
@@ -753,16 +756,10 @@ def _local_ssh_public_key() -> str | None:
 def _local_ssh_host_public_key() -> str | None:
     """Read the public half of the local SSH daemon host identity."""
 
-    override = os.environ.get("OMLX_CLUSTER_SSH_HOST_PUBLIC_KEY")
-    candidates = (
-        [Path(override).expanduser()]
-        if override
-        else [
-            Path("/etc/ssh/ssh_host_ed25519_key.pub"),
-            Path("/etc/ssh/ssh_host_rsa_key.pub"),
-        ]
-    )
-    for path in candidates:
+    for path in (
+        Path("/etc/ssh/ssh_host_ed25519_key.pub"),
+        Path("/etc/ssh/ssh_host_rsa_key.pub"),
+    ):
         try:
             return normalize_ssh_public_key(path.read_text(encoding="utf-8").strip())
         except (OSError, PairingRequestError):
@@ -805,6 +802,11 @@ def _pairing_caps(caps: dict[str, Any]) -> dict[str, Any]:
         )
         return dict(caps)
     return {**caps, "ssh_user": ssh_user}
+
+
+def _agent_controlled(caps: Any) -> bool:
+    """Whether a peer is driven over its own control channel instead of SSH."""
+    return isinstance(caps, dict) and caps.get("control") == "agent"
 
 
 def _advertised_ssh_user(caps: Any) -> str | None:
@@ -853,6 +855,8 @@ class PairingManager:
       install/retract steps; defaults drive ``omlx/cluster/ssh_keys.py``.
     * ``http_post`` / ``http_get`` — joiner-side transport; loopback fakes
       in tests, urllib in production.
+    * ``join_watch_s`` — how often a join awaiting approval asks the
+      coordinator in the background; ``None`` leaves it to dashboard polls.
     """
 
     def __init__(
@@ -874,8 +878,10 @@ class PairingManager:
         http_get: Callable[[str, float], Any] | None = None,
         clock: Callable[[], float] = time.time,
         audit: PairingAuditLog | Callable[..., Any] | None = None,
+        join_watch_s: float | None = None,
     ) -> None:
         self.base_path = Path(base_path) if base_path is not None else DEFAULT_BASE_PATH
+        self.join_watch_s = join_watch_s
         self._identity = (
             dict(identity)
             if identity is not None
@@ -947,10 +953,23 @@ class PairingManager:
                 break
         return addresses
 
-    def local_ssh_material(self) -> dict[str, Any]:
-        """Complete local trust material the opposite peer must install."""
+    def local_ssh_material(self, *, ssh: bool = True) -> dict[str, Any]:
+        """Complete local trust material the opposite peer must install.
+
+        ``ssh=False`` describes this node to an agent-controlled peer: no SSH
+        keys and no account name, so nothing is installed on either side.
+        """
 
         addresses = self.local_addrs()
+        if not ssh:
+            return {
+                "node_id": self.node_id,
+                "friendly_name": self.friendly_name,
+                "caps": dict(self._caps_provider() if self._caps_provider else {}),
+                "addrs": addresses,
+                "ssh_public_key": None,
+                "ssh_host_public_key": None,
+            }
         if not addresses:
             raise EnrollmentDriveError(
                 "SSH enrollment requires a verified local address"
@@ -961,10 +980,19 @@ class PairingManager:
             "caps": _pairing_caps(self._caps_provider() if self._caps_provider else {}),
             "addrs": addresses,
             "ssh_public_key": normalize_ssh_public_key(self._ssh_key_provider() or ""),
-            "ssh_host_public_key": normalize_ssh_public_key(
-                self._ssh_host_key_provider() or ""
-            ),
+            "ssh_host_public_key": self._local_ssh_host_key(),
         }
+
+    def _local_ssh_host_key(self) -> str:
+        host_key = self._ssh_host_key_provider()
+        if not host_key:
+            # macOS creates host keys when sshd first accepts a connection.
+            raise PairingRequestError(
+                "This Mac has no SSH host key yet. Turn on Remote Login in "
+                "System Settings > General > Sharing. If it is already on, run "
+                "ssh localhost once in Terminal to create the key, then retry."
+            )
+        return normalize_ssh_public_key(host_key)
 
     def _record_audit(
         self, event: str, *, node_id: str = "", detail: dict[str, Any] | None = None
@@ -1015,9 +1043,7 @@ class PairingManager:
         validate_pairing_code(code)
         caps = self._caps_provider() if self._caps_provider else {}
         ssh_public_key = normalize_ssh_public_key(self._ssh_key_provider() or "")
-        ssh_host_public_key = normalize_ssh_public_key(
-            self._ssh_host_key_provider() or ""
-        )
+        ssh_host_public_key = self._local_ssh_host_key()
         code_salt = secrets.token_bytes(16)
         return {
             "node_id": self.node_id,
@@ -1276,8 +1302,17 @@ class PairingManager:
                 normalized_addrs.append(raw)
         if http_port is not None and not (1 <= int(http_port) <= 65535):
             raise PairingRequestError("join request http_port is out of range")
-        ssh_public_key = normalize_ssh_public_key(ssh_public_key or "")
-        ssh_host_public_key = normalize_ssh_public_key(ssh_host_public_key or "")
+        if _agent_controlled(caps):
+            # The code verifier binds the empty keys, so the request cannot be
+            # turned into an SSH enrollment later.
+            if ssh_public_key or ssh_host_public_key:
+                raise PairingRequestError(
+                    "an agent-controlled peer must not send SSH keys"
+                )
+            ssh_public_key, ssh_host_public_key = None, ""
+        else:
+            ssh_public_key = normalize_ssh_public_key(ssh_public_key or "")
+            ssh_host_public_key = normalize_ssh_public_key(ssh_host_public_key or "")
 
         with self._lock:
             now = self._clock()
@@ -1400,8 +1435,9 @@ class PairingManager:
             # race an enrollment that has already passed code verification.
             pending.approving = True
 
+        agent = _agent_controlled(pending.caps)
         try:
-            coordinator_material = self.local_ssh_material()
+            coordinator_material = self.local_ssh_material(ssh=not agent)
         except Exception as exc:
             self._record_audit(
                 "approve_enrollment_failed",
@@ -1432,7 +1468,7 @@ class PairingManager:
             "ssh_host_public_key": pending.ssh_host_public_key,
         }
         try:
-            enrollment = self._enrollment_driver(peer)
+            enrollment = {} if agent else self._enrollment_driver(peer)
         except Exception as exc:
             self._record_audit(
                 "approve_enrollment_failed", node_id=node_id, detail={"error": str(exc)}
@@ -1471,6 +1507,10 @@ class PairingManager:
             "paired_at": paired_at,
             "role": "peer",
         }
+        if agent:
+            # Written only here; discovery caps never decide who is trusted
+            # with the control channel.
+            key_record["control"] = "agent"
         key_written = False
         try:
             with self._lock:
@@ -1490,12 +1530,13 @@ class PairingManager:
                 except Exception as rollback_exc:
                     rollback_errors.append(f"pairing key: {rollback_exc}")
             try:
-                self._revocation_driver(
-                    {
-                        "peer_public_key": pending.ssh_public_key,
-                        "addrs": list(pending.addrs),
-                    }
-                )
+                if not agent:
+                    self._revocation_driver(
+                        {
+                            "peer_public_key": pending.ssh_public_key,
+                            "addrs": list(pending.addrs),
+                        }
+                    )
             except Exception as rollback_exc:
                 rollback_errors.append(f"SSH enrollment: {rollback_exc}")
             with self._lock:
@@ -1595,7 +1636,14 @@ class PairingManager:
                 "coordinator_identity_tag": key_record.get("coordinator_identity_tag"),
             }
             package = key_record.get("cluster_key_package")
-            if package is not None:
+            # For a helper daemon the key opens its control channel. Once the
+            # daemon has taken the package, only a search of the codes needs it.
+            taken = (
+                key_record.get("control") == "agent"
+                and now - float(key_record.get("paired_at") or 0.0)
+                > AGENT_KEY_PACKAGE_SECONDS
+            )
+            if package is not None and not taken:
                 status["cluster_key_package"] = package
             if device:
                 status["friendly_name"] = device.get("friendly_name")
@@ -1642,7 +1690,8 @@ class PairingManager:
             or (device or {}).get("last_addrs")
             or [],
         }
-        if material["peer_public_key"] or material["addrs"]:
+        agent = (key_record or {}).get("control") == "agent"
+        if not agent and (material["peer_public_key"] or material["addrs"]):
             try:
                 revocation = self._revocation_driver(material) or revocation
             except Exception as exc:
@@ -1667,6 +1716,14 @@ class PairingManager:
             "was_pending": was_pending,
             "revocation": revocation,
         }
+
+    def control_key(self, node_id: str) -> bytes | None:
+        """The cluster key of an agent-controlled peer, None for SSH peers."""
+
+        record = self._key_store.get(node_id)
+        if record is None or record.get("control") != "agent":
+            return None
+        return bytes.fromhex(record["cluster_key"])
 
     def paired_devices(self) -> list[dict[str, Any]]:
         """Persisted paired devices (discovered-but-unpaired never land here)."""
@@ -1698,6 +1755,7 @@ def configure_pairing_manager(
     *,
     registry: Any = None,
     enrollment_store: Any = None,
+    join_watch_s: float | None = 2.0,
     **kwargs: Any,
 ) -> PairingManager:
     """Create the process-wide manager at server startup.
@@ -1712,6 +1770,7 @@ def configure_pairing_manager(
             registry,
             enrollment_store,
             base_path=base_path,
+            join_watch_s=join_watch_s,
             **kwargs,
         )
         return _configured_manager

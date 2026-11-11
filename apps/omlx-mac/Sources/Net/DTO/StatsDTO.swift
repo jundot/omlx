@@ -56,6 +56,7 @@ struct StatsDTO: Codable, Equatable, Sendable {
     struct RuntimeCacheDTO: Codable, Equatable, Sendable {
         let basePath: String?
         let ssdCacheDir: String?
+        let ssdCacheUnavailable: Bool?
         let totalNumFiles: Int
         let totalSizeBytes: Int64
         let effectiveBlockSizes: [Int]?

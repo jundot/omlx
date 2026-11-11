@@ -17,6 +17,7 @@ import pytest
 
 from omlx.cluster import launch, memory_guard
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
+from omlx.cluster.inference_worker import _execution_settings, _tensor_shard_options
 from omlx.cluster.launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
@@ -302,6 +303,67 @@ def test_ring_launch_reserves_full_collective_port_span():
     )
 
 
+def test_launch_ports_stay_below_the_ephemeral_window():
+    low, high = launch._SAFE_PORT_RANGE
+
+    for _ in range(8):
+        api_port, collective_port = _available_launch_ports(_deployment())
+        assert low <= api_port <= high
+        assert low <= collective_port <= high
+
+
+def test_reap_stale_remote_workers_kills_only_peer_workers(monkeypatch):
+    scanned = []
+    killed = []
+
+    def fake_scan(ssh_target, deployment_id, *, runner):
+        scanned.append((ssh_target, deployment_id))
+        return [4711, 4712], ""
+
+    def fake_kill(ssh_target, pid, *, grace, runner):
+        killed.append((ssh_target, pid))
+        return True
+
+    monkeypatch.setattr(launch, "_remote_deployment_worker_pids", fake_scan)
+    monkeypatch.setattr(launch, "_kill_remote_pid", fake_kill)
+
+    launch._reap_stale_remote_workers(_deployment())
+
+    assert scanned == [("user@studio.local", "cluster-test")]
+    assert killed == [("user@studio.local", 4711), ("user@studio.local", 4712)]
+
+
+@pytest.mark.parametrize(
+    ("scan", "message"),
+    [
+        ((None, "ssh transport broken"), "ssh transport broken"),
+        (([4711], ""), r"survived SIGKILL.*Reboot"),
+    ],
+)
+def test_reap_stale_remote_workers_blocks_launch(monkeypatch, scan, message):
+    monkeypatch.setattr(
+        launch, "_remote_deployment_worker_pids", lambda *_a, **_k: scan
+    )
+    monkeypatch.setattr(launch, "_kill_remote_pid", lambda *_a, **_k: False)
+
+    with pytest.raises(launch.DistributedLaunchError, match=message):
+        launch._reap_stale_remote_workers(_deployment())
+
+
+def test_remote_worker_scan_quotes_peer_stderr_when_output_is_not_json():
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="", stderr="No user exists for uid 501"
+        )
+
+    pids, error = launch._remote_deployment_worker_pids(
+        "user@spark-a", "cluster-test", runner=runner
+    )
+
+    assert pids is None
+    assert "No user exists for uid 501" in error
+
+
 def test_supervisor_preserves_structured_peer_loss_reason():
     supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
     reason = "rank 1 on studio stopped reporting"
@@ -347,6 +409,34 @@ def test_rank_exit_detail_waits_for_rank_stderr_forwarded_after_the_exit_line():
         match=r"(?s)rank 0 exited with code 1.*side-channel helper stopped",
     ):
         supervisor._wait_for_ready()
+
+
+def test_rank_exit_detail_includes_remote_rank_output_from_stdout():
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    supervisor.process = SimpleNamespace(poll=lambda: None)
+
+    # Remote ranks run under ssh -tt, so their stderr reaches the launcher's stdout.
+    supervisor._drain(
+        io.StringIO(
+            f'{launch._EVENT_PREFIX}{{"type":"rank_ready","rank":0}}\n'
+            "ImportError: libcudart.so.13: cannot open shared object file\r\n"
+        ),
+        supervisor._stdout,
+        True,
+    )
+    supervisor._drain(
+        io.StringIO("[WARN] Node with rank 1 exited with code 1\n"),
+        supervisor._stderr,
+        False,
+    )
+
+    with pytest.raises(launch.DistributedLaunchError) as excinfo:
+        supervisor._wait_for_ready()
+
+    detail = str(excinfo.value)
+    assert "rank 1 exited with code 1" in detail
+    assert "ImportError: libcudart.so.13" in detail
+    assert launch._EVENT_PREFIX not in detail
 
 
 def test_supervisor_prefers_rank_marker_over_mlx_cleanup_traceback(monkeypatch):
@@ -1523,7 +1613,10 @@ def _parsed_plan(deployment: ClusterDeployment, tmp_path):
 
 
 def test_prompt_cache_ssd_reaches_the_rank_and_scopes_its_directory(tmp_path):
-    from omlx.cluster.inference_worker import _prompt_cache_ssd_dir
+    from omlx.cluster.inference_worker import (
+        _drop_other_numerics_snapshots,
+        _prompt_cache_ssd_dir,
+    )
 
     deployment = _deployment()
     args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
@@ -1540,6 +1633,20 @@ def test_prompt_cache_ssd_reaches_the_rank_and_scopes_its_directory(tmp_path):
     assert rank0.endswith(f"{args.deployment_id}/{args.plan_hash}/rank-0")
     assert rank1.endswith(f"{args.deployment_id}/{args.plan_hash}/rank-1")
     assert rank0 != rank1
+    # CED prefill states never restore into a run without it.
+    args.state_dir = str(tmp_path / "state")
+    ced = _prompt_cache_ssd_dir(args, rank=0, numerics="ced-prefill-1")
+    assert ced.endswith("/rank-0-ced-prefill-1")
+    # Starting with CED drops rank 0's other revisions, not other ranks'.
+    plan_dir = Path(ced).parent
+    for name in ("rank-0", "rank-0-ced-prefill-1", "rank-1", "rank-10-ced-prefill-1"):
+        (plan_dir / name).mkdir(parents=True)
+    _drop_other_numerics_snapshots(ced, rank=0)
+    assert sorted(path.name for path in plan_dir.iterdir()) == [
+        "rank-0-ced-prefill-1",
+        "rank-1",
+        "rank-10-ced-prefill-1",
+    ]
 
 
 def test_prompt_cache_ssd_can_be_turned_off(tmp_path):
@@ -1551,6 +1658,47 @@ def test_prompt_cache_ssd_can_be_turned_off(tmp_path):
         prompt_cache_ssd=False, state_dir=str(tmp_path), deployment_id="d"
     )
     assert _prompt_cache_ssd_dir(off, rank=0) is None
+
+
+def test_lightning_mtp_reaches_the_rank_load_settings(tmp_path):
+    from omlx.cluster.inference_worker import _mtp_load_settings
+
+    deployment = _deployment()
+    args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
+    assert _mtp_load_settings(args) is None
+
+    execution = replace(
+        deployment.execution, mtp=True, mtp_depth=3, mtp_fixed_depth=True
+    )
+    args, _plan_hash, _assignments = _parsed_plan(
+        replace(deployment, execution=execution), tmp_path
+    )
+    settings = _mtp_load_settings(args)
+    assert settings.mtp_enabled is True
+    assert settings.mtp_fixed_depth == 3
+    assert settings.mtp_adaptive_max_depth is None
+
+
+def test_v41_prefill_paths_reach_the_tensor_shard_loader(tmp_path):
+    deployment = _deployment()
+    args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
+    # Off, a model-owned tensor shard loader gets no options.
+    assert _tensor_shard_options(_execution_settings(args)) == {}
+
+    execution = replace(
+        deployment.execution,
+        ced_prefill=True,
+        a8_prefill=True,
+        a8_prefill_min_tokens=256,
+    )
+    args, _plan_hash, _assignments = _parsed_plan(
+        replace(deployment, execution=execution), tmp_path
+    )
+    assert _tensor_shard_options(_execution_settings(args)) == {
+        "ced_prefill": True,
+        "a8_prefill": True,
+        "a8_prefill_min_tokens": 256,
+    }
 
 
 def test_the_node_role_reaches_the_rank_through_the_launched_argv(tmp_path):

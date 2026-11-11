@@ -165,6 +165,30 @@ def test_prompt_boundary_store_skips_missing_snapshot_for_snapshot_models():
     scheduler._extract_live_request_cache_for_store.assert_not_called()
 
 
+def test_prompt_boundary_store_keeps_sub_block_tail_snapshot():
+    scheduler = _scheduler()
+    prompt_tokens = list(range(3))
+    tail_tokens = prompt_tokens[:2]
+    tail_cache = [
+        {
+            "state": ("arrays-at-tail",),
+            "class_name": "ArraysCache",
+            "cache_type": "ArraysCache",
+        }
+    ]
+    scheduler._get_boundary_store_override = MagicMock(
+        return_value=(tail_tokens, tail_cache, "tail-config", {})
+    )
+
+    result = scheduler._prepare_prompt_boundary_cache_store(
+        "req-parser-stop",
+        _request(prompt_tokens),
+        uid=7,
+    )
+
+    assert result == (tail_tokens, tail_cache, "tail-config", {})
+
+
 def test_prompt_boundary_store_uses_live_cache_for_sliceable_models():
     scheduler = _scheduler()
     prompt_tokens = list(range(10))
@@ -304,14 +328,17 @@ def test_cleanup_finished_skip_cache_store_takes_leak_guard_branch(
     "preserve_reasoning, expected_sequence",
     [(False, list(range(6))), (True, list(range(12)))],
 )
+@pytest.mark.parametrize("folded", [0, 2])
 def test_prompt_boundary_store_covers_output_when_reasoning_is_preserved(
-    preserve_reasoning, expected_sequence
+    preserve_reasoning, expected_sequence, folded
 ):
     """A think-prefix request whose history keeps the reasoning stores prompt + output after a parser stop."""
     scheduler = _scheduler()
     request = SimpleNamespace(
-        prompt_token_ids=list(range(6)),
+        prompt_token_ids=list(range(6 + folded)),
         output_token_ids=list(range(6, 12)),
+        memory_requeues=int(folded > 0),
+        requeued_output_tokens=folded,
         needs_think_prefix=True,
         preserve_reasoning=preserve_reasoning,
         specprefill_indices=None,
@@ -319,11 +346,39 @@ def test_prompt_boundary_store_covers_output_when_reasoning_is_preserved(
     scheduler._get_boundary_store_override = MagicMock(return_value=None)
     scheduler._detect_boundary_snapshot_need = MagicMock(return_value=False)
     scheduler._extract_live_request_cache_for_store = MagicMock(
-        return_value=([{"state": ("kv",), "class_name": "KVCache", "cache_type": "KVCache"}], "cfg")
+        return_value=(
+            [{"state": ("kv",), "class_name": "KVCache", "cache_type": "KVCache"}],
+            "cfg",
+        )
     )
 
     result = scheduler._prepare_prompt_boundary_cache_store("req", request, uid=3)
 
-    scheduler._get_boundary_store_override.assert_called_once_with("req", expected_sequence)
+    scheduler._get_boundary_store_override.assert_called_once_with(
+        "req", expected_sequence
+    )
     assert result is not None
     assert result[0] == expected_sequence[: (len(expected_sequence) // 4) * 4]
+
+
+def test_requeued_snapshot_store_rejects_mismatched_live_tokens():
+    import mlx.core as mx
+
+    scheduler = _scheduler()
+    scheduler._stream = mx.default_stream(mx.default_device())
+    request = _request(list(range(10)))
+    request.memory_requeues = 1
+    request.requeued_output_tokens = 2
+    request.output_token_ids = list(range(8, 14))
+    scheduler._get_boundary_store_override = MagicMock(
+        return_value=(list(range(12)), [{"state": ("boundary",)}], None, {})
+    )
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.extract_cache.return_value = {
+        7: ([object()], list(range(11)) + [99])
+    }
+    scheduler._extract_cache_states = MagicMock()
+
+    assert scheduler._prepare_prompt_boundary_cache_store("req", request, 7) is None
+    scheduler.batch_generator.extract_cache.assert_called_once_with([7])
+    scheduler._extract_cache_states.assert_not_called()

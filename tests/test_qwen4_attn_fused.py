@@ -12,6 +12,7 @@ a BF16 output could hide a different summation order.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 
 import mlx.core as mx
@@ -19,6 +20,7 @@ import mlx.nn as nn
 import pytest
 
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+from omlx.patches.qwen35_yarn import apply_qwen35_yarn_patch
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -36,6 +38,7 @@ from omlx.patches.qwen35_verify_sdpa_split import (  # noqa: E402
 qwen35_verify_qmm.apply_verify_qmm_patch()
 qwen35_verify_linear.apply()
 apply_qwen35_verify_sdpa_split_patch()
+apply_qwen35_yarn_patch()
 q35_language = importlib.import_module("mlx_vlm.models.qwen3_5.language")
 q35_verifier = importlib.import_module("mlx_vlm.models.qwen3_5.speculative_verifier")
 
@@ -107,9 +110,21 @@ _CONFIG = qwen4_exp.TextConfig(
 )
 
 
-def _attention(seed: int):
+# Static YaRN at factor 4: the MLX path runs mlx-vlm's eager MRoPE.
+_YARN_CONFIG = dataclasses.replace(
+    _CONFIG,
+    rope_parameters={
+        **_CONFIG.rope_parameters,
+        "type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 262144,
+    },
+)
+
+
+def _attention(seed: int, config=_CONFIG):
     mx.random.seed(seed)
-    attn = language.Qwen4ExpAttention(_CONFIG)
+    attn = language.Qwen4ExpAttention(config)
     for _, module in attn.named_modules():
         if isinstance(module, nn.Linear):
             fan_in = module.weight.shape[1]
@@ -254,6 +269,26 @@ def test_masked_rows_equal_mlx_path(monkeypatch, context):
         assert prologues == [rows]
 
 
+@requires_kernels
+@pytest.mark.parametrize("context", [0, 1023, 1500, 2043])
+@pytest.mark.parametrize("rows", [1, 4, 16])
+def test_yarn_dense_rows_equal_mlx_path(monkeypatch, context, rows):
+    attn = _attention(seed=3, config=_YARN_CONFIG)
+    assert attn.rotary_emb.attention_scaling > 1
+    cache = _prefill(attn, context, seed=4)
+    prologues = _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (11,))
+    if context + rows <= 2043 + 8 and attn_fused.row_plan(context + 1, context + rows):
+        assert prologues == [rows]
+
+
+@requires_kernels
+def test_yarn_masked_rows_equal_mlx_path(monkeypatch):
+    attn = _attention(seed=7, config=_YARN_CONFIG)
+    cache = _prefill_chunked(attn, 2060, seed=8)
+    for rows in (1, 4, 16):
+        assert _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (13,)) == [rows]
+
+
 def test_fused_verify_rollback_then_decode_matches_mlx(monkeypatch):
     """Accept one draft of a four-row window, roll the rest back, decode on."""
     attn = _attention(seed=5)
@@ -321,14 +356,15 @@ def test_fp32_sdpa_gate_matches_mlx(keys, rows, spread):
     assert _bit_equal(got, want)
 
 
-@requires_kernels
-@pytest.mark.parametrize("rows", [1, 4, 8, 16])
+@pytest.mark.parametrize("rows", [1, 4, 8, 16, 300])
 @pytest.mark.parametrize("pos_ndim", [2, 3])
-def test_fp32_prep_matches_norms_and_mrope(rows, pos_ndim):
-    attn = _attention(seed=9)
+@pytest.mark.parametrize("config", [_CONFIG, _YARN_CONFIG], ids=["default", "yarn"])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16], ids=["fp32", "bf16"])
+def test_prep_matches_norms_and_mrope(rows, pos_ndim, config, dtype):
+    attn = _attention(seed=9, config=config)
     mx.random.seed(rows + pos_ndim)
-    q_proj = mx.random.normal((rows, 24 * 512)) * 4
-    k_proj = mx.random.normal((rows, 2 * 256)) * 4
+    q_proj = (mx.random.normal((rows, 24 * 512)) * 4).astype(dtype)
+    k_proj = (mx.random.normal((rows, 2 * 256)) * 4).astype(dtype)
     start = 40000 + rows
     positions = _positions(start, rows) if pos_ndim == 3 else _positions(start, rows)[0]
     rotary = attn.rotary_emb
@@ -337,7 +373,7 @@ def test_fp32_prep_matches_norms_and_mrope(rows, pos_ndim):
     keys = attn.k_norm(k_proj.reshape(1, rows, 2, 256)).transpose(0, 2, 1, 3)
     want_q, want_k = rotary.apply_rotary(queries, keys, positions, unsqueeze_dim=1)
 
-    assert attn_fused.ready(mx.float32, 24, 2, 256, rotary.dim, pos_ndim)
+    assert attn_fused.prep_ready(dtype, 24, 2, 256, rotary.dim, pos_ndim)
     got_q, got_k = attn_fused.prep_qk(
         q_proj,
         k_proj,
@@ -350,6 +386,76 @@ def test_fp32_prep_matches_norms_and_mrope(rows, pos_ndim):
         heads=24,
         kv_heads=2,
         rotary_dim=rotary.dim,
+        rope_scale=rotary.attention_scaling,
     )
     assert _bit_equal(got_q, want_q)
     assert _bit_equal(got_k, want_k)
+
+
+@pytest.mark.parametrize("config", [_CONFIG, _YARN_CONFIG], ids=["default", "yarn"])
+def test_gathered_prefill_prep_matches_mlx_path(monkeypatch, config):
+    """Prefill chunks before, across and past the QSA budget take the q/k
+    norms and MRoPE from ``prep_qk``: outputs and cache equal the MLX ops'."""
+    attn = _attention(seed=5, config=config)
+    rows = []
+    prep = attn._prep_qk
+
+    def counting(*args):
+        rows.append(args[0].shape[0])
+        return prep(*args)
+
+    monkeypatch.setattr(attn, "_prep_qk", counting)
+
+    def prefill():
+        cache = language.QSAKVCache()
+        mx.random.seed(21)
+        outs, done = [], 0
+        for size in (1500, 1500, 700):
+            x = (mx.random.normal((1, size, config.hidden_size)) * 0.5).astype(
+                mx.bfloat16
+            )
+            out = attn(
+                x, mask="causal", cache=cache, position_ids=_positions(done, size)
+            )
+            mx.eval(out)
+            outs.append(out)
+            done += size
+        return outs, _state(cache)
+
+    got, got_state = prefill()
+    assert rows == [1500, 1500, 700]
+    monkeypatch.setattr(attn_fused, "_DISABLED", True)
+    want, want_state = prefill()
+    assert all(_bit_equal(g, w) for g, w in zip(got, want))
+    assert all(_bit_equal(g, w) for g, w in zip(got_state, want_state))
+
+
+@pytest.mark.parametrize("context", [100, 3000], ids=["dense", "past-budget"])
+@pytest.mark.parametrize("positions", ["mrope", "none"])
+def test_decode_prep_matches_mlx_path(monkeypatch, context, positions):
+    """A decode row below and past the QSA budget, with text MRoPE positions
+    (the masked path past the budget) or none (gathered QSA decode): output and
+    cache equal the MLX path's."""
+    attn = _attention(seed=7)
+    cache = _prefill_chunked(attn, context, seed=3)
+
+    def step(x):
+        if positions == "mrope":
+            return _step(attn, cache, x)
+        out = attn(x, mask=None, cache=cache, position_ids=None)
+        mx.eval(out)
+        return out
+
+    for seed in range(3):
+        mx.random.seed(seed)
+        x = (mx.random.normal((1, 1, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+        got = step(x)
+        got_state = _state(cache)
+        cache.trim(1)
+        monkeypatch.setattr(attn_fused, "_DISABLED", True)
+        want = step(x)
+        want_state = _state(cache)
+        cache.trim(1)
+        monkeypatch.setattr(attn_fused, "_DISABLED", False)
+        assert _bit_equal(got, want)
+        assert all(_bit_equal(g, w) for g, w in zip(got_state, want_state))

@@ -20,7 +20,7 @@ class DSparkAttention(Attention):
     def append_context(self, main_x, cache, *, start_offset=None):
         c = self._config
         start = cache.offset if start_offset is None else start_offset
-        positions = mx.arange(start, start + main_x.shape[1])
+        positions = range(start, start + main_x.shape[1])
         kv = quantize_activation(
             rope(self.kv_norm(self.wkv(main_x)), positions, c, False)
         )
@@ -29,7 +29,7 @@ class DSparkAttention(Attention):
     def __call__(self, x, cache):
         c = self._config
         batch, length, _ = x.shape
-        positions = mx.arange(cache.offset, cache.offset + length)
+        positions = range(cache.offset, cache.offset + length)
         q = rope(
             self.wq_b(self.q_norm(self.wq_a(x))).reshape(
                 batch, length, c.n_heads, c.head_dim
@@ -58,7 +58,8 @@ class DSparkAttention(Attention):
             .astype(q.dtype)
         )
         out = rope(out, positions, c, False, inverse=True)
-        grouped = out.reshape(batch, length, c.o_groups, -1)
+        # 1017 reference DSparkAttention: act_quant(o) before the wo_a einsum.
+        grouped = quantize_activation(out.reshape(batch, length, c.o_groups, -1))
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
         return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
 
@@ -96,6 +97,8 @@ class DSparkBlock(Block):
             n_activated_experts=active,
             engram_layer_ids=(),
             engram_num_embeddings=(),
+            # Drafts keep the A16 path, as their dense projections do.
+            a8_prefill=False,
         )
         super().__init__(draft, c.n_layers + stage)
         self.attn = DSparkAttention(draft, c.n_layers + stage)
@@ -189,6 +192,14 @@ def forward_spec(model, input_ids, main_hidden, cache, *, temperature=0.0):
 
 def proposal_forward(model, input_ids, cache, draft_length=None):
     """Compute parallel draft logits; the shared loop applies Markov biases."""
+    h = proposal_hidden(model, input_ids, cache, draft_length)
+    final = model.mtp[-1]
+    return project_logits(final.norm(h), model.head.weight), h
+
+
+def proposal_hidden(model, input_ids, cache, draft_length=None):
+    """The last stage's output of proposal_forward, before its norm and vocabulary head
+    (several requests' blocks can share one head projection)."""
     c = model._config
     width = max(1, min(draft_length or c.dspark_block_size, c.dspark_block_size))
     input_ids = input_ids.reshape(input_ids.shape[0], -1)[:, -1:]
@@ -207,7 +218,4 @@ def proposal_forward(model, input_ids, cache, draft_length=None):
     pre = mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1])
     for stage, item in zip(model.mtp, cache):
         h, pre = stage(h, pre, item)
-    final = model.mtp[-1]
-    h = hc_pre(h, pre)
-    logits = project_logits(final.norm(h), model.head.weight)
-    return logits, h
+    return hc_pre(h, pre)

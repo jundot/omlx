@@ -5,13 +5,16 @@ Shared runtime for decision models served through ``/v1/systemone``.
 A decision model reads a prompt with a Qwen3.5 backbone and scores the
 options of typed questions without generating text. This module loads the
 backbone (mlx-vlm when the checkpoint has a vision tower, mlx-lm otherwise)
-and runs causal prefill in chunks, so the engine can give the GPU to other
-models between chunks.
+and runs causal prefill in chunks, or a whole-prompt encode in layer steps,
+so the engine can give the GPU to other models between steps.
 """
 
 import json
 import logging
-from collections.abc import Callable, Generator
+import os
+import tempfile
+from collections.abc import Callable, Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +23,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx_vlm.utils import load as vlm_load
 
-from ..model_discovery import _vision_weight_bytes
+from ..model_discovery import DECISION_SIDECAR_WEIGHTS, _vision_weight_bytes
 from ..utils.image import load_image
 from ..utils.model_loading import (
     lm_load_compat,
@@ -47,6 +50,24 @@ def round4(value: float) -> float:
 
 def decode_images(urls: list[str] | None) -> list:
     return [load_image(url, field="images") for url in urls or []]
+
+
+@contextmanager
+def _backbone_files(path: Path) -> Iterator[Path]:
+    """Yield ``path``, or a symlinked view of it without decision head weights.
+
+    Without an index mlx-vlm loads every ``*.safetensors`` file, so a head next
+    to a single backbone shard would be loaded into the backbone (d3-nano).
+    """
+    heads = {name for name in DECISION_SIDECAR_WEIGHTS if (path / name).is_file()}
+    if not heads or (path / "model.safetensors.index.json").is_file():
+        yield path
+        return
+    with tempfile.TemporaryDirectory(prefix="omlx-decision-") as view:
+        for entry in path.iterdir():
+            if entry.name not in heads:
+                os.symlink(entry.absolute(), Path(view) / entry.name)
+        yield Path(view)
 
 
 class DecisionBackbone:
@@ -78,9 +99,11 @@ class DecisionBackbone:
         if _vision_weight_bytes(path) > 0:
             # Also installs the Qwen3.5 GatedDeltaNet q/k norm fix for mlx-vlm.
             maybe_apply_pre_load_patches(self.model_path, for_vlm=True)
-            model, processor = vlm_load(
-                self.model_path, trust_remote_code=self.trust_remote_code
-            )
+            # load() evaluates the weights, so the view can go away after it.
+            with _backbone_files(path) as files:
+                model, processor = vlm_load(
+                    str(files), trust_remote_code=self.trust_remote_code
+                )
             tokenizer = processor.tokenizer
             self.image_processor = processor.image_processor
         else:
@@ -210,6 +233,61 @@ class DecisionBackbone:
         if getattr(type(self._text_model).__call__, "_omlx_mtp_call_marker", False):
             hidden = self._text_model.norm(hidden)
         return hidden
+
+    def embed_tokens(self, ids: np.ndarray) -> mx.array:
+        return self._text_model.embed_tokens(mx.array(ids)[None])
+
+    def vision_features(
+        self, pixel_values: np.ndarray, grid_thw: np.ndarray
+    ) -> mx.array:
+        """Vision-tower features of images or videos, one row per prompt token."""
+        tower = self.model.vision_tower
+        pixels = mx.array(pixel_values).astype(tower.patch_embed.proj.weight.dtype)
+        features, _ = tower(pixels, mx.array(grid_thw))
+        return features
+
+    def encode(
+        self,
+        embeds: mx.array,
+        positions: mx.array,
+        chunk_size: ChunkSize,
+        causal: bool,
+    ) -> Generator[int, None, mx.array]:
+        """Run every layer over the whole prompt; return the last token's
+        final-normed hidden state.
+
+        Without ``causal`` the full-attention layers read every prompt token;
+        the Gated DeltaNet layers stay causal. One step runs the layers that
+        ``chunk_size()`` tokens of causal prefill would cost and yields that
+        token count.
+        """
+        layers = self._text_model.layers
+        depth = len(layers)
+        length = embeds.shape[1]
+        mask = "causal" if causal else None
+        position_embeddings = None
+        for layer in layers:
+            if not layer.is_linear:
+                rotary = layer.self_attn.rotary_emb
+                if not rotary.fused_apply:
+                    position_embeddings = rotary(embeds, positions)
+                break
+        hidden = embeds
+        done = 0
+        while done < depth:
+            end = min(depth, done + max(1, chunk_size() * depth // length))
+            for layer in layers[done:end]:
+                hidden = layer(
+                    hidden,
+                    mask=None if layer.is_linear else mask,
+                    cache=None,
+                    position_ids=positions,
+                    position_embeddings=position_embeddings,
+                )
+            mx.eval(hidden)
+            yield length * end // depth - length * done // depth
+            done = end
+        return self._text_model.norm(hidden[0, -1])
 
     def logits(self, hidden: mx.array) -> mx.array:
         if isinstance(self._lm_head, nn.Embedding | nn.QuantizedEmbedding):

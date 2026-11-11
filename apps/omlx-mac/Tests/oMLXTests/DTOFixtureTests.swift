@@ -143,6 +143,11 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertNotNil(settings.integrations,  "integrations block missing")
         XCTAssertEqual(settings.scheduler?.embeddingBatchSize, 32)
         XCTAssertEqual(settings.huggingface?.hfCacheEnabled, true)
+        XCTAssertEqual(settings.integrations?.markitdownEnabled, true)
+        XCTAssertEqual(settings.integrations?.markitdownExposeModel, false)
+        XCTAssertEqual(settings.integrations?.markitdownMaxFileSizeMb, 25)
+        XCTAssertEqual(settings.integrations?.markitdownMaxFilesPerRequest, 5)
+        XCTAssertEqual(settings.integrations?.markitdownPdfProcessingEngine, "markitdown")
     }
 
     // MARK: - Models list
@@ -188,12 +193,13 @@ final class DTOFixtureTests: XCTestCase {
         let json = """
         {"task_id": "t1", "repo_id": "mlx-community/model", "status": "downloading",
          "progress": 45.5, "total_size": 1073741824, "downloaded_size": 536870912,
-         "speed_bps": 45298483.2, "error": "", "created_at": 1.0, "started_at": 1.0,
-         "completed_at": 0.0, "retry_count": 0}
+         "speed_bps": 45298483.2, "eta_seconds": 9000, "error": "", "created_at": 1.0,
+         "started_at": 1.0, "completed_at": 0.0, "retry_count": 0}
         """
         let task = try Self.makeDecoder().decode(HFTaskDTO.self, from: Data(json.utf8))
         XCTAssertEqual(task.speedBps, 45298483.2)
         XCTAssertEqual(task.speedText, "43.2 MB/s")
+        XCTAssertEqual(task.etaText, "2h 30m")
     }
 
     func testHFTaskWithoutSpeedKeepsOldServerCompatible() throws {
@@ -208,6 +214,7 @@ final class DTOFixtureTests: XCTestCase {
         let task = try Self.makeDecoder().decode(HFTaskDTO.self, from: Data(json.utf8))
         XCTAssertNil(task.speedBps)
         XCTAssertNil(task.speedText)
+        XCTAssertNil(task.etaText)
     }
 
     func testHFTaskZeroSpeedReadsExplicitZero() throws {
@@ -215,17 +222,19 @@ final class DTOFixtureTests: XCTestCase {
         let stopped = HFTaskDTO(
             taskId: "t1", repoId: "mlx-community/model", status: "downloading",
             progress: 45.5, totalSize: 100, downloadedSize: 50,
-            speedBps: 0, error: "", createdAt: 1.0, startedAt: 1.0,
-            completedAt: 0.0, retryCount: 0
+            speedBps: 0, etaSeconds: nil, error: "", createdAt: 1.0, startedAt: 1.0,
+            completedAt: 0.0, retryCount: 0, files: nil, ggufFiles: nil
         )
         XCTAssertEqual(stopped.speedText, "0 B/s")
+        XCTAssertNil(stopped.etaText)
 
         let active = HFTaskDTO(
             taskId: "t2", repoId: "mlx-community/model", status: "downloading",
             progress: 45.5, totalSize: 100, downloadedSize: 50,
-            speedBps: 512, error: "", createdAt: 1.0, startedAt: 1.0,
-            completedAt: 0.0, retryCount: 0
+            speedBps: 512, etaSeconds: 125, error: "", createdAt: 1.0, startedAt: 1.0,
+            completedAt: 0.0, retryCount: 0, files: nil, ggufFiles: nil
         )
         XCTAssertEqual(active.speedText, "512 B/s")
+        XCTAssertEqual(active.etaText, "2m 5s")
     }
 }

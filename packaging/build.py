@@ -409,9 +409,9 @@ def _write_engine_commits(omlx_pkg_dir: Path):
 
     repo_urls = {
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
-        "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
+        "mlx-vlm": "https://github.com/Neywa-Labs/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
-        "mlx-audio": "https://github.com/Blaizzy/mlx-audio",
+        "mlx-audio": "https://github.com/Neywa-Labs/mlx-audio",
     }
 
     commits = {}
@@ -730,7 +730,7 @@ def build_venvstacks():
 
 
 # mlx-audio git commit — aligned with pyproject.toml [audio] extra
-_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78"
+_MLX_AUDIO_GIT = "git+https://github.com/Neywa-Labs/mlx-audio@8c244a1faff44cfa69e3151c195f52a4c1c90be5"
 
 
 def _install_mlx_audio(export_dir: Path):

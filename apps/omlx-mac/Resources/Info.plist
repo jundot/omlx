@@ -29,6 +29,10 @@
 	  runtime switch causes Tahoe ControlCenter to silently block the
 	  status item (see app.py:189-200 + issue #725 from the Python menubar).
 	-->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Ask AI uses the microphone so you can ask by voice.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Ask AI can answer with an oMLX server on another Mac on your network, such as a Mac Studio.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 oMLX. All rights reserved.</string>
 	<key>NSSupportsAutomaticTermination</key>
@@ -58,6 +62,7 @@
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>en</string>
+		<string>de</string>
 		<string>zh-Hans</string>
 		<string>zh-Hant</string>
 		<string>ja</string>

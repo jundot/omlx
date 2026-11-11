@@ -50,6 +50,8 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         batch_size: int | None = None,
         *,
         scheduler_config: Any | None = None,
+        audio_enabled: bool = False,
+        audio_max_seconds: float | None = None,
     ):
         """
         Initialize the embedding engine.
@@ -61,10 +63,17 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             batch_size: Explicit per-forward input chunk size override.
             scheduler_config: Shared scheduler configuration. Embedding uses
                 embedding_batch_size as its per-forward input chunk size.
+            audio_enabled: Load the model's audio tower so audio items are
+                accepted (per-model embedding_audio_enabled setting).
+            audio_max_seconds: Longest audio item read before the waveform is
+                cut (per-model embedding_audio_max_seconds; None = processor
+                default).
         """
         super().__init__()
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
+        self._audio_enabled = audio_enabled
+        self._audio_max_seconds = audio_max_seconds
         if batch_size is None:
             batch_size = (
                 getattr(scheduler_config, "embedding_batch_size", 32)
@@ -106,7 +115,10 @@ class EmbeddingEngine(BaseNonStreamingEngine):
 
         logger.info(f"Starting embedding engine: {self._model_name}")
         self._model = MLXEmbeddingModel(
-            self._model_name, trust_remote_code=self._trust_remote_code
+            self._model_name,
+            trust_remote_code=self._trust_remote_code,
+            audio_enabled=self._audio_enabled,
+            audio_max_seconds=self._audio_max_seconds,
         )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(get_mlx_executor(), self._model.load)

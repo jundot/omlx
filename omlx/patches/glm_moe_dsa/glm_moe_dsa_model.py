@@ -27,7 +27,7 @@ from .sparse_mla import (
 
 def _native_sparse_mla_default_min_k() -> str:
     """Match the MLX fork's default sparse MLA threshold when native is present."""
-    return "11264" if glm_fast.has("glm_dsa_sparse_mla_attention") else str(2**63 - 1)
+    return "11264" if glm_fast.has("sparse_mla_attention") else str(2**63 - 1)
 
 
 # Decode-sized multi-row forwards (MTP draft verify and head folds run

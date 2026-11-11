@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for accuracy evaluation modules."""
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
 
 from omlx.eval.base import BaseBenchmark
+from omlx.eval.cmmlu import CMMLUBenchmark
 from omlx.eval.datasets import deterministic_sample, stratified_sample
 from omlx.eval.gsm8k import GSM8KBenchmark, _extract_numeric_answer, _normalize_number
 from omlx.eval.hellaswag import HellaSwagBenchmark
-from omlx.eval.livecodebench import _extract_code
+from omlx.eval.jmmlu import JMMLUBenchmark
+from omlx.eval.kmmlu import KMMLUBenchmark
+from omlx.eval.livecodebench import LiveCodeBenchBenchmark, _extract_code
 from omlx.eval.mmlu import MMLUBenchmark, _parse_choices
 from omlx.eval.truthfulqa import TruthfulQABenchmark
 
@@ -151,6 +155,41 @@ class TestTruthfulQA:
         assert self.bench.check_answer("C", {"answer": 2}) is True
 
 
+# --- CMMLU / JMMLU / KMMLU Tests ---
+
+
+class TestCJKMultipleChoice:
+    @pytest.mark.parametrize(
+        ("bench_cls", "response", "expected"),
+        [
+            (CMMLUBenchmark, "答案是B", "B"),
+            (CMMLUBenchmark, "因此，正确答案是C。", "C"),
+            (CMMLUBenchmark, "根据题意，应选D", "D"),
+            (JMMLUBenchmark, "正解はBです。", "B"),
+            (JMMLUBenchmark, "答えはC", "C"),
+            (KMMLUBenchmark, "정답은 B입니다.", "B"),
+            (KMMLUBenchmark, "따라서 정답은 D입니다", "D"),
+        ],
+    )
+    def test_extract_answer_letter_against_cjk_text(
+        self, bench_cls, response, expected
+    ):
+        """A letter written straight against CJK text is still the answer."""
+        assert bench_cls().extract_answer(response, {}) == expected
+
+    @pytest.mark.parametrize(
+        ("response", "expected"),
+        [
+            ("答案：B。A选项错误", "B"),
+            ("B是正确的，A是错误的", "B"),
+            ("我不知道", ""),
+        ],
+    )
+    def test_extract_answer_earlier_steps_still_win(self, response, expected):
+        """A letter the existing steps find beats one that touches CJK text."""
+        assert CMMLUBenchmark().extract_answer(response, {}) == expected
+
+
 # --- GSM8K Tests ---
 
 
@@ -219,6 +258,12 @@ class TestGSM8K:
 # --- LiveCodeBench Tests ---
 
 
+@pytest.fixture(scope="module")
+def lcb_items():
+    bench = LiveCodeBenchBenchmark()
+    return {item["id"]: item for item in asyncio.run(bench.load_dataset())}
+
+
 class TestLiveCodeBench:
     def test_extract_code_python_block(self):
         response = "Here's my solution:\n```python\ndef solve():\n    print(42)\n```\nDone."
@@ -239,6 +284,30 @@ class TestLiveCodeBench:
     def test_extract_code_empty(self):
         code = _extract_code("")
         assert code == ""
+
+    def test_format_prompt_functional_shows_signature(self, lcb_items):
+        prompt = LiveCodeBenchBenchmark().format_prompt(lcb_items["2727"])[0]["content"]
+        assert "def countSeniors(self, details: List[str]) -> int:" in prompt
+        assert "Read input from stdin" not in prompt
+
+    def test_check_answer_functional_compares_return_value(self, lcb_items):
+        bench = LiveCodeBenchBenchmark()
+        item = lcb_items["2791"]
+        signature = (
+            "class Solution:\n"
+            "    def circularGameLosers(self, n: int, k: int) -> List[int]:\n"
+        )
+        gold = signature + (
+            "        seen = set()\n"
+            "        i, r = 0, 1\n"
+            "        while i not in seen:\n"
+            "            seen.add(i)\n"
+            "            i = (i + r * k) % n\n"
+            "            r += 1\n"
+            "        return [j + 1 for j in range(n) if j not in seen]\n"
+        )
+        assert bench.check_answer(gold, item) is True
+        assert bench.check_answer(signature + "        return []\n", item) is False
 
 
 # --- HumanEval Tests ---
@@ -305,6 +374,30 @@ class TestHumanEval:
         code = benchmark.extract_answer(visible, item)
 
         assert code == "def add(a, b):\n    return a + b"
+        assert benchmark.check_answer(code, item) is True
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            "return a + b",
+            "   return a + b",
+            "```python\n    return a + b\n```",
+            "total = a + b\n    return total",
+            "total = a + b\nreturn total",
+        ],
+    )
+    def test_body_only_answer_lands_in_the_function(self, response):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        benchmark = HumanEvalBenchmark()
+        item = {
+            "prompt": 'def add(a, b):\n    """Add two numbers."""\n',
+            "test": "def check(candidate):\n    assert candidate(1, 2) == 3",
+            "entry_point": "add",
+        }
+
+        code = benchmark.extract_answer(response, item)
+
         assert benchmark.check_answer(code, item) is True
 
 

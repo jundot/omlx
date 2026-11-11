@@ -3,9 +3,11 @@
 
 Covers the plain sorted gather, the gate/up variant with the SwiGLU in its
 epilogue (``sorted_gather_qmm_swiglu``, routed through
-``m5_gather_qmm.fused_gate_up_activation``) and its row-mapped form that
-reads token rows in place (``moe_routes.sort_routes``). Every variant must be
-bit-identical to the path it replaces and fall back to it when unsupported.
+``m5_gather_qmm.fused_gate_up_activation``), its row-mapped form that
+reads token rows in place (``moe_routes.sort_routes``) and the split gate/up
+form with MiniMax's scaled SwiGLU-OAI (``sorted_gather_qmm_swiglu_oai``).
+Every variant must be bit-identical to the path it replaces and fall back to
+it when unsupported.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import pytest
 
 import omlx.patches.m5_gather_qmm as patch_mod
 import omlx.patches.m5_gather_qmm_nax as nax
+from omlx.patches import mlx_vlm_minimax_m3_compat as minimax_compat
 from omlx.patches import moe_gate_up_fusion as fusion
 from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
 from omlx.patches.moe_routes import sort_routes
@@ -37,12 +40,6 @@ def _on_nax() -> bool:
 
 
 needs_nax = pytest.mark.skipif(not _on_nax(), reason="needs an M5 (NAX) GPU")
-
-
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX", raising=False)
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX_PLAN", raising=False)
 
 
 def _stock():
@@ -133,6 +130,8 @@ def test_supports_gating():
     assert nax.supports(x.astype(mx.float16), w4, s64.astype(mx.float16),
                         s64.astype(mx.float16), idx, 64, 4, "affine")
     assert nax.supports(x, w4, s32u8, None, idx, 32, 4, "mxfp4")
+    s16u8 = mx.zeros((E, N, K // 16), dtype=mx.uint8)
+    assert nax.supports(x, w4, s16u8, None, idx, 16, 4, "nvfp4")
     w8 = mx.zeros((E, N, K // 4), dtype=mx.uint32)
     assert nax.supports(x, w8, s64, s64, idx, 64, 8, "affine")
 
@@ -144,8 +143,7 @@ def test_supports_gating():
     w3 = mx.zeros((E, N, K * 3 // 32), dtype=mx.uint32)
     assert not nax.supports(x, w3, s64, s64, idx, 64, 3, "affine")
     assert not nax.supports(x, w4, s32u8, None, idx, 32, 4, "nvfp4")
-    s16 = mx.zeros((E, N, K // 16), dtype=mx.uint8)
-    assert not nax.supports(x, w4, s16, None, idx, 16, 4, "mxfp4")
+    assert not nax.supports(x, w4, s16u8, None, idx, 16, 4, "mxfp4")
     # Layout: 2-D rows, rows per index != 1, int32 indices, too few rows.
     assert not nax.supports(x.reshape(M, K), w4, s64, s64, idx, 64, 4, "affine")
     x2 = mx.zeros((M // 2, 2, K), dtype=mx.bfloat16)
@@ -161,16 +159,6 @@ def test_supports_gating():
     w100 = mx.zeros((E, 100, K // 8), dtype=mx.uint32)
     s100 = mx.zeros((E, 100, K // 64), dtype=mx.bfloat16)
     assert not nax.supports(x, w100, s100, s100, idx, 64, 4, "affine")
-
-
-def test_kill_switch(monkeypatch):
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
-    x = mx.zeros((16, 1, 128), dtype=mx.bfloat16)
-    w = mx.zeros((4, 64, 16), dtype=mx.uint32)
-    s = mx.zeros((4, 64, 2), dtype=mx.bfloat16)
-    idx = mx.zeros((16,), dtype=mx.uint32)
-    assert not nax.enabled()
-    assert nax.sorted_gather_qmm(x, w, s, s, idx, group_size=64, bits=4) is None
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +178,7 @@ _ALIGNED = [
     ("affine", 4, 64, mx.float16),
     ("mxfp4", 4, 32, mx.bfloat16),
     ("mxfp4", 4, 32, mx.float16),
+    ("nvfp4", 4, 16, mx.bfloat16),
 ]
 
 
@@ -217,13 +206,9 @@ def _plan_id(plan):
 
 @pytest.fixture(params=_PLANS, ids=_plan_id)
 def forced_plan(request, monkeypatch):
-    """Run a test with every configuration pinned through the env override."""
+    """Run a test with every configuration pinned in place of ``_plan``."""
     plan = request.param
-    sched = "seg" if plan.sched == SEG else "db"
-    monkeypatch.setenv(
-        "OMLX_M5_GATHER_QMM_NAX_PLAN",
-        f"{sched},{plan.bm},{plan.bk},{plan.gx},{plan.pad}",
-    )
+    monkeypatch.setattr(nax, "_plan", lambda *a, **k: plan)
     return plan
 
 
@@ -246,7 +231,7 @@ def test_bit_identical_to_stock_sorted_kernel(mode, bits, gs, dtype, plan, K):
 
 
 @needs_nax
-@pytest.mark.parametrize("mode,gs", [("affine", 64), ("mxfp4", 32)])
+@pytest.mark.parametrize("mode,gs", [("affine", 64), ("mxfp4", 32), ("nvfp4", 16)])
 @pytest.mark.parametrize("skew", [0.0, 1.2])
 def test_routed_rows_match_stock(mode, gs, skew):
     """SwitchGLU routing (uniform and skewed, empty experts) at MoE shapes."""
@@ -430,12 +415,11 @@ def test_tile_scan_bounded_on_unsorted_indices():
 
 
 @pytest.fixture
-def installed(monkeypatch):
+def installed():
     """The m5 reroute wrapper on mx.gather_qmm (restored afterwards)."""
     was_installed = getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
     raw = patch_mod._original_gather_qmm if was_installed else mx.gather_qmm
     mx.gather_qmm = raw
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_FIX", raising=False)
     assert apply_m5_gather_qmm_workaround()
     yield raw
     mx.gather_qmm = raw
@@ -489,24 +473,6 @@ def test_wrapper_routes_sorted_calls_to_nax(installed, monkeypatch):
 
 
 @needs_nax
-def test_wrapper_kill_switch_keeps_stock_path(installed, monkeypatch):
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
-    seen = []
-    monkeypatch.setattr(
-        nax, "_launch", lambda *a, **k: seen.append(1) or None
-    )
-    E, N, K = 8, 128, 128
-    wq, scales, biases, _ = _quantized(E, N, K, "affine", 4, 64, mx.bfloat16)
-    x, idx = _rows((20, 0, 50, 7, 64, 1, 30, 9), K, mx.bfloat16)
-    out = mx.gather_qmm(
-        x, wq, scales, biases, rhs_indices=idx, group_size=64, bits=4, sorted_indices=True
-    )
-    ref = _stock_sorted(x, wq, scales, biases, idx, "affine", 4, 64)
-    assert not seen
-    assert mx.array_equal(out, ref).item()
-
-
-@needs_nax
 def test_failed_self_test_falls_back(installed, monkeypatch):
     monkeypatch.setattr(nax, "_verified", {})
     monkeypatch.setattr(nax, "_self_test", lambda key: False)
@@ -532,6 +498,7 @@ def test_self_test_passes_for_supported_instantiations(plan):
         (mx.float16, "affine", 8, 64, False, True),
         (mx.bfloat16, "mxfp4", 4, 32, True, True),
         (mx.bfloat16, "mxfp4", 4, 32, False, False),
+        (mx.bfloat16, "nvfp4", 4, 16, True, True),
     ]:
         if plan.sched == DB and not (key[4] and key[5]):
             continue  # db runs aligned shapes only (seg covers the rest)
@@ -549,6 +516,7 @@ _EPI_FORMATS = [
     ("mxfp4", 4, 32, mx.bfloat16),  # MiMo-V2.6
     ("affine", 4, 32, mx.bfloat16),
     ("affine", 8, 64, mx.float16),
+    ("nvfp4", 4, 16, mx.bfloat16),
 ]
 # Every pinned plan on the main format, the other formats on the automatic
 # plan. Each runtime instantiation also runs its own canary.
@@ -756,9 +724,21 @@ def test_reference_activation_matches_the_model_activations():
             nax.reference_activation(x_up, x_gate, limit),
             f"limit={limit}",
         )
+    minimax_compat.apply_mlx_vlm_minimax_m3_compat_patch()
+    minimax = importlib.import_module("mlx_vlm.models.minimax_m3_vl.language")
+    up_scale, gate_scale = mx.random.uniform(
+        0.5, 2.0, (2, 3000, 1, 1), key=mx.random.key(4)
+    )
+    for consts in _OAI:
+        args = (x_up, x_gate, up_scale, gate_scale, *consts)
+        _assert_bitwise(
+            minimax._scaled_swiglu_oai(*args),
+            nax._ref_scaled_swiglu_oai(*args),
+            f"oai={consts}",
+        )
 
 
-def test_epilogue_unsupported_calls_return_none(monkeypatch):
+def test_epilogue_unsupported_calls_return_none():
     E, K, M = 4, 128, 64
     x = mx.zeros((M, 1, K), dtype=mx.bfloat16)
     idx = mx.zeros((M,), dtype=mx.uint32)
@@ -778,8 +758,6 @@ def test_epilogue_unsupported_calls_return_none(monkeypatch):
     assert call(64, limit=float("inf")) is None
     assert call(64, limit=float("nan")) is None
     assert call(64, x=x.astype(mx.float32)) is None
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
-    assert call(64) is None
 
 
 @needs_nax
@@ -845,7 +823,7 @@ def _dsa_gate_up(mode="affine", gs=64, E=16, n=64, K=128, bias=False):
 
 
 @needs_nax
-def test_fused_gate_up_activation_routing(installed, epilogue_calls, monkeypatch):
+def test_fused_gate_up_activation_routing(installed, epilogue_calls):
     from omlx.patches.glm_moe_dsa.switch_layers import SwiGLU
 
     proj = _dsa_gate_up()
@@ -863,9 +841,6 @@ def test_fused_gate_up_activation_routing(installed, epilogue_calls, monkeypatch
     assert patch_mod.fused_gate_up_activation(proj, few_x, few_idx, act) is None
     biased = _dsa_gate_up(bias=True)
     assert patch_mod.fused_gate_up_activation(biased, x, idx, act) is None
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
-    assert patch_mod.fused_gate_up_activation(proj, x, idx, act) is None
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX")
     mx.gather_qmm = installed
     assert patch_mod.fused_gate_up_activation(proj, x, idx, act) is None
     assert epilogue_calls == [True]
@@ -939,22 +914,23 @@ def test_row_map_of_routed_tokens(mode, gs, limit, tokens, top_k, E):
     _assert_bitwise(got, ref)
 
 
-def test_sort_routes_matches_mlx_lm_gather_sort():
+@pytest.mark.parametrize("tokens", [50, 400])  # 600 and 4800 routes
+def test_sort_routes_matches_mlx_lm_gather_sort(tokens):
     from mlx_lm.models.switch_layers import _gather_sort
 
-    h = mx.random.normal((2, 50, 1, 1, 32)).astype(mx.bfloat16)
+    h = mx.random.normal((2, tokens, 1, 1, 32)).astype(mx.bfloat16)
     inds = mx.argpartition(
-        -mx.random.uniform(shape=(2, 50, 16)), kth=5, axis=-1
+        -mx.random.uniform(shape=(2, tokens, 16)), kth=5, axis=-1
     )[..., :6]
     x_tok, row_map, idx, inv = sort_routes(h, inds)
     x_ref, idx_ref, inv_ref = _gather_sort(h, inds)
-    assert x_tok.shape == (100, 1, 32) and row_map.dtype == mx.uint32
+    assert x_tok.shape == (2 * tokens, 1, 32) and row_map.dtype == mx.uint32
     _assert_bitwise(x_tok[row_map], x_ref)
     assert mx.array_equal(idx, idx_ref).item()
     assert mx.array_equal(inv, inv_ref).item()
 
 
-def test_row_map_unsupported_calls_return_none(monkeypatch):
+def test_row_map_unsupported_calls_return_none():
     E, K, n, T = 4, 128, 64, 40
     idx = mx.zeros((64,), dtype=mx.uint32)
     x_tok = mx.zeros((T, 1, K), dtype=mx.bfloat16)
@@ -973,8 +949,6 @@ def test_row_map_unsupported_calls_return_none(monkeypatch):
     assert call(rmap, x=x_tok.reshape(T, K)) is None  # token rows [T, 1, K]
     assert not nax.supports(x_tok, w, s, s, idx, 64, 4, "affine")  # no map
     assert nax.supports(x_tok, w, s, s, idx, 64, 4, "affine", rmap)
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
-    assert call(rmap) is None
 
 
 def _dsa_problem(tokens=96, E=16, n=64, K=128, top_k=8):
@@ -1036,6 +1010,87 @@ def test_fused_gate_up_activation_reads_token_rows(installed, launches, monkeypa
     assert launches == [True, False, False, False]
     _assert_bitwise(off, ref)
     _assert_bitwise(bad, ref)
+
+
+# ---------------------------------------------------------------------------
+# Split gate/up with the scaled SwiGLU-OAI (sorted_gather_qmm_swiglu_oai)
+# ---------------------------------------------------------------------------
+
+# MiniMax M3.1's constants, and a clip bound that is not a bf16 value.
+_OAI = [(1.702, 7.0, 1.0), (1.3, 7.3, 0.5)]
+
+
+def _oai_problem(mode, gs, K, n=128):
+    """Separate gate and up FP4 operands with per-expert scales, wide rows."""
+    E = len(_COUNTS)
+    gate = _quantized(E, n, K, mode, 4, gs, mx.bfloat16, seed=3)[:2]
+    up = _quantized(E, n, K, mode, 4, gs, mx.bfloat16, seed=4)[:2]
+    scales = tuple(mx.random.uniform(0.5, 2.0, (2, E), key=mx.random.key(6)))
+    x, idx = _wide_rows(_COUNTS, K, mx.bfloat16)
+    return gate, up, scales, x, idx
+
+
+def _oai_unfused(x, gate, up, scales, idx, mode, gs, consts, plan=None):
+    kw = dict(group_size=gs, bits=4, mode=mode, plan=plan)
+    x_gate = nax.sorted_gather_qmm(x, *gate, None, idx, **kw)
+    x_up = nax.sorted_gather_qmm(x, *up, None, idx, **kw)
+    gate_scale, up_scale = (s[idx][:, None, None] for s in scales)
+    return nax._ref_scaled_swiglu_oai(x_up, x_gate, up_scale, gate_scale, *consts)
+
+
+def _oai_fused(x, gate, up, scales, idx, mode, gs, consts, plan=None, row_map=None):
+    alpha, limit, beta = consts
+    return nax.sorted_gather_qmm_swiglu_oai(
+        x, gate, up, idx, group_size=gs, bits=4, mode=mode, alpha=alpha,
+        limit=limit, beta=beta, expert_scales=scales, plan=plan, row_map=row_map,
+    )
+
+
+@needs_nax
+@pytest.mark.parametrize("mode,gs", [("nvfp4", 16), ("mxfp4", 32)])
+@pytest.mark.parametrize(
+    "plan", [None] + _PLANS, ids=lambda p: _plan_id(p) if p else "auto"
+)
+def test_split_swiglu_oai_bit_identical_to_unfused(mode, gs, plan):
+    """Aligned K, a 64-deep tail after 128-deep steps and a ragged K, read
+    from the sorted rows and through a row map."""
+    for K in (256, 320, 96):
+        gate, up, scales, x, idx = _oai_problem(mode, gs, K)
+        M = int(idx.shape[0])
+        T = M // 3 + 1
+        x_tok, row_map = _token_rows(T, K, mx.bfloat16), _row_map(M, T)
+        for consts in _OAI:
+            args = (gate, up, scales, idx, mode, gs, consts, plan)
+            got = _oai_fused(x, *args)
+            assert got is not None and got.shape == (M, 1, 128)
+            _assert_bitwise(got, _oai_unfused(x, *args), f"K={K} {consts}")
+            mapped = _oai_fused(x_tok, *args, row_map=row_map)
+            assert mapped is not None
+            _assert_bitwise(
+                mapped, _oai_unfused(x_tok[row_map], *args), f"K={K} {consts} map"
+            )
+
+
+def test_split_swiglu_oai_unsupported_calls_return_none():
+    E, K, M, n = 4, 128, 64, 64
+    x = mx.zeros((M, 1, K), dtype=mx.bfloat16)
+    idx = mx.zeros((M,), dtype=mx.uint32)
+    ones = mx.ones((E,))
+
+    def call(mode="nvfp4", gs=16, n_up=n, scales=(ones, ones)):
+        def operand(rows):
+            w = mx.zeros((E, rows, K // 8), dtype=mx.uint32)
+            return w, mx.zeros((E, rows, K // gs), dtype=mx.uint8)
+
+        return nax.sorted_gather_qmm_swiglu_oai(
+            x, operand(n), operand(n_up), idx, group_size=gs, bits=4, mode=mode,
+            alpha=1.702, limit=7.0, beta=1.0, expert_scales=scales, verify=False,
+        )
+
+    # Affine operands, mismatched gate and up, a scale per row.
+    assert call(mode="affine", gs=64) is None
+    assert call(n_up=2 * n) is None
+    assert call(scales=(ones, mx.ones((M,)))) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1319,7 +1374,6 @@ def qwen_regroup(monkeypatch):
 
     import omlx.patches.qwen35_moe_gate_up as gate_up
 
-    monkeypatch.delenv("OMLX_QWEN35_MOE_GATE_UP", raising=False)
     verifier = Qwen3_5BatchInvariantForward
     monkeypatch.setattr(verifier, "_switch_glu", verifier._switch_glu)
     saved = {cls: cls.__dict__.get("__call__") for cls in (SwitchGLU, VLMSwitchGLU)}
@@ -1346,11 +1400,11 @@ def _regrouped(gate_up_mod, glu):
 
 
 def _qwen_weighted_sum_kernel():
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
-    if not fast.has_symbol("qwen35_moe_weighted_sum"):
-        pytest.skip("qwen35_moe_weighted_sum native kernel unavailable")
-    return fast.qwen35_moe_weighted_sum
+    if not fast.has_symbol("moe_weighted_sum"):
+        pytest.skip("moe_weighted_sum native kernel unavailable")
+    return fast.moe_weighted_sum
 
 
 @needs_nax

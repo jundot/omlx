@@ -359,7 +359,9 @@ class TestEndToEndMtpRounds:
 def _make_route_request():
     return SimpleNamespace(
         request_id="req-budget",
-        sampling_params=SimpleNamespace(max_tokens=64, stop_token_ids=None),
+        sampling_params=SimpleNamespace(
+            max_tokens=64, stop_token_ids=None, logprobs=False
+        ),
         rope_deltas=0.0,
         prompt_token_ids=list(PROMPT),
     )

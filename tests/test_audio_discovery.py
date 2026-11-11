@@ -117,6 +117,14 @@ class TestDetectAudioModelType:
         })
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_mimo_llm_model_type_returns_llm(self, tmp_path):
+        """MiMo-7B LLMs share model_type "mimo" with an mlx-audio ASR remap key."""
+        _write_config(tmp_path, {
+            "model_type": "mimo",
+            "architectures": ["MiMoForCausalLM"],
+        })
+        assert detect_model_type(tmp_path) == "llm"
+
     def test_whisper_model_type_returns_audio_stt(self, tmp_path):
         """model_type="whisper" without known STT architecture -> audio_stt."""
         _write_config(tmp_path, {
@@ -198,6 +206,25 @@ class TestDetectAudioModelType:
         """model_type='audiodit' (LongCat-AudioDiT) -> audio_tts."""
         _write_config(tmp_path, {"model_type": "audiodit"})
         assert detect_model_type(tmp_path) == "audio_tts"
+
+    def test_ming3_dense_architecture_returns_audio_tts(self, tmp_path):
+        """Ming-3.0-tts uses model_type 'dense', an LLM collision name."""
+        _write_config(tmp_path, {
+            "model_type": "dense",
+            "architectures": ["BailingMMNativeForConditionalGeneration"],
+            "llm_config": {"model_type": "qwen2"},
+            "ditar_config": {"patch_size": 1},
+        })
+        assert detect_model_type(tmp_path) == "audio_tts"
+
+    def test_ming_omni_with_vision_config_stays_vlm(self, tmp_path):
+        """Ming omni VLM checkpoints share the architecture name."""
+        _write_config(tmp_path, {
+            "model_type": "bailingmm",
+            "architectures": ["BailingMMNativeForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1024},
+        })
+        assert detect_model_type(tmp_path) == "vlm"
 
 
 # ---------------------------------------------------------------------------

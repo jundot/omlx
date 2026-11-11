@@ -377,7 +377,7 @@ def test_original_affine_expert_reads_repack_only_selected_experts(tmp_path):
         plan.close()
 
 
-def test_engram_and_expert_estimates_compose(tmp_path, monkeypatch):
+def test_engram_and_expert_estimates_compose(tmp_path):
     from test_engine_pool import _make_pool
 
     from omlx.engine_pool import EngineEntry
@@ -423,8 +423,6 @@ def test_engram_and_expert_estimates_compose(tmp_path, monkeypatch):
         )
         == expected
     )
-    monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
-    assert pool._entry_runtime_resident_size(entry, settings) == base.mmap_bytes
 
 
 def _synthetic_affine_experts(tmp_path, fraction, seed=412):
@@ -466,41 +464,60 @@ def _synthetic_affine_experts(tmp_path, fraction, seed=412):
     return reference, OffloadedExpert(Expert(config, True), plan, prefix), plan
 
 
-def _lru_reference(sequence, capacity):
-    """The serial residency policy: hits protect, misses evict the LRU expert."""
-    slot_of, free = {}, list(range(capacity))
-    for ids in sequence:
+def _eviction_reference(sequence, capacity, half_life):
+    """The serial residency policy: hits protect, a miss evicts the unprotected
+    resident expert with the lowest decayed use count (ties: least recent)."""
+    slot_of, free, uses, misses = {}, list(range(capacity)), {}, 0
+    for clock, ids in enumerate(sequence, start=1):
         needed = list(dict.fromkeys(ids))
+        for e in needed:
+            count, then = uses.get(e, (0.0, clock))
+            uses[e] = (count * 0.5 ** ((clock - then) / half_life) + 1.0, clock)
         for e in needed:
             if e in slot_of:
                 slot_of[e] = slot_of.pop(e)
         protected = set(needed)
         for e in needed:
             if e not in slot_of:
-                slot = (
-                    free.pop()
-                    if free
-                    else slot_of.pop(next(k for k in slot_of if k not in protected))
-                )
+                if free:
+                    slot = free.pop()
+                else:
+                    candidates = [k for k in slot_of if k not in protected]
+                    decayed = [
+                        uses[k][0] * 0.5 ** ((clock - uses[k][1]) / half_life)
+                        for k in candidates
+                    ]
+                    victim = candidates[decayed.index(min(decayed))]
+                    slot = slot_of.pop(victim)
                 slot_of[e] = slot
-    return list(slot_of.items())
+                misses += 1
+    return list(slot_of.items()), misses
 
 
 @pytest.mark.parametrize("inflight", [1, 1 << 30])
-def test_parallel_reads_install_in_serial_lru_order(tmp_path, monkeypatch, inflight):
+@pytest.mark.parametrize("in_place", [True, False])
+@pytest.mark.parametrize("half_life", [32, 1])
+def test_parallel_reads_install_in_serial_eviction_order(
+    tmp_path, monkeypatch, inflight, in_place, half_life
+):
     from omlx.patches.deepseek_v41 import moe_offload
 
     monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", inflight)
+    monkeypatch.setattr(moe_offload, "EVICTION_HALF_LIFE", half_life)
     _, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
     try:
         assert plan.capacity == 3
+        assert disk.slots._views is not None  # affine slabs are slot bytes
+        if not in_place:
+            disk.slots._views = None
         sequence = [[0, 1, 2], [3, 1], [4, 5, 5], [1, 4], [6, 7, 0], [2]]
         for ids in sequence:
             slots = disk.slots.ensure_ids(ids)
             assert slots == [disk.slots.slot_of[e] for e in ids]
-        assert list(disk.slots.slot_of.items()) == _lru_reference(sequence, 3)
+        expected, expected_misses = _eviction_reference(sequence, 3, half_life)
+        assert list(disk.slots.slot_of.items()) == expected
         misses = sum(len(dict.fromkeys(ids)) for ids in sequence) - disk.slots.hits
-        assert disk.slots.misses == misses == 11
+        assert disk.slots.misses == misses == expected_misses
         assert disk.slots.fetched_bytes == misses * plan.expert_bytes
         assert plan.expert_bytes * plan.count == plan.full_bytes
     finally:
@@ -510,11 +527,90 @@ def test_parallel_reads_install_in_serial_lru_order(tmp_path, monkeypatch, infli
         disk(mx.zeros((1, 1, 64), mx.bfloat16), mx.array([0]), sorted_indices=True)
 
 
+def test_in_place_reads_fall_back_when_slot_arrays_are_replaced(tmp_path):
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    try:
+        assert disk.slots._views is not None
+        lin = disk.slots.expert.w1
+        lin["weight"] = mx.array(lin["weight"])  # same values, a new array object
+        disk.slots.ensure_ids([0, 1])
+        assert disk.slots._views is None  # the copying path took over
+        x = mx.random.normal((1, 1, 1, 1, 64)).astype(mx.bfloat16)
+        idx = mx.array([[[0, 1]]])
+        w = mx.ones(idx.shape) / 2
+        want, got = reference(x, idx, w), disk(x, idx, w)
+        mx.eval(want, got)
+        np.testing.assert_allclose(
+            got.astype(mx.float32), want.astype(mx.float32), rtol=0.01, atol=0.002
+        )
+    finally:
+        plan.close()
+
+
+@pytest.mark.parametrize("field", ["weight", "scales"])
+def test_in_place_reads_detect_a_moved_buffer_under_the_same_array(tmp_path, field):
+    """``array[i] = v`` keeps the Python object but can move its buffer."""
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    try:
+        disk.slots.ensure_ids([0, 1, 2])
+        lin = disk.slots.expert.w3
+        owner = lin[field]
+        owner[0] = owner[0]  # same values, same object, possibly a new buffer
+        mx.eval(owner)
+        assert lin[field] is owner
+        disk.slots.ensure_ids([3, 4])  # misses: the in-place path re-checks first
+        x = mx.random.normal((1, 1, 1, 1, 64)).astype(mx.bfloat16)
+        for idx in ([[[3, 4]]], [[[0, 2]]]):
+            idx = mx.array(idx)
+            w = mx.ones(idx.shape) / 2
+            want, got = reference(x, idx, w), disk(x, idx, w)
+            mx.eval(want, got)
+            np.testing.assert_allclose(
+                got.astype(mx.float32), want.astype(mx.float32), rtol=0.01, atol=0.002
+            )
+    finally:
+        plan.close()
+
+
+def test_in_place_slot_bytes_match_the_checkpoint(tmp_path):
+    """Every installed slot holds exactly the expert's stored bytes, over many
+    evictions, and matches what the copying path installs."""
+    import random
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    (tmp_path / "copy").mkdir()
+    _, copy, copy_plan = _synthetic_affine_experts(tmp_path / "copy", 0.375)
+    copy.slots._views = None
+    rng = random.Random(7)
+    try:
+        checked = 0
+        for _ in range(60):
+            ids = rng.sample(range(plan.count), rng.randint(1, plan.capacity))
+            disk.slots.ensure_ids(ids)
+            copy.slots.ensure_ids(ids)
+            for e in ids:
+                for proj in ("w1", "w3", "w2"):
+                    for slab in plan.slabs(disk.slots.prefix, proj, e):
+                        field = slab.key.rsplit(".", 1)[1]
+                        stored = bytes(plan.read(slab))
+                        got = getattr(disk.slots.expert, proj)[field][disk.slots.slot_of[e]]
+                        ref = getattr(copy.slots.expert, proj)[field][copy.slots.slot_of[e]]
+                        assert np.array(got.view(mx.uint8)).tobytes() == stored
+                        assert np.array(ref.view(mx.uint8)).tobytes() == stored
+                        checked += 1
+        assert checked > 200
+        assert disk.slots._views is not None  # stayed on the in-place path
+    finally:
+        plan.close()
+        copy_plan.close()
+
+
 def test_failed_read_leaves_the_cache_intact(tmp_path, monkeypatch):
     from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
 
     _, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
     original = ExpertOffloadPlan.read
+    original_into = ExpertOffloadPlan.read_into
     broken = {"expert": None}
 
     def read(slab):
@@ -522,7 +618,13 @@ def test_failed_read_leaves_the_cache_intact(tmp_path, monkeypatch):
             raise OSError("simulated EIO")
         return original(slab)
 
+    def read_into(slab, dst):
+        if slab.expert == broken["expert"] and slab.key.endswith("w3.scales"):
+            raise OSError("simulated EIO")
+        return original_into(slab, dst)
+
     monkeypatch.setattr(ExpertOffloadPlan, "read", staticmethod(read))
+    monkeypatch.setattr(ExpertOffloadPlan, "read_into", staticmethod(read_into))
     try:
         assert disk.slots.ensure_ids([0, 1, 2]) == [2, 1, 0]
         broken["expert"] = 4
@@ -575,11 +677,35 @@ def test_sorted_routes_chunk_on_expert_boundaries(tmp_path, monkeypatch):
         # chunk, never a chunk cut inside an expert's run.
         assert calls == [4, 3, 5, 3]
         assert disk.slots.misses == 8 and disk.slots.hits == 0
+        # Read-ahead must not outlive the call that started it.
+        assert disk.slots._ahead == {}
         # A second sweep evicts the last resident pair before reaching it:
         # sorted routes over more experts than slots thrash by construction.
         disk(x, idx, weights, sorted_indices=True)
         assert disk.slots.misses == 16 and disk.slots.hits == 0
     finally:
+        plan.close()
+
+
+def test_read_ahead_folds_into_the_inflight_window(tmp_path, monkeypatch):
+    """Carried reads count against the same bound ``ensure_ids`` enforces."""
+    from omlx.patches.deepseek_v41 import moe_offload
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
+    window = 2
+    monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", window * plan.expert_bytes)
+    try:
+        assert disk.slots.read_ahead([0, 1, 2, 3, 4, 5, 6, 7]) == window
+        assert len(disk.slots._ahead) == window
+        # The read-ahead itself installs nothing.
+        assert disk.slots.misses == 0 and disk.slots.hits == 0
+        # The chunk that needs them consumes the carried reads instead of
+        # starting a second set.
+        assert len(disk.slots.ensure_ids([0, 1])) == 2
+        assert disk.slots.misses == 2
+        assert disk.slots._ahead == {}
+    finally:
+        disk.slots.release_read_ahead()
         plan.close()
 
 
@@ -645,6 +771,8 @@ def test_consumed_read_buffers_are_released_within_window(
     from omlx.patches.deepseek_v41 import moe_offload
 
     _, disk, plan = _synthetic_affine_experts(tmp_path, 1.0)
+    # The window bounds the copying path's host buffers; in-place reads have none.
+    disk.slots._views = None
     budget = window_experts * plan.expert_bytes
     monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", budget)
     refs, samples = [], []

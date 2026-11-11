@@ -266,3 +266,63 @@ def test_second_request_prefix_preparation_preserves_dspark_owner(
     primed = prompt_priming.take_primed(adapter, second_cache, mx.array([22]))
     assert primed is not None
     assert primed[1] == cached_tokens + 2
+
+
+def test_interleaved_prefills_keep_their_dspark_contexts():
+    from types import SimpleNamespace
+
+    from omlx.models.vlm import VLMModelAdapter
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    model = LanguageModel(mtp_config())
+    load_reference_weights(model)
+    model.configure_mtp(True, 3)
+    adapter = VLMModelAdapter(
+        SimpleNamespace(
+            config=SimpleNamespace(model_type="deepseek_v41"), language_model=model
+        )
+    )
+    caches = {name: model.make_cache() for name in "abc"}
+
+    def insert(name, uid, tokens):
+        # After insertion the first decode step feeds the final prompt token;
+        # a prompt inserted whole is prefilled by the generator.
+        prompt_priming.bind_uid(adapter, name, uid)
+        cache = caches[name]
+        scope = (
+            prompt_priming.decode_scope(adapter, [uid])
+            if len(tokens) == 1
+            else prompt_priming.prefill_scope(adapter, [uid], [tokens], cache)
+        )
+        with scope:
+            model(mx.array([tokens]), cache=cache)
+
+    def activate(name, uid, token):
+        cache = caches[name]
+        model(mx.array([[token]]), cache=cache, return_hidden=True)
+        primed = prompt_priming.take_primed(adapter, cache, mx.array([token]), uid=uid)
+        return None if primed is None else primed[1]
+
+    for name in "abc":
+        prompt_priming.prepare_prefix_context(
+            adapter,
+            request_id=name,
+            prompt_tokens=[1, 2, 3, 4],
+            cached_tokens=0,
+            prefix_cache=None,
+        )
+    # Scheduler chunks activate their request; insertion and activation of one
+    # request happen after the other request has prefilled.
+    for name, chunk in (("a", [3, 4]), ("b", [7, 8, 9]), ("a", [5])):
+        prompt_priming.activate_request(adapter, name)
+        model(mx.array([chunk]), cache=caches[name])
+    insert("a", 0, [6])
+    insert("b", 1, [10])
+    # A short prompt is prefilled by the generator alone.
+    insert("c", 2, [3, 4])
+    assert [activate("a", 0, 11), activate("b", 1, 12), activate("c", 2, 5)] == [
+        4,
+        4,
+        2,
+    ]
+

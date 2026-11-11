@@ -45,8 +45,8 @@ def test_full_attention_fallback_matches_upstream_qwen3():
     assert np.array_equal(np.array(actual), np.array(expected))
 
 
-def test_sliding_config_builds_both_attention_masks(monkeypatch):
-    """The patch must retain layer order and build the configured SWA mask."""
+def test_sliding_layers_run_chunked_and_match_the_window_mask(monkeypatch):
+    """Sliding layers must skip the full window mask and keep its output."""
     calls = []
     create_attention_mask = qwen3_model.create_attention_mask
 
@@ -58,16 +58,23 @@ def test_sliding_config_builds_both_attention_masks(monkeypatch):
     args = _model_args(
         qwen3_model.ModelArgs,
         layer_types=["sliding_attention", "full_attention"],
-        sliding_window=2,
+        sliding_window=3,
     )
     model = qwen3_model.Qwen3Model(args)
+    mx.eval(model.parameters())
+    inputs = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
 
-    output = model(mx.array([[1, 2, 3, 4]]))
-    mx.eval(output)
+    actual = model(inputs)
+    h = model.embed_tokens(inputs)
+    window_mask = create_attention_mask(h, None, window_size=3)
+    for is_sliding, layer in zip(model.is_sliding, model.layers):
+        h = layer(h, mask=window_mask if is_sliding else "causal")
+    expected = model.norm(h)
+    mx.eval(actual, expected)
 
     assert model.is_sliding == [True, False]
-    assert calls == [None, 2]
-    assert output.shape == (1, 4, 8)
+    assert calls == [None]
+    assert np.allclose(np.array(actual), np.array(expected), atol=1e-5)
 
 
 def test_patch_install_is_idempotent_and_updates_live_module(monkeypatch):

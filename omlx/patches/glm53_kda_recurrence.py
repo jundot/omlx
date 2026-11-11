@@ -35,14 +35,11 @@ kernels, so they are bit-identical to each other.
   without NAX (per-core measured ~1.5x slower on an 80-core M3 Ultra), and
   the fallback when the GPU core count is unknown, a core would get more
   than 128 rows, or the dtype is not 16-bit.
-
-``OMLX_GLM53_KDA_RECURRENCE=blocked`` selects the blocked kernel.
 """
 
 from __future__ import annotations
 
 import functools
-import os
 import re
 import subprocess
 from typing import NamedTuple, Optional, Tuple
@@ -752,10 +749,7 @@ def kda_recurrence(
     return out
 
 
-_PERCORE_DEFAULT = (
-    os.environ.get("OMLX_GLM53_KDA_RECURRENCE", "percore") != "blocked"
-    and is_nax_available()
-)
+_PERCORE_DEFAULT = is_nax_available()
 if _PERCORE_DEFAULT:
     # Resolve the core count (~20 ms ioreg call) at import, i.e. at model
     # load, rather than inside the first prefill.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Batch-one Qwen4 QSA decode gather regression tests."""
+"""Qwen4 QSA decode gather regression tests, batch-one and batched."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.memory_monitor import qwen4_gathered_min_query_tokens
+from omlx import memory_monitor
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -25,7 +25,7 @@ def _vendored_qwen4(monkeypatch):
     monkeypatch.setattr(qsa_fast, "_DECODE_SELECT_FAILED", {})
 
 
-def _tiny_text_config():
+def _tiny_text_config(budget=8, ratio=2, max_positions=128):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp import TextConfig
 
@@ -46,7 +46,7 @@ def _tiny_text_config():
         rms_norm_eps=1e-6,
         vocab_size=64,
         num_key_value_heads=2,
-        max_position_embeddings=128,
+        max_position_embeddings=max_positions,
         hc_count=2,
         hc_lowrank=8,
         head_dim=8,
@@ -62,8 +62,8 @@ def _tiny_text_config():
         indexer_n_heads=2,
         indexer_kv_heads=1,
         indexer_head_dim=8,
-        indexer_budget=8,
-        indexer_compress_ratio=2,
+        indexer_budget=budget,
+        indexer_compress_ratio=ratio,
         eos_token_id=1,
         rope_parameters={
             "rope_type": "default",
@@ -75,7 +75,7 @@ def _tiny_text_config():
 
 
 def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    monkeypatch.setattr(memory_monitor, "_QWEN4_GATHERED_MIN_QUERY_TOKENS", 2)
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
@@ -129,7 +129,7 @@ def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
 
 def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
     # The fixture prefill is 10 rows; lower the gathered width gate for it.
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    monkeypatch.setattr(memory_monitor, "_QWEN4_GATHERED_MIN_QUERY_TOKENS", 2)
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language
 
@@ -381,7 +381,7 @@ def test_qwen4_decode_sdpa_fails_closed_when_native_shape_is_rejected(monkeypatc
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
 
-    from omlx.custom_kernels.decode_fast import fast
+    from omlx.custom_kernels.attention import fast
 
     q = mx.random.normal((1, 4, 1, 8))
     k = mx.random.normal((1, 2, 9, 8))
@@ -408,7 +408,7 @@ def test_qwen4_decode_sdpa_uses_native_only_after_capability_accepts(monkeypatch
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
 
-    from omlx.custom_kernels.decode_fast import fast
+    from omlx.custom_kernels.attention import fast
 
     q = mx.random.normal((1, 24, 1, 256)).astype(mx.bfloat16)
     k = mx.random.normal((1, 2, 2051, 256)).astype(mx.bfloat16)
@@ -656,29 +656,6 @@ def test_qwen4_verify_rows_survive_rollback_like_official(monkeypatch):
         assert mx.array_equal(fast_value, reference_value).item()
 
 
-def test_qwen4_verify_gather_kill_switch_keeps_official_path(monkeypatch):
-    import mlx_vlm.models.qwen4_exp.language as language
-
-    config, attention, fast_cache, _ = _layer_and_prefix()
-    calls = []
-    original = language.contiguous_causal_gathered_qsa
-    monkeypatch.setattr(
-        language,
-        "contiguous_causal_gathered_qsa",
-        lambda *a, **k: calls.append(1) or original(*a, **k),
-    )
-    monkeypatch.setattr(language, "_GATHERED_VERIFY_DISABLED", True)
-    mx.eval(
-        attention(
-            mx.random.normal((1, 4, config.hidden_size)),
-            mask="causal",
-            cache=fast_cache,
-            target_verify=True,
-        )
-    )
-    assert calls == []
-
-
 def test_qwen4_verify_gather_requires_rank_two_positions():
     config, attention, fast_cache, _ = _layer_and_prefix()
     rows = 4
@@ -707,8 +684,6 @@ def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
     narrow = mx.random.normal((1, 4, config.hidden_size))
     wide = mx.random.normal((1, 16, config.hidden_size))
 
-    monkeypatch.delenv("OMLX_QWEN4_GATHERED_MIN_QUERY", raising=False)
-    assert qwen4_gathered_min_query_tokens() == 16
     assert not attention._gathered_text_prefill_eligible(
         narrow, "causal", cache, None, None, False
     )
@@ -716,12 +691,42 @@ def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
         wide, "causal", cache, None, None, False
     )
 
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    monkeypatch.setattr(memory_monitor, "_QWEN4_GATHERED_MIN_QUERY_TOKENS", 2)
     assert attention._gathered_text_prefill_eligible(
         narrow, "causal", cache, None, None, False
     )
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "garbage")
-    assert qwen4_gathered_min_query_tokens() == 16
+
+
+def test_qwen4_decode_rows_never_read_back_rank_three_positions(monkeypatch):
+    """A one-row step never takes gathered prefill, so the host comparison of
+    its rank-three positions (a GPU sync per step) is never made."""
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    cache = _crossover_cache(config, attention)
+    checked = []
+
+    def broadcast_check(position_ids, length):
+        checked.append(length)
+        return True
+
+    monkeypatch.setattr(language, "_broadcast_text_mrope_position_ids", broadcast_check)
+    row = mx.random.normal((1, 1, config.hidden_size))
+    row_planes = mx.full((3, 1, 1), cache.offset, dtype=mx.int32)
+    assert not attention._gathered_text_prefill_eligible(
+        row, "causal", cache, row_planes, None, False
+    )
+    assert checked == []
+
+    wide = mx.random.normal((1, 16, config.hidden_size))
+    wide_planes = mx.broadcast_to(
+        (cache.offset + mx.arange(16, dtype=mx.int32))[None, None], (3, 1, 16)
+    )
+    assert attention._gathered_text_prefill_eligible(
+        wide, "causal", cache, wide_planes, None, False
+    )
+    assert checked == [16]
 
 
 def test_qwen4_trim_keeps_pooled_index_prefix_exact():
@@ -780,7 +785,7 @@ def test_qwen4_trim_then_decode_matches_official_after_partial_invalidation(
     """Verify -> rollback -> decode stays exact with the retained pooled prefix."""
     config = _tiny_text_config()
     language = _language()
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    monkeypatch.setattr(memory_monitor, "_QWEN4_GATHERED_MIN_QUERY_TOKENS", 2)
     attention = language.Qwen4ExpAttention(config)
     mx.eval(attention.parameters())
     fast_cache = _crossover_cache(config, attention, length=12, seed=61)
@@ -925,8 +930,11 @@ def _require_selection(result):
 @pytest.mark.parametrize(
     "key_len",
     [
-        2052,  # 513 blocks: one above the budget
+        2052,  # 513 blocks: one above the budget, 1 per thread
         2055,  # three-token tail
+        4096,  # 1024 blocks: largest bank held 1 per thread
+        4100,  # 1025 blocks: 2 per thread
+        8197,  # 2049 blocks, one-token tail: 4 per thread
         24003,  # 24K decode
         32768,  # 8192 blocks: largest bank held 8 per thread
         32773,  # 8193 blocks, one-token tail: 16 per thread
@@ -997,7 +1005,7 @@ def test_pipeline_limit_keeps_the_kernel_for_smaller_banks(monkeypatch):
     actual, scores = select(2055)
     assert actual is not None
     assert mx.array_equal(actual, _official_mask(scores, 2055)).item()
-    assert launches == [16, 8]
+    assert launches == [16, 1]
 
 
 def test_block_scores_round_like_maximum_sum_divide():
@@ -1125,8 +1133,7 @@ def test_decode_steps_match_the_ops_path_bit_for_bit(monkeypatch, key_len):
         mx.eval(fast, ops)
         assert mx.array_equal(fast.view(mx.uint16), ops.view(mx.uint16)).item(), step
     assert ran["mask"] == 6
-    if qsa_fast._gpu_class() == "d":
-        assert ran["sdpa"] == 6
+    assert ran["sdpa"] == (6 if qsa_fast._two_pass_blocks(12, key_len + 1) else 0)
     for fast_state, ops_state in zip(fast_cache.state, ops_cache.state):
         assert mx.array_equal(fast_state, ops_state).item()
     pooled = fast_cache._pooled_index_offset
@@ -1136,21 +1143,27 @@ def test_decode_steps_match_the_ops_path_bit_for_bit(monkeypatch, key_len):
     ).item()
 
 
-@pytest.mark.skipif(
-    qsa_fast._gpu_class() != "d",
-    reason="MLX's two-pass partition count is transcribed for 'd'-class GPUs only",
-)
 @pytest.mark.parametrize(
     "key_len",
     [
         2052,
-        16383,  # last 128-partition length
-        16384,  # first 512-partition length
-        65536,  # first 1024-partition length
+        8192,  # 's': MLX's own kernel through 8192 keys
+        8193,  # 's': first 256-partition length
+        16383,  # 'd': last 128-partition length
+        16384,  # 'd': first 512-partition length
+        32768,  # 's': last 256-partition length
+        32769,  # 's': first 512-partition length
+        65536,  # 'd': first 1024-partition length; 's': last 512
+        65537,  # 's': first 1024-partition length
     ],
 )
 @pytest.mark.parametrize("kind", ["qsa", "sparse_head", "all"])
 def test_masked_decode_sdpa_matches_mlx_bit_for_bit(key_len, kind):
+    if qsa_fast._two_pass_blocks(12, key_len) is None:
+        assert qsa_fast._gpu_class() != "d" and not (
+            qsa_fast._gpu_class() == "s" and key_len > 8192
+        )
+        pytest.skip("MLX's own kernel runs this length on this GPU class")
     rng = np.random.default_rng(key_len)
     capacity = key_len + 777
     # Cache-shaped views: a prefix of a larger buffer, as update_and_fetch returns.
@@ -1195,7 +1208,7 @@ def _official_gathered_tokens(head_scores: mx.array, key_len: int) -> mx.array:
     return tokens
 
 
-@pytest.mark.parametrize("key_len", [2052, 32770, 65539])
+@pytest.mark.parametrize("key_len", [2052, 4100, 8197, 32770, 65539])
 @pytest.mark.parametrize("kind", ["normal", "cutoff_ties", "specials"])
 def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
     blocks = key_len // RATIO
@@ -1213,3 +1226,484 @@ def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
     _require_selection(actual)
     assert actual.dtype == expected.dtype and actual.shape == expected.shape
     assert mx.array_equal(actual, expected).item()
+
+
+# Batched decode and verify. Every row keeps its completed-block bank across
+# steps (bit-identical to fresh per-row caches), and batched decode steps and
+# verify windows attend only each query's selected K/V (close to the dense
+# masked path, with identical cache state).
+
+
+class _BankPair:
+    """The same batch driven twice: banks on (fast) and off (reference)."""
+
+    def __init__(self, monkeypatch, language, attention, config, prefixes, seed):
+        self.monkeypatch = monkeypatch
+        self.language = language
+        self.attention = attention
+        self.config = config
+        mx.random.seed(seed)
+        self.fast = self._batch(prefixes)
+        self.reference = self._batch(prefixes, reuse=True)
+
+    def _batch(self, prefixes, reuse=False):
+        if not reuse:
+            self._inputs = [
+                mx.random.normal((1, n, self.config.hidden_size)) for n in prefixes
+            ]
+        rows = []
+        for prefix in self._inputs:
+            row = self.language.QSAKVCache()
+            mx.eval(self.attention(prefix, mask="causal", cache=row))
+            rows.append(row)
+        return self.language.BatchQSAKVCache.merge(rows)
+
+    def step(self, length=1, target_verify=False, positions="none"):
+        batch = self.fast.offset.shape[0]
+        x = mx.random.normal((batch, length, self.config.hidden_size))
+        outputs = []
+        for enabled, cache in ((True, self.fast), (False, self.reference)):
+            self.monkeypatch.setattr(self.language, "_BATCH_ROW_BANKS_ENABLED", enabled)
+            mask = self.language._create_qwen3_5_attention_mask(x, cache)
+            position_ids = None
+            if positions == "mrope":
+                position_ids = mx.broadcast_to(
+                    cache.offset[None, :, None] + mx.arange(length)[None, None],
+                    (3, batch, length),
+                )
+            out = self.attention(
+                x,
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                target_verify=target_verify,
+            )
+            mx.eval(out)
+            outputs.append(out)
+        assert mx.array_equal(outputs[0], outputs[1]).item()
+        self.assert_same_state()
+
+    def both(self, fn):
+        fn(self.fast)
+        fn(self.reference)
+        self.assert_same_state()
+
+    def assert_same_state(self):
+        fast, reference = self.fast, self.reference
+        assert fast.index_offset == reference.index_offset
+        assert fast._idx == reference._idx
+        assert fast.left_padding.tolist() == reference.left_padding.tolist()
+        assert fast.offset.tolist() == reference.offset.tolist()
+        for a, b in zip(fast.state[1:], reference.state[1:]):
+            assert mx.array_equal(a, b).item()
+        width = fast._idx
+        assert mx.array_equal(
+            fast.keys[..., :width, :], reference.keys[..., :width, :]
+        ).item()
+
+
+def _bank_setup(monkeypatch, prefixes=(12, 23, 5), seed=7, **config):
+    language = _language()
+    # The banks feed the dense masked path here; the gathered arm is tested below.
+    monkeypatch.setattr(language, "_GATHERED_BATCH_DISABLED", True, raising=False)
+    cfg = _tiny_text_config(**config)
+    attention = language.Qwen4ExpAttention(cfg)
+    mx.eval(attention.parameters())
+    return language, _BankPair(monkeypatch, language, attention, cfg, prefixes, seed)
+
+
+def _pooled_blocks(monkeypatch, language):
+    """Count the blocks pooled through the shared pooling helper."""
+
+    pooled = []
+    original = language.pool_completed_index_keys
+
+    def counting(*args, **kwargs):
+        out = original(*args, **kwargs)
+        pooled.append(int(out.shape[1]))
+        return out
+
+    monkeypatch.setattr(language, "pool_completed_index_keys", counting)
+    return pooled
+
+
+def _ragged_rollback(retained, window):
+    """What mlx_vlm's vector rollback does for per-row accepted counts."""
+
+    def apply(cache):
+        keep = max(retained)
+        if window - keep:
+            cache.trim(window - keep)
+        padding = [keep - value for value in retained]
+        if any(padding):
+            cache.prepare(right_padding=padding)
+            cache.finalize()
+
+    return apply
+
+
+def _assert_bank_kept(pair):
+    """The batch change kept the bank, with one entry per row."""
+
+    bank = pair.fast._pooled_bank
+    assert bank is not None
+    assert len(bank.blocks) == int(pair.fast.offset.shape[0])
+
+
+@pytest.mark.parametrize("positions", ["none", "mrope"])
+def test_batch_banks_match_fresh_row_caches_through_a_running_batch(
+    monkeypatch, positions
+):
+    language, pair = _bank_setup(monkeypatch)
+    for _ in range(3):
+        pair.step(positions=positions)
+    # A Lightning MTP verify window, then ragged acceptance.
+    pair.step(length=3, target_verify=True, positions=positions)
+    pair.both(_ragged_rollback([3, 1, 2], 3))
+    _assert_bank_kept(pair)
+    for _ in range(2):
+        pair.step(positions=positions)
+    pair.step(length=3, target_verify=True, positions=positions)
+    pair.both(_ragged_rollback([1, 2, 1], 3))
+    _assert_bank_kept(pair)
+    pair.step(positions=positions)
+    # Rows keep their banks through rollback, reorder, drop, join and trim.
+    pair.both(lambda cache: cache.filter(mx.array([2, 0, 1])))
+    _assert_bank_kept(pair)
+    pair.step(positions=positions)
+    pair.both(lambda cache: cache.filter(mx.array([1, 2, 0])))
+    pair.step(positions=positions)
+    # The longest row (the smallest left padding) leaves: the rest shift left.
+    pair.both(lambda cache: cache.filter(mx.array([0, 2])))
+    _assert_bank_kept(pair)
+    for _ in range(2):
+        pair.step(positions=positions)
+    # A new request joins.
+    joiner = _BankPair(monkeypatch, language, pair.attention, pair.config, (17,), 3)
+    pair.fast.extend(joiner.fast)
+    pair.reference.extend(joiner.reference)
+    pair.assert_same_state()
+    _assert_bank_kept(pair)
+    for _ in range(3):
+        pair.step(positions=positions)
+    # A plain trim, then different tokens in the trimmed columns.
+    pair.both(lambda cache: cache.trim(2))
+    _assert_bank_kept(pair)
+    for _ in range(2):
+        pair.step(positions=positions)
+    _assert_bank_kept(pair)
+
+
+def test_batch_banks_pool_only_new_blocks(monkeypatch):
+    language, pair = _bank_setup(monkeypatch, prefixes=(40, 57, 31))
+    pair.step()  # first step pools every row's history
+    pooled = _pooled_blocks(monkeypatch, language)
+    monkeypatch.setattr(language, "_BATCH_ROW_BANKS_ENABLED", True)
+    batch = 3
+    for _ in range(8):
+        x = mx.random.normal((batch, 1, pair.config.hidden_size))
+        mask = language._create_qwen3_5_attention_mask(x, pair.fast)
+        mx.eval(pair.attention(x, mask=mask, cache=pair.fast))
+    # Eight one-token steps complete at most four blocks per row (ratio 2).
+    assert pooled and sum(pooled) <= batch * 4
+    assert all(width <= 1 for width in pooled)
+
+
+def test_batch_bank_rollback_repools_the_block_it_cut(monkeypatch):
+    language, pair = _bank_setup(monkeypatch, prefixes=(21, 30))
+    pair.step()
+    pair.step(length=3, target_verify=True)
+    banks = list(pair.fast._pooled_bank.blocks)
+    pair.both(_ragged_rollback([1, 3], 3))
+    clamped = list(pair.fast._pooled_bank.blocks)
+    assert clamped[0] < banks[0] and clamped[1] == banks[1]
+    pair.step()
+
+
+def test_batch_bank_dropped_when_raw_bank_is_reassigned(monkeypatch):
+    language, pair = _bank_setup(monkeypatch)
+    pair.step()
+    assert pair.fast._pooled_bank is not None
+    pair.fast.state = pair.fast.state
+    assert pair.fast._pooled_bank is None
+    pair.reference.state = pair.reference.state
+    pair.step()
+
+
+def test_batch_bank_bytes_are_counted(monkeypatch):
+    language, pair = _bank_setup(monkeypatch)
+    before = pair.fast.nbytes
+    pair.step()
+    banks = pair.fast._pooled_bank.keys.nbytes
+    assert banks and pair.fast.nbytes >= before + banks
+
+
+def test_batch_banks_match_at_the_served_shape(monkeypatch):
+    """ratio 4 / top-k 512 as served: the native decode selection applies."""
+
+    language, pair = _bank_setup(
+        monkeypatch,
+        prefixes=(2100, 2600, 1900),
+        seed=5,
+        budget=2048,
+        ratio=4,
+        max_positions=8192,
+    )
+    for _ in range(3):
+        pair.step()
+    pair.step(length=4, target_verify=True)
+    pair.both(_ragged_rollback([2, 4, 1], 4))
+    for _ in range(2):
+        pair.step()
+
+
+def test_batch_banks_stay_exact_through_right_padded_prefill(monkeypatch):
+    """Batched prompt processing right-pads the shorter prompt: prepare()
+    runs before the chunks are appended and finalize() rolls the padding into
+    left padding after the last one. Blocks pooled over that padding must not
+    survive the roll."""
+
+    language, pair = _bank_setup(monkeypatch, prefixes=(4, 4))
+    lengths = (23, 9)
+    width = max(lengths)
+    prompts = [mx.random.normal((1, n, pair.config.hidden_size)) for n in lengths]
+    padded = mx.concatenate(
+        [mx.pad(p, [(0, 0), (0, width - p.shape[1]), (0, 0)]) for p in prompts]
+    )
+    caches = []
+    for enabled in (True, False):
+        monkeypatch.setattr(language, "_BATCH_ROW_BANKS_ENABLED", enabled)
+        cache = language.BatchQSAKVCache([0, 0])
+        cache.prepare(lengths=list(lengths), right_padding=[width - n for n in lengths])
+        for start in range(0, width, 6):
+            chunk = padded[:, start : start + 6]
+            mask = language._create_qwen3_5_attention_mask(chunk, cache)
+            mx.eval(pair.attention(chunk, mask=mask, cache=cache))
+        cache.finalize()
+        caches.append(cache)
+    pair.fast, pair.reference = caches
+    assert pair.fast._pooled_bank is not None
+    pair.assert_same_state()
+    for _ in range(4):
+        pair.step()
+    pair.step(length=3, target_verify=True)
+    pair.both(_ragged_rollback([2, 1], 3))
+    for _ in range(2):
+        pair.step()
+
+
+# budget 8 / ratio 2 -> sparse once a row holds more than 4 complete blocks
+# (>= 10 tokens). The 5-token row stays below the crossover.
+_GATHER_PREFIXES = (12, 23, 5)
+
+
+class _GatherPair:
+    """One attention layer and the same batch twice: gathered (fast) and the
+    dense masked path (reference)."""
+
+    def __init__(self, monkeypatch, prefixes=_GATHER_PREFIXES, seed=7, **config):
+        self.monkeypatch = monkeypatch
+        self.language = _language()
+        self.config = _tiny_text_config(**config)
+        self.attention = self.language.Qwen4ExpAttention(self.config)
+        mx.eval(self.attention.parameters())
+        mx.random.seed(seed)
+        self.inputs = [
+            mx.random.normal((1, n, self.config.hidden_size)) for n in prefixes
+        ]
+        self.fast = self.language.BatchQSAKVCache.merge(self.rows())
+        self.reference = self.language.BatchQSAKVCache.merge(self.rows())
+        self.calls = []
+        original = self.language.Qwen4ExpAttention._gathered_batch
+
+        def counted(attention, *args, **kwargs):
+            self.calls.append(args[0].shape[1])
+            return original(attention, *args, **kwargs)
+
+        monkeypatch.setattr(self.language.Qwen4ExpAttention, "_gathered_batch", counted)
+
+    def rows(self):
+        rows = []
+        for prefix in self.inputs:
+            row = self.language.QSAKVCache()
+            mx.eval(self.attention(prefix, mask="causal", cache=row))
+            rows.append(row)
+        return rows
+
+    def forward(self, cache, x, gathered, target_verify=False, positions="none"):
+        self.monkeypatch.setattr(
+            self.language, "_GATHERED_BATCH_DISABLED", not gathered
+        )
+        batch, length = x.shape[:2]
+        mask = self.language._create_qwen3_5_attention_mask(x, cache)
+        position_ids = None
+        if positions == "mrope":
+            position_ids = mx.broadcast_to(
+                cache.offset[None, :, None] + mx.arange(length)[None, None],
+                (3, batch, length),
+            )
+        out = self.attention(
+            x,
+            mask=mask,
+            cache=cache,
+            position_ids=position_ids,
+            target_verify=target_verify,
+        )
+        mx.eval(out)
+        return out
+
+    def step(self, length=1, target_verify=False, positions="none", tol=2e-5):
+        batch = self.fast.offset.shape[0]
+        x = mx.random.normal((batch, length, self.config.hidden_size))
+        before = len(self.calls)
+        actual = self.forward(self.fast, x, True, target_verify, positions)
+        assert len(self.calls) == before + 1, "the gathered batch arm did not run"
+        expected = self.forward(self.reference, x, False, target_verify, positions)
+        assert len(self.calls) == before + 1
+        assert (
+            actual.shape == expected.shape == (batch, length, self.config.hidden_size)
+        )
+        assert mx.allclose(actual, expected, rtol=tol, atol=tol).item()
+        self.assert_same_state()
+        return actual
+
+    def both(self, fn):
+        fn(self.fast)
+        fn(self.reference)
+        self.assert_same_state()
+
+    def assert_same_state(self):
+        fast, reference = self.fast, self.reference
+        assert fast._idx == reference._idx
+        assert fast.index_offset == reference.index_offset
+        assert fast.offset.tolist() == reference.offset.tolist()
+        assert fast.left_padding.tolist() == reference.left_padding.tolist()
+        for a, b in zip(fast.state[1:], reference.state[1:]):
+            assert mx.array_equal(a, b).item()
+        width = fast._idx
+        for a, b in ((fast.keys, reference.keys), (fast.values, reference.values)):
+            assert mx.array_equal(a[..., :width, :], b[..., :width, :]).item()
+
+
+@pytest.mark.parametrize("positions", ["none", "mrope"])
+def test_batch_gather_decode_verify_and_rollback_match_the_dense_path(
+    monkeypatch, positions
+):
+    pair = _GatherPair(monkeypatch)
+    for _ in range(3):
+        pair.step(positions=positions)
+    pair.step(length=3, target_verify=True, positions=positions)
+    pair.both(_ragged_rollback([3, 1, 2], 3))
+    for _ in range(2):
+        pair.step(positions=positions)
+    pair.step(length=4, target_verify=True, positions=positions)
+    pair.both(_ragged_rollback([1, 4, 2], 4))
+    pair.both(lambda cache: cache.filter(mx.array([1, 2])))
+    for _ in range(2):
+        pair.step(positions=positions)
+    assert pair.fast._omlx_last_prefill_gathered is True
+
+
+@pytest.mark.parametrize("length", [1, 3])
+def test_batch_gather_reads_at_most_budget_plus_tail_keys(monkeypatch, length):
+    pair = _GatherPair(monkeypatch)
+    widths = []
+    original = mx.fast.scaled_dot_product_attention
+
+    def tracked(queries, keys, values, **kwargs):
+        widths.append(int(keys.shape[2]))
+        return original(queries, keys, values, **kwargs)
+
+    for _ in range(2):
+        pair.step()
+    batch = len(_GATHER_PREFIXES)
+    x = mx.random.normal((batch, length, pair.config.hidden_size))
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", tracked)
+    pair.forward(pair.fast, x, True, target_verify=length > 1)
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", original)
+    # budget 8 + tail 1, never the padded width (> 25 here).
+    assert widths and max(widths) <= 8 + 1
+
+
+def test_batch_gather_row_does_not_depend_on_its_batch_mates(monkeypatch):
+    pair = _GatherPair(monkeypatch, seed=5)
+    singles = pair.rows()
+    x = mx.random.normal((len(_GATHER_PREFIXES), 1, pair.config.hidden_size))
+    batched = pair.forward(pair.fast, x, True)
+    for i, single in enumerate(singles):
+        alone = pair.attention(x[i : i + 1], cache=single)
+        assert mx.allclose(batched[i : i + 1], alone, rtol=2e-5, atol=2e-5).item()
+
+
+def test_batch_gather_served_shape_matches_the_dense_path(monkeypatch):
+    """ratio 4 / top-k 512 as served: the native selection and decode kernels."""
+
+    pair = _GatherPair(
+        monkeypatch,
+        prefixes=(2100, 2600, 1900),
+        seed=5,
+        budget=2048,
+        ratio=4,
+        max_positions=8192,
+    )
+    for _ in range(3):
+        pair.step(tol=5e-5)
+    pair.step(length=4, target_verify=True, tol=5e-5)
+    pair.both(_ragged_rollback([2, 4, 1], 4))
+    for _ in range(2):
+        pair.step(tol=5e-5)
+
+
+def test_batch_gather_eligibility_fails_closed(monkeypatch):
+    pair = _GatherPair(monkeypatch)
+    language, attention, cache = pair.language, pair.attention, pair.fast
+    monkeypatch.setattr(language, "_GATHERED_BATCH_DISABLED", False)
+    batch = len(_GATHER_PREFIXES)
+    decode = mx.zeros((batch, 1, pair.config.hidden_size))
+    marker = language._create_qwen3_5_attention_mask(decode, cache)
+
+    def paddings(
+        x=decode, mask=marker, c=cache, positions=None, embeddings=None, verify=False
+    ):
+        return attention._gathered_batch_paddings(
+            x, mask, c, positions, embeddings, verify
+        )
+
+    assert paddings() == cache.left_padding.tolist()
+    # Narrow non-verify windows stay dense, exactly as for a batch-one row.
+    narrow = mx.zeros((batch, 3, pair.config.hidden_size))
+    assert paddings(x=narrow, mask=None) is None
+    window_mask = language._create_qwen3_5_attention_mask(narrow, cache)
+    assert paddings(x=narrow, mask=window_mask, verify=True)
+    assert paddings(verify=True) is None
+    # A caller-supplied mask of another shape (or an additive one) keeps its
+    # meaning on the dense path; so do multimodal embeddings.
+    assert paddings(x=narrow, mask=window_mask[..., 1:], verify=True) is None
+    assert paddings(x=narrow, mask=window_mask.astype(mx.float16), verify=True) is None
+    assert paddings(mask=mx.ones((batch, 1, 1, cache._idx + 1), dtype=mx.bool_)) is None
+    assert paddings(embeddings=(mx.zeros((1,)), mx.zeros((1,)))) is None
+    # Prefill-width windows keep the dense path.
+    wide = mx.zeros(
+        (batch, language._GATHERED_BATCH_MAX_QUERY + 1, pair.config.hidden_size)
+    )
+    assert paddings(x=wide, mask=None, verify=True) is None
+    # Row-exact verify keeps its own arms.
+    monkeypatch.setattr(language, "_row_exact_verify_armed", lambda: True)
+    assert paddings(x=narrow, mask=window_mask, verify=True) is None
+    monkeypatch.setattr(language, "_row_exact_verify_armed", lambda: False)
+    # Singleton caches belong to the batch-one arms.
+    assert paddings(x=decode[:1], mask=None, c=language.QSAKVCache()) is None
+    # A misaligned indexer bank cannot be sliced per row.
+    cache.index_offset = cache._idx - 1
+    assert paddings() is None
+
+
+def test_batch_gather_rows_below_the_crossover_keep_the_dense_path(monkeypatch):
+    pair = _GatherPair(monkeypatch, prefixes=(5, 3))
+    monkeypatch.setattr(pair.language, "_GATHERED_BATCH_DISABLED", False)
+    x = mx.zeros((2, 1, pair.config.hidden_size))
+    mask = pair.language._create_qwen3_5_attention_mask(x, pair.fast)
+    assert (
+        pair.attention._gathered_batch_paddings(x, mask, pair.fast, None, None, False)
+        is None
+    )

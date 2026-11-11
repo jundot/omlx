@@ -5,9 +5,13 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
-from omlx.patches.deepseek_v41.activation import quantize_swiglu_activation
+from omlx.patches.deepseek_v41.activation import (
+    pack_fp8_activation,
+    quantize_swiglu_activation,
+)
 from omlx.patches.deepseek_v41.quantization import (
     _compiled_quantize_activation,
+    _pack_activation,
     quantize_activation,
 )
 
@@ -49,6 +53,32 @@ def test_fp8_activation_midpoints_and_scale_boundaries(dtype):
         quantize_activation(x).astype(mx.float32),
         _compiled_quantize_activation(x).astype(mx.float32),
     )
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_fp8_pack_kernel_matches_graph_bytes(dtype):
+    codes = np.asarray(mx.from_fp8(mx.arange(127, dtype=mx.uint8), dtype=mx.float32))
+    mid = (codes[:-1] + codes[1:]) / 2
+    edges = np.concatenate(
+        [
+            mid,
+            np.nextafter(mid, np.float32(-np.inf)),
+            np.nextafter(mid, np.float32(np.inf)),
+        ]
+    )
+    rows = np.zeros((len(edges) * 2 + 2, 32), np.float32)
+    rows[: 2 * len(edges), 0] = np.concatenate([edges, -edges])
+    rows[: 2 * len(edges), -1] = 448
+    rows[-1] = -0.0
+    exponents = [-10, 0, 6] if dtype == mx.float16 else [-110, -10, 0, 10, 110]
+    cases = [mx.array(rows * np.float32(2.0**e)).astype(dtype) for e in exponents]
+    mx.random.seed(733)
+    for length in (1, 5, 129):
+        cases.append((mx.random.normal((1, length, 512)) * 3).astype(dtype))
+    for x in cases:
+        np.testing.assert_array_equal(
+            pack_fp8_activation(x), _pack_activation(x, 8, 32, False)
+        )
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
@@ -125,20 +155,20 @@ def test_paired_swiglu_preserves_row_and_quantization_boundaries(
     )
 
 
-@pytest.mark.parametrize("device", [mx.cpu, mx.gpu])
-def test_normal_scales_are_exact_and_nonzero(device):
+def test_normal_scales_are_exact_and_nonzero():
     from omlx.patches.deepseek_v41.quantization import _normal_power_of_two
 
-    with mx.stream(device):
-        exponent = mx.arange(-126, 128, dtype=mx.float32)
-        actual = _normal_power_of_two(exponent)
-        compiled = mx.compile(_normal_power_of_two)(exponent)
-        expected = np.exp2(np.arange(-126, 128, dtype=np.float32))
-        np.testing.assert_array_equal(actual, expected)
-        np.testing.assert_array_equal(compiled, expected)
+    exponent = mx.arange(-126, 128, dtype=mx.float32)
+    actual = _normal_power_of_two(exponent)
+    compiled = mx.compile(_normal_power_of_two)(exponent)
+    expected = np.exp2(np.arange(-126, 128, dtype=np.float32))
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(compiled, expected)
 
 
-@pytest.mark.parametrize("bits,group,e4m3", [(8, 32, False), (4, 32, False), (4, 16, True)])
+@pytest.mark.parametrize(
+    "bits,group,e4m3", [(8, 32, False), (4, 32, False), (4, 16, True)]
+)
 def test_zero_activation_groups_remain_zero(bits, group, e4m3):
     from omlx.patches.deepseek_v41.quantization import (
         _quantize_activation,
@@ -151,7 +181,9 @@ def test_zero_activation_groups_remain_zero(bits, group, e4m3):
         _quantize_activation(x, bits, group, e4m3),
         _compiled_quantize_activation(x, bits, group, e4m3),
         quantize_activation(x, bits, group, e4m3),
-        unpack_activation(pack_activation(x, bits, group, e4m3), bits, group, e4m3, mx.float32),
+        unpack_activation(
+            pack_activation(x, bits, group, e4m3), bits, group, e4m3, mx.float32
+        ),
     ):
         # This rejects NaNs explicitly, including matching NaNs in both paths.
         assert mx.all(mx.isfinite(result)).item()
@@ -159,9 +191,48 @@ def test_zero_activation_groups_remain_zero(bits, group, e4m3):
 
 
 def test_fp8_kernel_preserves_exact_power_of_two_scaled_values():
-    # Every scale whose maximum finite FP8 value fits in a normal FP32.
-    # A transcendental exp2 approximation can shift these values and FP8 ties.
-    exponents = np.arange(-126, 119, dtype=np.int32)
+    # Every scale from the reference amax floor (1e-4 <= 448 * 2^-22) up to the largest
+    # whose maximum finite FP8 value fits in a normal FP32. A transcendental exp2
+    # approximation can shift these values and FP8 ties.
+    exponents = np.arange(-22, 119, dtype=np.int32)
     rows = np.repeat(np.ldexp(np.float32(448), exponents)[:, None], 32, axis=1)
     actual = quantize_activation(mx.array(rows))
     np.testing.assert_array_equal(actual, rows)
+
+
+def test_fp8_kernel_applies_reference_amax_floor():
+    # DeepSeek-V4.1-Flash kernel.py act_quant clamps amax to 1e-4, so every group
+    # below it shares the scale fast_round_scale(1e-4 / 448) = 2^-22 and is rounded on
+    # that FP8 grid (subnormal codes, then zero).
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    exponents = np.arange(-126, -22, dtype=np.int32)
+    rows = np.repeat(np.ldexp(np.float32(448), exponents)[:, None], 32, axis=1)
+    scale = np.float32(2.0**-22)
+    expected = (rows / scale).astype(ml_dtypes.float8_e4m3fn).astype(np.float32) * scale
+    actual = quantize_activation(mx.array(rows))
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("shape", [(1, 37, 8, 512), (2, 5, 512), (1, 9, 4, 128)])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_rope_kernel_matches_reference_rotation(shape, inverse):
+    """The one-pass RoPE kernel rotates the tail pairs like the fp32 reference (_rope_apply;
+    FMA contraction may differ by one bf16 ulp), its fused act_quant is quantize_activation of
+    that rotation, and the heads-major input of the native attention output gives the same."""
+    from omlx.patches.deepseek_v41.activation import rope_activation
+    from omlx.patches.deepseek_v41.language import _rope_apply
+
+    rng = np.random.default_rng(len(shape) + shape[1])
+    x = mx.array(rng.normal(0, 3, shape).astype(np.float32)).astype(mx.bfloat16)
+    cos = mx.array(rng.uniform(-1, 1, (shape[1], 32)).astype(np.float32))
+    sin = mx.array(rng.uniform(-1, 1, (shape[1], 32)).astype(np.float32))
+    expected = _rope_apply(x, cos, sin, inverse).astype(mx.float32)
+    actual = rope_activation(x, cos, sin, inverse).astype(mx.float32)
+    ulp = 2.0 ** (np.floor(np.log2(np.maximum(np.abs(np.asarray(expected)), 2.0**-126))) - 7)
+    assert np.all(np.abs(np.asarray(actual - expected)) <= ulp)
+    np.testing.assert_array_equal(np.asarray(actual[..., :-64]), np.asarray(x[..., :-64].astype(mx.float32)))
+    fused = rope_activation(x, cos, sin, inverse, quantize=True)
+    assert mx.array_equal(fused, quantize_activation(rope_activation(x, cos, sin, inverse))).item()
+    if len(shape) == 4:
+        heads = mx.contiguous(x.transpose(0, 2, 1, 3))
+        assert mx.array_equal(rope_activation(heads, cos, sin, inverse, True, heads_major=True), fused).item()

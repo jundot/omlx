@@ -198,7 +198,7 @@ class AnthropicTool(BaseModel):
 class ToolChoice(BaseModel):
     """Tool choice specification."""
 
-    type: Literal["auto", "any", "tool"]
+    type: Literal["auto", "any", "tool", "none"]
     name: str | None = None  # Required when type="tool"
 
 
@@ -223,7 +223,7 @@ class MessagesRequest(BaseModel):
     """Request for Anthropic Messages API."""
 
     model: str
-    max_tokens: int
+    max_tokens: int = Field(gt=0)
     messages: list[AnthropicMessage]
     system: str | list[SystemContent] | None = None
     stop_sequences: list[str] | None = None

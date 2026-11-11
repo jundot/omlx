@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 
+from ..mlx_vlm_qwen35_base_compat import base_layout_key
 from .qwen38_fp8 import dequantize_fp8_weights
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ def apply() -> bool:
 
         sanitized_weights = {}
         for key, value in weights.items():
+            key = base_layout_key(key)
             if "model" in key:
                 if "model.language_model" in key:
                     key = key.replace(

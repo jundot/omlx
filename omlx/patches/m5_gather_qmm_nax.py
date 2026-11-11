@@ -43,8 +43,8 @@ mean rows per expert and K (measured on M5 Ultra at the Qwen3.8, GLM-5.3
 and MiMo-V2.6 expert shapes).
 
 Every configuration dequantizes exactly like mlx (fp32 ``scale * q +
-bias`` rounded once to the activation dtype for affine; ``bfloat(e8m0) *
-e2m1`` for MXFP4) and issues the same 16x32x16 tensor ops in the same K
+bias`` rounded once to the activation dtype for affine; ``bfloat(scale) *
+e2m1`` for MXFP4/NVFP4) and issues the same 16x32x16 tensor ops in the same K
 order, so every output element is bit-identical to mlx's sorted kernel
 wherever that kernel is correct. A K tail (a multiple of 32) runs only its
 valid 32-deep sub-steps and never reads weight bytes or scales past K (the
@@ -76,29 +76,30 @@ fragment holds the values it would read from the copy and the tensor ops
 are unchanged: bit-identical, and the copy is never computed (callers keep
 it lazy, see ``moe_routes.sort_routes``).
 
+``sorted_gather_qmm_swiglu_oai`` is that epilogue for MiniMax M3.1: gate and
+up stay two ``[E, n, K]`` FP4 operands (each loader thread reads the operand
+of its weight row), and the epilogue is the model's scaled SwiGLU-OAI in
+float32 with the per-expert gate and up scales.
+
 Supported: ``transpose=True``, rhs-indices only, ``x`` of shape
 ``[M, 1, K]`` with a flat sorted ``uint32`` index of length ``M``, bf16/fp16
 activations, N a multiple of 32, affine 4/8-bit with group 32/64/128
-(scales and biases in the activation dtype) and MXFP4 (group 32); the
-epilogue additionally needs ``2 * n % 64 == 0``, the row map a uint32
-``[M]`` map and fewer than 2**32 token-row elements. Anything else returns
-None and the caller keeps the stock path.
+(scales and biases in the activation dtype), MXFP4 (group 32) and NVFP4
+(group 16, no global scale); the epilogue additionally needs
+``2 * n % 64 == 0``, the row map a uint32 ``[M]`` map and fewer than 2**32
+token-row elements. Anything else returns None and the caller keeps the
+stock path.
 
 The index must hold each expert's rows as one contiguous run: the tile
 pre-pass relies on it (as mlx 0.32.3's own sorted kernel does), and an
 expert split over two runs leaves rows unwritten. Every caller sorts the
 routes globally first.
-
-``OMLX_M5_GATHER_QMM_NAX=0`` disables the module (plain gather, epilogue
-and row map); ``OMLX_M5_GATHER_QMM_NAX_PLAN=sched,bm,bk,gx,pad`` (e.g.
-``seg,128,128,32,8192``) pins a configuration (testing).
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import os
 import threading
 from functools import partial
 from pathlib import Path
@@ -108,9 +109,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
-
-_ENV_ENABLE = "OMLX_M5_GATHER_QMM_NAX"
-_ENV_PLAN = "OMLX_M5_GATHER_QMM_NAX_PLAN"
 
 # Output tile width and column simdgroups (fixed; the Metal source assumes
 # them). Tile heights are multiples of 32 rows (one row simdgroup each).
@@ -124,6 +122,9 @@ _MAX_EXPERTS = 2048
 
 # Row tiles per grid-x group in the tile-on-x layout.
 _GX = 32
+
+# Scale group of the FP4 formats (E8M0 and E4M3 scales).
+_FP4_GROUP = {"mxfp4": 32, "nvfp4": 16}
 
 _MLX_UTILS_HEADERS = (
     "mlx/backend/metal/kernels/utils.h",
@@ -349,10 +350,11 @@ struct AffineQ {
   }
 };
 
-// MXFP4: e2m1 values times the e8m0 group scale, dequantized to bfloat like
+// FP4: e2m1 values times the group scale, dequantized to bfloat like
 // mlx's fp QuantizedBlockLoader (Wtype = bfloat).
+// GS 32 is MXFP4 (e8m0 scales), GS 16 is NVFP4 (e4m3 scales).
 template <int GS>
-struct Mxfp4Q {
+struct Fp4Q {
   using WT = bfloat;
   STEEL_CONST int kBits = 4;
   STEEL_CONST int kGroup = GS;
@@ -367,7 +369,11 @@ struct Mxfp4Q {
   }
   METAL_FUNC P params(const int g) const thread {
     uint8_t sb = scales[g];
-    return P{float(static_cast<bfloat>(*(thread fp8_e8m0*)(&sb)))};
+    if constexpr (GS == 16) {
+      return P{float(static_cast<bfloat>(*(thread fp8_e4m3*)(&sb)))};
+    } else {
+      return P{float(static_cast<bfloat>(*(thread fp8_e8m0*)(&sb)))};
+    }
   }
   METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
     uint8_t qb = uint8_t(q);
@@ -385,6 +391,26 @@ METAL_FUNC int pair_row(const int r, const int half_n) {
   return ((r >> 4) & 1) * half_n + ((r >> 5) << 4) + (r & 15);
 }
 
+// Split gate/up: gate and up are separate [E, half_n, K] operands.
+// True when loader thread lid loads an up row (the odd 16-row blocks).
+// The caller passes that thread the up operand; its row there is pair_row(r, 0).
+template <typename G>
+METAL_FUNC bool loads_up(const uint lid) {
+  return ((lid / G::kTPR) >> 4) & 1;
+}
+
+// Epilogue operands. EPI 2 reads limit, in T.
+// EPI 3 reads the float SwiGLU-OAI constants and the tile's expert scales.
+template <typename T>
+struct ActArgs {
+  T limit;
+  float alpha;
+  float bound;
+  float beta;
+  float gate_scale;
+  float up_scale;
+};
+
 // Activation epilogue of a paired simdgroup block (defined with the
 // activation kernels only; see _ACT_HEADER).
 template <typename T, int EPI, typename DTile>
@@ -393,7 +419,7 @@ METAL_FUNC void store_act(
     device T* y,
     const int ld,
     const int rows,
-    const T limit);
+    thread const ActArgs<T>& args);
 
 // Weight-tile loader: loader thread lid owns row lid / kTPR of the
 // kBN x BK tile and the kVPT values from column (lid % kTPR) * kVPT, in
@@ -678,6 +704,7 @@ METAL_FUNC void map_rows(
 // the tile of fused columns [y_col, y_col + kBN) computes gate and up of
 // output columns [y_col / 2, y_col / 2 + kBN / 2) through the paired row
 // map and writes act(gate, up) to the [M, half_n] output.
+// SPLIT: see loads_up; N is still 2 * half_n.
 template <
     typename T,
     typename Q,
@@ -685,7 +712,8 @@ template <
     bool ALIGN_N,
     bool ALIGN_K,
     int EPI = 0,
-    bool MAP = false>
+    bool MAP = false,
+    bool SPLIT = false>
 METAL_FUNC void gather_seg(
     const device T* x,
     const device uint32_t* rmap,
@@ -699,7 +727,7 @@ METAL_FUNC void gather_seg(
     threadgroup typename Q::WT* Ws,
     const uint sgid,
     const uint lane,
-    const T limit = T(0)) {
+    const ActArgs<T> args = ActArgs<T>{}) {
   using WT = typename Q::WT;
   constexpr bool kPair = EPI != 0;
   static_assert(!kPair || ALIGN_N, "paired gate/up tiles are full");
@@ -719,10 +747,10 @@ METAL_FUNC void gather_seg(
   const int w_col = kPair ? y_col / 2 : y_col;
   const int ldy = kPair ? half_n : N;
 
-  const size_t w_row = size_t(expert) * N + w_col;
+  const size_t w_row = size_t(expert) * (SPLIT ? half_n : N) + w_col;
   q.advance(w_row * K_g);
   TileLoader<Q, G, kPair> loader(
-      w + w_row * K_w, K, q, sgid * 32 + lane, half_n);
+      w + w_row * K_w, K, q, sgid * 32 + lane, SPLIT ? 0 : half_n);
   const bool loads = G::kLT == G::kThreads || sgid * 32 + lane < uint(G::kLT);
   const bool row_live = ALIGN_N || loader.row < tgp_bn;
 
@@ -805,7 +833,7 @@ METAL_FUNC void gather_seg(
     if constexpr (kPair) {
       if (sg_active) {
         store_act<T, EPI>(
-            Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), limit);
+            Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), args);
       }
     } else if (kAlignedM.value && sgp_sn == kSN) {
       Dtile.store(y + tm * N + tn, N);
@@ -822,8 +850,14 @@ METAL_FUNC void gather_seg(
 // device memory (rows past the tile are clamped to its last row and never
 // stored) and 16-row fragments without rows of the tile are skipped.
 // Requires K % 64 == 0 and N % 64 == 0. EPI > 0: the activation epilogue
-// of gather_seg.
-template <typename T, typename Q, typename G, int EPI = 0, bool MAP = false>
+// of gather_seg, SPLIT as there.
+template <
+    typename T,
+    typename Q,
+    typename G,
+    int EPI = 0,
+    bool MAP = false,
+    bool SPLIT = false>
 METAL_FUNC void gather_db(
     const device T* x,
     const device uint32_t* rmap,
@@ -837,7 +871,7 @@ METAL_FUNC void gather_db(
     threadgroup typename Q::WT* Ws,
     const uint sgid,
     const uint lane,
-    const T limit = T(0)) {
+    const ActArgs<T> args = ActArgs<T>{}) {
   using WT = typename Q::WT;
   static_assert(G::kBK == 64, "db runs 64-deep K steps");
   constexpr bool kPair = EPI != 0;
@@ -853,10 +887,10 @@ METAL_FUNC void gather_db(
   const int half_n = N / 2;
   const int w_col = kPair ? y_col / 2 : y_col;
 
-  const size_t w_row = size_t(expert) * N + w_col;
+  const size_t w_row = size_t(expert) * (SPLIT ? half_n : N) + w_col;
   q.advance(w_row * K_g);
   TileLoader<Q, G, kPair> loader(
-      w + w_row * K_w, K, q, sgid * 32 + lane, half_n);
+      w + w_row * K_w, K, q, sgid * 32 + lane, SPLIT ? 0 : half_n);
   const bool loads = G::kLT == G::kThreads || sgid * 32 + lane < uint(G::kLT);
 
   const int m0 = kSM * int(sgid / kWN);
@@ -948,7 +982,7 @@ METAL_FUNC void gather_db(
           y + size_t(row_start + m0) * half_n + w_col + (kSN / 2) * (sgid % kWN),
           half_n,
           rows,
-          limit);
+          args);
     }
   } else {
     device T* yb = y + size_t(row_start + m0) * N + y_col + kSN * (sgid % kWN);
@@ -1027,7 +1061,7 @@ _AFFINE_SOURCE = _MM_SOURCE_TMPL.format(
 )
 
 _FP_SOURCE = _MM_SOURCE_TMPL.format(
-    q_type="using Q = omlx_gqmm::Mxfp4Q<GS>;",
+    q_type="using Q = omlx_gqmm::Fp4Q<GS>;",
     q_init="Q q{scales};",
 )
 
@@ -1050,13 +1084,25 @@ namespace omlx_gqmm {
 // nn.silu(gate) * up (Sigmoid, Multiply, Multiply); EPI == 2 first clips
 // like GLM-5.3's clamped SwiGLU: gate = minimum(gate, limit),
 // up = minimum(maximum(up, -limit), limit).
+// EPI == 3 is MiniMax's scaled SwiGLU-OAI, every intermediate in float.
+// Gate and up are scaled per expert and clipped as above.
+// The result is gate * sigmoid(alpha * gate) * (up + beta).
 template <typename T, int EPI>
-METAL_FUNC T act(T g, T u, const T limit) {
-  if constexpr (EPI == 2) {
-    g = Minimum()(g, limit);
-    u = Minimum()(Maximum()(u, T(-limit)), limit);
+METAL_FUNC T act(T g, T u, thread const ActArgs<T>& a) {
+  if constexpr (EPI == 3) {
+    const float fg = Minimum()(Multiply()(float(g), a.gate_scale), a.bound);
+    const float fu = Minimum()(
+        Maximum()(Multiply()(float(u), a.up_scale), -a.bound), a.bound);
+    return static_cast<T>(Multiply()(
+        Multiply()(fg, Sigmoid()(Multiply()(a.alpha, fg))),
+        Add()(fu, a.beta)));
+  } else {
+    if constexpr (EPI == 2) {
+      g = Minimum()(g, a.limit);
+      u = Minimum()(Maximum()(u, T(-a.limit)), a.limit);
+    }
+    return Multiply()(Multiply()(g, Sigmoid()(g)), u);
   }
-  return Multiply()(Multiply()(g, Sigmoid()(g)), u);
 }
 
 // D.frag_at(i, 0) holds gate and D.frag_at(i, 1) up of the same 16 output
@@ -1070,7 +1116,7 @@ METAL_FUNC void store_act(
     device T* y,
     const int ld,
     const int rows,
-    const T limit) {
+    thread const ActArgs<T>& args) {
   const short2 sc = BaseNAXFrag::get_coord();
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < DTile::kTileRows; i++) {
@@ -1086,7 +1132,7 @@ METAL_FUNC void store_act(
           v[j] = act<T, EPI>(
               static_cast<T>(D.frag_at(i, 0)[e]),
               static_cast<T>(D.frag_at(i, 1)[e]),
-              limit);
+              args);
         }
         *(device vec<T, BaseNAXFrag::kElemCols>*)(y + size_t(r) * ld + sc.x) =
             v;
@@ -1113,29 +1159,43 @@ _ACT_SOURCE_TMPL = """
         return;
     }}
     {q_init}
-    const T limit = lim[0];
+    const omlx_gqmm::ActArgs<T> args{{{args}}};
     if constexpr (SCHED == 1) {{
-        omlx_gqmm::gather_db<T, Q, G, EPI, {mapped}>(
-            x, {rmap}, (const device uint8_t*)w, q, desc, y_col, y, params[0],
+        omlx_gqmm::gather_db<T, Q, G, EPI, {mapped}, {split}>(
+            x, {rmap}, {w}, q, desc, y_col, y, params[0],
             params[1], Ws, simdgroup_index_in_threadgroup,
-            thread_index_in_simdgroup, limit);
+            thread_index_in_simdgroup, args);
     }} else {{
-        omlx_gqmm::gather_seg<T, Q, G, true, ALIGN_K, EPI, {mapped}>(
-            x, {rmap}, (const device uint8_t*)w, q, desc, y_col, y, params[0],
+        omlx_gqmm::gather_seg<T, Q, G, true, ALIGN_K, EPI, {mapped}, {split}>(
+            x, {rmap}, {w}, q, desc, y_col, y, params[0],
             params[1], Ws, simdgroup_index_in_threadgroup,
-            thread_index_in_simdgroup, limit);
+            thread_index_in_simdgroup, args);
     }}
 """
 
+# Split FP4 gate/up: each loader thread reads the operand of its weight row.
+_FP_SPLIT_INIT = """const bool up_row = omlx_gqmm::loads_up<G>(
+        simdgroup_index_in_threadgroup * 32 + thread_index_in_simdgroup);
+    Q q{up_row ? su : scales};
+    const device uint8_t* w_sel = (const device uint8_t*)(up_row ? wu : w);"""
 
-def _act_source(q_type: str, q_init: str, mapped: bool) -> str:
+
+def _act_source(q_type: str, q_init: str, mapped: bool, oai: bool = False) -> str:
     # Mapped kernels read the sorted rows through the ``rmap`` input; the
     # others pass ``tiles`` as the (unread) row map.
+    # ``oai`` selects the split gate/up and SwiGLU-OAI operands.
     return _ACT_SOURCE_TMPL.format(
         q_type=q_type,
-        q_init=q_init,
+        q_init=_FP_SPLIT_INIT if oai else q_init,
+        args=(
+            "T(0), oai[0], oai[1], oai[2], gsc[desc.y], usc[desc.y]"
+            if oai
+            else "lim[0]"
+        ),
         mapped="true" if mapped else "false",
+        split="true" if oai else "false",
         rmap="rmap" if mapped else "tiles",
+        w="w_sel" if oai else "(const device uint8_t*)w",
     )
 
 
@@ -1143,15 +1203,19 @@ _AFFINE_Q = (
     "using Q = omlx_gqmm::AffineQ<T, GS, BITS>;",
     "Q q{scales, biases};",
 )
-_FP_Q = ("using Q = omlx_gqmm::Mxfp4Q<GS>;", "Q q{scales};")
+_FP_Q = ("using Q = omlx_gqmm::Fp4Q<GS>;", "Q q{scales};")
 _AFFINE_ACT_SOURCE = _act_source(*_AFFINE_Q, mapped=False)
 _FP_ACT_SOURCE = _act_source(*_FP_Q, mapped=False)
 _AFFINE_ACT_MAP_SOURCE = _act_source(*_AFFINE_Q, mapped=True)
 _FP_ACT_MAP_SOURCE = _act_source(*_FP_Q, mapped=True)
+_FP_OAI_SOURCE = _act_source(*_FP_Q, mapped=False, oai=True)
+_FP_OAI_MAP_SOURCE = _act_source(*_FP_Q, mapped=True, oai=True)
 
 # Epilogue kinds (the kernel's EPI): silu(gate) * up, and the clamped form.
+# _EPI_OAI is the scaled SwiGLU-OAI of split gate/up operands.
 _EPI_SWIGLU = 1
 _EPI_CLAMPED = 2
+_EPI_OAI = 3
 
 _SCHED_SEG = 0
 _SCHED_DB = 1
@@ -1191,18 +1255,9 @@ _act_header_failed = False
 _verified: dict[tuple, bool] = {}
 
 
-def enabled() -> bool:
-    """False when ``OMLX_M5_GATHER_QMM_NAX`` disables the module."""
-    return os.environ.get(_ENV_ENABLE, "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-    }
-
-
 def _get_act_kernel(kind: str):
-    """Build (once) the ``affine_act`` or ``fp_act`` kernel object, or its
-    row-mapped variant (``*_act_map``: sorted rows read through ``rmap``)."""
+    """Build (once) the ``affine_act``, ``fp_act`` or ``fp_oai`` kernel object,
+    or its row-mapped variant (``*_map``: sorted rows read through ``rmap``)."""
     global _act_header_failed
     kernel = _kernels.get(kind)
     if kernel is not None or _act_header_failed:
@@ -1222,20 +1277,28 @@ def _get_act_kernel(kind: str):
             return None
         header = mlx_src + _MM_HEADER + _ACT_HEADER
         mapped = kind.endswith("_map")
-        affine = kind.startswith("affine")
-        inputs = ["x", "w", "scales"] + (["biases"] if affine else [])
-        inputs += ["tiles", "tile_count", "params", "lim"]
+        family = kind.removesuffix("_map")
+        inputs = ["x", "w", "scales"]
+        inputs += {"affine_act": ["biases"], "fp_oai": ["wu", "su"]}.get(family, [])
+        inputs += ["tiles", "tile_count", "params"]
+        inputs += ["oai", "gsc", "usc"] if family == "fp_oai" else ["lim"]
         if mapped:
             inputs.append("rmap")
         source = {
-            (True, False): _AFFINE_ACT_SOURCE,
-            (False, False): _FP_ACT_SOURCE,
-            (True, True): _AFFINE_ACT_MAP_SOURCE,
-            (False, True): _FP_ACT_MAP_SOURCE,
-        }[(affine, mapped)]
+            "affine_act": _AFFINE_ACT_SOURCE,
+            "fp_act": _FP_ACT_SOURCE,
+            "fp_oai": _FP_OAI_SOURCE,
+            "affine_act_map": _AFFINE_ACT_MAP_SOURCE,
+            "fp_act_map": _FP_ACT_MAP_SOURCE,
+            "fp_oai_map": _FP_OAI_MAP_SOURCE,
+        }[kind]
+        name = {
+            "affine_act": "omlx_gqmm_affine_swiglu",
+            "fp_act": "omlx_gqmm_mxfp4_swiglu",
+            "fp_oai": "omlx_gqmm_fp4_swiglu_oai",
+        }[family]
         kernel = mx.fast.metal_kernel(
-            name=("omlx_gqmm_affine_swiglu" if affine else "omlx_gqmm_mxfp4_swiglu")
-            + ("_map" if mapped else ""),
+            name=name + ("_map" if mapped else ""),
             input_names=inputs,
             output_names=["y"],
             header=header,
@@ -1247,9 +1310,9 @@ def _get_act_kernel(kind: str):
 
 def _get_kernel(kind: str):
     """Build (once) the ``scan``, ``affine`` or ``fp`` kernel object (and
-    the ``*_act`` epilogue variants)."""
+    the ``*_act`` / ``fp_oai`` epilogue variants)."""
     global _header_failed
-    if kind.endswith("_act") or kind.endswith("_act_map"):
+    if kind.endswith(("_act", "_oai", "_map")):
         return _get_act_kernel(kind)
     kernel = _kernels.get(kind)
     if kernel is not None or _header_failed:
@@ -1304,20 +1367,6 @@ def _get_kernel(kind: str):
         return kernel
 
 
-def _parse_plan(text: str) -> Optional[Plan]:
-    parts = [p.strip().lower() for p in text.split(",")]
-    if len(parts) != 5 or parts[0] not in ("seg", "db"):
-        return None
-    try:
-        bm, bk, gx, pad = (int(p) for p in parts[1:])
-    except ValueError:
-        return None
-    sched = _SCHED_SEG if parts[0] == "seg" else _SCHED_DB
-    if bm not in _TILE_ROWS or bk not in (64, 128) or gx < 0 or not 0 <= pad <= 8192:
-        return None
-    return Plan(sched, bm, bk, gx, pad)
-
-
 def _plan(rows: int, experts: int, K: int, N: int) -> Plan:
     """Kernel configuration for a call (mean rows per expert and K).
 
@@ -1336,11 +1385,6 @@ def _plan(rows: int, experts: int, K: int, N: int) -> Plan:
 
     Ragged K or N keeps 64-row seg tiles in the plain layout.
     """
-    forced = os.environ.get(_ENV_PLAN, "").strip()
-    if forced:
-        plan = _parse_plan(forced)
-        if plan is not None:
-            return plan
     if K % 64 or N % 64:
         return Plan(_SCHED_SEG, 64, 64, 0, 0)
     per_expert = rows / max(1, experts)
@@ -1404,8 +1448,8 @@ def supports(
             return False
         if biases.shape != scales.shape:
             return False
-    elif mode == "mxfp4":
-        if bits != 4 or group_size != 32 or biases is not None:
+    elif mode in _FP4_GROUP:
+        if bits != 4 or group_size != _FP4_GROUP[mode] or biases is not None:
             return False
         if scales.dtype != mx.uint8:
             return False
@@ -1430,22 +1474,30 @@ def _launch(
     epi=0,
     limit=None,
     row_map=None,
+    up=None,
+    expert_scales=None,
 ):
     """Tile pre-pass + matmul. ``epi`` > 0 runs the activation epilogue on
     the ``[gate; up]`` rows of ``w`` (``N % 64 == 0``) and returns
     ``[M, 1, N / 2]``; with it, ``row_map`` reads the sorted rows as
-    ``x[row_map]`` in place."""
+    ``x[row_map]`` in place. ``_EPI_OAI`` takes the gate rows in ``w`` and the
+    up operand in ``up`` = ``(w, scales)``, ``limit`` = ``(alpha, limit,
+    beta)`` and ``expert_scales`` = ``(gate, up)``."""
     scan = _get_kernel("scan")
     kind = "affine" if mode == "affine" else "fp"
     if row_map is not None and not epi:
         return None
-    mm = _get_kernel(
-        (f"{kind}_act" + ("_map" if row_map is not None else "")) if epi else kind
-    )
+    if epi:
+        kind += "_oai" if epi == _EPI_OAI else "_act"
+        if row_map is not None:
+            kind += "_map"
+    mm = _get_kernel(kind)
     if scan is None or mm is None:
         return None
     M, K = int(indices.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])
+    if up is not None:
+        N *= 2
     bm = plan.bm
     max_tiles = (M + bm - 1) // bm + min(E, M)
     kw = {} if stream is None else {"stream": stream}
@@ -1463,13 +1515,19 @@ def _launch(
     if mode == "affine":
         inputs.append(biases)
         template.append(("BITS", bits))
+    if up is not None:
+        inputs += up
     inputs += [tiles, tile_count, mx.array([N, K], dtype=mx.int32)]
     template.append(("SCHED", int(plan.sched)))
-    if epi:
+    if epi == _EPI_OAI:
+        inputs.append(mx.array(limit, dtype=mx.float32))
+        inputs += [scale.astype(mx.float32) for scale in expert_scales]
+    elif epi:
         # The clip bound converts like the unfused path's Python-float
         # operand of mx.clip (float, then the activation dtype).
         bound = 0.0 if limit is None else limit
         inputs.append(mx.array(bound, dtype=x.dtype).reshape(1))
+    if epi:
         template.append(("EPI", int(epi)))
         if row_map is not None:
             inputs.append(row_map)
@@ -1607,7 +1665,12 @@ def _describe(key: tuple) -> str:
     epi = ""
     if len(key) > 7:
         limit = key[8]
-        epi = " + silu(gate) * up" if limit is None else f" + clamped SwiGLU {limit:g}"
+        if key[7] == _EPI_OAI:
+            epi = " + scaled SwiGLU-OAI, split gate/up"
+        elif limit is None:
+            epi = " + silu(gate) * up"
+        else:
+            epi = f" + clamped SwiGLU {limit:g}"
         if len(key) > 9:
             epi += ", row map"
     return (
@@ -1632,6 +1695,19 @@ def _ref_clamped_swiglu(x_up: mx.array, x_gate: mx.array, limit: float) -> mx.ar
     return nn.silu(x_gate) * x_up
 
 
+@partial(mx.compile, shapeless=True)
+def _ref_scaled_swiglu_oai(
+    x_linear, x_glu, linear_scale, glu_scale, alpha: float, limit: float, beta: float
+):
+    # MiniMax M3.1's _scaled_swiglu_oai (minimax_m3_vl language).
+    dtype = x_linear.dtype
+    x_glu = mx.clip(x_glu.astype(mx.float32) * glu_scale, a_min=None, a_max=limit)
+    x_linear = mx.clip(
+        x_linear.astype(mx.float32) * linear_scale, a_min=-limit, a_max=limit
+    )
+    return (x_glu * mx.sigmoid(alpha * x_glu) * (x_linear + beta)).astype(dtype)
+
+
 def reference_activation(
     x_up: mx.array, x_gate: mx.array, limit: Optional[float] = None
 ) -> mx.array:
@@ -1640,6 +1716,20 @@ def reference_activation(
     if limit is None:
         return _ref_swiglu(x_gate, x_up)
     return _ref_clamped_swiglu(x_up, x_gate, float(limit))
+
+
+def _canary_epilogue(wq, scales, biases, epi, limit):
+    """``_launch`` weight operands and keywords of an epilogue canary on the
+    fused ``[E, 2 * _BN, K]`` problem: as is, or split into gate and up with
+    per-expert scales for the scaled SwiGLU-OAI."""
+    kw = dict(epi=epi, limit=limit)
+    if epi != _EPI_OAI:
+        return (wq, scales, biases), kw
+    kw["up"] = (wq[:, _BN:], scales[:, _BN:])
+    kw["expert_scales"] = tuple(
+        mx.random.uniform(0.5, 2.0, (2, wq.shape[0]), key=mx.random.key(0x0A1))
+    )
+    return (wq[:, :_BN], scales[:, :_BN], None), kw
 
 
 def _bits_equal(a: mx.array, b: mx.array) -> bool:
@@ -1652,7 +1742,7 @@ def _bits_equal(a: mx.array, b: mx.array) -> bool:
 def _self_test_act(key: tuple) -> Optional[bool]:
     """Run one activation-epilogue instantiation on a small canary against
     the unfused path: the plain kernel with the same configuration, split
-    into gate and up, then ``reference_activation`` (bitwise, including the
+    into gate and up, then the reference activation (bitwise, including the
     signs of zeros). The canary rows span 0.1x to 16x the plain canary's
     scale so the projections cover sigmoid's saturated tails and the clip
     bounds. None: could not be evaluated here (see ``_self_test``)."""
@@ -1664,17 +1754,19 @@ def _self_test_act(key: tuple) -> Optional[bool]:
         wq, scales, biases, _, x, idx = _canary_problem(
             dtype, mode, bits, group_size, 2 * _BN, K, x_scale=row_scale
         )
-        out = _launch(
-            x, wq, scales, biases, idx, group_size, bits, mode, plan, None,
-            epi=epi, limit=limit,
-        )
-        gate_up = _launch(
-            x, wq, scales, biases, idx, group_size, bits, mode, plan, None
-        )
+        ops, kw = _canary_epilogue(wq, scales, biases, epi, limit)
+        tail = (idx, group_size, bits, mode, plan, None)
+        out = _launch(x, *ops, *tail, **kw)
+        gate_up = _launch(x, wq, scales, biases, *tail)
         if out is None or gate_up is None:
             return False
         x_gate, x_up = mx.split(gate_up, 2, axis=-1)
-        ok = _bits_equal(out, reference_activation(x_up, x_gate, limit))
+        if epi == _EPI_OAI:
+            gate_scale, up_scale = (s[idx][:, None, None] for s in kw["expert_scales"])
+            ref = _ref_scaled_swiglu_oai(x_up, x_gate, up_scale, gate_scale, *limit)
+        else:
+            ref = reference_activation(x_up, x_gate, limit)
+        ok = _bits_equal(out, ref)
     except Exception as e:  # noqa: BLE001
         if "transformation" in str(e):
             return None
@@ -1712,14 +1804,10 @@ def _self_test_act_map(key: tuple) -> Optional[bool]:
             mx.random.normal((T, 1, K), key=mx.random.key(0x70C)) * tok_scale
         ).astype(dtype)
         row_map = ((mx.arange(M, dtype=mx.uint32) * 7 + 3) % T).astype(mx.uint32)
-        out = _launch(
-            x_tok, wq, scales, biases, idx, group_size, bits, mode, plan, None,
-            epi=epi, limit=limit, row_map=row_map,
-        )
-        ref = _launch(
-            x_tok[row_map], wq, scales, biases, idx, group_size, bits, mode,
-            plan, None, epi=epi, limit=limit,
-        )
+        ops, kw = _canary_epilogue(wq, scales, biases, epi, limit)
+        tail = (idx, group_size, bits, mode, plan, None)
+        out = _launch(x_tok, *ops, *tail, row_map=row_map, **kw)
+        ref = _launch(x_tok[row_map], *ops, *tail, **kw)
         if out is None or ref is None:
             return False
         ok = _bits_equal(out, ref)
@@ -1772,14 +1860,12 @@ def sorted_gather_qmm(
 
     ``indices`` must group each expert's rows in one contiguous run (see
     the module docstring). ``plan`` pins a configuration (testing); by
-    default ``_plan`` picks one. Returns None when the module is disabled,
-    the call is not supported (see ``supports``), the kernels cannot be
+    default ``_plan`` picks one. Returns None when the call is not
+    supported (see ``supports``), the kernels cannot be
     built or the instantiation failed its one-time self-test; the caller
     then keeps the stock path.
     """
-    if not enabled() or not supports(
-        x, w, scales, biases, indices, group_size, bits, mode
-    ):
+    if not supports(x, w, scales, biases, indices, group_size, bits, mode):
         return None
     M, K = int(x.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])
@@ -1832,13 +1918,11 @@ def sorted_gather_qmm_swiglu(
     ops, so the output is bit-identical to passing ``x[row_map]`` (checked
     per instantiation on a scrambled canary map).
 
-    Returns None when disabled (``OMLX_M5_GATHER_QMM_NAX=0``), unsupported
-    (``supports``, or ``2 * n % 64 != 0``), or not verified; the caller then
+    Returns None when unsupported (``supports``, or ``2 * n % 64 != 0``) or
+    not verified; the caller then
     keeps the unfused path (materialising ``x[row_map]``).
     """
-    if not enabled() or not supports(
-        x, w, scales, biases, indices, group_size, bits, mode, row_map
-    ):
+    if not supports(x, w, scales, biases, indices, group_size, bits, mode, row_map):
         return None
     M, K = int(indices.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])
@@ -1868,4 +1952,71 @@ def sorted_gather_qmm_swiglu(
     return _launch(
         x, w, scales, biases, indices, group_size, bits, mode, plan, stream,
         epi=epi, limit=limit, row_map=row_map,
+    )
+
+
+def sorted_gather_qmm_swiglu_oai(
+    x: mx.array,
+    gate: tuple[mx.array, mx.array],
+    up: tuple[mx.array, mx.array],
+    indices: mx.array,
+    *,
+    group_size: int,
+    bits: int,
+    mode: str,
+    alpha: float,
+    limit: float,
+    beta: float,
+    expert_scales: tuple[mx.array, mx.array],
+    stream=None,
+    plan: Optional[Plan] = None,
+    verify: bool = True,
+    row_map: Optional[mx.array] = None,
+) -> Optional[mx.array]:
+    """MiniMax M3.1's scaled SwiGLU-OAI of separate gate and up projections
+    for sorted rows, in one kernel.
+
+    ``gate`` and ``up`` are the ``(w, scales)`` of two FP4 ``[E, n, K]``
+    operands and ``expert_scales`` their ``[E]`` float scales. Returns
+    ``[M, 1, n]``: with ``g`` and ``u`` the ``sorted_gather_qmm`` of each, in
+    float32 ``g = minimum(g * gate_scale, limit)``, ``u = clip(u * up_scale,
+    -limit, limit)`` and ``g * sigmoid(alpha * g) * (u + beta)``, rounded
+    once. The tiles, the epilogue and ``row_map`` are those of
+    ``sorted_gather_qmm_swiglu``, and each instantiation must match the
+    unfused path bitwise on a canary before it is used.
+
+    Returns None when unsupported or not verified.
+    """
+    (w, scales), (wu, su) = gate, up
+    if mode not in _FP4_GROUP or wu.shape != w.shape or wu.dtype != w.dtype:
+        return None
+    if su.shape != scales.shape or su.dtype != scales.dtype:
+        return None
+    if not supports(x, w, scales, None, indices, group_size, bits, mode, row_map):
+        return None
+    M, K = int(indices.shape[0]), int(x.shape[2])
+    E, n = int(w.shape[0]), int(w.shape[1])
+    consts = (float(alpha), float(limit), float(beta))
+    if (2 * n) % _BN or not all(math.isfinite(c) for c in consts):
+        return None
+    if any(scale.shape != (E,) for scale in expert_scales):
+        return None
+    if plan is None:
+        plan = _plan(M, E, K, 2 * n)
+    if plan.sched == _SCHED_DB and (K % 64 or plan.bk != 64):
+        plan = plan._replace(sched=_SCHED_SEG)
+    if verify:
+        key = (x.dtype, mode, bits, group_size, plan, True, K % plan.bk == 0)
+        if not _checked(key, _self_test) or not _checked(
+            key + (_EPI_OAI, consts), _self_test_act
+        ):
+            return None
+        if row_map is not None and not _checked(
+            key + (_EPI_OAI, consts, "map"), _self_test_act_map
+        ):
+            return None
+    return _launch(
+        x, w, scales, None, indices, group_size, bits, mode, plan, stream,
+        epi=_EPI_OAI, limit=consts, row_map=row_map, up=(wu, su),
+        expert_scales=expert_scales,
     )

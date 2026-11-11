@@ -15,18 +15,26 @@ Note: Uses pytest-asyncio for async tests.
 import asyncio
 import concurrent.futures
 import weakref
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
+import omlx.engine_core as engine_core
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.engine_core import (
     AsyncEngineCore,
     EngineConfig,
     EngineCore,
     _raise_request_output_error,
 )
-from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
+from omlx.exceptions import (
+    PrefillMemoryAbortedError,
+    PrefillMemoryExceededError,
+    RequestAbortedError,
+)
 from omlx.output_collector import RequestOutputCollector
 from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
@@ -587,6 +595,35 @@ class TestEngineCoreAbortRequest:
                 await engine.stop()
                 engine.close()
 
+    @pytest.mark.asyncio
+    async def test_admin_abort_ends_stream_with_request_aborted_error(
+        self, mock_model, mock_tokenizer
+    ):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+
+                request_id = await engine.add_request(prompt="Hello")
+                await engine.abort_request(
+                    request_id, reason="Stopped by admin", error_code="admin_abort"
+                )
+
+                outputs = []
+                with pytest.raises(RequestAbortedError, match="Stopped by admin"):
+                    async for output in engine.stream_outputs(request_id):
+                        outputs.append(output)
+                assert outputs[-1].finish_reason == "error"
+                assert outputs[-1].new_text == "\n\n[Error: Stopped by admin]"
+                assert request_id in engine.scheduler._pending_abort_ids
+            finally:
+                await engine.stop()
+                engine.close()
+
 
 class TestEngineCoreGetStats:
     """Tests for EngineCore.get_stats()."""
@@ -702,7 +739,9 @@ class TestEngineCoreClose:
             future = MagicMock()
             future.result.side_effect = concurrent.futures.TimeoutError
             executor = MagicMock()
-            executor.submit.return_value = future
+            executor.submit.side_effect = lambda fn, *args: (
+                future if getattr(fn, "__name__", "") == "shutdown" else MagicMock()
+            )
             engine._mlx_executor = executor
 
             with (
@@ -1446,6 +1485,64 @@ class TestGlobalMLXExecutor:
         future.result.assert_called_once_with(timeout=60.0)
         executor.shutdown.assert_called_once_with(wait=False)
 
+    def test_teardown_reclaim_survives_pending_command_buffer_errors(self):
+        """A victim engine's stored GPU errors must not fail its unload."""
+        error = RuntimeError(
+            "[METAL] Command buffer execution failed: Discarded (victim of GPU "
+            "error/recovery) (00000005:kIOGPUCommandBufferCallbackErrorInnocentVictim)."
+        )
+        with (
+            patch.object(
+                engine_core, "_sync_and_clear_cache", side_effect=[error, error, None]
+            ) as sync,
+            patch.object(engine_core, "clear_thread_streams"),
+        ):
+            engine_core._final_engine_thread_reclaim("stream")
+        assert sync.call_count == 3
+
+        with (
+            patch.object(
+                engine_core,
+                "_sync_and_clear_cache",
+                side_effect=RuntimeError("[metal::malloc] out of memory"),
+            ),
+            pytest.raises(RuntimeError, match="malloc"),
+        ):
+            engine_core._final_engine_thread_reclaim("stream")
+
+    def test_close_drains_pending_gpu_error_before_scheduler_teardown(
+        self, mock_model, mock_tokenizer
+    ):
+        """Scheduler teardown must not stop on an error a GPU reset left behind."""
+        pending = [
+            RuntimeError(
+                "[METAL] Command buffer execution failed: Discarded (victim of "
+                "GPU error/recovery)"
+            )
+        ]
+        real_synchronize = mx.synchronize
+
+        def synchronize(*args):
+            if pending:
+                raise pending.pop()
+            return real_synchronize(*args)
+
+        def shutdown():
+            mx.synchronize()
+
+        with (
+            patch("omlx.engine_core.get_registry") as mock_registry,
+            patch.object(mx, "synchronize", side_effect=synchronize),
+            patch.object(engine_core, "fatal_exit", side_effect=SystemExit) as fatal,
+        ):
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine.scheduler.shutdown = shutdown
+            engine.close()
+
+        fatal.assert_not_called()
+        assert engine._closed
+
     def test_get_mlx_executor_returns_singleton(self):
         """get_mlx_executor() must always return the same executor instance."""
         from omlx.engine_core import get_mlx_executor
@@ -1467,6 +1564,64 @@ class TestGlobalMLXExecutor:
             finally:
                 engine1.close()
                 engine2.close()
+
+    @pytest.mark.skipif(
+        not quant_fast.has_symbol("share_command_queue"),
+        reason="native quant_matmul extension not built",
+    )
+    def test_engine_streams_share_one_metal_queue(self, mock_model, mock_tokenizer):
+        """Engines keep their own threads but submit on one queue (#4224).
+
+        The thread's default stream keeps its own queue: a default-stream
+        producer feeding the engine stream in one eval would deadlock on a
+        single in-order queue.
+        """
+
+        def step(stream):
+            produced = mx.arange(1 << 16, dtype=mx.float32) * 2
+            with mx.stream(stream):
+                total = (produced + 1).sum()
+            mx.eval(total)
+            return quant_fast.share_command_queue(stream), total.item()
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engines = [
+                EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+                for _ in range(2)
+            ]
+            try:
+                results = [
+                    e._mlx_executor.submit(step, e._mlx_stream).result(timeout=30)
+                    for e in engines
+                ]
+            finally:
+                for e in engines:
+                    e.close()
+
+        assert results[0][0] == results[1][0]
+        assert [total for _, total in results] == [float(1 << 32)] * 2
+
+    def test_warns_once_when_engines_keep_own_queues(
+        self, mock_model, mock_tokenizer, caplog
+    ):
+        """Without the native extension, a second live engine logs one warning."""
+        with (
+            patch("omlx.engine_core.get_registry") as mock_registry,
+            patch.object(engine_core, "share_command_queue", return_value=None),
+            patch.object(engine_core, "_warned_own_queues", False),
+            caplog.at_level("WARNING", logger="omlx.engine_core"),
+        ):
+            mock_registry.return_value.acquire.return_value = True
+            engines = [
+                EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+                for _ in range(3)
+            ]
+            for e in engines:
+                e.close()
+
+        warnings = [r for r in caplog.records if "#4224" in r.getMessage()]
+        assert len(warnings) == 1
 
     @pytest.mark.asyncio
     async def test_shared_executor_serializes_concurrent_tasks(self):
@@ -1903,15 +2058,77 @@ class TestStepBurst:
         """Elapsed budget ends the burst (also caps slow prefill-chunk steps)."""
         engine = self._make_engine(mock_model, mock_tokenizer, max_steps=8, budget=0.05)
         try:
-            engine.scheduler.step = MagicMock(
-                return_value=SchedulerOutput(has_work=True)
+            # deadline = 100.01 + 0.05: steps end at 100.01, 100.04, 100.07.
+            outs = self._run_timed_burst(engine, [0.01] + [0.03] * 7)
+            assert len(outs) == 3
+            assert engine.scheduler.step.call_count == 3
+        finally:
+            engine.close()
+
+    def _run_timed_burst(
+        self, engine, durations, outputs=None, chunk_steps=(), prefilling=False
+    ):
+        """Run one burst where step i takes durations[i] seconds."""
+        clock = [100.0]
+        calls = iter(range(len(durations)))
+
+        def step():
+            index = next(calls)
+            clock[0] += durations[index]
+            if outputs and outputs[index] is not None:
+                return outputs[index]
+            output = SchedulerOutput(has_work=True)
+            output.ran_prefill_chunk = index in chunk_steps
+            return output
+
+        engine.scheduler.step = MagicMock(side_effect=step)
+        engine.scheduler.has_requests = MagicMock(return_value=True)
+        engine.scheduler.prefilling = deque([object()] if prefilling else [])
+        with patch("omlx.engine_core.time.monotonic", side_effect=lambda: clock[0]):
+            return engine._step_burst()
+
+    @pytest.mark.parametrize(
+        ("durations", "chunk_steps", "expected_steps"),
+        [
+            ([3.0, 3.0, 3.0], {0, 1, 2}, 1),
+            ([0.12, 0.12, 0.12, 0.12], (), 2),
+            ([0.05, 0.05, 0.05, 0.05], {0, 1, 2, 3}, 3),
+        ],
+        ids=["slow_chunk", "slow_decode", "fast_chunks"],
+    )
+    def test_prefill_chunk_over_budget_ends_burst(
+        self, mock_model, mock_tokenizer, durations, chunk_steps, expected_steps
+    ):
+        """Only a chunk that alone spends the budget ends the burst (#5148)."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4, budget=0.1)
+        try:
+            outs = self._run_timed_burst(
+                engine, durations, chunk_steps=chunk_steps, prefilling=True
             )
-            engine.scheduler.has_requests = MagicMock(return_value=True)
-            # deadline = monotonic()(=100.0) + 0.05; next check (=200.0) exceeds it.
-            with patch("omlx.engine_core.time.monotonic", side_effect=[100.0, 200.0]):
-                outs = engine._step_burst()
-            assert len(outs) == 1
-            assert engine.scheduler.step.call_count == 1
+            assert len(outs) == expected_steps
+        finally:
+            engine.close()
+
+    @pytest.mark.parametrize(
+        ("prefilling", "expected_steps"),
+        [(True, 1), (False, 4)],
+        ids=["prefill_in_flight", "no_prefill"],
+    )
+    def test_finished_request_ends_burst_while_prefilling(
+        self, mock_model, mock_tokenizer, prefilling, expected_steps
+    ):
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4, budget=0.1)
+        finished = SchedulerOutput(
+            has_work=True,
+            outputs=[RequestOutput(request_id="a", finished=True)],
+            finished_request_ids={"a"},
+        )
+        try:
+            outs = self._run_timed_burst(
+                engine, [0.01] * 4, [finished, None, None, None], prefilling=prefilling
+            )
+            assert outs[0] is finished
+            assert len(outs) == expected_steps
         finally:
             engine.close()
 

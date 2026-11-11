@@ -128,6 +128,32 @@ def test_validate_rejects_non_gemma4_base():
         validate_gemma4_assistant_pair(base, ASSISTANT_CONFIG)
 
 
+def test_combine_routes_unified_assistant_to_assistant_merge(tmp_path):
+    out = _write_base_output(tmp_path)
+    base = dict(BASE_CONFIG, model_type="gemma4_unified")
+    (out / "config.json").write_text(json.dumps(base))
+    asst_config = dict(ASSISTANT_CONFIG, model_type="gemma4_unified_assistant")
+    asst = _write_assistant(tmp_path, config=asst_config)
+
+    combine_mtp_into_output(out, asst)
+
+    merged = mx.load(str(out / GEMMA4_ASSISTANT_MTP_SHARD))
+    assert GEMMA4_ASSISTANT_MTP_PREFIX + "pre_projection.weight" in merged
+    config = json.loads((out / "config.json").read_text())
+    assert config["text_config"]["mtp_assistant_config"] == asst_config
+
+
+@pytest.mark.parametrize(
+    ("base_type", "assistant_type"),
+    [("gemma4", "gemma4_unified_assistant"), ("gemma4_unified", "gemma4_assistant")],
+)
+def test_validate_rejects_assistant_for_other_gemma4_variant(base_type, assistant_type):
+    base = dict(BASE_CONFIG, model_type=base_type)
+    asst = dict(ASSISTANT_CONFIG, model_type=assistant_type)
+    with pytest.raises(ValueError, match="must have model_type"):
+        validate_gemma4_assistant_pair(base, asst)
+
+
 def test_validate_rejects_headless_assistant():
     headless = dict(ASSISTANT_CONFIG)
     headless["text_config"] = {"model_type": "gemma4_text"}
@@ -565,6 +591,33 @@ def test_import_mtplx_sidecar_renames_when_keys_align(tmp_path):
 
     index = json.loads((out / "model.safetensors.index.json").read_text())
     assert index["weight_map"]["mtp.fc.weight"] == GEMMA4_ASSISTANT_MTP_SHARD
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        # OptiQ copies the HF head and ships no runtime contract file.
+        {"mtp_policy": "optiq-int4-prequantized-gs64"},
+        {"mtplx_mtp_norm_encoding": "delta"},
+    ],
+)
+def test_import_mtplx_sidecar_shifts_zero_centered_head_norms(tmp_path, marker):
+    out = _write_qwen_mtplx_sidecar_model(tmp_path, sidecar_rel="optiq/mtp.safetensors")
+    config = json.loads((out / "config.json").read_text())
+    config.update(marker)
+    (out / "config.json").write_text(json.dumps(config))
+    if "mtp_policy" in marker:
+        (out / MTPLX_RUNTIME_FILE).unlink()
+
+    result = import_mtplx_sidecar(out)
+
+    # Keys align, but the shifted head needs a written shard, not a rename.
+    assert result["merge_mode"] == "remap"
+    merged = mx.load(str(out / GEMMA4_ASSISTANT_MTP_SHARD))
+    for key, value in merged.items():
+        expected = 2.0 if value.ndim == 1 else 1.0
+        assert mx.all(value == expected).item(), key
+    assert (out / "optiq" / "mtp.safetensors").exists()
 
 
 def test_import_mtplx_sidecar_resolves_mtp_file_override(tmp_path):

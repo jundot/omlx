@@ -11,16 +11,22 @@ from omlx.patches.deepseek_v41.sensitivity import measure_sensitivity
 
 
 class Block(nn.Module):
+    calls = []
+
     def __init__(self):
         super().__init__()
         self.proj = nn.Linear(64, 64, bias=False)
         self.proj.weight = mx.sin(mx.arange(4096).reshape(64, 64)).astype(mx.bfloat16)
 
-    def __call__(self, h, pre, cache, shared, start, image_mask):
+    def __call__(self, h, pre, cache, shared, start, image_mask, ced_tail=None):
+        Block.calls.append((id(self), ced_tail))
+        if ced_tail is not None:
+            # Like a CED tail layer, only the last ced_tail positions run.
+            h = h[:, -ced_tail:]
         old = cache[1]
         if old is not None:
             h = h + old
-        h = h + shared.get("h", mx.zeros_like(h))
+        h = h + shared.get("h", mx.zeros_like(h))[:, -h.shape[1] :]
         value = self.proj(h)
         cache[1] = value
         shared["h"] = value
@@ -39,8 +45,9 @@ class Core(nn.Module):
         h = mx.sin(x[..., None] + mx.arange(64)).astype(mx.bfloat16)
         pre = mx.ones_like(h)
         shared = {}
-        for block, state in zip(self.layers, cache):
-            h, pre = block(h, pre, state, shared, 0, None)
+        for index, (block, state) in enumerate(zip(self.layers, cache)):
+            tail = 1 if index == 1 else None
+            h, pre = block(h, pre, state, shared, 0, None, ced_tail=tail)
         return h
 
 
@@ -79,6 +86,21 @@ def test_measure_sensitivity_restores_layers_weights_and_snapshots(
         assert all(layer.proj is proj for layer, proj in zip(core.layers, projections))
         actual = core(tokens, cache=core.make_cache())
         assert mx.array_equal(actual, expected).item()
+
+
+def test_measure_sensitivity_replays_each_layers_ced_tail(monkeypatch):
+    import omlx.oq as oq
+
+    with mx.stream(mx.cpu):
+        model = SimpleNamespace(language_model=Core())
+        first, second = model.language_model.layers
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a: mx.array([[1, 2]]))
+        Block.calls.clear()
+        measure_sensitivity(model, None, num_samples=1, seq_length=2)
+        # Capture, baseline and quantized replays must all see the same tail.
+        assert {tail for block, tail in Block.calls if block == id(first)} == {None}
+        assert {tail for block, tail in Block.calls if block == id(second)} == {1}
+        assert sum(block == id(second) for block, _ in Block.calls) == 3
 
 
 def test_cancellation_during_second_projection_restores_first():

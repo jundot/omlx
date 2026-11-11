@@ -13,17 +13,19 @@ and FP32 calls in query chunks of about 10 ms each (issue #2225). On NAX, MLX's
 default already selects its split-D head-dim-256 kernel for causal and
 array-mask prefills with at least 1024 queries.
 
-``OMLX_SDPA256_TILED=1/0`` remains accepted for compatibility and now forces or
-disables the bounded route. CUDA retains the array-tiled implementation because
-MLX 0.32.3's CUDA fused kernel does not support head_dim 256.
+CUDA retains the array-tiled implementation because MLX 0.32.3's CUDA fused
+kernel does not support head_dim 256.
+
+On M1/M2, FP16 decode-shaped calls above the vector kernel's thread limit run
+as two query-row halves (issue #4609).
 
 Install mechanics mirror turboquant_attention.py (patch the module attr + rebind
 already-imported model modules). The route is strictly gated (see _should_route);
 everything else passes through to the original SDPA unchanged.
 """
 
+import functools
 import logging
-import os
 import time
 
 import mlx.core as mx
@@ -55,10 +57,13 @@ _DEFAULT_DISPATCH_BUDGET = 250_000_000
 _MIN_DISPATCH_BUDGET = 20_000_000
 _MAX_DISPATCH_BUDGET = 2_000_000_000
 _DISPATCH_BUDGET: int | None = None
+# MLX 0.32.4 sends up to 32 simdgroups (query rows x GQA factor) to its vector
+# kernel without checking the pipeline limit. On M1/M2 its FP16 head-dim-256
+# 2-pass build allows 896 threads, which is 28 simdgroups.
+_VECTOR_MAX_Q_LEN = 8
+_VECTOR_MAX_SIMDGROUPS = 32
+_VECTOR_SIMDGROUP_LIMIT = 28
 
-# Backward-compatible override: True = force the bounded route, False = never
-# force it (opt out of the #2025 memory fix), None = the default below.
-_FORCE_TILED: bool | None = None
 # Bounded-route reasons already logged. The first engagement per reason logs at
 # INFO; repeats stay silent to keep the hot path quiet.
 _TILED_ROUTE_LOGGED: "set[str]" = set()
@@ -70,31 +75,9 @@ def _note_tiled_route(reason: str, detail: str) -> None:
     _TILED_ROUTE_LOGGED.add(reason)
     logger.info(
         "sdpa256: head-dim-256 long-context prefill is using the "
-        "memory-bounded path: %s. OMLX_SDPA256_TILED=0 opts out.",
+        "memory-bounded path: %s.",
         detail,
     )
-
-
-def _parse_force_tiled_env() -> bool | None:
-    value = os.environ.get("OMLX_SDPA256_TILED", "").strip()
-    if value == "1":
-        return True
-    if value == "0":
-        return False
-    return None
-
-
-def _tiled_route_required() -> bool:
-    """Use the bounded route unless the environment override disables it."""
-    if _FORCE_TILED is not None:
-        if _FORCE_TILED:
-            _note_tiled_route("forced", "forced by OMLX_SDPA256_TILED=1")
-        return _FORCE_TILED
-    _note_tiled_route(
-        "long-context",
-        "bounded attention keeps execution consistent with prefill memory pricing",
-    )
-    return True
 
 
 def _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len):
@@ -316,6 +299,63 @@ def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
     return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
 
 
+@functools.cache
+def _vector_thread_limited_gpu() -> bool:
+    try:
+        architecture = str(mx.device_info().get("architecture", ""))
+    except Exception:
+        return False
+    return architecture.startswith(("applegpu_g13", "applegpu_g14"))
+
+
+def _over_vector_thread_limit(queries, keys, mask) -> bool:
+    try:
+        q_len = queries.shape[-2]
+        if not 1 < q_len <= _VECTOR_MAX_Q_LEN or queries.dtype != mx.float16:
+            return False
+        if queries.shape[-1] != HEAD_DIM or not isinstance(keys, mx.array):
+            return False
+        # A causal call is not known to fail, and splitting it trims the keys.
+        if isinstance(mask, str):
+            return False
+        if (
+            isinstance(mask, mx.array)
+            and mask.ndim >= 2
+            and mask.shape[-2] not in (1, q_len)
+        ):
+            return False
+        n_kv = keys.shape[-3]
+        if n_kv <= 0:
+            return False
+        simdgroups = queries.shape[-3] // n_kv * q_len
+        return (
+            _VECTOR_SIMDGROUP_LIMIT < simdgroups <= _VECTOR_MAX_SIMDGROUPS
+            and _vector_thread_limited_gpu()
+        )
+    except Exception:
+        return False
+
+
+def _split_query_rows(original, queries, keys, values, cache, scale, mask, sinks):
+    # Each half keeps the key-partition plan of the full call, so every row
+    # equals the unsplit result.
+    half = (queries.shape[-2] + 1) // 2
+    per_row = isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] > 1
+    outs = [
+        original(
+            queries[..., rows, :],
+            keys,
+            values,
+            cache,
+            scale,
+            mask[..., rows, :] if per_row else mask,
+            sinks,
+        )
+        for rows in (slice(None, half), slice(half, None))
+    ]
+    return mx.concatenate(outs, axis=-2)
+
+
 def _should_route(queries, keys, cache, mask, sinks) -> bool:
     # Never raise: any unexpected input must fall through to the original SDPA,
     # never break a request. Worst case we decline to engage.
@@ -344,15 +384,17 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
         n_kv = keys.shape[-3]
         if n_kv <= 0 or n_q % n_kv != 0:
             return False
-        return _tiled_route_required()
+        _note_tiled_route(
+            "long-context",
+            "bounded attention keeps execution consistent with prefill memory pricing",
+        )
+        return True
     except Exception:
         return False
 
 
 def _register_bounded_route(min_kv_len: int) -> bool:
-    """Publish only a runtime guarantee that is actually enabled."""
-    if _FORCE_TILED is False:
-        return False
+    """Publish the bounded route's O(L) cost; False if registration fails."""
     try:
         from .. import memory_monitor
 
@@ -372,11 +414,10 @@ def _register_bounded_route(min_kv_len: int) -> bool:
 def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool:
     """Monkey-patch mlx-lm's scaled_dot_product_attention for head_dim=256
     long-context prefill, and register the O(L) cost with the memory monitor."""
-    global _PATCHED, _SDPA256_MIN_KV_LEN, _FORCE_TILED
+    global _PATCHED, _SDPA256_MIN_KV_LEN
     if _PATCHED:
         return False
     _SDPA256_MIN_KV_LEN = min_kv_len
-    _FORCE_TILED = _parse_force_tiled_env()
 
     try:
         from mlx_lm.models import base as mlx_base
@@ -394,6 +435,10 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
         mask: mx.array | None,
         sinks: mx.array | None = None,
     ) -> mx.array:
+        if _over_vector_thread_limit(queries, keys, mask):
+            return _split_query_rows(
+                original_sdpa, queries, keys, values, cache, scale, mask, sinks
+            )
         if _should_route(queries, keys, cache, mask, sinks):
             return _flash_sdpa256(queries, keys, values, scale, mask, sinks)
         return original_sdpa(queries, keys, values, cache, scale, mask, sinks)
@@ -439,6 +484,17 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
                 mask=None,
                 sinks=None,
             ) -> mx.array:
+                if _over_vector_thread_limit(queries, keys, mask):
+                    return _split_query_rows(
+                        original_vlm_sdpa,
+                        queries,
+                        keys,
+                        values,
+                        cache,
+                        scale,
+                        mask,
+                        sinks,
+                    )
                 if _should_route(queries, keys, cache, mask, sinks):
                     return _flash_sdpa256(queries, keys, values, scale, mask, sinks)
                 return original_vlm_sdpa(
@@ -456,21 +512,13 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
                     mod.scaled_dot_product_attention = patched_vlm_sdpa
 
     # Keep the prefill memory guard in lockstep: tell the monitor head_dim 256
-    # prefill is now O(L), so it stops charging the O(L^2) score matrix. The
-    # explicit benchmark override disables this guarantee, so registering it
-    # in that mode would under-estimate the same unfused path the user forced.
+    # prefill is now O(L), so it stops charging the O(L^2) score matrix.
     _register_bounded_route(min_kv_len)
 
     _PATCHED = True
-    if _FORCE_TILED is None:
-        routing = "always force bounded for qualifying calls (#2025)"
-    elif _FORCE_TILED:
-        routing = "always force bounded (OMLX_SDPA256_TILED=1)"
-    else:
-        routing = "never force bounded (OMLX_SDPA256_TILED=0)"
     logger.info(
-        "sdpa256 attention patch applied (head_dim=256 prefill, kv_len>=%d, %s)",
+        "sdpa256 attention patch applied (head_dim=256 prefill, kv_len>=%d, "
+        "always force bounded for qualifying calls (#2025))",
         min_kv_len,
-        routing,
     )
     return True

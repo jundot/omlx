@@ -2,6 +2,7 @@
 """Tests for the OQManager admin component."""
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -631,6 +632,23 @@ class TestOQManagerEnhanced:
         assert task.imatrix_cache_path.endswith("-s8-l128.npz")
 
 
+@pytest.mark.asyncio
+async def test_start_rejects_output_dir_of_active_task(fp_model_dir, monkeypatch):
+    manager = OQManager(model_dirs=[str(fp_model_dir)])
+
+    async def _noop_run(task_id):
+        return None
+
+    monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+    # Both names resolve to Llama-3B-oQ4.
+    twin = fp_model_dir / "Llama-3B-bf16"
+    shutil.copytree(fp_model_dir / "Llama-3B", twin)
+
+    await manager.start_quantization(str(fp_model_dir / "Llama-3B"), 4)
+    with pytest.raises(ValueError, match="Another quantization is writing"):
+        await manager.start_quantization(str(twin), 4)
+
+
 class TestOQManagerHfCacheDiscovery:
     """HF cache models (non-MLX) should appear as quantization sources."""
 
@@ -830,7 +848,7 @@ async def test_v41_source_metadata_and_converted_filter(tmp_path, layer_key):
 @pytest.mark.parametrize(
     "settings, message",
     [
-        ({"oq_level": 8, "enhanced": True}, "Choose oQ3/oQ3e or oQ4/oQ4e"),
+        ({"oq_level": 8, "enhanced": True}, "Choose oQ2, oQ2.5, oQ2.7, oQ3 or oQ4"),
         ({"oq_level": 4, "dtype": "float16"}, "requires dtype='bfloat16'"),
         ({"oq_level": 3, "group_size": 32}, "group_size=64"),
     ],
@@ -846,3 +864,93 @@ async def test_v41_rejects_unsupported_settings_before_queueing(
         await manager.start_quantization(str(source), **settings)
     assert not manager._active_tasks
     assert list(tmp_path.iterdir()) == [source]
+
+
+@pytest.mark.asyncio
+async def test_v41_preserve_ngram_table_names_output_and_reaches_export(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "DeepSeek-V4.1"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    (source / "model.safetensors").write_bytes(bytes(64))
+    calls = []
+
+    def _fake_quantize(model_path, output_path, *args, **kwargs):
+        calls.append(kwargs)
+        Path(output_path).mkdir(parents=True)
+
+    monkeypatch.setattr("omlx.oq.quantize_oq_streaming", _fake_quantize)
+    manager = OQManager(model_dirs=[str(tmp_path)])
+    task = await manager.start_quantization(
+        str(source), 4, enhanced=True, preserve_ngram_table=True
+    )
+    await manager._active_tasks[task.task_id]
+
+    assert task.status is QuantStatus.COMPLETED
+    assert task.output_name == "DeepSeek-V4.1-oQ4e-ngram"
+    assert [call["preserve_ngram_table"] for call in calls] == [True]
+
+
+@pytest.mark.asyncio
+async def test_preserve_ngram_table_is_rejected_outside_v41(tmp_path):
+    source = tmp_path / "Llama"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (source / "model.safetensors").write_bytes(bytes(64))
+    manager = OQManager(model_dirs=[str(tmp_path)])
+    with pytest.raises(ValueError, match="only available for DeepSeek V4.1"):
+        await manager.start_quantization(str(source), 4, preserve_ngram_table=True)
+    assert not manager._active_tasks
+
+
+class TestOQManagerUnreadableEntries:
+    """Unreadable entries in a model dir must not empty the source list."""
+
+    @staticmethod
+    def _deny_iterdir(monkeypatch, *denied: Path):
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path in denied:
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+    @pytest.mark.asyncio
+    async def test_unreadable_hidden_system_dir_is_skipped(
+        self, fp_model_dir, monkeypatch
+    ):
+        """A volume's .Spotlight-V100 / .Trashes is EPERM without Full Disk
+        Access; the scan should still list the real models."""
+        spotlight = fp_model_dir / ".Spotlight-V100"
+        spotlight.mkdir()
+        trashes = fp_model_dir / ".Trashes"
+        trashes.mkdir()
+        self._deny_iterdir(monkeypatch, spotlight, trashes)
+
+        manager = OQManager(model_dirs=[str(fp_model_dir)])
+        source_models, all_models = await manager.list_quantizable_models()
+
+        assert [m["name"] for m in source_models] == ["Llama-3B"]
+        assert [m["name"] for m in all_models] == ["Llama-3B"]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_model_group_and_root_are_skipped(
+        self, fp_model_dir, second_fp_model_dir, tmp_path, monkeypatch
+    ):
+        """An unreadable organization folder or model root is skipped while
+        models in readable directories are still listed."""
+        locked_group = fp_model_dir / "LockedOrg"
+        locked_group.mkdir()
+        locked_root = tmp_path / "locked_root"
+        locked_root.mkdir()
+        self._deny_iterdir(monkeypatch, locked_group, locked_root)
+
+        manager = OQManager(
+            model_dirs=[str(locked_root), str(fp_model_dir), str(second_fp_model_dir)]
+        )
+        source_models, _ = await manager.list_quantizable_models()
+
+        assert sorted(m["name"] for m in source_models) == ["Llama-3B", "Qwen-7B"]

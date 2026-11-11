@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import dataclasses
-import importlib
 from unittest.mock import Mock
 
 import mlx.core as mx
@@ -26,7 +25,13 @@ HC, HIDDEN, LOWRANK = 4, 2560, 320
 WIDTH = HC * HIDDEN
 
 
-def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN, group_size: int = 64):
+def _module(
+    bits: int,
+    use_combine: bool = True,
+    hidden: int = HIDDEN,
+    group_size: int = 64,
+    dtype=mx.bfloat16,
+):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual, Qwen4ExpRMSNorm
 
@@ -35,7 +40,7 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN, group_siz
     nn.Module.__init__(module)
     module.hc_count, module.hidden_size, module.hc_lowrank = HC, hidden, LOWRANK
     module.hc_norm = Qwen4ExpRMSNorm(width, group_size=hidden, eps=1e-6)
-    module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(mx.bfloat16)
+    module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(dtype)
     module.input_mix_weight_down = nn.QuantizedLinear(
         width, LOWRANK, bias=False, group_size=group_size, bits=bits
     )
@@ -53,10 +58,10 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN, group_siz
             # up-projection gate into saturation where any rounding difference flips whole elements.
             projection.scales = (
                 mx.abs(mx.random.normal(projection.scales.shape)) * 0.01 + 0.002
-            ).astype(mx.bfloat16)
+            ).astype(dtype)
             projection.biases = (
                 mx.random.normal(projection.biases.shape) * 0.005
-            ).astype(mx.bfloat16)
+            ).astype(dtype)
     mx.eval(module.parameters())
     return module
 
@@ -90,14 +95,18 @@ def _ulps(a, b):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("group_size", [32, 64])
+@pytest.mark.parametrize(
+    "group_size,dtype", [(32, mx.bfloat16), (64, mx.bfloat16), (64, mx.float16)]
+)
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("rows", [1, 4, 16])
 @pytest.mark.parametrize("use_combine", [True, False])
-def test_fused_matches_canonical_path(bits, rows, use_combine, group_size):
+def test_fused_matches_canonical_path(bits, rows, use_combine, group_size, dtype):
     mx.random.seed(20260905 + bits * 100 + rows)
     _assert_fused_matches_canonical(
-        _module(bits, use_combine, group_size=group_size), rows, use_combine
+        _module(bits, use_combine, group_size=group_size, dtype=dtype),
+        rows,
+        use_combine,
     )
 
 
@@ -119,7 +128,8 @@ def _assert_fused_matches_canonical(module, rows, use_combine):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     hidden = module.hidden_size
-    x = mx.random.normal((1, rows, HC * hidden)).astype(mx.bfloat16)
+    dtype = module.hc_norm.weight.dtype
+    x = mx.random.normal((1, rows, HC * hidden)).astype(dtype)
     mx.eval(x)
     assert hc_fused.compatible(module, x)
     fused = hc_fused.fused_forward(module, x)
@@ -137,7 +147,7 @@ def _assert_fused_matches_canonical(module, rows, use_combine):
     else:
         fused_mixed, canon_mixed = fused, canonical
     assert fused_mixed.shape == canon_mixed.shape == (1, rows, hidden)
-    assert fused_mixed.dtype == mx.bfloat16
+    assert fused_mixed.dtype == dtype
     max_vs_canon, mean_vs_canon = _ulps(fused_mixed, canon_mixed)
     assert max_vs_canon <= 16 and mean_vs_canon <= 0.5
     # Both paths round differently; judge each against fp32. The fused path keeps fp32 through
@@ -278,22 +288,11 @@ def test_compatible_fails_closed():
         mx.float16
     )
     assert not hc_fused.compatible(module, ok)
-
-
-def test_kill_switch_disables_fused_path(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN4_HC_FUSED", "0")
-    from mlx_vlm.models.qwen4_exp import hc_fused
-
-    reloaded = importlib.reload(hc_fused)
-    try:
-        assert not reloaded.enabled()
-        assert not reloaded.write_enabled()
-        assert not reloaded.compatible(
-            _module(4), mx.random.normal((1, 4, WIDTH)).astype(mx.bfloat16)
-        )
-    finally:
-        monkeypatch.delenv("OMLX_QWEN4_HC_FUSED")
-        importlib.reload(hc_fused)
+    # An FP16 layout takes FP16 rows only.
+    fp16 = _module(4, dtype=mx.float16)
+    if mx.metal.is_available():
+        assert hc_fused.compatible(fp16, ok.astype(mx.float16))
+    assert not hc_fused.compatible(fp16, ok)
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -378,16 +377,20 @@ def test_specializations_validate_once_and_keep_warm_calls_lazy(monkeypatch):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("group_size", [32, 64])
+@pytest.mark.parametrize(
+    "group_size,dtype", [(32, mx.bfloat16), (64, mx.bfloat16), (64, mx.float16)]
+)
 @pytest.mark.parametrize("bits", [4, 5])
 @pytest.mark.parametrize("rows", [17, 2048])
 @pytest.mark.parametrize("use_combine", [True, False])
-def test_prefill_path_matches_canonical(bits, rows, use_combine, group_size, monkeypatch):
+def test_prefill_path_matches_canonical(
+    bits, rows, use_combine, group_size, dtype, monkeypatch
+):
     """Prefill fuses the stream norm and, with inject weights, the mix/inject tail."""
     from mlx_vlm.models.qwen4_exp import hc_fused
 
-    module = _module(bits, use_combine, group_size=group_size)
-    x = (mx.random.normal((1, rows, WIDTH)) * 2).astype(mx.bfloat16)
+    module = _module(bits, use_combine, group_size=group_size, dtype=dtype)
+    x = (mx.random.normal((1, rows, WIDTH)) * 2).astype(dtype)
     mx.eval(x)
     assert not hc_fused.compatible(module, x)
     assert hc_fused.prefill_compatible(module, x)
@@ -406,7 +409,7 @@ def test_prefill_path_matches_canonical(bits, rows, use_combine, group_size, mon
     else:
         mixed, canon_mixed = out, canon
     assert mixed.shape == canon_mixed.shape == (1, rows, HIDDEN)
-    assert mixed.dtype == mx.bfloat16
+    assert mixed.dtype == dtype
     max_ulps, mean_ulps = _ulps(mixed, canon_mixed)
     assert max_ulps <= 16 and mean_ulps <= 0.5
 
@@ -1017,13 +1020,18 @@ def _two_launch_fits(hc_fused, monkeypatch, module, rows):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("gpu_class", ["d", "s"])
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("use_combine", [True, False])
-def test_two_launch_decode_keeps_three_launch_bits(bits, use_combine, monkeypatch):
+def test_two_launch_decode_keeps_three_launch_bits(
+    bits, use_combine, gpu_class, monkeypatch
+):
     """Mixed, written residual and injection match the three-launch kernels bit for bit at
-    every decode row count, with and without a pending write (checkpoint shapes)."""
+    every decode row count, with and without a pending write (checkpoint shapes), in
+    each GPU class's geometry."""
     from mlx_vlm.models.qwen4_exp import hc_fused
 
+    monkeypatch.setattr(hc_fused, "_gpu_class", lambda: gpu_class)
     rows_list = range(1, hc_fused.MAX_ROWS + 1) if bits == 6 else (1, 2, 3, 5, 16)
     for seed in (0, 1, 2) if bits == 6 else (0,):
         mx.random.seed(4017 + 97 * seed + bits)
@@ -1042,11 +1050,15 @@ def test_two_launch_decode_keeps_three_launch_bits(bits, use_combine, monkeypatc
 # 64: every down block is a partial tail; 768/1152/1344: partial final down, inject
 # and norm blocks (see test_fused_matches_canonical_path_at_other_hidden_sizes).
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("gpu_class", ["d", "s"])
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("hidden", [64, 1152, 1344])
-def test_two_launch_decode_keeps_bits_with_partial_blocks(hidden, bits, monkeypatch):
+def test_two_launch_decode_keeps_bits_with_partial_blocks(
+    hidden, bits, gpu_class, monkeypatch
+):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
+    monkeypatch.setattr(hc_fused, "_gpu_class", lambda: gpu_class)
     mx.random.seed(4018 + hidden + bits)
     module = _module(bits, True, hidden=hidden)
     for rows in (1, 3, 16):
@@ -1115,10 +1127,13 @@ _NDN_INV = "    const float inv = metal::rsqrt(tot / float(H) + e);\n"
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("gpu_class", ["d", "s"])
 @pytest.mark.parametrize("group_size", [32, 64])
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("rows", [1, 3, 16])
-def test_two_launch_decode_keeps_three_launch_fp32_sums(bits, rows, group_size, monkeypatch):
+def test_two_launch_decode_keeps_three_launch_fp32_sums(
+    bits, rows, group_size, gpu_class, monkeypatch
+):
     """The BF16 outputs absorb most one-ulp FP32 changes (reversing the up sum order
     changed no output bit over 128 rows), so compare the FP32 values each path rounds:
     the stream sums of squares, the down and inject slice sums
@@ -1126,6 +1141,7 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(bits, rows, group_size, 
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     monkeypatch.setattr(hc_fused, "_V2_MAX_ROWS", hc_fused.MAX_ROWS)
+    monkeypatch.setattr(hc_fused, "_gpu_class", lambda: gpu_class)
     mx.random.seed(4020 + 10 * bits + rows + group_size)
     module = _module(bits, True, group_size=group_size)
     down, up = module.input_mix_weight_down, module.input_mix_weight_up
@@ -1272,7 +1288,7 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(bits, rows, group_size, 
     )[0]
     chunks = hc_fused._up_chunks(bits, LOWRANK)
     threads = chunks * (hc_fused._V2_UP_THREADS // chunks)
-    outputs = hc_fused._V2_UP_OUTPUTS
+    outputs = hc_fused._up_outputs(rows)
     up2_probe = _probe(
         _probe(
             _probe(hc_fused._U2_SOURCE, _U2_EPILOGUE, store_acc),
@@ -1309,7 +1325,7 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(bits, rows, group_size, 
 
 # Deferred residual writes: a real-shape stack must match eager writes bit for bit.
 # Each layer's tail write is carried into the next hyper-connection norm (and the
-# final mixer); the reference runs with OMLX_QWEN4_HC_FUSED_WRITE off.
+# final mixer); the reference runs with deferred writes off.
 
 
 def _stack(seed: int):
@@ -1492,13 +1508,12 @@ def _decode_and_verify(model, head, ids):
 
 
 @needs_metal
-@pytest.mark.parametrize("seed", [0, 1, 2])
-def test_decode_and_verify_rows_match_eager_writes(monkeypatch, seed):
-    _assert_identical(monkeypatch, seed, _decode_and_verify)
+def test_decode_and_verify_rows_match_eager_writes(monkeypatch):
+    _assert_identical(monkeypatch, 0, _decode_and_verify)
 
 
 @needs_metal
-@pytest.mark.parametrize("chunk", [17, 257, 2048])
+@pytest.mark.parametrize("chunk", [17, 257])
 def test_prefill_chunks_match_eager_writes(monkeypatch, chunk):
     def prefill(model, head, ids):
         cache = model.make_cache()

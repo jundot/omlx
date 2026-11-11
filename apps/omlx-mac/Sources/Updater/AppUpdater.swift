@@ -9,8 +9,9 @@
 // boundary.
 //
 // Cancellation: `cancel()` is best-effort; an in-flight download exits at
-// the next stream chunk. A staged copy that's already on disk gets
-// cleaned up by `cleanupStaged()` on the next launch.
+// the next stream chunk.
+// A staged copy newer than the running app stays on disk across launches.
+// The next check reuses it only after a fresh signature check.
 
 import AppKit
 import Foundation
@@ -53,35 +54,39 @@ final class AppUpdater {
         case ready
     }
 
-    static let stagedAppName = UpdateInstaller.stagedAppName
+    nonisolated static let stagedAppName = UpdateInstaller.stagedAppName
     private static var swapScheduled = false
 
     private let dmgURL: URL
     private let version: String
+    private let allowsMeteredNetwork: Bool
     private let onProgress: @MainActor (Progress) -> Void
     private let onError: @MainActor (UpdateError) -> Void
     private let onReady: @MainActor () -> Void
 
     private var task: Task<Void, Never>?
     private var session: URLSession?
-    private var downloadTask: URLSessionDownloadTask?
+    private var downloadTask: URLSessionTask?
     private var cancelled = false
 
+    /// `allowsMeteredNetwork: false` fails the download on Low Data Mode and hotspot connections.
     init(
         dmgURL: URL,
         version: String,
+        allowsMeteredNetwork: Bool,
         onProgress: @escaping @MainActor (Progress) -> Void,
         onError: @escaping @MainActor (UpdateError) -> Void,
         onReady: @escaping @MainActor () -> Void
     ) {
         self.dmgURL = dmgURL
         self.version = version
+        self.allowsMeteredNetwork = allowsMeteredNetwork
         self.onProgress = onProgress
         self.onError = onError
         self.onReady = onReady
     }
 
-    static func appBundleURL() -> URL {
+    nonisolated static func appBundleURL() -> URL {
         Bundle.main.bundleURL
     }
 
@@ -89,17 +94,46 @@ final class AppUpdater {
         FileManager.default.isWritableFile(atPath: app.deletingLastPathComponent().path)
     }
 
-    /// Best-effort cleanup of a leftover staged bundle from a prior attempt.
+    private nonisolated static var stagedAppURL: URL {
+        appBundleURL().deletingLastPathComponent().appendingPathComponent(stagedAppName)
+    }
+
     /// Call once on launch.
-    static func cleanupStaged() {
-        let app = appBundleURL()
-        let staged = app.deletingLastPathComponent().appendingPathComponent(stagedAppName)
+    /// With `keepPending`, keeps a staged bundle newer than the running app.
+    /// Anything else is the old app left by a swap, or an older pending update.
+    static func cleanupStaged(currentVersion: String, keepPending: Bool) {
         UpdateInstaller.cleanupLaunchAgents(
             in: AppConfig.appSupportURL().appendingPathComponent(
                 UpdateInstaller.jobsDirectoryName
             )
         )
-        try? FileManager.default.removeItem(at: staged)
+        if keepPending, let staged = stagedVersion(),
+           ReleasesChecker.isNewer(staged, than: currentVersion) {
+            return
+        }
+        Task { await discardStaged() }
+    }
+
+    nonisolated static func stagedVersion() -> String? {
+        let plist = stagedAppURL.appendingPathComponent("Contents/Info.plist")
+        return NSDictionary(contentsOf: plist)?["CFBundleShortVersionString"] as? String
+    }
+
+    /// True when the staged bundle is `version` and still passes the signature check.
+    /// A copy cut short by a quit or crash fails the check.
+    nonisolated static func stagedBundleMatches(version: String) async -> Bool {
+        guard stagedVersion() == version else { return false }
+        return await Task.detached(priority: .utility) {
+            (try? verifyAppSignature(at: stagedAppURL.path)) != nil
+        }.value
+    }
+
+    /// Removes the staged bundle off the main thread.
+    /// The bundle has tens of thousands of files.
+    nonisolated static func discardStaged() async {
+        await Task.detached(priority: .utility) {
+            try? FileManager.default.removeItem(at: stagedAppURL)
+        }.value
     }
 
     func start() {
@@ -154,9 +188,13 @@ final class AppUpdater {
         if cancelled { return }
         onProgress(.mounting)
 
+        // hdiutil attach, ditto, and codesign block for seconds each.
+        // A background download runs while the app is in use.
         let mountPoint: URL
         do {
-            mountPoint = try mountDMG(at: dmgPath)
+            mountPoint = try await Task.detached(priority: .utility) {
+                try Self.mountDMG(at: dmgPath)
+            }.value
         } catch let err as UpdateError {
             onError(err); return
         } catch {
@@ -166,7 +204,7 @@ final class AppUpdater {
         var mountedDMGNeedsCleanup = true
         defer {
             if mountedDMGNeedsCleanup {
-                try? unmountDMG(at: mountPoint)
+                try? Self.unmountDMG(at: mountPoint)
             }
         }
 
@@ -175,10 +213,16 @@ final class AppUpdater {
 
         let stagedApp = app.deletingLastPathComponent().appendingPathComponent(Self.stagedAppName)
         do {
-            try stageApp(fromMount: mountPoint, to: stagedApp)
-            try verifyAppSignature(at: stagedApp.path)
+            try await Task.detached(priority: .utility) {
+                do {
+                    try Self.stageApp(fromMount: mountPoint, to: stagedApp)
+                    try Self.verifyAppSignature(at: stagedApp.path)
+                } catch {
+                    try? FileManager.default.removeItem(at: stagedApp)
+                    throw error
+                }
+            }.value
         } catch {
-            try? FileManager.default.removeItem(at: stagedApp)
             onError(error as? UpdateError ?? .stageFailed(error.localizedDescription))
             return
         }
@@ -187,7 +231,7 @@ final class AppUpdater {
         do {
             try Self.finishStagedUpdate(
                 detach: {
-                    try unmountDMG(at: mountPoint)
+                    try Self.unmountDMG(at: mountPoint)
                     mountedDMGNeedsCleanup = false
                 },
                 removeTemporaryFiles: {
@@ -222,11 +266,15 @@ final class AppUpdater {
 
     // MARK: - Download
 
-    private func downloadDMG(to dest: URL) async throws {
-        let config = URLSessionConfiguration.default
+    func downloadDMG(
+        to dest: URL,
+        configuration config: URLSessionConfiguration = .default
+    ) async throws {
+        // Idle timeout only. Throttled CDN routes can need hours for the DMG.
         config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 3600
-        let delegate = DMGDownloadDelegate(destination: dest) { [weak self] pct, received, total in
+        config.allowsConstrainedNetworkAccess = allowsMeteredNetwork
+        config.allowsExpensiveNetworkAccess = allowsMeteredNetwork
+        let delegate = try DMGDownloadDelegate(destination: dest) { [weak self] pct, received, total in
             Task { @MainActor [weak self] in
                 guard let self, !self.cancelled else { return }
                 self.onProgress(.downloading(percent: pct, receivedBytes: received, totalBytes: total))
@@ -240,72 +288,97 @@ final class AppUpdater {
             self.downloadTask = nil
         }
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            delegate.continuation = continuation
-            let task = session.downloadTask(with: dmgURL)
-            self.downloadTask = task
-            task.resume()
+        // A stalled transfer resumes from the bytes on disk with a new request.
+        // URLSession resume data replays the signed CDN URL, which expires.
+        var stalls = 0
+        while true {
+            let offset = delegate.received
+            var request = URLRequest(url: dmgURL)
+            if offset > 0 {
+                request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
+            }
+            do {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    delegate.continuation = continuation
+                    let task = session.dataTask(with: request)
+                    self.downloadTask = task
+                    task.resume()
+                }
+                break
+            } catch let error as URLError where !cancelled {
+                stalls = delegate.received > offset ? 0 : stalls + 1
+                guard stalls <= 5 else { throw error }
+                if stalls > 0 {
+                    try await Task.sleep(for: .seconds(1 << stalls))
+                }
+            }
         }
         if cancelled {
             throw UpdateError.cancelled
         }
     }
 
-    private final class DMGDownloadDelegate: NSObject, URLSessionDownloadDelegate {
-        let destination: URL
+    private final class DMGDownloadDelegate: NSObject, URLSessionDataDelegate {
+        let file: FileHandle
         let onProgress: @Sendable (Int, Int64, Int64) -> Void
         var continuation: CheckedContinuation<Void, Error>?
+        private(set) var received: Int64 = 0
+        private var total: Int64 = 0
+        private var etag: String?
 
         private let lock = NSLock()
-        private var completed = false
         private var lastReportedPct = -1
 
         init(
             destination: URL,
             onProgress: @escaping @Sendable (Int, Int64, Int64) -> Void
-        ) {
-            self.destination = destination
+        ) throws {
+            FileManager.default.createFile(atPath: destination.path, contents: nil)
+            file = try FileHandle(forWritingTo: destination)
             self.onProgress = onProgress
         }
 
         func urlSession(
             _ session: URLSession,
-            downloadTask: URLSessionDownloadTask,
-            didWriteData bytesWritten: Int64,
-            totalBytesWritten: Int64,
-            totalBytesExpectedToWrite: Int64
+            dataTask: URLSessionDataTask,
+            didReceive response: URLResponse,
+            completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
         ) {
-            guard totalBytesExpectedToWrite > 0 else { return }
-            let pct = Int(totalBytesWritten * 100 / totalBytesExpectedToWrite)
+            let http = response as? HTTPURLResponse
+            let etag = http?.value(forHTTPHeaderField: "ETag")
+            // The CDN ignores If-Range, so a resumed body is checked by ETag.
+            let continuesFile = received == 0
+                ? http?.statusCode == 200
+                : http?.statusCode == 206 && etag == self.etag
+            guard continuesFile else {
+                finish(.failure(UpdateError.downloadFailed("HTTP \(http?.statusCode ?? -1)")))
+                completionHandler(.cancel)
+                return
+            }
+            if received == 0 {
+                total = response.expectedContentLength
+                self.etag = etag
+            }
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            do {
+                try file.write(contentsOf: data)
+            } catch {
+                finish(.failure(UpdateError.downloadFailed(error.localizedDescription)))
+                dataTask.cancel()
+                return
+            }
+            received += Int64(data.count)
+            guard total > 0 else { return }
+            let pct = Int(received * 100 / total)
             lock.lock()
             let shouldReport = pct != lastReportedPct
             if shouldReport { lastReportedPct = pct }
             lock.unlock()
             if shouldReport {
-                onProgress(pct, totalBytesWritten, totalBytesExpectedToWrite)
-            }
-        }
-
-        func urlSession(
-            _ session: URLSession,
-            downloadTask: URLSessionDownloadTask,
-            didFinishDownloadingTo location: URL
-        ) {
-            guard let http = downloadTask.response as? HTTPURLResponse,
-                  http.statusCode == 200
-            else {
-                let code = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? -1
-                finish(.failure(UpdateError.downloadFailed("HTTP \(code)")))
-                return
-            }
-            do {
-                if FileManager.default.fileExists(atPath: destination.path) {
-                    try FileManager.default.removeItem(at: destination)
-                }
-                try FileManager.default.moveItem(at: location, to: destination)
-                finish(.success(()))
-            } catch {
-                finish(.failure(UpdateError.downloadFailed(error.localizedDescription)))
+                onProgress(pct, received, total)
             }
         }
 
@@ -316,16 +389,15 @@ final class AppUpdater {
         ) {
             if let error {
                 finish(.failure(error))
+            } else if received < total {
+                finish(.failure(URLError(.networkConnectionLost)))
+            } else {
+                finish(.success(()))
             }
         }
 
         private func finish(_ result: Result<Void, Error>) {
             lock.lock()
-            guard !completed else {
-                lock.unlock()
-                return
-            }
-            completed = true
             let continuation = self.continuation
             self.continuation = nil
             lock.unlock()
@@ -341,7 +413,7 @@ final class AppUpdater {
 
     // MARK: - Mount / unmount
 
-    private func mountDMG(at dmg: URL) throws -> URL {
+    private nonisolated static func mountDMG(at dmg: URL) throws -> URL {
         let result = try runProcess(
             "/usr/bin/hdiutil",
             args: ["attach", "-nobrowse", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
@@ -364,7 +436,7 @@ final class AppUpdater {
         throw UpdateError.mountFailed("Could not parse hdiutil output")
     }
 
-    private func unmountDMG(at mountPoint: URL) throws {
+    private nonisolated static func unmountDMG(at mountPoint: URL) throws {
         let result = try runProcess(
             "/usr/bin/hdiutil",
             args: ["detach", mountPoint.path, "-force"]
@@ -378,7 +450,7 @@ final class AppUpdater {
 
     // MARK: - Stage
 
-    private func stageApp(fromMount mountPoint: URL, to stagedApp: URL) throws {
+    private nonisolated static func stageApp(fromMount mountPoint: URL, to stagedApp: URL) throws {
         let appInVolume = try findAppInVolume(mountPoint)
         if FileManager.default.fileExists(atPath: stagedApp.path) {
             try FileManager.default.removeItem(at: stagedApp)
@@ -395,7 +467,7 @@ final class AppUpdater {
         }
     }
 
-    private func findAppInVolume(_ mountPoint: URL) throws -> URL {
+    private nonisolated static func findAppInVolume(_ mountPoint: URL) throws -> URL {
         let preferred = mountPoint.appendingPathComponent("oMLX.app")
         if FileManager.default.fileExists(atPath: preferred.path) { return preferred }
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: mountPoint.path)) ?? []
@@ -409,10 +481,10 @@ final class AppUpdater {
 
     /// A plain `--verify` also accepts ad-hoc or foreign signatures, so the
     /// check pins the Developer ID team that signs releases.
-    static let releaseRequirement =
+    nonisolated static let releaseRequirement =
         #"=anchor apple generic and identifier "app.omlx" and certificate leaf[subject.OU] = "PSK5Q5T46L""#
 
-    func verifyAppSignature(at appPath: String) throws {
+    nonisolated static func verifyAppSignature(at appPath: String) throws {
         let result = try runProcess(
             "/usr/bin/codesign",
             args: ["--verify", "--deep", "--strict", "-R", Self.releaseRequirement, appPath]

@@ -4,8 +4,10 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import mlx.core as mx
 import pytest
 
+from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import (
     _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
     _SDPA_FULL_SUPPORTED_HEAD_DIMS,
@@ -13,6 +15,8 @@ from omlx.memory_monitor import (
     _SDPA_VECTOR_SUPPORTED_HEAD_DIMS,
     MemoryInfo,
     MemoryMonitor,
+    raise_if_prefill_exceeds,
+    set_model_info_from_model,
 )
 from omlx.utils.hardware import format_bytes
 
@@ -761,8 +765,8 @@ class TestEstimateResidentKvBytes:
 
 
 class TestSetModelInfoFromModelRotating:
-    """DFlash mirror: set_model_info_from_model classifies via the shared
-    helper so rotating specs reach the monitor."""
+    """set_model_info_from_model classifies via the shared helper so rotating
+    specs reach the monitor."""
 
     def _fake_model(self, cache_list, num_layers=30):
         class _Cfg:
@@ -805,6 +809,47 @@ class TestSetModelInfoFromModelRotating:
         assert monitor._num_kv_cache_layers == 0
         assert monitor._rotating_layer_specs == ((30, 512),)
         assert monitor.estimate_prompt_kv_bytes(100_000) == 0
+
+
+class TestRaiseIfPrefillExceeds:
+    """The shared prefill preflight that engines without a scheduler call."""
+
+    def _monitor(self):
+        class _Cfg:
+            num_hidden_layers = 32
+            num_key_value_heads = 8
+            num_attention_heads = 32
+            head_dim = 192
+
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        set_model_info_from_model(monitor, SimpleNamespace(config=_Cfg()))
+        return monitor
+
+    def test_noop_when_fully_cached(self):
+        raise_if_prefill_exceeds(
+            self._monitor(),
+            prefill_memory_guard=True,
+            hard_limit_bytes=1,
+            current_usage_bytes=0,
+            prefill_step_size=2048,
+            num_prompt_tokens=1000,
+            cached_tokens=1000,
+        )
+
+    def test_uses_caller_supplied_usage_without_mlx_probe(self, monkeypatch):
+        def probe():
+            raise AssertionError("preflight must not read MLX directly")
+
+        monkeypatch.setattr(mx, "get_active_memory", probe)
+        with pytest.raises(PrefillMemoryExceededError):
+            raise_if_prefill_exceeds(
+                self._monitor(),
+                prefill_memory_guard=True,
+                hard_limit_bytes=1,
+                current_usage_bytes=0,
+                prefill_step_size=2048,
+                num_prompt_tokens=65536,
+            )
 
 
 class TestDeepSeekV4PrefillMemoryProfile:
@@ -859,15 +904,12 @@ class TestDeepSeekV4PrefillMemoryProfile:
     def _set_wsdpa_route(
         monkeypatch,
         *,
-        enabled: bool = True,
         broken: bool = False,
         dense: bool = True,
         topk: bool = True,
     ):
         from omlx.patches.deepseek_v4 import wsdpa_attention as wsdpa
 
-        monkeypatch.setattr(wsdpa, "_ENABLED", enabled)
-        monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
         monkeypatch.setattr(wsdpa, "_broken", broken)
         monkeypatch.setattr(wsdpa, "_ready", dense)
         monkeypatch.setattr(wsdpa, "_topk_ready", topk)
@@ -906,12 +948,10 @@ class TestDeepSeekV4PrefillMemoryProfile:
         assert active == self._wsdpa_bytes(query_tokens, local_tokens)
         assert active < fallback
 
-        for enabled, broken in ((False, False), (True, True)):
-            self._set_wsdpa_route(monkeypatch, enabled=enabled, broken=broken)
-            assert (
-                supported.estimate_chunk_transient_bytes(query_tokens, kv_len)
-                == fallback
-            )
+        self._set_wsdpa_route(monkeypatch, broken=True)
+        assert (
+            supported.estimate_chunk_transient_bytes(query_tokens, kv_len) == fallback
+        )
 
         self._set_wsdpa_route(monkeypatch)
         unsupported = self._monitor(ratios=[0], wsdpa_dtype_supported=False)

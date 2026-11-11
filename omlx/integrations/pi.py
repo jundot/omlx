@@ -31,7 +31,7 @@ class PiIntegration(Integration):
             display_name="Pi",
             type="config_file",
             install_check="pi",
-            install_hint="npm install -g @mariozechner/pi-coding-agent",
+            install_hint="npm install -g @earendil-works/pi-coding-agent",
         )
 
     def get_command(self, ctx: IntegrationContext) -> str:

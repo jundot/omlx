@@ -30,7 +30,7 @@ from omlx.memory_monitor import (
     make_prefill_memory_profile,
 )
 from omlx.prefill_transient_tracker import PrefillTransientTracker
-from omlx.request import Request, SamplingParams
+from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import (
     PrefillEvictionRequest,
     Scheduler,
@@ -191,7 +191,7 @@ def _throttle_ctx(
     return ns
 
 
-def _call(ns, requested, kv_len=0, *, gathered_core=False):
+def _call(ns, requested, kv_len=0, *, gathered_core=False, probe=False):
     with (
         patch.object(sched_mod.mx, "get_active_memory", return_value=0),
         patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
@@ -203,7 +203,27 @@ def _call(ns, requested, kv_len=0, *, gathered_core=False):
             loop_label="test",
             kv_len=kv_len,
             gathered_core=gathered_core,
+            probe=probe,
         )
+
+
+def test_adaptive_throttle_probe_neither_pauses_nor_notifies():
+    ns = _throttle_ctx(
+        current=50 * _GB,
+        hard=58 * _GB,
+        samples_bpt=2 * 1024**2,
+    )
+    ns._fake_current = 50 * _GB
+    request = SimpleNamespace(prefill_eviction_retries=0)
+    ns.requests = {"r": request}
+    ns.config = SimpleNamespace(model_name="model-b")
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+    # A packed forward only asks whether its rows fit.
+    assert _call(ns, 2048, probe=True) < 2048
+    assert request.prefill_eviction_retries == 0
+    assert ns._throttle_notified_requests == set()
 
 
 def test_adaptive_throttle_requests_eviction_before_shrinking():
@@ -639,6 +659,60 @@ def test_qwen4_measured_excess_is_flat_not_scaled_to_the_next_chunk():
     assert predicted < 20 * _GB / measured_tokens * candidate
 
 
+def test_flat_overhead_throttle_keeps_the_chunk_its_prediction_fits():
+    """Weights above the soft watermark put every chunk in a tier. Flat-overhead
+    profiles size from their static profile and measured overhead, so a
+    throttled chunk keeps the largest size that fits instead of a tier."""
+    hard = 114 * _GB
+    ns = _throttle_ctx(current=0, hard=hard, monitor=_qwen4_monitor())
+    target = Scheduler._prefill_peak_target(ns)
+    ns._fake_current = int(
+        target - ns._predicted_chunk_transient(4096, 0, gathered_core=True)
+    )
+    assert ns._fake_current > ns._memory_limit_bytes * ns._prefill_safe_zone_ratio
+    fits = Scheduler._largest_fitting_prefill_chunk(
+        ns, 8192, 32, target - ns._fake_current, 0, gathered_core=True
+    )
+    assert 4096 <= fits < 8192
+    assert _call(ns, 8192, gathered_core=True) == fits
+
+    # A model sized by its EWMA keeps the tier at the same usage.
+    per_token = (target - ns._fake_current) / 4096 / Scheduler._PREFILL_TRANSIENT_SAFETY
+    generic = _throttle_ctx(current=0, hard=hard, samples_bpt=per_token)
+    generic._fake_current = ns._fake_current
+    assert _call(generic, 8192) <= Scheduler._PREFILL_STEP_TIERS[0]
+
+
+def test_qwen4_released_overhead_does_not_shrink_chunks_to_the_floor():
+    """Replay sequential 34K-token prompts on a 128 GB M5 Max. Every pool clear
+    re-armed the overhead an 8192-token chunk had shown, so each later chunk
+    was charged it and the prefill ran at 32 tokens, and admission priced the
+    32-token floor chunk at 2.9 GB. A chunk is charged what was measured up to
+    its width."""
+    ns = _throttle_ctx(current=0, hard=117.5 * _GB, monitor=_qwen4_monitor())
+    for n_tokens, kv_len, delta_mb in (
+        (8192, 0, 5130),
+        (2048, 8192, 1580),
+        (32, 10240, 148),
+    ):
+        Scheduler._record_chunk_transient(
+            ns,
+            n_tokens,
+            0,
+            delta_mb * 1024**2,
+            request_id="earlier",
+            loop_label="incident-replay",
+            kv_len=kv_len,
+            requested_step=8192,
+            gathered_core=True,
+        )
+    ns._prefill_transient_tracker.record_flat_reclaim(8 * _GB)
+    ns._fake_current = int(102.65 * _GB)
+
+    assert _call(ns, 7552, kv_len=17024, gathered_core=True) >= 2048
+    assert ns._admission_transient_bound(32, 34_000, gathered_core=True) < _GB / 2
+
+
 @pytest.mark.parametrize(
     ("markers", "predicted", "expected"),
     [([], True, True), ([True, True], False, True), ([True, False], True, False)],
@@ -825,13 +899,9 @@ def test_generic_reclaim_that_cannot_fit_still_aborts(gathered_core):
 
 
 @pytest.mark.parametrize("path", ["adaptive", "guard"])
-@pytest.mark.parametrize("snap", ["0", "1"])
 @pytest.mark.parametrize("budget_tokens", [32, 63, 64, 511, 512, 513])
-def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(
-    monkeypatch, path, snap, budget_tokens
-):
-    """A linear predictor keeps its previous sizes, including the opt-out."""
-    monkeypatch.setenv("OMLX_CHUNK_SNAP", snap)
+def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(path, budget_tokens):
+    """A linear predictor keeps its previous sizes."""
     hard = 20 * _GB
     cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
     # A 10-byte observation produces an exactly representable 13-byte
@@ -842,9 +912,7 @@ def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(
     call = _call if path == "adaptive" else _guard_call
     chosen = call(ns, 512)
 
-    expected = min(512, budget_tokens)
-    if snap == "1":
-        expected = expected // 32 * 32
+    expected = min(512, budget_tokens) // 32 * 32
     assert chosen == expected
     assert current + ns._admission_transient_bound(chosen, 0) <= cap
 
@@ -1083,12 +1151,16 @@ def test_record_chunk_transient_skips_partial_speed_sample():
 
 
 def test_record_chunk_transient_keeps_full_speed_spike_as_last_sample():
-    """A same-size spike remains available to protect the next full step."""
+    """A same-size spike protects the next full step until its prefill ends."""
     tracker = PrefillTransientTracker()
+    owner = SimpleNamespace(status=RequestStatus.WAITING)
     ns = SimpleNamespace(
         _prefill_min_chunk_tokens=32,
         _prefill_speed_priority=True,
         _prefill_transient_tracker=tracker,
+        _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
+        memory_monitor=None,
+        requests={"req-spike": owner},
     )
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
@@ -1115,6 +1187,13 @@ def test_record_chunk_transient_keeps_full_speed_spike_as_last_sample():
     assert tracker.samples == 2
     assert tracker.last_n_tokens == 2048
     assert tracker.last_delta_bytes == spike
+    safety = Scheduler._PREFILL_TRANSIENT_SAFETY
+    predicted = Scheduler._predicted_chunk_transient(ns, 2048, 0)
+    assert predicted == pytest.approx(spike * safety)
+
+    owner.status = RequestStatus.RUNNING
+    predicted = Scheduler._predicted_chunk_transient(ns, 2048, 0)
+    assert predicted == pytest.approx(256 * 1024**2 * safety)
 
 
 def test_record_chunk_transient_keeps_partial_context_sample():
@@ -1283,6 +1362,7 @@ def test_step_prefill_reclaims_before_first_guard(monitor, expected_gathered):
         _guard_prefill_chunk=lambda n, **kwargs: events.append("guard") or n,
         _record_chunk_transient=MagicMock(),
         _maybe_record_fixed_state_bytes=MagicMock(),
+        _note_memory_admission_progress=MagicMock(),
         _reserve_qsa_index_capacity=MagicMock(),
     )
     ns.running = {}
@@ -1344,6 +1424,7 @@ def test_step_prefill_reclaims_before_first_guard(monitor, expected_gathered):
         kv_len=0,
         requested_step=2,
         gathered_core=expected_gathered,
+        unowned_pool_bytes=0,
     )
 
 
@@ -1364,6 +1445,7 @@ def _requeue_ctx():
         _MAX_PREFILL_OOM_RETRIES=2,
         _reclaim_prefill_headroom=lambda: 0,
     )
+    ns._requeue_prefill_retry = Scheduler._requeue_prefill_retry.__get__(ns, Scheduler)
     return ns
 
 
@@ -1459,11 +1541,6 @@ class TestSnapChunkSize:
         ns = self._ns()
         assert ns._snap_chunk_size(2048, 2048) == 2048
         assert ns._snap_chunk_size(2049, 2048) == 2049
-
-    def test_env_toggle_disables_snapping(self, monkeypatch):
-        monkeypatch.setenv("OMLX_CHUNK_SNAP", "0")
-        ns = self._ns()
-        assert ns._snap_chunk_size(33, 2048) == 33
 
     def test_respects_min_chunk_grid(self):
         ns = self._ns(min_chunk=256)
@@ -1839,6 +1916,87 @@ def test_prefill_loop_records_pool_release_before_next_chunk(chunked, monkeypatc
     assert len(charges) == 3
     assert charges[0] == 0
     assert all(charge > 0 for charge in charges[1:])
+
+
+def test_prefill_rate_excludes_pool_the_chunk_did_not_fill(monkeypatch):
+    """Decode buffers pooled between chunks are not prefill transient (#4587)."""
+    model = Model(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+        )
+    )
+    sched_mod.mx.eval(model.parameters())
+    ns = Scheduler(
+        model,
+        SimpleNamespace(eos_token_id=2, encode=lambda s: [1]),
+        SchedulerConfig(prefill_step_size=64, paged_cache_block_size=0),
+    )
+    ns._prefill_min_chunk_tokens = 32
+    # Contended chunked prefill below soft keeps its pool between chunks.
+    ns._should_clear_after_chunk = lambda: False
+    mib = 1024**2
+    pool = [0]
+    cleared = [True]
+    widths = []
+
+    def clear(stream):
+        pool[0] = 0
+        cleared[0] = True
+
+    monkeypatch.setattr(sched_mod, "_sync_and_clear_cache", clear)
+    monkeypatch.setattr(sched_mod.mx, "get_active_memory", lambda: 0)
+    monkeypatch.setattr(sched_mod.mx, "get_cache_memory", lambda: pool[0])
+    monkeypatch.setattr(sched_mod, "get_phys_footprint", lambda: 0)
+    monkeypatch.setattr(sched_mod, "get_graphics_footprint", lambda: 0)
+    original_model = ns.model
+
+    def forward(tokens, *args, **kwargs):
+        width = tokens.shape[1]
+        # A chunk reuses only a retained pool of its own width.
+        if cleared[0] or widths[-1] != width:
+            pool[0] += width * mib
+        cleared[0] = False
+        widths.append(width)
+        return original_model(tokens, *args, **kwargs)
+
+    ns.model = forward
+    original_adaptive = ns._adaptive_chunk_size
+
+    def adaptive(n, **kwargs):
+        pool[0] += 512 * mib  # A decode step pooled its buffers.
+        return original_adaptive(n, **kwargs)
+
+    ns._adaptive_chunk_size = adaptive
+    prompt = [10] * 233
+    req = Request(request_id="pool", prompt=prompt, sampling_params=SamplingParams())
+    req.prompt_token_ids = prompt
+    req.num_prompt_tokens = len(prompt)
+    state = _PrefillState(
+        request=req,
+        cache=make_prompt_cache(model),
+        tokens_remaining=sched_mod.mx.array(prompt[:-1])[None],
+        last_token=prompt[-1:],
+        tokens_processed=0,
+        base_size=0,
+        emitted_boundaries={},
+        boundary_enabled=False,
+        block_size=0,
+        total_length=len(prompt),
+    )
+    while not ns._step_prefill_chunk(state):
+        pass
+
+    tracker = ns._prefill_transient_tracker
+    assert widths == [64, 64, 64, 40]
+    assert tracker.last_delta_bytes_for(False) == 40 * mib
+    assert tracker.bytes_per_token_for(False) == pytest.approx(mib)
 
 
 def test_resumed_prefill_pausing_before_progress_skips_readmission():

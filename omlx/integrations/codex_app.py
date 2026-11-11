@@ -14,12 +14,12 @@ own codex CLI binary, which is used as a fallback when no ``codex``
 is on PATH (DMG-only installs).
 
 Usage:
-    omlx launch codex_app --model qwen3.5
+    omlx launch codex_app [--model qwen3.5]
 
 Which launches:
     codex app
 
-Both CLI and App use the same config file:
+The App reads the provider and the oMLX model catalog from:
     ~/.codex/config.toml
 """
 
@@ -27,10 +27,18 @@ from __future__ import annotations
 
 import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 from omlx.integrations.base import Integration, IntegrationContext
-from omlx.integrations.codex import CODEX_CONFIG_PATH, write_codex_config
+from omlx.integrations.codex import (
+    CODEX_CONFIG_PATH,
+    check_codex_version,
+    codex_instructions,
+    resolve_codex_models,
+    write_codex_config,
+    write_codex_model_catalog,
+)
 from omlx.integrations.macapp import find_mac_app
 from omlx.utils.install import get_cli_command_prefix
 
@@ -39,6 +47,12 @@ CODEX_APP_BUNDLE_ID = "com.openai.codex"
 # Both pre-rename (Codex.app) and post-rename (ChatGPT.app) folder names.
 _APP_BUNDLE_NAMES = ("Codex.app", "ChatGPT.app")
 _APP_BUNDLE_ROOTS = (Path("/Applications"), Path.home() / "Applications")
+# Bundled CLI under Contents/Resources: nested app first, then the flat
+# executable of older releases.
+_BUNDLED_CLI_PATHS = (
+    Path("codex-cli/CodexCLI.app/Contents/MacOS/codex"),
+    Path("codex"),
+)
 
 
 def find_codex_app_bundle() -> Path | None:
@@ -50,17 +64,21 @@ def find_codex_app_bundle() -> Path | None:
     return find_mac_app(_APP_BUNDLE_ROOTS, _APP_BUNDLE_NAMES, CODEX_APP_BUNDLE_ID)
 
 
-def resolve_codex_binary() -> str | None:
-    """Resolve a runnable codex CLI: PATH first, then the app-bundled one."""
-    path_bin = shutil.which("codex")
-    if path_bin:
-        return path_bin
+def bundled_codex_binary() -> str | None:
+    """Return the codex CLI shipped inside the desktop app bundle, or None."""
     bundle = find_codex_app_bundle()
     if bundle is not None:
-        bundled = bundle / "Contents" / "Resources" / "codex"
-        if bundled.is_file() and os.access(bundled, os.X_OK):
-            return str(bundled)
+        resources = bundle / "Contents" / "Resources"
+        for relative in _BUNDLED_CLI_PATHS:
+            bundled = resources / relative
+            if bundled.is_file() and os.access(bundled, os.X_OK):
+                return str(bundled)
     return None
+
+
+def resolve_codex_binary() -> str | None:
+    """Resolve a runnable codex CLI: PATH first, then the app-bundled one."""
+    return shutil.which("codex") or bundled_codex_binary()
 
 
 class CodexAppIntegration(Integration):
@@ -78,6 +96,8 @@ class CodexAppIntegration(Integration):
                 "Install the ChatGPT (formerly Codex) desktop app, "
                 "or: npm install -g @openai/codex"
             ),
+            # The App switches models in its picker; --model sets the default.
+            requires_model_selection=False,
         )
 
     def is_installed(self) -> bool:
@@ -86,13 +106,22 @@ class CodexAppIntegration(Integration):
         return resolve_codex_binary() is not None
 
     def get_command(self, ctx: IntegrationContext) -> str:
-        return (
-            f"{get_cli_command_prefix()} "
-            f"launch codex_app --model {ctx.model or 'select-a-model'}"
-        )
+        cmd = f"{get_cli_command_prefix()} launch codex_app"
+        return f"{cmd} --model {ctx.model}" if ctx.model else cmd
 
     def configure(self, ctx: IntegrationContext) -> None:
-        write_codex_config(self.CONFIG_PATH, ctx)
+        model_ids, model = resolve_codex_models(ctx)
+        # The App runs its bundled codex, which can differ from the PATH one.
+        codex_bin = bundled_codex_binary() or shutil.which("codex")
+        check_codex_version(codex_bin)
+        catalog_path = write_codex_model_catalog(
+            self.CONFIG_PATH.parent,
+            "codex-app",
+            ctx,
+            model_ids,
+            codex_instructions(codex_bin, self._scrubbed_env()),
+        )
+        write_codex_config(self.CONFIG_PATH, replace(ctx, model=model), catalog_path)
 
     def launch(self, ctx: IntegrationContext) -> None:
         self.configure(ctx)

@@ -11,6 +11,8 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from omlx.api.anthropic_models import MessagesRequest as AnthropicMessagesRequest
+from omlx.api.audio_models import AudioSpeechRequest
 from omlx.api.openai_models import (
     AssistantMessage,
     ChatCompletionChoice,
@@ -33,6 +35,7 @@ from omlx.api.openai_models import (
     ToolDefinition,
     Usage,
 )
+from omlx.api.responses_models import ResponsesRequest
 
 
 class TestContentPart:
@@ -518,6 +521,12 @@ class TestChatCompletionRequest:
             "reasoning_effort": "low",
         }
 
+    @pytest.mark.parametrize("watts", [0, 1, 1001])
+    def test_gpu_power_limit_rejects_out_of_range_watts(self, watts):
+        # A 0 W target parks the GPU at its lowest clock; it is not "off".
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(model="m", messages=[], gpu_power_limit_w=watts)
+
     @pytest.mark.parametrize("enabled", [True, False])
     def test_matching_thinking_alias_preserves_input(self, enabled):
         template_kwargs = {"enable_thinking": enabled, "custom": "value"}
@@ -797,6 +806,24 @@ class TestCompletionModels:
                 }
             )
 
+    def test_ngram_window_shorter_than_ngram_is_rejected(self):
+        fields = {"no_repeat_ngram_size": 35, "ngram_window": 34}
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest.model_validate(
+                {"model": "m", "messages": [{"role": "user", "content": "hi"}]} | fields
+            )
+        with pytest.raises(ValidationError):
+            CompletionRequest.model_validate({"model": "m", "prompt": "hi"} | fields)
+
+    def test_ignore_eos_defaults_off_and_parses(self):
+        chat = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        completion = {"model": "m", "prompt": "hi"}
+        assert ChatCompletionRequest.model_validate(chat).ignore_eos is False
+        assert CompletionRequest.model_validate(completion).ignore_eos is False
+        on = {"ignore_eos": True}
+        assert ChatCompletionRequest.model_validate(chat | on).ignore_eos is True
+        assert CompletionRequest.model_validate(completion | on).ignore_eos is True
+
     def test_completion_request(self):
         """Test creating completion request."""
         req = CompletionRequest(
@@ -952,3 +979,41 @@ class TestStopCoercion:
             stop=["a"],
         )
         assert req.stop == ["a"]
+
+
+_USER_MESSAGES = [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "payload"),
+    [
+        (ChatCompletionRequest, {"messages": _USER_MESSAGES, "max_tokens": 0}),
+        (
+            ChatCompletionRequest,
+            {"messages": _USER_MESSAGES, "max_completion_tokens": -1},
+        ),
+        (CompletionRequest, {"prompt": "hi", "max_tokens": -1}),
+        (AnthropicMessagesRequest, {"messages": _USER_MESSAGES, "max_tokens": 0}),
+        (ResponsesRequest, {"input": "hi", "max_output_tokens": -1}),
+        (AudioSpeechRequest, {"input": "hi", "max_tokens": 0}),
+    ],
+)
+def test_output_token_caps_must_be_positive(model_cls, payload):
+    with pytest.raises(ValidationError):
+        model_cls.model_validate({"model": "m", **payload})
+
+
+def test_chat_request_top_logprobs_requires_logprobs():
+    messages = [{"role": "user", "content": "hi"}]
+    with pytest.raises(ValidationError, match="top_logprobs requires logprobs"):
+        ChatCompletionRequest(model="m", messages=messages, top_logprobs=3)
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest(
+            model="m", messages=messages, logprobs=True, top_logprobs=21
+        )
+    request = ChatCompletionRequest(
+        model="m", messages=messages, logprobs=True, top_logprobs=0
+    )
+    assert request.logprobs is True
+    request = ChatCompletionRequest(model="m", messages=messages, logprobs=None)
+    assert not request.logprobs

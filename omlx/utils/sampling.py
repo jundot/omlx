@@ -16,10 +16,12 @@ without further changes.
 
 from __future__ import annotations
 
+import functools
 import math
-from typing import Callable, List
+from typing import Callable, List, Optional, Sequence
 
 import mlx.core as mx
+import numpy as np
 
 
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
@@ -162,6 +164,35 @@ def apply_xtc(
     )
 
 
+def make_no_repeat_ngram_processor(
+    ngram_size: int, window: int = 0
+) -> Callable[[mx.array, mx.array], mx.array]:
+    """Ban tokens that would repeat an n-gram already in ``tokens``.
+
+    A nonzero ``window`` searches only the last ``window`` tokens.
+    Lazy ops only, so the decode step does not wait on the host.
+    """
+
+    def no_repeat_ngram_processor(tokens: mx.array, logits: mx.array) -> mx.array:
+        start = max(0, len(tokens) - window) if window else 0
+        recent = tokens[start:]
+        count = len(recent) - ngram_size + 1
+        if count <= 0:
+            return logits
+        # Row i is the prefix of the n-gram starting at i; compare it to the tail.
+        prefixes = mx.as_strided(recent, (count, ngram_size - 1), (1, 1))
+        matches = (prefixes == recent[count:]).all(axis=1)
+        last = recent[ngram_size - 1 :]
+        # Unmatched n-grams, and ids past the vocab, go to a spare slot.
+        vocab = logits.shape[-1]
+        target = mx.where(matches & (last < vocab), last, vocab)
+        banned = mx.zeros((vocab + 1,), dtype=mx.bool_)
+        banned[target] = True
+        return mx.where(banned[:vocab], -mx.inf, logits)
+
+    return no_repeat_ngram_processor
+
+
 def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
     """Sample a token id from the categorical distribution defined by
     ``logits / temp``. RNG state is advanced through ``mx.random.categorical``."""
@@ -176,13 +207,15 @@ def make_sampler(
     top_k: int = 0,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
-    xtc_special_tokens: List[int] = [],
+    xtc_special_tokens: Optional[List[int]] = None,
 ) -> Callable[[mx.array], mx.array]:
     """Build a sampler callable matching ``mlx_lm.sample_utils.make_sampler``.
 
     Returns ``argmax`` when ``temp == 0``; otherwise composes optional
     top-p / min-p / xtc / top-k filters and finishes with categorical sampling.
     """
+    if xtc_special_tokens is None:
+        xtc_special_tokens = []
     if temp == 0:
         sampler = lambda x: mx.argmax(x, axis=-1)
     else:
@@ -255,3 +288,76 @@ def make_sampler(
     sampler.min_tokens_to_keep = min_tokens_to_keep
     sampler.xtc_probability = xtc_probability
     return sampler
+
+
+# mlx-lm samples a decode batch in one call only when every row holds the same
+# sampler object, so equal parameters reuse one. XTC flips one coin per call.
+@functools.lru_cache(maxsize=256)
+def _shared_sampler(
+    temp: float, top_p: float, min_p: float, min_tokens_to_keep: int, top_k: int
+) -> Callable[[mx.array], mx.array]:
+    return make_sampler(
+        temp=temp,
+        top_p=top_p,
+        min_p=min_p,
+        min_tokens_to_keep=min_tokens_to_keep,
+        top_k=top_k,
+    )
+
+
+def make_shared_sampler(
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    top_k: int = 0,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: Sequence[int] = (),
+) -> Callable[[mx.array], mx.array]:
+    """``make_sampler`` that hands equal parameters the same sampler object."""
+    if xtc_probability > 0.0:
+        return make_sampler(
+            temp=temp,
+            top_p=top_p,
+            min_p=min_p,
+            min_tokens_to_keep=min_tokens_to_keep,
+            top_k=top_k,
+            xtc_probability=xtc_probability,
+            xtc_threshold=xtc_threshold,
+            xtc_special_tokens=list(xtc_special_tokens or ()),
+        )
+    return _shared_sampler(
+        float(temp),
+        float(top_p),
+        float(min_p),
+        int(min_tokens_to_keep),
+        int(top_k or 0),
+    )
+
+
+def select_logprobs(
+    logprobs: mx.array, token_id: int, top_n: int
+) -> tuple[float, list[tuple[int, float]]]:
+    """Return the logprob of ``token_id`` and the ``top_n`` most likely tokens.
+
+    The row is read on the host: an MLX op here would wait behind the decode
+    step BatchGenerator has already queued. The row is in the model dtype, so
+    it is renormalized in float32.
+    """
+    if logprobs.dtype == mx.bfloat16:
+        raw = np.frombuffer(memoryview(logprobs), dtype=np.uint16)
+        values = (raw.astype(np.uint32) << 16).view(np.float32)
+    else:
+        values = np.asarray(memoryview(logprobs)).astype(np.float32)
+    peak = values.max()
+    values = values - (peak + np.log(np.exp(values - peak).sum()))
+    chosen = float(values[token_id])
+    top_n = min(top_n, values.size)
+    if top_n <= 0:
+        return chosen, []
+    top_ids = np.argpartition(-values, top_n - 1)[:top_n]
+    top_ids = top_ids[np.argsort(-values[top_ids], kind="stable")]
+    # Tokens masked by a logits processor are not alternatives.
+    top_ids = top_ids[np.isfinite(values[top_ids])]
+    return chosen, [(int(i), float(values[i])) for i in top_ids]

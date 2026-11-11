@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from omlx.admin import routes as admin_routes
+from omlx.settings import GlobalSettings
 
 
 def _global_settings(tmp_path):
@@ -14,6 +15,7 @@ def _global_settings(tmp_path):
         cache=SimpleNamespace(
             ssd_cache_max_size="auto",
             get_ssd_cache_dir=lambda base_path: cache_dir,
+            is_ssd_cache_dir_unavailable=lambda: False,
             get_ssd_cache_max_size_bytes=lambda base_path: 0,
         ),
     )
@@ -209,3 +211,20 @@ def test_engine_returning_none_stats_is_skipped(tmp_path):
 
     assert payload["models"] == []
     assert payload["hot_cache_max_bytes"] == 0
+
+
+def test_unavailable_ssd_cache_dir_reports_ssd_cache_off(tmp_path):
+    not_a_dir = tmp_path / "not-a-dir"
+    not_a_dir.write_text("")
+    settings = GlobalSettings(base_path=tmp_path / "omlx")
+    settings.cache.ssd_cache_dir = str(not_a_dir / "cache")
+    settings.ensure_directories()
+
+    pool = SimpleNamespace(get_status=lambda: {"models": []})
+    with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
+        payload = admin_routes._build_runtime_cache_observability(settings)
+
+    assert payload["ssd_cache_unavailable"] is True
+    assert payload["response_state_dir"] == ""
+    # The auto limit would otherwise follow the free space of a parent disk.
+    assert payload["disk_max_bytes"] == 0

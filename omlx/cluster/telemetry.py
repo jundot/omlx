@@ -18,6 +18,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..exceptions import PrefillMemoryExceededError
 from .performance import ExecutionSettings
 from .planner import PipelineAssignment
 
@@ -87,6 +88,22 @@ def _python_token_id(value: Any) -> int:
     if not 0 <= token <= 2**31 - 1:
         raise ValueError("generated token is outside signed int32 range")
     return token
+
+
+def _type_tool_turn_as_user(request: Any, tokenized: Any) -> Any:
+    """Type a tool-result turn's prompt checkpoint "user", as for a user turn.
+
+    MLX-LM types it "assistant", which LRUPromptCache evicts first, so a
+    non-trimmable cache lost the conversation prefix on every agent step.
+    """
+
+    messages = getattr(request, "messages", None)
+    # A trailing assistant message is a prefill that the model continues.
+    if not messages or messages[-1].get("role") == "assistant":
+        return tokenized
+    if tokenized[2] != ["assistant"]:
+        return tokenized
+    return (tokenized[0], tokenized[1], ["user"], *tokenized[3:])
 
 
 class MarkerWriter(Protocol):
@@ -1317,6 +1334,10 @@ def install_server_telemetry(
                     )
                 if execution.max_kv_size is not None:
                     kwargs.setdefault("max_kv_size", execution.max_kv_size)
+            model = args[0] if args else kwargs.get("model")
+            if getattr(model, "_omlx_one_prompt_prefill", False):
+                # Prompts prefill one at a time, as on a single Mac.
+                kwargs["prefill_batch_size"] = 1
             super().__init__(*args, **kwargs)
             # Full token sequence per in-flight uid, so a boundary snapshot can
             # be keyed while the batched prefill is still running.
@@ -1362,9 +1383,12 @@ def install_server_telemetry(
                         self._omlx_tokens[uid] = prefix + body
             return uids
 
-        def remove(self, uids: Any) -> Any:
+        def remove(self, uids: Any, return_prompt_caches: bool = False) -> Any:
             uid_values = list(uids)
-            if world_size > 1:
+            # MLX-LM asks for the prompt caches only when a stop sequence ended
+            # the requests. Every rank decides that from the same tokens, as
+            # with an EOS token, so that removal needs no cancel vote.
+            if world_size > 1 and not return_prompt_caches:
                 prepared = self._omlx_prepared_cancel_vote
                 if prepared is None or prepared[1] != tuple(uid_values):
                     raise RuntimeError(
@@ -1375,7 +1399,9 @@ def install_server_telemetry(
             # Mutate the MLX-LM batch first. Only then publish cancellation and
             # wake the HTTP collector; an exception during cache filtering must
             # not advertise a request as safely removed when its graph remains.
-            result = super().remove(uid_values)
+            result = super().remove(
+                uid_values, return_prompt_caches=return_prompt_caches
+            )
             for uid in uid_values:
                 self._omlx_tokens.pop(uid, None)
             telemetry.cancel_uids(uid_values)
@@ -1664,11 +1690,28 @@ def install_server_telemetry(
             )
 
         def _tokenize(self, tokenizer: Any, request: Any, args: Any) -> Any:
-            tokenized = super()._tokenize(tokenizer, request, args)
+            tokenized = _type_tool_turn_as_user(
+                request, super()._tokenize(tokenizer, request, args)
+            )
             if prefill_guard is None:
                 return tokenized
 
             prompt = tokenized[0]
+            try:
+                self._omlx_admit_prefill(prompt)
+            except PrefillMemoryExceededError:
+                # The vote is shared, so every rank rejected. Drop the prompts
+                # each rank retains and measure once more before refusing.
+                logger.warning(
+                    "Prefill rejected; dropping %d cached prompts and retrying",
+                    len(self.prompt_cache),
+                )
+                self.prompt_cache.trim_to(n_sequences=0, n_bytes=0)
+                mx.clear_cache()
+                self._omlx_admit_prefill(prompt)
+            return tokenized
+
+        def _omlx_admit_prefill(self, prompt: list[int]) -> None:
             _cache, rest = self.prompt_cache.prefetch_nearest_cache(
                 self.model_provider.model_key,
                 prompt,
@@ -1686,9 +1729,8 @@ def install_server_telemetry(
             except Exception:
                 self.prompt_cache.discard_prefetched_cache()
                 raise
-            return tokenized
 
-        def _serve_single(self, request: Any) -> Any:
+        def _serve_single(self, request: Any, stream: Any) -> Any:
             # The coordinated context above makes every rank observe the same
             # cancellation. Suppress only MLX-LM's obsolete distributed guard,
             # whose entire behavior is to raise NotImplementedError after that
@@ -1698,7 +1740,7 @@ def install_server_telemetry(
             cancellation_state.sequential = was_distributed
             self._is_distributed = False
             try:
-                return super()._serve_single(request)
+                return super()._serve_single(request, stream)
             finally:
                 self._is_distributed = was_distributed
                 cancellation_state.sequential = previous

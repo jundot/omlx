@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -41,13 +41,45 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[mcp]"
-          python -m pip install pytest pytest-asyncio pytest-xdist
+          # pytest 9.2 ignores xdist 3.8's loadgroup node id suffix, so the gpu group runs in parallel.
+          python -m pip install "pytest<9.2" pytest-asyncio pytest-xdist
+
+      # xdist workers share one Harmony vocab cache file. Parallel cold downloads can read it half written.
+      - name: Warm the Harmony vocab cache
+        run: python -c "from openai_harmony import load_harmony_encoding; load_harmony_encoding('HarmonyGptOss')"
 
       - name: Run unit tests
         run: >-
-          python -m pytest tests/ -m "not slow and not integration"
-          -n 3 --dist loadgroup
+          python -m pytest tests/ apps/omlx-web/tests apps/omlx-mac/Tests/python
+          -m "not slow and not integration"
+          -n 3 --dist loadgroup --no-loadscope-reorder
           --durations=50 --junitxml=test-results.xml
+
+      - name: Run web UI script tests
+        working-directory: apps/omlx-web/tests
+        run: node --test
+
+      # The server must import and start without the apps.
+      - name: Check the API-only server without apps
+        run: |
+          rm -rf apps
+          python -m pytest tests/ --collect-only -q > /dev/null
+          mkdir -p "$RUNNER_TEMP/models"
+          OMLX_BASE_PATH="$RUNNER_TEMP/omlx" omlx serve \
+            --model-dir "$RUNNER_TEMP/models" --port 18765 --api-key ci-smoke-key \
+            > "$RUNNER_TEMP/serve.log" 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:18765/health > /dev/null && break
+            sleep 1
+          done
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+          test "$(code http://127.0.0.1:18765/health)" = 200
+          test "$(code -H 'Authorization: Bearer ci-smoke-key' http://127.0.0.1:18765/v1/models)" = 200
+          test "$(code http://127.0.0.1:18765/admin)" = 404
+          test "$(code -H 'Accept: text/html' http://127.0.0.1:18765/admin/api/global-settings)" = 401
+          grep -q "omlx_web is not installed" "$RUNNER_TEMP/serve.log"
+          kill "$server_pid"
 
       - name: Upload test results
         if: always()
@@ -56,3 +88,23 @@ jobs:
           name: test-results-py${{ matrix.python-version }}
           path: test-results.xml
           retention-days: 14
+
+  mac-app-build:
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build and test the macOS app
+        # The percentage-label assertions expect US formatting.
+        run: >-
+          xcodebuild
+          -project apps/omlx-mac/oMLX.xcodeproj
+          -scheme oMLX
+          -configuration Debug
+          -destination 'platform=macOS,arch=arm64'
+          -testLanguage en
+          -testRegion US
+          CODE_SIGNING_ALLOWED=NO
+          test

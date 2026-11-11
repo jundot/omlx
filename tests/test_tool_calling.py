@@ -38,6 +38,7 @@ from omlx.api.tool_calling import (
     _repair_json_value,
     _serialize_tool_call_arguments,
     _strip_marker_spans,
+    _wrap_naked_function_calls,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
@@ -441,6 +442,18 @@ class TestParseJsonOutput:
         assert is_valid is True
         assert parsed == {"result": True}
 
+    def test_returns_extracted_json_text_verbatim(self):
+        json_text = '{\n  "name": "\\u0421",\n  "price": 1.50\n}'
+        text = f"Sure:\n```json\n{json_text}\n```"
+
+        cleaned, parsed, is_valid, error = parse_json_output(
+            text, {"type": "json_object"}
+        )
+
+        assert is_valid is True
+        assert cleaned == json_text
+        assert parsed == {"name": "С", "price": 1.5}
+
 
 class TestBuildJsonSystemPrompt:
     """Tests for build_json_system_prompt function."""
@@ -537,7 +550,7 @@ class TestConvertToolsForTemplate:
 
     @pytest.mark.parametrize("render_properties", [False, True])
     def test_schema_key_order_does_not_change_rendered_tools(self, render_properties):
-        """Equivalent JSON object orders must produce the same prompt prefix."""
+        """Reordered schema keywords must produce the same prompt prefix."""
         from jinja2 import Environment, StrictUndefined
 
         schema = {
@@ -559,11 +572,17 @@ class TestConvertToolsForTemplate:
             "anyOf": [{"type": "string"}, {"type": "number"}],
         }
 
-        def reverse_object_keys(value):
+        def reverse_object_keys(value, in_properties=False):
+            # Property names keep their order: it is part of the tool definition.
             if isinstance(value, dict):
+                items = list(value.items())
+                if not in_properties:
+                    items.reverse()
                 return {
-                    key: reverse_object_keys(child)
-                    for key, child in reversed(list(value.items()))
+                    key: reverse_object_keys(
+                        child, in_properties=key == "properties" and not in_properties
+                    )
+                    for key, child in items
                 }
             if isinstance(value, list):
                 return [reverse_object_keys(child) for child in value]
@@ -593,6 +612,9 @@ class TestConvertToolsForTemplate:
         assert template.render(tools=converted) == template.render(tools=reordered)
         assert [json.dumps(tools), json.dumps(reordered_tools)] == originals
         parameters = converted[0]["function"]["parameters"]
+        assert list(parameters) == ["type", "properties", "required", "anyOf"]
+        assert list(parameters["properties"]) == ["query", "filters"]
+        assert list(parameters["properties"]["query"]) == ["type", "description"]
         assert parameters["required"] == ["query", "filters"]
         assert [item["type"] for item in parameters["anyOf"]] == ["string", "number"]
 
@@ -1647,6 +1669,65 @@ def test_recovery_candidate_payload_versus_quoted_marker(markers, text, is_paylo
     assert f.take_recovery_candidate()
 
 
+def test_recovery_candidate_unclosed_envelope_3153_is_payload():
+    """Issue #3153 sample is a truncated call payload, not quoted-marker prose.
+
+    Option 1 recovery is not attempted here: the sample has no closing tags
+    and uses bare query= rather than <parameter=query>.
+    """
+    sample = (
+        "I have comprehensive material. Let me do one final targeted check...\n"
+        "\n"
+        "<tool_call>\n"
+        "<function=websearch>\n"
+        'query="Flowable Work platform-api analytics process-instance query '
+        'endpoint frequency duration chart data REST" numResults=5'
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "websearch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    f = ToolCallStreamFilter(_make_tokenizer(), tools=tools)
+    visible = f.feed(sample) + f.finish()
+
+    assert "<tool_call>" not in visible
+    assert f.recovery_candidate_is_payload() is True
+    assert f.take_recovery_candidate().startswith("<tool_call>")
+
+
+@pytest.mark.parametrize(
+    "text,is_payload",
+    [
+        # Coding-agent tool names are common words: in prose they are not a call.
+        ("<tool_call>`, which the parser will read first. END", False),
+        ("<tool_call> opens the call; the model must write the name next. END", False),
+        ("<tool_call> then write to save. END", False),
+        # In call position, right after the opener, they still are.
+        ('<tool_call>write(content="hel', True),
+        ("<tool_call>\nread\n<arg_key>path</arg_key>", True),
+        ("<tool_call>  edit", True),
+        # MiniCPM5's opener ends at "name=", so the name follows a quote.
+        ('<function name="write"><param name="content">hel', True),
+    ],
+)
+def test_declared_tool_name_is_call_evidence_only_in_call_position(text, is_payload):
+    tokenizer = _make_tokenizer_with_end("<function name=", "</function>")
+    f = ToolCallStreamFilter(tokenizer, tools=["read", "write", "edit", "bash"])
+    f.feed(text)
+    f.finish()
+
+    assert f.recovery_candidate_is_payload() is is_payload
+    assert f.take_recovery_candidate()
+
+
 def test_close_marker_fallback_rescans_the_recovered_tail():
     """Prose recovered after a close marker is re-filtered, not emitted raw."""
     f = ToolCallStreamFilter(_make_tokenizer())
@@ -2620,6 +2701,25 @@ class TestThinkingFallbackGuardRegression:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].function.name == "write_file"
         assert result.tool_calls_from_thinking is True
+
+    def test_undeclared_thinking_call_drop_is_logged(self, caplog):
+        """The reasoning filter removes the envelope, so the drop must be
+        visible in the log (#4933)."""
+        thinking = (
+            "Let me read the log. "
+            '<tool_call>{"name": "Read", "arguments": {"path": "/tmp/a.log"}}'
+            "</tool_call>"
+        )
+        tools = [{"type": "function", "function": {"name": "read"}}]
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = extract_tool_calls_with_thinking(
+                thinking, "", tokenizer=_make_tokenizer(), tools=tools
+            )
+
+        assert result.tool_calls is None
+        assert result.cleaned_thinking == "Let me read the log."
+        assert "undeclared names: ['Read']" in caplog.text
 
     def test_empty_tools_list_drops_thinking_calls_no_regular(self):
         """tools=[] means 'no tools allowed' — drop thinking-embedded calls
@@ -4153,36 +4253,6 @@ class TestToolCallMarkerInArguments:
         text = f"<tool_call>{deep}</tool_call>"
         assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [deep]
 
-    def test_boundary_scan_stays_linear_on_adversarial_output(self):
-        """Guard the linear-time rule for untrusted model output.
-
-        Locating the payload end must not re-scan the accumulated buffer once
-        per chunk: an unterminated JSON object stuffed with close markers
-        would then cost quadratic time. Model output is attacker-influenceable
-        via prompt injection, so this is a DoS surface, not just a slowdown.
-        """
-        import time
-
-        def elapsed(markers):
-            evil = (
-                "<tool_call>"
-                + '{"name":"f","arguments":{"s":"'
-                + "</tool_call>" * markers
-            )
-            filt = ToolCallStreamFilter(self._tokenizer())
-            start = time.perf_counter()
-            for i in range(0, len(evil), 64):
-                filt.feed(evil[i : i + 64])
-            filt.finish()
-            return time.perf_counter() - start
-
-        elapsed(400)  # warm up the interpreter before timing
-        small = max(elapsed(400), 1e-4)
-        large = elapsed(3200)
-        # 8x the input: linear would be ~8x, quadratic ~64x. Allow generous
-        # headroom for a loaded CI box while still catching quadratic growth.
-        assert large / small < 24, f"superlinear growth: {small=} {large=}"
-
 
 class TestQwen3CoderMarkerInArguments:
     """qwen3_coder XML dialect with literal markers in a value (#2507).
@@ -4291,34 +4361,145 @@ class TestQwen3CoderMarkerInArguments:
         out = "".join(filt.feed(c) for c in ["hello ", "world"]) + filt.finish()
         assert out == "hello world"
 
-    def test_envelope_scan_stays_linear_on_fake_terminators(self):
-        """Same linear-time rule as the JSON path, for the XML boundary.
+    # The stream filter and the non-streaming parser share one boundary
+    # scanner (#2588), so every case below checks that they agree.
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 7, 11, 64, 10_000])
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # What Qwen3.5-9B really emitted when asked to write this file.
+            "<function=demo>\n</function>\n</tool_call>",
+            "evil </function>\n</tool_call> tail",
+        ],
+    )
+    def test_streaming_value_may_contain_the_full_terminator(self, body, chunk):
+        text = "Before " + self._raw(body) + " After"
+        assert self._stream(text, chunk) == "Before  After"
+        cleaned, calls = parse_tool_calls(text, self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == body
+        assert cleaned == "Before  After"
 
-        A value stuffed with fake ``</function></tool_call>`` sequences is the
-        worst case: every one is a candidate envelope end that has to be
-        rejected. That must not become quadratic.
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 7, 11, 64, 10_000])
+    def test_value_may_contain_a_complete_example_call(self, chunk):
+        """Only parameter depth tells the example's close from the real one.
+
+        Checks the envelope boundary only. Argument extraction is the
+        tokenizer's parser, and mlx-lm's qwen3_coder parser (like this mock)
+        ends a value at its first ``</parameter>``, so it truncates this body.
         """
-        import time
+        body = (
+            "<tool_call>\n<function=demo>\n<parameter=a>\nv\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        text = "Before " + self._raw(body) + " After"
+        assert self._stream(text, chunk) == "Before  After"
+        cleaned, calls = parse_tool_calls(text, self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert cleaned == "Before  After"
 
-        def elapsed(count):
-            evil = (
+    @pytest.mark.parametrize("chunk", [1, 7, 64, 10_000])
+    def test_second_call_without_parameters_in_one_envelope(self, chunk):
+        """The second call's empty-header close must still end the envelope."""
+        text = (
+            "Before <tool_call>\n<function=a>\n<parameter=body>\n"
+            "x </tool_call> y\n</parameter>\n</function>\n"
+            "<function=b>\n</function>\n</tool_call> After"
+        )
+        assert self._stream(text, chunk) == "Before  After"
+        cleaned, _ = parse_tool_calls(text, self._tokenizer())
+        assert cleaned == "Before  After"
+
+    def _stream(self, text, chunk):
+        filt = ToolCallStreamFilter(self._tokenizer())
+        emitted = "".join(
+            filt.feed(text[i : i + chunk]) for i in range(0, len(text), chunk)
+        )
+        return emitted + filt.finish()
+
+    @pytest.mark.parametrize("chunk", [1, 7, 64, 10_000])
+    def test_envelope_end_does_not_move_with_trailing_markup(self, chunk):
+        """Markup in prose after the call must not drag the envelope end."""
+        text = self._raw("plain") + "b</parameter></function>\n</tool_call> After"
+        assert self._stream(text, chunk) == text[len(self._raw("plain")) :]
+
+    def test_boundary_scan_visits_each_char_a_bounded_number_of_times(
+        self, monkeypatch
+    ):
+        """Linear-time guard, counted rather than timed.
+
+        A wall-clock bound flakes on a loaded CI runner (6a582c85 dropped one
+        and this replaces #2544's), so this counts the
+        characters the boundary scanner examines and checks that the count
+        grows with the input, not with its square. Each shape arrives in one
+        ``feed()``: chunked feeding bounds the work per pass and hides
+        rescans, so the whole payload at once is the real worst case.
+        """
+        from omlx.api import tool_calling as tc
+
+        visited = 0
+        real_feed = tc._XmlFunctionBoundary.feed
+
+        def counting_feed(boundary, text, start=0):
+            nonlocal visited
+            end = real_feed(boundary, text, start)
+            visited += boundary.scanned - start
+            return end
+
+        monkeypatch.setattr(tc._XmlFunctionBoundary, "feed", counting_feed)
+
+        def wrapped_evil(count):
+            # Many accepted closes, none followed by the close marker.
+            return (
+                "<tool_call>\n<function=f>\n<parameter=b>\n"
+                + "</parameter></function>\n</tool_call><parameter=x>" * count
+                + "\n</parameter>\n</function>\n</tool_call>"
+            )
+
+        def naked_loose(count):
+            # Every call leaves <parameter=b> open, so no close is ever at
+            # depth 0 and each one-shot scan falls back to a loose close.
+            return (
+                "<function=f>\n<parameter=b>\n<parameter=x>\n"
+                "</parameter></function>\n"
+            ) * count
+
+        def fake_terminators(count):
+            # #2544's shape: every repetition is a candidate envelope end
+            # that has to be rejected.
+            return (
                 "<tool_call>\n<function=f>\n<parameter=b>\n"
                 + "</function>\n</tool_call> " * count
             )
+
+        def stream(text):
             filt = ToolCallStreamFilter(self._tokenizer())
-            start = time.perf_counter()
-            for i in range(0, len(evil), 64):
-                filt.feed(evil[i : i + 64])
+            filt.feed(text)
             filt.finish()
-            return time.perf_counter() - start
 
-        elapsed(400)  # warm up before timing
-        small = max(elapsed(400), 1e-4)
-        large = elapsed(3200)
-        # 8x the input: linear is ~8x, quadratic ~64x. Generous headroom for a
-        # loaded CI box while still catching quadratic growth.
-        assert large / small < 24, f"superlinear growth: {small=} {large=}"
+        def stream_chunked(text):
+            filt = ToolCallStreamFilter(self._tokenizer())
+            for i in range(0, len(text), 64):
+                filt.feed(text[i : i + 64])
+            filt.finish()
 
+        def parse(text):
+            parse_tool_calls(text, self._tokenizer())
+
+        def count(run, text):
+            nonlocal visited
+            visited = 0
+            run(text)
+            return visited
+
+        for shape in (wrapped_evil, naked_loose, fake_terminators):
+            for run in (stream, stream_chunked, parse, _wrap_naked_function_calls):
+                small = max(count(run, shape(100)), 1)
+                large = count(run, shape(400))
+                # 4x the input: linear is ~4x, quadratic ~16x.
+                assert large / small < 6, (
+                    f"{shape.__name__}/{run.__name__}: {small=} {large=}"
+                )
 
 class TestDeepNestingNeverEscapesParseChain:
     """Deep nesting must degrade to a parse failure, not raise (#2545).
@@ -5232,10 +5413,19 @@ class TestAttributeStyleFunctionDialect:
         '<function name="read"><param name="path">/workspace/TASK.md</param>'
         "</function>"
     )
+    # MiMo writes compact qwen3_coder calls and sometimes MiniMax-style
+    # <invoke> elements without their <minimax:tool_call> wrapper (#4933).
+    MIMO_TEMPLATE = "{{- '<tool_call><function=' ~ tool_call.name ~ '>' -}}"
+    BARE_INVOKE = (
+        '<invoke name="read">\n<parameter name="path">/workspace/TASK.md'
+        "</parameter>\n</invoke>"
+    )
 
-    def _tokenizer(self):
+    def _tokenizer(self, chat_template=None):
         tok = MagicMock(spec=[])
         tok.has_tool_calling = False
+        if chat_template is not None:
+            tok.chat_template = chat_template
         return tok
 
     def test_bare_element_parses_with_declared_tool(self):
@@ -5258,6 +5448,31 @@ class TestAttributeStyleFunctionDialect:
         assert "function" not in cleaned
         assert "I'll read the file." in cleaned
         assert "Standing by." in cleaned
+
+    def test_bare_invoke_parses_for_mimo_template(self):
+        text = f"I'll read the file. {self.BARE_INVOKE} Standing by."
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(self.MIMO_TEMPLATE), [self.READ_TOOL]
+        )
+        assert [c.function.name for c in calls] == ["read"]
+        assert json.loads(calls[0].function.arguments) == {"path": "/workspace/TASK.md"}
+        assert "invoke" not in cleaned
+        assert "I'll read the file." in cleaned
+        assert "Standing by." in cleaned
+
+    @pytest.mark.parametrize(
+        "chat_template, name",
+        [(None, "read"), (MIMO_TEMPLATE, "evil")],
+        ids=["other-template", "undeclared-name"],
+    )
+    def test_bare_invoke_left_as_text(self, chat_template, name):
+        text = f'<invoke name="{name}"><parameter name="path">/x</parameter></invoke>'
+        tok = self._tokenizer(chat_template)
+        cleaned, calls = parse_tool_calls(text, tok, [self.READ_TOOL])
+        assert calls is None
+        assert cleaned == text
+        f = ToolCallStreamFilter(tok, tools=[self.READ_TOOL])
+        assert f.feed(text) + f.finish() == text
 
     def test_parameter_spelling_variant(self):
         text = (
@@ -5343,6 +5558,21 @@ class TestAttributeStyleFunctionDialect:
             'ion name="read"><param name="pa',
             'th">/x</param></funct',
             "ion>",
+            " Done.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Sure.  Done."
+
+    def test_stream_filter_suppresses_bare_invoke_across_chunks(self):
+        f = ToolCallStreamFilter(
+            self._tokenizer(self.MIMO_TEMPLATE), tools=[self.READ_TOOL]
+        )
+        chunks = [
+            "Sure. ",
+            "<inv",
+            'oke name="re',
+            'ad">\n<parameter name="path">/x</parameter>\n</inv',
+            "oke>",
             " Done.",
         ]
         out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
@@ -5651,7 +5881,14 @@ def test_qwen_untyped_parameter_conversion_boundaries(spec, raw, expected):
     assert json.loads(calls[0].function.arguments)["v"] == expected
 
 
-@pytest.mark.parametrize("spec", [{}, {"type": ["string", "null"]}])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {},
+        {"type": ["string", "null"]},
+        {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+    ],
+)
 def test_qwen_parameter_is_not_decoded_twice(monkeypatch, spec):
     from mlx_lm.tool_parsers import qwen3_coder
 
@@ -5689,6 +5926,7 @@ def test_qwen_parameter_is_not_decoded_twice(monkeypatch, spec):
         (["string"], "null", "null"),
         (["string", "null"], '"null"', "null"),
         (["number", "string"], "42", 42),
+        (["boolean", "null"], "False", False),
     ],
 )
 def test_xml_union_parameter_preserves_declared_value_type(
@@ -5708,9 +5946,65 @@ def test_xml_union_parameter_preserves_declared_value_type(
     assert validate_json_schema(arguments, schema)[0]
 
 
-@pytest.mark.parametrize("types", [["unknown"], [None], []])
+@pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+@pytest.mark.parametrize(
+    "spec, raw, expected",
+    [
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "123", "123"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "true", "true"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, '{"a": 1}', '{"a": 1}'),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "[1, 2]", "[1, 2]"),
+        ({"oneOf": [{"type": "string"}, {"type": "null"}]}, '{"a": 1}', '{"a": 1}'),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, '"123"', "123"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "null", None),
+        ({"anyOf": [{"type": "string"}]}, "123", "123"),
+        ({"anyOf": [{"type": "string"}]}, "null", "null"),
+        ({"oneOf": [{"type": "string"}, {"type": "object"}]}, '{"a": 1}', {"a": 1}),
+        (
+            {"anyOf": [{"type": "array"}, {"type": "null"}]},
+            "[true, null]",
+            [True, None],
+        ),
+        ({"anyOf": [{"type": "integer"}, {"type": "null"}]}, "7", 7),
+        ({"anyOf": [{"type": "boolean"}, {"type": "null"}]}, "False", False),
+        ({"anyOf": [{"type": "boolean"}, {"type": "null"}]}, "True", True),
+    ],
+)
+def test_xml_union_keyword_parameter_keeps_declared_alternatives(
+    parser_module, spec, raw, expected
+):
+    """The oneOf/anyOf alternatives bound what an XML value may decode to."""
+    schema = {"type": "object", "properties": {"v": spec}, "required": ["v"]}
+    tools = [{"function": {"name": "f", "parameters": schema}}]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        _qwen_parser_tokenizer(parser_module),
+        tools,
+    )
+    assert calls and len(calls) == 1
+    arguments = json.loads(calls[0].function.arguments)
+    assert arguments["v"] == expected
+    assert type(arguments["v"]) is type(expected)
+    assert validate_json_schema(arguments, schema)[0]
+
+
+@pytest.mark.parametrize("types", [["unknown"], [None], [], [{"type": "string"}]])
 def test_invalid_union_type_declarations_keep_best_effort_parsing(types):
     assert _coerce_param_value("123", "v", {"v": {"type": types}}, "f") == 123
+
+
+@pytest.mark.parametrize(
+    "alternatives, raw, expected",
+    [
+        ([{"$ref": "#/$defs/M"}, {"type": "null"}], '{"a": 1}', {"a": 1}),
+        ([{"enum": [1, 2]}, {"type": "null"}], "1", 1),
+    ],
+)
+def test_untyped_union_alternatives_keep_best_effort_parsing(
+    alternatives, raw, expected
+):
+    spec = {"v": {"anyOf": alternatives}}
+    assert _coerce_param_value(raw, "v", spec, "f") == expected
 
 
 @pytest.mark.parametrize(
@@ -5741,7 +6035,6 @@ def test_native_union_parameter_keeps_correct_python_literal_values(
         tools,
     )
     assert json.loads(calls[0].function.arguments)["v"] == expected
-
 
 
 def test_stream_filter_suppresses_envelope_with_long_tool_name():
@@ -5775,3 +6068,20 @@ def test_qwen_missing_outer_close_does_not_merge_next_call():
     decoded = [(c.function.name, c.function.arguments) for c in calls]
     assert decoded == [("f", '{"a": "one"}'), ("f", '{"a": "two"}')]
     assert errors == ()
+
+
+@pytest.mark.parametrize(
+    "think_start, expected",
+    [
+        ("<think>", "Strip ```` spans."),
+        ("<mm:think>", "Strip ``<think>...</think>`` spans."),
+    ],
+)
+def test_think_tags_in_the_answer_survive_for_leading_thinking_models(
+    think_start, expected
+):
+    tok = _make_tokenizer()
+    tok.think_start = think_start
+    cleaned, calls = parse_tool_calls("Strip ``<think>...</think>`` spans.", tok, None)
+    assert calls is None
+    assert cleaned == expected

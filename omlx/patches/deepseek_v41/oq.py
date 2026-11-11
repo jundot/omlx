@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Budget-checked oQ3/oQ4 export of the mixed-precision V4.1 release.
+"""Budget-checked oQ2-oQ4 export of the mixed-precision V4.1 release.
 
-Engram follows Qwen4-Exp's uniform affine group-32 embedding policy and is
-excluded from the remaining weights' bit budget. If all other source weights
-fit their independent budget at original precision, that allocation dominates
-every lossy alternative: neither sensitivity ranking nor an imatrix can improve
-it. oQ3 measures layer sensitivity and projection input statistics, then uses
-the official mixed-bit allocator and weighted affine arithmetic for oQ3e.
+Engram follows Qwen4-Exp's uniform affine group-32 embedding policy, stays at
+4 bits and is excluded from the remaining weights' bit budget;
+``preserve_ngram_table`` copies the official FP8 tables unchanged. If all other
+source weights fit their independent budget at original precision, that
+allocation dominates every lossy alternative: neither sensitivity ranking nor
+an imatrix can improve it. Levels below oQ4 measure layer sensitivity and
+projection input statistics, then use the official mixed-bit allocator and
+weighted affine arithmetic for the e variants.
 """
 
 import json
@@ -107,7 +109,10 @@ def requantize_projection(
 def source_budget(
     source, config, mapping, *, preserve_mtp, text_only=False, engram_bits=4
 ):
-    """Count actual exported bytes, including scales, norms and draft heads."""
+    """Count actual exported bytes, including scales, norms and draft heads.
+
+    ``engram_bits=None`` prices Engram at its stored source bytes.
+    """
     headers = {}
     for filename in dict.fromkeys(mapping.values()):
         with (source / filename).open("rb") as f:
@@ -122,9 +127,14 @@ def source_budget(
             draft_tensors += 1
         if text_only and name.startswith(("vision.", "aligner.", "image_")):
             continue
+        info = headers[filename][name]
+        if ".engram.embed." in name and engram_bits is None:
+            engram_bytes += info["data_offsets"][1] - info["data_offsets"][0]
+            if name.endswith(".weight"):
+                engram_params += math.prod(info["shape"])
+            continue
         if name.endswith(".scale"):
             continue
-        info = headers[filename][name]
         shape, dtype = info["shape"], info["dtype"]
         count = math.prod(shape) * (2 if dtype in ("I8", "U8") else 1)
         if ".engram.embed." in name:
@@ -147,20 +157,22 @@ def source_budget(
             output_bytes += info["data_offsets"][1] - info["data_offsets"][0]
     if preserve_mtp and draft_tensors == 0:
         raise ValueError("Requested MTP preservation but source has no draft weights")
+    engram = {
+        "logical_parameters": engram_params,
+        "tensor_bytes": engram_bytes,
+        "effective_bpw": engram_bytes * 8 / max(engram_params, 1),
+    }
+    if engram_bits is None:
+        engram["precision"] = "source"
+    else:
+        engram.update(bits=engram_bits, group_size=32, mode="affine")
     return {
         "remaining_weights": {
             "logical_parameters": params,
             "tensor_bytes": output_bytes,
             "effective_bpw": output_bytes * 8 / max(params, 1),
         },
-        "engram": {
-            "logical_parameters": engram_params,
-            "tensor_bytes": engram_bytes,
-            "effective_bpw": engram_bytes * 8 / max(engram_params, 1),
-            "bits": engram_bits,
-            "group_size": 32,
-            "mode": "affine",
-        },
+        "engram": engram,
         "tensor_bytes": output_bytes + engram_bytes,
         "preserved_source_draft_tensors": draft_tensors,
     }
@@ -273,6 +285,85 @@ def quantize_engram(
     }
 
 
+def _tensor_location(path, key):
+    with path.open("rb") as f:
+        size = struct.unpack("<Q", f.read(8))[0]
+        entry = json.loads(f.read(size))[key]
+    start, end = entry["data_offsets"]
+    return entry, 8 + size + start, end - start
+
+
+def copy_engram(
+    source, destination, table, *, module_name, chunk_bytes=64 << 20, progress=None
+):
+    """Copy a table's stored bytes unchanged under the converted key names.
+
+    The official FP8 table keeps its E4M3 values and one E8M0 scale per 32
+    channels, which DiskEngramEmbedding decodes like the source checkpoint.
+    """
+    if table.get("bias_key"):
+        raise ValueError("Engram table is already quantized: copy is unsupported")
+    parts = [("weight", source / table["weight_file"], table["weight_key"])]
+    if table.get("scale_key"):
+        scale_file = table.get("scale_file") or table["weight_file"]
+        parts.append(("scales", source / scale_file, table["scale_key"]))
+    located = [(name, path, *_tensor_location(path, key)) for name, path, key in parts]
+    weight = located[0][2]
+    if len(weight["shape"]) != 2 or weight["shape"][-1] % 32:
+        raise ValueError("Engram rows must divide into 32-channel groups")
+    mode = None
+    if len(located) > 1:
+        scales = located[1][2]
+        rows, width = weight["shape"]
+        if (
+            not weight["dtype"].startswith("F8_E4M3")
+            or not scales["dtype"].startswith("F8_E8M0")
+            or scales["shape"] != [rows, width // 32]
+        ):
+            raise ValueError("Only FP8 Engram tables with E8M0 block scales copy")
+        mode = "mxfp8"
+    header, offset = {}, 0
+    for name, _, entry, _, length in located:
+        header[f"{module_name}.{name}"] = {
+            "dtype": entry["dtype"],
+            "shape": entry["shape"],
+            "data_offsets": [offset, offset + length],
+        }
+        offset += length
+    header["__metadata__"] = {"format": "mlx"}
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    partial = destination.with_suffix(destination.suffix + ".partial")
+    done = 0
+    with partial.open("xb") as out:
+        out.write(struct.pack("<Q", len(encoded)))
+        out.write(encoded)
+        for _, path, _, start, length in located:
+            with path.open("rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining:
+                    data = f.read(min(chunk_bytes, remaining))
+                    if not data:
+                        raise ValueError(f"Truncated Engram source: {path.name}")
+                    out.write(data)
+                    remaining -= len(data)
+                    done += len(data)
+                    if progress is not None:
+                        progress(done, offset)
+    partial.rename(destination)
+    spec = {
+        "weight_file": destination.name,
+        "weight_key": f"{module_name}.weight",
+        "group_size": 32,
+    }
+    if mode is not None:
+        spec.update(
+            scale_file=destination.name, scale_key=f"{module_name}.scales", mode=mode
+        )
+    return spec
+
+
 def quantize(
     source,
     destination,
@@ -293,16 +384,21 @@ def quantize(
     imatrix_strict=False,
     imatrix_num_samples=128,
     imatrix_seq_length=512,
+    preserve_ngram_table=False,
 ):
     from ...oq import (
         _OQ_BPW_TARGETS,
         _emit_progress,
         _get_predicate_bits,
         _lookup_imatrix_importance,
+        _offload_table_bits,
         _validate_v41_oq_settings,
     )
 
     _validate_v41_oq_settings(oq_level, dtype, group_size)
+    # Engram sits outside the bit budget and calibration reads the source
+    # checkpoint, so keeping it at source precision changes no other tensor.
+    engram_bits = None if preserve_ngram_table else _offload_table_bits(oq_level)
     if oq_level == 4 and (sensitivity_model_path or sensitivity_map_override):
         raise ValueError(
             "V4.1 original-precision oQ4 does not use sensitivity overrides"
@@ -326,7 +422,7 @@ def quantize(
         mapping,
         preserve_mtp=preserve_mtp,
         text_only=text_only,
-        engram_bits=oq_level,
+        engram_bits=engram_bits,
     )
     default_target, default_cap = _OQ_BPW_TARGETS[oq_level]
     target = default_target if target_bpw is None else target_bpw
@@ -336,16 +432,17 @@ def quantize(
     if oq_level == 4 and budget["remaining_weights"]["effective_bpw"] > target:
         raise ValueError(
             "Original-precision allocation exceeds the requested oQ4 budget; "
-            "V4.1 calibrated affine allocation is currently supported for oQ3"
+            "V4.1 calibrated affine allocation is supported below oQ4"
         )
     allocation, imatrix, preparation = {}, None, {}
-    if oq_level == 3:
+    if oq_level < 4:
         allocation, imatrix, preparation = prepare_affine_conversion(
             source,
             destination,
             config,
             mapping,
             budget,
+            oq_level=oq_level,
             target=target,
             cap=cap,
             preserve_mtp=preserve_mtp,
@@ -396,14 +493,12 @@ def quantize(
     writer = ShardWriter(destination)
     tables = source_engram_tables(mapping, config)
     exported_tables = {}
-    engram_start, engram_span = (20, 20) if oq_level == 3 else (0, 30)
+    engram_start, engram_span = (20, 20) if oq_level < 4 else (0, 30)
     projection_start = engram_start + engram_span
     for i, (name, table) in enumerate(tables.items()):
-        if _get_predicate_bits(name + ".weight", config, oq_level, 64) != (
-            oq_level,
-            32,
-            "affine",
-        ):
+        if engram_bits is not None and _get_predicate_bits(
+            name + ".weight", config, oq_level, 64
+        ) != (engram_bits, 32, "affine"):
             raise ValueError("V4.1 Engram policy differs from Qwen4-Exp")
         filename = f".model-engram-{i:02d}.safetensors"
         last = [-1]
@@ -421,16 +516,30 @@ def quantize(
                     f"Engram {i + 1}/{len(tables)}: {percent}%",
                 )
 
-        spec = quantize_engram(
-            source,
-            destination / filename,
-            table,
-            progress=progress,
-            module_name=name,
-            bits=oq_level,
-        )
+        if engram_bits is None:
+            spec = copy_engram(
+                source,
+                destination / filename,
+                table,
+                module_name=name,
+                progress=progress,
+            )
+        else:
+            spec = quantize_engram(
+                source,
+                destination / filename,
+                table,
+                progress=progress,
+                module_name=name,
+                bits=engram_bits,
+            )
         writer.add_file(
-            filename, [spec[key] for key in ("weight_key", "scale_key", "bias_key")]
+            filename,
+            [
+                spec[key]
+                for key in ("weight_key", "scale_key", "bias_key")
+                if spec.get(key)
+            ],
         )
         exported_tables[name] = spec
     quantized = {}
@@ -509,7 +618,8 @@ def quantize(
     report["shard_count"] = len(set(output_map.values()))
     for spec in exported_tables.values():
         spec["weight_file"] = output_map[spec["weight_key"]]
-        spec["scale_file"] = output_map[spec["scale_key"]]
+        if spec.get("scale_key"):
+            spec["scale_file"] = output_map[spec["scale_key"]]
     if written_bytes != budget["remaining_weights"]["tensor_bytes"]:
         raise ValueError("Exported non-Engram bytes differ from the independent budget")
     config.pop("quantization_config", None)
@@ -556,6 +666,7 @@ def prepare_affine_conversion(
     mapping,
     budget,
     *,
+    oq_level,
     target,
     cap,
     preserve_mtp,
@@ -570,6 +681,7 @@ def prepare_affine_conversion(
 ):
     from ...oq import (
         _OQE_CALIB_DATASET,
+        _base_bits_for_level,
         _emit_progress,
         _load_or_collect_imatrix,
         _normalize_sensitivity_map_override,
@@ -648,7 +760,10 @@ def prepare_affine_conversion(
                 )
 
             sensitivity = measure_sensitivity(
-                model, processor.tokenizer, bits=3, progress=progress
+                model,
+                processor.tokenizer,
+                bits=_base_bits_for_level(oq_level),
+                progress=progress,
             )
         finally:
             model.close()
@@ -662,6 +777,7 @@ def prepare_affine_conversion(
         config,
         imatrix,
         sensitivity,
+        oq_level=oq_level,
         target=target,
         cap=cap,
     )

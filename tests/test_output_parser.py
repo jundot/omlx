@@ -1107,6 +1107,8 @@ class TestOutputParserFactory:
         "template, expected",
         [
             ("<tool_call>\n<function=", "qwen3_coder"),
+            # MiMo: no newline, so MLX-LM alone infers json_tools (#4933).
+            ("'<tool_call><function=' ~ tool_call.name ~ '>'", "qwen3_coder"),
             ("<arg_key>", "glm47"),
             ("[TOOL_CALLS]", "mistral"),  # Empty end marker.
         ],
@@ -1648,6 +1650,18 @@ class TestMuseGlimmerOutputParserSession:
         assert long_text.strip()[:20] in combined
         assert "more text" in combined
         assert not stopped
+
+    @pytest.mark.parametrize(
+        ("model_name", "model_config"),
+        [
+            ("any-name", {"model_type": "muse_spark"}),
+            ("Muse-Spark-Open-816B-A42B-NVFP4", None),
+        ],
+    )
+    def test_muse_spark_uses_channel_parser(self, model_name, model_config):
+        factory = detect_output_parser(model_name, InklingTokenizer({}), model_config)
+        assert factory is not None
+        assert factory.kind == "muse_glimmer"
 
     def test_non_muse_model_not_claimed(self):
         tokenizer = InklingTokenizer({})

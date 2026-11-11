@@ -28,7 +28,7 @@ import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from .config import parse_size
 
@@ -199,7 +199,6 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
-    qwen4_gdn_decode_wide_proj: bool = False
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
@@ -255,7 +254,6 @@ class ServerSettings:
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
-            qwen4_gdn_decode_wide_proj=data.get("qwen4_gdn_decode_wide_proj", False),
             distributed_inference_enabled=data.get(
                 "distributed_inference_enabled",
                 False,
@@ -331,6 +329,10 @@ class ModelSettings:
         )
 
 
+ConcurrentPriority = Literal["prefill", "balanced", "decode"]
+CONCURRENT_PRIORITIES: tuple[str, ...] = get_args(ConcurrentPriority)
+
+
 @dataclass
 class SchedulerSettings:
     """Scheduler configuration settings."""
@@ -346,15 +348,22 @@ class SchedulerSettings:
     #   "speed" — never shrink; keep full-size steps and only admit prompts
     #     that fit at full speed (smaller effective context limit).
     prefill_priority: str = "context"
-    # When True (default), prefill yields GPU time to running decodes:
-    # prompts are force-chunked under contention, chunks are capped while
-    # any engine decodes, and each chunk accrues a decode time debt repaid
-    # before the next chunk runs. Off restores the pre-fairness behavior.
-    decode_fairness: bool = True
+    # How prefill shares the GPU with running decodes:
+    #   "prefill" - no decode fairness; prefill runs to completion.
+    #   "balanced" (default) - fairness with the adaptive debt ratio.
+    #   "decode" - fairness with the fixed debt ratio.
+    concurrent_priority: str = "balanced"
+
+    @property
+    def decode_fairness(self) -> bool:
+        return self.concurrent_priority != "prefill"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return asdict(self)
+        data = asdict(self)
+        # Older builds read only this switch after a downgrade.
+        data["decode_fairness"] = self.decode_fairness
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SchedulerSettings:
@@ -371,12 +380,18 @@ class SchedulerSettings:
         prefill_priority = data.get("prefill_priority", "context")
         if prefill_priority not in ("context", "speed"):
             prefill_priority = "context"
+        concurrent_priority = data.get("concurrent_priority")
+        if concurrent_priority not in CONCURRENT_PRIORITIES:
+            # Older settings stored only the decode_fairness switch.
+            concurrent_priority = (
+                "balanced" if data.get("decode_fairness", True) else "prefill"
+            )
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
-            decode_fairness=bool(data.get("decode_fairness", True)),
+            concurrent_priority=concurrent_priority,
         )
 
 
@@ -404,6 +419,11 @@ class CacheSettings:
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
     gdn_sidecar_state_dtype: str = "fp32"
+    # Runtime-only: the configured dir that GlobalSettings.ensure_directories()
+    # could not create, e.g. on a disconnected external drive.
+    unavailable_ssd_cache_dir: Path | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def get_gdn_snapshot_storage(self) -> str:
         """Return the user-facing GDN storage policy."""
@@ -453,6 +473,13 @@ class CacheSettings:
         if self.ssd_cache_dir:
             return Path(self.ssd_cache_dir).expanduser().resolve()
         return base_path / "cache"
+
+    def is_ssd_cache_dir_unavailable(self) -> bool:
+        """Return whether the configured SSD cache dir was unavailable at startup."""
+        return bool(self.ssd_cache_dir) and (
+            Path(self.ssd_cache_dir).expanduser().resolve()
+            == self.unavailable_ssd_cache_dir
+        )
 
     def get_ssd_cache_max_size_bytes(self, base_path: Path) -> int:
         """
@@ -550,6 +577,9 @@ class CacheSettings:
 
 MemoryGuardTier = Literal["safe", "balanced", "aggressive", "custom"]
 VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"}
+
+# KV cache storage formats `splash serve --kv-format` accepts.
+SPLASH_KV_FORMATS = frozenset({"int8", "bf16"})
 
 
 @dataclass
@@ -866,21 +896,27 @@ class UISettings:
     language: str = "en"
     # Admin dashboard block layout. None means the built-in default layout.
     dashboard_layout: dict[str, Any] | None = None
+    # Web UI color token overrides, {"light": {token: hex}, "dark": {...}}.
+    # None means the stock colors.
+    custom_theme: dict[str, dict[str, str]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
             "language": self.language,
             "dashboard_layout": self.dashboard_layout,
+            "custom_theme": self.custom_theme,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> UISettings:
         """Create from dictionary."""
         layout = data.get("dashboard_layout")
+        theme = data.get("custom_theme")
         return cls(
             language=data.get("language", "en"),
             dashboard_layout=layout if isinstance(layout, dict) else None,
+            custom_theme=theme if isinstance(theme, dict) else None,
         )
 
 
@@ -912,6 +948,10 @@ class ClaudeCodeSettings:
     opus_model: str | None = None
     sonnet_model: str | None = None
     haiku_model: str | None = None
+    # When True, oMLX exposes derived Claude Desktop tier aliases
+    # (claude-opus / claude-sonnet / claude-haiku)
+    # that resolve at runtime to the configured tier models.
+    desktop_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -920,6 +960,7 @@ class ClaudeCodeSettings:
             "opus_model": self.opus_model,
             "sonnet_model": self.sonnet_model,
             "haiku_model": self.haiku_model,
+            "desktop_enabled": self.desktop_enabled,
         }
 
     @classmethod
@@ -930,6 +971,7 @@ class ClaudeCodeSettings:
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),
             haiku_model=data.get("haiku_model"),
+            desktop_enabled=data.get("desktop_enabled", False),
         )
 
 
@@ -942,6 +984,7 @@ class IntegrationSettings:
     openclaw_model: str | None = None
     hermes_model: str | None = None
     pi_model: str | None = None
+    vibe_model: str | None = None
     copilot_model: str | None = None
     dsh_model: str | None = None
     openclaw_tools_profile: str = "coding"
@@ -959,6 +1002,13 @@ class IntegrationSettings:
     web_search_content_mode: str = "snippet"  # "snippet" | "full"
     web_search_content_truncate: bool = True
     web_search_content_max_chars: int = 20000
+    # External engines: Splash (omlx/engine/splash.py). An empty path means
+    # oMLX looks for an installed launcher itself.
+    splash_path: str | None = None
+    splash_kv_format: str = "int8"  # "int8" | "bf16"
+    splash_max_memory_gb: float | None = None  # None = what the ceiling leaves
+    splash_ssd_cache_gb: float | None = None  # None = oMLX's SSD cache size
+    splash_ane_prefill: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -968,6 +1018,7 @@ class IntegrationSettings:
             "openclaw_model": self.openclaw_model,
             "hermes_model": self.hermes_model,
             "pi_model": self.pi_model,
+            "vibe_model": self.vibe_model,
             "copilot_model": self.copilot_model,
             "dsh_model": self.dsh_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
@@ -984,6 +1035,11 @@ class IntegrationSettings:
             "web_search_content_mode": self.web_search_content_mode,
             "web_search_content_truncate": self.web_search_content_truncate,
             "web_search_content_max_chars": self.web_search_content_max_chars,
+            "splash_path": self.splash_path,
+            "splash_kv_format": self.splash_kv_format,
+            "splash_max_memory_gb": self.splash_max_memory_gb,
+            "splash_ssd_cache_gb": self.splash_ssd_cache_gb,
+            "splash_ane_prefill": self.splash_ane_prefill,
         }
 
     @classmethod
@@ -995,6 +1051,7 @@ class IntegrationSettings:
             openclaw_model=data.get("openclaw_model"),
             hermes_model=data.get("hermes_model"),
             pi_model=data.get("pi_model"),
+            vibe_model=data.get("vibe_model"),
             copilot_model=data.get("copilot_model"),
             dsh_model=data.get("dsh_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
@@ -1019,6 +1076,11 @@ class IntegrationSettings:
             web_search_content_max_chars=data.get(
                 "web_search_content_max_chars", 20000
             ),
+            splash_path=data.get("splash_path") or None,
+            splash_kv_format=data.get("splash_kv_format", "int8"),
+            splash_max_memory_gb=data.get("splash_max_memory_gb"),
+            splash_ssd_cache_gb=data.get("splash_ssd_cache_gb"),
+            splash_ane_prefill=data.get("splash_ane_prefill", True),
         )
 
 
@@ -1534,7 +1596,7 @@ class GlobalSettings:
         self._save_data(data)
 
     def ensure_inference_auth_setting(self) -> None:
-        """Add the manual opt-in default without persisting runtime overrides."""
+        """Add the opt-in default without persisting runtime overrides."""
         path = self.base_path / "settings.json"
         data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         auth = data.setdefault("auth", {})
@@ -1587,7 +1649,6 @@ class GlobalSettings:
         # Required directories - fatal if creation fails
         required = [
             self.base_path,
-            self.cache.get_ssd_cache_dir(self.base_path),
             self.logging.get_log_dir(self.base_path),
         ]
 
@@ -1600,9 +1661,26 @@ class GlobalSettings:
                     logger.error(f"Failed to create directory {directory}: {e}")
                     raise
 
-        # Model directories - skip unavailable paths (e.g. disconnected external drive)
-        valid_dirs = []
-        for directory in self.model.get_model_dirs(self.base_path):
+        # SSD cache - turn the SSD cache off until restart when the configured
+        # dir is unavailable. Writing to another disk could fill it unnoticed.
+        cache_dir = self.cache.get_ssd_cache_dir(self.base_path)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            if cache_dir == self.base_path / "cache":
+                logger.error(f"Failed to create directory {cache_dir}: {e}")
+                raise
+            if self.cache.unavailable_ssd_cache_dir != cache_dir:
+                logger.warning(
+                    f"SSD cache directory unavailable, SSD cache is off until "
+                    f"restart: {cache_dir} ({e})"
+                )
+            self.cache.unavailable_ssd_cache_dir = cache_dir
+
+        # Keep unavailable model dirs (e.g. disconnected external drive) in the
+        # settings so discovery finds them again after reconnection.
+        model_dirs = self.model.get_model_dirs(self.base_path)
+        for directory in model_dirs:
             if not directory.exists():
                 try:
                     directory.mkdir(parents=True, exist_ok=True)
@@ -1616,12 +1694,9 @@ class GlobalSettings:
             access_error = model_directory_access_error(directory)
             if access_error is not None:
                 logger.warning(f"Model directory unavailable, skipping: {access_error}")
-                continue
 
-            valid_dirs.append(str(directory))
-
-        # Update model_dirs to only include valid paths
-        self.model.model_dirs = valid_dirs
+        # Store resolved paths so they match what the admin API reports.
+        self.model.model_dirs = [str(d) for d in model_dirs]
         self.model.model_dir = None
 
     def validate(self) -> list[str]:
@@ -1851,6 +1926,16 @@ class GlobalSettings:
             errors.append("markitdown_max_files_per_request must be > 0")
         if not str(self.integrations.markitdown_pdf_processing_engine or "").strip():
             errors.append("markitdown_pdf_processing_engine must not be empty")
+        if self.integrations.splash_kv_format not in SPLASH_KV_FORMATS:
+            errors.append(
+                f"splash_kv_format must be one of {sorted(SPLASH_KV_FORMATS)}"
+            )
+        memory = self.integrations.splash_max_memory_gb
+        if memory is not None and memory <= 0:
+            errors.append("splash_max_memory_gb must be > 0")
+        ssd = self.integrations.splash_ssd_cache_gb
+        if ssd is not None and ssd < 0:
+            errors.append("splash_ssd_cache_gb must be >= 0")
 
         # HuggingFace validation
         if self.huggingface.endpoint:
@@ -1901,17 +1986,19 @@ class GlobalSettings:
         # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
         # the writer thread internally — the dir is not used for disk I/O.
         ssd_dir = (
-            self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+            self.cache.get_ssd_cache_dir(self.base_path)
+            if self.cache.enabled and not self.cache.is_ssd_cache_dir_unavailable()
+            else None
         )
 
         return SchedulerConfig(
-            qwen4_gdn_decode_wide_proj=self.server.qwen4_gdn_decode_wide_proj,
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
+            adaptive_decode_share=self.scheduler.concurrent_priority == "balanced",
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

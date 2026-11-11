@@ -23,6 +23,19 @@ final class DownloadsScreenVM {
     private(set) var tasks: [HFTaskDTO] = []
     private(set) var recommended: [HFModelInfo] = []
 
+    /// Repo format the HF search and suggestions show. The view reloads
+    /// the suggestions when it changes.
+    var hfModelFormat: HFModelFormat = HFModelFormat(
+        rawValue: UserDefaults.standard.string(forKey: DownloadsScreenVM.hfModelFormatKey) ?? ""
+    ) ?? .mlx {
+        didSet {
+            UserDefaults.standard.set(hfModelFormat.rawValue, forKey: Self.hfModelFormatKey)
+            searchResults = []
+            lastSearchQuery = ""
+        }
+    }
+    static let hfModelFormatKey = "downloads.hfModelFormat"
+
     /// Configured HF mirror endpoint. Empty when using the HF default
     /// (huggingface.co). Loaded once on screen start, kept in sync with
     /// PATCH /admin/api/global-settings (`hf_endpoint`).
@@ -82,6 +95,18 @@ final class DownloadsScreenVM {
     func showModelCard(repoId: String) {
         let resolvedSource: ModelCardSource = (source == .hf) ? .huggingFace : .modelScope
         modelCardTarget = ModelCardTarget(repoId: repoId, source: resolvedSource)
+    }
+
+    /// Hugging Face downloads pick their files in the model-card sheet
+    /// first; ModelScope downloads start right away.
+    func requestDownload(repo: String? = nil, client: OMLXClient) {
+        guard source == .hf else {
+            startDownload(repo: repo, client: client)
+            return
+        }
+        let target = (repo ?? repoText).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return }
+        modelCardTarget = ModelCardTarget(repoId: target, source: .huggingFace, startTab: .files)
     }
 
     /// Host the user sees on the Downloads screen. Strips scheme so the
@@ -282,7 +307,9 @@ final class DownloadsScreenVM {
             self.searchLoading = true
             defer { Task { @MainActor [weak self] in self?.searchLoading = false } }
             do {
-                let resp = try await client.searchHFModels(query: q, limit: 20)
+                let resp = try await client.searchHFModels(
+                    query: q, limit: 20, modelFormat: self.hfModelFormat
+                )
                 if Task.isCancelled { return }
                 self.searchResults = resp.models
                 self.lastSearchQuery = q
@@ -372,7 +399,7 @@ final class DownloadsScreenVM {
     /// Starts a download against the active source. `repo` lets the
     /// suggested-models grid pass a repo id without having to first stuff
     /// it into the input box.
-    func startDownload(repo: String? = nil, client: OMLXClient) {
+    func startDownload(repo: String? = nil, files: [String]? = nil, client: OMLXClient) {
         let target = (repo ?? (source == .hf ? repoText : msRepoText))
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { return }
@@ -383,8 +410,11 @@ final class DownloadsScreenVM {
             do {
                 switch activeSource {
                 case .hf:
-                    _ = try await client.startHFDownload(repoId: target)
-                    if repo == nil { self?.repoText = "" }
+                    _ = try await client.startHFDownload(repoId: target, files: files)
+                    if self?.repoText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .caseInsensitiveCompare(target) == .orderedSame {
+                        self?.repoText = ""
+                    }
                 case .ms:
                     _ = try await client.startMSDownload(modelId: target)
                     if repo == nil { self?.msRepoText = "" }
@@ -453,7 +483,7 @@ final class DownloadsScreenVM {
             // the original dashboard surfaces both lists side-by-side.
             switch source {
             case .hf:
-                let resp = try await client.getHFRecommended()
+                let resp = try await client.getHFRecommended(modelFormat: hfModelFormat)
                 self.recommended = Self.merge(trending: resp.trending, popular: resp.popular)
             case .ms:
                 let resp = try await client.getMSRecommended()

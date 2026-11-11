@@ -3,13 +3,13 @@
 // `defaultValue` fallback so the catalog isn't load-bearing) and `symbol`
 // driving the SF Symbol on the row.
 //
-// Section groupings (Server / Models / Benchmark / General) live inline in
+// Section groupings (Server / App / Models / Benchmark / General) live inline in
 // AppView; the visual grouping is purely a layout decision in the shell.
 
 import SwiftUI
 
 enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
-    case server, status, appearance, network, performance, logs
+    case server, status, appearance, network, performance, askAI, logs
     case models, downloads, integrations, quantization
     case throughputBench, accuracyBench, contextBench
     case security, about
@@ -30,6 +30,10 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
             return String(localized: "sidebar.performance",
                           defaultValue: "Performance",
                           comment: "Sidebar row label / navigation title for the Performance section")
+        case .askAI:
+            return String(localized: "sidebar.askAI",
+                          defaultValue: "Ask AI",
+                          comment: "Sidebar row label / navigation title for the Ask AI section")
         case .status:
             return String(localized: "sidebar.status",
                           defaultValue: "Status",
@@ -86,6 +90,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         case .server:          return "server.rack"
         case .network:         return "network"
         case .performance:     return "bolt.fill"
+        case .askAI:           return "text.bubble"
         case .status:          return "gauge.with.dots.needle.50percent"
         case .appearance:      return "paintbrush"
         case .logs:            return "scroll"

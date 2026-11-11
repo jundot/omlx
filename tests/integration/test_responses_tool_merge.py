@@ -31,7 +31,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omlx.engine.base import BaseEngine
-from omlx.mcp.tools import merge_tools
+from omlx.mcp.tools import mcp_tools_to_openai, merge_tools
 from omlx.mcp.types import MCPTool
 
 
@@ -78,6 +78,7 @@ class RecordingEngine(BaseEngine):
         self._model_type = "llama"
         self._grammar_compiler = grammar_compiler
         self.recorded_chat_kwargs: List[Dict[str, Any]] = []
+        self.recorded_count_calls: List[Dict[str, Any]] = []
         self.started = False
 
     @property
@@ -112,6 +113,14 @@ class RecordingEngine(BaseEngine):
         yield MockGenerationOutput(text="Hello world.")
 
     def count_chat_tokens(self, messages, tools=None, chat_template_kwargs=None, **kwargs) -> int:
+        self.recorded_count_calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "chat_template_kwargs": chat_template_kwargs,
+                **kwargs,
+            }
+        )
         prompt = self._tokenizer.apply_chat_template(messages, tokenize=False)
         return len(self._tokenizer.encode(prompt))
 
@@ -191,6 +200,10 @@ class FakeMCPManager:
 
     def get_merged_tools(self, user_tools=None):
         return merge_tools(self._mcp_tools, user_tools)
+
+    def get_all_tools_openai(self):
+        # /v1/messages merges MCP tools through this instead of get_merged_tools.
+        return mcp_tools_to_openai(self._mcp_tools)
 
 
 MCP_WEATHER_TOOL = MCPTool(
@@ -362,3 +375,120 @@ class TestToolChoiceNoneSuppressesTemplateExposure:
         assert tools is None, (
             f"MCP tools leaked to the template despite tool_choice='none': {tools!r}"
         )
+
+
+ANTHROPIC_STOCK_TOOL = {
+    "name": "get_stock_price",
+    "description": "Get the current stock price",
+    "input_schema": {
+        "type": "object",
+        "properties": {"ticker": {"type": "string"}},
+    },
+}
+
+
+class TestAnthropicToolChoiceNone:
+    """tool_choice {"type": "none"} hides client and MCP tools on /v1/messages."""
+
+    @pytest.mark.parametrize(
+        ("tool_choice", "expected"),
+        [
+            ({"type": "auto"}, {"get_stock_price", "weather__get_weather"}),
+            ({"type": "none"}, set()),
+        ],
+    )
+    def test_messages_tools_follow_tool_choice(
+        self, client_with_mcp, engine, tool_choice, expected
+    ):
+        resp = client_with_mcp.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "What's the weather?"}],
+                "tools": [ANTHROPIC_STOCK_TOOL],
+                "tool_choice": tool_choice,
+            },
+        )
+        assert resp.status_code == 200
+        assert engine.recorded_chat_kwargs, "engine.chat was never called"
+        tools = engine.recorded_chat_kwargs[-1].get("tools") or []
+        assert {t["function"]["name"] for t in tools} == expected
+
+    @pytest.mark.parametrize(
+        ("tool_choice", "expected"),
+        [
+            ({"type": "auto"}, {"get_stock_price", "weather__get_weather"}),
+            ({"type": "none"}, set()),
+        ],
+    )
+    def test_count_tokens_tools_follow_tool_choice(
+        self, client_with_mcp, engine, tool_choice, expected
+    ):
+        resp = client_with_mcp.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "What's the weather?"}],
+                "tools": [ANTHROPIC_STOCK_TOOL],
+                "tool_choice": tool_choice,
+            },
+        )
+        assert resp.status_code == 200
+        assert engine.recorded_count_calls, "engine.count_chat_tokens was never called"
+        tools = engine.recorded_count_calls[-1]["tools"] or []
+        assert {t["function"]["name"] for t in tools} == expected
+
+
+class TestAnthropicCountTokensMatchesMessages:
+    """count_tokens counts the prompt /v1/messages renders, not a raw template."""
+
+    @pytest.mark.parametrize(
+        "thinking",
+        [None, {"type": "disabled"}, {"type": "enabled", "budget_tokens": 1024}],
+    )
+    def test_count_sees_the_messages_prompt(self, client_with_mcp, engine, thinking):
+        body = {
+            "model": "test-model",
+            "system": "You are terse.",
+            "messages": [{"role": "user", "content": "What's the weather?"}],
+            "tools": [ANTHROPIC_STOCK_TOOL],
+        }
+        if thinking is not None:
+            body["thinking"] = thinking
+
+        resp = client_with_mcp.post("/v1/messages", json={**body, "max_tokens": 16})
+        assert resp.status_code == 200
+        resp = client_with_mcp.post("/v1/messages/count_tokens", json=body)
+        assert resp.status_code == 200
+
+        # The first call is /v1/messages' context check, the second is the count.
+        assert len(engine.recorded_count_calls) == 2
+        messages_call, count_call = engine.recorded_count_calls
+        assert count_call == messages_call
+        if thinking is not None:
+            assert (
+                count_call["chat_template_kwargs"]["enable_thinking"]
+                is (thinking["type"] == "enabled")
+            )
+
+    def test_template_error_is_400_on_both(self, client_with_mcp, engine, monkeypatch):
+        # count_tokens used to fall back to "role: content" lines here and
+        # return 200 with a count of a prompt the model never sees.
+        from jinja2 import TemplateError
+
+        def failing_render(messages, **kwargs):
+            raise TemplateError("Conversation roles must alternate user/assistant")
+
+        monkeypatch.setattr(engine.tokenizer, "apply_chat_template", failing_render)
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "What's the weather?"}],
+        }
+
+        resp = client_with_mcp.post("/v1/messages", json={**body, "max_tokens": 16})
+        assert resp.status_code == 400
+        assert "Chat template error" in resp.text
+        resp = client_with_mcp.post("/v1/messages/count_tokens", json=body)
+        assert resp.status_code == 400
+        assert "Chat template error" in resp.text

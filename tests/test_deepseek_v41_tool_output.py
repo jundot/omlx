@@ -23,7 +23,7 @@ CALL = (
 )
 
 
-def replay(text, split, prefilled=False):
+def replay(text, split, prefilled=False, finish_reason=None):
     chunks = [text[:split], text[split:]]
     tokenizer = Tokenizer(dict(enumerate(chunks)))
     factory = detect_output_parser("v41", tokenizer, {"model_type": "deepseek_v41"})
@@ -37,6 +37,7 @@ def replay(text, split, prefilled=False):
         result = session.process_token(i)
         output.append(result.stream_text)
         stopped.append(result.is_stop)
+    session.notify_finish_reason(finish_reason)
     final = session.finalize()
     output.append(final.stream_text)
     return "".join(output), stopped, final
@@ -69,7 +70,7 @@ def test_real_call_after_reasoning_at_any_split():
 )
 def test_incomplete_or_invalid_envelope_does_not_stop(text):
     for split in range(len(text) + 1):
-        visible, stops, final = replay(text, split)
+        visible, stops, final = replay(text, split, finish_reason="stop")
         assert visible == text, split
         assert not any(stops), split
         assert not final.tool_calls

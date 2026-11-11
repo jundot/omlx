@@ -281,13 +281,6 @@ def test_stored_stage_links_are_never_trusted_for_a_new_launch():
     assert deployment.stage_links == ()
 
 
-def test_operators_can_turn_stage_links_off(monkeypatch):
-    monkeypatch.setenv(launch_links.DISABLE_ENV, "0")
-    deployment, report, _ = _attach()
-    assert deployment.stage_links == ()
-    assert report["reason"] == f"disabled by {launch_links.DISABLE_ENV}"
-
-
 def test_tensor_parallel_deployments_keep_mlx_collectives():
     tp = replace(
         _deployment(),

@@ -175,6 +175,20 @@ class TestGetMaxContextWindow:
             # Fallback (32768) returned, not the policy (16_000).
             assert get_max_context_window("no-native-model") == 32_768
 
+    def test_loaded_engine_plan_lowers_the_limit(self):
+        """An engine that fits its context to memory (Splash) caps the limit,
+        so a longer prompt gets the standard overflow error from oMLX."""
+        from omlx.server import get_max_context_window
+
+        state = self._mount_native_and_policy(native_ctx=262_144, policy_cap=None)
+        engine = state.engine_pool.get_entry.return_value.engine
+        engine.max_context_tokens = 77_817
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("splash-model") == 77_817
+        engine.max_context_tokens = 300_000
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("splash-model") == 262_144
+
 
 class TestValidateContextWindow:
     """Tests for validate_context_window()."""
@@ -213,9 +227,12 @@ class TestValidateContextWindow:
         with patch("omlx.server._server_state", state):
             with pytest.raises(HTTPException) as exc_info:
                 validate_context_window(1001)
+            # Overflow markers that clients match before compacting.
+            detail = exc_info.value.detail.lower()
             assert exc_info.value.status_code == 400
-            assert "1001 tokens" in exc_info.value.detail
-            assert "1000 tokens" in exc_info.value.detail
+            assert exc_info.value.code == "context_length_exceeded"
+            assert "prompt is too long: 1001 tokens > 1000" in detail
+            assert "maximum context length" in detail
 
     def test_raises_with_model_specific_limit(self):
         """Test uses model-specific limit when available."""
@@ -232,8 +249,7 @@ class TestValidateContextWindow:
             with pytest.raises(HTTPException) as exc_info:
                 validate_context_window(200, "test-model")
             assert exc_info.value.status_code == 400
-            assert "200 tokens" in exc_info.value.detail
-            assert "100 tokens" in exc_info.value.detail
+            assert "200 tokens > 100" in exc_info.value.detail
 
 
 class TestCountChatTokens:
@@ -282,3 +298,41 @@ class TestCountChatTokens:
         count = engine.count_chat_tokens(messages, tools)
 
         assert count == 7
+
+
+class TestGetRerankMaxLength:
+    """get_rerank_max_length() mirrors get_embedding_max_length but must not
+    consult the LLM-oriented global sampling default: only an explicit request
+    or the model's own per-model max_context_window override applies."""
+
+    def test_request_value_wins(self):
+        from omlx.server import get_rerank_max_length
+
+        with patch("omlx.server.get_model_settings_for_request") as gm:
+            assert get_rerank_max_length("m", 1024) == 1024
+            gm.assert_not_called()
+
+    def test_per_model_override_applies(self):
+        from omlx.server import get_rerank_max_length
+
+        settings = ModelSettings(max_context_window=4096)
+        with patch(
+            "omlx.server.get_model_settings_for_request", return_value=settings
+        ):
+            assert get_rerank_max_length("m") == 4096
+
+    def test_no_override_defers_to_model_default(self):
+        """None lets the reranker resolve its own declared model_max_length."""
+        from omlx.server import get_rerank_max_length
+
+        with patch(
+            "omlx.server.get_model_settings_for_request",
+            return_value=ModelSettings(max_context_window=None),
+        ):
+            assert get_rerank_max_length("m") is None
+
+    def test_missing_settings_defers_to_model_default(self):
+        from omlx.server import get_rerank_max_length
+
+        with patch("omlx.server.get_model_settings_for_request", return_value=None):
+            assert get_rerank_max_length("m") is None

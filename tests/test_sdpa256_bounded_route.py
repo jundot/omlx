@@ -21,14 +21,12 @@ N_Q, N_KV, N_LAYERS = 24, 4, 16
 @pytest.fixture(autouse=True)
 def _clean_route_state():
     saved = dict(mm._SDPA_TILED_PREFILL_HEAD_DIMS)
-    force, logged = sdpa256._FORCE_TILED, set(sdpa256._TILED_ROUTE_LOGGED)
+    logged = set(sdpa256._TILED_ROUTE_LOGGED)
     mm._SDPA_TILED_PREFILL_HEAD_DIMS.clear()
-    sdpa256._FORCE_TILED = None
     sdpa256._TILED_ROUTE_LOGGED.clear()
     yield
     mm._SDPA_TILED_PREFILL_HEAD_DIMS.clear()
     mm._SDPA_TILED_PREFILL_HEAD_DIMS.update(saved)
-    sdpa256._FORCE_TILED = force
     sdpa256._TILED_ROUTE_LOGGED.clear()
     sdpa256._TILED_ROUTE_LOGGED.update(logged)
 
@@ -162,7 +160,7 @@ def test_route_is_bounded_with_an_empty_registry():
     """Registration is the estimator's business. A route that depended on it
     could be talked out of the safe path by a failed registration."""
     assert not mm._SDPA_TILED_PREFILL_HEAD_DIMS
-    assert sdpa256._tiled_route_required() is True
+    assert sdpa256._should_route(*_qk(2048, 16384), None, "causal", None) is True
 
 
 def test_route_survives_a_broken_memory_monitor(monkeypatch):
@@ -174,7 +172,7 @@ def test_route_survives_a_broken_memory_monitor(monkeypatch):
     monkeypatch.setattr(mm, "register_tiled_prefill_head_dim", boom)
     assert sdpa256._register_bounded_route(8192) is False
     assert not mm._SDPA_TILED_PREFILL_HEAD_DIMS
-    assert sdpa256._tiled_route_required() is True
+    assert sdpa256._should_route(*_qk(2048, 16384), None, "causal", None) is True
 
 
 def test_unknown_model_geometry_does_not_unlock_the_unfused_path():
@@ -182,7 +180,7 @@ def test_unknown_model_geometry_does_not_unlock_the_unfused_path():
     cannot move it."""
     monitor = MemoryMonitor(max_kv_cache_memory=GIB)  # no set_model_info
     assert monitor.has_model_info() is False
-    assert sdpa256._tiled_route_required() is True
+    assert sdpa256._should_route(*_qk(2048, 16384), None, "causal", None) is True
 
 
 def test_non_qualifying_shapes_keep_the_stock_path():
@@ -196,30 +194,10 @@ def test_non_qualifying_shapes_keep_the_stock_path():
     )
 
 
-# --- 8. explicit override behaviour is unchanged ---------------------------
-
-
-def test_explicit_override_still_forces_and_disables_the_route():
-    q, k = _qk(2048, 16384)
-    sdpa256._FORCE_TILED = True
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
-    sdpa256._FORCE_TILED = False
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
-    sdpa256._FORCE_TILED = None
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
-
-
-def test_opting_out_withdraws_the_o_l_admission_promise():
-    """OMLX_SDPA256_TILED=0 restores the unfused path, so the estimator must
-    not go on charging the bounded route's transient."""
-    sdpa256._FORCE_TILED = False
-    assert sdpa256._register_bounded_route(sdpa256._SDPA256_MIN_KV_LEN) is False
-    assert HEAD_DIM not in mm._SDPA_TILED_PREFILL_HEAD_DIMS
-
-
 def test_bounded_route_logs_once_not_per_call(caplog):
+    q, k = _qk(2048, 16384)
     with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
         for _ in range(5):
-            sdpa256._tiled_route_required()
+            sdpa256._should_route(q, k, None, "causal", None)
     notices = [r for r in caplog.records if "memory-bounded path" in r.getMessage()]
     assert len(notices) == 1

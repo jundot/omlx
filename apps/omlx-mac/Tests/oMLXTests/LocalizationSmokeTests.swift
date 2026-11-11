@@ -60,10 +60,15 @@ final class LocalizationSmokeTests: XCTestCase {
         "server.section.advanced", "server.row.base_path",
         "security.section.api_key", "security.api_key.row_label",
         "integrations.section.claude_code", "integrations.tool.codex",
+        "integrations.section.external_engines",
+        "integrations.section.markitdown", "integrations.markitdown.pdf_processing_missing_model",
         "performance.section.cache", "performance.cache.enabled",
+        "askai.row.enabled", "askai.section.presets",
+        "settings.search.prompt", "settings.search.empty",
         "status.section.system", "status.section.active_now",
         // High-density screens
         "models.active.title", "models.library.title",
+        "models.updates.check", "models.updates.available",
         "downloads.hf.section.title", "downloads.active.title",
         "quant.header.title", "quant.about.title",
         // Profile + bench
@@ -113,8 +118,13 @@ final class LocalizationSmokeTests: XCTestCase {
         // when missing. We pass `value: <sentinel>` so a real missing key
         // resolves to the sentinel and never accidentally equals the key.
         let sentinel = "__missing__"
+        // Resolve against the source-language bundle rather than `.main`.
+        // With a partial catalog for the host's language (Korean, Japanese,
+        // Traditional Chinese, and now German), `.main` picks that language's
+        // table, and an explicit `value:` suppresses the fallback to English,
+        // so every sentinel would come back unresolved.
         for key in Self.sentinelKeys {
-            let resolved = NSLocalizedString(key, bundle: .main,
+            let resolved = NSLocalizedString(key, bundle: Self.englishBundle,
                                              value: sentinel, comment: "")
             XCTAssertNotEqual(resolved, sentinel,
                               "key \(key) is wired in code but missing from xcstrings")

@@ -19,6 +19,12 @@ final class AppServices: NSObject {
     /// PR 8 — when non-nil, the AppView swaps the Models screen for the
     /// per-model ModelSettingsScreen drilled to this id.
     var modelDetailID: String?
+    /// Sub-page shown inside the per-model settings; nil is its top page.
+    /// AppView resets it whenever `modelDetailID` changes.
+    var modelDetailPage: ModelSettingsPage?
+    /// Sub-page shown inside the Ask AI screen; nil is its top page.
+    /// AppView resets it when another section is selected.
+    var askAIPage: AskAIPage?
     /// When set, AppView pulls the sidebar selection to this section on
     /// the next runloop tick and clears the request. Lets a screen
     /// imperatively navigate the user (e.g. the Profiles tab's
@@ -29,9 +35,13 @@ final class AppServices: NSObject {
     /// `ScrollViewReader` observes this, scrolls, then nils it. Extend the
     /// enum as more deep links land.
     var requestedServerAnchor: ServerAnchor?
+    /// Quits and reopens oMLX. Set by AppDelegate.
+    @ObservationIgnored var relaunchApp: @MainActor () -> Void = {}
 
     let client: OMLXClient
     let updates: UpdateController
+    /// Keep model update results when navigating to Downloads or model settings.
+    let models = ModelsScreenVM()
     /// Read-only preset bundle (sourced from the shipped JSON + remote
     /// refresh). The per-model settings preset chip strip subscribes via
     /// Observation to react to refreshes.
@@ -48,6 +58,10 @@ final class AppServices: NSObject {
     let accuracyBench   = AccuracyBenchScreenVM()
     let contextBench    = ContextBenchScreenVM()
 
+    /// Ask AI bar. Lives for the whole app so an answer keeps streaming
+    /// while the panel is hidden.
+    let askAI = AskAIController()
+
     @ObservationIgnored
     private weak var server: ServerProcess?
 
@@ -60,6 +74,8 @@ final class AppServices: NSObject {
         // Wire Sparkle (or its stub) on the next runloop so any user prefs
         // saved on disk are applied before the first background check.
         DispatchQueue.main.async { [weak self] in
+            // The test host would otherwise check and download real releases.
+            guard !MenubarController.isRunningUnitTests else { return }
             self?.updates.bootstrap()
         }
     }

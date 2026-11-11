@@ -11,7 +11,7 @@ chunked-prefill mask offsets.
 import mlx.core as mx
 import pytest
 
-from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+from omlx.custom_kernels.sparse_index import fast as glm_fast
 
 _MASK_FOLD_AVAILABLE = (
     glm_fast.is_native_available()

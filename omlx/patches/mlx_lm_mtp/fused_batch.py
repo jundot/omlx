@@ -102,9 +102,29 @@ def advance(batch, batch_state):
     batched_head.flush(batch_state)
     groups = defaultdict(list)
     replacements = {}
+    host = _row_verify_host(batch.model)
+    limit = bg._shared_verify_width(batch.model) if host is not None else 0
+    together = set()
+    if limit and len(states) > 1:
+        # Each request verifies its own block, but blocks of one width share a forward.
+        by_width = defaultdict(list)
+        for index, state in enumerate(states):
+            if (
+                not state.queue
+                and state.chain
+                and state.next_main is not None
+                and state.drafts is not None
+            ):
+                by_width[int(state.drafts.shape[0])].append(index)
+        for width, members in by_width.items():
+            per_forward = max(1, limit // (width + 1))
+            for start in range(0, len(members), per_forward):
+                chunk = members[start : start + per_forward]
+                if len(chunk) > 1 and _verify_rows_together(batch, batch_state, host, chunk, replacements):
+                    together.update(chunk)
     for index, uid in enumerate(batch.uids):
         state = batch_state.states[uid]
-        if state.queue:
+        if state.queue or index in together:
             continue
         row = bg._make_row_batch(batch, index, state=state)
         if not state.chain or _independent_verify(batch.model):
@@ -121,6 +141,65 @@ def advance(batch, batch_state):
         _advance_group(batch, depth, rows, replacements)
 
     bg._replace_cache_rows(batch, replacements)
+
+
+def _row_verify_host(model):
+    """The model object that verifies several requests' blocks in one forward while
+    keeping each request's own cache and rollback (mtp_verify_rows), or None."""
+    if not _independent_verify(model):
+        return None
+    for host in (
+        model,
+        getattr(model, "language_model", None),
+        getattr(model, "_language_model", None),
+    ):
+        if host is not None and callable(getattr(host, "mtp_verify_rows", None)):
+            return host
+    return None
+
+
+def _verify_rows_together(batch, batch_state, host, indices, replacements):
+    """One verify forward for the requests at `indices` (equal draft widths), then
+    each request's own acceptance, rollback and next draft. False leaves them to the
+    per-request path."""
+    rows = [
+        (index, bg._make_row_batch(batch, index, state=batch_state.states[batch.uids[index]]))
+        for index in indices
+    ]
+    states = [batch_state.states[batch.uids[index]] for index in indices]
+    width = int(states[0].drafts.shape[0]) + 1
+    caches = [row.prompt_cache for _, row in rows]
+    if not host.mtp_verify_rows_ok(caches, width):
+        return False
+    inputs = mx.stack(
+        [mx.concatenate([state.next_main, state.drafts]) for state in states]
+    )
+    started = time.perf_counter()
+    logits, hidden, caches = host.mtp_verify_rows(inputs, caches)
+    verify_ms = (time.perf_counter() - started) * 1000 / len(rows)
+    # Greedy requests draft together (one vocabulary head read for all of them).
+    jobs = (
+        []
+        if bg._dspark_host(batch.model) is not None
+        and all(bg._is_greedy(row) and bg._proc_list(row) is None for _, row in rows)
+        else None
+    )
+    for i, ((index, row), state, cache) in enumerate(zip(rows, states, caches)):
+        row.prompt_cache = cache
+        bg._set_singleton_mrope_delta(row)
+        bg._run_verify_cycle_chain(
+            row,
+            state,
+            # A verify-only cluster rank gets no hidden: it never drafts.
+            verify_result=(logits[i : i + 1], None if hidden is None else hidden[i : i + 1], None, None),
+            verify_ms=verify_ms,
+            draft_jobs=jobs,
+        )
+        replacements[index] = row.prompt_cache
+        batch._token_context[index] = row._token_context[0]
+    if jobs:
+        bg._dspark_draft_jobs(jobs)
+    return True
 
 
 def _advance_group(batch, depth, rows, replacements, *, cache=None):
@@ -191,7 +270,6 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     vector_rollback = isinstance(gdn, SpeculativeCacheTransaction) or (
         whole_batch
         and gdn is not None
-        and not getattr(batch.model, "_omlx_mtp_commit_align", 0)
         and all(_supports_batch_rollback(layer) for layer in cache)
         and any(
             getattr(host, "_omlx_mtp_batch_rollback", False)

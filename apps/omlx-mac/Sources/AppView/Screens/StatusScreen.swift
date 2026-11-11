@@ -25,6 +25,7 @@ struct StatusScreen: View {
             // expose port/host editors, so Restart just bounces the cached
             // endpoint.
             ServerHeroCard()
+            PrefillLendingBanner()
 
             SectionHeader(String(localized: "status.session_stats",
                                   defaultValue: "Serving Stats",
@@ -93,7 +94,7 @@ struct StatusScreen: View {
                                      comment: "Sublabel for GPU utilization row")
                 ) {
                     Text(vm.gpuUtilizationText)
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.callout))
                 }
                 Row(label: String(localized: "status.row.thermal_state",
                                   defaultValue: "Thermal State",
@@ -104,14 +105,14 @@ struct StatusScreen: View {
                                   defaultValue: "Server Uptime",
                                   comment: "Row label for server uptime")) {
                     Text(vm.uptimeText)
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.callout))
                 }
                 Row(label: String(localized: "status.row.version",
                                   defaultValue: "oMLX Version",
                                   comment: "Row label for the running oMLX version"),
                     isLast: true) {
                     Text(vm.versionText)
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.callout))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -222,33 +223,38 @@ private struct RuntimeCacheSection: View {
                                   defaultValue: "Memory Cache",
                                   comment: "Row label for the in-memory (hot) KV cache size gauge")) {
                     Text(memoryGaugeText)
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.callout))
                 }
                 Row(label: String(localized: "status.runtime_cache.memory_entries",
                                   defaultValue: "Memory Entries",
                                   comment: "Row label for the number of in-memory KV cache entries")) {
                     Text(memoryEntriesText)
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.callout))
                 }
             }
             Row(label: String(localized: "status.runtime_cache.files",
                               defaultValue: "Cache Files",
                               comment: "Row label for cache file count")) {
                 Text(fileCountText)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.callout))
             }
             Row(label: String(localized: "status.runtime_cache.size",
                               defaultValue: "Total Size",
                               comment: "Row label for total cache size on disk")) {
                 Text(sizeText)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.callout))
             }
             if let dir = cache?.ssdCacheDir, !dir.isEmpty {
                 Row(label: String(localized: "status.runtime_cache.location",
                                   defaultValue: "Location",
-                                  comment: "Row label for the SSD cache directory path")) {
+                                  comment: "Row label for the SSD cache directory path"),
+                    warning: cache?.ssdCacheUnavailable == true
+                        ? String(localized: "status.runtime_cache.location.unavailable",
+                                 defaultValue: "SSD cache is off because this directory was not available when the server started. Restart the server after reconnecting the drive.",
+                                 comment: "Warning under the SSD cache location when it was unavailable at server start")
+                        : nil) {
                     Text(dir)
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -315,7 +321,7 @@ private struct RuntimeCacheSection: View {
 }
 
 /// Bytes → human-readable string. Mirrors `formatByteCount` in
-/// `omlx/admin/static/js/dashboard.js` — 1024-scaled, one decimal place.
+/// `apps/omlx-web/omlx_web/static/js/dashboard.js` — 1024-scaled, one decimal place.
 private func formatByteCount(_ bytes: Int64) -> String {
     let b = Double(max(0, bytes))
     if b >= 1024 * 1024 * 1024 { return String(format: "%.1f GB", b / (1024 * 1024 * 1024)) }
@@ -335,13 +341,13 @@ private struct StatTilesRow: View {
                 label: String(localized: "status.tile.total",
                               defaultValue: "Total Prefill Tokens",
                               comment: "Stat tile label for total prefill tokens processed"),
-                value: stats.map { fmtNum($0.totalPromptTokens) } ?? "—"
+                value: stats.map { CountFormat.compact($0.totalPromptTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cached",
                               defaultValue: "Cached Tokens",
                               comment: "Stat tile label for cached tokens"),
-                value: stats.map { fmtNum($0.totalCachedTokens) } ?? "—"
+                value: stats.map { CountFormat.compact($0.totalCachedTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cache_efficiency",
@@ -368,20 +374,20 @@ private struct StatTile: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label)
-                .font(.omlxText(11, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
                 .textCase(.uppercase)
                 .kerning(0.6)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
             Text(value)
-                .font(.omlxText(22, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.title1, weight: .semibold))
                 .kerning(-0.5)
                 .foregroundStyle(accentColor)
                 .frame(maxWidth: .infinity)
             if let sub {
                 Text(sub)
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textTertiary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
@@ -439,7 +445,7 @@ private struct GpuMemoryTrailing: View {
             ProgressBar(progress: progress, tint: theme.blueDot)
                 .frame(width: 140)
             Text(labelText(used: used, max: max))
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
                 .frame(minWidth: 110, alignment: .trailing)
         }
@@ -471,7 +477,7 @@ private struct SystemRamTrailing: View {
             ProgressBar(progress: progress, tint: theme.text.opacity(0.7))
                 .frame(width: 140)
             Text(labelText)
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
                 .frame(minWidth: 110, alignment: .trailing)
         }
@@ -506,7 +512,7 @@ private struct ThermalTrailing: View {
                 .fill(color(for: severity))
                 .frame(width: 8, height: 8)
             Text(SystemMetricsPoller.label(for: severity))
-                .font(.omlxText(12))
+                .font(.omlxText(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.text)
         }
     }
@@ -533,7 +539,7 @@ private struct ActiveNowList: View {
                     Text(String(localized: "status.active_now.empty",
                                 defaultValue: "Server idle — no models loaded",
                                 comment: "Empty-state text shown when the Active Now list has no entries"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 12)
@@ -544,7 +550,7 @@ private struct ActiveNowList: View {
                         HStack(spacing: 12) {
                             modelStateBadge(for: model)
                             Text(model.estimatedSizeFormatted ?? "—")
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.textSecondary)
                                 .frame(minWidth: 60, alignment: .trailing)
                         }
@@ -634,11 +640,24 @@ private struct UpdatesSection: View {
                 ))
             }
             Row(
+                label: String(localized: "status.updates.background_download",
+                              defaultValue: "Download Automatically",
+                              comment: "Row label for the toggle that downloads found updates in the background"),
+                sublabel: String(localized: "status.updates.background_download.sub",
+                                 defaultValue: "Download in the background, then ask before installing",
+                                 comment: "Sublabel for the background update download toggle")
+            ) {
+                RowSwitch(isOn: Binding(
+                    get: { updates.backgroundDownload },
+                    set: { updates.backgroundDownload = $0 }
+                ))
+            }
+            Row(
                 label: String(localized: "status.updates.auto_download",
                               defaultValue: "Notify About Updates",
                               comment: "Row label for the automatic update notification toggle"),
                 sublabel: String(localized: "status.updates.auto_download.sub",
-                                 defaultValue: "Show release notes before downloading in the background",
+                                 defaultValue: "Show the release notes when an update is found",
                                  comment: "Sublabel for the automatic update notification toggle"),
                 isLast: true
             ) {
@@ -657,19 +676,19 @@ private struct UpdatesSection: View {
             Text(String(localized: "status.updates.checking_primary",
                         defaultValue: "Checking for updates…",
                         comment: "Primary update status line while a check is in progress"))
-                .font(.omlxText(13, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                 .foregroundStyle(theme.text)
         case .available(let upd), .ready(let upd):
             Text(String(localized: "status.updates.available_primary",
                         defaultValue: "oMLX \(upd.version) is available",
                         comment: "Primary update status line when a new version is available; placeholder is the version string"))
-                .font(.omlxText(13, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                 .foregroundStyle(theme.text)
         case .downloading:
             Text(String(localized: "status.updates.downloading_primary",
                         defaultValue: "Downloading update…",
                         comment: "Primary update status line while the new build is downloading"))
-                .font(.omlxText(13, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                 .foregroundStyle(theme.text)
         case .idle:
             Text(updates.lastError == nil
@@ -679,7 +698,7 @@ private struct UpdatesSection: View {
                  : String(localized: "status.updates.error_primary",
                           defaultValue: "Update check failed",
                           comment: "Primary update status line when checking for updates failed"))
-                .font(.omlxText(13, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                 .foregroundStyle(theme.text)
         }
     }
@@ -691,29 +710,35 @@ private struct UpdatesSection: View {
             Text(String(localized: "status.updates.checking_secondary",
                         defaultValue: "Checking GitHub releases…",
                         comment: "Secondary update status line while a check is in progress"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
         case .available(let upd):
-            Text(String(localized: "status.updates.available_secondary",
-                        defaultValue: "Ready to download · \(upd.sizeText ?? "—")",
-                        comment: "Secondary update status line when a new version is available; placeholder is the download size or em dash"))
-                .font(.omlxText(11))
-                .foregroundStyle(theme.textSecondary)
+            if let error = updates.lastError {
+                Text(error)
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
+                    .foregroundStyle(theme.redDot)
+            } else {
+                Text(String(localized: "status.updates.available_secondary",
+                            defaultValue: "Ready to download · \(upd.sizeText ?? "—")",
+                            comment: "Secondary update status line when a new version is available; placeholder is the download size or em dash"))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
+                    .foregroundStyle(theme.textSecondary)
+            }
         case .downloading(let pct):
             Text(String(localized: "status.updates.downloading_secondary",
                         defaultValue: "Downloading · \(pct)%",
                         comment: "Secondary update status line during download; placeholder is the percent complete"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
         case .ready(let upd):
             Text(String(localized: "status.updates.ready_secondary",
                         defaultValue: "\(upd.version) is ready to install",
                         comment: "Secondary update status line once the staged bundle is ready; placeholder is the version"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
         case .idle(let lastChecked):
             Text(updates.lastError ?? lastCheckedText(lastChecked))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
         }
     }
@@ -772,12 +797,61 @@ private struct UpdatesSection: View {
     }
 }
 
-// MARK: - Helpers
+/// Shown while this Mac runs another Mac's Prefill Accelerator helper.
+private struct PrefillLendingBanner: View {
+    @Environment(AppServices.self) private var services
+    @Environment(\.omlxTheme) private var theme
+    @State private var lending: PrefillLendingDTO?
+    @State private var stopping = false
 
-private func fmtNum(_ n: Int) -> String {
-    let v = Double(n)
-    if v >= 1e9 { return String(format: "%.2fB", v / 1e9) }
-    if v >= 1e6 { return String(format: "%.2fM", v / 1e6) }
-    if v >= 1e3 { return String(format: "%.1fK", v / 1e3) }
-    return String(n)
+    var body: some View {
+        Group {
+            if let lending, lending.active {
+                HStack(spacing: 12) {
+                    Image(systemName: "bolt.horizontal.circle")
+                        .foregroundStyle(theme.warningText)
+                    Text(text(lending))
+                        .font(.omlxText(12.5))
+                        .foregroundStyle(theme.warningText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Button(String(localized: "status.prefill_lending.stop",
+                                  defaultValue: "Stop",
+                                  comment: "Button that stops lending this Mac to another Mac's prefill")) {
+                        Task { await stop() }
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(stopping)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(theme.warningBg))
+                .padding(.horizontal, 28)
+                .padding(.top, 12)
+            }
+        }
+        .task {
+            while !Task.isCancelled {
+                // The endpoint exists only while the cluster setting is on.
+                lending = try? await services.client.prefillLending()
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    private func text(_ lending: PrefillLendingDTO) -> String {
+        let host = lending.host ?? "another Mac"
+        let layers = lending.layers ?? 0
+        let model = (lending.model ?? "").split(separator: "/").last.map(String.init) ?? ""
+        return String(localized: "status.prefill_lending.text",
+                      defaultValue: "This Mac is helping \(host) with prompt prefill: \(layers) layers of \(model). It stops when \(host) unloads the model.",
+                      comment: "Banner shown while this Mac runs another Mac's prefill helper")
+    }
+
+    private func stop() async {
+        stopping = true
+        defer { stopping = false }
+        _ = try? await services.client.stopPrefillLending()
+        lending = nil
+    }
 }

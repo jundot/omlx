@@ -362,6 +362,10 @@ class ClefModel:
         self.backbone = DecisionBackbone(model_path, trust_remote_code)
         self.head: JointSchemaHead | None = None
 
+    @property
+    def has_vision(self) -> bool:
+        return self.backbone.has_vision
+
     def load(self) -> None:
         self.backbone.load()
         path = Path(self.model_path)
@@ -379,6 +383,8 @@ class ClefModel:
 
     def encode(self, request: dict, truncate: bool = True) -> ClefPlan:
         """Tokenize and preprocess on the CPU; raises the request errors."""
+        if request.get("videos"):
+            raise DecisionRequestError("this model does not take videos")
         backbone = self.backbone
         images = decode_images(request.get("images"))
         pixel_values = image_grid_thw = None

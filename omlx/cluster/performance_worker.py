@@ -116,13 +116,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
 
     from .jaccl_lease import acquire_jaccl_communicator_lease
 
-    with acquire_jaccl_communicator_lease(
-        deployment_id="performance-probe",
-        state_dir=os.environ.get(
-            "OMLX_CLUSTER_STATE_DIR",
-            "~/.omlx/cluster/runtime",
-        ),
-    ):
+    with acquire_jaccl_communicator_lease(deployment_id="performance-probe"):
         return _run_probe(args)
 
 

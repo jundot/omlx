@@ -290,7 +290,12 @@ def test_adaptive_calibration_stops_on_coverage_or_available_data(
 
 @pytest.mark.parametrize("vision", ["vision.proj", "aligner.proj", "image_projection"])
 @pytest.mark.parametrize("calibrated_vision", [False, True])
-def test_affine_plan_preserves_vision_precision(vision, calibrated_vision):
+@pytest.mark.parametrize(
+    "level, target, cap, bits", [(3, 3.5, 3.7, 3), (2, 2.8, 3.0, 2)]
+)
+def test_affine_plan_preserves_vision_precision(
+    vision, calibrated_vision, level, target, cap, bits
+):
     from types import SimpleNamespace
 
     from omlx.patches.deepseek_v41.oq_inventory import build_affine_plan
@@ -319,15 +324,17 @@ def test_affine_plan_preserves_vision_precision(vision, calibrated_vision):
         {"model_type": "deepseek_v41"},
         imatrix,
         {0: 0.25, 1: 0.5},
-        target=3.5,
-        cap=3.7,
+        oq_level=level,
+        target=target,
+        cap=cap,
     )
     assert set(specs) == {good, missing_expert}
-    assert specs[good]["bits"] == 3
-    assert specs[missing_expert]["bits"] == 3
+    assert specs[good]["bits"] == bits
+    assert specs[missing_expert]["bits"] == bits
     assert report["fixed_source_bytes"] == 8192
-    assert report["tensor_bytes"] == 8192 + (524288 + 8192) * 7 // 16
-    assert report["effective_bpw"] <= 3.7
+    # Affine group-64 storage costs bits/8 bytes plus a BF16 scale and bias.
+    assert report["tensor_bytes"] == 8192 + (524288 + 8192) * (2 * bits + 1) // 16
+    assert report["effective_bpw"] <= cap
     assert report["unobserved_experts"] == {missing_expert: [1]}
     assert report["unobserved_expert_policy"] == "uniform_importance_at_allocated_bits"
     assert report["preserved_modules"][vision] == "precision_policy"
@@ -338,9 +345,50 @@ def test_affine_plan_preserves_vision_precision(vision, calibrated_vision):
             {"model_type": "deepseek_v41"},
             imatrix,
             {0: 0.25, 1: 0.5},
+            oq_level=3,
             target=3.0,
             cap=3.1,
         )
+
+
+def test_affine_plan_lifts_attention_when_experts_exceed_target():
+    from types import SimpleNamespace
+
+    from omlx.patches.deepseek_v41.oq_inventory import build_affine_plan
+
+    # As in the release at oQ3: 3-bit experts plus the BF16 tensors kept at
+    # source precision already pass the target, so only the ladder, bounded
+    # by the cap, can raise a low-sensitivity layer's attention above its
+    # 4-bit floor.
+    experts = [f"language_model.layers.{i}.ffn.experts.w1" for i in range(4)]
+    attention = "language_model.layers.2.attn.wq_a"
+    kept = "language_model.layers.0.attn.wo_a"
+    inventory = {name: dict(shape=(128, 64, 64), source_bytes=0) for name in experts}
+    inventory[attention] = dict(shape=(64, 128), source_bytes=0)
+    inventory[kept] = dict(shape=(256, 128), source_bytes=65536)
+    imatrix = SimpleNamespace(
+        entries={
+            **{name: SimpleNamespace(counts=np.ones(128)) for name in experts},
+            attention: SimpleNamespace(counts=np.ones(1)),
+        }
+    )
+    budget = dict(
+        remaining_weights=dict(logical_parameters=2138112, tensor_bytes=65536)
+    )
+    specs, report = build_affine_plan(
+        inventory,
+        budget,
+        {"model_type": "deepseek_v41"},
+        imatrix,
+        {0: 1.0, 1: 1.0, 2: 0.05, 3: 1.0},
+        oq_level=3,
+        target=3.6,
+        cap=3.8,
+    )
+    assert all(specs[name]["bits"] == 3 for name in experts)
+    assert specs[attention] == dict(bits=8, group_size=64, mode="affine")
+    assert report["preserved_modules"][kept] == "uncalibrated"
+    assert 3.6 < report["effective_bpw"] <= 3.8
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,7 @@ import threading
 
 import pytest
 
+from omlx.cluster import jaccl_side_channel
 from omlx.cluster.jaccl_side_channel import (
     _coordinator_endpoint,
     init_cluster_group,
@@ -24,8 +25,8 @@ def _free_loopback_port() -> int:
 def test_socket_side_channel_orders_ranks_and_reuses_connections(monkeypatch):
     port = _free_loopback_port()
     monkeypatch.setenv("MLX_JACCL_COORDINATOR", f"127.0.0.1:{port}")
-    monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TIMEOUT_SECONDS", "3")
-    monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TRANSPORT", "direct")
+    monkeypatch.setattr(jaccl_side_channel, "_DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS", 3.0)
+    monkeypatch.setattr(jaccl_side_channel, "_side_channel_transport", lambda: "direct")
     results: dict[str, bytes] = {}
     errors: list[BaseException] = []
     server_ready = threading.Event()
@@ -63,8 +64,10 @@ def test_sidecar_orders_ranks_without_using_parent_network(monkeypatch, tmp_path
     # oMLX.app exports PYTHONHOME for its bundled interpreter.
     monkeypatch.setenv("PYTHONHOME", str(tmp_path))
     monkeypatch.setenv("MLX_JACCL_COORDINATOR", f"127.0.0.1:{port}")
-    monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TIMEOUT_SECONDS", "3")
-    monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TRANSPORT", "sidecar")
+    monkeypatch.setattr(jaccl_side_channel, "_DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS", 3.0)
+    monkeypatch.setattr(
+        jaccl_side_channel, "_side_channel_transport", lambda: "sidecar"
+    )
     results: dict[str, bytes] = {}
     errors: list[BaseException] = []
 
@@ -96,7 +99,7 @@ def test_side_channel_requires_a_valid_ipv4_coordinator(monkeypatch, value):
         _coordinator_endpoint()
 
 
-def test_init_cluster_group_only_injects_factory_for_enabled_jaccl(monkeypatch):
+def test_init_cluster_group_only_injects_factory_for_jaccl(monkeypatch):
     calls: list[dict[str, object]] = []
 
     class Distributed:
@@ -114,10 +117,6 @@ def test_init_cluster_group_only_injects_factory_for_enabled_jaccl(monkeypatch):
     assert calls[-1]["backend"] == "jaccl"
     assert calls[-1]["strict"] is True
     assert calls[-1]["all_gather_factory"] is jaccl_all_gather_factory
-
-    monkeypatch.setenv("OMLX_JACCL_PYTHON_SIDE_CHANNEL", "0")
-    assert init_cluster_group(MX(), backend="jaccl", strict=True) == "group"
-    assert calls[-1] == {"backend": "jaccl", "strict": True}
 
     assert init_cluster_group(MX(), backend="ring", strict=False) == "group"
     assert calls[-1] == {"backend": "ring", "strict": False}

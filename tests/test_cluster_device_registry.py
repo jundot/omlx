@@ -247,6 +247,8 @@ def test_merge_on_paired_device_never_downgrades_caps_or_addrs(tmp_path):
                 "backends": [],
                 "thunderbolt": False,
                 "jaccl": False,
+                # Only pairing may mark a device as agent-controlled.
+                "control": "agent",
             },
             "addrs": [{"ip": "fe80::42", "if_type": "unknown"}],
         }

@@ -1,0 +1,815 @@
+    :root { accent-color: rgb(var(--palette-neutral-900)); }
+    [data-theme="dark"] { accent-color: rgb(var(--palette-neutral-200)); }
+
+    /* Dark neutral channels. Not in theme.css: chat loads it without this file. */
+    [data-theme="dark"] {
+        --text-scale-300: var(--palette-zinc-450);
+        --text-scale-400: var(--palette-zinc-450);
+        --text-scale-500: var(--palette-zinc-450);
+        --text-scale-600: var(--palette-zinc-400);
+        --text-scale-700: var(--palette-zinc-400);
+        --text-scale-800: var(--palette-night-50);
+        --text-scale-900: var(--palette-night-50);
+        --surface-scale-white: var(--palette-night-850);
+        --surface-scale-50: var(--palette-night-800);
+        --surface-scale-100: var(--palette-night-700);
+        --surface-scale-200: var(--palette-night-700);
+        --border-scale-100: var(--palette-zinc-700);
+        --border-scale-200: var(--palette-zinc-700);
+        --border-scale-300: var(--palette-zinc-600);
+    }
+
+    body {
+        background-color: var(--bg-primary) !important;
+        color: var(--text-primary) !important;
+    }
+
+    /* === Page-level backgrounds === */
+    /* A 20% white overlay highlights a dark card, so it stays white. */
+    [data-theme="dark"] .bg-white\/20 { background-color: rgb(var(--palette-white) / 0.2) !important; }
+    /* The 100 and 200 surface channels share night-700, so step the hover up. */
+    [data-theme="dark"] .hover\:bg-neutral-200:hover { background-color: rgb(var(--palette-zinc-700)) !important; }
+
+    /* Cluster status is operational data, not decorative helper copy. Keep
+       its cache/fabric labels and request metrics readable in dark mode even
+       when the global muted palette is intentionally subtle. */
+    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-600,
+    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-500 {
+        color: rgb(var(--palette-zinc-300)) !important;
+    }
+    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-400 {
+        color: rgb(var(--palette-zinc-400)) !important;
+    }
+
+    /* === Borders === */
+    /* Row dividers that skip x-show rows (inline display: none), unlike divide-y. */
+    .settings-rows > :not(template):not([style*="display: none"]) ~ :not(template):not([style*="display: none"]) { border-top: 1px solid rgb(var(--border-scale-200)); }
+
+    /* === Hover states ===
+       In dark the 700 step equals 600, so lift its hover to the primary text. */
+    [data-theme="dark"] .hover\:text-neutral-700:hover { color: var(--text-primary) !important; }
+
+    /* === Gauge track (visible in both themes) === */
+    .gauge-track { background-color: rgb(var(--palette-neutral-200)); }
+    [data-theme="dark"] .gauge-track { background-color: rgb(var(--palette-zinc-700)) !important; }
+
+    /* === Active nav tab (bg-white with shadow inside dark nav) === */
+    [data-theme="dark"] .shadow-sm { box-shadow: 0 1px 2px 0 rgb(var(--palette-black) / 0.3) !important; }
+
+    /* === Settings dropdown === */
+    [data-theme="dark"] .shadow-lg { box-shadow: 0 4px 12px 0 rgb(var(--palette-black) / 0.5) !important; }
+
+    /* === Primary buttons and badges: bg-neutral-900 ===
+       No !important, so hover and disabled variants still win. */
+    :is(button, a, span).bg-neutral-900 { background-color: var(--btn-primary); color: var(--btn-primary-text); }
+    :is(button, a).hover\:bg-neutral-800:hover { background-color: var(--btn-primary-hover); }
+    [data-theme="dark"] :is(button, a, span).bg-neutral-900 :is(span, svg, .text-white) {
+        color: var(--btn-primary-text);
+    }
+    [data-theme="dark"] span.bg-neutral-900 span.bg-white {
+        background-color: var(--btn-primary-text);
+    }
+    /* Spinner inside inverted button */
+    [data-theme="dark"] button.bg-neutral-900 svg.animate-spin circle { stroke: var(--btn-primary-text); }
+    [data-theme="dark"] button.bg-neutral-900 svg.animate-spin path { fill: var(--btn-primary-text); }
+
+    /* Tensor segments use a semantic palette instead of theme-remapped
+       Tailwind utilities. This prevents white-on-light text when dark-mode
+       utility overrides alter a segment background independently. */
+    .cluster-v2-tensor-segment {
+        color: rgb(var(--palette-slate-50));
+        text-shadow: none;
+        -webkit-font-smoothing: antialiased;
+    }
+    .cluster-v2-tensor-segment--0 { background: rgb(var(--palette-zinc-900)); }
+    .cluster-v2-tensor-segment--1 { background: rgb(var(--palette-zinc-700)); }
+    .cluster-v2-tensor-segment--2 { background: rgb(var(--palette-zinc-600)); }
+    .cluster-v2-tensor-segment--3 {
+        color: rgb(var(--palette-zinc-900));
+        background: rgb(var(--palette-zinc-300));
+    }
+    .cluster-v2-tensor-segment--4 {
+        color: rgb(var(--palette-zinc-800));
+        background: rgb(var(--palette-zinc-200));
+    }
+
+    /* === Log viewer: keep dark === */
+    [data-theme="dark"] div.bg-neutral-900 { background-color: rgb(var(--palette-night-950)) !important; }
+    [data-theme="dark"] textarea.bg-neutral-900 { background-color: rgb(var(--palette-night-950)) !important; color: rgb(var(--palette-green-400)) !important; }
+    [data-theme="dark"] .bg-neutral-800 { background-color: rgb(var(--palette-night-900)) !important; }
+    [data-theme="dark"] .border-neutral-700 { border-color: rgb(var(--palette-zinc-700)) !important; }
+
+    /* === Input fields === */
+    [data-theme="dark"] input:not([type="range"]),
+    [data-theme="dark"] select,
+    [data-theme="dark"] textarea:not(.bg-neutral-900) {
+        background-color: var(--bg-secondary) !important;
+        color: var(--text-primary) !important;
+        border-color: var(--border-faint) !important;
+    }
+    [data-theme="dark"] input:not([type="range"]):focus,
+    [data-theme="dark"] select:focus,
+    [data-theme="dark"] textarea:not(.bg-neutral-900):focus {
+        box-shadow: 0 0 0 2px rgb(var(--palette-white) / 0.1) !important;
+        border-color: var(--border-normal) !important;
+    }
+    [data-theme="dark"] select option {
+        background-color: var(--bg-secondary);
+        color: var(--text-primary);
+    }
+
+    /* === Code/pre blocks === */
+    [data-theme="dark"] code:not([class]) { background-color: var(--code-bg) !important; color: var(--text-primary) !important; }
+    [data-theme="dark"] pre:not(.bg-neutral-100) { background-color: var(--code-bg) !important; color: var(--text-primary) !important; }
+
+    /* === Focus rings === */
+    .focus\:ring-neutral-900:focus,
+    .focus\:ring-black:focus { --tw-ring-color: var(--focus-ring-color); }
+
+    /* === Toggle switches and selected choices (ON state: bg-black) === */
+    button.bg-black { background-color: var(--switch-on); }
+    button.border-black { border-color: var(--switch-on); }
+    [data-theme="dark"] button.bg-black span.bg-white {
+        background-color: rgb(var(--palette-white));
+    }
+    /* Toggle OFF state */
+    [data-theme="dark"] button[role="switch"].bg-neutral-200:not(:focus) {
+        box-shadow: inset 0 0 0 1px rgb(var(--palette-zinc-500));
+    }
+    [data-theme="dark"] button.hover\:border-neutral-400:hover {
+        border-color: var(--text-muted) !important;
+    }
+
+    /* === Range slider === */
+    [data-theme="dark"] input[type="range"] {
+        background-color: var(--border-faint) !important;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+        background-color: var(--switch-on);
+    }
+
+    /* === Decorative tag hues (dark mode adjustments) ===
+       Fixed hues, not theme roles; the status roles are in status.css. */
+    [data-theme="dark"] .bg-orange-50 { background-color: rgb(var(--palette-orange-500) / 0.15) !important; }
+    [data-theme="dark"] .border-orange-200 { border-color: rgb(var(--palette-orange-500) / 0.3) !important; }
+    [data-theme="dark"] .text-orange-700 { color: rgb(var(--palette-orange-300)) !important; }
+    [data-theme="dark"] .bg-purple-50 { background-color: rgb(var(--palette-purple-500) / 0.15) !important; }
+    [data-theme="dark"] .border-purple-200 { border-color: rgb(var(--palette-purple-500) / 0.3) !important; }
+    [data-theme="dark"] .text-purple-700 { color: rgb(var(--palette-violet-300)) !important; }
+    [data-theme="dark"] .bg-emerald-50 { background-color: rgb(var(--palette-emerald-500) / 0.15) !important; }
+    [data-theme="dark"] .hover\:bg-emerald-100:hover { background-color: rgb(var(--palette-emerald-500) / 0.25) !important; }
+    [data-theme="dark"] .border-emerald-200 { border-color: rgb(var(--palette-emerald-500) / 0.3) !important; }
+    [data-theme="dark"] .text-emerald-600 { color: rgb(var(--palette-emerald-400)) !important; }
+    [data-theme="dark"] .text-emerald-700 { color: rgb(var(--palette-emerald-300)) !important; }
+    [data-theme="dark"] .bg-cyan-50 { background-color: rgb(var(--palette-cyan-500) / 0.15) !important; }
+    [data-theme="dark"] .border-cyan-200 { border-color: rgb(var(--palette-cyan-500) / 0.3) !important; }
+    [data-theme="dark"] .text-cyan-700 { color: rgb(var(--palette-cyan-300)) !important; }
+    [data-theme="dark"] .bg-sky-50 { background-color: rgb(var(--palette-sky-500) / 0.15) !important; }
+    [data-theme="dark"] .border-sky-200 { border-color: rgb(var(--palette-sky-500) / 0.3) !important; }
+    [data-theme="dark"] .text-sky-600 { color: rgb(var(--palette-sky-400)) !important; }
+    [data-theme="dark"] .text-sky-700 { color: rgb(var(--palette-sky-300)) !important; }
+    [data-theme="dark"] .bg-indigo-50 { background-color: rgb(var(--palette-indigo-500) / 0.15) !important; }
+    [data-theme="dark"] .border-indigo-200 { border-color: rgb(var(--palette-indigo-500) / 0.3) !important; }
+    [data-theme="dark"] .text-indigo-700 { color: rgb(var(--palette-indigo-300)) !important; }
+    [data-theme="dark"] .bg-violet-50 { background-color: rgb(var(--palette-violet-500) / 0.15) !important; }
+    [data-theme="dark"] .border-violet-200 { border-color: rgb(var(--palette-violet-500) / 0.3) !important; }
+    [data-theme="dark"] .text-violet-600 { color: rgb(var(--palette-violet-400)) !important; }
+    [data-theme="dark"] .text-violet-700 { color: rgb(var(--palette-violet-300)) !important; }
+    [data-theme="dark"] .bg-pink-50 { background-color: rgb(var(--palette-pink-500) / 0.15) !important; }
+    [data-theme="dark"] .border-pink-200 { border-color: rgb(var(--palette-pink-500) / 0.3) !important; }
+    [data-theme="dark"] .text-pink-700 { color: rgb(var(--palette-pink-300)) !important; }
+    [data-theme="dark"] .bg-rose-50 { background-color: rgb(var(--palette-rose-500) / 0.15) !important; }
+    [data-theme="dark"] .border-rose-200 { border-color: rgb(var(--palette-rose-500) / 0.3) !important; }
+    [data-theme="dark"] .text-rose-700 { color: rgb(var(--palette-rose-300)) !important; }
+    [data-theme="dark"] .bg-teal-50 { background-color: rgb(var(--palette-teal-500) / 0.15) !important; }
+    [data-theme="dark"] .border-teal-200 { border-color: rgb(var(--palette-teal-500) / 0.3) !important; }
+    [data-theme="dark"] .text-teal-700 { color: rgb(var(--palette-teal-300)) !important; }
+    /* Small "API" tag inside the emerald profile pill. */
+    [data-theme="dark"] .bg-white\/70 { background-color: rgb(var(--palette-white) / 0.12) !important; }
+
+    /* === Background grain texture in dark mode === */
+    [data-theme="dark"] .bg-grain { opacity: 0.02; }
+
+    /* === Modal shadow === */
+    [data-theme="dark"] .shadow-2xl { box-shadow: 0 25px 50px -12px rgb(var(--palette-black) / 0.5) !important; }
+
+    /* === Selection text === */
+    [data-theme="dark"] ::selection { background-color: rgb(var(--palette-zinc-700)); color: var(--text-primary); }
+
+    /* === Disabled states === */
+    [data-theme="dark"] .disabled\:opacity-50:disabled { opacity: 0.5; }
+
+    /* === Model card markdown styles === */
+    .model-card-content { font-size: 0.8125rem; line-height: 1.6; color: var(--text-secondary); }
+    .model-card-content h1 { font-size: 1.125rem; font-weight: 700; color: var(--text-primary); margin: 1.25rem 0 0.5rem; }
+    .model-card-content h2 { font-size: 1rem; font-weight: 600; color: var(--text-primary); margin: 1rem 0 0.5rem; border-bottom: 1px solid var(--border-faint); padding-bottom: 0.25rem; }
+    .model-card-content h3 { font-size: 0.875rem; font-weight: 600; color: var(--text-secondary); margin: 0.75rem 0 0.375rem; }
+    .model-card-content p { margin: 0.5rem 0; }
+    .model-card-content a { color: var(--link-color); text-decoration: none; }
+    .model-card-content a:hover { text-decoration: underline; }
+    .model-card-content code { font-size: 0.75rem; background: var(--code-bg); color: var(--text-primary); padding: 0.125rem 0.375rem; border-radius: 0.25rem; }
+    .model-card-content pre { background: var(--bg-secondary); border: 1px solid var(--border-faint); border-radius: 0.75rem; padding: 0.75rem; overflow-x: auto; margin: 0.5rem 0; }
+    .model-card-content pre code { background: none; padding: 0; font-size: 0.6875rem; }
+    .model-card-content ul, .model-card-content ol { padding-left: 1.25rem; margin: 0.375rem 0; }
+    .model-card-content li { margin: 0.125rem 0; }
+    .model-card-content table { width: 100%; border-collapse: collapse; font-size: 0.75rem; margin: 0.5rem 0; }
+    .model-card-content th { text-align: left; padding: 0.375rem 0.5rem; border-bottom: 2px solid var(--border-normal); font-weight: 600; color: var(--text-secondary); }
+    .model-card-content td { padding: 0.375rem 0.5rem; border-bottom: 1px solid var(--border-faint); }
+    .model-card-content blockquote { border-left: 3px solid var(--border-normal); padding-left: 0.75rem; margin: 0.5rem 0; color: var(--text-tertiary); }
+    .model-card-content hr { border: none; border-top: 1px solid var(--border-faint); margin: 0.75rem 0; }
+    .model-card-content img { max-width: 100%; border-radius: 0.5rem; margin: 0.5rem 0; }
+    .model-card-content h1:first-child { margin-top: 0; }
+
+    /* Keep usage columns readable inside narrow screens and dashboard blocks.
+       The existing scroll container owns overflow, not the page. */
+    .usage-model-table { min-width: 48rem; }
+    .usage-model-table th:first-child {
+        min-width: 14rem;
+        overflow-wrap: anywhere;
+    }
+    .usage-model-table td { white-space: nowrap; }
+
+    /* === Serving stats === */
+    /* Phones pair the stat tiles two per row; an odd count would leave a lone
+       half-width tile, so let the last one span the row. */
+    @media (max-width: 639px) {
+        .serving-stat-tile--wide { grid-column: 1 / -1; }
+    }
+
+    /* === Dashboard layout grid (GridStack) === */
+    /* GridStack insets every block by its 12px margin; pull the grid out by the
+       same amount so Status lines up with the other tabs. */
+    .dash-grid { margin-inline: -12px; }
+    .dash-grid > .dash-block-parked { display: none; }
+    /* Item content is absolutely positioned by GridStack; let shadows, tooltips
+       and select popovers escape in view mode. */
+    /* gridstack.css forces overflow-y on .size-to-content items with a
+       5-class selector, so !important is the only way to keep view mode open. */
+    .dash-grid > .grid-stack-item > .grid-stack-item-content { overflow: visible !important; }
+    .dash-grid.dash-editing > .grid-stack-item > .grid-stack-item-content {
+        overflow: hidden !important;
+        border-radius: 1rem;
+        outline: 1px dashed var(--border-normal);
+        outline-offset: -1px;
+    }
+    .dash-grid.dash-editing .dash-block-body { pointer-events: none; opacity: 0.85; }
+    .dash-grid.dash-editing {
+        background-image: repeating-linear-gradient(
+            to right,
+            var(--border-faint) 0 1px,
+            transparent 1px calc(100% / 24)
+        );
+        border-radius: 1rem;
+    }
+
+    .dash-block-chrome {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+        padding: 0.375rem 0.75rem;
+        background: var(--bg-tertiary);
+        color: var(--text-secondary);
+        border-bottom: 1px solid var(--border-faint);
+        font-size: 0.75rem;
+        font-weight: 600;
+        user-select: none;
+    }
+    .dash-block-handle {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex: 1;
+        cursor: grab;
+    }
+    .dash-block-handle:active { cursor: grabbing; }
+    .dash-block-remove {
+        display: inline-flex;
+        padding: 0.25rem;
+        border-radius: 0.375rem;
+        color: var(--text-tertiary);
+    }
+    .dash-block-remove:hover,
+    .dash-block-remove--active { color: var(--text-primary); background: var(--border-faint); }
+    .dash-tile-grip {
+        display: inline-flex;
+        color: var(--text-tertiary);
+        cursor: grab;
+    }
+    .dash-tile-grip:active { cursor: grabbing; }
+
+    /* Tray pills live outside the grid, so undo GridStack's absolute item layout. */
+    .dash-tray-pill { position: relative; width: auto; min-width: 0; }
+    .dash-tray-pill .grid-stack-item-content {
+        position: static;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.375rem;
+        padding: 0.375rem 0.75rem;
+        border: 1px solid var(--border-normal);
+        border-radius: 9999px;
+        background: var(--bg-primary);
+        color: var(--text-secondary);
+        font-size: 0.75rem;
+        font-weight: 600;
+        cursor: grab;
+        overflow: visible;
+    }
+    .dash-tray-pill.ui-draggable-dragging { opacity: 0.85; z-index: 100; }
+
+    .dash-grid .grid-stack-placeholder > .placeholder-content {
+        background: rgb(var(--palette-black) / 0.06);
+        border: 2px dashed var(--border-normal);
+        border-radius: 1rem;
+    }
+    [data-theme="dark"] .dash-grid .grid-stack-placeholder > .placeholder-content {
+        background: rgb(var(--palette-white) / 0.06);
+    }
+    .dash-grid .ui-resizable-handle.ui-resizable-se {
+        width: 18px;
+        height: 18px;
+        right: 2px;
+        bottom: 2px;
+        background: none;
+        border-right: 2px solid var(--border-normal);
+        border-bottom: 2px solid var(--border-normal);
+        border-bottom-right-radius: 0.75rem;
+        transform: none;
+    }
+    .dash-grid .ui-resizable-handle.ui-resizable-e,
+    .dash-grid .ui-resizable-handle.ui-resizable-w { width: 12px; }
+
+    /* Instant hover tooltip for navbar icon buttons (native title waits ~1s). */
+    .nav-tooltip { position: relative; }
+    .nav-tooltip::after {
+        content: attr(data-tooltip);
+        position: absolute;
+        top: calc(100% + 6px);
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 0.25rem 0.5rem;
+        border-radius: 0.375rem;
+        background: var(--text-primary);
+        color: var(--bg-primary);
+        font-size: 0.6875rem;
+        font-weight: 500;
+        line-height: 1.2;
+        white-space: nowrap;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.1s ease-out;
+        z-index: 60;
+    }
+    .nav-tooltip:hover::after,
+    .nav-tooltip:focus-visible::after { opacity: 1; }
+
+    /* === Badge === */
+    /* One shape for every status label. The tone comes from color utilities
+       (bg-{tone}-50 text-{tone}-700 border-{tone}-200); :where keeps this rule
+       at zero specificity so those utilities always win. */
+    :where(.badge) {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0.125rem 0.5rem;
+        font-size: 10px;
+        line-height: 14px;
+        font-weight: 500;
+        border: 1px solid transparent;
+        border-radius: 9999px;
+        white-space: nowrap;
+    }
+
+    /* === Sub-tab row === */
+    /* Pins under the sticky navbar. <main> must not clip overflow, or it becomes
+       the scroll container and nothing inside it sticks (see dashboard.html). */
+    :root {
+        --dashboard-topbar-height: 77px;
+        --dashboard-subtabs-height: 57px;
+    }
+    .page-tabs {
+        position: sticky;
+        top: var(--dashboard-topbar-height);
+        z-index: 30;
+        background-color: var(--bg-primary);
+        padding-block: 0.5rem 0.75rem;
+    }
+
+    /* === Segmented control === */
+    .segmented {
+        display: inline-flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0.25rem;
+        background-color: var(--bg-tertiary);
+        border-radius: 0.5rem;
+    }
+    .segmented__item {
+        padding: 0.25rem 0.75rem;
+        font-size: 0.875rem;
+        line-height: 1.5;
+        font-weight: 500;
+        color: var(--text-secondary);
+        background-color: transparent;
+        border: 0;
+        border-radius: 0.375rem;
+        cursor: pointer;
+        transition: background-color 0.15s ease, color 0.15s ease;
+    }
+    .segmented__item:hover { color: var(--text-primary); }
+    .segmented__item--active {
+        background-color: var(--bg-primary);
+        color: var(--text-primary);
+    }
+    /* Half-filled smarts dot on the Recommended downloader tab. */
+    .rec-dot-half {
+        background: linear-gradient(90deg, rgb(var(--palette-neutral-500)) 50%, rgb(var(--palette-neutral-200)) 50%);
+    }
+    [data-theme="dark"] .rec-dot-half {
+        background: linear-gradient(90deg, rgb(var(--palette-neutral-500)) 50%, var(--bg-tertiary) 50%);
+    }
+    /* Compact size for choices inside a card or a table row. */
+    .segmented--sm { padding: 0.125rem; }
+    .segmented--sm .segmented__item {
+        padding: 0.25rem 0.75rem;
+        font-size: 0.75rem;
+        line-height: 1rem;
+    }
+
+    /* === Global settings section rail === */
+    .settings-layout {
+        display: grid;
+        grid-template-columns: 11rem minmax(0, 1fr);
+        gap: 1.5rem;
+        align-items: start;
+    }
+    /* The sub-tab row is the mask cards scroll under; extend it to the rail's
+       top so the cards and the rail are cut at the same line. The static layout
+       is unchanged: the added padding comes out of the margin (mb-6). */
+    .page-tabs.page-tabs--settings-rail {
+        padding-bottom: 1.5rem;
+        margin-bottom: 0.75rem;
+    }
+    .settings-section {
+        scroll-margin-top: calc(var(--dashboard-topbar-height) + var(--dashboard-subtabs-height) + 0.75rem);
+    }
+    .settings-rail {
+        position: sticky;
+        top: calc(var(--dashboard-topbar-height) + var(--dashboard-subtabs-height) + 0.75rem);
+        max-height: calc(100vh - var(--dashboard-topbar-height) - var(--dashboard-subtabs-height) - 1.5rem);
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 0.125rem;
+        padding: 0.5rem;
+        background-color: var(--bg-primary);
+        border: 1px solid var(--border-faint);
+        border-radius: 1rem;
+    }
+    .settings-rail__item {
+        display: block;
+        padding: 0.375rem 0.75rem;
+        font-size: 0.875rem;
+        line-height: 1.4;
+        color: var(--text-secondary);
+        border-radius: 0.5rem;
+        text-decoration: none;
+        transition: background-color 0.15s ease, color 0.15s ease;
+    }
+    .settings-rail__item:hover {
+        color: var(--text-primary);
+        background-color: var(--bg-secondary);
+    }
+    .settings-rail__item--active,
+    .settings-rail__item--active:hover {
+        color: var(--text-primary);
+        font-weight: 600;
+        background-color: var(--bg-tertiary);
+    }
+    /* Model settings modal: the rail sticks inside the scrolling modal body. */
+    .model-settings-layout {
+        display: grid;
+        grid-template-columns: 12.5rem minmax(0, 1fr);
+        gap: 1.5rem;
+        align-items: start;
+    }
+    .model-settings-layout > .settings-rail {
+        top: 0;
+        max-height: none;
+    }
+    @media (max-width: 900px) {
+        .settings-layout { grid-template-columns: minmax(0, 1fr); }
+        .settings-rail { display: none; }
+        .model-settings-layout { grid-template-columns: minmax(0, 1fr); }
+    }
+
+    /* === Log viewer: record table === */
+    /* Every row has one fixed height, so the mounted window is computed from
+       the scroll offset instead of measured per row. */
+    .log-grid {
+        display: grid;
+        grid-template-columns: 10.75rem 5.5rem 11rem minmax(0, 1fr);
+        align-items: center;
+        gap: 0.75rem;
+    }
+    .log-head {
+        padding: 0.5rem 1.25rem;
+        background-color: var(--bg-secondary);
+        border-bottom: 1px solid var(--border-faint);
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: var(--text-tertiary);
+    }
+    .log-viewport {
+        position: relative;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+    }
+    .log-spacer { position: relative; }
+    .log-row {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 30px;
+        padding: 0 1.25rem;
+        overflow: hidden;
+        border-bottom: 1px solid var(--border-faint);
+        font-size: 0.875rem;
+        color: var(--text-primary);
+        cursor: pointer;
+    }
+    .log-row:hover { background-color: var(--bg-secondary); }
+    .log-row--selected { background-color: var(--bg-tertiary); }
+    .log-time,
+    .log-module {
+        overflow: hidden;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.75rem;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+    }
+    .log-time { color: var(--text-tertiary); }
+    .log-message {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        min-width: 0;
+    }
+    .log-message__text {
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+    }
+    .log-empty {
+        padding: 2rem 1.25rem;
+        font-size: 0.875rem;
+        color: var(--text-tertiary);
+        text-align: center;
+    }
+    .log-level {
+        color: var(--text-secondary);
+        background-color: var(--bg-tertiary);
+    }
+    .log-level--debug { color: rgb(var(--palette-teal-700)); background-color: rgb(var(--palette-teal-500) / 0.14); }
+    .log-level--info { color: rgb(var(--palette-blue-700)); background-color: rgb(var(--palette-blue-500) / 0.14); }
+    .log-level--warning { color: rgb(var(--palette-amber-700)); background-color: rgb(var(--palette-amber-500) / 0.16); }
+    .log-level--error { color: rgb(var(--palette-red-700)); background-color: rgb(var(--palette-red-500) / 0.14); }
+    .log-level--critical { color: rgb(var(--palette-purple-700)); background-color: rgb(var(--palette-purple-500) / 0.16); }
+    [data-theme="dark"] .log-level--debug { color: rgb(var(--palette-teal-300)); }
+    [data-theme="dark"] .log-level--info { color: rgb(var(--palette-blue-300)); }
+    [data-theme="dark"] .log-level--warning { color: rgb(var(--palette-amber-300)); }
+    [data-theme="dark"] .log-level--error { color: rgb(var(--palette-red-300)); }
+    [data-theme="dark"] .log-level--critical { color: rgb(var(--palette-purple-300)); }
+    .log-count {
+        flex-shrink: 0;
+        padding: 0 0.25rem;
+        font-size: 0.75rem;
+        line-height: 1.25rem;
+        font-weight: 600;
+        color: rgb(var(--palette-amber-700));
+        background-color: rgb(var(--palette-amber-500) / 0.16);
+        border-radius: 0.375rem;
+    }
+    [data-theme="dark"] .log-count { color: rgb(var(--palette-amber-300)); }
+    .log-count--muted,
+    [data-theme="dark"] .log-count--muted {
+        color: var(--text-tertiary);
+        background-color: var(--bg-tertiary);
+    }
+    .log-chips {
+        display: flex;
+        flex-shrink: 0;
+        align-items: center;
+        gap: 0.25rem;
+    }
+    .log-chip {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 0.25rem;
+        padding: 0 0.25rem;
+        font-size: 0.75rem;
+        line-height: 1.25rem;
+        color: var(--text-secondary);
+        background-color: var(--bg-tertiary);
+        border-radius: 0.375rem;
+        white-space: nowrap;
+    }
+    .log-chip__label { color: var(--text-tertiary); }
+    .log-chip__value { font-weight: 600; color: var(--text-primary); }
+    .log-action {
+        padding: 0 0.25rem;
+        font-size: 0.75rem;
+        line-height: 1.25rem;
+        font-weight: 600;
+        color: var(--link-color);
+        background: transparent;
+        border: 0;
+        cursor: pointer;
+        white-space: nowrap;
+    }
+    .log-action:hover { text-decoration: underline; }
+    .log-detail {
+        padding: 1rem 1.25rem;
+        background-color: var(--bg-secondary);
+        border-bottom: 1px solid var(--border-faint);
+    }
+    .log-detail__head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.5rem;
+        font-size: 0.75rem;
+        color: var(--text-tertiary);
+    }
+    .log-detail__body {
+        margin: 0.5rem 0 0;
+        padding: 0.75rem;
+        max-height: 30vh;
+        overflow: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.8125rem;
+        line-height: 1.5;
+        color: var(--text-primary);
+        background-color: var(--bg-primary);
+        border: 1px solid var(--border-faint);
+        border-radius: 0.5rem;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+    }
+    .log-occurrences {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        margin-top: 0.5rem;
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+    }
+    .log-occurrences__list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        max-height: 200px;
+        overflow-y: auto;
+    }
+    .log-occurrence { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .log-occurrences__more { color: var(--text-tertiary); }
+    @media (max-width: 768px) {
+        .log-grid { grid-template-columns: 10.75rem 5.5rem minmax(0, 1fr); }
+        .log-grid__module { display: none; }
+    }
+
+    /* === Usage: hourly strip above the heatmap === */
+    .heat-strip {
+        display: grid;
+        grid-template-columns: 90px repeat(24, minmax(0, 1fr));
+        gap: 3px;
+        align-items: end;
+        height: 2rem;
+    }
+    .heat-strip__bar {
+        display: block;
+        border-radius: 2px 2px 0 0;
+        background-color: rgb(var(--palette-green-600));
+    }
+
+    /* === Custom theme editor === */
+    .theme-editor {
+        display: grid;
+        gap: 1.5rem;
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
+    }
+    /* The first card follows a <template>, so space-y would inset it. */
+    .theme-editor .space-y-4 > :first-of-type { margin-top: 0; }
+    /* Previews above the fields when narrow, on their left when wide. */
+    .theme-editor__aside { order: -1; }
+    @media (min-width: 1280px) {
+        .theme-editor { grid-template-columns: 34rem minmax(0, 1fr); }
+        .theme-editor__aside {
+            order: 0;
+            position: sticky;
+            top: calc(var(--dashboard-topbar-height) + var(--dashboard-subtabs-height) + 1rem);
+            align-self: start;
+        }
+    }
+    @media (min-width: 1536px) {
+        .theme-editor { grid-template-columns: 38rem minmax(0, 1fr); }
+    }
+    .theme-mode-head {
+        justify-content: center;
+        justify-self: center;
+        width: max-content;
+        padding: 0.25rem 0.75rem;
+        border-radius: 999px;
+        border: 1px solid transparent;
+        line-height: 1;
+    }
+    .theme-previews { display: grid; gap: 0.75rem; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    @media (max-width: 640px) { .theme-previews { grid-template-columns: minmax(0, 1fr); } }
+    .theme-token-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) repeat(2, 12rem);
+    }
+    .theme-token-label {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        padding: 0.5rem 0.75rem 0.5rem 1rem;
+    }
+    .theme-token-row--head .theme-token-label { padding-block: 0.625rem; }
+    @media (min-width: 640px) { .theme-token-label { padding-left: 1.5rem; } }
+    .theme-token-cell { display: flex; align-items: center; justify-content: flex-end; gap: 0.375rem; }
+    /* Each mode is a full-height column in its own stock colors, ruled off from its neighbour. */
+    .theme-editor .theme-mode-cell {
+        background-color: var(--theme-cell-surface);
+        border-left: 1px solid rgb(var(--border-scale-200));
+        padding: 0.5rem 0.75rem;
+    }
+    .theme-token-row--head .theme-mode-cell { display: flex; justify-content: center; padding-block: 0.625rem; }
+    .theme-token-row--head > .theme-token-label { border-bottom: 1px solid rgb(var(--border-scale-200)); }
+    .theme-token-row--head > .theme-mode-cell { box-shadow: inset 0 -1px 0 var(--theme-cell-line); }
+    .theme-token-rows > .theme-token-row + .theme-token-row > .theme-token-label { border-top: 1px solid rgb(var(--border-scale-200)); }
+    .theme-token-rows > .theme-token-row + .theme-token-row > .theme-mode-cell {
+        box-shadow: inset 0 1px 0 var(--theme-cell-line);
+    }
+    .theme-editor .theme-mode-cell .theme-swatch { border-color: var(--theme-cell-border); }
+    .theme-editor .theme-mode-cell .theme-swatch:focus-within { outline-color: var(--theme-cell-ring); }
+    .theme-editor .theme-mode-cell .theme-hex-input:focus {
+        box-shadow: 0 0 0 2px var(--theme-cell-ring) !important;
+        border-color: var(--theme-cell-border) !important;
+    }
+    .theme-editor .theme-mode-cell .theme-cell-reset { color: var(--theme-cell-icon); }
+    .theme-editor .theme-mode-cell .theme-cell-reset:hover {
+        color: var(--theme-cell-icon-hover);
+        background-color: var(--theme-cell-hover);
+    }
+    @media (max-width: 639px) {
+        .theme-token-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .theme-token-row > :first-child { grid-column: 1 / -1; }
+        .theme-token-label + .theme-mode-cell,
+        .theme-token-label + template + .theme-mode-cell { border-left: 0; }
+        .theme-token-rows > .theme-token-row + .theme-token-row > .theme-mode-cell { box-shadow: none; }
+        .theme-token-cell { justify-content: flex-start; }
+    }
+    .theme-swatch {
+        position: relative;
+        flex: none;
+        width: 2rem;
+        height: 2rem;
+        border-radius: 0.5rem;
+        border: 1px solid var(--border-normal);
+        overflow: hidden;
+        cursor: pointer;
+    }
+    /* The native color input is transparent; show its focus on the swatch. */
+    .theme-swatch:focus-within { outline: 2px solid var(--focus-ring-color); outline-offset: 2px; }
+    .theme-swatch__fill { position: absolute; inset: 0; }
+    .theme-swatch input[type="color"] {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        opacity: 0;
+        cursor: pointer;
+    }
+    .theme-hex-input {
+        width: 5.75rem;
+        flex: none;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        text-transform: lowercase;
+    }
+    /* Beats the dark `input` rule so each column keeps its own theme. */
+    .theme-editor .theme-mode-cell .theme-hex-input {
+        background-color: var(--theme-cell-bg) !important;
+        border-color: var(--theme-cell-border) !important;
+        color: var(--theme-cell-fg) !important;
+    }
+    .theme-editor .theme-mode-cell .theme-hex-input::placeholder { color: var(--theme-cell-placeholder); }
+    /* Outranks the column rule above and the dark `input:focus` rule. */
+    .theme-editor .theme-mode-cell .theme-hex-input.theme-hex-input--invalid { border-color: var(--theme-cell-danger) !important; }
+
+    /* A canvas drawn by theme_preview.js; the shadow follows its rounded corners. */
+    .theme-preview { display: block; width: 100%; filter: drop-shadow(0 12px 14px rgb(var(--palette-black) / 0.1)); }

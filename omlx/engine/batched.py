@@ -10,18 +10,23 @@ import asyncio
 import copy
 import functools
 import logging
+import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
+from ..adapter.output_parser import repair_tool_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..model_settings import (
+    a8_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from ..patches.mlx_lm_mtp import drafter_target
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
-from ..utils.tokenizer import get_tokenizer_config
+from ..speculative.dflash import attach_drafter, detach_drafter
+from ..utils.tokenizer import get_tokenizer_config, is_mimo_tool_template
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -98,8 +103,10 @@ class BatchedEngine(BaseEngine):
         self._tokenizer = None
         self._engine = None
         self._loaded = False
+        self._dflash_drafter: Any | None = None
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
+        self._grammar_compiler_lock = threading.Lock()
 
     async def _preflight_or_raise_with_eviction(
         self,
@@ -129,6 +136,10 @@ class BatchedEngine(BaseEngine):
     def tokenizer(self) -> Any:
         """Get the tokenizer."""
         return self._tokenizer
+
+    @property
+    def supports_logprobs(self) -> bool:
+        return True
 
     @property
     def supports_early_tool_call_streaming(self) -> bool:
@@ -201,50 +212,54 @@ class BatchedEngine(BaseEngine):
         """
         if self._grammar_compiler is not None:
             return self._grammar_compiler
-        if self._grammar_compiler_init_attempted:
-            return None
-        self._grammar_compiler_init_attempted = True
-        try:
-            from ..api.grammar import (
-                create_grammar_compiler,
-                grammar_cache_limit_bytes,
-            )
+        # Prompt preparation calls this from worker threads. Build it once.
+        with self._grammar_compiler_lock:
+            if self._grammar_compiler is not None:
+                return self._grammar_compiler
+            if self._grammar_compiler_init_attempted:
+                return None
+            self._grammar_compiler_init_attempted = True
+            try:
+                from ..api.grammar import (
+                    create_grammar_compiler,
+                    grammar_cache_limit_bytes,
+                )
 
-            self._grammar_compiler = create_grammar_compiler(
-                self._tokenizer,
-                self._model,
-                cache_limit_bytes=grammar_cache_limit_bytes(self.model_type),
-            )
-            logger.info("GrammarCompiler initialized for %s", self._model_name)
-        except Exception:
-            from ..utils.install import get_install_method
+                self._grammar_compiler = create_grammar_compiler(
+                    self._tokenizer,
+                    self._model,
+                    cache_limit_bytes=grammar_cache_limit_bytes(self.model_type),
+                )
+                logger.info("GrammarCompiler initialized for %s", self._model_name)
+            except Exception:
+                from ..utils.install import get_install_method
 
-            method = get_install_method()
-            if self.model_type == "k2_horizon":
-                logger.info(
-                    "K2 tool grammar is unavailable; generating unconstrained "
-                    "tool calls with normal API parsing. Install omlx[grammar] "
-                    "to enable tool-name constraints."
-                )
-            elif method == "dmg":
-                logger.warning(
-                    "GrammarCompiler initialization failed for %s on the "
-                    "DMG build. The bundle ships xgrammar against a torch "
-                    "stub; this usually means the bundled xgrammar / tvm-"
-                    "ffi version drifted past what the stub covers.",
-                    self._model_name,
-                )
-            elif method == "homebrew":
-                logger.info(
-                    "Structured output requires xgrammar. "
-                    "Reinstall with: brew reinstall omlx --with-grammar"
-                )
-            else:
-                logger.info(
-                    "Structured output requires xgrammar. "
-                    "Install with: pip install 'omlx[grammar]'"
-                )
-        return self._grammar_compiler
+                method = get_install_method()
+                if self.model_type == "k2_horizon":
+                    logger.info(
+                        "K2 tool grammar is unavailable; generating unconstrained "
+                        "tool calls with normal API parsing. Install omlx[grammar] "
+                        "to enable tool-name constraints."
+                    )
+                elif method == "dmg":
+                    logger.warning(
+                        "GrammarCompiler initialization failed for %s on the "
+                        "DMG build. The bundle ships xgrammar against a torch "
+                        "stub; this usually means the bundled xgrammar / tvm-"
+                        "ffi version drifted past what the stub covers.",
+                        self._model_name,
+                    )
+                elif method == "homebrew":
+                    logger.info(
+                        "Structured output requires xgrammar. "
+                        "Reinstall with: brew reinstall omlx --with-grammar"
+                    )
+                else:
+                    logger.info(
+                        "Structured output requires xgrammar. "
+                        "Install with: pip install 'omlx[grammar]'"
+                    )
+            return self._grammar_compiler
 
     @property
     def prefix_cache_enabled(self) -> bool:
@@ -338,9 +353,14 @@ class BatchedEngine(BaseEngine):
         self._model, self._tokenizer = await loop.run_in_executor(
             get_mlx_executor(), _load_model_sync
         )
+        # The scheduler repairs only its deep copy, and API tool parsing reads
+        # this tokenizer. Repair it here only for MiMo-format templates (#4933).
+        if is_mimo_tool_template(getattr(self._tokenizer, "chat_template", None)):
+            repair_tool_parser(self._tokenizer)
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
+            apply_activation_fp16,
             apply_post_load_transforms,
             materialize_lazy_state,
         )
@@ -407,6 +427,12 @@ class BatchedEngine(BaseEngine):
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._model
         )
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            apply_activation_fp16,
+            self._model,
+            self._model_settings,
+        )
 
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
@@ -458,7 +484,11 @@ class BatchedEngine(BaseEngine):
 
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
-                logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
+                logger.info(
+                    "KV cache compression enabled: %s, %s bits",
+                    getattr(self._model_settings, "turboquant_kv_scheme", "turboquant"),
+                    tq_bits,
+                )
 
         # Install after TurboQuant so only non-quantized, long SDPA256 prefills
         # take the bounded route used by the prefill memory estimator.
@@ -509,7 +539,7 @@ class BatchedEngine(BaseEngine):
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
-        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+        if a8_prefill_on(self._model_settings):
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -519,7 +549,7 @@ class BatchedEngine(BaseEngine):
                 apply_qwen35_oq_a8_patch(
                     self._model,
                     min_tokens=int(
-                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                        getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                     ),
                 )
             except Exception:
@@ -742,6 +772,9 @@ class BatchedEngine(BaseEngine):
             if tq_enabled:
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_kv_scheme = getattr(
+                    self._model_settings, "turboquant_kv_scheme", "turboquant"
+                )
                 scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
@@ -798,7 +831,14 @@ class BatchedEngine(BaseEngine):
                         get_mlx_executor(), _load_draft
                     )
                     self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model, draft_model_name=specprefill_draft
+                        draft_model,
+                        draft_model_name=specprefill_draft,
+                        keep_pct=getattr(
+                            self._model_settings, "specprefill_keep_pct", None
+                        ),
+                        threshold=getattr(
+                            self._model_settings, "specprefill_threshold", None
+                        ),
                     )
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"
@@ -808,6 +848,35 @@ class BatchedEngine(BaseEngine):
 
         self._loaded = True
         logger.info(f"BatchedEngine loaded: {self._model_name}")
+
+    def _dflash_host(self) -> Any:
+        return getattr(self._model, "language_model", self._model)
+
+    def prepare_dflash_target(self) -> Any:
+        """Return the model a DFlash drafter binds to, ready for captures.
+
+        Plain-attention models without speculative rollback (Qwen3, Laguna)
+        gain layer captures and rollback here, before the drafter binds.
+        """
+        if not hasattr(self._dflash_host(), "rollback_speculative_cache"):
+            drafter_target.apply(self._dflash_host())
+        return self._model
+
+    def set_dflash_drafter(self, drafter: Any) -> None:
+        """Attach a DFlash block drafter to the Lightning MTP decode path."""
+        attach_drafter(self._dflash_host(), drafter)
+        self._dflash_drafter = drafter
+        logger.info(
+            "DFlash drafter attached to engine: %s (kind=%s, block=%d, layers=%s)",
+            self._model_name,
+            drafter.kind,
+            drafter.block_size,
+            drafter.target_layer_ids,
+        )
+
+    @property
+    def dflash_drafter(self) -> Any | None:
+        return self._dflash_drafter
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -842,6 +911,8 @@ class BatchedEngine(BaseEngine):
                 logger.warning(
                     "ANE prefill state release failed during stop", exc_info=True
                 )
+        if self._dflash_drafter is not None and self._model is not None:
+            detach_drafter(self._dflash_host())
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -849,6 +920,7 @@ class BatchedEngine(BaseEngine):
                 "_model",
                 "_tokenizer",
                 "_grammar_compiler",
+                "_dflash_drafter",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
         )
@@ -957,14 +1029,10 @@ class BatchedEngine(BaseEngine):
         Returns:
             Number of prompt tokens
         """
-        return len(
-            self._encode_chat_prompt(
-                messages,
-                tools,
-                chat_template_kwargs=chat_template_kwargs,
-                is_partial=is_partial,
-            )
+        _, token_ids = self.prepare_chat_prompt(
+            messages, tools, chat_template_kwargs, is_partial
         )
+        return len(token_ids)
 
     async def tokenize_chat(
         self,
@@ -977,7 +1045,7 @@ class BatchedEngine(BaseEngine):
     ) -> list[int]:
         if not self._loaded:
             await self.start()
-        return self._encode_chat_prompt(
+        _, token_ids = self.prepare_chat_prompt(
             messages,
             tools,
             chat_template_kwargs=chat_template_kwargs,
@@ -985,8 +1053,9 @@ class BatchedEngine(BaseEngine):
             add_generation_prompt=add_generation_prompt,
             add_special_tokens=add_special_tokens,
         )
+        return token_ids
 
-    def _encode_chat_prompt(
+    def prepare_chat_prompt(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
@@ -994,9 +1063,8 @@ class BatchedEngine(BaseEngine):
         is_partial: bool | None = None,
         add_generation_prompt: bool | None = None,
         add_special_tokens: bool | None = None,
-    ) -> list[int]:
-        # Same rendering as chat(); the scheduler encodes the prompt with the
-        # tokenizer defaults.
+    ) -> tuple[str, list[int]]:
+        """Render and tokenize a chat prompt for reuse within one request."""
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
@@ -1007,8 +1075,8 @@ class BatchedEngine(BaseEngine):
             add_generation_prompt=add_generation_prompt,
         )
         if add_special_tokens is None:
-            return list(self._tokenizer.encode(prompt))
-        return list(
+            return prompt, list(self._tokenizer.encode(prompt))
+        return prompt, list(
             self._tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
         )
 
@@ -1029,6 +1097,7 @@ class BatchedEngine(BaseEngine):
             "specprefill_system_end",
             "generation_prompt_text",
             "generation_prompt_persists",
+            "system_prefix_ids",
         ):
             if kwargs.get(key) is not None:
                 specprefill_kwargs[key] = kwargs.pop(key)
@@ -1041,6 +1110,7 @@ class BatchedEngine(BaseEngine):
         template_tools: Any,
         ct_kwargs: dict[str, Any] | None,
         kwargs: dict[str, Any],
+        full_prompt_token_count: int | None = None,
     ) -> None:
         """Compute the system-prompt token boundary and add it to ``kwargs``.
 
@@ -1066,7 +1136,11 @@ class BatchedEngine(BaseEngine):
                 non_system_prompt = self._apply_chat_template(
                     non_system, template_tools, chat_template_kwargs=ct_kwargs
                 )
-                full_tokens = len(self._tokenizer.encode(prompt))
+                full_tokens = (
+                    full_prompt_token_count
+                    if full_prompt_token_count is not None
+                    else len(self._tokenizer.encode(prompt))
+                )
                 non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
                 system_end = full_tokens - non_system_tokens
                 if system_end > 0:
@@ -1131,12 +1205,19 @@ class BatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             repetition_context_size=kwargs.get("repetition_context_size"),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            ngram_window=kwargs.get("ngram_window", 0),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            ignore_eos=bool(kwargs.get("ignore_eos", False)),
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
+            stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
+            logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -1147,7 +1228,9 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             tools=tools,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
@@ -1160,6 +1243,7 @@ class BatchedEngine(BaseEngine):
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
+            logprobs=output.logprobs,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
         )
@@ -1211,12 +1295,19 @@ class BatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             repetition_context_size=kwargs.get("repetition_context_size"),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            ngram_window=kwargs.get("ngram_window", 0),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            ignore_eos=bool(kwargs.get("ignore_eos", False)),
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
+            stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
+            logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: pass per-request overrides to engine
@@ -1258,6 +1349,7 @@ class BatchedEngine(BaseEngine):
                     finished=output.finished,
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
+                    logprobs=output.logprobs,
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
@@ -1339,24 +1431,37 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
+        prepared = kwargs.pop("_prepared_prompt", None)
+        prompt = (
+            prepared[0]
+            if prepared is not None
+            else self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
         )
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
         self._inject_specprefill_system_end(
-            messages, prompt, template_tools, ct_kwargs, kwargs
+            messages,
+            prompt,
+            template_tools,
+            ct_kwargs,
+            kwargs,
+            full_prompt_token_count=len(prepared[1]) if prepared is not None else None,
         )
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        system_prefix = self._system_prefix_ids(messages, template_tools, ct_kwargs)
+        if system_prefix:
+            kwargs["system_prefix_ids"] = system_prefix
 
         return await self.generate(
-            prompt=prompt,
+            prompt=prepared[1] if prepared is not None else prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -1377,49 +1482,41 @@ class BatchedEngine(BaseEngine):
     ) -> None:
         """Early prefill memory check for chat completions.
 
-        Tokenizes the templated prompt and asks the scheduler whether the
-        request would exceed the configured memory ceiling. Raises
+        Uses prepared tokens or tokenizes the prompt, then asks the scheduler
+        whether the request would exceed the configured memory ceiling. Raises
         ``PrefillMemoryExceededError`` (with the caller's ``request_id``
         attached) if it would. Designed to be called from the FastAPI
         route handler BEFORE the response is wrapped in a
         ``StreamingResponse``, so the exception can be mapped to HTTP
         400 by ``prefill_memory_exceeded_handler``.
-
-        Cheap enough to run as a precondition: tokenization of even a
-        100k-token chat takes tens of milliseconds compared to the many
-        seconds the prefill it gates would consume.
         """
         if not self._loaded:
             await self.start()
-        messages = self._preprocess_messages(messages)
-        template_tools = convert_tools_for_template(tools) if tools else None
-        ct_kwargs = kwargs.get("chat_template_kwargs")
-        partial = kwargs.get("is_partial")
         self._prepare_k2_tool_grammar(tools, kwargs)
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
-        )
-        # Tokenizer errors (UnicodeDecodeError, HF Rust "Already borrowed",
-        # malformed input) are normally surfaced by the real chat path's
-        # add_request → tokenize call as a 500 — there's no path-specific
-        # 400 handler today. Don't introduce a NEW failure mode here: if
-        # tokenization fails during preflight, log it and skip the memory
-        # check. The actual chat path will hit the same error and raise it
-        # through the existing handler chain so the response shape stays
-        # consistent.
-        try:
-            num_tokens = len(self._tokenizer.encode(prompt))
-        except Exception as e:
-            logger.warning(
-                "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
-                "skipping prefill memory check, real chat path will surface "
-                "the error",
-                type(e).__name__,
+        prepared = kwargs.get("_prepared_prompt")
+        if prepared is not None:
+            num_tokens = len(prepared[1])
+        else:
+            messages = self._preprocess_messages(messages)
+            template_tools = convert_tools_for_template(tools) if tools else None
+            prompt = self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+                is_partial=kwargs.get("is_partial"),
             )
-            return
+            # Standalone preflight keeps tokenizer failures for the real chat
+            # path to surface through its existing error handler.
+            try:
+                num_tokens = len(self._tokenizer.encode(prompt))
+            except Exception as e:
+                logger.warning(
+                    "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
+                    "skipping prefill memory check, real chat path will surface "
+                    "the error",
+                    type(e).__name__,
+                )
+                return
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
@@ -1501,24 +1598,37 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
+        prepared = kwargs.pop("_prepared_prompt", None)
+        prompt = (
+            prepared[0]
+            if prepared is not None
+            else self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
         )
 
         # SpecPrefill: protect the system-prompt region from token dropping.
         self._inject_specprefill_system_end(
-            messages, prompt, template_tools, ct_kwargs, kwargs
+            messages,
+            prompt,
+            template_tools,
+            ct_kwargs,
+            kwargs,
+            full_prompt_token_count=len(prepared[1]) if prepared is not None else None,
         )
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        system_prefix = self._system_prefix_ids(messages, template_tools, ct_kwargs)
+        if system_prefix:
+            kwargs["system_prefix_ids"] = system_prefix
 
         async for output in self.stream_generate(
-            prompt=prompt,
+            prompt=prepared[1] if prepared is not None else prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -1558,6 +1668,25 @@ class BatchedEngine(BaseEngine):
         if self._engine:
             return self._engine.get_cache_stats()
         return None
+
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        """Abort one live request; False when it is unknown or already finished."""
+        core = self._engine.engine if self._engine else None
+        if (
+            core is None
+            or request_id not in core._output_collectors
+            or request_id in core._finished_at
+        ):
+            return False
+        return await core.abort_request(
+            request_id, reason=reason, error_code=error_code
+        )
 
     async def abort_all_requests(
         self,

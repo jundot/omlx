@@ -65,10 +65,19 @@ class SamplingParams:
     # default (mlx-lm uses 20). Loop units longer than the window never
     # overlap their own penalty context.
     repetition_context_size: Optional[int] = None
+    # Ban tokens that would repeat an n-gram of this size (0 = off), looking
+    # only at the last ngram_window tokens when that is set (0 = all tokens).
+    no_repeat_ngram_size: int = 0
+    ngram_window: int = 0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
+    # Forced-length generation (benchmark use): when True the model's own
+    # EOS/EOT/generation_config stop tokens do not end generation — only
+    # max_tokens does. Request-level stop strings / stop_token_ids still
+    # stop as usual.
+    ignore_eos: bool = False
 
     # Logprobs settings (memory optimization: disabled by default)
     logprobs: bool = False  # Whether to return logprobs
@@ -83,6 +92,13 @@ class SamplingParams:
 
     # Seed for reproducible generation (best-effort, per OpenAI spec)
     seed: Optional[int] = None
+
+    # Stop strings skip the leading think block. Set by the APIs that return
+    # reasoning separately; /v1/completions returns it inline.
+    stop_skips_reasoning: bool = False
+
+    # Read-only logits processor, applied after every other processor.
+    logits_observer: Any = None
 
     def __post_init__(self):
         if self.stop is None:
@@ -135,12 +151,28 @@ class Request:
 
     # Prefix cache fields
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
-    cached_tokens: int = 0  # Number of tokens retrieved from cache
+    cached_tokens: int = 0  # Prefix tokens in KV, including resumed prefill
+    prefill_resumed_tokens: int = 0  # Locally computed tokens retained after a pause
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
 
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
+    # Ordinary prefix reuse awaiting scheduling validation; None once recorded.
+    pending_prefix_cache_tokens: int | None = None
+
+    # Memory-pressure requeue. The first ``requeued_output_tokens`` outputs
+    # are folded into ``prompt_token_ids`` so re-admission prefills them;
+    # ``requeue_row_state`` carries the row's sampler, logits processors and
+    # stop matcher into the next insert.
+    memory_requeues: int = 0
+    requeued_output_tokens: int = 0
+    requeue_reported_cached_tokens: int = 0
+    requeue_row_state: Optional[Tuple[Any, List[Any], Any]] = None
+    # Token index after the last media placeholder. Embeddings are gone by
+    # then, so the resumed prefix must cover every media token.
+    requeue_media_end: int = 0
+
     # Skip the post-completion prefix/SSD cache store for this request.
     # Set by internal probes (context benchmark) whose KV must never
     # pollute the shared cache tiers or trigger the completion-time
@@ -228,6 +260,10 @@ class Request:
     generation_prompt_start: int = 0  # Token index where the generation prompt starts
     generation_prompt_persists: bool = False  # History keeps the generation prompt
 
+    # Rendered leading system block; a shared tail snapshot ends where it does.
+    system_prefix_ids: Optional[List[int]] = None
+    system_prefix_end: int = 0  # Token index where the shared system prefix ends
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
     generation_overflow_retries: int = 0  # Per-request __next_prime retry counter
@@ -237,6 +273,7 @@ class Request:
     prefill_eviction_retries: int = (
         0  # Per-request prefill-headroom eviction phase counter
     )
+    packed_prefill_excluded: bool = False  # Retries alone after a failed pack
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None
@@ -292,6 +329,17 @@ class Request:
 
 
 @dataclass
+class TokenLogprob:
+    """Log probability of one generated token or of one alternative to it."""
+
+    token_id: int
+    text: str
+    token_bytes: List[int]
+    logprob: float
+    top: List["TokenLogprob"] = field(default_factory=list)
+
+
+@dataclass
 class RequestOutput:
     """
     Output for a single request after a generation step.
@@ -325,6 +373,8 @@ class RequestOutput:
 
     # Tool calls (for Harmony and other models with tool calling support)
     tool_calls: Optional[List[Dict[str, str]]] = None
+    # One entry per token in new_token_ids when the request asked for logprobs.
+    logprobs: Optional[List[TokenLogprob]] = None
     # Prefix cache stats
     cached_tokens: int = 0
     # Error message (set when engine encounters an unrecoverable error)

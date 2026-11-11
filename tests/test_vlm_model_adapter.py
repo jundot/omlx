@@ -57,6 +57,42 @@ class TestVLMModelAdapter:
         assert adapter._pending_embeds is None
         assert adapter._embed_offset == 0
 
+    def test_prefill_prompt_ids_reach_only_the_first_chunk(self):
+        """Bound ids replace another request's stash at offset 0, nowhere else."""
+        from types import SimpleNamespace
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        seen = []
+
+        class LanguageModel:
+            _prompt_ids = None
+
+            def __call__(self, inputs, cache=None, **kwargs):
+                seen.append(self._prompt_ids)
+                return MockMXArray()
+
+        vlm = self._make_mock_vlm_model()
+        vlm.language_model = LanguageModel()
+        vlm.config.model_type = "unlimited-ocr"
+        adapter = VLMModelAdapter(vlm)
+        stale = [7, 7]
+
+        for offset, bound, expected in (
+            (0, [1, 2, 3], [1, 2, 3]),  # first prefill chunk
+            (256, [1, 2, 3], None),  # later prefill chunk
+            (0, None, None),  # unbound call
+            (300, None, None),  # decode
+        ):
+            vlm.language_model._prompt_ids = stale
+            if bound is not None:
+                adapter.bind_prefill_prompt_ids(bound)
+            adapter(MockMXArray((1, 4)), cache=[SimpleNamespace(offset=offset)])
+            if expected is None:
+                assert seen[-1] is None
+            else:
+                assert seen[-1].tolist() == expected
+
     def test_release_resources_drops_model_references(self):
         """release_resources drops raw VLM/language model and pending arrays."""
         from omlx.models.vlm import VLMModelAdapter
@@ -740,7 +776,7 @@ class TestPerRequestMRoPEDecode:
         """A scheduler-proven text request keeps (1, T) positions through decode and MTP verify steps."""
         import omlx.models.vlm as vlm_module
 
-        monkeypatch.setattr(vlm_module, "_STEP_TEXT_POSITIONS_MIN_CONTEXT", 0)
+        monkeypatch.setattr(vlm_module, "_step_text_positions_min_context", lambda: 0)
         import mlx.core as mx
 
         from omlx.models.vlm import VLMModelAdapter
@@ -765,7 +801,7 @@ class TestPerRequestMRoPEDecode:
         """Unproven requests and batched steps keep the fail-closed (3, B, T) form."""
         import omlx.models.vlm as vlm_module
 
-        monkeypatch.setattr(vlm_module, "_STEP_TEXT_POSITIONS_MIN_CONTEXT", 0)
+        monkeypatch.setattr(vlm_module, "_step_text_positions_min_context", lambda: 0)
         import mlx.core as mx
 
         from omlx.models.vlm import VLMModelAdapter
@@ -802,23 +838,6 @@ class TestPerRequestMRoPEDecode:
         adapter(mx.zeros((1, 2), dtype=mx.int32), cache=[cache_layer])
         assert vlm.language_model.call_args.kwargs["position_ids"].shape == (3, 1, 2)
 
-    def test_qwen4_step_text_positions_kill_switch(self, monkeypatch):
-        """OMLX_QWEN4_STEP_TEXT_POSITIONS=0 keeps every step on the rank-three form."""
-        import mlx.core as mx
-
-        import omlx.models.vlm as vlm_module
-        from omlx.models.vlm import VLMModelAdapter
-
-        monkeypatch.setattr(vlm_module, "_STEP_TEXT_POSITIONS_DISABLED", True)
-        vlm = self._make_qwen4_mrope_vlm_model()
-        adapter = VLMModelAdapter(vlm)
-        adapter.mark_text_positions(7)
-        cache_layer = MagicMock()
-        cache_layer.offset = 64
-        adapter.set_step_rope_deltas(mx.array([0.0]), uids=[7])
-        adapter(mx.zeros((1, 4), dtype=mx.int32), cache=[cache_layer])
-        assert vlm.language_model.call_args.kwargs["position_ids"].shape == (3, 1, 4)
-
     def test_qwen4_step_text_positions_engage_only_above_min_context(self, monkeypatch):
         """Backbone rows keep the generic form below the context threshold (gathered arms are
         null-to-negative there) and switch to (1, T) above it."""
@@ -827,7 +846,9 @@ class TestPerRequestMRoPEDecode:
         import omlx.models.vlm as vlm_module
         from omlx.models.vlm import VLMModelAdapter
 
-        monkeypatch.setattr(vlm_module, "_STEP_TEXT_POSITIONS_MIN_CONTEXT", 65536)
+        monkeypatch.setattr(
+            vlm_module, "_step_text_positions_min_context", lambda: 65536
+        )
         vlm = self._make_qwen4_mrope_vlm_model()
         adapter = VLMModelAdapter(vlm)
         adapter.mark_text_positions(7)
@@ -852,19 +873,17 @@ class TestPerRequestMRoPEDecode:
         assert vlm.language_model.call_args.kwargs["position_ids"].shape == (1, 4)
 
     def test_qwen4_step_threshold_default_follows_fused_attention_rows(self, monkeypatch):
-        """Unset, the threshold keeps the masked path at every context while the fused
+        """The threshold keeps the masked path at every context while the fused
         attention rows run (faster there, and bit-identical to the MLX ops), and is
-        the gathered crossover otherwise; an explicit value still wins."""
+        the gathered crossover otherwise."""
         import mlx.core as mx
 
-        import omlx.models.vlm as vlm_module
         from omlx.models.vlm import VLMModelAdapter
         from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
         compat.apply_mlx_vlm_qwen4_exp_compat_patch()
         from mlx_vlm.models.qwen4_exp import attn_fused
 
-        monkeypatch.setattr(vlm_module, "_STEP_TEXT_POSITIONS_MIN_CONTEXT", None)
         vlm = self._make_qwen4_mrope_vlm_model()
         adapter = VLMModelAdapter(vlm)
         adapter.mark_text_positions(7)
@@ -882,10 +901,6 @@ class TestPerRequestMRoPEDecode:
         monkeypatch.setattr(attn_fused, "rows_available", lambda: False)
         assert step_shape(32_767) == (3, 1, 4)
         assert step_shape(32_768) == (1, 4)
-
-        monkeypatch.setattr(attn_fused, "rows_available", lambda: True)
-        monkeypatch.setattr(vlm_module, "_STEP_TEXT_POSITIONS_MIN_CONTEXT", 65536)
-        assert step_shape(82_000) == (1, 4)
 
     def test_qwen4_unregister_clears_text_positions_proof(self):
         import mlx.core as mx
@@ -988,6 +1003,26 @@ def test_adapter_forwards_prefetch_ple_to_the_language_model():
     plain.config.model_type = "qwen3_5_moe"
     VLMModelAdapter(plain).prefetch_ple(next_ids, current_ids)  # no hook: no error
     assert VLMModelAdapter(plain).ple_gathers_ahead() is False
+
+
+def test_adapter_forwards_prefetch_engram_to_the_language_model():
+    from unittest.mock import MagicMock
+
+    from omlx.models.vlm import VLMModelAdapter
+
+    vlm = MagicMock()
+    vlm.config.model_type = "deepseek_v41"
+    adapter = VLMModelAdapter(vlm)
+    next_ids, current_ids, cache = object(), object(), object()
+    adapter.prefetch_engram(next_ids, current_ids, cache=cache)
+    vlm.language_model.prefetch_engram.assert_called_once_with(
+        next_ids, current_ids, cache=cache
+    )
+    plain = MagicMock(spec=[])
+    plain.language_model = MagicMock(spec=[])
+    plain.config = MagicMock()
+    plain.config.model_type = "qwen3_5_moe"
+    VLMModelAdapter(plain).prefetch_engram(next_ids, current_ids, cache=cache)
 
 
 def test_ssd_cache_restore_binds_nested_vlm_caches_and_preserves_quantization():

@@ -66,11 +66,14 @@ def projection_inventory(source, config, mapping, *, preserve_mtp=False):
     return inventory
 
 
-def build_affine_plan(inventory, budget, config, imatrix, sensitivity, *, target, cap):
+def build_affine_plan(
+    inventory, budget, config, imatrix, sensitivity, *, oq_level, target, cap
+):
     """Price preserved source tensors separately from eligible affine projections."""
     import numpy as np
 
     from ...oq import (
+        _base_bits_for_level,
         _build_quant_plan,
         _tensor_quantized_bytes,
         universal_quant_predicate,
@@ -99,7 +102,7 @@ def build_affine_plan(inventory, budget, config, imatrix, sensitivity, *, target
             preserved[name] = "outside_layer_sensitivity"
         elif entry is None:
             preserved[name] = "uncalibrated"
-        elif universal_quant_predicate(name, None, config, 3) is False:
+        elif universal_quant_predicate(name, None, config, oq_level) is False:
             preserved[name] = "precision_policy"
         else:
             shapes[name] = shape
@@ -107,22 +110,25 @@ def build_affine_plan(inventory, budget, config, imatrix, sensitivity, *, target
             if missing:
                 unobserved[name] = missing
     if not shapes:
-        raise ValueError("V4.1 oQ3e has no calibrated eligible projections")
+        raise ValueError(f"V4.1 oQ{oq_level:g} has no calibrated eligible projections")
     total_params = budget["remaining_weights"]["logical_parameters"]
     eligible_params = sum(math.prod(shape) for shape in shapes.values())
     fixed_bytes = budget["remaining_weights"]["tensor_bytes"] - sum(
         inventory[name]["source_bytes"] for name in shapes
     )
+    base_bits = _base_bits_for_level(oq_level)
     plan = _build_quant_plan(
         shapes,
         config,
-        3,
+        oq_level,
         target_bpw=(target * total_params - 8 * fixed_bytes) / eligible_params,
         hard_cap_bpw=(cap * total_params - 8 * fixed_bytes) / eligible_params,
         supported_bits=(2, 3, 4, 6, 8),
     )
     specs = {
-        name: plan.boost_map.get(name, dict(bits=3, group_size=64, mode="affine"))
+        name: plan.boost_map.get(
+            name, dict(bits=base_bits, group_size=64, mode="affine")
+        )
         for name in shapes
     }
     if any(spec["bits"] not in (2, 3, 4, 6, 8) for spec in specs.values()):

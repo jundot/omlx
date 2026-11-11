@@ -28,10 +28,9 @@ token window (measured 0.87/0.76/0.67/0.61 with the same head weights):
   ``block.embed_norm(backbone.embed_norm(embed(ids)))``. Feeding the raw
   embedding drops depth-0 agreement 0.87 -> 0.58 (vLLM documents the
   same cliff);
-* head logits skip the trunk final norm by default
+* head logits skip the trunk final norm
   (``chain_hidden_post_norm: false`` — raw block output through the LM
-  head with the muP divide). ``OMLX_INKLING_MTP_FINAL_NORM=trunk``
-  restores the trunk-norm readout (measured equivalent).
+  head with the muP divide).
 
 All cycle bookkeeping lives on the ``_InklingMTPCacheList`` instance the
 batch generator threads through the cycle, so request switches isolate
@@ -53,7 +52,7 @@ The head consumes PRE-norm trunk hidden (per-block ``hidden_norm``,
 Prompt priming captures (token, pre-norm hidden) pairs into a sliding
 window ring during prefill (no head forwards), then ``mtp_take_primed``
 folds all active blocks chained over that window at activation
-(``OMLX_INKLING_MTP_PRIME_WINDOW``, default 1024: sliding head blocks
+(``_PRIME_WINDOW``, 1024: sliding head blocks
 warm fully past 512 rows; the two global blocks cover their full
 rel_extent=1024 band — only band-outside long-range keys are lost).
 """
@@ -61,7 +60,6 @@ rel_extent=1024 band — only band-outside long-range keys are lost).
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
@@ -87,6 +85,8 @@ _STASH_ROWS = _RING + 16
 # depth probe after a shallow cruise pays the whole gap refold (polluting
 # t_est) and drafts from stale rows (polluting the accept estimates).
 _KEEPALIVE_LAG = 32
+# Prompt pairs kept for priming (see the module docstring).
+_PRIME_WINDOW = 1024
 
 _ATTN = {
     "wq_du": "q_proj",
@@ -150,24 +150,6 @@ class _InklingPrimeCtx:
     pending_hidden: Optional[Any] = None
     expected_offset: int = 0
     valid: bool = True
-
-
-def _prime_window() -> int:
-    try:
-        return int(os.environ.get("OMLX_INKLING_MTP_PRIME_WINDOW", "1024"))
-    except ValueError:
-        return 1024
-
-
-_FINAL_NORM_MODE: Optional[str] = None
-
-
-def _final_norm_mode() -> str:
-    global _FINAL_NORM_MODE
-    if _FINAL_NORM_MODE is None:
-        mode = os.environ.get("OMLX_INKLING_MTP_FINAL_NORM", "none").lower()
-        _FINAL_NORM_MODE = mode if mode in ("none", "trunk") else "none"
-    return _FINAL_NORM_MODE
 
 
 def _map_transformer_block(sub: str, v: mx.array) -> dict:
@@ -488,8 +470,6 @@ def _patch_language_model(inkling_lang: Any) -> None:
     def _mtp_readout(self, h_last):
         # chain_hidden_post_norm=false: raw block output through the LM
         # head (muP divide + vocab clip live in _logits_from_norm).
-        if _final_norm_mode() == "trunk":
-            return self.speculative_logits_from_hidden(h_last)
         return self._logits_from_norm(h_last)
 
     def _mtp_run_block(self, block_idx, block_cache, hid_win, tok_win):
@@ -786,7 +766,7 @@ def _patch_language_model(inkling_lang: Any) -> None:
             tok = mx.concatenate(ctx.tok_chunks + [seam_tok], axis=1)
             hid = mx.concatenate(ctx.hid_chunks + [ctx.pending_hidden], axis=1)
             f = int(tok.shape[1])
-            w_eff = min(f, _prime_window())
+            w_eff = min(f, _PRIME_WINDOW)
             tok = tok[:, -w_eff:]
             hid = hid[:, -w_eff:]
             head_cache = self.make_mtp_cache()
@@ -842,7 +822,7 @@ def _inkling_prime_capture(host, inputs, hidden, cache) -> None:
     """
     from ..mlx_lm_mtp import prompt_priming
 
-    if prompt_priming._suppressed() or not prompt_priming.priming_enabled():
+    if prompt_priming._suppressed():
         return
     if cache is None or not prompt_priming._host_eligible(host):
         return
@@ -887,8 +867,9 @@ def _inkling_prime_capture(host, inputs, hidden, cache) -> None:
     ctx.tok_chunks.append(tok_chunk)
     ctx.hid_chunks.append(hid_chunk)
     ctx.total += int(tok_chunk.shape[1])
-    window = _prime_window()
-    while ctx.tok_chunks and ctx.total - int(ctx.tok_chunks[0].shape[1]) >= window:
+    while (
+        ctx.tok_chunks and ctx.total - int(ctx.tok_chunks[0].shape[1]) >= _PRIME_WINDOW
+    ):
         ctx.total -= int(ctx.tok_chunks.pop(0).shape[1])
         ctx.hid_chunks.pop(0)
     ctx.pending_hidden = hidden[:, -1:]

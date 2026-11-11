@@ -8,6 +8,7 @@ Note: Configuration validation tests are in test_config.py.
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -36,6 +37,32 @@ class TestCLIModule:
 
         # The module should have the main entry point
         assert callable(cli.main)
+
+    def test_package_import_relaxes_metal_preemption_timeout(self):
+        """Importing omlx sets the Metal driver flag and keeps an explicit value."""
+        code = (
+            "import os, omlx; print(os.environ.get('AGX_RELAX_CDM_CTXSTORE_TIMEOUT'))"
+        )
+        env = {
+            k: v for k, v in os.environ.items() if k != "AGX_RELAX_CDM_CTXSTORE_TIMEOUT"
+        }
+        default = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        explicit = subprocess.run(
+            [sys.executable, "-c", code],
+            env={**env, "AGX_RELAX_CDM_CTXSTORE_TIMEOUT": "0"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        expected = "1" if sys.platform == "darwin" else "None"
+        assert default.stdout.strip() == expected
+        assert explicit.stdout.strip() == "0"
 
 
 class TestCLIHelp:
@@ -453,6 +480,59 @@ class TestLaunchCommandFunction:
         assert ctx.model_type == "vlm"
         assert ctx.extra_args == ()
 
+    def test_launch_command_brackets_ipv6_host_in_urls(self):
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "OpenCode"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "qwen3.5",
+                    "model_type": "llm",
+                    "max_context_window": 32768,
+                }
+            ]
+        }
+
+        settings = MagicMock()
+        settings.server.host = "::1"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool="opencode",
+            host=None,
+            port=None,
+            api_key="test-key",
+            model="qwen3.5",
+            tools_profile="coding",
+        )
+
+        with (
+            patch(
+                "requests.get", side_effect=[health_response, status_response]
+            ) as mock_get,
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        called_urls = [call.args[0] for call in mock_get.call_args_list]
+        assert called_urls == [
+            "http://[::1]:8000/health",
+            "http://[::1]:8000/v1/models/status",
+        ]
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.host == "::1"  # raw host preserved; brackets are URL-only
+        assert ctx.base_url == "http://[::1]:8000"
+
     def test_launch_command_passes_cross_session_flag_to_integration(self):
         from omlx.cli import launch_command
 
@@ -495,7 +575,17 @@ class TestLaunchCommandFunction:
         ctx = integration.launch.call_args.args[0]
         assert ctx.cross_session is True
 
-    def test_launch_command_skips_picker_when_integration_registers_catalog(self):
+    @pytest.mark.parametrize(
+        ("tool", "setting"),
+        [
+            ("dsh", "dsh_model"),
+            ("codex_app", "codex_model"),
+            ("copilot", "copilot_model"),
+        ],
+    )
+    def test_launch_command_skips_picker_when_integration_registers_catalog(
+        self, tool, setting
+    ):
         """Tools with requires_model_selection=False never prompt.
 
         The model comes from the saved per-tool default (or --model) and
@@ -510,6 +600,7 @@ class TestLaunchCommandFunction:
 
         health_response = MagicMock()
         health_response.raise_for_status.return_value = None
+        health_response.json.return_value = {"default_model": "server-default"}
 
         status_response = MagicMock()
         status_response.ok = True
@@ -519,10 +610,10 @@ class TestLaunchCommandFunction:
         settings.server.host = "127.0.0.1"
         settings.server.port = 8000
         settings.claude_code = None
-        settings.integrations.dsh_model = "Qwen3.8-27B-oQ5e-mtp"
+        setattr(settings.integrations, setting, "Qwen3.8-27B-oQ5e-mtp")
 
         args = argparse.Namespace(
-            tool="dsh",
+            tool=tool,
             host=None,
             port=None,
             api_key="test-key",
@@ -542,6 +633,7 @@ class TestLaunchCommandFunction:
         integration.launch.assert_called_once()
         ctx = integration.launch.call_args.args[0]
         assert ctx.model == "Qwen3.8-27B-oQ5e-mtp"
+        assert ctx.default_model == "server-default"
 
     def test_launch_command_resolves_alias_status_metadata(self):
         """Alias model IDs should keep status metadata from the real model."""
@@ -931,6 +1023,38 @@ class TestLaunchCommandFunction:
         assert ctx.sonnet_model == "cli-sonnet"
         assert ctx.haiku_model == "cli-haiku"
 
+    def test_launch_command_requires_claude_desktop_toggle(self, capsys):
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.is_installed.return_value = True
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+        settings.claude_code.desktop_enabled = False
+        args = argparse.Namespace(
+            tool="claude_desktop",
+            host=None,
+            port=None,
+            api_key=None,
+            model=None,
+            tools_profile="coding",
+        )
+        requests_get = MagicMock()
+
+        with (
+            patch("requests.get", requests_get),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
+        ):
+            launch_command(args)
+
+        assert exc.value.code == 1
+        requests_get.assert_not_called()
+        integration.launch.assert_not_called()
+        assert "not enabled" in capsys.readouterr().out
+
 
 class TestLaunchArgvParsing:
     """Tests for top-level argv parsing of `omlx launch ...`."""
@@ -1055,6 +1179,7 @@ class TestServeCommandFunctions:
             enabled=False,
             ane_compile_cache=False,
             get_ssd_cache_dir=lambda base_path: tmp_path / "cache",
+            is_ssd_cache_dir_unavailable=lambda: False,
             get_ssd_cache_max_size_bytes=lambda base_path: 0,
             get_hot_cache_max_size_bytes=lambda: 0,
         )
@@ -1232,8 +1357,13 @@ class TestServeCommandFunctions:
         assert _is_local_address("127.0.0.1")
         assert not _is_local_address("192.0.2.1")
 
-    def test_serve_hands_prebound_socket_to_uvicorn(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("headless", [False, True])
+    def test_serve_hands_prebound_socket_to_uvicorn(
+        self, tmp_path, monkeypatch, headless
+    ):
         """Successful serve startup should pass the pre-bound socket into uvicorn."""
+        import os
+
         import omlx
         import uvicorn
 
@@ -1241,8 +1371,9 @@ class TestServeCommandFunctions:
 
         host, port = "127.0.0.1", 0
         settings = self._make_settings(tmp_path, host=host, port=port)
-        args = self._make_serve_args(tmp_path, host=host, port=port)
+        args = self._make_serve_args(tmp_path, host=host, port=port, headless=headless)
         events = []
+        monkeypatch.delenv("OMLX_HEADLESS", raising=False)
 
         fake_server = ModuleType("omlx.server")
 
@@ -1251,6 +1382,8 @@ class TestServeCommandFunctions:
 
         def fake_init_server(**kwargs):
             events.append("init")
+            # omlx.server reads this when it is first imported.
+            events.append(os.environ.get("OMLX_HEADLESS"))
 
         fake_server.app = app
         fake_server.init_server = MagicMock(side_effect=fake_init_server)
@@ -1291,7 +1424,7 @@ class TestServeCommandFunctions:
         serve_command(args)
 
         fake_server.init_server.assert_called_once()
-        assert events == ["bind", "init", "run"]
+        assert events == ["bind", "init", "1" if headless else None, "run"]
         assert captured["socket_count"] == 1
         assert captured["socket_name"][0] == host
         assert captured["socket_name"][1] > 0

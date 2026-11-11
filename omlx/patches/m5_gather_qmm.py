@@ -22,18 +22,16 @@ The wrapper self-arms: the first matching call runs a tiny canary whose last
 expert is followed by NaN in the same buffer, against an fp32 dequantized
 reference, and only intervenes when the defect is present on this
 machine/mlx build. Healthy setups keep the fast path untouched, and the patch
-retires itself once mlx ships a kernel fix. Kill switch:
-``OMLX_M5_GATHER_QMM_FIX=0``.
+retires itself once mlx ships a kernel fix.
 
 On NAX hosts every supported sorted call (``transpose=True`` rhs gather
-of ``[M, 1, K]`` rows, bf16/fp16 activations, affine 4/8-bit or MXFP4
-weights, at least 4 rows per expert) goes to the runtime-compiled kernel
+of ``[M, 1, K]`` rows, bf16/fp16 activations, affine 4/8-bit, MXFP4 or
+NVFP4 weights, at least 4 rows per expert) goes to the runtime-compiled kernel
 in ``m5_gather_qmm_nax`` before any of the above: segmented tile
 scheduling (one expert per 64- to 128-row tile) on the tensor units,
 correct for any K and row count in one dispatch, bit-identical to mlx's
 sorted kernel wherever that kernel is correct. Each kernel instantiation self-tests
 once; anything unsupported or failing keeps the stock handling above.
-``OMLX_M5_GATHER_QMM_NAX=0`` disables only this route.
 
 ``fused_gate_up_activation`` lets a SwitchGLU forward whose fused ``[gate;
 up]`` sorted projection would take that route run its SwiGLU in the NAX
@@ -41,18 +39,20 @@ kernel's epilogue instead of a separate elementwise pass (bit-identical).
 Given the token rows and the sorted row map (``moe_routes.sort_routes``),
 that kernel reads each routed token's row in place instead of from the
 ``[T * k, 1, K]`` copy that the sort would otherwise gather (bit-identical).
+``split_gate_up_swiglu_oai`` does both for MiniMax M3.1, whose gate and up
+are separate projections with a scaled SwiGLU-OAI.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 
 import mlx.core as mx
 
 from omlx.custom_kernels.nax import is_nax_available
 
 from . import m5_gather_qmm_nax as _nax
+from .moe_routes import sort_routes
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +70,9 @@ _POSITIONAL = (
     "group_size",
     "bits",
     "mode",
+    "global_scale",
 )
-_DEFAULT_GROUP_SIZE = {"affine": 64, "mxfp4": 32}
+_DEFAULT_GROUP_SIZE = {"affine": 64, "mxfp4": 32, "nvfp4": 16}
 
 
 def _poisoned_tail(a: mx.array, value) -> mx.array:
@@ -125,6 +126,11 @@ def _rhs_indices(args, kwargs):
     return args[3] if len(args) > 3 else kwargs.get("rhs_indices")
 
 
+def _global_scale(args, kwargs):
+    at = _POSITIONAL.index("global_scale")
+    return args[at] if len(args) > at else kwargs.get("global_scale")
+
+
 def _needs_reroute(x, args, kwargs) -> bool:
     """True when this call would select the defective NAX rhs kernel."""
     if not kwargs.get("sorted_indices"):
@@ -152,11 +158,10 @@ def _on_nax_host() -> bool:
     return _nax_host
 
 
-def _nax_rows_ok(x, w) -> bool:
+def _nax_rows_ok(rows: int, w) -> bool:
     """Same gate as mlx's own choice of the sorted rhs kernel (GatherQMM:
     B >= 16 rows and B / E >= 4); fewer rows per expert run the per-row
     qmv kernel, which is correct and cheaper there."""
-    rows = x.shape[0] if x.ndim == 3 else 0
     return rows >= 16 and w.ndim == 3 and rows // max(int(w.shape[0]), 1) >= 4
 
 
@@ -175,7 +180,7 @@ def _nax_sorted_gather_qmm(x, w, args, kwargs):
         or not params.get("transpose", True)
     ):
         return None
-    if not _nax_rows_ok(x, w):
+    if not _nax_rows_ok(x.shape[0] if x.ndim == 3 else 0, w):
         return None
     mode = params.get("mode") or "affine"
     group_size = params.get("group_size")
@@ -200,7 +205,10 @@ def _nax_sorted_gather_qmm(x, w, args, kwargs):
 
 
 def _gather_qmm_rerouted(x, w, *args, **kwargs):
-    if kwargs.get("sorted_indices") and _nax.enabled() and _on_nax_host():
+    if _global_scale(args, kwargs) is not None:
+        # The NAX kernels take no global scale; keep MLX's kernel.
+        return _original_gather_qmm(x, w, *args, **kwargs)
+    if kwargs.get("sorted_indices") and _on_nax_host():
         out = _nax_sorted_gather_qmm(x, w, args, kwargs)
         if out is not None:
             return out
@@ -269,9 +277,11 @@ def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
         return None
     if not getattr(mx.gather_qmm, "_omlx_m5_reroute", False):
         return None
-    if not (_nax.enabled() and _on_nax_host()):
+    if not _on_nax_host():
         return None
     if "bias" in proj or not all(hasattr(proj, a) for a in ("group_size", "bits")):
+        return None
+    if "global_scale" in proj:
         return None
     w = proj.get("weight")
     scales = proj.get("scales")
@@ -279,7 +289,7 @@ def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
         return None
     if not isinstance(x, mx.array) or not isinstance(indices, mx.array):
         return None
-    if not _nax_rows_ok(x, w):
+    if not _nax_rows_ok(x.shape[0] if x.ndim == 3 else 0, w):
         return None
     kw = dict(
         group_size=int(proj.group_size),
@@ -300,15 +310,64 @@ def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
     )
 
 
+def split_gate_up_swiglu_oai(
+    gate, up, x, indices, *, alpha, limit, beta, expert_scales
+):
+    """MiniMax M3.1's scaled SwiGLU-OAI of the separate ``gate`` and ``up``
+    switch projections on the sorted routes, in one kernel, or None.
+
+    ``x`` holds the token rows ``[..., K]`` and ``indices`` their routes
+    ``[..., k]``. Returns ``(hidden, idx, inv_order)``: ``idx`` and
+    ``inv_order`` are those of ``moe_routes.sort_routes`` and ``hidden`` is
+    the ``[M, 1, n]`` activation of the sorted routes. Taken where the two
+    ``sorted_indices=True`` projections would run on the NAX sorted gather
+    kernel (the conditions of ``fused_gate_up_activation``, same format for
+    both): the kernel reads the token rows in place and applies the activation
+    with ``expert_scales`` = ``(gate, up)`` in its epilogue
+    (``m5_gather_qmm_nax.sorted_gather_qmm_swiglu_oai``, self-tested
+    bit-identical to the unfused path). None otherwise.
+    """
+    if not getattr(mx.gather_qmm, "_omlx_m5_reroute", False) or not _on_nax_host():
+        return None
+    operands, formats = [], set()
+    for proj in (gate, up):
+        # A module that wraps the projection holds no arrays: it must be called.
+        w, scales = proj.get("weight"), proj.get("scales")
+        if not isinstance(w, mx.array) or not isinstance(scales, mx.array):
+            return None
+        if "bias" in proj or "global_scale" in proj:
+            return None
+        if not all(hasattr(proj, a) for a in ("group_size", "bits", "mode")):
+            return None
+        operands.append((w, scales))
+        formats.add((int(proj.group_size), int(proj.bits), proj.mode))
+    if len(formats) != 1 or not _nax_rows_ok(indices.size, operands[0][0]):
+        return None
+    group_size, bits, mode = formats.pop()
+    x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), indices)
+    hidden = _nax.sorted_gather_qmm_swiglu_oai(
+        x_tok,
+        *operands,
+        idx,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        alpha=alpha,
+        limit=limit,
+        beta=beta,
+        expert_scales=expert_scales,
+        row_map=row_map,
+    )
+    return None if hidden is None else (hidden, idx, inv_order)
+
+
 def apply_m5_gather_qmm_workaround() -> bool:
     """Install the reroute wrapper on ``mx.gather_qmm``.
 
     Idempotent; returns True when the wrapper was installed by this
-    call. Disabled entirely via ``OMLX_M5_GATHER_QMM_FIX=0``.
+    call.
     """
     global _original_gather_qmm
-    if os.environ.get("OMLX_M5_GATHER_QMM_FIX", "1") == "0":
-        return False
     if getattr(mx.gather_qmm, "_omlx_m5_reroute", False):
         return False
     _original_gather_qmm = mx.gather_qmm

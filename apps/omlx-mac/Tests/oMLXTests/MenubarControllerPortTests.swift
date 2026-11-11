@@ -29,6 +29,8 @@ private final class MenubarStatsRequestRecorder: @unchecked Sendable {
     private var activityRequestCount = 0
     private var activityResponseStatusCode = 200
     private var publicStatusResponseStatusCode = 200
+    private var publicStatusRequestCount = 0
+    private var requiredPublicStatusAPIKey: String?
     private var updateNotificationCount = 0
 
     func reset() {
@@ -37,6 +39,8 @@ private final class MenubarStatsRequestRecorder: @unchecked Sendable {
         activityRequestCount = 0
         activityResponseStatusCode = 200
         publicStatusResponseStatusCode = 200
+        publicStatusRequestCount = 0
+        requiredPublicStatusAPIKey = nil
         updateNotificationCount = 0
     }
 
@@ -76,6 +80,30 @@ private final class MenubarStatsRequestRecorder: @unchecked Sendable {
         return publicStatusResponseStatusCode
     }
 
+    func recordPublicStatusRequest() {
+        lock.lock()
+        defer { lock.unlock() }
+        publicStatusRequestCount += 1
+    }
+
+    func recordedPublicStatusRequestCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return publicStatusRequestCount
+    }
+
+    func setRequiredPublicStatusAPIKey(_ apiKey: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        requiredPublicStatusAPIKey = apiKey
+    }
+
+    func currentRequiredPublicStatusAPIKey() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return requiredPublicStatusAPIKey
+    }
+
     func recordUpdateNotification() {
         lock.lock()
         defer { lock.unlock() }
@@ -108,6 +136,14 @@ private final class MenubarStatsURLProtocol: URLProtocol, @unchecked Sendable {
         requestRecorder.setPublicStatusResponseStatusCode(statusCode)
     }
 
+    static func setRequiredPublicStatusAPIKey(_ apiKey: String?) {
+        requestRecorder.setRequiredPublicStatusAPIKey(apiKey)
+    }
+
+    static func recordedPublicStatusRequestCount() -> Int {
+        requestRecorder.recordedPublicStatusRequestCount()
+    }
+
     static func recordUpdateNotification() {
         requestRecorder.recordUpdateNotification()
     }
@@ -134,7 +170,13 @@ private final class MenubarStatsURLProtocol: URLProtocol, @unchecked Sendable {
         let scope = components?.queryItems?.first(where: { $0.name == "scope" })?.value
         let statusCode: Int
         if url.path == "/api/status" {
-            statusCode = Self.requestRecorder.currentPublicStatusResponseStatusCode()
+            Self.requestRecorder.recordPublicStatusRequest()
+            if let apiKey = Self.requestRecorder.currentRequiredPublicStatusAPIKey(),
+               request.value(forHTTPHeaderField: "Authorization") != "Bearer \(apiKey)" {
+                statusCode = 401
+            } else {
+                statusCode = Self.requestRecorder.currentPublicStatusResponseStatusCode()
+            }
         } else if url.path == "/admin/api/activity" {
             Self.requestRecorder.recordActivityRequest()
             statusCode = Self.requestRecorder.currentActivityResponseStatusCode()
@@ -247,7 +289,9 @@ final class MenubarControllerPortTests: XCTestCase {
         let stats = try JSONDecoder().decode(MenubarStatsPoller.Stats.self, from: data)
         let activity = try XCTUnwrap(stats.liveActivity)
 
-        XCTAssertEqual(activity.menuBarTitle, "PP 38% · 12k/32k")
+        // Digits follow Locale.current; CountFormatTests pins the ladder.
+        XCTAssertEqual(activity.menuBarTitle,
+                       "PP 38% · \(CountFormat.compact(12_000))/\(CountFormat.compact(32_000))")
         XCTAssertEqual(activity.detail, "Laguna XS.2 · 321 tok/s · 47s left")
     }
 
@@ -393,6 +437,28 @@ final class MenubarControllerPortTests: XCTestCase {
 
         XCTAssertEqual(poller.liveStats?.liveActivity?.menuBarTitle, "GEN 42.1 tok/s")
         XCTAssertEqual(MenubarStatsURLProtocol.recordedActivityRequestCount(), 1)
+    }
+
+    func testRefreshOncePicksUpAPIKeySetAfterLaunch() async {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [MenubarStatsURLProtocol.self]
+        MenubarStatsURLProtocol.setRequiredPublicStatusAPIKey("new-key")
+        let poller = MenubarStatsPoller(
+            baseURL: URL(string: "http://omlx.test")!,
+            apiKey: nil,
+            sessionConfiguration: sessionConfiguration,
+            apiKeyLoader: { "new-key" }
+        )
+        XCTAssertFalse(poller.hasAPIKey)
+
+        await poller.refreshOnce()
+        XCTAssertTrue(poller.hasAPIKey)
+        XCTAssertEqual(poller.sessionStats?.totalPromptTokens, 99)
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedPublicStatusRequestCount(), 2)
+
+        // The reloaded key sticks, so later ticks do not 401 first.
+        await poller.refreshOnce()
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedPublicStatusRequestCount(), 3)
     }
 
     func testRefreshOncePostsOneConsolidatedUpdateNotification() async {

@@ -14,7 +14,7 @@ from omlx.model_settings import ModelSettings
 
 @pytest.fixture
 def tuner_pool(monkeypatch, tmp_path):
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     base = ModelSettings(qwen35_ane_prefill_enabled=True)
     (tmp_path / "config.json").write_text(json.dumps(dict(num_hidden_layers=3)))
@@ -28,7 +28,7 @@ def tuner_pool(monkeypatch, tmp_path):
     restored = Mock()
     monkeypatch.setattr(ane_tuning, "_pin_speed_priority", lambda _: "old")
     monkeypatch.setattr(ane_tuning, "_restore_speed_priority", restored)
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "_ext", SimpleNamespace(ane_compile_program=object()))
     yield pool
     assert base.qwen35_ane_prefill_enabled
@@ -179,7 +179,7 @@ def test_tuning_eligibility_uses_mlp_weight_format(dtype, bits, shared):
 async def test_long_prefill_measurement_requires_native_execution(
     monkeypatch, enabled, operations
 ):
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     warmups = []
 
@@ -200,10 +200,10 @@ async def test_long_prefill_measurement_requires_native_execution(
     )
     measure = AsyncMock(side_effect=[{"processing_tps": v} for v in (101, 1000, 103)])
     monkeypatch.setattr(ane_tuning, "_run_single_test", measure)
-    monkeypatch.setattr(fast, "qwen35_ane_profile_set_enabled", lambda _: True)
-    monkeypatch.setattr(fast, "qwen35_ane_profile_reset", lambda: None)
+    monkeypatch.setattr(fast, "ane_profile_set_enabled", lambda _: True)
+    monkeypatch.setattr(fast, "ane_profile_reset", lambda: None)
     monkeypatch.setattr(
-        fast, "qwen35_ane_profile_snapshot", lambda: {"mlp": {"operations": operations}}
+        fast, "ane_profile_snapshot", lambda: {"mlp": {"operations": operations}}
     )
     monkeypatch.setattr(ane_tuning, "_runs", {})
     run = ane_tuning.create_run(

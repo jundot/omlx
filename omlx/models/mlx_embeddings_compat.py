@@ -13,6 +13,8 @@ _QWEN3_VL_PROCESSOR_PATCHED = False
 
 _QWEN3_VL_POSIDS_PATCHED = False
 
+_SIGLIP_SINGLE_TOWER_PATCHED = False
+
 
 def _flatten_images(images: Any) -> list[Any]:
     """Flatten the per-sample nested image batch transformers hands to processors.
@@ -161,3 +163,45 @@ def patch_qwen3_vl_position_ids_recompute() -> None:
     qwen3_vl_model.compute_qwen3_vl_hidden_states = compute_recomputing_position_ids
     _QWEN3_VL_POSIDS_PATCHED = True
     logger.debug("Applied position-ids recompute patch for mlx-embeddings Qwen3-VL")
+
+
+def patch_siglip_single_tower_forward() -> None:
+    """Let the mlx-embeddings SigLIP forward embed text or images alone.
+
+    Upstream ``Model.__call__`` always runs both towers, so a call without
+    ``pixel_values`` or ``input_ids`` fails on ``None.shape``. A one-modality
+    call runs only its tower and is L2-normalized like the two-tower output.
+    The text tower runs unmasked: SigLIP pads to ``max_length`` and pools the
+    last position, and its reference tokenizers emit no attention mask.
+    """
+    global _SIGLIP_SINGLE_TOWER_PATCHED
+    if _SIGLIP_SINGLE_TOWER_PATCHED:
+        return
+
+    try:
+        from mlx_embeddings.models import siglip
+        from mlx_embeddings.models.base import ViTModelOutput, normalize_embeddings
+    except Exception as exc:
+        logger.debug("SigLIP single-tower patch skipped: %s", exc)
+        _SIGLIP_SINGLE_TOWER_PATCHED = True
+        return
+
+    original = siglip.Model.__call__
+    if getattr(original, "_omlx_patched", False):
+        _SIGLIP_SINGLE_TOWER_PATCHED = True
+        return
+
+    @functools.wraps(original)
+    def call_single_tower(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None and input_ids is not None:
+            text_embeds = self.get_text_features(input_ids=input_ids)
+            return ViTModelOutput(text_embeds=normalize_embeddings(text_embeds))
+        if input_ids is None and pixel_values is not None:
+            image_embeds = self.get_image_features(pixel_values=pixel_values)
+            return ViTModelOutput(image_embeds=normalize_embeddings(image_embeds))
+        return original(self, input_ids=input_ids, pixel_values=pixel_values, **kwargs)
+
+    call_single_tower._omlx_patched = True
+    siglip.Model.__call__ = call_single_tower
+    _SIGLIP_SINGLE_TOWER_PATCHED = True
+    logger.debug("Applied single-tower forward patch for mlx-embeddings SigLIP")

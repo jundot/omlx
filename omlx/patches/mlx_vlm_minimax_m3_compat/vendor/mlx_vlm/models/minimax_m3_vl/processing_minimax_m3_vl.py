@@ -19,6 +19,8 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.video_processing_utils import BaseVideoProcessor
 
+from omlx.patches.mlx_vlm_minimax_m3_compat import minimax_thinking_mode_template
+
 from ..base import install_auto_processor_patch, load_chat_template, to_mlx
 
 OPENAI_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
@@ -1007,11 +1009,14 @@ class MiniMaxM3VLProcessor(ProcessorMixin):
         )
         if Path(pretrained_model_name_or_path).exists():
             load_chat_template(tokenizer, pretrained_model_name_or_path)
+        tokenizer.chat_template = minimax_thinking_mode_template(
+            getattr(tokenizer, "chat_template", None)
+        )
 
         proc_cfg = (
             _load_json(pretrained_model_name_or_path, "processor_config.json") or {}
         )
-        chat_template = (
+        chat_template = minimax_thinking_mode_template(
             chat_template
             or proc_cfg.get("chat_template")
             or getattr(tokenizer, "chat_template", None)

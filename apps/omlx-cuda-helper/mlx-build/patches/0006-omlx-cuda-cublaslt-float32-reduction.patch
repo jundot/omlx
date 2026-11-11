@@ -1,0 +1,25 @@
+cuBLASLt may pick a split-K algorithm that adds its partial sums in the output type. With bfloat16 or
+float16 outputs every partial sum is rounded, and the product differs from a float32 product rounded
+once in about a third of its elements (seen for 8192 x 2560 times 2560 x 512, relative error 3e-3).
+Restrict the reduction scheme to the compute type (float32), which also allows not splitting.
+
+diff --git a/mlx/backend/cuda/cublas_utils.cpp b/mlx/backend/cuda/cublas_utils.cpp
+index 8a03eccde..992721e45 100644
+--- a/mlx/backend/cuda/cublas_utils.cpp
++++ b/mlx/backend/cuda/cublas_utils.cpp
+@@ -74,6 +74,15 @@ auto get_cublas_handles(cu::Device& device) {
+         CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+         &workspace_size,
+         sizeof(uint64_t)));
++    // A split-K algorithm may add its partial sums in the output type. For
++    // 16-bit outputs that rounds every partial sum; keep them in the
++    // compute type (float32) or do not split.
++    uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
++    CHECK_CUBLAS_ERROR(cublasLtMatmulPreferenceSetAttribute(
++        storage.pref,
++        CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
++        &reduction,
++        sizeof(uint32_t)));
+   }
+   return std::make_tuple(storage.handle, storage.pref);
+ }

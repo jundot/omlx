@@ -2,7 +2,6 @@
 
 import logging
 import math
-import os
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -27,7 +26,9 @@ from omlx.patches.deepseek_v4.verify_attention import (
     exact_attention,
     exact_local_scores,
     exact_local_values,
+    ring_kernel_is_exact,
     rowwise_gemm,
+    steel_rowwise_available,
 )
 from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_prefill
 
@@ -98,6 +99,86 @@ def _batched_m1_attention(
 ) -> mx.array:
     """Attend independent cache views with one decode-consistent kernel."""
     return exact_attention(queries, key_rows, scale, sinks)
+
+
+# Lightning MTP hosts (num_nextn_predict_layers > 0, MTP active at load) run their
+# one-row decode through the same decode-consistent attention paths as embedded
+# DSpark models, so the exact verify forward reproduces decode bitwise. Switch off
+# with set_lightning_decode_consistent(False) to keep stock decode kernels.
+_LIGHTNING_DECODE_CONSISTENT = True
+
+
+def set_lightning_decode_consistent(flag: bool) -> None:
+    global _LIGHTNING_DECODE_CONSISTENT
+    _LIGHTNING_DECODE_CONSISTENT = bool(flag)
+
+
+def _lightning_decode_consistent(config: Any) -> bool:
+    """True when this load attaches a Lightning MTP head whose verify is decode-exact."""
+    if not _LIGHTNING_DECODE_CONSISTENT or _is_dspark_model(config):
+        return False
+    if int(getattr(config, "num_nextn_predict_layers", 0) or 0) <= 0:
+        return False
+    try:
+        from omlx.patches.mlx_lm_mtp import is_mtp_active
+    except Exception:
+        return False
+    return bool(is_mtp_active())
+
+
+def _local_padding_free(local_cache: Any) -> bool:
+    """Whether a single-row local ring holds no left padding from an earlier shared batch.
+
+    The decode-consistent one-row and verify paths attend every slot of the local ring (they take no mask), which is
+    only correct when the ring holds this request's keys alone. A ``BatchRotatingKVCache`` left with one row after
+    ``filter`` keeps that row's left padding until the window has been overwritten (at most ``sliding_window``
+    tokens); until then the masked stock path must be used. Padding only shrinks between ``filter``/``extend`` calls,
+    so a clean answer is memoised on the cache and the wrappers below clear it when the batch changes.
+    """
+    if local_cache is None:
+        return True
+    left_padding = getattr(local_cache, "left_padding", None)
+    if not isinstance(left_padding, mx.array):
+        return True
+    if getattr(local_cache, "_omlx_padding_free", False):
+        return True
+    free = bool(mx.all(left_padding <= 0).item())
+    local_cache._omlx_padding_free = free
+    return free
+
+
+def _single_row_decode_mask(mask: Optional[mx.array], local_cache: Any, B: int, L: int) -> Optional[mx.array]:
+    """Drop the local mask for one-row decode on a padding-free single-row batch cache.
+
+    ``BatchRotatingKVCache.make_mask`` returns an array even when every slot is valid. Once the row holds no padding
+    that mask is all true, but passing it still selects the masked attention kernel, which rounds differently from
+    the unmasked one the decode-consistent exact path reproduces. Returning ``None`` keeps a request that went through
+    a batch on the same arithmetic as one that never did, with MTP on or off.
+    """
+    if mask is None or B != 1 or L != 1 or local_cache is None:
+        return mask
+    if not isinstance(getattr(local_cache, "left_padding", None), mx.array):
+        return mask
+    return None if _local_padding_free(local_cache) else mask
+
+
+def _track_batch_rotating_padding() -> None:
+    from mlx_lm.models.cache import BatchRotatingKVCache
+
+    if getattr(BatchRotatingKVCache, "_omlx_padding_tracked", False):
+        return
+    for name in ("filter", "extend"):
+        original = getattr(BatchRotatingKVCache, name)
+
+        def wrapped(self, *args, _original=original, **kwargs):
+            self._omlx_padding_free = False
+            return _original(self, *args, **kwargs)
+
+        setattr(BatchRotatingKVCache, name, wrapped)
+    BatchRotatingKVCache._omlx_padding_tracked = True
+
+
+_track_batch_rotating_padding()
 
 
 def _is_dspark_model(config: Any) -> bool:
@@ -417,9 +498,9 @@ def _dspark_ring_mm(
     transpose_rhs: bool,
 ) -> mx.array:
     """Run an exact local GEMM without materializing every ring snapshot."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.attention import fast
 
-    return fast.dspark_ring_gemm(
+    return fast.ring_gemm(
         mx.contiguous(lhs[:, 0]),
         mx.contiguous(source),
         mx.contiguous(indices),
@@ -490,9 +571,6 @@ _INDEXER_POOL_TILE = 16384
 # with 64 index heads this is reached at P = ctx/4 ~= 32768, i.e. ctx ~= 128k.
 _INDEXER_MAX_ELEMS = 2**30
 _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED = False
-_DEEPSEEK_V4_M2_MMA_SCORE = os.getenv(
-    "OMLX_DSV4F_M2_MMA_SCORE", "1"
-).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = False
 
 
@@ -529,13 +607,11 @@ def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
 def _dsv4f_m2_mma_score_enabled(config, compress_ratio: int) -> bool:
     """Gate for the v25 from-scratch MMA score kernel (1.37x over Steel).
 
-    Exact-fingerprint pairing, env rollback (OMLX_DSV4F_M2_MMA_SCORE=0),
-    and an extension build exposing the symbol. The kernel serves bf16 /
-    H=64 / D=128 / weights [B, L, H] / non-causal only — all guaranteed by
-    the fingerprint and this call site; N >= 64 is re-checked per call.
+    Exact-fingerprint pairing; the call site also requires an extension
+    build exposing the symbol. The kernel serves bf16 / H=64 / D=128 /
+    weights [B, L, H] / non-causal only - all guaranteed by the fingerprint
+    and this call site; N >= 64 is re-checked per call.
     """
-    if not _DEEPSEEK_V4_M2_MMA_SCORE:
-        return False
     return _dsv4f_m2_exact_pairing(config, compress_ratio)
 
 
@@ -651,6 +727,27 @@ def _sparse_pooled_ring_attention(
     batch, _, length, head_dim = q.shape
     if length != 1:
         raise ValueError("DSpark physical-ring attention requires L=1 rows.")
+    try:
+        from omlx.custom_kernels.attention import fast
+
+        ring_exact = ring_kernel_is_exact(fast)
+    except Exception:
+        ring_exact = False
+    if not ring_exact:
+        # The packed ring kernel is not bitwise equal to one-row decode on this GPU:
+        # materialize the snapshots and take the exact rowwise path.
+        return _sparse_pooled_attention(
+            q,
+            mx.take(local_source, local_indices, axis=0)[:, None],
+            pooled,
+            topk,
+            None,
+            None,
+            scale,
+            sinks,
+            decode_consistent=True,
+            verify_rows=True,
+        )
     idx = topk[:, None, :, :, None]
     pooled = mx.take_along_axis(
         mx.broadcast_to(
@@ -676,9 +773,9 @@ def _native_sparse_attention_available() -> bool:
     if _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
         return False
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        from omlx.custom_kernels.attention import fast as attention_fast
 
-        return glm_fast.has_symbol("deepseek_v4_sparse_attention")
+        return attention_fast.has_symbol("compressed_sparse_attention")
     except Exception as exc:
         _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
         logging.getLogger(__name__).warning(
@@ -704,6 +801,7 @@ def _sparse_pooled_attention(
     decode_consistent: bool = False,
     native_only: bool = False,
     _standard_mask: bool = False,
+    verify_rows: bool = False,
 ) -> Optional[mx.array]:
     global _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
 
@@ -743,10 +841,10 @@ def _sparse_pooled_attention(
                 return out
         if not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+                from omlx.custom_kernels.attention import fast as attention_fast
 
-                if glm_fast.has_symbol("deepseek_v4_sparse_attention"):
-                    return glm_fast.deepseek_v4_sparse_attention(
+                if attention_fast.has_symbol("compressed_sparse_attention"):
+                    return attention_fast.compressed_sparse_attention(
                         q,
                         local_kv,
                         pooled,
@@ -777,7 +875,8 @@ def _sparse_pooled_attention(
     )
 
     q_scaled = q * scale
-    exact_local = decode_consistent and L == 1 and 1 <= B <= 6
+    # Verify blocks lay their rows out as B <= 6 one-row queries. Other batched decode stays on stock kernels.
+    exact_local = decode_consistent and L == 1 and (B == 1 or (verify_rows and B <= 6))
     pooled_sq = pooled.squeeze(1)
     if exact_local and local_mask is None and pooled_mask is None and sinks is not None:
         return _dspark_sparse_exact_attention(
@@ -802,7 +901,7 @@ def _sparse_pooled_attention(
     normalizer = mx.logsumexp(local_scores, -1, keepdims=True)
 
     q_bl = q_scaled.transpose(0, 2, 1, 3)
-    if decode_consistent and L == 1:
+    if exact_local:
         pooled_scores = _dspark_rowwise_mm(q_bl, pooled_sq, True)
     else:
         pooled_scores = q_bl @ pooled_sq.swapaxes(-1, -2)
@@ -828,7 +927,7 @@ def _sparse_pooled_attention(
     else:
         out = local_weights @ local_kv
     pw_bl = pooled_weights.transpose(0, 2, 1, 3)
-    if decode_consistent and L == 1:
+    if exact_local:
         pooled_out = _dspark_rowwise_mm(pw_bl, pooled_sq, False)
     else:
         pooled_out = pw_bl @ pooled_sq
@@ -1304,7 +1403,7 @@ class Indexer(nn.Module):
             dtype_supported=q.dtype in (mx.float16, mx.bfloat16),
         ):
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+                from omlx.custom_kernels.sparse_index import fast as index_fast
 
                 _have_native = native_indexer_available()
                 if not _have_native and not native_indexer_disabled():
@@ -1349,12 +1448,11 @@ class Indexer(nn.Module):
                     # on the exact M2/DSV4F pairing, bit-exact incl. the
                     # fused pooled-ratio mask (validated across aligned and
                     # unaligned M/N and chunked-prefill offsets). Gated by
-                    # fingerprint + OMLX_DSV4F_M2_MMA_SCORE + extension
-                    # symbol; every other configuration keeps the Steel
-                    # path below unchanged.
+                    # fingerprint + extension symbol; every other configuration
+                    # keeps the Steel path below unchanged.
                     _use_mma = (
                         self._m2_mma_score
-                        and getattr(glm_fast, "_EXT_MMA_SCORE", False)
+                        and getattr(index_fast, "_EXT_MMA_SCORE", False)
                         and q.dtype == mx.bfloat16
                         and pooled.shape[1] >= 64
                     )
@@ -1367,7 +1465,7 @@ class Indexer(nn.Module):
                             "1.37x over Steel)"
                         )
                     if _use_mma:
-                        scores4 = glm_fast.dsa_indexer_scores_mma(
+                        scores4 = index_fast.dsa_indexer_scores_mma(
                             q,
                             pooled[:, None],
                             weights,
@@ -1375,7 +1473,7 @@ class Indexer(nn.Module):
                             mask_q_offset=_mask_q_offset,
                         )
                     else:
-                        scores4 = glm_fast.dsa_indexer_scores(
+                        scores4 = index_fast.dsa_indexer_scores(
                             q,
                             pooled[:, None],
                             weights,
@@ -1389,7 +1487,7 @@ class Indexer(nn.Module):
                             scores4,
                             mx.finfo(scores4.dtype).min,
                         )
-                    indices = glm_fast.dsa_topk_indices(
+                    indices = index_fast.dsa_topk_indices(
                         scores4,
                         self.index_topk,
                         # The bucketed writer appends equal-threshold entries
@@ -1494,10 +1592,10 @@ def _batch_indexer_rows(
         indices = None
         if not _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED:
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
+                from omlx.custom_kernels.sparse_index import fast
 
-                if fast.has_symbol("dspark_fp32_topk_indices"):
-                    indices = fast.dspark_fp32_topk_indices(
+                if fast.has_symbol("fp32_topk_indices"):
+                    indices = fast.fp32_topk_indices(
                         scores,
                         indexer.index_topk,
                     )
@@ -1554,10 +1652,10 @@ def _batch_indexer_rows(
         indices = None
         if not _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED and k == 512:
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
+                from omlx.custom_kernels.sparse_index import fast
 
-                if fast.has_symbol("dspark_fp32_topk_indices"):
-                    indices = fast.dspark_fp32_topk_indices(scores, k)
+                if fast.has_symbol("fp32_topk_indices"):
+                    indices = fast.fp32_topk_indices(scores, k)
             except Exception as exc:
                 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
                 logging.getLogger(__name__).warning(
@@ -1582,6 +1680,7 @@ class LocalAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        self.decode_consistent = self.dspark or _lightning_decode_consistent(config)
         self.layer_idx = layer_idx
         self.compress_ratio = 0
         self.hidden_size = config.hidden_size
@@ -1640,7 +1739,8 @@ class LocalAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
-        if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
+        mask = _single_row_decode_mask(mask, cache, B, L)
+        if is_dspark_verify_armed() and B == 1 and 1 < L <= 6 and _local_padding_free(cache):
             key_rows = _consume_rotating_verify_rows(cache, kv)
             out = _batched_m1_attention(q, key_rows, self.scale, sinks)
             out = _project_attention_output(self, out, offset)
@@ -1650,7 +1750,7 @@ class LocalAttention(nn.Module):
         if cache is not None:
             kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        if self.dspark and B == 1 and L == 1:
+        if self.decode_consistent and B == 1 and L == 1 and _local_padding_free(cache):
             out = exact_attention(q, [kv], self.scale, sinks)
         else:
             out = None
@@ -1690,6 +1790,7 @@ class CompressedAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        self.decode_consistent = self.dspark or _lightning_decode_consistent(config)
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
         self.hidden_size = config.hidden_size
@@ -1752,7 +1853,8 @@ class CompressedAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
-        if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
+        mask = _single_row_decode_mask(mask, local_cache, B, L)
+        if is_dspark_verify_armed() and B == 1 and 1 < L <= 6 and _local_padding_free(local_cache):
             compressed_kv, compressed_gate = self.compressor.project(x)
             pooled_rows = _consume_verify_rows(
                 self.compressor,
@@ -1805,7 +1907,7 @@ class CompressedAttention(nn.Module):
             and _standard_mask
             and pooled.shape[1] > 0
             and L > 4
-            and not (self.dspark and B == 1 and L == 1)
+            and not (self.decode_consistent and B == 1 and L == 1 and _local_padding_free(local_cache))
             and _native_sparse_attention_available()
         ):
             pooled_indices = mx.broadcast_to(
@@ -1824,7 +1926,7 @@ class CompressedAttention(nn.Module):
                 q_offset=offset,
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
-                decode_consistent=self.dspark,
+                decode_consistent=self.decode_consistent,
                 native_only=True,
                 _standard_mask=_standard_mask,
             )
@@ -1832,7 +1934,7 @@ class CompressedAttention(nn.Module):
             if pooled.shape[1] > 0:
                 kv = mx.concatenate([kv, pooled[:, None]], axis=2)
             mask = _extend_mask(mask, pooled_mask, kv.shape[2])
-            if self.dspark and B == 1 and L == 1:
+            if self.decode_consistent and B == 1 and L == 1 and _local_padding_free(local_cache):
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
                 out = scaled_dot_product_attention(
@@ -1859,6 +1961,7 @@ class SparseCompressedAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        self.decode_consistent = self.dspark or _lightning_decode_consistent(config)
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
         self.hidden_size = config.hidden_size
@@ -1922,7 +2025,8 @@ class SparseCompressedAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
-        if is_dspark_verify_armed() and B == 1 and L <= 6:
+        mask = _single_row_decode_mask(mask, local_cache, B, L)
+        if is_dspark_verify_armed() and B == 1 and L <= 6 and _local_padding_free(local_cache):
             compressed_kv, compressed_gate = self.compressor.project(x)
             index_kv, index_gate = self.indexer.compressor.project(x)
             pooled_rows = _consume_verify_rows(
@@ -1991,11 +2095,18 @@ class SparseCompressedAttention(nn.Module):
                 )
                 if use_ring_kernel:
                     try:
-                        from omlx.custom_kernels.glm_moe_dsa import fast
+                        from omlx.custom_kernels.attention import fast
 
                         use_ring_kernel = (
                             fast.is_native_available()
-                            and fast.has_symbol("dspark_ring_gemm")
+                            and fast.has_symbol("ring_gemm")
+                            # The ring GEMM is bitwise-equal to the native
+                            # Steel rowwise path, not to MLX's generic bf16
+                            # matmul.  Only take it where rowwise_gemm would
+                            # also dispatch to Steel, or verify rows drift
+                            # from decode bits by one ULP (applegpu_g17s).
+                            and steel_rowwise_available()
+                            and ring_kernel_is_exact(fast)
                         )
                     except Exception:
                         use_ring_kernel = False
@@ -2024,7 +2135,8 @@ class SparseCompressedAttention(nn.Module):
                             None,
                             self.scale,
                             sinks,
-                            decode_consistent=self.dspark,
+                            decode_consistent=self.decode_consistent,
+                            verify_rows=True,
                         )
                 finally:
                     set_dspark_verify_armed(True)
@@ -2060,7 +2172,7 @@ class SparseCompressedAttention(nn.Module):
             )[:, None]
 
         if pooled.shape[1] == 0:
-            if self.dspark and B == 1 and L == 1:
+            if self.decode_consistent and B == 1 and L == 1 and _local_padding_free(local_cache):
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
                 out = None
@@ -2086,7 +2198,7 @@ class SparseCompressedAttention(nn.Module):
                         sinks=sinks,
                     )
         elif pooled.shape[1] <= self.indexer.index_topk:
-            if self.dspark and B == 1 and L == 1:
+            if self.decode_consistent and B == 1 and L == 1 and _local_padding_free(local_cache):
                 full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
                 out = exact_attention(q, [full_kv], self.scale, sinks)
             else:
@@ -2127,7 +2239,7 @@ class SparseCompressedAttention(nn.Module):
                 q_offset=offset,
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
-                decode_consistent=self.dspark,
+                decode_consistent=self.decode_consistent,
                 _standard_mask=_standard_mask,
             )
 

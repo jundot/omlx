@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omlx.cluster import pairing, pairing_routes
+from omlx.cluster.discovery import PeerCaps
 from omlx.cluster.pairing import (
     CODE_TTL_SECONDS,
     LOCKOUT_SECONDS,
@@ -436,6 +437,28 @@ def test_unpair_revokes_everything(tmp_path):
     assert joiner.paired_devices() == []
 
 
+def test_forget_route_unpairs_through_the_real_manager(tmp_path, monkeypatch):
+    from omlx.cluster import routes
+
+    coordinator, joiner, _, _, _ = _loopback_pair(tmp_path)
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator.approve("join-node", code)
+    joiner.complete_join(joiner.poll_join("coordinator.local:8080"))
+    monkeypatch.setattr(pairing_routes, "_manager", lambda: coordinator)
+    monkeypatch.setattr(
+        routes, "get_cluster_registry", lambda: SimpleNamespace(list=lambda: [])
+    )
+    app = FastAPI()
+    app.include_router(routes.router)
+
+    response = TestClient(app).delete("/admin/api/cluster/forget?node_id=join-node")
+
+    assert response.status_code == 200
+    assert response.json()["forgotten_node_ids"] == ["join-node"]
+    assert coordinator.paired_devices() == []
+
+
 def test_unpair_unknown_device_fails_closed(tmp_path):
     coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator")
     with pytest.raises(PairingStateError, match="unknown device"):
@@ -645,6 +668,100 @@ def test_approval_requires_coordinator_ssh_material(tmp_path):
 
     assert coordinator.paired_devices() == []
     assert [row["node_id"] for row in coordinator.pending_requests()] == ["join-node"]
+
+
+def test_missing_ssh_host_key_asks_for_remote_login(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    joiner._ssh_host_key_provider = lambda: None
+    joiner.start_join()
+
+    with pytest.raises(PairingRequestError, match="Remote Login"):
+        joiner.request_join("coordinator.local:8080")
+
+    joiner._ssh_host_key_provider = lambda: _test_public_key("host-join-node")
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator._ssh_host_key_provider = lambda: None
+
+    with pytest.raises(EnrollmentDriveError, match="Remote Login"):
+        coordinator.approve("join-node", code)
+    assert coordinator.paired_devices() == []
+
+
+def _agent_request(node_id="helper-node", code="048213", **extra):
+    """A join request as a helper daemon builds it: no SSH identities."""
+    salt = bytes(range(16))
+    return {
+        "node_id": node_id,
+        "friendly_name": "nvidia1",
+        "caps": {"chip": "2x NVIDIA RTX A6000", "ram_gb": 96.0, "control": "agent"},
+        "code_hash": pairing_code_hash(code, node_id, "", "", salt),
+        "code_salt": base64.b64encode(salt).decode(),
+        "addrs": ["192.168.1.230"],
+        "http_port": 8765,
+        **extra,
+    }
+
+
+def test_agent_controlled_peer_pairs_without_ssh_enrollment(tmp_path):
+    driver_calls, revocation_calls = [], []
+    coordinator = _manager(
+        tmp_path,
+        node_id="coord-node",
+        name="Coordinator",
+        driver_calls=driver_calls,
+        revocation_calls=revocation_calls,
+    )
+    # Remote Login is off on the host: an SSH peer could not pair here.
+    coordinator._ssh_host_key_provider = lambda: None
+    coordinator.handle_join_request(_agent_request())
+
+    approved = coordinator.approve("helper-node", "048213")
+
+    assert driver_calls == [] and approved["enrollment"] == {}
+    material = coordinator.join_status("helper-node")["coordinator"]
+    assert material["ssh_public_key"] is None
+    assert material["ssh_host_public_key"] is None
+    assert "ssh_user" not in material["caps"]
+    key = unwrap_cluster_key(approved["cluster_key_package"], "048213")
+    assert coordinator.control_key("helper-node") == key
+    assert approved["coordinator_identity_tag"] == pairing.coordinator_identity_tag(
+        key, material
+    )
+    assert coordinator.paired_devices()[0]["caps"]["control"] == "agent"
+
+    # The daemon takes its wrapped key right after the approval. Later the
+    # open status route no longer hands it out.
+    assert "cluster_key_package" in coordinator.join_status("helper-node")
+    coordinator._clock.now += pairing.AGENT_KEY_PACKAGE_SECONDS + 1
+    late = coordinator.join_status("helper-node")
+    assert late["state"] == "approved" and "cluster_key_package" not in late
+
+    assert coordinator.unpair("helper-node")["removed_key"] is True
+    assert revocation_calls == []
+    assert coordinator.control_key("helper-node") is None
+
+
+def test_ssh_keys_must_match_the_control_mode(tmp_path):
+    coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator")
+    with pytest.raises(PairingRequestError, match="must not send SSH keys"):
+        coordinator.handle_join_request(
+            _agent_request(ssh_public_key=_test_public_key("helper-node"))
+        )
+    mac = _agent_request(node_id="mac-node")
+    mac["caps"] = {"chip": "M4 Max"}
+    with pytest.raises(PairingRequestError, match="invalid SSH public key"):
+        coordinator.handle_join_request(mac)
+
+    # An SSH-paired peer never hands out its cluster key as a control key.
+    coordinator2, joiner, *_ = _loopback_pair(tmp_path / "ssh")
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator2.approve("join-node", code)
+    assert coordinator2.control_key("join-node") is None
+    # Its wrapped key stays on the status route for a joiner that polls late.
+    coordinator2._clock.now += CODE_TTL_SECONDS
+    assert "cluster_key_package" in coordinator2.join_status("join-node")
 
 
 def test_default_enrollment_requires_key_and_verified_address(monkeypatch):
@@ -939,6 +1056,46 @@ def _client(tmp_path):
 def _restore_manager_getter():
     yield
     pairing_routes.set_pairing_manager_getter(None)
+
+
+def test_an_invite_only_asks_the_other_mac_to_show_its_code(tmp_path, monkeypatch):
+    client, manager, clock = _client(tmp_path)
+    host = SimpleNamespace(
+        node_id="host-node",
+        friendly_name="Studio",
+        paired=False,
+        http_port=8000,
+        addrs=[{"ip": "127.0.0.1"}, {"ip": "fe80::1"}, {"ip": "10.0.0.2"}],
+        caps=PeerCaps(),
+    )
+    service = SimpleNamespace(peers=lambda: [host], address_health=lambda node: {})
+    monkeypatch.setattr(pairing_routes, "discovery_service_or_none", lambda: service)
+    sent = []
+    manager._http_post = lambda url, payload, timeout: sent.append((url, payload))
+    assert client.post("/api/cluster/pair/invite", json={"node_id": "host-node"}).json()
+    # Loopback and scope-less link-local addresses cannot reach the other Mac.
+    assert sent == [
+        ("http://10.0.0.2:8000/api/cluster/pair/invited", {"node_id": "coord-node"})
+    ]
+    # A helper daemon has no browser: the invite tells it where to join.
+    host.caps = PeerCaps(control="agent")
+    client.post("/api/cluster/pair/invite", json={"node_id": "host-node"})
+    assert sent[-1][1] == {"node_id": "coord-node", "http_port": manager.http_port}
+    host.caps = PeerCaps()
+
+    invited = "/api/cluster/pair/invited"
+    assert client.post(invited, json={"node_id": "stranger"}).status_code == 404
+    assert client.post(invited, json={"node_id": "host-node"}).status_code == 202
+    assert client.get("/api/cluster/pair/invite").json() == {
+        "invite": {"node_id": "host-node", "name": "Studio"}
+    }
+    # Nothing joins until this Mac's user asks for the code.
+    assert manager.ui_session.snapshot()["state"] == "idle"
+    client.delete("/api/cluster/pair/invite")
+    assert client.get("/api/cluster/pair/invite").json() == {"invite": None}
+    client.post(invited, json={"node_id": "host-node"})
+    clock.now += CODE_TTL_SECONDS + 1
+    assert client.get("/api/cluster/pair/invite").json() == {"invite": None}
 
 
 def test_endpoints_full_flow(tmp_path, monkeypatch):

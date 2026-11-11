@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: Apache-2.0
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert/strict');
+const path = require('path');
+const root = path.resolve(__dirname, '..');
+const context = {localStorage: {getItem: () => null}, window: {t: k => k}, console, URLSearchParams,
+    alert: message => {throw Error(message)}};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js'), 'utf8'), context);
+(async () => {
+    const app = context.dashboard();
+    app.loadModels = async () => {};
+    app.selectedModel = {id: 'v41', config_model_type: 'deepseek_v41', moe_expert_offload_supported: true};
+    let payload;
+    context.fetch = async (_, init) => {
+        payload = JSON.parse(init.body);
+        return {ok: true, json: async () => ({})};
+    };
+    const enabled = 'moe_expert_offload_enabled', fraction = 'moe_expert_offload_resident_fraction';
+    for (const value of [.125, .25, .5, .75]) {
+        app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:value});
+        await app.saveModelSettings();
+        assert.equal(payload[enabled], true);
+        assert.equal(payload[fraction], value);
+        app.modelSettings = app.buildModelSettingsState(app.selectedModel, payload);
+        assert.equal(app.modelSettings[fraction], value);
+    }
+    const html = fs.readFileSync(path.join(root, 'omlx_web/templates/dashboard/_modal_model_settings.html'), 'utf8');
+    const offload = html.split('<!-- MoE Expert Offload -->')[1].split('<!-- TurboQuant KV Cache -->')[0];
+    const condition = offload.match(/x-if="([^"]+)"/)[1];
+    for (const supported of [true, false, undefined]) {
+        assert.equal(vm.runInNewContext(condition, {selectedModel:{moe_expert_offload_supported:supported}}), supported === true);
+    }
+    for (const key of ['mtp_enabled', 'vlm_mtp_enabled', 'dflash_enabled']) {
+        // The disabled bindings also read selectedModel.
+        const scope = {modelSettings: {[enabled]:false, [key]:true}, selectedModel: null};
+        assert.equal(vm.runInNewContext(offload.match(/:disabled="([^"]+)"/)[1], scope), true);
+        const lines = html.split('\n');
+        const i = lines.findIndex(line => line.includes('@click=') && line.includes(`modelSettings.${key} = !modelSettings.${key}`));
+        const disabled = lines[i+1].match(/:disabled="([^"]+)"/)[1];
+        assert.equal(vm.runInNewContext(disabled, {modelSettings:{[enabled]:true}, selectedModel: null}), true);
+    }
+    const percent = 'moe_expert_offload_resident_percent';
+    for (const [stored, displayed] of [[0.125, 12.5], [0.333, 33.3], [0.02, 2], [1, 100]]) {
+        app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:stored});
+        assert.equal(app.modelSettings[percent], displayed);
+        app.onMoeExpertOffloadResidentBlur();
+        await app.saveModelSettings();
+        assert.equal(payload[fraction], stored, 'untouched values must survive blur and save');
+        assert.equal(app.modelSettings.moe_expert_offload_resident_touched, false);
+    }
+    for (const [input, saved] of [[5, 0.05], [10, 0.1], [12.5, 0.125], [33.3, 0.333], [95, 0.95]]) {
+        app.modelSettings[percent] = input;
+        app.onMoeExpertOffloadResidentPercent();
+        assert.equal(app.moeExpertOffloadResidentInvalid(), false);
+        app.onMoeExpertOffloadResidentBlur();
+        await app.saveModelSettings();
+        assert.equal(payload[fraction], saved);
+        app.modelSettings = app.buildModelSettingsState(app.selectedModel, payload);
+        assert.equal(app.modelSettings[percent], input);
+    }
+    for (const [input, settled] of [['', 5], [0, 5], [100, 95]]) {
+        const previous = app.modelSettings[fraction];
+        app.modelSettings[percent] = input;
+        app.onMoeExpertOffloadResidentPercent();
+        assert.equal(app.moeExpertOffloadResidentInvalid(), true);
+        assert.equal(app.modelSettings[fraction], previous, 'partial input must not change the saved fraction');
+        app.onMoeExpertOffloadResidentBlur();
+        await app.saveModelSettings();
+        assert.equal(app.modelSettings[percent], settled);
+        assert.equal(payload[fraction], settled / 100);
+    }
+    const fitUrls = [];
+    context.fetch = async url => {
+        fitUrls.push(url);
+        return {ok: true, json: async () => ({status: 'fit', max_percent: 35, bytes: 7.2 * 1024 ** 3, reserve_bytes: 4 * 1024 ** 3})};
+    };
+    const query = mtp => `/admin/api/models/v41/moe-offload-fit?mtp_enabled=${mtp}&qwen4_ple_ssd_offload=false&deepseek_v41_engram_ssd_offload=false`;
+    await app.loadMoeOffloadFit();
+    await app.loadMoeOffloadFit();
+    assert.deepEqual(fitUrls, [query(false)], 'unchanged edits must not refetch');
+    app.modelSettings.mtp_enabled = true;
+    await app.loadMoeOffloadFit();
+    assert.deepEqual(fitUrls, [query(false), query(true)], 'unsaved size flags are sent');
+    assert.equal(app.moeOffloadFitText(), 'modal.model_settings.moe_expert_offload_fit');
+    app.modelSettings.mtp_enabled = false;
+    app.applyMoeOffloadFit();
+    context.fetch = async (_, init) => {
+        payload = JSON.parse(init.body);
+        return {ok: true, json: async () => ({})};
+    };
+    await app.saveModelSettings();
+    assert.equal(payload[fraction], 0.35, 'the hint applies its percent as the resident fraction');
+    assert.ok(offload.includes('x-effect="loadMoeOffloadFit()"'));
+    assert.match(offload, /<input type="number" min="5" max="95" step="any" inputmode="decimal"/);
+    assert.ok(offload.includes('@input="onMoeExpertOffloadResidentPercent()"'));
+    assert.ok(offload.includes('@blur="onMoeExpertOffloadResidentBlur()"'));
+    console.log('PASS: offload save/reopen, spec toggle exclusion and fractional resident percentage');
+})().catch(error => {console.error(error); process.exitCode = 1});

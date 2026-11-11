@@ -13,12 +13,26 @@ CACHE_CLASS = "DeepseekV41Cache"
 def _ratio(meta):
     if tuple(meta) == ("deepseek_v41", "2"):
         return None  # Legacy full snapshots remain readable without compaction.
-    if tuple(meta[:2]) != ("deepseek_v41", "3") or len(meta) != 3:
+    if tuple(meta[:2]) not in _SLOTS or len(meta) != 3:
         raise ValueError("Unknown V4.1 cache metadata")
     ratio = int(meta[2])
     if ratio < 0:
         raise ValueError("Invalid V4.1 compression ratio")
     return ratio
+
+
+# Cache slots per format version; version 4 adds the decoder replay input.
+_SLOTS = {("deepseek_v41", "3"): 7, ("deepseek_v41", "4"): 11}
+
+
+def is_delta(state):
+    """Whether ``state`` is a compacted block (cache slots plus a range record)."""
+    return len(state) - 1 in _SLOTS.values()
+
+
+def full_snapshot_slots(state):
+    """Slot count of a full V4.1 state, or None for a compacted block."""
+    return len(state) if len(state) in _SLOTS.values() else None
 
 
 def compact_state(state, meta, start, end):
@@ -30,11 +44,12 @@ def compact_state(state, meta, start, end):
         raise ValueError("Invalid V4.1 snapshot token range")
     row_start, row_end = (start // ratio, end // ratio) if ratio else (0, 0)
     record = [1, start, end, row_start, row_end, ratio]
-    if len(state) == 8:
-        if state[7].tolist() != record:
+    slots = _SLOTS[tuple(meta[:2])]
+    if len(state) == slots + 1:
+        if state[slots].tolist() != record:
             raise ValueError("V4.1 delta belongs to another boundary")
         return state
-    if len(state) != 7 or state[0].tolist() != [end]:
+    if len(state) != slots or state[0].tolist() != [end]:
         raise ValueError("V4.1 snapshot offset does not match its boundary")
     result = list(state)
     for slot in (2, 3):
@@ -84,7 +99,7 @@ def restore_chain(markers, metas, token_count):
         ):
             raise ValueError("Missing V4.1 boundary state")
         name, state = marker[1:]
-        if name == CACHE_CLASS and len(state) == 7:
+        if name == CACHE_CLASS and full_snapshot_slots(state):
             # A legacy full checkpoint can anchor a subsequent delta chain.
             last, last_meta = list(state), meta
             cursor = int(state[0].item())
@@ -105,9 +120,12 @@ def restore_chain(markers, metas, token_count):
                 raise ValueError("V4.1 KV/index lengths diverge")
             parts = {slot: [state[slot]] for slot in (2, 3)}
             continue
-        if name != DELTA_CLASS or len(state) != 8:
+        if name != DELTA_CLASS or not is_delta(state):
             raise ValueError("Unknown V4.1 persisted state")
-        record = state[7]
+        slots = len(state) - 1
+        if _ratio(meta) is None or _SLOTS[tuple(meta[:2])] != slots:
+            raise ValueError("V4.1 delta does not match its metadata")
+        record = state[slots]
         if record.shape != (6,) or record.dtype != mx.int64:
             raise ValueError("Invalid V4.1 delta range record")
         version, start, end, first, stop, ratio = record.tolist()
@@ -133,7 +151,7 @@ def restore_chain(markers, metas, token_count):
             ):
                 raise ValueError("V4.1 packed delta shape mismatch")
             parts[slot].append(value)
-        cursor, rows, last, last_meta = end, stop, list(state[:7]), meta
+        cursor, rows, last, last_meta = end, stop, list(state[:slots]), meta
     if last is None or cursor != token_count:
         raise ValueError("V4.1 restored offset does not match the cache hit")
     for slot in (2, 3):

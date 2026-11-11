@@ -321,8 +321,8 @@ def _geometry(layer, batch):
     )
 
 
-def fused_eligible(layer, q, cache, length) -> bool:
-    """One block covering the whole speculative window, stock norm, bf16/fp16."""
+def replay_eligible(layer, q, cache, length) -> bool:
+    """One bf16/fp16 block over the whole speculative window that replay can commit."""
     transaction = getattr(cache, "_speculation", None)
     state = cache[1]
     return (
@@ -330,16 +330,24 @@ def fused_eligible(layer, q, cache, length) -> bool:
         and transaction is not None
         and transaction["length"] == length
         and 1 not in transaction["records"]
-        and isinstance(layer.norm, _NORM_CLASS)
         and q.dtype in (mx.bfloat16, mx.float16)
         and layer.head_k_dim == 128
         and layer.head_v_dim == 128
         and layer.num_v_heads % layer.num_k_heads == 0
         and layer.A_log.dtype == q.dtype
         and layer.dt_bias.dtype == q.dtype
-        and layer.norm.weight.dtype == q.dtype
         and (state is None or state.dtype == mx.float32)
+        and (state is None or state.shape[0] == q.shape[0])
         and length <= 32
+    )
+
+
+def fused_eligible(layer, q, cache, length) -> bool:
+    """A replayable block whose stock norm the fused kernel also computes."""
+    return (
+        replay_eligible(layer, q, cache, length)
+        and isinstance(layer.norm, _NORM_CLASS)
+        and layer.norm.weight.dtype == q.dtype
         and _sigmoid_exp() is not None
     )
 
@@ -430,10 +438,17 @@ def record_block(cache, index, layer, start, rows, length):
     """Record a replayable block; the slot holds its lazy final state."""
     full = mx.full((start.shape[0],), length, dtype=mx.int32)
     final = replay_state(layer, start, rows, full)
-    transaction = cache._speculation
-    transaction["records"][int(index)] = ("replay", start, rows, int(length), layer)
+    record = ("replay", start, rows, int(length), layer, final)
+    cache._speculation["records"][int(index)] = record
     cache[index] = final
     cache._omlx_gdn_pending = (final, start, rows, full)
+
+
+def record_replay(cache, index, layer, start, rows, length, final):
+    """Record a block computed outside the fused kernel by its rows only."""
+    record = ("replay", start, rows, int(length), layer, final)
+    cache._speculation["records"][int(index)] = record
+    cache[index] = final
 
 
 def record_window(cache, index, previous, rows, width):
@@ -465,14 +480,20 @@ def _commit_window(cache, index, record, lengths):
 
 
 def _commit_replay(cache, index, record, lengths):
-    _, start, rows, _length, layer = record
+    _, start, rows, length, layer, final = record
     if all(value == 0 for value in lengths):
         cache[index] = start
+        return
+    if all(value == length for value in lengths):
+        cache[index] = final
         return
     keep = mx.array(lengths, dtype=mx.int32)
     state = replay_state(layer, start, rows, keep)
     cache[index] = state
-    cache._omlx_gdn_pending = (state, start, rows, keep)
+    # Only the fused verify of the next block reads the pending replay.
+    pending = getattr(cache, "_omlx_gdn_pending", None)
+    if pending is not None and pending[1] is start:
+        cache._omlx_gdn_pending = (state, start, rows, keep)
 
 
 def deferred_states_ready(cache, index, length) -> bool:

@@ -20,6 +20,8 @@ struct IntegrationsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            ExternalEnginesSection(vm: vm, client: services.client)
+            MarkItDownSection(vm: vm, client: services.client)
             ClaudeCodeSection(vm: vm, client: services.client)
             ClaudeSetupCommandSection(vm: vm)
             OtherIntegrationsSection(vm: vm, client: services.client)
@@ -28,6 +30,279 @@ struct IntegrationsScreen: View {
             FooterBar(error: vm.lastError)
         }
         .task { await vm.load(client: services.client) }
+    }
+}
+
+// MARK: - External engines
+
+/// Engines that serve a model from their own process. Each model picks its
+/// engine in Model Settings > Advanced; this section holds what they share.
+private struct ExternalEnginesSection: View {
+    @Bindable var vm: IntegrationsScreenVM
+    let client: OMLXClient
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        SectionHeader(
+            String(localized: "integrations.section.external_engines",
+                   defaultValue: "External Engines",
+                   comment: "Section header for engines that serve models from their own process"),
+            subtitle: String(localized: "integrations.section.external_engines.sub",
+                             defaultValue: "Serve a model with another inference engine in its own process. Choose the engine per model in Model Settings → Advanced.",
+                             comment: "Subtitle for the External Engines section")
+        )
+
+        ListGroup {
+            if vm.showsSplashPathField {
+                Row(
+                    label: String(localized: "integrations.splash.binary",
+                                  defaultValue: "Splash",
+                                  comment: "Row label for the Splash launcher"),
+                    sublabel: vm.splash?.available == true
+                        ? String(localized: "integrations.splash.binary.sub",
+                                 defaultValue: "Path to the splash or splash-m1 launcher.",
+                                 comment: "Sublabel for the Splash launcher path field")
+                        : (vm.splash?.reason ?? "")
+                ) {
+                    HStack(spacing: 7) {
+                        TextInput(text: $vm.splashPathDraft,
+                                  placeholder: "/opt/homebrew/bin/splash",
+                                  mono: true,
+                                  width: .controlMedium)
+                        Button {
+                            vm.chooseSplashLauncher()
+                        } label: {
+                            Image(systemName: "folder")
+                        }
+                        .buttonStyle(.omlx(.plain, size: .small))
+                        .help(String(localized: "integrations.splash.browse.help",
+                                     defaultValue: "Choose launcher",
+                                     comment: "Tooltip for choosing the Splash launcher"))
+                        Button(String(localized: "integrations.splash.apply",
+                                      defaultValue: "Apply",
+                                      comment: "Apply button for the Splash launcher path")) {
+                            Task { await vm.save(.splashPath, client: client) }
+                        }
+                        .buttonStyle(.omlx(.primary, size: .small))
+                        .disabled(vm.splashPathDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                        if !vm.splashPathSetting.isEmpty {
+                            Button(String(localized: "integrations.splash.use_auto",
+                                          defaultValue: "Detect Automatically",
+                                          comment: "Button that clears the Splash path so the server detects the launcher")) {
+                                vm.splashPathDraft = ""
+                                Task { await vm.save(.splashPath, client: client) }
+                            }
+                            .buttonStyle(.omlx(.normal, size: .small))
+                        }
+                        if vm.editingSplashPath {
+                            Button(String(localized: "integrations.splash.cancel",
+                                          defaultValue: "Cancel",
+                                          comment: "Cancel editing the Splash launcher path")) {
+                                vm.editingSplashPath = false
+                            }
+                            .buttonStyle(.omlx(.plain, size: .small))
+                        }
+                    }
+                }
+            } else if let splash = vm.splash {
+                Row(
+                    label: String(localized: "integrations.splash.binary",
+                                  defaultValue: "Splash",
+                                  comment: "Row label for the Splash launcher"),
+                    sublabel: splash.path ?? ""
+                ) {
+                    HStack(spacing: 7) {
+                        StatusPill(status: .custom(
+                            color: theme.greenDot,
+                            label: "\(splash.label ?? "Splash") \(splash.version ?? "")",
+                            fillBg: true
+                        ))
+                        .help(splash.autoDetected == true
+                              ? String(localized: "integrations.splash.detected",
+                                       defaultValue: "Found automatically",
+                                       comment: "Tooltip when the Splash launcher was detected")
+                              : String(localized: "integrations.splash.configured",
+                                       defaultValue: "Set by path",
+                                       comment: "Tooltip when the Splash launcher path was set by the user"))
+                        Button(String(localized: "integrations.splash.change",
+                                      defaultValue: "Change",
+                                      comment: "Button to edit the detected Splash launcher path")) {
+                            vm.beginEditingSplashPath()
+                        }
+                        .buttonStyle(.omlx(.normal, size: .small))
+                    }
+                }
+            }
+
+            Row(label: String(localized: "integrations.splash.kv_format",
+                              defaultValue: "KV Cache Precision",
+                              comment: "Row label for the Splash KV cache format"),
+                sublabel: String(localized: "integrations.splash.kv_format.sub",
+                                 defaultValue: "int8 holds about twice the context of bf16 in the same memory.",
+                                 comment: "Sublabel for the Splash KV cache format")) {
+                Popup(selection: vm.bind($vm.splashKvFormat, save: {
+                    Task { await vm.save(.splashKvFormat, client: client) }
+                }), width: .controlCompact, options: [("int8", "int8"), ("bf16", "bf16")])
+            }
+
+            Row(label: String(localized: "integrations.splash.max_memory",
+                              defaultValue: "Memory Limit",
+                              comment: "Row label for the Splash memory limit"),
+                sublabel: String(localized: "integrations.splash.max_memory.sub",
+                                 defaultValue: "Empty gives Splash enough for the full context window; a larger limit gives its prefix cache more room.",
+                                 comment: "Sublabel for the Splash memory limit")) {
+                TextInput(text: $vm.splashMaxMemoryGb,
+                          placeholder: String(localized: "integrations.splash.auto",
+                                              defaultValue: "Auto",
+                                              comment: "Placeholder for an automatic Splash size"),
+                          suffix: "GB",
+                          width: .controlNarrow)
+            }
+
+            Row(label: String(localized: "integrations.splash.ssd_cache",
+                              defaultValue: "SSD Cache",
+                              comment: "Row label for the Splash SSD cache size"),
+                sublabel: String(localized: "integrations.splash.ssd_cache.sub",
+                                 defaultValue: "Splash's prefix cache in the oMLX SSD cache folder. Empty uses the oMLX SSD cache size; 0 turns it off.",
+                                 comment: "Sublabel for the Splash SSD cache size"),
+                warning: String(localized: "integrations.splash.ssd_cache.warning",
+                                defaultValue: "Applies to each Splash model, and a model's cache stays after it unloads, so the total can grow to this size times the number of Splash models you use. Set a size when you use more than one.",
+                                comment: "Warning under the Splash SSD cache size about its per-model limit")) {
+                TextInput(text: $vm.splashSsdCacheGb,
+                          placeholder: String(localized: "integrations.splash.auto",
+                                              defaultValue: "Auto",
+                                              comment: "Placeholder for an automatic Splash size"),
+                          suffix: "GB",
+                          width: .controlNarrow)
+            }
+
+            let running = vm.splash?.models ?? []
+            Row(label: String(localized: "integrations.splash.ane_prefill",
+                              defaultValue: "Neural Engine Prefill",
+                              comment: "Row label for Splash Neural Engine prefill"),
+                sublabel: String(localized: "integrations.splash.ane_prefill.sub",
+                                 defaultValue: "Let Splash run part of long prompts on the Neural Engine when that is faster.",
+                                 comment: "Sublabel for Splash Neural Engine prefill"),
+                isLast: running.isEmpty) {
+                RowSwitch(isOn: vm.bind($vm.splashAnePrefill, save: {
+                    Task { await vm.save(.splashAnePrefill, client: client) }
+                }))
+            }
+
+            ForEach(Array(running.enumerated()), id: \.element.id) { index, model in
+                Row(label: model.id,
+                    sublabel: model.logPath,
+                    isLast: index == running.count - 1) {
+                    let used = UInt64(max(0, model.memoryBytes ?? 0))
+                    let budget = UInt64(max(0, model.memoryBudgetBytes ?? 0))
+                    Text("\(SystemMetricsPoller.formatBytesAsGiB(used)) / \(SystemMetricsPoller.formatBytesAsGiB(budget)) GB")
+                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
+                        .foregroundStyle(theme.textSecondary)
+                }
+            }
+        }
+        FooterBar {
+            Button(String(localized: "integrations.splash.limits.apply",
+                          defaultValue: "Apply",
+                          comment: "Apply button for the Splash memory and SSD cache sizes")) {
+                Task { await vm.save(.splashLimits, client: client) }
+            }
+            .buttonStyle(.omlx(.primary))
+            .disabled(!vm.hasPendingSplashLimits)
+        }
+    }
+}
+
+// MARK: - MarkItDown
+
+private struct MarkItDownSection: View {
+    @Bindable var vm: IntegrationsScreenVM
+    let client: OMLXClient
+
+    @FocusState private var focusedLimit: IntegrationsScreenVM.Field?
+
+    var body: some View {
+        SectionHeader(
+            String(localized: "integrations.section.markitdown",
+                   defaultValue: "MarkItDown",
+                   comment: "Section header for MarkItDown document conversion")
+        )
+
+        ListGroup {
+            Row(label: String(localized: "integrations.markitdown.enabled",
+                              defaultValue: "Enable MarkItDown",
+                              comment: "Row label for enabling MarkItDown"),
+                sublabel: String(localized: "integrations.markitdown.enabled.sub",
+                                 defaultValue: "Preprocess supported file attachments before LLM requests.",
+                                 comment: "Sublabel for enabling MarkItDown")) {
+                RowSwitch(isOn: vm.bind($vm.markitdownEnabled, save: {
+                    Task { await vm.save(.markitdownEnabled, client: client) }
+                }))
+                .disabled(vm.isSavingMarkitdownVisibility)
+                .accessibilityLabel(Text("integrations.markitdown.enabled"))
+            }
+
+            Row(label: String(localized: "integrations.markitdown.expose_model",
+                              defaultValue: "Show as model",
+                              comment: "Row label for exposing MarkItDown in model lists"),
+                sublabel: String(localized: "integrations.markitdown.expose_model.sub",
+                                 defaultValue: "Expose MarkItDown in model lists for direct Markdown conversion requests.",
+                                 comment: "Sublabel for exposing MarkItDown in model lists")) {
+                RowSwitch(isOn: vm.bind($vm.markitdownModelVisible, save: {
+                    Task { await vm.save(.markitdownExposeModel, client: client) }
+                }))
+                .disabled(!vm.markitdownEnabled || vm.isSavingMarkitdownVisibility)
+                .accessibilityLabel(Text("integrations.markitdown.expose_model"))
+            }
+
+            Row(label: String(localized: "integrations.markitdown.max_file_size",
+                              defaultValue: "Max file size",
+                              comment: "Row label for the maximum MarkItDown file size"),
+                sublabel: String(localized: "integrations.markitdown.max_file_size.sub",
+                                 defaultValue: "Reject larger document attachments before conversion.",
+                                 comment: "Sublabel for the maximum MarkItDown file size")) {
+                TextInput(text: $vm.markitdownMaxFileSizeText, suffix: "MB", width: .controlNarrow)
+                    .focused($focusedLimit, equals: .markitdownMaxFileSize)
+                    .onSubmit { Task { await vm.save(.markitdownMaxFileSize, client: client) } }
+                    .disabled(vm.savingMarkitdownFields.contains(.markitdownMaxFileSize))
+                    .accessibilityLabel(Text("integrations.markitdown.max_file_size"))
+            }
+
+            Row(label: String(localized: "integrations.markitdown.max_files",
+                              defaultValue: "Max files per request",
+                              comment: "Row label for the maximum MarkItDown files per request"),
+                sublabel: String(localized: "integrations.markitdown.max_files.sub",
+                                 defaultValue: "Limit document attachments converted in one request.",
+                                 comment: "Sublabel for the maximum MarkItDown files per request")) {
+                TextInput(text: $vm.markitdownMaxFilesText, width: .controlNarrow)
+                    .focused($focusedLimit, equals: .markitdownMaxFiles)
+                    .onSubmit { Task { await vm.save(.markitdownMaxFiles, client: client) } }
+                    .disabled(vm.savingMarkitdownFields.contains(.markitdownMaxFiles))
+                    .accessibilityLabel(Text("integrations.markitdown.max_files"))
+            }
+
+            Row(label: String(localized: "integrations.markitdown.pdf_processing_engine",
+                              defaultValue: "PDF processing engine",
+                              comment: "Row label for the MarkItDown PDF processing engine"),
+                sublabel: String(localized: "integrations.markitdown.pdf_processing_engine.sub",
+                                 defaultValue: "Select whether PDF document requests are processed by MarkItDown itself or by an OCR engine.",
+                                 comment: "Sublabel for the MarkItDown PDF processing engine"),
+                warning: vm.markitdownPdfWarning,
+                isLast: true) {
+                Popup(selection: vm.bind($vm.markitdownPdfProcessingEngine, save: {
+                    Task { await vm.save(.markitdownPdfProcessingEngine, client: client) }
+                }), width: .controlMedium, options: vm.markitdownPdfOptions)
+                .disabled(vm.savingMarkitdownFields.contains(.markitdownPdfProcessingEngine))
+                .accessibilityLabel(Text("integrations.markitdown.pdf_processing_engine"))
+            }
+        }
+        .onChange(of: focusedLimit) { previous, _ in
+            if let previous { Task { await vm.save(previous, client: client) } }
+        }
+        .onDisappear {
+            if let focusedLimit { Task { await vm.save(focusedLimit, client: client) } }
+        }
     }
 }
 
@@ -105,6 +380,29 @@ private struct ClaudeCodeSection: View {
                         options: vm.modelOptions
                     )
                 }
+                Row(
+                    label: String(localized: "integrations.claude.desktop",
+                                  defaultValue: "Claude Desktop",
+                                  comment: "Row label for the Claude Desktop tier-alias toggle"),
+                    sublabel: String(localized: "integrations.claude.desktop.sub",
+                                     defaultValue: "Expose claude-opus / claude-sonnet / claude-haiku as aliases of the tier models",
+                                     comment: "Sublabel explaining the Claude Desktop tier-alias toggle")
+                ) {
+                    Toggle("", isOn: vm.bind($vm.desktopEnabled, save: {
+                        Task { await vm.save(.desktopEnabled, client: client) }
+                    }))
+                    .labelsHidden().toggleStyle(.switch)
+                }
+                if vm.desktopEnabled {
+                    FreeRow {
+                        CommandBlock(
+                            command: vm.claudeDesktopLaunchCommand,
+                            caption: String(localized: "integrations.claude.desktop.command",
+                                            defaultValue: "Claude Desktop",
+                                            comment: "Caption above the Claude Desktop launcher command block")
+                        )
+                    }
+                }
             }
         }
     }
@@ -114,7 +412,7 @@ private struct ClaudeCodeSection: View {
 
 /// Houses both the primary `omlx launch claude` block and the "Advanced"
 /// env-var recipe that points the real `claude` binary at the local server.
-/// Mirrors `claudeCodeCommand` in `omlx/admin/static/js/dashboard.js`.
+/// Mirrors `claudeCodeCommand` in `apps/omlx-web/omlx_web/static/js/dashboard.js`.
 private struct ClaudeSetupCommandSection: View {
     var vm: IntegrationsScreenVM
     @State private var showAdvanced = false
@@ -146,7 +444,7 @@ private struct ClaudeSetupCommandSection: View {
                 Text(String(localized: "integrations.setup.advanced.label",
                             defaultValue: "Advanced — run `claude` directly",
                             comment: "Disclosure label revealing the advanced env-var recipe for running claude directly"))
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
                     .foregroundStyle(theme.textSecondary)
             }
             .padding(.horizontal, 4)
@@ -168,12 +466,12 @@ private struct CommandBlock: View {
                 Text(caption ?? String(localized: "integrations.command.terminal_caption",
                                        defaultValue: "$ Terminal",
                                        comment: "Caption above each shell command block"))
-                    .font(.omlxText(10, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.caption, weight: .semibold))
                     .foregroundStyle(theme.textTertiary)
                     .textCase(.uppercase)
                     .kerning(0.6)
                 Text(command)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.text)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -282,6 +580,16 @@ private struct OtherIntegrationsSection: View {
                 command: vm.piCommand
             )
             IntegrationRow(
+                name: String(localized: "integrations.tool.vibe",
+                             defaultValue: "Mistral Vibe",
+                             comment: "Display name for the Mistral Vibe integration"),
+                modelBinding: vm.bind($vm.vibeModel, save: {
+                    Task { await vm.save(.vibeModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.vibeCommand
+            )
+            IntegrationRow(
                 name: String(localized: "integrations.tool.copilot",
                              defaultValue: "Copilot CLI",
                              comment: "Display name for the Copilot CLI integration"),
@@ -328,7 +636,7 @@ private struct IntegrationRow: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 12) {
                     Text(name)
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     Spacer(minLength: 12)
                     Popup(
@@ -343,11 +651,11 @@ private struct IntegrationRow: View {
                             Text(String(localized: "integrations.openclaw.profile_label",
                                         defaultValue: "Tools profile",
                                         comment: "Row label for the OpenClaw tools-profile picker"))
-                                .font(.omlxText(12))
+                                .font(.omlxText(DesignTokens.FontSize.callout))
                                 .foregroundStyle(theme.textSecondary)
                             if let profileSublabel {
                                 Text(profileSublabel)
-                                    .font(.omlxText(11))
+                                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                                     .foregroundStyle(theme.textTertiary)
                             }
                         }

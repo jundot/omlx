@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from omlx.config import OMLXConfig
 from omlx.settings import (
     BURST_DECODE_MODES,
     DEFAULT_BURST_DECODE_MODE,
@@ -53,7 +52,6 @@ class TestServerSettings:
         assert settings.auto_start_on_launch is True
         assert settings.burst_decode_mode == "balanced"
         assert settings.preserve_mid_system_cache is True
-        assert settings.qwen4_gdn_decode_wide_proj is False
         assert settings.distributed_inference_enabled is False
         assert settings.max_audio_upload_size == "100MB"
         assert settings.max_audio_upload_bytes() == 100 * 1024 * 1024
@@ -88,7 +86,6 @@ class TestServerSettings:
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
-            "qwen4_gdn_decode_wide_proj": False,
             "distributed_inference_enabled": False,
             "max_audio_upload_size": "100MB",
             "max_image_upload_size": "50MB",
@@ -96,13 +93,6 @@ class TestServerSettings:
             "max_image_side_length": 2048,
             "gpu_keep_warm_interval": 0.5,
         }
-
-    def test_qwen4_decode_setting_round_trip(self):
-        settings = GlobalSettings()
-        assert ServerSettings.from_dict({}).qwen4_gdn_decode_wide_proj is False
-        settings.server = ServerSettings.from_dict({"qwen4_gdn_decode_wide_proj": True})
-        assert settings.server.to_dict()["qwen4_gdn_decode_wide_proj"] is True
-        assert settings.to_scheduler_config().qwen4_gdn_decode_wide_proj is True
 
     def test_from_dict_distributed_inference_is_opt_in(self):
         assert ServerSettings.from_dict({}).distributed_inference_enabled is False
@@ -394,16 +384,23 @@ class TestSchedulerSettings:
             "embedding_batch_size": 32,
             "chunked_prefill": False,
             "prefill_priority": "context",
+            "concurrent_priority": "balanced",
             "decode_fairness": True,
         }
 
-    def test_decode_fairness_from_dict(self):
-        """Defaults on; explicit false round-trips."""
-        assert SchedulerSettings.from_dict({}).decode_fairness is True
-        assert (
-            SchedulerSettings.from_dict({"decode_fairness": False}).decode_fairness
-            is False
-        )
+    def test_concurrent_priority_from_dict(self):
+        """Valid values pass through; older files map the on/off switch."""
+
+        def priority(data):
+            return SchedulerSettings.from_dict(data).concurrent_priority
+
+        assert priority({}) == "balanced"
+        assert priority({"decode_fairness": False}) == "prefill"
+        assert priority({"decode_fairness": True}) == "balanced"
+        assert priority({"concurrent_priority": "decode"}) == "decode"
+        assert priority({"concurrent_priority": "fast"}) == "balanced"
+        legacy_off = SchedulerSettings.from_dict({"decode_fairness": False})
+        assert legacy_off.decode_fairness is False
 
     def test_prefill_priority_from_dict(self):
         """Valid values pass through; anything else falls back to context."""
@@ -1527,26 +1524,50 @@ class TestGlobalSettings:
             assert custom_cache.exists()
             assert custom_logs.exists()
 
-    def test_ensure_directories_unavailable_model_dir(self):
-        """Test that unavailable model dirs are skipped instead of crashing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base = Path(tmpdir) / "omlx"
-            valid_models = Path(tmpdir) / "valid_models"
-            unavailable = Path("/Volumes/NonExistentDrive/Models")
+    def test_ensure_directories_unavailable_ssd_cache_dir(self, tmp_path):
+        """An unavailable cache dir turns the SSD cache off without a fallback dir."""
+        not_a_dir = tmp_path / "not-a-dir"
+        not_a_dir.write_text("")
+        configured = not_a_dir / "cache"
+        settings = GlobalSettings(base_path=tmp_path / "omlx")
+        settings.cache.ssd_cache_dir = str(configured)
+        settings.cache.ssd_cache_max_size = "180GB"
 
-            settings = GlobalSettings(base_path=base)
-            settings.model.model_dirs = [str(valid_models), str(unavailable)]
-            settings.ensure_directories()
+        settings.ensure_directories()
+        settings.ensure_directories()  # e.g. save() keeps the SSD cache off
 
-            assert base.exists()
-            assert valid_models.exists()
-            # Unavailable path should be removed from model_dirs
-            resolved_dirs = settings.model.get_model_dirs(base)
-            assert len(resolved_dirs) == 1
-            assert resolved_dirs[0] == valid_models.resolve()
+        assert not (tmp_path / "omlx" / "cache").exists()
+        assert settings.cache.to_dict()["ssd_cache_dir"] == str(configured)
+        assert settings.cache.is_ssd_cache_dir_unavailable()
+        assert settings.to_scheduler_config().paged_ssd_cache_dir is None
 
-    def test_ensure_directories_unreadable_model_dir(self, tmp_path, monkeypatch):
-        """Test that existing but unreadable model dirs are skipped."""
+        # A newly configured dir is used as is.
+        settings.cache.ssd_cache_dir = str(tmp_path / "other")
+        config = settings.to_scheduler_config()
+        assert config.paged_ssd_cache_dir == str((tmp_path / "other").resolve())
+        assert config.paged_ssd_cache_max_size == 180 * 1024**3
+        assert config.paged_ssd_cache_auto_size is False
+
+    def test_ensure_directories_keeps_unavailable_model_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """Unavailable model dirs stay configured and are stored resolved."""
+        base = tmp_path / "omlx"
+        unavailable = Path("/Volumes/NonExistentDrive/Models")
+        monkeypatch.chdir(tmp_path)
+
+        settings = GlobalSettings(base_path=base)
+        settings.model.model_dirs = ["valid_models", str(unavailable)]
+        settings.ensure_directories()
+
+        assert (tmp_path / "valid_models").exists()
+        expected = [str((tmp_path / "valid_models").resolve()), str(unavailable)]
+        assert settings.model.model_dirs == expected
+        # The admin API reports resolved dirs; a mismatch reloads all models.
+        assert [str(d) for d in settings.model.get_model_dirs(base)] == expected
+
+    def test_ensure_directories_keeps_unreadable_model_dir(self, tmp_path, monkeypatch):
+        """Existing but unreadable model dirs stay configured."""
         base = tmp_path / "omlx"
         valid_models = tmp_path / "valid_models"
         unreadable = tmp_path / "unreadable_models"
@@ -1565,8 +1586,10 @@ class TestGlobalSettings:
         settings.model.model_dirs = [str(valid_models), str(unreadable)]
         settings.ensure_directories()
 
-        resolved_dirs = settings.model.get_model_dirs(base)
-        assert resolved_dirs == [valid_models.resolve()]
+        assert settings.model.model_dirs == [
+            str(valid_models.resolve()),
+            str(unreadable.resolve()),
+        ]
 
     def test_validate_valid_settings(self):
         """Test validation with valid settings."""
@@ -1793,39 +1816,6 @@ class TestGlobalSettings:
         gdn_errors = [e for e in errors if "gdn_sidecar_state_dtype" in e]
         assert len(gdn_errors) == 1
         assert "must be one of" in gdn_errors[0]
-
-    def test_legacy_config_gdn_env_and_validation(self):
-        """The legacy config layer exposes the same GDN cache plumbing."""
-        with patch.dict(
-            os.environ,
-            {
-                "OMLX_GDN_SSD_SPLIT_ENABLED": "1",
-                "OMLX_GDN_SSD_PENDING_MAX_SIZE": "768MB",
-                "OMLX_GDN_SIDECAR_STATE_DTYPE": "bf16",
-            },
-            clear=False,
-        ):
-            config = OMLXConfig.from_env()
-        assert config.paged_ssd_cache.gdn_ssd_split_enabled is True
-        assert config.paged_ssd_cache.gdn_ssd_pending_max_size == "768MB"
-        assert config.paged_ssd_cache.gdn_sidecar_state_dtype == "bf16"
-
-        config.paged_ssd_cache.hot_cache_only = True
-        errors = config.validate()
-        assert any("gdn_ssd_split_enabled" in e for e in errors)
-
-    def test_legacy_config_gdn_storage_mode_env(self):
-        with patch.dict(
-            os.environ,
-            {
-                "OMLX_GDN_SNAPSHOT_STORAGE": "embedded",
-                "OMLX_GDN_SSD_SPLIT_ENABLED": "1",
-            },
-            clear=False,
-        ):
-            config = OMLXConfig.from_env()
-        assert config.paged_ssd_cache.gdn_ssd_split_enabled is False
-        assert config.paged_ssd_cache.gdn_snapshot_storage == "embedded"
 
     def test_validate_invalid_initial_cache_blocks(self):
         """Test validation catches invalid initial_cache_blocks."""
@@ -2298,8 +2288,11 @@ class TestGlobalSettings:
         settings = GlobalSettings()
         settings.scheduler.max_concurrent_requests = 128
         settings.scheduler.embedding_batch_size = 12
+        settings.scheduler.concurrent_priority = "decode"
 
         scheduler_config = settings.to_scheduler_config()
+        assert scheduler_config.decode_fairness is True
+        assert scheduler_config.adaptive_decode_share is False
         assert scheduler_config.max_num_seqs == 128
         assert scheduler_config.completion_batch_size == 128
         assert scheduler_config.embedding_batch_size == 12
@@ -2940,8 +2933,8 @@ class TestClaudeCodeValidation:
 class TestClaudeCodeRouteIntegration:
     """Integration tests for the settings chain: dataclass <-> dict <-> routes."""
 
-    def test_claude_code_to_dict_has_four_keys(self):
-        """to_dict must include all four keys so GlobalSettings.save() persists them."""
+    def test_claude_code_to_dict_has_five_keys(self):
+        """to_dict must include all five keys so GlobalSettings.save() persists them."""
         s = ClaudeCodeSettings(
             mode="local",
             opus_model="mlx-community/Qwen3-30B-A3B-4bit",
@@ -2954,6 +2947,7 @@ class TestClaudeCodeRouteIntegration:
             "opus_model",
             "sonnet_model",
             "haiku_model",
+            "desktop_enabled",
         }
         assert set(d.keys()) == expected_keys
 
@@ -2964,12 +2958,14 @@ class TestClaudeCodeRouteIntegration:
             opus_model="mlx-community/Qwen3-30B-A3B-4bit",
             sonnet_model="mlx-community/Qwen3-14B-4bit",
             haiku_model="mlx-community/Qwen3-4B-4bit",
+            desktop_enabled=True,
         )
         reloaded = ClaudeCodeSettings.from_dict(original.to_dict())
         assert reloaded.mode == "local"
         assert reloaded.opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
         assert reloaded.sonnet_model == "mlx-community/Qwen3-14B-4bit"
         assert reloaded.haiku_model == "mlx-community/Qwen3-4B-4bit"
+        assert reloaded.desktop_enabled is True
 
     def test_claude_code_round_trip_null_models(self):
         """Null model fields survive the round-trip."""
@@ -3011,6 +3007,65 @@ class TestClaudeCodeRouteIntegration:
         )
         assert "claude_code_opus_model" in r.model_fields_set
         assert r.claude_code_opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
+
+    @pytest.mark.parametrize(
+        ("before", "after", "action"),
+        [(False, True, "configure"), (True, False, "restore"), (False, False, None)],
+    )
+    def test_desktop_toggle_writes_claude_config_on_transition(
+        self, tmp_path, monkeypatch, before, after, action
+    ):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+        from omlx.integrations import claude_desktop
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.claude_code.desktop_enabled = before
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        calls = []
+        monkeypatch.setattr(
+            claude_desktop,
+            "configure_omlx_gateway",
+            lambda port, api_key: calls.append("configure") or True,
+        )
+        monkeypatch.setattr(
+            claude_desktop, "restore", lambda: calls.append("restore") or True
+        )
+
+        request = admin_routes.GlobalSettingsRequest.model_validate(
+            {"claude_code_desktop_enabled": after}
+        )
+        result = asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+
+        assert gs.claude_code.desktop_enabled is after
+        assert calls == ([action] if action else [])
+        assert result["claude_desktop"].get("action") == action
+
+    def test_desktop_restore_endpoint_clears_toggle(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+        from omlx.integrations import claude_desktop
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.claude_code.desktop_enabled = True
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(claude_desktop, "restore", lambda: True)
+        monkeypatch.setattr(claude_desktop, "is_configured", lambda: False)
+
+        result = asyncio.run(
+            admin_routes.claude_desktop_restore(
+                admin_routes.ClaudeDesktopRestoreRequest(), is_admin=True
+            )
+        )
+
+        assert result["configured"] is False
+        assert (
+            GlobalSettings.load(base_path=tmp_path).claude_code.desktop_enabled is False
+        )
 
 
 class TestCORSMiddleware:
@@ -3065,7 +3120,11 @@ class TestUISettings:
 
         layout = {"version": 1, "width": "wide", "blocks": []}
         result = UISettings(language="ko", dashboard_layout=layout).to_dict()
-        assert result == {"language": "ko", "dashboard_layout": layout}
+        assert result == {
+            "language": "ko",
+            "dashboard_layout": layout,
+            "custom_theme": None,
+        }
 
     def test_from_dict_legacy_without_layout(self):
         from omlx.settings import UISettings
@@ -3094,6 +3153,46 @@ class TestUISettings:
         assert restored.ui.dashboard_layout == layout
 
 
+class TestCustomThemeRoute:
+    """/api/global-settings validates and persists ui_custom_theme."""
+
+    def _post(self, gs, monkeypatch, body):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        request = admin_routes.GlobalSettingsRequest.model_validate(body)
+        return asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+
+    def test_post_persists_and_null_restores(self, tmp_path, monkeypatch):
+        from omlx.admin import routes as admin_routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        theme = {"light": {"bg-primary": "#FDF6E3"}, "dark": {}}
+        self._post(gs, monkeypatch, {"ui_custom_theme": theme})
+        saved = {"light": {"bg-primary": "#fdf6e3"}, "dark": {}}
+        assert GlobalSettings.load(base_path=tmp_path).ui.custom_theme == saved
+        assert admin_routes.configured_custom_theme() == saved
+
+        self._post(gs, monkeypatch, {"ui_custom_theme": None})
+        assert gs.ui.custom_theme is None
+
+    @pytest.mark.parametrize(
+        "colors",
+        [{"bg-primary": "red"}, {"text-primary": "#00000000"}, {"Bad Key": "#000000"}],
+    )
+    def test_rejects_malformed_colors(self, colors):
+        from pydantic import ValidationError
+
+        from omlx.admin.routes import CustomThemeRequest
+
+        with pytest.raises(ValidationError):
+            CustomThemeRequest.model_validate({"light": colors})
+
+
 class TestDashboardLayoutRoute:
     """/api/global-settings validates and persists ui_dashboard_layout."""
 
@@ -3106,6 +3205,7 @@ class TestDashboardLayoutRoute:
                 {"id": "serving_stats", "x": 0, "y": 0, "w": 12},
                 {"id": "active_models", "x": 12, "y": 0, "w": 12},
             ],
+            "serving_stats_tiles": ["generated_tokens", "requests"],
         }
         layout.update(overrides)
         return layout
@@ -3188,6 +3288,40 @@ class TestDashboardLayoutRoute:
         )
         assert [b.id for b in layout.blocks] == ["serving_stats"]
         assert layout.blocks[0].w == 24
+
+    def test_serving_stats_tiles_keep_order_and_drop_unknown(self):
+        from omlx.admin.routes import DashboardLayoutRequest
+
+        layout = DashboardLayoutRequest.model_validate(
+            self._layout(
+                serving_stats_tiles=[
+                    "generated_tokens",
+                    "not_a_tile",
+                    "requests",
+                    "generated_tokens",
+                ]
+            )
+        )
+        assert layout.serving_stats_tiles == ["generated_tokens", "requests"]
+        # Layouts saved before the tile picker existed get the original tiles.
+        legacy = self._layout()
+        del legacy["serving_stats_tiles"]
+        assert DashboardLayoutRequest.model_validate(legacy).serving_stats_tiles == [
+            "requests",
+            "prefill_tokens",
+            "cached_tokens",
+            "cache_efficiency",
+        ]
+
+    def test_more_than_four_serving_stats_tiles_is_rejected(self):
+        import pydantic
+
+        from omlx.admin.routes import DASHBOARD_SERVING_TILE_IDS, DashboardLayoutRequest
+
+        with pytest.raises(pydantic.ValidationError):
+            DashboardLayoutRequest.model_validate(
+                self._layout(serving_stats_tiles=list(DASHBOARD_SERVING_TILE_IDS))
+            )
 
     @pytest.mark.parametrize(
         "block",

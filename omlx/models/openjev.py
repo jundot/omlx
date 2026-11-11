@@ -241,6 +241,10 @@ class OpenJevModel:
         self._letter_ids: list[int] = []
         self._vision_end_id: int | None = None
 
+    @property
+    def has_vision(self) -> bool:
+        return self.backbone.has_vision
+
     def load(self) -> None:
         self.backbone.load()
         tokenizer = self.backbone.tokenizer
@@ -258,6 +262,8 @@ class OpenJevModel:
 
         OpenJev never truncates; ``truncate`` is accepted for API symmetry.
         """
+        if request.get("videos"):
+            raise DecisionRequestError("this model does not take videos")
         state = split_state(request["state"], request.get("images"))
         plan = OpenJevPlan(questions=request["questions"], state=state, items=[])
         if state.image is not None:

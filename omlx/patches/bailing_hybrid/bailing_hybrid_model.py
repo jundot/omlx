@@ -2,12 +2,21 @@
 # ruff: noqa
 # Copyright © 2026 Apple Inc.
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from omlx.model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
+from omlx.patches.mlx_lm_mtp import (
+    get_mtp_depth,
+    is_mtp_active,
+    is_mtp_depth_fixed,
+    prompt_priming,
+)
 
 from .activations import swiglu
 from .base import (
@@ -21,6 +30,8 @@ from .gated_delta import gated_delta_kernel, gated_delta_ops, normalize_qk
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -176,6 +187,10 @@ class MLP(nn.Module):
         return self.down_proj(swiglu(gate, up))
 
 
+# Verify-sized forwards skip expanding per-head K/V over the whole cache.
+_ABSORBED_MAX_L = MAX_LIGHTNING_MTP_DRAFT_TOKENS + 1
+
+
 class MultiLatentAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -288,7 +303,8 @@ class MultiLatentAttention(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorbed = L <= _ABSORBED_MAX_L
+        if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
         else:
@@ -298,7 +314,7 @@ class MultiLatentAttention(nn.Module):
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
-        if L == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         if self.g_proj is not None:
@@ -444,12 +460,50 @@ class LinearAttention(nn.Module):
         self.o_norm = GatedRMSNorm(self.head_dim, args.rms_norm_eps)
         self.o_proj = nn.Linear(projection_size, args.hidden_size, bias=False)
 
+    def _process_chunk(
+        self,
+        x_q: mx.array,
+        x_k: mx.array,
+        x_v: mx.array,
+        f: mx.array,
+        beta: mx.array,
+        state: Tuple[Optional[mx.array], ...],
+        mask: Optional[mx.array],
+        lengths: Optional[mx.array],
+    ) -> Tuple[mx.array, Tuple[mx.array, ...]]:
+        """Returns the new state in cache slot order."""
+        B, L, _ = x_q.shape
+        recurrent_state, conv_q, conv_k, conv_v = state
+        q, conv_q = self.q_conv1d(x_q, conv_q, mask, lengths)
+        k, conv_k = self.k_conv1d(x_k, conv_k, mask, lengths)
+        v, conv_v = self.v_conv1d(x_v, conv_v, mask, lengths)
+        q = q.reshape(B, L, self.num_attention_heads, self.head_dim)
+        k = k.reshape(B, L, self.num_attention_heads, self.head_dim)
+        v = v.reshape(B, L, self.num_attention_heads, self.head_dim)
+        f = f.reshape(B, L, self.num_attention_heads, self.head_dim)
+
+        output, recurrent_state = recurrent_kda(
+            q,
+            k,
+            v,
+            f,
+            beta,
+            self.A_log,
+            self.dt_bias,
+            recurrent_state,
+            safe_gate=self.safe_gate,
+            lower_bound=self.lower_bound,
+            mask=mask,
+        )
+        return output, (recurrent_state, conv_q, conv_k, conv_v)
+
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         offset: int = 0,
+        n_confirmed: int = 0,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -480,10 +534,8 @@ class LinearAttention(nn.Module):
                     f"got {len(slots)}"
                 )
             state = tuple(slots)
-        if state is None or all(value is None for value in state):
-            recurrent_state = conv_q = conv_k = conv_v = None
-        else:
-            recurrent_state, conv_q, conv_k, conv_v = state
+        if state is None:
+            state = (None,) * 4
 
         lengths = cache.lengths if cache is not None else None
         if lengths is not None:
@@ -493,35 +545,21 @@ class LinearAttention(nn.Module):
             # resulting all-true mask would advance the recurrent state over
             # padding. The current chunk lengths are authoritative here.
             mask = mx.arange(L)[None, :] < lengths[:, None]
-        q, conv_q = self.q_conv1d(self.q_proj(x), conv_q, mask, lengths)
-        k, conv_k = self.k_conv1d(self.k_proj(x), conv_k, mask, lengths)
-        v, conv_v = self.v_conv1d(self.v_proj(x), conv_v, mask, lengths)
-        q = q.reshape(B, L, self.num_attention_heads, self.head_dim)
-        k = k.reshape(B, L, self.num_attention_heads, self.head_dim)
-        v = v.reshape(B, L, self.num_attention_heads, self.head_dim)
-        f = self.f_proj(x).reshape(
-            B, L, self.num_attention_heads, self.head_dim
+        inputs = (
+            self.q_proj(x),
+            self.k_proj(x),
+            self.v_proj(x),
+            self.f_proj(x),
+            self.b_proj(x),
         )
-        beta = self.b_proj(x)
-
-        output, recurrent_state = recurrent_kda(
-            q,
-            k,
-            v,
-            f,
-            beta,
-            self.A_log,
-            self.dt_bias,
-            recurrent_state,
-            safe_gate=self.safe_gate,
-            lower_bound=self.lower_bound,
-            mask=mask,
-        )
+        output, next_state = self._process_chunk(*inputs, state, mask, lengths)
         if cache is not None:
-            cache[0] = recurrent_state
-            cache[1] = conv_q
-            cache[2] = conv_k
-            cache[3] = conv_v
+            if 0 < n_confirmed < L:
+                # Kept for mtp_partial_rollback to replay the accepted prefix.
+                cache.rollback_state = state
+                cache._mtp_draft_stash = inputs
+            for slot, value in enumerate(next_state):
+                cache[slot] = value
             cache.advance(L)
 
         gate = self.g_proj(x).reshape(
@@ -661,14 +699,44 @@ class DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         offset: int = 0,
+        n_confirmed: int = 0,
     ) -> mx.array:
         if self.is_global:
             r = self.attention(self.input_layernorm(x), mask, cache)
         else:
-            r = self.attention(self.input_layernorm(x), mask, cache, offset=offset)
+            r = self.attention(
+                self.input_layernorm(x),
+                mask,
+                cache,
+                offset=offset,
+                n_confirmed=n_confirmed,
+            )
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
+
+
+class MTPLayer(DecoderLayer):
+    """Ling's nextn layer; names match ``model.layers.<num_hidden_layers>.*``."""
+
+    def __init__(self, args: ModelArgs):
+        # The index past the last layer group builds MLA + sparse MoE.
+        super().__init__(args, layer_idx=args.num_hidden_layers)
+        dims = args.hidden_size
+        self.enorm = nn.RMSNorm(dims, eps=args.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(dims, eps=args.rms_norm_eps)
+        self.eh_proj = nn.Linear(2 * dims, dims, bias=False)
+        self.final_layernorm = nn.RMSNorm(dims, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        h: mx.array,
+        embeds: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+    ) -> mx.array:
+        x = self.eh_proj(mx.concatenate([self.enorm(embeds), self.hnorm(h)], axis=-1))
+        return self.final_layernorm(super().__call__(x, mask, cache))
 
 
 class LanguageModel(nn.Module):
@@ -692,6 +760,7 @@ class LanguageModel(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         h = self.word_embeddings(inputs)
 
@@ -708,7 +777,7 @@ class LanguageModel(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             mask = attn_mask if layer.is_global else gla_mask
-            h = layer(h, mask, c, offset=offset)
+            h = layer(h, mask, c, offset=offset, n_confirmed=n_confirmed)
 
         return self.norm(h)
 
@@ -722,19 +791,118 @@ class Model(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
+        n_mtp = int(args.num_nextn_predict_layers or 0)
+        self._omlx_mtp_decode_enabled = bool(n_mtp and is_mtp_active())
+        if self._omlx_mtp_decode_enabled:
+            # Ling ships one nextn layer; deeper drafts chain on it.
+            self.mtp = [MTPLayer(args)]
+            self._omlx_mtp_chain = True
+            self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
+            self._omlx_mtp_head_hidden_normed = True
+
+    def _logits(self, hidden: mx.array) -> mx.array:
+        if self.args.tie_word_embeddings:
+            return self.model.word_embeddings.as_linear(hidden)
+        return self.lm_head(hidden)
+
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
     ) -> mx.array:
-        out = self.model(inputs, cache)
-        if self.args.tie_word_embeddings:
-            return self.model.word_embeddings.as_linear(out)
-        return self.lm_head(out)
+        out = self.model(inputs, cache, n_confirmed=n_confirmed)
+        if return_hidden:
+            return self._logits(out), out
+        if not n_confirmed and hasattr(self, "mtp"):
+            try:
+                prompt_priming.maybe_capture(self, inputs, out, cache)
+            except Exception:
+                logger.debug("MTP prompt-priming capture failed", exc_info=True)
+        return self._logits(out)
+
+    def make_mtp_cache(self):
+        return [KVCache() for _ in self.mtp] if hasattr(self, "mtp") else []
+
+    def mtp_forward(
+        self,
+        h: mx.array,
+        input_ids: mx.array,
+        cache: Optional[Any] = None,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        """``h`` is the normed trunk hidden, or the head's own output when chaining."""
+        layer_cache = cache[0] if cache else None
+        mask = create_attention_mask(h, layer_cache, return_array=True)
+        out = self.mtp[0](h, self.model.word_embeddings(input_ids), mask, layer_cache)
+        source = out
+        if logits_keep and source.shape[1] > logits_keep:
+            source = source[:, -logits_keep:]
+        logits = self._logits(source)
+        if return_hidden:
+            return logits, out
+        return logits
+
+    def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
+        """MLA layers trim; KDA layers replay the kept prefix from the stash."""
+        layers = self.model.layers
+        if len(cache) != len(layers):
+            return False
+        n_trim = num_drafts - accepted
+        if n_trim <= 0:
+            return True
+        for layer, c in zip(layers, cache):
+            if layer.is_global:
+                if not (hasattr(c, "is_trimmable") and c.is_trimmable()):
+                    return False
+            elif (
+                getattr(c, "rollback_state", None) is None
+                or getattr(c, "_mtp_draft_stash", None) is None
+            ):
+                return False
+        # Build every replay first so an error cannot leave layers out of step.
+        keep = accepted + 1
+        replayed = {}
+        for i, (layer, c) in enumerate(zip(layers, cache)):
+            if not layer.is_global:
+                inputs = [x[:, :keep] for x in c._mtp_draft_stash]
+                replayed[i] = layer.attention._process_chunk(
+                    *inputs, c.rollback_state, None, None
+                )[1]
+        for i, c in enumerate(cache):
+            if i not in replayed:
+                c.trim(n_trim)
+                continue
+            for slot, value in enumerate(replayed[i]):
+                c[slot] = value
+            c.rollback_state = None
+            c._mtp_draft_stash = None
+        return True
 
     def sanitize(self, weights):
         n_layers = self.args.num_hidden_layers
+        nextn_prefix = f"model.layers.{n_layers}."
+        if hasattr(self, "mtp") and not any(
+            k.startswith((nextn_prefix, "mtp.")) for k in weights
+        ):
+            # Some exports declare the nextn layer but ship no weights for it.
+            del self.mtp
+            self._omlx_mtp_decode_enabled = False
+        if not hasattr(self, "mtp"):
+            weights = {k: v for k, v in weights.items() if not k.startswith("mtp.")}
+            return self._sanitize_layers(weights, n_layers)
+        if not any(k.startswith(nextn_prefix) for k in weights):
+            return self._sanitize_layers(weights, n_layers)  # oQ output: mtp.0.*
+        weights = self._sanitize_layers(weights, n_layers + 1)
+        return {
+            ("mtp.0." + k[len(nextn_prefix) :] if k.startswith(nextn_prefix) else k): v
+            for k, v in weights.items()
+        }
 
+    def _sanitize_layers(self, weights, n_layers):
         # Drop MTP and any extra non-base layers (Ling 2.6 has 1 MTP layer
         # appended after num_hidden_layers; deletes weights for those).
         weights = {
@@ -783,6 +951,12 @@ class Model(nn.Module):
             kv_b_key = f"{prefix}.attention.kv_b_proj.weight"
             if kv_b_key in weights:
                 v = weights.pop(kv_b_key)
+                # The split halves carry no scale sidecar (Ling 3.1 FP8).
+                scale_key = f"{kv_b_key}_scale_inv"
+                if scale_key in weights and v.dtype == mx.uint8:
+                    v = self._dequantize_fp8_block(
+                        kv_b_key, v, weights.pop(scale_key)
+                    )
                 head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
                 num_heads = self.args.num_attention_heads
                 v = v.reshape(num_heads, head_dim, -1)
@@ -794,6 +968,49 @@ class Model(nn.Module):
                 weights[f"{prefix}.attention.unembed_out.weight"] = wv
 
         return self._convert_fp8_block_weights(weights)
+
+    def _dequantize_fp8_block(self, weight_key, weight, scale):
+        quantization_config = self.args.quantization_config or {}
+        block_size = quantization_config.get("weight_block_size", (128, 128))
+        if not isinstance(block_size, (list, tuple)) or len(block_size) != 2:
+            block_size = (128, 128)
+        block_rows, block_cols = (int(block_size[0]), int(block_size[1]))
+
+        if scale.dtype == mx.uint8:
+            scale = mx.power(
+                mx.array(2.0, dtype=mx.float32),
+                scale.astype(mx.float32) - 127.0,
+            )
+        else:
+            scale = scale.astype(mx.float32)
+        weight = mx.from_fp8(weight, dtype=mx.float32)
+        out_dim, in_dim = weight.shape[-2:]
+        target_out = scale.shape[-2] * block_rows
+        target_in = scale.shape[-1] * block_cols
+        if target_out < out_dim or target_in < in_dim:
+            raise ValueError(
+                f"Invalid FP8 block scale for {weight_key}: weight "
+                f"{weight.shape}, scale {scale.shape}, block {block_size}"
+            )
+
+        pad_out = target_out - out_dim
+        pad_in = target_in - in_dim
+        if pad_out or pad_in:
+            padding = [(0, 0)] * (weight.ndim - 2)
+            padding.extend(((0, pad_out), (0, pad_in)))
+            weight = mx.pad(weight, padding)
+
+        lead = weight.shape[:-2]
+        weight = weight.reshape(
+            *lead,
+            scale.shape[-2],
+            block_rows,
+            scale.shape[-1],
+            block_cols,
+        )
+        weight = weight * scale[..., :, None, :, None]
+        weight = weight.reshape(*lead, target_out, target_in)
+        return weight[..., :out_dim, :in_dim].astype(mx.bfloat16)
 
     def _convert_fp8_block_weights(self, weights):
         """Convert Ling's published FP8 and MXFP4 tensor layouts for MLX.
@@ -809,11 +1026,6 @@ class Model(nn.Module):
         rename the scale sidecar instead of dequantizing the experts.
         """
         quantization_config = self.args.quantization_config or {}
-        block_size = quantization_config.get("weight_block_size", (128, 128))
-        if not isinstance(block_size, (list, tuple)) or len(block_size) != 2:
-            block_size = (128, 128)
-        block_rows, block_cols = (int(block_size[0]), int(block_size[1]))
-
         scale_keys = [key for key in weights if key.endswith(".weight_scale_inv")]
         for scale_key in scale_keys:
             weight_key = scale_key[: -len("_scale_inv")]
@@ -838,43 +1050,9 @@ class Model(nn.Module):
             if source_weight.dtype != mx.uint8:
                 continue
 
-            scale = weights.pop(scale_key)
-            if scale.dtype == mx.uint8:
-                scale = mx.power(
-                    mx.array(2.0, dtype=mx.float32),
-                    scale.astype(mx.float32) - 127.0,
-                )
-            else:
-                scale = scale.astype(mx.float32)
-            weight = mx.from_fp8(weights.pop(weight_key), dtype=mx.float32)
-            out_dim, in_dim = weight.shape[-2:]
-            target_out = scale.shape[-2] * block_rows
-            target_in = scale.shape[-1] * block_cols
-            if target_out < out_dim or target_in < in_dim:
-                raise ValueError(
-                    f"Invalid FP8 block scale for {weight_key}: weight "
-                    f"{weight.shape}, scale {scale.shape}, block {block_size}"
-                )
-
-            pad_out = target_out - out_dim
-            pad_in = target_in - in_dim
-            if pad_out or pad_in:
-                padding = [(0, 0)] * (weight.ndim - 2)
-                padding.extend(((0, pad_out), (0, pad_in)))
-                weight = mx.pad(weight, padding)
-
-            lead = weight.shape[:-2]
-            weight = weight.reshape(
-                *lead,
-                scale.shape[-2],
-                block_rows,
-                scale.shape[-1],
-                block_cols,
+            weight = self._dequantize_fp8_block(
+                weight_key, weights.pop(weight_key), weights.pop(scale_key)
             )
-            weight = weight * scale[..., :, None, :, None]
-            weight = weight.reshape(*lead, target_out, target_in)
-            weight = weight[..., :out_dim, :in_dim].astype(mx.bfloat16)
-
             quantized, scales, biases = mx.quantize(weight, group_size=64, bits=8)
             weights[weight_key] = quantized
             base = weight_key[: -len("weight")]

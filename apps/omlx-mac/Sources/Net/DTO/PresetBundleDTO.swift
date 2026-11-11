@@ -1,5 +1,5 @@
 // Shipped preset bundle — the canonical source for "preset" chips in
-// the per-model settings UI. Mirrors `omlx/admin/static/omlx_preset.json`
+// the per-model settings UI. Mirrors `apps/omlx-web/omlx_web/static/omlx_preset.json`
 // (the same file HTML's `loadPresets()` reads from localStorage cache or
 // the static fixture). The remote-refresh endpoint
 // `POST /admin/api/presets/refresh` proxies omlx.ai and returns this

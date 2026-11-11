@@ -20,6 +20,8 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import prompt_priming
+
 logger = logging.getLogger(__name__)
 
 _PRIME_CTX_ATTR = "_omlx_mtp_prime_ctx"
@@ -109,6 +111,7 @@ class DSparkContextCache:
         self.keys = self._physical(next_keys, next_offset)
         self.offset = next_offset
 
+
 @dataclass
 class _DSparkPrimeContext:
     caches: list[DSparkContextCache]
@@ -154,9 +157,15 @@ def capture_prompt(
     aux_hidden: mx.array,
     target_cache: Optional[list[Any]],
 ) -> None:
-    """Stream target-layer hidden states into the DSpark context cache."""
+    """Stream target-layer hidden states into the owning request's context."""
     if target_cache is None or inputs.ndim != 2 or inputs.shape[0] != 1:
         return
+    prompt_priming.owned_capture(
+        host, lambda: _capture_prompt(host, inputs, aux_hidden, target_cache)
+    )
+
+
+def _capture_prompt(host, inputs, aux_hidden, target_cache):
     offset_after = _target_cache_offset(target_cache)
     if offset_after is None:
         return

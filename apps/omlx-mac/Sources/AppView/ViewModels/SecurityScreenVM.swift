@@ -6,6 +6,7 @@ final class SecurityScreenVM {
     var apiKeySet: Bool = false
     var apiKey: String?
     var skipApiKeyVerification: Bool = false
+    var allowUnauthenticatedInference: Bool = false
     var subKeys: [SubKeyDTO] = []
     var lastError: String?
 
@@ -29,6 +30,8 @@ final class SecurityScreenVM {
             self.apiKeySet = settings.auth?.apiKeySet ?? false
             self.apiKey = settings.auth?.apiKey
             self.skipApiKeyVerification = settings.auth?.skipApiKeyVerification ?? false
+            self.allowUnauthenticatedInference =
+                settings.auth?.allowUnauthenticatedInference ?? false
             self.subKeys = settings.auth?.subKeys ?? []
             self.lastError = nil
         } catch {
@@ -83,6 +86,20 @@ final class SecurityScreenVM {
             )
             self.lastError = nil
         } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
+    func setAllowUnauthenticatedInference(_ enabled: Bool, client: OMLXClient) async {
+        let previous = allowUnauthenticatedInference
+        allowUnauthenticatedInference = enabled
+        do {
+            _ = try await client.updateGlobalSettings(
+                GlobalSettingsPatch(allowUnauthenticatedInference: enabled)
+            )
+            self.lastError = nil
+        } catch {
+            allowUnauthenticatedInference = previous
             self.lastError = error.omlxDescription
         }
     }

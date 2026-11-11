@@ -182,6 +182,29 @@ def test_custom_dispatch_is_vlm_only(tmp_path, monkeypatch):
         model_loading.maybe_load_custom_quantization(str(tmp_path), is_vlm=False)
 
 
+def test_load_hooks_mlx_vlm_weight_transform(tmp_path, monkeypatch):
+    import mlx_vlm.utils as vlm_utils
+
+    (tmp_path / "config.json").write_text(json.dumps(_config()))
+    monkeypatch.setattr(bridge, "_patch_qwen35_model_class", lambda: None)
+    monkeypatch.setattr(vlm_utils, "load_config", lambda path, **kwargs: _config())
+    original_transform = vlm_utils.transform_quantized_weights
+    patch_key = "model.visual.patch_embed.proj.weight"
+
+    def fake_load(path, **kwargs):
+        assert "quantization_config" not in vlm_utils.load_config(path)
+        weights, quantization = vlm_utils.transform_quantized_weights(
+            {patch_key: mx.zeros((2, 3, 1, 2, 4))}, None
+        )
+        assert quantization is None
+        assert weights[patch_key].shape == (2, 1, 2, 4, 3)
+        return "MODEL", "PROCESSOR"
+
+    monkeypatch.setattr(vlm_utils, "load", fake_load)
+    assert bridge.load(tmp_path) == ("MODEL", "PROCESSOR")
+    assert vlm_utils.transform_quantized_weights is original_transform
+
+
 def test_config_gate_does_not_mutate_input():
     config = _config()
     original = copy.deepcopy(config)
