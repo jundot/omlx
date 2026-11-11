@@ -4938,6 +4938,36 @@ async def test_qwen_closed_envelope_with_unclosed_parameter_never_emits_call():
     assert events[-1]["error"]["code"] == "invalid_tool_call"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("raw", ["", "All done."], ids=["no_text", "prose"])
+async def test_tool_calls_finish_without_calls_is_invalid(api, raw):
+    events = await _recovery_stream(raw, api, finish_reason="tool_calls")
+
+    assert _recovery_error_codes(events, api) == ["invalid_tool_call"]
+    assert _recovery_calls(events, api) == []
+    if api == "chat":
+        assert _chat_finish_reasons(events) == []
+    elif api == "anthropic":
+        assert not any(e.get("type") == "message_delta" for e in events)
+    else:
+        assert events[-1]["type"] == "response.failed"
+
+
+def test_nonstream_tool_calls_finish_without_calls_is_invalid(monkeypatch):
+    client = _nonstream_tool_call_client(
+        monkeypatch, "All done.", qwen_parser=False, finish_reason="tool_calls"
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json=_NONSTREAM_RECOVERY_REQUESTS["/v1/chat/completions"],
+    )
+    client.close()
+
+    assert response.status_code == 500, response.text
+    assert response.json()["error"]["code"] == "invalid_tool_call"
+
+
 # Prose that quotes the control marker. The filter withholds it to EOF, but
 # nothing here is a tool call payload.
 _RECOVERY_PROSE = (

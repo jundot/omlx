@@ -7016,7 +7016,7 @@ async def stream_chat_completion(
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
-    elif has_tools and accumulated_text:
+    elif has_tools:
         # Separate thinking from content, then parse tool calls from content
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(
@@ -9551,7 +9551,7 @@ async def stream_responses_api(
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
-    elif has_tools and accumulated_text:
+    elif has_tools:
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
             leading_only=leading_only,

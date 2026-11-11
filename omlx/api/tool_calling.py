@@ -2561,6 +2561,10 @@ def extract_tool_calls_with_thinking(
                     tool_calls = None
                     tool_calls_from_thinking = False
 
+    if tools and finish_reason == "tool_calls" and not tool_calls and not parse_errors:
+        # A remote backend can consume the call span and still report this finish.
+        parse_errors = ("malformed",)
+
     return ToolCallExtraction(
         cleaned_text=cleaned_text,
         tool_calls=tool_calls,
