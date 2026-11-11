@@ -2516,6 +2516,7 @@ class VLMBatchedEngine(BaseEngine):
                 attach=scheduler.attach_prefill_helper,
                 chunk_tokens=scheduler._base_prefill_step_size(0, 1 << 30),
             )
+            scheduler._prefill_helper_retry = self._prefill_helper.retry_if_offline
             self.configure_prefill_helper(self._model_settings)
 
         # TurboQuant KV cache

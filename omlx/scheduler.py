@@ -86,7 +86,7 @@ from .prefill_boundaries import (
 )
 from .prefill_helper.adapter import Capture
 from .prefill_helper.client import HelperError
-from .prefill_helper.session import HelperPrefill, PrefillHelperSession
+from .prefill_helper.session import MIN_TOKENS, HelperPrefill, PrefillHelperSession
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import (
@@ -2344,6 +2344,7 @@ class Scheduler:
         self._prefill_states: dict[str, _PrefillState] = {}
         # Prefill Accelerator session for this model (see attach_prefill_helper).
         self._prefill_helper = None
+        self._prefill_helper_retry: Callable[[], None] | None = None
         # Packed prefill: "" once the model is known to be unsupported.
         self._packed_prefill_family: str | None = None
         self._packed_prefill_disabled: str | None = None
@@ -6901,6 +6902,13 @@ class Scheduler:
         it. A block drafter's layers come back from whichever Mac runs them.
         """
         session = self._prefill_helper
+        if (
+            session is None
+            and self._prefill_helper_retry is not None
+            and len(tokens) - 1 >= MIN_TOKENS
+        ):
+            # A helper back after a sleep can wait minutes in backoff.
+            self._prefill_helper_retry()
         drafter = _block_drafter_for(self.model)
         if (
             session is None

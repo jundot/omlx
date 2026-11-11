@@ -47,6 +47,8 @@ _OS_BYTES = 16 << 30
 # Disk a model copy leaves free on the helper Mac without asking.
 _DISK_SPARE_BYTES = 50 << 30
 _RETRY_DELAYS_S = (15.0, 30.0, 60.0, 120.0, 300.0)
+# A prompt that could use a helper in backoff retries it at most this often.
+_RETRY_ON_USE_S = 15.0
 _WATCH_S = 2.0
 # A helper with open jobs that sends nothing for this long is gone.
 _STALL_S = 60.0
@@ -518,6 +520,18 @@ class PrefillHelperManager:
 
     def retry(self) -> None:
         self._commands.put(("retry",))
+
+    def retry_if_offline(self) -> None:
+        """Only when offline: any queued command cancels a copy waiting for the user."""
+        with self._lock:
+            status = self._status
+            if (
+                status["state"] == "offline"
+                and time.time() - status["since"] >= _RETRY_ON_USE_S
+                and self._commands.empty()
+            ):
+                # Unlike Retry, a tick keeps the backoff growing if it fails.
+                self._commands.put(("tick",))
 
     def stop(self) -> None:
         """Stop the helper but keep the choice; Retry starts it again."""
