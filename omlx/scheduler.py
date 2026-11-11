@@ -8010,10 +8010,8 @@ class Scheduler:
             rejected: Per-step rejected outputs. A chunked prefill that hits
                 the memory hard limit emits a finish_reason="error" entry
                 here so the engine can surface the failure to the client.
-            first: Short requests admitted ahead of the in-flight chunk.
-                They run first, so they finish their prefill before a
-                full-width head chunk (a longer chunk never packs behind
-                them uncontended).
+            first: Short requests admitted ahead of the in-flight chunk. They
+                run first so a full-width head chunk does not delay them.
         """
         if not self.prefilling:
             return
@@ -15863,7 +15861,7 @@ class Scheduler:
         try:
             # Alternate open prefill opportunities so neither admissions nor in-flight chunks starve.
             admit_first = False
-            already_prefilling: set[str] | None = None
+            prefilling_before: set[str] | None = None
             prefill_gate_open = self._prefill_gate_open() if self.prefilling else True
             if (
                 self._decode_fairness
@@ -15881,7 +15879,7 @@ class Scheduler:
                         request.num_prompt_tokens <= limit for request in self.waiting
                     ):
                         admit_first = True
-                        already_prefilling = {
+                        prefilling_before = {
                             request.request_id for request in self.prefilling
                         }
                 else:
@@ -15889,15 +15887,10 @@ class Scheduler:
                     self._admit_prefill_next = not admit_first
             if admit_first:
                 scheduled, rejected = self._schedule_waiting()
-            # Short requests admitted above that wait to pack (their first
-            # chunk runs in _advance_chunked_prefills) go ahead of the head.
+            # Short requests admitted above that wait to pack go ahead of the head.
             short_first = (
-                {
-                    request.request_id
-                    for request in self.prefilling
-                    if request.request_id not in already_prefilling
-                }
-                if already_prefilling is not None
+                {r.request_id for r in self.prefilling} - prefilling_before
+                if prefilling_before is not None
                 else set()
             )
 

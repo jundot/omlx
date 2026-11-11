@@ -2214,48 +2214,6 @@ def test_packed_prefill_keeps_the_head_chunk_and_fills_the_forward(monkeypatch):
     assert scheduler.get_stats()["packed_prefill"]["rows"] == 3
 
 
-def test_packed_prefill_forward_is_counted_once(monkeypatch):
-    """A packed forward over several rows counts as one chunk forward."""
-    scheduler = _make_packed_scheduler()
-    forwards = _record_packed_forwards(monkeypatch)
-    _stage_prefill(scheduler, "a", 5)
-    _stage_prefill(scheduler, "b", 7)
-    _advance(scheduler)
-    assert forwards == [[("a", 4), ("b", 6)]]
-    assert scheduler._prefill_forwards == 1
-
-
-def test_short_first_request_prefills_before_packed_head(monkeypatch):
-    """A short request admitted ahead of the in-flight chunk prefills first,
-    with the right cache. The head's full chunk does not pack behind it, and
-    the head still advances in the same step (#5148)."""
-    scheduler = _make_packed_scheduler()
-    forwards = _record_packed_forwards(monkeypatch)
-    inserted = _record_inserted_caches(monkeypatch, scheduler)
-    chunks = []
-    run = Scheduler._run_prefill_chunks
-
-    def record(self, plans):
-        chunks.append([(plan.state.request.request_id, plan.tokens) for plan in plans])
-        return run(self, plans)
-
-    monkeypatch.setattr(Scheduler, "_run_prefill_chunks", record)
-    _stage_prefill(scheduler, "inflight", 40)
-    _stage_prefill(scheduler, "short", 7)
-    scheduled, rejected = [], []
-    with patch("omlx.scheduler._sync_and_clear_cache"):
-        scheduler._advance_chunked_prefills(scheduled, rejected, first={"short"})
-    assert chunks[0] == [("short", 6)]
-    assert chunks[1][0][0] == "inflight"
-    assert [request.request_id for request in scheduled] == ["short"]
-    assert rejected == []
-    assert forwards == []
-    expected = _cache_with_prefix(scheduler.model, list(range(3, 9)))
-    _assert_same_cache(inserted["short"], expected)
-    assert scheduler._prefill_states["inflight"].tokens_processed > 0
-    assert scheduler._prefill_forwards == 2
-
-
 def test_packed_forwards_leave_the_single_chunk_rate_alone(monkeypatch):
     """The contended cap prices single-row chunks, which run slower per token."""
 

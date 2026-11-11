@@ -536,10 +536,8 @@ class EngineCore:
             return outputs
         now = time.monotonic()
         if now - started >= budget and getattr(outputs[0], "ran_prefill_chunk", False):
-            # A prefill chunk used the whole budget. Another step would run
-            # another chunk, and requests queued on the executor (admission,
-            # aborts) would wait for both, so hand control back now (#5148).
-            # Slow decode-only steps keep bursting.
+            # A chunk that spent the whole budget hands control back, so queued
+            # admissions and aborts do not wait for a second chunk (#5148).
             return outputs
         deadline = now + budget
         while len(outputs) < max_steps:

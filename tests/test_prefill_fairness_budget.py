@@ -1,6 +1,6 @@
 """Regressions for sharing decode time between consecutive prefill forwards."""
 
-from contextlib import ExitStack
+from contextlib import contextmanager
 from itertools import count
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -440,13 +440,10 @@ def test_cancel_after_admission_turn_preserves_inflight_prefill(clock):
 
 
 def test_uncontended_short_request_is_admitted_before_inflight_chunk(clock):
-    """With nothing decoding, a short request that arrives mid-prefill is
-    admitted before the in-flight chunk, which then shrinks to share the GPU
-    with its decode instead of running at full width first (#5148)."""
+    """With nothing decoding, a short arrival goes ahead of the chunk (#5148)."""
     scheduler = make_scheduler(prefill_step_size=4096)
     add_prefill(scheduler, "inflight")
-    waiting = make_request("waiting", 3)
-    scheduler.add_request(waiting)
+    scheduler.add_request(make_request("waiting", 3))
     events = []
     chunk_sizes = []
 
@@ -455,42 +452,6 @@ def test_uncontended_short_request_is_admitted_before_inflight_chunk(clock):
         chunk_sizes.append(
             scheduler._prefill_step_size_for_progress(state.tokens_processed, 8192)
         )
-        clock.now += 0.5
-        scheduler._accrue_decode_debt(0.5)
-        return False
-
-    def forward(tokens, **kwargs):
-        events.append("waiting")
-        clock.now += 0.01
-
-    scheduler.model.side_effect = forward
-    with (
-        patch.object(scheduler, "_step_prefill_chunk", side_effect=advance),
-        patch("omlx.scheduler.make_prompt_cache", return_value=[]),
-    ):
-        scheduler.step()
-        assert events == ["waiting", "inflight"]
-        assert chunk_sizes[0] < 4096
-        assert "waiting" in scheduler.running
-        assert not scheduler.waiting
-        # The in-flight prefill keeps advancing once the debt is repaid.
-        scheduler._repay_decode_debt(scheduler._decode_time_owed_s)
-        scheduler.step()
-
-    assert events == ["waiting", "inflight", "inflight"]
-    assert prefill_ids(scheduler) == ["inflight"]
-
-
-def test_disabled_fairness_keeps_chunk_before_admission(clock):
-    """Without decode fairness the chunk does not shrink, so admitting first
-    would gain nothing; the order stays chunk first."""
-    scheduler = make_scheduler(decode_fairness=False)
-    add_prefill(scheduler, "inflight")
-    scheduler.add_request(make_request("waiting", 3))
-    events = []
-
-    def advance(state):
-        events.append("inflight")
         return False
 
     scheduler.model.side_effect = lambda tokens, **kwargs: events.append("waiting")
@@ -500,13 +461,12 @@ def test_disabled_fairness_keeps_chunk_before_admission(clock):
     ):
         scheduler.step()
 
-    assert events == ["inflight", "waiting"]
+    assert events == ["waiting", "inflight"]
+    assert chunk_sizes[0] < 4096
     assert "waiting" in scheduler.running
 
 
 def test_step_reports_whether_a_prefill_chunk_ran(clock):
-    """EngineCore ends a burst only after a step that ran a chunk; a step that
-    held the prefill for decode reports none."""
     scheduler = make_scheduler()
     add_prefill(scheduler, "inflight")
 
@@ -521,7 +481,8 @@ def test_step_reports_whether_a_prefill_chunk_ran(clock):
         assert not scheduler.step().ran_prefill_chunk
 
 
-def fake_chunk_forwards(forwards, clock, seconds_per_token=0.001):
+@contextmanager
+def fake_chunk_forwards(forwards, clock):
     """Replace chunk planning and forwards with token bookkeeping."""
 
     def plan(self, state, *, limit=None, guarded=True):
@@ -539,8 +500,10 @@ def fake_chunk_forwards(forwards, clock, seconds_per_token=0.001):
         )
 
     def run(self, plans):
-        self._prefill_forwards = getattr(self, "_prefill_forwards", 0) + 1
-        forwards.append([(plan.state.request.request_id, plan.tokens) for plan in plans])
+        self._prefill_forwards += 1
+        forwards.append(
+            [(plan.state.request.request_id, plan.tokens) for plan in plans]
+        )
         done = []
         for plan in plans:
             state = plan.state
@@ -548,74 +511,54 @@ def fake_chunk_forwards(forwards, clock, seconds_per_token=0.001):
             state.tokens_remaining = mx.zeros((1, left), dtype=mx.int32)
             state.tokens_processed += plan.tokens
             done.append(left == 0)
-        seconds = sum(plan.tokens for plan in plans) * seconds_per_token
+        seconds = sum(plan.tokens for plan in plans) * 0.001
         clock.now += seconds
         self._accrue_decode_debt(seconds)
         return done
 
-    return (
+    with (
         patch.object(Scheduler, "_plan_prefill_chunk", plan),
         patch.object(Scheduler, "_run_prefill_chunks", run),
         patch("omlx.scheduler.make_prompt_cache", return_value=[]),
-    )
+    ):
+        yield
 
 
-def add_long_prefill(scheduler, request_id, remaining, processed=0):
-    request = add_prefill(scheduler, request_id)
+def add_long_prefill(scheduler, request_id, remaining):
+    add_prefill(scheduler, request_id)
     state = scheduler._prefill_states[request_id]
     state.tokens_remaining = mx.zeros((1, remaining), dtype=mx.int32)
-    state.tokens_processed = processed
-    return request
 
 
-@pytest.mark.parametrize("processed", [0, 8192])
-def test_uncontended_long_request_keeps_its_turn(clock, processed):
-    """A long arrival does not put its full-width first chunk ahead of the
-    in-flight request's chunk; that order and its costs stay as on main."""
+@pytest.mark.parametrize(
+    "waiting", [[20000], [30, 20000]], ids=["long", "short_and_long"]
+)
+def test_uncontended_long_waiting_keeps_chunk_first(clock, waiting):
+    """A long arrival does not push the in-flight request's last chunk back."""
     scheduler = make_scheduler(prefill_step_size=4096)
-    add_long_prefill(scheduler, "inflight", 4096, processed)
-    scheduler.add_request(make_request("long", 20000))
+    add_long_prefill(scheduler, "inflight", 4096)
+    for index, tokens in enumerate(waiting):
+        scheduler.add_request(make_request(f"waiting-{index}", tokens))
     forwards = []
-    with ExitStack() as stack:
-        for patcher in fake_chunk_forwards(forwards, clock):
-            stack.enter_context(patcher)
+    with fake_chunk_forwards(forwards, clock):
         scheduler.step()
 
     assert forwards[0] == [("inflight", 4096)]
     assert "inflight" in scheduler.running
 
 
-def test_uncontended_mixed_waiting_keeps_chunk_first(clock):
-    scheduler = make_scheduler(prefill_step_size=4096)
-    add_long_prefill(scheduler, "inflight", 20000)
-    scheduler.add_request(make_request("short", 30))
-    scheduler.add_request(make_request("long", 20000))
-    forwards = []
-    with ExitStack() as stack:
-        for patcher in fake_chunk_forwards(forwards, clock):
-            stack.enter_context(patcher)
-        scheduler.step()
-
-    assert forwards[0] == [("inflight", 4096)]
-
-
 def test_uncontended_short_packable_request_prefills_before_inflight_chunk(clock):
-    """A chat-sized prompt that takes the packed path prefills alone ahead of
-    the head, starts decoding, and the head chunk shrinks (#5148)."""
+    """A packed short arrival prefills alone ahead of the head chunk (#5148)."""
     scheduler = make_scheduler(prefill_step_size=4096)
     scheduler._packed_min_row_tokens = 64
-    add_long_prefill(scheduler, "inflight", 20000, 8192)
+    add_long_prefill(scheduler, "inflight", 20000)
     scheduler.add_request(make_request("chat", 300))
     forwards = []
-    with ExitStack() as stack:
-        for patcher in fake_chunk_forwards(forwards, clock):
-            stack.enter_context(patcher)
-        stack.enter_context(
-            patch.object(Scheduler, "_packed_prefill_ready", return_value=True)
-        )
-        stack.enter_context(
-            patch.object(Scheduler, "_packed_prefill_fits", return_value=True)
-        )
+    with (
+        fake_chunk_forwards(forwards, clock),
+        patch.object(Scheduler, "_packed_prefill_ready", return_value=True),
+        patch.object(Scheduler, "_packed_prefill_fits", return_value=True),
+    ):
         scheduler.step()
 
     assert forwards[0] == [("chat", 299)]

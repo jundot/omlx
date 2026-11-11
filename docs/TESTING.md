@@ -273,16 +273,3 @@ Run `python -m pytest -q tests/test_gpu_power.py` to check the GPU power limiter
 Run `python -m pytest -q tests/test_prefill_helper.py` for the host side: splits against an unsplit prefill on small models of each family, the SSH and control-channel transports with fake helpers, GPU budgets, and the link-aware layer choice. `test_payload_matches_the_contract_fixture` compares each family's boundary, state and prefix arrays with the recorded fixture in `tests/fixtures/prefill_contract/<family>/`. When it fails because the arrays changed on purpose, raise the adapter's `contract` and record again with `python tests/fixtures/record_prefill_contract.py <family> --force`; a Linux helper is then refused for the family until its own contract is raised too.
 
 Run `python -m pytest -q apps/omlx-cuda-helper/tests` for the Linux helper. `test_protocol.py` pairs the helper with a real `PairingManager` and drives its control channel with the host's `agent` module, `test_chain.py` runs two stage processes with a fake family, and the per-family files replay the same contract fixtures through the helper's own implementation. They need no NVIDIA GPU: on a Mac the stages run on Metal, and on the helper machine the same files run on CUDA. CI does not run this folder.
-
-# Mid-prefill admission tests
-
-Run `python -m pytest -q tests/test_engine_core.py tests/test_prefill_fairness_budget.py tests/test_scheduler_chunked_prefill.py -k "breaks_on_budget or over_budget_ends_burst or ends_burst_while_prefilling or uncontended_short or uncontended_long or uncontended_mixed or disabled_fairness_keeps_chunk or prefill_chunk_ran or forward_is_counted or short_first_request"` to check how fast a request that arrives during a long chunked prefill gets in and out.
-
-- A step that ran a prefill chunk and spent the whole burst budget ends the executor burst, so the new request's `add_request` runs after that chunk instead of after a second one. `step()` reports this as `ran_prefill_chunk`, counted once per chunk forward, packed or not.
-- Decode-only steps keep bursting, including ones slower than the budget and ones taken while a prefill waits its turn. Fast chunk steps keep bursting. The in-loop deadline still ends a burst when a chunk lands later in it.
-- A request that finishes while a chunked prefill is in flight ends the burst, so its last output is not held behind the next chunk. Bursts with nothing prefilling are unchanged, even with requests waiting.
-- With decode fairness on and nothing decoding, `step()` admits waiting requests ahead of the in-flight chunk only when each fits in one contended chunk.
-  - A short request that prefills inline starts decoding, and the in-flight chunk shrinks.
-  - A short request that takes the packed path prefills before the head, and the head's full chunk does not pack behind it.
-- A long waiting request, or a mix of short and long ones, keeps the chunk-first order, whatever the in-flight request's progress.
-- With decode fairness off, the order stays chunk first.
