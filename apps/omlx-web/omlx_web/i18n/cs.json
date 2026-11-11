@@ -2335,7 +2335,7 @@
   "usage.speed": "Výstup tok/s",
   "usage.empty": "V tomto rozsahu nejsou zaznamenána žádná data. Historie začíná po aktualizaci.",
   "usage.heatmap": "Využití tokenů podle dne a hodiny",
-  "usage.heatmap_note": "Hodiny 00–23 · tmavší zelená znamená více tokenů · opakující se hodiny přechodu na letní čas se slučují",
+  "usage.heatmap_note": "Hodiny 00–23 · sytější zelená znamená více tokenů · opakující se hodiny přechodu na letní čas se slučují",
   "usage.unavailable": "Historie využití není dostupná. Inferenze běží normálně dál.",
   "usage.delayed": "Historie může být neúplná: ukládání je zpožděné nebo dočasný buffer přetekl.",
   "usage.loading": "Načítám využití…",

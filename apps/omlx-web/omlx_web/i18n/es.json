@@ -2335,7 +2335,7 @@
   "usage.speed": "Salida tok/s",
   "usage.empty": "No hay uso registrado en este intervalo. El historial comienza después de actualizar.",
   "usage.heatmap": "Uso de tokens por día y hora",
-  "usage.heatmap_note": "Horas 00–23 · verde más oscuro significa más tokens · las horas repetidas por horario de verano se combinan",
+  "usage.heatmap_note": "Horas 00–23 · un verde más intenso significa más tokens · las horas repetidas por horario de verano se combinan",
   "usage.unavailable": "El historial de uso no está disponible. La inferencia continúa normalmente.",
   "usage.delayed": "El historial puede estar incompleto: el almacenamiento está retrasado o el búfer pendiente se desbordó.",
   "usage.loading": "Cargando uso…",

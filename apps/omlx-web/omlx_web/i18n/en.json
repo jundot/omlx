@@ -2335,7 +2335,7 @@
   "usage.speed": "Output tok/s",
   "usage.empty": "No recorded usage in this range. History begins after upgrading.",
   "usage.heatmap": "Token Usage by Day and Hour",
-  "usage.heatmap_note": "00–23 hours · darker green means more tokens · repeated DST hours combine",
+  "usage.heatmap_note": "00–23 hours · more vivid green means more tokens · repeated DST hours combine",
   "usage.unavailable": "Usage history is unavailable. Inference continues normally.",
   "usage.delayed": "History may be incomplete: storage is delayed or the pending buffer overflowed.",
   "usage.loading": "Loading usage…",

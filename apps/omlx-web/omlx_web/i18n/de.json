@@ -2335,7 +2335,7 @@
   "usage.speed": "Ausgabe-Token/s",
   "usage.empty": "Keine aufgezeichnete Nutzung in diesem Zeitraum. Der Verlauf beginnt nach dem Upgrade.",
   "usage.heatmap": "Token-Nutzung nach Tag und Stunde",
-  "usage.heatmap_note": "Stunden 00–23 · dunkleres Grün bedeutet mehr Token · doppelte Stunden bei der Zeitumstellung werden zusammengefasst",
+  "usage.heatmap_note": "Stunden 00–23 · kräftigeres Grün bedeutet mehr Token · doppelte Stunden bei der Zeitumstellung werden zusammengefasst",
   "usage.unavailable": "Der Nutzungsverlauf ist nicht verfügbar. Die Inferenz läuft normal weiter.",
   "usage.delayed": "Der Verlauf ist möglicherweise unvollständig: Die Speicherung ist verzögert oder der Wartepuffer ist übergelaufen.",
   "usage.loading": "Nutzung wird geladen…",
