@@ -1952,6 +1952,42 @@ class TestAdminAPI:
         (row,) = admin_routes._external_engines_for_model(pool, info, None)
         assert row["draft_repo"] is None
 
+    @pytest.mark.parametrize("engine, expected", [("splash", False), (None, True)])
+    def test_model_list_marks_mtp_unused_on_an_external_engine(
+        self, tmp_path, engine, expected
+    ):
+        model = _write_model(tmp_path / "models" / "Qwen3.8-27B-4bit-mtp")
+        config = json.loads((model / "config.json").read_text())
+        config["text_config"]["mtp_num_hidden_layers"] = 1
+        (model / "config.json").write_text(json.dumps(config))
+        (model / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"mtp.fc.weight": "model.safetensors"}})
+        )
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [{"id": "Qwen3.8-27B-4bit-mtp", "model_path": str(model)}]
+        }
+        manager = MagicMock()
+        manager.get_all_settings.return_value = {
+            "Qwen3.8-27B-4bit-mtp": ModelSettings(external_engine=engine)
+        }
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+            patch.object(
+                admin_routes,
+                "_get_server_state",
+                return_value=MagicMock(default_model=None),
+            ),
+            patch.object(admin_routes, "_get_global_settings", return_value=None),
+        ):
+            row = asyncio.run(admin_routes.list_models(is_admin=True))["models"][0]
+
+        assert row["mtp_compatible"] is expected
+        if not expected:
+            assert "external engine" in row["mtp_compatibility_reason"]
+
 
 # -- native response_format ---------------------------------------------------
 

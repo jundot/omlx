@@ -1180,11 +1180,22 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.vlm_mtp_draft_block_size = None
 
 
-def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
+_MTP_EXTERNAL_ENGINE_REASON = (
+    "MTP is not used when an external engine serves this model"
+)
+
+
+def _mtp_compat_for_model(
+    model_info: dict, external_engine: str | None = None
+) -> tuple[bool, str]:
     """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
 
     Returns ``(compatible, reason)``. Reason is empty on success and
     suitable for surfacing to users (admin UI shows it under the toggle).
+
+    ``external_engine`` is the engine that serves the model, if its settings
+    pick one. Lightning MTP runs in this process, so the external engine's own
+    speculation is used instead and the head is never read (issue #5146).
 
     The check is conservative: even when the config declares MTP layers
     we also peek at the safetensors weight index to verify that the
@@ -1203,6 +1214,9 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
         _has_mtp_heads,
         _is_mtp_compatible,
     )
+
+    if external_engine:
+        return False, _MTP_EXTERNAL_ENGINE_REASON
 
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
     if is_paro:
@@ -2456,7 +2470,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
-        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(
+            model_info, external_engine=getattr(settings, "external_engine", None)
+        )
         external_engines = _external_engines_for_model(
             engine_pool, model_info, settings
         )
