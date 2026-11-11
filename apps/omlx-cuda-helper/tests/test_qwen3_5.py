@@ -12,7 +12,6 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 from omlx_cuda_helper.families import qwen3_5  # noqa: E402
-from omlx_cuda_helper.families.qwen3_5 import kernels  # noqa: E402
 from omlx_cuda_helper.families.qwen3_5.stage import load_stage  # noqa: E402
 
 # Recorded by tests/fixtures/record_prefill_contract.py in the oMLX tree.
@@ -122,14 +121,14 @@ def test_a_stage_returns_the_layers_a_block_drafter_reads():
 def test_a_repeated_kernel_self_check_still_compares_with_plain_ops(monkeypatch):
     attention = load_stage(FIXTURE / "model", 3, 4).layers[0].mixer
 
-    def wrong(scores, first, rows):
-        return mx.ones_like(scores), mx.ones((scores.shape[0], 1))
+    def wrong(queries, keys, values, scale, mask):
+        return mx.ones_like(queries)
 
-    monkeypatch.setattr(kernels, "causal_weights", wrong)
-    # As an earlier self-check had left a kernel in use.
-    attention.causal_weights = wrong
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", wrong)
+    # As an earlier self-check had left fused attention in use.
+    attention.fused = True
     attention.enable_kernels()
-    assert attention.causal_weights is None
+    assert attention.fused is False
 
 
 def test_plan_counts_only_what_a_stage_loads():

@@ -196,7 +196,7 @@ class Attention:
         self.o_proj = w.linear("o_proj")
         self.q_norm = w["q_norm.weight"]
         self.k_norm = w["k_norm.weight"]
-        self.causal_weights = None
+        self.fused = False
 
     def parameters(self) -> list[mx.array]:
         linears = (self.q_proj, self.k_proj, self.v_proj, self.o_proj)
@@ -204,20 +204,18 @@ class Attention:
         return own + [a for layer in linears for a in layer.parameters()]
 
     def enable_kernels(self) -> None:
-        """Use the causal softmax kernel if ``attend`` gives the same result."""
+        """Use fused attention if it matches ``attend`` on plain ops."""
         dtype = self.q_proj.weight.dtype
         rows, total = 40, 104
         keys = mx.random.normal((1, self.kv_heads, total, self.head_dim)).astype(dtype)
         values = mx.random.normal(keys.shape).astype(dtype)
         queries = mx.random.normal((1, self.heads, rows, self.head_dim)).astype(dtype)
-        # The reference runs on plain ops, also when a kernel is in use.
-        self.causal_weights = None
+        # The reference runs on plain ops, also when fused attention is in use.
+        self.fused = False
         want = self.attend(queries, keys, values, step=16)
-        self.causal_weights = kernels.causal_weights
-        if not kernels.close(
-            self.attend(queries, keys, values, step=16), want, "Causal softmax"
-        ):
-            self.causal_weights = None
+        self.fused = True
+        if not kernels.attention_matches(self.attend(queries, keys, values), want):
+            self.fused = False
 
     def attend(
         self, queries: mx.array, keys: mx.array, values: mx.array, step: int = 0
@@ -226,9 +224,9 @@ class Attention:
 
         ``queries`` [1, heads, rows, dim] are the newest ``rows`` tokens of
         ``keys`` / ``values`` [1, kv heads, total, dim]. Returns
-        [1, rows, heads, dim]. Scores, softmax and value sums are float32 and
-        the output rounds once. ``step`` query rows share a score sheet; 0
-        sizes it to ``_SHEET_BYTES``.
+        [1, rows, heads, dim]. Without fused attention, scores, softmax and
+        value sums are float32 and the output rounds once; ``step`` query
+        rows then share a score sheet, and 0 sizes it to ``_SHEET_BYTES``.
         """
         rows, total = queries.shape[2], keys.shape[2]
         past = total - rows
@@ -237,6 +235,11 @@ class Attention:
         # Exact for a head width that is a power of four; else it moves the
         # float32 scores by less than their own rounding.
         scale = 1.0 / math.sqrt(dim)
+        if self.fused:
+            out = mx.fast.scaled_dot_product_attention(
+                queries, keys, values, scale=scale, mask="causal"
+            )
+            return out.transpose(0, 2, 1, 3)
         grouped = queries.reshape(1, kv, groups, rows, dim)
         # Transposed once: every step multiplies by the same keys.
         keys = mx.contiguous(keys.astype(mx.float32).swapaxes(-1, -2))
@@ -248,17 +251,10 @@ class Attention:
             n = stop - start
             q = grouped[..., start:stop, :].astype(mx.float32) * scale
             scores = q.reshape(1, kv, groups * n, dim) @ keys
-            if self.causal_weights is not None:
-                weights, norm = self.causal_weights(
-                    scores.reshape(-1, total), past + start + 1, n
-                )
-                weights = weights.reshape(scores.shape)
-                out = (weights @ values) / norm.reshape(1, kv, groups * n, 1)
-            else:
-                visible = past + mx.arange(start, stop)[:, None] >= mx.arange(total)
-                scores = scores.reshape(1, kv, groups, n, total)
-                weights = mx.softmax(mx.where(visible, scores, -mx.inf), axis=-1)
-                out = weights.reshape(1, kv, groups * n, total) @ values
+            visible = past + mx.arange(start, stop)[:, None] >= mx.arange(total)
+            scores = scores.reshape(1, kv, groups, n, total)
+            weights = mx.softmax(mx.where(visible, scores, -mx.inf), axis=-1)
+            out = weights.reshape(1, kv, groups * n, total) @ values
             outputs.append(out.astype(queries.dtype).reshape(1, kv, groups, n, dim))
             # One step at a time: each holds a float32 sheet of its scores.
             mx.eval(outputs[-1])

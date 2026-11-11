@@ -18,92 +18,25 @@ def available() -> bool:
     return mx.cuda.is_available()
 
 
-def close(got: mx.array, want: mx.array, what: str) -> bool:
-    """Whether a kernel result equals its reference up to float32 rounding.
+def attention_matches(got: mx.array, want: mx.array) -> bool:
+    """Whether fused attention agrees with the plain-ops reference.
 
-    A 16-bit output may round the other way in a few places when the float32
-    sums take another order; anything more is a wrong kernel.
+    cuDNN's fused attention moves 16-bit outputs by about 3e-3 relative to
+    the float32 reference; a wrong mask or layout moves them far more.
     """
     a, b = got.astype(mx.float32), want.astype(mx.float32)
     error = (mx.linalg.norm(a - b) / mx.maximum(mx.linalg.norm(b), 1e-30)).item()
-    differ = (got != want).astype(mx.float32).mean().item()
-    limit = 1e-5 if want.dtype == mx.float32 else 1e-3
-    if error <= limit and (want.dtype == mx.float32 or differ <= 0.02):
+    if error <= 1e-2:
         return True
     logger.warning(
-        "%s kernel differs from its reference (relative error %.2e, %.1f%% of "
-        "values); using the reference",
-        what,
+        "Fused attention differs from its reference (relative error %.2e); "
+        "using the reference",
         error,
-        100 * differ,
     )
     return False
 
 
-_CAUSAL_WEIGHTS = """
-  const int tid = threadIdx.x;
-  const int total = s_shape[1];
-  const int visible = geometry[0] + blockIdx.x % geometry[1];
-  const float* sr = s + size_t(blockIdx.x) * total;
-  float* wr = w + size_t(blockIdx.x) * total;
-  extern __shared__ char smem[];
-  float* part = reinterpret_cast<float*>(smem);
-
-  float top = -3.4028234664e38f;
-  for (int j = tid; j < visible; j += blockDim.x) top = fmaxf(top, sr[j]);
-  part[tid] = top;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) part[tid] = fmaxf(part[tid], part[tid + stride]);
-    __syncthreads();
-  }
-  top = part[0];
-  __syncthreads();
-
-  float acc = 0.0f;
-  for (int j = tid; j < total; j += blockDim.x) {
-    const float e = j < visible ? expf(sr[j] - top) : 0.0f;
-    wr[j] = e;
-    acc += e;
-  }
-  part[tid] = acc;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) part[tid] += part[tid + stride];
-    __syncthreads();
-  }
-  if (tid == 0) z[blockIdx.x] = part[0];
-"""
-_CAUSAL_WEIGHTS_KERNEL: list = []
 _THREADS = 256
-
-
-def causal_weights(scores: mx.array, first: int, rows: int) -> tuple[mx.array, ...]:
-    """Unnormalized causal softmax of float32 scores [n, total] in one launch.
-
-    Row ``i`` attends to the first ``first + i % rows`` keys. Returns the
-    weights [n, total] (zero on hidden keys) and their row sums [n, 1].
-    """
-    if not _CAUSAL_WEIGHTS_KERNEL:
-        _CAUSAL_WEIGHTS_KERNEL.append(
-            mx.fast.cuda_kernel(
-                name="qwen35_causal_weights",
-                input_names=["s", "geometry"],
-                output_names=["w", "z"],
-                source=_CAUSAL_WEIGHTS,
-                shared_memory=_THREADS * 4,
-            )
-        )
-    n = scores.shape[0]
-    weights, norm = _CAUSAL_WEIGHTS_KERNEL[0](
-        inputs=[scores, mx.array([first, rows], dtype=mx.int32)],
-        grid=(n * _THREADS, 1, 1),
-        threadgroup=(_THREADS, 1, 1),
-        output_shapes=[scores.shape, (n, 1)],
-        output_dtypes=[mx.float32, mx.float32],
-    )
-    return weights, norm
-
 
 # Conversions the kernels share; the 16-bit types round to nearest even.
 _HEADER = """
