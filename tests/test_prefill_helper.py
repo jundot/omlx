@@ -766,8 +766,11 @@ class _FakeLauncher:
         self.budget, self.missing = budget, list(missing)
         self.free, self.copies, self.hold = free, list(copies), hold
         self.copied, self.deleted, self.servers, self.paired = [], [], [], True
+        self.unreachable = False
 
     def resolve_target(self, node_id):
+        if self.unreachable:
+            raise launcher.UnreachableError("M5max does not answer over SSH.")
         if not self.paired:
             raise launcher.LaunchError("This Mac is not paired.")
         return HelperTarget(
@@ -1026,6 +1029,20 @@ def test_manager_blocks_what_a_retry_cannot_fix(tmp_path):
     manager.configure("node-2", None)
     _wait_state(manager, "error", reason="not paired")
     assert attached == []
+    manager.close()
+
+
+def test_manager_retries_a_helper_that_does_not_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (0.05,))
+    attached = []
+    fake = _FakeLauncher(None)
+    fake.unreachable = True
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
+    manager.configure("node-1", None)
+    _wait_state(manager, "offline", reason="does not answer over SSH")
+    fake.unreachable = False
+    _wait_state(manager, "ready")
+    assert attached
     manager.close()
 
 

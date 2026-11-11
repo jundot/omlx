@@ -34,7 +34,7 @@ from ..cluster.transport import probe_host_interfaces
 from . import wire
 from .adapter import StageAdapter
 from .adapters import adapter_for
-from .launcher import LaunchError, required_files
+from .launcher import LaunchError, UnreachableError, required_files
 
 __all__ = ["LaunchError", "required_files"]
 
@@ -147,7 +147,7 @@ def resolve_target(node_id: str) -> AgentTarget:
                 paired_at=float(device.get("paired_at") or 0.0),
             )
         )
-    raise LaunchError(f"{device['friendly_name']} does not answer.")
+    raise UnreachableError(f"{device['friendly_name']} does not answer.")
 
 
 def _slower(*speeds: int | None) -> int | None:
