@@ -76,6 +76,8 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         /// "context" (default) | "speed" — what the prefill memory guard
         /// optimizes under pressure.
         let prefillPriority: String?
+        /// "prefill" | "balanced" (default) | "decode": how prefill shares the GPU.
+        let concurrentPriority: String?
     }
 
     struct CacheSettings: Codable, Equatable, Sendable {
@@ -377,6 +379,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// Multi-block prefill — splits long prompts across scheduler ticks.
     var chunkedPrefill: Bool? = nil
     var prefillPriority: String? = nil
+    var concurrentPriority: String? = nil
 
     var cacheEnabled: Bool? = nil
     var hotCacheOnly: Bool? = nil

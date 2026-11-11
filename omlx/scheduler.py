@@ -1792,6 +1792,9 @@ def _get_attr_or_key(obj: Any, name: str) -> Any:
 # time stays at parity with fairness off; 1.0 buys ~5x decode at ~16%
 # batch-completion cost.
 _DECODE_FAIR_SHARE = 0.5
+# Per-row decode rate that the adaptive share leaves to running requests.
+# Decode time beyond it only delays queued prompts, so the debt stops there.
+_DECODE_RATE_FLOOR_TPS = 10.0
 # Contended chunks are sized in TIME, not tokens: a chunk is the victim's
 # decode stall, and stall tolerance is a human constant while tokens/second
 # is a machine constant. The cap in tokens is derived per engine from the
@@ -1814,6 +1817,20 @@ _CONTENDED_CHUNK_GRID = 64
 _DECODE_ACTIVITY_TTL_S = 2.5
 # Most requests whose resumable prefill chunks share one forward.
 _PACKED_PREFILL_MAX_ROWS = 4
+
+
+def _decode_share_for_floor(row_decode_tps: float | None) -> float:
+    """Debt ratio that holds each running row at the rate floor.
+
+    A row at ``row_decode_tps`` needs ``floor / row_decode_tps`` of wall time.
+    It never exceeds the fixed share, which also applies before any measurement.
+    """
+    if not row_decode_tps or row_decode_tps <= 0.0:
+        return _DECODE_FAIR_SHARE
+    fraction = _DECODE_RATE_FLOOR_TPS / row_decode_tps
+    if fraction >= 1.0:
+        return _DECODE_FAIR_SHARE
+    return min(_DECODE_FAIR_SHARE, fraction / (1.0 - fraction))
 
 
 def _ceil_to_contended_grid(tokens: int) -> int:
@@ -1949,6 +1966,8 @@ class SchedulerConfig:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk. Inert while nothing is decoding.
     decode_fairness: bool = True
+    # When True, own-engine debt shrinks while running rows stay above the floor.
+    adaptive_decode_share: bool = True
     # Set by the engine when MoE expert offload wrapped the model.
     moe_offload_active: bool = False
 
@@ -2431,7 +2450,12 @@ class Scheduler:
         self._decode_fairness: bool = bool(
             getattr(self.config, "decode_fairness", True)
         )
+        self._adaptive_decode_share: bool = bool(
+            getattr(self.config, "adaptive_decode_share", True)
+        )
         self._decode_time_owed_s: float = 0.0
+        self._row_decode_tps: float | None = None
+        self._row_decode_acc: list[float] = [0.0, 0.0]
         self._prefill_hold_until: float = 0.0
         self._admit_prefill_next: bool = False
         # Measured throughputs feeding the adaptive fairness constants.
@@ -6561,6 +6585,7 @@ class Scheduler:
           long each hold has to be, and the deadline is shared process-wide
           so concurrent prefillers pause together.
         The debt resets whenever no decode is running anywhere.
+        The measured row rate resets with it, since the next rows may differ.
         """
         if not self._decode_fairness:
             return True
@@ -6568,18 +6593,24 @@ class Scheduler:
             return False
         if not self.running:
             self._decode_time_owed_s = 0.0
+            self._row_decode_tps = None
         return time.perf_counter() >= self._prefill_hold_deadline()
 
     def _accrue_decode_debt(self, chunk_seconds: float) -> None:
         if not self._decode_fairness:
             return
-        share = max(0.0, chunk_seconds) * _DECODE_FAIR_SHARE
-        if share <= 0.0:
+        chunk_seconds = max(0.0, chunk_seconds)
+        if chunk_seconds <= 0.0:
             return
+        # Another engine's decode rate is not visible here, so it gets the fixed share.
+        others_decoding = self._others_decoding()
         if self.running:
-            self._decode_time_owed_s += share
-        elif self._others_decoding():
-            deadline = time.perf_counter() + share
+            ratio = _DECODE_FAIR_SHARE
+            if self._adaptive_decode_share and not others_decoding:
+                ratio = _decode_share_for_floor(self._row_decode_tps)
+            self._decode_time_owed_s += chunk_seconds * ratio
+        elif others_decoding:
+            deadline = time.perf_counter() + chunk_seconds * _DECODE_FAIR_SHARE
             self._prefill_hold_until = deadline
             with suppress(Exception):
                 get_decode_activity().extend_hold(deadline)
@@ -6591,13 +6622,32 @@ class Scheduler:
             0.0, self._decode_time_owed_s - max(0.0, decode_seconds)
         )
 
+    def _sample_row_decode_rate(self, tokens: int, decode_dt: float) -> None:
+        """Track tokens per running row per second of decode time.
+
+        Uses 100 ms buckets like ``_sample_decode_rate``; one MTP pop is not a rate.
+        """
+        rows = len(self.running)
+        if tokens <= 0 or decode_dt <= 0.0 or rows <= 0:
+            return
+        acc = self._row_decode_acc
+        acc[0] += tokens / rows
+        acc[1] += decode_dt
+        if acc[1] < 0.1:
+            return
+        rate = acc[0] / acc[1]
+        acc[0] = 0.0
+        acc[1] = 0.0
+        prev = self._row_decode_tps
+        self._row_decode_tps = rate if prev is None else 0.5 * prev + 0.5 * rate
+
     def _sample_decode_rate(self, tokens: int, decode_dt: float) -> None:
         """Track solo vs contended decode rate (observability only).
 
         Quiet samples (no prefill active anywhere in the process) feed the
-        solo baseline; the rest feed the contended EMA. The pair verifies
-        the fairness share guarantee — contended should hover around
-        share/(1+share) of solo — without steering anything.
+        solo baseline; the rest feed the contended EMA. Neither steers anything.
+        With the fixed share, contended should hover around share/(1+share) of solo.
+        The adaptive share can sit lower, down to the decode rate floor.
 
         Per-step rates are useless here: an MTP queue pop emits a token in
         microseconds, so single steps read as tens of thousands of tok/s.
@@ -15864,6 +15914,7 @@ class Scheduler:
                     responses.extend(self._step_vlm_mtp())
                 _decode_dt = time.perf_counter() - _t_decode_start
                 self._repay_decode_debt(_decode_dt)
+                self._sample_row_decode_rate(len(responses), _decode_dt)
                 self._sample_decode_rate(len(responses), _decode_dt)
                 output.has_work = True
 

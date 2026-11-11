@@ -98,6 +98,7 @@ from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
 from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_KV_FORMATS,
+    ConcurrentPriority,
     SubKeyEntry,
     burst_decode_env,
 )
@@ -743,6 +744,8 @@ class GlobalSettingsRequest(BaseModel):
     embedding_batch_size: int | None = None
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
+    concurrent_priority: ConcurrentPriority | None = None
+    # Older on/off form of concurrent_priority.
     decode_fairness: bool | None = None
 
     # Cache settings
@@ -4778,6 +4781,7 @@ def _global_settings_response(global_settings):
             "embedding_batch_size": global_settings.scheduler.embedding_batch_size,
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
             "prefill_priority": global_settings.scheduler.prefill_priority,
+            "concurrent_priority": global_settings.scheduler.concurrent_priority,
             "decode_fairness": global_settings.scheduler.decode_fairness,
         },
         "cache": {
@@ -5301,10 +5305,20 @@ async def update_global_settings(
         runtime_applied.append("prefill_priority")
         logger.info(f"Prefill priority set to '{value}'")
 
-    # Apply decode fairness setting (Live)
-    if request.decode_fairness is not None:
-        enabled = bool(request.decode_fairness)
-        global_settings.scheduler.decode_fairness = enabled
+    # Apply concurrent request priority setting (Live)
+    concurrent_priority = request.concurrent_priority
+    if concurrent_priority is None and request.decode_fairness is not None:
+        current = global_settings.scheduler.concurrent_priority
+        if not request.decode_fairness:
+            concurrent_priority = "prefill"
+        elif current == "prefill":
+            concurrent_priority = "balanced"
+        else:
+            concurrent_priority = current
+    if concurrent_priority is not None:
+        global_settings.scheduler.concurrent_priority = concurrent_priority
+        enabled = concurrent_priority != "prefill"
+        adaptive = concurrent_priority == "balanced"
         from ..server import _server_state
 
         pool = _server_state.engine_pool
@@ -5312,6 +5326,7 @@ async def update_global_settings(
             pool_config = getattr(pool, "_scheduler_config", None)
             if pool_config is not None:
                 pool_config.decode_fairness = enabled
+                pool_config.adaptive_decode_share = adaptive
             for mid, entry in pool._entries.items():
                 if entry is None or entry.engine is None:
                     continue
@@ -5326,13 +5341,13 @@ async def update_global_settings(
                 )
                 if scheduler is not None:
                     scheduler._decode_fairness = enabled
+                    scheduler._adaptive_decode_share = adaptive
                     scheduler._decode_time_owed_s = 0.0
                     if hasattr(scheduler, "config"):
                         scheduler.config.decode_fairness = enabled
-        runtime_applied.append("decode_fairness")
-        logger.info(
-            f"Decode fairness {'enabled' if enabled else 'disabled'}"
-        )
+                        scheduler.config.adaptive_decode_share = adaptive
+        runtime_applied.append("concurrent_priority")
+        logger.info(f"Concurrent request priority set to '{concurrent_priority}'")
 
     if request.hot_cache_max_size is not None:
         try:
