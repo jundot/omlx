@@ -707,6 +707,36 @@ process.stdout.write(JSON.stringify({
     }
 
 
+def test_a_paired_helper_daemon_reopens_before_any_model_uses_it():
+    result = _run_wizard(
+        """
+(async () => {
+const reopen = async (...paired) => {
+  const page = clusterV2Wizard();
+  page.devicesPayload = { paired };
+  page.devicesLoaded = true;
+  page.deploymentsLoaded = true;
+  page.apiFetch = (url) => url === '/admin/api/models'
+    ? Promise.resolve({ models: [] })
+    : new Promise(() => {});
+  await page.restoreAccelerator();
+  return [page.wizardState(), page.accelerator?.nodeId || null];
+};
+const agent = { control: 'agent' };
+const helper = await reopen(
+  { node_id: 'old', caps: agent, state: 'dead' }, { node_id: 'gpu', caps: agent },
+);
+const mac = await reopen({ node_id: 'm5', friendly_name: 'M5max' });
+process.stdout.write(JSON.stringify({ helper, mac }));
+})();
+"""
+    )
+
+    # The helper that answers comes first. A paired Mac may also split a
+    # model, so it stays on the device cards.
+    assert result == {"helper": ["accelerator", "gpu"], "mac": ["device_card", None]}
+
+
 def test_a_helper_mac_shows_whom_it_helps_until_setup_changes():
     result = _run_wizard(
         """

@@ -1828,7 +1828,13 @@ function clusterV2Wizard() {
             const used = new Set(
                 (payload?.models || []).map((model) => model.settings?.prefill_helper_node_id),
             );
-            const device = this.pairedDevices().find((item) => used.has(item.node_id));
+            // A helper daemon is only ever a Prefill Accelerator; one that
+            // answers comes first.
+            const helpers = this.pairedDevices().filter((item) => this.deviceHelperOnly(item));
+            const device =
+                this.pairedDevices().find((item) => used.has(item.node_id)) ||
+                helpers.find((item) => item.state !== 'dead') ||
+                helpers[0];
             if (device && open()) this.startAccelerator(device, { asHost: true });
         },
 
