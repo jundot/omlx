@@ -687,8 +687,10 @@ class PrefillHelperManager:
             fixed_layers=self.fixed_layers,
             unit_helper=saved.get("helper"),
             unit_host=saved.get("host"),
+            unit_extra=saved.get("extra"),
+            alone_ratio=saved.get("alone"),
         )
-        self._saved = (saved.get("helper"), saved.get("host"))
+        self._saved = tuple(saved.get(k) for k in ("helper", "host", "extra", "alone"))
         self.attach(self._session)
         self._set(
             "ready",
@@ -754,14 +756,21 @@ class PrefillHelperManager:
 
     def _save_speeds(self) -> None:
         session = self._session
-        speeds = (session.unit_helper, session.unit_host)
-        if None in speeds or speeds == self._saved:
+        speeds = (
+            session.unit_helper,
+            session.unit_host,
+            session.unit_extra,
+            session.alone_ratio,
+        )
+        if None in speeds[:2] or speeds == self._saved:
             return
         with _SPEEDS_LOCK:
             data = self._load_speeds()
             data[self._speeds_key()] = {
                 "helper": speeds[0],
                 "host": speeds[1],
+                "extra": speeds[2],
+                "alone": speeds[3],
                 "at": time.time(),
             }
             try:

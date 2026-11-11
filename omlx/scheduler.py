@@ -86,7 +86,7 @@ from .prefill_boundaries import (
 )
 from .prefill_helper.adapter import Capture
 from .prefill_helper.client import HelperError
-from .prefill_helper.session import HelperPrefill
+from .prefill_helper.session import HelperPrefill, PrefillHelperSession
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import (
@@ -664,6 +664,8 @@ class _PrefillState:
     system_at: int | None = None
     # Set while a prefill helper runs the first layers of this request.
     helper: HelperPrefill | None = None
+    # The helper session that left this request to this Mac, to time it.
+    alone: PrefillHelperSession | None = None
 
 
 @dataclass
@@ -6866,6 +6868,8 @@ class Scheduler:
                 state.cache if state.base_size > 0 else None,
                 capture,
             )
+        if state.helper is None:
+            state.alone = session
         # Without a job the request still prefills here in chunks.
         self.prefilling.append(request)
         self._prefill_states[request.request_id] = state
@@ -7040,6 +7044,12 @@ class Scheduler:
             capture=capture,
             **chunk_kwargs,
         )
+        # Timed apart: the estimate for this Mac alone counts only its layers.
+        mx.eval(
+            [c.state for c in state.cache[helper.layers :]],
+            [v for _, v in tree_flatten(output) if isinstance(v, mx.array)],
+        )
+        layers_done = time.perf_counter()
         adapter.apply_state(state.cache, helper.layers, part.state)
         adapter.finish_chunk(lm, chunk, output, state.cache)
         if capture is not None:
@@ -7053,7 +7063,11 @@ class Scheduler:
             )
         mx.eval([c.state for c in state.cache])
         session.observe(
-            helper.layers, part.size, part.seconds, time.perf_counter() - began
+            helper.layers,
+            part.size,
+            part.seconds,
+            layers_done - began,
+            extra_s=time.perf_counter() - layers_done,
         )
 
     def _next_prefill_chunk_len(self, state: _PrefillState, n: int) -> int:
@@ -7886,14 +7900,14 @@ class Scheduler:
         rid = request.request_id
         # Prefill complete - emit final boundary snapshot and insert.
         self._prefill_states.pop(rid, None)
+        seconds = time.monotonic() - (request.prefill_started_at or time.monotonic())
         if state.helper is not None:
-            state.helper.session.finish(
-                rid,
-                state.tokens_processed,
-                time.monotonic() - (request.prefill_started_at or time.monotonic()),
-            )
+            state.helper.session.finish(rid, state.tokens_processed, seconds)
             # A requeued insert must not wait on the finished job.
             state.helper = None
+        elif state.alone is not None:
+            state.alone.observe_alone(state.tokens_processed, seconds)
+            state.alone = None
         self._emit_final_boundary_if_needed(state)
         Scheduler._clear_cache(self)
 

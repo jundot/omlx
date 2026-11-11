@@ -498,6 +498,7 @@ def test_auto_split_balances_measured_speed():
     work = [1.0] * 20 + [0.1] + [0.0] * 19  # DeepSeek V4.1 with CED
     client = SimpleNamespace(info={"warm_seconds": 18.0, "warm_tokens": 1}, alive=True)
     session = PrefillHelperSession(client, DSV41, None, 18, "helper-mac", work)
+    session.alone_ratio = 1.0  # a prompt has run on this Mac alone
     # Until this Mac is timed, the helper takes every layer it holds.
     assert session.pick_layers() == 18
     # This Mac takes twice as long per unit of work: the helper gets more.
@@ -540,6 +541,35 @@ def test_auto_split_balances_measured_speed():
     assert quick.pick_layers() == 4
     assert quick.pick_layers([100] * 10) == 4
     assert quick.pick_layers([100]) == 0
+
+
+def test_auto_split_keeps_the_cost_of_a_split_out_of_this_mac_alone():
+    link = SimpleNamespace(info={}, alive=True, link_bps=1.0, token_bytes={-1: 12.0})
+    session = PrefillHelperSession(link, DSV41, None, 10, "helper", [1.0] * 10)
+    # Split at 8: this Mac's two layers took 1 s per token each, taking in the
+    # helper's state and finishing the chunk 3 s per token more.
+    session.observe(8, 2048, helper_s=0.08 * 2048, host_s=2 * 2048, extra_s=3 * 2048)
+    # Alone this Mac needs 10 s per token, less than the link's 12.
+    session.alone_ratio = 1.0
+    assert session.pick_layers() == 0
+    # On a faster link the split also pays the 3 s on this Mac.
+    link.token_bytes = {-1: 9.0}
+    assert session.pick_layers() == 4
+
+
+def test_auto_split_times_this_mac_alone_before_a_close_call():
+    def session(alone_s):
+        link = SimpleNamespace(info={}, alive=True, link_bps=1.0, token_bytes={-1: 9.5})
+        split = PrefillHelperSession(link, DSV41, None, 10, "helper", [1.0] * 10)
+        split.unit_helper, split.unit_host = 0.01, 1.0
+        # The link's 9.5 s per token is close to the 10 s estimated alone:
+        # this prompt stays here and is timed.
+        assert split.pick_layers() == 0
+        split.observe_alone(2048, alone_s * 2048)
+        return split.pick_layers()
+
+    assert session(12.0) == 1
+    assert session(9.0) == 0
 
 
 def test_job_uses_fewer_layers_than_the_helper_holds():
@@ -1030,7 +1060,7 @@ def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
     manager.configure("node-1", None)
     _wait_state(manager, "ready")
     assert (attached[-1].unit_helper, attached[-1].unit_host) == (1e-5, 3e-5)
-    attached[-1].observe(2, 2048, helper_s=1.0, host_s=3.0)
+    attached[-1].observe(2, 2048, helper_s=1.0, host_s=3.0, extra_s=0.5)
     measured = (attached[-1].unit_helper, attached[-1].unit_host)
     manager.close()
 
@@ -1038,6 +1068,7 @@ def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
     again.configure("node-1", None)
     _wait_state(again, "ready")
     assert (attached[-1].unit_helper, attached[-1].unit_host) == measured
+    assert attached[-1].unit_extra == 0.5 / 2048
     # Switching Macs keeps the measured speeds under the Mac that measured them.
     again.configure("node-2", None)
     _wait_state(again, "ready")
