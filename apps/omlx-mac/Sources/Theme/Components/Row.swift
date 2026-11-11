@@ -101,19 +101,21 @@ extension Row where Trailing == EmptyView {
 /// strips, multi-line custom rows, etc.
 struct FreeRow<Content: View>: View {
     let isLast: Bool
+    let verticalPadding: CGFloat
     let content: () -> Content
 
     @Environment(\.omlxTheme) private var theme
 
-    init(isLast: Bool = false, @ViewBuilder content: @escaping () -> Content) {
+    init(isLast: Bool = false, verticalPadding: CGFloat = 10, @ViewBuilder content: @escaping () -> Content) {
         self.isLast = isLast
+        self.verticalPadding = verticalPadding
         self.content = content
     }
 
     var body: some View {
         content()
             .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.vertical, verticalPadding)
             .frame(maxWidth: .infinity, alignment: .leading)
             .overlay(alignment: .bottom) {
                 if !isLast {

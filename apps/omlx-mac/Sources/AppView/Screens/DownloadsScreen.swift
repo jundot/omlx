@@ -872,9 +872,7 @@ private struct SuggestedSection: View {
                     let isLast = idx == min(models.count, 15) - 1
                     FreeRow(isLast: isLast) {
                         HStack(spacing: 10) {
-                            Squircle(systemSymbol: "cpu",
-                                     size: 26,
-                                     gradient: SquircleGradient.models)
+                            ModelIconTile(systemSymbol: "cpu")
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(m.repoId)
                                     .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))

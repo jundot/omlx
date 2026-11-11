@@ -14393,6 +14393,36 @@
         }
       }
     },
+    "models.library.copy_alias" : {
+      "comment" : "Tooltip and context menu item that copies a model's alias",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alias kopieren"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy alias"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скопировать псевдоним"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制别名"
+          }
+        }
+      }
+    },
     "models.library.empty.sub" : {
       "comment" : "Empty-state subtitle directing the user to the Downloads screen",
       "extractionState" : "manual",
