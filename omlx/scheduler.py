@@ -3852,6 +3852,9 @@ class Scheduler:
             prefill_step_size=self.config.prefill_step_size,
             stream=self._stream,
         )
+        # The wired limit is process-wide. Restoring this generator's snapshot
+        # on close would unwire models that other generators still serve.
+        bg._old_wired_limit = None
 
         return bg
 

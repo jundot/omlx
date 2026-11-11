@@ -2377,6 +2377,35 @@ class TestSchedulerStatistics:
 class TestSchedulerReset:
     """Tests for Scheduler reset methods."""
 
+    def test_dropped_generator_keeps_wired_limit_for_other_models(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """Unloading one model must not unwire a model still serving (#5165)."""
+        small = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        large = Scheduler(model=type(mock_model)(), tokenizer=mock_tokenizer)
+        recommended = 64 * 1024**3
+        limit = {"bytes": 0}
+
+        def set_wired_limit(value):
+            previous, limit["bytes"] = limit["bytes"], value
+            return previous
+
+        monkeypatch.setattr(mx, "set_wired_limit", set_wired_limit)
+        monkeypatch.setattr(mx, "synchronize", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            mx,
+            "device_info",
+            lambda: {"max_recommended_working_set_size": recommended},
+        )
+
+        small._ensure_batch_generator(SamplingParams())
+        large._ensure_batch_generator(SamplingParams())
+        small.batch_generator = None
+        gc.collect()
+
+        assert large.batch_generator is not None
+        assert limit["bytes"] == recommended
+
     def test_reset_clears_state(self, mock_model, mock_tokenizer):
         """Test reset() clears all scheduler state."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
