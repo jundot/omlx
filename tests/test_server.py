@@ -1885,6 +1885,17 @@ def test_prepare_chat_prompt_for_request_prepares_vlm_prompt():
     )
 
 
+@pytest.mark.asyncio
+async def test_text_engine_prepares_prompt_off_the_event_loop():
+    engine = BatchedEngine(model_name="test-model")
+
+    prepare_thread = await srv._prepare_prompt_off_loop(
+        engine, lambda engine: threading.get_ident()
+    )
+
+    assert prepare_thread != threading.get_ident()
+
+
 @pytest.fixture
 def served_vlm_engine(monkeypatch):
     """Serve a real VLMBatchedEngine with a stub tokenizer and scheduler."""

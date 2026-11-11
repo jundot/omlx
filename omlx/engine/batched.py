@@ -209,16 +209,10 @@ class BatchedEngine(BaseEngine):
         """Lazily create and return a GrammarCompiler for this model.
 
         Returns ``None`` when xgrammar is not installed or initialization fails.
-
-        Prompt preparation runs in a worker thread once the engine is off-loaded
-        from the event loop, so concurrent first requests can reach this lazily
-        initialized state at the same time. Without the lock the second caller
-        would observe ``_init_attempted`` and get ``None`` forever; the
-        double-check keeps construction single-shot while letting waiters reuse
-        the result.
         """
         if self._grammar_compiler is not None:
             return self._grammar_compiler
+        # Prompt preparation calls this from worker threads. Build it once.
         with self._grammar_compiler_lock:
             if self._grammar_compiler is not None:
                 return self._grammar_compiler

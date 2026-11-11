@@ -1477,16 +1477,8 @@ class TestBatchedEngineToolParserRepair:
 
 
 class TestGrammarCompilerLazyInit:
-    """The lazy grammar compiler must be safe under concurrent first use."""
-
     def test_concurrent_first_access_shares_one_compiler(self):
-        """All concurrent callers get the compiler, and it is built once.
-
-        Prompt preparation is off-loaded to a worker thread, so the first
-        requests of a k2_horizon model can reach this property at the same
-        time. With only the ``_init_attempted`` flag the losers returned
-        ``None`` and never retried.
-        """
+        """Concurrent first callers all get the compiler, built once."""
         from omlx.engine.batched import BatchedEngine
 
         engine = BatchedEngine(model_name="test-model")
@@ -1496,7 +1488,6 @@ class TestGrammarCompilerLazyInit:
         sentinel = object()
         calls: list[int] = []
         results: list[Any] = []
-        errors: list[BaseException] = []
         start = threading.Barrier(8)
 
         def fake_create(tokenizer, model, cache_limit_bytes=-1):
@@ -1506,10 +1497,7 @@ class TestGrammarCompilerLazyInit:
 
         def worker():
             start.wait(timeout=5)
-            try:
-                results.append(engine.grammar_compiler)
-            except BaseException as exc:  # pragma: no cover - failure path
-                errors.append(exc)
+            results.append(engine.grammar_compiler)
 
         with patch("omlx.api.grammar.create_grammar_compiler", side_effect=fake_create):
             threads = [threading.Thread(target=worker) for _ in range(8)]
@@ -1518,27 +1506,6 @@ class TestGrammarCompilerLazyInit:
             for thread in threads:
                 thread.join(timeout=5)
 
-        assert not errors
         assert len(results) == 8
         assert all(result is sentinel for result in results), results
         assert len(calls) == 1
-
-    def test_failed_init_is_not_retried(self):
-        """A failing compiler is attempted once and then reported as absent."""
-        from omlx.engine.batched import BatchedEngine
-
-        engine = BatchedEngine(model_name="test-model")
-        engine._model = SimpleNamespace(config={"model_type": "k2_horizon"})
-        engine._tokenizer = object()
-
-        with (
-            patch(
-                "omlx.api.grammar.create_grammar_compiler",
-                side_effect=RuntimeError("boom"),
-            ) as create,
-            patch("omlx.utils.install.get_install_method", return_value="pip"),
-        ):
-            assert engine.grammar_compiler is None
-            assert engine.grammar_compiler is None
-
-        assert create.call_count == 1

@@ -2446,16 +2446,9 @@ def _prepare_chat_prompt_for_request(
 
 
 async def _prepare_prompt_off_loop(engine: BaseEngine, prepare, *args, **kwargs):
-    """Call ``prepare(engine, ...)`` in a worker thread when it can block.
+    """Call ``prepare(engine, ...)`` in a worker thread for batched engines.
 
-    Rendering the chat template and encoding a long prompt is pure CPU work;
-    doing it on the event loop stalls every other stream and ``/health`` for
-    the whole duration. Both batched engines now do it off loop: the grammar
-    compiler the text engine lazily builds is guarded by a lock in
-    :mod:`omlx.engine.batched`.
-
-    ``DistributedBatchedEngine`` subclasses ``BatchedEngine`` but does not
-    prepare prompts itself, so match the exact types that do.
+    Encoding a long prompt on the event loop stalls every other stream.
     """
     if type(engine) in (BatchedEngine, VLMBatchedEngine):
         return await asyncio.to_thread(prepare, engine, *args, **kwargs)
