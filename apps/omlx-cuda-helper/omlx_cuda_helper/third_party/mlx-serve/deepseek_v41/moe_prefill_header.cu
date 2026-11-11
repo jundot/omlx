@@ -1,7 +1,8 @@
 // Adapted from mlx-serve src/kernels/moe/moe_prefill_cuda_header.cu (MIT,
 // Copyright (c) 2026 David Dalcu). Changed: the expert weights are affine
-// codes (3, 4 or 8 bits, 64 weights a group, bf16 scales and biases) instead
-// of fp4/fp8 codes, and a weight is code * scale + bias in float, rounded once.
+// codes (3, 4 or 8 bits, 64 weights a group, bf16 scales and biases), where a
+// weight is code * scale + bias in float rounded once, or with MX MLX mxfp4
+// codes (E2M1, one E8M0 scale per 32 weights), whose weights bf16 holds exactly.
 // Each tensor-core step starts from zero and its 16 products are added to
 // the running sum with a correctly rounded float add: a tensor core does not
 // round its own accumulator to nearest, which over a 4096-wide row moves
@@ -32,6 +33,14 @@ __device__ __forceinline__ void msv_mma(float* c, const uint32_t* a, uint32_t b0
 __device__ __forceinline__ uint32_t msv_affine(uint32_t code, float scale, float bias) {
   const __nv_bfloat16 v = __float2bfloat16_rn(fmaf(static_cast<float>(code), scale, bias));
   return *reinterpret_cast<const unsigned short*>(&v);
+}
+// The float value of E2M1 code q (sign bit 3) times the E8M0 scale
+// 2**(e - 127), built from its bits. The product is exact in float and in
+// bf16, so the order of the decode does not matter.
+__device__ __forceinline__ float msv_mx4(uint32_t q, float scale) {
+  const uint32_t m = q & 7u;
+  const uint32_t mag = m < 2u ? m * 0x3F000000u : (((126u + (m >> 1)) << 23) | ((m & 1u) << 22));
+  return __uint_as_float(mag | ((q & 8u) << 28)) * scale;
 }
 // Code i of 64 3-bit codes packed as one little-endian bit stream in w.
 __device__ __forceinline__ uint32_t msv_code3(const unsigned long long* w, int i) {
@@ -65,9 +74,9 @@ __device__ __forceinline__ void msv_expert_range(const uint32_t* inds, int R, ui
 // `wrow(r)` (codes), `srow(r)` and `brow(r)` (scales, biases). Weights stream through registers BD
 // 128-wide K stages ahead, each warp load reading whole 64+ byte row pieces; the CTA turns a stage
 // into one bf16 tile that ldmatrix feeds to mma.m16n8k16, K in order. Leaves smem free for the caller.
-template <int BITS, int K, int BD, int ST, typename ARow, typename WRow, typename SRow, typename BRow>
+template <int BITS, int K, int BD, int ST, bool MX, typename ARow, typename WRow, typename SRow, typename BRow>
 __device__ __forceinline__ void msv_expert_tile(uint8_t* smem, int mv, ARow arow, WRow wrow, SRow srow, BRow brow, float (&acc)[2][4][4]) {
-  constexpr int BM = 64, BN = 128, KS = 128, GROUP = 64;
+  constexpr int BM = 64, BN = 128, KS = 128, GROUP = MX ? 32 : 64;
   constexpr int RB = KS * BITS / 8;
   constexpr int KT = K / KS;
   constexpr int A_ST = BM * KS * 2;
@@ -111,8 +120,12 @@ __device__ __forceinline__ void msv_expert_tile(uint8_t* smem, int mv, ARow arow
       const int r = (i * 256 + tid) / CPR;
       dst[i] = __ldcg(reinterpret_cast<const uint4*>(wrow(r) + (long)t * RB + cc * 16));
       const int g = (t * KS + cc * CV) / GROUP;
-      sc[i] = static_cast<uint32_t>(__ldcg(reinterpret_cast<const unsigned short*>(srow(r) + g))) |
-          (static_cast<uint32_t>(__ldcg(reinterpret_cast<const unsigned short*>(brow(r) + g))) << 16);
+      if constexpr (MX) {
+        sc[i] = static_cast<uint32_t>(__ldcg(reinterpret_cast<const unsigned char*>(srow(r) + g)));
+      } else {
+        sc[i] = static_cast<uint32_t>(__ldcg(reinterpret_cast<const unsigned short*>(srow(r) + g))) |
+            (static_cast<uint32_t>(__ldcg(reinterpret_cast<const unsigned short*>(brow(r) + g))) << 16);
+      }
     }
   };
   #pragma unroll
@@ -164,17 +177,31 @@ __device__ __forceinline__ void msv_expert_tile(uint8_t* smem, int mv, ARow arow
           const float bias = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&bbits));
           uint32_t out[CV / 2];
           if constexpr (BITS == 4) {
-            // The 16 values a code of this group can take.
-            uint32_t tab[16];
-            #pragma unroll
-            for (int q = 0; q < 16; ++q) tab[q] = msv_affine(q, scale, bias);
-            #pragma unroll
-            for (int w4 = 0; w4 < 4; ++w4)
+            if constexpr (MX) {
+              const uint32_t e8 = bsc[j][i] & 0xffu;
+              // 2**(e8 - 127); e8 = 0 is the subnormal 2**-127.
+              const float mx_scale = __uint_as_float(e8 ? e8 << 23 : 0x00400000u);
               #pragma unroll
-              for (int q = 0; q < 4; ++q) {
-                const uint32_t pair = (vw[w4] >> (8 * q)) & 0xff;
-                out[4 * w4 + q] = tab[pair & 15] | (tab[pair >> 4] << 16);
-              }
+              for (int w4 = 0; w4 < 4; ++w4)
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                  const uint32_t pair = (vw[w4] >> (8 * q)) & 0xff;
+                  const __nv_bfloat162 v = __floats2bfloat162_rn(msv_mx4(pair & 15, mx_scale), msv_mx4(pair >> 4, mx_scale));
+                  out[4 * w4 + q] = *reinterpret_cast<const uint32_t*>(&v);
+                }
+            } else {
+              // The 16 values a code of this group can take.
+              uint32_t tab[16];
+              #pragma unroll
+              for (int q = 0; q < 16; ++q) tab[q] = msv_affine(q, scale, bias);
+              #pragma unroll
+              for (int w4 = 0; w4 < 4; ++w4)
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                  const uint32_t pair = (vw[w4] >> (8 * q)) & 0xff;
+                  out[4 * w4 + q] = tab[pair & 15] | (tab[pair >> 4] << 16);
+                }
+            }
           } else {
             #pragma unroll
             for (int w4 = 0; w4 < 4; ++w4)

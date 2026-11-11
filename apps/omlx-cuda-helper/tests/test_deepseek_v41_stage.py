@@ -13,6 +13,8 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 from omlx_cuda_helper.families import deepseek_v41  # noqa: E402
+from omlx_cuda_helper.families.deepseek_v41 import kernels, layers, quant  # noqa: E402
+from omlx_cuda_helper.families.deepseek_v41.config import Config  # noqa: E402
 from omlx_cuda_helper.families.deepseek_v41.stage import load_stage  # noqa: E402
 
 # Recorded by tests/fixtures/record_prefill_contract.py in the oMLX tree.
@@ -132,3 +134,41 @@ def test_plan_and_warm():
     assert all(
         _stage(*bounds).warm(12) > 0 for bounds in ((0, 3), (3, 6), (1, 6), (2, 6))
     )
+
+
+@pytest.mark.skipif(not kernels.available(), reason="the tile kernels run on CUDA")
+@pytest.mark.parametrize(
+    "spec",
+    [{"mode": "affine", "bits": 3, "group_size": 64}, {"mode": "mxfp4", "bits": 4}],
+    ids=["affine3", "mxfp4"],
+)
+def test_expert_tiles_read_banks_as_gather_qmm(spec):
+    """Gate/up with SwiGLU and FP8, then down, against MLX's expert kernel."""
+
+    def bank(name, rows, width, seed):
+        w = mx.random.normal((2, rows, width), key=mx.random.key(seed)) * 0.1
+        group = spec.get("group_size", 32)
+        q = mx.quantize(w.astype(mx.bfloat16), group, spec["bits"], mode=spec["mode"])
+        tensors = dict(zip((".weight", ".scales", ".biases"), q))
+        weights = {name + part: value for part, value in tensors.items()}
+        return layers.ExpertBank(weights, name, Config(quantized={name: spec}))
+
+    gate, up, down = (
+        bank("g", 128, 256, 1),
+        bank("u", 128, 256, 2),
+        bank("d", 256, 128, 3),
+    )
+    assert kernels.experts_fit([gate, up, down])
+    keys = mx.random.split(mx.random.key(4), 3)
+    x = quant.quantize(mx.random.normal((40, 256), key=keys[0]).astype(mx.bfloat16))
+    experts = mx.sort(mx.random.randint(0, 2, (40,), key=keys[1])).astype(mx.uint32)
+    weights = mx.random.uniform(0.1, 1.0, (40,), key=keys[2])
+    rows = x[:, None]
+    want = layers._swiglu(gate(rows, experts), up(rows, experts), weights, 10.0, True)
+    got = kernels.expert_gate_up(
+        x, mx.arange(40, dtype=mx.uint32), experts, gate, up, weights, 10.0, True
+    )
+    assert kernels.relative_error(got, want.reshape(got.shape)) < layers._TILE_ERROR
+    got = kernels.expert_down(want.reshape(40, -1), experts, down)
+    want = down(want, experts)
+    assert kernels.relative_error(got, want.reshape(got.shape)) < layers._TILE_ERROR

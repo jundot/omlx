@@ -1,8 +1,8 @@
 // Adapted from mlx-serve src/kernels/moe/moe_prefill_cuda_gu.cu (MIT,
-// Copyright (c) 2026 David Dalcu). Changed: affine banks with biases, and the
-// epilogue is DeepSeek V4.1's SwiGLU: gate and up as bf16, clamped by LIMIT,
-// silu(gate) * up times the route weight in float, rounded to bf16, then the
-// FP8 round trip of each group of 32 values when QBITS is 8.
+// Copyright (c) 2026 David Dalcu). Changed: affine banks with biases or mxfp4
+// banks, and the epilogue is DeepSeek V4.1's SwiGLU: gate and up as bf16,
+// clamped by LIMIT, silu(gate) * up times the route weight in float, rounded
+// to bf16, then the FP8 round trip of each group of 32 values when QBITS is 8.
 extern __shared__ __align__(128) uint8_t smem[];
 __shared__ int range[2];
 const uint32_t e = blockIdx.y;
@@ -11,21 +11,22 @@ const int begin = range[0], end = range[1];
 const long n0 = (long)e * I + blockIdx.x * 64;
 const uint8_t* gcodes = reinterpret_cast<const uint8_t*>(gw) + n0 * (K * BITS / 8);
 const uint8_t* ucodes = reinterpret_cast<const uint8_t*>(uw) + n0 * (K * BITS / 8);
-const T* gscales = gs + n0 * (K / 64);
-const T* gbiases = gb + n0 * (K / 64);
-const T* uscales = us + n0 * (K / 64);
-const T* ubiases = ub + n0 * (K / 64);
+// Scales (and biases) are bf16 for affine codes, uint8 E8M0 with MX.
+const auto* gscales = gs + n0 * (K / GROUP);
+const auto* gbiases = gb + n0 * (K / GROUP);
+const auto* uscales = us + n0 * (K / GROUP);
+const auto* ubiases = ub + n0 * (K / GROUP);
 const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp >> 2, wn = warp & 3;
 const float limit = __uint_as_float(LIMIT);
 T* tile = reinterpret_cast<T*>(smem);
 for (int r0 = begin + (int)blockIdx.z * 64; r0 < end; r0 += (int)gridDim.z * 64) {
   const int mv = end - r0 < 64 ? end - r0 : 64;
   float acc[2][4][4];
-  msv_expert_tile<BITS, K, BDEP, STG>(smem, mv,
+  msv_expert_tile<BITS, K, BDEP, STG, MX>(smem, mv,
       [&](int row) { return x + (long)rows[r0 + row] * K; },
       [&](int r) { return (r < 64 ? gcodes : ucodes) + (long)(r & 63) * (K * BITS / 8); },
-      [&](int r) { return (r < 64 ? gscales : uscales) + (long)(r & 63) * (K / 64); },
-      [&](int r) { return (r < 64 ? gbiases : ubiases) + (long)(r & 63) * (K / 64); }, acc);
+      [&](int r) { return (r < 64 ? gscales : uscales) + (long)(r & 63) * (K / GROUP); },
+      [&](int r) { return (r < 64 ? gbiases : ubiases) + (long)(r & 63) * (K / GROUP); }, acc);
   // Stage both projections as T: columns 0-63 gate, 64-127 up.
   #pragma unroll
   for (int a = 0; a < 2; ++a)

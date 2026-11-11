@@ -783,23 +783,45 @@ def _tile_kernel(
     )
 
 
+def _tile_format(bank) -> str | None:
+    """The bank's format when the expert tile kernels read it: "affine" (3- or
+    4-bit codes, bf16 scales and biases, 64 weights a group) or "mxfp4" (E2M1
+    codes, E8M0 scales, 32 weights a group); None otherwise."""
+    spec = bank.spec or {}
+    mode = spec.get("mode")
+    if mode == "affine":
+        fits = (
+            spec.get("group_size") == 64
+            and bank.bits in (3, 4)
+            and bank.biases is not None
+            and bank.scales.dtype == mx.bfloat16
+        )
+    elif mode == "mxfp4":
+        fits = (
+            spec.get("group_size", 32) == 32
+            and bank.bits == 4
+            and bank.biases is None
+            and bank.scales.dtype == mx.uint8
+        )
+    else:
+        return None
+    rows, width = bank.weight.shape[1], bank.weight.shape[2] * 32 // bank.bits
+    return mode if fits and not rows % 128 and not width % 128 else None
+
+
 def experts_fit(banks) -> bool:
-    """Whether the expert tile kernels multiply by these banks: affine codes
-    of 3 or 4 bits, 64 weights a group, bf16 scales and biases, 128-row tiles."""
-    for bank in banks:
-        spec = bank.spec or {}
-        if (
-            spec.get("mode") != "affine"
-            or spec.get("group_size") != 64
-            or bank.bits not in (3, 4)
-            or bank.bits != banks[0].bits
-            or bank.biases is None
-            or bank.scales.dtype != mx.bfloat16
-            or bank.weight.shape[1] % 128
-            or bank.weight.shape[2] * 32 // bank.bits % 128
-        ):
-            return False
-    return True
+    """Whether the expert tile kernels multiply by these banks, in one format
+    and code width, with 128-row tiles."""
+    first = _tile_format(banks[0])
+    return first is not None and all(
+        _tile_format(b) == first and b.bits == banks[0].bits for b in banks
+    )
+
+
+def _tile_layout(bank) -> list[tuple[str, int | bool]]:
+    """Template values of a bank's format: code bits, mxfp4 and group size."""
+    mxfp4 = bank.spec["mode"] == "mxfp4"
+    return [("BITS", bank.bits), ("MX", mxfp4), ("GROUP", 32 if mxfp4 else 64)]
 
 
 def _tile_grid(tiles: int, experts: int, routes: int) -> tuple[int, int, int]:
@@ -829,17 +851,18 @@ def expert_gate_up(x, token, experts, gate, up, weights, limit, quantize):
             experts,
             gate.weight,
             gate.scales,
-            gate.biases,
+            # An mxfp4 bank has no biases; its scales fill the unread slot.
+            gate.scales if gate.biases is None else gate.biases,
             up.weight,
             up.scales,
-            up.biases,
+            up.scales if up.biases is None else up.biases,
             weights,
         ],
         template=[
             ("T", mx.bfloat16),
             ("STG", _TILE_STAGES),
             ("BDEP", _TILE_PREFETCH),
-            ("BITS", gate.bits),
+            *_tile_layout(gate),
             ("K", x.shape[-1]),
             ("I", inner),
             ("LIMIT", _bits(limit) if limit else 0),
@@ -860,12 +883,18 @@ def expert_down(act, experts, down):
     return _tile_kernel(
         "expert_down", "moe_prefill_down.cu", ("x", "w", "s", "b", "inds"), ("y",)
     )(
-        inputs=[act, down.weight, down.scales, down.biases, experts],
+        inputs=[
+            act,
+            down.weight,
+            down.scales,
+            down.scales if down.biases is None else down.biases,
+            experts,
+        ],
         template=[
             ("T", mx.bfloat16),
             ("STG", _TILE_STAGES),
             ("BDEP", _TILE_PREFETCH),
-            ("BITS", down.bits),
+            *_tile_layout(down),
             ("K", act.shape[1]),
             ("N", out),
         ],
