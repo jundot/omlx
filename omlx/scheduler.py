@@ -3385,11 +3385,9 @@ class Scheduler:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            # Ternary Bonsai 2 packs run the Qwen3.5 GDN stack under their own type.
-            is_qwen35 = (
-                model_type.startswith("qwen3_5")
-                or model_type == "prism_hadamard_qwen35"
-            )
+            # Wider chunks feed the Qwen3.5 MoE expert GEMMs more rows. Dense
+            # Qwen3.5 gains under 2% and keeps the default chunk and block.
+            is_qwen35_moe = model_type.startswith("qwen3_5_moe")
             is_qwen4 = model_type.startswith("qwen4_exp")
             if is_qwen4:
                 from .custom_kernels.attention import fast
@@ -3404,7 +3402,7 @@ class Scheduler:
                 # Top-6-of-384 routing leaves ~32 rows per expert at 2048 tokens;
                 # 8192 fills the gather_qmm tiles better.
                 return 8192
-            if is_qwen35 or is_qwen4:
+            if is_qwen35_moe or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
