@@ -52,7 +52,7 @@ dependencies = [
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
     # The mlx-lm pin above includes the NewlineTokenizer registration fix
     # required by transformers 5.13+. mlx-vlm requires the 5.14 processor API.
-    "transformers>=5.14.0,<5.22",
+    "transformers>=5.14.0,<5.23",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -73,7 +73,8 @@ dependencies = [
     "tqdm>=4.66.0",
     "pyyaml>=6.0",
     "itsdangerous>=2.0",
-    "jinja2>=3.0",
+    # transformers 5.22.2 refuses to render chat templates with older jinja2.
+    "jinja2>=3.1.6",
     # mlx-lm 0.31.3 imports rich from mlx_lm.cli_ui for chat/lora entrypoints.
     "rich>=13.0.0",
     "sentencepiece",
