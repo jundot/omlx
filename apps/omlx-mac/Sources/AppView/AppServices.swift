@@ -65,9 +65,9 @@ final class AppServices: NSObject {
     @ObservationIgnored
     private weak var server: ServerProcess?
 
-    init(config: AppConfig = .default, server: ServerProcess? = nil, session: URLSession? = nil) {
+    init(config: AppConfig = .default, server: ServerProcess? = nil) {
         self.config = config
-        self.client = OMLXClient(host: config.host, port: config.port, apiKey: config.apiKey, session: session)
+        self.client = OMLXClient(host: config.host, port: config.port, apiKey: config.apiKey)
         self.updates = UpdateController()
         super.init()
         self.bind(server: server)
