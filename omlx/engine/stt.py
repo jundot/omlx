@@ -1221,22 +1221,7 @@ class STTEngine(BaseNonStreamingEngine):
             if hasattr(model, "create_streaming_session"):
                 backend: Any = _VoxtralRealtimeBackend(model)
                 loop = asyncio.get_running_loop()
-                startup = loop.run_in_executor(get_mlx_executor(), backend.start_sync)
-                try:
-                    await asyncio.shield(startup)
-                except asyncio.CancelledError:
-                    # Cancelling the waiter cannot stop the MLX worker. Keep
-                    # its session slot and eviction protection until it exits.
-                    while not startup.done():
-                        try:
-                            await asyncio.shield(startup)
-                        except asyncio.CancelledError:
-                            continue
-                        except Exception:
-                            break
-                    if not startup.cancelled():
-                        startup.exception()
-                    raise
+                await loop.run_in_executor(get_mlx_executor(), backend.start_sync)
             elif hasattr(model, "generate_streaming"):
                 backend = _WhisperRealtimeBackend(model, language=language)
             else:

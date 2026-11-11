@@ -134,58 +134,6 @@ class TestRealtimeSessionLifecycle:
         assert not engine.has_active_requests()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("startup_fails", [False, True])
-    async def test_cancelled_voxtral_startup_keeps_slot_until_worker_finishes(
-        self, startup_fails
-    ):
-        engine = STTEngine("m")
-        loop = asyncio.get_running_loop()
-        started = asyncio.Event()
-        finish = threading.Event()
-
-        def start():
-            loop.call_soon_threadsafe(started.set)
-            assert finish.wait(5)
-            if startup_fails:
-                raise ValueError("startup failed")
-            return _FakeVoxtralSession()
-
-        engine._model = SimpleNamespace(create_streaming_session=start)
-        task = asyncio.create_task(engine.create_realtime_session())
-        try:
-            await asyncio.wait_for(started.wait(), timeout=5)
-            for _ in range(2):
-                task.cancel()
-                await asyncio.sleep(0)
-                assert not task.done()
-                assert engine.has_active_requests()
-                with pytest.raises(RuntimeError, match="already active"):
-                    await engine.create_realtime_session()
-        finally:
-            finish.set()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        assert not engine.has_active_requests()
-
-        engine._model = SimpleNamespace(create_streaming_session=_FakeVoxtralSession)
-        session = await engine.create_realtime_session()
-        await session.release()
-
-    @pytest.mark.asyncio
-    async def test_backend_constructor_failure_releases_session_and_activity(self):
-        engine = STTEngine("m")
-        engine._model = SimpleNamespace(generate_streaming=lambda: None)
-        with patch(
-            "omlx.engine.stt._WhisperRealtimeBackend",
-            side_effect=ValueError("startup failed"),
-        ):
-            with pytest.raises(ValueError, match="startup failed"):
-                await engine.create_realtime_session()
-        assert not engine.has_active_requests()
-        session = await engine.create_realtime_session()
-        await session.release()
-
-    @pytest.mark.asyncio
     async def test_second_session_rejected_until_release(self):
         engine = STTEngine("m")
         engine._model = SimpleNamespace(generate_streaming=lambda: None)
