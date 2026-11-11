@@ -46,6 +46,7 @@
 		4BB000000000000000000003 /* AppControlServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000003 /* AppControlServer.swift */; };
 		6BB000000000000000000001 /* AppView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000001 /* AppView.swift */; };
 		6BB000000000000000000002 /* AppSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000002 /* AppSection.swift */; };
+		F5EA12C3D4E5678900000002 /* SettingsSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5EA12C3D4E5678900000001 /* SettingsSearch.swift */; };
 		6BB000000000000000000004 /* ServerScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000004 /* ServerScreen.swift */; };
 		6BB000000000000000000005 /* StatusScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000005 /* StatusScreen.swift */; };
 		6BB000000000000000000011 /* AppearanceScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000011 /* AppearanceScreen.swift */; };
@@ -128,6 +129,7 @@
 		DBB000000000000000000901 /* BenchDTODecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000901 /* BenchDTODecodeTests.swift */; };
 		DBB000000000000000000104 /* ShellEnvWriterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000104 /* ShellEnvWriterTests.swift */; };
 		DBB000000000000000000105 /* ThemeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000105 /* ThemeTests.swift */; };
+		F5EA12C3D4E5678900000004 /* SettingsSearchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5EA12C3D4E5678900000003 /* SettingsSearchTests.swift */; };
 		DBB0000000000000000000F5 /* LogRecordsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC0000000000000000000F5 /* LogRecordsTests.swift */; };
 		DBB000000000000000000106 /* ReleasesCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000106 /* ReleasesCheckerTests.swift */; };
 		DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000107 /* ModelsScreenSortingTests.swift */; };
@@ -215,6 +217,7 @@
 		4CC000000000000000000003 /* AppControlServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppControlServer.swift; sourceTree = "<group>"; };
 		6CC000000000000000000001 /* AppView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppView.swift; sourceTree = "<group>"; };
 		6CC000000000000000000002 /* AppSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSection.swift; sourceTree = "<group>"; };
+		F5EA12C3D4E5678900000001 /* SettingsSearch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSearch.swift; sourceTree = "<group>"; };
 		6CC000000000000000000004 /* ServerScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreen.swift; sourceTree = "<group>"; };
 		6CC000000000000000000005 /* StatusScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusScreen.swift; sourceTree = "<group>"; };
 		6CC000000000000000000011 /* AppearanceScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceScreen.swift; sourceTree = "<group>"; };
@@ -298,6 +301,7 @@
 		DCC000000000000000000901 /* BenchDTODecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchDTODecodeTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000104 /* ShellEnvWriterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriterTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000105 /* ThemeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeTests.swift; sourceTree = "<group>"; };
+		F5EA12C3D4E5678900000003 /* SettingsSearchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSearchTests.swift; sourceTree = "<group>"; };
 		DCC0000000000000000000F5 /* LogRecordsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogRecordsTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000106 /* ReleasesCheckerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleasesCheckerTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000107 /* ModelsScreenSortingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreenSortingTests.swift; sourceTree = "<group>"; };
@@ -392,6 +396,7 @@
 				DCC000000000000000000901 /* BenchDTODecodeTests.swift */,
 				DCC000000000000000000104 /* ShellEnvWriterTests.swift */,
 				DCC000000000000000000105 /* ThemeTests.swift */,
+				F5EA12C3D4E5678900000003 /* SettingsSearchTests.swift */,
 				DCC0000000000000000000F5 /* LogRecordsTests.swift */,
 				DCC000000000000000000106 /* ReleasesCheckerTests.swift */,
 				DCC000000000000000000107 /* ModelsScreenSortingTests.swift */,
@@ -528,6 +533,7 @@
 			children = (
 				6CC000000000000000000001 /* AppView.swift */,
 				6CC000000000000000000002 /* AppSection.swift */,
+				F5EA12C3D4E5678900000001 /* SettingsSearch.swift */,
 				7CC000000000000000000001 /* AppServices.swift */,
 				AA81FB452FE29345001BF56E /* Utils */,
 				AAD9D5152FE283B000FAEA05 /* ViewModels */,
@@ -831,6 +837,7 @@
 				4BB000000000000000000003 /* AppControlServer.swift in Sources */,
 				6BB000000000000000000001 /* AppView.swift in Sources */,
 				6BB000000000000000000002 /* AppSection.swift in Sources */,
+				F5EA12C3D4E5678900000002 /* SettingsSearch.swift in Sources */,
 				6BB000000000000000000004 /* ServerScreen.swift in Sources */,
 				6BB000000000000000000005 /* StatusScreen.swift in Sources */,
                 ABCDEF012345678901234501 /* UsageHistoryView.swift in Sources */,
@@ -917,6 +924,7 @@
 				DBB000000000000000000901 /* BenchDTODecodeTests.swift in Sources */,
 				DBB000000000000000000104 /* ShellEnvWriterTests.swift in Sources */,
 				DBB000000000000000000105 /* ThemeTests.swift in Sources */,
+				F5EA12C3D4E5678900000004 /* SettingsSearchTests.swift in Sources */,
 				DBB000000000000000000106 /* ReleasesCheckerTests.swift in Sources */,
 				DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */,
 				DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */,

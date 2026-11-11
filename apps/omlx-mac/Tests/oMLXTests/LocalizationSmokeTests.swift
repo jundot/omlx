@@ -64,6 +64,7 @@ final class LocalizationSmokeTests: XCTestCase {
         "integrations.section.markitdown", "integrations.markitdown.pdf_processing_missing_model",
         "performance.section.cache", "performance.cache.enabled",
         "askai.row.enabled", "askai.section.presets",
+        "settings.search.prompt", "settings.search.empty",
         "status.section.system", "status.section.active_now",
         // High-density screens
         "models.active.title", "models.library.title",

@@ -822,6 +822,7 @@ private struct SuggestedSection: View {
             HStack(spacing: 6) {
                 if let format {
                     Popup(
+                        "downloads.format.label",
                         selection: format,
                         width: .controlMedium,
                         options: HFModelFormat.allCases.map { ($0, $0.label) }
