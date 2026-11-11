@@ -4,12 +4,14 @@ import SwiftUI
 @MainActor
 @Observable
 final class IntegrationsScreenVM {
-    enum Field: Sendable {
+    enum Field: Hashable, Sendable {
         case claudeMode, opusModel, sonnetModel, haikuModel, desktopEnabled
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
         case hermesModel, copilotModel, dshModel, vibeModel
         case mcpConfig
         case splashPath, splashLimits, splashKvFormat, splashAnePrefill
+        case markitdownEnabled, markitdownExposeModel, markitdownMaxFileSize
+        case markitdownMaxFiles, markitdownPdfProcessingEngine
     }
 
     // Claude Code
@@ -43,6 +45,19 @@ final class IntegrationsScreenVM {
     var splashSsdCacheGb: String = ""
     private var splashLimitsLoaded = ("", "")
 
+    // MarkItDown
+    var markitdownEnabled = true
+    var markitdownExposeModel = false
+    var markitdownMaxFileSizeText = "25"
+    var markitdownMaxFilesText = "5"
+    var markitdownPdfProcessingEngine = "markitdown"
+    private var markitdownLoaded = (
+        enabled: true, exposeModel: false, maxFileSizeMb: 25,
+        maxFilesPerRequest: 5, pdfProcessingEngine: "markitdown"
+    )
+    private(set) var savingMarkitdownFields: Set<Field> = []
+    private(set) var markitdownOcrModels: [String] = []
+
     // MCP
     var mcpConfigPath: String = ""
     /// Last value persisted to the server. Drives the Apply button's
@@ -73,6 +88,44 @@ final class IntegrationsScreenVM {
             out.append((id, id))
         }
         return out
+    }
+
+    var markitdownModelVisible: Bool {
+        get { markitdownEnabled && markitdownExposeModel }
+        set {
+            if markitdownEnabled { markitdownExposeModel = newValue }
+        }
+    }
+
+    var isSavingMarkitdownVisibility: Bool {
+        savingMarkitdownFields.contains(.markitdownEnabled)
+            || savingMarkitdownFields.contains(.markitdownExposeModel)
+    }
+
+    var markitdownOcrModelMissing: Bool {
+        markitdownPdfProcessingEngine != "markitdown"
+            && !availableModels.contains(markitdownPdfProcessingEngine)
+    }
+
+    var markitdownPdfOptions: [(String, String)] {
+        var options = [("markitdown", "MarkItDown")]
+        if markitdownOcrModelMissing {
+            options.append((markitdownPdfProcessingEngine, markitdownPdfProcessingEngine))
+        }
+        options += markitdownOcrModels.map { ($0, $0) }
+        return options
+    }
+
+    var markitdownPdfWarning: String? {
+        guard markitdownPdfProcessingEngine == "markitdown" || markitdownOcrModelMissing else { return nil }
+        let warning = String(localized: "integrations.markitdown.pdf_processing_markitdown_warning",
+                             defaultValue: "Scanned or image-only PDFs will fail when MarkItDown is selected, and PDFs with tables may not be processed correctly.",
+                             comment: "Warning when PDFs are processed by MarkItDown without OCR")
+        guard markitdownOcrModelMissing else { return warning }
+        let missing = String(localized: "integrations.markitdown.pdf_processing_missing_model",
+                             defaultValue: "The selected OCR model is unavailable. PDFs use MarkItDown until the model is available again or you select another engine.",
+                             comment: "Warning when the configured PDF OCR model is unavailable")
+        return "\(missing)\n\(warning)"
     }
 
     /// Composed `omlx launch claude` command. Claude tier selections are
@@ -211,6 +264,15 @@ final class IntegrationsScreenVM {
                 self.splashSsdCacheGb     = Self.gigabytesText(it.splashSsdCacheGb)
                 self.splashLimitsLoaded   = (self.splashMaxMemoryGb, self.splashSsdCacheGb)
             }
+            self.markitdownEnabled = settings.integrations?.markitdownEnabled ?? true
+            self.markitdownExposeModel = settings.integrations?.markitdownExposeModel ?? false
+            let maxFileSize = settings.integrations?.markitdownMaxFileSizeMb ?? 25
+            let maxFiles = settings.integrations?.markitdownMaxFilesPerRequest ?? 5
+            self.markitdownMaxFileSizeText = String(maxFileSize)
+            self.markitdownMaxFilesText = String(maxFiles)
+            self.markitdownPdfProcessingEngine = settings.integrations?.markitdownPdfProcessingEngine ?? "markitdown"
+            self.markitdownLoaded = (markitdownEnabled, markitdownExposeModel, maxFileSize,
+                                    maxFiles, markitdownPdfProcessingEngine)
             self.splash = settings.externalEngines?.splash
             if let mcp = settings.mcp {
                 let path = mcp.configPath ?? ""
@@ -219,8 +281,7 @@ final class IntegrationsScreenVM {
             }
 
             // Available models
-            let models = try await client.listModels().models
-            self.availableModels = models.map { $0.id }
+            try await refreshModels(client: client)
 
             // Stats — host/port/api_key/cli_prefix for the command builders.
             // Failure here is non-fatal: the screen still works against the
@@ -240,6 +301,7 @@ final class IntegrationsScreenVM {
     }
 
     func save(_ field: Field, client: OMLXClient) async {
+        guard !savingMarkitdownFields.contains(field) else { return }
         var patch = GlobalSettingsPatch()
         switch field {
         case .claudeMode:           patch.claudeCodeMode = claudeMode
@@ -272,7 +334,46 @@ final class IntegrationsScreenVM {
             }
             patch.splashMaxMemoryGb = memory
             patch.splashSsdCacheGb = ssd
+        case .markitdownEnabled:
+            guard !isSavingMarkitdownVisibility, markitdownEnabled != markitdownLoaded.enabled else { return }
+            patch.markitdownEnabled = markitdownEnabled
+        case .markitdownExposeModel:
+            guard markitdownEnabled, !isSavingMarkitdownVisibility,
+                  markitdownExposeModel != markitdownLoaded.exposeModel else { return }
+            patch.markitdownExposeModel = markitdownExposeModel
+        case .markitdownMaxFileSize, .markitdownMaxFiles:
+            let text = field == .markitdownMaxFileSize ? markitdownMaxFileSizeText : markitdownMaxFilesText
+            guard let value = Int(Self.trimmed(text)), value > 0 else {
+                self.lastError = String(localized: "integrations.markitdown.limits.invalid",
+                                        defaultValue: "Enter a whole number greater than zero.",
+                                        comment: "Error when a MarkItDown file limit is not a positive integer")
+                return
+            }
+            if field == .markitdownMaxFileSize {
+                if value == markitdownLoaded.maxFileSizeMb {
+                    lastError = nil
+                    return
+                }
+                patch.markitdownMaxFileSizeMb = value
+            } else {
+                if value == markitdownLoaded.maxFilesPerRequest {
+                    lastError = nil
+                    return
+                }
+                patch.markitdownMaxFilesPerRequest = value
+            }
+        case .markitdownPdfProcessingEngine:
+            guard markitdownPdfProcessingEngine != markitdownLoaded.pdfProcessingEngine else { return }
+            patch.markitdownPdfProcessingEngine = markitdownPdfProcessingEngine
         }
+        switch field {
+        case .markitdownEnabled, .markitdownExposeModel, .markitdownMaxFileSize,
+             .markitdownMaxFiles, .markitdownPdfProcessingEngine:
+            savingMarkitdownFields.insert(field)
+        default:
+            break
+        }
+        defer { savingMarkitdownFields.remove(field) }
         do {
             _ = try await client.updateGlobalSettings(patch)
             self.lastError = nil
@@ -285,12 +386,42 @@ final class IntegrationsScreenVM {
                 await load(client: client)
             case .splashLimits:
                 self.splashLimitsLoaded = (Self.trimmed(splashMaxMemoryGb), Self.trimmed(splashSsdCacheGb))
+            case .markitdownEnabled:
+                if let value = patch.markitdownEnabled { markitdownLoaded.enabled = value }
+                try await refreshModels(client: client)
+            case .markitdownExposeModel:
+                if let value = patch.markitdownExposeModel { markitdownLoaded.exposeModel = value }
+                try await refreshModels(client: client)
+            case .markitdownMaxFileSize:
+                if let value = patch.markitdownMaxFileSizeMb {
+                    markitdownLoaded.maxFileSizeMb = value
+                    markitdownMaxFileSizeText = String(value)
+                }
+            case .markitdownMaxFiles:
+                if let value = patch.markitdownMaxFilesPerRequest {
+                    markitdownLoaded.maxFilesPerRequest = value
+                    markitdownMaxFilesText = String(value)
+                }
+            case .markitdownPdfProcessingEngine:
+                if let value = patch.markitdownPdfProcessingEngine { markitdownLoaded.pdfProcessingEngine = value }
             default:
                 break
             }
         } catch {
+            switch field {
+            case .markitdownEnabled: markitdownEnabled = markitdownLoaded.enabled
+            case .markitdownExposeModel: markitdownExposeModel = markitdownLoaded.exposeModel
+            case .markitdownPdfProcessingEngine: markitdownPdfProcessingEngine = markitdownLoaded.pdfProcessingEngine
+            default: break
+            }
             self.lastError = error.omlxDescription
         }
+    }
+
+    private func refreshModels(client: OMLXClient) async throws {
+        let models = try await client.listModels().models
+        availableModels = models.map { $0.id }
+        markitdownOcrModels = models.filter { ($0.configModelType ?? "").lowercased().contains("ocr") }.map { $0.id }
     }
 
     private static func trimmed(_ value: String) -> String {
