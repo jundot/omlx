@@ -1251,22 +1251,74 @@ def _cache_arrays(cache):
     return arrays
 
 
-def test_qwen4_dflash_capture_order_and_final_hidden():
+@pytest.mark.parametrize("hc_count", [2, 4])
+@pytest.mark.parametrize("defer_write", [False, True])
+@pytest.mark.parametrize("token_ids", [[[2, 3, 4]], [[2]], [[2, 3], [4, 5]]])
+def test_qwen4_dflash_capture_order_and_final_hidden(
+    monkeypatch, hc_count, defer_write, token_ids
+):
     config = _tiny_config()
+    config.text_config.hc_count = hc_count
+    monkeypatch.setattr(qwen4_language.hc_fused, "write_enabled", lambda: defer_write)
     model = qwen4_language.LanguageModel(config.text_config, config)
-    tokens = mx.array([[2, 3, 4]], dtype=mx.int32)
-    forward = model(tokens, capture_layer_ids=[0, 1], return_hidden=True)
-    reverse = model(tokens, capture_layer_ids=[1, 0], return_hidden=True)
-    prefill = model(tokens, cache=model.make_cache(), capture_layer_ids=[1, 0])
-    assert prefill.gdn_states is None
-    assert len(forward.hidden_states) == len(reverse.hidden_states) == 3
-    for actual, expected in zip(
-        reverse.hidden_states,
-        [forward.hidden_states[1], forward.hidden_states[0], forward.hidden_states[2]],
-    ):
-        assert actual.shape == (1, 3, 32)
-        assert mx.array_equal(actual, expected).item()
-    assert mx.allclose(model.lm_head(reverse.hidden_states[-1]), reverse.logits).item()
+    tokens = mx.array(token_ids, dtype=mx.int32)
+    baseline = model(tokens, cache=model.make_cache())
+    native_cache = model.make_cache()
+    native = model(tokens, cache=native_cache, return_hidden=True)
+    accepted = [tokens.shape[1] - 1] * tokens.shape[0]
+    if native.gdn_states is not None:
+        model.rollback_speculative_cache(
+            native_cache, native.gdn_states, accepted, tokens.shape[1]
+        )
+    completed = []
+    original = qwen4_language.Qwen4ExpDecoderLayer.__call__
+
+    def record_layer(layer, *args, **kwargs):
+        output = original(layer, *args, **kwargs)
+        if kwargs["defer_write"]:
+            residual, branch, weights = output
+            streams = residual.reshape(*residual.shape[:-1], hc_count, 32)
+            streams = streams + branch[..., None, :] * weights[..., None]
+        else:
+            streams = output.reshape(*output.shape[:-1], hc_count, 32)
+        completed.append(streams)
+        return output
+
+    monkeypatch.setattr(qwen4_language.Qwen4ExpDecoderLayer, "__call__", record_layer)
+    for layer_ids in ([0, 1], [1, 0], [1, 0, 1], [0]):
+        for return_hidden in (False, True):
+            completed.clear()
+            cache = model.make_cache()
+            out = model(
+                tokens,
+                cache=cache,
+                capture_layer_ids=layer_ids,
+                return_hidden=return_hidden,
+            )
+            assert len(out.hidden_states) == len(layer_ids) + int(return_hidden)
+            for actual, index in zip(out.hidden_states, layer_ids):
+                assert actual.shape == (*tokens.shape, 32)
+                assert mx.allclose(actual, completed[index].mean(axis=-2)).item()
+                residual = completed[index].reshape(*tokens.shape, hc_count * 32)
+                mixed = model.model.hyper_connection_mixer(residual)
+                assert not mx.allclose(actual, mixed).item()
+            expected = native if return_hidden else baseline
+            assert mx.allclose(out.logits, expected.logits, atol=1e-6).item()
+            assert mx.array_equal(
+                mx.argmax(out.logits, axis=-1), mx.argmax(expected.logits, axis=-1)
+            ).item()
+            if return_hidden:
+                assert mx.allclose(model.lm_head(out.hidden_states[-1]), out.logits).item()
+                model.rollback_speculative_cache(
+                    cache, out.gdn_states, accepted, tokens.shape[1]
+                )
+            else:
+                assert out.gdn_states is None
+    assert mx.allclose(
+        native.hidden_states[0],
+        completed[-1].reshape(*tokens.shape, hc_count * 32),
+        atol=1e-6,
+    ).item()
 
 
 @pytest.mark.parametrize("accepted", [0, 1, 3])

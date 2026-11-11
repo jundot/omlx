@@ -23,8 +23,10 @@ oMLX runs DFlash inside its standard engines. `BatchedEngine` (mlx-lm text model
 "Single row" means a request speculates while it decodes alone; a batch of two or more decodes normally, since rows that accept different counts would need a ragged rollback of sliding-window caches. MiMo V2 checkpoints with the omnimodal vision sidecar load on the VLM engine and run without DFlash; other model types also load without DFlash and log a warning. The gate lives in `omlx/utils/model_loading.py` (`dflash_batched_supported`, `dflash_compatibility`).
 
 Qwen3.8 Flash Next uses the vendored Qwen4 runtime. Its paired DFlash2 drafter
-reads mixed hidden states in the requested layer order, while native Lightning
-MTP retains the separate hyperstream residual. Verification reuses Qwen4's
+reads the plain average of each captured layer's completed hyperstreams in
+the requested layer order, without RMS normalization or learned mixer gates.
+Captures include any deferred residual write. Native Lightning MTP retains
+the separate hyperstream residual. Verification reuses Qwen4's
 cache transaction and PLE rollback, including unequal acceptance across rows.
 DFlash does not require native MTP to be enabled.
 
@@ -60,7 +62,7 @@ Removed with the external engine: the dflash-mlx L1/L2 prefix caches (`dflash_in
 | `omlx/speculative/dflash/selection.py`, `kernels.py` | Proposal sampling, the DFlash2 candidate selector and its Metal kernels. |
 | `omlx/patches/mlx_lm_mtp/` | Lightning MTP verify, acceptance, rollback and depth controllers; `drafter_target.py` adds captures and rollback to plain-attention targets (Qwen3, Laguna, MiMo V2, Muse Glimmer). |
 | `omlx/patches/mlx_vlm_mtp/*_vlm_runtime.py` | Captures for Qwen3.5, GLM-5.3 and Gemma 4 VLM targets. |
-| `omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/language.py` | Ordered mixed captures, ordinary-decode observation, and cache transactions for Qwen3.8 Flash Next. |
+| `omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/language.py` | Ordered stream-average captures, ordinary-decode observation, and cache transactions for Qwen3.8 Flash Next. |
 | `omlx/scheduler.py` | Prefill capture and seeding (`_dflash_prefill_capture`, `_dflash_seed_prefill`). |
 | `omlx/engine_pool.py` | Gate, drafter load after engine start, memory estimate. |
 

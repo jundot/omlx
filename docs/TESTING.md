@@ -205,7 +205,7 @@ Run `python -m pytest -q tests/test_bailing_hybrid_patch.py -k mtp` for the Ling
 ### Batched DFlash drafter
 
 Run `python -m pytest tests/test_mlx_vlm_qwen4_exp_compat.py tests/test_dflash_model_types.py tests/test_model_loading.py -q -k "dflash or native_verify_starts or mtp_one_row_step"` for Qwen3.8 Flash Next.
-The tiny Qwen4 tests check ordered mixed captures, final hidden states, serial replay after rejection, unequal batch acceptance, scoped ordinary-decode observation, DFlash2 proposals, and failed-forward cleanup.
+The tiny Qwen4 tests check ordered stream-average captures with deferred residual writes enabled and disabled, final hidden states, serial replay after rejection, unequal batch acceptance, scoped ordinary-decode observation, DFlash2 proposals, and failed-forward cleanup.
 The loader test requires DFlash dispatch with native MTP disabled.
 The native MTP tests retain raw hyperstream hidden states and one transaction per verification.
 These tests do not load real checkpoints or measure speed.
