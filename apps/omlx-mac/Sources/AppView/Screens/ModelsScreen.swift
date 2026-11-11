@@ -134,6 +134,9 @@ private struct ActiveModelsSection: View {
                                 .foregroundStyle(theme.text)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
+                            if let alias = m.displayAlias {
+                                ModelAliasBadge(alias: alias)
+                            }
                             Spacer(minLength: 8)
                             ActiveBadge(model: m)
                             Text(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))
@@ -279,7 +282,11 @@ private struct LibrarySection: View {
                                         .foregroundStyle(theme.text)
                                         .lineLimit(1)
                                         .truncationMode(.tail)
-                                    CopyIconButton(value: m.id)
+                                        .layoutPriority(-1)
+                                    if let alias = m.displayAlias {
+                                        ModelAliasBadge(alias: alias)
+                                    }
+                                    CopyIconButton(value: m.apiModelName)
                                     if m.isInHFCache {
                                         StatusPill(status: .custom(
                                             color: theme.textTertiary,
@@ -310,6 +317,7 @@ private struct LibrarySection: View {
                                                          comment: "Tooltip on the GGUF badge in the model library"))
                                     }
                                 }
+                                .lineLimit(1)
                                 updateBadge(for: m)
                                 Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
                                     .font(.omlxMono(DesignTokens.FontSize.subheadline))
@@ -420,6 +428,29 @@ private struct LibrarySection: View {
 
 // MARK: - Helpers
 
+private struct ModelAliasBadge: View {
+    let alias: String
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        Text(alias)
+            .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .medium))
+            .foregroundStyle(theme.textSecondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2.5)
+            .frame(maxWidth: 120)
+            .fixedSize(horizontal: true, vertical: false)
+            .background(Capsule().fill(theme.codeBg))
+            .overlay(Capsule().strokeBorder(theme.inputBorder, lineWidth: 0.5))
+            .help(alias)
+            .accessibilityLabel(Text(String(localized: "settings.basic.alias.label",
+                                            defaultValue: "Model Alias")))
+            .accessibilityValue(Text(alias))
+    }
+}
+
 func sortModelsByName(_ models: [ModelDTO]) -> [ModelDTO] {
     models.enumerated().sorted { lhs, rhs in
         // Favorites always sort first; names decide within each group.
@@ -443,6 +474,13 @@ extension ModelDTO {
     var displayTitle: String {
         displayName ?? settings?.displayName ?? id
     }
+
+    var displayAlias: String? {
+        guard let alias = settings?.modelAlias, !alias.isEmpty else { return nil }
+        return alias
+    }
+
+    var apiModelName: String { displayAlias ?? id }
 }
 
 func formatBytes(_ bytes: Int64) -> String {
