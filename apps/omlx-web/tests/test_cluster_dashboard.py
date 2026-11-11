@@ -65,29 +65,6 @@ def test_v2_uses_authenticated_cluster_admin_apis():
         assert endpoint in source
 
 
-def test_advanced_tools_preserve_cuda_connectx_and_diagnostics():
-    template = TEMPLATE.read_text(encoding="utf-8")
-    source = JAVASCRIPT.read_text(encoding="utf-8")
-
-    for marker in (
-        "data-cluster-v2-advanced-tools",
-        "data-cluster-v2-cuda-enrollment",
-        "data-cluster-v2-cuda-command",
-        "data-cluster-v2-connectx-verify",
-        "data-cluster-v2-diagnostics",
-    ):
-        assert marker in template
-    for endpoint in (
-        "/admin/api/cluster/join-keys",
-        "/admin/api/cluster/join-status",
-        "/admin/api/cluster/cuda-fabric/verify",
-        "/admin/api/cluster/diagnostics",
-    ):
-        assert endpoint in source
-    assert "Advanced (legacy)" not in template
-    assert "clusterLegacyView" not in template + source
-
-
 def test_dashboard_does_not_reference_an_unbundled_alpine_plugin():
     rendered = webui.templates.get_template("dashboard.html").render()
     assert "@alpinejs/" not in rendered

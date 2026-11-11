@@ -71,14 +71,6 @@ function clusterV2Wizard() {
         runtime: '/admin/api/cluster/runtime',
         deployments: '/admin/api/cluster/deployments',
         replan: '/admin/api/cluster/replan',
-        diagnostics: '/admin/api/cluster/diagnostics',
-        joinKeys: '/admin/api/cluster/join-keys',
-        joinStatus: '/admin/api/cluster/join-status',
-        revokeJoinKey: (id) =>
-            `/admin/api/cluster/join-keys/${encodeURIComponent(id)}`,
-        cudaFabricVerify: '/admin/api/cluster/cuda-fabric/verify',
-        rdmaLinks: '/admin/api/cluster/rdma-links',
-        rdmaLinkVerify: '/admin/api/cluster/rdma-links/verify',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
         deploymentLoad: (id) =>
@@ -313,31 +305,13 @@ function clusterV2Wizard() {
         membershipProposal: null,
         membershipReturnStage: null,
 
-        // ---- bounded advanced tools (the old v1 console is removed) ---------
-        advancedOpen: false,
-        diagnosticsLoading: false,
-        diagnosticsError: '',
-        cudaJoin: {
-            controllerIp: '',
-            loading: false,
-            command: '',
-            joinId: '',
-            expiresAt: 0,
-            copied: false,
-            error: '',
-            status: { join_keys: [], nodes: [] },
-        },
-        cudaFabricLoading: false,
-        cudaFabricError: '',
-        cudaFabricResult: null,
-        cudaFabricMemberA: '',
-        cudaFabricMemberB: '',
-        rdmaLinks: { loading: false, verifying: '', error: '', data: null },
-
         // ---- feedback ----------------------------------------------------------
         toasts: [],
         toastSeq: 0,
         installCommandCopied: false,
+        cudaGuideOpen: false,
+        cudaGuideOs: 'linux',
+        cudaGuideCopied: '',
 
         pollTimer: null,
         tickBusy: false,
@@ -379,7 +353,6 @@ function clusterV2Wizard() {
                     this.tickCount % CLUSTER_V2_DEPLOYMENTS_EVERY_TICKS === 0
                 ) {
                     await this.refreshDeployments();
-                    await this.refreshRdmaLinks();
                 }
                 await this.restoreAccelerator();
             } finally {
@@ -3926,289 +3899,6 @@ function clusterV2Wizard() {
         },
 
         // =====================================================================
-        // Advanced tools — CUDA enrollment/fabric proof and diagnostics
-        // =====================================================================
-        async toggleAdvancedTools() {
-            this.advancedOpen = !this.advancedOpen;
-            if (this.advancedOpen) await this.loadCudaJoinStatus();
-        },
-
-        cudaNodes() {
-            return Array.isArray(this.cudaJoin.status?.nodes)
-                ? this.cudaJoin.status.nodes
-                : [];
-        },
-
-        cudaJoinSuggestedIp() {
-            const explicit = String(this.cudaJoin.controllerIp || '').trim();
-            if (explicit) return explicit;
-            const addresses = this.selfDevice()?.addrs || [];
-            const local = addresses.find(
-                (item) =>
-                    item?.ip &&
-                    /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(item.ip)) &&
-                    !String(item.ip).startsWith('127.'),
-            );
-            if (local) return String(local.ip);
-            const host = String(window.location?.hostname || '');
-            return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) &&
-                !host.startsWith('127.')
-                ? host
-                : '';
-        },
-
-        cudaJoinState() {
-            const id = this.cudaJoin.joinId;
-            return (this.cudaJoin.status?.join_keys || []).find(
-                (item) => item.join_id === id,
-            );
-        },
-
-        cudaJoinCommandUsable() {
-            const state = this.cudaJoinState();
-            const expiresAt = Number(
-                state?.expires_at || this.cudaJoin.expiresAt || 0,
-            );
-            return Boolean(
-                this.cudaJoin.command &&
-                (!state || state.status === 'pending') &&
-                expiresAt * 1000 > Date.now(),
-            );
-        },
-
-        cudaJoinStatusLabel() {
-            if (!this.cudaJoin.command) return '';
-            const state = this.cudaJoinState();
-            if (state?.status === 'used') {
-                return window.t('cluster.v2.cuda.used');
-            }
-            if (state?.status === 'revoked') return window.t('cluster.v2.cuda.revoked');
-            const remaining = Math.ceil(
-                (Number(state?.expires_at || this.cudaJoin.expiresAt || 0) *
-                    1000 -
-                    Date.now()) /
-                    60000,
-            );
-            return remaining > 0
-                ? window.t('cluster.v2.cuda.expires_in').replace('{n}', String(remaining))
-                : window.t('cluster.v2.cuda.expired');
-        },
-
-        async loadCudaJoinStatus() {
-            try {
-                const payload = await this.apiFetch(CLUSTER_V2_API.joinStatus, {
-                    cache: 'no-store',
-                });
-                this.cudaJoin.status = payload || { join_keys: [], nodes: [] };
-                const ids = this.cudaNodes().map((node) => node.node_id);
-                if (!ids.includes(this.cudaFabricMemberA)) {
-                    this.cudaFabricMemberA = ids[0] || '';
-                }
-                if (
-                    !ids.includes(this.cudaFabricMemberB) ||
-                    this.cudaFabricMemberB === this.cudaFabricMemberA
-                ) {
-                    this.cudaFabricMemberB =
-                        ids.find((id) => id !== this.cudaFabricMemberA) || '';
-                }
-                this.cudaJoin.error = payload?.load_error || '';
-            } catch (error) {
-                this.cudaJoin.error =
-                    error?.message || window.t('cluster.v2.err.cuda_status');
-            }
-        },
-
-        async revokeCudaJoinCommand() {
-            const id = String(this.cudaJoin.joinId || '').trim();
-            if (!id) return;
-            try {
-                await this.apiFetch(CLUSTER_V2_API.revokeJoinKey(id), {
-                    method: 'DELETE',
-                });
-                this.cudaJoin.command = '';
-                this.cudaJoin.joinId = '';
-                this.cudaJoin.expiresAt = 0;
-                await this.loadCudaJoinStatus();
-            } catch (error) {
-                if (error?.status === 404) {
-                    this.cudaJoin.command = '';
-                    this.cudaJoin.joinId = '';
-                    await this.loadCudaJoinStatus();
-                    return;
-                }
-                this.cudaJoin.error =
-                    error?.message || window.t('cluster.v2.err.revoke_join');
-            }
-        },
-
-        async generateCudaJoinCommand() {
-            if (this.cudaJoin.loading) return;
-            const controllerIp = this.cudaJoinSuggestedIp();
-            if (!controllerIp) {
-                this.cudaJoin.error =
-                    window.t('cluster.v2.cuda.controller_ip_required');
-                return;
-            }
-            this.cudaJoin.controllerIp = controllerIp;
-            this.cudaJoin.loading = true;
-            this.cudaJoin.error = '';
-            try {
-                if (this.cudaJoinCommandUsable()) {
-                    await this.revokeCudaJoinCommand();
-                    if (this.cudaJoin.error) return;
-                }
-                const secure = window.location?.protocol === 'https:';
-                const port = Number(window.location?.port) || (secure ? 443 : 80);
-                const result = await this.apiFetch(CLUSTER_V2_API.joinKeys, {
-                    method: 'POST',
-                    cache: 'no-store',
-                    body: JSON.stringify({
-                        controller_ip: controllerIp,
-                        controller_port: port,
-                        scheme: secure ? 'https' : 'http',
-                        ttl_seconds: 1800,
-                    }),
-                });
-                this.cudaJoin.command = result?.command || '';
-                this.cudaJoin.joinId = result?.join_id || '';
-                this.cudaJoin.expiresAt = Number(result?.expires_at || 0);
-                await this.loadCudaJoinStatus();
-            } catch (error) {
-                this.cudaJoin.error =
-                    error?.message || window.t('cluster.v2.err.cuda_join');
-            } finally {
-                this.cudaJoin.loading = false;
-            }
-        },
-
-        copyCudaJoinCommand() {
-            const command = this.cudaJoin.command;
-            if (!command) return;
-            const done = () => {
-                this.cudaJoin.copied = true;
-                setTimeout(() => (this.cudaJoin.copied = false), 2000);
-            };
-            if (navigator.clipboard?.writeText) {
-                navigator.clipboard.writeText(command).then(done, done);
-            } else {
-                done();
-            }
-        },
-
-        async verifyCudaFabric() {
-            const selected = new Set([
-                this.cudaFabricMemberA,
-                this.cudaFabricMemberB,
-            ]);
-            const nodes = this.cudaNodes().filter((node) =>
-                selected.has(node.node_id),
-            );
-            if (nodes.length !== 2 || this.cudaFabricLoading) return;
-            this.cudaFabricLoading = true;
-            this.cudaFabricError = '';
-            this.cudaFabricResult = null;
-            try {
-                this.cudaFabricResult = await this.apiFetch(
-                    CLUSTER_V2_API.cudaFabricVerify,
-                    {
-                        method: 'POST',
-                        body: JSON.stringify({
-                            hosts: nodes.map((node) => ({
-                                node_id: node.node_id,
-                                ssh: node.ssh,
-                            })),
-                        }),
-                    },
-                );
-                this.notify('success', window.t('cluster.v2.toast.cuda_verified'));
-                await this.refreshDevices();
-            } catch (error) {
-                this.cudaFabricError =
-                    error?.message || window.t('cluster.v2.err.cuda_verify');
-            } finally {
-                this.cudaFabricLoading = false;
-            }
-        },
-
-        async refreshRdmaLinks() {
-            if (this.rdmaLinks.loading) return;
-            this.rdmaLinks.loading = true;
-            try {
-                this.rdmaLinks.data = await this.apiFetch(CLUSTER_V2_API.rdmaLinks);
-                this.rdmaLinks.error = '';
-            } catch (error) {
-                this.rdmaLinks.error =
-                    error?.message || window.t('cluster.v2.err.rdma_links');
-            } finally {
-                this.rdmaLinks.loading = false;
-            }
-        },
-
-        async verifyRdmaLink(name) {
-            if (this.rdmaLinks.verifying) return;
-            this.rdmaLinks.verifying = name;
-            this.rdmaLinks.error = '';
-            try {
-                const result = await this.apiFetch(CLUSTER_V2_API.rdmaLinkVerify, {
-                    method: 'POST',
-                    body: JSON.stringify({ link: name }),
-                });
-                if (result.verified) {
-                    this.notify('success', window.t('cluster.v2.toast.rdma_verified'));
-                } else {
-                    this.rdmaLinks.error = result.reason || window.t('cluster.v2.err.rdma_verify');
-                }
-                await this.refreshRdmaLinks();
-            } catch (error) {
-                this.rdmaLinks.error =
-                    error?.message || window.t('cluster.v2.err.rdma_verify');
-            } finally {
-                this.rdmaLinks.verifying = '';
-            }
-        },
-
-        rdmaLinkDetail(link) {
-            const measured = link.verification?.measurements;
-            if (!link.verified || !measured) {
-                return link.stale_reason || link.reason || '';
-            }
-            return window.t('cluster.v2.rdma.measured')
-                .replace('{latency}', measured.latency_p50_us.toFixed(1))
-                .replace('{to}', measured.to_peer_gbit_s.toFixed(1))
-                .replace('{from}', measured.from_peer_gbit_s.toFixed(1));
-        },
-
-        async downloadClusterDiagnostics() {
-            if (this.diagnosticsLoading) return;
-            this.diagnosticsLoading = true;
-            this.diagnosticsError = '';
-            try {
-                const report = await this.apiFetch(CLUSTER_V2_API.diagnostics, {
-                    cache: 'no-store',
-                });
-                const blob = new Blob(
-                    [JSON.stringify(report, null, 2) + '\n'],
-                    { type: 'application/json' },
-                );
-                const link = document.createElement('a');
-                const url = URL.createObjectURL(blob);
-                link.href = url;
-                link.download = `omlx-cluster-diagnostics-${new Date()
-                    .toISOString()
-                    .replaceAll(':', '-')}.json`;
-                document.body.appendChild(link);
-                link.click();
-                link.remove();
-                URL.revokeObjectURL(url);
-            } catch (error) {
-                this.diagnosticsError =
-                    error?.message || window.t('cluster.v2.err.diagnostics');
-            } finally {
-                this.diagnosticsLoading = false;
-            }
-        },
-
-        // =====================================================================
         // Feedback — toasts, never modals
         // =====================================================================
         notify(type, message, timeoutMs = 6000) {
@@ -4245,6 +3935,80 @@ function clusterV2Wizard() {
             this.devicesUnreachable = false;
             this.devicesFailureCount = 0;
             this.refreshDevices();
+        },
+
+        // This Mac's address for a helper that asks it to pair: the one the
+        // page was opened at, else a LAN address that is not a bridge's.
+        cudaGuideMacAddress() {
+            const host = window.location.hostname;
+            if (/^\d+\.\d+\.\d+\.\d+$/.test(host) && !host.startsWith('127.')) {
+                return host;
+            }
+            const ipv4 = (this.selfDevice()?.addrs || [])
+                .map((addr) => addr.ip)
+                .filter((ip) => /^\d+\.\d+\.\d+\.\d+$/.test(ip) && !ip.startsWith('127.'));
+            return ipv4.find((ip) => !ip.endsWith('.1')) || ipv4[0] || 'MAC_ADDRESS';
+        },
+
+        cudaGuideSteps() {
+            const image = 'jundot/omlx-cuda-helper';
+            const run = 'sudo docker run -d --name omlx-helper --restart unless-stopped --gpus all '
+                + `--network host -v omlx-helper:/data ${image}\nsudo docker logs -f omlx-helper`;
+            if (this.cudaGuideOs === 'windows') {
+                const port = this.selfDevice()?.http_port || window.location.port || 8000;
+                return [
+                    {
+                        text: 'cluster.v2.cuda_guide.windows_docker',
+                        command: 'winget install -e --id Docker.DockerDesktop',
+                    },
+                    {
+                        text: 'cluster.v2.cuda_guide.windows_firewall',
+                        command: 'New-NetFirewallRule -DisplayName "oMLX helper" -Direction Inbound '
+                            + '-Protocol TCP -LocalPort 8850-8852 -Action Allow',
+                    },
+                    {
+                        text: 'cluster.v2.cuda_guide.windows_run',
+                        command: 'docker run -d --name omlx-helper --restart unless-stopped --gpus all '
+                            + `-p 8850-8852:8850-8852 -v omlx-helper:/data ${image} `
+                            + `--no-mdns --pair ${this.cudaGuideMacAddress()}:${port}\n`
+                            + 'docker logs -f omlx-helper',
+                    },
+                ];
+            }
+            if (this.cudaGuideOs === 'spark') {
+                return [{ text: 'cluster.v2.cuda_guide.spark_run', command: run }];
+            }
+            const keyring = '/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg';
+            return [
+                {
+                    text: 'cluster.v2.cuda_guide.linux_docker',
+                    command: [
+                        'curl -fsSL https://get.docker.com | sudo sh',
+                        'curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey'
+                            + ` | sudo gpg --yes --dearmor -o ${keyring}`,
+                        'curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list'
+                            + ` | sed 's#deb https://#deb [signed-by=${keyring}] https://#g'`
+                            + ' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list',
+                        'sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit',
+                        'sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker',
+                    ].join('\n'),
+                },
+                { text: 'cluster.v2.cuda_guide.linux_run', command: run },
+            ];
+        },
+
+        copyCudaGuide(command, key) {
+            const done = () => {
+                this.cudaGuideCopied = key;
+                setTimeout(() => {
+                    if (this.cudaGuideCopied === key) this.cudaGuideCopied = '';
+                }, 2000);
+            };
+            if (navigator.clipboard?.writeText) {
+                navigator.clipboard.writeText(command).then(done, done);
+            } else {
+                done();
+            }
         },
 
         copyInstallCommand() {

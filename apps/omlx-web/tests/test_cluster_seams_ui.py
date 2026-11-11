@@ -62,9 +62,18 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
 
     # These are compatibility/manual operator APIs retained after the v1
     # dashboard console was removed. Cluster v2 uses discovery/pairing,
-    # autoconfigure, deployment lifecycle, CUDA enrollment, and diagnostics;
-    # scripts and older clients may still use these explicit low-level probes.
+    # autoconfigure and the deployment lifecycle; scripts and older clients
+    # may still use these explicit low-level probes. CUDA worker enrollment,
+    # the ConnectX/RDMA link checks and the diagnostics report have had no
+    # dashboard panel since the advanced tools were removed.
     allowed_without_caller: set[str] = {
+        "/admin/api/cluster/cuda-fabric/verify",
+        "/admin/api/cluster/diagnostics",
+        "/admin/api/cluster/join-keys",
+        "/admin/api/cluster/join-keys/{parameter}",
+        "/admin/api/cluster/join-status",
+        "/admin/api/cluster/rdma-links",
+        "/admin/api/cluster/rdma-links/verify",
         "/admin/api/cluster/backend-selection",
         "/admin/api/cluster/collective-smoke",
         "/admin/api/cluster/discover",

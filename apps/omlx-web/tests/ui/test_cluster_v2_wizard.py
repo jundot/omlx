@@ -82,12 +82,6 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/runtime",
     "/admin/api/cluster/deployments",
     "/admin/api/cluster/replan",
-    "/admin/api/cluster/diagnostics",
-    "/admin/api/cluster/join-keys",
-    "/admin/api/cluster/join-status",
-    "/admin/api/cluster/cuda-fabric/verify",
-    "/admin/api/cluster/rdma-links",
-    "/admin/api/cluster/rdma-links/verify",
 }
 
 
@@ -1358,7 +1352,6 @@ def test_cluster_v2_is_the_sole_dashboard_flow():
     assert dashboard.count('{% include "dashboard/_cluster_v2.html" %}') == 1
     assert "clusterLegacyView" not in dashboard + template
     assert "Advanced (legacy)" not in dashboard + template
-    assert "data-cluster-v2-advanced-tools" in template
     # cluster_v2.js loads before dashboard.js so the factory exists when
     # Alpine initializes x-data="clusterV2Wizard()".
     scripts = dashboard.index("js/cluster_v2.js"), dashboard.index("js/dashboard.js")
@@ -1527,56 +1520,25 @@ component.roleOptions = roles;
 """ % json.dumps(str(FIXTURES / "node_roles.json"))
 
 
-def test_advanced_cuda_tools_use_selected_pair_and_one_time_join_contract():
+def test_cuda_guide_pairs_windows_with_a_mac_address_the_pc_can_reach():
     result = _run_wizard(
         """
-Object.assign(global.window, {
-  location: { hostname: '192.168.1.20', protocol: 'http:', port: '8000' },
-});
-global.setTimeout = () => 0;
-const calls = [];
-const nodes = [
-  { node_id: 'cuda-a', hostname: 'CUDA A', ssh: 'cuda-a.local' },
-  { node_id: 'cuda-b', hostname: 'CUDA B', ssh: 'cuda-b.local' },
-  { node_id: 'cuda-c', hostname: 'CUDA C', ssh: 'cuda-c.local' },
-];
-component.apiFetch = async (url, options = {}) => {
-  calls.push({ url, method: options.method || 'GET', body: options.body || null });
-  if (url.endsWith('/join-status')) return { join_keys: [], nodes };
-  if (url.endsWith('/join-keys')) return {
-    command: 'curl secure | sh', join_id: 'a'.repeat(16),
-    expires_at: Date.now() / 1000 + 1800,
-  };
-  if (url.endsWith('/cuda-fabric/verify')) return { verified: true };
-  throw new Error('unexpected URL ' + url);
-};
-(async () => {
-  await component.toggleAdvancedTools();
-  component.cudaJoin.controllerIp = '192.168.1.20';
-  await component.generateCudaJoinCommand();
-  component.cudaFabricMemberA = 'cuda-a';
-  component.cudaFabricMemberB = 'cuda-c';
-  await component.verifyCudaFabric();
-  const verify = calls.find((call) => call.url.endsWith('/cuda-fabric/verify'));
-  process.stdout.write(JSON.stringify({
-    command: component.cudaJoin.command,
-    joined: component.cudaNodes().length,
-    verify: JSON.parse(verify.body),
-    methods: calls.map((call) => call.method),
-  }));
-})().catch((error) => { console.error(error); process.exit(1); });
+component.devicesPayload = { self: { http_port: 8000, addrs: [
+  { ip: '10.0.1.1' }, { ip: 'fe80::1%en0' }, { ip: '192.168.1.30' },
+] } };
+component.cudaGuideOs = 'windows';
+const command = () => component.cudaGuideSteps().at(-1).command;
+global.window.location = { hostname: '127.0.0.1', port: '8000' };
+const local = command();
+global.window.location = { hostname: '192.168.2.1', port: '8000' };
+const lan = command();
+process.stdout.write(JSON.stringify({ local, lan }));
 """,
     )
-
-    assert result["command"] == "curl secure | sh"
-    assert result["joined"] == 3
-    assert result["verify"] == {
-        "hosts": [
-            {"node_id": "cuda-a", "ssh": "cuda-a.local"},
-            {"node_id": "cuda-c", "ssh": "cuda-c.local"},
-        ]
-    }
-    assert "POST" in result["methods"]
+    # A bridge or Thunderbolt address usually ends in .1.
+    assert "--pair 192.168.1.30:8000" in result["local"]
+    # The address the page was opened at reaches this Mac.
+    assert "--pair 192.168.2.1:8000" in result["lan"]
 
 
 def test_plan_step_has_a_per_node_role_picker_with_defaults_unchanged():
