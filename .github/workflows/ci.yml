@@ -56,15 +56,8 @@ jobs:
           --durations=50 --junitxml=test-results.xml
 
       - name: Run web UI script tests
-        run: >-
-          node --test
-          apps/omlx-web/tests/custom_theme_ui.test.cjs
-          apps/omlx-web/tests/deepseek_v41_offload_ui.test.cjs
-          apps/omlx-web/tests/hf_repo_id_ui.test.cjs
-          apps/omlx-web/tests/moe_expert_offload_ui.test.cjs
-          apps/omlx-web/tests/qwen_oq_a8_ui.test.cjs
-          apps/omlx-web/tests/theme_preview.test.cjs
-          apps/omlx-web/tests/usage_history_ui.test.cjs
+        working-directory: apps/omlx-web/tests
+        run: node --test
 
       # The server must import and start without the apps.
       - name: Check the API-only server without apps
