@@ -95,3 +95,23 @@ jobs:
           name: test-results-py${{ matrix.python-version }}
           path: test-results.xml
           retention-days: 14
+
+  mac-app-build:
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build and test the macOS app
+        # The percentage-label assertions expect US formatting.
+        run: >-
+          xcodebuild
+          -project apps/omlx-mac/oMLX.xcodeproj
+          -scheme oMLX
+          -configuration Debug
+          -destination 'platform=macOS,arch=arm64'
+          -testLanguage en
+          -testRegion US
+          CODE_SIGNING_ALLOWED=NO
+          test
