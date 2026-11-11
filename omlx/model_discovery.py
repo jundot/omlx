@@ -63,7 +63,6 @@ VLM_MODEL_TYPES = {
     "molmo2",
     "bunny_llama",
     "multi_modality",
-    "florence2",
     "deepseekocr",
     "deepseekocr_2",
     "unlimited_ocr",
@@ -202,7 +201,6 @@ VLM_ARCHITECTURES = {
     "MolmoForCausalLM",
     "Molmo2ForConditionalGeneration",
     "LlavaQwen2ForCausalLM",  # apple/FastVLM (all sizes)
-    "Florence2ForConditionalGeneration",
     "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
@@ -300,11 +298,7 @@ RERANKER_ARCHITECTURES = SUPPORTED_RERANKER_ARCHITECTURES | UNSUPPORTED_RERANKER
 # Note: "whisper" and "qwen3_tts" were previously listed here but are now
 # handled as audio types (audio_stt / audio_tts) — see AUDIO_* sets below.
 
-# Florence-2 is an encoder-decoder VLM: its decoder cache is a
-# CacheList(SimpleKVCache, SimpleKVCache) that cannot be merged, so the
-# continuous-batching path can never reuse it. mlx-vlm ships the architecture,
-# which used to make oMLX load the checkpoint fine and fail on the first image
-# request with a 500. Skip it at scan time instead.
+# Florence-2 is an encoder-decoder; its decoder cache cannot join a batch.
 UNSUPPORTED_ARCHITECTURES: set[str] = {"Florence2ForConditionalGeneration"}
 UNSUPPORTED_MODEL_TYPES: set[str] = {"florence2"}
 

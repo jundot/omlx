@@ -4205,11 +4205,8 @@ class VLMBatchedEngine(BaseEngine):
         # _format_messages_for_vlm_template(), so a residual key can survive
         # formatting; the chat template must never see the non-standard field.
         detect_and_strip_partial(formatted_messages)
-        # Prompt-only message formats (florence2, paligemma, moondream2/3,
-        # plamo2vl, falcon_ocr) render every message to a plain string. The
-        # processor tokenizes that string itself and there is no chat template
-        # to apply, so mirror mlx-vlm's apply_chat_template() and use the last
-        # rendered message as the prompt.
+        # Prompt-only formats have no chat template. Like mlx-vlm
+        # apply_chat_template(), use the last rendered message as the prompt.
         prompt_only = bool(formatted_messages) and all(
             isinstance(message, str) for message in formatted_messages
         )

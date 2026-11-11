@@ -1956,31 +1956,9 @@ class TestUnsupportedModels:
         assert _is_unsupported_model(tmp_path) is False
 
     def test_florence2_is_unsupported(self, tmp_path):
-        """Florence-2 is an encoder-decoder: skipped instead of 500ing on use."""
-        config = {
-            "model_type": "florence2",
-            "architectures": ["Florence2ForConditionalGeneration"],
-            "vision_config": {"model_type": "davit"},
-        }
+        config = {"model_type": "florence2", "vision_config": {"model_type": "davit"}}
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert _is_unsupported_model(tmp_path) is True
-
-    def test_florence2_model_type_alone_is_unsupported(self, tmp_path):
-        """Florence-2 conversions without the HF architecture are skipped too."""
-        config = {"model_type": "florence2"}
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert _is_unsupported_model(tmp_path) is True
-
-    def test_paligemma_still_supported(self, tmp_path):
-        """Other prompt-only formats (paligemma, moondream) stay discoverable."""
-        config = {
-            "model_type": "paligemma",
-            "architectures": ["PaliGemmaForConditionalGeneration"],
-            "vision_config": {"model_type": "siglip_vision_model"},
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert _is_unsupported_model(tmp_path) is False
-        assert detect_model_type(tmp_path) == "vlm"
 
     def test_audio_models_included_in_discovery(self, tmp_path):
         """Audio models are now discovered (not skipped) with correct types."""

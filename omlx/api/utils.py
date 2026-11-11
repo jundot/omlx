@@ -122,9 +122,7 @@ def detect_and_strip_partial(messages: list[dict]) -> bool:
     Returns:
         True if the final message is an assistant message with ``partial=True``.
     """
-    # Prompt-only VLM message formats (florence2, paligemma, moondream2/3,
-    # plamo2vl, falcon_ocr) render each message to a plain string, which carries
-    # no role and no ``partial`` flag to strip.
+    # Prompt-only VLM formats render each message to a plain string.
     is_partial = (
         bool(messages)
         and isinstance(messages[-1], dict)
