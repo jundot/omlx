@@ -59,7 +59,7 @@ from omlx.api.utils import (
     uses_native_reasoning_content,
 )
 from omlx.exceptions import InvalidRequestError
-from omlx.model_settings import ModelSettings
+from omlx.model_settings import ModelSettings, merge_chat_template_request_kwargs
 
 
 class TestReasoningEffortChatTemplateKwargs:
@@ -85,22 +85,12 @@ class TestReasoningEffortChatTemplateKwargs:
         assert merged == {"reasoning_effort": 0.9}
         assert isinstance(merged["reasoning_effort"], float)
 
-    def test_none_effort_disables_thinking(self):
-        assert merge_reasoning_effort_chat_template_kwargs(None, "none") == {
-            "enable_thinking": False
+    @pytest.mark.parametrize("effort", ["none", " Off "])
+    def test_off_effort_disables_thinking_and_keeps_effort(self, effort):
+        assert merge_reasoning_effort_chat_template_kwargs(None, effort) == {
+            "enable_thinking": False,
+            "reasoning_effort": effort,
         }
-
-    def test_off_effort_disables_thinking(self):
-        assert merge_reasoning_effort_chat_template_kwargs(None, " Off ") == {
-            "enable_thinking": False
-        }
-
-    def test_none_effort_keeps_other_template_kwargs(self):
-        merged = merge_reasoning_effort_chat_template_kwargs(
-            {"preserve_thinking": True}, "none"
-        )
-
-        assert merged == {"preserve_thinking": True, "enable_thinking": False}
 
     def test_explicit_enable_thinking_wins_over_none_effort(self):
         merged = merge_reasoning_effort_chat_template_kwargs(
@@ -116,10 +106,16 @@ class TestReasoningEffortChatTemplateKwargs:
 
         assert merged == {"reasoning_effort": "low"}
 
-    def test_minimal_effort_still_forwarded(self):
-        assert merge_reasoning_effort_chat_template_kwargs(None, "minimal") == {
-            "reasoning_effort": "minimal"
-        }
+    def test_forced_enable_thinking_keeps_none_effort(self):
+        settings = ModelSettings(
+            enable_thinking=True, forced_ct_kwargs=["enable_thinking"]
+        )
+
+        merged = merge_chat_template_request_kwargs(
+            settings, merge_reasoning_effort_chat_template_kwargs(None, "none")
+        )
+
+        assert merged == {"enable_thinking": True, "reasoning_effort": "none"}
 
 
 class TestCleanOutputText:
