@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -46,6 +47,8 @@ _STOP_TIMEOUT_S = 15.0
 _CHUNK_BYTES = 16 << 20
 # A probe of a link the helper may not be on ends this fast.
 _LINK_PROBE_TIMEOUT_S = 2.0
+# A 169.254 address means DHCP failed; macOS sends all of 169.254 out of one port.
+_SELF_ASSIGNED = ipaddress.ip_network("169.254.0.0/16")
 # A helper takes its pairing key by polling this Mac every 2 s after approval.
 _KEY_PICKUP_S = 10.0
 
@@ -152,6 +155,12 @@ def _slower(*speeds: int | None) -> int | None:
     return min(known) if len(known) == len(speeds) else None
 
 
+def _routed_ipv4(link: dict[str, Any]) -> list[str]:
+    """The IPv4 addresses of a helper port, without self-assigned ones."""
+    addresses = (cidr.split("/", 1)[0] for cidr in link.get("ipv4") or [])
+    return [a for a in addresses if ipaddress.ip_address(a) not in _SELF_ASSIGNED]
+
+
 def _fastest_link(target: AgentTarget) -> AgentTarget:
     """*target* moved to a faster wired link the helper reports, if one answers.
 
@@ -163,16 +172,18 @@ def _fastest_link(target: AgentTarget) -> AgentTarget:
         links = remote_info(target)["links"]
     except LaunchError:
         return target
-    cables = [link for link in links if link.get("link_local") and not link.get("ipv4")]
+    routed = [(link, _routed_ipv4(link)) for link in links]
+    cables = [
+        link for link, addresses in routed if link.get("link_local") and not addresses
+    ]
     try:
         ports = probe_host_interfaces("localhost").media_speeds if cables else {}
     except (OSError, RuntimeError):
         ports = {}
     current = target.speed_mbps
     candidates = []
-    for link in links:
+    for link, addresses in routed:
         helper_speed = link.get("mbps")
-        addresses = [cidr.split("/", 1)[0] for cidr in link.get("ipv4") or []]
         if target.address in addresses:
             current = _slower(target.speed_mbps, helper_speed)
         for address in addresses:

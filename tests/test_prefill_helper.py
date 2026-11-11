@@ -1455,6 +1455,12 @@ def test_a_helper_daemon_moves_to_a_faster_wired_link(monkeypatch):
     assert (moved.address, moved.speed_mbps) == ("fe80::2%en7", 2500)
     assert moved.endpoint == "[fe80::2%en7]:8851"
     assert tried == ["fe80::2%en8", "fe80::2%en7"]
+    # A self-assigned address does not route reliably from macOS, also when
+    # discovery found the helper there.
+    links[1].update(ipv4=["169.254.10.2/16"])
+    assert agent._fastest_link(lan).address == "fe80::2%en7"
+    cable = replace(lan, address="169.254.10.2", speed_mbps=None)
+    assert agent._fastest_link(cable).address == "fe80::2%en7"
     # Static addresses on the cable work the same way.
     links[1].update(ipv4=["10.10.0.2/30"])
     assert agent._fastest_link(lan).address == "10.10.0.2"
