@@ -13805,6 +13805,13 @@ class Scheduler:
             # restored KV. Commit metrics only after both guards have run.
             self._record_prefix_cache_result(request)
 
+            if request.specprefill_indices is None and len(tokens_to_process) == 1:
+                # External prefill restores the drafter context of cached
+                # tokens, and a hit that leaves one prompt token skips it.
+                Scheduler._dflash_prepare_request(
+                    self, request, len(request.prompt_token_ids) - 1
+                )
+
             # External prefill: process tokens[0:N-1] outside BatchGenerator.
             # Only the last token goes to insert() for the first decode step.
             # SpecPrefill already handled its own prefill above, so skip for those.
