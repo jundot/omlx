@@ -4662,14 +4662,17 @@ class VLMBatchedEngine(BaseEngine):
                 )
                 image_cache_key_start = image_cache_key_ranges[0][0]
                 image_hash = image_cache_key_ranges[-1][1]
-            elif has_audio and extra_model_inputs.get("sound_clips"):
-                # Waveform lengths differ. Pad into one masked array so two
+            elif has_audio and "sound_clips" in extra_model_inputs:
+                # Checked before ``input_features``: Nemotron's processor
+                # emits raw waveforms, never feature arrays. Waveform
+                # lengths differ. Pad into one masked array so two
                 # different clips of the same length do not share
                 # prefix-cache blocks.
                 import numpy as np
 
+                # numpy cannot read a bfloat16 mx array, so upcast through mx.
                 clips = [
-                    np.asarray(c, dtype=np.float32).reshape(-1)
+                    np.asarray(mx.array(c, dtype=mx.float32)).reshape(-1)
                     for c in extra_model_inputs["sound_clips"]
                 ]
                 width = max(len(c) for c in clips)

@@ -274,7 +274,7 @@ def test_unmatched_audio_runs_key_from_first_audio_token_or_start(audio_token_id
     assert ranges[0][1] != other[0][1]
 
 
-def prepare_sound_clips_case(ids, clips):
+def prepare_sound_clips_case(ids, clips, context_token_id=AUDIO):
     # Nemotron-3 Nano Omni's processor exposes raw waveforms as
     # ``sound_clips`` (issue #5122).
     engine = VLMBatchedEngine(model_name="sound-clip-boundary-test")
@@ -282,7 +282,7 @@ def prepare_sound_clips_case(ids, clips):
     engine._processor.apply_chat_template.return_value = "prompt"
     engine._vlm_model = MagicMock()
     engine._vlm_model.config.model_type = "gemma4"
-    engine._vlm_model.config.sound_context_token_id = AUDIO
+    engine._vlm_model.config.sound_context_token_id = context_token_id
     engine._vlm_model.get_input_embeddings.return_value = SimpleNamespace(
         inputs_embeds=mx.zeros((1, len(ids), 1))
     )
@@ -316,9 +316,30 @@ def test_equal_length_sound_clips_do_not_share_cached_blocks():
     assert reused_tokens(ids, a[5], a[5], a[3], a[3]) == 12
 
 
-def test_empty_sound_clips_publish_no_audio_keys():
-    # A present-but-empty clip list must not crash the cache-key branch.
+def test_mixed_length_sound_clips_key_each_run():
+    # The short row is right-padded to the long one; masking must trim
+    # it back so each run keys on its own clip only.
+    ids = [1] * 4 + [AUDIO] * 2 + [2] * 4 + [AUDIO] * 3 + [3] * 4
+    short, long = mx.ones((8000,)), mx.zeros((16000,))
+    a = prepare_sound_clips_case(ids, [short, long])
+    assert [start for start, _ in a[5]] == [4, 10]
+    # The padded short row hashes as the same clip sent alone.
+    solo = prepare_sound_clips_case([1] * 4 + [AUDIO] * 2 + [3] * 4, [short])
+    assert a[5][0] == solo[5][0]
+    # Keys are cumulative: a later clip moves its own key, not earlier ones.
+    b = prepare_sound_clips_case(ids, [short, mx.full((16000,), 0.5)])
+    assert b[5][0] == a[5][0]
+    assert b[5][1][1] != a[5][1][1]
+
+
+def test_bf16_sound_clips_are_keyed():
+    # numpy cannot read a bfloat16 mx array; the conversion goes through mx.
     ids = [1] * 4 + [AUDIO] * 4 + [2] * 4
-    result = prepare_sound_clips_case(ids, [])
-    assert result[0] == ids
-    assert result[5] == []
+    result = prepare_sound_clips_case(ids, [mx.ones((16000,), dtype=mx.bfloat16)])
+    assert [start for start, _ in result[5]] == [4]
+
+
+def test_sound_clips_key_whole_request_without_context_token_id():
+    ids = [1] * 4 + [AUDIO] * 4 + [2] * 4
+    result = prepare_sound_clips_case(ids, [mx.zeros((16000,))], context_token_id=None)
+    assert [start for start, _ in result[5]] == [0]
