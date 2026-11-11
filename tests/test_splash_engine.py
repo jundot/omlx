@@ -2208,7 +2208,13 @@ class TestSplashBenchmark:
         assert bench.overhead == 0
         assert bench.prompt(100) == "tokens:100"
 
-    async def test_run_benchmark_against_splash_endpoint(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("saved_window", "launch_window"),
+        [(None, None), (1024, 1024 + 128), (131072, None)],
+    )
+    async def test_run_benchmark_against_splash_endpoint(
+        self, monkeypatch, saved_window, launch_window
+    ):
         stats = StreamStats(
             prompt_tokens=1000,
             completion_tokens=100,
@@ -2233,6 +2239,11 @@ class TestSplashBenchmark:
         pool.get_entry.return_value = SimpleNamespace(
             model_type="qwen3_5", model_settings=None, model_path=Path("/tmp/model")
         )
+        settings = ModelSettings(
+            external_engine="splash", max_context_window=saved_window
+        )
+        pool._settings_manager.get_settings.return_value = settings
+        pool.external_engine_id.return_value = "splash"
         run = BenchmarkRun(
             bench_id="splash-run-1",
             request=BenchmarkRequest(
@@ -2243,6 +2254,10 @@ class TestSplashBenchmark:
         await run_benchmark(run, pool)
 
         client.aclose.assert_awaited_once()
+        # Only a saved window shorter than the run grows, and only for this launch.
+        runtime_settings = pool.get_engine.await_args.kwargs["runtime_settings"]
+        assert getattr(runtime_settings, "max_context_window", None) == launch_window
+        assert settings.max_context_window == saved_window
         results = {r["test_type"]: r for r in run.results}
         assert (results["single"]["requested_pp"], results["single"]["pp"]) == (
             1024,

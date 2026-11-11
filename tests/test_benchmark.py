@@ -777,7 +777,7 @@ class _FakeBenchEnginePool:
     def get_entry(self, model_id):
         return SimpleNamespace(config_model_type="llama")
 
-    async def get_engine(self, model_id, force_lm=False):
+    async def get_engine(self, model_id, force_lm=False, runtime_settings=None):
         self.force_lm_values.append(force_lm)
         return self._engine
 
