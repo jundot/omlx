@@ -2066,8 +2066,19 @@ def test_payload_matches_the_contract_fixture(family):
             np.testing.assert_array_equal(data, expected[name], err_msg=hint)
 
 
-def test_qwen35_helper_refuses_a_checkpoint_it_cannot_load(tmp_path):
-    # Last in this file: load_first installs the server's prefill patches.
+def test_qwen35_helper_refuses_a_checkpoint_it_cannot_load(tmp_path, monkeypatch):
+    # The server's prefill patches are process-wide; xdist runs other files next.
+    for name in (
+        "apply_sdpa256_attention_patch",
+        "apply_qwen35_fa256_attention_patch",
+        "apply_qwen35_gdn_prework_patch",
+        "apply_qwen35_gdn_prefill_patch",
+        "apply_qwen35_q4_mlp_patch",
+        "apply_qwen35_q4_prefill_linear_patch",
+    ):
+        monkeypatch.setattr(
+            f"omlx.prefill_helper.adapters.qwen3_5.{name}", lambda *_: None
+        )
     source = _CONTRACT_DIR / "qwen3_5" / "model"
     weights = mx.load(str(source / "model.safetensors"))
     config = json.loads((source / "config.json").read_text())
