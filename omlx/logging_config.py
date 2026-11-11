@@ -11,6 +11,7 @@ This module provides centralized logging configuration with support for:
 """
 
 import logging
+import os
 import sys
 from contextvars import ContextVar
 from logging.handlers import TimedRotatingFileHandler
@@ -223,6 +224,28 @@ class RequestLogContext:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         _request_id.set(self.previous_id)
+
+
+def is_console_handler(handler: logging.Handler) -> bool:
+    """True for a stream handler that writes to the console (not a file)."""
+    return isinstance(handler, logging.StreamHandler) and not isinstance(
+        handler, logging.FileHandler
+    )
+
+
+def console_log_level(level: int) -> int:
+    """Level for the console handler.
+
+    Under a supervisor (``OMLX_SUPERVISED``: launchd via ``brew services``, or
+    the menubar app) stdout and stderr are captured into a file that never
+    rotates, while server.log already holds every record. The console then
+    keeps warnings and errors only, so the captured file holds failures, not
+    a second copy of the server log. A plain ``omlx serve`` keeps full
+    console output.
+    """
+    if os.environ.get("OMLX_SUPERVISED"):
+        return max(level, logging.WARNING)
+    return level
 
 
 def configure_file_logging(

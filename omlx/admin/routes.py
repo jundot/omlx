@@ -63,6 +63,7 @@ from ..exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
 )
+from ..logging_config import console_log_level, is_console_handler
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
@@ -1276,7 +1277,10 @@ def _apply_log_level_runtime(level: str) -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
     for handler in root_logger.handlers:
-        handler.setLevel(log_level)
+        if is_console_handler(handler):
+            handler.setLevel(console_log_level(log_level))
+        else:
+            handler.setLevel(log_level)
 
     # Update omlx-related loggers
     omlx_loggers = [

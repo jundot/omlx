@@ -180,7 +180,12 @@ def serve_command(args):
     from . import process_title
     from .integrations.base import bracket_host
     from .settings import burst_decode_env, init_settings
-    from .logging_config import configure_file_logging, AdminStatsAccessFilter
+    from .logging_config import (
+        AdminStatsAccessFilter,
+        configure_file_logging,
+        console_log_level,
+        is_console_handler,
+    )
 
     process_title.set_process_title()
 
@@ -221,6 +226,9 @@ def serve_command(args):
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    for handler in logging.getLogger().handlers:
+        if is_console_handler(handler):
+            handler.setLevel(console_log_level(log_level))
     # Set omlx loggers
     for name in [
         "omlx",
