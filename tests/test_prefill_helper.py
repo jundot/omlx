@@ -854,6 +854,16 @@ def _wait_state(manager, *states, reason="", timeout=30):
     raise AssertionError(f"state stayed {manager.status()}")
 
 
+def _wait_until(predicate, message, timeout=30):
+    """Wait for something append-only to happen, not for a state to be visible."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError(message)
+
+
 def test_manager_asks_before_deleting_other_copies_then_attaches(tmp_path):
     attached = []
     old = {"name": "Old", "bytes": 20 << 30, "used": 0.0}
@@ -1025,12 +1035,24 @@ def test_manager_retries_a_lost_helper_but_not_a_stopped_one(tmp_path, monkeypat
     attached = []
     fake = _FakeLauncher(None)
     manager = _manager(fake, attached, tmp_path / "speeds.json")
+    seen = []
+    reported = manager._set
+
+    def record(state, **fields):
+        seen.append(state)
+        reported(state, **fields)
+
+    monkeypatch.setattr(manager, "_set", record)
     manager.configure("node-1", None)
     _wait_state(manager, "ready")
     first = attached[-1]
     first.client.close()
-    _wait_state(manager, "offline", "connecting", "starting")
+    # The retry can run to completion between two polls, so wait for the second
+    # helper to be launched instead of catching a transient state; the recorded
+    # transitions still show the manager left "ready" on the way there.
+    _wait_until(lambda: len(fake.servers) >= 2, "the lost helper was not retried")
     _wait_state(manager, "ready")
+    assert "offline" in seen
     assert attached[-1] is not first and len(fake.servers) == 2
     # Stopped on the helper Mac: stays off until the user retries.
     attached[-1].client.stopped_by_helper = True
