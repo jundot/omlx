@@ -85,18 +85,18 @@ Setup:
 3. Run the Prefill Accelerator checks (control channel, link, model families, GPU memory, free disk).
 4. Choose the helper in the model's settings. Missing model files are copied over the control channel to the helper's models folder.
 
-Measured on an M3 Ultra (512 GB) with two RTX A6000 (48 GB each) over a 500 Mbit/s link, for a 32K-token prompt with **Auto**:
+Measured on an M3 Ultra (512 GB) with two RTX A6000 (48 GB each) over a direct 2.5 GbE cable, for a 32K-token prompt with **Auto**. 1 GbE is an estimate from Auto's speed model, calibrated on measured runs.
 
-| Model | Layers that fit | Layers Auto used | This Mac alone | With the helper | Sent per token |
-|---|---|---|---|---|---|
-| Qwen3.8 27B oQ4e | 63 of 64 | 37 | 405 tok/s | 726 tok/s | 75 KB |
-| GLM-5.3 Flash oQ4e | 21 of 45 | 21 | 561 tok/s | 867 tok/s | 60 KB |
-| MiniMax M3.1 Flash oQ4e | 21 of 60 | 21 | 327 tok/s | 461 tok/s | 63 KB |
-| Qwen3.8 Flash-Next oQ4e | 47 of 48 | 11 | 1,388 tok/s | 1,539 tok/s | 35 KB |
-| DeepSeek V4.1 Flash oQ3e | 12 of 40 | none | 1,119 tok/s | 1,119 tok/s | - |
-| DeepSeek V4.1 Flash oQ4e | 10 of 40 | none | 1,148 tok/s | 1,147 tok/s | - |
+| Model | Layers that fit | Layers Auto used | This Mac alone | 2.5 GbE | 1 GbE (estimate, approx.) | Sent per token |
+|---|---|---|---|---|---|---|
+| Qwen3.8 27B oQ4e | 58 of 64 | 56 | 405 tok/s | 2,079 tok/s (+413%) | 1,025 tok/s (+153%) | 109 KB |
+| Qwen3.8 Flash-Next oQ4e | 42 of 48 | 35 | 1,388 tok/s | 3,574 tok/s (+157%) | 1,950 tok/s (+40%) | 65 KB |
+| DeepSeek V4.1 Flash oQ3e | 12 of 40 | 12 | 1,119 tok/s | 1,971 tok/s (+76%) | 1,820 tok/s (+63%) | 45 KB |
+| DeepSeek V4.1 Flash oQ4e | 10 of 40 | 10 | 1,148 tok/s | 1,761 tok/s (+53%) | 1,740 tok/s (+52%) | 45 KB |
+| GLM-5.3 Flash oQ4e | 21 of 45 | 21 | 561 tok/s | 947 tok/s (+69%) | 920 tok/s (+64%) | 60 KB |
+| MiniMax M3.1 Flash oQ4e | 22 of 60 | 22 | 327 tok/s | 485 tok/s (+48%) | 475 tok/s (+45%) | 66 KB |
 
-The helper's GPUs were idle most of the time in every run: on this link the transfer, or the layers that stay on this Mac, set the speed. A fixed layer count above what Auto picks is slower on a link like this (Qwen3.8 Flash-Next with all 47 layers: about 740 tok/s). Auto kept DeepSeek V4.1 on this Mac on this link, because a split was slower: most of the 45 KB each token sends is the boundary between layers (about 42 KB), which does not shrink when the helper takes more layers. Auto times a prompt on this Mac alone before it trusts a close call.
+At 2.5 GbE the link was busy for about two thirds of each Qwen3.8 run and peaked at 308 MB/s. For DeepSeek V4.1, GLM-5.3 and MiniMax the layers that stay on this Mac set the speed, because only 10 to 22 of their layers fit in the two GPUs. On a slower link Auto uses fewer layers. It can keep DeepSeek V4.1 on this Mac there: most of the 45 KB each token sends is the boundary between layers (about 42 KB), which does not shrink when the helper takes fewer layers. Auto times a prompt on this Mac alone before it trusts a close call.
 
 ### Numerics
 
