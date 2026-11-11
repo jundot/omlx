@@ -1703,6 +1703,31 @@ def test_recovery_candidate_unclosed_envelope_3153_is_payload():
     assert f.take_recovery_candidate().startswith("<tool_call>")
 
 
+@pytest.mark.parametrize(
+    "text,is_payload",
+    [
+        # Coding-agent tool names are common words: in prose they are not a call.
+        ("<tool_call>`, which the parser will read first. END", False),
+        ("<tool_call> opens the call; the model must write the name next. END", False),
+        ("<tool_call> then write to save. END", False),
+        # In call position, right after the opener, they still are.
+        ('<tool_call>write(content="hel', True),
+        ("<tool_call>\nread\n<arg_key>path</arg_key>", True),
+        ("<tool_call>  edit", True),
+        # MiniCPM5's opener ends at "name=", so the name follows a quote.
+        ('<function name="write"><param name="content">hel', True),
+    ],
+)
+def test_declared_tool_name_is_call_evidence_only_in_call_position(text, is_payload):
+    tokenizer = _make_tokenizer_with_end("<function name=", "</function>")
+    f = ToolCallStreamFilter(tokenizer, tools=["read", "write", "edit", "bash"])
+    f.feed(text)
+    f.finish()
+
+    assert f.recovery_candidate_is_payload() is is_payload
+    assert f.take_recovery_candidate()
+
+
 def test_close_marker_fallback_rescans_the_recovered_tail():
     """Prose recovered after a close marker is re-filtered, not emitted raw."""
     f = ToolCallStreamFilter(_make_tokenizer())
