@@ -7477,6 +7477,54 @@ def _iter_loaded_schedulers():
         yield model_id, scheduler
 
 
+@router.post("/api/ssd-cache/rescan")
+async def rescan_ssd_cache(is_admin: bool = Depends(require_admin)):
+    """Re-scan the paged SSD cache directory of live engines.
+
+    Indexes block files added out-of-band (e.g. copied from another node for a
+    KV handoff) WITHOUT unloading models. Safe to call under traffic: in-flight
+    temp writes are skipped by the stale-tmp rule of the startup scan, and the
+    scan itself is additive - blocks already indexed keep their LRU position.
+
+    Response maps model_id -> scan stats so a caller can verify the imported
+    blocks became discoverable without restarting the engine.
+    """
+    from ..server import _server_state
+
+    if _server_state.engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    pool = _server_state.engine_pool
+    resolve_scheduler = getattr(
+        pool, "_resolve_scheduler_from_engine",
+        lambda engine: getattr(engine, "scheduler", None),
+    )
+    results: dict[str, dict] = {}
+    seen_managers: set[int] = set()
+    for model_id in pool.get_loaded_model_ids():
+        entry = pool._entries.get(model_id)
+        engine = getattr(entry, "engine", None) if entry else None
+        scheduler = resolve_scheduler(engine) if engine is not None else None
+        ssd = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd is None:
+            results[model_id] = {"status": "no_ssd_manager"}
+            continue
+        if id(ssd) in seen_managers:
+            continue
+        seen_managers.add(id(ssd))
+        before_count = ssd._tracked_ssd_count()
+        before_size = ssd._tracked_ssd_size()
+        ssd._scan_existing_files()
+        results[model_id] = {
+            "status": "rescanned",
+            "blocks_before": before_count,
+            "blocks_after": ssd._tracked_ssd_count(),
+            "bytes_before": before_size,
+            "bytes_after": ssd._tracked_ssd_size(),
+        }
+    logger.info(f"SSD cache rescan requested via admin API: {results}")
+    return {"rescan": results}
+
+
 @router.post("/api/ssd-cache/clear")
 async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     """Clear all SSD cache files for all loaded models.
