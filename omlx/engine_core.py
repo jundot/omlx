@@ -648,6 +648,15 @@ class EngineCore:
                         # making the server unresponsive to all HTTP requests.
                         await asyncio.sleep(0)
 
+                    if any(
+                        getattr(output, "ran_prefill_chunk", False)
+                        for output in step_outputs
+                    ):
+                        # Work queued behind the chunk (VLM prompt prep) wakes
+                        # its caller before this barrier returns, so the
+                        # caller's add_request gets in before the next chunk.
+                        await loop.run_in_executor(self._mlx_executor, lambda: None)
+
                     if eviction_request is not None:
                         callback = self.config.prefill_eviction_callback
                         if callback is not None:
