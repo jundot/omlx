@@ -728,6 +728,15 @@ class BatchedEngine(BaseEngine):
             apply_qwen35_padded_row_attention_patch()
         except Exception:
             logger.debug("qwen3_5 padded-row attention patch not applied", exc_info=True)
+        # Opt-in (OMLX_DEFER_REALIGN=1): defer ragged MTP rollback rolls.
+        try:
+            from ..patches.qwen35_deferred_realign import (
+                apply_qwen35_deferred_realign_patch,
+            )
+
+            apply_qwen35_deferred_realign_patch()
+        except Exception:
+            logger.warning("deferred realignment patch not applied", exc_info=True)
 
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
