@@ -11,9 +11,9 @@ cover the Hugging Face `_text` names and the existing mlx-lm name, including
 strict loading of quantized output.
 No model download is required.
 
-# LFM3-Omni oQ sanitize tests
+# LFM3-Omni oQ tests
 
-Run `python -m pytest -q tests/test_oq.py -k 'Lfm3OmniSanitize or lfm3_codec_sidecars'` to check that oQ renames LFM3-Omni weights to the names mlx-vlm loads, keeps LFM3 speech modules in floating point, and copies the speech codec for multimodal output. The cases cover eager sanitize, streaming sanitize discovery, and text-only sidecars. They use a small config and need no model download.
+Run `python -m pytest -q tests/test_oq.py -k 'Lfm3OmniSanitize or lfm3_omni_copies_codec'` to check that oQ writes LFM3-Omni weights under the names mlx-vlm loads (eager sanitize and streaming discovery), keeps the speech modules in floating point, copies the speech codec, and walks the conv layers with the native mask. They use a small config and need no model download.
 
 # Qwen3-ASR audio quantization tests
 

@@ -375,8 +375,9 @@ def _is_vlm_load(config: dict) -> bool:
     ``mlx_vlm.speculative.drafters.<type>`` lookup and fails.
     """
     model_type = str(config.get("model_type", "")).lower().replace("-", "_")
-    return model_type in (VLM_NATIVE_TEXT_MODEL_TYPES | {"lfm3_audio"}) or (
-        _has_vision_subconfig(config) and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
+    return model_type in VLM_NATIVE_TEXT_MODEL_TYPES or (
+        _has_vision_subconfig(config)
+        and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
     )
 
 
@@ -477,14 +478,6 @@ def _configure_minimax_shared_expert_layout(config: dict, oq_level: float) -> bo
     return True
 
 
-def _quant_text_config(config: dict) -> dict:
-    """Return the backbone config used by the quantization planner."""
-    text = config.get("text_config")
-    if not isinstance(text, dict) and config.get("model_type") == "lfm3_audio":
-        text = config.get("lfm")
-    return text if isinstance(text, dict) else {}
-
-
 def _normalize_sensitivity_map_override(
     config: dict,
     sensitivity_map_override: dict[int | str, float] | None,
@@ -500,9 +493,15 @@ def _normalize_sensitivity_map_override(
     if not isinstance(sensitivity_map_override, dict) or not sensitivity_map_override:
         raise ValueError("sensitivity_map_override must be a non-empty dict")
 
-    text_config = _quant_text_config(config)
+    text_config = config.get("text_config")
     num_layers = int(
-        config.get("num_hidden_layers") or text_config.get("num_hidden_layers", 0) or 0
+        config.get("num_hidden_layers")
+        or (
+            text_config.get("num_hidden_layers", 0)
+            if isinstance(text_config, dict)
+            else 0
+        )
+        or 0
     )
     if num_layers <= 0:
         raise ValueError(
@@ -640,9 +639,10 @@ def _is_token_embedding_tensor(path: str) -> bool:
 
 
 def _is_lfm3_speech_module(path: str, config: dict) -> bool:
-    return config.get("model_type") in {"lfm3_audio", "lfm3_omni"} and path.split(
-        ".", 1
-    )[0] in {"audio_tower", "audio_projector", "depth_decoder", "codebook_embedding"}
+    """Speech modules that mlx-vlm's LFM3 quant predicate keeps in floating point."""
+    return config.get("model_type") == "lfm3_omni" and path.startswith(
+        ("audio_tower", "audio_projector", "depth_decoder", "codebook_embedding")
+    )
 
 
 def universal_quant_predicate(
@@ -680,15 +680,11 @@ def universal_quant_predicate(
     if path in non_quantizable:
         return False
 
-    # Match mlx-vlm's LFM3 speech policy before applying sensitivity boosts.
-    if _is_lfm3_speech_module(path, config):
-        return False
-
     indexer_override = _indexer_q8_override(path, config)
     if indexer_override is not None:
         return indexer_override
 
-    tc = _quant_text_config(config)
+    tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
     num_experts = (
         config.get("num_local_experts")
@@ -743,7 +739,7 @@ def universal_quant_predicate(
     if _is_vision_tensor(path):
         return False
 
-    if _is_audio_tensor(path):
+    if _is_audio_tensor(path) or _is_lfm3_speech_module(path, config):
         return False
 
     if any(
@@ -1135,7 +1131,7 @@ _GLOBAL_ATTENTION_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.self_attn\.[qkvo]_pro
 
 def _global_attention_layers(config: dict) -> set[int]:
     """Full-attention layers of a hybrid model (sliding or linear attention elsewhere)."""
-    text_config = _quant_text_config(config)
+    text_config = config.get("text_config") or {}
     layer_types = config.get("layer_types") or text_config.get("layer_types") or []
     if len(set(layer_types)) < 2:
         return set()
@@ -4156,7 +4152,7 @@ def estimate_bpw_and_size(
     # Build budget plan for accurate estimate (position-based sensitivity)
     _level_targets = _bpw_targets_for_level(oq_level)
     if _level_targets is not None:
-        tc = _quant_text_config(config)
+        tc = config.get("text_config", {})
         num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
         pos_sens = {}
         for i in range(num_layers):
@@ -4770,7 +4766,6 @@ def _build_model_sanitizer(
         any("ForConditionalGeneration" in a for a in architectures)
         or _has_vision_subconfig(config)
         or model_type in VLM_NATIVE_TEXT_MODEL_TYPES
-        or model_type == "lfm3_audio"
     ) and not (mlx_lm_text_only or (text_only and model_type != "glm5_next"))
 
     # Serving normally registers oMLX's vendored Qwen4 implementation before
@@ -4870,17 +4865,15 @@ def _build_model_sanitizer(
             model_config_cls = model_module.ModelConfig
             model_config = model_config_cls.from_dict(config)
 
-            vision_config = getattr(model_config, "vision_config", None)
+            vision_config = model_config.vision_config
             if isinstance(vision_config, dict):
                 vision_config = model_module.VisionConfig.from_dict(vision_config)
-            text_config = getattr(model_config, "text_config", None)
+            text_config = model_config.text_config
             if isinstance(text_config, dict):
                 text_config = model_module.TextConfig.from_dict(text_config)
 
-            if vision_config is not None:
-                model_config.vision_config = vision_config
-            if text_config is not None:
-                model_config.text_config = text_config
+            model_config.vision_config = vision_config
+            model_config.text_config = text_config
             # Gemma 4 E2B/E4B carry an audio tower; their sanitize reads
             # audio_config.subsampling_conv_channels, so leaving the dict in
             # place made sanitize raise and the build fall back to raw names.
@@ -4933,12 +4926,8 @@ def _build_model_sanitizer(
 
                 proxy_cls = _Proxy
                 if sanitize_uses_super:
-                    # LFM3-Omni's sanitize calls super().sanitize(), and Python
-                    # only accepts that when self is an instance of the model
-                    # class. A plain proxy made sanitize raise, so oQ wrote the
-                    # checkpoint's original names and the loader could not
-                    # find the per-layer bit settings. Subclass the model
-                    # without running its __init__ so nothing is allocated.
+                    # super() needs self to be a model instance (LFM3-Omni).
+                    # Skip __init__ so no weights are allocated.
                     proxy_cls = type(
                         "_ModelProxy",
                         (_Proxy, model_module.Model),
@@ -5224,7 +5213,7 @@ def _copy_model_sidecars(
         shutil.copy2(py_file, output / py_file.name)
 
     # LFM3 speech decoding loads its codec separately from the model weights.
-    if not text_only and model_type in {"lfm3_audio", "lfm3_omni"}:
+    if not text_only and model_type == "lfm3_omni":
         for name in ("audio_tokenizer", "audio_detokenizer"):
             codec = source / name
             if codec.is_dir():
@@ -7071,11 +7060,6 @@ def quantize_oq_streaming(
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
-    if text_only and normalized_model_type in {"lfm3_audio", "lfm3_omni"}:
-        raise ValueError(
-            "oQ text-only conversion is not supported for LFM3 audio models; "
-            "disable text-only to retain the speech and vision components"
-        )
     mimo_multimodal = (
         normalized_model_type in {"mimo_v2", "mimo_v2_flash"}
         and _has_vision_subconfig(config)
@@ -7531,12 +7515,7 @@ def quantize_oq_streaming(
         preserve_mtp=preserve_mtp,
     )
     source_model_type = _stream_source_model_type(config)
-    if sanitize_fn is None and source_model_type in {
-        "qwen4_exp",
-        "glm5_next",
-        "lfm3_audio",
-        "lfm3_omni",
-    }:
+    if sanitize_fn is None and source_model_type in {"qwen4_exp", "glm5_next"}:
         raise RuntimeError(
             f"no model sanitizer for {source_model_type}: refusing to quantize on raw "
             "checkpoint keys (the recipe's tensor rules would not match)"
@@ -7576,11 +7555,6 @@ def quantize_oq_streaming(
                     f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors"
                 )
             except Exception as e2:
-                if source_model_type in {"lfm3_audio", "lfm3_omni"}:
-                    raise RuntimeError(
-                        f"{source_model_type} sanitize failed ({e2}); refusing to "
-                        "quantize on raw checkpoint keys"
-                    ) from e2
                 logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
@@ -11850,7 +11824,7 @@ def _build_streaming_proxy_for_sensitivity(
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
 
-    _copy_model_sidecars(source, output, model_type=config.get("model_type", ""))
+    _copy_model_sidecars(source, output)
 
 
 def _measure_sensitivity_from_quantized_model(
