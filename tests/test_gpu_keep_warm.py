@@ -7,8 +7,10 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 from omlx import engine_pool as ep
+from omlx.admin import routes as admin_routes
 from omlx.settings import GlobalSettings, ServerSettings
 
 
@@ -132,7 +134,7 @@ async def test_idle_window_is_configurable(pool):
     assert ep.EnginePool()._gpu_keep_warm_idle_window == 300.0
 
 
-def test_idle_window_settings_default_roundtrip_and_env(monkeypatch):
+def test_idle_window_settings_default_roundtrip():
     assert ServerSettings().gpu_keep_warm_idle_window == 300.0
     assert ServerSettings.from_dict({}).gpu_keep_warm_idle_window == 300.0
     s = ServerSettings.from_dict({"gpu_keep_warm_idle_window": 3600})
@@ -141,10 +143,16 @@ def test_idle_window_settings_default_roundtrip_and_env(monkeypatch):
         ServerSettings.from_dict(s.to_dict()).gpu_keep_warm_idle_window == 3600.0
     )
 
-    settings = GlobalSettings()
-    monkeypatch.setenv("OMLX_GPU_KEEP_WARM_IDLE_WINDOW", "900")
-    settings._apply_env_overrides()
-    assert settings.server.gpu_keep_warm_idle_window == 900.0
-    monkeypatch.setenv("OMLX_GPU_KEEP_WARM_IDLE_WINDOW", "nope")
-    settings._apply_env_overrides()
-    assert settings.server.gpu_keep_warm_idle_window == 900.0
+
+@pytest.mark.asyncio
+async def test_non_finite_idle_window_is_rejected(monkeypatch, tmp_path):
+    settings = GlobalSettings(base_path=tmp_path)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+    request = admin_routes.GlobalSettingsRequest(gpu_keep_warm_idle_window=1e999)
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_routes.update_global_settings(request, is_admin=True)
+    assert exc_info.value.status_code == 400
+    assert settings.server.gpu_keep_warm_idle_window == 300.0
+
+    settings.server.gpu_keep_warm_idle_window = float("inf")
+    assert "gpu_keep_warm_idle_window must be finite" in settings.validate()

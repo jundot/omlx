@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -1245,14 +1246,6 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_GPU_KEEP_WARM_INTERVAL value: {gpu_keep_warm}"
                 )
-        if keep_warm_window := os.getenv("OMLX_GPU_KEEP_WARM_IDLE_WINDOW"):
-            try:
-                self.server.gpu_keep_warm_idle_window = float(keep_warm_window)
-            except ValueError:
-                logger.warning(
-                    "Invalid OMLX_GPU_KEEP_WARM_IDLE_WINDOW value: "
-                    f"{keep_warm_window}"
-                )
         if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
             self.server.max_audio_upload_size = max_audio_upload_size
         if max_image_upload_size := (
@@ -1774,6 +1767,10 @@ class GlobalSettings:
 
         if self.server.max_image_side_length < 0:
             errors.append("max_image_side_length must be non-negative")
+        if not math.isfinite(self.server.gpu_keep_warm_interval):
+            errors.append("gpu_keep_warm_interval must be finite")
+        if not math.isfinite(self.server.gpu_keep_warm_idle_window):
+            errors.append("gpu_keep_warm_idle_window must be finite")
 
         # Memory guard tier validation
         if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:

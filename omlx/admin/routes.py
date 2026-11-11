@@ -13,6 +13,7 @@ import copy
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -4863,6 +4864,12 @@ async def update_global_settings(
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
+
+    # Infinity would persist and break JSON encoding of the settings response.
+    for name in ("gpu_keep_warm_interval", "gpu_keep_warm_idle_window"):
+        value = getattr(request, name)
+        if value is not None and not math.isfinite(value):
+            raise HTTPException(status_code=400, detail=f"{name} must be finite")
 
     from ..utils.network import (
         is_loopback_bind,
