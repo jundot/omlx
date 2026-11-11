@@ -66,6 +66,11 @@ def from_host(value: HostArray) -> mx.array:
     return array
 
 
+# Set by the worker where kernels read CUDA managed memory slowly (an integrated
+# GPU, WSL): weights then load on the GPU stream, into the GPU's memory pool.
+weights_on_gpu = False
+
+
 def load(model_dir: str | Path, names: list[str]) -> dict[str, mx.array]:
     """The named tensors, lazy until evaluated. Each shard is opened once."""
     root = Path(model_dir)
@@ -75,7 +80,8 @@ def load(model_dir: str | Path, names: list[str]) -> dict[str, mx.array]:
     for name in names:
         file = index[name].file
         if file not in shards:
-            shards[file] = mx.load(str(root / file))
+            stream = mx.gpu if weights_on_gpu else None
+            shards[file] = mx.load(str(root / file), stream=stream)
         out[name] = shards[file][name]
     return out
 

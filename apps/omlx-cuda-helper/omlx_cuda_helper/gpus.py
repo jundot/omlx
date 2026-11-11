@@ -10,6 +10,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+_NO_MEMORY = ("[N/A]", "[Not Supported]")
+
 
 def _run(*command: str) -> str:
     try:
@@ -21,7 +23,11 @@ def _run(*command: str) -> str:
 
 
 def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
-    """NVIDIA GPUs as {index, name, total, free} in bytes."""
+    """NVIDIA GPUs as {index, name, total, free, integrated}, sizes in bytes.
+
+    An integrated GPU (DGX Spark) has no memory of its own, so nvidia-smi
+    reports none: it holds its layers in the system RAM.
+    """
     out = _run(
         "nvidia-smi",
         "--query-gpu=index,name,memory.total,memory.free",
@@ -32,8 +38,13 @@ def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
         parts = [p.strip() for p in line.split(",")]
         if len(parts) != 4:
             continue
+        integrated = parts[2] in _NO_MEMORY
         try:
-            index, total, free = int(parts[0]), int(parts[2]), int(parts[3])
+            index = int(parts[0])
+            if integrated:
+                total, free = memory()
+            else:
+                total, free = int(parts[2]) << 20, int(parts[3]) << 20
         except ValueError:
             continue
         if only is None or index in only:
@@ -41,11 +52,20 @@ def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
                 {
                     "index": index,
                     "name": parts[1],
-                    "total": total << 20,
-                    "free": free << 20,
+                    "total": total,
+                    "free": free,
+                    "integrated": integrated,
                 }
             )
     return found
+
+
+def wsl() -> bool:
+    """Whether this runs on WSL, where CUDA has no concurrent managed memory."""
+    try:
+        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower()
+    except OSError:
+        return False
 
 
 def chip_label(found: list[dict[str, Any]]) -> str:

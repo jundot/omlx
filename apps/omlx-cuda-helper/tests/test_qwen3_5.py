@@ -11,6 +11,7 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
+from omlx_cuda_helper import tensors  # noqa: E402
 from omlx_cuda_helper.families import qwen3_5  # noqa: E402
 from omlx_cuda_helper.families.qwen3_5.stage import load_stage  # noqa: E402
 
@@ -103,6 +104,12 @@ def test_stages_reproduce_the_contract_fixture(bounds):
                     atol=meta["atol"],
                     err_msg=tag + name,
                 )
+
+
+@pytest.mark.skipif(not mx.cuda.is_available(), reason="a GPU load runs on CUDA")
+def test_weights_loaded_into_the_gpu_pool_give_the_same_stages(monkeypatch):
+    monkeypatch.setattr(tensors, "weights_on_gpu", True)
+    test_stages_reproduce_the_contract_fixture((0, 2, 5))
 
 
 def test_a_stage_returns_the_layers_a_block_drafter_reads():

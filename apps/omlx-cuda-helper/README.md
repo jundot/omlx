@@ -8,11 +8,40 @@ The Mac that runs oMLX keeps the whole model, the KV cache and the API. This hel
 
 See `docs/experimental/prefill-accelerator.md` for the feature as a whole.
 
+## Run with Docker
+
+`jundot/omlx-cuda-helper` has images for linux/amd64 (Linux, and Docker Desktop on Windows) and linux/arm64 (DGX Spark); Docker picks the one for the machine. They need an NVIDIA driver of version 580 or later (CUDA 13) and GPU access for containers: the NVIDIA Container Toolkit on Linux (DGX OS has it), the WSL 2 backend on Windows.
+
+Linux and DGX Spark:
+
+```bash
+docker run -d --name omlx-helper --restart unless-stopped --gpus all --network host \
+  -v omlx-helper:/data jundot/omlx-cuda-helper
+docker logs -f omlx-helper
+```
+
+Host networking lets the oMLX Cluster tab find the helper. Arguments after the image name go to `serve` (see the options below), for example `--name gpu-box`.
+
+Windows (Docker Desktop):
+
+```powershell
+docker run -d --name omlx-helper --restart unless-stopped --gpus all `
+  -p 8850-8852:8850-8852 -v omlx-helper:/data jundot/omlx-cuda-helper `
+  --name gpu-box --no-mdns --pair MAC_ADDRESS
+```
+
+Docker Desktop does not pass discovery through to the container, so the helper asks the Mac to pair (`MAC_ADDRESS` is the Mac's address, with `:PORT` when oMLX does not listen on 8000). Type the code from `docker logs omlx-helper` in the Cluster tab. The Mac then reaches the helper at the Windows machine's address on the published ports, which the Windows firewall must let in.
+
+The volume holds the helper's identity, its pairings, the model files oMLX copies to it and the compiled kernels. To use model folders already on the machine, mount them at `/data/models`. Other commands run in the container, for example `docker exec omlx-helper omlx-cuda-helper --state-dir /data status`.
+
+The amd64 image runs on GPUs from the Ampere generation on (RTX 30, 40 and 50, RTX A and Ada, A100, H100), the arm64 image on GB10. Only 2x RTX A6000 on Linux has been tested so far, not Windows or DGX Spark.
+
+To build the image yourself, run `docker buildx build --platform linux/amd64 -t omlx-cuda-helper .` in this folder (about an hour on 6 cores; MLX is built from source). Build the arm64 image on an arm64 machine, such as a Mac with Apple silicon or the DGX Spark itself: under emulation it takes many hours.
+
 ## Requirements
 
-- Linux x86_64 with one or two NVIDIA GPUs. Tested on 2x RTX A6000 (48 GB each), Ubuntu 26.04, driver 595.
-- Python 3.11 or later (tested with 3.12).
-- The patched MLX CUDA wheel built by `mlx-build/` (CUDA 12.9 toolchain; MLX refuses CUDA 13.1).
+- One or two NVIDIA GPUs. Tested on 2x RTX A6000 (48 GB each), Ubuntu 26.04, driver 595.
+- Without Docker: Python 3.11 or later (tested with 3.12) and the patched MLX CUDA wheel built by `mlx-build/` (tested with the CUDA 12.9 toolchain; MLX refuses CUDA 13.1).
 - The Mac and the helper on the same network. The link carries each chunk's hidden state and cache rows back to the Mac, so it limits the speedup on short prompts and on models that send a lot per token.
 - Optional: a direct Ethernet cable between the Mac and the helper. When it is faster than the shared network, the Mac moves the helper's traffic to it. The cable needs no addresses: without them the Mac reaches the helper at its IPv6 link-local address, and static IPv4 addresses work too. Discovery and pairing still run on the shared network, so keep both machines on it.
 - On the Mac: an oMLX version with helper support, with **Global Settings > Advanced > Enable Distributed Inference** turned on.
@@ -83,7 +112,7 @@ The same families as the Mac helper. A helper and a Mac work together when they 
 | Qwen3.8 Flash-Next | `qwen4_exp` | 47 of 48 |
 | MiniMax M3 / M3.1 | `minimax_m3_vl` | 21 of 60 |
 | GLM-5.3 Flash | `glm5_next` | 21 of 45 |
-| DeepSeek V4.1 | `deepseek_v41` | 12 of 40 |
+| DeepSeek V4.1 | `deepseek_v41` | 12 of 40 (10 for oQ4e) |
 
 Layer counts are for the oQ4e checkpoints (oQ3e for DeepSeek V4.1). How many of them a prompt uses is chosen per prompt from the measured speed of both machines and of the link.
 

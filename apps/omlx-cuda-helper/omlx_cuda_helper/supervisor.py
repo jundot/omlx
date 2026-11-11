@@ -244,12 +244,17 @@ class Supervisor:
             ]
             if previous_socket:
                 command += ["--upstream", f"unix:{previous_socket}"]
+            gpu = found[position]
+            if gpu.get("integrated") or gpus.wsl():
+                # Kernels read managed memory slowly there; weights go to the
+                # GPU's own memory pool.
+                command.append("--weights-on-gpu")
             env = {
                 **os.environ,
                 # nvidia-smi numbers the GPUs by PCI bus. The default CUDA
                 # order (fastest first) differs on a machine with mixed GPUs.
                 "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-                "CUDA_VISIBLE_DEVICES": str(found[position]["index"]),
+                "CUDA_VISIBLE_DEVICES": str(gpu["index"]),
                 # MLX names a compiled kernel by its source only, so a cache
                 # shared across MLX builds hands one the kernels of another.
                 "MLX_PTX_CACHE_DIR": str(self._kernel_cache()),
@@ -257,6 +262,10 @@ class Supervisor:
                 # change which blocks win.
                 "MLX_ENABLE_TF32": "0",
             }
+            if gpu.get("integrated"):
+                # Prefill kernels run slower inside CUDA graphs on an
+                # integrated GPU; the same kernels run either way.
+                env["MLX_USE_CUDA_GRAPHS"] = "0"
             proc = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,

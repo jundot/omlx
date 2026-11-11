@@ -173,6 +173,20 @@ def test_the_helper_reports_its_wired_links(monkeypatch):
     assert gpus.link_mbps("fe80::2%enp6s0") == 2500
 
 
+def test_an_integrated_gpu_holds_its_layers_in_system_ram(monkeypatch):
+    # nvidia-smi on a DGX Spark reports no memory for its GPU.
+    rows = "0, NVIDIA GB10, [N/A], [N/A]\n1, NVIDIA RTX A6000, 49140, 48600\n"
+    monkeypatch.setattr(gpus, "_run", lambda *command: rows)
+    monkeypatch.setattr(gpus, "memory", lambda: (128 << 30, 100 << 30))
+    spark, card = gpus.gpus()
+    assert (spark["total"], spark["free"], spark["integrated"]) == (
+        128 << 30,
+        100 << 30,
+        True,
+    )
+    assert (card["free"], card["integrated"]) == (48600 << 20, False)
+
+
 def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
     pytest.importorskip("omlx")
     from omlx.prefill_helper import agent, launcher

@@ -451,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--listen", required=True, help="tcp:HOST:PORT or unix:PATH")
     parser.add_argument("--upstream", help="unix:PATH of the stage before")
     parser.add_argument("--warm-tokens", type=int, default=8192)
+    parser.add_argument("--weights-on-gpu", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
@@ -465,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     tensors.check_backend()
+    tensors.weights_on_gpu = args.weights_on_gpu
     stage = families.stage_module(args.model_type).load_stage(
         args.model, args.first, args.last
     )

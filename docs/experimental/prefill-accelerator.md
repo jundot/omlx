@@ -80,8 +80,8 @@ DeepSeek V4.1 **CED prefill** is on unless turned off in the model's settings. *
 
 Setup:
 
-1. On the Linux machine, build the MLX wheel and start the helper (`omlx-cuda-helper serve`).
-2. In the Cluster tab, press **Pair** on the helper and type the code from its log.
+1. On the machine with the NVIDIA GPU, start the helper with Docker. The Cluster tab shows the commands for Linux, Windows and DGX Spark under **Add a PC with an NVIDIA GPU**; building from source is described in the helper's README.
+2. In the Cluster tab, press **Pair** on the helper and type the code from its log (`docker logs omlx-helper`). On Windows the helper asks this Mac to pair instead, because Docker Desktop does not pass discovery through.
 3. Run the Prefill Accelerator checks (control channel, link, model families, GPU memory, free disk).
 4. Choose the helper in the model's settings. Missing model files are copied over the control channel to the helper's models folder.
 
@@ -89,13 +89,14 @@ Measured on an M3 Ultra (512 GB) with two RTX A6000 (48 GB each) over a 500 Mbit
 
 | Model | Layers that fit | Layers Auto used | This Mac alone | With the helper | Sent per token |
 |---|---|---|---|---|---|
-| Qwen3.8 27B oQ4e | 63 of 64 | 37 | 405 tok/s | 724 tok/s | 75 KB |
-| GLM-5.3 Flash oQ4e | 21 of 45 | 21 | 561 tok/s | 866 tok/s | 60 KB |
-| MiniMax M3.1 Flash oQ4e | 21 of 60 | 21 | 327 tok/s | 473 tok/s | 63 KB |
-| Qwen3.8 Flash-Next oQ4e | 47 of 48 | 11 | 1,387 tok/s | 1,527 tok/s | 35 KB |
-| DeepSeek V4.1 Flash oQ3e | 7 of 40 | 4 | 1,119 tok/s | 1,007 tok/s | 45 KB |
+| Qwen3.8 27B oQ4e | 63 of 64 | 37 | 405 tok/s | 726 tok/s | 75 KB |
+| GLM-5.3 Flash oQ4e | 21 of 45 | 21 | 561 tok/s | 867 tok/s | 60 KB |
+| MiniMax M3.1 Flash oQ4e | 21 of 60 | 21 | 327 tok/s | 461 tok/s | 63 KB |
+| Qwen3.8 Flash-Next oQ4e | 47 of 48 | 11 | 1,388 tok/s | 1,539 tok/s | 35 KB |
+| DeepSeek V4.1 Flash oQ3e | 12 of 40 | none | 1,119 tok/s | 1,119 tok/s | - |
+| DeepSeek V4.1 Flash oQ4e | 10 of 40 | none | 1,148 tok/s | 1,147 tok/s | - |
 
-The helper's GPUs were idle most of the time in every run: on this link the transfer, or the layers that stay on this Mac, set the speed. A fixed layer count above what Auto picks is slower on a link like this (Qwen3.8 Flash-Next with all 47 layers: about 720 tok/s). DeepSeek V4.1 fits only 7 layers on these GPUs and was slower with the helper on this link; leave the helper off for it unless the link is faster.
+The helper's GPUs were idle most of the time in every run: on this link the transfer, or the layers that stay on this Mac, set the speed. A fixed layer count above what Auto picks is slower on a link like this (Qwen3.8 Flash-Next with all 47 layers: about 740 tok/s). Auto kept DeepSeek V4.1 on this Mac on this link, because a split was slower: most of the 45 KB each token sends is the boundary between layers (about 42 KB), which does not shrink when the helper takes more layers. Auto times a prompt on this Mac alone before it trusts a close call.
 
 ### Numerics
 
@@ -105,11 +106,12 @@ Measured with greedy decoding on 8 prompts per model (a generated log with an op
 
 | Model | Helper layers | First-token KL, median (max) | Top token changed | Same 64-token continuation | Lookups right of 40, off / on |
 |---|---|---|---|---|---|
-| Qwen3.8 27B oQ4e | 63 of 64 | 0.0009 (0.008) | 0 of 8 | 6 of 8 | 40 / 40 |
+| Qwen3.8 27B oQ4e | 63 of 64 | 0.0009 (0.003) | 0 of 8 | 6 of 8 | 40 / 40 |
 | GLM-5.3 Flash oQ4e | 21 of 45 | 0.006 (0.03) | 0 of 8 | 0 of 8 | 39 / 40 |
-| Qwen3.8 Flash-Next oQ4e | 47 of 48 | 0.007 (0.03) | 1 of 8 | 6 of 8 | 40 / 40 |
+| Qwen3.8 Flash-Next oQ4e | 47 of 48 | 0.010 (0.02) | 0 of 8 | 7 of 8 | 40 / 40 |
 | MiniMax M3.1 Flash oQ4e | 21 of 60 | 0.006 (0.14) | 2 of 8 | 3 of 8 | 40 / 40 |
-| DeepSeek V4.1 Flash oQ3e | 7 of 40 | 0.05 (0.46) | 1 of 8 | 2 of 8 | 40 / 40 |
+| DeepSeek V4.1 Flash oQ3e | 12 of 40 | 0.035 (0.47) | 2 of 8 | 1 of 8 | 40 / 40 |
+| DeepSeek V4.1 Flash oQ4e | 10 of 40 | 0.042 (0.14) | 2 of 8 | 2 of 8 | 40 / 40 |
 
 KL is taken over the first token's 20 most likely tokens. With the helper off, two runs of a prompt are identical. GLM-5.3 answered with reasoning text, which diverges early. The answers to the lookup questions did not get worse in any run.
 
