@@ -15,6 +15,7 @@ Note: Uses pytest-asyncio for async tests.
 import asyncio
 import concurrent.futures
 import weakref
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -2057,15 +2058,77 @@ class TestStepBurst:
         """Elapsed budget ends the burst (also caps slow prefill-chunk steps)."""
         engine = self._make_engine(mock_model, mock_tokenizer, max_steps=8, budget=0.05)
         try:
-            engine.scheduler.step = MagicMock(
-                return_value=SchedulerOutput(has_work=True)
+            # deadline = 100.01 + 0.05: steps end at 100.01, 100.04, 100.07.
+            outs = self._run_timed_burst(engine, [0.01] + [0.03] * 7)
+            assert len(outs) == 3
+            assert engine.scheduler.step.call_count == 3
+        finally:
+            engine.close()
+
+    def _run_timed_burst(
+        self, engine, durations, outputs=None, chunk_steps=(), prefilling=False
+    ):
+        """Run one burst where step i takes durations[i] seconds."""
+        clock = [100.0]
+        calls = iter(range(len(durations)))
+
+        def step():
+            index = next(calls)
+            clock[0] += durations[index]
+            if outputs and outputs[index] is not None:
+                return outputs[index]
+            output = SchedulerOutput(has_work=True)
+            output.ran_prefill_chunk = index in chunk_steps
+            return output
+
+        engine.scheduler.step = MagicMock(side_effect=step)
+        engine.scheduler.has_requests = MagicMock(return_value=True)
+        engine.scheduler.prefilling = deque([object()] if prefilling else [])
+        with patch("omlx.engine_core.time.monotonic", side_effect=lambda: clock[0]):
+            return engine._step_burst()
+
+    @pytest.mark.parametrize(
+        ("durations", "chunk_steps", "expected_steps"),
+        [
+            ([3.0, 3.0, 3.0], {0, 1, 2}, 1),
+            ([0.12, 0.12, 0.12, 0.12], (), 2),
+            ([0.05, 0.05, 0.05, 0.05], {0, 1, 2, 3}, 3),
+        ],
+        ids=["slow_chunk", "slow_decode", "fast_chunks"],
+    )
+    def test_prefill_chunk_over_budget_ends_burst(
+        self, mock_model, mock_tokenizer, durations, chunk_steps, expected_steps
+    ):
+        """Only a chunk that alone spends the budget ends the burst (#5148)."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4, budget=0.1)
+        try:
+            outs = self._run_timed_burst(
+                engine, durations, chunk_steps=chunk_steps, prefilling=True
             )
-            engine.scheduler.has_requests = MagicMock(return_value=True)
-            # deadline = monotonic()(=100.0) + 0.05; next check (=200.0) exceeds it.
-            with patch("omlx.engine_core.time.monotonic", side_effect=[100.0, 200.0]):
-                outs = engine._step_burst()
-            assert len(outs) == 1
-            assert engine.scheduler.step.call_count == 1
+            assert len(outs) == expected_steps
+        finally:
+            engine.close()
+
+    @pytest.mark.parametrize(
+        ("prefilling", "expected_steps"),
+        [(True, 1), (False, 4)],
+        ids=["prefill_in_flight", "no_prefill"],
+    )
+    def test_finished_request_ends_burst_while_prefilling(
+        self, mock_model, mock_tokenizer, prefilling, expected_steps
+    ):
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4, budget=0.1)
+        finished = SchedulerOutput(
+            has_work=True,
+            outputs=[RequestOutput(request_id="a", finished=True)],
+            finished_request_ids={"a"},
+        )
+        try:
+            outs = self._run_timed_burst(
+                engine, [0.01] * 4, [finished, None, None, None], prefilling=prefilling
+            )
+            assert outs[0] is finished
+            assert len(outs) == expected_steps
         finally:
             engine.close()
 

@@ -2030,6 +2030,9 @@ class SchedulerOutput:
     prefill_eviction_request: PrefillEvictionRequest | None = None
     # Whether any work was done
     has_work: bool = False
+    # Whether this step ran a chunked-prefill forward. EngineCore ends a
+    # decode burst after a slow one so queued admissions run first.
+    ran_prefill_chunk: bool = False
 
 
 class _ResumedStopSequences:
@@ -2458,6 +2461,8 @@ class Scheduler:
         self._row_decode_acc: list[float] = [0.0, 0.0]
         self._prefill_hold_until: float = 0.0
         self._admit_prefill_next: bool = False
+        # Chunked-prefill forwards run so far; step() reports whether it ran one.
+        self._prefill_forwards: int = 0
         # Measured throughputs feeding the adaptive fairness constants.
         # Best-observed prefill tok/s sizes the contended chunk (stall-time
         # target): contended chunks only measure SLOWER, so a running max
@@ -6551,6 +6556,10 @@ class Scheduler:
             return 0
         if not self._decode_contention():
             return 0
+        return Scheduler._contended_chunk_size(self)
+
+    def _contended_chunk_size(self) -> int:
+        """Chunk size used while a decode contends with this prefill."""
         tps = self._prefill_tps_best
         if tps and tps > 0.0:
             cap = int(_DECODE_STALL_TARGET_MS / 1000.0 * tps)
@@ -7270,6 +7279,7 @@ class Scheduler:
         Returns, per plan, whether that request's prefill is complete.
         """
         interrupt_batch_timing(getattr(self, "batch_generator", None))
+        self._prefill_forwards = getattr(self, "_prefill_forwards", 0) + 1
         head = plans[0]
         processed_before = [plan.state.tokens_processed for plan in plans]
         kv_len = max(
@@ -7985,6 +7995,7 @@ class Scheduler:
         self,
         scheduled: "list[Request]",
         rejected: "list[RequestOutput]",
+        first: "set[str] | frozenset[str]" = frozenset(),
     ) -> None:
         """Advance in-flight prefills until decode fairness requires a yield.
 
@@ -7999,6 +8010,8 @@ class Scheduler:
             rejected: Per-step rejected outputs. A chunked prefill that hits
                 the memory hard limit emits a finish_reason="error" entry
                 here so the engine can surface the failure to the client.
+            first: Short requests admitted ahead of the in-flight chunk. They
+                run first so a full-width head chunk does not delay them.
         """
         if not self.prefilling:
             return
@@ -8019,6 +8032,8 @@ class Scheduler:
             # These chunks finish their requests; behind a longer head they
             # would wait for its whole prefill, so they run first.
             pending_prefills.sort(key=lambda request: not too_short_to_pack(request))
+        if first:
+            pending_prefills.sort(key=lambda request: request.request_id not in first)
 
         for index, request in enumerate(pending_prefills):
             rid = request.request_id
@@ -15812,6 +15827,7 @@ class Scheduler:
             SchedulerOutput with results of this step
         """
         output = SchedulerOutput()
+        prefill_forwards = getattr(self, "_prefill_forwards", 0)
 
         # Publish decode activity for cross-engine prefill fairness (a
         # count of 0 removes the entry, so idle engines never throttle a
@@ -15845,23 +15861,45 @@ class Scheduler:
         try:
             # Alternate open prefill opportunities so neither admissions nor in-flight chunks starve.
             admit_first = False
+            prefilling_before: set[str] | None = None
             prefill_gate_open = self._prefill_gate_open() if self.prefilling else True
             if (
                 self._decode_fairness
                 and self.prefilling
                 and self.waiting
-                and self._decode_contention()
                 and prefill_gate_open
             ):
-                admit_first = self._admit_prefill_next
-                self._admit_prefill_next = not admit_first
+                if not self._decode_contention():
+                    # Nothing decodes. Requests that fit in one contended
+                    # chunk prefill ahead of the in-flight chunk, which then
+                    # shrinks while they decode; after it they would wait a
+                    # whole chunk (#5148). Longer ones keep their turn.
+                    limit = Scheduler._contended_chunk_size(self)
+                    if all(
+                        request.num_prompt_tokens <= limit for request in self.waiting
+                    ):
+                        admit_first = True
+                        prefilling_before = {
+                            request.request_id for request in self.prefilling
+                        }
+                else:
+                    admit_first = self._admit_prefill_next
+                    self._admit_prefill_next = not admit_first
             if admit_first:
                 scheduled, rejected = self._schedule_waiting()
+            # Short requests admitted above that wait to pack go ahead of the head.
+            short_first = (
+                {r.request_id for r in self.prefilling} - prefilling_before
+                if prefilling_before is not None
+                else set()
+            )
 
             chunked_scheduled: list[Request] = []
             chunked_rejected: list[RequestOutput] = []
             if self.prefilling and prefill_gate_open:
-                self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
+                self._advance_chunked_prefills(
+                    chunked_scheduled, chunked_rejected, first=short_first
+                )
 
             if not admit_first:
                 scheduled, rejected = self._schedule_waiting()
@@ -16101,6 +16139,9 @@ class Scheduler:
 
         self._publish_admin_snapshot()
 
+        output.ran_prefill_chunk = (
+            getattr(self, "_prefill_forwards", 0) != prefill_forwards
+        )
         return output
 
     def _publish_admin_snapshot(self) -> None:

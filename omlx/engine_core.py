@@ -511,13 +511,15 @@ class EngineCore:
         scheduler.step() services aborts/admission/finish every step, so
         correctness is unchanged; the only cost is event-loop responsiveness,
         bounded by decode_burst_budget_s. Stops early when no work remains, a
-        request produces its first chunk, a prefill eviction needs the (async)
-        callback, or the budget elapses —
-        the budget also ends the burst when a slow prefill-chunk step lands.
+        request produces its first chunk, a request finishes while a chunked
+        prefill is in flight, a prefill eviction needs the (async) callback,
+        or the budget elapses — the budget also ends the burst when a slow
+        prefill-chunk step lands, including the first one.
 
         Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
         """
         max_steps = self.config.decode_burst_max_steps
+        started = time.monotonic()
         outputs = [self.scheduler.step()]
         if max_steps <= 1:
             return outputs
@@ -532,7 +534,12 @@ class EngineCore:
         )
         if budget <= 0:
             return outputs
-        deadline = time.monotonic() + budget
+        now = time.monotonic()
+        if now - started >= budget and getattr(outputs[0], "ran_prefill_chunk", False):
+            # A chunk that spent the whole budget hands control back, so queued
+            # admissions and aborts do not wait for a second chunk (#5148).
+            return outputs
+        deadline = now + budget
         while len(outputs) < max_steps:
             last = outputs[-1]
             # Also release the first chunk of a request admitted mid-burst.
@@ -542,6 +549,13 @@ class EngineCore:
                 item.new_token_ids
                 and item.completion_tokens == len(item.new_token_ids)
                 for item in last.outputs
+            ):
+                break
+            # A finished request's last output (finish reason, usage) would
+            # otherwise wait for the rest of the burst, which can be a whole
+            # prefill chunk while a prefill is in flight.
+            if last.finished_request_ids and getattr(
+                self.scheduler, "prefilling", None
             ):
                 break
             if (
