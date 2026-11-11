@@ -1,0 +1,8 @@
+# Applied in order on top of MLX_COMMIT.
+0001-mlx-serve-cuda-custom-kernel-disk-cache.patch
+0002-mlx-serve-cuda-sorted-gather-experts.patch
+0003-omlx-cuda-gather-qmm-rhs-affine.patch
+0004-omlx-cuda-affine-dequant-round-once.patch
+0005-omlx-cuda-expert-kernel-64bit-strides.patch
+0006-omlx-cuda-cublaslt-float32-reduction.patch
+0007-omlx-cuda-cudnn-sdpa-head-dim-256.patch

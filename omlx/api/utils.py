@@ -92,13 +92,29 @@ def cache_reasoning_output(
     return bool(native_reasoning) or preserve_thinking is True
 
 
+_THINKING_OFF_EFFORTS = frozenset({"none", "off"})
+
+
 def merge_reasoning_effort_chat_template_kwargs(
     chat_template_kwargs: dict[str, Any] | None,
     reasoning_effort: Any | None,
 ) -> dict[str, Any] | None:
-    """Forward an API reasoning effort without overriding explicit template kwargs."""
+    """Forward an API reasoning effort without overriding explicit template kwargs.
+
+    ``none`` and ``off`` mean no reasoning in the OpenAI API, so they also set
+    the template's off switch (``enable_thinking=False``). The effort is still
+    forwarded for templates that read it directly and ignore ``enable_thinking``.
+    An explicit ``enable_thinking`` or ``reasoning_effort`` in the template
+    kwargs still wins.
+    """
     merged = dict(chat_template_kwargs or {})
     if reasoning_effort is not None:
+        if (
+            isinstance(reasoning_effort, str)
+            and reasoning_effort.strip().lower() in _THINKING_OFF_EFFORTS
+            and "reasoning_effort" not in merged
+        ):
+            merged.setdefault("enable_thinking", False)
         merged.setdefault("reasoning_effort", reasoning_effort)
     return merged or None
 

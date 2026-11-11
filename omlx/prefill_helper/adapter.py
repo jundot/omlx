@@ -74,6 +74,11 @@ class StageAdapter:
     """Split a model family's prefill forward between two Macs."""
 
     model_types: tuple[str, ...] = ()
+    # Version of what crosses the link for this family: names, dtypes, shapes
+    # and meaning of the boundary, state, prefix and host-fed arrays. A helper
+    # built from other code connects only when its version is equal. Raise it
+    # with any change to those arrays and record the contract fixture again.
+    contract = 1
     # Whether run_first/run_rest fill a Capture (block drafters need it).
     captures_layers = False
 
@@ -82,6 +87,11 @@ class StageAdapter:
         return getattr(model, "_language_model", None) or getattr(
             model, "language_model", model
         )
+
+    def serves(self, engine_type: str | None, model_path: str | Path | None) -> bool:
+        """Whether a model of this family gets a helper, given the engine
+        that serves it and its checkpoint folder."""
+        return True
 
     def layer_count(self, lm: Any) -> int:
         raise NotImplementedError

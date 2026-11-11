@@ -384,16 +384,23 @@ class TestSchedulerSettings:
             "embedding_batch_size": 32,
             "chunked_prefill": False,
             "prefill_priority": "context",
+            "concurrent_priority": "balanced",
             "decode_fairness": True,
         }
 
-    def test_decode_fairness_from_dict(self):
-        """Defaults on; explicit false round-trips."""
-        assert SchedulerSettings.from_dict({}).decode_fairness is True
-        assert (
-            SchedulerSettings.from_dict({"decode_fairness": False}).decode_fairness
-            is False
-        )
+    def test_concurrent_priority_from_dict(self):
+        """Valid values pass through; older files map the on/off switch."""
+
+        def priority(data):
+            return SchedulerSettings.from_dict(data).concurrent_priority
+
+        assert priority({}) == "balanced"
+        assert priority({"decode_fairness": False}) == "prefill"
+        assert priority({"decode_fairness": True}) == "balanced"
+        assert priority({"concurrent_priority": "decode"}) == "decode"
+        assert priority({"concurrent_priority": "fast"}) == "balanced"
+        legacy_off = SchedulerSettings.from_dict({"decode_fairness": False})
+        assert legacy_off.decode_fairness is False
 
     def test_prefill_priority_from_dict(self):
         """Valid values pass through; anything else falls back to context."""
@@ -2281,8 +2288,11 @@ class TestGlobalSettings:
         settings = GlobalSettings()
         settings.scheduler.max_concurrent_requests = 128
         settings.scheduler.embedding_batch_size = 12
+        settings.scheduler.concurrent_priority = "decode"
 
         scheduler_config = settings.to_scheduler_config()
+        assert scheduler_config.decode_fairness is True
+        assert scheduler_config.adaptive_decode_share is False
         assert scheduler_config.max_num_seqs == 128
         assert scheduler_config.completion_batch_size == 128
         assert scheduler_config.embedding_batch_size == 12

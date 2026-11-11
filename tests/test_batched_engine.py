@@ -13,6 +13,8 @@ Tests cover:
 Note: mlx_lm.load() is mocked to avoid loading real models.
 """
 
+import threading
+import time
 from abc import ABC
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -1496,3 +1498,38 @@ class TestBatchedEngineToolParserRepair:
 
         assert engine.tokenizer is tokenizer
         assert tokenizer.tool_parser.__module__ == f"mlx_lm.tool_parsers.{expected}"
+
+
+class TestGrammarCompilerLazyInit:
+    def test_concurrent_first_access_shares_one_compiler(self):
+        """Concurrent first callers all get the compiler, built once."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._model = SimpleNamespace(config={"model_type": "k2_horizon"})
+        engine._tokenizer = object()
+
+        sentinel = object()
+        calls: list[int] = []
+        results: list[Any] = []
+        start = threading.Barrier(8)
+
+        def fake_create(tokenizer, model, cache_limit_bytes=-1):
+            calls.append(1)
+            time.sleep(0.05)
+            return sentinel
+
+        def worker():
+            start.wait(timeout=5)
+            results.append(engine.grammar_compiler)
+
+        with patch("omlx.api.grammar.create_grammar_compiler", side_effect=fake_create):
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert len(results) == 8
+        assert all(result is sentinel for result in results), results
+        assert len(calls) == 1

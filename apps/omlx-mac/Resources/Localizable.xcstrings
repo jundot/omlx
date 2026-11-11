@@ -5201,19 +5201,25 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prefill-Priorität"
+            "value" : "Umgang mit langen Prompts"
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prefill Priority"
+            "value" : "Long Prompt Handling"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обработка длинных промптов"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预填充优先级"
+            "value" : "长提示词处理"
           }
         }
       }
@@ -7635,6 +7641,96 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "保存"
+          }
+        }
+      }
+    },
+    "concurrent_priority.option.balanced" : {
+      "comment" : "Concurrent request priority option that adapts how much GPU time running responses keep",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgewogen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Balanced"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Баланс"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "平衡"
+          }
+        }
+      }
+    },
+    "concurrent_priority.option.decode" : {
+      "comment" : "Concurrent request priority option that keeps running responses decoding first",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decodierung zuerst"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decode First"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сначала декодирование"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "解码优先"
+          }
+        }
+      }
+    },
+    "concurrent_priority.option.prefill" : {
+      "comment" : "Concurrent request priority option that prefills new prompts first",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill zuerst"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill First"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сначала префилл"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "预填充优先"
           }
         }
       }
@@ -15891,6 +15987,66 @@
         }
       }
     },
+    "performance.scheduler.concurrent_priority" : {
+      "comment" : "Row label for the concurrent request priority popup",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Priorität bei gleichzeitigen Anfragen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Concurrent Request Priority"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Приоритет одновременных запросов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "并发请求优先级"
+          }
+        }
+      }
+    },
+    "performance.scheduler.concurrent_priority.sub" : {
+      "comment" : "Sublabel for the concurrent request priority popup",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Was zuerst läuft, wenn ein neuer Prompt eintrifft, während andere Antworten generiert werden. „Prefill zuerst“ kann laufende Antworten während eines langen Prompts anhalten."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "What runs first when a new prompt arrives while other responses are generating. Prefill First can pause them during a long prompt."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Что выполняется первым, когда новый промпт приходит во время генерации других ответов. «Сначала префилл» может приостанавливать ответы во время длинного промпта."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在其他响应生成期间收到新提示词时，先处理哪一方。“预填充优先”在长提示词期间可能会暂停正在生成的响应。"
+          }
+        }
+      }
+    },
     "performance.scheduler.prefill_priority" : {
       "comment" : "Row label for the prefill priority segmented control",
       "extractionState" : "manual",
@@ -15898,19 +16054,25 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prefill-Priorität"
+            "value" : "Umgang mit langen Prompts"
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prefill Priority"
+            "value" : "Long Prompt Handling"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обработка длинных промптов"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预填充优先级"
+            "value" : "长提示词处理"
           }
         }
       }
@@ -15922,19 +16084,25 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "„Maximaler Kontext“ ermöglicht bei Speicherdruck größere Prompts auf Kosten der Prefill-Geschwindigkeit. „Geschwindigkeit“ behält die volle Prefill-Geschwindigkeit bei und lehnt Prompts ab, die nicht in den Speicher passen."
+            "value" : "Bei Speicherdruck nimmt „Maximaler Kontext“ längere Prompts mit langsamerem Prefill an. „Volle Geschwindigkeit“ hält den Prefill schnell und lehnt Prompts ab, die nicht passen."
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Max Context trades prefill speed for larger prompts under memory pressure; Speed keeps full prefill speed and rejects prompts that would not fit."
+            "value" : "Under memory pressure, Max Context accepts longer prompts at a slower prefill speed. Full Speed keeps prefill at full speed and rejects prompts that would not fit."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "При нехватке памяти «Максимальный контекст» принимает более длинные промпты ценой более медленного префилла. «Полная скорость» сохраняет скорость префилла и отклоняет промпты, которые не помещаются."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最大上下文在内存压力下以预填充速度换取更大的提示；速度保持完整预填充速度并拒绝不适合的提示。"
+            "value" : "内存紧张时，“最大上下文”会降低预填充速度以接受更长的提示词，“全速”保持预填充全速并拒绝放不下的提示词。"
           }
         }
       }
@@ -15955,6 +16123,12 @@
             "value" : "Max Context"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Максимальный контекст"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15970,19 +16144,25 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Geschwindigkeit"
+            "value" : "Volle Geschwindigkeit"
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Speed"
+            "value" : "Full Speed"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Полная скорость"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "速度"
+            "value" : "全速"
           }
         }
       }
@@ -27797,13 +27977,13 @@
       }
     },
     "settings.acceleration.prefill_helper.update" : {
-      "comment" : "Picker suffix for a paired Mac on another oMLX version",
+      "comment" : "Picker suffix for a paired helper that needs an update",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "needs the same oMLX version"
+            "value" : "needs an update"
           }
         }
       }

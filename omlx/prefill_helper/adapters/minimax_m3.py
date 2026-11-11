@@ -68,6 +68,7 @@ def _cache_state(i: int, item: Any, since: int) -> Arrays:
 
 class MiniMaxM3Adapter(StageAdapter):
     model_types = ("minimax_m3_vl",)
+    contract = 1
     captures_layers = True
 
     def layer_count(self, lm: Any) -> int:

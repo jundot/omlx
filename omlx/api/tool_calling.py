@@ -45,20 +45,23 @@ def _template_safe_description(value: Any) -> str:
     return str(value)
 
 
+# Fully sorted keys put "type" last, and Qwen3.6 then makes fewer direct
+# tool calls. These keys keep the order clients usually send.
+_SCHEMA_LEADING_KEYS = ("type", "description", "properties", "required")
+
+
 def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
-    """Copy JSON Schema with stable object order and template descriptions."""
+    """Copy JSON Schema with stable key order and template descriptions."""
     if isinstance(value, dict):
         copied = {}
-        # Equivalent client JSON key orders must render the same token prefix.
-        # Keep array order intact: only object member order is canonicalized.
-        for key in sorted(value):
-            child = value[key]
+        for key, child in value.items():
             if key == "properties" and isinstance(child, dict):
+                # Property order is part of the tool definition; keep it.
                 copied[key] = {
                     name: _copy_schema_with_template_defaults(
-                        child[name], is_schema=True
+                        prop_schema, is_schema=True
                     )
-                    for name in sorted(child)
+                    for name, prop_schema in child.items()
                 }
             elif key in {
                 "items",
@@ -87,7 +90,10 @@ def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
             copied["description"] = _template_safe_description(
                 copied.get("description")
             )
-        return copied
+        # Equivalent client key orders must render the same token prefix.
+        leading = [key for key in _SCHEMA_LEADING_KEYS if key in copied]
+        rest = sorted(key for key in copied if key not in _SCHEMA_LEADING_KEYS)
+        return {key: copied[key] for key in leading + rest}
 
     if isinstance(value, list):
         return [

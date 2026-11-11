@@ -183,7 +183,7 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
-                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
+                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', concurrent_priority: 'balanced' },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_unavailable: false, ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
@@ -354,7 +354,7 @@
             _aneTuningPollTimer: null,
             // Prefill Accelerator: paired Macs that can help the open model,
             // and its helper status (polled while the modal is open).
-            prefillHelper: { modelId: null, candidates: [], version: '', loading: false, status: null, busy: false, original: null, applied: false },
+            prefillHelper: { modelId: null, candidates: [], loading: false, status: null, busy: false, original: null, applied: false },
             _prefillHelperPollTimer: null,
             // Set while this Mac runs another Mac's prefill helper.
             prefillLending: null,
@@ -1477,7 +1477,7 @@
                             embedding_batch_size: this.globalSettings.scheduler.embedding_batch_size,
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             prefill_priority: this.globalSettings.scheduler.prefill_priority,
-                            decode_fairness: this.globalSettings.scheduler.decode_fairness,
+                            concurrent_priority: this.globalSettings.scheduler.concurrent_priority,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
@@ -3130,7 +3130,6 @@
                 this.prefillHelper = {
                     modelId: model.id,
                     candidates: [],
-                    version: '',
                     loading: false,
                     status: model.prefill_helper || null,
                     busy: false,
@@ -3157,7 +3156,6 @@
                     if (resp.ok && this.prefillHelper.modelId === modelId) {
                         const data = await resp.json();
                         this.prefillHelper.candidates = data.devices || [];
-                        this.prefillHelper.version = data.version || '';
                     }
                 } catch (_) { /* network error */ }
                 if (this.prefillHelper.modelId === modelId) this.prefillHelper.loading = false;
@@ -3217,8 +3215,7 @@
                 if (!device.online) {
                     parts.push(window.t('modal.model_settings.prefill_helper_offline'));
                 } else if (!device.version_ok) {
-                    parts.push(window.t('modal.model_settings.prefill_helper_update')
-                        .replace('{version}', this.prefillHelper.version || ''));
+                    parts.push(window.t('modal.model_settings.prefill_helper_update'));
                 } else if (device.layers_fit > 0) {
                     parts.push(window.t('modal.model_settings.prefill_helper_fits')
                         .replace('{n}', device.layers_fit));
@@ -3334,6 +3331,8 @@
                             .replace('{size}', size(s.bytes));
                     case 'ready':
                     case 'working': {
+                        // No split beats this Mac alone over the measured link.
+                        if (s.layers === 0) return t('slow_link').replace('{name}', name);
                         let text = t(s.state).replace('{name}', name).replace('{n}', s.held ?? '');
                         if (s.last_prompt) {
                             text += ' · ' + t('last_prompt')

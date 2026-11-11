@@ -638,6 +638,13 @@ def _is_token_embedding_tensor(path: str) -> bool:
     )
 
 
+def _is_lfm3_speech_module(path: str, config: dict) -> bool:
+    """Speech modules that mlx-vlm's LFM3 quant predicate keeps in floating point."""
+    return config.get("model_type") == "lfm3_omni" and path.startswith(
+        ("audio_tower", "audio_projector", "depth_decoder", "codebook_embedding")
+    )
+
+
 def universal_quant_predicate(
     path: str, module, config: dict, oq_level: int = 4
 ) -> bool | dict:
@@ -732,7 +739,7 @@ def universal_quant_predicate(
     if _is_vision_tensor(path):
         return False
 
-    if _is_audio_tensor(path):
+    if _is_audio_tensor(path) or _is_lfm3_speech_module(path, config):
         return False
 
     if any(
@@ -1048,6 +1055,7 @@ def _budgeted_shapes(named_shapes: dict[str, tuple], config: dict) -> dict[str, 
         if not _is_qwen4_exp_ngram_embedding_tensor(path, config)
         and not _is_vision_tensor(path)
         and not _is_audio_tensor(path)
+        and not _is_lfm3_speech_module(path, config)
     }
 
 
@@ -4703,6 +4711,21 @@ def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype):
     return w_mx
 
 
+def _sanitize_uses_zero_arg_super(model_cls) -> bool:
+    """Return whether any ``sanitize`` in the model's MRO calls ``super()``.
+
+    Zero-argument ``super()`` compiles to a ``__class__`` closure cell, so the
+    cell is a reliable marker without running the method.
+    """
+    for klass in getattr(model_cls, "__mro__", ()):
+        method = klass.__dict__.get("sanitize")
+        method = getattr(method, "__func__", method)
+        code = getattr(method, "__code__", None)
+        if code is not None and "__class__" in code.co_freevars:
+            return True
+    return False
+
+
 def _build_model_sanitizer(
     config: dict,
     text_only: bool = False,
@@ -4868,6 +4891,7 @@ def _build_model_sanitizer(
             has_audio = config.get("audio_config") is not None
             _AUDIO_SENTINEL = object() if has_audio else None
             has_vision = config.get("vision_config") is not None
+            sanitize_uses_super = _sanitize_uses_zero_arg_super(model_module.Model)
 
             def _vlm_sanitize(weights):
                 class _Proxy:
@@ -4900,7 +4924,16 @@ def _build_model_sanitizer(
                             return attr.__get__(self, type(self))
                         return attr
 
-                proxy = _Proxy()
+                proxy_cls = _Proxy
+                if sanitize_uses_super:
+                    # super() needs self to be a model instance (LFM3-Omni).
+                    # Skip __init__ so no weights are allocated.
+                    proxy_cls = type(
+                        "_ModelProxy",
+                        (_Proxy, model_module.Model),
+                        {"__init__": lambda self: None},
+                    )
+                proxy = proxy_cls()
                 proxy.config = model_config
                 if has_vision:
                     # EmbeddingGemma 2 drops vision weights when vision_tower is None.
@@ -5156,7 +5189,7 @@ def _holds_chat_template(path: Path) -> bool:
 
 
 def _copy_model_sidecars(
-    source: Path, output: Path, *, text_only: bool = False
+    source: Path, output: Path, *, text_only: bool = False, model_type: str = ""
 ) -> None:
     """Copy tokenizer/processor sidecar files needed to load the output.
 
@@ -5178,6 +5211,13 @@ def _copy_model_sidecars(
 
     for py_file in source.glob("*.py"):
         shutil.copy2(py_file, output / py_file.name)
+
+    # LFM3 speech decoding loads its codec separately from the model weights.
+    if not text_only and model_type == "lfm3_omni":
+        for name in ("audio_tokenizer", "audio_detokenizer"):
+            codec = source / name
+            if codec.is_dir():
+                shutil.copytree(codec, output / name)
 
 
 def _copy_bundled_drafts(source: Path, output: Path) -> None:
@@ -6142,6 +6182,10 @@ def _source_imatrix_signature(
         # Invalidate caches produced by the old independent-block walk, which
         # captured only q_proj in the shared-KV tail of E2B/E4B.
         signature["layer_walk"] = "gemma4_shared_kv_v1"
+    elif model_type.startswith(("lfm2", "lfm3")) or model_type == "gear":
+        # Older walks passed attention masks to convolution layers, so their
+        # captured activations cannot be reused.
+        signature["layer_walk"] = "conv_mask_v1"
     elif _is_qwen4_exp_config(config):
         signature["layer_walk"] = "qwen4_mtp_batch_positions_v1"
     elif str(config.get("model_type", "")).lower() == "deepseek_v41":
@@ -7938,7 +7982,9 @@ def quantize_oq_streaming(
         with open(output / "oq_imatrix_report.json", "w") as f:
             json.dump(imatrix_report, f, indent=2, ensure_ascii=False)
 
-    _copy_model_sidecars(source, output, text_only=text_only)
+    _copy_model_sidecars(
+        source, output, text_only=text_only, model_type=config.get("model_type", "")
+    )
     for name in DECISION_SIDECAR_FILES:
         if (source / name).is_file():
             shutil.copy2(source / name, output / name)
@@ -8782,6 +8828,8 @@ def _is_recurrent_layer(layer) -> bool:
         return bool(layer.is_linear)
     if hasattr(layer, "is_global"):
         return not bool(layer.is_global)
+    if hasattr(layer, "is_attention_layer"):
+        return not bool(layer.is_attention_layer)
     return False
 
 

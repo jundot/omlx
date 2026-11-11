@@ -660,21 +660,18 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
-                                <!-- Prioritize Decoding During Prefill -->
+                                <!-- Concurrent Request Priority -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex-1 min-w-0">
-                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.decode_fairness') }}</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.decode_fairness_description') }}</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.concurrent_priority.label') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.concurrent_priority.description') }}</p>
                                     </div>
-                                    <button type="button"
-                                            @click="globalSettings.scheduler.decode_fairness = !globalSettings.scheduler.decode_fairness"
-                                            :class="globalSettings.scheduler.decode_fairness ? 'bg-black' : 'bg-neutral-200'"
-                                            role="switch"
-                                            :aria-checked="globalSettings.scheduler.decode_fairness ? 'true' : 'false'"
-                                            class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                        <span :class="globalSettings.scheduler.decode_fairness ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
-                                    </button>
+                                    <select x-model="globalSettings.scheduler.concurrent_priority"
+                                            class="flex-shrink-0 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="prefill">{{ t('settings.resource.concurrent_priority.prefill') }}</option>
+                                        <option value="balanced">{{ t('settings.resource.concurrent_priority.balanced') }}</option>
+                                        <option value="decode">{{ t('settings.resource.concurrent_priority.decode') }}</option>
+                                    </select>
                                 </div>
                                 <!-- Prefill Priority -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">

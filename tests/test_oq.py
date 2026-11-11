@@ -7524,6 +7524,19 @@ class TestTextOnlyMultimodalMetadata:
         assert not (out / "preprocessor_config.json").exists()
         assert not (out / "processor_config.json").exists()
 
+    def test_lfm3_omni_copies_codec(self, tmp_path):
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(tmp_path)
+        (src / "audio_tokenizer").mkdir()
+        (src / "audio_tokenizer" / "config.json").write_text("{}")
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out, model_type="lfm3_omni")
+
+        assert (out / "audio_tokenizer" / "config.json").is_file()
+
     def test_multimodal_keeps_processor_sidecars(self, tmp_path):
         from omlx.oq import _copy_model_sidecars
 
@@ -9048,3 +9061,146 @@ class TestGemma4AudioConfigSanitize:
         out = sanitize({"model." + key: mx.zeros((32, 128, 3, 3))})
         assert list(out) == [key]
         assert out[key].shape == (32, 3, 3, 128)
+
+
+# =============================================================================
+# Test VLM sanitizers that call super() (LFM3-Omni, #5129)
+# =============================================================================
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestLfm3OmniSanitize:
+    """LFM3-Omni's ``Model.sanitize`` calls ``super().sanitize()``."""
+
+    CONFIG = {
+        "model_type": "lfm3_omni",
+        "architectures": ["Lfm3OmniForConditionalGeneration"],
+        "text_config": {
+            "model_type": "lfm3",
+            "num_hidden_layers": 2,
+            "layer_types": ["conv", "full_attention"],
+            "tie_word_embeddings": True,
+        },
+        "vision_config": {
+            "model_type": "lfm3_vl_vision",
+            "num_hidden_layers": 1,
+            "layer_types": ["conv"],
+        },
+        "audio_encoder_config": {
+            "text_config": {
+                "model_type": "lfm2",
+                "hidden_size": 768,
+                "num_hidden_layers": 1,
+                "layer_types": ["conv"],
+                "vocab_size": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 128000,
+                "norm_eps": 1e-05,
+                "conv_bias": False,
+                "conv_L_cache": 3,
+                "block_ff_dim": 2560,
+                "block_multiple_of": 256,
+                "block_ffn_dim_multiplier": 1.0,
+                "block_auto_adjust_ff_dim": True,
+            }
+        },
+        "depth_config": {
+            "model_type": "lfm3",
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+        },
+    }
+
+    # Checkpoint name -> (loader name, checkpoint shape, loader shape)
+    WEIGHTS = {
+        "model.audio_encoder.lfm.layers.2.self_attn.q_proj.weight": (
+            "audio_tower.lfm.layers.2.self_attn.q_proj.weight",
+            (16, 16),
+            (16, 16),
+        ),
+        "model.audio_encoder.lfm.layers.0.conv.conv.weight": (
+            "audio_tower.lfm.layers.0.conv.conv.weight",
+            (16, 1, 3),
+            (16, 3, 1),
+        ),
+        "model.language_model.layers.1.self_attn.q_proj.weight": (
+            "language_model.model.layers.1.self_attn.q_proj.weight",
+            (8, 8),
+            (8, 8),
+        ),
+        "model.audio_projector.linear_1.weight": (
+            "audio_projector.linear_1.weight",
+            (4, 4),
+            (4, 4),
+        ),
+    }
+
+    def test_sanitize_uses_loader_names(self, tmp_path):
+        pytest.importorskip("mlx_vlm.models.lfm3_omni")
+        expected = {target: loaded for target, _, loaded in self.WEIGHTS.values()}
+        sanitize = _build_model_sanitizer(self.CONFIG, text_only=False)
+
+        out = sanitize(
+            {name: mx.zeros(shape) for name, (_, shape, _) in self.WEIGHTS.items()}
+        )
+        assert {name: value.shape for name, value in out.items()} == expected
+
+        path = tmp_path / "model.safetensors"
+        _write_safetensors(
+            str(path),
+            {
+                name: np.zeros(shape, dtype=np.float16)
+                for name, (_, shape, _) in self.WEIGHTS.items()
+            },
+        )
+        plan = _discover_sanitize_plan(sanitize, _LazyTensorIndex([str(path)]))
+        assert plan is not None
+        assert {name: tuple(info["shape"]) for name, info in plan.items()} == expected
+
+    def test_speech_modules_stay_float(self):
+        from omlx.oq import _budgeted_shapes
+
+        speech = "depth_decoder.model.layers.2.self_attn.q_proj"
+        backbone = "language_model.model.layers.0.self_attn.q_proj"
+        config = {
+            "model_type": "lfm3_omni",
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {speech: {"bits": 8, "group_size": 64}},
+        }
+        assert universal_quant_predicate(speech, None, config, 4) is False
+        assert universal_quant_predicate(backbone, None, config, 4) is not False
+        shapes = {speech: (64, 64), backbone: (64, 64)}
+        assert _budgeted_shapes(shapes, config) == {backbone: (64, 64)}
+
+    def test_lfm3_calibration_matches_native_layer_walk(self):
+        from mlx_vlm.models.lfm3.config import ModelConfig
+        from mlx_vlm.models.lfm3.language import Lfm3Model
+
+        from omlx.oq import _layer_masks_for_model
+
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "lfm3",
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "vocab_size": 64,
+                "layer_types": ["conv", "full_attention", "sliding_attention"],
+                "sliding_window": 4,
+            }
+        )
+        model = Lfm3Model(config)
+        tokens = mx.array([[1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1]])
+        hidden = model.embed_tokens(tokens)
+        masks = _layer_masks_for_model(model, model.layers, hidden)
+        assert masks[0] is None
+        for layer, mask in zip(model.layers, masks):
+            hidden = _forward_layer(layer, hidden, mask, None)
+            assert hidden.shape == (2, 6, 32)
+        actual = model.embedding_norm(hidden)
+        expected = model(tokens)
+        assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()

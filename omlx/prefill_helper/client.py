@@ -27,6 +27,11 @@ import numpy as np
 from . import wire
 
 _KEEP_WARM_SECONDS = 0.5
+# Smaller frames sit in the socket buffers; their time says little of the link.
+_LINK_FRAME_BYTES = 32 << 20
+# Short chunks are mostly fixed-size state.
+_LINK_TOKENS = 1024
+_EWMA = 0.5
 
 
 class HelperError(RuntimeError):
@@ -150,6 +155,11 @@ class HelperClient:
         self.alive = True
         self.stopped_by_helper = False
         self.replaced_on_helper = False
+        # Measured on received chunks: the link's bytes per second, and the
+        # bytes per prompt token of the boundary (key -1) and each layer's
+        # state. The split treats the link as one more stage.
+        self.link_bps: float | None = None
+        self.token_bytes: dict[int, float] = {}
         # Last frame from the helper, or the last job sent to it.
         self.heard = time.monotonic()
         threading.Thread(target=self._receive, daemon=True).start()
@@ -208,7 +218,11 @@ class HelperClient:
     def _receive(self) -> None:
         try:
             while True:
-                meta, arrays = wire.recv(self.sock)
+                meta, specs = wire.recv_header(self.sock)
+                began = time.perf_counter()
+                arrays = wire.recv_arrays(self.sock, specs)
+                if meta.get("op") == "chunk":
+                    self._measure(meta, arrays, time.perf_counter() - began)
                 self.heard = time.monotonic()
                 if meta.get("op") == "stopped":
                     self.stopped_by_helper = True
@@ -221,6 +235,29 @@ class HelperClient:
                     job._deliver(meta, arrays)
         except (OSError, ValueError, wire.ProtocolError) as error:
             self._fail(f"prefill helper connection lost: {error}")
+
+    def _measure(self, meta: dict, arrays: dict, seconds: float) -> None:
+        sizes: dict[int, int] = {}
+        for name, (data, _) in arrays.items():
+            # State arrays are named "s:{layer}.{slot}".
+            layer = name[2:].split(".", 1)[0] if name.startswith("s:") else ""
+            key = int(layer) if layer.isdigit() else -1
+            sizes[key] = sizes.get(key, 0) + data.nbytes
+        total = sum(sizes.values())
+        if total >= _LINK_FRAME_BYTES and seconds > 0:
+            rate = total / seconds
+            self.link_bps = (
+                rate
+                if self.link_bps is None
+                else _EWMA * rate + (1 - _EWMA) * self.link_bps
+            )
+        tokens = int(meta.get("size") or 0)
+        if tokens >= _LINK_TOKENS:
+            # A job sends only the layers it used; keep what the others cost.
+            self.token_bytes = {
+                **self.token_bytes,
+                **{key: n / tokens for key, n in sizes.items()},
+            }
 
     def _fail(self, reason: str) -> None:
         self.alive = False
