@@ -63,7 +63,6 @@ VLM_MODEL_TYPES = {
     "molmo2",
     "bunny_llama",
     "multi_modality",
-    "florence2",
     "deepseekocr",
     "deepseekocr_2",
     "unlimited_ocr",
@@ -202,7 +201,6 @@ VLM_ARCHITECTURES = {
     "MolmoForCausalLM",
     "Molmo2ForConditionalGeneration",
     "LlavaQwen2ForCausalLM",  # apple/FastVLM (all sizes)
-    "Florence2ForConditionalGeneration",
     "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
@@ -299,9 +297,10 @@ RERANKER_ARCHITECTURES = SUPPORTED_RERANKER_ARCHITECTURES | UNSUPPORTED_RERANKER
 # multimodal models (e.g., MiniCPM-o) won't trigger this.
 # Note: "whisper" and "qwen3_tts" were previously listed here but are now
 # handled as audio types (audio_stt / audio_tts) — see AUDIO_* sets below.
-UNSUPPORTED_MODEL_TYPES: set[str] = set()
 
-UNSUPPORTED_ARCHITECTURES: set[str] = set()
+# Florence-2 is an encoder-decoder; its decoder cache cannot join a batch.
+UNSUPPORTED_ARCHITECTURES: set[str] = {"Florence2ForConditionalGeneration"}
+UNSUPPORTED_MODEL_TYPES: set[str] = {"florence2"}
 
 # ---------------------------------------------------------------------------
 # Audio model detection — dynamically loaded from mlx-audio when available
