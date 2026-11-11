@@ -282,8 +282,11 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
     held = list(session.get("gpu_bytes") or [])
     gpus = info.get("gpus") or []
     # A session running there makes way for this one, so its memory counts.
+    # Its size is the plan's estimate, so a GPU never gets more than it has.
     budgets = [
-        int(gpu["free"]) + (int(held[i]) if i < len(held) else 0)
+        min(
+            int(gpu["total"]), int(gpu["free"]) + (int(held[i]) if i < len(held) else 0)
+        )
         for i, gpu in enumerate(gpus)
     ]
     names = [str(gpu.get("name") or "GPU") for gpu in gpus]

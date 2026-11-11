@@ -241,8 +241,10 @@ def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
             target, str(copied), "fake", 6, host_name="Studio", warm_tokens=8
         )
         assert process.hello["layers"] == 6
-        lending = agent.remote_info(target)["lending"]
-        assert lending == {"host": "Studio", "model": "Model"}
+        info = agent.remote_info(target)
+        assert info["lending"] == {"host": "Studio", "model": "Model"}
+        # What the session holds counts as free, up to each GPU's size.
+        assert info["budgets"] == [48 << 30, 48 << 30]
         host = Upstream(
             socket.create_connection(("::1", process.port), timeout=10),
             process.token,
