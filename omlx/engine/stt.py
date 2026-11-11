@@ -1212,20 +1212,23 @@ class STTEngine(BaseNonStreamingEngine):
                 f"model '{self._model_name}'."
             )
 
-        model = self._model
-        if hasattr(model, "create_streaming_session"):
-            backend: Any = _VoxtralRealtimeBackend(model)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(get_mlx_executor(), backend.start_sync)
-        elif hasattr(model, "generate_streaming"):
-            backend = _WhisperRealtimeBackend(model, language=language)
-        else:
-            backend = _SegmentedRealtimeBackend(model, language=language)
-
         self._realtime_active = True
         activity_id = self._begin_activity(
             "transcribing", detail="Realtime transcription"
         )
+        try:
+            model = self._model
+            if hasattr(model, "create_streaming_session"):
+                backend: Any = _VoxtralRealtimeBackend(model)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(get_mlx_executor(), backend.start_sync)
+            elif hasattr(model, "generate_streaming"):
+                backend = _WhisperRealtimeBackend(model, language=language)
+            else:
+                backend = _SegmentedRealtimeBackend(model, language=language)
+        except BaseException:
+            await self._release_realtime_session(activity_id)
+            raise
         logger.info("STT realtime session started: model=%s", self._model_name)
         return RealtimeTranscriptionSession(self, backend, activity_id)
 
