@@ -83,7 +83,7 @@ The same families as the Mac helper. A helper and a Mac work together when they 
 | Qwen3.8 Flash-Next | `qwen4_exp` | 47 of 48 |
 | MiniMax M3 / M3.1 | `minimax_m3_vl` | 21 of 60 |
 | GLM-5.3 Flash | `glm5_next` | 21 of 45 |
-| DeepSeek V4.1 | `deepseek_v41` | 7 of 40 |
+| DeepSeek V4.1 | `deepseek_v41` | 12 of 40 |
 
 Layer counts are for the oQ4e checkpoints (oQ3e for DeepSeek V4.1). How many of them a prompt uses is chosen per prompt from the measured speed of both machines and of the link.
 

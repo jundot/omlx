@@ -320,10 +320,19 @@ class StageServer:
         stage, upstream = self.stage, self.upstream
         own = max(0, min(job.layers, stage.last) - stage.first)
         state = stage.new_job(own) if own else None
+        # A later stage may read state of the layers before it: its optional
+        # load_upstream gets the job's "p:" arrays, then each chunk's "s:" arrays.
+        earlier = getattr(stage, "load_upstream", None) if own and stage.first else None
         if own:
             mine = {n: v for n, v in job.prefix.items() if _layer_of(n) >= stage.first}
             if mine:
                 stage.load_prefix(state, mine)
+        if earlier is not None:
+            below = {
+                f"p:{n}": v for n, v in job.prefix.items() if _layer_of(n) < stage.first
+            }
+            if below:
+                earlier(state, below)
         capture = None
         if own and job.capture:
             wanted = [i for i in job.capture["layers"] if i >= stage.first]
@@ -356,6 +365,8 @@ class StageServer:
                     else:
                         # State and captured layers of the stages before.
                         arrays[name] = value
+                if earlier is not None:
+                    earlier(state, {n: v for n, v in arrays.items() if n[:2] == "s:"})
             began = time.perf_counter()
             if own:
                 following = job.chunks[index + 1] if index + 1 < len(job.chunks) else 0

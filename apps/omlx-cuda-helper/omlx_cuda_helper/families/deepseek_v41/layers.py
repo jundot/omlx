@@ -8,6 +8,8 @@ index keys, partial compressor KV, partial compressor gates, n-gram history.
 
 from __future__ import annotations
 
+import logging
+
 import mlx.core as mx
 
 from ...tensors import unpack
@@ -15,6 +17,11 @@ from . import kernels, ops, quant
 from .config import Config, expert_bits
 
 WINDOW, COMPRESSED, INDEX_KEYS, PARTIAL_KV, PARTIAL_GATE = 1, 2, 3, 4, 5
+# Relative L2 error the expert tile kernels may have against gather_qmm: their
+# float32 sums differ in order, which moves a few 16-bit and FP8 values.
+_TILE_ERROR = 3e-3
+
+logger = logging.getLogger(__name__)
 
 
 class Projection:
@@ -181,9 +188,29 @@ def _swiglu(gate, up, weights, limit, quantize):
 
 def _attend(q, window, pooled, wi, ci, sink, scale):
     """ops.sparse_attention, on the CUDA kernels when they run for this dtype."""
+    if kernels.attention_tc_fits(q) and kernels.use_attention_tc(
+        q.dtype, *q.shape[-2:]
+    ):
+        out = kernels.sparse_attention_tc(q, window, pooled, wi, ci, sink, scale)
+        # Evaluated here, the layer's peak memory stays about 1.3 GiB lower at
+        # 8192 rows than when the rest of the layer runs with it.
+        mx.eval(out)
+        return out
     if kernels.use_attention(q.dtype):
         return kernels.sparse_attention(q, window, pooled, wi, ci, sink, scale)
     return ops.sparse_attention(q, window, pooled, wi, ci, sink, scale)
+
+
+def _hc_mixes(x, fn_t, scale, base, config):
+    if x.dtype == mx.bfloat16 and kernels.use_hc_mixes(config, fn_t):
+        return kernels.hc_mixes(x, fn_t, scale, base, config)
+    return ops.hc_mixes(x, fn_t, scale, base, config)
+
+
+def _hc_pre_norm(x, pre, weight, eps):
+    if kernels.use_hc_pre_norm(x.dtype, x.shape[-1]):
+        return kernels.hc_pre_norm(x, pre, weight, eps)
+    return ops.hc_pre_norm(x, pre, weight, eps)
 
 
 def _hc_post(x, residual, post, comb):
@@ -248,6 +275,8 @@ class Block:
         self.experts = [
             ExpertBank(weights, f"{base}ffn.experts.{n}", c) for n in ("w1", "w3", "w2")
         ]
+        # Set by check_kernels once the expert tile kernels reproduce gather_qmm.
+        self.tiles = False
         self.shared = [
             projection(f"ffn.shared_experts.{n}") for n in ("w1", "w3", "w2")
         ]
@@ -327,7 +356,12 @@ class Block:
         weights = (self.i_weights(x) * scale).astype(x.dtype).astype(mx.float32)
         keys = quant.unpack(shared["index_k"][0], x.dtype, bits=4)
         if kernels.use_index(x.dtype):
-            return kernels.index_topk(q, keys, weights, start, ratio, c.index_topk)
+            tensor_cores = kernels.index_tc_fits(q) and kernels.use_index_tc(
+                *q.shape[-2:]
+            )
+            return kernels.index_topk(
+                q, keys, weights, start, ratio, c.index_topk, tensor_cores
+            )
         return ops.index_topk(q, keys, weights, start, ratio, c.index_topk)
 
     def _attention(self, x, cache, shared, start):
@@ -402,31 +436,86 @@ class Block:
             weights = weights / (mx.sum(weights, -1, keepdims=True) + 1e-20)
         return chosen, weights * c.route_scale
 
+    def _routed(self, flat, xq, chosen, weights, tiles):
+        """(each route's expert output [R, D] sorted by expert, inverse order).
+
+        ``xq`` is the FP8 round trip of ``flat``; ``tiles`` runs the expert
+        tile kernels instead of gather_qmm.
+        """
+        c, k = self.config, chosen.shape[-1]
+        w1, w3, w2 = self.experts
+        # Routes sorted by expert let the expert kernels batch each expert.
+        experts = chosen.reshape(-1).astype(mx.uint32)
+        order = mx.argsort(experts)
+        experts, token = experts[order], order // k
+        route_weights = weights.reshape(-1)[order]
+        if tiles:
+            act = kernels.expert_gate_up(
+                xq if w1.quantize_input else flat,
+                token.astype(mx.uint32),
+                experts,
+                w1,
+                w3,
+                route_weights,
+                c.swiglu_limit,
+                w2.quantize_input,
+            )
+            routed = kernels.expert_down(act, experts, w2)
+        else:
+            rows = {q: (xq if q else flat)[token][:, None] for q in (False, True)}
+            gate = w1(rows[w1.quantize_input], experts)
+            up = w3(rows[w3.quantize_input], experts)
+            y = _swiglu(gate, up, route_weights, c.swiglu_limit, w2.quantize_input)
+            routed = w2(y, experts)
+        return routed, mx.argsort(order)
+
+    def check_kernels(self) -> None:
+        """Turn the expert tile kernels on when they reproduce gather_qmm on a
+        sample of routes through this layer's banks."""
+        w1, w3, _ = self.experts
+        if not (
+            kernels.available()
+            and kernels.experts_fit(self.experts)
+            and w1.quantize_input == w3.quantize_input
+        ):
+            return
+        c = self.config
+        keys = mx.random.split(mx.random.key(5), 3)
+        flat = mx.random.normal((96, c.dim), key=keys[0]).astype(self.attn_norm.dtype)
+        shape = (96, c.n_activated_experts)
+        chosen = mx.random.randint(0, c.n_routed_experts, shape, key=keys[1])
+        weights = mx.random.uniform(0.1, 1.0, shape, key=keys[2])
+        xq = _quantize(flat)
+        want = self._routed(flat, xq, chosen, weights, False)[0]
+        want = want.reshape(chosen.size, -1)
+        try:
+            got = self._routed(flat, xq, chosen, weights, True)[0]
+            error = kernels.relative_error(got, want)
+        except RuntimeError as failure:
+            logger.warning("DeepSeek V4.1 expert tile kernels are off: %r", failure)
+            return
+        self.tiles = error <= _TILE_ERROR
+        if not self.tiles:
+            logger.warning(
+                "DeepSeek V4.1 expert tile kernels are off: layer %d differs from "
+                "gather_qmm by %.2e",
+                self.layer,
+                error,
+            )
+
     def _moe(self, x):
         c, dtype = self.config, x.dtype
         flat = x.reshape(-1, x.shape[-1])
         chosen, weights = self.route(flat)
-        k = chosen.shape[-1]
         w1, w3, w2 = self.experts
         s1, s3, s2 = self.shared
         quantizes = any(p.quantize_input for p in (w1, w3, s1, s3))
         # Quantization is row-local, so one round trip serves every route.
         xq = _quantize(flat) if quantizes else flat
-        # Routes sorted by expert let the expert kernels batch each expert.
-        experts = chosen.reshape(-1).astype(mx.uint32)
-        order = mx.argsort(experts)
-        experts, token = experts[order], order // k
-        rows = {q: (xq if q else flat)[token][:, None] for q in (False, True)}
-        gate = w1(rows[w1.quantize_input], experts)
-        up = w3(rows[w3.quantize_input], experts)
-        y = _swiglu(
-            gate, up, weights.reshape(-1)[order], c.swiglu_limit, w2.quantize_input
-        )
-        routed = w2(y, experts)
+        routed, inverse = self._routed(flat, xq, chosen, weights, self.tiles)
         y = _swiglu(s1(flat, xq), s3(flat, xq), None, c.swiglu_limit, s2.quantize_input)
         # y is already quantized when the down projection asks for it.
         shared = s2(y, y)
-        inverse = mx.argsort(order)
         if kernels.use_combine(dtype):
             out = kernels.combine(routed, inverse, shared)
         else:
@@ -436,9 +525,9 @@ class Block:
     def __call__(self, h, pre, cache, shared, start):
         """Run the layer on streams h [1, L, n, D]; returns (h, next pre)."""
         c = self.config
-        ap, ao, ac = ops.hc_mixes(h, *self.hc["attn"], c)
-        x = ops.hc_pre_norm(h, pre, self.attn_norm, c.norm_eps)
+        ap, ao, ac = _hc_mixes(h, *self.hc["attn"], c)
+        x = _hc_pre_norm(h, pre, self.attn_norm, c.norm_eps)
         h = _hc_post(self._attention(x, cache, shared, start), h, ao, ac)
-        fp, fo, fc = ops.hc_mixes(h, *self.hc["ffn"], c)
-        x = ops.hc_pre_norm(h, ap, self.ffn_norm, c.norm_eps)
+        fp, fo, fc = _hc_mixes(h, *self.hc["ffn"], c)
+        x = _hc_pre_norm(h, ap, self.ffn_norm, c.norm_eps)
         return _hc_post(self._moe(x), h, fo, fc), fp

@@ -1,0 +1,20 @@
+Sources adapted from mlx-serve (https://github.com/ddalcu/mlx-serve), MIT,
+Copyright (c) 2026 David Dalcu, at commit 9191fbdf. License: ../LICENSE.
+
+moe_prefill_header.cu    from src/kernels/moe/moe_prefill_cuda_header.cu
+moe_prefill_gate_up.cu   from src/kernels/moe/moe_prefill_cuda_gu.cu
+moe_prefill_down.cu      from src/kernels/moe/moe_prefill_cuda.cu
+
+The header and the down projection are the GLM-5.3 versions of this helper
+(../glm5_next, same changes): MLX affine codes of 4 or 8 bits with bf16
+scales and biases, 64 weights a group, each weight rounded once to bf16 from
+float, and each mma.m16n8k16 step added to the running sum with a correctly
+rounded float add. The launch geometry and the tensor-core main loop are
+unchanged. Added here: 3-bit codes (MLX's little-endian bit stream), which a
+thread loads as the 24 bytes of one group and unpacks to the same bf16 tile.
+
+The gate/up epilogue is DeepSeek V4.1's: gate and up round to bf16, are
+clamped by the swiglu limit, silu(gate) * up is multiplied by the route
+weight in float and rounded to bf16, and each group of 32 values takes the
+FP8 (E4M3, power-of-two scale) round trip when the down projection quantizes
+its input. The helpers of that math come from the family's kernels.py.

@@ -12,7 +12,8 @@ from ... import checkpoint
 from .config import Config, expert_bits, load_config
 
 CONTRACT = 1
-# The embedding stays with layer 0; legal_cuts gives the later cuts.
+# A later stage may start at any layer: it gets the shared state of the layers
+# before it from the stage before.
 FIRST_STAGE_MIN = 1
 
 _NOT_LOADED = (".engram.embed.", ".mtp.")
@@ -58,29 +59,3 @@ def plan(model_dir: str | Path) -> tuple[int, list[int]]:
             per_layer[layer] = per_layer.get(layer, 0) + size
     count = max(per_layer) + 1 if per_layer else 0
     return shared, [per_layer.get(i, 0) for i in range(count)]
-
-
-def stage_start_allowed(config: Config, first: int, last: int) -> bool:
-    """Whether a stage holding ``[first, last)`` can continue from a boundary.
-
-    A boundary carries no compressed KV and no token history, so a later stage
-    needs the KV source of each compressed layer and no Engram layer.
-    """
-    if first == 0:
-        return True
-    for layer in range(first, last):
-        if layer in config.engram_layer_ids:
-            return False
-        if config.compress_ratios[layer] and config.kv_source(layer) < first:
-            return False
-    return True
-
-
-def legal_cuts(model_dir: str | Path, layers: int) -> list[int]:
-    """First layers a second stage may have when the helper holds ``layers``."""
-    config = load_config(model_dir)
-    return [
-        cut
-        for cut in range(FIRST_STAGE_MIN, layers)
-        if stage_start_allowed(config, cut, layers)
-    ]

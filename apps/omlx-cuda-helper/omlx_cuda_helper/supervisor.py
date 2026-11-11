@@ -37,13 +37,11 @@ def plan_stages(
     layers: int,
     free: list[int],
     first_stage_min: int = 1,
-    legal_cuts: list[int] | None = None,
 ) -> list[tuple[int, int, int, int]]:
     """Stages as (gpu position, first layer, last layer, bytes).
 
     Two GPUs split the layers as evenly as memory allows, since the stages
     overlap in time. The first stage also holds the tensors outside the layers.
-    ``legal_cuts`` lists the only layers a second stage may start at.
     """
     sizes = per_layer[:layers]
     if len(sizes) < layers:
@@ -53,14 +51,7 @@ def plan_stages(
         return sum(sizes[first:last]) + (shared if first == 0 else 0)
 
     if len(free) >= 2 and layers > first_stage_min:
-        cuts = sorted(
-            (
-                a
-                for a in range(first_stage_min, layers)
-                if legal_cuts is None or a in legal_cuts
-            ),
-            key=lambda a: abs(a - layers / 2),
-        )
+        cuts = sorted(range(first_stage_min, layers), key=lambda a: abs(a - layers / 2))
         a, b = sorted(sorted(range(len(free)), key=lambda i: -free[i])[:2])
         for cut in cuts:
             head, tail = cost(0, cut), cost(cut, layers)
@@ -163,16 +154,12 @@ class Supervisor:
                     raise RuntimeError("no NVIDIA GPU is available")
                 free = [gpu["free"] for gpu in found]
                 first_min = getattr(planner, "FIRST_STAGE_MIN", 1)
-                cuts_of = getattr(planner, "legal_cuts", None)
                 stages = None
                 # The host sizes the layers from the file sizes; what a stage
                 # really loads can be larger, so hold as many as fit.
                 for count in range(layers, 0, -1):
-                    cuts = cuts_of(model_dir, count) if cuts_of else None
                     try:
-                        stages = plan_stages(
-                            shared, per_layer, count, free, first_min, cuts
-                        )
+                        stages = plan_stages(shared, per_layer, count, free, first_min)
                     except RuntimeError:
                         continue
                     if count < layers:

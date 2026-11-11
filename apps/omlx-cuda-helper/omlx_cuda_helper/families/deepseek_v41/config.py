@@ -148,8 +148,9 @@ def load_config(model_dir: str | Path) -> Config:
 def expert_bits(spec: dict[str, Any]) -> int:
     """Bits per weight a routed expert bank is held with on the GPU.
 
-    The CUDA expert kernel is much slower below 4-bit affine codes, so narrower
-    codes are stored as 4-bit codes of the same values.
+    The expert tile kernels read 3- and 4-bit affine codes; MLX's expert kernel
+    is much slower below 4 bits, so narrower codes are stored as 4-bit codes
+    of the same values.
     """
     bits = spec["bits"]
-    return 4 if spec["mode"] == "affine" and bits < 4 else bits
+    return 4 if spec["mode"] == "affine" and bits < 3 else bits

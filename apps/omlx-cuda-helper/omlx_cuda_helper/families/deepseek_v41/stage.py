@@ -4,6 +4,8 @@
 A boundary holds ``h`` [1, L, streams, dim], ``pre`` [1, L, streams] and, after
 an index source, ``idx`` [1, L, K]. A layer's state is its seven cache slots; a
 KV-source layer sends only the compressed rows and index keys the chunk added.
+A later stage rebuilds the compressed KV and index keys of the last KV source
+before it from the state of the stages before, as the host does after a cut.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import numpy as np
 from ... import checkpoint
 from ...tensors import from_host, load, to_host
 from ...wire import HostArray
-from . import ngram, quant, resident, stage_start_allowed
+from . import ngram, quant, resident
 from .config import Config, load_config
 from .layers import COMPRESSED, INDEX_KEYS, PARTIAL_GATE, PARTIAL_KV, Block
 
@@ -36,6 +38,10 @@ class _Job:
     def __init__(self, layers: int):
         self.caches: list[list] = [[None] * _SLOTS for _ in range(layers)]
         self.position = 0
+        # Compressed ids of the last tokens, for the Engram hashes.
+        self.history: np.ndarray | None = None
+        # Growing slots of the last KV source before the stage, by slot.
+        self.upstream: dict[int, mx.array] = {}
 
 
 class Stage:
@@ -62,12 +68,21 @@ class Stage:
             ]
             block = Block(load(model_dir, names), layer, config)
             mx.eval(block.parameters())
+            block.check_kernels()
             self.blocks.append(block)
         self.dtype = self.blocks[0].attn_norm.dtype
         self.hasher = None
-        if first == 0 and config.engram_layer_ids:
+        engram = any(first <= i < last for i in config.engram_layer_ids)
+        if engram or (first == 0 and config.engram_layer_ids):
             # Layer 0 keeps the n-gram history even when it has no Engram.
             self.hasher = ngram.NgramHash(config, ngram.compressed_token_map(model_dir))
+        # The KV source before the stage whose compressed rows the stage reads.
+        self.source = None
+        for layer in range(first, last):
+            if layer in config.kv_source_layers or config.compress_ratios[layer]:
+                if layer not in config.kv_source_layers:
+                    self.source = config.kv_source(layer)
+                break
 
     def memory_bytes(self) -> int:
         return mx.get_active_memory()
@@ -82,12 +97,28 @@ class Stage:
                 job.caches[layer - self.first][slot] = from_host(value)
                 if slot == _OFFSET:
                     job.position = int(value[0][0])
+                if layer == 0 and slot == _HISTORY:
+                    job.history = np.asarray(value[0])
+
+    def load_upstream(self, job: _Job, arrays: Arrays) -> None:
+        """State of the layers before this stage: the job's prefix ("p:" names),
+        then the state of each chunk ("s:" names) before the chunk runs."""
+        for name, value in arrays.items():
+            layer, slot = (int(part) for part in name[2:].split("."))
+            if layer == self.source and slot in _GROWING:
+                rows, old = from_host(value), job.upstream.get(slot)
+                job.upstream[slot] = (
+                    rows if old is None else mx.concatenate([old, rows], 1)
+                )
+            elif name[0] == "p" and layer == 0 and slot == _HISTORY:
+                # The stage hashes each chunk itself from there on.
+                job.history = np.asarray(value[0])
 
     def warm(self, tokens: int) -> float:
         """Seconds of one dummy chunk once the kernels are compiled."""
         config, rng = self.config, np.random.default_rng(0)
         ids = rng.integers(0, config.vocab_size, tokens).astype(np.int32)
-        boundary = None
+        boundary, upstream = None, {}
         if self.first:
             shape = (1, tokens, config.hc_mult, config.dim)
             h = mx.random.normal(shape, key=mx.random.key(0)).astype(self.dtype)
@@ -95,11 +126,24 @@ class Stage:
                 (mx.arange(config.hc_mult) == 0).astype(mx.float32), shape[:-1]
             )
             boundary = {"h": h, "pre": pre}
+        if self.source is not None:
+            ratio = config.compress_ratios[self.source]
+            rows = tokens // ratio
+            kv = mx.random.normal((1, rows, config.head_dim), key=mx.random.key(1))
+            upstream = {
+                COMPRESSED: quant.pack(kv, 4, 16, True),
+                INDEX_KEYS: quant.pack(mx.zeros((1, rows, config.index_head_dim)), 4),
+            }
+            # Each query's first visible rows, as the index of the stage before.
+            top = mx.arange(min(config.index_topk, rows), dtype=mx.int32)
+            visible = (mx.arange(tokens) + 1)[:, None] // ratio
+            boundary["idx"] = mx.where(top < visible, top, -1)[None]
         seconds = 0.0
         # The first pass compiles; the second gives the speed of a chunk.
         for _ in range(2):
             began = time.perf_counter()
             job = self.new_job(self.last - self.first)
+            job.upstream = dict(upstream)
             self._forward(job, ids, boundary, None)
             mx.synchronize()
             seconds = time.perf_counter() - began
@@ -159,12 +203,14 @@ class Stage:
             h, pre = boundary["h"], boundary["pre"]
             # The rest is shared state of the layers before: the top-k rows.
             shared = {n: v for n, v in boundary.items() if n not in ("h", "pre")}
-        hashes = history = None
+        if self.source is not None:
+            shared["kv"] = job.upstream[COMPRESSED]
+            shared["index_k"] = job.upstream[INDEX_KEYS]
+        hashes = None
         engram_ids = list(config.engram_layer_ids)
         if self.hasher is not None:
-            history = job.caches[0][_HISTORY]
-            history = np.asarray(history) if history is not None else None
-            hashes, history = self.hasher(
+            history = job.history
+            hashes, job.history = self.hasher(
                 tokens, history if history is not None and history.size else None
             )
         for j, cache in enumerate(job.caches):
@@ -182,8 +228,8 @@ class Stage:
                 )
             h, pre = block(h, pre, cache, shared, start)
             cache[_OFFSET] = mx.array([start + length], mx.int32)
-            if history is not None and j == 0:
-                cache[_HISTORY] = mx.array(history, mx.int64)
+            if self.hasher is not None and self.first + j == 0:
+                cache[_HISTORY] = mx.array(job.history, mx.int64)
             self._fill_empty(cache, h.dtype)
             mx.eval(h, pre, cache)
         job.position = start + length
@@ -211,9 +257,4 @@ class Stage:
 
 
 def load_stage(model_dir: str | Path, first: int, last: int) -> Stage:
-    if not stage_start_allowed(load_config(model_dir), first, last):
-        raise ValueError(
-            f"A DeepSeek V4.1 stage cannot start at layer {first}: a layer of "
-            "the stage reads compressed KV or token history from before"
-        )
     return Stage(model_dir, first, last)

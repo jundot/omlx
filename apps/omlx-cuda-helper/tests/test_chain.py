@@ -115,7 +115,17 @@ def _same(a, b):
     "options",
     [
         {"capture": {"layers": [1, 4], "from": 7}},
-        {"prefix": {f"{i}.acc": (np.array([i + 0.5]), "float64") for i in range(6)}},
+        # The second stage's first layer reads the prefix rows of the layer
+        # before it, which only the first stage holds.
+        {
+            "prefix": {
+                **{f"{i}.acc": (np.array([i + 0.5]), "float64") for i in range(6)},
+                **{
+                    f"{i}.rows": (np.full((1, 2, 1), i + 0.25, np.float32), "float32")
+                    for i in range(6)
+                },
+            }
+        },
         # A job may use fewer layers than the helper holds: the cut moves into
         # the first stage, or the second stage runs only part of its layers.
         {"layers": 2},
@@ -206,11 +216,6 @@ def test_plan_splits_layers_evenly_within_each_gpu_memory():
     # A busy first GPU: the stages swap places instead of giving up a GPU.
     swapped = plan_stages(gib, [2 * gib] * 20, 8, [12 * gib, 48 * gib], 2)
     assert [(g, a, b) for g, a, b, _ in swapped] == [(1, 0, 5), (0, 5, 8)]
-    # A family may allow only some layers to start a second stage.
-    ruled = plan_stages(gib, [2 * gib] * 20, 16, [48 * gib, 48 * gib], 2, [2, 12])
-    assert [(g, a, b) for g, a, b, _ in ruled] == [(0, 0, 12), (1, 12, 16)]
-    alone = plan_stages(gib, [2 * gib] * 20, 16, [48 * gib, 48 * gib], 2, [])
-    assert [(g, a, b) for g, a, b, _ in alone] == [(0, 0, 16)]
     # Of three GPUs, the two with the most free memory hold the stages.
     three = plan_stages(gib, [2 * gib] * 20, 16, [9 * gib, 48 * gib, 48 * gib], 2)
     assert [(g, a, b) for g, a, b, _ in three] == [(1, 0, 8), (2, 8, 16)]
