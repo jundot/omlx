@@ -49,6 +49,7 @@ from mlx_lm.models.cache import BatchKVCache as LMBatchKVCache
 from mlx_vlm.models.cache import BatchKVCache
 
 from ..model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
+from . import qwen35_deferred_realign as dr
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +156,24 @@ def _padded_causal_mask_shape(mask, batch: int, length: int, k_size: int) -> boo
     )
 
 
-def _per_row(original, queries, keys, values, pads, scale):
+def _loop_causal(q, k, v, scale):
+    """Exact causal attention of a query block over one row, row by row."""
+    prefix = k.shape[2] - q.shape[2]
+    return mx.concatenate(
+        [
+            mx.fast.scaled_dot_product_attention(
+                q[:, :, i : i + 1],
+                k[:, :, : prefix + i + 1],
+                v[:, :, : prefix + i + 1],
+                scale=scale,
+            )
+            for i in range(q.shape[2])
+        ],
+        axis=2,
+    )
+
+
+def _per_row(original, queries, keys, values, pads, scale, tails=None):
     """Each row through its batch-1 route on a view of its own keys.
 
     Decode: a lone request's decode is stock SDPA with no mask (no seam
@@ -164,15 +182,19 @@ def _per_row(original, queries, keys, values, pads, scale):
     """
     outputs = []
     for row, pad in enumerate(pads):
+        # A deferred-realignment tail ends the row before _idx.
+        end = keys.shape[2] - (tails[row] if tails else 0)
         q = queries[row : row + 1]
-        k = keys[row : row + 1, :, pad:, :]
-        v = values[row : row + 1, :, pad:, :]
+        k = keys[row : row + 1, :, pad:end, :]
+        v = values[row : row + 1, :, pad:end, :]
         if queries.shape[2] == 1:
             out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
         else:
             out = original(q, k, v, cache=None, scale=scale, mask="causal")
             if out is None:
-                return None
+                if not tails:
+                    return None
+                out = _loop_causal(q, k, v, scale)
         outputs.append(out)
     return mx.concatenate(outputs, axis=0)
 
@@ -194,14 +216,34 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
         return False
 
     def attention_mask(h, cache):
+        t = dr.tails(cache) if cache is not None else None
+        if t and (
+            h.shape[1] > _MAX_VERIFY_WIDTH
+            or h.shape[0] != len(t)
+            or (h.shape[1] > 1 and not dr.in_verify())
+        ):
+            # Not a block the per-row tail path serves (too wide, a different
+            # batch, or a multi-token forward outside the speculative verifier,
+            # which would take the stock masked SDPA): realign this cache now
+            # (the mask is built from its padding) and every other layer in
+            # set_pads, not just the layer the mask is built from.
+            dr.realign(cache)
+            dr.request_realign_all(cache)
+            t = None
         mask = original_mask(h, cache)
         if cache is not None and hasattr(cache, _ROWS_ATTR):
             delattr(cache, _ROWS_ATTR)
         length = h.shape[1]
+        if t and length == 1:
+            # Rows end before _idx: every layer must take the per-row seam.
+            cache._qwen3_5_decode_left_padding = [
+                int(p) for p in cache.left_padding.tolist()
+            ]
+            return "left_padded_decode"
         if (
             1 < length <= _MAX_VERIFY_WIDTH
             and _plain_padded_cache(cache)
-            and cache._idx + length > _VERIFY_KERNEL_MAX_KEYS
+            and (t or cache._idx + length > _VERIFY_KERNEL_MAX_KEYS)
             and _padded_causal_mask_shape(mask, h.shape[0], length, cache._idx + length)
         ):
             # The per-row route drops the mask and slices each row's keys
@@ -213,14 +255,33 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
             # One small host read per forward, like mlx-vlm's decode pads.
             mx.eval(same, cache.left_padding)
             pads = tuple(int(p) for p in cache.left_padding.tolist())
-            if same.item() and len(pads) == h.shape[0] and max(pads) > 0:
+            if same.item() and len(pads) == h.shape[0] and (t or max(pads) > 0):
                 setattr(cache, _ROWS_ATTR, (pads, cache._idx, length, mask.shape))
+            elif t:
+                # The tail path drops the mask, which is only valid for the
+                # padded causal mask: otherwise realign everything and serve
+                # this forward through the stock masked path.
+                dr.realign(cache)
+                dr.request_realign_all(cache)
+                return original_mask(h, cache)
+        elif t and length > 1:
+            dr.realign(cache)
+            dr.request_realign_all(cache)
+            return original_mask(h, cache)
         return mask
 
     def set_pads(caches, layers, pads):
         original_set_pads(caches, layers, pads)
         if caches is None:
             return
+        if any(
+            entry is not None and entry.__dict__.pop("_omlx_realign_all", False)
+            for entry in caches
+            if hasattr(entry, "__dict__")
+        ):
+            for layer, entry in zip(layers, caches):
+                if not layer.is_linear and entry is not None and dr.tails(entry):
+                    dr.realign(entry)
         rows = None
         for layer, entry in zip(layers, caches):
             if not layer.is_linear and entry is not None:
@@ -229,6 +290,9 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
         for layer, entry in zip(layers, caches):
             if layer.is_linear or entry is None:
                 continue
+            if _plain_padded_cache(entry):
+                # Only caches this attention serves may defer realignment.
+                entry.__dict__["_omlx_tail_ok"] = True
             if rows is None:
                 if hasattr(entry, _ROWS_ATTR):
                     delattr(entry, _ROWS_ATTR)
@@ -236,6 +300,23 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
                 setattr(entry, _ROWS_ATTR, rows)
 
     def attention(queries, keys, values, *, cache, scale, mask):
+        t = dr.tails(cache) if cache is not None else None
+        if t is not None:
+            # Rows end at _idx - tail: no batched path knows that, so always
+            # per row (decode pads from the hook, verify pads from the stash
+            # or the cache).
+            rows = getattr(cache, _ROWS_ATTR, None)
+            if queries.shape[2] == 1:
+                pads = getattr(cache, "_qwen3_5_decode_left_padding", None)
+            else:
+                pads = list(rows[0]) if rows is not None else None
+            if pads is None or len(pads) != queries.shape[0]:
+                pads = [int(p) for p in cache.left_padding.tolist()]
+            out = _per_row(
+                original_attention, queries, keys, values, pads, scale, tails=t
+            )
+            _log_engaged(len(pads), queries.shape[2])
+            return out
         if (
             cache is not None
             and _plain_padded_cache(cache)
@@ -260,4 +341,11 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
     q35._set_qwen3_5_decode_left_padding = set_pads
     _PATCHED = True
     logger.info("qwen3_5 padded-row attention patch applied")
+    # Ragged MTP rollbacks on the caches this attention serves keep per-row
+    # tails instead of rolling. Without it the attention above still works:
+    # no cache ever gets a tail.
+    try:
+        dr.apply_qwen35_deferred_realign_patch()
+    except Exception:
+        logger.warning("deferred realignment patch not applied", exc_info=True)
     return True
