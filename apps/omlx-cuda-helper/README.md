@@ -108,9 +108,9 @@ The same families as the Mac helper. A helper and a Mac work together when they 
 
 | Family | `model_type` | Layers that fit on 2x 48 GB |
 |---|---|---|
-| Qwen3.8 27B (Qwen3.5 architecture) | `qwen3_5` | 63 of 64 |
-| Qwen3.8 Flash-Next | `qwen4_exp` | 47 of 48 |
-| MiniMax M3 / M3.1 | `minimax_m3_vl` | 21 of 60 |
+| Qwen3.8 27B (Qwen3.5 architecture) | `qwen3_5` | 58 of 64 |
+| Qwen3.8 Flash-Next | `qwen4_exp` | 42 of 48 |
+| MiniMax M3 / M3.1 | `minimax_m3_vl` | 22 of 60 |
 | GLM-5.3 Flash | `glm5_next` | 21 of 45 |
 | DeepSeek V4.1 | `deepseek_v41` | 12 of 40 (10 for oQ4e) |
 
