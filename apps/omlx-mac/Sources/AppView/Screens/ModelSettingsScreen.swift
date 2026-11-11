@@ -1563,8 +1563,8 @@ private struct PrefillAcceleratorGroup: View {
                                 comment: "Picker suffix for a paired Mac that does not answer"))
         } else if device.versionOk != true {
             parts.append(String(localized: "settings.acceleration.prefill_helper.update",
-                                defaultValue: "needs the same oMLX version",
-                                comment: "Picker suffix for a paired Mac on another oMLX version"))
+                                defaultValue: "needs an update",
+                                comment: "Picker suffix for a paired helper that needs an update"))
         } else if let fit = device.layersFit, fit > 0 {
             parts.append(String(localized: "settings.acceleration.prefill_helper.fits",
                                 defaultValue: "\(fit) layers fit",

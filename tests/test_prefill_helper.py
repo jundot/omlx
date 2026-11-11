@@ -20,10 +20,12 @@ import numpy as np
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from mlx.utils import tree_unflatten
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
 from test_mlx_vlm_minimax_m3_compat import _tiny_text_config
 from test_scheduler_chunked_prefill import (
     _tiny_glm5_next,
+    _tiny_qwen3_5,
     _tiny_qwen4_exp,
     _tiny_vlm_adapter,
 )
@@ -31,14 +33,16 @@ from test_scheduler_chunked_prefill import (
 from omlx.cluster.transport import HostInterfaces, InterfaceAddress
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
+from omlx.patches.mlx_lm_mtp import prompt_priming
 from omlx.patches.mlx_vlm_minimax_m3_compat import (
     apply_mlx_vlm_minimax_m3_compat_patch,
 )
-from omlx.prefill_helper import launcher, lending, wire
+from omlx.prefill_helper import agent, launcher, lending, wire
 from omlx.prefill_helper import manager as manager_module
 from omlx.prefill_helper import routes as helper_routes
 from omlx.prefill_helper import worker as worker_module
-from omlx.prefill_helper.adapters import adapter_for
+from omlx.prefill_helper.adapter import Capture
+from omlx.prefill_helper.adapters import adapter_for, adapter_for_model
 from omlx.prefill_helper.client import HelperClient, HelperError
 from omlx.prefill_helper.launcher import HelperTarget
 from omlx.prefill_helper.manager import PrefillHelperManager
@@ -51,6 +55,7 @@ DSV41 = adapter_for("deepseek_v41")
 GLM = adapter_for("glm5_next")
 QWEN4 = adapter_for("qwen4_exp")
 MINIMAX = adapter_for("minimax_m3_vl")
+QWEN35 = adapter_for("qwen3_5")
 _TABLES = tempfile.TemporaryDirectory(prefix="omlx-prefill-helper-")
 _TABLE_IDS = itertools.count()
 
@@ -171,6 +176,23 @@ def test_split_matches_whole_model_with_engram(k):
 def test_split_continues_a_cached_prefix():
     _run(tiny(**_ENGRAM), 2, [6, 5, 4], prefix=1)
     _run(tiny_ced(), 3, [9, 6, 7], prefix=1)
+
+
+def _dsv41_contract():
+    """Below the CED midpoint: a window-only layer, KV sources of ratio 2 and
+    1 with their readers, and Engram on the first two layers. A second helper
+    stage can start at the sources 3 and 5."""
+    engram = {**_ENGRAM, "engram_layer_ids": (0, 1)}
+    return _model(
+        tiny_ced(
+            n_layers=12,
+            compress_ratios=(0, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1),
+            kv_source_layers=(1, 3, 5, 6),
+            index_source_layers=(1, 3, 5, 6, 8, 10),
+            candidate_source_layer=6,
+            **engram,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -476,13 +498,78 @@ def test_auto_split_balances_measured_speed():
     work = [1.0] * 20 + [0.1] + [0.0] * 19  # DeepSeek V4.1 with CED
     client = SimpleNamespace(info={"warm_seconds": 18.0, "warm_tokens": 1}, alive=True)
     session = PrefillHelperSession(client, DSV41, None, 18, "helper-mac", work)
+    session.alone_ratio = 1.0  # a prompt has run on this Mac alone
     # Until this Mac is timed, the helper takes every layer it holds.
     assert session.pick_layers() == 18
     # This Mac takes twice as long per unit of work: the helper gets more.
     session.observe(10, 2048, helper_s=10 * 2048, host_s=10.1 * 2 * 2048)
     assert session.pick_layers() == 14
+    # A slow link is a stage too: each layer's state costs transfer time, so
+    # fewer layers cross (4 s per token for the boundary, 1.5 s per layer).
+    client.link_bps = 1.0
+    client.token_bytes = {-1: 4.0, **{i: 1.5 for i in range(18)}}
+    assert session.pick_layers() == 10
+    # A job's chunks carry only the layers it used, here ten that cost less.
+    # What the layers above them cost stays known: the split does not take
+    # them for free and swing back.
+    sent = {"b:h": 4096, **{f"s:{i}.k": 512 for i in range(10)}}
+    chunk = {name: (np.zeros(size, np.uint8), "uint8") for name, size in sent.items()}
+    HelperClient._measure(client, {"size": 1024}, chunk, 1.0)
+    assert session.pick_layers() == 13
+    # A layer no job has used yet is taken to cost what the measured ones do.
+    client.token_bytes = {-1: 4.0, **{i: 1.5 for i in range(10)}}
+    assert session.pick_layers() == 10
+    # Slower than this Mac alone at any split: the prompt stays here.
+    client.link_bps = 0.05
+    assert session.pick_layers() == 0
+    assert session.start("r", np.arange(4096), [4096], None) is None
+    # A helper that timed slow is not a slow link: it keeps a job, whose
+    # chunks correct the estimate.
+    client.link_bps = 1.0
+    session.observe(10, 2048, helper_s=10 * 2048 * 1000, host_s=10.1 * 2 * 2048)
+    assert session.pick_layers() == 1
     session.fixed_layers = 5
     assert session.pick_layers() == 5
+    # A split that is faster once it runs can still lose a short prompt to
+    # the wait for its first chunk: 4.5 s per token on the link here, against
+    # 10 s per token alone and 6 s per token split.
+    link = SimpleNamespace(
+        info={}, alive=True, link_bps=1.0, token_bytes={-1: 3.5, 0: 0.25}
+    )
+    quick = PrefillHelperSession(link, DSV41, None, 4, "helper", [1.0] * 10)
+    quick.unit_helper, quick.unit_host = 0.1, 1.0
+    assert quick.pick_layers() == 4
+    assert quick.pick_layers([100] * 10) == 4
+    assert quick.pick_layers([100]) == 0
+
+
+def test_auto_split_keeps_the_cost_of_a_split_out_of_this_mac_alone():
+    link = SimpleNamespace(info={}, alive=True, link_bps=1.0, token_bytes={-1: 12.0})
+    session = PrefillHelperSession(link, DSV41, None, 10, "helper", [1.0] * 10)
+    # Split at 8: this Mac's two layers took 1 s per token each, taking in the
+    # helper's state and finishing the chunk 3 s per token more.
+    session.observe(8, 2048, helper_s=0.08 * 2048, host_s=2 * 2048, extra_s=3 * 2048)
+    # Alone this Mac needs 10 s per token, less than the link's 12.
+    session.alone_ratio = 1.0
+    assert session.pick_layers() == 0
+    # On a faster link the split also pays the 3 s on this Mac.
+    link.token_bytes = {-1: 9.0}
+    assert session.pick_layers() == 4
+
+
+def test_auto_split_times_this_mac_alone_before_a_close_call():
+    def session(alone_s):
+        link = SimpleNamespace(info={}, alive=True, link_bps=1.0, token_bytes={-1: 9.5})
+        split = PrefillHelperSession(link, DSV41, None, 10, "helper", [1.0] * 10)
+        split.unit_helper, split.unit_host = 0.01, 1.0
+        # The link's 9.5 s per token is close to the 10 s estimated alone:
+        # this prompt stays here and is timed.
+        assert split.pick_layers() == 0
+        split.observe_alone(2048, alone_s * 2048)
+        return split.pick_layers()
+
+    assert session(12.0) == 1
+    assert session(9.0) == 0
 
 
 def test_job_uses_fewer_layers_than_the_helper_holds():
@@ -660,6 +747,7 @@ class _PlanAdapter(type(DSV41)):
 
 class _FakeLauncher:
     LaunchError = launcher.LaunchError
+    incompatible = staticmethod(launcher.incompatible)
 
     def __init__(
         self,
@@ -972,7 +1060,7 @@ def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
     manager.configure("node-1", None)
     _wait_state(manager, "ready")
     assert (attached[-1].unit_helper, attached[-1].unit_host) == (1e-5, 3e-5)
-    attached[-1].observe(2, 2048, helper_s=1.0, host_s=3.0)
+    attached[-1].observe(2, 2048, helper_s=1.0, host_s=3.0, extra_s=0.5)
     measured = (attached[-1].unit_helper, attached[-1].unit_host)
     manager.close()
 
@@ -980,6 +1068,7 @@ def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
     again.configure("node-1", None)
     _wait_state(again, "ready")
     assert (attached[-1].unit_helper, attached[-1].unit_host) == measured
+    assert attached[-1].unit_extra == 0.5 / 2048
     # Switching Macs keeps the measured speeds under the Mac that measured them.
     again.configure("node-2", None)
     _wait_state(again, "ready")
@@ -1066,7 +1155,7 @@ def test_a_mac_helping_another_model_counts_that_memory_as_free(monkeypatch):
         "available": 20 << 30,
         "lending": {"host": "Studio", "model": "/m/Other", "active_gib": 60.0},
     }
-    assert manager_module.helper_budget(info) == 80 << 30
+    assert manager_module.helper_budget(info) == [80 << 30]
     target = HelperTarget("n", "M5max", "u@10.0.0.2", "10.0.0.2", "thunderbolt")
     monkeypatch.setattr(helper_routes.launcher, "resolve_target", lambda node: target)
     monkeypatch.setattr(helper_routes.launcher, "remote_info", lambda t: info)
@@ -1199,6 +1288,237 @@ def test_accelerator_check_reports_each_row(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# A helper daemon (Linux, NVIDIA) is driven over its control channel.
+# ---------------------------------------------------------------------------
+
+_KEY = bytes(range(32))
+_GPU = {"name": "NVIDIA RTX A6000", "total": 48 << 30}
+
+
+def _fake_daemon(root, events):
+    """A helper daemon's control channel, as far as the host drives it."""
+    listener = socket.create_server(("127.0.0.1", 0))
+
+    def reply_to(meta, arrays):
+        op = meta["op"]
+        if op == "info":
+            return {
+                "op": "ok",
+                "version": "0.1.0",
+                "data_protocol": wire.PROTOCOL,
+                "contracts": {"deepseek_v41": DSV41.contract},
+                "gpus": [{**_GPU, "free": 40 << 30}, {**_GPU, "free": 44 << 30}],
+                "disk_free": 1 << 40,
+                "link_mbps": 1000,
+                "session": {"host": "Studio", "model": "Other", "gpu_bytes": [4 << 30]},
+            }
+        if op == "probe":
+            folder = root / meta["name"]
+            partial = {
+                name: (folder / f"{name}.part").stat().st_size
+                for name in meta["files"]
+                if (folder / f"{name}.part").exists()
+            }
+            missing = [n for n in meta["files"] if not (folder / n).exists()]
+            return {
+                "op": "ok",
+                "found": None,
+                "copy": str(folder),
+                "missing": missing,
+                "partial": partial,
+                "copies": [],
+                "free": 1 << 40,
+            }
+        if op == "put":
+            folder = root / meta["name"]
+            folder.mkdir(parents=True, exist_ok=True)
+            part = folder / f"{meta['file']}.part"
+            if (part.stat().st_size if part.exists() else 0) != meta["offset"]:
+                return {"op": "error", "error": "wrong offset"}
+            with open(part, "ab") as f:
+                f.write(arrays["data"][0].tobytes())
+            if meta["last"]:
+                part.rename(folder / meta["file"])
+            return {"op": "ok"}
+        events.append((op, meta))
+        if op == "start":
+            return {"op": "ready", "port": 4242, "hello": {"layers": meta["layers"]}}
+        return {"op": "ok", "free": 7}
+
+    def one(sock):
+        try:
+            wire.recv(sock)
+            wire.authenticate(sock, agent._control_key(_KEY), server=True)
+            wire.send(sock, {"op": "hello", "v": 1, "node_id": "helper"})
+            while True:
+                wire.send(sock, reply_to(*wire.recv(sock)))
+        except (OSError, wire.ProtocolError):
+            events.append(("closed", {}))
+        finally:
+            sock.close()
+
+    def accept():
+        while True:
+            try:
+                sock, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=one, args=(sock,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    return listener
+
+
+def test_agent_transport_drives_a_helper_daemon(tmp_path, monkeypatch):
+    events = []
+    listener = _fake_daemon(tmp_path / "helper", events)
+    port = listener.getsockname()[1]
+    me = SimpleNamespace(node_id="studio")
+    monkeypatch.setattr(agent, "get_node_identity", lambda: me)
+    target = agent.AgentTarget("helper", "nvidia1", "127.0.0.1", "ethernet", port, _KEY)
+
+    # The memory of a session already running there counts as free.
+    info = agent.remote_info(target)
+    assert manager_module.helper_budget(info) == [44 << 30, 44 << 30]
+    assert info["device"] == "2x NVIDIA RTX A6000"
+    assert info["lending"] == {"host": "Studio", "model": "Other"}
+    assert agent.incompatible(info, DSV41, "nvidia1") is None
+    assert "does not support" in agent.incompatible(info, GLM, "nvidia1")
+    older = {**info, "contracts": {"deepseek_v41": DSV41.contract - 1}}
+    assert "update the helper" in agent.incompatible(older, DSV41, "nvidia1")
+
+    # A copy stopped halfway resumes from the bytes the helper kept.
+    model = tmp_path / "Model"
+    model.mkdir()
+    (model / "config.json").write_bytes(b"{}")
+    (model / "w.safetensors").write_bytes(os.urandom(2500))
+    monkeypatch.setattr(agent, "_CHUNK_BYTES", 1000)
+    names, sent = ["config.json", "w.safetensors"], []
+    agent.copy_files(
+        target, model, "/x/Model", names, sent.append, cancelled=lambda: bool(sent)
+    )
+    assert sent == ["config.json"]
+    where = agent.locate_files(target, "Model", {"w.safetensors": 2500})
+    assert where["missing"] == ["w.safetensors"] and not where["partial"]
+    stops = iter([False, True])
+    agent.copy_files(
+        target, model, "/x/Model", ["w.safetensors"], cancelled=lambda: next(stops)
+    )
+    where = agent.locate_files(target, "Model", {"w.safetensors": 2500})
+    assert where["partial"] == {"w.safetensors": 1000}
+    agent.copy_files(target, model, "/x/Model", ["w.safetensors"])
+    copied = tmp_path / "helper" / "Model" / "w.safetensors"
+    assert copied.read_bytes() == (model / "w.safetensors").read_bytes()
+    assert agent.delete_copies(target, ["Old"]) == 7
+
+    # The data token never crosses: both ends derive it from the session id.
+    process = agent.launch(
+        target, "/x/Model", "deepseek_v41", 5, host_name="Studio", warm_tokens=8
+    )
+    start = next(meta for op, meta in events if op == "start")
+    assert (start["model"], start["contract"]) == ("Model", DSV41.contract)
+    assert process.token == agent._data_token(_KEY, bytes.fromhex(start["session"]))
+    assert (process.port, process.hello) == (4242, {"layers": 5})
+    process.stop()
+
+    stranger = replace(target, key=bytes(32))
+    with pytest.raises(launcher.LaunchError, match="Pair it again"):
+        agent.remote_info(stranger)
+    listener.close()
+
+
+def test_a_helper_daemon_moves_to_a_faster_wired_link(monkeypatch):
+    lan = agent.AgentTarget(
+        "gpu", "gpu-box", "192.168.1.230", "ethernet", 8851, _KEY, speed_mbps=1000
+    )
+    links = [
+        {"ipv4": ["192.168.1.230/24"], "link_local": "fe80::1", "mbps": 1000},
+        {"ipv4": [], "link_local": "fe80::2", "mbps": 2500},
+    ]
+    ports = SimpleNamespace(media_speeds={"en0": 1000, "en8": 10000, "en7": 2500})
+    answers = {"fe80::2%en7", "10.10.0.2"}
+    tried = []
+
+    def connect(target, timeout):
+        tried.append(target.address)
+        if target.address not in answers:
+            raise launcher.LaunchError("no route")
+        return SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(agent, "remote_info", lambda target: {"links": links})
+    monkeypatch.setattr(agent, "probe_host_interfaces", lambda host: ports)
+    monkeypatch.setattr(agent, "_local_link", lambda address: ("ethernet", 2500))
+    monkeypatch.setattr(agent, "_connect", connect)
+    # A cable without DHCP: the helper's link-local address, scoped to the
+    # port of this Mac that reaches it. A port at the LAN's speed is not tried.
+    moved = agent._fastest_link(lan)
+    assert (moved.address, moved.speed_mbps) == ("fe80::2%en7", 2500)
+    assert moved.endpoint == "[fe80::2%en7]:8851"
+    assert tried == ["fe80::2%en8", "fe80::2%en7"]
+    # A self-assigned address does not route reliably from macOS, also when
+    # discovery found the helper there.
+    links[1].update(ipv4=["169.254.10.2/16"])
+    assert agent._fastest_link(lan).address == "fe80::2%en7"
+    cable = replace(lan, address="169.254.10.2", speed_mbps=None)
+    assert agent._fastest_link(cable).address == "fe80::2%en7"
+    # Static addresses on the cable work the same way.
+    links[1].update(ipv4=["10.10.0.2/30"])
+    assert agent._fastest_link(lan).address == "10.10.0.2"
+    # A link no faster than the LAN is not worth the move.
+    links[1]["mbps"] = 1000
+    assert agent._fastest_link(lan) is lan
+
+
+def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch):
+    # The first GPU also holds the shared tensors; each keeps 8 GiB spare.
+    gib = 1 << 30
+    assert manager_module.fit_layers(2 * gib, [4 * gib] * 20, [20 * gib] * 2, 19) == 5
+    # A busy GPU does not end the chain: the roomier one takes the first stage.
+    assert (
+        manager_module.fit_layers(2 * gib, [4 * gib] * 20, [9 * gib, 20 * gib], 19) == 2
+    )
+    # More GPUs hold no more layers: the helper runs its stages on two.
+    assert manager_module.fit_layers(2 * gib, [4 * gib] * 20, [20 * gib] * 4, 19) == 5
+
+    paired = {"n": {"friendly_name": "nvidia1"}}
+    registry = SimpleNamespace(get=paired.get, is_paired=paired.__contains__)
+    monkeypatch.setattr(helper_routes, "get_device_registry", lambda: registry)
+    monkeypatch.setattr(helper_routes, "forget_host", lambda node: None)
+    target = agent.AgentTarget(
+        "n", "nvidia1", "10.0.0.9", "ethernet", 7001, _KEY, speed_mbps=10000
+    )
+    info = {
+        "version": "0.1.0",
+        "data_protocol": wire.PROTOCOL,
+        "contracts": {"qwen4_exp": 1},
+        "budgets": [40 * gib, 44 * gib],
+        "disk_free": 1 << 40,
+        "link_mbps": 1000,
+    }
+    daemon = SimpleNamespace(
+        VIA=agent.VIA,
+        resolve_target=lambda node: target,
+        remote_info=lambda target, host=None: info,
+        incompatible=agent.incompatible,
+    )
+    monkeypatch.setattr(helper_routes, "transport_for", lambda node: daemon)
+    rows = helper_routes._check("n")["rows"]
+    # No SSH and no battery on a helper daemon; its own version is fine.
+    assert [(r["key"], r["status"]) for r in rows] == [
+        ("control", "pass"),
+        ("link", "warn"),
+        ("version", "pass"),
+        ("memory", "pass"),
+        ("disk", "pass"),
+    ]
+    assert rows[0]["detail"] == "10.0.0.9:7001"
+    # This Mac's port is 10 Gb, the helper's 1 Gb: the slower end is the link.
+    assert rows[1]["speed_mbps"] == 1000
+    assert rows[2]["families"] == ["qwen4_exp"] and "expected" not in rows[2]
+    assert (rows[3]["bytes"], rows[3]["gpus"]) == (84 * gib, 2)
+
+
+# ---------------------------------------------------------------------------
 # GLM-5.3: KDA and sparse-attention layers on either side of the cut.
 # ---------------------------------------------------------------------------
 
@@ -1206,6 +1526,21 @@ def test_accelerator_check_reports_each_row(tmp_path, monkeypatch):
 def _glm():
     mx.random.seed(7)
     lm, _ = _tiny_glm5_next()
+    mx.eval(lm.parameters())
+    return lm
+
+
+def _glm_contract():
+    """_glm with its identity gains and its zero gates, biases and mixes moved,
+    so the fixture pins the hyper-connection, the router and the index pool."""
+    lm = _glm()
+    lm.apply(
+        lambda p: (
+            p + mx.random.uniform(-0.3, 0.3, p.shape)
+            if p.ndim == 1 or not mx.any(p).item()
+            else p
+        )
+    )
     mx.eval(lm.parameters())
     return lm
 
@@ -1318,13 +1653,152 @@ def test_qwen4_split_matches_whole_model(layers, k, prefix):
     )
 
 
+# ---------------------------------------------------------------------------
+# Qwen3.5: Gated DeltaNet and full-attention layers on either side of the cut.
+# ---------------------------------------------------------------------------
+
+
+def _tiny_qwen35():
+    """The tiny Qwen3.5 stack with six layers (L L L F L L) and a partial
+    rotary width, so a cut can sit inside a linear run or right after
+    attention. Keys of 32 dims in inference mode take the recurrence kernel
+    a loaded model runs."""
+    lm, _ = _tiny_qwen3_5()
+    rope = {**lm.args.rope_parameters, "partial_rotary_factor": 0.5}
+    text = replace(
+        lm.args, num_hidden_layers=6, linear_key_head_dim=32, rope_parameters=rope
+    )
+    # A call without position ids reads these to number a text prompt.
+    config = SimpleNamespace(
+        model_type="qwen3_5",
+        text_config=text,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=61,
+        video_token_id=62,
+        vision_start_token_id=63,
+    )
+    return type(lm)(text, config).eval(), config
+
+
+def _qwen35():
+    mx.random.seed(7)
+    lm, _ = _tiny_qwen35()
+    mx.eval(lm.parameters())
+    return lm
+
+
+def _qwen35_contract():
+    """_qwen35 with its identity norm gains and gate biases moved."""
+    lm = _qwen35()
+    lm.apply(lambda p: p + mx.random.uniform(-0.3, 0.3, p.shape) if p.ndim == 1 else p)
+    mx.eval(lm.parameters())
+    return lm
+
+
+def _qwen35_state(cache):
+    out = []
+    for item in cache:
+        out += item.cache if hasattr(item, "cache") else item.state
+    return [np.asarray(a) for a in out]
+
+
+@pytest.mark.parametrize(
+    "k,sizes,prefix",
+    [
+        (2, [9, 6, 7], 0),
+        (4, [9, 6, 7], 0),
+        (5, [12, 10], 0),
+        (2, [9, 6, 7], 1),
+        (4, [9, 6, 7], 1),
+    ],
+)
+def test_qwen35_split_matches_whole_model(k, sizes, prefix):
+    ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 23)))
+    _split_matches(QWEN35, _qwen35, ids, sizes, k, prefix, _qwen35_state)
+
+
+def test_qwen35_split_feeds_a_block_drafter_and_the_mtp_head(monkeypatch):
+    k, start = 4, 3
+    host, helper = _qwen35(), _qwen35()
+    QWEN35.keep_first(helper, k)
+    # A helper Mac whose GPU rounds its rotary frequencies another way: its
+    # attention layer must turn by the frequencies the host sends.
+    rotary = helper.model.layers[3].self_attn.rotary_emb
+    rotary._inv_freq = rotary.inv_freq * 1.01
+    ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 12)))
+    whole = host(ids, cache=host.make_cache(), capture_layer_ids=[1, 5])
+    # A model with an active Lightning MTP head, as its loader marks it.
+    host._omlx_mtp_decode_enabled = host._omlx_mtp_chain = True
+    host.mtp = SimpleNamespace()
+    primed = []
+    monkeypatch.setattr(prompt_priming, "maybe_capture", lambda *a: primed.append(a))
+
+    cache = host.make_cache()
+    here, there = Capture([1, 5], start), Capture([1], start)
+    inputs = QWEN35.job_feed(host, None, np.asarray(ids[0]), [ids.shape[1]], k)(0)
+    boundary, state = QWEN35.run_first(
+        helper, helper.make_cache(), ids, 0, inputs, there
+    )
+    out = QWEN35.run_rest(None, host, cache, ids, k, boundary, state, capture=here)
+    QWEN35.apply_state(cache, k, state)
+    QWEN35.finish_chunk(host, ids, out, cache)
+
+    lower, upper = (np.asarray(a[:, start:]) for a in whole.hidden_states)
+    np.testing.assert_array_equal(np.asarray(there.out[1]), lower)
+    np.testing.assert_array_equal(np.asarray(here.out[5]), upper)
+    assert list(here.out) == [5]
+    # The head sees the final norm of the last layer, after the helper's
+    # attention rows moved the cache offset.
+    ((lm, tokens, normed, primed_cache),) = primed
+    assert lm is host and tokens is ids and primed_cache is cache
+    assert cache[3].offset == ids.shape[1]
+    np.testing.assert_array_equal(
+        np.asarray(normed), np.asarray(host.model.norm(whole.hidden_states[1]))
+    )
+    # A priming failure leaves the head unprimed, as in a local prefill.
+    failing = MagicMock(side_effect=RuntimeError("priming"))
+    monkeypatch.setattr(prompt_priming, "maybe_capture", failing)
+    QWEN35.finish_chunk(host, ids, out, cache)
+    failing.assert_called_once()
+
+
+def test_only_a_model_that_gets_a_helper_has_an_adapter(tmp_path):
+    path = str(tmp_path)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    assert adapter_for_model("qwen3_5", "vlm", path) is QWEN35
+    # Text-only conversions run on the LLM or decision engine: no helper.
+    assert adapter_for_model("qwen3_5", "batched", path) is None
+    entry = SimpleNamespace(
+        config_model_type="qwen3_5", engine_type="decision", model_path=path
+    )
+    assert helper_routes._adapter(entry) is None
+    # The server loads a ParoQuant checkpoint with a loader of its own.
+    config = {"model_type": "qwen3_5", "quantization_config": {}}
+    config["quantization_config"]["quant_method"] = "paroquant"
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert adapter_for_model("qwen3_5", "vlm", path) is None
+    # The other families keep their adapter on every engine.
+    assert adapter_for_model("qwen4-exp", "batched", path) is QWEN4
+
+
+def test_qwen35_keeps_a_yarn_prompt_off_the_helpers_attention_layers():
+    host = _qwen35()
+    host.args.rope_parameters["type"] = "yarn"
+    tokens = np.arange(8)
+    # Three linear layers need no positions; the fourth is attention.
+    assert QWEN35.job_feed(host, None, tokens, [8], 3) is None
+    with pytest.raises(RuntimeError, match="YaRN"):
+        QWEN35.job_feed(host, None, tokens, [8], 4)
+
+
 @pytest.mark.parametrize(
     "factory,make,adapter,k,state_of",
     [
         (_tiny_glm5_next, _glm, GLM, 2, _glm_state),
         (_tiny_qwen4_exp, _qwen4, QWEN4, 1, _qwen4_state),
+        (_tiny_qwen35, _qwen35, QWEN35, 4, _qwen35_state),
     ],
-    ids=["glm", "qwen4"],
+    ids=["glm", "qwen4", "qwen35"],
 )
 def test_scheduler_family_helper_prefill_matches_local(
     factory, make, adapter, k, state_of
@@ -1354,11 +1828,11 @@ def test_scheduler_family_helper_prefill_matches_local(
 # ---------------------------------------------------------------------------
 
 
-def _minimax():
+def _minimax(**overrides):
     apply_mlx_vlm_minimax_m3_compat_patch()
     from mlx_vlm.models.minimax_m3_vl.language import LanguageModel
 
-    args = _tiny_text_config(
+    params = dict(
         pack_shared_expert=False,
         num_hidden_layers=4,
         moe_layer_freq=[0, 0, 1, 1],
@@ -1372,8 +1846,35 @@ def _minimax():
             "sparse_topk_blocks": 2,
         },
     )
+    args = _tiny_text_config(**{**params, **overrides})
     mx.random.seed(7)
     lm = LanguageModel(args)
+    mx.eval(lm.parameters())
+    return lm
+
+
+def _minimax_contract():
+    """The M3.1 layout: scaled routed experts with a routing bias, an index
+    head per KV head, and one layer without a sparse index."""
+    lm = _minimax(
+        routed_expert_scales=True,
+        use_routing_bias=True,
+        moe_layer_freq=[0, 1, 1, 1],
+        num_key_value_heads=2,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [1, 0, 1, 1],
+            "sparse_index_dim": 16,
+            "sparse_num_index_heads": 2,
+            "sparse_block_size": 2,
+            "sparse_topk_blocks": 3,
+        },
+    )
+    # Norm gains, routing biases and expert scales (every 1-D parameter) start
+    # at identity values; move them so the fixture pins their use.
+    lm.apply(lambda p: p + mx.random.uniform(-0.3, 0.3, p.shape) if p.ndim == 1 else p)
     mx.eval(lm.parameters())
     return lm
 
@@ -1440,3 +1941,106 @@ def test_scheduler_seeds_a_block_drafter_from_both_macs():
     for (_, a), (_, b) in zip(local, split):
         for x, y in zip(a, b):
             np.testing.assert_array_equal(x, y)
+
+
+# ---------------------------------------------------------------------------
+# Contract fixtures: the arrays each family sends over the link, for helper
+# builds that share no code with oMLX (apps/omlx-cuda-helper).
+# ---------------------------------------------------------------------------
+
+_CONTRACT_DIR = Path(__file__).parent / "fixtures" / "prefill_contract"
+_CONTRACT_SIZES, _CONTRACT_PREFIX = [9, 6, 7], 1
+# family -> (adapter, tiny model, layers on the helper, checkpoint name prefix)
+_CONTRACT_CASES = {
+    "qwen4_exp": (QWEN4, lambda: _qwen4(4), 3, "language_model."),
+    "minimax_m3_vl": (MINIMAX, _minimax_contract, 3, "language_model."),
+    "qwen3_5": (QWEN35, _qwen35_contract, 5, "language_model."),
+    "glm5_next": (GLM, _glm_contract, 3, "language_model."),
+    "deepseek_v41": (DSV41, _dsv41_contract, 6, "language_model."),
+}
+
+
+def _contract_case(family, weights=None):
+    """One prompt through a split: a prefix on this Mac, then helper chunks.
+
+    Returns the host model, the token ids and every array as it crosses the
+    link: ``p:`` prefix state, ``in<chunk>:`` host-fed rows, ``b<chunk>:``
+    boundary and ``s<chunk>:`` state.
+    """
+    adapter, make, k, _ = _CONTRACT_CASES[family]
+    host, helper = make(), make()
+    if weights is not None:
+        for model in (host, helper):
+            model.update(tree_unflatten(list(weights.items())))
+    adapter.keep_first(helper, k)
+    rng = np.random.default_rng(5)
+    ids = mx.array(rng.integers(3, 58, (1, sum(_CONTRACT_SIZES))))
+    chunks = _chunks(ids, _CONTRACT_SIZES)
+    cache, helper_cache = host.make_cache(), helper.make_cache()
+    for chunk in chunks[:_CONTRACT_PREFIX]:
+        host(chunk, cache=cache)
+    state = adapter.prefix_state(cache, k)
+    adapter.load_prefix(helper_cache, state)
+    arrays = {f"p:{n}": wire.to_host(v) for n, v in state.items()}
+    rest = chunks[_CONTRACT_PREFIX:]
+    tokens = np.concatenate([np.asarray(c[0]) for c in rest])
+    feed = adapter.job_feed(host, cache, tokens, [c.shape[1] for c in rest], k)
+    for index, chunk in enumerate(rest):
+        inputs = feed(index) if feed else {}
+        arrays.update({f"in{index}:{n}": v for n, v in inputs.items()})
+        boundary, state = adapter.run_first(helper, helper_cache, chunk, 0, inputs)
+        arrays.update({f"b{index}:{n}": wire.to_host(v) for n, v in boundary.items()})
+        arrays.update({f"s{index}:{n}": wire.to_host(v) for n, v in state.items()})
+        # DeepSeek runs its layers through the prefill entry point.
+        prefill = getattr(host, "_omlx_prefill", None)
+        adapter.run_rest(prefill, host, cache, chunk, k, boundary, state)
+        adapter.apply_state(cache, k, state)
+        mx.eval([c.state for c in cache])
+    return host, np.asarray(ids), arrays
+
+
+def _contract_manifest(arrays):
+    return [[n, d, a.dtype.str, list(a.shape)] for n, (a, d) in arrays.items()]
+
+
+@pytest.mark.parametrize("family", sorted(_CONTRACT_CASES))
+def test_payload_matches_the_contract_fixture(family):
+    folder = _CONTRACT_DIR / family
+    meta = json.loads((folder / "meta.json").read_text())
+    adapter, _, _, prefix = _CONTRACT_CASES[family]
+    hint = (
+        f"the {family} payload changed: raise {type(adapter).__name__}.contract "
+        "and run tests/fixtures/record_prefill_contract.py"
+    )
+    assert adapter.contract == meta["contract"], hint
+    stored = mx.load(str(folder / "model" / "model.safetensors"))
+    weights = {name.removeprefix(prefix): value for name, value in stored.items()}
+    _, _, arrays = _contract_case(family, weights)
+    assert _contract_manifest(arrays) == meta["manifest"], hint
+    expected = np.load(folder / "case.npz")
+    for name, (data, _) in arrays.items():
+        if data.dtype.kind == "f":
+            np.testing.assert_allclose(
+                data, expected[name], rtol=meta["rtol"], atol=meta["atol"], err_msg=hint
+            )
+        else:
+            np.testing.assert_array_equal(data, expected[name], err_msg=hint)
+
+
+def test_qwen35_helper_refuses_a_checkpoint_it_cannot_load(tmp_path):
+    # Last in this file: load_first installs the server's prefill patches.
+    source = _CONTRACT_DIR / "qwen3_5" / "model"
+    weights = mx.load(str(source / "model.safetensors"))
+    config = json.loads((source / "config.json").read_text())
+    # Without a tensor of layer 1 a non-strict load would leave it random.
+    del weights["language_model.model.layers.1.mlp.up_proj.weight"]
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert len(QWEN35.load_first(str(tmp_path), 1).model.layers) == 1
+    with pytest.raises(ValueError, match="not in the checkpoint"):
+        QWEN35.load_first(str(tmp_path), 2)
+    # The server loads a ParoQuant checkpoint with a loader of its own.
+    config["quantization_config"] = {"quant_method": "paroquant"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="own loader"):
+        QWEN35.load_first(str(tmp_path), 1)

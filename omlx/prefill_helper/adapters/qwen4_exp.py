@@ -245,6 +245,7 @@ def _cache_state(i: int, item: Any, since: int | None) -> Arrays:
 
 class Qwen4ExpAdapter(StageAdapter):
     model_types = ("qwen4_exp",)
+    contract = 1
 
     def layer_count(self, lm: Any) -> int:
         return len(_layers(lm))

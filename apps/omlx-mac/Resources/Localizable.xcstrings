@@ -27797,13 +27797,13 @@
       }
     },
     "settings.acceleration.prefill_helper.update" : {
-      "comment" : "Picker suffix for a paired Mac on another oMLX version",
+      "comment" : "Picker suffix for a paired helper that needs an update",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "needs the same oMLX version"
+            "value" : "needs an update"
           }
         }
       }

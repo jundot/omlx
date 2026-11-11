@@ -108,6 +108,7 @@ def _append_sparse(i: int, item: Any, state: Arrays) -> None:
 
 class Glm5NextAdapter(StageAdapter):
     model_types = ("glm5_next",)
+    contract = 1
     captures_layers = True
 
     def layer_count(self, lm: Any) -> int:

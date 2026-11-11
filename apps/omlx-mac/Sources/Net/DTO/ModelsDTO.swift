@@ -435,7 +435,7 @@ struct PrefillHelperCandidatesDTO: Codable, Equatable, Sendable {
         let nodeId: String
         let name: String
         var chip: String? = nil
-        var ramGb: Int? = nil
+        var ramGb: Double? = nil
         let online: Bool
         var reason: String? = nil
         var link: String? = nil

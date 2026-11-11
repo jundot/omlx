@@ -1,0 +1,22 @@
+The sorted expert gather (gather_qmm_rhs_sm80) also takes affine weights. Upstream gates it to the
+floating point modes, so a 4-bit affine expert bank runs qmm_sm80 with one block per (row, expert)
+pair on grid z, which exceeds the 65,535 block limit at 8192 prefill rows x top-10 experts.
+
+diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
+index a69c49d8f..2bd507843 100644
+--- a/mlx/backend/cuda/quantized/quantized.cpp
++++ b/mlx/backend/cuda/quantized/quantized.cpp
+@@ -194,9 +194,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+   // naive kernel until it does.
+   bool can_use_qmm_sm80 =
+       !global_scale.has_value() && supports(supports_qmm_sm80);
+-  bool can_use_gather_qmm_rhs_sm80 = mode_ != QuantizationMode::Affine &&
+-      right_sorted_ && !global_scale.has_value() &&
+-      supports(supports_gather_qmm_rhs_sm80);
++  // The rhs kernel reads the affine biases like the scales, so affine
++  // expert banks take it too instead of one CTA per row.
++  bool can_use_gather_qmm_rhs_sm80 = right_sorted_ &&
++      !global_scale.has_value() && supports(supports_gather_qmm_rhs_sm80);
+   bool can_use_qmm_naive = supports(supports_qmm_naive);
+   bool can_use_fp_gather_qmv = supports(supports_fp_gather_qmv);
+   bool can_use_qmv = supports(supports_qmv) || can_use_fp_gather_qmv;

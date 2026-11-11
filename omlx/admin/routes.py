@@ -92,7 +92,7 @@ from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
-from ..prefill_helper.adapters import adapter_for as stage_adapter_for
+from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.routes import helper_status as prefill_helper_status
 from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
 from ..settings import (
@@ -2610,7 +2610,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "paroquant_reason": paroquant_reason,
             "activation_fp16_supported": activation_fp16_supported,
             "prefill_helper_supported": stage_adapter_for(
-                (model_info.get("config_model_type") or "").replace("-", "_").lower()
+                model_info.get("config_model_type"),
+                model_info.get("engine_type"),
+                model_info.get("model_path"),
             )
             is not None,
             "prefill_helper": _prefill_helper_status(model_id),
@@ -3062,7 +3064,7 @@ async def update_model_settings(
         )
     if "prefill_helper_node_id" in sent:
         supported = stage_adapter_for(
-            (entry.config_model_type or "").replace("-", "_").lower()
+            entry.config_model_type, entry.engine_type, entry.model_path
         )
         current_settings.prefill_helper_node_id = (
             (request.prefill_helper_node_id or None) if supported else None
