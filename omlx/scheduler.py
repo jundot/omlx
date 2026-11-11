@@ -15888,13 +15888,16 @@ class Scheduler:
                 and prefill_gate_open
             ):
                 if not self._decode_contention():
-                    # Nothing decodes. Requests that fit in one contended
-                    # chunk prefill ahead of the in-flight chunk, which then
-                    # shrinks while they decode; after it they would wait a
-                    # whole chunk (#5148). Longer ones keep their turn.
-                    limit = Scheduler._contended_chunk_size(self)
+                    # Nothing decodes. Requests that fit in one prefill chunk
+                    # go ahead of the in-flight chunk, which then shrinks
+                    # while they decode; behind it they would wait for whole
+                    # chunks (#5148). Longer ones keep their turn.
                     if all(
-                        request.num_prompt_tokens <= limit for request in self.waiting
+                        request.num_prompt_tokens
+                        <= Scheduler._base_prefill_step_size(
+                            self, 0, request.num_prompt_tokens
+                        )
+                        for request in self.waiting
                     ):
                         admit_first = True
                         prefilling_before = {
