@@ -7,16 +7,22 @@ prefill is force-chunked, chunks are capped, and each chunk accrues a
 decode time debt that must be repaid before the next chunk runs.
 """
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
+import omlx.admin.routes as admin_routes
+import omlx.server as server
 from omlx.decode_activity import get_decode_activity
 from omlx.scheduler import (
     _CONTENDED_PREFILL_CHUNK,
     Scheduler,
     SchedulerConfig,
 )
+from omlx.settings import GlobalSettings
 
 
 @pytest.fixture(autouse=True)
@@ -361,3 +367,78 @@ class TestHoldStepBehavior:
                 out = s.step()
         advance.assert_not_called()
         assert not out.has_work
+
+
+class TestAdaptiveDecodeShare:
+    @pytest.mark.parametrize(
+        ("adaptive", "row_tps", "other_engine", "expected"),
+        [
+            (True, None, False, 0.5),  # no measurement yet
+            (True, 20.0, False, 0.5),  # 1/3 of 20 tok/s is below the 10 tok/s floor
+            (True, 100.0, False, 10.0 / 90.0),  # holds 100 tok/s rows at 10 tok/s
+            (True, 100.0, True, 0.5),  # another engine's rate is not visible
+            (False, 100.0, False, 0.5),  # Decode First keeps the fixed share
+        ],
+    )
+    def test_own_engine_debt_ratio(self, adaptive, row_tps, other_engine, expected):
+        s = _make_scheduler(adaptive_decode_share=adaptive)
+        if other_engine:
+            get_decode_activity().publish("other-engine", 1)
+        s.running = {"r1": MagicMock()}
+        s._row_decode_tps = row_tps
+        s._accrue_decode_debt(1.0)
+        assert s._decode_time_owed_s == pytest.approx(expected)
+
+    def test_row_rate_is_per_row_in_100ms_buckets(self):
+        s = _make_scheduler()
+        s.running = {"r1": MagicMock(), "r2": MagicMock()}
+        s._sample_row_decode_rate(2, 0.05)
+        assert s._row_decode_tps is None
+        s._sample_row_decode_rate(18, 0.05)
+        assert s._row_decode_tps == pytest.approx(100.0)
+        # Rows that start after an idle gap are measured again.
+        s.running = {}
+        s._prefill_gate_open()
+        assert s._row_decode_tps is None
+
+
+class TestConcurrentPrioritySetting:
+    def test_admin_api_applies_priority_and_legacy_switch_live(
+        self, tmp_path, monkeypatch
+    ):
+        gs = GlobalSettings(base_path=tmp_path)
+        scheduler = _make_scheduler()
+        engine = SimpleNamespace(
+            _engine=SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler))
+        )
+        pool = SimpleNamespace(
+            _scheduler_config=SchedulerConfig(),
+            _entries={"m": SimpleNamespace(engine=engine)},
+        )
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(server._server_state, "engine_pool", pool)
+
+        def post(**fields):
+            request = admin_routes.GlobalSettingsRequest(**fields)
+            return asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        post(concurrent_priority="decode")
+        assert scheduler._decode_fairness is True
+        assert scheduler._adaptive_decode_share is False
+        assert pool._scheduler_config.adaptive_decode_share is False
+
+        # The old on/off switch keeps a chosen fairness mode.
+        post(decode_fairness=False)
+        assert gs.scheduler.concurrent_priority == "prefill"
+        assert scheduler._decode_fairness is False
+        post(decode_fairness=True)
+        assert gs.scheduler.concurrent_priority == "balanced"
+        assert scheduler._decode_fairness is True
+        assert scheduler._adaptive_decode_share is True
+
+        restored = GlobalSettings.load(base_path=tmp_path)
+        assert restored.scheduler.concurrent_priority == "balanced"
+        with pytest.raises(ValidationError):
+            post(concurrent_priority="fast")

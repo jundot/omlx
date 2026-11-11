@@ -109,6 +109,33 @@ private struct SchedulerSection: View {
                 RowSwitch(isOn: $vm.chunkedPrefill)
             }
             Row(
+                label: String(localized: "performance.scheduler.concurrent_priority",
+                              defaultValue: "Concurrent Request Priority",
+                              comment: "Row label for the concurrent request priority popup"),
+                sublabel: String(localized: "performance.scheduler.concurrent_priority.sub",
+                                 defaultValue: "What runs first when a new prompt arrives while other responses are generating. Prefill First can pause them during a long prompt.",
+                                 comment: "Sublabel for the concurrent request priority popup")
+            ) {
+                Popup(
+                    selection: $vm.concurrentPriority,
+                    width: .controlMedium,
+                    options: [
+                        ("prefill",
+                         String(localized: "concurrent_priority.option.prefill",
+                                defaultValue: "Prefill First",
+                                comment: "Concurrent request priority option that prefills new prompts first")),
+                        ("balanced",
+                         String(localized: "concurrent_priority.option.balanced",
+                                defaultValue: "Balanced",
+                                comment: "Concurrent request priority option that adapts how much GPU time running responses keep")),
+                        ("decode",
+                         String(localized: "concurrent_priority.option.decode",
+                                defaultValue: "Decode First",
+                                comment: "Concurrent request priority option that keeps running responses decoding first")),
+                    ]
+                )
+            }
+            Row(
                 label: String(localized: "performance.scheduler.prefill_priority",
                               defaultValue: "Prefill Priority",
                               comment: "Row label for the prefill priority segmented control"),
