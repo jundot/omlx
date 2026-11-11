@@ -559,7 +559,7 @@ async def create_transcription(
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
-        engine = await pool.get_engine(resolved_model)
+        engine = await pool.get_engine(resolved_model, _lease=True)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
@@ -572,6 +572,7 @@ async def create_transcription(
     if not isinstance(engine, STTEngine):
         engine = _lfm3_speech(engine)
     if engine is None:
+        await pool.release_engine(resolved_model)
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a speech-to-text model",
@@ -644,6 +645,7 @@ async def create_transcription(
                 os.unlink(tmp_path)
             except OSError:
                 pass
+        await pool.release_engine(resolved_model)
 
     _record_audio_request(resolved_model)
 
@@ -1661,7 +1663,7 @@ async def process_audio(
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
-        engine = await pool.get_engine(resolved_model)
+        engine = await pool.get_engine(resolved_model, _lease=True)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
@@ -1674,6 +1676,7 @@ async def process_audio(
     if not isinstance(engine, STSEngine):
         engine = _lfm3_speech(engine)
     if engine is None:
+        await pool.release_engine(resolved_model)
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a speech-to-speech / audio processing model",
@@ -1703,6 +1706,7 @@ async def process_audio(
                 os.unlink(tmp_path)
             except OSError:
                 pass
+        await pool.release_engine(resolved_model)
 
     _record_audio_request(resolved_model)
 
