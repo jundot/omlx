@@ -1021,8 +1021,8 @@
   "cluster.v2.exec.throughput": "吞吐优先",
   "cluster.v2.exec.throughput_detail": "请求重叠时自动扩大批处理",
   "cluster.v2.exec.throughput_limits": "16 解码 · 8 预填充 · 批处理 8",
-  "cluster.v2.header.subtitle": "oMLX 会自动发现网络中的其他 Mac。用一组配对码把它们配对，模型便会自动拆分到整个资源池。",
-  "cluster.v2.header.title": "你的 Mac，一台电脑",
+  "cluster.v2.header.subtitle": "oMLX 会自动发现网络中的 Mac 和带 NVIDIA GPU 的 PC。\n模型可在 Mac 之间拆分运行，长提示词可由 Mac 或 NVIDIA PC 加速处理。",
+  "cluster.v2.header.title": "你的设备，一台电脑",
   "cluster.v2.join.cleanup_pending": "这台 Mac 上先前的加入已取消。只要此标签页保持打开，另一台 Mac 上的清理就会自动重试。你仍可加入其他 Mac。",
   "cluster.v2.join.other_mac": "另一台 Mac",
   "cluster.v2.link.ethernet": "以太网",
@@ -1152,7 +1152,7 @@
   "cluster.v2.steps.checks_title": "检查",
   "cluster.v2.steps.discover_hint": "在你的网络中自动进行",
   "cluster.v2.steps.discover_title": "发现设备",
-  "cluster.v2.steps.pair_hint": "一个配对码，连接两台 Mac",
+  "cluster.v2.steps.pair_hint": "每台设备一个配对码",
   "cluster.v2.steps.pair_title": "配对",
   "cluster.v2.steps.plan_hint_pipeline": "每台 Mac 的层数",
   "cluster.v2.steps.plan_title": "拆分模型",
@@ -2448,5 +2448,6 @@
   "cluster.v2.cuda_guide.windows_docker": "Install Docker Desktop, which runs on WSL 2, and an NVIDIA driver of version 580 or later. Then start Docker Desktop.",
   "cluster.v2.cuda_guide.windows_firewall": "In PowerShell as administrator, let this Mac reach the helper.",
   "cluster.v2.cuda_guide.windows_run": "Start the helper in PowerShell. It asks this Mac to pair: type the code from its log on this page. If this Mac has more than one address, use the one the PC can reach.",
-  "cluster.v2.cuda_guide.spark_run": "DGX OS comes with Docker and the NVIDIA Container Toolkit. Start the helper. It appears on this page: press Pair on it and type the code from its log."
+  "cluster.v2.cuda_guide.spark_run": "DGX OS comes with Docker and the NVIDIA Container Toolkit. Start the helper. It appears on this page: press Pair on it and type the code from its log.",
+  "cluster.v2.device_card.helper_ready": "{name} can speed up long prompts for models on this Mac."
 }

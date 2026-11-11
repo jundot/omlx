@@ -1021,8 +1021,8 @@
   "cluster.v2.exec.throughput": "Throughput",
   "cluster.v2.exec.throughput_detail": "Wider automatic batches when requests overlap",
   "cluster.v2.exec.throughput_limits": "16 decode · 8 prompt · batch 8",
-  "cluster.v2.header.subtitle": "oMLX finds other Macs on your network by itself. Pair them with one code and models split across the whole pool automatically.",
-  "cluster.v2.header.title": "Your Macs, one computer",
+  "cluster.v2.header.subtitle": "oMLX가 네트워크의 Mac과 NVIDIA GPU PC를 알아서 찾습니다.\n모델은 Mac끼리 나눠 실행하고, 긴 프롬프트는 Mac이나 NVIDIA PC가 빠르게 처리합니다.",
+  "cluster.v2.header.title": "여러 기기를 한 대처럼",
   "cluster.v2.join.cleanup_pending": "The previous join is cancelled on this Mac. Cleanup on the other Mac will be retried while this tab is visible. You can join a different Mac.",
   "cluster.v2.join.other_mac": "the other Mac",
   "cluster.v2.link.ethernet": "Ethernet",
@@ -1152,7 +1152,7 @@
   "cluster.v2.steps.checks_title": "Check",
   "cluster.v2.steps.discover_hint": "Automatic on your network",
   "cluster.v2.steps.discover_title": "Find devices",
-  "cluster.v2.steps.pair_hint": "One code, both Macs",
+  "cluster.v2.steps.pair_hint": "기기마다 코드 하나",
   "cluster.v2.steps.pair_title": "Pair",
   "cluster.v2.steps.plan_hint_pipeline": "Layers per Mac",
   "cluster.v2.steps.plan_title": "Split the model",
@@ -2448,5 +2448,6 @@
   "cluster.v2.cuda_guide.windows_docker": "WSL 2에서 동작하는 Docker Desktop과 580 이상 버전의 NVIDIA 드라이버를 설치한 뒤 Docker Desktop을 실행합니다.",
   "cluster.v2.cuda_guide.windows_firewall": "관리자 권한 PowerShell에서 이 Mac이 헬퍼에 연결할 수 있게 허용합니다.",
   "cluster.v2.cuda_guide.windows_run": "PowerShell에서 헬퍼를 시작합니다. 헬퍼가 이 Mac에 페어링을 요청하면 헬퍼 로그의 코드를 이 화면에 입력하세요. 이 Mac의 주소가 여러 개면 PC에서 닿는 주소로 바꾸세요.",
-  "cluster.v2.cuda_guide.spark_run": "DGX OS에는 Docker와 NVIDIA Container Toolkit이 들어 있습니다. 헬퍼를 시작합니다. 이 화면에 나타나면 Pair를 누르고 헬퍼 로그의 코드를 입력하세요."
+  "cluster.v2.cuda_guide.spark_run": "DGX OS에는 Docker와 NVIDIA Container Toolkit이 들어 있습니다. 헬퍼를 시작합니다. 이 화면에 나타나면 Pair를 누르고 헬퍼 로그의 코드를 입력하세요.",
+  "cluster.v2.device_card.helper_ready": "{name}에서 이 Mac 모델의 긴 프롬프트를 빠르게 처리할 수 있습니다."
 }

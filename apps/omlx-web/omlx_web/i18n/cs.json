@@ -1021,8 +1021,8 @@
   "cluster.v2.exec.throughput": "Propustnost",
   "cluster.v2.exec.throughput_detail": "Širší automatické batche při překrývání požadavků",
   "cluster.v2.exec.throughput_limits": "16 decode · 8 promptů · batch 8",
-  "cluster.v2.header.subtitle": "oMLX samo najde další Macy ve vaší síti. Spárujte je jedním kódem a modely se automaticky rozdělí do celého poolu.",
-  "cluster.v2.header.title": "Vaše Macy, jeden počítač",
+  "cluster.v2.header.subtitle": "oMLX najde vaše Macy a PC s GPU NVIDIA v síti.\nRozdělte model mezi Macy, nebo nechte Mac či PC s NVIDIA zrychlit dlouhé prompty.",
+  "cluster.v2.header.title": "Vaše zařízení, jeden počítač",
   "cluster.v2.join.cleanup_pending": "Předchozí připojení bylo na tomto Macu zrušeno. Úklid na druhém Macu se zkusí znovu, dokud bude tato karta vidět. Můžete se připojit k jinému Macu.",
   "cluster.v2.join.other_mac": "druhý Mac",
   "cluster.v2.link.ethernet": "Ethernet",
@@ -1152,7 +1152,7 @@
   "cluster.v2.steps.checks_title": "Zkontrolovat",
   "cluster.v2.steps.discover_hint": "Automaticky ve vaší síti",
   "cluster.v2.steps.discover_title": "Najít zařízení",
-  "cluster.v2.steps.pair_hint": "Jeden kód, oba Macy",
+  "cluster.v2.steps.pair_hint": "Jeden kód pro zařízení",
   "cluster.v2.steps.pair_title": "Spárovat",
   "cluster.v2.steps.plan_hint_pipeline": "Vrstvy na Mac",
   "cluster.v2.steps.plan_title": "Rozdělit model",
@@ -2448,5 +2448,6 @@
   "cluster.v2.cuda_guide.windows_docker": "Install Docker Desktop, which runs on WSL 2, and an NVIDIA driver of version 580 or later. Then start Docker Desktop.",
   "cluster.v2.cuda_guide.windows_firewall": "In PowerShell as administrator, let this Mac reach the helper.",
   "cluster.v2.cuda_guide.windows_run": "Start the helper in PowerShell. It asks this Mac to pair: type the code from its log on this page. If this Mac has more than one address, use the one the PC can reach.",
-  "cluster.v2.cuda_guide.spark_run": "DGX OS comes with Docker and the NVIDIA Container Toolkit. Start the helper. It appears on this page: press Pair on it and type the code from its log."
+  "cluster.v2.cuda_guide.spark_run": "DGX OS comes with Docker and the NVIDIA Container Toolkit. Start the helper. It appears on this page: press Pair on it and type the code from its log.",
+  "cluster.v2.device_card.helper_ready": "{name} can speed up long prompts for models on this Mac."
 }
