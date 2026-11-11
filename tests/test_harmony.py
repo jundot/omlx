@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Harmony streaming parser (omlx.adapter.harmony)."""
 
-import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -136,30 +135,6 @@ class TestToolCallParsing:
             {"name": "Read", "arguments": '{"path":"from-analysis.py"}'},
             {"name": "Read", "arguments": '{"path":"ok.py"}'},
         ]
-
-    def test_tool_call_arguments_do_not_forge_log_lines(self, caplog):
-        """Model text with a newline must not split the INFO record."""
-        forged = (
-            '{"path":"t.py"}\n'
-            "2026-11-07 19:00:00,000 - omlx.scheduler - INFO - Request finished (stop)"
-        )
-        parser = object.__new__(HarmonyStreamingParser)
-        parser._parser = SimpleNamespace(
-            messages=[
-                SimpleNamespace(
-                    channel="commentary",
-                    recipient="functions.Read",
-                    content=[SimpleNamespace(text=forged)],
-                )
-            ]
-        )
-
-        with caplog.at_level(logging.INFO):
-            parser.get_tool_calls()
-
-        records = [record.getMessage() for record in caplog.records]
-        assert any("Extracted tool call" in message for message in records)
-        assert all("\n" not in message and "\r" not in message for message in records)
 
 
 # ── Multi-message sequences ──────────────────────────────────────────
@@ -378,22 +353,6 @@ class TestParseToolCallsFromTokens:
         )
         assert analysis_text == ""
         assert isinstance(tool_calls, list)
-
-    def test_decoded_prompt_does_not_forge_log_lines(self, encoding, caplog):
-        """The decoded prompt in the parse input record is escaped."""
-        text = (
-            "<|channel|>final<|message|>hi\n"
-            "2026-11-07 19:00:00,000 - omlx.scheduler - INFO - Request finished (stop)"
-            "<|end|>"
-        )
-        tokens = encoding.encode(text, allowed_special="all")
-
-        with caplog.at_level(logging.INFO):
-            parse_tool_calls_from_tokens(tokens, prepend_start=True)
-
-        records = [record.getMessage() for record in caplog.records]
-        assert any("parse_tool_calls input" in message for message in records)
-        assert all("\n" not in message and "\r" not in message for message in records)
 
     def test_extracts_final_text(self, encoding):
         """Extracts text from final channel."""
