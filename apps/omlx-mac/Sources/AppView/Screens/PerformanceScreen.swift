@@ -137,10 +137,10 @@ private struct SchedulerSection: View {
             }
             Row(
                 label: String(localized: "performance.scheduler.prefill_priority",
-                              defaultValue: "Prefill Priority",
+                              defaultValue: "Long Prompt Handling",
                               comment: "Row label for the prefill priority segmented control"),
                 sublabel: String(localized: "performance.scheduler.prefill_priority.sub",
-                                 defaultValue: "Max Context trades prefill speed for larger prompts under memory pressure; Speed keeps full prefill speed and rejects prompts that would not fit.",
+                                 defaultValue: "Under memory pressure, Max Context accepts longer prompts at a slower prefill speed. Full Speed keeps prefill at full speed and rejects prompts that would not fit.",
                                  comment: "Sublabel for the prefill priority segmented control"),
                 isLast: true
             ) {
@@ -153,7 +153,7 @@ private struct SchedulerSection: View {
                                        comment: "Prefill priority option that favors the largest context")),
                         (value: "speed",
                          label: String(localized: "prefill_priority.option.speed",
-                                       defaultValue: "Speed",
+                                       defaultValue: "Full Speed",
                                        comment: "Prefill priority option that favors prefill speed")),
                     ],
                     icons: ["arrow.up.left.and.arrow.down.right", "speedometer"]
