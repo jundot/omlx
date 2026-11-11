@@ -33,6 +33,7 @@ from . import agent
 from . import launcher as default_launcher
 from .adapter import StageAdapter
 from .client import HelperClient
+from .launcher import UnreachableError
 from .lending import forget_host
 from .session import PrefillHelperSession
 
@@ -179,6 +180,10 @@ def _reach(
     """The helper and its ``remote_info``, if it can serve this family."""
     try:
         target = launcher.resolve_target(node_id)
+    except UnreachableError:
+        # Asleep, unplugged, or off the network: let the retry loop back off
+        # instead of giving up until the user presses Retry (issue #5166).
+        raise
     except launcher.LaunchError as error:
         raise _PermanentError(str(error)) from error
     forget_host(node_id)

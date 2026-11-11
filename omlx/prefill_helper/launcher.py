@@ -59,6 +59,12 @@ class LaunchError(RuntimeError):
     """The helper cannot start; the message is shown to the user."""
 
 
+class UnreachableError(LaunchError):
+    """The helper cannot be reached right now: asleep, unplugged, or off the
+    network. Worth retrying with backoff, unlike a version, memory, disk, or
+    pairing problem."""
+
+
 @dataclass(frozen=True)
 class HelperTarget:
     node_id: str
@@ -118,7 +124,9 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
         except (OSError, subprocess.SubprocessError):
             continue
     if target is None:
-        raise LaunchError(f"{device['friendly_name']} does not answer over SSH.")
+        raise UnreachableError(
+            f"{device['friendly_name']} does not answer over SSH."
+        )
     local, peer = probe_host_interfaces("localhost"), probe_host_interfaces(target)
     link = shared_link_addresses(local, peer)
     cable = None if link.kind in _FAST_LINKS else thunderbolt_link_local(local, peer)
@@ -132,7 +140,7 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
             bind_address=cable[1],
         )
     if not link.ok:
-        raise LaunchError(link.reason or "No network link to the helper Mac.")
+        raise UnreachableError(link.reason or "No network link to the helper Mac.")
     wifi = (
         link.source.interface in local.wifi_interfaces
         or link.peer.interface in peer.wifi_interfaces
