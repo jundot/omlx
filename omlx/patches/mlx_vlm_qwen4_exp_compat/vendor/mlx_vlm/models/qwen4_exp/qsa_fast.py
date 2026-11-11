@@ -265,7 +265,7 @@ def _decode_block_selection(
     block_topk: int,
     tokens: bool,
 ) -> mx.array | None:
-    if _DECODE_SELECT_DISABLED or _thread_limited_gpu():
+    if _DECODE_SELECT_DISABLED:
         return None
     blocks = int(head_scores.shape[-1])
     tail = key_tokens - blocks * compress_ratio
@@ -534,22 +534,9 @@ def _gpu_class() -> str:
         return ""
 
 
-@functools.lru_cache(maxsize=None)
-def _thread_limited_gpu() -> bool:
-    """g13/g14 GPUs cap threadgroups at 896 threads, below the 1024 threads
-    the decode-select and two-pass combine kernels launch."""
-    try:
-        architecture = str(mx.device_info().get("architecture", ""))
-    except Exception:
-        return False
-    return architecture.startswith(("applegpu_g13", "applegpu_g14"))
-
-
 def _two_pass_blocks(n_simds: int, keys: int) -> int | None:
     """MLX 0.32's sdpa_vector_2pass partition count; None where not transcribed."""
 
-    if _thread_limited_gpu():
-        return None
     gpu = _gpu_class()
     if gpu == "d" and n_simds >= 6:
         if keys < 16384:
