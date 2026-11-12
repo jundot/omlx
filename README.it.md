@@ -67,8 +67,9 @@ brew update && brew upgrade omlx
 # Esegui come servizio in background (si riavvia automaticamente in caso di crash)
 omlx start
 
-# Facoltativo: supporto MCP (Model Context Protocol)
+# Facoltativo: supporto MCP (Model Context Protocol), poi riavvia per caricarlo
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
+omlx restart
 ```
 
 ### Dai sorgenti
@@ -78,7 +79,7 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 make install                # Installazione in modalità editable con l'interfaccia web e i kernel personalizzati nativi
 # Senza Xcode completo? make install-no-kernels installa senza i kernel
-make mcp                    # Facoltativo: supporto MCP (Model Context Protocol)
+make mcp                    # Facoltativo: supporto MCP, riavvia `omlx serve` per caricarlo
 ```
 
 Richiede macOS 15.0+ (Sequoia), Python 3.11–3.13 e Apple Silicon (M1/M2/M3/M4/M5).
@@ -174,6 +175,13 @@ token, disponibile solo dove supportato. Vedi
 i confini di sicurezza, le limitazioni attuali e la checklist di validazione su hardware
 fisico.
 
+Un Mac abbinato può anche accelerare il prefill senza suddividere il modello: il
+[Prefill Accelerator](docs/experimental/prefill-accelerator.md) esegue i primi
+livelli dei prompt lunghi sull'altro Mac, mentre il modello, la sua cache e la
+decodifica restano su questo (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next,
+Qwen3.8 27B e MiniMax M3). L'helper può essere anche una macchina Linux con
+GPU NVIDIA che esegue [omlx-cuda-helper](apps/omlx-cuda-helper/README.md).
+
 ### Modelli visione-linguaggio
 
 Esegui i VLM con lo stesso stack di batching continuo e cache KV a livelli degli LLM testuali. Supporta chat con più immagini, immagini in ingresso come base64, URL o file, e tool calling con contesto visivo. I checkpoint MiMo V2.6 con sidecar inclusi accettano anche video a fotogrammi campionati e audio a 24 kHz. I checkpoint Qwen3.5, Qwen3.6 e Qwen3.8 (densi e MoE) accettano video in ingresso nativo come data URI base64 `video_url` / `input_video`; per il video serve OpenCV (`opencv-python-headless`). La conversione oQ dei checkpoint MiMo V2.6 ufficiali conserva il supporto per immagini e audio. I modelli OCR (DeepSeek-OCR, DOTS-OCR, GLM-OCR) vengono rilevati automaticamente e usati con prompt ottimizzati.
@@ -184,6 +192,8 @@ Gestione della cache KV a blocchi ispirata a vLLM, con condivisione dei prefissi
 
 - **Livello hot (RAM)**: i blocchi usati di frequente restano in memoria per un accesso rapido.
 - **Livello cold (SSD)**: quando la cache hot si riempie, i blocchi vengono trasferiti su SSD in formato safetensors. Alla richiesta successiva con un prefisso corrispondente vengono ripristinati dal disco invece di essere ricalcolati da zero, anche dopo un riavvio del server.
+
+La compressione KV facoltativa [Affine4](docs/affine4.md) e [Affine8](docs/affine8.md) aggiunge formati di cache con segno a 4 e 8 bit, con attention di decodifica Metal TensorOps e un fallback portabile. Selezionali in **Impostazioni modello → Risparmio di memoria → Compressione della cache KV**.
 
 <p align="center">
   <img src="docs/images/omlx_hot_cold_cache.png" alt="Cache hot e cold di oMLX" width="720">
@@ -213,7 +223,7 @@ Configura parametri di campionamento, kwargs del chat template, TTL, alias del m
 
 - **Alias del modello**: imposta un nome personalizzato visibile tramite l'API. `/v1/models` restituisce l'alias e le richieste accettano sia l'alias sia il nome della directory.
 - **Forzatura del tipo di modello**: imposta manualmente un modello come LLM o VLM, indipendentemente dal rilevamento automatico.
-- **Motore esterno**: servi i checkpoint MLX di Qwen3.8-27B e Qwen3.6-35B-A3B presenti nelle tue directory dei modelli con il motore Metal di [Splash](https://github.com/incoai/splash), in un processo separato (build ufficiale su M3 o successivi, Splash M1 su M1/M2). Vedi [docs/Splash.md](docs/Splash.md).
+- **Motore esterno**: servi i modelli supportati da [Splash](https://github.com/incoai/splash), compresi i file GGUF, dalle tue directory dei modelli sul motore Metal di Splash, in un processo separato. Vedi [docs/Splash.md](docs/Splash.md) per i modelli e le versioni di Splash supportati.
 - **Profili**: salva con un nome gruppi di impostazioni per modello e passa dall'uno all'altro dal pannello di amministrazione. Un profilo può anche essere esposto come modello a sé: in tal caso `/v1/models` elenca anche `<model>:<profile>` (es. `qwen3-8b:thinking`), servito dallo stesso motore del modello base con le impostazioni del profilo applicate a ogni richiesta — senza memoria aggiuntiva e senza ricaricare il modello. Se il modello base ha un alias, l'ID esposto viene pubblicato come `<alias>:<profile>`; la forma con il nome della directory continua a funzionare, proprio come per il modello base.
 
 <p align="center">
@@ -224,6 +234,8 @@ Configura parametri di campionamento, kwargs del chat template, TTL, alias del m
 
 Chatta con qualsiasi modello caricato direttamente dal pannello di amministrazione. Supporta cronologia delle conversazioni, cambio di modello, tema scuro, output dei modelli con ragionamento e caricamento di immagini per i modelli VLM/OCR.
 
+Gli allegati supportano documenti PDF, DOCX, PPTX, TXT e MD. Gli allegati vengono accettati in base all'estensione del file. Se il client indica un tipo MIME che oMLX non riconosce, come `application/octet-stream`, il tipo MIME per il convertitore viene dedotto dall'estensione.
+
 <p align="center">
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="Chat di oMLX" width="720">
 </p>
@@ -231,7 +243,7 @@ Chatta con qualsiasi modello caricato direttamente dal pannello di amministrazio
 
 ### Download dei modelli
 
-Cerca e scarica modelli MLX da HuggingFace direttamente dalla dashboard di amministrazione. Sfoglia le schede dei modelli, controlla le dimensioni dei file e scarica con un clic.
+Cerca e scarica modelli da HuggingFace direttamente dalla dashboard di amministrazione, in formato MLX, GGUF o in tutti i formati. Sfoglia le schede dei modelli, poi scegli i file da scaricare: un checkpoint MLX mantiene i file che gli servono e un GGUF porta con sé il suo proiettore visivo.
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="Download dei modelli in oMLX" width="720">
@@ -244,6 +256,10 @@ Configura OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, Mistral Vibe e D
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="Integrazioni di oMLX" width="720">
 </p>
+
+`omlx launch codex` e `omlx launch codex_app` forniscono a Codex un catalogo di tutti i modelli di chat del server, così puoi cambiare modello con `/model` o con il selettore dei modelli dell'app. Il modello iniziale è scelto da `--model`, dal modello Codex salvato o dal modello predefinito del server. Serve Codex 0.148 o successivo; riavvialo dopo aver aggiunto o rimosso modelli.
+
+`omlx launch copilot` fornisce a Copilot CLI un catalogo di tutti i modelli di chat del server, così puoi cambiare modello con `/model`. Il modello iniziale è scelto da `--model`, dal modello Copilot salvato o dal modello predefinito del server. Il catalogo viene scritto nel file `providers.json` di Copilot accanto agli altri provider, e il file resta con permessi `0600` perché contiene la chiave API del server. Serve Copilot CLI 1.0.83 o successivo; riavvialo dopo aver aggiunto o rimosso modelli.
 
 Installa [Mistral Vibe](https://github.com/mistralai/mistral-vibe) 2.26.0 o successivo con `uv tool install mistral-vibe`, poi esegui `omlx launch vibe` per scegliere un modello locale, oppure `omlx launch vibe --model <model-id>`. Provider, modello, riferimento alla chiave API e finestra di contesto di Vibe vengono configurati per quel processo tramite le variabili d'ambiente `VIBE_*`, che ne sovrascrivono la configurazione. Il file `config.toml` esistente, `VIBE_HOME`, i permessi dei tool e la configurazione cloud restano invariati. Gli argomenti per Vibe vanno passati dopo `--`, ad esempio `omlx launch vibe --model <model-id> -- --resume`.
 
@@ -274,7 +290,7 @@ Sostituisce le API di OpenAI e Anthropic senza modifiche lato client. Supporta l
 | `POST /v1/messages` | API Messages di Anthropic |
 | `POST /v1/embeddings` | Embedding di testo |
 | `POST /v1/rerank` | Reranking di documenti |
-| `POST /v1/systemone` | Decisioni tipizzate con modelli decisionali (TypeSafe System One) |
+| `POST /v1/systemone` | Decisioni tipizzate con modelli decisionali o modelli di chat (TypeSafe System One) |
 | `GET /v1/models` | Elenco dei modelli disponibili |
 | `POST /tokenize`, `POST /detokenize` | API del tokenizer compatibile con vLLM (anche sotto `/v1`) |
 
@@ -287,7 +303,7 @@ Supporta tutti i formati di function calling disponibili in mlx-lm, la validazio
 | Famiglia di modelli | Formato |
 |---|---|
 | Llama, Qwen, DeepSeek ecc. | JSON `<tool_call>` |
-| Serie Qwen3.5 | XML `<function=...>` |
+| Serie Qwen3.5, Raon-1 mini | XML `<function=...>` |
 | Gemma | `<start_function_call>` |
 | GLM (4.7, 5) | XML `<arg_key>/<arg_value>` |
 | MiniMax | `<minimax:tool_call>` con namespace |
@@ -302,7 +318,7 @@ Una grammatica JSON, EBNF o regex usata da sola vincola la risposta fin dal prim
 
 ## Modelli
 
-Fai puntare `--model-dir` a una directory che contiene sottodirectory di modelli in formato MLX. Sono supportate anche le cartelle organizzate su due livelli (es. `mlx-community/model-name/`).
+Fai puntare `--model-dir` a una directory che contiene sottodirectory di modelli in formato MLX. Sono supportate anche le cartelle organizzate su due livelli (es. `mlx-community/model-name/`). I file GGUF in queste cartelle vengono elencati come un modello per file ed eseguiti su un [motore esterno](docs/Splash.md#gguf-models).
 
 ```
 ~/models/
@@ -318,7 +334,7 @@ Il tipo di ogni modello viene rilevato automaticamente. Puoi anche scaricare i m
 | Tipo | Modelli |
 |------|--------|
 | LLM | Qualsiasi modello supportato da [mlx-lm](https://github.com/ml-explore/mlx-lm) |
-| VLM | Serie Qwen3.5, GLM-4V, Pixtral e altri modelli [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) |
+| VLM | Serie Qwen3.5, GLM-4V, Pixtral e altri modelli [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
@@ -371,9 +387,9 @@ Il limite predefinito della cache SSD, `auto`, usa il 50% della somma tra lo spa
 
 
 La maggior parte delle impostazioni si può configurare anche dal pannello di amministrazione web all'indirizzo `/admin`. Le impostazioni vengono salvate in `~/.omlx/settings.json` e i flag della CLI hanno la precedenza.
-Imposta la chiave API principale prima di cambiare l'host del server in un indirizzo LAN o in `0.0.0.0`, oppure salva le due impostazioni insieme. Senza una chiave API principale, oMLX si rifiuta di avviarsi su qualsiasi indirizzo che non sia di loopback. L'opzione esistente `skip_api_key_verification` resta limitata ai bind sul solo loopback.
+Imposta la chiave API principale prima di cambiare l'host del server in un indirizzo LAN o in `0.0.0.0`, oppure salva le due impostazioni insieme. Senza una chiave API principale, oMLX si rifiuta di avviarsi su qualsiasi indirizzo che non sia di loopback. "Disattiva tutta l'autenticazione" (`skip_api_key_verification`) disattiva sia l'autenticazione dell'inferenza sia quella di amministrazione, quindi resta limitata ai bind sul solo loopback.
 
-Per l'inferenza senza chiave, arresta oMLX, imposta manualmente `auth.allow_unauthenticated_inference` su `true` in `settings.json` e riavvia. Il valore predefinito è `false` e non esiste un'opzione corrispondente nell'interfaccia. In questo modo chiunque riesca a raggiungere il server può usare l'inferenza (comprese le Responses memorizzate e l'audio), i tool MCP e la ricerca web. Sui bind di rete, mantieni configurata una chiave API principale e lascia `skip_api_key_verification` su `false`; gli endpoint di gestione continuano a richiedere l'autenticazione.
+Per l'inferenza senza chiave su un bind di rete, attiva "Consenti l'inferenza senza chiave API" nelle impostazioni dell'interfaccia web di amministrazione o nella schermata Sicurezza dell'app macOS. L'opzione imposta `auth.allow_unauthenticated_inference`, è `false` per impostazione predefinita e si applica senza riavvio. In questo modo chiunque riesca a raggiungere il server può usare l'inferenza (comprese le Responses memorizzate e l'audio), i tool MCP e la ricerca web. Gli endpoint di gestione continuano a richiedere la chiave API principale o un accesso da amministratore.
 
 <details>
 <summary>Architettura</summary>
@@ -462,12 +478,15 @@ I contributi sono benvenuti! Per i dettagli, vedi la [guida per i contributori](
 ## Ringraziamenti
 
 - [MLX](https://github.com/ml-explore/mlx) e [mlx-lm](https://github.com/ml-explore/mlx-lm) di Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Inferenza di modelli visione-linguaggio su Apple Silicon
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) - Inferenza di modelli visione-linguaggio su Apple Silicon
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX è nato da vllm-mlx v0.1.0 e si è evoluto in modo significativo con il servizio multi-modello, la cache KV a livelli, i VLM con supporto completo della cache paginata, un pannello di amministrazione e un'app per la barra dei menu di macOS
 - [venvstacks](https://venvstacks.lmstudio.ai) - Ambienti Python portabili a layer per il bundle dell'app macOS
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Supporto dei modelli di embedding su Apple Silicon
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Decodifica speculativa a diffusione a blocchi su Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - I kernel Metal verify-shape di Lightning MTP si basano su MTPLX di Youssof Altoukhi, che ha ispirato anche la pipeline depth-k
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - Il kernel fuso di prework per la verifica GDN è adattato dal port, realizzato in mlx-serve, del kernel qwen35_packed_gdn_prework di mlxfast-challenge, e i kernel GDN fusi di decodifica e prefill di Qwen4 sono adattati da `transformer.zig` di mlx-serve, distribuito con licenza MIT; lo staging K/V a 128 bit di Qwen4 QSA è adattato dal kernel `msv_attn_p256` di mlx-serve, anch'esso con licenza MIT
-- [Splash](https://github.com/incoai/splash) - I kernel lineari verify-shape usano l'operando dei pesi bf16 `0x4300 | q` di Splash con somme degli input per gruppo (dal suo `linear_q4_sgmatrix.metal`, con licenza Apache-2.0), e l'attention di verifica basata su operazioni tensoriali adatta il design a tile di `paged_attention_tile.h` di Splash; Splash stesso può inoltre servire i modelli supportati come motore esterno
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - I kernel GDN e QSA di Qwen (uno tramite il suo port di mlxfast-challenge), i kernel degli expert dell'helper Linux e le patch CUDA di MLX sono adattati dal suo codice con licenza MIT
+- [TensorFold](https://github.com/ashhart/TensorFold) - I kernel CUDA di sparse attention e Gated DeltaNet dell'helper Linux per MiniMax M3, GLM-5.3 e Qwen3.8 Flash-Next sono adattati dai suoi kernel con licenza Apache-2.0
+- [Splash](https://github.com/incoai/splash) - I kernel lineari e di attention verify-shape e il caricamento del tokenizer GGUF sono adattati dal suo codice con licenza Apache-2.0, e Splash può servire i modelli come motore esterno
 - [SiliconScope](https://github.com/kennss/SiliconScope) - Le statistiche nella barra dei menu riprendono il design e l'approccio al rendering di SiliconScope di Kennt Kim, che ha ispirato anche il meccanismo che limita i re-render per ridurre il consumo energetico
+- [m5gpu](https://github.com/beamivalice/m5gpu) - Il limite di potenza della GPU scrive il target di potenza della GPU AGX documentato da m5gpu di beamivalice (`SetMaxGPUAbsolutePower` con `AbsoluteTarget`, e `-1000` per rimuoverlo)
+- [ming-tts-serve](https://github.com/sbusso/ming-tts-serve) - Il ciclo di decodifica in pipeline di Ming-3.0-tts segue ming-tts-serve di Stéphane Busso, e i suoi kernel DiT fusi sono adattati da `ming_fused.zig` di ming-tts-serve, con licenza MIT
