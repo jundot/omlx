@@ -484,7 +484,8 @@ def launch(
         lines.put(None)
 
     threading.Thread(target=read_stdout, daemon=True).start()
-    threading.Thread(target=lambda: errors.extend(process.stderr), daemon=True).start()
+    stderr = threading.Thread(target=lambda: errors.extend(process.stderr), daemon=True)
+    stderr.start()
     deadline = time.monotonic() + _READY_TIMEOUT_S
     while True:
         try:
@@ -497,6 +498,8 @@ def launch(
             hello = json.loads(line[len(READY_PREFIX) :])
             return HelperProcess(process, int(hello["port"]), hello, token)
     process.terminate()
+    # Its last lines can still be in flight when stdout closes.
+    stderr.join(timeout=5)
     detail = "".join(errors[-5:]).strip()
     raise LaunchError(
         f"The helper on {target.name} did not start"

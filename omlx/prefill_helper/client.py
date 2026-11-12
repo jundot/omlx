@@ -155,6 +155,8 @@ class HelperClient:
         self.alive = True
         self.stopped_by_helper = False
         self.replaced_on_helper = False
+        # A job ran out of the helper's GPU memory and its prompt ran here.
+        self.out_of_memory = False
         # Measured on received chunks: the link's bytes per second, and the
         # bytes per prompt token of the boundary (key -1) and each layer's
         # state. The split treats the link as one more stage.
@@ -229,6 +231,8 @@ class HelperClient:
                     self.replaced_on_helper = bool(meta.get("replaced"))
                     self._fail("stopped on the helper Mac")
                     return
+                if meta.get("op") == "error" and meta.get("out_of_memory"):
+                    self.out_of_memory = True
                 with self._lock:
                     job = self._jobs.get(meta.get("job_id", ""))
                 if job is not None:

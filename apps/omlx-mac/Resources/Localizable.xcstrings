@@ -28342,6 +28342,18 @@
         }
       }
     },
+    "settings.acceleration.prefill_helper.state.out_of_memory" : {
+      "comment" : "Prefill Accelerator status suffix after a prompt went past the helper's GPU memory and ran on this Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ran out of GPU memory for a prompt"
+          }
+        }
+      }
+    },
     "settings.acceleration.prefill_helper.state.ready" : {
       "comment" : "Prefill Accelerator status when the helper is ready",
       "extractionState" : "manual",

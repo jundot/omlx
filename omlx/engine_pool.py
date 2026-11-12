@@ -65,6 +65,7 @@ from .exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
     describe_ceiling_binding,
+    is_metal_out_of_memory,
 )
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
@@ -307,22 +308,6 @@ def _settled_phys_footprint() -> int:
     """phys_footprint minus freed Metal buffers the kernel still charges."""
     mlx_bytes = int(mx.get_active_memory()) + int(mx.get_cache_memory())
     return max(0, get_phys_footprint() - unreleased_graphics_bytes(mlx_bytes))
-
-
-def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
-    # Track visited exceptions: a cause chain can loop (an exception raised
-    # ``from`` itself), and this runs on the event loop during a failed load.
-    seen: set[int] = set()
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        text = str(exc)
-        if (
-            "kIOGPUCommandBufferCallbackErrorOutOfMemory" in text
-            or "Insufficient Memory" in text
-        ):
-            return True
-        exc = exc.__cause__
-    return False
 
 
 def _set_concurrency_limits(config: object, value: int) -> None:
@@ -4664,7 +4649,7 @@ class EnginePool:
             if (
                 not entry.abort_loading
                 and not entry_detached
-                and _is_metal_out_of_memory(exc)
+                and is_metal_out_of_memory(exc)
             ):
                 # Depends on what else is resident, so do not cache it: a retry
                 # after memory is freed can succeed with the same files.

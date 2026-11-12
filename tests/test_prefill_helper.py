@@ -202,12 +202,17 @@ def _dsv41_contract():
 TOKEN = b"session-token"
 
 
-def _serve(lm, k, *, once=True, adapter=DSV41):
+def _serve(lm, k, *, once=True, adapter=DSV41, memory_limit=0):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
     server = HelperServer(
-        lm, adapter, k, TOKEN, {"protocol": wire.PROTOCOL, "layers": k}
+        lm,
+        adapter,
+        k,
+        TOKEN,
+        {"protocol": wire.PROTOCOL, "layers": k},
+        memory_limit=memory_limit,
     )
     thread = threading.Thread(
         target=server.serve, args=(listener,), kwargs={"once": once}, daemon=True
@@ -257,6 +262,23 @@ def test_helper_over_a_socket_matches_whole_model():
     thread.join(10)
     listener.close()
     _assert_same_cache(reference, cache)
+
+
+def test_a_prompt_past_the_helpers_memory_is_handed_back_as_out_of_memory():
+    config, k, sizes = tiny(**_ENGRAM), 2, [6, 5]
+    host = _model(config)
+    listener, thread = _serve(_helper_model(config, k), k, memory_limit=1)
+    client = HelperClient("127.0.0.1", listener.getsockname()[1], TOKEN)
+    tokens = np.arange(3, 3 + sum(sizes))
+    job = client.submit(
+        tokens, sizes, feed=DSV41.job_feed(host, None, tokens, sizes, k)
+    )
+    with pytest.raises(HelperError, match="no GPU memory left"):
+        job.take(timeout=60)
+    assert client.out_of_memory
+    client.close()
+    thread.join(10)
+    listener.close()
 
 
 def test_client_notices_a_helper_that_stops_sending():
@@ -760,8 +782,9 @@ class _FakeLauncher:
         free=1 << 40,
         copies=(),
         hold=None,
+        fits=None,
     ):
-        self.lm, self.k = lm, k
+        self.lm, self.k, self.fits, self.launched = lm, k, fits, []
         self.version = version or launcher_version()
         self.budget, self.missing = budget, list(missing)
         self.free, self.copies, self.hold = free, list(copies), hold
@@ -818,6 +841,13 @@ class _FakeLauncher:
         warm_tokens,
         a8_min_tokens=None,
     ):
+        self.launched.append(layers)
+        if self.fits is not None and layers > self.fits:
+            raise launcher.LaunchError(
+                "The helper on M5max did not start: RuntimeError: [METAL] Command "
+                "buffer execution failed: Insufficient Memory "
+                "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+            )
         listener, thread = _serve(_helper_model(tiny(), layers), layers)
         server = SimpleNamespace(
             listener=listener, thread=thread, layers=layers, a8=a8_min_tokens
@@ -1113,6 +1143,29 @@ def test_manager_retries_a_lost_helper_but_not_a_stopped_one(tmp_path, monkeypat
     attached[-1].client.close()
     status = _wait_state(manager, "stopped", reason="now helping another model")
     assert status["reason"] == "M5max is now helping another model"
+    manager.close()
+
+
+def test_auto_starts_with_a_layer_fewer_after_running_out_of_memory(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (0.05,))
+    attached = []
+    fake = _FakeLauncher(None, fits=1)
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
+    manager.configure("node-1", None)
+    assert _wait_state(manager, "ready")["held"] == 1 and fake.launched == [2, 1]
+    # A prompt went past the helper's memory and ran here: the status says so.
+    attached[-1].client.out_of_memory = True
+    assert manager.status()["out_of_memory"]
+    # A fixed count is not changed.
+    manager.configure("node-1", 2)
+    _wait_state(manager, "offline", reason="Insufficient Memory")
+    assert set(fake.launched[2:]) == {2}
+    # Not even one layer: waits for the user instead of retrying.
+    fake.fits = 0
+    manager.configure("node-1", None)
+    _wait_state(manager, "error", reason="Not even one layer")
     manager.close()
 
 
@@ -1674,6 +1727,14 @@ def test_glm_split_matches_whole_model(k, prefix):
 # ---------------------------------------------------------------------------
 # Qwen3.8 Flash-Next: GDN, PLE and QSA layers on either side of the cut.
 # ---------------------------------------------------------------------------
+
+
+def test_glm_helper_drops_the_mtp_head():
+    lm = _glm()
+    # What an MTP checkpoint attaches, also when the helper lacks its files.
+    lm.mtp = [lm.model.layers[-1]]
+    GLM.keep_first(lm, 1)
+    assert "mtp" not in lm
 
 
 def _qwen4(layers=2):

@@ -10,6 +10,7 @@ user agrees. While this Mac loads the model, the helper is copied to and
 started on the other Mac, and the loaded model takes it over; nothing is
 copied or started twice. The measured speeds of each model and helper Mac are kept on disk, so
 a restarted helper splits its first prompt by them instead of guessing.
+On Auto, a helper that runs out of GPU memory at start tries one layer fewer.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from typing import Any
 from ..cluster.identity import get_node_identity
 from ..cluster.pairing import get_pairing_manager
 from ..cluster.registry import default_devices_path
+from ..exceptions import is_metal_out_of_memory
 from . import agent
 from . import launcher as default_launcher
 from .adapter import StageAdapter
@@ -165,6 +167,46 @@ def held_layers(
     if held < 1:
         raise _PermanentError(f"Not even one layer fits in {name}'s GPU memory.")
     return held
+
+
+def _launch_fitting(
+    launcher: Any,
+    target: Any,
+    model_dir: str,
+    model_type: str,
+    held: int,
+    *,
+    auto: bool,
+    report: Callable[..., None],
+    cancelled: Callable[[], bool],
+    **launch: Any,
+) -> tuple:
+    """The started helper and the layers it holds.
+
+    The file sizes leave out what loaded layers allocate besides weights.
+    On Auto, a helper out of GPU memory at start tries one layer fewer.
+    """
+    while True:
+        report("starting", layers=held)
+        try:
+            return launcher.launch(target, model_dir, model_type, held, **launch), held
+        except launcher.LaunchError as error:
+            # The error ends with the helper's last lines of stderr.
+            if not auto or not is_metal_out_of_memory(error):
+                raise
+            if held == 1:
+                raise _PermanentError(
+                    f"Not even one layer fits in {target.name}'s GPU memory."
+                ) from error
+        logger.warning(
+            "Prefill helper on %s ran out of GPU memory with %d layers; trying %d",
+            target.name,
+            held,
+            held - 1,
+        )
+        if cancelled():
+            raise _CancelledError("cancelled while starting the helper")
+        held -= 1
 
 
 def this_host() -> dict | None:
@@ -384,12 +426,15 @@ class FilePrep:
             if launch is None:
                 self._set("files_ready", held=held)
                 return
-            self._set("starting", layers=held)
-            process = self.launcher.launch(
+            process, held = _launch_fitting(
+                self.launcher,
                 target,
                 model_dir,
                 launch["model_type"],
                 held,
+                auto=self.layers is None,
+                report=self._set,
+                cancelled=self._cancel.is_set,
                 host_name=computer_name(),
                 warm_tokens=launch["warm_tokens"],
                 a8_min_tokens=launch["a8_min_tokens"],
@@ -548,6 +593,8 @@ class PrefillHelperManager:
         if session is not None and status.get("state") == "ready":
             status["layers"] = session.pick_layers()
             status["last_prompt"] = session.last_prompt
+            # A prompt went past the helper's memory and ran on this Mac.
+            status["out_of_memory"] = session.client.out_of_memory
             if session.client.job_count():
                 status["state"] = "working"
         return status
@@ -675,12 +722,15 @@ class PrefillHelperManager:
                 self._report,
                 self._ask,
             )
-            self._set("starting", node_id=self.node_id, layers=held)
-            process = launcher.launch(
+            process, held = _launch_fitting(
+                launcher,
                 target,
                 model_dir,
                 self.model_type,
                 held,
+                auto=self.fixed_layers is None,
+                report=self._report,
+                cancelled=lambda: not self._commands.empty(),
                 host_name=computer_name(),
                 warm_tokens=self.chunk_tokens,
                 a8_min_tokens=self.a8_min_tokens,

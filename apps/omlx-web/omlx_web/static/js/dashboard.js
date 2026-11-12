@@ -3339,6 +3339,7 @@
                                 .replace('{tokens}', Number(s.last_prompt.tokens).toLocaleString())
                                 .replace('{seconds}', Number(s.last_prompt.seconds).toFixed(1));
                         }
+                        if (s.out_of_memory) text += ' · ' + t('out_of_memory');
                         return text;
                     }
                     case 'offline':

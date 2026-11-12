@@ -1678,6 +1678,11 @@ private struct PrefillAcceleratorGroup: View {
                                        defaultValue: "last prompt \(last.tokens) tokens in \(seconds)s",
                                        comment: "Prefill Accelerator status suffix with the last prompt timing")
             }
+            if status.outOfMemory == true {
+                text += " · " + String(localized: "settings.acceleration.prefill_helper.state.out_of_memory",
+                                       defaultValue: "ran out of GPU memory for a prompt",
+                                       comment: "Prefill Accelerator status suffix after a prompt went past the helper's GPU memory and ran on this Mac")
+            }
             return text
         case "offline":
             let reason = status.reason ?? ""

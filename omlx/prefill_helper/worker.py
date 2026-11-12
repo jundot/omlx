@@ -29,6 +29,7 @@ import mlx.core as mx
 import numpy as np
 
 from .. import __version__
+from ..exceptions import is_metal_out_of_memory
 from . import wire
 from .adapter import Capture
 from .adapters import adapter_for
@@ -37,6 +38,10 @@ from .lending import active_lending, active_marker_path
 WINDOW = wire.WINDOW
 _KEEP_WARM_SECONDS = 0.5
 READY_PREFIX = "OMLX_PREFILL_HELPER_READY "
+
+
+class _OutOfMemoryError(RuntimeError):
+    """A job's caches outgrew the helper's share of GPU memory."""
 
 
 @dataclass
@@ -210,9 +215,10 @@ class HelperServer:
                 cache = self.lm.make_cache()
                 self._run_chunks(session, job, cache)
         except Exception as error:  # reported to the host, which prefills locally
-            session.outbox.put(
-                ({"op": "error", "job_id": job.job_id, "error": repr(error)}, None)
-            )
+            meta = {"op": "error", "job_id": job.job_id, "error": repr(error)}
+            if isinstance(error, _OutOfMemoryError) or is_metal_out_of_memory(error):
+                meta["out_of_memory"] = True
+            session.outbox.put((meta, None))
         finally:
             session.by_id.pop(job.job_id, None)
             del cache
@@ -248,7 +254,7 @@ class HelperServer:
                 boundary.update({f"cap.{i}": v for i, v in capture.out.items()})
             elapsed = time.perf_counter() - began
             if self.memory_limit and mx.get_active_memory() > self.memory_limit:
-                raise RuntimeError(
+                raise _OutOfMemoryError(
                     "the helper Mac has no GPU memory left for this prompt"
                 )
             arrays = {f"b:{n}": wire.to_host(v) for n, v in boundary.items()}

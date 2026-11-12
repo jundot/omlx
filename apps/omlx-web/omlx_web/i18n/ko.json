@@ -1360,6 +1360,7 @@
   "modal.model_settings.prefill_helper_state_working": "Working on {name} with {n} layers",
   "modal.model_settings.prefill_helper_state_slow_link": "{name}까지의 링크가 느려서 프롬프트 처리가 빨라지지 않습니다. 프롬프트는 이 Mac에서 처리됩니다.",
   "modal.model_settings.prefill_helper_state_last_prompt": "last prompt {tokens} tokens in {seconds}s",
+  "modal.model_settings.prefill_helper_state_out_of_memory": "ran out of GPU memory for a prompt",
   "modal.model_settings.prefill_helper_state_offline": "{name} is unreachable ({reason}). Retrying.",
   "modal.model_settings.prefill_helper_state_stopped": "Stopped.",
   "modal.model_settings.prefill_helper_state_error": "The helper could not start.",
