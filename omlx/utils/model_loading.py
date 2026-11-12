@@ -1383,10 +1383,17 @@ def bundled_dflash_draft(model_path: str | Path | None) -> str | None:
 def dflash_draft_for(
     model_settings: Any | None, model_path: str | Path | None
 ) -> str | None:
-    """The configured DFlash draft, else one bundled with the target."""
+    """The configured DFlash draft, else one bundled with the target.
+
+    A configured ``~/...`` path is expanded: the loader only checks the
+    filesystem for an existing path and otherwise takes the string as a Hub
+    repo id, which a ``~`` path never is.
+    """
     if model_settings is None or not getattr(model_settings, "dflash_enabled", False):
         return None
     configured = getattr(model_settings, "dflash_draft_model", None)
+    if configured and configured.startswith("~"):
+        configured = str(Path(configured).expanduser())
     return configured or bundled_dflash_draft(model_path)
 
 
