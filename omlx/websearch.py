@@ -8,10 +8,12 @@ tools are never merged into /v1/chat/completions requests, so external
 API clients are unaffected.
 
 Providers:
-- duckduckgo (default): ddgs library, no credentials required. Note that
-  ddgs performs HTTP through primp, which may not honor the proxy
-  environment variables applied from NetworkSettings; the brave and
-  searxng paths use httpx and inherit them.
+- duckduckgo (default): ddgs library, no credentials required. ddgs
+  performs HTTP through primp, which honors the HTTP(S)_PROXY variables
+  applied from NetworkSettings (checked with ddgs 9.16.1 and primp 2.0.1).
+  Every search opens a new client, so applied values take effect on the
+  next search; the brave and searxng paths use httpx and inherit them the
+  same way.
 - brave: Brave Search API with a user-supplied subscription token.
 - searxng: an external SearXNG instance reachable via a base URL. The
   instance must have the JSON output format enabled.
