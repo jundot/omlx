@@ -219,8 +219,8 @@ def _quantize(x: mx.array, bits: int = 8) -> mx.array:
 
 
 def _pack(x: mx.array) -> mx.array:
-    """quant.pack(x) of FP8 rows, on the CUDA kernel when it reproduces it."""
-    if kernels.use_fp8_pack(x.dtype):
+    """FP8 rows as quant.pack(x) packs them, on the CUDA kernel when it does so."""
+    if x.size and kernels.use_fp8_pack(x.dtype):
         return kernels.pack_fp8(x)
     return quant.pack(x)
 
@@ -560,6 +560,8 @@ class Block:
         flat = mx.random.normal((96, c.dim), key=keys[0]).astype(self.attn_norm.dtype)
         shape = (96, c.n_activated_experts)
         chosen = mx.random.randint(0, c.n_routed_experts, shape, key=keys[1])
+        # Every row also routes to expert 0, so one expert fills two 64-route tiles.
+        chosen = mx.concatenate([mx.zeros_like(chosen[:, :1]), chosen[:, 1:]], 1)
         weights = mx.random.uniform(0.1, 1.0, shape, key=keys[2])
         xq = _quantize(flat)
         want = self._routed(flat, xq, chosen, weights, False)[0]

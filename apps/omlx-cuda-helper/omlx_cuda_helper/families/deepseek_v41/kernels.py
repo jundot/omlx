@@ -41,9 +41,10 @@ inline void v41_quantize(float* v) {
   const unsigned pb = __float_as_uint(__fmul_rn(amax, __uint_as_float(INV_LIMIT)));
   const int e = int((pb >> 23) & 0xFFu) - 127 + int((pb & 0x7FFFFFu) != 0u);
   const float scale = __uint_as_float(unsigned(e + 127) << 23);
-  // Scales and steps are normal powers of two, so their reciprocals are exact
-  // and a product rounds as the quotient does.
-  const float inv_scale = __uint_as_float(unsigned(127 - e) << 23);
+  // Finite scales and the steps are normal powers of two, so their reciprocals
+  // are exact and a product rounds as the quotient does. An inf scale (an inf
+  // value) takes 0, which gives the quotients' zeros and NaNs.
+  const float inv_scale = e < 127 ? __uint_as_float(unsigned(127 - e) << 23) : 0.0f;
   const float levels[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
   for (int i = 0; i < 32; ++i) {
     const float scaled = fminf(fmaxf(__fmul_rn(v[i], inv_scale), -limit), limit);
@@ -72,7 +73,7 @@ inline unsigned v41_quantize_codes(const float* v, unsigned char* codes) {
   const unsigned pb = __float_as_uint(__fmul_rn(amax, __uint_as_float(INV_LIMIT)));
   const int e = int((pb >> 23) & 0xFFu) - 127 + int((pb & 0x7FFFFFu) != 0u);
   const float scale = __uint_as_float(unsigned(e + 127) << 23);
-  const float inv_scale = __uint_as_float(unsigned(127 - e) << 23);
+  const float inv_scale = e < 127 ? __uint_as_float(unsigned(127 - e) << 23) : 0.0f;
   unsigned word[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
   for (int i = 0; i < 32; ++i) {
     const float scaled = fminf(fmaxf(__fmul_rn(v[i], inv_scale), -448.0f), 448.0f);
@@ -942,9 +943,11 @@ def _tile_layout(bank) -> list[tuple[str, int | bool]]:
     return [("BITS", bank.bits), ("MX", mxfp4), ("GROUP", 32 if mxfp4 else 64)]
 
 
-def _tile_grid(tiles: int, experts: int, routes: int) -> tuple[int, int, int]:
-    # Each launch covers every 64-row tile of an expert in `splits` blocks.
-    splits = min(max(_TILE_BUDGET // (tiles * experts), 1), 8, -(-routes // 64))
+def _tile_grid(
+    tiles: int, experts: int, routes: int, rows: int = 64
+) -> tuple[int, int, int]:
+    # Each launch covers every pass of `rows` routes of an expert in `splits` blocks.
+    splits = min(max(_TILE_BUDGET // (tiles * experts), 1), 8, -(-routes // rows))
     return (_TILE_THREADS * tiles, experts, splits)
 
 
@@ -1051,7 +1054,7 @@ def fp8_codes(x: mx.array) -> tuple[mx.array, mx.array]:
 
 
 def pack_fp8(x: mx.array) -> mx.array:
-    """quant.pack(x) of rows [..., D]: E4M3 codes, then the E8M0 scales."""
+    """Rows [..., D] as quant.pack(x) packs them: E4M3 codes, then E8M0 scales."""
     codes, scales = fp8_codes(x.reshape(-1, x.shape[-1]))
     return mx.concatenate([codes, scales], -1).reshape(*x.shape[:-1], -1)
 
@@ -1080,7 +1083,7 @@ def expert_gate_up_mx(codes, scales, token, experts, gate, up, weights, limit):
             ("LIMIT", _bits(limit) if limit else 0),
             *((n, v) for n, v in _quantizer(8) if n != "BITS"),
         ],
-        grid=_tile_grid(inner // 64, count, routes),
+        grid=_tile_grid(inner // 64, count, routes, 64 * _TILE_MX_PASS),
         threadgroup=(_TILE_THREADS, 1, 1),
         output_shapes=[(routes, inner), (routes, inner // 32)],
         output_dtypes=[mx.uint8, mx.uint8],
@@ -1105,7 +1108,7 @@ def expert_down_mx(codes, scales, experts, down):
             ("K", codes.shape[1]),
             ("N", out),
         ],
-        grid=_tile_grid(out // 128, count, codes.shape[0]),
+        grid=_tile_grid(out // 128, count, codes.shape[0], 64 * _TILE_MX_PASS),
         threadgroup=(_TILE_THREADS, 1, 1),
         output_shapes=[(codes.shape[0], out)],
         output_dtypes=[mx.bfloat16],
@@ -1401,7 +1404,7 @@ def sparse_attention_tc(q, window, pooled, wi, ci, sink, scale):
     """ops.sparse_attention with bf16 products on tensor cores."""
     _, length, heads, width = q.shape
     ids, table = _slots(window, pooled, wi, ci)
-    # q goes in whole; with q[0] the launch copies all of q first.
+    # Pass q whole: with q[0] the launch copies all of q first.
     return _attention_tc_kernel(width)(
         inputs=[
             q,
@@ -1581,7 +1584,7 @@ def _fp8_pack_check(dtype: mx.Dtype) -> bool:
     x = mx.random.normal((70, 512), key=mx.random.key(15)) * 3
     # Rows of zeros, of negative zeros and below the scale floor.
     x = mx.concatenate([x, mx.zeros((1, 512)), -mx.zeros((1, 512)), x[:2] * 1e-7])
-    x = x.astype(dtype)
+    x = x.astype(dtype)[None]
     return mx.array_equal(pack_fp8(x), quant.pack(x))
 
 

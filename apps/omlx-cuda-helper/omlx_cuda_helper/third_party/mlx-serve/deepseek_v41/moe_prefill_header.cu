@@ -297,6 +297,7 @@ __device__ __forceinline__ void msv_expert_tile_mx(uint8_t* smem, int mv, ACode 
   constexpr int BM = 64, BN = 128, KS = 128, G = KS / 32;
   constexpr int KT = K / KS;
   constexpr int A_ST = MT * BM * KS, AS_ST = MT * BM * G;
+  static_assert(MT * BM <= 256, "the A scales of a pass load one per thread");
   constexpr int RB = KS / 2, CPR = RB / 16, NL = BN * CPR / 256;
   uint8_t* sa = smem;
   uint8_t* sas = sa + ST * A_ST;
