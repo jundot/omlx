@@ -17,7 +17,7 @@ import mlx.core as mx
 import numpy as np
 
 from ... import checkpoint
-from ...tensors import from_host, load, to_host
+from ...tensors import from_host, load, peak_bytes, to_host
 from ...wire import HostArray
 from . import ngram, quant, resident
 from .config import Config, load_config
@@ -59,8 +59,8 @@ class Stage:
                 "language_model.embed.weight"
             ]
             mx.eval(self.embed)
-        self.blocks = []
-        for layer in range(first, last):
+
+        def load_block(layer: int) -> Block:
             names = [
                 name
                 for name in index
@@ -69,7 +69,10 @@ class Stage:
             block = Block(load(model_dir, names), layer, config)
             mx.eval(block.parameters())
             block.check_kernels()
-            self.blocks.append(block)
+            return block
+
+        self._load_block = load_block
+        self.blocks = [load_block(layer) for layer in range(first, last)]
         self.dtype = self.blocks[0].attn_norm.dtype
         self.hasher = None
         engram = any(first <= i < last for i in config.engram_layer_ids)
@@ -87,8 +90,25 @@ class Stage:
     def memory_bytes(self) -> int:
         return mx.get_active_memory()
 
+    def peak_bytes(self) -> int:
+        return peak_bytes()
+
+    def drop_layer(self) -> None:
+        """Free the weights of the last layer held."""
+        self.blocks.pop()
+        self.last -= 1
+        mx.clear_cache()
+
+    def add_layer(self) -> None:
+        """Load the layer after the last one held, as the stage loaded it."""
+        self.blocks.append(self._load_block(self.last))
+        self.last += 1
+
     def new_job(self, layers: int) -> _Job:
         return _Job(layers)
+
+    def trim(self, job: _Job, layers: int) -> None:
+        del job.caches[layers:]
 
     def load_prefix(self, job: _Job, state: Arrays) -> None:
         for name, value in state.items():

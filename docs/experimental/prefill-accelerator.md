@@ -74,6 +74,7 @@ DeepSeek V4.1 **CED prefill** is on unless turned off in the model's settings. *
 - **No SSH and no oMLX on the helper.** The helper is a small daemon without a UI. Pair it in the Cluster tab with the 6-digit code it prints in its log; this Mac then drives it over a control channel that the pairing key protects. In the Cluster tab it has no Join button, because it can only be a prefill helper.
 - **Compatibility is per model family**, not per oMLX version. The checks list the families the helper serves and name the side to update when they disagree.
 - **Two GPUs run as a pipeline.** Each GPU holds a range of layers. GPU memory decides how many layers the helper takes, and with it the speedup.
+- **Long prompts drop layers.** When the next chunk's cache would not fit in the helper's GPU memory, the helper drops its last layers one at a time and this Mac runs them from that chunk on. The helper loads them again while no prompt waits.
 - **INT8 Activation Prefill** does not apply to the helper's layers.
 - **The link matters more.** The checks warn below 5 GbE. **Auto** measures the link and what each layer sends, uses fewer layers on a slow link, and keeps a prompt on this Mac when the transfer alone would take longer than prefilling here.
 - **A direct Ethernet cable** to the helper is used when it is faster than the network both machines share. It needs no addresses (the helper is reached at its IPv6 link-local address), but discovery and pairing run on the shared network, so the helper stays on it too.

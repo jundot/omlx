@@ -48,6 +48,10 @@ def _replay(bounds, layers):
     meta, arrays = _case()
     sizes, skip = meta["sizes"], meta["prefix_chunks"]
     stages = [_stage(a, b) for a, b in zip(bounds, bounds[1:])]
+    for stage in stages:
+        # A layer loaded again after a long prompt runs as at the first load.
+        stage.drop_layer()
+        stage.add_layer()
     jobs = []
     for stage in stages:
         own = max(0, min(layers, stage.last) - stage.first)

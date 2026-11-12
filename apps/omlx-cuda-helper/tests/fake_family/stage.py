@@ -37,8 +37,20 @@ class FakeStage:
     def memory_bytes(self):
         return (self.last - self.first) << 30
 
+    def peak_bytes(self):
+        return self.memory_bytes()
+
+    def drop_layer(self):
+        self.last -= 1
+
+    def add_layer(self):
+        self.last += 1
+
     def new_job(self, layers):
         return FakeJob(layers)
+
+    def trim(self, job, layers):
+        del job.acc[layers:]
 
     def load_prefix(self, job, state):
         for name, (data, _) in state.items():

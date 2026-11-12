@@ -110,8 +110,12 @@ def _finish(model, cache, last):
 def _run(config, k, sizes, prefix=0):
     """Whole-model reference vs split prefill over the same chunks.
 
-    ``prefix`` chunks run on this Mac alone first, like a cached prefix.
+    ``prefix`` chunks run on this Mac alone first, like a cached prefix. A list
+    ``k`` splits each chunk at its own layer, as a helper that drops its last
+    layers during a long prompt.
     """
+    splits = k if isinstance(k, list) else [k] * (len(sizes) - prefix)
+    k = splits[0]
     host, helper = _model(config), _model(config)
     DSV41.keep_first(helper, k)
     ids = mx.array(np.random.default_rng(7).integers(3, 60, (1, sum(sizes) + 1)))
@@ -137,7 +141,11 @@ def _run(config, k, sizes, prefix=0):
     )
     for index, (chunk, nxt) in enumerate(zip(rest, nexts[prefix:])):
         inputs = feed(index) if feed else {}
-        boundary, state = DSV41.run_first(helper, helper_cache, chunk, nxt, inputs)
+        k = splits[index]
+        with DSV41.use_first(helper, k):
+            boundary, state = DSV41.run_first(
+                helper, helper_cache[:k], chunk, nxt, inputs
+            )
         DSV41.run_rest(
             host._omlx_prefill,
             host,
@@ -162,13 +170,13 @@ def test_split_matches_whole_model(k):
     _run(tiny(), k, [7, 5, 3])
 
 
-@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("k", [1, 3, [3, 2, 1]])
 def test_split_matches_whole_model_with_ced(k):
     # Chunks wider than the window skip the decoder tail, then replay it.
     _run(tiny_ced(), k, [9, 6, 7])
 
 
-@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("k", [1, 3, [3, 1, 1]])
 def test_split_matches_whole_model_with_engram(k):
     _run(tiny(**_ENGRAM), k, [7, 5, 3])
 

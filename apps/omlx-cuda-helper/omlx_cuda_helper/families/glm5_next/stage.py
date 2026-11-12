@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -85,9 +86,11 @@ class Stage:
         layers: list[Layer],
         embedding: _Embedding | None,
         first: int,
+        load_layer: Callable[[int], Layer],
     ):
         self.config, self.layers, self.embedding = config, layers, embedding
         self.first, self.last = first, first + len(layers)
+        self._load_layer = load_layer
         self.device = mx.device_info().get("device_name", "GPU")
         # A later stage makes its own input for the warm run in this dtype.
         self.dtype = layers[0].attn_norm.weight.dtype
@@ -130,8 +133,26 @@ class Stage:
     def memory_bytes(self) -> int:
         return mx.get_active_memory()
 
+    def peak_bytes(self) -> int:
+        return tensors.peak_bytes()
+
+    def drop_layer(self) -> None:
+        """Free the weights of the last layer held."""
+        self.layers.pop()
+        self.last -= 1
+        mx.clear_cache()
+
+    def add_layer(self) -> None:
+        """Load the layer after the last one held. The kernel checks of the
+        first load hold for every layer of a kind."""
+        self.layers.append(self._load_layer(self.last))
+        self.last += 1
+
     def new_job(self, layers: int) -> list[Any]:
         return [layer.attn.new_state() for layer in self.layers[:layers]]
+
+    def trim(self, job: list[Any], layers: int) -> None:
+        del job[layers:]
 
     def load_prefix(self, job: list[Any], state: dict[str, HostArray]) -> None:
         slots: dict[int, dict[str, mx.array]] = {}
@@ -210,10 +231,8 @@ def load_stage(model_dir: str | Path, first: int, last: int) -> Stage:
         loaded = tensors.load(model_dir, found)
         return {n[len(scope) :]: value for n, value in loaded.items()}
 
-    layers = []
-    for index in range(first, last):
-
-        def quant(module: str, index: int = index) -> dict[str, Any] | None:
+    def load_layer(index: int) -> Layer:
+        def quant(module: str) -> dict[str, Any] | None:
             return _quantization(raw, index, module)
 
         layer = Layer(
@@ -221,7 +240,9 @@ def load_stage(model_dir: str | Path, first: int, last: int) -> Stage:
         )
         # Evaluated layer by layer so the packed sources free as they go.
         mx.eval(layer.parameters())
-        layers.append(layer)
+        return layer
+
+    layers = [load_layer(index) for index in range(first, last)]
     embedding = None
     if first == 0:
         table = raw.get("quantization") or raw.get("quantization_config") or {}
@@ -231,4 +252,4 @@ def load_stage(model_dir: str | Path, first: int, last: int) -> Stage:
             tensors_under("embed_tokens."), checkpoint.quantization(raw, path)
         )
         mx.eval(embedding.parameters())
-    return Stage(config, layers, embedding, first)
+    return Stage(config, layers, embedding, first, load_layer)

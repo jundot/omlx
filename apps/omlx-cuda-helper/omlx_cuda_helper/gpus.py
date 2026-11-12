@@ -64,6 +64,16 @@ def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
     return found
 
 
+def memory_limit(gpu: dict[str, Any]) -> int:
+    """Bytes a stage on *gpu* may hold before it hands a prompt back.
+
+    On an integrated GPU the OS keeps its share of the RAM.
+    """
+    if gpu.get("integrated"):
+        return max(0, gpu["total"] - _OS_BYTES)
+    return int(gpu["total"] * 0.95)
+
+
 def wsl() -> bool:
     """Whether this runs on WSL, where CUDA has no concurrent managed memory."""
     try:

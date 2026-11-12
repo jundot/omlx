@@ -241,6 +241,8 @@ class Supervisor:
                 listen,
                 "--warm-tokens",
                 str(warm_tokens),
+                "--memory-limit",
+                str(gpus.memory_limit(found[position])),
             ]
             if previous_socket:
                 command += ["--upstream", f"unix:{previous_socket}"]

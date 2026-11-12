@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -45,13 +46,13 @@ def tmp_path():
     shutil.rmtree(path, ignore_errors=True)
 
 
-def _serve(stage, tmp_path, name, upstream=None):
+def _serve(stage, tmp_path, name, upstream=None, limit=0):
     """A stage server on a Unix socket; returns a host connection to it."""
     path = str(tmp_path / name)
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(path)
     listener.listen(1)
-    server = StageServer(stage, TOKEN, INFO, upstream)
+    server = StageServer(stage, TOKEN, INFO, upstream, limit)
     threading.Thread(target=server.serve, args=(listener,), daemon=True).start()
     sock = socket.socket(socket.AF_UNIX)
     sock.connect(path)
@@ -68,11 +69,23 @@ def _chain(cut, layers, tmp_path):
 
 
 def _run(
-    host, job_id="job", *, layers=None, prefix=None, feed=False, capture=None, late=0.0
+    host,
+    job_id="job",
+    *,
+    layers=None,
+    prefix=None,
+    feed=False,
+    capture=None,
+    late=0.0,
+    ran=None,
 ):
+    """The arrays of each chunk. With a ``ran`` list the job lets the stages
+    drop layers, and the list gets the layers each chunk ran."""
     meta = {"op": "job", "job_id": job_id, "chunks": CHUNKS}
     if layers is not None:
         meta["layers"] = layers
+    if ran is not None:
+        meta["fewer_layers"] = True
     if feed:
         meta["feed"] = True
     if capture:
@@ -91,6 +104,8 @@ def _run(
                 {"rows": (rows, "float32")},
             )
         meta, arrays = host.take(job_id, index)
+        if ran is not None:
+            ran.append(meta["layers"])
         out.append({name: data for name, (data, _) in arrays.items()})
     return out
 
@@ -188,6 +203,61 @@ def test_a_job_that_ends_early_frees_both_stages(tmp_path, monkeypatch):
     with pytest.raises(StageError, match="out of memory"):
         _run(host, "failed")
     _same(_run(host, "next"), _run(_whole(6, tmp_path)))
+
+
+class _Tight(FakeStage):
+    """Holds 1 GiB per layer and 64 MiB per token and layer of a running job."""
+
+    _job = staticmethod(lambda: None)
+
+    def new_job(self, layers):
+        job = super().new_job(layers)
+        job.tokens = 0
+        self._job = weakref.ref(job)
+        return job
+
+    def memory_bytes(self):
+        job = self._job()
+        state = len(job.acc) * job.tokens << 26 if job is not None else 0
+        return super().memory_bytes() + state
+
+    def run(self, job, **chunk):
+        job.tokens += len(chunk["tokens"])
+        return super().run(job, **chunk)
+
+
+@pytest.mark.parametrize("chain", [False, True], ids=["one-stage", "chain"])
+def test_a_long_prompt_drops_layers_from_the_end_and_loads_them_again(tmp_path, chain):
+    if chain:
+        # The first stage runs out of room; the second cannot follow it.
+        tight, want = _Tight(0, 3), [6, 2, 2, 2, 1]
+        first = _serve(tight, tmp_path, "s0", limit=4 << 30)
+        host = _serve(FakeStage(3, 6), tmp_path, "s1", upstream=first)
+    else:
+        tight, want = _Tight(0, 6), [6, 5, 4, 4, 3]
+        host = _serve(tight, tmp_path, "s0", limit=8 << 30)
+    top, ran = tight.last, []
+    got = _run(host, ran=ran)
+    assert ran == want
+    # The layers a chunk ran give what they give in the whole model; the host
+    # runs the others.
+    for k, mine, whole in zip(ran, got, _run(_whole(6, tmp_path))):
+        names = [n for n in whole if not n.startswith("s:") or _layer(n) < k]
+        assert sorted(mine) == sorted(names)
+        for name, data in mine.items():
+            if name == "b:h":
+                np.testing.assert_array_equal(data[..., :1], whole[f"s:{k - 1}.rows"])
+            else:
+                np.testing.assert_array_equal(data, whole[name])
+    _until(lambda: tight.last == top)
+    if not chain:
+        # A host that runs a fixed split gets the prompt back instead.
+        with pytest.raises(StageError, match="no GPU memory left"):
+            _run(host, "fixed")
+
+
+def _layer(name):
+    return int(name[2:].split(".")[0])
 
 
 def test_a_silent_peer_does_not_hold_the_data_port(monkeypatch):

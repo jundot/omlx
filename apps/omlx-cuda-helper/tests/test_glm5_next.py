@@ -38,6 +38,10 @@ def _replay(model, bounds, capture=None):
     meta, arrays = _case()
     k, sizes, skip = meta["layers"], meta["sizes"], meta["prefix_chunks"]
     stages = [load_stage(model, a, b) for a, b in zip(bounds, bounds[1:])]
+    for stage in stages:
+        # A layer loaded again after a long prompt runs as at the first load.
+        stage.drop_layer()
+        stage.add_layer()
     jobs = [s.new_job(min(s.last, k) - s.first) for s in stages]
     for stage, job in zip(stages, jobs):
         held = range(stage.first, stage.first + len(job))

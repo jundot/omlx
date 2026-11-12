@@ -13,11 +13,18 @@ from . import checkpoint
 from .wire import HostArray
 
 
-def memory_limit() -> int:
-    """GPU bytes a stage may hold before it gives a prompt back, or 0."""
-    info = mx.device_info()
-    total = info.get("total_memory") or info.get("memory_size") or 0
-    return int(total * 0.95)
+def limit_memory(limit: int) -> None:
+    """Hold MLX's buffers, cached ones included, under *limit* bytes: past it
+    the allocator frees its cache before it allocates."""
+    if limit:
+        mx.set_memory_limit(limit)
+
+
+def peak_bytes() -> int:
+    """Peak GPU bytes since the last call."""
+    peak = mx.get_peak_memory()
+    mx.reset_peak_memory()
+    return peak
 
 
 def check_backend() -> None:

@@ -42,6 +42,10 @@ class StageError(RuntimeError):
     pass
 
 
+class _OutOfMemoryError(StageError):
+    """The next chunk would take the stage past its memory limit."""
+
+
 def _layer_of(name: str) -> int:
     """State and prefix arrays are named ``"{layer}.{slot}"``."""
     return int(name.split(".", 1)[0])
@@ -128,9 +132,20 @@ class _Job:
     prefix: Arrays
     feed: bool = False
     capture: dict | None = None
+    # The host follows the layers each chunk reports, so the job may drop some.
+    fewer: bool = False
     inputs: dict[int, Arrays] = field(default_factory=dict)
     acked: int = -1
     cancelled: bool = False
+
+
+@dataclass
+class _Use:
+    """Memory of a chunk: bytes it keeps per token and own layer, and the
+    bytes it holds only while it runs."""
+
+    kept: float
+    passing: int
 
 
 @dataclass
@@ -153,10 +168,19 @@ class StageServer:
         info: dict[str, Any],
         upstream: Upstream | None = None,
         memory_limit: int = 0,
+        working: int = 0,
     ):
+        """``working`` is what the warm chunk held while it ran."""
         self.stage, self.token, self.info, self.upstream = stage, token, info, upstream
-        # A job whose caches outgrow this hands the prompt back to the host.
+        # A chunk that would take the stage past this drops layers first; a
+        # job with no layer left to drop hands the prompt back to the host.
         self.memory_limit = memory_limit
+        # Layers held at start. Dropped ones load again while no job waits.
+        self.top = stage.last
+        # Bytes each dropped layer freed, the last dropped at the end.
+        self._dropped: list[int] = []
+        # What the first chunk of a job is expected to take.
+        self._opening = _Use(0.0, working)
         self._session: _Session | None = None
 
     def notify_stopped(self) -> None:
@@ -236,10 +260,11 @@ class StageServer:
             meta["job_id"],
             arrays["tokens"][0].reshape(-1),
             [int(n) for n in meta["chunks"]],
-            min(int(meta.get("layers", self.stage.last)), self.stage.last),
+            min(int(meta.get("layers", self.top)), self.top),
             prefix,
             bool(meta.get("feed")),
             meta.get("capture"),
+            bool(meta.get("fewer_layers")),
         )
         if self.upstream is not None:
             first = self.stage.first
@@ -255,6 +280,8 @@ class StageServer:
             }
             if job.feed:
                 up["feed"] = True
+            if job.fewer:
+                up["fewer_layers"] = True
             if job.capture:
                 below = [i for i in job.capture["layers"] if i < first]
                 if below:
@@ -294,19 +321,68 @@ class StageServer:
                 return
 
     def _next_job(self, session: _Session) -> _Job | None:
-        with session.changed:
-            while not session.jobs and not session.closed:
-                session.changed.wait()
-            return session.jobs.popleft() if session.jobs else None
+        while True:
+            with session.changed:
+                if session.jobs or session.closed:
+                    return session.jobs.popleft() if session.jobs else None
+                if not self._room_to_restore():
+                    session.changed.wait()
+                    continue
+            # One layer at a time, so a new job waits for at most one.
+            self._restore()
+
+    def _room_to_restore(self) -> bool:
+        return bool(self._dropped) and (
+            self.stage.memory_bytes() + self._dropped[-1] + self._opening.passing
+            <= self.memory_limit
+        )
+
+    def _restore(self) -> None:
+        self.stage.add_layer()
+        self._dropped.pop()
+        logger.info("layer %d is back in GPU memory", self.stage.last - 1)
+
+    def _drop(self) -> None:
+        held = self.stage.memory_bytes()
+        self.stage.drop_layer()
+        self._dropped.append(max(0, held - self.stage.memory_bytes()))
+        logger.info("layer %d left GPU memory for a long prompt", self.stage.last)
+
+    def _fit(self, job: _Job, state: Any, own: int, size: int, use: _Use) -> int:
+        """The own layers the next chunk can run within the memory limit.
+
+        Layers the job does not use go first, then the job's last ones; the
+        host runs those from this chunk on. The first stage keeps one layer.
+        """
+        stage = self.stage
+        while True:
+            need = stage.memory_bytes()
+            if own:
+                need += int(own * size * use.kept) + use.passing
+            if need <= self.memory_limit:
+                return own
+            if stage.last > stage.first + own:
+                self._drop()
+            elif job.fewer and own > (0 if stage.first else 1):
+                own -= 1
+                stage.trim(state, own)
+                self._drop()
+            else:
+                raise _OutOfMemoryError(
+                    "the helper has no GPU memory left for this prompt"
+                )
 
     def _run_job(self, session: _Session, job: _Job) -> None:
         try:
             self._run_chunks(session, job)
         except Exception as error:  # reported to the host, which prefills locally
-            logger.exception("job %s failed", job.job_id)
-            session.outbox.put(
-                ({"op": "error", "job_id": job.job_id, "error": repr(error)}, None)
-            )
+            meta = {"op": "error", "job_id": job.job_id, "error": repr(error)}
+            if isinstance(error, _OutOfMemoryError):
+                logger.warning("job %s: %s", job.job_id, error)
+                meta["out_of_memory"] = True
+            else:
+                logger.exception("job %s failed", job.job_id)
+            session.outbox.put((meta, None))
         finally:
             session.by_id.pop(job.job_id, None)
             if self.upstream is not None:
@@ -318,13 +394,20 @@ class StageServer:
 
     def _run_chunks(self, session: _Session, job: _Job) -> None:
         stage, upstream = self.stage, self.upstream
+        if not job.fewer:
+            # This host runs the layers it asked for on every chunk.
+            while stage.last < job.layers:
+                self._restore()
         own = max(0, min(job.layers, stage.last) - stage.first)
         state = stage.new_job(own) if own else None
         # A later stage may read state of the layers before it: its optional
         # load_upstream gets the job's "p:" arrays, then each chunk's "s:" arrays.
         earlier = getattr(stage, "load_upstream", None) if own and stage.first else None
         if own:
-            mine = {n: v for n, v in job.prefix.items() if _layer_of(n) >= stage.first}
+            end = stage.first + own
+            mine = {
+                n: v for n, v in job.prefix.items() if stage.first <= _layer_of(n) < end
+            }
             if mine:
                 stage.load_prefix(state, mine)
         if earlier is not None:
@@ -339,7 +422,7 @@ class StageServer:
             capture = (
                 {"layers": wanted, "from": job.capture["from"]} if wanted else None
             )
-        start = 0
+        start, use, rise, ahead = 0, self._opening, 0, 0
         for index, size in enumerate(job.chunks):
             with session.changed:
                 while (
@@ -358,6 +441,11 @@ class StageServer:
                     return
                 meta, received = taken
                 before = float(meta["seconds"])
+                ahead = int(meta.get("layers", stage.first))
+                if own and ahead < stage.first:
+                    # The stage before dropped layers; these cannot follow them.
+                    own = 0
+                    stage.trim(state, 0)
                 boundary = {}
                 for name, value in received.items():
                     if name.startswith("b:") and not name.startswith("b:cap."):
@@ -365,10 +453,17 @@ class StageServer:
                     else:
                         # State and captured layers of the stages before.
                         arrays[name] = value
-                if earlier is not None:
+                if earlier is not None and own:
                     earlier(state, {n: v for n, v in arrays.items() if n[:2] == "s:"})
+            if self.memory_limit:
+                # A chunk's passing bytes can grow with the prompt: count the
+                # last rise once more.
+                expected = _Use(use.kept, use.passing + rise)
+                own = self._fit(job, state, own, size, expected)
             began = time.perf_counter()
             if own:
+                held = stage.memory_bytes()
+                stage.peak_bytes()
                 following = job.chunks[index + 1] if index + 1 < len(job.chunks) else 0
                 boundary, mine = stage.run(
                     state,
@@ -380,24 +475,26 @@ class StageServer:
                     capture=capture,
                 )
                 arrays.update({f"s:{n}": v for n, v in mine.items()})
+                kept = stage.memory_bytes()
+                passing = max(0, stage.peak_bytes() - kept)
+                rise = max(0, passing - use.passing) if index else 0
+                use = _Use(max(0, kept - held) / (own * size), passing)
+                if index == 0:
+                    self._opening = use
             elapsed = time.perf_counter() - began
-            if self.memory_limit and stage.memory_bytes() > self.memory_limit:
-                raise StageError("the helper has no GPU memory left for this prompt")
             arrays.update({f"b:{n}": v for n, v in (boundary or {}).items()})
-            session.outbox.put(
-                (
-                    {
-                        "op": "chunk",
-                        "job_id": job.job_id,
-                        "index": index,
-                        "start": start,
-                        "size": size,
-                        # The stages overlap in time, so the slower one paces.
-                        "seconds": max(before, elapsed),
-                    },
-                    arrays,
-                )
-            )
+            reply = {
+                "op": "chunk",
+                "job_id": job.job_id,
+                "index": index,
+                "start": start,
+                "size": size,
+                # The stages overlap in time, so the slower one paces.
+                "seconds": max(before, elapsed),
+            }
+            if job.fewer:
+                reply["layers"] = stage.first + own if own else ahead
+            session.outbox.put((reply, arrays))
             start += size
         session.outbox.put(({"op": "done", "job_id": job.job_id}, None))
 
@@ -451,6 +548,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--listen", required=True, help="tcp:HOST:PORT or unix:PATH")
     parser.add_argument("--upstream", help="unix:PATH of the stage before")
     parser.add_argument("--warm-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--memory-limit",
+        type=int,
+        default=0,
+        help="bytes a stage may hold before it drops layers or hands a prompt back",
+    )
     parser.add_argument("--weights-on-gpu", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -466,11 +569,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     tensors.check_backend()
+    tensors.limit_memory(args.memory_limit)
     tensors.weights_on_gpu = args.weights_on_gpu
     stage = families.stage_module(args.model_type).load_stage(
         args.model, args.first, args.last
     )
+    held = stage.memory_bytes()
+    stage.peak_bytes()
     warm_seconds = stage.warm(args.warm_tokens)
+    working = max(0, stage.peak_bytes() - held)
     listener, port = _listen(args.listen)
     upstream = None
     warm_before, active_before = 0.0, 0.0
@@ -490,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
         "active_gib": stage.memory_bytes() / 2**30 + active_before,
         "device": stage.device,
     }
-    server = StageServer(stage, token, hello, upstream, tensors.memory_limit())
+    server = StageServer(stage, token, hello, upstream, args.memory_limit, working)
 
     def stop(*_: Any) -> None:
         os._exit(0)

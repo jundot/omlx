@@ -17,7 +17,7 @@ import mlx.core as mx
 import numpy as np
 
 from ... import checkpoint
-from ...tensors import Linear, from_host, load, to_host
+from ...tensors import Linear, from_host, load, peak_bytes, to_host
 from ...wire import HostArray
 from . import ROOT, Config, kernels, read_config, sparse
 
@@ -514,31 +514,43 @@ class MiniMaxStage:
             self.embedding = _Embedding(load(model_dir, wanted), prefix, config)
             mx.eval(self.embedding.parameters())
         self.vocab = names[f"{ROOT}embed_tokens.weight"].shape[0] if first == 0 else 0
-        self.layers = []
-        for index in range(first, last):
+
+        def load_layer(index: int) -> _Layer:
             prefix = f"{ROOT}layers.{index}."
             wanted = [n for n in names if n.startswith(prefix)]
             layer = _Layer(load(model_dir, wanted), index, config, cfg)
             mx.eval(layer.parameters())
             # The packed arrays of the unpacked linears are no longer needed.
             mx.clear_cache()
-            self.layers.append(layer)
+            return layer
+
+        self._load_layer, self._cfg = load_layer, cfg
+        self.layers = [load_layer(index) for index in range(first, last)]
         self.dtype = self.layers[0].dtype
         self.hidden = self.layers[0].norm.shape[0]
+        # Kernels the self-check turned off for every layer of the stage.
+        self._off: set[str] = set()
         if kernels.available():
             for layer in self.layers:
-                attention = layer.attention
-                attention.kernel = kernels.covers_attention(
-                    cfg, self.dtype, attention.index
-                )
-                if layer.moe:
-                    mlp = layer.mlp
-                    mlp.kernel = mlp.kernel_applies(self.dtype)
-                    # The router kernel takes a float32 weight and bfloat16 rows.
-                    mlp.router_kernel = (
-                        mlp.columns is not None and self.dtype == mx.bfloat16
-                    )
+                self._take_kernels(layer)
             self._verify_kernels(cfg)
+
+    def _take_kernels(self, layer: _Layer) -> None:
+        attention = layer.attention
+        attention.kernel = "attention" not in self._off and kernels.covers_attention(
+            self._cfg, self.dtype, attention.index
+        )
+        if layer.moe:
+            mlp = layer.mlp
+            mlp.kernel = "routed experts" not in self._off and mlp.kernel_applies(
+                self.dtype
+            )
+            # The router kernel takes a float32 weight and bfloat16 rows.
+            mlp.router_kernel = (
+                "router" not in self._off
+                and mlp.columns is not None
+                and self.dtype == mx.bfloat16
+            )
 
     def _verify_kernels(self, cfg: Config) -> None:
         """Run each kernel path and its portable twin on one of this stage's
@@ -577,6 +589,7 @@ class MiniMaxStage:
                 )
                 for other in modules:
                     setattr(other, switch, False)
+                self._off.add(name)
         mx.clear_cache()
 
     def warm(self, tokens: int) -> float:
@@ -605,8 +618,29 @@ class MiniMaxStage:
     def memory_bytes(self) -> int:
         return mx.get_active_memory()
 
+    def peak_bytes(self) -> int:
+        return peak_bytes()
+
+    def drop_layer(self) -> None:
+        """Free the weights of the last layer held."""
+        self.layers.pop()
+        self.last -= 1
+        mx.clear_cache()
+
+    def add_layer(self) -> None:
+        """Load the layer after the last one held, with the kernels the stage
+        took at load."""
+        layer = self._load_layer(self.last)
+        if kernels.available():
+            self._take_kernels(layer)
+        self.layers.append(layer)
+        self.last += 1
+
     def new_job(self, layers: int) -> list[_Cache]:
         return [_Cache() for _ in range(layers)]
+
+    def trim(self, job: list[_Cache], layers: int) -> None:
+        del job[layers:]
 
     def load_prefix(self, job: list[_Cache], state: Arrays) -> None:
         for layer, cache in zip(self.layers, job):

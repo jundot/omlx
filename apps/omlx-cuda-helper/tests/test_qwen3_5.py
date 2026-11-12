@@ -48,6 +48,10 @@ def _replay(bounds, capture=None):
         load_stage(FIXTURE / "model", first, last)
         for first, last in zip(bounds, bounds[1:])
     ]
+    for stage in stages:
+        # A layer loaded again after a long prompt runs as at the first load.
+        stage.drop_layer()
+        stage.add_layer()
     jobs = [s.new_job(min(s.last, k) - s.first) for s in stages]
     for stage, job in zip(stages, jobs):
         # On CUDA the replay then runs through the self-checked kernels.

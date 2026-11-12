@@ -46,6 +46,8 @@ class Chunk:
     seconds: float
     boundary: dict[str, mx.array]
     state: dict[str, mx.array]
+    # Layers the helper ran, when it may run fewer than the job asked for.
+    layers: int | None = None
 
 
 class HelperJob:
@@ -92,7 +94,13 @@ class HelperJob:
         if meta["index"] == len(self.chunks) - 1:
             self._finish()
         return Chunk(
-            meta["index"], meta["start"], meta["size"], meta["seconds"], boundary, state
+            meta["index"],
+            meta["start"],
+            meta["size"],
+            meta["seconds"],
+            boundary,
+            state,
+            meta.get("layers"),
         )
 
     def cancel(self) -> None:
@@ -177,6 +185,8 @@ class HelperClient:
         feed: Callable[[int], dict] | None = None,
         capture: dict | None = None,
     ) -> HelperJob:
+        """A helper daemon may run fewer layers than ``layers`` from some
+        chunk on, to fit a long prompt; each chunk says how many it ran."""
         if not self.alive:
             raise HelperError("prefill helper connection is closed")
         job = HelperJob(self, f"job-{next(self._ids)}", list(chunks))
@@ -192,6 +202,7 @@ class HelperClient:
         meta = {"op": "job", "job_id": job.job_id, "chunks": job.chunks}
         if layers is not None:
             meta["layers"] = int(layers)
+            meta["fewer_layers"] = True
         if feed is not None:
             meta["feed"] = True
         if capture is not None:
