@@ -22,6 +22,7 @@ struct IntegrationsScreen: View {
         VStack(alignment: .leading, spacing: 0) {
             ExternalEnginesSection(vm: vm, client: services.client)
             MarkItDownSection(vm: vm, client: services.client)
+            WebSearchSection(vm: vm, client: services.client)
             ClaudeCodeSection(vm: vm, client: services.client)
             ClaudeSetupCommandSection(vm: vm)
             OtherIntegrationsSection(vm: vm, client: services.client)
@@ -305,6 +306,152 @@ private struct MarkItDownSection: View {
         }
     }
 }
+
+// MARK: - Web Search
+
+private struct WebSearchSection: View {
+    @Bindable var vm: IntegrationsScreenVM
+    let client: OMLXClient
+
+    @Environment(\.omlxTheme) private var theme
+    @FocusState private var focusedField: IntegrationsScreenVM.WebSearchField?
+
+    var body: some View {
+        SectionHeader(String(localized: "integrations.websearch.section_label", defaultValue: "Web Search", comment: "Web search settings"))
+        ListGroup {
+            Row(label: String(localized: "integrations.websearch.provider", defaultValue: "Search provider", comment: "Web search settings"),
+                sublabel: String(localized: "integrations.websearch.provider_hint", defaultValue: "Backend used by the chat web search tool. DDGS Total queries every available engine and needs no key.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                Popup("integrations.websearch.provider", selection: vm.bind($vm.webSearch.provider, save: { save(.provider) }),
+                      width: .controlMedium, options: [
+                    ("ddgs", String(localized: "integrations.websearch.provider_ddgs_total", defaultValue: "DDGS Total", comment: "Web search settings")),
+                    ("ddgs_custom", String(localized: "integrations.websearch.provider_ddgs_custom", defaultValue: "DDGS Custom", comment: "Web search settings")),
+                    ("duckduckgo", String(localized: "integrations.websearch.provider_duckduckgo", defaultValue: "DuckDuckGo", comment: "Web search settings")),
+                    ("brave", String(localized: "integrations.websearch.provider_brave", defaultValue: "Brave Search", comment: "Web search settings")),
+                    ("searxng", String(localized: "integrations.websearch.provider_searxng", defaultValue: "SearXNG", comment: "Web search settings"))
+                ])
+                .disabled(vm.savingWebSearchFields.contains(.provider))
+                .accessibilityLabel(Text("integrations.websearch.provider"))
+            }
+            if vm.webSearch.provider == "ddgs_custom" {
+                FreeRow {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(String(localized: "integrations.websearch.ddgs_backends", defaultValue: "Search engines", comment: "Web search settings"))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                            .foregroundStyle(theme.text)
+                        Text(String(localized: "integrations.websearch.ddgs_backends_hint", defaultValue: "Pick at least one engine to query. All of these work without an API key.", comment: "Web search settings"))
+                            .font(.omlxText(11.5))
+                            .foregroundStyle(theme.textSecondary)
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), alignment: .leading)], alignment: .leading) {
+                            ForEach(IntegrationsScreenVM.ddgsBackends, id: \.self) { backend in
+                                Toggle(backend, isOn: Binding(
+                                    get: { vm.ddgsBackendChecked(backend) },
+                                    set: { selected in
+                                        vm.setDdgsBackend(backend, selected: selected)
+                                        save(.ddgsBackends)
+                                    }
+                                ))
+                                .toggleStyle(.checkbox)
+                            }
+                        }
+                        .disabled(vm.savingWebSearchFields.contains(.ddgsBackends))
+                    }
+                }
+            }
+            if vm.webSearch.provider == "brave" {
+                Row(label: String(localized: "integrations.websearch.brave_api_key", defaultValue: "Brave API key", comment: "Web search settings"),
+                    sublabel: String(localized: "integrations.websearch.brave_api_key_hint", defaultValue: "Subscription token from the Brave Search API dashboard.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                    TextInput("integrations.websearch.brave_api_key", text: $vm.webSearch.braveApiKey, isSecure: true, width: .controlMedium)
+                        .focused($focusedField, equals: .braveApiKey)
+                        .onSubmit { save(.braveApiKey) }
+                        .onDisappear { save(.braveApiKey) }
+                        .disabled(vm.savingWebSearchFields.contains(.braveApiKey))
+                        .accessibilityLabel(Text("integrations.websearch.brave_api_key"))
+                }
+            }
+            if vm.webSearch.provider == "searxng" {
+                Row(label: String(localized: "integrations.websearch.searxng_url", defaultValue: "SearXNG instance URL", comment: "Web search settings"),
+                    sublabel: String(localized: "integrations.websearch.searxng_url_hint", defaultValue: "Base URL of a SearXNG instance with the JSON output format enabled.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                    TextInput("integrations.websearch.searxng_url", text: $vm.webSearch.searxngUrl, placeholder: "http://localhost:8888", width: .controlMedium)
+                        .focused($focusedField, equals: .searxngUrl)
+                        .onSubmit { save(.searxngUrl) }
+                        .onDisappear { save(.searxngUrl) }
+                        .disabled(vm.savingWebSearchFields.contains(.searxngUrl))
+                        .accessibilityLabel(Text("integrations.websearch.searxng_url"))
+                }
+            }
+            Row(label: String(localized: "integrations.websearch.max_results", defaultValue: "Results per search", comment: "Web search settings"),
+                sublabel: String(localized: "integrations.websearch.max_results_hint", defaultValue: "How many sources one web_search call returns (1-10).", comment: "Web search settings"), sublabelLineLimit: nil) {
+                TextInput("integrations.websearch.max_results", text: $vm.webSearch.maxResults, isNumeric: true, range: 1...10, step: 1, width: .controlNarrow,
+                          onStep: { save(.maxResults) })
+                    .focused($focusedField, equals: .maxResults)
+                    .onSubmit { save(.maxResults) }
+                    .onDisappear { save(.maxResults) }
+                    .disabled(vm.savingWebSearchFields.contains(.maxResults))
+                    .accessibilityLabel(Text("integrations.websearch.max_results"))
+            }
+            Row(label: String(localized: "integrations.websearch.content_mode", defaultValue: "Result content", comment: "Web search settings"),
+                sublabel: String(localized: "integrations.websearch.content_mode_hint", defaultValue: "Snippets keep the prompt small. Full page content fetches and inlines each result page.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                Popup("integrations.websearch.content_mode", selection: vm.bind($vm.webSearch.contentMode, save: { save(.contentMode) }),
+                      width: .controlMedium, options: [
+                    ("snippet", String(localized: "integrations.websearch.content_mode_snippet", defaultValue: "Snippets only", comment: "Web search settings")),
+                    ("full", String(localized: "integrations.websearch.content_mode_full", defaultValue: "Full page content", comment: "Web search settings"))
+                ])
+                .disabled(vm.savingWebSearchFields.contains(.contentMode))
+                .accessibilityLabel(Text("integrations.websearch.content_mode"))
+            }
+            if vm.webSearch.contentMode == "full" {
+                Row(label: String(localized: "integrations.websearch.content_truncate", defaultValue: "Truncate page content", comment: "Web search settings"),
+                    sublabel: String(localized: "integrations.websearch.content_truncate_hint", defaultValue: "Cut each fetched page at the limit below. Turning this off can flood the model context.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                    RowSwitch(isOn: vm.bind($vm.webSearch.contentTruncate, save: { save(.contentTruncate) }))
+                        .disabled(vm.savingWebSearchFields.contains(.contentTruncate))
+                        .accessibilityLabel(Text("integrations.websearch.content_truncate"))
+                }
+                if vm.webSearch.contentTruncate {
+                    Row(label: String(localized: "integrations.websearch.content_max_chars", defaultValue: "Content limit", comment: "Web search settings"),
+                        sublabel: String(localized: "integrations.websearch.content_max_chars_hint", defaultValue: "Maximum characters kept per fetched page.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                        TextInput("integrations.websearch.content_max_chars", text: $vm.webSearch.contentMaxChars, isNumeric: true, range: 1...Double(Int.max), step: 1000,
+                                  suffix: String(localized: "integrations.websearch.chars_suffix", defaultValue: "chars", comment: "Web search settings"), width: .controlCompact,
+                                  onStep: { save(.contentMaxChars) })
+                            .focused($focusedField, equals: .contentMaxChars)
+                            .onSubmit { save(.contentMaxChars) }
+                            .onDisappear { save(.contentMaxChars) }
+                            .disabled(vm.savingWebSearchFields.contains(.contentMaxChars))
+                            .accessibilityLabel(Text("integrations.websearch.content_max_chars"))
+                    }
+                }
+            }
+            FreeRow(isLast: true) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(String(localized: "integrations.websearch.test_label", defaultValue: "Run a test search with the settings above", comment: "Web search settings"))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                            .foregroundStyle(theme.text)
+                        if let message = vm.webSearchTestMessage {
+                            Text(message)
+                                .font(.omlxText(11.5))
+                                .foregroundStyle(vm.webSearchTestOK == true ? theme.successText : theme.warningText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                    Button(vm.webSearchTesting ? String(localized: "integrations.websearch.testing", defaultValue: "Testing...", comment: "Web search settings") : String(localized: "integrations.websearch.test_button", defaultValue: "Test search", comment: "Web search settings")) {
+                        Task { await vm.testWebSearch(client: client) }
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(vm.webSearchTesting)
+                }
+            }
+        }
+        .onChange(of: focusedField) { previous, _ in
+            if let previous { save(previous) }
+        }
+    }
+
+    private func save(_ field: IntegrationsScreenVM.WebSearchField) {
+        Task { await vm.saveWebSearch(field, client: client) }
+    }
+}
+
 
 // MARK: - Claude Code
 

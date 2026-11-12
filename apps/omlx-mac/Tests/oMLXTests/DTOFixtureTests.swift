@@ -148,6 +148,14 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertEqual(settings.integrations?.markitdownMaxFileSizeMb, 25)
         XCTAssertEqual(settings.integrations?.markitdownMaxFilesPerRequest, 5)
         XCTAssertEqual(settings.integrations?.markitdownPdfProcessingEngine, "markitdown")
+        XCTAssertEqual(settings.integrations?.webSearchProvider, "ddgs")
+        XCTAssertEqual(settings.integrations?.webSearchBraveApiKey, "")
+        XCTAssertEqual(settings.integrations?.webSearchSearxngUrl, "")
+        XCTAssertEqual(settings.integrations?.webSearchDdgsBackends, "")
+        XCTAssertEqual(settings.integrations?.webSearchMaxResults, 3)
+        XCTAssertEqual(settings.integrations?.webSearchContentMode, "snippet")
+        XCTAssertEqual(settings.integrations?.webSearchContentTruncate, true)
+        XCTAssertEqual(settings.integrations?.webSearchContentMaxChars, 20000)
     }
 
     // MARK: - Models list

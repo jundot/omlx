@@ -1,6 +1,762 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "integrations.websearch.section_label" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Web Search"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Websuche"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "联网搜索"
+          }
+        }
+      }
+    },
+    "integrations.websearch.provider" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Search provider"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suchanbieter"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "搜索服务商"
+          }
+        }
+      }
+    },
+    "integrations.websearch.provider_hint" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backend used by the chat web search tool. DDGS Total queries every available engine and needs no key."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backend für das Websuchwerkzeug im Chat. DDGS Total fragt alle verfügbaren Suchmaschinen ab und benötigt keinen Schlüssel."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "聊天联网搜索工具使用的后端。DDGS Total 会查询所有可用引擎，无需密钥。"
+          }
+        }
+      }
+    },
+    "integrations.websearch.ddgs_backends" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Search engines"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suchmaschinen"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "搜索引擎"
+          }
+        }
+      }
+    },
+    "integrations.websearch.ddgs_backends_hint" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pick at least one engine to query. All of these work without an API key."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wählen Sie mindestens eine Suchmaschine aus. Alle aufgeführten Suchmaschinen funktionieren ohne API-Schlüssel."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "至少选择一个要查询的引擎。这些引擎均无需 API 密钥即可使用。"
+          }
+        }
+      }
+    },
+    "integrations.websearch.max_results" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Results per search"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse pro Suche"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每次搜索结果数"
+          }
+        }
+      }
+    },
+    "integrations.websearch.max_results_hint" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How many sources one web_search call returns (1-10)."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Anzahl der Quellen, die ein web_search-Aufruf zurückgibt (1–10)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "一次 web_search 调用返回多少个来源（1-10）。"
+          }
+        }
+      }
+    },
+    "integrations.websearch.content_mode" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Result content"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisinhalt"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "结果内容"
+          }
+        }
+      }
+    },
+    "integrations.websearch.content_mode_hint" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Snippets keep the prompt small. Full page content fetches and inlines each result page."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Textauszüge halten den Prompt klein. Bei vollständigem Seiteninhalt wird jede Ergebnisseite abgerufen und eingebunden."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "摘要片段可让提示词保持精简。完整页面内容会抓取并内联每个结果页面。"
+          }
+        }
+      }
+    },
+    "integrations.websearch.content_mode_snippet" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Snippets only"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur Textauszüge"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅摘要片段"
+          }
+        }
+      }
+    },
+    "integrations.websearch.content_mode_full" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Full page content"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vollständiger Seiteninhalt"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "完整页面内容"
+          }
+        }
+      }
+    },
+    "integrations.websearch.content_truncate" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Truncate page content"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Seiteninhalt kürzen"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "截断页面内容"
+          }
+        }
+      }
+    },
+    "integrations.websearch.content_truncate_hint" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cut each fetched page at the limit below. Turning this off can flood the model context."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jede abgerufene Seite auf das unten angegebene Limit kürzen. Wenn dies deaktiviert ist, kann der Modellkontext überfüllt werden."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按下方限制截断每个抓取的页面。关闭此选项可能导致模型上下文过载。"
+          }
+        }
+      }
+    },
+    "integrations.websearch.content_max_chars" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Content limit"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inhaltslimit"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "内容上限"
+          }
+        }
+      }
+    },
+    "integrations.websearch.content_max_chars_hint" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum characters kept per fetched page."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Anzahl an Zeichen, die pro abgerufener Seite beibehalten werden."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每个抓取页面最多保留的字符数。"
+          }
+        }
+      }
+    },
+    "integrations.websearch.chars_suffix" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "chars"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zeichen"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "字符"
+          }
+        }
+      }
+    },
+    "integrations.websearch.brave_api_key" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Brave API key"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Brave-API-Schlüssel"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Brave API 密钥"
+          }
+        }
+      }
+    },
+    "integrations.websearch.brave_api_key_hint" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Subscription token from the Brave Search API dashboard."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abonnement-Token aus dem Dashboard der Brave Search API."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "来自 Brave Search API 控制台的订阅令牌。"
+          }
+        }
+      }
+    },
+    "integrations.websearch.searxng_url" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SearXNG instance URL"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "URL der SearXNG-Instanz"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SearXNG 实例 URL"
+          }
+        }
+      }
+    },
+    "integrations.websearch.searxng_url_hint" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Base URL of a SearXNG instance with the JSON output format enabled."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Basis-URL einer SearXNG-Instanz mit aktiviertem JSON-Ausgabeformat."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已启用 JSON 输出格式的 SearXNG 实例基础 URL。"
+          }
+        }
+      }
+    },
+    "integrations.websearch.test_label" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Run a test search with the settings above"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eine Testsuche mit den obigen Einstellungen ausführen"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用以上设置运行测试搜索"
+          }
+        }
+      }
+    },
+    "integrations.websearch.test_button" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Test search"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suche testen"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "测试搜索"
+          }
+        }
+      }
+    },
+    "integrations.websearch.testing" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Testing..."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird getestet..."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "测试中…"
+          }
+        }
+      }
+    },
+    "integrations.websearch.test_success" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Search OK: %lld results"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suche erfolgreich: %lld Ergebnisse"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "搜索成功：%lld 个结果"
+          }
+        }
+      }
+    },
+    "integrations.websearch.test_failed" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Search test failed"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suchtest fehlgeschlagen"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "搜索测试失败"
+          }
+        }
+      }
+    },
+    "integrations.websearch.provider_brave" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Brave Search"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Brave Search"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Brave 搜索"
+          }
+        }
+      }
+    },
+    "integrations.websearch.provider_ddgs_custom" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DDGS Custom"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DDGS Custom"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DDGS 自定义"
+          }
+        }
+      }
+    },
+    "integrations.websearch.provider_ddgs_total" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DDGS Total"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DDGS Total"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DDGS 聚合"
+          }
+        }
+      }
+    },
+    "integrations.websearch.provider_duckduckgo" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DuckDuckGo"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DuckDuckGo"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DuckDuckGo"
+          }
+        }
+      }
+    },
+    "integrations.websearch.provider_searxng" : {
+      "comment" : "Web search settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SearXNG"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SearXNG"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SearXNG"
+          }
+        }
+      }
+    },
+    "integrations.websearch.url_invalid" : {
+      "comment" : "Web search settings validation",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter an HTTP or HTTPS URL with a host, or leave it empty."
+          }
+        }
+      }
+    },
+    "integrations.websearch.max_results_invalid" : {
+      "comment" : "Web search settings validation",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter a whole number between 1 and 10."
+          }
+        }
+      }
+    },
+    "integrations.websearch.content_limit_invalid" : {
+      "comment" : "Web search settings validation",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter a whole number greater than zero."
+          }
+        }
+      }
+    },
     "integrations.claude.desktop" : {
       "comment" : "Row label for the Claude Desktop aliases toggle",
       "extractionState" : "manual",

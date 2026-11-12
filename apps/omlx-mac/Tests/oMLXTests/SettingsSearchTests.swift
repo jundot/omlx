@@ -35,6 +35,23 @@ final class SettingsSearchTests: XCTestCase {
         }
     }
 
+    func testWebSearchFieldsAndProviderAliasesOpenIntegrations() throws {
+        for (query, key) in [
+            ("web search Brave credential", "brave_api_key"),
+            ("web search SearXNG endpoint", "searxng_url"),
+            ("web search mojeek", "ddgs_backends"),
+            ("web search full page", "content_mode"),
+            ("web search characters", "content_max_chars")
+        ] {
+            let result = try XCTUnwrap(SettingsSearch.results(for: query, bundle: english).first)
+            XCTAssertEqual(result.section, .integrations)
+            XCTAssertEqual(result.labelKey, "integrations.websearch.\(key)")
+        }
+        let german = try languageBundle("de")
+        let matches = SettingsSearch.results(for: "Suchanbieter", bundle: german)
+        XCTAssertTrue(matches.contains { $0.labelKey == "integrations.websearch.provider" })
+    }
+
     private func languageBundle(_ language: String) throws -> Bundle {
         let url = try XCTUnwrap(Bundle.main.url(forResource: language, withExtension: "lproj"))
         return try XCTUnwrap(Bundle(url: url))

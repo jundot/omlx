@@ -10,6 +10,7 @@ struct Row<Trailing: View>: View {
     let sublabel: String?
     let warning: String?
     let isLast: Bool
+    let sublabelLineLimit: Int?
     let trailing: Trailing
 
     @Environment(\.omlxTheme) private var theme
@@ -19,12 +20,14 @@ struct Row<Trailing: View>: View {
         sublabel: String? = nil,
         warning: String? = nil,
         isLast: Bool = false,
+        sublabelLineLimit: Int? = 2,
         @ViewBuilder trailing: () -> Trailing
     ) {
         self.label = label
         self.sublabel = sublabel
         self.warning = warning
         self.isLast = isLast
+        self.sublabelLineLimit = sublabelLineLimit
         self.trailing = trailing()
     }
 
@@ -39,7 +42,7 @@ struct Row<Trailing: View>: View {
                         Text(sublabel)
                             .font(.omlxText(11.5))
                             .foregroundStyle(theme.textSecondary)
-                            .lineLimit(2)
+                            .lineLimit(sublabelLineLimit)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     if let warning, !warning.isEmpty {
@@ -93,6 +96,7 @@ extension Row where Trailing == EmptyView {
         self.sublabel = sublabel
         self.warning = nil
         self.isLast = isLast
+        self.sublabelLineLimit = 2
         self.trailing = EmptyView()
     }
 }
