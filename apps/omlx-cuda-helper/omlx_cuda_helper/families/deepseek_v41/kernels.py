@@ -630,147 +630,211 @@ _ATTENTION_WEIGHTS = r"""
   denominator[t] = total + expf(sink[t % H] - running);
 """
 
-# ops.sparse_attention on bf16 tensor cores, one block of 4 warps per (query,
-# 16 heads). Rows of D bf16 sit in shared memory with their 16-byte chunks
-# XOR-swizzled by the row. Slots go in tiles of 64 as in ops._attend: a tile
-# is scored whole, its weights use the running maximum through it and round to
-# bf16 for the value product, and the denominator sums the unrounded weights.
-# Warp w scores keys 16 w on of a tile and sums the values of dims D / 4 w on.
+# ops.sparse_attention on bf16 tensor cores, one block of 8 warps per (query,
+# 64 heads), so a key tile is fetched once per query. Rows of bf16 sit in
+# shared memory with their 16-byte chunks XOR-swizzled by the row. Slots go in
+# tiles of 64 as in ops._attend: a tile is scored whole, its weights use the
+# running maximum through it and round to bf16 for the value product, and the
+# denominator sums the unrounded weights. Warp w scores keys 16 (w % 4) on of a
+# tile for heads 32 (w / 4) on and sums their values of dims D / 4 (w % 4) on.
+# The queries stream in 64-dim groups through three buffers, each group staged
+# with the same dims of the tile's keys.
 _ATTENTION_TC = r"""
-  constexpr int HB = 16, KT = 64, CH = D / 8, WD = D / 4;
+  constexpr int HB = 64, KT = 64, WD = D / 4, QD = 64, NQ = D / QD;
   extern __shared__ __align__(128) unsigned char smem[];
-  unsigned char* qs = smem;
-  unsigned char* ks = qs + HB * D * 2;
-  unsigned char* ps = ks + KT * D * 2;
+  unsigned char* ks = smem;
+  unsigned char* qs = ks + KT * D * 2;
+  unsigned char* ps = qs + 3 * HB * QD * 2;
   float* part = reinterpret_cast<float*>(ps + HB * KT * 2);
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t = lane & 3;
+  const int kq = w & 3, hp = w >> 2;
   const int S = meta[0], groups = H / HB;
   const int row = blockIdx.x / groups, h0 = (blockIdx.x % groups) * HB;
   const int* slot = ids + size_t(row) * S;
   const float hidden = __uint_as_float(0xff800000u), sc_scale = scale[0];
   const __nv_bfloat16* qrow = q + (size_t(row) * H + h0) * D;
-  for (int c = tid; c < HB * CH; c += 128) {
-    const int r = c / CH, k = c % CH;
-    v41_cp16(v41_smem(qs + r * D * 2 + ((k ^ (r & 7)) << 4)), qrow + r * D + k * 8, true);
-  }
-  float acc[WD / 8][4];
+  // Thread tid stages rows tid / 8 and tid / 8 + 32 of each chunk, 16 bytes tid % 8.
+  const int lr = tid >> 3, lk = tid & 7;
+  float acc[2][WD / 8][4];
   #pragma unroll
-  for (int n = 0; n < WD / 8; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
-  // Running maximum and this thread's part of the denominator, heads g and g + 8.
-  float m0 = -1e30f, m1 = -1e30f, l0 = 0.0f, l1 = 0.0f;
+  for (int m = 0; m < 2; ++m)
+    #pragma unroll
+    for (int n = 0; n < WD / 8; ++n)
+      acc[m][n][0] = acc[m][n][1] = acc[m][n][2] = acc[m][n][3] = 0.0f;
+  // Running maxima and this thread's parts of the denominators of heads
+  // 16 (2 hp + m) + g and 16 (2 hp + m) + g + 8.
+  float rmax[2][2] = {{-1e30f, -1e30f}, {-1e30f, -1e30f}};
+  float ls[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
   for (int b = 0; b * KT < S; ++b) {
-    for (int c = tid; c < KT * CH; c += 128) {
-      const int r = c / CH, k = c % CH, s = b * KT + r;
-      const int id = s < S ? slot[s] : -1;
-      v41_cp16(v41_smem(ks + r * D * 2 + ((k ^ (r & 7)) << 4)),
-               table + size_t(id < 0 ? 0 : id) * D + k * 8, id >= 0);
+    const int sa = b * KT + lr, sb = sa + 32;
+    const int ida = sa < S ? slot[sa] : -1, idb = sb < S ? slot[sb] : -1;
+    // Group c: dims 64 c on of the 64 heads into Q buffer c % 3 and of the 64 keys.
+    auto stage = [&](int c) {
+      unsigned char* qb = qs + (c % 3) * HB * QD * 2;
+      const int k = 8 * c + lk;
+      v41_cp16(v41_smem(qb + lr * QD * 2 + ((lk ^ (lr & 7)) << 4)), qrow + lr * D + k * 8, true);
+      v41_cp16(v41_smem(qb + (lr + 32) * QD * 2 + ((lk ^ (lr & 7)) << 4)),
+               qrow + (lr + 32) * D + k * 8, true);
+      v41_cp16(v41_smem(ks + lr * D * 2 + ((k ^ (lr & 7)) << 4)),
+               table + size_t(ida < 0 ? 0 : ida) * D + k * 8, ida >= 0);
+      v41_cp16(v41_smem(ks + (lr + 32) * D * 2 + ((k ^ (lr & 7)) << 4)),
+               table + size_t(idb < 0 ? 0 : idb) * D + k * 8, idb >= 0);
+      asm volatile("cp.async.commit_group;\n" ::);
+    };
+    stage(0);
+    if (NQ > 1) stage(1);
+    float sc[2][2][4];
+    #pragma unroll
+    for (int m = 0; m < 2; ++m)
+      #pragma unroll
+      for (int j = 0; j < 2; ++j) sc[m][j][0] = sc[m][j][1] = sc[m][j][2] = sc[m][j][3] = 0.0f;
+    for (int c = 0; c < NQ; ++c) {
+      if (c + 1 < NQ) {
+        asm volatile("cp.async.wait_group 1;\n" ::);
+      } else {
+        asm volatile("cp.async.wait_group 0;\n" ::);
+      }
+      // Group c is visible, and every warp is done with Q buffer (c + 2) % 3.
+      __syncthreads();
+      if (c + 2 < NQ) stage(c + 2);
+      const unsigned char* qb = qs + (c % 3) * HB * QD * 2;
+      #pragma unroll
+      for (int u = 0; u < QD / 16; ++u) {
+        const int s = c * (QD / 16) + u;
+        unsigned a[2][4], kb[4];
+        #pragma unroll
+        for (int m = 0; m < 2; ++m) {
+          const int qr = 32 * hp + 16 * m + (lane & 15), qk = 2 * u + (lane >> 4);
+          v41_ldsm4(v41_smem(qb + qr * QD * 2 + ((qk ^ (qr & 7)) << 4)), a[m]);
+        }
+        const int j = lane >> 3, kr = 16 * kq + (j >> 1) * 8 + (lane & 7), kk = 2 * s + (j & 1);
+        v41_ldsm4(v41_smem(ks + kr * D * 2 + ((kk ^ (kr & 7)) << 4)), kb);
+        #pragma unroll
+        for (int m = 0; m < 2; ++m) {
+          v41_mma(sc[m][0], a[m], kb[0], kb[1]);
+          v41_mma(sc[m][1], a[m], kb[2], kb[3]);
+        }
+      }
     }
-    asm volatile("cp.async.commit_group;\n" ::);
-    asm volatile("cp.async.wait_group 0;\n" ::);
-    __syncthreads();
-    float sc[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
-    #pragma unroll 8
-    for (int s = 0; s < D / 16; ++s) {
-      unsigned a[4], kb[4];
-      const int qr = lane & 15, qk = 2 * s + (lane >> 4);
-      v41_ldsm4(v41_smem(qs + qr * D * 2 + ((qk ^ (qr & 7)) << 4)), a);
-      const int j = lane >> 3, kr = 16 * w + (j >> 1) * 8 + (lane & 7), kk = 2 * s + (j & 1);
-      v41_ldsm4(v41_smem(ks + kr * D * 2 + ((kk ^ (kr & 7)) << 4)), kb);
-      v41_mma(sc[0], a, kb[0], kb[1]);
-      v41_mma(sc[1], a, kb[2], kb[3]);
-    }
-    float top0 = hidden, top1 = hidden;
+    float top[2][2] = {{hidden, hidden}, {hidden, hidden}};
     #pragma unroll
     for (int j = 0; j < 2; ++j)
       #pragma unroll
       for (int e = 0; e < 2; ++e) {
-        const int s = b * KT + 16 * w + 8 * j + 2 * t + e;
+        const int s = b * KT + 16 * kq + 8 * j + 2 * t + e;
         const bool ok = s < S && slot[s] >= 0;
-        sc[j][e] = ok ? sc[j][e] * sc_scale : hidden;
-        sc[j][2 + e] = ok ? sc[j][2 + e] * sc_scale : hidden;
-        top0 = fmaxf(top0, sc[j][e]);
-        top1 = fmaxf(top1, sc[j][2 + e]);
+        #pragma unroll
+        for (int m = 0; m < 2; ++m) {
+          sc[m][j][e] = ok ? sc[m][j][e] * sc_scale : hidden;
+          sc[m][j][2 + e] = ok ? sc[m][j][2 + e] * sc_scale : hidden;
+          top[m][0] = fmaxf(top[m][0], sc[m][j][e]);
+          top[m][1] = fmaxf(top[m][1], sc[m][j][2 + e]);
+        }
       }
     #pragma unroll
-    for (int off = 1; off < 4; off <<= 1) {
-      top0 = fmaxf(top0, __shfl_xor_sync(0xffffffffu, top0, off));
-      top1 = fmaxf(top1, __shfl_xor_sync(0xffffffffu, top1, off));
-    }
+    for (int m = 0; m < 2; ++m)
+      #pragma unroll
+      for (int off = 1; off < 4; off <<= 1) {
+        top[m][0] = fmaxf(top[m][0], __shfl_xor_sync(0xffffffffu, top[m][0], off));
+        top[m][1] = fmaxf(top[m][1], __shfl_xor_sync(0xffffffffu, top[m][1], off));
+      }
     if (t == 0) {
-      part[w * HB + g] = top0;
-      part[w * HB + g + 8] = top1;
+      #pragma unroll
+      for (int m = 0; m < 2; ++m) {
+        part[kq * HB + 32 * hp + 16 * m + g] = top[m][0];
+        part[kq * HB + 32 * hp + 16 * m + g + 8] = top[m][1];
+      }
     }
     __syncthreads();
-    const float n0 = fmaxf(m0, fmaxf(fmaxf(part[g], part[HB + g]),
-                                     fmaxf(part[2 * HB + g], part[3 * HB + g])));
-    const float n1 = fmaxf(m1, fmaxf(fmaxf(part[g + 8], part[HB + g + 8]),
-                                     fmaxf(part[2 * HB + g + 8], part[3 * HB + g + 8])));
-    const float f0 = expf(m0 - n0), f1 = expf(m1 - n1);
-    m0 = n0;
-    m1 = n1;
-    float s0 = 0.0f, s1 = 0.0f;
     #pragma unroll
-    for (int j = 0; j < 2; ++j) {
+    for (int m = 0; m < 2; ++m) {
+      const int h = 32 * hp + 16 * m + g;
+      const float n0 = fmaxf(rmax[m][0], fmaxf(fmaxf(part[h], part[HB + h]),
+                                             fmaxf(part[2 * HB + h], part[3 * HB + h])));
+      const float n1 = fmaxf(rmax[m][1], fmaxf(fmaxf(part[h + 8], part[HB + h + 8]),
+                                             fmaxf(part[2 * HB + h + 8], part[3 * HB + h + 8])));
+      const float f0 = expf(rmax[m][0] - n0), f1 = expf(rmax[m][1] - n1);
+      rmax[m][0] = n0;
+      rmax[m][1] = n1;
+      float s0 = 0.0f, s1 = 0.0f;
       #pragma unroll
-      for (int e = 0; e < 2; ++e) {
-        sc[j][e] = expf(sc[j][e] - n0);
-        sc[j][2 + e] = expf(sc[j][2 + e] - n1);
-        s0 += sc[j][e];
-        s1 += sc[j][2 + e];
+      for (int j = 0; j < 2; ++j) {
+        #pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          sc[m][j][e] = expf(sc[m][j][e] - n0);
+          sc[m][j][2 + e] = expf(sc[m][j][2 + e] - n1);
+          s0 += sc[m][j][e];
+          s1 += sc[m][j][2 + e];
+        }
+        const int chunk = 2 * kq + j;
+        *reinterpret_cast<unsigned*>(ps + h * KT * 2 + ((chunk ^ (g & 7)) << 4) + 4 * t) =
+            v41_pack(sc[m][j][0], sc[m][j][1]);
+        *reinterpret_cast<unsigned*>(ps + (h + 8) * KT * 2 + ((chunk ^ (g & 7)) << 4) + 4 * t) =
+            v41_pack(sc[m][j][2], sc[m][j][3]);
       }
-      const int chunk = 2 * w + j;
-      *reinterpret_cast<unsigned*>(ps + g * KT * 2 + ((chunk ^ (g & 7)) << 4) + 4 * t) =
-          v41_pack(sc[j][0], sc[j][1]);
-      *reinterpret_cast<unsigned*>(ps + (g + 8) * KT * 2 + ((chunk ^ (g & 7)) << 4) + 4 * t) =
-          v41_pack(sc[j][2], sc[j][3]);
-    }
-    l0 = l0 * f0 + s0;
-    l1 = l1 * f1 + s1;
-    #pragma unroll
-    for (int n = 0; n < WD / 8; ++n) {
-      acc[n][0] *= f0;
-      acc[n][1] *= f0;
-      acc[n][2] *= f1;
-      acc[n][3] *= f1;
+      ls[m][0] = ls[m][0] * f0 + s0;
+      ls[m][1] = ls[m][1] * f1 + s1;
+      #pragma unroll
+      for (int n = 0; n < WD / 8; ++n) {
+        acc[m][n][0] *= f0;
+        acc[m][n][1] *= f0;
+        acc[m][n][2] *= f1;
+        acc[m][n][3] *= f1;
+      }
     }
     __syncthreads();
     #pragma unroll
     for (int s = 0; s < KT / 16; ++s) {
-      unsigned a[4];
-      const int pr = lane & 15, pk = 2 * s + (lane >> 4);
-      v41_ldsm4(v41_smem(ps + pr * KT * 2 + ((pk ^ (pr & 7)) << 4)), a);
+      unsigned a[2][4];
+      #pragma unroll
+      for (int m = 0; m < 2; ++m) {
+        const int pr = 32 * hp + 16 * m + (lane & 15), pk = 2 * s + (lane >> 4);
+        v41_ldsm4(v41_smem(ps + pr * KT * 2 + ((pk ^ (pr & 7)) << 4)), a[m]);
+      }
       #pragma unroll
       for (int p = 0; p < WD / 16; ++p) {
         unsigned vb[4];
         const int j = lane >> 3, vr = 16 * s + (j & 1) * 8 + (lane & 7);
-        const int vk = WD / 8 * w + 2 * p + (j >> 1);
+        const int vk = WD / 8 * kq + 2 * p + (j >> 1);
         v41_ldsm4t(v41_smem(ks + vr * D * 2 + ((vk ^ (vr & 7)) << 4)), vb);
-        v41_mma(acc[2 * p], a, vb[0], vb[1]);
-        v41_mma(acc[2 * p + 1], a, vb[2], vb[3]);
+        #pragma unroll
+        for (int m = 0; m < 2; ++m) {
+          v41_mma(acc[m][2 * p], a[m], vb[0], vb[1]);
+          v41_mma(acc[m][2 * p + 1], a[m], vb[2], vb[3]);
+        }
       }
     }
     __syncthreads();
   }
   #pragma unroll
-  for (int off = 1; off < 4; off <<= 1) {
-    l0 += __shfl_xor_sync(0xffffffffu, l0, off);
-    l1 += __shfl_xor_sync(0xffffffffu, l1, off);
-  }
+  for (int m = 0; m < 2; ++m)
+    #pragma unroll
+    for (int off = 1; off < 4; off <<= 1) {
+      ls[m][0] += __shfl_xor_sync(0xffffffffu, ls[m][0], off);
+      ls[m][1] += __shfl_xor_sync(0xffffffffu, ls[m][1], off);
+    }
   if (t == 0) {
-    part[w * HB + g] = l0;
-    part[w * HB + g + 8] = l1;
+    #pragma unroll
+    for (int m = 0; m < 2; ++m) {
+      part[kq * HB + 32 * hp + 16 * m + g] = ls[m][0];
+      part[kq * HB + 32 * hp + 16 * m + g + 8] = ls[m][1];
+    }
   }
   __syncthreads();
-  const float d0 = part[g] + part[HB + g] + part[2 * HB + g] + part[3 * HB + g] +
-                   expf(sink[h0 + g] - m0);
-  const float d1 = part[g + 8] + part[HB + g + 8] + part[2 * HB + g + 8] +
-                   part[3 * HB + g + 8] + expf(sink[h0 + g + 8] - m1);
-  __nv_bfloat16* out0 = o + (size_t(row) * H + h0 + g) * D + WD * w + 2 * t;
-  __nv_bfloat16* out1 = out0 + 8 * D;
   #pragma unroll
-  for (int n = 0; n < WD / 8; ++n) {
-    *reinterpret_cast<unsigned*>(out0 + 8 * n) = v41_pack(acc[n][0] / d0, acc[n][1] / d0);
-    *reinterpret_cast<unsigned*>(out1 + 8 * n) = v41_pack(acc[n][2] / d1, acc[n][3] / d1);
+  for (int m = 0; m < 2; ++m) {
+    const int h = 32 * hp + 16 * m + g;
+    const float d0 = part[h] + part[HB + h] + part[2 * HB + h] + part[3 * HB + h] +
+                     expf(sink[h0 + h] - rmax[m][0]);
+    const float d1 = part[h + 8] + part[HB + h + 8] + part[2 * HB + h + 8] +
+                     part[3 * HB + h + 8] + expf(sink[h0 + h + 8] - rmax[m][1]);
+    __nv_bfloat16* out0 = o + (size_t(row) * H + h0 + h) * D + WD * kq + 2 * t;
+    __nv_bfloat16* out1 = out0 + 8 * D;
+    #pragma unroll
+    for (int n = 0; n < WD / 8; ++n) {
+      *reinterpret_cast<unsigned*>(out0 + 8 * n) = v41_pack(acc[m][n][0] / d0, acc[m][n][1] / d0);
+      *reinterpret_cast<unsigned*>(out1 + 8 * n) = v41_pack(acc[m][n][2] / d1, acc[m][n][3] / d1);
+    }
   }
 """
 
@@ -1291,8 +1355,8 @@ def _slots(window, pooled, wi, ci):
 
 
 def _attention_tc_shared(width: int) -> int:
-    """Shared bytes: 16 query rows, 64 key rows, the weights and the parts."""
-    return (16 + 64) * width * 2 + 16 * 64 * 2 + 4 * 16 * 4
+    """Shared bytes: 64 key rows, three 64-dim query groups, weights, parts."""
+    return 64 * width * 2 + 3 * 64 * 64 * 2 + 64 * 64 * 2 + 4 * 64 * 4
 
 
 @cache
@@ -1311,7 +1375,7 @@ def attention_tc_fits(q: mx.array) -> bool:
     heads, width = q.shape[-2:]
     return (
         q.dtype == mx.bfloat16
-        and heads % 16 == 0
+        and heads % 64 == 0
         and width % 64 == 0
         and _attention_tc_shared(width) <= 99 * 1024
     )
@@ -1321,9 +1385,10 @@ def sparse_attention_tc(q, window, pooled, wi, ci, sink, scale):
     """ops.sparse_attention with bf16 products on tensor cores."""
     _, length, heads, width = q.shape
     ids, table = _slots(window, pooled, wi, ci)
+    # q goes in whole; with q[0] the launch copies all of q first.
     return _attention_tc_kernel(width)(
         inputs=[
-            q[0],
+            q,
             table,
             ids,
             sink,
@@ -1331,8 +1396,8 @@ def sparse_attention_tc(q, window, pooled, wi, ci, sink, scale):
             mx.array([ids.shape[-1]], mx.int32),
         ],
         template=[("D", width), ("H", heads)],
-        grid=(128 * length * (heads // 16), 1, 1),
-        threadgroup=(128, 1, 1),
+        grid=(256 * length * (heads // 64), 1, 1),
+        threadgroup=(256, 1, 1),
         output_shapes=[(length, heads, width)],
         output_dtypes=[mx.bfloat16],
     )[0][None]
