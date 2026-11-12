@@ -45,13 +45,7 @@ from omlx.settings import GlobalSettings
 
 
 def _mock_pool() -> MagicMock:
-    """Mock EnginePool for server tests.
-
-    Server startup resets boundary snapshots under
-    ``_scheduler_config.paged_ssd_cache_dir``. Left as an auto-mock, that
-    path materializes MagicMock/ directories in the working tree, so pin
-    it to None (SSD cache off).
-    """
+    # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
     pool = MagicMock()
     pool._scheduler_config.paged_ssd_cache_dir = None
     return pool
@@ -868,7 +862,7 @@ class TestModelFallback:
 
     def _setup_pool(self, found_model=None):
         """Create a mock engine pool."""
-        pool = _mock_pool()
+        pool = MagicMock()
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
 
         if found_model:
@@ -940,7 +934,7 @@ class TestModelFallback:
         self._state.global_settings.model.model_fallback = False
         self._state.default_model = "default-model"
 
-        pool = _mock_pool()
+        pool = MagicMock()
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
         pool.get_engine = AsyncMock(
             side_effect=ModelUnavailableError("broken-model", "cached failure")
@@ -972,7 +966,7 @@ class TestGetEngineLLMTypeValidation:
             yield
 
     def _pool_returning(self, engine):
-        pool = _mock_pool()
+        pool = MagicMock()
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
         pool.get_engine = AsyncMock(return_value=engine)
         self._state.engine_pool = pool
@@ -1092,7 +1086,7 @@ class TestGetMaxContextWindow:
         )
 
     def _mount_pool(self, entries: dict):
-        pool = _mock_pool()
+        pool = MagicMock()
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
         pool.get_entry.side_effect = lambda mid: entries.get(mid)
         self._state.engine_pool = pool

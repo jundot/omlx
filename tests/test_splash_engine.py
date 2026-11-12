@@ -1994,8 +1994,7 @@ class TestNativeResponseFormat:
             engine.start = AsyncMock()
             engine.count_chat_tokens.return_value = 10
             pool = MagicMock()
-            # Startup and shutdown reset boundary snapshots under this dir. A bare
-            # mock attribute would materialize MagicMock/ directories in CWD.
+            # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
             pool._scheduler_config.paged_ssd_cache_dir = None
             pool.preload_pinned_models = AsyncMock()
             pool.check_ttl_expirations = AsyncMock()
