@@ -718,17 +718,6 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
 
-        # Padded batches the ragged/verify kernels refuse -> batch-1 attention
-        # per row. Applied after the patches above so it wraps them.
-        try:
-            from ..patches.qwen35_padded_row_attention import (
-                apply_qwen35_padded_row_attention_patch,
-            )
-
-            apply_qwen35_padded_row_attention_patch()
-        except Exception:
-            logger.debug("qwen3_5 padded-row attention patch not applied", exc_info=True)
-
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
             copy.copy(self._scheduler_config)

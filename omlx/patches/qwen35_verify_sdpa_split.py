@@ -958,13 +958,18 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
 
     try:
         from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+        from .mlx_vlm_mtp import qwen35_verify_attention
     except ImportError:
         return False
 
-    original = getattr(q35_lang, "_qwen3_5_left_padded_attention", None)
-    if original is None:
+    if getattr(q35_lang, "_qwen3_5_left_padded_attention", None) is None:
         logger.debug("verify-split: target-verify seam not found; patch skipped")
         return False
+    # Keep the bounded padded-verify kernel inside this wrapper whichever model
+    # starts first, so the seam order does not depend on load order.
+    qwen35_verify_attention.apply(q35_lang)
+    original = q35_lang._qwen3_5_left_padded_attention
 
     def patched_target_verify_attention(
         queries,

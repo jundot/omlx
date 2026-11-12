@@ -19,9 +19,9 @@ SCALE = D**-0.5
 SHORT, LONG = 600, 9000
 
 
-@pytest.fixture
-def patched(monkeypatch):
+def _fresh_seams(monkeypatch):
     from omlx.patches import qwen35_padded_row_attention as mod
+    from omlx.patches import qwen35_verify_sdpa_split as split
 
     for name in (
         "_qwen3_5_left_padded_attention",
@@ -30,13 +30,18 @@ def patched(monkeypatch):
     ):
         monkeypatch.setattr(q35, name, getattr(q35, name))
     monkeypatch.setattr(mod, "_PATCHED", False)
-    # The seams a served Qwen3.5 model already has: the bounded padded-verify
-    # kernel (MTP runtime) and the batch-1 verify split.
-    from omlx.patches import qwen35_verify_sdpa_split as split
-    from omlx.patches.mlx_vlm_mtp import qwen35_verify_attention
-
     monkeypatch.setattr(split, "_PATCHED", False, raising=False)
     monkeypatch.setattr(q35, "_omlx_verify_attention", False, raising=False)
+    return mod, split
+
+
+@pytest.fixture
+def patched(monkeypatch):
+    mod, split = _fresh_seams(monkeypatch)
+    # The seams a served Qwen3.5 model already has: the bounded padded-verify
+    # kernel (MTP runtime) and the batch-1 verify split.
+    from omlx.patches.mlx_vlm_mtp import qwen35_verify_attention
+
     qwen35_verify_attention.apply(q35)
     split.apply_qwen35_verify_sdpa_split_patch()
     original = q35._qwen3_5_left_padded_attention
@@ -141,6 +146,20 @@ def test_long_verify_rows_match_solo(patched, length):
     assert out is not None
     assert mx.array_equal(out, _solo(patched.original, q, k, v, pads)).item()
     assert cache not in patched.calls
+
+
+def test_long_verify_rows_are_claimed_when_another_model_started_first(monkeypatch):
+    # A non-Qwen VLM start installs the verify split and this patch before a
+    # Qwen3.5 load applies the bounded verify kernel. Without the bounded
+    # kernel inside both wrappers it returns None for these rows.
+    from omlx.patches.mlx_vlm_mtp import qwen35_verify_attention
+
+    mod, split = _fresh_seams(monkeypatch)
+    split.apply_qwen35_verify_sdpa_split_patch()
+    assert mod.apply_qwen35_padded_row_attention_patch()
+    qwen35_verify_attention.apply(q35)
+    cache, q, k, v, mask, _ = _step([SHORT + 3000, LONG], 4)
+    assert _call(q, k, v, cache, mask) is not None
 
 
 def test_short_verify_keeps_the_bounded_kernel(patched):

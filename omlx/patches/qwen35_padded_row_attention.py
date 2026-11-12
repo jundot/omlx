@@ -44,6 +44,11 @@ import logging
 from typing import Any
 
 import mlx.core as mx
+from mlx_lm.models.base import create_causal_mask
+from mlx_lm.models.cache import BatchKVCache as LMBatchKVCache
+from mlx_vlm.models.cache import BatchKVCache
+
+from ..model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +60,9 @@ _PATCH_MARKER = "_omlx_qwen35_padded_row_attention_patch"
 # exactly left padding + causal; each layer then receives a full-width slice
 # of that mask (_prepare_projected_qkv), so the shape identifies it.
 _ROWS_ATTR = "_omlx_qwen35_verify_row_pads"
-try:
-    from ..model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS as _MAX_DRAFTS
-except ImportError:  # pragma: no cover - keeps the patch importable alone
-    _MAX_DRAFTS = 8
 # Widest MTP verify block (target token + drafts). Wider multi-token blocks
 # (prefill chunks) keep their current path.
-_MAX_VERIFY_WIDTH = _MAX_DRAFTS + 1
+_MAX_VERIFY_WIDTH = MAX_LIGHTNING_MTP_DRAFT_TOKENS + 1
 # Matches the bounded padded-verify kernel in qwen35_verify_attention: at or
 # below this many keys that kernel already serves the batch.
 _VERIFY_KERNEL_MAX_KEYS = 8192
@@ -80,27 +81,10 @@ def _log_engaged(rows: int, q_len: int) -> None:
         )
 
 
-def _batch_cache_types() -> tuple[type, ...]:
-    types: list[type] = []
-    try:
-        from mlx_lm.models.cache import BatchKVCache as LMBatchKVCache
-
-        types.append(LMBatchKVCache)
-    except ImportError:
-        pass
-    try:
-        from mlx_vlm.models.cache import BatchKVCache
-
-        types.append(BatchKVCache)
-    except ImportError:
-        pass
-    return tuple(types)
-
-
 def _plain_padded_cache(cache: Any) -> bool:
     """A dense, unquantized, left-padded batch cache with no pending right pad."""
     return (
-        type(cache) in _batch_cache_types()
+        type(cache) in (LMBatchKVCache, BatchKVCache)
         and not hasattr(cache, "bits")
         and isinstance(getattr(cache, "left_padding", None), mx.array)
         and cache.left_padding.ndim == 1
@@ -220,8 +204,6 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
             and cache._idx + length > _VERIFY_KERNEL_MAX_KEYS
             and _padded_causal_mask_shape(mask, h.shape[0], length, cache._idx + length)
         ):
-            from mlx_lm.models.base import create_causal_mask
-
             # The per-row route drops the mask and slices each row's keys
             # from its pad: only valid if the mask is exactly that.
             expected = create_causal_mask(
