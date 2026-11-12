@@ -270,3 +270,68 @@ final class MenubarLogTests: XCTestCase {
         XCTAssertTrue(try contents().hasSuffix("log opened before any probe ran\n"))
     }
 }
+
+/// `MenubarNotch.covers` with the geometry of a 14-inch MacBook Pro at its
+/// default 1512x982 scale: unobscured top areas 663 and 664 points wide, so
+/// the notch spans x 663...848. Item frames are the 38-point-wide status
+/// item frames a real menubar.log recorded on that screen.
+final class MenubarNotchTests: XCTestCase {
+    private let builtIn = CGRect(x: 0, y: 0, width: 1512, height: 982)
+    private let leftWidth: CGFloat = 663
+    private let rightWidth: CGFloat = 664
+
+    private func item(x: CGFloat, on screen: CGRect? = nil) -> CGRect {
+        CGRect(x: (screen?.minX ?? 0) + x, y: 949, width: 38, height: 33)
+    }
+
+    private func covers(_ frame: CGRect, screen: CGRect? = nil) -> Bool {
+        MenubarNotch.covers(
+            itemFrame: frame,
+            screenFrame: screen ?? builtIn,
+            leftAreaWidth: leftWidth,
+            rightAreaWidth: rightWidth
+        )
+    }
+
+    func testItemsLoggedAsHiddenSitBehindTheNotch() {
+        for x: CGFloat in [773, 774, 807, 815, 822] {
+            XCTAssertTrue(covers(item(x: x)), "x=\(x)")
+        }
+    }
+
+    func testItemsLoggedAsVisibleSitRightOfTheNotch() {
+        for x: CGFloat in [886, 893, 900, 937, 971] {
+            XCTAssertFalse(covers(item(x: x)), "x=\(x)")
+        }
+    }
+
+    func testEdgesTouchingTheNotchDoNotCount() {
+        XCTAssertFalse(covers(item(x: 848)))
+        XCTAssertFalse(covers(item(x: 663 - 38)))
+        XCTAssertTrue(covers(item(x: 847)))
+        XCTAssertTrue(covers(item(x: 663 - 37)))
+    }
+
+    func testNotchFollowsTheScreenOriginInTheGlobalLayout() {
+        let rightOfExternal = CGRect(x: 1920, y: -98, width: 1512, height: 982)
+        XCTAssertTrue(covers(item(x: 800, on: rightOfExternal), screen: rightOfExternal))
+        XCTAssertFalse(covers(item(x: 900, on: rightOfExternal), screen: rightOfExternal))
+        XCTAssertFalse(covers(item(x: 800), screen: rightOfExternal))
+    }
+
+    func testScreensWithoutANotchNeverCover() {
+        let external = CGRect(x: 1512, y: -98, width: 1920, height: 1080)
+        XCTAssertFalse(MenubarNotch.covers(
+            itemFrame: item(x: 960, on: external),
+            screenFrame: external,
+            leftAreaWidth: nil,
+            rightAreaWidth: nil
+        ))
+        XCTAssertFalse(MenubarNotch.covers(
+            itemFrame: item(x: 760),
+            screenFrame: builtIn,
+            leftAreaWidth: 756,
+            rightAreaWidth: 756
+        ))
+    }
+}
