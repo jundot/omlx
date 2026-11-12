@@ -190,11 +190,6 @@ class ExternalAPIClient:
             transport=transport,
         )
 
-    @property
-    def max_tokens_override(self) -> int | None:
-        """Accuracy-run max_tokens floor from the endpoint config, if set."""
-        return self._config.max_tokens_override
-
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -540,13 +535,6 @@ class ExternalChatAdapter:
         max_tokens: int = 256,
         **kwargs: Any,
     ) -> _AdapterOutput:
-        # Floor the benchmark's per-question budget for thinking models:
-        # reasoning tokens count against max_tokens, so a small default
-        # (128 for MMLU) truncates the answer before it is written.
-        # Never shrinks a benchmark's own budget.
-        override = self._client.max_tokens_override
-        if override is not None:
-            max_tokens = max(max_tokens, override)
         temperature = 0.0 if self._sampling_profile == "deterministic" else None
         try:
             result = await self._client.chat_completion(
