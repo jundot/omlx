@@ -1260,6 +1260,20 @@ class TestExposedProfileModels:
         }
 
     @pytest.mark.asyncio
+    async def test_v1_models_status_exposes_exclusive_group(self, manager):
+        import omlx.server as server_module
+
+        manager.set_settings("qwen-base", ModelSettings(exclusive_group="chat"))
+        self._save_exposed_profile(manager, {"max_tokens": 1024})
+        server_module._server_state.engine_pool = self._FakePool()
+
+        status = await server_module.list_models_status(True)
+
+        by_id = {m["id"]: m for m in status["models"]}
+        assert by_id["qwen-base"]["exclusive_group"] == "chat"
+        assert by_id["qwen-base:thinking"]["exclusive_group"] == "chat"
+
+    @pytest.mark.asyncio
     async def test_v1_models_advertises_alias_form_for_exposed_profiles(self, manager):
         """With a base-model alias set, the catalog lists <alias>:<profile> —
         consistent with the base model being listed under its alias."""
@@ -1495,6 +1509,24 @@ class TestHealthPreloadReadiness:
             assert body["status"] == "healthy"
         finally:
             server_mod._server_state.pinned_preload_complete = old
+
+
+class TestHealthSwapWaiting:
+    @pytest.mark.asyncio
+    async def test_health_engine_pool_reports_swap_waiting(self):
+        from fastapi import Response
+
+        from omlx import server as server_mod
+
+        state = server_mod._server_state
+        old = (state.engine_pool, state.pinned_preload_complete)
+        try:
+            state.engine_pool = MagicMock(swap_waiting=3)
+            state.pinned_preload_complete = True
+            body = await server_mod.health(Response())
+            assert body["engine_pool"]["swap_waiting"] == 3
+        finally:
+            state.engine_pool, state.pinned_preload_complete = old
 
 
 @pytest.mark.parametrize("stream", [False, True])

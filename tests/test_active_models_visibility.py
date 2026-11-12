@@ -98,6 +98,36 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
     ]
 
 
+def test_active_models_counts_swap_waiting():
+    """Requests parked in admission have no engine, so they come from the pool."""
+
+    class ParkedPool:
+        _entries = {}
+
+        def get_status(self):
+            return {
+                "current_model_memory": 0,
+                "final_ceiling": 0,
+                "swap_waiting": 2,
+                "models": [],
+            }
+
+    with (
+        patch("omlx.admin.routes._get_server_state", return_value=None),
+        patch.object(admin_routes, "_get_engine_pool", return_value=ParkedPool()),
+        patch.object(admin_routes, "_get_settings_manager", return_value=None),
+        patch.object(admin_routes, "_get_global_settings", return_value=None),
+        patch(
+            "omlx.prefill_progress.get_prefill_tracker",
+            return_value=FakePrefillTracker(),
+        ),
+    ):
+        data = admin_routes._build_active_models_data()
+
+    assert data["swap_waiting"] == 2
+    assert data["total_waiting_requests"] == 2
+
+
 def test_active_models_does_not_count_waiting_collectors_as_active():
     waiting_request = SimpleNamespace(
         request_id="wait-1",

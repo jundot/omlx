@@ -45,6 +45,10 @@ class _FakePool:
     def get_entry(self, model_id):
         return self._entries.get(model_id)
 
+    def set_pinned(self, model_id, pinned):
+        self._entries[model_id].is_pinned = pinned
+        return True
+
     def recommended_sampling_settings(self, entry):
         return dict(self.recommended_sampling)
 

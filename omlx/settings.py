@@ -276,6 +276,9 @@ class ModelSettings:
     hide_helper_models: bool = (
         False  # Hide dFlash/Assistant/Draft helper models from /v1/models
     )
+    swap_wait_timeout_seconds: int = (
+        0  # Busy-model admission wait; 0 keeps the built-in window
+    )
 
     def get_model_dirs(self, base_path: Path) -> list[Path]:
         """
@@ -312,6 +315,7 @@ class ModelSettings:
             "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
             "model_fallback": self.model_fallback,
             "hide_helper_models": self.hide_helper_models,
+            "swap_wait_timeout_seconds": self.swap_wait_timeout_seconds,
         }
 
     @classmethod
@@ -321,11 +325,22 @@ class ModelSettings:
         # Backward compatibility: migrate old model_dir to model_dirs
         if not model_dirs and data.get("model_dir"):
             model_dirs = [data["model_dir"]]
+        # Do not raise here: a raise during load moves the whole settings
+        # file aside as corrupt.
+        try:
+            swap_wait = int(data.get("swap_wait_timeout_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid model.swap_wait_timeout_seconds %r, using 0",
+                data.get("swap_wait_timeout_seconds"),
+            )
+            swap_wait = 0
         return cls(
             model_dirs=model_dirs,
             model_dir=data.get("model_dir"),
             model_fallback=data.get("model_fallback", False),
             hide_helper_models=data.get("hide_helper_models", False),
+            swap_wait_timeout_seconds=swap_wait,
         )
 
 
@@ -1710,6 +1725,9 @@ class GlobalSettings:
 
         if type(self.auth.allow_unauthenticated_inference) is not bool:
             errors.append("auth.allow_unauthenticated_inference must be a boolean")
+
+        if not 0 <= self.model.swap_wait_timeout_seconds <= 3600:
+            errors.append("model.swap_wait_timeout_seconds must be between 0 and 3600")
 
         # Server validation
         if not 1 <= self.server.port <= 65535:

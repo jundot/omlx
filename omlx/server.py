@@ -2634,6 +2634,9 @@ def init_server(
     _server_state.engine_pool.configure_gpu_keep_warm(
         global_settings.server.gpu_keep_warm_interval if global_settings else 0.5
     )
+    _server_state.engine_pool.configure_swap_wait_timeout(
+        global_settings.model.swap_wait_timeout_seconds if global_settings else 0
+    )
     from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager
@@ -3410,6 +3413,7 @@ async def health(response: Response):
             "loaded_count": _server_state.engine_pool.loaded_model_count,
             "final_ceiling": ceiling,
             "current_model_memory": _server_state.engine_pool.current_model_memory,
+            "swap_waiting": _server_state.engine_pool.swap_waiting,
         }
 
     loading = not _server_state.pinned_preload_complete
@@ -3988,6 +3992,7 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["max_tokens"] = None
             m["is_favorite"] = False
             m["is_hidden"] = False
+            m["exclusive_group"] = None
             continue
 
         m["max_context_window"] = get_max_context_window(model_id)
@@ -4011,11 +4016,13 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
                 m["model_alias"] = base_ms.model_alias
             m["is_favorite"] = base_ms is not None and base_ms.is_favorite
             m["is_hidden"] = base_ms is not None and base_ms.is_hidden
+            m["exclusive_group"] = base_ms.exclusive_group if base_ms else None
             if ms and ms.max_tokens is not None:
                 max_tokens = ms.max_tokens
         else:
             m["is_favorite"] = False
             m["is_hidden"] = False
+            m["exclusive_group"] = None
         m["max_tokens"] = max_tokens
     return status
 

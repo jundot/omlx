@@ -79,6 +79,7 @@ from ..model_settings import (
     ModelSettings,
     ane_prefill_backend,
     ane_prefill_fraction,
+    normalize_exclusive_group,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
     validate_ane_prefill,
@@ -453,6 +454,7 @@ class ModelSettingsRequest(BaseModel):
     is_default: bool | None = None
     is_hidden: bool | None = None
     is_favorite: bool | None = None
+    exclusive_group: str | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
     embedding_audio_enabled: bool | None = None
@@ -729,6 +731,7 @@ class GlobalSettingsRequest(BaseModel):
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
     model_fallback: bool | None = None
     hide_helper_models: bool | None = None
+    swap_wait_timeout_seconds: int | None = Field(default=None, ge=0, le=3600)
 
     # Memory enforcement
     memory_prefill_memory_guard: bool | None = None
@@ -2568,6 +2571,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             ),
             "is_hidden": bool(settings and settings.is_hidden),
             "is_favorite": bool(settings and settings.is_favorite),
+            "exclusive_group": settings.exclusive_group if settings else None,
             "is_helper": (
                 bool(model_info.get("is_helper"))
                 or model_id in referenced_drafts
@@ -3135,6 +3139,13 @@ async def update_model_settings(
         current_settings.forced_ct_kwargs = request.forced_ct_kwargs
     if "ttl_seconds" in sent:
         current_settings.ttl_seconds = request.ttl_seconds
+    if "exclusive_group" in sent:
+        try:
+            current_settings.exclusive_group = normalize_exclusive_group(
+                request.exclusive_group
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     if "index_cache_freq" in sent:
         # 0 means disable (reset to None)
         current_settings.index_cache_freq = (
@@ -3472,8 +3483,8 @@ async def update_model_settings(
     _validate_model_settings(entry, current_settings.to_dict())
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
-        # Also update the engine pool entry
-        entry.is_pinned = request.is_pinned
+        # Also update the engine pool entry (wakes exclusive_group waiters)
+        engine_pool.set_pinned(model_id, request.is_pinned)
     if request.is_default is not None:
         current_settings.is_default = request.is_default
         if server_state:
@@ -4770,6 +4781,7 @@ def _global_settings_response(global_settings):
             ],
             "model_fallback": global_settings.model.model_fallback,
             "hide_helper_models": global_settings.model.hide_helper_models,
+            "swap_wait_timeout_seconds": global_settings.model.swap_wait_timeout_seconds,
         },
         "memory": {
             "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
@@ -5147,6 +5159,17 @@ async def update_global_settings(
     if request.hide_helper_models is not None:
         global_settings.model.hide_helper_models = request.hide_helper_models
         runtime_applied.append("hide_helper_models")
+    if request.swap_wait_timeout_seconds is not None:
+        from ..server import _server_state
+
+        global_settings.model.swap_wait_timeout_seconds = (
+            request.swap_wait_timeout_seconds
+        )
+        if _server_state.engine_pool is not None:
+            _server_state.engine_pool.configure_swap_wait_timeout(
+                request.swap_wait_timeout_seconds
+            )
+        runtime_applied.append("swap_wait_timeout_seconds")
 
     # Apply memory guard tier + custom ceiling change (Live)
     if (
@@ -7056,6 +7079,7 @@ def _build_active_models_data() -> dict:
             },
             "total_active_requests": 0,
             "total_waiting_requests": 0,
+            "swap_waiting": 0,
         }
 
     now = time.monotonic()
@@ -7075,6 +7099,9 @@ def _build_active_models_data() -> dict:
     models = []
     total_active = 0
     total_waiting = 0
+    # Requests parked in admission have no engine yet, so no per-model
+    # scheduler queue counts them.
+    swap_waiting = status.get("swap_waiting", 0)
 
     for model_info in status.get("models", []):
         if not model_info.get("loaded") and not model_info.get("is_loading"):
@@ -7406,7 +7433,8 @@ def _build_active_models_data() -> dict:
             ),
         },
         "total_active_requests": total_active,
-        "total_waiting_requests": total_waiting,
+        "total_waiting_requests": total_waiting + swap_waiting,
+        "swap_waiting": swap_waiting,
     }
 
 

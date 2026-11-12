@@ -7,6 +7,8 @@ import json
 import logging
 import shutil
 import threading
+import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -844,6 +846,58 @@ class TestQwenCpuShareMemoryEstimate:
         assert (
             sum("Qwen4-Exp PLE forced" in r.getMessage() for r in caplog.records) == 2
         )
+
+    def test_forced_offload_warning_dedup_is_scoped_per_caller(
+        self, tmp_path, caplog
+    ):
+        """Admission (live ceiling) and residency (stable ceiling) can disagree.
+        Each scope warns once per real change, not once per retry pass."""
+        model = tmp_path / "qwen4"
+        model.mkdir()
+        entry = EngineEntry(
+            model_id="qwen4",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            config_model_type="qwen4_exp",
+            estimated_size=400,
+        )
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=950,
+            ple_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._entries[entry.model_id] = entry
+
+        def count():
+            return sum("Qwen4-Exp PLE forced" in r.getMessage() for r in caplog.records)
+
+        with (
+            patch(
+                "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+                "qwen4_exp_residency_estimate",
+                return_value=estimate,
+            ),
+            caplog.at_level(logging.WARNING, logger="omlx.engine_pool"),
+        ):
+            # Admission sees a small live ceiling (forced), residency a big one.
+            for _ in range(5):
+                pool._qwen4_ple_offload_status(
+                    entry, None, ceiling=500, log_scope="admission"
+                )
+                pool._qwen4_ple_offload_status(entry, None, ceiling=10**6)
+            assert count() == 1
+            # Admission state really changes: not forced, then forced again.
+            pool._qwen4_ple_offload_status(
+                entry, None, ceiling=10**6, log_scope="admission"
+            )
+            pool._qwen4_ple_offload_status(
+                entry, None, ceiling=500, log_scope="admission"
+            )
+            assert count() == 2
 
     def test_glm5_next_offload_admission_threads_mtp_resident(self, tmp_path):
         # glm5_next Lightning MTP + expert offload: the admission estimate
@@ -2789,6 +2843,1365 @@ class TestEnginePoolEviction:
             # Try to load model-b - should fail (can't evict pinned model-a)
             with pytest.raises(InsufficientMemoryError):
                 await pool.get_engine("model-b")
+
+
+class TestCrossModelAdmissionRetry:
+    """#1970: a request whose model was evicted by a concurrent cross-model
+    load must retry admission instead of failing immediately with 507.
+
+    With a ceiling that admits only one model, a request for resident model-a
+    is starved while a concurrent request loads model-b (evicting model-a);
+    model-a's admission then finds model-b holding a request lease, so the LRU
+    sweep has nothing to evict and used to raise InsufficientMemoryError
+    (HTTP 507) even though model-b's lease could still drain. The pool now
+    re-attempts admission for a bounded budget, re-acquiring the lock per
+    attempt and never sleeping while holding it.
+    """
+
+    @pytest.fixture
+    def retry_pool(self, small_mock_model_dir, monkeypatch):
+        """Ceiling that admits either model alone, never both.
+
+        model-a = 1075 bytes, model-b = 2150 bytes, ceiling = 2500 bytes.
+        """
+        pool = _make_pool(ceiling=2500)
+        pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory,
+        )
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+        return pool
+
+    @staticmethod
+    def _mock_engine() -> MagicMock:
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+        engine.has_active_requests.return_value = False
+        return engine
+
+    # A regression that retries where it must fail fast waits for the whole
+    # window. A 30 s window and a 5 s limit separate the two on a loaded host.
+    SLOW_RETRY_S = 30.0
+    FAST_FAIL_LIMIT_S = 5.0
+
+    @classmethod
+    def _slow_retry(cls, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", cls.SLOW_RETRY_S
+        )
+        monkeypatch.setattr(
+            "omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", cls.SLOW_RETRY_S
+        )
+
+    @staticmethod
+    def _count_lru_sweeps(pool: EnginePool) -> list[int]:
+        """Count admission attempts by counting LRU sweeps."""
+        sweeps: list[int] = []
+        original = pool._find_lru_victim
+
+        def counting_find():
+            sweeps.append(1)
+            return original()
+
+        pool._find_lru_victim = counting_find
+        return sweeps
+
+    @staticmethod
+    def _count_admission_attempts(pool: EnginePool) -> list[int]:
+        """Count real admission attempts: a second attempt *is* the retry.
+
+        LRU sweeps are a weak proxy - the competing load sweeps the LRU list
+        too - so tests that must prove the loop iterated count this instead.
+        """
+        attempts: list[int] = []
+        original = pool._admit_engine_locked
+
+        async def counting_admit(*args, **kwargs):
+            attempts.append(1)
+            return await original(*args, **kwargs)
+
+        pool._admit_engine_locked = counting_admit
+        return attempts
+
+    def test_may_improve_reads_in_flight_state(self, retry_pool):
+        """Only in-flight work justifies a retry: a resident, idle, unpinned
+        model is already evictable, so waiting for it changes nothing."""
+        pool = retry_pool
+        pool._entries["model-a"].engine = self._mock_engine()
+
+        assert pool._admission_may_improve_locked("model-b") is False
+
+        pool._entries["model-b"].is_loading = True
+        assert pool._admission_may_improve_locked("model-a") is True
+        pool._entries["model-b"].is_loading = False
+
+        pool._entries["model-a"].in_use = 1
+        assert pool._admission_may_improve_locked("model-b") is True
+        pool._entries["model-a"].in_use = 0
+
+        pool._unloading_models.add("model-b")
+        assert pool._admission_may_improve_locked("model-a") is True
+
+    @pytest.mark.asyncio
+    async def test_retry_admits_when_competing_model_becomes_evictable(
+        self, retry_pool
+    ):
+        """Unit-level reprex: request for model-a must not 507 while the
+        competing request's lease on model-b is still draining."""
+        pool = retry_pool
+        engine_a = self._mock_engine()
+        engine_b = self._mock_engine()
+        sweeps = self._count_lru_sweeps(pool)
+        attempts = self._count_admission_attempts(pool)
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return engine_a if "model-a" in name else engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            # model-a is resident; the competing request loads model-b under a
+            # lease, which evicts model-a to make room.
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b", _lease=True)
+            assert pool._entries["model-a"].engine is None
+
+            async def drain_competing_lease():
+                await asyncio.sleep(0.05)
+                await pool.release_engine("model-b")
+
+            drainer = asyncio.create_task(drain_competing_lease())
+            engine = await asyncio.wait_for(
+                pool.get_engine("model-a", _lease=True), timeout=5.0
+            )
+            await drainer
+            await pool.release_engine("model-a")
+
+        assert engine is engine_a
+        assert pool._entries["model-a"].engine is engine_a
+        assert pool._entries["model-b"].engine is None
+        # A second admission attempt is the proof the retry loop iterated;
+        # `sweeps` alone would also grow while the competing load evicts.
+        assert len(attempts) >= 2
+        assert len(sweeps) >= 2
+
+    @pytest.mark.asyncio
+    async def test_parked_request_counts_in_swap_waiting(self, retry_pool):
+        """A request parked in admission retry has no engine yet. It must
+        show in get_status()["swap_waiting"] until it is admitted."""
+        pool = retry_pool
+        engine_a = self._mock_engine()
+        engine_b = self._mock_engine()
+        seen: list[int] = []
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return engine_a if "model-a" in name else engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b", _lease=True)
+            assert pool.get_status()["swap_waiting"] == 0
+
+            async def drain_competing_lease():
+                await asyncio.sleep(0.05)
+                seen.append(pool.get_status()["swap_waiting"])
+                await pool.release_engine("model-b")
+
+            drainer = asyncio.create_task(drain_competing_lease())
+            await asyncio.wait_for(pool.get_engine("model-a", _lease=True), timeout=5.0)
+            await drainer
+            await pool.release_engine("model-a")
+
+        assert seen == [1]
+        assert pool.get_status()["swap_waiting"] == 0
+
+    @pytest.mark.asyncio
+    async def test_swap_waiting_released_when_retry_gives_up(
+        self, retry_pool, monkeypatch
+    ):
+        """The count drops back to 0 when the retry deadline raises."""
+        pool = retry_pool
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 0.2)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
+        engine_a = self._mock_engine()
+        engine_b = self._mock_engine()
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return engine_a if "model-a" in name else engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            # The lease on model-b is never released, so model-a cannot load.
+            await pool.get_engine("model-b", _lease=True)
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-a", _lease=True)
+
+        assert pool.get_status()["swap_waiting"] == 0
+
+    @pytest.mark.asyncio
+    async def test_quiescent_pool_fails_fast_with_unchanged_message(
+        self, retry_pool, monkeypatch
+    ):
+        """Nothing loading, unloading, or serving means nothing can free the
+        memory on its own: fail at once, with the exact pre-existing message."""
+        pool = retry_pool
+        self._slow_retry(monkeypatch)
+        pool._entries["model-a"].is_pinned = True
+        engine_a = self._mock_engine()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=engine_a):
+            await pool.get_engine("model-a")
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError) as exc_info:
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+
+        expected = (
+            "Cannot load model-b: projected memory 3.15KB would exceed the memory "
+            "ceiling 2.44KB (current: 1.05KB, model: 2.10KB). Free system memory "
+            "or raise memory_guard_tier (safe → balanced → aggressive)."
+        )
+        assert str(exc_info.value) == expected
+        assert exc_info.value.required == 2150
+        assert exc_info.value.current == 1075
+        assert elapsed < self.FAST_FAIL_LIMIT_S  # no retry: the pool is static
+
+    @pytest.mark.asyncio
+    async def test_retry_wait_never_blocks_other_models(self, retry_pool):
+        """The retry must release the pool lock while it waits: a request for a
+        different, admissible model has to make progress while the first is
+        still retry-pending (sleeping under `self._lock` would serialize it)."""
+        pool = retry_pool
+        engine_a = self._mock_engine()
+        engine_b = self._mock_engine()
+        engine_c = self._mock_engine()
+        model_c_dir = Path(pool._entries["model-a"].model_path).parent / "model-c"
+        model_c_dir.mkdir()
+        (model_c_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_c_dir / "model.safetensors").write_bytes(b"0" * 50)
+        pool._entries["model-c"] = EngineEntry(
+            model_id="model-c",
+            model_path=str(model_c_dir),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=50,  # fits beside the resident model-b
+        )
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            if "model-a" in name:
+                return engine_a
+            if "model-c" in name:
+                return engine_c
+            return engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b", _lease=True)
+
+            waiter = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            # Let the waiter take its first (refused) attempt and park.
+            await asyncio.sleep(0.05)
+            assert not waiter.done()
+
+            # A model that needs the admission lock must still complete while
+            # the first request is parked between retries. The competing lease
+            # drains only after model-c has loaded, so a retry wait that held
+            # `self._lock` would park this load until the timeout.
+            loaded_c = await asyncio.wait_for(pool.get_engine("model-c"), timeout=5.0)
+            assert loaded_c is engine_c
+            assert not waiter.done()  # the lease has not drained yet
+
+            await pool.release_engine("model-b")
+            loaded_a = await asyncio.wait_for(waiter, timeout=10.0)
+
+        assert loaded_a is engine_a
+
+    @pytest.mark.asyncio
+    async def test_model_too_large_is_not_retried(self, retry_pool, monkeypatch):
+        """A model that can never fit raises ModelTooLargeError immediately,
+        even mid-swap with a hopeful-looking competing lease live."""
+        pool = retry_pool
+        self._slow_retry(monkeypatch)
+        engine_b = self._mock_engine()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=engine_b):
+            # A competing request holds model-b under a lease — the state the
+            # retry loop would otherwise wait on.
+            await pool.get_engine("model-b", _lease=True)
+            pool._entries["model-a"].estimated_size = 3000  # 3.15KB > 2.44KB
+
+            started = time.monotonic()
+            with pytest.raises(ModelTooLargeError):
+                await pool.get_engine("model-a")
+            elapsed = time.monotonic() - started
+
+        assert elapsed < self.FAST_FAIL_LIMIT_S
+        assert pool._entries["model-b"].engine is engine_b
+
+    @pytest.mark.asyncio
+    async def test_retry_is_bounded_by_the_busy_grace(self, retry_pool, monkeypatch):
+        """The retry loop must terminate. When the only hope is another
+        request's lease - possibly a minutes-long generation - the wait is
+        capped by the busy grace, not the full budget."""
+        pool = retry_pool
+        engine_a = self._mock_engine()
+
+        # Hope that never resolves, whatever the pool state.
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "busy"
+        )
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 30.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=engine_a):
+            await pool.get_engine("model-a", _lease=True)
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+
+        assert 0.2 <= elapsed < 5.0  # bounded by the grace, not by the 30 s budget
+
+    @pytest.mark.asyncio
+    async def test_load_hope_gets_the_full_budget(self, retry_pool, monkeypatch):
+        """A load or unload in flight settles in seconds, so it earns the full
+        budget rather than the short busy grace."""
+        pool = retry_pool
+        engine_a = self._mock_engine()
+
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "load"
+        )
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 0.6)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.1)
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=engine_a):
+            await pool.get_engine("model-a", _lease=True)
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+
+        assert 0.6 <= elapsed < 10.0  # past the grace, up to the full budget
+
+    @pytest.mark.asyncio
+    async def test_model_not_found_is_not_retried(self, retry_pool, monkeypatch):
+        """A model that vanished mid-retry propagates, it is never waited on."""
+        pool = retry_pool
+        self._slow_retry(monkeypatch)
+        pool._entries["model-a"].is_pinned = True
+        engine_a = self._mock_engine()
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "load"
+        )
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=engine_a):
+            await pool.get_engine("model-a")
+            started = time.monotonic()
+            with pytest.raises(ModelNotFoundError):
+                await pool.get_engine("no-such-model")
+            elapsed = time.monotonic() - started
+
+        assert elapsed < self.FAST_FAIL_LIMIT_S
+
+    @staticmethod
+    def _add_small_model(pool: EnginePool, name: str, size: int = 50) -> None:
+        model_dir = Path(pool._entries["model-a"].model_path).parent / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model.safetensors").write_bytes(b"0" * size)
+        pool._entries[name] = EngineEntry(
+            model_id=name,
+            model_path=str(model_dir),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=size,
+        )
+
+    @pytest.mark.asyncio
+    async def test_swap_wait_timeout_defaults_to_builtin_window(
+        self, retry_pool, monkeypatch
+    ):
+        pool = retry_pool
+        assert pool._swap_wait_timeout_s == 0.0
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "busy"
+        )
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 30.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-a", _lease=True)
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+
+        assert 0.2 <= elapsed < 5.0
+
+    @pytest.mark.asyncio
+    async def test_swap_wait_timeout_replaces_busy_grace(self, retry_pool, monkeypatch):
+        pool = retry_pool
+        pool.configure_swap_wait_timeout(0.6)
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "busy"
+        )
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 30.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.1)
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-a", _lease=True)
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+
+        assert 0.6 <= elapsed < 5.0
+
+    def test_configure_swap_wait_timeout_clamps(self, retry_pool):
+        pool = retry_pool
+        for value, expected in [(-5, 0.0), (None, 0.0), ("x", 0.0), (99999, 3600.0)]:
+            pool.configure_swap_wait_timeout(value)
+            assert pool._swap_wait_timeout_s == expected
+
+    @pytest.mark.asyncio
+    async def test_pinned_floor_fails_fast_without_retry_or_eviction(
+        self, retry_pool, monkeypatch
+    ):
+        """Pinned models alone leave no room for model-b: no wait, and the
+        idle model-c must not be evicted for nothing."""
+        pool = retry_pool
+        self._slow_retry(monkeypatch)
+        pool._entries["model-a"].is_pinned = True
+        self._add_small_model(pool, "model-c")
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "busy"
+        )
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-c")
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+
+        assert elapsed < self.FAST_FAIL_LIMIT_S
+        assert pool._entries["model-c"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_too_large_fails_before_evicting_idle_models(self, retry_pool):
+        pool = retry_pool
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-b")
+            pool._entries["model-a"].estimated_size = 3000  # 3.15KB > 2.44KB
+            with pytest.raises(ModelTooLargeError):
+                await pool.get_engine("model-a")
+
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_never_fits_check_defers_to_rechecks_when_dynamic_ceiling_binds(
+        self, retry_pool, monkeypatch
+    ):
+        pool = retry_pool
+        monkeypatch.setattr(pool, "_dynamic_ceiling_binds", lambda: True)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_CEILING_RECHECK_S", 0.01)
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-b")
+            pool._entries["model-a"].estimated_size = 3000
+            with pytest.raises(ModelTooLargeError):
+                await pool.get_engine("model-a")
+
+        # The late path is unchanged: it evicts first, then refuses.
+        assert pool._entries["model-b"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_retry_attempts_skip_ceiling_rechecks(self, retry_pool, monkeypatch):
+        pool = retry_pool
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "busy"
+        )
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
+        calls: list[bool] = []
+        original = pool._admit_engine_locked
+
+        async def recording_admit(*args, **kwargs):
+            calls.append(kwargs["allow_ceiling_rechecks"])
+            return await original(*args, **kwargs)
+
+        pool._admit_engine_locked = recording_admit
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-a", _lease=True)
+            calls.clear()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+
+        assert len(calls) >= 2
+        assert calls[0] is True
+        assert all(c is False for c in calls[1:])
+
+    @pytest.mark.asyncio
+    async def test_retry_after_foreign_unload_uses_committed_baseline(
+        self, retry_pool, monkeypatch
+    ):
+        """An unload by another request leaves footprint residue that the
+        committed baseline must ignore for a request that was waiting."""
+        pool = retry_pool
+        # Residue shows up only once an unload has completed.
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory
+            + (1500 if pool._unload_epoch > 0 else 0),
+        )
+        engine_a = self._mock_engine()
+        engine_b = self._mock_engine()
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return engine_a if "model-a" in name else engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-b", _lease=True)
+            waiter = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.15)
+            assert not waiter.done()
+
+            # No yield between the lease drop and the unload taking the lock,
+            # so the waiter cannot evict model-b itself first.
+            pool._entries["model-b"].in_use = 0
+            assert await pool.unload_if_idle_unpinned("model-b") is True
+
+            engine = await asyncio.wait_for(waiter, timeout=5.0)
+
+        assert engine is engine_a
+
+    @pytest.mark.asyncio
+    async def test_cancelled_waiter_leaves_no_state(self, retry_pool):
+        """Cancelling a request parked between retries releases the lock and
+        leaves lease counts unchanged."""
+        pool = retry_pool
+        self._add_small_model(pool, "model-c")
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-b", _lease=True)
+            waiter = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.15)
+            assert not waiter.done()
+
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+            assert not pool._lock.locked()
+            assert pool._entries["model-a"].in_use == 0
+            assert pool._entries["model-a"].engine is None
+            assert pool._entries["model-b"].in_use == 1
+            await asyncio.wait_for(pool.get_engine("model-c"), timeout=5.0)
+            await pool.release_engine("model-b")
+
+    @pytest.mark.asyncio
+    async def test_waiter_does_not_load_after_shutdown(self, retry_pool):
+        """A request parked between retries must not load a model once
+        shutdown() has unloaded the pool."""
+        pool = retry_pool
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()),
+            patch("omlx.engine_pool.shutdown_mlx_executor"),
+        ):
+            await pool.get_engine("model-b", _lease=True)
+            waiter = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.15)
+            assert not waiter.done()
+
+            pool._entries["model-b"].in_use = 0
+            await pool.shutdown()
+            with pytest.raises(ModelUnavailableError):
+                await asyncio.wait_for(waiter, timeout=5.0)
+
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_retry_that_evicts_still_rechecks_ceiling(
+        self, retry_pool, monkeypatch
+    ):
+        """A retry attempt skips the ceiling rechecks only when it evicted
+        nothing: after its own eviction the dynamic ceiling can read low."""
+        pool = retry_pool
+        self._add_small_model(pool, "model-c")
+        pool._entries["model-c"].is_pinned = True
+        monkeypatch.setattr(pool, "_dynamic_ceiling_binds", lambda: True)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_CEILING_RECHECK_S", 0)
+        engine_a = self._mock_engine()
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return engine_a if "model-a" in name else self._mock_engine()
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-c")
+            await pool.get_engine("model-b")
+            # The ceiling reads low until model-b is gone, then recovers.
+            pool._get_final_ceiling = lambda: (
+                1100 if pool._entries["model-b"].engine is not None else 2500
+            )
+            async with pool._lock:
+                engine = await pool._admit_engine_locked(
+                    "model-a",
+                    force_lm=False,
+                    _lease=False,
+                    runtime_settings=None,
+                    allow_ceiling_rechecks=False,
+                )
+
+        assert engine is engine_a
+        assert pool._entries["model-b"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_busy_pinned_only_blocker_fails_fast(self, retry_pool, monkeypatch):
+        """A leased pinned model cannot be evicted, so waiting for it is
+        pointless: fail at once instead of burning the busy window."""
+        pool = retry_pool
+        self._slow_retry(monkeypatch)
+        pool._entries["model-a"].is_pinned = True
+        self._add_small_model(pool, "model-c")
+        footprint = {"value": 0}
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint", lambda: footprint["value"]
+        )
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-a", _lease=True)
+            footprint["value"] = 2490
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-c")
+            elapsed = time.monotonic() - started
+
+        assert elapsed < self.FAST_FAIL_LIMIT_S
+
+
+class TestExclusiveGroup:
+    """exclusive_group: loading a model unloads idle same-group models and
+    waits (bounded, 409 on timeout) for busy ones."""
+
+    # Wake-up tests set every fallback delay to 30 s or more, so only the
+    # notify can finish inside this limit. A normal wake takes milliseconds.
+    NOTIFY_WAKE_LIMIT_S = 5.0
+
+    def _pool(self, small_mock_model_dir, monkeypatch, groups, ceiling=None):
+        pool = _make_pool(ceiling=ceiling)
+        pool.discover_models(str(small_mock_model_dir))
+        pool._settings_manager = SimpleNamespace(
+            get_settings=lambda mid: SimpleNamespace(exclusive_group=groups.get(mid))
+        )
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory,
+        )
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+        return pool
+
+    @staticmethod
+    def _mock_engine() -> MagicMock:
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+        engine.has_active_requests.return_value = False
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_idle_member_unloaded_even_when_memory_fits(
+        self, small_mock_model_dir, monkeypatch, caplog
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups, ceiling=10**9)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            with caplog.at_level(logging.INFO, logger="omlx.engine_pool"):
+                await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+        assert (
+            "Evicting 'model-a' for exclusive group 'g' before loading 'model-b'"
+            in caplog.text
+        )
+
+    @pytest.mark.asyncio
+    async def test_busy_member_makes_b_wait_then_swap(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a", _lease=True)
+
+            async def release_later():
+                await asyncio.sleep(0.1)
+                await pool.release_engine("model-a")
+
+            task = asyncio.create_task(release_later())
+            await asyncio.wait_for(pool.get_engine("model-b"), timeout=5.0)
+            await task
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_member_leased_during_group_unload_is_not_unloaded(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups: dict[str, str] = {}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        self._add_model_c(small_mock_model_dir, pool)
+        unloaded: list[tuple[str, int]] = []
+        original_unload = pool._unload_engine
+
+        async def unload_with_lease(mid, **kwargs):
+            unloaded.append((mid, pool._entries[mid].in_use))
+            if mid == "model-a":
+                # Drain marks keep the fast path off the remaining members
+                # while A unloads, so no lease can start on model-b.
+                assert pool._acquire_loaded_engine("model-b", False, True, None) is None
+            await original_unload(mid, **kwargs)
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+            groups.update({"model-a": "g", "model-b": "g", "model-c": "g"})
+            pool._unload_engine = unload_with_lease
+            await asyncio.wait_for(pool.get_engine("model-c"), timeout=5.0)
+
+        assert [mid for mid, _ in unloaded] == ["model-a", "model-b"]
+        assert all(in_use == 0 for _, in_use in unloaded)
+        assert pool._entries["model-b"].engine is None
+        assert pool._entries["model-c"].engine is not None
+        assert pool._entries["model-b"].drain_ticket is None
+
+    @pytest.mark.asyncio
+    async def test_busy_member_timeout_raises_busy_409(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            started = time.monotonic()
+            with pytest.raises(ModelBusyError) as exc_info:
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+        assert elapsed >= 0.2
+        assert str(exc_info.value) == (
+            "Cannot load 'model-b': exclusive group 'g' member 'model-a' is busy"
+        )
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-a"].pending_unload_reason is None
+
+    @pytest.mark.asyncio
+    async def test_swap_wait_timeout_bounds_group_wait(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        pool.configure_swap_wait_timeout(0.5)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.1)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            started = time.monotonic()
+            with pytest.raises(ModelBusyError):
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+        assert elapsed >= 0.5
+
+    @pytest.mark.asyncio
+    async def test_pinned_member_not_affected(self, small_mock_model_dir, monkeypatch):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        pool._entries["model-a"].is_pinned = True
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_pinned_b_ignores_group(self, small_mock_model_dir, monkeypatch):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        pool._entries["model-b"].is_pinned = True
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_other_group_and_none_untouched(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "h"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+            assert pool._entries["model-a"].engine is not None
+            groups.clear()
+            await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_never_fits_b_does_not_unload_member(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        # model-b is 2150 bytes, model-a 1075: b can never fit under 1500.
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups, ceiling=1500)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            with pytest.raises(ModelTooLargeError):
+                await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_group_change_applies_at_next_admission(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "h"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+            assert pool._entries["model-a"].engine is not None
+            await pool._unload_engine("model-b")
+            groups["model-b"] = "g"
+            await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_group_step_runs_with_guard_off(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups, ceiling=None)
+        assert pool._get_final_ceiling() == 0
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is None
+
+    def test_group_none_for_mock_settings_manager(self):
+        pool = _make_pool()
+        pool._settings_manager = MagicMock()
+        assert pool._exclusive_group_for("model-a") is None
+
+    # ---- Splash members (external process) -------------------------------
+
+    @staticmethod
+    def _splash_member(pool, tmp_path, model_id, busy):
+        """Make ``model_id`` a resident Splash engine. ``busy[0]`` is its
+        has_active_requests() value. Returns the AsyncMock that replaces stop()."""
+        from tests.test_splash_engine import _engine as splash_engine
+
+        engine = splash_engine(tmp_path / "splash")
+        engine.has_active_requests = lambda: busy[0]
+        engine.stop = AsyncMock()
+        entry = pool._entries[model_id]
+        entry.engine = engine
+        entry.actual_size = entry.estimated_size
+        pool._current_model_memory += entry.estimated_size
+        return engine.stop
+
+    @pytest.mark.asyncio
+    async def test_busy_splash_member_makes_b_wait_then_unloads_its_process(
+        self, small_mock_model_dir, tmp_path, monkeypatch, caplog
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        pool.configure_swap_wait_timeout(5.0)
+        busy = [True]
+        stop = self._splash_member(pool, tmp_path, "model-a", busy)
+        epoch = pool._unload_epoch
+        with (
+            self._engines(),
+            caplog.at_level(logging.INFO, logger="omlx.engine_pool"),
+        ):
+            waiter = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.3)
+            assert not waiter.done()
+            assert pool._entries["model-a"].engine is not None
+            stop.assert_not_awaited()
+            busy[0] = False
+            await asyncio.wait_for(waiter, timeout=5.0)
+        stop.assert_awaited_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+        assert pool._unload_epoch == epoch + 1
+        assert "Admission for 'model-b' refused" in caplog.text
+        assert "Unloaded Splash model: model-a, released its process" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_quiet_pool_with_pinned_splash_model_fails_fast(
+        self, small_mock_model_dir, tmp_path, monkeypatch
+    ):
+        # model-a 1075 + model-b 2150 bytes do not fit under 2500.
+        pool = self._pool(small_mock_model_dir, monkeypatch, {}, ceiling=2500)
+        pool.configure_swap_wait_timeout(30.0)
+        pool._entries["model-a"].is_pinned = True
+        stop = self._splash_member(pool, tmp_path, "model-a", [False])
+        started = time.monotonic()
+        with self._engines():
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+        assert time.monotonic() - started < 2.0
+        stop.assert_not_awaited()
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_splash_unload_bumps_unload_epoch(
+        self, small_mock_model_dir, tmp_path, monkeypatch
+    ):
+        pool = self._pool(small_mock_model_dir, monkeypatch, {})
+        self._splash_member(pool, tmp_path, "model-a", [False])
+        epoch = pool._unload_epoch
+        await pool._unload_engine("model-a")
+        assert pool._unload_epoch == epoch + 1
+        assert pool._current_model_memory == 0
+
+    # ---- draining (#1855) -------------------------------------------------
+
+    @staticmethod
+    def _add_model_c(model_dir, pool):
+        model_c = model_dir / "model-c"
+        model_c.mkdir()
+        (model_c / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_c / "model.safetensors").write_bytes(b"0" * 50)
+        pool.discover_models(str(model_dir))
+
+    def _engines(self):
+        return patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        )
+
+    @staticmethod
+    async def _stop(*tasks):
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_draining_member_refuses_new_fast_path_lease(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            waiter = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.1)
+            try:
+                assert pool._acquire_loaded_engine("model-a", False, True, None) is None
+                status = {m["id"]: m for m in pool.get_status()["models"]}
+                assert status["model-a"]["draining"] is True
+                assert status["model-b"]["exclusive_waiters"] == 1
+                entry = pool._entries["model-a"]
+                assert entry.pending_unload_reason is None
+                assert pool.is_abort_requested("model-a") is False
+                assert pool._find_pending_unload_ready_locked() is None
+            finally:
+                await self._stop(waiter)
+
+    @pytest.mark.asyncio
+    async def test_new_a_request_queues_behind_b_then_swaps_back(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 5.0)
+        order: list[str] = []
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+
+            async def request_b():
+                engine = await pool.get_engine("model-b")
+                order.append("b")
+                assert pool._entries["model-a"].engine is None
+                return engine
+
+            async def request_a2():
+                engine = await pool.get_engine("model-a", _lease=True)
+                order.append("a2")
+                return engine
+
+            task_b = asyncio.create_task(request_b())
+            await asyncio.sleep(0.05)
+            task_a2 = asyncio.create_task(request_a2())
+            await asyncio.sleep(0.2)
+            assert not task_a2.done()
+            await pool.release_engine("model-a")
+            await asyncio.wait_for(task_b, timeout=5.0)
+            await asyncio.wait_for(task_a2, timeout=5.0)
+        assert order == ["b", "a2"]
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_overlapping_a_traffic_does_not_starve_b(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 60.0)
+
+        async def a_request():
+            try:
+                await pool.get_engine("model-a", _lease=True)
+            except ModelBusyError:
+                return
+            await asyncio.sleep(0.2)
+            await pool.release_engine("model-a")
+
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            a_tasks: list[asyncio.Task] = []
+
+            async def traffic():
+                # Nominal 30 s of overlapping A traffic. A starved B can only
+                # load after it ends, and wait_for below gives up at 10 s.
+                for _ in range(600):
+                    a_tasks.append(asyncio.create_task(a_request()))
+                    await asyncio.sleep(0.05)
+
+            gen = asyncio.create_task(traffic())
+            await asyncio.sleep(0.1)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.15)
+            await pool.release_engine("model-a")
+            try:
+                engine = await asyncio.wait_for(task_b, timeout=10.0)
+                traffic_running = not gen.done()
+            finally:
+                await self._stop(gen)
+                await asyncio.gather(*a_tasks, return_exceptions=True)
+        assert engine is not None
+        assert traffic_running  # B got in while A traffic was still arriving
+        assert pool.is_abort_requested("model-a") is False
+
+    @pytest.mark.asyncio
+    async def test_b_timeout_clears_drain_and_releases_queued_a(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.3)
+        with self._engines():
+            engine_a = await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.1)
+            task_a2 = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.1)
+            assert not task_a2.done()
+            with pytest.raises(ModelBusyError):
+                await task_b
+            assert await asyncio.wait_for(task_a2, timeout=0.4) is engine_a
+        status = {m["id"]: m for m in pool.get_status()["models"]}
+        assert status["model-a"]["draining"] is False
+        assert pool._entries["model-a"].drain_ticket is None
+        assert pool._group_queues == {}
+        assert pool._entries["model-a"].engine is engine_a
+
+    @pytest.mark.asyncio
+    async def test_only_head_ticket_runs_admission(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g", "model-c": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        self._add_model_c(small_mock_model_dir, pool)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 5.0)
+        admitted: list[str] = []
+        original = pool._admit_engine_locked
+
+        async def spy(model_id, **kwargs):
+            admitted.append(model_id)
+            return await original(model_id, **kwargs)
+
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            pool._admit_engine_locked = spy
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            task_c = asyncio.create_task(pool.get_engine("model-c"))
+            await asyncio.sleep(0.5)
+            try:
+                assert "model-b" in admitted
+                assert "model-c" not in admitted
+                await pool.release_engine("model-a")
+                await asyncio.wait_for(task_b, timeout=5.0)
+                await asyncio.wait_for(task_c, timeout=5.0)
+            finally:
+                await self._stop(task_b, task_c)
+        assert pool._entries["model-c"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_head_clears_drain(self, small_mock_model_dir, monkeypatch):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.1)
+            assert pool._acquire_loaded_engine("model-a", False, False, None) is None
+            task_b.cancel()
+            await asyncio.gather(task_b, return_exceptions=True)
+            engine = pool._acquire_loaded_engine("model-a", False, False, None)
+        assert engine is pool._entries["model-a"].engine
+        assert pool._group_queues == {}
+
+    @pytest.mark.asyncio
+    async def test_pin_drained_member_mid_wait_serves_queued_requests(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 5.0)
+        with self._engines():
+            engine_a = await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            task_a2 = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.1)
+            try:
+                assert not task_a2.done()
+                pool.set_pinned("model-a", True)
+                assert await asyncio.wait_for(task_a2, timeout=0.5) is engine_a
+                await asyncio.wait_for(task_b, timeout=2.0)
+            finally:
+                await self._stop(task_b, task_a2)
+        assert pool._entries["model-a"].engine is engine_a
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_pin_waiter_mid_wait_drops_ticket(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 5.0)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.1)
+            try:
+                assert pool._entries["model-a"].drain_ticket is not None
+                pool.set_pinned("model-b", True)
+                await asyncio.wait_for(task_b, timeout=1.0)
+            finally:
+                await self._stop(task_b)
+        assert pool._group_queues == {}
+        assert pool._entries["model-a"].drain_ticket is None
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_group_change_of_drained_member_mid_wait(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 5.0)
+        with self._engines():
+            engine_a = await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            task_a2 = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.1)
+            try:
+                assert not task_a2.done()
+                groups["model-a"] = None
+                assert await asyncio.wait_for(task_a2, timeout=1.0) is engine_a
+                await asyncio.wait_for(task_b, timeout=2.0)
+            finally:
+                await self._stop(task_b, task_a2)
+        assert pool._entries["model-a"].engine is engine_a
+
+    @pytest.mark.asyncio
+    async def test_release_of_drained_lease_wakes_head_promptly(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        # Only a notify can wake the head in time: every fallback (grace,
+        # retry delay, poll) is 30 s or more, the limit is NOTIFY_WAKE_LIMIT_S.
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 60.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_INITIAL_DELAY_S", 30.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_MAX_DELAY_S", 30.0)
+        monkeypatch.setattr("omlx.engine_pool._GROUP_WAIT_POLL_S", 30.0)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.3)
+            released = time.monotonic()
+            await pool.release_engine("model-a")
+            try:
+                await asyncio.wait_for(task_b, timeout=10.0)
+                elapsed = time.monotonic() - released
+            finally:
+                await self._stop(task_b)
+        assert elapsed < self.NOTIFY_WAKE_LIMIT_S
+
+    @pytest.mark.asyncio
+    async def test_shutdown_wakes_group_waiters(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        # Only a notify can wake the head in time: every fallback (grace,
+        # retry delay, poll) is 30 s or more, the limit is NOTIFY_WAKE_LIMIT_S.
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 60.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_INITIAL_DELAY_S", 30.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_MAX_DELAY_S", 30.0)
+        monkeypatch.setattr("omlx.engine_pool._GROUP_WAIT_POLL_S", 30.0)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            task_a2 = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.1)
+            assert not task_a2.done()
+            started = time.monotonic()
+            try:
+                await pool.shutdown()
+                results = await asyncio.wait_for(
+                    asyncio.gather(task_b, task_a2, return_exceptions=True),
+                    timeout=10.0,
+                )
+                elapsed = time.monotonic() - started
+            finally:
+                await self._stop(task_b, task_a2)
+        assert all(isinstance(r, ModelUnavailableError) for r in results)
+        assert elapsed < self.NOTIFY_WAKE_LIMIT_S
+        assert pool._group_queues == {}
+        assert all(e.drain_ticket is None for e in pool._entries.values())
+
+    @pytest.mark.asyncio
+    async def test_queued_waiter_times_out_with_busy_and_leaves_head_intact(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g", "model-c": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        self._add_model_c(small_mock_model_dir, pool)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            pool.configure_swap_wait_timeout(0.6)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            pool.configure_swap_wait_timeout(0.15)
+            started = time.monotonic()
+            try:
+                with pytest.raises(ModelBusyError) as exc_info:
+                    await pool.get_engine("model-c")
+                elapsed = time.monotonic() - started
+                assert "queued behind 'model-b'" in str(exc_info.value)
+                assert elapsed >= 0.15
+                assert not task_b.done()
+                assert pool._group_queues["g"][0].model_id == "model-b"
+                assert pool._drain_blocks(pool._entries["model-a"])
+            finally:
+                await asyncio.gather(task_b, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_queued_waiters_count_in_swap_waiting(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        """The head and a queued waiter have no engine yet. Both must show in
+        swap_waiting, and the count must drop back to 0 when they finish."""
+        groups = {"model-a": "g", "model-b": "g", "model-c": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        self._add_model_c(small_mock_model_dir, pool)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            task_c = asyncio.create_task(pool.get_engine("model-c"))
+            await asyncio.sleep(0.05)
+            try:
+                assert pool.get_status()["swap_waiting"] == 2
+            finally:
+                await pool.release_engine("model-a")
+                await self._stop(task_b, task_c)
+        assert pool.get_status()["swap_waiting"] == 0
+
+    @pytest.mark.asyncio
+    async def test_admin_unload_of_drained_member_wakes_head(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        # Only a notify can wake the head in time: every fallback (grace,
+        # retry delay, poll) is 30 s or more, the limit is NOTIFY_WAKE_LIMIT_S.
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 60.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_INITIAL_DELAY_S", 30.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_MAX_DELAY_S", 30.0)
+        monkeypatch.setattr("omlx.engine_pool._GROUP_WAIT_POLL_S", 30.0)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.2)
+            # MagicMock engines look like they still have scheduler work.
+            pool._entry_has_scheduler_work = lambda entry: False
+            assert not await pool.request_unload("model-a", abort_active=False)
+            released = time.monotonic()
+            await pool.release_engine("model-a")
+            try:
+                await asyncio.wait_for(task_b, timeout=10.0)
+                elapsed = time.monotonic() - released
+            finally:
+                await self._stop(task_b)
+        assert elapsed < self.NOTIFY_WAKE_LIMIT_S
+        assert pool._entries["model-a"].drain_ticket is None
+        assert pool._entries["model-a"].engine is None
 
 
 class TestAdmissionSoftTargetEviction:

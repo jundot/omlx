@@ -103,6 +103,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "model_type_override",
         "active_profile_name",
         "ttl_seconds",
+        # Residency policy is per model, like is_pinned and ttl_seconds.
+        "exclusive_group",
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
         "deepseek_v41_engram_ssd_offload",

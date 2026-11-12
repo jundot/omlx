@@ -1061,3 +1061,30 @@ def test_reranker_context_window_i18n_key_exists_in_every_locale():
     for path in sorted(i18n_dir.glob("*.json")):
         catalog = json.loads(path.read_text())
         assert key in catalog, f"{path.name} is missing {key}"
+
+
+def test_exclusive_group_modal_field_is_wired_and_pin_gated():
+    html = _model_settings_template()
+    script = _dashboard_script()
+    assert 'x-model="modelSettings.exclusive_group"' in html
+    row = html.split('x-model="modelSettings.exclusive_group"', 1)[1].split(
+        "</label>", 1
+    )[0]
+    assert ':disabled="selectedModel?.pinned"' in row
+    assert "s.exclusive_group || ''" in script
+    assert "exclusive_group: ms.exclusive_group?.trim() || null" in script
+    reset = _section(script, "_resetPresetApplicableFields() {", "\n            },")
+    assert "exclusive_group" not in reset
+
+
+def test_exclusive_group_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    keys = {
+        "modal.model_settings.exclusive_group",
+        "modal.model_settings.exclusive_group_hint",
+        "settings.models.table.exclusive_group_tooltip",
+    }
+    for locale_path in sorted((root / "omlx_web/i18n").glob("*.json")):
+        translations = json.loads(locale_path.read_text())
+        missing_keys = keys - translations.keys()
+        assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"

@@ -264,6 +264,27 @@ class TestModelSettings:
         settings = ModelSettings()
         assert settings.model_dirs == []
         assert settings.model_dir is None
+        assert settings.swap_wait_timeout_seconds == 0
+
+    def test_swap_wait_timeout_round_trip(self):
+        settings = ModelSettings(swap_wait_timeout_seconds=45)
+        data = settings.to_dict()
+        assert data["swap_wait_timeout_seconds"] == 45
+        assert ModelSettings.from_dict(data).swap_wait_timeout_seconds == 45
+
+    def test_swap_wait_timeout_invalid_value_falls_back_without_raising(self):
+        settings = ModelSettings.from_dict({"swap_wait_timeout_seconds": "abc"})
+        assert settings.swap_wait_timeout_seconds == 0
+
+    def test_swap_wait_timeout_validate_range(self, tmp_path):
+        for bad in (-1, 3601):
+            gs = GlobalSettings(base_path=tmp_path)
+            gs.model.swap_wait_timeout_seconds = bad
+            assert any("swap_wait_timeout_seconds" in e for e in gs.validate())
+        for good in (0, 3600):
+            gs = GlobalSettings(base_path=tmp_path)
+            gs.model.swap_wait_timeout_seconds = good
+            assert not any("swap_wait_timeout_seconds" in e for e in gs.validate())
 
     def test_get_model_dirs_default(self):
         """Test default model directories."""
@@ -311,6 +332,7 @@ class TestModelSettings:
             "model_dir": "/models",
             "model_fallback": False,
             "hide_helper_models": False,
+            "swap_wait_timeout_seconds": 0,
         }
 
     def test_from_dict(self):
@@ -3400,3 +3422,46 @@ def test_inference_opt_in_keeps_network_management_requirements(
         allow_unauthenticated_inference=True,
     )
     assert any("non-loopback" in error for error in settings.validate())
+
+
+class TestSwapWaitTimeoutAdminRoute:
+    """model.swap_wait_timeout_seconds through the global settings routes."""
+
+    def test_post_sets_value_and_configures_pool(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+        from omlx.server import _server_state
+
+        gs = GlobalSettings(base_path=tmp_path)
+        pool = MagicMock()
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(_server_state, "engine_pool", pool)
+
+        request = admin_routes.GlobalSettingsRequest.model_validate(
+            {"swap_wait_timeout_seconds": 45}
+        )
+        asyncio.run(admin_routes.update_global_settings(request=request, is_admin=True))
+
+        assert gs.model.swap_wait_timeout_seconds == 45
+        pool.configure_swap_wait_timeout.assert_called_once_with(45)
+
+    def test_get_exposes_value(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.model.swap_wait_timeout_seconds = 12
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+
+        result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+        assert result["model"]["swap_wait_timeout_seconds"] == 12
+
+    def test_request_rejects_out_of_range(self):
+        from pydantic import ValidationError
+
+        from omlx.admin import routes as admin_routes
+
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(swap_wait_timeout_seconds=3601)

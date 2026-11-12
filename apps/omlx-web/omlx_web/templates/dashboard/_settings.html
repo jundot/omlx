@@ -413,6 +413,15 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.model.swap_wait_timeout_seconds') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.swap_wait_timeout_seconds_desc') }}</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.model.swap_wait_timeout_seconds"
+                                           min="0" max="3600" step="1"
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
                                 <div class="px-6 py-4">
                                     <div class="flex items-center justify-between mb-3">
                                         <div class="flex items-center gap-2">
@@ -1897,7 +1906,7 @@
                                         </div>
 
                                         <!-- Pin Toggle -->
-                                        <div class="hidden sm:flex w-12 justify-center flex-shrink-0">
+                                        <div class="hidden sm:flex flex-col items-center w-12 justify-center flex-shrink-0">
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_pinned', !model.pinned)"
@@ -1919,6 +1928,9 @@
                                             <template x-if="model.virtual">
                                                 <span class="text-xs text-neutral-300">—</span>
                                             </template>
+                                            <span x-show="!model.virtual && model.exclusive_group" x-text="model.exclusive_group"
+                                                  :title="window.t('settings.models.table.exclusive_group_tooltip')"
+                                                  class="max-w-full text-caption text-neutral-500 truncate"></span>
                                         </div>
 
                                         <!-- Visibility Toggle (on = visible in /v1/models) -->

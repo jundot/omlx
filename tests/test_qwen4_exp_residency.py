@@ -137,6 +137,23 @@ def test_polled_forced_status_logs_once(tmp_path, caplog):
     assert _forced_warnings(caplog) == 1
 
 
+def test_admission_retries_do_not_relog_forced_offload(tmp_path, caplog):
+    """Admission decides with a live ceiling, the residency checks with the
+    stable one. Each retry pass must not flip one shared dedup state."""
+    pool, entry, estimate = _qwen4_pool(tmp_path)
+    between_modes = (estimate.resident_bytes + estimate.mmap_bytes) // 2
+    pool._get_residency_ceiling = lambda: estimate.resident_bytes
+
+    with caplog.at_level(logging.WARNING, logger="omlx.engine_pool"):
+        for _ in range(5):
+            pool._effective_qwen4_model_settings(
+                entry, None, ceiling=between_modes, log_scope="admission"
+            )
+            pool._qwen4_ple_offload_status(entry, None)
+
+    assert _forced_warnings(caplog) == 1
+
+
 def test_forced_status_logs_again_after_a_transition(tmp_path, caplog):
     pool, entry, estimate = _qwen4_pool(tmp_path)
     between_modes = (estimate.resident_bytes + estimate.mmap_bytes) // 2

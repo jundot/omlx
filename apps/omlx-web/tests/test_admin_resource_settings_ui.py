@@ -107,3 +107,24 @@ assert.equal(state.mainTab, 'status');
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
+
+SWAP_WAIT_I18N_KEYS = {
+    "settings.model.swap_wait_timeout_seconds",
+    "settings.model.swap_wait_timeout_seconds_desc",
+}
+
+
+def test_swap_wait_timeout_setting_is_wired_in_the_ui():
+    template = (ROOT / "omlx_web/templates/dashboard/_settings.html").read_text()
+    script = (ROOT / "omlx_web/static/js/dashboard.js").read_text()
+
+    assert "globalSettings.model.swap_wait_timeout_seconds" in template
+    payload_start = script.index("async saveGlobalSettings()")
+    assert "swap_wait_timeout_seconds" in script[payload_start:]
+
+
+def test_swap_wait_timeout_i18n_keys_exist_in_every_locale():
+    for locale_path in sorted((ROOT / "omlx_web/i18n").glob("*.json")):
+        translations = json.loads(locale_path.read_text())
+        missing = SWAP_WAIT_I18N_KEYS - translations.keys()
+        assert not missing, f"{locale_path.name} is missing {sorted(missing)}"
