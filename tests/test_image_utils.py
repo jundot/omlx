@@ -1132,3 +1132,27 @@ class TestImageSizeAndDownscaling:
         monkeypatch.setattr(settings_module, "_global_settings", None)
         assert get_max_image_bytes() == 50 * 1024 * 1024
         assert get_max_image_side_length() == 2048
+
+
+def test_decode_images_false_keeps_the_image_count_without_decoding():
+    b64 = _image_to_base64(_make_test_image())
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                },
+            ],
+        }
+    ]
+
+    text_messages, images, audio = extract_images_from_messages(
+        messages, decode_images=False
+    )
+
+    assert text_messages[0]["content"] == "hi"
+    assert images == [None]
+    assert audio == []

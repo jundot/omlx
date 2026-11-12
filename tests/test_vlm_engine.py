@@ -1448,7 +1448,7 @@ class TestProcessChatMessages:
         await engine.preflight_chat(messages)
 
         mock_expand_video.assert_called_once_with(messages)
-        mock_extract.assert_called_once_with(expanded)
+        mock_extract.assert_called_once_with(expanded, decode_images=False)
 
         mock_expand_video.reset_mock()
         mock_extract.reset_mock()
