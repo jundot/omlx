@@ -892,13 +892,18 @@ def _patch_vlm_target_verify_attention() -> None:
     """
     try:
         from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+        from .mlx_vlm_mtp import qwen35_verify_attention
     except ImportError:
         return
     if getattr(q35_lang, "_omlx_tq_target_verify_patched", False):
         return
-    original = getattr(q35_lang, "_qwen3_5_left_padded_attention", None)
-    if original is None:
+    if getattr(q35_lang, "_qwen3_5_left_padded_attention", None) is None:
         return
+    # The bounded padded-verify kernel returns None for TurboQuant caches
+    # without calling inward, so keep it inside this wrapper.
+    qwen35_verify_attention.apply(q35_lang)
+    original = q35_lang._qwen3_5_left_padded_attention
 
     def patched(queries, keys, values, *, cache, scale, mask):
         from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
