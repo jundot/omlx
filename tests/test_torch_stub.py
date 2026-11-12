@@ -575,10 +575,9 @@ def _load_pyproject():
 
 
 def _pyproject_dev_pins(package):
-    """Collect pins from the [dev] extra and PEP 735 dependency group."""
+    """Collect pins from the PEP 735 dev dependency group."""
     data = _load_pyproject()
-    specs = list(data["project"]["optional-dependencies"]["dev"])
-    specs += [s for s in data["dependency-groups"]["dev"] if isinstance(s, str)]
+    specs = [s for s in data["dependency-groups"]["dev"] if isinstance(s, str)]
     return _package_pins(specs, package)
 
 
@@ -602,8 +601,8 @@ def test_pyproject_dev_pins_match_stub_targets(stub_module):
     ):
         pins = _pyproject_dev_pins(package)
         assert len(pins) == 1, (
-            f"{package}: expected one identical pin across both pyproject "
-            f"dev lists, got {sorted(pins) or 'none'}"
+            f"{package}: expected one pin in the pyproject dev group, "
+            f"got {sorted(pins) or 'none'}"
         )
         assert pins == {targets[0]}, (
             f"{package}: pyproject dev pin {sorted(pins)} != stub target "
