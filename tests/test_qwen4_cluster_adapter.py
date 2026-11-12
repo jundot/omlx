@@ -28,7 +28,7 @@ def _write_safetensors(path, tensors):
 
 
 def test_qwen4_registration_is_a_honored_pipeline_capability(tmp_path):
-    from omlx.cluster.pipeline_compat import pipeline_support
+    from omlx.cluster.pipeline_compat import pipeline_assignment_is_honored
 
     assert apply_qwen4_exp_mlx_lm_patch()
     import mlx_lm.models.qwen4_exp as module
@@ -36,7 +36,7 @@ def test_qwen4_registration_is_a_honored_pipeline_capability(tmp_path):
     assert module.SUPPORTS_PIPELINE is True
     assert module.HONORS_PIPELINE_ASSIGNMENT is True
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
-    assert pipeline_support(tmp_path) == "honored"
+    assert pipeline_assignment_is_honored(tmp_path)
 
 
 def test_qwen4_stage_starts_keep_the_ple_table_on_the_head():
@@ -60,7 +60,10 @@ def test_stage_keys_select_layers_heads_and_mtp_per_rank():
         "language_model.model.layers.4.mlp.down_proj.weight", **kwargs
     )
     assert _stage_key_needed("language_model.lm_head.weight", **kwargs)
-    assert not _stage_key_needed(
+    # The head is loaded everywhere, not only on the sampling rank: leaving it
+    # unloaded leaves random weights behind, so a rank that samples
+    # (``sampling_rank_only=false``) would answer from an untrained head.
+    assert _stage_key_needed(
         "language_model.lm_head.weight", **{**kwargs, "rank": 1}
     )
     assert _stage_key_needed("mtp.layers.0.self_attn.q_proj.weight", **kwargs)

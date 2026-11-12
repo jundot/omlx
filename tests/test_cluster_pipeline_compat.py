@@ -8,7 +8,6 @@ from omlx.cluster.pipeline_compat import (
     install_pipeline_compatibility,
     model_type_of,
     pipeline_assignment_is_honored,
-    pipeline_support,
 )
 from omlx.cluster.planner import PipelineAssignment
 from tests.test_deepseek_v41 import run_two_ranks
@@ -45,10 +44,10 @@ def test_a_checkpoint_without_a_readable_config_supports_no_split(tmp_path):
     """
 
     assert model_type_of(tmp_path) == ""
-    assert pipeline_support(tmp_path) == "none"
+    assert not pipeline_assignment_is_honored(tmp_path)
 
 
-def test_an_architecture_the_loader_has_no_module_for_reports_none(tmp_path):
+def test_an_architecture_the_loader_has_no_module_for_is_not_honoured(tmp_path):
     """Qwen3-Omni is mlx-vlm-native: mlx-lm has no module to hold a stage.
 
     Calling that an "even split" would describe a mechanism that does not exist,
@@ -58,24 +57,7 @@ def test_an_architecture_the_loader_has_no_module_for_reports_none(tmp_path):
 
     model = _model_config(tmp_path, "qwen3_omni")
 
-    assert pipeline_support(model) == "none"
     assert not pipeline_assignment_is_honored(model)
-
-
-def test_a_pipeline_model_is_even_split_before_the_pin_and_honoured_after(
-    tmp_path,
-):
-    """The two fail-closed states have to stay distinguishable.
-
-    "even" means the plan is worth rebalancing; "honored" means the installed
-    hook consumes it as written.
-    """
-
-    model = _model_config(tmp_path, "deepseek_v3")
-
-    assert pipeline_support(model) == "even"
-    with install_pipeline_compatibility(_assignment()):
-        assert pipeline_support(model) == "honored"
 
 
 def test_standard_pipeline_mixin_has_an_explicit_assignment_contract(tmp_path):
