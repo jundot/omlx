@@ -2100,3 +2100,26 @@ class TestSettingsSnapshotRoutes:
             "/admin/api/models/model-a/settings", json={"cache_reasoning_output": None}
         )
         assert "cache_reasoning_output" not in r.json()["settings"]
+
+
+def test_apply_rejects_profile_draft_that_cannot_load(client, tmp_path):
+    """Applying a profile may not turn on a feature with an unloadable draft."""
+    c, mgr = client
+    missing = str(tmp_path / "deleted-draft")
+    mgr.save_profile(
+        model_id="model-a",
+        name="broken",
+        display_name="Broken",
+        description=None,
+        settings={"specprefill_enabled": True, "specprefill_draft_model": missing},
+    )
+    mgr.set_settings("model-a", ModelSettings(temperature=0.5))
+
+    response = c.post("/admin/api/models/model-a/profiles/broken/apply")
+
+    assert response.status_code == 422, response.text
+    assert "no config.json" in response.json()["detail"]
+    stored = mgr.get_settings("model-a")
+    assert stored.temperature == 0.5
+    assert stored.active_profile_name is None
+    assert stored.specprefill_draft_model != missing

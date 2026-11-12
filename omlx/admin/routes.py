@@ -4000,11 +4000,23 @@ async def apply_model_profile(
 ):
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
+    stored = mgr.get_profile(model_id, name)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    # The sanitizer sees the merged result, where every key is present, so the
+    # profile's own fields are what decide whether this apply turns a feature
+    # on. Without that gate an apply that never enables a feature would be
+    # rejected by a draft directory the profile does not even name.
+    touched = set(stored.get("settings") or {})
     is_diffusion_model = _entry_is_diffusion_model(entry)
+
     def sanitizer(settings):
         if is_diffusion_model:
             _sanitize_diffusion_settings_dict(settings)
         _validate_model_settings(entry, settings)
+        draft_problem = _draft_usability_problem(settings, touched)
+        if draft_problem:
+            raise HTTPException(status_code=422, detail=draft_problem)
 
     try:
         applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
