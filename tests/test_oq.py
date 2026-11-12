@@ -2728,6 +2728,32 @@ def _write_safetensors(path, tensors):
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestSparkXLayerDiscovery:
+    def test_spark2_5_embedding_is_found(self):
+        """Spark-X keeps its token embedding at ``model.model.embedding`` (#4838)."""
+        pytest.importorskip("mlx_lm.models.spark2_5")
+        from mlx_lm.models import spark2_5
+
+        model = spark2_5.Model(
+            spark2_5.ModelArgs(
+                model_type="spark2_5",
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=8,
+                vocab_size=32,
+                sliding_window=4,
+                rope_parameters={"sliding_attention": {"rope_theta": 10000.0}},
+            )
+        )
+        embed_fn, layers = _find_model_layers(model)
+        assert embed_fn is model.model.embedding
+        assert layers is model.model.layers
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestEmbeddingGemma2Calibration:
     _TEXT = {
         "vocab_size": 32,

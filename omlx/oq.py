@@ -8317,6 +8317,16 @@ def _find_model_layers(model):
     elif hasattr(model, "model") and hasattr(model.model, "word_embeddings"):
         embed_fn = model.model.word_embeddings
         layers = model.model.layers
+    elif (
+        getattr(model, "model_type", None) == "spark2_5"
+        and hasattr(model, "model")
+        and hasattr(model.model, "embedding")
+    ):
+        # Spark-X names its token embedding ``embedding``. Match on the model
+        # type rather than the attribute: afm7 uses the same name but keeps
+        # extra kv-reuse blocks outside ``model.layers``.
+        embed_fn = model.model.embedding
+        layers = model.model.layers
     elif hasattr(model, "language_model") and hasattr(model.language_model, "model"):
         lm = model.language_model.model
         if hasattr(lm, "embed_tokens"):
