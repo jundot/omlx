@@ -11,6 +11,7 @@ This module provides centralized logging configuration with support for:
 """
 
 import logging
+import os
 import sys
 from contextvars import ContextVar
 from logging.handlers import TimedRotatingFileHandler
@@ -223,6 +224,21 @@ class RequestLogContext:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         _request_id.set(self.previous_id)
+
+
+def is_console_handler(handler: logging.Handler) -> bool:
+    # FileHandler is a StreamHandler subclass.
+    return isinstance(handler, logging.StreamHandler) and not isinstance(
+        handler, logging.FileHandler
+    )
+
+
+def console_log_level(level: int) -> int:
+    # Supervised stdout/stderr goes to a file that never rotates.
+    # server.log already has every record, so keep only warnings there.
+    if os.environ.get("OMLX_SUPERVISED"):
+        return max(level, logging.WARNING)
+    return level
 
 
 def configure_file_logging(
