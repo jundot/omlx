@@ -766,12 +766,15 @@ def test_automatic_never_falls_back_to_an_unsupported_pipeline():
         supports_pipeline=False,
     )
 
-    with pytest.raises(PlanningError, match="no tensor-parallel degree"):
+    # 8 heads divide 2 nodes, so the refusal names the link, not the heads (#3022).
+    with pytest.raises(PlanningError, match="too slow") as refusal:
         choose_parallelism(
             unsupported,
             _nodes(2),
             transports=[_link("ethernet", speed=10, tb_version=None)],
         )
+    assert "ethernet at 10 Gb/s" in str(refusal.value)
+    assert "divide" not in str(refusal.value)
 
 
 def test_grouped_query_attention_bounds_the_split():

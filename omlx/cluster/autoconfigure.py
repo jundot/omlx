@@ -340,9 +340,12 @@ def choose_parallelism(
         raise PlanningError(
             f"no workable split for {len(nodes)} nodes: {last_error}"
         )
+    # Only the link gate skips a candidate without recording an error.
     raise PlanningError(
-        f"no tensor-parallel degree divides {len(nodes)} nodes across "
-        f"architecture dimensions {model.tensor_parallel_divisors}"
+        f"tensor parallelism is the only way this model can use {len(nodes)} "
+        "Macs, but the link between them is too slow for it (detected: "
+        f"{describe_transports(transports)}). Connect them over Thunderbolt, "
+        "or choose the Tensor strategy to use this link anyway."
     )
 
 
