@@ -41,9 +41,12 @@ inline void v41_quantize(float* v) {
   const unsigned pb = __float_as_uint(__fmul_rn(amax, __uint_as_float(INV_LIMIT)));
   const int e = int((pb >> 23) & 0xFFu) - 127 + int((pb & 0x7FFFFFu) != 0u);
   const float scale = __uint_as_float(unsigned(e + 127) << 23);
+  // Scales and steps are normal powers of two, so their reciprocals are exact
+  // and a product rounds as the quotient does.
+  const float inv_scale = __uint_as_float(unsigned(127 - e) << 23);
   const float levels[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
   for (int i = 0; i < 32; ++i) {
-    const float scaled = fminf(fmaxf(v[i] / scale, -limit), limit);
+    const float scaled = fminf(fmaxf(__fmul_rn(v[i], inv_scale), -limit), limit);
     const float a = fabsf(scaled);
     float q;
     if (BITS == 8) {
@@ -51,7 +54,7 @@ inline void v41_quantize(float* v) {
       int se = int((__float_as_uint(a) >> 23) & 0xFFu) - 127 - 3;
       if (se < -9) se = -9;
       const float step = __uint_as_float(unsigned(se + 127) << 23);
-      q = fminf(rintf(a / step) * step, 448.0f);
+      q = fminf(rintf(__fmul_rn(a, __uint_as_float(unsigned(127 - se) << 23))) * step, 448.0f);
     } else {
       q = levels[int(a > 0.25f) + int(a >= 0.75f) + int(a > 1.25f) +
                  int(a >= 1.75f) + int(a > 2.5f) + int(a >= 3.5f) + int(a > 5.0f)];
@@ -60,7 +63,8 @@ inline void v41_quantize(float* v) {
   }
 }
 // v41_quantize<8>'s round trip of 32 values kept as E4M3 codes (the MX tile
-// kernels' activations); returns the E8M0 byte of the group's scale.
+// kernels' activations) at 16-byte aligned ``codes``; returns the E8M0 byte of
+// the group's scale.
 template <unsigned FLOOR, unsigned INV_LIMIT>
 inline unsigned v41_quantize_codes(const float* v, unsigned char* codes) {
   float amax = __uint_as_float(FLOOR);
@@ -68,19 +72,25 @@ inline unsigned v41_quantize_codes(const float* v, unsigned char* codes) {
   const unsigned pb = __float_as_uint(__fmul_rn(amax, __uint_as_float(INV_LIMIT)));
   const int e = int((pb >> 23) & 0xFFu) - 127 + int((pb & 0x7FFFFFu) != 0u);
   const float scale = __uint_as_float(unsigned(e + 127) << 23);
+  const float inv_scale = __uint_as_float(unsigned(127 - e) << 23);
+  unsigned word[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
   for (int i = 0; i < 32; ++i) {
-    const float scaled = fminf(fmaxf(v[i] / scale, -448.0f), 448.0f);
+    const float scaled = fminf(fmaxf(__fmul_rn(v[i], inv_scale), -448.0f), 448.0f);
     const float a = fabsf(scaled);
     int se = int((__float_as_uint(a) >> 23) & 0xFFu) - 127 - 3;
     if (se < -9) se = -9;
     const float step = __uint_as_float(unsigned(se + 127) << 23);
-    const float q = fminf(rintf(a / step) * step, 448.0f);
+    const float q = fminf(rintf(__fmul_rn(a, __uint_as_float(unsigned(127 - se) << 23))) * step, 448.0f);
     // E4M3: exponent bias 7 and three mantissa bits; below 2**-6, steps of 2**-9.
     const unsigned qb = __float_as_uint(q), qe = (qb >> 23) & 0xFFu;
     const unsigned mag = q == 0.0f ? 0u
         : qe < 121u ? unsigned(q * 512.0f) : ((qe - 120u) << 3) | ((qb >> 20) & 7u);
-    codes[i] = (unsigned char)(mag | (scaled < 0.0f ? 0x80u : 0u));
+    word[i / 4] |= (mag | (scaled < 0.0f ? 0x80u : 0u)) << (8 * (i % 4));
   }
+  // Byte stores of 32 codes a thread leave most of each write transaction unused.
+  uint4* out = reinterpret_cast<uint4*>(codes);
+  out[0] = make_uint4(word[0], word[1], word[2], word[3]);
+  out[1] = make_uint4(word[4], word[5], word[6], word[7]);
   return unsigned(e + 127);
 }
 // Eight consecutive values as fp32; p is 8-byte aligned.
@@ -1032,12 +1042,18 @@ def fp8_codes(x: mx.array) -> tuple[mx.array, mx.array]:
     groups = x.size // 32
     return _kernel("fp8_codes", _FP8_CODES, ("x",), ("codes", "scales"))(
         inputs=[x],
-        template=[(n, v) for n, v in _quantizer(8) if n != "BITS"],
+        template=[("T", x.dtype)] + [(n, v) for n, v in _quantizer(8) if n != "BITS"],
         grid=(groups, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[x.shape, (x.shape[0], x.shape[1] // 32)],
         output_dtypes=[mx.uint8, mx.uint8],
     )
+
+
+def pack_fp8(x: mx.array) -> mx.array:
+    """quant.pack(x) of rows [..., D]: E4M3 codes, then the E8M0 scales."""
+    codes, scales = fp8_codes(x.reshape(-1, x.shape[-1]))
+    return mx.concatenate([codes, scales], -1).reshape(*x.shape[:-1], -1)
 
 
 def expert_gate_up_mx(codes, scales, token, experts, gate, up, weights, limit):
@@ -1559,6 +1575,20 @@ def _pointwise_check(dtype: mx.Dtype) -> bool:
 def use_pointwise(dtype: mx.Dtype) -> bool:
     """Whether transform, swiglu and hc_post may run for this dtype."""
     return available() and _checked("pointwise", lambda: _pointwise_check(dtype))
+
+
+def _fp8_pack_check(dtype: mx.Dtype) -> bool:
+    x = mx.random.normal((70, 512), key=mx.random.key(15)) * 3
+    # Rows of zeros, of negative zeros and below the scale floor.
+    x = mx.concatenate([x, mx.zeros((1, 512)), -mx.zeros((1, 512)), x[:2] * 1e-7])
+    x = x.astype(dtype)
+    return mx.array_equal(pack_fp8(x), quant.pack(x))
+
+
+@cache
+def use_fp8_pack(dtype: mx.Dtype) -> bool:
+    """Whether pack_fp8 may stand in for quant.pack for this dtype."""
+    return available() and _checked("FP8 pack", lambda: _fp8_pack_check(dtype))
 
 
 def _combine_check(dtype: mx.Dtype) -> bool:

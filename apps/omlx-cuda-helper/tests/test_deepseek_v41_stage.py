@@ -206,6 +206,15 @@ def test_expert_tiles_read_banks_as_gather_qmm(spec):
     )
 
 
+@pytest.mark.skipif(not kernels.available(), reason="the FP8 kernel runs on CUDA")
+def test_fp8_pack_matches_quant_pack_for_each_input_dtype():
+    """The FP8 kernel compiled for one input dtype must not serve another."""
+    x = mx.random.normal((8, 64), key=mx.random.key(5)) * 3
+    for dtype in (mx.float32, mx.bfloat16):
+        rows = x.astype(dtype)
+        assert mx.array_equal(kernels.pack_fp8(rows), quant.pack(rows)).item()
+
+
 @pytest.mark.skipif(not mx_linear.available(), reason="needs the block-scaled mma")
 def test_an_mxfp8_projection_stays_packed_on_the_block_scaled_matmul():
     """Over a partial row tile and two stages of depth, its codes times the

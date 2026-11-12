@@ -218,6 +218,13 @@ def _quantize(x: mx.array, bits: int = 8) -> mx.array:
     return quant.quantize(x, bits)
 
 
+def _pack(x: mx.array) -> mx.array:
+    """quant.pack(x) of FP8 rows, on the CUDA kernel when it reproduces it."""
+    if kernels.use_fp8_pack(x.dtype):
+        return kernels.pack_fp8(x)
+    return quant.pack(x)
+
+
 def _rope(x, positions, config, compressed, inverse=False, bits=0):
     """RoPE of x [1, L, ..., D] at ``positions``, then quantize(bits) if set."""
     tables = ops.rope_table(positions, config, compressed)
@@ -428,7 +435,7 @@ class Block:
         q = self.wq_b(qr).reshape(1, length, c.n_heads, c.head_dim)
         q = _rope(q, positions, c, bool(ratio))
         kv = ops.norm(self.wkv(x, xq, codes), self.kv_norm, c.norm_eps)
-        new = quant.pack(_rope(kv, positions, c, bool(ratio)))
+        new = _pack(_rope(kv, positions, c, bool(ratio)))
         old = cache[WINDOW]
         old_len = min(start, c.window_size, 0 if old is None else old.shape[1])
         window = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
