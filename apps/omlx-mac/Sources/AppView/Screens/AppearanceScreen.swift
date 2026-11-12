@@ -27,6 +27,8 @@ struct AppearanceScreen: View {
     private var modelLibraryScope = MenuBarModelScope.all.rawValue
     @AppStorage(EnhancedReadability.enabledKey)
     private var enhancedReadability = false
+    @AppStorage(NumberScale.storageKey)
+    private var numberScale = NumberScale.compact.rawValue
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -83,8 +85,7 @@ struct AppearanceScreen: View {
                         localized: "appearance.row.menubar_icon.sub",
                         defaultValue: "Bring the oMLX icon back if it was removed from the menu bar. Separate from the Dock icon.",
                         comment: "Appearance row sublabel for the menu bar icon restore action"
-                    ),
-                    isLast: true
+                    )
                 ) {
                     Button {
                         NotificationCenter.default.post(
@@ -99,6 +100,40 @@ struct AppearanceScreen: View {
                         ))
                     }
                     .buttonStyle(.omlx(.normal, size: .small))
+                }
+                // Mirrors the web console's Number scale selector (#4633), so
+                // the two surfaces can be set to read the same way.
+                Row(
+                    label: String(
+                        localized: "appearance.row.number_scale",
+                        defaultValue: "Number Scale",
+                        comment: "Appearance row label for the number scale picker"
+                    ),
+                    sublabel: String(
+                        localized: "appearance.row.number_scale.sub",
+                        defaultValue: "Applies to counts in the window; the menu bar stays compact.",
+                        comment: "Appearance row sublabel explaining where the number scale applies"
+                    ),
+                    isLast: true
+                ) {
+                    Segmented(selection: $numberScale, options: [
+                        (
+                            NumberScale.compact.rawValue,
+                            String(
+                                localized: "appearance.number_scale.compact",
+                                defaultValue: "Higher Units",
+                                comment: "Number scale option that shows large counts in 万 or M and similar units"
+                            )
+                        ),
+                        (
+                            NumberScale.exact.rawValue,
+                            String(
+                                localized: "appearance.number_scale.exact",
+                                defaultValue: "Exact Digits",
+                                comment: "Number scale option that shows every digit of a count"
+                            )
+                        ),
+                    ])
                 }
             }
 

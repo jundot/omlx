@@ -303,7 +303,7 @@ struct ModelCardSheet: View {
         HStack(spacing: 3) {
             Image(systemName: symbol)
                 .font(.system(size: 10, weight: .medium))
-            Text(CountFormat.compact(value))
+            Text(CountFormat.count(value))
                 .font(.omlxMono(DesignTokens.FontSize.subheadline))
         }
         .foregroundStyle(theme.textSecondary)
