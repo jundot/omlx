@@ -70,34 +70,6 @@ def _pipeline_module(model_path: str | Path) -> Any | None:
         return None
 
 
-def pipeline_support(model_path: str | Path) -> str:
-    """How far this architecture can be split across ranks at all.
-
-    ``"honored"``  an installed hook consumes the plan's own stage boundary.
-    ``"even"``     a pipeline contract exists, but derives an even split and
-                   ignores the plan - which is what the pre-load memory guard
-                   recomputes and refuses against.
-    ``"none"``     no loader here can slice the layers, so a plan of more than
-                   one rank cannot run however the layers are divided.
-
-    Splitting this question out is what makes the refusal truthful: telling an
-    operator to "give this node fewer layers" when the architecture cannot be
-    divided at all sends them editing a plan that was never the problem.
-    """
-
-    module = _pipeline_module(model_path)
-    if module is None:
-        return "none"
-    if _module_honors_pipeline_assignment(module, seen=frozenset()):
-        return "honored"
-    for candidate in vars(module).values():
-        if isinstance(candidate, type) and callable(
-            getattr(candidate, "pipeline", None)
-        ):
-            return "even"
-    return "none"
-
-
 def pipeline_assignment_is_honored(model_path: str | Path) -> bool:
     """Whether this model's installed pipeline hook explicitly consumes the plan.
 

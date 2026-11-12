@@ -164,7 +164,13 @@ def _stage_key_needed(
         # a resident array first is exactly the 35.8 GiB the plan moved to SSD.
         return False
     if key.startswith("language_model.lm_head."):
-        return rank == 0
+        # Every rank loads the real head. A head left unloaded is
+        # ``load_model_weights(strict=False)``'s random initialisation, not a
+        # saving: the planner charges the head on every rank already (it is not
+        # in ``CLUSTER_UNLOADED_WEIGHT_PREFIXES``), and a rank that samples with
+        # random weights returns wrong tokens silently — which is exactly what
+        # ``sampling_rank_only=false`` asks it to do.
+        return True
     layer = _layer_index(key)
     if layer is not None:
         return start <= layer < end
