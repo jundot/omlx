@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -211,9 +212,13 @@ class ServerSettings:
     # Seconds between trivial GPU kernels submitted while a model is loaded
     # but idle, so the GPU stays out of its idle power state (the first
     # command buffer after ~1s+ of GPU idle stalls for up to seconds on
-    # large resident models). Ticks stop after 5 minutes without requests.
-    # 0 disables.
+    # large resident models). Ticks stop after gpu_keep_warm_idle_window
+    # seconds without requests. 0 disables.
     gpu_keep_warm_interval: float = 0.5
+    # Seconds without requests after which the keep-warm ticks stop (default
+    # 5 minutes). A client that talks to the server less often than this pays
+    # the first-command stall on every request; raise it to cover that gap.
+    gpu_keep_warm_idle_window: float = 300.0
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -263,6 +268,9 @@ class ServerSettings:
             max_request_body_size=data.get("max_request_body_size", "512MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),
             gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
+            gpu_keep_warm_idle_window=float(
+                data.get("gpu_keep_warm_idle_window", 300.0)
+            ),
         )
 
 
@@ -1782,6 +1790,10 @@ class GlobalSettings:
 
         if self.server.max_image_side_length < 0:
             errors.append("max_image_side_length must be non-negative")
+        if not math.isfinite(self.server.gpu_keep_warm_interval):
+            errors.append("gpu_keep_warm_interval must be finite")
+        if not math.isfinite(self.server.gpu_keep_warm_idle_window):
+            errors.append("gpu_keep_warm_idle_window must be finite")
 
         # Memory guard tier validation
         if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:

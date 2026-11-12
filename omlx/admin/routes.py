@@ -13,6 +13,7 @@ import copy
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -722,6 +723,7 @@ class GlobalSettingsRequest(BaseModel):
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
     gpu_keep_warm_interval: float | None = None
+    gpu_keep_warm_idle_window: float | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
 
@@ -4746,6 +4748,11 @@ def _global_settings_response(global_settings):
                 "gpu_keep_warm_interval",
                 0.5,
             ),
+            "gpu_keep_warm_idle_window": getattr(
+                global_settings.server,
+                "gpu_keep_warm_idle_window",
+                300.0,
+            ),
             "distributed_inference_enabled": getattr(
                 global_settings.server,
                 "distributed_inference_enabled",
@@ -4939,6 +4946,12 @@ async def update_global_settings(
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
+    # Infinity would persist and break JSON encoding of the settings response.
+    for name in ("gpu_keep_warm_interval", "gpu_keep_warm_idle_window"):
+        value = getattr(request, name)
+        if value is not None and not math.isfinite(value):
+            raise HTTPException(status_code=400, detail=f"{name} must be finite")
+
     from ..utils.network import (
         is_loopback_bind,
         is_valid_bind_host,
@@ -5073,6 +5086,17 @@ async def update_global_settings(
             keep_warm_pool.configure_gpu_keep_warm(interval)
             keep_warm_pool._ensure_gpu_keep_warm_task()
         runtime_applied.append("gpu_keep_warm_interval")
+    if request.gpu_keep_warm_idle_window is not None:
+        from ..server import _server_state
+
+        window = max(0.0, float(request.gpu_keep_warm_idle_window))
+        global_settings.server.gpu_keep_warm_idle_window = window
+        window_pool = _server_state.engine_pool
+        if window_pool is not None:
+            window_pool.configure_gpu_keep_warm(
+                global_settings.server.gpu_keep_warm_interval, window
+            )
+        runtime_applied.append("gpu_keep_warm_idle_window")
     if request.distributed_inference_enabled is not None:
         # Route exposure and Bonjour publication are fixed at process startup,
         # so this intentionally takes effect after the normal settings restart.
