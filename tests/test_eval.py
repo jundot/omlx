@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from omlx.engine.base import GenerationOutput
 from omlx.eval.base import BaseBenchmark
 from omlx.eval.cmmlu import CMMLUBenchmark
 from omlx.eval.datasets import deterministic_sample, stratified_sample
@@ -680,6 +681,51 @@ class TestEvalSingleSampling:
     async def test_max_tokens_always_benchmark_controlled(self):
         kwargs = await self._captured_chat_kwargs({"max_tokens": 5})
         assert kwargs["max_tokens"] != 5
+
+
+class TestMaxTokensOverride:
+    """Local max_tokens_override is a floor applied after the thinking clamp."""
+
+    @pytest.mark.parametrize(
+        "bench_cls, thinking, override, expected",
+        [
+            (MMLUBenchmark, False, None, 128),
+            (LiveCodeBenchBenchmark, True, None, 16384),
+            # Lifts the thinking cap (32768) and thinking-off defaults.
+            (LiveCodeBenchBenchmark, True, 65536, 65536),
+            (MMLUBenchmark, False, 4096, 4096),
+            # Never lowers a benchmark's own budget.
+            (LiveCodeBenchBenchmark, False, 8192, 16384),
+        ],
+    )
+    def test_question_max_tokens(self, bench_cls, thinking, override, expected):
+        engine = MagicMock(model_type=None)
+        assert bench_cls()._question_max_tokens(engine, thinking, override) == expected
+
+    async def test_result_records_limit_of_final_thinking_mode(self):
+        sent = []
+
+        class _Engine:
+            is_external_api = False
+            model_type = None
+
+            async def chat(self, messages, **kwargs):
+                sent.append(kwargs["max_tokens"])
+                return GenerationOutput(
+                    text="<think>x</think>The answer is A", finish_reason="stop"
+                )
+
+        class _Bench(MMLUBenchmark):
+            def format_prompt(self, item):
+                return [{"role": "user", "content": item["id"]}]
+
+        items = [{"id": "q0", "answer": "A"}, {"id": "q1", "answer": "A"}]
+        result = await _Bench().run(_Engine(), items, max_tokens_override=300)
+        # The probe switches to thinking, so the 8192 thinking floor wins.
+        assert result.thinking_used is True
+        assert result.max_tokens == 8192
+        assert sent[0] == 300
+        assert sent[-1] == 8192
 
 
 class TestExternalEvalDiagnostics:

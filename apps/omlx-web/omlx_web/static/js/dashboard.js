@@ -786,6 +786,8 @@
             // endpoint settings because it is a simple number the user sets
             // once per endpoint (thinking models need a larger budget).
             accExternalMaxTokens: localStorage.getItem('omlx_acc_external_max_tokens') || '',
+            // Local runs: session-only, since a larger limit makes runs much longer.
+            accMaxTokens: '',
             accRunning: false,
             _managerStatusTimer: null,
             benchConfirm: null,      // 'throughput' | 'accuracy' | 'context' while asking
@@ -5345,8 +5347,8 @@
 
             // Optional accuracy-only floor for per-question max_tokens.
             // Returns null when unset; throws on invalid input.
-            parseAccuracyMaxTokens() {
-                const raw = this.accExternalMaxTokens.trim();
+            parseAccuracyMaxTokens(input) {
+                const raw = input.trim();
                 if (!raw) return null;
                 const value = Number(raw);
                 if (!Number.isInteger(value) || value < 1 || value > 1000000) {
@@ -5359,7 +5361,7 @@
                 const body = this.externalRequestBody();
                 const extraBody = this.parseAccuracyExtraBody();
                 if (Object.keys(extraBody).length > 0) body.extra_body = extraBody;
-                const maxTokens = this.parseAccuracyMaxTokens();
+                const maxTokens = this.parseAccuracyMaxTokens(this.accExternalMaxTokens);
                 if (maxTokens !== null) body.max_tokens_override = maxTokens;
                 return body;
             },
@@ -6206,6 +6208,7 @@
 
             async addToAccQueue() {
                 let externalRequest = null;
+                let maxTokensOverride = null;
                 if (this.accExternalEnabled) {
                     if (!this.externalConfigValid()) {
                         this.accError = window.t('js.error.external_endpoint_required');
@@ -6219,6 +6222,14 @@
                     }
                 } else if (!this.accModelId) {
                     return;
+                } else {
+                    try {
+                        maxTokensOverride = this.parseAccuracyMaxTokens(this.accMaxTokens);
+                    } catch (err) {
+                        this.accAdvancedOptionsOpen = true;
+                        this.accError = err.message;
+                        return;
+                    }
                 }
                 const selected = Object.entries(this.accBenchmarks)
                     .filter(([_, v]) => v)
@@ -6239,6 +6250,7 @@
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accExternalEnabled ? false : this.accEnableThinking,
                             sampling_profile: this.accSamplingProfile,
+                            max_tokens_override: maxTokensOverride,
                             external: externalRequest,
                         }),
                     });
@@ -6493,8 +6505,8 @@
                         window.t('acc_bench.results.text_export.model')
                             .replace('{model}', () => m)
                     );
-                    lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8));
-                    lines.push('-'.repeat(62));
+                    lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8) + pad('MaxTok', 9));
+                    lines.push('-'.repeat(71));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
                             rpad(r.benchmark.toUpperCase(), 16) +
@@ -6504,7 +6516,8 @@
                             pad(r.time_s, 10) +
                             pad(r.thinking_used
                                 ? window.t('acc_bench.results.text_export.yes')
-                                : window.t('acc_bench.results.text_export.no'), 8)
+                                : window.t('acc_bench.results.text_export.no'), 8) +
+                            pad(r.external ? '-' : (r.max_tokens || '-'), 9)
                         );
                         if (r.external) {
                             lines.push(
@@ -6561,6 +6574,7 @@
                         total: r.total,
                         time_s: r.time_s,
                         thinking_used: r.thinking_used || false,
+                        max_tokens: r.max_tokens,
                         category_scores: r.category_scores || null,
                         questions: qr,
                     };

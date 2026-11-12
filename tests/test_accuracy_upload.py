@@ -208,6 +208,7 @@ def _result_data(**overrides) -> dict:
         "total": 120,
         "time_s": 12.3,
         "thinking_used": False,
+        "max_tokens": 128,
         "dataset_total": 14042,
         "sampling_profile": "deterministic",
         "category_scores": {"anatomy": 0.75},
@@ -253,6 +254,7 @@ class TestUploadIntelligenceResult:
         assert payload["correct_count"] == 90
         assert payload["total_questions"] == 120
         assert payload["dataset_total"] == 14042
+        assert payload["question_max_tokens"] == 128
         assert payload["model_repo"] == "mlx-community/Qwen3-4bit"
         assert payload["category_counts"] == {"anatomy": [4, 4]}
         assert payload["owner_hash"] == "h" * 64 + "a"

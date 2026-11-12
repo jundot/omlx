@@ -275,6 +275,7 @@ async def _do_upload(ctx: dict, result_data: dict) -> dict:
         "dataset_total": result_data.get("dataset_total"),
         "time_s": result_data.get("time_s"),
         "thinking_used": bool(result_data.get("thinking_used")),
+        "question_max_tokens": result_data.get("max_tokens"),
         "sampling_profile": ctx["sampling_profile"],
         "batch_size": ctx["batch_size"],
         "category_scores": result_data.get("category_scores"),
