@@ -42,6 +42,8 @@ python -m pytest tests/test_config.py  # Replace with the affected test files
 python -m pytest                      # Excludes slow and integration tests
 ```
 
+Python CI installs from `uv.lock` with `uv sync --locked --no-default-groups --group test --extra mcp`; run tests in that environment with `uv run --no-sync python -m pytest`. After changing dependencies in `pyproject.toml`, run `uv lock` and commit both files together.
+
 See [TESTING.md](TESTING.md) for additional checks. For inference or cache changes, include a representative real-model check when possible, covering affected features such as prefix reuse, streaming, or concurrent requests. State what you ran and what remains untested; CI or mocked tests do not replace hardware validation.
 
 UI and UX changes, in the admin dashboard or the macOS app, must include before and after screenshots of the actual screen in the PR description. Use a short screen recording when the change is about interaction. UI PRs are reviewed once screenshots are attached. Run relevant JavaScript tests and build the macOS app (`make app`) when those components change. The web UI lives in `apps/omlx-web/omlx_web/` and its tests in `apps/omlx-web/tests/`. After editing its templates, JavaScript, or translation keys (`apps/omlx-web/omlx_web/i18n/en.json` is the source), rebuild the CSS and normalize the catalogs:

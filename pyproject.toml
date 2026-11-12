@@ -198,9 +198,14 @@ bundle = [
 
 # PEP 735 development dependencies — installed by uv sync or pip install --group dev.
 [dependency-groups]
-dev = [
-    "pytest>=7.0.0",
+test = [
+    # pytest 9.2 ignores xdist 3.8's loadgroup node id suffix, so the gpu group runs in parallel.
+    "pytest>=7.0.0,<9.2",
     "pytest-asyncio>=0.21.0",
+    "pytest-xdist",
+]
+dev = [
+    {include-group = "test"},
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
