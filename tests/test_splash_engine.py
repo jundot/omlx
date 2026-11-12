@@ -2172,7 +2172,7 @@ class TestProcessMemory:
             "base_url": "http://127.0.0.1:8123/v1",
             "api_key": "secret",
             "model": REPO_ID,
-            "extra_body": {"reasoning_effort": "none"},
+            "extra_body": {"reasoning_effort": "none", "ignore_eos": True},
         }
 
 

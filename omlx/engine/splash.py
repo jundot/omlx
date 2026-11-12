@@ -1784,7 +1784,8 @@ class SplashEngine(BaseEngine):
     def benchmark_endpoint(self) -> dict[str, Any]:
         """Splash's own API, for the admin benchmark's chat-endpoint path.
 
-        Thinking is off so the benchmark measures plain prefill and decode.
+        Thinking is off so the benchmark measures plain prefill and decode, and
+        EOS is ignored so each test decodes its full token budget.
         """
         if self._process is None or self._process.poll() is not None:
             raise RuntimeError("Splash engine is not started")
@@ -1792,7 +1793,7 @@ class SplashEngine(BaseEngine):
             "base_url": f"{self._base_url}/v1",
             "api_key": self._api_key,
             "model": self._repo_id,
-            "extra_body": {"reasoning_effort": "none"},
+            "extra_body": {"reasoning_effort": "none", "ignore_eos": True},
         }
 
     def reserved_bytes(self) -> int:
