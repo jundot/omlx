@@ -1328,7 +1328,8 @@ class TestStreaming:
 # that carry the key from SPLASH_API_KEY.
 FAKE_SERVER = textwrap.dedent("""\
     import json, os, sys
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from http.server import BaseHTTPRequestHandler
+    from socketserver import TCPServer
     args = sys.argv[1:]
     model, port = args[args.index("--model") + 1], int(args[args.index("--port") + 1])
     assert os.environ["HF_HUB_OFFLINE"] == "1"
@@ -1349,7 +1350,8 @@ FAKE_SERVER = textwrap.dedent("""\
             self.wfile.write(json.dumps(data).encode())
         def log_message(self, *a):
             pass
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    # HTTPServer resolves the host name, which a broken resolver holds for 35 s.
+    TCPServer(("127.0.0.1", port), Handler).serve_forever()
     """)
 
 

@@ -15,8 +15,9 @@ import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from socketserver import TCPServer
 
 from omlx.integrations.base import Integration, IntegrationContext, chat_model_ids
 from omlx.utils.install import get_cli_command_prefix
@@ -95,9 +96,11 @@ def capture_codex_instructions(codex_bin: str, env: dict[str, str]) -> str | Non
         def log_message(self, format: str, *args) -> None:
             pass
 
-    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    # HTTPServer resolves the bound host's name, which a broken resolver holds for 35 s.
+    server = TCPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    overrides = _provider_overrides(f"http://127.0.0.1:{server.server_port}/v1") + [
+    port = server.server_address[1]
+    overrides = _provider_overrides(f"http://127.0.0.1:{port}/v1") + [
         ("model_providers.omlx.request_max_retries", "0"),
         ("model_providers.omlx.stream_max_retries", "0"),
     ]
