@@ -8311,6 +8311,9 @@ def _find_model_layers(model):
     if getattr(model, "model_type", None) == "muse_spark":
         # mlx-lm's Muse Spark normalizes its token embeddings.
         return model.model.language_model.embed, model.layers
+    if getattr(model, "model_type", None) == "spark2_5":
+        # afm7 also uses ``embedding`` but keeps kv-reuse blocks outside model.layers.
+        return model.model.embedding, model.model.layers
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         embed_fn = model.model.embed_tokens
         layers = model.model.layers
