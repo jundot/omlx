@@ -195,6 +195,9 @@ bundle = [
     # realtime STT WebSocket endpoint
     "wsproto==1.2.0",
 ]
+
+# PEP 735 development dependencies — installed by uv sync or pip install --group dev.
+[dependency-groups]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -207,21 +210,6 @@ dev = [
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
     # importable, which silently hides regressions — install no-deps
     # in the dev environment so the test actually runs.
-    "xgrammar==0.2.8",
-    "apache-tvm-ffi==0.1.11",
-]
-# PEP 735 dependency groups — consumed by `uv sync --dev`.
-# Keep in sync with [project.optional-dependencies] dev above
-# (pip/legacy toolchains use that section instead).
-[dependency-groups]
-dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "black>=23.0.0",
-    "ruff>=0.1.0",
-    "mypy>=1.0.0",
-    "mcp>=2.0.0,<3",
-    "venvstacks>=0.7.0",
     "xgrammar==0.2.8",
     "apache-tvm-ffi==0.1.11",
 ]

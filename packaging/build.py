@@ -628,8 +628,8 @@ def _venvstacks_driver() -> list[str]:
         return ["venvstacks"]
     print(
         "  ✗ No venvstacks driver found. Install with one of:\n"
-        "      pip install -e \".[dev]\"     (pip-managed venv)\n"
-        "      uv sync --dev                (uv-managed venv)\n"
+        "      pip install -e . --group dev (pip-managed venv, pip 25.1+)\n"
+        "      uv sync                      (uv-managed venv)\n"
         "      pipx install venvstacks       (host-global tool)",
         file=sys.stderr,
     )

@@ -20,12 +20,12 @@ install-no-kernels:
 mcp:
 	$(PYTHON) -m pip install -e ".[mcp]"
 
-# Same as install, with dev tools.
+# Same as install, with dev tools (requires pip 25.1+ for dependency groups).
 dev: dev-no-kernels
 	$(MAKE) kernels
 
 dev-no-kernels:
-	$(PYTHON) -m pip install -e ".[dev]"
+	$(PYTHON) -m pip install -e . --group dev
 
 # Rebuild every native custom kernel in place from scratch, then check that each one loads.
 # Needs full Xcode for the Metal compiler.
