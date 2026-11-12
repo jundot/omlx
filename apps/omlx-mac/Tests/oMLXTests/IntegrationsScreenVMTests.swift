@@ -166,6 +166,54 @@ final class IntegrationsScreenVMTests: XCTestCase {
         XCTAssertEqual(server.patches.count, 1)
     }
 
+    func testMCPExposureLoadsSettingsAndSavesOnlyItsFlag() async throws {
+        let (client, session) = try makeClient()
+        defer { session.invalidateAndCancel() }
+        let vm = IntegrationsScreenVM()
+        server.setMCP(["expose_tools": false])
+        await vm.load(client: client)
+        XCTAssertNil(vm.lastError)
+        XCTAssertFalse(vm.mcpExposeTools)
+
+        server.setMCP([:])
+        await vm.load(client: client)
+        XCTAssertNil(vm.lastError)
+        XCTAssertTrue(vm.mcpExposeTools)
+        XCTAssertTrue(server.patches.isEmpty)
+
+        vm.mcpConfigPath = "/tmp/unsaved-mcp.json"
+        for enabled in [false, true] {
+            vm.mcpExposeTools = enabled
+            await vm.save(.mcpExposeTools, client: client)
+            XCTAssertNil(vm.lastError)
+            XCTAssertEqual(server.patches.last! as NSDictionary, ["mcp_expose_tools": enabled] as NSDictionary)
+        }
+        XCTAssertEqual(vm.mcpConfigPath, "/tmp/unsaved-mcp.json")
+        XCTAssertTrue(vm.hasPendingMCPChanges)
+    }
+
+    func testMCPExposureFailedSaveRestoresLastSavedValueAndAllowsRetry() async throws {
+        let (client, session) = try makeClient()
+        defer { session.invalidateAndCancel() }
+        server.setMCP(["expose_tools": false])
+        let vm = IntegrationsScreenVM()
+        await vm.load(client: client)
+        for enabled in [true, false] {
+            server.rejectSaves(true)
+            vm.mcpExposeTools = enabled
+            await vm.save(.mcpExposeTools, client: client)
+            XCTAssertEqual(vm.mcpExposeTools, !enabled)
+            XCTAssertNotNil(vm.lastError)
+            XCTAssertFalse(vm.savingMCPExposeTools)
+
+            server.rejectSaves(false)
+            vm.mcpExposeTools = enabled
+            await vm.save(.mcpExposeTools, client: client)
+            XCTAssertEqual(vm.mcpExposeTools, enabled)
+            XCTAssertNil(vm.lastError)
+        }
+    }
+
     func testWebSearchLoadsConfiguredValues() async throws {
         let (client, session) = try makeClient()
         defer { session.invalidateAndCancel() }
@@ -324,6 +372,8 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
 
     func setSearchResponse(_ body: [String: Any]) { lock.withLock { searchResponse = body } }
 
+    func setMCP(_ values: [String: Any]) { lock.withLock { settings["mcp"] = values } }
+
     func setIntegrations(_ values: [String: Any]) {
         lock.withLock {
             var integrations = settings["integrations"] as! [String: Any]
@@ -375,6 +425,11 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
             if savesRejected {
                 status = 400
                 body = ["detail": "Settings save rejected"]
+            } else if let exposeTools = patch["mcp_expose_tools"] {
+                var mcp = settings["mcp"] as! [String: Any]
+                mcp["expose_tools"] = exposeTools
+                settings["mcp"] = mcp
+                body = ["success": true, "runtime_applied": ["mcp_expose_tools"]]
             } else {
                 var integrations = settings["integrations"] as! [String: Any]
                 integrations.merge(patch) { _, new in new }

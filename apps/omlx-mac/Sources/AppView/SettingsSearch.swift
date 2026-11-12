@@ -218,7 +218,10 @@ enum SettingsSearch {
             ("integrations.tool.copilot", "default model"),
             ("integrations.tool.dsh", "default model"),
         ])
-        add(.integrations, ["integrations.section.mcp"], [("integrations.mcp.config_path", "configuration file JSON tools")])
+        add(.integrations, ["integrations.section.mcp"], [
+            ("integrations.mcp.config_path", "configuration file JSON tools"),
+            ("integrations.mcp.expose_tools", "backend tools clients chat completions"),
+        ])
         add(.security, [], [
             ("security.api_key.row_label", "authentication credential token"),
             ("security.auth.disable_verify", "disable authentication verification"),

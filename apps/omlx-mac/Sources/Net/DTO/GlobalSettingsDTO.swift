@@ -241,6 +241,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     /// Code, OpenClaw, Hermes, …). Empty / nil means no MCP server is wired.
     struct MCPSettings: Codable, Equatable, Sendable {
         let configPath: String?
+        let exposeTools: Bool?
     }
 
     /// Mirrors `omlx.settings.UsageSettings`. `usage_history` switches the
@@ -340,6 +341,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// the server (`global_settings.mcp.config_path = None`). Shared across
     /// every integration launcher.
     var mcpConfig: String? = nil
+    var mcpExposeTools: Bool? = nil
 
     /// Record local usage history (Status → Usage History). Applied at
     /// runtime; turning it off keeps the existing usage.sqlite3 so turning
