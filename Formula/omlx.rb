@@ -116,8 +116,10 @@ class Omlx < Formula
     end
 
     # [audio] is the only source of mlx-audio and of the Kokoro G2P stack
-    # (misaki, spaCy) that the spaCy model check below needs.
-    install_spec = build.with?("grammar") ? "#{buildpath}[audio,grammar]" : "#{buildpath}[audio]"
+    # (misaki, spaCy) that the spaCy model check below needs. [cluster] adds
+    # zeroconf, the only way the Cluster tab finds NVIDIA prefill helpers.
+    extras = build.with?("grammar") ? "audio,cluster,grammar" : "audio,cluster"
+    install_spec = "#{buildpath}[#{extras}]"
     system(*pip_install, install_spec)
 
     if build.with?("custom-kernel")
