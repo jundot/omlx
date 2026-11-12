@@ -2035,6 +2035,54 @@ class TestLevelBudgetPlan:
         expert_boosts = [k for k in plan.boost_map if "switch_mlp" in k]
         assert len(expert_boosts) == 0, "Routed experts should stay at base bits"
 
+    @pytest.mark.parametrize("group_size", [32, 64, 128])
+    def test_quant_plan_base_given_requested_group_size(self, group_size):
+        from omlx.oq import _base_bits_for_level
+
+        oq_level = 4
+        base_bits = _base_bits_for_level(oq_level)
+        # Follows _tensor_quantized_bytes() but in bits:
+        # Each group has 4-byte overhead (from _bytes_per_group()), so
+        # each weight (group_size / group) would be 4 * 8 / group_size.
+        base_bpw = base_bits + 32 / group_size
+        config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            self._dense_shapes(),
+            config,
+            oq_level,
+            target_bpw=base_bpw,
+            hard_cap_bpw=base_bpw,
+            group_size=group_size,
+        )
+        assert plan.boost_map == {}
+        assert plan.effective_bpw == pytest.approx(base_bpw, abs=1e-6)
+
+    @pytest.mark.parametrize("group_size", [64, 128])
+    def test_quant_plan_bpw_matches_tensors_written_at_group_size(self, group_size):
+        # Note that given the current target of oQ4 (4.7, 4.8), group size of 32 won't get any boost.
+        from omlx.oq import _estimate_effective_bpw
+
+        oq_level = 4
+        bpw_targets = _bpw_targets_for_level(oq_level)
+        shapes = self._dense_shapes()
+        config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            self._dense_shapes(),
+            config,
+            oq_level,
+            target_bpw=bpw_targets[0],
+            hard_cap_bpw=bpw_targets[1],
+            group_size=group_size,
+        )
+
+        # Compute the boosted tensors' bpw.
+        boosted_bpw = _estimate_effective_bpw(
+            shapes, oq_level, group_size, "affine", overrides=plan.boost_map
+        )
+        # Unboosted tensors should be written at the requested group size.
+        assert plan.boost_map["lm_head"]["group_size"] == group_size
+        assert plan.effective_bpw == pytest.approx(boosted_bpw)
+        assert boosted_bpw <= bpw_targets[1]
 
 # =============================================================================
 # Test _forward_layer tuple unwrapping
@@ -8846,6 +8894,64 @@ class TestStreamedCalibration:
             assert fused[key] == pytest.approx(value, abs=1e-6)
         second = oq._load_or_collect_imatrix(str(source), config, **kwargs)
         assert not first.reused and second.reused
+
+    def test_imatrix_cache_hit_passes_requested_group_size(
+        self, checkpoint, tmp_path
+    ):
+        import omlx.oq as oq
+        
+        oq_level = 4
+        requested_group_size = 32
+        source, config, model, _, _ = checkpoint
+        sample_config = dict(num_samples=2, seq_length=6)
+
+        reference = oq._measure_sensitivity_from_model(
+            model, object(), config, oq_level, group_size=requested_group_size, **sample_config
+        )
+
+        fused = oq._load_or_collect_imatrix(
+            str(source),
+            config,
+            cache_path=str(tmp_path / "imatrix.npz"),
+            reuse_cache=True,
+            strict=False,
+            trust_remote_code=False,
+            stream_calibration=True,
+            require_mtp_entries=False,
+            measure_sensitivity=True,
+            sensitivity_oq_level=oq_level,
+            sensitivity_num_samples=2,
+            sensitivity_seq_length=6,
+            group_size=requested_group_size,
+            **sample_config,
+        ).metadata["collection"]["sensitivity_map"]
+        standalone = oq._measure_sensitivity_streaming(
+            str(source), config, oq_level, group_size=requested_group_size, **sample_config
+        )
+
+        # Recall that _streamed_sensitivity_layer is "exactly _measure_sensitivity_from_model's 
+        # per-layer walk", so we can expect identical contents.
+        for measured in (fused, standalone):
+            assert measured.keys() == reference.keys()
+            for key, value in reference.items():
+                assert measured[key] == pytest.approx(value, abs=1e-6)
+
+    def test_streamed_sensitivity_uses_requested_group_size(
+        self, checkpoint, tmp_path
+    ):
+        import omlx.oq as oq
+
+        oq_level = 4
+        requested_group_size = 32
+        source, config, model, _, _ = checkpoint
+        sample_config = dict(num_samples=2, seq_length=6)
+        reference = oq._measure_sensitivity_from_model(
+            model, object(), config, oq_level, group_size=requested_group_size, **sample_config
+        )
+        default = oq._measure_sensitivity_from_model(
+            model, object(), config, oq_level, **sample_config
+        )
+        assert reference != default
 
     @pytest.mark.parametrize("keep_mtp", [False, True])
     def test_output_preserves_ple_scale_and_reloads(
