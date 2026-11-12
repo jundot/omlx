@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
+import numpy as np
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import (
@@ -1639,9 +1640,6 @@ def _audio_feature_cache_key_ranges(
     hashed without its batch padding (clips are padded to the longest one in
     the request), so a clip keeps its key when a later turn adds a longer one.
     """
-    import hashlib
-
-    import numpy as np
 
     def _to_np(value):
         if isinstance(value, mx.array):
@@ -4663,28 +4661,13 @@ class VLMBatchedEngine(BaseEngine):
                 image_cache_key_start = image_cache_key_ranges[0][0]
                 image_hash = image_cache_key_ranges[-1][1]
             elif has_audio and "sound_clips" in extra_model_inputs:
-                import numpy as np
-
-                # Checked before ``input_features``: Nemotron's processor
-                # emits raw waveforms, never feature arrays. Waveform
-                # lengths differ. Pad into one masked array so two
-                # different clips of the same length do not share
-                # prefix-cache blocks.
-                # numpy cannot read a bfloat16 mx array, so only that
-                # case upcasts; float32 waveforms convert without a copy.
+                # Nemotron returns raw float32 waveforms. Right-pad them into
+                # one masked batch so each clip keys on its own samples.
                 clips = [
-                    np.asarray(
-                        (
-                            c.astype(mx.float32)
-                            if isinstance(c, mx.array) and c.dtype == mx.bfloat16
-                            else c
-                        ),
-                        dtype=np.float32,
-                    ).reshape(-1)
+                    np.asarray(c, dtype=np.float32).reshape(-1)
                     for c in extra_model_inputs["sound_clips"]
                 ]
-                # Empty lists cannot reach here: an empty clip list never
-                # survives the processor call (audio None omits the key).
+                # Never empty: the processor omits the key when audio is None.
                 width = max(len(c) for c in clips)
                 padded = np.zeros((len(clips), width), dtype=np.float32)
                 mask = np.zeros((len(clips), width), dtype=bool)
