@@ -320,7 +320,7 @@ private struct WebSearchSection: View {
         SectionHeader(String(localized: "integrations.websearch.section_label", defaultValue: "Web Search", comment: "Web search settings"))
         ListGroup {
             Row(label: String(localized: "integrations.websearch.provider", defaultValue: "Search provider", comment: "Web search settings"),
-                sublabel: String(localized: "integrations.websearch.provider_hint", defaultValue: "Backend used by the chat web search tool. DDGS Total queries every available engine and needs no key.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                sublabel: String(localized: "integrations.websearch.provider_hint", defaultValue: "Backend used by the chat web search tool. DDGS Total queries every available engine and needs no key.", comment: "Web search settings")) {
                 Popup("integrations.websearch.provider", selection: vm.bind($vm.webSearch.provider, save: { save(.provider) }),
                       width: .controlMedium, options: [
                     ("ddgs", String(localized: "integrations.websearch.provider_ddgs_total", defaultValue: "DDGS Total", comment: "Web search settings")),
@@ -359,7 +359,7 @@ private struct WebSearchSection: View {
             }
             if vm.webSearch.provider == "brave" {
                 Row(label: String(localized: "integrations.websearch.brave_api_key", defaultValue: "Brave API key", comment: "Web search settings"),
-                    sublabel: String(localized: "integrations.websearch.brave_api_key_hint", defaultValue: "Subscription token from the Brave Search API dashboard.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                    sublabel: String(localized: "integrations.websearch.brave_api_key_hint", defaultValue: "Subscription token from the Brave Search API dashboard.", comment: "Web search settings")) {
                     TextInput("integrations.websearch.brave_api_key", text: $vm.webSearch.braveApiKey, isSecure: true, width: .controlMedium)
                         .focused($focusedField, equals: .braveApiKey)
                         .onSubmit { save(.braveApiKey) }
@@ -370,7 +370,7 @@ private struct WebSearchSection: View {
             }
             if vm.webSearch.provider == "searxng" {
                 Row(label: String(localized: "integrations.websearch.searxng_url", defaultValue: "SearXNG instance URL", comment: "Web search settings"),
-                    sublabel: String(localized: "integrations.websearch.searxng_url_hint", defaultValue: "Base URL of a SearXNG instance with the JSON output format enabled.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                    sublabel: String(localized: "integrations.websearch.searxng_url_hint", defaultValue: "Base URL of a SearXNG instance with the JSON output format enabled.", comment: "Web search settings")) {
                     TextInput("integrations.websearch.searxng_url", text: $vm.webSearch.searxngUrl, placeholder: "http://localhost:8888", width: .controlMedium)
                         .focused($focusedField, equals: .searxngUrl)
                         .onSubmit { save(.searxngUrl) }
@@ -380,7 +380,7 @@ private struct WebSearchSection: View {
                 }
             }
             Row(label: String(localized: "integrations.websearch.max_results", defaultValue: "Results per search", comment: "Web search settings"),
-                sublabel: String(localized: "integrations.websearch.max_results_hint", defaultValue: "How many sources one web_search call returns (1-10).", comment: "Web search settings"), sublabelLineLimit: nil) {
+                sublabel: String(localized: "integrations.websearch.max_results_hint", defaultValue: "How many sources one web_search call returns (1-10).", comment: "Web search settings")) {
                 TextInput("integrations.websearch.max_results", text: $vm.webSearch.maxResults, isNumeric: true, range: 1...10, step: 1, width: .controlNarrow,
                           onStep: { save(.maxResults) })
                     .focused($focusedField, equals: .maxResults)
@@ -390,7 +390,7 @@ private struct WebSearchSection: View {
                     .accessibilityLabel(Text("integrations.websearch.max_results"))
             }
             Row(label: String(localized: "integrations.websearch.content_mode", defaultValue: "Result content", comment: "Web search settings"),
-                sublabel: String(localized: "integrations.websearch.content_mode_hint", defaultValue: "Snippets keep the prompt small. Full page content fetches and inlines each result page.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                sublabel: String(localized: "integrations.websearch.content_mode_hint", defaultValue: "Snippets keep the prompt small. Full page content fetches and inlines each result page.", comment: "Web search settings")) {
                 Popup("integrations.websearch.content_mode", selection: vm.bind($vm.webSearch.contentMode, save: { save(.contentMode) }),
                       width: .controlMedium, options: [
                     ("snippet", String(localized: "integrations.websearch.content_mode_snippet", defaultValue: "Snippets only", comment: "Web search settings")),
@@ -401,14 +401,14 @@ private struct WebSearchSection: View {
             }
             if vm.webSearch.contentMode == "full" {
                 Row(label: String(localized: "integrations.websearch.content_truncate", defaultValue: "Truncate page content", comment: "Web search settings"),
-                    sublabel: String(localized: "integrations.websearch.content_truncate_hint", defaultValue: "Cut each fetched page at the limit below. Turning this off can flood the model context.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                    sublabel: String(localized: "integrations.websearch.content_truncate_hint", defaultValue: "Cut each fetched page at the limit below. Turning this off can flood the model context.", comment: "Web search settings")) {
                     RowSwitch(isOn: vm.bind($vm.webSearch.contentTruncate, save: { save(.contentTruncate) }))
                         .disabled(vm.savingWebSearchFields.contains(.contentTruncate))
                         .accessibilityLabel(Text("integrations.websearch.content_truncate"))
                 }
                 if vm.webSearch.contentTruncate {
                     Row(label: String(localized: "integrations.websearch.content_max_chars", defaultValue: "Content limit", comment: "Web search settings"),
-                        sublabel: String(localized: "integrations.websearch.content_max_chars_hint", defaultValue: "Maximum characters kept per fetched page.", comment: "Web search settings"), sublabelLineLimit: nil) {
+                        sublabel: String(localized: "integrations.websearch.content_max_chars_hint", defaultValue: "Maximum characters kept per fetched page.", comment: "Web search settings")) {
                         TextInput("integrations.websearch.content_max_chars", text: $vm.webSearch.contentMaxChars, isNumeric: true, range: 1...Double(Int.max), step: 1000,
                                   suffix: String(localized: "integrations.websearch.chars_suffix", defaultValue: "chars", comment: "Web search settings"), width: .controlCompact,
                                   onStep: { save(.contentMaxChars) })
@@ -451,7 +451,6 @@ private struct WebSearchSection: View {
         Task { await vm.saveWebSearch(field, client: client) }
     }
 }
-
 
 // MARK: - Claude Code
 

@@ -721,18 +721,6 @@
         }
       }
     },
-    "integrations.websearch.url_invalid" : {
-      "comment" : "Web search settings validation",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Enter an HTTP or HTTPS URL with a host, or leave it empty."
-          }
-        }
-      }
-    },
     "integrations.websearch.max_results_invalid" : {
       "comment" : "Web search settings validation",
       "extractionState" : "manual",

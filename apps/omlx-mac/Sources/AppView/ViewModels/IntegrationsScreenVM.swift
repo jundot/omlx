@@ -79,14 +79,12 @@ final class IntegrationsScreenVM {
     var webSearch = WebSearchForm() {
         didSet {
             if webSearch != oldValue {
-                webSearchRevision += 1
                 webSearchTestMessage = nil
                 webSearchTestOK = nil
             }
         }
     }
     private var webSearchLoaded = WebSearchForm()
-    private var webSearchRevision = 0
     private(set) var savingWebSearchFields: Set<WebSearchField> = []
     private(set) var webSearchTesting = false
     private(set) var webSearchTestMessage: String?
@@ -476,33 +474,25 @@ final class IntegrationsScreenVM {
 
     func saveWebSearch(_ field: WebSearchField, client: OMLXClient) async {
         guard !savingWebSearchFields.contains(field) else { return }
-        let draft = webSearch
-        var submitted = draft
+        var submitted = webSearch
         var patch = GlobalSettingsPatch()
         switch field {
         case .provider:
             guard submitted.provider != webSearchLoaded.provider else { lastError = nil; return }
             patch.webSearchProvider = submitted.provider
         case .braveApiKey:
-            submitted.braveApiKey = Self.trimmed(draft.braveApiKey)
+            submitted.braveApiKey = Self.trimmed(submitted.braveApiKey)
             guard submitted.braveApiKey != webSearchLoaded.braveApiKey else { lastError = nil; return }
             patch.webSearchBraveApiKey = submitted.braveApiKey
         case .searxngUrl:
-            submitted.searxngUrl = Self.trimmed(draft.searxngUrl)
-            guard Self.validSearxngURL(submitted.searxngUrl) else {
-                lastError = String(localized: "integrations.websearch.url_invalid",
-                                   defaultValue: "Enter an HTTP or HTTPS URL with a host, or leave it empty.",
-                                   comment: "Invalid SearXNG instance URL")
-                return
-            }
-            while submitted.searxngUrl.hasSuffix("/") { submitted.searxngUrl.removeLast() }
+            submitted.searxngUrl = Self.trimmed(submitted.searxngUrl)
             guard submitted.searxngUrl != webSearchLoaded.searxngUrl else { lastError = nil; return }
             patch.webSearchSearxngUrl = submitted.searxngUrl
         case .ddgsBackends:
             guard submitted.ddgsBackends != webSearchLoaded.ddgsBackends else { lastError = nil; return }
             patch.webSearchDdgsBackends = submitted.ddgsBackends
         case .maxResults:
-            guard let value = Int(Self.trimmed(draft.maxResults)), (1...10).contains(value) else {
+            guard let value = Int(Self.trimmed(submitted.maxResults)), (1...10).contains(value) else {
                 lastError = String(localized: "integrations.websearch.max_results_invalid",
                                    defaultValue: "Enter a whole number between 1 and 10.",
                                    comment: "Invalid web search numeric setting")
@@ -518,7 +508,7 @@ final class IntegrationsScreenVM {
             guard submitted.contentTruncate != webSearchLoaded.contentTruncate else { lastError = nil; return }
             patch.webSearchContentTruncate = submitted.contentTruncate
         case .contentMaxChars:
-            guard let value = Int(Self.trimmed(draft.contentMaxChars)), value > 0 else {
+            guard let value = Int(Self.trimmed(submitted.contentMaxChars)), value > 0 else {
                 lastError = String(localized: "integrations.websearch.content_limit_invalid",
                                    defaultValue: "Enter a whole number greater than zero.",
                                    comment: "Invalid web search numeric setting")
@@ -532,48 +522,31 @@ final class IntegrationsScreenVM {
         defer { savingWebSearchFields.remove(field) }
         do {
             _ = try await client.updateGlobalSettings(patch)
-            switch field {
-            case .provider:
-                webSearchLoaded.provider = submitted.provider
-                if webSearch.provider == draft.provider { webSearch.provider = submitted.provider }
-            case .braveApiKey:
-                webSearchLoaded.braveApiKey = submitted.braveApiKey
-                if webSearch.braveApiKey == draft.braveApiKey { webSearch.braveApiKey = submitted.braveApiKey }
-            case .searxngUrl:
-                webSearchLoaded.searxngUrl = submitted.searxngUrl
-                if webSearch.searxngUrl == draft.searxngUrl { webSearch.searxngUrl = submitted.searxngUrl }
-            case .ddgsBackends:
-                webSearchLoaded.ddgsBackends = submitted.ddgsBackends
-                if webSearch.ddgsBackends == draft.ddgsBackends { webSearch.ddgsBackends = submitted.ddgsBackends }
-            case .maxResults:
-                webSearchLoaded.maxResults = submitted.maxResults
-                if webSearch.maxResults == draft.maxResults { webSearch.maxResults = submitted.maxResults }
-            case .contentMode:
-                webSearchLoaded.contentMode = submitted.contentMode
-                if webSearch.contentMode == draft.contentMode { webSearch.contentMode = submitted.contentMode }
-            case .contentTruncate:
-                webSearchLoaded.contentTruncate = submitted.contentTruncate
-                if webSearch.contentTruncate == draft.contentTruncate { webSearch.contentTruncate = submitted.contentTruncate }
-            case .contentMaxChars:
-                webSearchLoaded.contentMaxChars = submitted.contentMaxChars
-                if webSearch.contentMaxChars == draft.contentMaxChars { webSearch.contentMaxChars = submitted.contentMaxChars }
-            }
+            Self.copy(field, from: submitted, to: &webSearchLoaded)
+            Self.copy(field, from: submitted, to: &webSearch)
             lastError = nil
         } catch {
             switch field {
-            case .provider:
-                if webSearch.provider == draft.provider { webSearch.provider = webSearchLoaded.provider }
-            case .ddgsBackends:
-                if webSearch.ddgsBackends == draft.ddgsBackends { webSearch.ddgsBackends = webSearchLoaded.ddgsBackends }
-            case .contentMode:
-                if webSearch.contentMode == draft.contentMode { webSearch.contentMode = webSearchLoaded.contentMode }
-            case .contentTruncate:
-                if webSearch.contentTruncate == draft.contentTruncate { webSearch.contentTruncate = webSearchLoaded.contentTruncate }
+            case .provider, .ddgsBackends, .contentMode, .contentTruncate:
+                Self.copy(field, from: webSearchLoaded, to: &webSearch)
             case .braveApiKey, .searxngUrl, .maxResults, .contentMaxChars:
                 // Keep typed drafts available for correction or retry.
                 break
             }
             lastError = error.omlxDescription
+        }
+    }
+
+    private static func copy(_ field: WebSearchField, from source: WebSearchForm, to target: inout WebSearchForm) {
+        switch field {
+        case .provider: target.provider = source.provider
+        case .braveApiKey: target.braveApiKey = source.braveApiKey
+        case .searxngUrl: target.searxngUrl = source.searxngUrl
+        case .ddgsBackends: target.ddgsBackends = source.ddgsBackends
+        case .maxResults: target.maxResults = source.maxResults
+        case .contentMode: target.contentMode = source.contentMode
+        case .contentTruncate: target.contentTruncate = source.contentTruncate
+        case .contentMaxChars: target.contentMaxChars = source.contentMaxChars
         }
     }
 
@@ -593,12 +566,10 @@ final class IntegrationsScreenVM {
             searxngUrl: Self.trimmed(webSearch.searxngUrl), ddgsBackends: webSearch.ddgsBackends,
             maxResults: count
         )
-        let revision = webSearchRevision
         webSearchTesting = true
         defer { webSearchTesting = false }
         do {
             let response = try await client.testWebSearch(request)
-            guard revision == webSearchRevision else { return }
             webSearchTestOK = response.ok
             if response.ok {
                 webSearchTestMessage = String(localized: "integrations.websearch.test_success",
@@ -611,18 +582,9 @@ final class IntegrationsScreenVM {
                               comment: "Fallback error for a web search connectivity test")
             }
         } catch {
-            guard revision == webSearchRevision else { return }
             webSearchTestOK = false
             webSearchTestMessage = error.omlxDescription
         }
-    }
-
-    private static func validSearxngURL(_ text: String) -> Bool {
-        if text.isEmpty { return true }
-        guard let url = URLComponents(string: text),
-              let scheme = url.scheme, ["http", "https"].contains(scheme),
-              let host = url.host, !host.isEmpty else { return false }
-        return !text.contains(where: { $0.isWhitespace })
     }
 
     private func refreshModels(client: OMLXClient) async throws {
