@@ -4,6 +4,7 @@ Expected values come from the independent PyTorch reference with CPU kernel
 substitutions. See fixtures/deepseek_v41_expected.md for provenance and limits.
 """
 
+import json
 import sys
 import zlib
 from dataclasses import asdict
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx_lm.server import ToolCallFormatter
 
 from omlx.api.utils import extract_text_content, uses_native_reasoning_content
 from omlx.cache.deepseek_v41_delta import compact_state
@@ -1749,6 +1751,13 @@ def test_mlx_lm_tokenizer_gets_the_v41_protocol(tmp_path):
     assert tokenizer.apply_chat_template(
         messages, tokenize=False, enable_thinking=False
     ) == encode_messages(messages, thinking_mode="chat")
+    body = (
+        '\n<｜DSML｜ invoke name="get">\n'
+        '<｜DSML｜ parameter name="city" string="true">서울</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+    )
+    (call,) = ToolCallFormatter(tokenizer.tool_parser, None)([body])
+    assert json.loads(call["function"]["arguments"]) == {"city": "서울"}
 
 
 # One rank of a two-stage V4.1 deployment decoding with Lightning MTP: rank zero
