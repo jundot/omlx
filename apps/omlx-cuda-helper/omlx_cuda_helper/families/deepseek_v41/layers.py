@@ -275,8 +275,9 @@ class Block:
         self.experts = [
             ExpertBank(weights, f"{base}ffn.experts.{n}", c) for n in ("w1", "w3", "w2")
         ]
-        # Set by check_kernels once the expert tile kernels reproduce gather_qmm.
-        self.tiles = False
+        # Set by check_kernels once the expert tile kernels reproduce gather_qmm;
+        # "mx" for the block-scaled tiles.
+        self.tiles: bool | str = False
         self.shared = [
             projection(f"ffn.shared_experts.{n}") for n in ("w1", "w3", "w2")
         ]
@@ -440,7 +441,7 @@ class Block:
         """(each route's expert output [R, D] sorted by expert, inverse order).
 
         ``xq`` is the FP8 round trip of ``flat``; ``tiles`` runs the expert
-        tile kernels instead of gather_qmm.
+        tile kernels instead of gather_qmm, "mx" the block-scaled ones.
         """
         c, k = self.config, chosen.shape[-1]
         w1, w3, w2 = self.experts
@@ -449,7 +450,18 @@ class Block:
         order = mx.argsort(experts)
         experts, token = experts[order], order // k
         route_weights = weights.reshape(-1)[order]
-        if tiles:
+        if tiles == "mx":
+            codes, scales = kernels.expert_gate_up_mx(
+                *kernels.fp8_codes(flat),
+                token.astype(mx.uint32),
+                experts,
+                w1,
+                w3,
+                route_weights,
+                c.swiglu_limit,
+            )
+            routed = kernels.expert_down_mx(codes, scales, experts, w2)
+        elif tiles:
             act = kernels.expert_gate_up(
                 xq if w1.quantize_input else flat,
                 token.astype(mx.uint32),
@@ -498,6 +510,28 @@ class Block:
         if not self.tiles:
             logger.warning(
                 "DeepSeek V4.1 expert tile kernels are off: layer %d differs from "
+                "gather_qmm by %.2e",
+                self.layer,
+                error,
+            )
+            return
+        # The block-scaled mma takes the activations' FP8 round trip as codes.
+        if not (
+            kernels.mx_experts_fit(self.experts)
+            and all(w.quantize_input for w in self.experts)
+        ):
+            return
+        try:
+            got = self._routed(flat, xq, chosen, weights, "mx")[0]
+            error = kernels.relative_error(got, want)
+        except RuntimeError as failure:
+            logger.warning("DeepSeek V4.1 MX expert tiles are off: %r", failure)
+            return
+        if error <= _TILE_ERROR:
+            self.tiles = "mx"
+        else:
+            logger.warning(
+                "DeepSeek V4.1 MX expert tiles are off: layer %d differs from "
                 "gather_qmm by %.2e",
                 self.layer,
                 error,

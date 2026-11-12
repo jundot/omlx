@@ -59,6 +59,30 @@ inline void v41_quantize(float* v) {
     v[i] = (scaled < 0.0f ? -q : q) * scale;
   }
 }
+// v41_quantize<8>'s round trip of 32 values kept as E4M3 codes (the MX tile
+// kernels' activations); returns the E8M0 byte of the group's scale.
+template <unsigned FLOOR, unsigned INV_LIMIT>
+inline unsigned v41_quantize_codes(const float* v, unsigned char* codes) {
+  float amax = __uint_as_float(FLOOR);
+  for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(v[i]));
+  const unsigned pb = __float_as_uint(__fmul_rn(amax, __uint_as_float(INV_LIMIT)));
+  const int e = int((pb >> 23) & 0xFFu) - 127 + int((pb & 0x7FFFFFu) != 0u);
+  const float scale = __uint_as_float(unsigned(e + 127) << 23);
+  for (int i = 0; i < 32; ++i) {
+    const float scaled = fminf(fmaxf(v[i] / scale, -448.0f), 448.0f);
+    const float a = fabsf(scaled);
+    int se = int((__float_as_uint(a) >> 23) & 0xFFu) - 127 - 3;
+    if (se < -9) se = -9;
+    const float step = __uint_as_float(unsigned(se + 127) << 23);
+    const float q = fminf(rintf(a / step) * step, 448.0f);
+    // E4M3: exponent bias 7 and three mantissa bits; below 2**-6, steps of 2**-9.
+    const unsigned qb = __float_as_uint(q), qe = (qb >> 23) & 0xFFu;
+    const unsigned mag = q == 0.0f ? 0u
+        : qe < 121u ? unsigned(q * 512.0f) : ((qe - 120u) << 3) | ((qb >> 20) & 7u);
+    codes[i] = (unsigned char)(mag | (scaled < 0.0f ? 0x80u : 0u));
+  }
+  return unsigned(e + 127);
+}
 // Eight consecutive values as fp32; p is 8-byte aligned.
 inline void v41_load8(const float* p, float* v) {
   for (int i = 0; i < 8; ++i) v[i] = p[i];
@@ -361,6 +385,15 @@ _TRANSFORM = r"""
   }
   if (BITS) v41_quantize<BITS ? BITS : 8, FLOOR, INV_LIMIT>(v);
   v41_store32(v, y + base);
+"""
+
+# The FP8 round trip of x [L, D] as E4M3 codes [L, D] and E8M0 scales [L, D / 32].
+_FP8_CODES = r"""
+  const size_t group = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (group >= size_t(x_shape[0]) * x_shape[1] / 32) return;
+  float v[32];
+  v41_load32(x + group * 32, v);
+  scales[group] = (unsigned char)v41_quantize_codes<FLOOR, INV_LIMIT>(v, codes + group * 32);
 """
 
 # One thread per group of 32 values: silu(gate) * up with the reference
@@ -748,6 +781,9 @@ _INDEX_DOTS = 1 << 28
 # 128 x 128 weight tile in bf16; at most _TILE_BUDGET blocks at once.
 _TILE_THREADS = 256
 _TILE_SHARED = 2 * 64 * 128 * 2 + 128 * 128 * 2
+# The MX tiles stage bytes: two 64 x 128 code tiles, one 128 x 128 weight
+# tile and their scales. The gate/up epilogue reuses it for a bf16 64 x 128 tile.
+_TILE_MX_SHARED = 2 * (64 * 128 + 64 * 4) + 128 * 128 + 128 * 4
 _TILE_STAGES, _TILE_PREFETCH = 2, 4
 _TILE_BUDGET = 16384
 _BORROWED = Path(__file__).resolve().parents[2] / "third_party/mlx-serve/deepseek_v41"
@@ -771,7 +807,11 @@ def _kernel(name: str, source: str, inputs: tuple[str, ...], outputs: tuple[str,
 
 @cache
 def _tile_kernel(
-    name: str, body: str, inputs: tuple[str, ...], outputs: tuple[str, ...]
+    name: str,
+    body: str,
+    inputs: tuple[str, ...],
+    outputs: tuple[str, ...],
+    shared: int = _TILE_SHARED,
 ):
     return mx.fast.cuda_kernel(
         name="deepseek_v41_" + name,
@@ -779,7 +819,7 @@ def _tile_kernel(
         output_names=list(outputs),
         source=(_BORROWED / body).read_text(),
         header=(_BORROWED / "moe_prefill_header.cu").read_text() + _HEADER,
-        shared_memory=_TILE_SHARED,
+        shared_memory=shared,
     )
 
 
@@ -901,6 +941,87 @@ def expert_down(act, experts, down):
         grid=_tile_grid(out // 128, count, act.shape[0]),
         threadgroup=(_TILE_THREADS, 1, 1),
         output_shapes=[(act.shape[0], out)],
+        output_dtypes=[mx.bfloat16],
+    )[
+        0
+    ]
+
+
+def mx_experts_fit(banks) -> bool:
+    """Whether the MX tile kernels take these banks: mxfp4 on sm_120 / sm_121,
+    whose block-scaled mma multiplies E4M3 activations by E2M1 weights."""
+    info = mx.device_info()
+    return (
+        available()
+        and info.get("compute_capability_major") == 12
+        and experts_fit(banks)
+        and _tile_format(banks[0]) == "mxfp4"
+    )
+
+
+def fp8_codes(x: mx.array) -> tuple[mx.array, mx.array]:
+    """quant.quantize(x, 8) of x [L, D] as E4M3 codes and E8M0 scales [L, D / 32]."""
+    groups = x.size // 32
+    return _kernel("fp8_codes", _FP8_CODES, ("x",), ("codes", "scales"))(
+        inputs=[x],
+        template=[(n, v) for n, v in _quantizer(8) if n != "BITS"],
+        grid=(groups, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[x.shape, (x.shape[0], x.shape[1] // 32)],
+        output_dtypes=[mx.uint8, mx.uint8],
+    )
+
+
+def expert_gate_up_mx(codes, scales, token, experts, gate, up, weights, limit):
+    """expert_gate_up of quantized rows on the MX tiles: ``codes`` and
+    ``scales`` from fp8_codes. Returns the FP8 round trip of the SwiGLU output
+    [R, inner] as codes and scales, which expert_down_mx takes."""
+    count, inner = gate.weight.shape[:2]
+    routes = experts.size
+    return _tile_kernel(
+        "expert_gate_up_mx",
+        "moe_prefill_gate_up_mx.cu",
+        ("xc", "xs", "rows", "inds", "gw", "gs", "uw", "us", "rw"),
+        ("acodes", "ascales"),
+        _TILE_MX_SHARED,
+    )(
+        inputs=[codes, scales, token, experts, gate.weight, gate.scales]
+        + [up.weight, up.scales, weights],
+        template=[
+            ("STG", _TILE_STAGES),
+            ("BDEP", _TILE_PREFETCH),
+            ("K", codes.shape[-1]),
+            ("I", inner),
+            ("LIMIT", _bits(limit) if limit else 0),
+            *((n, v) for n, v in _quantizer(8) if n != "BITS"),
+        ],
+        grid=_tile_grid(inner // 64, count, routes),
+        threadgroup=(_TILE_THREADS, 1, 1),
+        output_shapes=[(routes, inner), (routes, inner // 32)],
+        output_dtypes=[mx.uint8, mx.uint8],
+    )
+
+
+def expert_down_mx(codes, scales, experts, down):
+    """expert_down of expert_gate_up_mx's codes and scales on the MX tiles."""
+    count, out = down.weight.shape[:2]
+    return _tile_kernel(
+        "expert_down_mx",
+        "moe_prefill_down_mx.cu",
+        ("xc", "xs", "w", "s", "inds"),
+        ("y",),
+        _TILE_MX_SHARED,
+    )(
+        inputs=[codes, scales, down.weight, down.scales, experts],
+        template=[
+            ("STG", _TILE_STAGES),
+            ("BDEP", _TILE_PREFETCH),
+            ("K", codes.shape[1]),
+            ("N", out),
+        ],
+        grid=_tile_grid(out // 128, count, codes.shape[0]),
+        threadgroup=(_TILE_THREADS, 1, 1),
+        output_shapes=[(codes.shape[0], out)],
         output_dtypes=[mx.bfloat16],
     )[
         0

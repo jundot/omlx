@@ -4,6 +4,8 @@ Copyright (c) 2026 David Dalcu, at commit 9191fbdf. License: ../LICENSE.
 moe_prefill_header.cu    from src/kernels/moe/moe_prefill_cuda_header.cu
 moe_prefill_gate_up.cu   from src/kernels/moe/moe_prefill_cuda_gu.cu
 moe_prefill_down.cu      from src/kernels/moe/moe_prefill_cuda.cu
+moe_prefill_gate_up_mx.cu  moe_prefill_gate_up.cu on the MX tile (below)
+moe_prefill_down_mx.cu     moe_prefill_down.cu on the MX tile (below)
 
 The header and the down projection are the GLM-5.3 versions of this helper
 (../glm5_next, same changes): MLX affine codes of 4 or 8 bits with bf16
@@ -22,3 +24,13 @@ clamped by the swiglu limit, silu(gate) * up is multiplied by the route
 weight in float and rounded to bf16, and each group of 32 values takes the
 FP8 (E4M3, power-of-two scale) round trip when the down projection quantizes
 its input. The helpers of that math come from the family's kernels.py.
+
+The MX tile (msv_expert_tile_mx, sm_120a / sm_121a) keeps msv_expert_tile's
+launch geometry, staging and K order and swaps its arithmetic: A rows are
+E4M3 codes with one E8M0 scale per 32 (the activation's FP8 round trip kept
+as codes), B rows are the mxfp4 codes widened to one byte each, and each k32
+step runs mma.sync.kind::mxf8f6f4.block_scale (E4M3 x E2M1, UE8M0 scales)
+from zero and is added with a correctly rounded float add. The products are
+the bf16 tile's exact products. The gate/up epilogue is unchanged up to the
+FP8 round trip, which it writes as codes and scales for the MX down projection.
+
