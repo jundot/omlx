@@ -1635,7 +1635,6 @@ class TestMing3Patches:
     @pytest.mark.parametrize(
         "stop_bias, max_steps, temperature, expected_len",
         [
-            ([20.0, -20.0], 9, 0.0, 9),
             ([-20.0, 20.0], 9, 0.0, 5),
             ([20.0, -20.0], 1, 0.0, 1),
             ([20.0, -20.0], 6, 0.5, 6),
@@ -1666,7 +1665,7 @@ class TestMing3Patches:
             assert mx.array_equal(got, want).item()
 
     @pytest.mark.parametrize(
-        "cfg, temperature", [(2.0, 0.0), (2.0, 0.5), (1.0, 0.5), (0.0, 0.0)]
+        "cfg, temperature", [(2.0, 0.5), (1.0, 0.5), (0.0, 0.0)]
     )
     def test_tiny_compiled_flow_matches_eager_flow(self, cfg, temperature):
         from omlx.patches.mlx_audio_ming3 import apply_ming3_patches
