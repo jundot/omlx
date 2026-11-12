@@ -119,11 +119,17 @@ class ModelLayout:
     # Prefill peak one attention chunk adds on top of the resident weights and
     # KV, expressed per token of context and priced at
     # ``_PREFILL_REFERENCE_CHUNK``. A plan charges ``per_token × context ×
-    # chunk / reference`` to the stage that prefill it, so a throughput plan
+    # chunk / reference`` to the stage that prefills it, so a throughput plan
     # (4096-token chunks) reserves four times the transient of an interactive
-    # one instead of the same zero every profile used to get. This is the same
-    # quantity ``MemoryMonitor.estimate_prefill_peak_bytes`` makes the rank
-    # prefill guard enforce at request time.
+    # one instead of the same zero every profile used to get.
+    # The price is ``MemoryMonitor.estimate_prefill_peak_bytes`` on the generic
+    # SDPA path — the transient the rank guard refuses a request over. Models
+    # with a prefill profile of their own (Qwen4 QSA, GLM-5 sparse MLA,
+    # DeepSeek V4.1) are admitted by the guard against that profile instead,
+    # which prices a bounded key set and comes out smaller, so a plan is
+    # conservative against admission rather than optimistic.
+    # MLA layouts keep 0: the generic formula cannot price a packed latent
+    # cache, and that is a known gap, not a claim that their prefill is free.
     prefill_transient_bytes_per_context_token: int = 0
     supports_tensor_parallel: bool = False
     # Whether mlx-lm can split this architecture into pipeline stages. False
@@ -1134,15 +1140,20 @@ _PREFILL_REFERENCE_CONTEXT = 8192
 
 
 def _prefill_transient_bytes_per_context_token(config: dict[str, Any]) -> int:
-    """Prefill peak the rank guard charges, per token of context.
+    """Prefill peak one chunk adds on top of weights and KV, per context token.
 
     Loading a stage is only half of admitting it: one prefill chunk allocates
     an attention score matrix that is gone again by the time the next chunk
     starts, so it never shows up in resident weights or KV and the plan used to
     price it at zero. That is how a split with 13 GiB of plan headroom died in
-    prefill. ``MemoryMonitor.estimate_prefill_peak_bytes`` is what the rank
-    prefill guard enforces at request time; the plan charges the same quantity
-    up front so it cannot choose a split the guard will then refuse.
+    prefill.
+
+    The number is ``MemoryMonitor.estimate_prefill_peak_bytes`` on the generic
+    SDPA path, which is what the rank guard refuses a request over when the
+    model has no prefill profile of its own. Profile models (Qwen4 QSA, GLM-5
+    sparse MLA, DeepSeek V4.1) are admitted against a gathered/selected key set
+    instead and price lower, so this reservation is an upper bound on that
+    admission rather than a match for it.
 
     The peak is linear in the chunk and (for the dense and tiled SDPA paths)
     linear in the context, so one number priced at
@@ -1151,7 +1162,9 @@ def _prefill_transient_bytes_per_context_token(config: dict[str, Any]) -> int:
 
     Returns 0 for checkpoints whose cache the generic formula cannot price —
     MLA stores one latent per layer, and over-charging it by an order of
-    magnitude would refuse splits that work — and when the dims are unreadable.
+    magnitude would refuse splits that work; the guard still prices those
+    through their profile, so the plan under-reserves them by that transient —
+    and when the dims are unreadable.
     """
 
     if _kv_cache_replicated_across_tp(config):
