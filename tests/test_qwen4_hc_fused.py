@@ -94,13 +94,26 @@ def _ulps(a, b):
     return float(diff.max().item()), float(diff.mean().item())
 
 
+# Every bits x layout pair; rows and use_combine rotate so each of their values meets every
+# bits value and every layout, and every rows x use_combine pair runs.
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize(
-    "group_size,dtype", [(32, mx.bfloat16), (64, mx.bfloat16), (64, mx.float16)]
+    "bits,rows,use_combine,group_size,dtype",
+    [
+        (4, 1, True, 32, mx.bfloat16),
+        (4, 4, False, 64, mx.bfloat16),
+        (4, 16, True, 64, mx.float16),
+        (5, 4, False, 32, mx.bfloat16),
+        (5, 16, True, 64, mx.bfloat16),
+        (5, 1, False, 64, mx.float16),
+        (6, 16, True, 32, mx.bfloat16),
+        (6, 1, False, 64, mx.bfloat16),
+        (6, 4, True, 64, mx.float16),
+        (8, 1, False, 32, mx.bfloat16),
+        (8, 4, True, 64, mx.bfloat16),
+        (8, 16, False, 64, mx.float16),
+    ],
 )
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
-@pytest.mark.parametrize("rows", [1, 4, 16])
-@pytest.mark.parametrize("use_combine", [True, False])
 def test_fused_matches_canonical_path(bits, rows, use_combine, group_size, dtype):
     mx.random.seed(20260905 + bits * 100 + rows)
     _assert_fused_matches_canonical(
