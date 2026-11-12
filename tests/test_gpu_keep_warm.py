@@ -3,6 +3,7 @@
 
 import asyncio
 import concurrent.futures
+import sys
 import time
 from types import SimpleNamespace
 
@@ -156,3 +157,35 @@ async def test_non_finite_idle_window_is_rejected(monkeypatch, tmp_path):
 
     settings.server.gpu_keep_warm_idle_window = float("inf")
     assert "gpu_keep_warm_idle_window must be finite" in settings.validate()
+
+
+@pytest.mark.asyncio
+async def test_admin_update_applies_idle_window(monkeypatch, tmp_path):
+    settings = GlobalSettings(base_path=tmp_path)
+    calls: list[tuple] = []
+
+    class Pool:
+        def configure_gpu_keep_warm(self, interval, window):
+            calls.append(("configure", interval, window))
+
+    fake_server = SimpleNamespace(
+        _server_state=SimpleNamespace(engine_pool=Pool())
+    )
+    monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+
+    async def save(_settings):
+        return None
+
+    monkeypatch.setattr(admin_routes, "_save_global_settings_async", save)
+
+    result = await admin_routes.update_global_settings(
+        admin_routes.GlobalSettingsRequest(gpu_keep_warm_idle_window=3600),
+        is_admin=True,
+    )
+
+    assert settings.server.gpu_keep_warm_idle_window == 3600.0
+    assert calls == [
+        ("configure", settings.server.gpu_keep_warm_interval, 3600.0),
+    ]
+    assert "gpu_keep_warm_idle_window" in result["runtime_applied"]
