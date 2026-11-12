@@ -291,11 +291,12 @@ __device__ __forceinline__ uint2 msv_fp4_bytes(uint32_t w) {
 // msv_expert_tile with MX: A codes from `acode(row)` and scales from
 // `ascale(row)`, B mxfp4 codes from `wrow(r)` and scales from `srow(r)`. Smem
 // holds ST stages of A codes and scales, then the B bytes and scales of one stage.
-template <int K, int BD, int ST, typename ACode, typename AScale, typename WRow, typename SRow>
-__device__ __forceinline__ void msv_expert_tile_mx(uint8_t* smem, int mv, ACode acode, AScale ascale, WRow wrow, SRow srow, float (&acc)[2][4][4]) {
+// One pass covers MT tiles of 64 rows, so each B stage is read once for all of them.
+template <int K, int BD, int ST, int MT, typename ACode, typename AScale, typename WRow, typename SRow>
+__device__ __forceinline__ void msv_expert_tile_mx(uint8_t* smem, int mv, ACode acode, AScale ascale, WRow wrow, SRow srow, float (&acc)[MT][2][4][4]) {
   constexpr int BM = 64, BN = 128, KS = 128, G = KS / 32;
   constexpr int KT = K / KS;
-  constexpr int A_ST = BM * KS, AS_ST = BM * G;
+  constexpr int A_ST = MT * BM * KS, AS_ST = MT * BM * G;
   constexpr int RB = KS / 2, CPR = RB / 16, NL = BN * CPR / 256;
   uint8_t* sa = smem;
   uint8_t* sas = sa + ST * A_ST;
@@ -307,12 +308,12 @@ __device__ __forceinline__ void msv_expert_tile_mx(uint8_t* smem, int mv, ACode 
   auto load_a = [&](int t) {
     const int st = t % ST;
     #pragma unroll
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 2 * MT; ++i) {
       const int q = tid + i * 256, row = q >> 3, c = q & 7;
       const bool ok = row < mv;
       msv_cp16(msv_smem(sa + st * A_ST + row * KS + ((c ^ (row & 7)) << 4)), acode(ok ? row : 0) + t * KS + c * 16, ok);
     }
-    if (tid < BM) {
+    if (tid < MT * BM) {
       const bool ok = tid < mv;
       msv_cp4(msv_smem(sas + st * AS_ST + tid * G), ascale(ok ? tid : 0) + t * G, ok);
     }
@@ -329,11 +330,13 @@ __device__ __forceinline__ void msv_expert_tile_mx(uint8_t* smem, int mv, ACode 
     }
   };
   #pragma unroll
-  for (int a = 0; a < 2; ++a)
+  for (int m = 0; m < MT; ++m)
     #pragma unroll
-    for (int j = 0; j < 4; ++j)
+    for (int a = 0; a < 2; ++a)
       #pragma unroll
-      for (int v = 0; v < 4; ++v) acc[a][j][v] = 0.f;
+      for (int j = 0; j < 4; ++j)
+        #pragma unroll
+        for (int v = 0; v < 4; ++v) acc[m][a][j][v] = 0.f;
   #pragma unroll
   for (int i = 0; i < ST - 1; ++i) { if (i < KT) load_a(i); msv_commit(); }
   #pragma unroll
@@ -365,16 +368,6 @@ __device__ __forceinline__ void msv_expert_tile_mx(uint8_t* smem, int mv, ACode 
           const uint8_t* ast = sas + (t % ST) * AS_ST;
           #pragma unroll
           for (int kb = 0; kb < G; ++kb) {
-            uint32_t af[2][4], sfa[2];
-            #pragma unroll
-            for (int a = 0; a < 2; ++a) {
-              const int idx = lane >> 3;
-              const int row = wm * 32 + a * 16 + (idx & 1) * 8 + (lane & 7);
-              const int c = kb * 2 + (idx >> 1);
-              msv_ldsm4(msv_smem(at + row * KS + ((c ^ (row & 7)) << 4)), af[a][0], af[a][1], af[a][2], af[a][3]);
-              // Lane l supplies the scale of row 8 * (l % 2) + l / 4 of the 16.
-              sfa[a] = ast[(wm * 32 + a * 16 + 8 * (lane & 1) + (lane >> 2)) * G + kb];
-            }
             uint32_t bf[4][2], sfb[4];
             #pragma unroll
             for (int p = 0; p < 2; ++p) {
@@ -386,10 +379,26 @@ __device__ __forceinline__ void msv_expert_tile_mx(uint8_t* smem, int mv, ACode 
             #pragma unroll
             for (int jj = 0; jj < 4; ++jj) sfb[jj] = sws[(wn * 32 + jj * 8 + (lane >> 2)) * G + kb];
             #pragma unroll
-            for (int a = 0; a < 2; ++a) {
-              if (wm * 32 + a * 16 < mv) {
+            for (int m = 0; m < MT; ++m) {
+              const int r0 = m * BM + wm * 32;
+              if (r0 < mv) {
+                uint32_t af[2][4], sfa[2];
                 #pragma unroll
-                for (int jj = 0; jj < 4; ++jj) msv_mma_mx(acc[a][jj], af[a], bf[jj][0], bf[jj][1], sfa[a], sfb[jj]);
+                for (int a = 0; a < 2; ++a) {
+                  const int idx = lane >> 3;
+                  const int row = r0 + a * 16 + (idx & 1) * 8 + (lane & 7);
+                  const int c = kb * 2 + (idx >> 1);
+                  msv_ldsm4(msv_smem(at + row * KS + ((c ^ (row & 7)) << 4)), af[a][0], af[a][1], af[a][2], af[a][3]);
+                  // Lane l supplies the scale of row 8 * (l % 2) + l / 4 of the 16.
+                  sfa[a] = ast[(r0 + a * 16 + 8 * (lane & 1) + (lane >> 2)) * G + kb];
+                }
+                #pragma unroll
+                for (int a = 0; a < 2; ++a) {
+                  if (r0 + a * 16 < mv) {
+                    #pragma unroll
+                    for (int jj = 0; jj < 4; ++jj) msv_mma_mx(acc[m][a][jj], af[a], bf[jj][0], bf[jj][1], sfa[a], sfb[jj]);
+                  }
+                }
               }
             }
           }

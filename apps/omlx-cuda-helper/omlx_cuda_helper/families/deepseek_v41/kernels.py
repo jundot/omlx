@@ -781,10 +781,14 @@ _INDEX_DOTS = 1 << 28
 # 128 x 128 weight tile in bf16; at most _TILE_BUDGET blocks at once.
 _TILE_THREADS = 256
 _TILE_SHARED = 2 * 64 * 128 * 2 + 128 * 128 * 2
-# The MX tiles stage bytes: two 64 x 128 code tiles, one 128 x 128 weight
-# tile and their scales. The gate/up epilogue reuses it for a bf16 64 x 128 tile.
-_TILE_MX_SHARED = 2 * (64 * 128 + 64 * 4) + 128 * 128 + 128 * 4
+# The MX tiles stage bytes: two stages of _TILE_MX_PASS 64 x 128 code tiles,
+# one 128 x 128 weight tile and their scales. A pass multiplies all its row
+# tiles by each weight stage, so a weight slab is read once per pass; on GB10
+# the slab reads bound the kernel. The gate/up epilogue reuses the memory for
+# its bf16 rows x 128 tile.
+_TILE_MX_PASS = 2
 _TILE_STAGES, _TILE_PREFETCH = 2, 4
+_TILE_MX_SHARED = _TILE_STAGES * _TILE_MX_PASS * 64 * (128 + 4) + 128 * (128 + 4)
 _TILE_BUDGET = 16384
 _BORROWED = Path(__file__).resolve().parents[2] / "third_party/mlx-serve/deepseek_v41"
 
@@ -990,6 +994,7 @@ def expert_gate_up_mx(codes, scales, token, experts, gate, up, weights, limit):
         template=[
             ("STG", _TILE_STAGES),
             ("BDEP", _TILE_PREFETCH),
+            ("MT", _TILE_MX_PASS),
             ("K", codes.shape[-1]),
             ("I", inner),
             ("LIMIT", _bits(limit) if limit else 0),
@@ -1016,6 +1021,7 @@ def expert_down_mx(codes, scales, experts, down):
         template=[
             ("STG", _TILE_STAGES),
             ("BDEP", _TILE_PREFETCH),
+            ("MT", _TILE_MX_PASS),
             ("K", codes.shape[1]),
             ("N", out),
         ],
