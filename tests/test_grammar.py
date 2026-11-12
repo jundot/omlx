@@ -18,7 +18,11 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.api.grammar import GrammarConstraintProcessor
+from omlx.api.grammar import (
+    GRAMMAR_CACHE_LIMIT_BYTES,
+    GrammarConstraintProcessor,
+    create_grammar_compiler,
+)
 from omlx.api.openai_models import StructuredOutputOptions
 from omlx.api.thinking import ThinkingBudgetProcessor
 from omlx.patches.k2_horizon.tool_grammar import compile_tool_grammar
@@ -872,6 +876,17 @@ class TestResponseFormatWarningHeader:
             header = self._call(rf)
             header.encode("ascii")  # raises if non-ASCII
             assert "\n" not in header and "\r" not in header
+
+
+class TestCreateGrammarCompiler:
+    def test_cache_limit_defaults_to_bound(self):
+        """The VLM engine passes no limit, so the default must be bounded."""
+        xgr = pytest.importorskip("xgrammar")
+        info = xgr.TokenizerInfo([f"<tok_{i}>" for i in range(8)])
+        with patch.object(xgr.TokenizerInfo, "from_huggingface", return_value=info):
+            compiler = create_grammar_compiler(object(), SimpleNamespace())
+
+        assert compiler.cache_limit_bytes == GRAMMAR_CACHE_LIMIT_BYTES
 
 
 # =========================================================================

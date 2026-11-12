@@ -32,8 +32,14 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# xgrammar keeps each compiled grammar for the compiler lifetime. Bound its LRU
+# so distinct schemas cannot grow the process footprint without limit.
+GRAMMAR_CACHE_LIMIT_BYTES = 1024**3
 
-def create_grammar_compiler(tokenizer, model, *, cache_limit_bytes=-1):
+
+def create_grammar_compiler(
+    tokenizer, model, *, cache_limit_bytes=GRAMMAR_CACHE_LIMIT_BYTES
+):
     """Create an xgrammar GrammarCompiler for the given tokenizer and model.
 
     Returns None if vocab_size cannot be determined.

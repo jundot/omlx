@@ -220,13 +220,18 @@ class BatchedEngine(BaseEngine):
                 return None
             self._grammar_compiler_init_attempted = True
             try:
-                from ..api.grammar import create_grammar_compiler
+                from ..api.grammar import (
+                    GRAMMAR_CACHE_LIMIT_BYTES,
+                    create_grammar_compiler,
+                )
 
                 self._grammar_compiler = create_grammar_compiler(
                     self._tokenizer,
                     self._model,
                     cache_limit_bytes=(
-                        64 * 1024**2 if self.model_type == "k2_horizon" else -1
+                        64 * 1024**2
+                        if self.model_type == "k2_horizon"
+                        else GRAMMAR_CACHE_LIMIT_BYTES
                     ),
                 )
                 logger.info("GrammarCompiler initialized for %s", self._model_name)
