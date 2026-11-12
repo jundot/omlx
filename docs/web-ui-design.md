@@ -27,6 +27,16 @@ Families outside Tailwind's palette:
 - `signal-red-*`: the readability red.
 - `mid-gray`: empty cells in the usage strip.
 
+### Danger text
+
+A warning block uses the first two steps below, so it reads as one level of emphasis instead of three shades of red:
+
+| Step | Use |
+|---|---|
+| `text-red-700` | The label of a setting that is dangerous to turn on, such as Settings → Authentication → Allow keyless inference |
+| `text-red-600` | Its supporting text, and inline error strings. 4.83:1 on white, so it clears the 4.5:1 text floor at 12px |
+| `text-red-500` | Accents only: hover, borders, rings, icons. As text at 12–14px it is 3.76:1 on white, under the 4.5:1 floor |
+
 ## Custom theme
 
 `ui.custom_theme` stores per-theme token overrides (`{"light": {"bg-primary": "#..."}, "dark": {...}}`), and `static/js/custom_theme.js` paints them before first paint. That file owns the token list and the contrast rules (`CONTRAST_RULES`, 4.5:1 for text and 3:1 for controls and accents): the Theme Settings editor disables Apply, names the failing pairs and outlines the fields to change. The server only checks that each value is `#rrggbb`.
@@ -65,7 +75,7 @@ Segmented items, menu rows, option cards and plain text links are not buttons fo
 ## Choice controls
 
 - Pick one of a few values: the `.segmented` control in `dashboard.css`. `ui.segmented` in `templates/components/ui.html` renders it for plain text items. Inside a card or a table row, add `segmented--sm`. Items that need icons, `x-for` or extra attributes use the classes directly: `segmented__item` on each button and `segmented__item--active` on the selected one.
-- On and off: the switch below. The track is 44x24, black when on and `bg-neutral-200` when off. Dark mode colors come from the `--switch-on` token.
+- On and off: the switch below. The track is 44x24, black when on and `bg-neutral-200` when off. Dark mode colors come from the `--switch-on` token. A switch that turns a dangerous capability on keeps `bg-red-600`, as in Settings → Authentication and Model settings → Trust remote code.
 
 ```html
 <button type="button" role="switch"
