@@ -943,3 +943,151 @@ def test_explicit_support_declaration_wins_over_vision_guard(monkeypatch):
     )
     config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 8}}
     assert planner._supports_pipeline(config) is True
+
+
+# --- prefill transient ------------------------------------------------------
+
+_QWEN4_TEXT_CONFIG = {
+    "num_hidden_layers": 48,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 12,
+}
+
+
+def _prefill_layout(per_token, *, layers=4, layer_bytes=1 * GIB, fixed=1 * GIB):
+    return ModelLayout(
+        source="test",
+        fixed_weight_bytes=fixed,
+        layer_weight_bytes=(layer_bytes,) * layers,
+        prefill_transient_bytes_per_context_token=per_token,
+    )
+
+
+def test_prefill_transient_is_priced_by_the_rank_guard_estimator():
+    """The plan reserves the same quantity the rank guard enforces.
+
+    One attention chunk's score matrix is not resident between chunks, so it
+    never showed up in the plan at all - that is the memory a 32 GiB Mac was
+    missing when a 4096-token throughput prefill killed it.
+    """
+
+    from omlx.cluster.planner import (
+        _PREFILL_REFERENCE_CHUNK,
+        _PREFILL_REFERENCE_CONTEXT,
+        _prefill_transient_bytes_per_context_token,
+    )
+    from omlx.memory_monitor import MemoryMonitor
+
+    per_token = _prefill_transient_bytes_per_context_token(
+        {"text_config": _QWEN4_TEXT_CONFIG}
+    )
+
+    monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        num_kv_cache_layers=12,
+        compute_dtype_size=2,
+    )
+    peak = monitor.estimate_prefill_peak_bytes(
+        _PREFILL_REFERENCE_CONTEXT, _PREFILL_REFERENCE_CHUNK
+    )
+
+    assert per_token == pytest.approx(peak / _PREFILL_REFERENCE_CONTEXT, abs=1)
+
+
+def test_prefill_transient_scales_with_the_execution_profile_chunk():
+    """Throughput prefills in 4096-token chunks, so it reserves 4x interactive."""
+
+    layout = _prefill_layout(200_000)
+
+    interactive = layout.prefill_transient_bytes(32768, 1024)
+    balanced = layout.prefill_transient_bytes(32768, 2048)
+    throughput = layout.prefill_transient_bytes(32768, 4096)
+
+    assert interactive > 0
+    assert balanced == 2 * interactive
+    assert throughput == 4 * interactive
+
+
+def test_the_plan_reserves_the_prefill_transient_on_every_stage():
+    layout = _prefill_layout(200_000)
+    nodes = (
+        NodeBudget(node_id="big", capacity_bytes=128 * GIB, rank=0),
+        NodeBudget(node_id="small", capacity_bytes=32 * GIB, rank=1),
+    )
+
+    plan = plan_unequal_pipeline(
+        layout, nodes, workload_profile="throughput", context_tokens=32768
+    )
+
+    expected = layout.prefill_transient_bytes(32768, 4096)
+    assert expected > 0
+    for assignment in plan.assignments:
+        assert assignment.prefill_transient_bytes == expected
+        # Headroom has to report the reservation, because that is the number
+        # the operator reads when judging a split.
+        assert assignment.planned_weight_bytes >= (
+            assignment.fixed_weight_bytes + assignment.kv_cache_bytes + expected
+        )
+        assert assignment.headroom_bytes == (
+            assignment.capacity_bytes
+            - assignment.reserve_bytes
+            - assignment.planned_weight_bytes
+        )
+
+
+def test_a_split_that_fits_weights_and_kv_but_not_prefill_is_refused():
+    """Weights and KV fitting is not enough: the chunk has to fit too."""
+
+    # Two nodes over four 1 GiB layers leave 2 GiB of weights plus 1 GiB of
+    # fixed weights per stage. A 6 GiB throughput-chunk reservation takes that
+    # to 9 GiB, past the 8 GiB budget; the 1.5 GiB interactive chunk fits.
+    layout = _prefill_layout(6 * GIB // 1024)
+    nodes = (
+        NodeBudget(node_id="a", capacity_bytes=8 * GIB, rank=0),
+        NodeBudget(node_id="b", capacity_bytes=8 * GIB, rank=1),
+    )
+
+    with pytest.raises(PlanningError, match="prefill transient"):
+        plan_unequal_pipeline(
+            layout, nodes, workload_profile="throughput", context_tokens=1024
+        )
+
+    plan = plan_unequal_pipeline(
+        layout, nodes, workload_profile="interactive", context_tokens=1024
+    )
+    assert plan.assignments, "the smaller chunk fits the same budgets"
+
+
+def test_prefill_transient_survives_the_layout_round_trip():
+    layout = _prefill_layout(12345)
+
+    restored = ModelLayout.from_dict(layout.to_dict())
+
+    assert restored.prefill_transient_bytes_per_context_token == 12345
+    assert restored.prefill_transient_bytes(8192, 2048) == layout.prefill_transient_bytes(
+        8192, 2048
+    )
+
+
+def test_mla_checkpoints_are_not_priced_with_the_gqa_prefill_formula():
+    """MLA keeps one latent per layer; the GQA score-matrix price is 10x off."""
+
+    from omlx.cluster.planner import _prefill_transient_bytes_per_context_token
+
+    config = {
+        "model_type": "glm5_next",
+        "text_config": {
+            **_QWEN4_TEXT_CONFIG,
+            "kv_lora_rank": 512,
+            "qk_rope_head_dim": 64,
+        },
+    }
+
+    assert _prefill_transient_bytes_per_context_token(config) == 0
