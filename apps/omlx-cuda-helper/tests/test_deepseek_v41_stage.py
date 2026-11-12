@@ -12,8 +12,14 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
+from omlx_cuda_helper import mx_linear  # noqa: E402
 from omlx_cuda_helper.families import deepseek_v41  # noqa: E402
-from omlx_cuda_helper.families.deepseek_v41 import kernels, layers, quant  # noqa: E402
+from omlx_cuda_helper.families.deepseek_v41 import (  # noqa: E402
+    kernels,
+    layers,
+    ops,
+    quant,
+)
 from omlx_cuda_helper.families.deepseek_v41.config import Config  # noqa: E402
 from omlx_cuda_helper.families.deepseek_v41.stage import load_stage  # noqa: E402
 
@@ -198,3 +204,20 @@ def test_expert_tiles_read_banks_as_gather_qmm(spec):
     assert (
         kernels.relative_error(got, want_down.reshape(got.shape)) < layers._TILE_ERROR
     )
+
+
+@pytest.mark.skipif(not mx_linear.available(), reason="needs the block-scaled mma")
+def test_an_mxfp8_projection_stays_packed_on_the_block_scaled_matmul():
+    """Over a partial row tile and two stages of depth, its codes times the
+    input's FP8 codes give the product of the unpacked weight."""
+    w = mx.random.normal((256, 512), key=mx.random.key(1)) * 0.05
+    packed, scales = mx.quantize(w.astype(mx.bfloat16), 32, 8, mode="mxfp8")[:2]
+    weights = {"w.weight": packed, "w.scales": scales}
+    config = Config(quantized={"w": {"mode": "mxfp8", "bits": 8}})
+    projection = layers.Projection(weights, "w", config)
+    assert projection.mx is not None and projection.weight_t is None
+    x = mx.random.normal((1, 130, 512), key=mx.random.key(2)).astype(mx.bfloat16)
+    want = ops.matmul(layers._quantize(x), projection.unpacked().T)
+    assert kernels.relative_error(projection(x), want) < layers._TILE_ERROR
+    projection.use_unpacked()
+    assert mx.array_equal(projection(x), want).item()
