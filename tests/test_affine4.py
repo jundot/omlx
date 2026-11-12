@@ -303,6 +303,59 @@ def test_bf16_prefill_forces_fused_sdpa_only_where_supported(
     close(output, dense(cache, queries, mask), atol=8e-3, rtol=8e-3)
 
 
+@pytest.mark.parametrize(
+    "dim,repeats,rows,mask,force_fused,cache_class",
+    [
+        (128, 8, 33, "causal", True, Affine8KVCache),
+        (64, 4, 33, None, True, Affine4KVCache),
+        (80, 4, 8, "causal", None, Affine8KVCache),
+    ],
+)
+def test_bf16_prefill_with_sinks_keeps_sinks(
+    monkeypatch, dim, repeats, rows, mask, force_fused, cache_class
+):
+    # Models with attention sinks used to skip this branch and dequantize the whole
+    # cache to fp32 per chunk; the portable fallback inside it also dropped the sinks.
+    if not mx.metal.is_available():
+        pytest.skip("Fused prefill requires Metal")
+    cache = cache_class()
+    cache.update_and_fetch(
+        random((1, 2, 513, dim), mx.bfloat16),
+        random((1, 2, 513, dim), mx.bfloat16, 1),
+    )
+    queries = random((1, 2 * repeats, rows, dim), mx.bfloat16, 2)
+    # Large sinks take most of the softmax mass, so a dropped sink fails.
+    sinks = mx.linspace(4, 9, 2 * repeats)
+    monkeypatch.setattr(affine4, "_tensor_ops_available", lambda: False)
+    original = mx.fast.scaled_dot_product_attention
+    calls = []
+
+    def capture(q, k, v, **kwargs):
+        calls.append(
+            (
+                q.dtype,
+                k.dtype,
+                kwargs.get("force_fused"),
+                kwargs.get("sinks") is not None,
+            )
+        )
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", capture)
+    output = cache.attention(queries, scale=dim**-0.5, mask=mask, sinks=sinks)
+    assert calls == [(mx.bfloat16, mx.bfloat16, force_fused, True)]
+    close(output, dense(cache, queries, mask, sinks), atol=8e-3, rtol=8e-3)
+
+
+@pytest.mark.parametrize("cache_class", [BatchAffine4KVCache, BatchAffine8KVCache])
+def test_unpadded_batch_keeps_string_mask(cache_class):
+    cache = cache_class([0, 0])
+    assert cache._attention_mask("causal", 5, 40) == "causal"
+    assert cache._attention_mask(None, 5, 40) is None
+    padded = cache_class([3, 0])
+    assert isinstance(padded._attention_mask("causal", 5, 40), mx.array)
+
+
 @pytest.mark.parametrize("magnitude", [60000, 1e6])
 @pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
 def test_native_large_queries(magnitude, cache_class):
