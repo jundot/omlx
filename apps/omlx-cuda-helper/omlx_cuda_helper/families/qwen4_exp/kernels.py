@@ -537,8 +537,9 @@ class BlockSelection:
 
 # GDN prework of one (row, 128-channel head) a warp, 4 channels a lane: the
 # causal conv in float32 rounded once, SiLU and, for the query and key heads,
-# the L2 norm with ``ops.row_sum``'s bf16 lane sums, every op through MLX's
-# functors as the plain ops run them.
+# the L2 norm with ``ops.row_sum``'s bf16 lane sums, every op rounded as the
+# plain ops round it. The lane sums take the _rn forms: sm_90 and newer lower
+# a bf16 product and sum to mul.bf16 and add.bf16, which ptxas fuses into fma.
 _GDN_PREWORK = """
   using namespace mlx::core::cu;
   constexpr int DIM = 128;
@@ -569,9 +570,9 @@ _GDN_PREWORK = """
   }
   const int section = head < KH ? 0 : (head < 2 * KH ? 1 : 2);
   if (section < 2) {
-    __nv_bfloat16 part = Square{}(act[0]);
+    __nv_bfloat16 part = __hmul_rn(act[0], act[0]);
     #pragma unroll
-    for (int e = 1; e < 4; ++e) part = Add{}(part, Square{}(act[e]));
+    for (int e = 1; e < 4; ++e) part = __hadd_rn(part, __hmul_rn(act[e], act[e]));
     float total = __bfloat162float(part);
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) total += __shfl_xor_sync(0xffffffffu, total, o);
@@ -884,7 +885,8 @@ _HC_NORM = """
 
 # The block input of one hyper-connection: sigmoid(up) in float32 rounded to
 # bf16, times each stream, the streams added one by one and scaled by 1 / S,
-# every step in bf16 as ``layers._stream_mixer`` does. A thread per 8 dims.
+# every step in bf16 as ``layers._stream_mixer`` does, the products and sums
+# in the _rn forms that do not fuse into fma. A thread per 8 dims.
 _HC_MIX = """
   using namespace mlx::core::cu;
   const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -904,8 +906,8 @@ _HC_MIX = """
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
       const __nv_bfloat16 gate = __float2bfloat16_rn(Sigmoid{}(__bfloat162float(ub[e])));
-      const __nv_bfloat16 term = Multiply{}(gate, nb[e]);
-      acc[e] = s == 0 ? term : Add{}(acc[e], term);
+      const __nv_bfloat16 term = __hmul_rn(gate, nb[e]);
+      acc[e] = s == 0 ? term : __hadd_rn(acc[e], term);
     }
   }
   uint4 packed;
@@ -915,7 +917,7 @@ _HC_MIX = """
   *reinterpret_cast<uint4*>(out + row * hidden + d) = packed;
 """
 # The residual write h + branch * gate of every stream, in bf16 like
-# ``layers.write``. A thread per 8 dims of one row, every stream.
+# ``layers.write``, without fma. A thread per 8 dims of one row, every stream.
 _HC_WRITE = """
   using namespace mlx::core::cu;
   const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -934,7 +936,7 @@ _HC_WRITE = """
     uint4 packed;
     __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&packed);
     #pragma unroll
-    for (int e = 0; e < 8; ++e) ob[e] = Add{}(hb[e], Multiply{}(bb[e], gate));
+    for (int e = 0; e < 8; ++e) ob[e] = __hadd_rn(hb[e], __hmul_rn(bb[e], gate));
     *reinterpret_cast<uint4*>(out + at) = packed;
   }
 """

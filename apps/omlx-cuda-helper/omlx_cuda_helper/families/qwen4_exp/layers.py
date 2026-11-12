@@ -52,7 +52,11 @@ def checked_square_sums(scale: mx.array, eps: float, dtype: mx.Dtype):
 
 @functools.cache
 def _stream_mixer(streams: int, hidden: int):
-    """Compiled ``(up, normed) -> block input`` for one residual geometry."""
+    """``(up, normed) -> block input`` for one residual geometry.
+
+    Not compiled: on sm_90 and newer a compiled graph fuses each bf16 product
+    and sum into one fma, while the host rounds both.
+    """
 
     def mix(up: mx.array, normed: mx.array) -> mx.array:
         # The host kernel takes this sigmoid in float32 and rounds it once.
@@ -64,7 +68,7 @@ def _stream_mixer(streams: int, hidden: int):
             mixed = mixed + gate[..., lo : lo + hidden] * normed[..., lo : lo + hidden]
         return mixed * (1.0 / streams)
 
-    return mx.compile(mix)
+    return mix
 
 
 class HyperConnection:
