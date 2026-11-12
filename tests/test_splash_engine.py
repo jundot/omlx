@@ -1996,6 +1996,8 @@ class TestNativeResponseFormat:
             engine.start = AsyncMock()
             engine.count_chat_tokens.return_value = 10
             pool = MagicMock()
+            # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
+            pool._scheduler_config.paged_ssd_cache_dir = None
             pool.preload_pinned_models = AsyncMock()
             pool.check_ttl_expirations = AsyncMock()
             pool.shutdown = AsyncMock()

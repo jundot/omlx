@@ -44,6 +44,13 @@ from omlx.server import (
 from omlx.settings import GlobalSettings
 
 
+def _mock_pool() -> MagicMock:
+    # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
+    pool = MagicMock()
+    pool._scheduler_config.paged_ssd_cache_dir = None
+    return pool
+
+
 class TestBoundarySnapshotLifecycle:
     def test_reset_helper_uses_engine_pool_cache_dir(self, tmp_path):
         from types import SimpleNamespace
@@ -1521,7 +1528,7 @@ def test_responses_reasoning_cache_policy(
     )
     engine.start = AsyncMock()
     engine.count_chat_tokens.return_value = 128
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1605,7 +1612,7 @@ def _anthropic_preflight_kwargs(monkeypatch, body, model_type="qwen3_5"):
     )
     engine.start = AsyncMock()
     engine.count_chat_tokens.return_value = 128
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1727,7 +1734,7 @@ def test_chat_completion_returns_token_logprobs(
             )
 
     engine.stream_chat = stream_chat
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1826,7 +1833,7 @@ def test_chat_routes_reuse_final_prepared_prompt(
         yield output
 
     engine.stream_chat = stream_chat
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1941,7 +1948,7 @@ def served_vlm_engine(monkeypatch):
 
     engine.chat = chat
     engine.stream_chat = stream_chat
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -2033,7 +2040,7 @@ def test_ignore_eos_reaches_the_engine(
 
     engine.stream_chat = streamed
     engine.stream_generate = streamed
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
