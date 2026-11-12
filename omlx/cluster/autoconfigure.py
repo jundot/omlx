@@ -248,9 +248,6 @@ def choose_parallelism(
 
     warnings: list[str] = []
     last_error: PlanningError | None = None
-    # Degrees the link gate rejected before planning was ever attempted. Kept
-    # so the refusal can name the link instead of the head counts.
-    skipped_for_link: list[int] = []
 
     for tensor_parallel_size in candidates:
         fast_enough = transports_are_fast_enough(
@@ -265,7 +262,6 @@ def choose_parallelism(
             and not fast_enough
             and not measured_on_this_path
         ):
-            skipped_for_link.append(tensor_parallel_size)
             continue
         try:
             plan = plan_hybrid(
@@ -340,22 +336,14 @@ def choose_parallelism(
         raise PlanningError(
             f"no workable split for {len(nodes)} nodes: {last_error}"
         )
-    # Every candidate was dropped by the link gate, so nothing was planned and
-    # no planning error was recorded. Reporting the architecture here names a
-    # dimension that may divide perfectly well and sends the user to inspect a
-    # model that was never the problem.
-    if skipped_for_link:
-        raise PlanningError(
-            f"tensor parallelism across {len(nodes)} nodes was not attempted "
-            f"because the detected link is too slow for it, and this "
-            f"architecture cannot use pipeline stages instead. Detected link: "
-            f"{describe_transports(transports)}. Choose the Tensor strategy "
-            f"explicitly to proceed anyway, or check the connection between "
-            f"the nodes."
-        )
+    # Only the link gate skips a candidate without recording an error.
     raise PlanningError(
-        f"no tensor-parallel degree divides {len(nodes)} nodes across "
-        f"architecture dimensions {model.tensor_parallel_divisors}"
+        f"tensor parallelism across {len(nodes)} nodes was not attempted "
+        "because the detected link is too slow for it, and this "
+        "architecture cannot use pipeline stages instead. Detected link: "
+        f"{describe_transports(transports)}. Choose the Tensor strategy "
+        "explicitly to proceed anyway, or check the connection between "
+        "the nodes."
     )
 
 
