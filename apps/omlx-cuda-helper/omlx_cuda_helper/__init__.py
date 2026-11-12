@@ -5,7 +5,7 @@ It shares no code with oMLX but speaks its cluster discovery, pairing and
 prefill-helper wire protocols.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Framing and ops of the prefill data channel (oMLX ``wire.PROTOCOL``).
 DATA_PROTOCOL = 1

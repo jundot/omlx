@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omlx-cuda-helper"
-version = "0.1.0"
+version = "0.1.1"
 description = "Prefill Accelerator helper for oMLX on Linux with NVIDIA GPUs"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
