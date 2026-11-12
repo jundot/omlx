@@ -218,6 +218,13 @@ def _quantize(x: mx.array, bits: int = 8) -> mx.array:
     return quant.quantize(x, bits)
 
 
+def _pack(x: mx.array) -> mx.array:
+    """FP8 rows as quant.pack(x) packs them, on the CUDA kernel when it does so."""
+    if x.size and kernels.use_fp8_pack(x.dtype):
+        return kernels.pack_fp8(x)
+    return quant.pack(x)
+
+
 def _rope(x, positions, config, compressed, inverse=False, bits=0):
     """RoPE of x [1, L, ..., D] at ``positions``, then quantize(bits) if set."""
     tables = ops.rope_table(positions, config, compressed)
@@ -428,7 +435,7 @@ class Block:
         q = self.wq_b(qr).reshape(1, length, c.n_heads, c.head_dim)
         q = _rope(q, positions, c, bool(ratio))
         kv = ops.norm(self.wkv(x, xq, codes), self.kv_norm, c.norm_eps)
-        new = quant.pack(_rope(kv, positions, c, bool(ratio)))
+        new = _pack(_rope(kv, positions, c, bool(ratio)))
         old = cache[WINDOW]
         old_len = min(start, c.window_size, 0 if old is None else old.shape[1])
         window = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
@@ -553,6 +560,8 @@ class Block:
         flat = mx.random.normal((96, c.dim), key=keys[0]).astype(self.attn_norm.dtype)
         shape = (96, c.n_activated_experts)
         chosen = mx.random.randint(0, c.n_routed_experts, shape, key=keys[1])
+        # Every row also routes to expert 0, so one expert fills two 64-route tiles.
+        chosen = mx.concatenate([mx.zeros_like(chosen[:, :1]), chosen[:, 1:]], 1)
         weights = mx.random.uniform(0.1, 1.0, shape, key=keys[2])
         xq = _quantize(flat)
         want = self._routed(flat, xq, chosen, weights, False)[0]

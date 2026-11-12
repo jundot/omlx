@@ -33,4 +33,7 @@ step runs mma.sync.kind::mxf8f6f4.block_scale (E4M3 x E2M1, UE8M0 scales)
 from zero and is added with a correctly rounded float add. The products are
 the bf16 tile's exact products. The gate/up epilogue is unchanged up to the
 FP8 round trip, which it writes as codes and scales for the MX down projection.
+One MX pass covers MT tiles of 64 routes of an expert (template value MT), so
+each staged weight tile serves all of them and the weight slab is read once a
+pass instead of once a 64-route tile. Each output keeps its k32 order.
 
