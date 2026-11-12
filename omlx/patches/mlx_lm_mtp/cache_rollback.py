@@ -174,6 +174,37 @@ def _wrap_rotating(cls, fields) -> None:
     cls._omlx_mtp_undo_attached = True
 
 
+def _fix_batch_rotating_mask(cls) -> None:
+    """Mask a multi-token update of a wrapped batch window by its real length.
+
+    ``make_mask`` trims the left padding by ``_idx - max_size + 1`` for a
+    multi-token update. After the window wraps, ``_idx`` is the ring cursor,
+    but the update first puts the ring in temporal order (``_idx`` becomes
+    the window length) and then drops that many oldest columns. The stock
+    mask therefore keeps the old padding count, and a left-padded row loses
+    its oldest valid key in every verify forward after its window wraps.
+    """
+    if getattr(cls, "_omlx_wrapped_mask_fixed", False):
+        return
+    original = cls.make_mask
+
+    def make_mask(self, N, window_size=None, return_array=False):
+        keys = getattr(self, "keys", None)
+        if N > 1 and self.rotated and keys is not None and self._idx < keys.shape[2]:
+            cursor = self._idx
+            self._idx = keys.shape[2]
+            try:
+                return original(
+                    self, N, window_size=window_size, return_array=return_array
+                )
+            finally:
+                self._idx = cursor
+        return original(self, N, window_size=window_size, return_array=return_array)
+
+    cls.make_mask = make_mask
+    cls._omlx_wrapped_mask_fixed = True
+
+
 def _attach_rotating_undo() -> bool:
     try:
         from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
@@ -186,6 +217,7 @@ def _attach_rotating_undo() -> bool:
         BatchRotatingKVCache,
         ("keys", "values", "offset", "_offset", "_idx", "rotated", "left_padding"),
     )
+    _fix_batch_rotating_mask(BatchRotatingKVCache)
     if vlm_cache is None:
         return True
     # mlx-vlm's own rotating caches (Gemma 4 sliding layers) share the
@@ -195,6 +227,7 @@ def _attach_rotating_undo() -> bool:
         vlm_cache.BatchRotatingKVCache,
         ("keys", "values", "offset", "_offset", "_idx", "rotated", "left_padding"),
     )
+    _fix_batch_rotating_mask(vlm_cache.BatchRotatingKVCache)
     return True
 
 
