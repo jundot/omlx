@@ -3576,18 +3576,18 @@ class ToolCallStreamFilter:
         if not self.active:
             return text
 
-        # Prose fast path: no marker can begin, so skip the ~24 us scan below.
+        out: List[str] = []
+        # Prose fast path: no marker can begin, so skip the scan below.
         if (
             not self._buffer
             and not self._after_naked_function
             and self._suppressing_until is None
             and self._marker_trigger_chars.isdisjoint(text)
         ):
-            self._record_content(out := [], text)
-            return out[0]
+            self._record_content(out, text)
+            return text
 
         self._buffer += text
-        out: List[str] = []
 
         while self._buffer:
             if self._after_naked_function:
