@@ -116,6 +116,7 @@ enum SettingsSearch {
         add(.appearance, ["appearance.section.general"], [
             ("appearance.row.refresh_interval", "menu bar update frequency polling"),
             ("appearance.row.show_dock_icon", "application icon"),
+            ("appearance.row.number_scale", "exact digits compact units count"),
         ])
         add(.appearance, ["appearance.section.model_library"], [("appearance.row.visible_models", "favorites menu bar")])
         add(.appearance, ["appearance.section.menubar_items"], [
