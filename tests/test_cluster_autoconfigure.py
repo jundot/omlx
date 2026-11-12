@@ -766,7 +766,7 @@ def test_automatic_never_falls_back_to_an_unsupported_pipeline():
         supports_pipeline=False,
     )
 
-    with pytest.raises(PlanningError, match="no tensor-parallel degree"):
+    with pytest.raises(PlanningError, match="Detected link: ethernet at 10 Gb/s"):
         choose_parallelism(
             unsupported,
             _nodes(2),

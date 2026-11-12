@@ -340,9 +340,14 @@ def choose_parallelism(
         raise PlanningError(
             f"no workable split for {len(nodes)} nodes: {last_error}"
         )
+    # Only the link gate skips a candidate without recording an error.
     raise PlanningError(
-        f"no tensor-parallel degree divides {len(nodes)} nodes across "
-        f"architecture dimensions {model.tensor_parallel_divisors}"
+        f"tensor parallelism across {len(nodes)} nodes was not attempted "
+        "because the detected link is too slow for it, and this "
+        "architecture cannot use pipeline stages instead. Detected link: "
+        f"{describe_transports(transports)}. Choose the Tensor strategy "
+        "explicitly to proceed anyway, or check the connection between "
+        "the nodes."
     )
 
 
