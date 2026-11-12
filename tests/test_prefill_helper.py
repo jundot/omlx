@@ -1498,6 +1498,13 @@ def test_agent_transport_drives_a_helper_daemon(tmp_path, monkeypatch):
     # The memory of a session already running there counts as free.
     info = agent.remote_info(target)
     assert manager_module.helper_budget(info) == [44 << 30, 44 << 30]
+    # An integrated GPU leaves the OS its share of the RAM.
+    spark = {"name": "NVIDIA GB10", "total": 121 << 30, "free": 119 << 30}
+    with monkeypatch.context() as patch:
+        patch.setattr(agent, "_call", lambda sock, meta: {"gpus": [spark]})
+        assert manager_module.helper_budget(agent.remote_info(target)) == [119 << 30]
+        spark["integrated"] = True
+        assert manager_module.helper_budget(agent.remote_info(target)) == [105 << 30]
     assert info["device"] == "2x NVIDIA RTX A6000"
     assert info["lending"] == {"host": "Studio", "model": "Other"}
     assert agent.incompatible(info, DSV41, "nvidia1") is None

@@ -312,6 +312,7 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
         "budgets": budgets,
         "budget": sum(budgets),
         "memory": sum(int(gpu["total"]) for gpu in gpus),
+        "integrated": any(gpu.get("integrated") for gpu in gpus),
         "device": device,
         "disk_free": info.get("disk_free"),
         "link_mbps": int(speed) if speed else None,

@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 
 # Activations of one chunk and allocator headroom on the helper.
 _RESERVE_BYTES = 8 << 30
-# macOS and the helper Mac's other apps; the GPU budget alone let the helper
-# swap (105 GiB of layers on a 128 GB Mac).
+# The OS and other apps on a helper with unified memory; the GPU budget alone
+# let the helper swap (105 GiB of layers on a 128 GB Mac or DGX Spark).
 _OS_BYTES = 16 << 30
 # Disk a model copy leaves free on the helper Mac without asking.
 _DISK_SPARE_BYTES = 50 << 30
@@ -83,8 +83,12 @@ def transport_for(node_id: str) -> Any:
 def helper_budget(info: dict) -> list[int]:
     """Bytes the helper may hold on each of its GPUs, from its ``remote_info``."""
     if "budgets" in info:
-        # A helper daemon reports the free memory of each GPU itself.
-        return [int(b) for b in info["budgets"]]
+        # A helper daemon reports the free memory of each GPU itself. An
+        # integrated GPU (DGX Spark) holds its layers in the RAM the OS needs.
+        budgets = [int(b) for b in info["budgets"]]
+        if info.get("integrated"):
+            budgets = [min(b, int(info["memory"]) - _OS_BYTES) for b in budgets]
+        return budgets
     budget = int(info["budget"])
     if info.get("memory"):
         budget = min(budget, int(info["memory"]) - _OS_BYTES)
