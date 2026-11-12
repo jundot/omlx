@@ -26,20 +26,9 @@ from omlx.scheduler import Scheduler, SchedulerConfig
 
 
 @pytest.fixture(autouse=True)
-def _clear_bounded_sdpa_routes():
-    """Price every prefill below with no bounded SDPA route installed.
-
-    ``_SDPA_TILED_PREFILL_HEAD_DIMS`` is a process-wide table and
-    ``apply_sdpa256_attention_patch()`` only ever adds to it, so a worker
-    that earlier ran the patch prices head_dim=256 prefill at the bounded
-    route (~6.96 GiB rather than ~13 GiB) and the unpriced-fallback
-    expectations below fail. These tests never install a route, so clear
-    on both sides: setup keeps an earlier test from leaking in, teardown
-    keeps this module from leaking out.
-    """
-    mm._SDPA_TILED_PREFILL_HEAD_DIMS.clear()
-    yield
-    mm._SDPA_TILED_PREFILL_HEAD_DIMS.clear()
+def _no_bounded_sdpa_routes(monkeypatch):
+    # A route installed earlier in the worker would replace the unpriced fallback.
+    monkeypatch.setattr(mm, "_SDPA_TILED_PREFILL_HEAD_DIMS", {})
 
 
 class _ModelConfig:
