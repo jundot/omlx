@@ -916,6 +916,12 @@
             "state" : "translated",
             "value" : "Inserisci un numero intero tra 1 e 10."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请输入 1 到 10 之间的整数。"
+          }
         }
       }
     },
@@ -934,6 +940,12 @@
             "state" : "translated",
             "value" : "Inserisci un numero intero maggiore di zero."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请输入大于零的整数。"
+          }
         }
       }
     },
@@ -948,6 +960,12 @@
           }
         },
         "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Desktop"
+          }
+        },
+        "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Claude Desktop"
@@ -1130,6 +1148,12 @@
             "state" : "translated",
             "value" : "Cerca aggiornamenti"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "检查更新"
+          }
         }
       }
     },
@@ -1145,6 +1169,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Nessun modello idoneo da verificare."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "没有符合条件的模型可检查。"
           }
         }
       }
@@ -1162,6 +1192,12 @@
             "state" : "translated",
             "value" : "Aggiornamenti disponibili: %lld · Verificati: %lld · Non riusciti: %lld"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "有可用更新：%lld · 已检查：%lld · 失败：%lld"
+          }
         }
       }
     },
@@ -1177,6 +1213,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Aggiornamento disponibile"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "有可用更新"
           }
         }
       }
@@ -1194,6 +1236,12 @@
             "state" : "translated",
             "value" : "%lld file · %@"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 个文件 · %@"
+          }
         }
       }
     },
@@ -1209,6 +1257,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Rivedi l'aggiornamento di %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "查看 %@ 的更新"
           }
         }
       }
@@ -1226,6 +1280,12 @@
             "state" : "translated",
             "value" : "Impossibile verificare gli aggiornamenti dei modelli. I risultati precedenti sono gli ultimi noti."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法检查模型更新。仍显示上次已知结果。"
+          }
         }
       }
     },
@@ -1242,6 +1302,12 @@
             "state" : "translated",
             "value" : "Impossibile verificare gli aggiornamenti dei modelli: %@"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法检查模型更新：%@"
+          }
         }
       }
     },
@@ -1257,6 +1323,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Impossibile avviare l'aggiornamento del modello: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法开始模型更新：%@"
           }
         }
       }
@@ -1286,6 +1358,12 @@
             "state" : "translated",
             "value" : "기본값으로 초기화"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "恢复默认值"
+          }
         }
       }
     },
@@ -1313,6 +1391,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "기본값을 불러옵니다. 경로와 API 키는 유지됩니다. Apply를 눌러 저장하세요."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "恢复默认值。路径和 API 密钥会保留。点击“应用”保存。"
           }
         }
       }
@@ -1342,6 +1426,12 @@
             "state" : "translated",
             "value" : "설정 초기화"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重置设置"
+          }
         }
       }
     },
@@ -1369,6 +1459,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "설정값을 초기화했습니다. Apply를 눌러야 저장됩니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "设置已恢复为默认值。点击“应用”保存更改。"
           }
         }
       }
@@ -3119,7 +3215,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "每个项目在菜单栏显示提示处理和 Token 生成速度。点击一个查看详情和实时图表。"
+            "value" : "每个项目在菜单栏显示提示词处理和 Token 生成速度。点击一个查看详情和实时图表。"
           }
         }
       }
@@ -4703,7 +4799,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Apple 的数组计算框架——驱动每个模型的引擎"
+            "value" : "Apple 的数组计算框架 — 驱动每个模型的引擎"
           }
         }
       }
@@ -8567,7 +8663,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "单请求 TTFT/TPOT + 连续批处理 TPS，跨上下文长度和批次大小扫描。结果保留在内存中，直到屏幕卸载。"
+            "value" : "单请求 TTFT/TPOT + 连续批处理 TPS，跨上下文长度和批次大小扫描。结果保留在内存中，直到离开该页面。"
           }
         }
       }
@@ -9491,7 +9587,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "TTFT（毫秒）"
+            "value" : "TTFT (ms)"
           }
         }
       }
@@ -13820,6 +13916,12 @@
             "state" : "translated",
             "value" : "MarkItDown"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MarkItDown"
+          }
         }
       }
     },
@@ -13843,6 +13945,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Attiva MarkItDown"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 MarkItDown"
           }
         }
       }
@@ -13868,6 +13976,12 @@
             "state" : "translated",
             "value" : "Pre-elabora gli allegati supportati prima delle richieste all'LLM."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在向 LLM 发起请求前预处理支持的文件附件。"
+          }
         }
       }
     },
@@ -13891,6 +14005,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Mostra come modello"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "作为模型显示"
           }
         }
       }
@@ -13916,6 +14036,12 @@
             "state" : "translated",
             "value" : "Espone MarkItDown negli elenchi dei modelli per richieste dirette di conversione in Markdown."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在模型列表中显示 MarkItDown，以便直接发起 Markdown 转换请求。"
+          }
         }
       }
     },
@@ -13939,6 +14065,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Dimensione max file"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大文件大小"
           }
         }
       }
@@ -13964,6 +14096,12 @@
             "state" : "translated",
             "value" : "Rifiuta i documenti allegati più grandi prima della conversione."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "拒绝大于此大小的文档附件。"
+          }
         }
       }
     },
@@ -13987,6 +14125,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "File max per richiesta"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每次请求的最大文件数"
           }
         }
       }
@@ -14012,6 +14156,12 @@
             "state" : "translated",
             "value" : "Limita i documenti allegati convertiti in una richiesta."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "限制单次请求中转换的文档附件数量。"
+          }
         }
       }
     },
@@ -14035,6 +14185,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Motore di elaborazione PDF"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PDF 处理引擎"
           }
         }
       }
@@ -14060,6 +14216,12 @@
             "state" : "translated",
             "value" : "Scegli se le richieste con documenti PDF vengono elaborate da MarkItDown o da un motore OCR."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择 PDF 文档请求由 MarkItDown 本身处理，还是由 OCR 引擎处理。"
+          }
         }
       }
     },
@@ -14083,6 +14245,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Il modello OCR selezionato non è disponibile. I PDF usano MarkItDown finché il modello non torna disponibile o non selezioni un altro motore."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "所选的 OCR 模型不可用。在模型恢复可用或你选择其他引擎之前，PDF 将使用 MarkItDown。"
           }
         }
       }
@@ -14108,6 +14276,12 @@
             "state" : "translated",
             "value" : "Con MarkItDown i PDF scansionati o di sole immagini non vengono elaborati e quelli con tabelle potrebbero essere elaborati in modo errato."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择 MarkItDown 时，扫描件或纯图片 PDF 会失败，含表格的 PDF 可能无法正确处理。"
+          }
         }
       }
     },
@@ -14131,6 +14305,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Inserisci un numero intero maggiore di zero."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请输入大于零的整数。"
           }
         }
       }
@@ -14156,6 +14336,12 @@
             "state" : "translated",
             "value" : "Motori esterni"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "外部引擎"
+          }
         }
       }
     },
@@ -14179,6 +14365,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Serve un modello con un altro motore di inferenza in un processo separato. Scegli il motore per ogni modello in Impostazioni modello → Avanzate."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在独立进程中用其他推理引擎提供模型服务。在“模型设置 → 高级”中为每个模型选择引擎。"
           }
         }
       }
@@ -14492,6 +14684,12 @@
             "state" : "translated",
             "value" : "Prefill su Neural Engine"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "神经网络引擎预填充"
+          }
         }
       }
     },
@@ -14515,6 +14713,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Consente a Splash di eseguire parte dei prompt lunghi su Neural Engine quando è più veloce."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在速度更快时，让 Splash 把长提示词的一部分放到神经网络引擎上运行。"
           }
         }
       }
@@ -14540,6 +14744,12 @@
             "state" : "translated",
             "value" : "Salva"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用"
+          }
         }
       }
     },
@@ -14564,6 +14774,12 @@
             "state" : "translated",
             "value" : "Auto"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自动"
+          }
         }
       }
     },
@@ -14584,6 +14800,12 @@
           }
         },
         "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash"
+          }
+        },
+        "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Splash"
@@ -14612,6 +14834,12 @@
             "state" : "translated",
             "value" : "Percorso del launcher splash o splash-m1."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "splash 或 splash-m1 启动器的路径。"
+          }
         }
       }
     },
@@ -14635,6 +14863,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Scegli launcher"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择启动器"
           }
         }
       }
@@ -14660,6 +14894,12 @@
             "state" : "translated",
             "value" : "Scegli il launcher splash o splash-m1."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择 splash 或 splash-m1 启动器。"
+          }
         }
       }
     },
@@ -14683,6 +14923,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Seleziona"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择"
           }
         }
       }
@@ -14708,6 +14954,12 @@
             "state" : "translated",
             "value" : "Annulla"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "取消"
+          }
         }
       }
     },
@@ -14731,6 +14983,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Modifica"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "更改"
           }
         }
       }
@@ -14756,6 +15014,12 @@
             "state" : "translated",
             "value" : "Impostato tramite percorso"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已通过路径设置"
+          }
         }
       }
     },
@@ -14779,6 +15043,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Rilevato automaticamente"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已自动找到"
           }
         }
       }
@@ -14804,6 +15074,12 @@
             "state" : "translated",
             "value" : "Precisione della cache KV"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "KV 缓存精度"
+          }
         }
       }
     },
@@ -14827,6 +15103,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "A parità di memoria, int8 contiene circa il doppio del contesto di bf16."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在相同内存下，int8 可容纳的上下文约为 bf16 的两倍。"
           }
         }
       }
@@ -14852,6 +15134,12 @@
             "state" : "translated",
             "value" : "Applica"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用"
+          }
         }
       }
     },
@@ -14875,6 +15163,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Inserisci un numero intero di gigabyte o lascia il campo vuoto per il valore automatico."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请输入整数 GB，或将字段留空以自动设置。"
           }
         }
       }
@@ -14900,6 +15194,12 @@
             "state" : "translated",
             "value" : "Limite di memoria"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "内存上限"
+          }
         }
       }
     },
@@ -14923,6 +15223,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Se vuoto, Splash riceve la memoria necessaria per l'intera finestra di contesto; un limite più alto lascia più spazio alla sua cache dei prefissi."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "留空时，Splash 会获得足以容纳完整上下文窗口的内存；上限越大，前缀缓存的空间越多。"
           }
         }
       }
@@ -14948,6 +15254,12 @@
             "state" : "translated",
             "value" : "Cache SSD"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD 缓存"
+          }
         }
       }
     },
@@ -14971,6 +15283,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Cache dei prefissi di Splash nella cartella della cache SSD di oMLX. Se vuoto, usa la dimensione della cache SSD di oMLX; 0 la disattiva."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash 在 oMLX SSD 缓存文件夹中的前缀缓存。留空则沿用 oMLX 的 SSD 缓存大小；0 表示关闭。"
           }
         }
       }
@@ -14996,6 +15314,12 @@
             "state" : "translated",
             "value" : "Si applica a ogni modello Splash e la cache di un modello resta dopo lo scaricamento, quindi il totale può arrivare a questa dimensione moltiplicata per il numero di modelli Splash usati. Imposta una dimensione se ne usi più di uno."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此大小按每个 Splash 模型分别计算，模型卸载后缓存仍会保留，因此总占用最多可达此大小乘以使用过的 Splash 模型数量。使用多个 Splash 模型时请设置一个大小。"
+          }
         }
       }
     },
@@ -15019,6 +15343,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Rileva automaticamente"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自动检测"
           }
         }
       }
@@ -16021,6 +16351,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "로그 항목 크기 조절"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "调整日志条目大小"
           }
         }
       }
@@ -21916,7 +22252,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "无配置文件"
+            "value" : "无配置"
           }
         }
       }
@@ -21952,7 +22288,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%@ 配置文件 · 在此模型上处于活动状态"
+            "value" : "%@ 配置 · 在此模型上处于活动状态"
           }
         }
       }
@@ -22060,7 +22396,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工作配置文件"
+            "value" : "工作配置"
           }
         }
       }
@@ -22132,7 +22468,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "起草器量化 · W%1$lld G%2$lld"
+            "value" : "草稿模型量化 · W%1$lld G%2$lld"
           }
         }
       }
@@ -23320,7 +23656,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "此配置文件未覆盖任何设置。"
+            "value" : "此配置未覆盖任何设置。"
           }
         }
       }
@@ -23392,7 +23728,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "此配置文件中的引擎级设置仅在应用于基础模型时生效 — 它们不会更改暴露的模型。"
+            "value" : "此配置中的引擎级设置仅在应用于基础模型时生效 — 它们不会更改暴露的模型。"
           }
         }
       }
@@ -23428,7 +23764,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在 /v1/models 上将此配置文件作为其自己的模型 ID 提供服务，共享基础模型的引擎"
+            "value" : "在 /v1/models 上将此配置作为其自己的模型 ID 提供服务，共享基础模型的引擎"
           }
         }
       }
@@ -23896,7 +24232,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "未设置配置文件或配置文件字段留空时回退到此"
+            "value" : "未设置配置或配置字段留空时回退到此"
           }
         }
       }
@@ -23932,7 +24268,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%1$@ 配置文件 · 设置：%2$lld"
+            "value" : "%1$@ 配置 · 设置：%2$lld"
           }
         }
       }
@@ -23968,7 +24304,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置档"
+            "value" : "配置"
           }
         }
       }
@@ -24004,7 +24340,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工作配置文件 · 基于 %1$@（%2$@）"
+            "value" : "工作配置 · 基于 %1$@（%2$@）"
           }
         }
       }
@@ -24040,7 +24376,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工作配置文件 · 基于服务器默认值"
+            "value" : "工作配置 · 基于服务器默认值"
           }
         }
       }
@@ -24184,7 +24520,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "尚无 %@ 配置文件。"
+            "value" : "尚无 %@ 配置。"
           }
         }
       }
@@ -24292,7 +24628,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置文件名"
+            "value" : "配置名称"
           }
         }
       }
@@ -24328,7 +24664,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "将当前配置文件另存为"
+            "value" : "将当前配置另存为"
           }
         }
       }
@@ -29996,7 +30332,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "任何能访问此服务器的人都将可以无需 API 密钥使用推理 API、MCP 工具和网页搜索。\n\n开启此设置即表示您已知晓服务器将容易受到来自网络的攻击，理解您正在解除此安全保护，并确认已采取适当的安全措施。"
+            "value" : "任何能访问此服务器的人都将可以无需 API 密钥使用推理 API、MCP 工具和网页搜索。\n\n开启此设置即表示你已知晓服务器将容易受到来自网络的攻击，理解你正在解除此安全保护，并确认已采取适当的安全措施。"
           }
         }
       }
@@ -31148,7 +31484,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "指标 (Prometheus)"
+            "value" : "指标（Prometheus）"
           }
         }
       }
@@ -32657,7 +32993,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅每个模型 — 在配置文件上设置。"
+            "value" : "仅限单个模型 — 在配置上设置。"
           }
         }
       }
@@ -32729,7 +33065,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅每个模型。"
+            "value" : "仅限单个模型。"
           }
         }
       }
@@ -32801,7 +33137,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅每个模型。"
+            "value" : "仅限单个模型。"
           }
         }
       }
@@ -32945,7 +33281,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "服务器默认值不包含 min_p；在模型配置文件上设置。"
+            "value" : "服务器默认值不包含 min_p；在模型配置上设置。"
           }
         }
       }
@@ -32981,7 +33317,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅每个模型"
+            "value" : "仅限单个模型"
           }
         }
       }
@@ -33053,7 +33389,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅每个模型 — 参见 模型 → [模型] → 高级。"
+            "value" : "仅限单个模型 — 参见“模型”→“[模型]”→“高级”。"
           }
         }
       }
@@ -33125,7 +33461,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅每个模型。"
+            "value" : "仅限单个模型。"
           }
         }
       }
@@ -33341,7 +33677,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅每个模型 — 参见 模型 → [模型] → 高级。"
+            "value" : "仅限单个模型 — 参见“模型”→“[模型]”→“高级”。"
           }
         }
       }
@@ -33629,7 +33965,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅每个模型 — 参见 模型 → [模型] → 基础。"
+            "value" : "仅限单个模型 — 参见“模型”→“[模型]”→“基础”。"
           }
         }
       }
@@ -34202,7 +34538,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "默认配置文件"
+            "value" : "默认配置"
           }
         }
       }
@@ -34238,7 +34574,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "当模型没有配置文件，或配置文件留下空字段时使用的回退值"
+            "value" : "当模型没有配置，或配置字段留空时使用的回退值"
           }
         }
       }
@@ -34751,7 +35087,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Adaptive max depth"
+            "value" : "自适应最大深度"
           }
         }
       }
@@ -34787,7 +35123,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Automatically adjusts the draft depth up to the selected maximum."
+            "value" : "自动调整草稿深度，最高不超过所选上限。"
           }
         }
       }
@@ -34823,7 +35159,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "3 个 Token（默认）"
           }
         }
       }
@@ -34859,7 +35195,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld tokens"
+            "value" : "%lld 个 Token"
           }
         }
       }
@@ -34987,6 +35323,12 @@
             "state" : "translated",
             "value" : "Auto"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自动"
+          }
         }
       }
     },
@@ -35004,6 +35346,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ è a batteria. Il prefill ne scarica rapidamente la carica."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 正在使用电池。预填充会快速消耗电量。"
           }
         }
       }
@@ -35023,6 +35371,12 @@
             "state" : "translated",
             "value" : "Copia comunque"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仍然复制"
+          }
         }
       }
     },
@@ -35040,6 +35394,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Copia i file ora"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "立即复制文件"
           }
         }
       }
@@ -35059,6 +35419,12 @@
             "state" : "translated",
             "value" : "Elimina e copia"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "删除并复制"
+          }
         }
       }
     },
@@ -35076,6 +35442,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%lld livelli entrano"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "可容纳 %lld 层"
           }
         }
       }
@@ -35095,6 +35467,12 @@
             "state" : "translated",
             "value" : "Prefill Accelerator"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "预填充加速器"
+          }
         }
       }
     },
@@ -35112,6 +35490,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Livelli sull'helper"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "辅助设备上的层数"
           }
         }
       }
@@ -35131,6 +35515,12 @@
             "state" : "translated",
             "value" : "Auto ripartisce il lavoro in base alla velocità misurata di entrambi i Mac."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "“自动”会根据两台 Mac 的实测速度分配工作。"
+          }
         }
       }
     },
@@ -35148,6 +35538,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Questo Mac non ha unità tensoriali INT8, quindi solo i livelli sul Mac Prefill Accelerator usano attivazioni INT8."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "这台 Mac 没有 INT8 张量单元，因此只有预填充加速器 Mac 上的层使用 INT8 激活。"
           }
         }
       }
@@ -35167,6 +35563,12 @@
             "state" : "translated",
             "value" : "%@ sta aiutando %@ con %@. Usarlo qui interrompe quell'aiuto."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 正在协助 %@ 处理 %@。在此处使用会停止该协助。"
+          }
         }
       }
     },
@@ -35184,6 +35586,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Nella dashboard web, attiva Impostazioni globali > Avanzate > Abilita inferenza distribuita su entrambi i Mac e riavvia oMLX, poi abbina un Mac nella scheda Cluster."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在 Web 仪表盘中，于两台 Mac 上开启“全局设置 → 高级 → 启用分布式推理”并重启 oMLX，然后在“集群”标签中配对一台 Mac。"
           }
         }
       }
@@ -35203,6 +35611,12 @@
             "state" : "translated",
             "value" : "memoria insufficiente"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "内存不足"
+          }
         }
       }
     },
@@ -35220,6 +35634,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Disattivato"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭"
           }
         }
       }
@@ -35239,6 +35659,12 @@
             "state" : "translated",
             "value" : "offline"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "离线"
+          }
         }
       }
     },
@@ -35256,6 +35682,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Apri la scheda Cluster"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开集群标签"
           }
         }
       }
@@ -35275,6 +35707,12 @@
             "state" : "translated",
             "value" : "Riprova"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重试"
+          }
         }
       }
     },
@@ -35292,6 +35730,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Riavvia"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新开始"
           }
         }
       }
@@ -35311,6 +35755,12 @@
             "state" : "translated",
             "value" : "Connessione a %@..."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在连接 %@…"
+          }
         }
       }
     },
@@ -35328,6 +35778,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Copia dei file del modello su %@: %@ di %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在将模型文件复制到 %@：%@ / %@"
           }
         }
       }
@@ -35347,6 +35803,12 @@
             "state" : "translated",
             "value" : "circa %lld min rimanenti"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "约剩 %lld 分钟"
+          }
         }
       }
     },
@@ -35364,6 +35826,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "circa %lld s rimanenti"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "约剩 %lld 秒"
           }
         }
       }
@@ -35383,6 +35851,12 @@
             "state" : "translated",
             "value" : "%@ richiede %@ di file del modello per %lld livelli. Vengono copiati quando questo modello si carica, oppure copiali ora."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ 缺少 %3$lld 层所需的 %2$@ 模型文件。加载此模型时会复制，也可以现在复制。"
+          }
         }
       }
     },
@@ -35400,6 +35874,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "I file del modello per %lld livelli sono pronti su %@. Prefill Accelerator si avvia quando questo modello viene caricato."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已在 %2$@ 上准备好 %1$lld 层所需的模型文件。加载此模型时会启动预填充加速器。"
           }
         }
       }
@@ -35419,6 +35899,12 @@
             "state" : "translated",
             "value" : "ultimo prompt %lld token in %@ s"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上次提示词 %1$lld Token，用时 %2$@ 秒"
+          }
         }
       }
     },
@@ -35436,6 +35922,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ ha poco spazio su disco. Copiare %@ di file del modello lascia liberi solo %@."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 磁盘空间不足。复制 %@ 的模型文件后只剩 %@ 可用。"
           }
         }
       }
@@ -35455,6 +35947,12 @@
             "state" : "translated",
             "value" : "%@ richiede %@ di file del modello. Per mantenere liberi 50 GB, la copia elimina prima queste copie di modelli più vecchie: %@. Restano liberi %@."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 需要 %@ 的模型文件。为保留 50 GB 可用空间，复制前会先删除这些较旧的模型副本：%@。仍会保留 %@ 可用。"
+          }
         }
       }
     },
@@ -35472,6 +35970,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ non è raggiungibile (%@). Nuovo tentativo in corso."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法连接 %@（%@）。正在重试。"
           }
         }
       }
@@ -35491,6 +35995,12 @@
             "state" : "translated",
             "value" : "memoria GPU esaurita durante un prompt"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "提示词的 GPU 内存不足"
+          }
         }
       }
     },
@@ -35508,6 +36018,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Pronto su %@ con %lld livelli"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已在 %@ 上以 %lld 层就绪"
           }
         }
       }
@@ -35527,6 +36043,12 @@
             "state" : "translated",
             "value" : "Caricamento di %lld livelli su %@..."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在 %2$@ 上加载 %1$lld 层…"
+          }
         }
       }
     },
@@ -35544,6 +36066,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Fermato."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已停止。"
           }
         }
       }
@@ -35563,6 +36091,12 @@
             "state" : "translated",
             "value" : "Si avvia quando questo modello viene caricato."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "加载此模型时启动。"
+          }
         }
       }
     },
@@ -35580,6 +36114,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Ferma"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "停止"
           }
         }
       }
@@ -35599,6 +36139,12 @@
             "state" : "translated",
             "value" : "Un altro Mac esegue i primi livelli dei prompt lunghi, così il prefill termina prima. La decodifica resta su questo Mac."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "另一台 Mac 会运行长提示词的前几层，因此预填充能更快完成。解码仍在这台 Mac 上进行。"
+          }
         }
       }
     },
@@ -35616,6 +36162,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "richiede un aggiornamento"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要更新"
           }
         }
       }
@@ -35641,6 +36193,12 @@
             "state" : "translated",
             "value" : "Decodifica fusa estesa Qwen4"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Qwen4 扩展融合解码"
+          }
         }
       }
     },
@@ -35664,6 +36222,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Accelera la decodifica su Qwen4 oQ8e e altri layout GDN, come alcuni vecchi download oQ e modelli della community (fino a 1,5 GiB di memoria in più). Nessun effetto sulle build attuali da oQ2.5e a oQ6e o fp16, e poco effetto con Lightning MTP attivo."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在 Qwen4 oQ8e 及其他 GDN 布局（如部分旧版 oQ 下载和社区模型）上加快解码（最多额外占用 1.5 GiB 内存）。对当前的 oQ2.5e 到 oQ6e 和 fp16 版本无效，开启 Lightning MTP 后效果也很小。"
           }
         }
       }
@@ -35725,6 +36289,12 @@
             "state" : "translated",
             "value" : "Azioni delle impostazioni"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "设置操作"
+          }
         }
       }
     },
@@ -35748,6 +36318,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Disattiva MoE Expert Offload prima di attivare le attivazioni Float16."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 Float16 激活前，请先关闭 MoE 专家卸载。"
           }
         }
       }
@@ -35773,6 +36349,12 @@
             "state" : "translated",
             "value" : "Attivazioni Float16"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Float16 激活"
+          }
         }
       }
     },
@@ -35796,6 +36378,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Converte in float16 al caricamento le scale, le norme e gli embedding bfloat16 di questo modello. Le GPU M1 e M2 emulano bfloat16, quindi prefill e decodifica risultano più veloci. L'output può differire leggermente da bfloat16."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "加载时将此模型的 bfloat16 缩放、归一化和嵌入转换为 float16。M1 和 M2 GPU 会模拟 bfloat16，因此预填充和解码会更快。输出可能与 bfloat16 略有差异。"
           }
         }
       }
@@ -36191,7 +36779,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "转发到模型的聊天模板。切换\"强制\"以覆盖每次请求的值。"
+            "value" : "转发到模型的聊天模板。切换“强制”以覆盖每次请求的值。"
           }
         }
       }
@@ -36396,6 +36984,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Audio"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "音频"
           }
         }
       }
@@ -36889,6 +37483,12 @@
             "state" : "translated",
             "value" : "Usa motore esterno"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用外部引擎"
+          }
         }
       }
     },
@@ -36913,6 +37513,12 @@
             "state" : "translated",
             "value" : "Queste impostazioni non si applicano finché il modello è eseguito da un motore esterno."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "外部引擎为此模型提供服务时，这些设置不适用。"
+          }
         }
       }
     },
@@ -36936,6 +37542,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Esegue questo modello con un altro motore di inferenza in un processo dedicato, anziché con i motori MLX di oMLX."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在独立进程中用其他推理引擎为此模型提供服务，而不是使用 oMLX 的 MLX 引擎。"
           }
         }
       }
@@ -37421,7 +38033,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "执行 HuggingFace 自定义模型代码。仅对你信任的模型启用。仅限每模型 — 不会从配置文件继承。"
+            "value" : "执行 HuggingFace 自定义模型代码。仅对你信任的模型启用。仅限单个模型 — 不会从配置继承。"
           }
         }
       }
@@ -37703,7 +38315,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "请求未设置 max_length 时使用。Jina 重排序模型一次最多读取这么多 token 的文档，其他重排序模型将每个查询-文档对截断到此长度。"
+            "value" : "请求未设置 max_length 时使用。Jina 重排序模型一次最多读取这么多 Token 的文档，其他重排序模型将每个查询-文档对截断到此长度。"
           }
         },
         "zh-Hant" : {
@@ -38491,6 +39103,12 @@
             "state" : "translated",
             "value" : "Disattiva MoE Expert Offload prima di attivare DFlash."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 DFlash 前，请先关闭 MoE 专家卸载。"
+          }
         }
       }
     },
@@ -38705,7 +39323,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "自适应"
           }
         }
       }
@@ -39785,7 +40403,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "共享目标分词器的助手起草器。"
+            "value" : "共享目标分词器的助手草稿模型。"
           }
         }
       }
@@ -39857,7 +40475,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用外部起草器（Gemma 4 assistant 或 Qwen MTP）加速单个请求。"
+            "value" : "使用外部草稿模型（Gemma 4 assistant 或 Qwen MTP）加速单个请求。"
           }
         }
       }
@@ -40099,6 +40717,12 @@
             "state" : "translated",
             "value" : "Torna alle impostazioni del modello"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "返回模型设置"
+          }
         }
       }
     },
@@ -40254,6 +40878,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Quota dei pesi degli esperti mantenuta in memoria (5-95%)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "常驻内存的专家权重比例（5-95%）。"
           }
         }
       }
@@ -40885,6 +41515,12 @@
             "state" : "translated",
             "value" : "Disattiva le attivazioni Float16 prima di attivare MoE Expert Offload."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 MoE 专家卸载前，请先关闭 Float16 激活。"
+          }
         }
       }
     },
@@ -40908,6 +41544,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Disattiva DFlash prima di attivare MoE Expert Offload."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 MoE 专家卸载前，请先关闭 DFlash。"
           }
         }
       }
@@ -40933,6 +41575,12 @@
             "state" : "translated",
             "value" : "Disattiva Lightning MTP prima di attivare MoE Expert Offload."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 MoE 专家卸载前，请先关闭 Lightning MTP。"
+          }
         }
       }
     },
@@ -40956,6 +41604,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Disattiva VLM MTP prima di attivare MoE Expert Offload."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 MoE 专家卸载前，请先关闭 VLM MTP。"
           }
         }
       }
@@ -41016,6 +41670,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Disattiva MoE Expert Offload prima di attivare Lightning MTP."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 Lightning MTP 前，请先关闭 MoE 专家卸载。"
           }
         }
       }
@@ -41159,7 +41819,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "全局配置文件"
+            "value" : "全局配置"
           }
         }
       }
@@ -41195,7 +41855,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "模型配置文件 · %@"
+            "value" : "模型配置 · %@"
           }
         }
       }
@@ -41231,7 +41891,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "无配置文件"
+            "value" : "无配置"
           }
         }
       }
@@ -41267,7 +41927,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预设配置文件"
+            "value" : "预设配置"
           }
         }
       }
@@ -41303,7 +41963,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "服务器默认配置文件"
+            "value" : "服务器默认配置"
           }
         }
       }
@@ -41339,7 +41999,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "未设置配置文件或配置文件字段留空时使用"
+            "value" : "未设置配置或配置字段留空时使用"
           }
         }
       }
@@ -41411,7 +42071,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工作配置文件"
+            "value" : "工作配置"
           }
         }
       }
@@ -41483,7 +42143,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置档"
+            "value" : "配置"
           }
         }
       }
@@ -41519,7 +42179,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "10% — 激进（约 5-7 倍，有一定质量损失）"
+            "value" : "10% — 激进（约 5–7 倍，有一定质量损失）"
           }
         }
       }
@@ -41761,6 +42421,12 @@
             "state" : "translated",
             "value" : "Prefill ANE"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 预填充"
+          }
         }
       }
     },
@@ -41784,6 +42450,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Prefill CED"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CED 预填充"
           }
         }
       }
@@ -41809,6 +42481,12 @@
             "state" : "translated",
             "value" : "Non usato con motore esterno"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "外部引擎不适用"
+          }
         }
       }
     },
@@ -41832,6 +42510,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%lld kwargs"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 个参数"
           }
         }
       }
@@ -41857,6 +42541,12 @@
             "state" : "translated",
             "value" : "MoE Offload %@%%"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE 卸载 %@%%"
+          }
         }
       }
     },
@@ -41880,6 +42570,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Disattivato"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭"
           }
         }
       }
@@ -41905,6 +42601,12 @@
             "state" : "translated",
             "value" : "Decodifica fusa estesa"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "扩展融合解码"
+          }
         }
       }
     },
@@ -41928,6 +42630,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Limite risultati strumenti"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "工具结果上限"
           }
         }
       }
@@ -42690,6 +43398,12 @@
             "state" : "translated",
             "value" : "Prefill INT8"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "INT8 预填充"
+          }
         }
       }
     },
@@ -42713,6 +43427,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "TurboQuant %@ bit"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TurboQuant %@ 位"
           }
         }
       }
@@ -42773,6 +43493,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Disattiva MoE Expert Offload prima di attivare VLM MTP."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 VLM MTP 前，请先关闭 MoE 专家卸载。"
           }
         }
       }
@@ -42916,7 +43642,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "选择助手起草器…"
+            "value" : "选择助手草稿模型…"
           }
         }
       }
@@ -44236,6 +44962,12 @@
             "state" : "translated",
             "value" : "Ferma"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "停止"
+          }
         }
       }
     },
@@ -44253,6 +44985,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Questo Mac sta aiutando %@ con il prefill dei prompt: %lld livelli di %@. Si ferma quando %@ scarica il modello."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "这台 Mac 正在协助 %1$@ 进行提示词预填充：%3$@ 的 %2$lld 层。%4$@ 卸载该模型后即停止。"
           }
         }
       }
@@ -46049,7 +46787,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预填充处理（不含已缓存）"
+            "value" : "提示词处理（不含已缓存）"
           }
         }
       }
@@ -51040,7 +51778,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "资料库"
+            "value" : "模型库"
           }
         },
         "zh-Hant" : {
@@ -51078,6 +51816,12 @@
             "state" : "translated",
             "value" : "닫기"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭"
+          }
         }
       }
     },
@@ -51107,6 +51851,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "기본값으로 초기화…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "恢复默认值…"
           }
         }
       }
@@ -51138,6 +51888,12 @@
             "state" : "translated",
             "value" : "최적 설정 적용…"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用最佳设置…"
+          }
         }
       }
     },
@@ -51167,6 +51923,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "커스텀 레시피 적용…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用自定义配方…"
           }
         }
       }
@@ -51198,6 +51960,12 @@
             "state" : "translated",
             "value" : "이 모델의 모든 설정을 초기화할까요?"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "要重置此模型的所有设置吗？"
+          }
         }
       }
     },
@@ -51227,6 +51995,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "샘플링, 가속, 고정/기본 모델 플래그, 별칭, 표시 이름이 모두 기본값으로 돌아갑니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "采样、加速、固定/默认标记、别名和显示名称都将恢复为默认值。"
           }
         }
       }
@@ -51258,6 +52032,12 @@
             "state" : "translated",
             "value" : "초기화"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重置"
+          }
         }
       }
     },
@@ -51287,6 +52067,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "커스텀 레시피 적용"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用自定义配方"
           }
         }
       }
@@ -51318,6 +52104,12 @@
             "state" : "translated",
             "value" : "omlx.ai 벤치마크 상세 페이지의 Recipe 행에서 복사한 레시피를 붙여넣으세요."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "粘贴从 omlx.ai 基准测试详情页“配方”行复制的配方。"
+          }
         }
       }
     },
@@ -51347,6 +52139,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "레시피를 적용하는 중..."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在应用配方…"
           }
         }
       }
@@ -51378,6 +52176,12 @@
             "state" : "translated",
             "value" : "적용"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用"
+          }
         }
       }
     },
@@ -51407,6 +52211,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "omlx.ai에서 최고의 벤치마크 결과를 가져오는 중..."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在从 omlx.ai 获取最佳基准测试结果…"
           }
         }
       }
@@ -51438,6 +52248,12 @@
             "state" : "translated",
             "value" : "벤치마크 설정을 적용하는 중..."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在应用基准测试设置…"
+          }
         }
       }
     },
@@ -51467,6 +52283,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "적용할 벤치마크 결과를 고르세요. 같은 칩·같은 모델에서 내 메모리 이하 구성의 4k 프롬프트 최고 결과입니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每行是在 4k 提示词下，与此芯片和模型匹配且内存相同或更少的最佳结果。"
           }
         }
       }
@@ -51498,6 +52320,12 @@
             "state" : "translated",
             "value" : "PP 우선 (프롬프트 처리)"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最佳提示词处理（PP）"
+          }
         }
       }
     },
@@ -51527,6 +52355,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "TG 우선 (토큰 생성)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最佳 Token 生成（TG）"
           }
         }
       }
@@ -51558,6 +52392,12 @@
             "state" : "translated",
             "value" : "커스텀 레시피 적용 결과"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已应用自定义配方"
+          }
         }
       }
     },
@@ -51587,6 +52427,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "omlx.ai 최적 설정"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "来自 omlx.ai 的最佳设置"
           }
         }
       }
@@ -51618,6 +52464,12 @@
             "state" : "translated",
             "value" : "벤치마크에 동일한 사양과 모델의 결과가 없네요."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "没有与此设备和模型匹配的基准测试结果。"
+          }
         }
       }
     },
@@ -51647,6 +52499,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "비슷한 모델의 설정을 찾아서 커스텀 레시피를 적용해 보세요!"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在社区基准测试中查找相似模型，再用“应用自定义配方”套用其配方。"
           }
         }
       }
@@ -51678,6 +52536,12 @@
             "state" : "translated",
             "value" : "커뮤니티 벤치마크 열기"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开社区基准测试"
+          }
         }
       }
     },
@@ -51707,6 +52571,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이미 같은 설정이라 변경된 항목이 없습니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "设置已匹配，未做更改。"
           }
         }
       }
@@ -51738,6 +52608,12 @@
             "state" : "translated",
             "value" : "레시피의 아래 설정으로 적용되었습니다!"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "以下设置已按该配方应用！"
+          }
         }
       }
     },
@@ -51767,6 +52643,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "선택한 벤치마크의 아래 설정으로 적용되었습니다!"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "以下设置已按所选基准测试应用！"
           }
         }
       }
@@ -51798,6 +52680,12 @@
             "state" : "translated",
             "value" : "이 머신에서 제외된 기능"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已在此机器上跳过"
+          }
         }
       }
     },
@@ -51828,6 +52716,12 @@
             "state" : "translated",
             "value" : "적용된 설정"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已应用设置"
+          }
         }
       }
     },
@@ -51857,6 +52751,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "다음 로드부터 새 설정이 적용됩니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型将在下次加载时使用新设置。"
           }
         }
       }
@@ -52920,6 +53820,12 @@
             "state" : "translated",
             "value" : "Server"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器"
+          }
         }
       }
     },
@@ -52937,6 +53843,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Rispondi con"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "回答来源"
           }
         }
       }
@@ -52956,6 +53868,12 @@
             "state" : "translated",
             "value" : "Il server su questo Mac, oppure un altro server oMLX sulla tua rete, come un Mac Studio."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "这台 Mac 上的服务器，或网络中的另一台 oMLX 服务器，例如 Mac Studio。"
+          }
         }
       }
     },
@@ -52973,6 +53891,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Questo Mac"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "这台 Mac"
           }
         }
       }
@@ -52992,6 +53916,12 @@
             "state" : "translated",
             "value" : "Un altro server"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "另一台服务器"
+          }
         }
       }
     },
@@ -53009,6 +53939,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Indirizzo"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "地址"
           }
         }
       }
@@ -53028,6 +53964,12 @@
             "state" : "translated",
             "value" : "Un host, host:porta o un indirizzo https://. La porta predefinita è 8000."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "主机、主机:端口，或 https:// 地址。默认端口为 8000。"
+          }
         }
       }
     },
@@ -53045,6 +53987,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Chiave API"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API 密钥"
           }
         }
       }
@@ -53064,6 +54012,12 @@
             "state" : "translated",
             "value" : "Salvata nel Portachiavi, non nelle impostazioni di Ask AI."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保存在你的钥匙串中，而非 Ask AI 设置中。"
+          }
         }
       }
     },
@@ -53081,6 +54035,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Nascondi la chiave API"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "隐藏 API 密钥"
           }
         }
       }
@@ -53100,6 +54060,12 @@
             "state" : "translated",
             "value" : "Mostra la chiave API"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "显示 API 密钥"
+          }
         }
       }
     },
@@ -53117,6 +54083,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Connessione"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连接"
           }
         }
       }
@@ -53136,6 +54108,12 @@
             "state" : "translated",
             "value" : "Prova la connessione"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "测试连接"
+          }
         }
       }
     },
@@ -53153,6 +54131,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Verifica in corso…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在检查…"
           }
         }
       }
@@ -53172,6 +54156,12 @@
             "state" : "translated",
             "value" : "Connesso. Modelli di chat disponibili: %lld"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已连接。可用的聊天模型：%lld"
+          }
         }
       }
     },
@@ -53189,6 +54179,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Inserisci un indirizzo valido, come studio.local:8000."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请输入有效的地址，例如 studio.local:8000。"
           }
         }
       }
@@ -53208,6 +54204,12 @@
             "state" : "translated",
             "value" : "Il server richiede una chiave API."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器需要 API 密钥。"
+          }
         }
       }
     },
@@ -53225,6 +54227,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Il server non ha accettato questa chiave API."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器未接受此 API 密钥。"
           }
         }
       }
@@ -53244,6 +54252,12 @@
             "state" : "translated",
             "value" : "Impossibile raggiungere %@:%lld."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法连接 %@:%lld。"
+          }
         }
       }
     },
@@ -53261,6 +54275,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Questo indirizzo usa http, quindi la chiave API e le tue domande non sono cifrate sulla rete. Usa una rete di cui ti fidi oppure un indirizzo https."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此地址使用 http，因此 API 密钥和你的问题在网络中不会加密。请使用你信任的网络，或改用 https 地址。"
           }
         }
       }
@@ -53280,6 +54300,12 @@
             "state" : "translated",
             "value" : "Impossibile raggiungere l'altro server. Controlla l'indirizzo e la chiave API."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法连接另一台服务器。请检查其地址和 API 密钥。"
+          }
         }
       }
     },
@@ -53298,6 +54324,12 @@
             "state" : "translated",
             "value" : "Inserisci l'indirizzo dell'altro server per scegliere tra i suoi modelli."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "输入另一台服务器的地址，以便从中选择模型。"
+          }
         }
       }
     },
@@ -53315,6 +54347,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Inserisci l'indirizzo dell'altro server nelle impostazioni di Ask AI."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在 Ask AI 设置中输入另一台服务器的地址。"
           }
         }
       }
@@ -54664,7 +55702,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%@ 无法读取图片。带图片的问题请使用视觉模型 (VLM)。"
+            "value" : "%@ 无法读取图片。带图片的问题请使用视觉模型（VLM）。"
           }
         }
       }
@@ -54988,7 +56026,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在此模型生成期间限制整台 Mac 的 GPU 功率，范围 2 到 1000 W。只有低于平时功耗时才有效。例如，M5 Max 生成回答时约使用 25 W：10 W 可让每 token 能耗降低约 40%，5 W 约降低一半。"
+            "value" : "在此模型生成期间限制整台 Mac 的 GPU 功率，范围 2 到 1000 W。只有低于平时功耗时才有效。例如，M5 Max 生成回答时约使用 25 W：10 W 可让每 Token 能耗降低约 40%，5 W 约降低一半。"
           }
         }
       }
@@ -55276,7 +56314,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "每 token 能耗"
+            "value" : "每 Token 能耗"
           }
         }
       }
@@ -55312,7 +56350,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "提示处理速度"
+            "value" : "提示词处理速度"
           }
         }
       }
@@ -55384,7 +56422,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "30 W 及以上几乎不影响回答速度。低于 5 W 时每 token 能耗不再下降，只会让回答变慢。最小值为 2 W。限制生效期间，其他请求和应用也会变慢。基准测试不受此限制。"
+            "value" : "30 W 及以上几乎不影响回答速度。低于 5 W 时每 Token 能耗不再下降，只会让回答变慢。最小值为 2 W。限制生效期间，其他请求和应用也会变慢。基准测试不受此限制。"
           }
         }
       }
@@ -55672,7 +56710,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "点按“测试”，然后在 macOS 询问是否从其他应用粘贴时选择“允许”。"
+            "value" : "点击“测试”，然后在 macOS 询问是否从其他应用粘贴时选择“允许”。"
           }
         }
       }
@@ -55708,7 +56746,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "若不想每次对话都被询问，请打开“系统设置 > 隐私与安全性”，为 oMLX 选择“始终允许”。"
+            "value" : "若不想每次对话都被询问，请打开“系统设置 → 隐私与安全性”，为 oMLX 选择“始终允许”。"
           }
         }
       }
@@ -55996,7 +57034,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "占位符会在对话开始时填入。点按即可添加。"
+            "value" : "占位符会在对话开始时填入。点击即可添加。"
           }
         }
       }
@@ -57148,7 +58186,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用控制面板设置 > 集成中设定的搜索服务。"
+            "value" : "使用 Web 仪表盘 → 设置 → 集成中设置的搜索服务。"
           }
         }
       }
@@ -57868,7 +58906,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "如果之前拒绝过，请打开“系统设置 > 隐私与安全性 > 麦克风”并开启 oMLX。"
+            "value" : "如果之前拒绝过，请打开“系统设置 → 隐私与安全性 → 麦克风”并开启 oMLX。"
           }
         }
       }
@@ -58840,7 +59878,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "请在“系统设置 > 录屏与系统录音”中允许 oMLX，然后重新启动 oMLX。"
+            "value" : "请在“系统设置 → 录屏与系统录音”中允许 oMLX，然后重新启动 oMLX。"
           }
         }
       }
