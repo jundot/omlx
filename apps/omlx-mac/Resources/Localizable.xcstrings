@@ -10,6 +10,12 @@
             "state" : "translated",
             "value" : "Claude Desktop"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Desktop"
+          }
         }
       }
     },
@@ -17,16 +23,22 @@
       "comment" : "Placeholder for the global settings search field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen suchen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Search Settings"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Einstellungen suchen"
+            "value" : "Cerca nelle impostazioni"
           }
         },
         "ja" : {
@@ -65,16 +77,22 @@
       "comment" : "Empty state for global settings search results",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Einstellungen gefunden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "No settings found"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Keine Einstellungen gefunden"
+            "value" : "Nessuna impostazione trovata"
           }
         },
         "ja" : {
@@ -113,16 +131,22 @@
       "comment" : "Accessible label for the Hugging Face model format preference",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellformat"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Model Format"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Modellformat"
+            "value" : "Formato del modello"
           }
         },
         "ja" : {
@@ -164,6 +188,12 @@
             "state" : "translated",
             "value" : "Check for updates"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cerca aggiornamenti"
+          }
         }
       }
     },
@@ -173,6 +203,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "No eligible models to check."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nessun modello idoneo da verificare."
           }
         }
       }
@@ -184,6 +220,12 @@
             "state" : "translated",
             "value" : "Updates available: %lld · Checked: %lld · Failed: %lld"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aggiornamenti disponibili: %lld · Verificati: %lld · Non riusciti: %lld"
+          }
         }
       }
     },
@@ -193,6 +235,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Update available"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aggiornamento disponibile"
           }
         }
       }
@@ -204,6 +252,12 @@
             "state" : "translated",
             "value" : "%lld files · %@"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld file · %@"
+          }
         }
       }
     },
@@ -213,6 +267,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Review update for %@"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rivedi l'aggiornamento di %@"
           }
         }
       }
@@ -224,6 +284,12 @@
             "state" : "translated",
             "value" : "Could not check for model updates. Previous results are last known results."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile verificare gli aggiornamenti dei modelli. I risultati precedenti sono gli ultimi noti."
+          }
         }
       }
     },
@@ -234,6 +300,12 @@
             "state" : "translated",
             "value" : "Could not check for model updates: %@"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile verificare gli aggiornamenti dei modelli: %@"
+          }
         }
       }
     },
@@ -243,6 +315,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Could not start the model update: %@"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile avviare l'aggiornamento del modello: %@"
           }
         }
       }
@@ -6437,7 +6515,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Priorità del prefill"
+            "value" : "Gestione dei prompt lunghi"
           }
         },
         "ru" : {
@@ -6887,7 +6965,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "ru" : {
@@ -6959,7 +7037,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "ru" : {
@@ -8069,7 +8147,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "ru" : {
@@ -8141,7 +8219,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "ru" : {
@@ -8321,7 +8399,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %1$lld / tg %2$lld"
+            "value" : "PP %1$lld / TG %2$lld"
           }
         },
         "ru" : {
@@ -8573,7 +8651,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %lld"
+            "value" : "PP %lld"
           }
         },
         "ru" : {
@@ -9395,6 +9473,12 @@
             "value" : "Balanced"
           }
         },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bilanciato"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9425,6 +9509,12 @@
             "value" : "Decode First"
           }
         },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prima la decodifica"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9453,6 +9543,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Prefill First"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prima il prefill"
           }
         },
         "ru" : {
@@ -12566,6 +12662,12 @@
             "state" : "translated",
             "value" : "MarkItDown"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MarkItDown"
+          }
         }
       }
     },
@@ -12583,6 +12685,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Enable MarkItDown"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Attiva MarkItDown"
           }
         }
       }
@@ -12602,6 +12710,12 @@
             "state" : "translated",
             "value" : "Preprocess supported file attachments before LLM requests."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pre-elabora gli allegati supportati prima delle richieste all'LLM."
+          }
         }
       }
     },
@@ -12619,6 +12733,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Show as model"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mostra come modello"
           }
         }
       }
@@ -12638,6 +12758,12 @@
             "state" : "translated",
             "value" : "Expose MarkItDown in model lists for direct Markdown conversion requests."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Espone MarkItDown negli elenchi dei modelli per richieste dirette di conversione in Markdown."
+          }
         }
       }
     },
@@ -12655,6 +12781,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Max file size"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dimensione max file"
           }
         }
       }
@@ -12674,6 +12806,12 @@
             "state" : "translated",
             "value" : "Reject larger document attachments before conversion."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rifiuta i documenti allegati più grandi prima della conversione."
+          }
         }
       }
     },
@@ -12691,6 +12829,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Max files per request"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "File max per richiesta"
           }
         }
       }
@@ -12710,6 +12854,12 @@
             "state" : "translated",
             "value" : "Limit document attachments converted in one request."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Limita i documenti allegati convertiti in una richiesta."
+          }
         }
       }
     },
@@ -12727,6 +12877,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "PDF processing engine"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Motore di elaborazione PDF"
           }
         }
       }
@@ -12746,6 +12902,12 @@
             "state" : "translated",
             "value" : "Select whether PDF document requests are processed by MarkItDown itself or by an OCR engine."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scegli se le richieste con documenti PDF vengono elaborate da MarkItDown o da un motore OCR."
+          }
         }
       }
     },
@@ -12763,6 +12925,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "The selected OCR model is unavailable. PDFs use MarkItDown until the model is available again or you select another engine."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il modello OCR selezionato non è disponibile. I PDF usano MarkItDown finché il modello non torna disponibile o non selezioni un altro motore."
           }
         }
       }
@@ -12782,6 +12950,12 @@
             "state" : "translated",
             "value" : "Scanned or image-only PDFs will fail when MarkItDown is selected, and PDFs with tables may not be processed correctly."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Con MarkItDown i PDF scansionati o di sole immagini non vengono elaborati e quelli con tabelle potrebbero essere elaborati in modo errato."
+          }
         }
       }
     },
@@ -12799,6 +12973,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Enter a whole number greater than zero."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inserisci un numero intero maggiore di zero."
           }
         }
       }
@@ -16620,7 +16800,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Imposta OMLX_API_KEY per attivare le statistiche"
+            "value" : "Imposta una chiave API nella schermata Sicurezza per attivare le statistiche"
           }
         },
         "ru" : {
@@ -17299,6 +17479,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Copy alias"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copia alias"
           }
         },
         "ru" : {
@@ -19735,6 +19921,12 @@
             "value" : "Concurrent Request Priority"
           }
         },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Priorità richieste simultanee"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19763,6 +19955,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "What runs first when a new prompt arrives while other responses are generating. Prefill First can pause them during a long prompt."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cosa viene eseguito prima quando arriva un nuovo prompt mentre altre risposte sono in generazione. Prima il prefill può sospenderle durante un prompt lungo."
           }
         },
         "ru" : {
@@ -19798,7 +19996,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Priorità del prefill"
+            "value" : "Gestione dei prompt lunghi"
           }
         },
         "ru" : {
@@ -19834,7 +20032,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Contesto massimo accetta prompt più grandi con un prefill più lento; Velocità rifiuta i prompt troppo grandi."
+            "value" : "Con poca memoria, Contesto massimo accetta prompt più lunghi con un prefill più lento; Massima velocità mantiene il prefill veloce e rifiuta i prompt che non entrano."
           }
         },
         "ru" : {
@@ -19906,7 +20104,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Velocità"
+            "value" : "Massima velocità"
           }
         },
         "ru" : {
@@ -20518,7 +20716,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Valori predefiniti del server in uso · modifica un campo per creare un profilo di lavoro"
+            "value" : "Le modifiche vengono salvate automaticamente per questo modello"
           }
         },
         "ru" : {
@@ -20770,7 +20968,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Quant. drafter · W%1$lld/A%2$lld G%3$lld"
+            "value" : "Quant. drafter · W%1$lld G%2$lld"
           }
         },
         "ru" : {
@@ -21310,7 +21508,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Aggiorna dal profilo di lavoro"
+            "value" : "Aggiorna con le impostazioni attuali"
           }
         },
         "ru" : {
@@ -28490,7 +28688,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Disattiva verifica chiave API"
+            "value" : "Disattiva tutta l'autenticazione"
           }
         },
         "ru" : {
@@ -34135,6 +34333,12 @@
             "state" : "translated",
             "value" : "ran out of GPU memory for a prompt"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "memoria GPU esaurita durante un prompt"
+          }
         }
       }
     },
@@ -34259,7 +34463,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "richiede la stessa versione di oMLX"
+            "value" : "richiede un aggiornamento"
           }
         }
       }
@@ -35477,7 +35681,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sperimentali"
+            "value" : "Funzionalità sperimentali"
           }
         },
         "ja" : {
@@ -35639,7 +35843,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sovrascrive i parametri di campionamento della richiesta con i valori configurati"
+            "value" : "Usa questi valori di Temperatura, Top P e Top K anche quando un client o un agente ne richiede altri."
           }
         },
         "ja" : {
@@ -36125,7 +36329,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Se vuoto, viene usato l'ID del modello"
+            "value" : "Le richieste API possono chiamare questo modello anche con l'alias, oltre che con il nome."
           }
         },
         "ja" : {
@@ -36215,7 +36419,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Numero massimo di token per richiesta"
+            "value" : "Imposta la dimensione totale del contesto gestibile dal modello. I prompt più lunghi vengono rifiutati."
           }
         },
         "ja" : {
@@ -36449,7 +36653,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Limite dei token generati (vuoto = predefinito)"
+            "value" : "Limita il numero di token generati dal modello in un turno quando la richiesta non imposta max_tokens."
           }
         },
         "ja" : {
@@ -36899,7 +37103,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Limita i candidati ai primi K (intero positivo)."
+            "value" : "Limita i candidati ai primi K (0 lo disattiva)."
           }
         },
         "ru" : {
@@ -37079,7 +37283,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Secondi di inattività prima del rilascio (vuoto = nessun TTL)"
+            "value" : "Rilascia automaticamente il modello dopo questo periodo di inattività."
           }
         },
         "ja" : {
@@ -37625,7 +37829,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Attiva la quantizzazione del modello draft (bit dei pesi, bit di attivazione e dimensione del gruppo)."
+            "value" : "Attiva la quantizzazione del modello draft (bit dei pesi e dimensione del gruppo)."
           }
         },
         "ru" : {
@@ -37805,7 +38009,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Algoritmo di verifica. \"adaptive\" riduce la dimensione del blocco quando l'accettazione cala; \"off\" disattiva la verifica speculativa."
+            "value" : "Algoritmo di verifica. \"adaptive\" sceglie quante bozze verificare a ogni ciclo in base a costo e accettazione misurati; \"dflash\" e \"off\" verificano l'intero blocco."
           }
         },
         "ru" : {
@@ -41171,7 +41375,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Top K deve essere un intero positivo."
+            "value" : "Top K deve essere 0 o un intero positivo."
           }
         },
         "ru" : {
@@ -45181,7 +45385,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Mostra le note di rilascio prima del download in background"
+            "value" : "Mostra le note di rilascio quando viene trovato un aggiornamento"
           }
         },
         "ru" : {
@@ -49744,7 +49948,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ripristina predefiniti"
+            "value" : "Ripristina predefiniti…"
           }
         },
         "ko" : {
@@ -49774,7 +49978,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Applica impostazioni ottimali"
+            "value" : "Applica impostazioni ottimali…"
           }
         },
         "ko" : {
@@ -49804,7 +50008,7 @@
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Applica ricetta personalizzata"
+            "value" : "Applica ricetta personalizzata…"
           }
         },
         "ko" : {
@@ -51558,6 +51762,12 @@
             "state" : "translated",
             "value" : "Server"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server"
+          }
         }
       }
     },
@@ -51569,6 +51779,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Answer with"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rispondi con"
           }
         }
       }
@@ -51582,6 +51798,12 @@
             "state" : "translated",
             "value" : "The server on this Mac, or another oMLX server on your network, such as a Mac Studio."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il server su questo Mac, oppure un altro server oMLX sulla tua rete, come un Mac Studio."
+          }
         }
       }
     },
@@ -51593,6 +51815,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "This Mac"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Questo Mac"
           }
         }
       }
@@ -51606,6 +51834,12 @@
             "state" : "translated",
             "value" : "Another server"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Un altro server"
+          }
         }
       }
     },
@@ -51617,6 +51851,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Address"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Indirizzo"
           }
         }
       }
@@ -51630,6 +51870,12 @@
             "state" : "translated",
             "value" : "A host, host:port, or https:// address. The default port is 8000."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Un host, host:porta o un indirizzo https://. La porta predefinita è 8000."
+          }
         }
       }
     },
@@ -51641,6 +51887,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "API key"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chiave API"
           }
         }
       }
@@ -51654,6 +51906,12 @@
             "state" : "translated",
             "value" : "Saved in your Keychain, not in the Ask AI settings."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Salvata nel Portachiavi, non nelle impostazioni di Ask AI."
+          }
         }
       }
     },
@@ -51665,6 +51923,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Hide the API key"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nascondi la chiave API"
           }
         }
       }
@@ -51678,6 +51942,12 @@
             "state" : "translated",
             "value" : "Show the API key"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mostra la chiave API"
+          }
         }
       }
     },
@@ -51689,6 +51959,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Connection"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connessione"
           }
         }
       }
@@ -51702,6 +51978,12 @@
             "state" : "translated",
             "value" : "Test connection"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prova la connessione"
+          }
         }
       }
     },
@@ -51713,6 +51995,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Checking…"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verifica in corso…"
           }
         }
       }
@@ -51726,6 +52014,12 @@
             "state" : "translated",
             "value" : "Connected. Chat models available: %lld"
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connesso. Modelli di chat disponibili: %lld"
+          }
         }
       }
     },
@@ -51737,6 +52031,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Enter a valid address, such as studio.local:8000."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inserisci un indirizzo valido, come studio.local:8000."
           }
         }
       }
@@ -51750,6 +52050,12 @@
             "state" : "translated",
             "value" : "The server needs an API key."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il server richiede una chiave API."
+          }
         }
       }
     },
@@ -51761,6 +52067,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "The server did not accept this API key."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il server non ha accettato questa chiave API."
           }
         }
       }
@@ -51774,6 +52086,12 @@
             "state" : "translated",
             "value" : "Couldn't reach %@:%lld."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile raggiungere %@:%lld."
+          }
         }
       }
     },
@@ -51785,6 +52103,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "This address uses http, so the API key and your questions are not encrypted on the network. Use a network you trust, or an https address."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Questo indirizzo usa http, quindi la chiave API e le tue domande non sono cifrate sulla rete. Usa una rete di cui ti fidi oppure un indirizzo https."
           }
         }
       }
@@ -51798,6 +52122,12 @@
             "state" : "translated",
             "value" : "Can't reach the other server. Check its address and API key."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile raggiungere l'altro server. Controlla l'indirizzo e la chiave API."
+          }
         }
       }
     },
@@ -51810,6 +52140,12 @@
             "state" : "translated",
             "value" : "Enter the other server's address to pick from its models."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inserisci l'indirizzo dell'altro server per scegliere tra i suoi modelli."
+          }
         }
       }
     },
@@ -51821,6 +52157,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Enter the other server's address in Ask AI settings."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inserisci l'indirizzo dell'altro server nelle impostazioni di Ask AI."
           }
         }
       }
