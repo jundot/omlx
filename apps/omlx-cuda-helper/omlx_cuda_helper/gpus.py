@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 _NO_MEMORY = ("[N/A]", "[Not Supported]")
+# The OS and other apps of a machine whose GPU shares its RAM, as the host keeps.
+_OS_BYTES = 16 << 30
 
 
 def _run(*command: str) -> str:
@@ -26,7 +28,8 @@ def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
     """NVIDIA GPUs as {index, name, total, free, integrated}, sizes in bytes.
 
     An integrated GPU (DGX Spark) has no memory of its own, so nvidia-smi
-    reports none: it holds its layers in the system RAM.
+    reports none: it holds its layers in the system RAM, and its free memory
+    leaves the OS its share.
     """
     out = _run(
         "nvidia-smi",
@@ -42,7 +45,8 @@ def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
         try:
             index = int(parts[0])
             if integrated:
-                total, free = memory()
+                total, available = memory()
+                free = max(0, available - _OS_BYTES)
             else:
                 total, free = int(parts[2]) << 20, int(parts[3]) << 20
         except ValueError:

@@ -179,9 +179,10 @@ def test_an_integrated_gpu_holds_its_layers_in_system_ram(monkeypatch):
     monkeypatch.setattr(gpus, "_run", lambda *command: rows)
     monkeypatch.setattr(gpus, "memory", lambda: (128 << 30, 100 << 30))
     spark, card = gpus.gpus()
+    # Its free memory leaves the OS 16 GiB, as the host's budget does.
     assert (spark["total"], spark["free"], spark["integrated"]) == (
         128 << 30,
-        100 << 30,
+        84 << 30,
         True,
     )
     assert (card["free"], card["integrated"]) == (48600 << 20, False)
