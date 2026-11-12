@@ -5,16 +5,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Websuche"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Web Search"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Websuche"
+            "value" : "Ricerca web"
           }
         },
         "zh-Hans" : {
@@ -29,16 +35,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suchanbieter"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Search provider"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Suchanbieter"
+            "value" : "Provider di ricerca"
           }
         },
         "zh-Hans" : {
@@ -53,16 +65,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backend für das Websuchwerkzeug im Chat. DDGS Total fragt alle verfügbaren Suchmaschinen ab und benötigt keinen Schlüssel."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Backend used by the chat web search tool. DDGS Total queries every available engine and needs no key."
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Backend für das Websuchwerkzeug im Chat. DDGS Total fragt alle verfügbaren Suchmaschinen ab und benötigt keinen Schlüssel."
+            "value" : "Backend usato dal tool di ricerca web della chat. DDGS Total interroga tutti i motori disponibili e non richiede alcuna chiave."
           }
         },
         "zh-Hans" : {
@@ -77,16 +95,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suchmaschinen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Search engines"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Suchmaschinen"
+            "value" : "Motori di ricerca"
           }
         },
         "zh-Hans" : {
@@ -101,16 +125,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wählen Sie mindestens eine Suchmaschine aus. Alle aufgeführten Suchmaschinen funktionieren ohne API-Schlüssel."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Pick at least one engine to query. All of these work without an API key."
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Wählen Sie mindestens eine Suchmaschine aus. Alle aufgeführten Suchmaschinen funktionieren ohne API-Schlüssel."
+            "value" : "Scegli almeno un motore da interrogare. Funzionano tutti senza chiave API."
           }
         },
         "zh-Hans" : {
@@ -125,16 +155,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse pro Suche"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Results per search"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ergebnisse pro Suche"
+            "value" : "Risultati per ricerca"
           }
         },
         "zh-Hans" : {
@@ -149,16 +185,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Anzahl der Quellen, die ein web_search-Aufruf zurückgibt (1–10)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "How many sources one web_search call returns (1-10)."
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Anzahl der Quellen, die ein web_search-Aufruf zurückgibt (1–10)."
+            "value" : "Numero di fonti restituite da una chiamata web_search (1-10)."
           }
         },
         "zh-Hans" : {
@@ -173,16 +215,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisinhalt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Result content"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ergebnisinhalt"
+            "value" : "Contenuto dei risultati"
           }
         },
         "zh-Hans" : {
@@ -197,16 +245,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Textauszüge halten den Prompt klein. Bei vollständigem Seiteninhalt wird jede Ergebnisseite abgerufen und eingebunden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Snippets keep the prompt small. Full page content fetches and inlines each result page."
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Textauszüge halten den Prompt klein. Bei vollständigem Seiteninhalt wird jede Ergebnisseite abgerufen und eingebunden."
+            "value" : "Gli estratti mantengono il prompt compatto. Il contenuto completo scarica e incorpora ogni pagina dei risultati."
           }
         },
         "zh-Hans" : {
@@ -221,16 +275,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur Textauszüge"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Snippets only"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nur Textauszüge"
+            "value" : "Solo estratti"
           }
         },
         "zh-Hans" : {
@@ -245,16 +305,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vollständiger Seiteninhalt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Full page content"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Vollständiger Seiteninhalt"
+            "value" : "Contenuto completo"
           }
         },
         "zh-Hans" : {
@@ -269,16 +335,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Seiteninhalt kürzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Truncate page content"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Seiteninhalt kürzen"
+            "value" : "Tronca il contenuto delle pagine"
           }
         },
         "zh-Hans" : {
@@ -293,16 +365,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jede abgerufene Seite auf das unten angegebene Limit kürzen. Wenn dies deaktiviert ist, kann der Modellkontext überfüllt werden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Cut each fetched page at the limit below. Turning this off can flood the model context."
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Jede abgerufene Seite auf das unten angegebene Limit kürzen. Wenn dies deaktiviert ist, kann der Modellkontext überfüllt werden."
+            "value" : "Taglia ogni pagina scaricata al limite indicato sotto. Disattivando l'opzione, il contesto del modello può saturarsi."
           }
         },
         "zh-Hans" : {
@@ -317,16 +395,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inhaltslimit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Content limit"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Inhaltslimit"
+            "value" : "Limite contenuto"
           }
         },
         "zh-Hans" : {
@@ -341,16 +425,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Anzahl an Zeichen, die pro abgerufener Seite beibehalten werden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Maximum characters kept per fetched page."
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Maximale Anzahl an Zeichen, die pro abgerufener Seite beibehalten werden."
+            "value" : "Numero massimo di caratteri conservati per ogni pagina scaricata."
           }
         },
         "zh-Hans" : {
@@ -365,16 +455,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zeichen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "chars"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Zeichen"
+            "value" : "caratteri"
           }
         },
         "zh-Hans" : {
@@ -389,16 +485,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Brave-API-Schlüssel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Brave API key"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Brave-API-Schlüssel"
+            "value" : "Chiave API Brave"
           }
         },
         "zh-Hans" : {
@@ -413,16 +515,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abonnement-Token aus dem Dashboard der Brave Search API."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Subscription token from the Brave Search API dashboard."
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Abonnement-Token aus dem Dashboard der Brave Search API."
+            "value" : "Token di abbonamento dalla dashboard di Brave Search API."
           }
         },
         "zh-Hans" : {
@@ -437,16 +545,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "URL der SearXNG-Instanz"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "SearXNG instance URL"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "URL der SearXNG-Instanz"
+            "value" : "URL dell'istanza SearXNG"
           }
         },
         "zh-Hans" : {
@@ -461,16 +575,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Basis-URL einer SearXNG-Instanz mit aktiviertem JSON-Ausgabeformat."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Base URL of a SearXNG instance with the JSON output format enabled."
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Basis-URL einer SearXNG-Instanz mit aktiviertem JSON-Ausgabeformat."
+            "value" : "URL di base di un'istanza SearXNG con il formato di output JSON attivo."
           }
         },
         "zh-Hans" : {
@@ -485,16 +605,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eine Testsuche mit den obigen Einstellungen ausführen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Run a test search with the settings above"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Eine Testsuche mit den obigen Einstellungen ausführen"
+            "value" : "Esegui una ricerca di prova con le impostazioni qui sopra"
           }
         },
         "zh-Hans" : {
@@ -509,16 +635,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suche testen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Test search"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Suche testen"
+            "value" : "Prova ricerca"
           }
         },
         "zh-Hans" : {
@@ -533,16 +665,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird getestet..."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Testing..."
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Wird getestet..."
+            "value" : "Prova in corso..."
           }
         },
         "zh-Hans" : {
@@ -557,16 +695,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suche erfolgreich: %lld Ergebnisse"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Search OK: %lld results"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Suche erfolgreich: %lld Ergebnisse"
+            "value" : "Ricerca riuscita: %lld risultati"
           }
         },
         "zh-Hans" : {
@@ -581,16 +725,22 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suchtest fehlgeschlagen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Search test failed"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Suchtest fehlgeschlagen"
+            "value" : "Prova non riuscita"
           }
         },
         "zh-Hans" : {
@@ -605,13 +755,19 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Brave Search"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Brave Search"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Brave Search"
@@ -629,13 +785,19 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DDGS Custom"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "DDGS Custom"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "DDGS Custom"
@@ -653,13 +815,19 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DDGS Total"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "DDGS Total"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "DDGS Total"
@@ -677,13 +845,19 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DuckDuckGo"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "DuckDuckGo"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "DuckDuckGo"
@@ -701,13 +875,19 @@
       "comment" : "Web search settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SearXNG"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "SearXNG"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "SearXNG"
@@ -730,6 +910,12 @@
             "state" : "translated",
             "value" : "Enter a whole number between 1 and 10."
           }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inserisci un numero intero tra 1 e 10."
+          }
         }
       }
     },
@@ -741,6 +927,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Enter a whole number greater than zero."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inserisci un numero intero maggiore di zero."
           }
         }
       }
@@ -2396,16 +2588,22 @@
       "comment" : "Appearance row label for the number scale picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zahlenformat"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Number Scale"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Zahlenformat"
+            "value" : "Scala dei numeri"
           }
         },
         "ja" : {
@@ -2444,16 +2642,22 @@
       "comment" : "Appearance row sublabel explaining where the number scale applies",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gilt für Zähler im Fenster; die Menüleiste bleibt kompakt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Applies to counts in the window; the menu bar stays compact."
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Gilt für Zähler im Fenster; die Menüleiste bleibt kompakt."
+            "value" : "Si applica ai conteggi nella finestra; la barra dei menu resta compatta."
           }
         },
         "ja" : {
@@ -2492,16 +2696,22 @@
       "comment" : "Number scale option that shows large counts in 万 or M and similar units",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Größere Einheiten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Higher Units"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Größere Einheiten"
+            "value" : "Unità maggiori"
           }
         },
         "ja" : {
@@ -2540,16 +2750,22 @@
       "comment" : "Number scale option that shows every digit of a count",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vollständige Zahlen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Exact Digits"
           }
         },
-        "de" : {
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Vollständige Zahlen"
+            "value" : "Cifre esatte"
           }
         },
         "ja" : {
