@@ -5133,6 +5133,7 @@ async def create_chat_completion(
         native_response_format = _native_response_format(
             engine, response_format, structured_outputs
         )
+        tools_for_template = _resolve_template_tools(request, engine, resolved_model)
         if native_response_format is None and (
             structured_outputs is not None or response_format
         ):
@@ -5147,10 +5148,11 @@ async def create_chat_completion(
                 response_format=response_format,
                 chat_template_kwargs=merged_ct_kwargs or None,
                 reasoning_parser=reasoning_parser,
+                tools=tools_for_template,
             )
         )
-        # Fall back to prompt injection when grammar is not compiled. The degrade
-        # is also surfaced to the caller as a Warning response header (#1241).
+        # Tool-enabled requests need a visible final-answer contract even when
+        # grammar compilation succeeds. Preserve the existing prompt otherwise.
         # Only response formats that actually request grammar-constrained JSON
         # (json_object / json_schema) can be "unenforced"; a plain text format
         # never asked for enforcement, so it must not warn (#1241 review).
@@ -5161,11 +5163,17 @@ async def create_chat_completion(
             and _response_format_requests_grammar(response_format)
         ):
             response_format_warning = _response_format_warning_header(response_format)
-            json_instruction = build_json_system_prompt(response_format)
+        if native_response_format is None and (
+            tools_for_template or compiled_grammar is None
+        ):
+            json_instruction = _json_instruction_for_request(
+                structured_outputs=structured_outputs,
+                response_format=response_format,
+                tools=tools_for_template,
+            )
             if json_instruction:
                 messages = _inject_json_instruction(messages, json_instruction)
 
-        tools_for_template = _resolve_template_tools(request, engine, resolved_model)
         # Resolve template defaults before preparing the prompt for reuse.
         _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
         await _ensure_tokenizer_for_system_probe(engine, messages)
@@ -5714,6 +5722,22 @@ def _build_format_element(structured_outputs=None, response_format=None):
     return None
 
 
+def _json_instruction_for_request(
+    structured_outputs=None, response_format=None, *, tools=None
+) -> str | None:
+    """Describe the effective JSON format without overriding non-JSON grammars."""
+    if structured_outputs is not None:
+        fmt = _build_format_element(structured_outputs=structured_outputs)
+        if fmt is not None:
+            if fmt["type"] != "json_schema":
+                return None
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {"schema": fmt["json_schema"]},
+            }
+    return build_json_system_prompt(response_format, tools_available=bool(tools))
+
+
 def _patch_output_format(tag_dict: dict, user_grammar: dict) -> bool:
     """Replace the output ``any_text`` slot in a builtin structural tag.
 
@@ -5857,7 +5881,11 @@ _JSON_SCHEMA_MAX_WHITESPACE_CNT = 32
 
 
 def _compile_bare_grammar(compiler, fmt: dict):
-    """Compile a grammar without any structural tag wrapping."""
+    """Compile a grammar without a reasoning protocol wrapper."""
+    if fmt["type"] == "or":
+        return compiler.compile_structural_tag(
+            {"type": "structural_tag", "format": fmt}
+        )
     if fmt["type"] == "json_schema":
         import json as _json
 
@@ -5953,6 +5981,7 @@ def _compile_grammar_for_request(
     response_format=None,
     chat_template_kwargs=None,
     reasoning_parser=None,
+    tools=None,
 ):
     """Compile a grammar from structured_outputs or response_format.
 
@@ -5960,6 +5989,8 @@ def _compile_grammar_for_request(
     the user's grammar is wrapped in an xgrammar builtin structural tag
     so that protocol tokens (thinking tags, channel markers) are handled
     automatically.  When not set, the grammar is compiled bare.
+    Resolved tools add a separate tool-response alternative, so the final
+    answer's format cannot mask the output parser's tool-call protocol.
 
     Returns a compiled grammar object or ``None``.  ``structured_outputs``
     raises :class:`HTTPException` when grammar is unavailable or fails to
@@ -6006,6 +6037,10 @@ def _compile_grammar_for_request(
         return None
 
     try:
+        if tools:
+            from .api.grammar import with_tool_call_alternative
+
+            fmt = with_tool_call_alternative(fmt, engine.tokenizer)
         if reasoning_parser:
             return _compile_with_structural_tag(
                 compiler,
@@ -8688,6 +8723,19 @@ async def create_response(
         # returns plain dicts in {"role": str, "content": str} format.
         # Those extract functions expect Pydantic Message objects from OpenAI/Anthropic requests.
 
+        # Resolve tools before compiling text.format so the grammar can allow
+        # the same tool responses that the chat template exposes.
+        tools_disabled = request.tool_choice == "none" or (
+            getattr(engine, "is_diffusion_model", False)
+            and not getattr(engine, "supports_tool_calling", False)
+        )
+        effective_tools = None if tools_disabled else openai_tools
+        if _server_state.mcp_manager and not tools_disabled and mcp_tools_exposed():
+            effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
+        tools_for_template = (
+            convert_tools_for_template(effective_tools) if effective_tools else None
+        )
+
         # Handle text.format (structured output)
         response_format = None
         compiled_grammar = None
@@ -8706,6 +8754,8 @@ async def create_response(
                         "strict": fmt.strict or False,
                     },
                 }
+                if tools_for_template and fmt.description is not None:
+                    response_format["json_schema"]["description"] = fmt.description
             if response_format:
                 from .api.openai_models import ResponseFormat
 
@@ -8727,40 +8777,23 @@ async def create_response(
                         response_format=rf,
                         chat_template_kwargs=merged_ct_kwargs or None,
                         reasoning_parser=reasoning_parser,
+                        tools=tools_for_template,
                     )
-                if native_response_format is None and compiled_grammar is None:
-                    # Non-strict formats still degrade to prompt injection, so
-                    # surface it to the caller with the same Warning response
-                    # header /v1/chat/completions uses; the log line alone only
-                    # ever reaches the operator (#1241).
-                    response_format_warning = _response_format_warning_header(rf)
-                    json_instruction = build_json_system_prompt(rf)
+                if native_response_format is None and (
+                    tools_for_template or compiled_grammar is None
+                ):
+                    if compiled_grammar is None:
+                        # Prompt guidance is not schema enforcement. Keep the
+                        # downgrade warning when compilation is unavailable.
+                        response_format_warning = _response_format_warning_header(rf)
+                    json_instruction = _json_instruction_for_request(
+                        response_format=rf, tools=tools_for_template
+                    )
                     if json_instruction:
                         messages = _inject_json_instruction(messages, json_instruction)
             else:
                 compiled_grammar = None
 
-        # Merge MCP tools, matching create_chat_completion's tools_disabled
-        # semantics: tool_choice="none" suppresses tool exposure to the chat
-        # template, and the MCP merge itself must run even when the client
-        # sent no tools of its own, since MCP servers can offer tools the
-        # client never listed.
-        tools_disabled = request.tool_choice == "none" or (
-            getattr(engine, "is_diffusion_model", False)
-            and not getattr(engine, "supports_tool_calling", False)
-        )
-        effective_tools = None if tools_disabled else openai_tools
-        if (
-            _server_state.mcp_manager
-            and not tools_disabled
-            and mcp_tools_exposed()
-        ):
-            effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
-
-        # Convert tools for chat template
-        tools_for_template = (
-            convert_tools_for_template(effective_tools) if effective_tools else None
-        )
         # Resolve template defaults before preparing the prompt for reuse.
         native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
         if (
