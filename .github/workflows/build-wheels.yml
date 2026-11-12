@@ -50,7 +50,8 @@ jobs:
           xcrun --sdk macosx --show-sdk-version
           python -m pip install --upgrade pip
           python -m pip install build setuptools wheel "cmake>=3.27" "nanobind==3.1.0" "mlx==0.32.4"
-          export CMAKE_ARGS="-DPython_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"
+          CMAKE_ARGS="-DPython_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"
+          export CMAKE_ARGS
           python -m build --wheel --no-isolation
 
       - name: Smoke-test wheel (native kernels must import and report available)
