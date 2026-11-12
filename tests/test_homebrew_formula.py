@@ -106,8 +106,10 @@ class TestSharedPipFlags:
 
     def test_audio_extra_is_the_only_mlx_audio_source(self, formula):
         """spaCy for the model check comes only from omlx's [audio] extra, and a
-        separate mlx-audio resource pins a second revision that drifts (#4942)."""
-        assert '"#{buildpath}[audio,grammar]" : "#{buildpath}[audio]"' in formula
+        separate mlx-audio resource pins a second revision that drifts (#4942).
+        [cluster] comes along for zeroconf, which finds NVIDIA prefill helpers."""
+        assert '"audio,cluster,grammar" : "audio,cluster"' in formula
+        assert 'install_spec = "#{buildpath}[#{extras}]"' in formula
         assert 'resource "mlx-audio"' not in formula
 
     def test_no_bare_pip_install_besides_spacy_wheel(self, formula):
