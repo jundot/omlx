@@ -68,10 +68,10 @@ from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
-    compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
     extract_media_from_messages,
+    image_hash_prefixes,
 )
 from ..utils.video import (
     NATIVE_VIDEO_MODEL_TYPES,
@@ -4147,6 +4147,10 @@ class VLMBatchedEngine(BaseEngine):
                 field="messages",
             )
 
+        # One pass over the pixels: every prefix digest below snapshots these
+        # prefixes instead of re-hashing all preceding images.
+        cumulative_hashes = image_hash_prefixes(images)
+
         # Normalize audio to numpy float32 arrays expected by processor.
         # Request-facing string paths are rejected before this point; remaining
         # sources are inline buffers, arrays, or (array, sample_rate) tuples.
@@ -4426,7 +4430,11 @@ class VLMBatchedEngine(BaseEngine):
                             boundary_tokens += 1
 
                     images_consumed += msg_num_images
-                    cumulative_hash = compute_image_hash(images[:images_consumed])
+                    cumulative_hash = (
+                        cumulative_hashes[images_consumed - 1]
+                        if images_consumed > 0
+                        else None
+                    )
                     image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
 
                 # A later image's prefix can diverge earlier. Its cumulative
@@ -4481,7 +4489,7 @@ class VLMBatchedEngine(BaseEngine):
             image_hash = None
             image_token_count = None
             if num_images > 0:
-                image_hash = compute_image_hash(images)
+                image_hash = cumulative_hashes[-1] if cumulative_hashes else None
                 image_token_count = self._image_token_count(input_ids)
             elif has_video:
                 image_cache_key_ranges = self._video_cache_key_ranges(
