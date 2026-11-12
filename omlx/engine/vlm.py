@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
+import numpy as np
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import (
@@ -1639,9 +1640,6 @@ def _audio_feature_cache_key_ranges(
     hashed without its batch padding (clips are padded to the longest one in
     the request), so a clip keeps its key when a later turn adds a longer one.
     """
-    import hashlib
-
-    import numpy as np
 
     def _to_np(value):
         if isinstance(value, mx.array):
@@ -4460,9 +4458,12 @@ class VLMBatchedEngine(BaseEngine):
         }
 
         # Check for any multimodal inputs. Most processors expose audio as
-        # ``input_features``; MiMo's tokenizer produces discrete ``audio_codes``.
+        # ``input_features``; MiMo's tokenizer produces discrete
+        # ``audio_codes``, and Nemotron-3 Nano Omni passes raw waveforms as
+        # ``sound_clips``.
         has_audio = any(
-            key in extra_model_inputs for key in ("input_features", "audio_codes")
+            key in extra_model_inputs
+            for key in ("input_features", "audio_codes", "sound_clips")
         )
         has_video = extra_model_inputs.get("pixel_values_videos") is not None
         has_multimodal = (
@@ -4680,6 +4681,32 @@ class VLMBatchedEngine(BaseEngine):
                     token_ids,
                     extra_model_inputs["audio_codes"],
                     self._vlm_model.config.audio_token_id,
+                    image_ranges,
+                )
+                image_cache_key_start = image_cache_key_ranges[0][0]
+                image_hash = image_cache_key_ranges[-1][1]
+            elif has_audio and "sound_clips" in extra_model_inputs:
+                # Nemotron returns raw float32 waveforms. Right-pad them into
+                # one masked batch so each clip keys on its own samples.
+                clips = [
+                    np.asarray(c, dtype=np.float32).reshape(-1)
+                    for c in extra_model_inputs["sound_clips"]
+                ]
+                # Never empty: the processor omits the key when audio is None.
+                width = max(len(c) for c in clips)
+                padded = np.zeros((len(clips), width), dtype=np.float32)
+                mask = np.zeros((len(clips), width), dtype=bool)
+                for i, c in enumerate(clips):
+                    padded[i, : len(c)] = c
+                    mask[i, : len(c)] = True
+                image_ranges = image_cache_key_ranges
+                if image_hash is not None and not image_ranges:
+                    image_ranges = [(0, image_hash)]
+                image_cache_key_ranges = _audio_feature_cache_key_ranges(
+                    token_ids,
+                    padded,
+                    mask,
+                    getattr(self._vlm_model.config, "sound_context_token_id", None),
                     image_ranges,
                 )
                 image_cache_key_start = image_cache_key_ranges[0][0]
