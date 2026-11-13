@@ -5005,6 +5005,31 @@ def _global_settings_response(global_settings):
     }
 
 
+def _detach_hf_http_client() -> None:
+    """Make huggingface_hub build its next HTTP client from the current env.
+
+    huggingface_hub shares one client that reads HTTP(S)_PROXY, NO_PROXY and
+    the CA bundle variables when it is created, so proxy or CA changes applied
+    here would otherwise reach model downloads only after a restart. The old
+    client is detached, not closed: ``close_session()`` would abort a non-xet
+    download that is still streaming through it. Requests already in flight
+    finish on the old client; the next request gets a new one.
+    """
+    try:
+        from huggingface_hub.utils import _http as hf_http
+    except ImportError:
+        return
+    lock = getattr(hf_http, "_CLIENT_LOCK", None)
+    if lock is None or not hasattr(hf_http, "_GLOBAL_CLIENT"):
+        logger.warning(
+            "huggingface_hub internals changed; network settings reach "
+            "model downloads after a restart"
+        )
+        return
+    with lock:
+        hf_http._GLOBAL_CLIENT = None
+
+
 @router.post("/api/global-settings")
 async def update_global_settings(
     request: GlobalSettingsRequest,
@@ -5759,6 +5784,7 @@ async def update_global_settings(
         network_changed = True
 
     if network_changed:
+        _detach_hf_http_client()
         runtime_applied.append("network")
         logger.info("Network settings updated")
 
