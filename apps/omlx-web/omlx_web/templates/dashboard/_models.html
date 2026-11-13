@@ -853,7 +853,7 @@
                                                               }"
                                                               x-text="task.status"></span>
                                                     </div>
-                                                    <p x-show="task.error" x-cloak class="text-xs text-red-500 mt-1.5 truncate" x-text="task.error"></p>
+                                                    <p x-show="task.error" x-cloak class="text-xs text-red-600 mt-1.5 truncate" x-text="task.error"></p>
                                                     <template x-if="task.status === 'downloading'">
                                                         <div class="mt-2.5">
                                                             <div class="h-1.5 bg-neutral-100 rounded-full overflow-hidden">
@@ -1307,7 +1307,7 @@
                                                                           }"
                                                                           x-text="task.status"></span>
                                                                 </div>
-                                                                <p x-show="task.error" x-cloak class="text-xs text-red-500 mt-1.5 truncate" x-text="task.error"></p>
+                                                                <p x-show="task.error" x-cloak class="text-xs text-red-600 mt-1.5 truncate" x-text="task.error"></p>
                                                                 <template x-if="task.status === 'downloading'">
                                                                     <div class="mt-2.5">
                                                                         <div class="h-1.5 bg-neutral-100 rounded-full overflow-hidden">
@@ -1650,7 +1650,7 @@
                                                     <p x-show="task.progress_detail && !['completed','failed','cancelled'].includes(task.status)"
                                                        class="text-xs text-neutral-400 mt-1 break-words" x-text="task.progress_detail"></p>
                                                     <p x-show="task.error"
-                                                       class="text-xs text-red-500 mt-1.5 break-all" x-text="task.error"></p>
+                                                       class="text-xs text-red-600 mt-1.5 break-all" x-text="task.error"></p>
                                                     <!-- Progress bar -->
                                                     <template x-if="['loading','quantizing','saving'].includes(task.status)">
                                                         <div class="mt-2.5">

@@ -8,6 +8,8 @@ so 12px text in that colour is under the 4.5:1 text floor the theme editor and
 WCAG AA both apply. The card now uses the documented ladder: ``red-700`` for
 the label of a dangerous setting, ``red-600`` for its supporting text and for
 inline errors, ``red-500`` for accents (hover, borders, rings, icons) only.
+The same ladder applies to the other dashboard error strings, which this test
+pins so a new page cannot silently fall back to ``red-500`` text.
 
 These are static-template assertions, like test_admin_enhanced_readability.py:
 no browser render and no server.
@@ -63,3 +65,30 @@ def test_design_rules_document_the_danger_steps():
     assert "### Danger text" in design
     for step in ("`text-red-700`", "`text-red-600`", "`text-red-500`"):
         assert step in design
+
+
+DASHBOARD = ROOT / "omlx_web/templates/dashboard"
+
+
+def _dashboard(name: str) -> str:
+    return (DASHBOARD / name).read_text(encoding="utf-8")
+
+
+def test_dashboard_error_strings_use_red_600():
+    """Inline errors across the dashboard use the 4.5:1 red step."""
+    assert 'x-show="logError" class="text-red-600"' in _dashboard("_logs.html")
+    assert "text-sm text-red-600" in _dashboard("_bench.html")
+    assert "'text-red-600'" in _dashboard("_bench_accuracy.html")
+
+    models = _dashboard("_models.html")
+    error_lines = [line for line in models.splitlines() if "task.error" in line]
+    assert len(error_lines) >= 4
+    assert all("text-red-500" not in line for line in error_lines)
+    # The only red-500 left in this template is the hover accent on delete icons.
+    assert models.count("text-red-500") == models.count("hover:text-red-500")
+
+
+def test_dashboard_icons_keep_red_500_as_an_accent():
+    """Status icons are accents, not text, so they stay on red-500."""
+    cluster = _dashboard("_cluster_v2.html")
+    assert cluster.count('class="w-4 h-4 text-red-500"') == 2
