@@ -143,6 +143,19 @@ Replay is approximate; cache restoration is compared with the same chunk boundar
 
 Run `python -m pytest -q tests/test_deepseek_v41.py` for the text/vision port. Synthetic weights and small recorded official outputs cover prefill/decode, DSpark, Engram and vision numerics without a checkpoint download or vendored reference implementation. See `tests/fixtures/deepseek_v41_expected.md` for provenance and reference corrections. PyTorch is optional for the independent FP8/FP4 arithmetic checks. Other cases cover BatchGenerator admission, cache restoration, DSML and VLM engine execution.
 
+Native packed GGUF: `python -m pytest tests/test_deepseek_v41_gguf.py -q` checks all nine GGML formats in Unsloth's mixed `UD-IQ2_XXS` recipe against recorded upstream CPU results, routed and dense Metal projections, and a synthetic model loaded without the final Engram shard. Original Engram files stay unchanged; vision and optional DSpark come from the original checkpoint. Missing backbone shards and truncated payloads remain errors.
+
+Prepare a native MLX model folder with references to the GGUF and original weights:
+
+```sh
+python -m omlx.patches.deepseek_v41.gguf \
+  --gguf-path ~/models/llm/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS \
+  --hf-path ~/models/llm/DeepSeek-V4.1-Flash-1017 \
+  --mlx-path ~/models/llm/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-original-engram
+```
+
+Preparation can run before the GGUF download finishes. Select the generated folder in oMLX. The published backbone occupies parts `00001` through `00005` of six; `00006` contains only the bundled Engram table and is ignored, whether present or absent. The original checkpoint must remain available for its Engram tables, tokenizer, vision and optional DSpark. Engram residency follows the existing SSD N-gram Offload setting. GGUF expert weights stay packed, with codebook lookup and scaling during Metal matmul. Embeddings, the output head and attention `wo_a` materialize as BF16 for existing consumers. This initial path runs prefill as repeated packed GEMV; fused MoE decode, tiled gather GEMM, A8 acceleration and expert/cluster offload are not implemented for GGUF. Full-checkpoint generation and throughput still require real weights.
+
 FP8 activation boundary and layout checks: `python -m pytest tests/test_deepseek_v41_activation.py -q`. These compare fused FP8 and weighted SwiGLU kernels against reference arithmetic across rounding ties, scale transitions, clipping, intermediate casts and floating-point dtypes, and the one-pass RoPE kernel (with its fused act_quant and heads-major input) against the reference rotation.
 
 Fused decode kernels: `python -m pytest tests/test_deepseek_v41_fused_decode.py -q`. A five-layer random model with MXFP or oQ2-oQ3 affine layouts (2-8 bits) runs each decode layer against the unfused block, batched and MTP verify blocks are checked bitwise against single-token decode (including the matrix-tile kernels an MTP-enabled model uses), and DSpark generation must reproduce greedy decoding.

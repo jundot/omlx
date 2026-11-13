@@ -1166,6 +1166,16 @@ def estimate_model_size(model_path: Path) -> int:
             total_size += f.stat().st_size
 
     if total_size == 0:
+        config_file = model_path / "config.json"
+        if config_file.is_file():
+            config = json.loads(config_file.read_text())
+            spec = config.get("omlx_deepseek_v41") or {}
+            if config.get("model_type") == "deepseek_v41" and spec.get("gguf"):
+                from .patches.deepseek_v41.residency import (
+                    deepseek_v41_residency_estimate,
+                )
+
+                return deepseek_v41_residency_estimate(model_path).resident_bytes
         raise ValueError(f"No model weights found in {model_path}")
 
     # Add overhead for runtime buffers (~5%)

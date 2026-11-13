@@ -43,6 +43,28 @@ def _header(filename, size, mtime_ns):
 def checkpoint_signature(model_path):
     """Sizes and mtimes of every file a residency estimate depends on."""
     path = Path(model_path).expanduser().resolve()
+    config = json.loads((path / "config.json").read_text())
+    spec = config.get("omlx_deepseek_v41") or {}
+    if spec.get("gguf"):
+        from .gguf import supplementary
+
+        source = Path(spec["gguf"]["source"])
+        index = source / "model.safetensors.index.json"
+        mapping = json.loads(index.read_text())["weight_map"]
+        files = {path / "config.json", index}
+        files.update(source / name for name in supplementary(mapping).values())
+        files.update(Path(spec["gguf"]["path"]).glob("*.gguf"))
+        files.update(
+            path / table[field]
+            for table in spec["engram_tables"].values()
+            for field in ("weight_file", "scale_file")
+            if table.get(field)
+        )
+        return tuple(
+            (str(f), st.st_size, st.st_mtime_ns)
+            for f in sorted(files)
+            for st in (f.stat(),)
+        )
     files = [path / "config.json", path / "model.safetensors.index.json"]
     files.extend(path.glob("*.safetensors"))
     files.extend((path / "engram").glob("*.safetensors"))
@@ -65,9 +87,13 @@ def _estimate(model_path, signature):
     spec = config.get("omlx_deepseek_v41")
     if spec is not None and spec.get("version") != 1:
         return EngramResidencyEstimate(False, 0, 0, 0)
-    mapping = json.loads((path / "model.safetensors.index.json").read_text())[
+    gguf = spec.get("gguf") if spec else None
+    source = Path(gguf["source"]) if gguf else path
+    mapping = json.loads((source / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
+    if gguf:
+        mapping = {key: str(source / filename) for key, filename in mapping.items()}
     headers = {}
     stats = {name: (size, mtime) for name, size, mtime in signature}
 
@@ -94,11 +120,38 @@ def _estimate(model_path, signature):
             for key in ("weight_key", "scale_key", "bias_key")
             if table.get(key)
         }
-        base = sum(
-            tensor_bytes(filename, key)
-            for key, filename in mapping.items()
-            if key not in engram_keys
-        )
+        if gguf:
+            from math import prod
+
+            from .config import ModelConfig
+            from .gguf import (
+                FORMATS,
+                backbone_tensors,
+                dense_weight,
+                supplementary,
+                target_name,
+            )
+
+            base = sum(
+                (
+                    prod(t["shape"]) * 2
+                    if t["qtype"] in FORMATS and dense_weight(target_name(t["name"]))
+                    else t["size"]
+                )
+                for t in backbone_tensors(gguf["path"], ModelConfig.from_dict(config))
+            )
+            # Charge all original draft stages conservatively: MTP can be
+            # enabled at load time without regenerating this reference folder.
+            base += sum(
+                tensor_bytes(filename, key)
+                for key, filename in supplementary(mapping).items()
+            )
+        else:
+            base = sum(
+                tensor_bytes(filename, key)
+                for key, filename in mapping.items()
+                if key not in engram_keys
+            )
         for table in tables.values():
             engram += tensor_bytes(table["weight_file"], table["weight_key"])
             if table.get("scale_key"):
