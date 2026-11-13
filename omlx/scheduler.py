@@ -5151,6 +5151,13 @@ class Scheduler:
             ratios.append(watermark / hard_limit)
         return max(0.0, min(1.0, *ratios))
 
+    def _cached_prefix_bytes(self, cached_tokens: int) -> int:
+        """KV bytes of the request's own cached prefix, which admission keeps."""
+        monitor = self.memory_monitor
+        if monitor is None or cached_tokens <= 0:
+            return 0
+        return int(monitor.estimate_resident_kv_bytes(cached_tokens))
+
     def _releasable_hot_cache_credit(self, own_prefix_bytes: int) -> int:
         """Limit the hot cache gives back once a request is admitted.
 
@@ -13132,7 +13139,9 @@ class Scheduler:
 
             request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
 
-        hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
+        hot_cache_credit = self._releasable_hot_cache_credit(
+            self._cached_prefix_bytes(cached_tokens)
+        )
         admission_limit = self._admission_limit_bytes()
         if est.estimated - hot_cache_credit > admission_limit:
             message = self._format_rejection_message(
@@ -13214,14 +13223,16 @@ class Scheduler:
             return None
 
         # Evict models only for what the hot cache cannot give back.
-        hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
+        hot_cache_credit = self._releasable_hot_cache_credit(
+            self._cached_prefix_bytes(cached_tokens)
+        )
         admission_limit = self._admission_limit_bytes()
         if est.estimated - hot_cache_credit > admission_limit:
             return PrefillEvictionRequest(
                 request_id=request_id,
                 model_id=getattr(self.config, "model_name", ""),
                 current_bytes=int(current),
-                target_cap_bytes=int(admission_limit + hot_cache_credit),
+                target_cap_bytes=int(admission_limit),
                 predicted_transient_bytes=int(est.kv_exact + est.transient),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
@@ -13240,7 +13251,7 @@ class Scheduler:
             request_id=request_id,
             model_id=getattr(self.config, "model_name", ""),
             current_bytes=int(current),
-            target_cap_bytes=int(safety_rejection.limit_bytes + hot_cache_credit),
+            target_cap_bytes=int(safety_rejection.limit_bytes),
             predicted_transient_bytes=max(
                 0, int(safety_rejection.estimated_bytes) - int(current)
             ),

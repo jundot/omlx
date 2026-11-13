@@ -1383,3 +1383,132 @@ def test_post_prefill_guard_uses_stable_physical_cap(
     else:
         check()
     assert scheduler._reclaim_prefill_headroom.call_count == reclaims
+
+
+def _hot_cache_credit_scheduler() -> Scheduler:
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18  # keep safety cap out
+    scheduler._prefill_abort_margin = 1.0  # credit factor 1.0 keeps the arithmetic exact
+    scheduler._prefill_headroom_safety = 1.0
+    return scheduler
+
+
+def _set_held_hot_cache(scheduler: Scheduler, held: int) -> None:
+    scheduler._memory_hot_cache_reserved_bytes = held
+    scheduler.config.hot_cache_budget = SimpleNamespace(
+        total_bytes=held, releasable_bytes=lambda protected: held
+    )
+
+
+def test_hot_cache_credit_is_not_reduced_by_the_new_prefill_kv():
+    """#4561: a long uncached prefill gets the full hot-cache credit.
+
+    The credit protects only the request's own cached prefix. Passing the
+    new-token KV as that prefix zeroed the credit for long prompts, so a
+    prompt that fits once the cache releases was rejected.
+    """
+    scheduler = _hot_cache_credit_scheduler()
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est is not None
+    reserved = est.kv_exact
+    _set_held_hot_cache(scheduler, reserved)
+    limit = est.estimated - reserved
+    scheduler._memory_hard_limit_bytes = limit
+    scheduler._memory_hard_watermark_bytes = limit
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)  # fits once the cache releases
+
+
+def test_hot_cache_credit_excludes_the_request_own_cached_prefix():
+    """The request's own cached prefix stays protected, so it is never credited."""
+    cached = 16384
+    scheduler = _hot_cache_credit_scheduler()
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=cached, current=0
+        )
+        prefix = int(scheduler.memory_monitor.estimate_resident_kv_bytes(cached))
+    assert est is not None and prefix > 0
+    held = prefix + prefix // 4
+    _set_held_hot_cache(scheduler, held)
+    # Only held - prefix is releasable; crediting the whole cache must not admit.
+    limit = est.estimated - held + prefix // 2
+    scheduler._memory_hard_limit_bytes = limit
+    scheduler._memory_hard_watermark_bytes = limit
+    with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError):
+        scheduler.preflight_or_raise(num_prompt_tokens=32768, cached_tokens=cached)
+
+
+def test_route_preflight_admits_but_stream_check_rejects_with_real_cached_tokens():
+    """Route callers pass no cached_tokens, so route preflight credits the whole
+    hot cache. The in-stream check prices the real cached count and rejects, so
+    that backstop, not the route, is what stops an oversized cached request.
+    """
+    cached = 16384
+    scheduler = _hot_cache_credit_scheduler()
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est is not None
+    _set_held_hot_cache(scheduler, est.kv_exact)
+    limit = est.estimated - est.kv_exact
+    scheduler._memory_hard_limit_bytes = limit
+    scheduler._memory_hard_watermark_bytes = limit
+    request = _make_request(32768)
+    request.cached_tokens = cached
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)  # route: admits
+        rejection = scheduler._preflight_memory_check(request)  # stream: rejects
+    assert rejection is not None
+
+
+def test_eviction_request_target_cap_excludes_hot_cache_credit():
+    """The ladder's gain is measured against the real limit.
+
+    The credit already assumes every releasable byte is gone, so a target
+    cap of limit + credit lets a release counted inside the credit count
+    twice: the ladder declared a fit, skipped idle eviction, and the route
+    re-check then rejected the request, having shed its hot cache for
+    nothing.
+    """
+    cached = 16384
+    scheduler = _hot_cache_credit_scheduler()
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=cached, current=0
+        )
+        prefix = int(scheduler.memory_monitor.estimate_resident_kv_bytes(cached))
+    assert est is not None and prefix > 0
+    held = prefix + prefix // 4
+    _set_held_hot_cache(scheduler, held)
+    limit = est.estimated - held + prefix // 2
+    scheduler._memory_hard_limit_bytes = limit
+    scheduler._memory_hard_watermark_bytes = limit
+    with patches[0], patches[1]:
+        request = scheduler.preflight_eviction_request(
+            num_prompt_tokens=32768, cached_tokens=cached, request_id="r1"
+        )
+    assert request is not None
+    assert request.reason == "prefill_preflight"
+    assert request.target_cap_bytes == scheduler._admission_limit_bytes()
