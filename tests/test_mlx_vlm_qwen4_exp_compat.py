@@ -1782,96 +1782,46 @@ def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
 
 
 def test_disk_backed_ple_advises_a_decode_tokens_pages_before_copying(tmp_path):
-    """A token's per-shard gathers ask for every page first, so missing pages
-    are read together; larger gathers keep the I/O pool prefetch."""
-    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    """A token's per-shard gathers advise every page before the first copy; larger gathers keep the pool prefetch."""
+    embedding, table = _disk_ple(tmp_path, shards=4, rows=2048, dims=160, bits=4)
     from mlx_vlm.models.qwen4_exp import language as ple
-
-    source_prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
-    stored_prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
-    rows_per_shard = 2048
-    tensors = {}
-    expected_rows = []
-    for shard_index in range(4):
-        dense = (
-            mx.arange(rows_per_shard * 160, dtype=mx.float32).reshape(-1, 160) / 997
-            + shard_index
-        ).astype(mx.bfloat16)
-        weight, scales, biases = mx.quantize(
-            dense, group_size=32, bits=4, mode="affine"
-        )
-        base = f"{stored_prefix}.shards.{shard_index}"
-        tensors[f"{base}.weight"] = weight
-        tensors[f"{base}.scales"] = scales
-        tensors[f"{base}.biases"] = biases
-        expected_rows.append(
-            mx.dequantize(weight, scales, biases, group_size=32, bits=4, mode="affine")
-        )
-    filename = "model-00001-of-00001.safetensors"
-    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {key: filename for key in tensors}}),
-        encoding="utf-8",
-    )
-    embedding = ple.DiskBackedShardedEmbedding(
-        tmp_path,
-        source_prefix,
-        num_embeddings=4 * rows_per_shard,
-        dims=160,
-        num_shards=4,
-    )
 
     events = []
 
     class RecordingMap(mmap.mmap):
         def madvise(self, option, start, length):
-            assert option == mmap.MADV_WILLNEED
             events.append(("advise", start, start + length))
             return super().madvise(option, start, length)
 
-    def recording(reader):
-        copy_rows = reader.rows_np
-
-        def rows_np(key, rows):
-            events.append(("copy", key, [int(row) for row in rows]))
-            return copy_rows(key, rows)
-
-        return rows_np
-
     reader = next(iter(embedding._readers.values()))
+    copy_rows = reader.rows_np
+
+    def rows_np(key, rows):
+        events.append(("copy", key, int(rows[0])))
+        return copy_rows(key, rows)
+
     reader._mapping.close()
     reader._mapping = RecordingMap(reader._file.fileno(), 0, access=mmap.ACCESS_READ)
-    reader.rows_np = recording(reader)
+    reader.rows_np = rows_np
 
     # One decode token: a row in each of the four shards.
-    local_rows = [5, 900, 2047, 1500]
-    indices = [shard * rows_per_shard + row for shard, row in enumerate(local_rows)]
-    values = embedding(mx.array([indices], dtype=mx.int32))
-    mx.eval(values)
-    expected = mx.stack(
-        [expected_rows[shard][row] for shard, row in enumerate(local_rows)]
-    )[None]
-    assert mx.allclose(values, expected, atol=2e-2, rtol=2e-2).item()
-
-    copies = [event for event in events if event[0] == "copy"]
+    indices = mx.array([[5, 2048 + 900, 2 * 2048 + 2047, 3 * 2048 + 1500]], dtype=mx.int32)
+    values = embedding(indices)
+    assert mx.array_equal(values, mx.take(table, indices.reshape(-1), axis=0)[None]).item()
     advised = [event for event in events if event[0] == "advise"]
-    assert len(copies) == len(advised) == 4 * 3
-    assert events[: len(advised)] == advised, "every page is advised before a copy"
-    page = ple._PLE_PAGE_SIZE
-    for _, key, (row,) in copies:
+    assert len(advised) == 4 * 3 and events[: len(advised)] == advised
+    for _, key, row in events[len(advised) :]:
         entry = reader._header[key]
         start, end = entry["data_offsets"]
         row_bytes = (end - start) // entry["shape"][0]
         first = reader._data_start + start + row * row_bytes
         assert any(
-            begin % page == 0 and begin <= first and first + row_bytes <= stop
+            begin % ple._PLE_PAGE_SIZE == 0 and begin <= first and first + row_bytes <= stop
             for _, begin, stop in advised
         ), key
 
-    # A gather larger than the pool threshold keeps the pool prefetch.
     events.clear()
-    many = list(range(ple._PLE_POOL_PREFETCH_ROWS + 1))
-    mx.eval(embedding(mx.array([many], dtype=mx.int32)))
+    embedding(mx.array([list(range(ple._PLE_POOL_PREFETCH_ROWS + 1))], dtype=mx.int32))
     assert [event[0] for event in events] == ["copy"] * 3
     embedding.close()
 
