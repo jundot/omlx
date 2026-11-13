@@ -128,7 +128,11 @@ def apply_top_p_top_k(logprobs: mx.array, top_p: float, top_k: int) -> mx.array:
     idx = mx.take_along_axis(idx, order, axis=-1)
     probs = mx.exp(vals)
     mass_above = mx.cumsum(probs, axis=-1) - probs
-    vals = mx.where(mass_above < top_p, vals, -float("inf"))
+    # Top-p keeps every token tied with the last surviving probability.
+    cutoff = mx.min(
+        mx.where(mass_above < top_p, vals, float("inf")), axis=-1, keepdims=True
+    )
+    vals = mx.where(vals >= cutoff, vals, -float("inf"))
     out = mx.full(logprobs.shape, -float("inf"), dtype=logprobs.dtype)
     return mx.put_along_axis(out, idx, vals.astype(logprobs.dtype), axis=-1)
 
