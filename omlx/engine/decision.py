@@ -22,6 +22,7 @@ from ..engine_core import get_mlx_executor
 from ..model_discovery import decision_kind
 from ..models.clef import ClefModel
 from ..models.d1 import D1Model
+from ..models.d1_lfm2 import D1Lfm2Model
 from ..models.d3 import D3Model
 from ..models.openjev import OpenJevModel
 from ..scheduler import _CONTENDED_CHUNK_FLOOR, SchedulerConfig
@@ -35,8 +36,9 @@ _MODEL_CLASSES = {
     "openjev": OpenJevModel,
     "d3": D3Model,
     "d1": D1Model,
+    "d1_lfm2": D1Lfm2Model,
 }
-DecisionModel = ClefModel | OpenJevModel | D3Model | D1Model
+DecisionModel = ClefModel | OpenJevModel | D3Model | D1Model | D1Lfm2Model
 
 
 class DecisionEngine(BaseNonStreamingEngine):

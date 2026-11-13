@@ -36,7 +36,7 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev", "d3", "d1"]
+DecisionKind = Literal["clef", "openjev", "d3", "d1", "d1_lfm2"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -512,14 +512,26 @@ def _is_d3_decision_config(path: Path) -> bool:
         return False
 
 
+def _is_d1_config(config: dict) -> bool:
+    """True for a LiquidAI d1 config: the ``D1Model`` marker on a VL backbone.
+
+    d1 declares the marker either as its architecture or as the checkpoint's
+    remote-code ``AutoModel`` entry.
+    """
+    return "D1Model" in (config.get("architectures") or ()) or str(
+        (config.get("auto_map") or {}).get("AutoModel", "")
+    ).endswith("D1Model")
+
+
 def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
     """Return the decision-model family of a checkpoint, or None.
 
     Clef is identified by its joint head files and Decision 3.0 by its
-    readout and decision config. LiquidAI d1 declares ``D1Model`` on an
-    LFM3-VL or LFM3-Omni config. OpenJev is a plain Qwen3.5 checkpoint, so it
-    is identified by its helper directory or, for MLX conversions without the
-    helper, by the directory name.
+    readout and decision config. LiquidAI d1 declares ``D1Model`` on a VL
+    config: on an LFM3-VL or LFM3-Omni backbone it is ``d1``, on the older
+    LFM2-VL backbone (mlx-vlm's ``models.d1``) it is ``d1_lfm2``. OpenJev is a
+    plain Qwen3.5 checkpoint, so it is identified by its helper directory or,
+    for MLX conversions without the helper, by the directory name.
     """
     if (model_path / CLEF_HEAD_WEIGHTS).is_file() and (
         model_path / CLEF_HEAD_CONFIG
@@ -536,11 +548,11 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
         except (OSError, ValueError):
             return None
     model_type = config.get("model_type")
-    if model_type in {"lfm3_vl", "lfm3_omni"} and (
-        "D1Model" in (config.get("architectures") or ())
-        or str((config.get("auto_map") or {}).get("AutoModel", "")).endswith("D1Model")
-    ):
-        return "d1"
+    if _is_d1_config(config):
+        if model_type in {"lfm3_vl", "lfm3_omni"}:
+            return "d1"
+        if model_type == "lfm2_vl":
+            return "d1_lfm2"
     if model_type != "qwen3_5":
         return None
     if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
