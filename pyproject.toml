@@ -258,11 +258,13 @@ target-version = ["py311", "py312", "py313"]
 
 [tool.ruff]
 line-length = 88
-select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
-ignore = ["E501", "B905"]
 # Vendored upstream files (mlx-vlm copies under patches) keep their
 # original formatting for pin-bump diffability.
 extend-exclude = ["omlx/patches/*/vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+ignore = ["E501", "B905"]
 
 [tool.mypy]
 python_version = "3.11"
