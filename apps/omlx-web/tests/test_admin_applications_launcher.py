@@ -20,7 +20,7 @@ EN = json.loads((ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8"))
 
 # The launcher's tools and the command binding each one reveals.
 TOOL_COMMANDS = {
-    "claude": ["claudeCommand"],
+    "claude": ["claudeCodeCommandDisplay", "claudeDesktopCommand"],
     "codex": ["codexCommand", "codexAppCommand"],
     "dsh": ["dshCommand"],
     "opencode": ["opencodeCommand"],
@@ -30,6 +30,9 @@ TOOL_COMMANDS = {
     "vibe": ["vibeCommand"],
     "copilot": ["copilotCommand"],
 }
+
+# Claude's bar renders a masked command and copies the real one.
+DISPLAY_COPIES = {"claudeCodeCommandDisplay": "claudeCodeCommand"}
 
 VOID_TAGS = {
     "area",
@@ -137,13 +140,16 @@ def panels(root):
     }
 
 
+def is_command_line(node):
+    """A ``<code>`` bound to one launch command or to Claude's masked copy of it."""
+    return node.tag == "code" and node.attrs.get("x-text", "").endswith(
+        ("Command", "Display")
+    )
+
+
 def command_lines(root):
     """Every ``x-text`` launch-command binding in the rendered card."""
-    return [
-        node
-        for node in nodes(root)
-        if node.tag == "code" and node.attrs.get("x-text", "").endswith("Command")
-    ]
+    return [node for node in nodes(root) if is_command_line(node)]
 
 
 def test_every_tool_has_one_tile_and_one_panel():
@@ -212,7 +218,10 @@ def test_every_command_line_has_one_copy_button_for_that_command():
         assert (
             len(buttons) == 1
         ), f"{line.attrs['x-text']} needs exactly one copy button"
-        assert line.attrs["x-text"] in buttons[0].attrs["@click"]
+        copied = DISPLAY_COPIES.get(line.attrs["x-text"], line.attrs["x-text"])
+        assert (
+            copied in buttons[0].attrs["@click"]
+        ), f"{line.attrs['x-text']} must copy {copied}"
 
 
 def test_card_starts_collapsed_and_keeps_tool_state_locally():
@@ -227,8 +236,7 @@ def test_card_starts_collapsed_and_keeps_tool_state_locally():
 
     # Nothing outside the collapsed wrapper may bind a launch command.
     for node in nodes(card):
-        binding = node.attrs.get("x-text", "")
-        if binding.endswith("Command"):
+        if is_command_line(node):
             assert wrapper[0] in list(node.ancestors())
 
 
