@@ -264,6 +264,186 @@ def test_budget_and_local_paths_pick_identical_victims(tmp_path):
     assert results[0] == results[1]
 
 
+# --- releasable_bytes agrees with shrink_to ----------------------------------
+
+
+def _shared_owners(tmp_path, policy, n_owners, cap_entries=1000):
+    """Managers sharing one budget, recording evictions like ``_manager``."""
+    shared = SharedHotCacheBudget(cap_entries * SIZE, eviction_policy=policy)
+    owners = []
+    for i in range(n_owners):
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / f"shared_{policy}_{i}",
+            max_size_bytes=1 << 20,
+            hot_cache_max_bytes=cap_entries * SIZE,
+            hot_cache_only=True,
+            hot_cache_budget=shared,
+            hot_cache_eviction_policy=policy,
+        )
+        mgr.evicted = []
+        original = mgr._handle_hot_cache_eviction
+
+        def record(block_hash, entry, mgr=mgr, original=original):
+            mgr.evicted.append(block_hash)
+            original(block_hash, entry)
+
+        mgr._handle_hot_cache_eviction = record
+        owners.append(mgr)
+    return shared, owners
+
+
+class TestReleasableBytes:
+    """The memory enforcer and admission credit rely on releasable_bytes
+    predicting what shrink_to can actually free."""
+
+    @pytest.mark.parametrize(
+        "policy,releasable_keys",
+        [("lru", [b"A0", b"A1", b"X"]), ("chain_aware_lru", [b"X"])],
+    )
+    def test_protected_tip_keeps_its_ancestors(self, tmp_path, policy, releasable_keys):
+        shared, (mgr,) = _shared_owners(tmp_path, policy, 1)
+        for key, parent in _chain("A", 3) + [(b"X", None)]:
+            _put(mgr, key, parent)
+        size = mgr._hot_cache_entry_size(_entry())
+        protected = {b"A2"}
+        predicted = shared.releasable_bytes(protected)
+        assert predicted == len(releasable_keys) * size
+        assert shared.shrink_to(0, protected) == predicted
+        assert sorted(mgr.evicted) == sorted(releasable_keys)
+
+    def test_orphaned_chain_above_a_protected_block_is_releasable(self, tmp_path):
+        # B1's parent is not hot, so B1 is an orphan; evicting it orphans B2.
+        shared, (mgr,) = _shared_owners(tmp_path, "chain_aware_lru", 1)
+        for key, parent in [(b"B1", b"gone"), (b"B2", b"B1"), (b"B3", b"B2")]:
+            _put(mgr, key, parent)
+        size = mgr._hot_cache_entry_size(_entry())
+        assert shared.releasable_bytes({b"B3"}) == 2 * size
+        assert shared.shrink_to(0, {b"B3"}) == 2 * size
+        assert list(mgr._hot_cache) == [b"B3"]
+
+    def test_protected_block_in_the_middle_stops_the_orphan_cascade(self, tmp_path):
+        shared, (mgr,) = _shared_owners(tmp_path, "chain_aware_lru", 1)
+        for key, parent in [(b"B1", b"gone"), (b"B2", b"B1"), (b"B3", b"B2"), (b"B4", b"B3")]:
+            _put(mgr, key, parent)
+        size = mgr._hot_cache_entry_size(_entry())
+        # B1 goes (orphan); B2 is protected; B3 is pinned by protected B4.
+        protected = {b"B2", b"B4"}
+        assert shared.releasable_bytes(protected) == size
+        assert shared.shrink_to(0, protected) == size
+        assert list(mgr._hot_cache) == [b"B2", b"B3", b"B4"]
+
+    @pytest.mark.parametrize("policy", ["lru", "chain_aware_lru"])
+    @pytest.mark.parametrize("n_owners", [1, 2])
+    def test_random_forests(self, tmp_path, policy, n_owners):
+        """Random forests (shared prefixes, orphans, touches, removals) and
+        random protected sets: releasable_bytes == what shrink_to(0) frees."""
+        for seed in range(80):
+            rng = random.Random(seed)
+            shared, owners = _shared_owners(
+                tmp_path / f"s{seed}", policy, n_owners
+            )
+            keys: list[list[bytes]] = [[] for _ in owners]
+            for step in range(rng.randint(5, 40)):
+                o = rng.randrange(n_owners)
+                op = rng.choices(["put", "get", "remove"], [70, 20, 10])[0]
+                if op == "put":
+                    key = f"k{step}".encode()
+                    parent = rng.choice(keys[o] + [None, None, b"gone"]) if keys[o] else None
+                    _put(owners[o], key, parent, size=rng.choice([SIZE // 2, SIZE, 3 * SIZE]))
+                    keys[o].append(key)
+                elif op == "get" and keys[o]:
+                    owners[o]._hot_cache_get(rng.choice(keys[o]))
+                elif op == "remove" and keys[o]:
+                    owners[o]._hot_cache_remove(rng.choice(keys[o]))
+            hot = [k for mgr in owners for k in mgr._hot_cache]
+            protected = set(rng.sample(hot, rng.randint(0, len(hot)))) if hot else set()
+            predicted = shared.releasable_bytes(protected)
+            freed = shared.shrink_to(0, protected)
+            assert predicted == freed, f"seed={seed} protected={sorted(protected)}"
+            for mgr in owners:
+                mgr.close()
+
+
+# --- the default lru policy is unchanged --------------------------------------
+
+
+class _UpstreamLRU:
+    """Reference for the eviction behavior before hot_cache_eviction_policy
+    existed: strict LRU order, a lone oversized entry is kept, and shrinking
+    skips protected entries."""
+
+    def __init__(self, cap_bytes: int):
+        from collections import OrderedDict
+
+        self.cap = cap_bytes
+        self.entries: OrderedDict[bytes, int] = OrderedDict()
+        self.evicted: list[bytes] = []
+
+    @property
+    def total(self) -> int:
+        return sum(self.entries.values())
+
+    def put(self, key: bytes, size: int) -> None:
+        self.entries.pop(key, None)
+        while self.entries and self.total + size > self.cap:
+            victim, _ = self.entries.popitem(last=False)
+            self.evicted.append(victim)
+        self.entries[key] = size
+
+    def get(self, key: bytes) -> None:
+        if key in self.entries:
+            self.entries.move_to_end(key)
+
+    def remove(self, key: bytes) -> None:
+        self.entries.pop(key, None)
+
+    def shrink(self, target: int, protected: set[bytes]) -> None:
+        while self.total > target:
+            victim = next((k for k in self.entries if k not in protected), None)
+            if victim is None:
+                return
+            del self.entries[victim]
+            self.evicted.append(victim)
+
+
+def test_lru_policy_picks_the_same_victims_as_before(tmp_path, budget):
+    """With the default policy, put/get/remove/shrink sequences evict exactly
+    what plain LRU did, in the same order, whatever the parent links."""
+    for seed in range(60):
+        rng = random.Random(seed)
+        mgr = _manager(tmp_path, "lru", cap_entries=8, budget=budget, name=f"ref{seed}")
+        ref = _UpstreamLRU(mgr._effective_hot_cache_max_bytes())
+        keys: list[bytes] = []
+        for step in range(200):
+            op = rng.choices(["put", "get", "remove", "shrink"], [60, 25, 8, 7])[0]
+            if op == "put":
+                key = f"k{step}".encode() if rng.random() < 0.9 or not keys else rng.choice(keys)
+                parent = rng.choice(keys + [None, b"gone"]) if keys else None
+                entry = _entry(parent, rng.choice([SIZE // 2, SIZE, 2 * SIZE, 10 * SIZE]))
+                mgr._hot_cache_put(key, entry)
+                ref.put(key, mgr._hot_cache_entry_size(entry))
+                keys.append(key)
+            elif op == "get" and keys:
+                key = rng.choice(keys)
+                mgr._hot_cache_get(key)
+                ref.get(key)
+            elif op == "remove" and keys:
+                key = rng.choice(keys)
+                mgr._hot_cache_remove(key)
+                ref.remove(key)
+            elif op == "shrink":
+                target = rng.randint(0, 8) * SIZE
+                hot = list(mgr._hot_cache)
+                protected = set(rng.sample(hot, rng.randint(0, len(hot)))) if hot else set()
+                mgr.shrink_hot_cache_to(target, protected_hashes=protected)
+                ref.shrink(target, protected)
+            context = f"seed={seed} step={step} op={op}"
+            assert mgr.evicted == ref.evicted, context
+            assert list(mgr._hot_cache) == list(ref.entries), context
+            assert mgr._stats["hot_cache_admission_refusals"] == 0, context
+        mgr.close()
+
+
 class TestConfig:
     def test_invalid_policy_rejected(self, tmp_path):
         with pytest.raises(ValueError):

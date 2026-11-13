@@ -1731,13 +1731,39 @@ class SharedHotCacheBudget:
         return first_leaf
 
     def releasable_bytes(self, protected_hashes: set[bytes]) -> int:
-        """Bytes ``shrink_to`` can free while keeping ``protected_hashes``."""
+        """Bytes ``shrink_to`` can free while keeping ``protected_hashes``.
+
+        Under ``chain_aware_lru`` a protected entry also keeps the hot
+        ancestors it builds on (see ``_hot_pinned_hashes``), so those do not
+        count.
+        """
         with self._lock:
-            return sum(
-                entry.size_bytes
+            if self.eviction_policy != "chain_aware_lru":
+                return sum(
+                    entry.size_bytes
+                    for entry in self._entries.values()
+                    if entry.block_hash not in protected_hashes
+                )
+            entries = [
+                entry
                 for entry in self._entries.values()
                 if entry.block_hash not in protected_hashes
-            )
+            ]
+        # Owners are asked outside the budget lock: their own hot-cache lock
+        # must not nest with it.
+        pinned: dict[int, set[bytes]] = {}
+        total = 0
+        for entry in entries:
+            owner_pinned = pinned.get(id(entry.owner))
+            if owner_pinned is None:
+                pinned_fn = getattr(entry.owner, "_hot_pinned_hashes", None)
+                owner_pinned = (
+                    pinned_fn(protected_hashes) if callable(pinned_fn) else set()
+                )
+                pinned[id(entry.owner)] = owner_pinned
+            if entry.block_hash not in owner_pinned:
+                total += entry.size_bytes
+        return total
 
     def shrink_to(
         self,
@@ -2201,6 +2227,46 @@ class PagedSSDCacheManager(CacheManager):
             return False
         parent = self._hot_entry_parent(entry)
         return parent is not None and (parent not in self._hot_cache or parent in pending)
+
+    def _hot_pinned_hashes(self, protected_hashes: set[bytes]) -> set[bytes]:
+        """Unprotected hot entries chain_aware_lru cannot evict while
+        ``protected_hashes`` stay hot.
+
+        A protected entry's hot ancestors always have a hot child, so they
+        never become leaves. The exception is a chain whose topmost hot block
+        is an orphan (its parent is no longer hot): orphans are evicted
+        first, which orphans the next block down, so one shrink frees every
+        block above the nearest protected one.
+        """
+        if not self._hot_chain_aware or not protected_hashes:
+            return set()
+        pinned: set[bytes] = set()
+        with self._hot_cache_lock:
+            hot = self._hot_cache
+            for block_hash in protected_hashes:
+                entry = hot.get(block_hash)
+                if entry is None:
+                    continue
+                path: list[bytes] = []
+                seen: set[bytes] = {block_hash}
+                parent = self._hot_entry_parent(entry)
+                while (
+                    parent is not None
+                    and parent in hot
+                    and parent not in protected_hashes
+                    and parent not in pinned
+                    and parent not in seen
+                ):
+                    path.append(parent)
+                    seen.add(parent)
+                    parent = self._hot_entry_parent(hot[parent])
+                # Stopped at the root (parent None), at a block that stays
+                # (protected, already pinned, or a cycle), or at a parent that
+                # is no longer hot: only that last case lets the orphan
+                # cascade free the path.
+                if parent is None or parent in hot:
+                    pinned.update(path)
+        return pinned
 
     def _hot_pick_victim_locked(
         self,
