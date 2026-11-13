@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import resource
 import subprocess
 import tempfile
 import time
@@ -22,6 +21,7 @@ from pathlib import Path
 
 from .base import BaseBenchmark
 from .datasets import deterministic_sample, load_jsonl
+from .sandbox import limited_python_command
 
 logger = logging.getLogger(__name__)
 
@@ -64,18 +64,6 @@ def _extract_code(response: str) -> str:
     return "\n".join(code_lines) if code_lines else response.strip()
 
 
-def _set_resource_limits():
-    """Set resource limits for subprocess. Called via preexec_fn."""
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (EXEC_MEMORY_LIMIT_BYTES, EXEC_MEMORY_LIMIT_BYTES))
-    except (ValueError, resource.error):
-        pass
-    try:
-        resource.setrlimit(resource.RLIMIT_CPU, (EXEC_TIMEOUT_SECONDS + 5, EXEC_TIMEOUT_SECONDS + 5))
-    except (ValueError, resource.error):
-        pass
-
-
 # Starter signatures use typing names such as `List`.
 _FUNCTIONAL_PREAMBLE = "from typing import *\nimport json\n"
 
@@ -114,12 +102,13 @@ def _execute_code(code: str, stdin_input: str = "") -> tuple[str, bool, str]:
 
     try:
         result = subprocess.run(
-            ["python3", tmp_path],
+            limited_python_command(
+                tmp_path, EXEC_MEMORY_LIMIT_BYTES, EXEC_TIMEOUT_SECONDS + 5
+            ),
             input=stdin_input,
             capture_output=True,
             text=True,
             timeout=EXEC_TIMEOUT_SECONDS,
-            preexec_fn=_set_resource_limits,
             env={
                 "PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"),
                 "HOME": os.environ.get("HOME", "/tmp"),
