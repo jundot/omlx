@@ -3803,9 +3803,8 @@ async def _create_markitdown_chat_completion(
     )
 
 
-@app.get("/v1/models", response_model=None)
-async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
-    """List all available models with load status."""
+async def _list_visible_models() -> list[ModelInfo]:
+    """Build the visible model list shared by /v1/models and its retrieve route."""
     models = []
     favorite_ids: set[str] = set()
 
@@ -3959,6 +3958,14 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
     if favorite_ids:
         models.sort(key=lambda m: m.id not in favorite_ids)
 
+    return models
+
+
+@app.get("/v1/models", response_model=None)
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
+    """List all available models with load status."""
+    models = await _list_visible_models()
+
     # Serialize explicitly: FastAPI's jsonable_encoder and the
     # ``ModelsResponse`` container both serialize items as the base
     # ``ModelInfo`` (dropping the tier metadata), while a route-level
@@ -4023,6 +4030,17 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["is_hidden"] = False
         m["max_tokens"] = max_tokens
     return status
+
+
+@app.get("/v1/models/{model_id}", response_model=None)
+async def retrieve_model(
+    model_id: str, _: bool = Depends(verify_inference_api_key)
+) -> JSONResponse:
+    """Return one visible model, matching an OpenAI retrieve call."""
+    for model in await _list_visible_models():
+        if model.id == model_id:
+            return JSONResponse(content=model.model_dump())
+    raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
 
 @app.post("/v1/models/{model_id}/unload")
