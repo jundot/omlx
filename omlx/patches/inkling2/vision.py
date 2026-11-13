@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 vision tower (checkpoint ``model.visual.*``).
 
-A ViT over 20 px patches with an axial 2D rotary embedding on interleaved
-channel pairs, a learned 32 x 32 position table resampled bilinearly to each
-image's patch grid, and one class token per image (attention stays inside
-each image). Every 2 x 2 block of patches is one language-model image token:
-the merger concatenates the block's patch states and projects them to the
-text hidden size with a two-layer GELU MLP.
-
-The image processor hands over one ``40 x 40`` pixel block per image token,
-in raster order, plus ``image_grid_thw`` = (1, rows, columns) per image.
+A ViT with axial 2D RoPE on interleaved channel pairs, a 32 x 32 position table
+resampled bilinearly to each image, and one class token per image. Each 2 x 2
+patch block becomes one image token; the processor sends one 40 px pixel block
+per image token in raster order.
 """
 
 from __future__ import annotations
@@ -40,7 +35,6 @@ class VisionArgs:
     def from_dict(cls, params: dict) -> VisionArgs:
         names = cls.__dataclass_fields__
         args = cls(**{k: v for k, v in params.items() if k in names})
-        # Checkpoint configs use the original names.
         if "native_patch_size" in params:
             args.patch_size = int(params["native_patch_size"])
         if "adapter_merge_size" in params:

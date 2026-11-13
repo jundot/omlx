@@ -431,7 +431,7 @@ def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
     for i0 in range(0, length, qb):
         i1 = min(length, i0 + qb)
         nq = i1 - i0
-        a0 = s - length + i0  # key index of the first query
+        a0 = s - length + i0
         hi = s - length + i1
         f = max(lo, a0 - r + 1)
         near = hi - f

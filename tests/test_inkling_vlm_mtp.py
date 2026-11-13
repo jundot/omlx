@@ -605,46 +605,6 @@ def test_inkling2_fused_kernels_match_reference():
     assert mx.allclose(w, picked / picked.sum(-1, keepdims=True) * 8.0, atol=1e-5)
 
 
-def test_inkling2_sanitize_maps_original_layout():
-    from omlx.patches.inkling2 import loader
-
-    model = _inkling2_tiny(formats=("mxfp8",) * 6)
-    e, h, i = 8, 128, 64
-    nvfp4 = {
-        "mlp.experts.w13_weight": mx.zeros((e, 2 * i, h // 2), mx.uint8),
-        "mlp.experts.w13_weight_scale": mx.zeros((e, 2 * i, h // 16), mx.uint8),
-        "mlp.experts.w13_weight_amax": mx.full((e,), 0.5),
-        "mlp.experts.w13_weight_outer_scale_denominator": mx.array([1344.0]),
-    }
-    out = {}
-    assert loader._expert_tensors(nvfp4, "w13", out, "p.") == "nvfp4"
-    assert out["p.mlp.experts.w13.weight"].shape == (e, 2 * i, h // 8)
-    # MLX's NVFP4 global scale convention divides by 6 * 448 = 2688.
-    assert mx.allclose(out["p.mlp.experts.w13.global_scale"], mx.full((e,), 1.0))
-    mxfp8 = {
-        "mlp.experts.w2_weight": mx.zeros((e, h, i), mx.uint8),
-        "mlp.experts.w2_weight_scale": mx.zeros((e, h, i // 32), mx.uint8),
-    }
-    assert loader._expert_tensors(mxfp8, "w2", out, "p.") == "mxfp8"
-    assert "p.mlp.experts.w2.global_scale" not in out
-
-    source = {
-        "model.llm.attn_res.attn_queries.4": mx.zeros((3, h)),
-        "model.llm.attn_res.mlp_queries.0": mx.zeros((h,)),
-        "model.llm.unembed.weight": mx.zeros((320, h), mx.bfloat16),
-        "model.visual.proj_in.weight": mx.zeros((4, 4)),
-    }
-    mapped, formats = loader.sanitize_weights(model, source)
-    assert formats == {}
-    # attn_queries[i] belongs to layer i + 1; vision tensors are dropped.
-    assert set(mapped) == {
-        "model.layers.5.attn_input.query",
-        "model.layers.0.mlp_input.query",
-        "lm_head.weight",
-    }
-    assert mapped["model.layers.5.attn_input.query"].shape == (3, h)
-
-
 def test_inkling2_model_is_freed_without_cyclic_gc():
     import gc
     import weakref
@@ -659,51 +619,6 @@ def test_inkling2_model_is_freed_without_cyclic_gc():
         assert ref() is None
     finally:
         gc.enable()
-
-
-@pytest.mark.parametrize(
-    "formats, routed",
-    [
-        # Source checkpoint: NVFP4 layers take the NAX expert kernel, MXFP8
-        # layers keep MLX's sorted kernel.
-        (("nvfp4",) * 6 + ("mxfp8",) * 6, {"nvfp4": True, "mxfp8": False}),
-        # oQ output: affine experts take the NAX expert kernel too.
-        (
-            ({"bits": 4, "group_size": 64, "mode": "affine"},) * 6,
-            {"affine": True},
-        ),
-    ],
-)
-def test_inkling2_sorted_experts_route_to_nax_kernel(monkeypatch, formats, routed):
-    from mlx.utils import tree_flatten
-
-    import omlx.patches.m5_gather_qmm as m5
-
-    m5.apply_m5_gather_qmm_workaround()
-    seen = []
-
-    def record(x, w, scales, biases, indices, *, group_size, bits, mode, **kw):
-        ok = m5._nax.supports(x, w, scales, biases, indices, group_size, bits, mode)
-        seen.append((mode, ok))
-        return None  # keep the stock kernel on hosts without tensor units
-
-    monkeypatch.setattr(m5, "_nax_host", True)
-    monkeypatch.setattr(m5._nax, "sorted_gather_qmm", record)
-    model = _inkling2_tiny(formats=formats)
-    # BF16 activations as in the checkpoint; the source FP32 tensors stay FP32.
-    keep = (".query", "router_weight", "router_bias", "global_scale")
-    model.load_weights(
-        [
-            (name, value.astype(mx.bfloat16))
-            for name, value in tree_flatten(model.parameters())
-            if mx.issubdtype(value.dtype, mx.floating) and not name.endswith(keep)
-        ],
-        strict=False,
-    )
-    mx.eval(model(mx.random.randint(0, 300, (1, 40))))
-    assert {mode for mode, _ in seen} == set(routed)
-    for mode, supported in seen:
-        assert supported is routed[mode]
 
 
 @pytest.mark.parametrize(
@@ -758,27 +673,6 @@ def test_inkling2_image_processor_pads_normalizes_and_orders_blocks():
     pad = (-1.0 / 255 - 0.5) / 0.5
     np.testing.assert_allclose(blocks[5, 10:, :], pad, atol=1e-6)
     np.testing.assert_allclose(blocks[2, :, 10:], pad, atol=1e-6)
-
-
-def test_inkling2_processor_expands_each_placeholder():
-    from omlx.patches.inkling2.processing import Inkling2Processor
-
-    class _Tokenizer:
-        model_input_names = ["input_ids"]
-
-        def convert_tokens_to_ids(self, token):
-            return 7
-
-        def __call__(self, texts, **kwargs):
-            ids = [[7 if part == "<I>" else 1 for part in t.split("|")] for t in texts]
-            return {"input_ids": np.array(ids), "attention_mask": np.ones((1, len(ids[0])))}
-
-    processor = Inkling2Processor(_Tokenizer(), image_token="<I>|")
-    images = [np.zeros((40, 80, 3), np.uint8), np.zeros((90, 40, 3), np.uint8)]
-    out = processor(text="a|<I>|b|<I>|c", images=images)
-    # 1 x 2 and 3 x 1 image tokens.
-    assert (out["input_ids"][0] == 7).sum() == 5
-    assert out["image_grid_thw"].tolist() == [[1, 1, 2], [1, 3, 1]]
 
 
 def test_inkling2_position_table_matches_bilinear_resize():

@@ -1,19 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Routed-expert source tensors of Inkling 2 as oQ's logical tensors.
 
-The source stores each routed projection as ``<proj>_weight`` plus
-``<proj>_weight_scale`` and, for NVFP4 layers, a per-expert ``_amax`` and a
-shared ``_outer_scale_denominator``. The runtime reads MLX's carriers instead:
-the codes viewed as ``uint32``, the block scales, and the amax in MLX's
-convention. ``view`` and the tensor-by-tensor scale are not ops oQ's streaming
-plan can replay, so they happen here, where the source tensors are read.
-
-Each projection becomes a logical ``<proj>.weight`` that can be written
-unchanged (``load_packed``) or requantized from its dequantized value
-(``materialize``), plus ``<proj>.global_scale`` for NVFP4 layers. The
-dequantized value leaves the tensor scale to the caller, like Muse Spark's
-experts: oQ folds it in when it requantizes and keeps it when it passes the
-codes through.
+The runtime needs the codes viewed as ``uint32`` and the amax in MLX's
+convention, which oQ's streaming plan cannot replay, so both happen here as the
+source is read. Each projection becomes ``<proj>.weight`` (passed through or
+requantized) plus ``<proj>.global_scale`` for NVFP4; the dequantized value
+leaves the tensor scale to the caller.
 """
 
 from __future__ import annotations

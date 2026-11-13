@@ -1,19 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """oQ's Inkling 2 layout: the source checkpoint mapped to the runtime layout.
 
-The source keeps the ``model.llm.*`` names. oQ writes the layout that the
-runtime model loads, so ``sanitizer`` stacks the attention projections that
-share an input, moves the attention-residual queries onto their layers and
-renames the rest. It only uses the ops oQ's streaming plan can replay. The
-routed experts need ops it cannot replay (``view`` and a tensor-by-tensor
-scale), so ``oq_virtual`` exposes them as ``.weight`` and ``.global_scale``
-tensors before this mapping runs.
-
-Calibration runs on the packed source model, resident, through the runtime
-model (the source is about 390 GB of 4/8-bit experts, and no proxy is smaller).
-The helpers below give oQ's layer walk what that model needs: Inkling 2 layers
-exchange the completed attention-residual blocks, so the walk carries them, and
-the head input is the last layer's mixture over all blocks.
+``sanitizer`` uses only ops oQ's streaming plan can replay; ``oq_virtual``
+exposes the routed experts before it runs. Calibration runs on the packed
+source model (no proxy would be smaller), and the walk helpers carry the
+completed attention-residual blocks between layers.
 """
 
 from __future__ import annotations

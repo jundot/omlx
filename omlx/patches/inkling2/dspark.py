@@ -1,24 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bundled DSpark drafter for Inkling 2 (``mtp.safetensors``).
 
-The draft is a five-layer DFlash-style block model:
+A five-layer block drafter. Each layer mixes the target's context taps (the
+partial block sums entering ``target_layer_ids[:-1]`` and the final-norm
+output) with its own softmax weights and projects them to context K/V. The
+block attends to that context and to itself in both directions, and the mask
+positions propose through the target LM head plus an RNN Markov head.
 
-- the target's partial block sums entering layers ``target_layer_ids[:-1]``
-  plus its final-norm output are the context taps; every draft layer mixes
-  them with its own softmax weights (``fuse_weight`` row) and RMS norm
-  (``dflare_norm``) and projects the mix into context K/V with dedicated
-  ``k_proj_ctx``/``v_proj_ctx``/``k_norm_ctx``;
-- the block ``[anchor, mask x (block_size - 1)]`` attends to that context and
-  to itself in both directions through Qwen3-style layers (q/k norms, RoPE,
-  SiLU MLP);
-- the mask positions propose tokens through the target LM head plus an RNN
-  Markov head whose state starts from the last committed position's taps
-  (the last ``fuse_weight`` row); step logits are
-  ``softcap(lm_head(h) + bias)``.
-
-Layers in ``local_layer_ids`` attend the context window ending at the anchor.
-The drafter keeps that window for every layer, so the full-attention layer
-also sees only the newest ``sliding_window_size - 1`` context positions.
+Every layer, including the full-attention one, sees only the newest
+``sliding_window_size - 1`` context positions.
 """
 
 from __future__ import annotations
@@ -318,7 +308,6 @@ class Inkling2DSparkModel(nn.Module):
         return self._embed_fn(tokens)
 
     def _logits(self, hidden: mx.array) -> mx.array:
-        # Raw head logits; the Markov step adds its bias and the softcap.
         return self._lm_head_fn(hidden)
 
 

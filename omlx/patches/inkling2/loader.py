@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Checkpoint name and layout mapping for Inkling 2.
+"""Map the published Inkling 2 checkpoint to the runtime layout.
 
-The published checkpoint keeps its original ``model.llm.*`` names. Attention
-projections that share an input are stacked into one matrix here, the
-attention-residual query lists are moved onto their layers, and the routed
-expert codes are viewed as MLX ``uint32`` carriers without re-rounding.
+Attention projections that share an input are stacked, the attention-residual
+queries move onto their layers, and the expert codes are viewed as MLX
+``uint32`` carriers without re-rounding.
 """
 
 from __future__ import annotations

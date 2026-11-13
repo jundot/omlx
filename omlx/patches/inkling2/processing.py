@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Torch-free Inkling 2 image processor and processor.
+"""Torch-free port of transformers' Inkling 2 image processor and processor.
 
-Port of transformers' ``Inkling2ImageProcessor``/``Inkling2Processor``: no
-resizing; each image is padded on the right and bottom to a multiple of the
-40 px image-token block (fill -1 on the 0-255 scale, before normalization),
-normalized to [-1, 1] and cut into one block per image token in raster order.
-Transparent images are composited over an 8 px checkerboard first. The chat
-template emits one ``<|unused_200054|>`` per image, which the processor
-expands to ``rows * columns`` image tokens.
+Images are not resized: they are padded right and bottom to 40 px blocks (fill
+-1 on the 0-255 scale, before normalization), normalized to [-1, 1] and cut
+into one block per image token. Transparent images are composited over a
+checkerboard first.
 """
 
 from __future__ import annotations

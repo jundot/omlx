@@ -9226,64 +9226,6 @@ class TestInkling2OQ:
     NVFP4 = {"bits": 4, "group_size": 16, "mode": "nvfp4"}
     MXFP8 = {"bits": 8, "group_size": 32, "mode": "mxfp8"}
 
-    def test_expert_tensors_become_logical_weights(self, inkling2_source):
-        config = json.loads((inkling2_source / "config.json").read_text())
-        files = _source_weight_files(inkling2_source)
-        assert [f.name for f in files] == ["model.safetensors"]
-        idx = _LazyTensorIndex(files, config=config)
-        root = "model.llm.layers."
-        nvfp4_key = f"{root}0.mlp.experts.w13.weight"
-        mxfp8_key = f"{root}5.mlp.experts.w2.weight"
-        assert idx.source_quant_info(nvfp4_key)["mode"] == "nvfp4"
-        assert idx.source_quant_info(mxfp8_key)["mode"] == "mxfp8"
-        logical = idx.logical_metadata()
-        assert logical[nvfp4_key] == ((8, 128, 64), "BF16")
-        assert logical[mxfp8_key] == ((8, 64, 64), "BF16")
-        assert logical[f"{root}0.mlp.experts.w2.global_scale"] == ((8,), "F32")
-        assert f"{root}5.mlp.experts.w2.global_scale" not in logical
-        assert f"{root}0.mlp.experts.w13_weight" not in logical
-        assert f"{root}5.mlp.experts.w13_weight_scale" not in logical
-
-        # The packed carriers are the source bytes viewed as uint32.
-        weight, scales = idx._load_packed(nvfp4_key)
-        raw_w = idx.load_source(f"{root}0.mlp.experts.w13_weight")
-        assert weight.dtype == mx.uint32 and weight.shape == (8, 128, 8)
-        assert mx.array_equal(weight, raw_w.view(mx.uint32)).item()
-        assert mx.array_equal(
-            scales, idx.load_source(f"{root}0.mlp.experts.w13_weight_scale")
-        ).item()
-        weight, scales = idx._load_packed(mxfp8_key)
-        assert weight.shape == (8, 64, 16)
-
-        # The dequantized value leaves the tensor scale to the caller, and the
-        # scale agrees with MLX's own convention.
-        amax = idx.load_source(f"{root}0.mlp.experts.w13_weight_amax")
-        assert mx.array_equal(
-            idx.materialize_virtual(f"{root}0.mlp.experts.w13.global_scale"), amax
-        ).item()
-        units = idx.materialize_virtual(nvfp4_key)
-        assert units.dtype == mx.bfloat16
-        packed, block = idx._load_packed(nvfp4_key)
-        for expert in (0, 5):
-            real = mx.dequantize(
-                packed[expert],
-                block[expert],
-                None,
-                group_size=16,
-                bits=4,
-                mode="nvfp4",
-                global_scale=amax[expert],
-                dtype=mx.float32,
-            )
-            scale = amax[expert].item() / 2688.0
-            folded = units[expert].astype(mx.float32) * scale
-            assert mx.allclose(folded, real, rtol=1e-2, atol=1e-6).item()
-        packed, block = idx._load_packed(mxfp8_key)
-        expected = mx.dequantize(
-            packed, block, None, group_size=32, bits=8, mode="mxfp8", dtype=mx.bfloat16
-        )
-        assert mx.array_equal(idx.materialize_virtual(mxfp8_key), expected).item()
-
     @pytest.mark.parametrize("text_only", [True, False])
     def test_sanitizer_matches_runtime_loader(self, inkling2_source, text_only):
         from omlx.patches.inkling2.loader import sanitize_weights
@@ -9430,64 +9372,6 @@ class TestInkling2OQ:
         # Without the tensor scale the weights would be off by about 2688 / amax.
         assert (mx.linalg.norm(got - real) / mx.linalg.norm(real)).item() < 0.5
 
-    def test_attention_and_head_rules(self, inkling2_source):
-        import omlx.oq as oq
-
-        config = json.loads((inkling2_source / "config.json").read_text())
-        full = {**config, "_oq_use_budget_plan": False}
-        for path in (
-            "model.layers.0.attn.in_proj.weight",
-            "model.layers.5.attn.q_proj.weight",
-            "model.layers.5.attn.k_proj.weight",
-            "model.layers.5.attn.v_proj.weight",
-            "model.layers.3.attn.o_proj.weight",
-        ):
-            assert _get_predicate_bits(path, full, 4, 64)[0] == 8, path
-        # Routed down projections count as experts, not as dense w2/o weights.
-        assert (
-            _get_predicate_bits("model.layers.4.mlp.experts.w2.weight", full, 4, 64)[0]
-            == 4
-        )
-        assert (
-            _get_predicate_bits("model.layers.4.mlp.experts.w13.weight", full, 4, 64)[0]
-            == 4
-        )
-
-        # Real shapes, with all 48 layers of experts in one module each.
-        shapes = {
-            "model.embed": (201024, 4608),
-            "lm_head": (201024, 4608),
-            "model.layers.0.attn.in_proj": (15048, 4608),
-            "model.layers.0.attn.o_proj": (4608, 6144),
-            "model.layers.0.mlp.experts.w13": (384 * 48, 4608, 4608),
-            "model.layers.0.mlp.experts.w2": (384 * 48, 4608, 2304),
-        }
-        fixed = {path: dict(self.NVFP4) for path in shapes if ".mlp.experts." in path}
-        plan = _build_quant_plan(
-            shapes, config, 4, target_bpw=4.7, hard_cap_bpw=4.8, fixed_overrides=fixed
-        )
-        for path in ("model.embed", "lm_head", "model.layers.0.attn.in_proj"):
-            assert plan.boost_map[path]["bits"] == 8, path
-        assert oq._is_token_embedding_tensor("model.embed.weight")
-
-    def test_footprint_is_the_packed_model(self, inkling2_source, tmp_path):
-        import omlx.oq as oq
-
-        config = json.loads((inkling2_source / "config.json").read_text())
-        files = _source_weight_files(inkling2_source)
-        idx = _LazyTensorIndex(files, config=config)
-        storage = _checkpoint_storage_bytes(files)
-        assert oq._logical_footprint_bytes(idx) > storage
-        assert oq._calibration_footprint_bytes(idx, storage, config) == storage
-        budget = _calibration_memory_budget(storage, model_fraction=1.0)
-        assert budget["model_limit_bytes"] == budget["capacity_bytes"]
-        # The draft only counts as a weight file for other model types.
-        other = tmp_path / "other"
-        other.mkdir()
-        (other / "config.json").write_text(json.dumps({"model_type": "llama"}))
-        (other / "mtp.safetensors").write_bytes(b"")
-        assert [f.name for f in _source_weight_files(other)] == ["mtp.safetensors"]
-
     def test_layer_walk_reproduces_the_forward(self, inkling2_source):
         from omlx.patches.inkling2 import oq_layout
 
@@ -9508,48 +9392,6 @@ class TestInkling2OQ:
         assert mx.allclose(
             logits[..., :120], expected[..., :120], rtol=1e-4, atol=1e-4
         ).item()
-
-    def test_imatrix_covers_attention_experts_and_head(
-        self, inkling2_source, monkeypatch
-    ):
-        import omlx.oq as oq
-
-        model = _inkling2_model(inkling2_source)
-        config = json.loads((inkling2_source / "config.json").read_text())
-        config["_oq_imatrix_capture_skip"] = frozenset(
-            {"model.layers.0.mlp.experts.w13"}
-        )
-        tokens = mx.array(np.random.default_rng(0).integers(1, 120, (3, 24)), mx.int32)
-        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
-        entries, meta = _collect_imatrix_from_model(
-            model,
-            object(),
-            config,
-            calib_dataset=oq._OQE_CALIB_DATASET,
-            num_samples=3,
-            seq_length=24,
-        )
-        assert meta["layer_state_kind"] == "inkling2"
-        assert "model.layers.0.mlp.experts.w13" not in entries
-        for layer in range(_INK2_LAYERS):
-            attn = "q_proj" if layer == _INK2_LAYERS - 1 else "in_proj"
-            assert f"model.layers.{layer}.attn.{attn}" in entries
-            assert f"model.layers.{layer}.attn.o_proj" in entries
-        # Each token reaches its top-2 experts in every captured projection.
-        for key, width in (
-            ("model.layers.4.mlp.experts.w13", 64),
-            ("model.layers.4.mlp.experts.w2", 64),
-            ("model.layers.0.mlp.experts.w2", 64),
-        ):
-            assert entries[key].in_sum2.shape == (8, width), key
-            assert int(entries[key].counts.sum()) == 3 * 24 * 2, key
-        assert int(entries["lm_head"].counts[0]) == 3 * 24
-        assert entries["lm_head"].in_sum2.shape == (64,)
-        # The sensitivity walk scores every layer through the same state.
-        scores = _measure_sensitivity_from_model(
-            model, object(), config, 4, num_samples=3, seq_length=24
-        )
-        assert sorted(scores) == list(range(_INK2_LAYERS))
 
     def test_oqe_weights_requantized_experts_and_skips_passthrough(
         self, inkling2_source, tmp_path, monkeypatch

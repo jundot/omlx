@@ -1,24 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 model (mlx-lm module registered as ``inkling2``).
 
-The vision tower is in ``vision.py``; image features replace the image-token
-embeddings before the decoder.
-
-Architecture notes (from the transformers ``inkling2`` reference):
-
-- Attention residuals: decoder layers exchange a *partial block sum* instead of
-  a plain residual stream. Every ``n_layers_per_attn_res_block`` layers the
-  incoming partial sum becomes a completed block. Attention and MLP inputs are
-  a softmax mixture over the RMS-normalized completed blocks plus the current
-  partial sum, driven by learned per-layer queries (full layers use three
-  queries, one each for the q, k and v inputs).
-- No RoPE. Position comes from short causal convolutions on k/v and on the
-  sublayer outputs, and from a per-token relative bias over the last
-  ``rel_extent`` keys (``r @ rel_proj`` indexed by backward distance).
-- Every attention row has an input-dependent sink logit (zero value).
-- Routed experts ship in NVFP4 (layers 0-39, with a per-expert FP32 tensor
-  scale applied after the matmul) and MXFP8 (layers 40-47). The packed codes
-  and block scales are used as-is through MLX's native carriers.
+- Attention residuals: layers exchange a partial block sum, which becomes a
+  completed block every ``n_layers_per_attn_res_block`` layers. Attention and
+  MLP inputs are learned softmax mixtures over the RMS-normalized blocks.
+- No RoPE: position comes from short causal convolutions and a relative bias
+  over the last ``rel_extent`` keys. Every attention row has a sink logit.
+- Routed experts keep the checkpoint's NVFP4 and MXFP8 codes in MLX's native
+  carriers; the NVFP4 tensor scale is applied after the matmul.
 """
 
 from __future__ import annotations
@@ -256,7 +245,6 @@ class Inkling2Experts(nn.Module):
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
-        # x: [N, H] bf16, inds/weights: [N, K]
         xe = mx.expand_dims(x, (-2, -3))
         do_sort = inds.size >= 64
         idx = inds

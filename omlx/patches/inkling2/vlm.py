@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Serve Inkling 2 on the VLM engine.
-
-The model is the mlx-lm module (``omlx.patches.inkling2.model``) with its
-vision tower. ``Model`` adds the mlx-vlm interface the VLM engine calls:
-``language_model``, ``get_input_embeddings`` and ``encode_image`` for the
-pixel blocks and ``image_grid_thw`` of the Inkling 2 processor.
-"""
+"""Serve the mlx-lm Inkling 2 module on the VLM engine through mlx-vlm's model
+interface."""
 
 from __future__ import annotations
 
@@ -60,7 +55,6 @@ class _LanguageModel:
         return self._model.args.text
 
     def __getattr__(self, name):
-        # model, layers, make_cache and the speculative rollback hooks.
         return getattr(self._model, name)
 
 
