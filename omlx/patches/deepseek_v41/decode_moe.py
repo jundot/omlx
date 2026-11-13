@@ -563,8 +563,8 @@ inline void aff_mma16(W w, S s, B b, uint r0, X x, uint XS, uint lane, uint ks,
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 // Top-k of scores + bias with ties to the lower index (any tie order is spec-conformant).
-template <int NE, int K>
-inline void topk_select(const device float* scores, const device float* bias, threadgroup int* chosen, uint tid) {
+template <int NE, int K, typename S, typename B>
+inline void topk_select(S scores, B bias, threadgroup int* chosen, uint tid) {
     // Simdgroup 0 keeps the biased scores in registers (lane l holds experts l + 32 i) and takes
     // the K maxima in turn, ties to the lower index; taken experts read as -inf.
     constexpr int PER = (NE + 31) / 32;
@@ -602,10 +602,10 @@ _GATE = r"""
     if (row < uint(NE)) {
         float dot[NB];
         for (int b = 0; b < NB; ++b) dot[b] = 0.0f;
-        const device bfloat16_t* wr = w + row * DIM;
+        const auto wr = w + row * DIM;
         for (uint k = part * (DIM / KS) + lane * 8; k < (part + 1) * (DIM / KS); k += 256) {
-            const float4 w0 = float4(*(const device packed_bfloat4*)(wr + k));
-            const float4 w1 = float4(*(const device packed_bfloat4*)(wr + k + 4));
+            const float4 w0 = float4(wr[k], wr[k+1], wr[k+2], wr[k+3]);
+            const float4 w1 = float4(wr[k+4], wr[k+5], wr[k+6], wr[k+7]);
             for (int b = 0; b < NB; ++b) {
                 const auto xb = x + b * DIM;
                 const float4 a0 = float4(*(const device packed_bfloat4*)(xb + k));
@@ -637,8 +637,12 @@ _GATE = r"""
     for (uint gb = group; gb < uint(NB * (DIM / 32)); gb += NGROUPS_STRIDE) {
         const uint b = gb / (DIM / 32), g = gb % (DIM / 32);
         const float v = float(x[b * DIM + g * 32 + lane]);
-        const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-        xq[b * DIM + g * 32 + lane] = act_quant_value(v, s);
+        if (QUANTIZE_INPUT) {
+            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
+            xq[b * DIM + g * 32 + lane] = act_quant_value(v, s);
+        } else {
+            xq[b * DIM + g * 32 + lane] = v;
+        }
     }
 """
 
@@ -681,7 +685,7 @@ _UP = r"""
     if (sg == 0) {   // act_quant over this 32-row block (the w2 input's quantization group)
         const float v = hblock[lane];
         const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-        hq[slot * INTER + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+        hq[slot * INTER + threadgroup_position_in_grid.x * 32 + lane] = slot < uint(TOPK) ? R2_ACT(v, s) : S2_ACT(v, s);
     }
 """
 
@@ -728,7 +732,7 @@ _UP_NB = r"""
     const uint row0 = rb * 32 + sg * 4;
     if (ys < uint(NB * TOPK)) {
         const uint b = ys / TOPK, slot = ys % TOPK;
-        const device float* sc_b = scores + b * NE;
+        const auto sc_b = scores + b * NE;
         topk_select<NE, TOPK>(sc_b, bias, chosen, tid);
         float wsum = 0.0f;
         for (int j = 0; j < TOPK; ++j) wsum += sc_b[chosen[j]];
@@ -753,7 +757,7 @@ _UP_NB = r"""
         if (sg == 0) {
             const float v = hblock[0][lane];
             const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = act_quant_value(v, s);
+            hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = R2_ACT(v, s);
         }
     } else {
         float g4[4 * NB], u4[4 * NB];
@@ -769,7 +773,7 @@ _UP_NB = r"""
         for (uint v = sg; v < uint(NB); v += 8) {
             const float y = hblock[v][lane];
             const float s = act_scale(max(simd_max(abs(y)), 1e-4f));
-            hqs[v * INTER + rb * 32 + lane] = act_quant_value(y, s);
+            hqs[v * INTER + rb * 32 + lane] = S2_ACT(y, s);
         }
     }
 """
@@ -783,7 +787,7 @@ _UP_NB_MMA = r"""
     const uint row0 = rb * 32 + sg * 4;
     if (ys < uint(NB * TOPK)) {
         const uint b = ys / TOPK, slot = ys % TOPK;
-        const device float* sc_b = scores + b * NE;
+        const auto sc_b = scores + b * NE;
         topk_select<NE, TOPK>(sc_b, bias, chosen, tid);
         float wsum = 0.0f;
         for (int j = 0; j < TOPK; ++j) wsum += sc_b[chosen[j]];
@@ -808,7 +812,7 @@ _UP_NB_MMA = r"""
         if (sg == 0) {
             const float v = hblock[0][lane];
             const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = act_quant_value(v, s);
+            hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = R2_ACT(v, s);
         }
     } else {
         // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups,
@@ -834,7 +838,7 @@ _UP_NB_MMA = r"""
         for (uint v = sg; v < uint(NB); v += 8) {
             const float y = hblock[v][lane];
             const float s = act_scale(max(simd_max(abs(y)), 1e-4f));
-            hqs[v * INTER + rb * 32 + lane] = act_quant_value(y, s);
+            hqs[v * INTER + rb * 32 + lane] = S2_ACT(y, s);
         }
     }
 """
@@ -903,8 +907,12 @@ def use_mma(nb):
 
 def weight_format(p):
     """(mode, bits, group_size) of a projection the fused kernels read, or None: MXFP8 /
-    MXFP4 with group 32, or affine (oQ exports) with bf16 / fp16 scales and biases."""
+    MXFP4 with group 32, affine (oQ exports), or packed GGUF (bits holds its qtype)."""
     mode = getattr(p, "mode", None)
+    if mode == "gguf":
+        from .gguf import FORMATS
+
+        return (mode, p.qtype, FORMATS[p.qtype][0])
     if p is None or not getattr(p, "quantize_input", True):
         return None
     if mode in ("mxfp8", "mxfp4"):
@@ -926,9 +934,24 @@ def format_macros(roles):
     """Per-role weight access for the kernel sources: <role>_WPR(K) uint32 words and
     <role>_SPR(K) scales per row, <role>_ROWS / <role>_ROWS_NB / <role>_MMA8 the row dot
     products (one vector, NB vectors, NB vectors on simdgroup matrices)."""
+    roles = tuple(roles)
     lines = []
+    if any(fmt[0] == "gguf" for _, fmt in roles):
+        from .gguf_quant import header
+
+        lines.append(header())
     for role, (mode, bits, gs) in roles:
-        if mode == "affine":
+        if mode == "gguf":
+            from .gguf import FORMATS
+
+            block, size, _ = FORMATS[bits]
+            wpr, spr = f"((K_) / {block} * {size})", "0"
+            args = f"{bits}, {block}, {size}"
+            rows = f"gguf_rows_nb<K_, R_, 1, {args}>(w_, r0_, x_, K_, l_, acc_)"
+            nb = f"gguf_rows_nb<K_, R_, NB_, {args}>(w_, r0_, x_, xs_, l_, acc_)"
+            mma = f"gguf_mma8<K_, KS_, NB_, {args}>(w_, r0_, x_, xs_, l_, ks_, red_, tile_)"
+            mma16 = f"gguf_mma16<K_, KS_, NB_, {args}>(w_, r0_, x_, xs_, l_, ks_, red_, t0_, t1_)"
+        elif mode == "affine":
             # Masked terms for 3 and 5 bits (codes straddle bytes), shifts otherwise.
             helper = "aff16" if bits in (3, 5) else "aff8"
             wpr, spr = f"((K_) * {bits} / 32)", f"((K_) / {gs})"
@@ -951,6 +974,7 @@ def format_macros(roles):
         lines += [
             f"#define {role}_WPR(K_) {wpr}",
             f"#define {role}_SPR(K_) {spr}",
+            f"#define {role}_ACT(v_, s_) " + ("(v_)" if mode == "gguf" else "act_quant_value(v_, s_)"),
             f"#define {role}_ROWS(K_, R_, w_, s_, b_, r0_, x_, l_, acc_) {rows}",
             f"#define {role}_ROWS_NB(K_, R_, NB_, w_, s_, b_, r0_, x_, xs_, l_, acc_) {nb}",
             f"#define {role}_MMA8(K_, KS_, NB_, w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, tile_) {mma}",
@@ -965,6 +989,10 @@ def format_tag(formats):
 
 def _biases(p):
     return p.biases if "biases" in p else _const((0,) * 8)
+
+
+def _scales(p):
+    return p.scales if "scales" in p else _const((0,) * 8)
 
 
 def _formats(moe):
@@ -991,7 +1019,7 @@ def _gate(moe, x, config):
     return _gate_kernel()(
         inputs=[x, moe.gate.weight, _const((getattr(config, "gate_temp", 1.0),))],
         template=[("NE", ne), ("DIM", dim), ("TPG", tpg), ("KS", ks), ("NGROUPS_STRIDE", n_tg * (tpg // 32)),
-                  ("NB", nb)],
+                  ("NB", nb), ("QUANTIZE_INPUT", getattr(moe.experts.w1, "mode", None) != "gguf")],
         grid=(n_tg * tpg, 1, 1), threadgroup=(tpg, 1, 1),
         output_shapes=[(nb * ne,), (nb * dim,)], output_dtypes=[mx.float32, mx.float32])
 
@@ -1025,29 +1053,29 @@ def fused_decode_moe_nb(moe, x, config, mma=None):
     """NB tokens at once. x: [NB, dim] bf16 (ffn_norm outputs). Returns [NB, dim] bf16; each
     token's result equals fused_decode_moe on that token alone, bit for bit without matrix
     tiles (mma=False) and within fp32 summation rounding with them (default: use_mma(NB)).
-    Matrix tiles (MXFP8 or affine shared experts) give a token the same result for any NB."""
+    Matrix tiles preserve each token's activation policy; FP32 sum order may differ."""
     nb = x.shape[0]
     formats = _formats(moe)
-    mma = (use_mma(nb) if mma is None else mma) and all(f[0] in ("mxfp8", "affine") for f in formats[3:])
+    mma = (use_mma(nb) if mma is None else mma) and all(f[0] in ("mxfp8", "affine", "gguf") for f in formats[3:])
     up_k, down_r, down_s = _kernels_nb(mma, formats)
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
     scores, xq = _gate(moe, x, config)
     e, s = moe.experts, moe.shared_experts
     hq, hqs, idx, w = up_k(
         inputs=[scores, moe.gate.bias, _const((config.route_scale,)), _const((config.swiglu_limit,)), xq,
-                e.w1.weight, e.w1.scales, _biases(e.w1), e.w3.weight, e.w3.scales, _biases(e.w3),
-                s.w1.weight, s.w1.scales, _biases(s.w1), s.w3.weight, s.w3.scales, _biases(s.w3)],
+                e.w1.weight, _scales(e.w1), _biases(e.w1), e.w3.weight, _scales(e.w3), _biases(e.w3),
+                s.w1.weight, _scales(s.w1), _biases(s.w1), s.w3.weight, _scales(s.w3), _biases(s.w3)],
         template=[("NE", ne), ("TOPK", topk), ("DIM", dim), ("INTER", inter), ("NB", nb)],
         grid=((nb * topk + 1) * 256, inter // 32, 1), threadgroup=(256, 1, 1),
         output_shapes=[(nb * topk * inter,), (nb * inter,), (nb * topk,), (nb * topk,)],
         output_dtypes=[mx.float32, mx.float32, mx.int32, mx.float32])
     partial = down_r(
-        inputs=[hq, idx, e.w2.weight, e.w2.scales, _biases(e.w2)],
+        inputs=[hq, idx, e.w2.weight, _scales(e.w2), _biases(e.w2)],
         template=[("TOPK", topk), ("DIM", dim), ("INTER", inter)],
         grid=(nb * topk * 32, dim // 4, 1), threadgroup=(topk * 32, 1, 1),
         output_shapes=[(nb * dim,)], output_dtypes=[mx.float32])[0]
     out = down_s(
-        inputs=[hqs, partial, s.w2.weight, s.w2.scales, _biases(s.w2)],
+        inputs=[hqs, partial, s.w2.weight, _scales(s.w2), _biases(s.w2)],
         template=[("DIM", dim), ("INTER", inter), ("NB", nb)],
         grid=(dim // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(nb * dim,)], output_dtypes=[mx.bfloat16])[0]
@@ -1086,11 +1114,13 @@ def supported(moe, x, config):
         and x.dtype == mx.bfloat16
         and getattr(config, "score_func", "sqrtsoftplus") == "sqrtsoftplus"
         and all(f is not None for f in formats)
+        # Gate shares one input buffer across routed/shared gate and up projections.
+        and all((formats[i][0] == "gguf") == (formats[0][0] == "gguf") for i in (1, 3, 4))
         and formats[3] != MXFP4 and formats[4] != MXFP4 and formats[5] != MXFP4
         and config.n_activated_experts <= 31
         and config.dim % 256 == 0
         # The shared down projection splits its groups over two simdgroups.
-        and config.moe_inter_dim % (2 * formats[5][2]) == 0
+        and config.moe_inter_dim % (64 if formats[5][0] == "gguf" else 2 * formats[5][2]) == 0
     )
 
 
@@ -1103,14 +1133,14 @@ def fused_decode_moe(moe, x, config):
     hq, idx, w = up_k(
         inputs=[scores, moe.gate.bias, _const((config.route_scale,)),
                 _const((config.swiglu_limit,)), xq,
-                e.w1.weight, e.w1.scales, _biases(e.w1), e.w3.weight, e.w3.scales, _biases(e.w3),
-                s.w1.weight, s.w1.scales, _biases(s.w1), s.w3.weight, s.w3.scales, _biases(s.w3)],
+                e.w1.weight, _scales(e.w1), _biases(e.w1), e.w3.weight, _scales(e.w3), _biases(e.w3),
+                s.w1.weight, _scales(s.w1), _biases(s.w1), s.w3.weight, _scales(s.w3), _biases(s.w3)],
         template=[("NE", ne), ("TOPK", topk), ("DIM", dim), ("INTER", inter)],
         grid=(inter // 32 * 256, topk + 1, 1), threadgroup=(256, 1, 1),
         output_shapes=[((topk + 1) * inter,), (topk,), (topk,)],
         output_dtypes=[mx.float32, mx.int32, mx.float32])
     out = down_k(
-        inputs=[hq, idx, e.w2.weight, e.w2.scales, _biases(e.w2), s.w2.weight, s.w2.scales, _biases(s.w2)],
+        inputs=[hq, idx, e.w2.weight, _scales(e.w2), _biases(e.w2), s.w2.weight, _scales(s.w2), _biases(s.w2)],
         template=[("TOPK", topk), ("DIM", dim), ("INTER", inter)],
         grid=(dim // 4 * (topk + 1) * 32, 1, 1), threadgroup=((topk + 1) * 32, 1, 1),
         output_shapes=[(dim,)], output_dtypes=[mx.bfloat16])[0]

@@ -31,6 +31,7 @@ from .activation import (
 )
 from .cache import DeepseekV41Cache
 from .engram import Engram, NgramHash, build_compressed_token_map
+from .gguf_quant import GGUFProjection
 from .head import project_logits
 from .hyper_connection import (
     PROJECTION_WIDTH_MULTIPLE,
@@ -573,7 +574,9 @@ class Expert(nn.Module):
             )
         block_plan = None
         block_kind = None
-        if sorted_indices:
+        if sorted_indices and all(isinstance(p, GGUFProjection) for p in projections):
+            block_plan = _build_mxfp4_blocks(indices, self.w1.num_experts, 8)
+        elif sorted_indices:
             kinds = [
                 (
                     p._native_block_kind(x, True)
@@ -592,6 +595,8 @@ class Expert(nn.Module):
             if indices is None:
                 return module(value)
             if isinstance(module, QuantizedProjection):
+                return module(value, indices, sorted_indices, block_plan)
+            if isinstance(module, GGUFProjection):
                 return module(value, indices, sorted_indices, block_plan)
             return module(value, indices, sorted_indices=sorted_indices)
 

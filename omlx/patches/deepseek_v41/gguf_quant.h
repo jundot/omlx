@@ -27,6 +27,7 @@ Source revision: ggml-org/llama.cpp 3810efca0b9e819c8eb51addd93c3c87225b7476.
 */
 #define QK_K 256
 #define IQ1S_DELTA 0.125f
+
 constant uchar kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128
 };
 constant uchar ksigns_iq2xs[128] = {0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
@@ -985,4 +986,141 @@ void dequantize_iq1_s(device const block_iq1_s * xb, short il, thread type4x4 & 
         reg[2][i] = dl * (grid2[i] & 0xf) + ml;
         reg[3][i] = dl * (grid2[i] >>  4) + ml;
     }
+}
+
+// Contiguous eight-value decode for row dots and simdgroup matrix fragments.
+// Codebook words stay in registers; avoid constructing two 4x4 matrices for
+// every lane/row and reloading their byte-addressed constant pointers.
+template <int QT>
+inline void gguf_decode8(const device uchar* b, uint k, thread float* v) {
+    if constexpr (QT == 8) {
+        const float d = float(*reinterpret_cast<const device half*>(b));
+        const float4 a = float4(*reinterpret_cast<const device packed_char4*>(b + 2 + k)) * d;
+        const float4 c = float4(*reinterpret_cast<const device packed_char4*>(b + 6 + k)) * d;
+        for (uint j = 0; j < 4; ++j) { v[j] = a[j]; v[j + 4] = c[j]; }
+    } else if constexpr (QT == 10) {
+        const uint g = k / 16, q = 16 + 32 * (g / 8) + 16 * (g & 1) + k % 16;
+        const float d = float(*reinterpret_cast<const device half*>(b + 80)) * float(b[g] & 15);
+        const float m = float(*reinterpret_cast<const device half*>(b + 82)) * float(b[g] >> 4);
+        for (uint j = 0; j < 8; ++j) v[j] = d * float((b[q + j] >> (2 * ((g / 2) % 4))) & 3) - m;
+    } else if constexpr (QT == 13) {
+        const uint g = k / 32;
+        const device uchar* s = b + 4;
+        const uint sc = g < 4 ? (s[g] & 63) : ((s[g + 4] & 15) | ((s[g - 4] >> 6) << 4));
+        const uint mi = g < 4 ? (s[g + 4] & 63) : ((s[g + 4] >> 4) | ((s[g] >> 6) << 4));
+        const float d = float(*reinterpret_cast<const device half*>(b)) * float(sc);
+        const float m = float(*reinterpret_cast<const device half*>(b + 2)) * float(mi);
+        for (uint j = 0; j < 8; ++j) {
+            const uint i = k % 32 + j;
+            const uint q = ((b[48 + 32 * (g / 2) + i] >> (4 * (g & 1))) & 15) | (((b[16 + i] >> g) & 1) << 4);
+            v[j] = d * float(q) - m;
+        }
+    } else if constexpr (QT == 14) {
+        const float d = float(*reinterpret_cast<const device half*>(b + 208)) * float(char(b[192 + k / 16]));
+        for (uint j = 0; j < 8; ++j) {
+            const uint i = k + j, r = i % 128;
+            const uint lo = (b[64 * (i / 128) + r % 64] >> (4 * (r / 64))) & 15;
+            const uint hi = (b[128 + 32 * (i / 128) + r % 32] >> (2 * (r / 32))) & 3;
+            v[j] = d * float(int(lo | (hi << 4)) - 32);
+        }
+    } else if constexpr (QT == 19) {
+        const uint i8 = k / 8, h = reinterpret_cast<const device ushort*>(b + 34)[i8 / 4];
+        const uint index = uint(b[2 + i8]) | (((h >> (3 * (i8 % 4))) & 7) << 8);
+        const uint grid = iq1s_grid_gpu[index];
+        const float d = float(*reinterpret_cast<const device half*>(b)) * float(2 * ((h >> 12) & 7) + 1);
+        const float m = d * ((h & 0x8000) ? -1.125f : -0.875f);
+        for (uint j = 0; j < 8; ++j) v[j] = d * float((grid >> (8 * (j % 4) + 4 * (j / 4))) & 15) + m;
+    } else {
+        const uint i8 = k / 8, ib = i8 / 4, sub = i8 % 4;
+        ulong grid;
+        uint signs;
+        float d;
+        if constexpr (QT == 16) {
+            const device uchar* q = b + 2 + 8 * ib;
+            const device ushort* s = reinterpret_cast<const device ushort*>(q + 4);
+            const uint h = uint(s[0]) | (uint(s[1]) << 16);
+            grid = iq2xxs_grid[q[sub]];
+            signs = ksigns_iq2xs[(h >> (7 * sub)) & 127];
+            d = float(*reinterpret_cast<const device half*>(b)) * (0.5f + float(h >> 28)) * 0.25f;
+        } else if constexpr (QT == 17) {
+            const uint q = reinterpret_cast<const device ushort*>(b + 2)[i8];
+            grid = iq2xs_grid[q & 511];
+            signs = ksigns_iq2xs[q >> 9];
+            d = float(*reinterpret_cast<const device half*>(b)) * (0.5f + float((b[66 + ib] >> (4 * (sub / 2))) & 15)) * 0.25f;
+        } else if constexpr (QT == 18) {
+            const device ushort* s = reinterpret_cast<const device ushort*>(b + 66 + 4 * ib);
+            const uint h = uint(s[0]) | (uint(s[1]) << 16);
+            grid = ulong(iq3xxs_grid[b[2 + 2 * i8]]) | (ulong(iq3xxs_grid[b[3 + 2 * i8]]) << 32);
+            signs = ksigns_iq2xs[(h >> (7 * sub)) & 127];
+            d = float(*reinterpret_cast<const device half*>(b)) * (0.5f + float(h >> 28)) * 0.5f;
+        } else { // IQ2_S
+            grid = iq2s_grid[uint(b[2 + i8]) | (((uint(b[66 + ib]) >> (2 * sub)) & 3) << 8)];
+            signs = b[34 + i8];
+            d = float(*reinterpret_cast<const device half*>(b)) * (0.5f + float((b[74 + ib] >> (4 * (sub / 2))) & 15)) * 0.25f;
+        }
+        for (uint j = 0; j < 8; ++j) v[j] = d * float((grid >> (8 * j)) & 255ul) * ((signs & (1u << j)) ? -1.0f : 1.0f);
+    }
+}
+
+template <int K, int ROWS, int NB, int QT, int BLOCK, int BYTES, typename W, typename X>
+inline void gguf_rows_nb(W w, uint row0, X x, uint xs, uint lane, thread float* acc) {
+    for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
+    for (uint k = lane * 8; k < uint(K); k += 256) {
+        float xv[NB][8];
+        for (int b = 0; b < NB; ++b)
+            for (int j = 0; j < 8; ++j) xv[b][j] = float(x[size_t(b) * xs + k + j]);
+        for (int r = 0; r < ROWS; ++r) {
+            const device uchar* p = reinterpret_cast<const device uchar*>(w) + (size_t(row0 + r) * (K / BLOCK) + k / BLOCK) * BYTES;
+            float v[8];
+            gguf_decode8<QT>(p, k % BLOCK, v);
+            for (int b = 0; b < NB; ++b)
+                for (int j = 0; j < 8; ++j) acc[r * NB + b] += v[j] * xv[b][j];
+        }
+    }
+    for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
+}
+
+template <int K, int KS, int NB, int QT, int BLOCK, int BYTES, typename W, typename X>
+inline void gguf_mma8(W w, uint row0, X x, uint xs, uint lane, uint ks,
+                     threadgroup float* red, threadgroup float* tile) {
+    static_assert(K % (32 * KS) == 0 && NB <= 8, "whole K groups and at most eight vectors");
+    constexpr uint GROUPS = K / 32 / KS;
+    const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
+    const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
+    simdgroup_matrix<float, 8, 8> a, b, acc;
+    acc.thread_elements()[0] = 0.0f;
+    acc.thread_elements()[1] = 0.0f;
+    for (uint group = ks * GROUPS; group < (ks + 1) * GROUPS; ++group) {
+        const uint k = group * 32, kq = k + 4 * fn;
+        const device uchar* p = reinterpret_cast<const device uchar*>(w) + (size_t(row0 + fm) * (K / BLOCK) + kq / BLOCK) * BYTES;
+        float v[8];
+        gguf_decode8<QT>(p, kq % BLOCK, v);
+        for (uint j = 0; j < 4; ++j) {
+            a.thread_elements()[0] = v[j];
+            a.thread_elements()[1] = v[j + 4];
+            b.thread_elements()[0] = fn < NB ? float(x[size_t(fn) * xs + k + 4 * fm + j]) : 0.0f;
+            b.thread_elements()[1] = fn + 1 < NB ? float(x[size_t(fn + 1) * xs + k + 4 * fm + j]) : 0.0f;
+            simdgroup_multiply_accumulate(acc, a, b, acc);
+        }
+    }
+    red[ks * 64 + fm * 8 + fn] = acc.thread_elements()[0];
+    red[ks * 64 + fm * 8 + fn + 1] = acc.thread_elements()[1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) {
+        float v0 = 0.0f, v1 = 0.0f;
+        for (uint i = 0; i < KS; ++i) {
+            v0 += red[i * 64 + fm * 8 + fn];
+            v1 += red[i * 64 + fm * 8 + fn + 1];
+        }
+        tile[fm * 8 + fn] = v0;
+        tile[fm * 8 + fn + 1] = v1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template <int K, int KS, int NB, int QT, int BLOCK, int BYTES, typename W, typename X>
+inline void gguf_mma16(W w, uint row0, X x, uint xs, uint lane, uint ks,
+                      threadgroup float* red, threadgroup float* tile0, threadgroup float* tile1) {
+    gguf_mma8<K, KS, 8, QT, BLOCK, BYTES>(w, row0, x, xs, lane, ks, red, tile0);
+    gguf_mma8<K, KS, NB - 8, QT, BLOCK, BYTES>(w, row0, x + 8 * xs, xs, lane, ks, red, tile1);
 }

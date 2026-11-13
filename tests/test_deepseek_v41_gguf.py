@@ -75,6 +75,10 @@ def test_packed_projection_matches_cpu_golden(qtype):
     np.testing.assert_array_equal(broadcast.reshape(4, 1, 3), sorted_rows)
     shared = GGUFProjection(p.weight[0], qtype=qtype, input_dims=512)
     bf16 = mx.array(x).astype(mx.bfloat16)
+    np.testing.assert_array_equal(
+        shared(bf16).astype(mx.float32),
+        shared(bf16, sorted_indices=True).astype(mx.float32),
+    )
     np.testing.assert_allclose(
         shared(bf16).astype(mx.float32),
         (bf16.astype(mx.float32) @ dense[0].T).astype(mx.bfloat16).astype(mx.float32),
@@ -267,3 +271,227 @@ def test_packed_row_validation():
         row_bytes(255, 16)
     with pytest.raises(ValueError, match="row length"):
         GGUFProjection(mx.zeros((2, 65), mx.uint8), qtype=16, input_dims=256)
+
+
+@pytest.mark.parametrize("qtype", FORMATS)
+def test_packed_matrix_and_gather_tails(qtype):
+    raw, rng = packed(qtype, (4, 11, 512), 6500 + qtype)
+    p = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=512)
+    dense = dequantize(p.weight, qtype, (4, 11, 512), mx.float32)
+    ids = np.repeat(np.arange(4, dtype=np.int32), [5, 17, 0, 45])
+    x = rng.normal(size=(len(ids), 512)).astype(np.float32)
+    actual = p(mx.array(x[:, None]), mx.array(ids), sorted_indices=True)[:, 0]
+    expected = np.einsum("rk,rnk->rn", x, np.asarray(dense)[ids])
+    np.testing.assert_allclose(actual, expected, atol=1e-3, rtol=1e-4)
+    shared = GGUFProjection(p.weight[0], qtype=qtype, input_dims=512)
+    np.testing.assert_allclose(
+        shared(mx.array(x[:33])), x[:33] @ np.asarray(dense[0]).T, atol=1e-3, rtol=1e-4
+    )
+    np.testing.assert_allclose(
+        shared(mx.array(x)), x @ np.asarray(dense[0]).T, atol=1e-3, rtol=1e-4
+    )
+
+
+def gguf_module(module, qtype, seed):
+    shape = (
+        *module.weight.shape[:-1],
+        getattr(module, "input_dims", module.weight.shape[-1]),
+    )
+    raw, _ = packed(qtype, shape, seed)
+    blocks = raw.reshape(*shape[:-1], shape[-1] // FORMATS[qtype][0], FORMATS[qtype][1])
+    offset = {10: 80, 14: 208}.get(qtype, 0)
+    blocks[..., offset : offset + 2] = np.array([0.0002], "<f2").view(np.uint8)
+    if qtype in (10, 13):
+        offset = 82 if qtype == 10 else 2
+        blocks[..., offset : offset + 2] = np.array([0.00003], "<f2").view(np.uint8)
+    return GGUFProjection(mx.array(raw), qtype=qtype, input_dims=shape[-1])
+
+
+@pytest.mark.parametrize(
+    "formats", [(19, 19, 10, 8), (16, 16, 17, 8), (22, 22, 18, 13)]
+)
+@pytest.mark.parametrize("rows", [1, 6])
+def test_gguf_fused_moe_keeps_unquantized_activations(formats, rows):
+    from test_deepseek_v41 import tiny
+
+    from omlx.patches.deepseek_v41 import decode_moe as dm
+    from omlx.patches.deepseek_v41.language import MoE
+
+    c = tiny(dim=1024, moe_inter_dim=768, swiglu_limit=10)
+    moe = MoE(c)
+    for n, qt in zip(("w1", "w3", "w2"), formats[:3]):
+        setattr(moe.experts, n, gguf_module(getattr(moe.experts, n), qt, 92 + qt))
+        setattr(
+            moe.shared_experts,
+            n,
+            gguf_module(getattr(moe.shared_experts, n), formats[3], 71 + qt),
+        )
+    mx.random.seed(21)
+    moe.gate.weight = mx.random.normal(moe.gate.weight.shape) * 0.05
+    moe.gate.bias = mx.array([0.01, -0.02, 0.03, -0.04])
+    x = mx.random.normal((rows, c.dim)).astype(mx.bfloat16)
+    assert dm.supported(moe, x[:1], c)
+    expected = moe(x[None], None)[0]
+    actual, ids, weights = dm.fused_decode_moe_nb(moe, x, c)
+    np.testing.assert_allclose(
+        actual.astype(mx.float32), expected.astype(mx.float32), atol=2e-4, rtol=0.015
+    )
+    wanted_ids, wanted_weights = moe.gate(x, None)
+    np.testing.assert_array_equal(ids, wanted_ids)
+    np.testing.assert_allclose(weights, wanted_weights, atol=1e-6, rtol=1e-5)
+    individual = mx.concatenate(
+        [dm.fused_decode_moe_nb(moe, x[r : r + 1], c)[0] for r in range(rows)]
+    )
+    exact = dm.fused_decode_moe_nb(moe, x, c, mma=False)[0]
+    np.testing.assert_array_equal(
+        exact.astype(mx.float32), individual.astype(mx.float32)
+    )
+    np.testing.assert_allclose(
+        actual.astype(mx.float32), exact.astype(mx.float32), atol=2e-4, rtol=0.015
+    )
+
+
+@pytest.mark.parametrize("inter", [768, 800])
+def test_gguf_fused_moe_rejects_incompatible_shared_input_and_k_split(inter):
+    from test_deepseek_v41 import tiny
+
+    from omlx.patches.deepseek_v41 import decode_moe as dm
+    from omlx.patches.deepseek_v41.language import MoE
+
+    c = tiny(dim=1024, moe_inter_dim=inter)
+    moe = MoE(c)
+    for n in ("w1", "w3", "w2"):
+        setattr(moe.experts, n, gguf_module(getattr(moe.experts, n), 8, 10))
+    x = mx.zeros((1, c.dim), mx.bfloat16)
+    assert not dm.supported(moe, x, c)
+    for n in ("w1", "w3", "w2"):
+        setattr(
+            moe.shared_experts, n, gguf_module(getattr(moe.shared_experts, n), 8, 11)
+        )
+    assert dm.supported(moe, x, c) == (inter % 64 == 0)
+
+
+@pytest.mark.parametrize("batch,rows", [(1, 1), (1, 6), (2, 6)])
+def test_gguf_fused_block_and_mtp_verify_match_unfused(monkeypatch, batch, rows):
+    from test_deepseek_v41_fused_decode import build
+
+    from omlx.patches.deepseek_v41 import decode_fused
+
+    model = build(
+        n_layers=1,
+        compress_ratios=(0,),
+        kv_source_layers=(),
+        index_source_layers=(),
+        candidate_source_layer=-1,
+    )
+    c, blk = model._config, model.layers[0]
+    for n in ("wq_a", "wkv", "wq_b", "wo_b"):
+        setattr(blk.attn, n, gguf_module(getattr(blk.attn, n), 8, 11))
+    for n, qt in zip(("w1", "w3", "w2"), (19, 16, 22)):
+        setattr(
+            blk.ffn.experts, n, gguf_module(getattr(blk.ffn.experts, n), qt, 71 + qt)
+        )
+        setattr(
+            blk.ffn.shared_experts,
+            n,
+            gguf_module(getattr(blk.ffn.shared_experts, n), 8, 77 + qt),
+        )
+    assert decode_fused.supported(blk, c)
+    expected_caches = [model.make_cache()[0] for _ in range(batch)]
+    actual_caches = [model.make_cache()[0] for _ in range(batch)]
+    mx.random.seed(91)
+    h = mx.random.normal((batch, rows, c.hc_mult, c.dim)).astype(mx.bfloat16)
+    pre = mx.ones((batch, rows, c.hc_mult), mx.float32)
+    with monkeypatch.context() as patch:
+        patch.setattr(decode_fused, "supported", lambda *args: False)
+        expected = [
+            blk(h[b : b + 1], pre[b : b + 1], expected_caches[b], {}, 0, None)
+            for b in range(batch)
+        ]
+        expected_h = mx.concatenate([v[0] for v in expected])
+        expected_pre = mx.concatenate([v[1] for v in expected])
+        mx.eval(expected_h, expected_pre)
+    actual_h, actual_pre = decode_fused.decode_block_verify_nb(
+        blk, h, pre, actual_caches, [{} for _ in range(batch)], [0] * batch, c
+    )
+    np.testing.assert_allclose(
+        actual_h.astype(mx.float32), expected_h.astype(mx.float32), atol=0.02, rtol=0.01
+    )
+    np.testing.assert_allclose(actual_pre, expected_pre, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("qtype", [8, 14])
+def test_gguf_verify_projection_reuses_weights_without_changing_rows(qtype):
+    raw, rng = packed(qtype, (8192, 512), 381 + qtype)
+    p = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=512)
+    x = mx.array(rng.normal(size=(6, 512)).astype(np.float32)).astype(mx.bfloat16)
+    expected = mx.concatenate([p(x[r : r + 1]) for r in range(6)])
+    np.testing.assert_array_equal(p(x).astype(mx.float32), expected.astype(mx.float32))
+
+
+def test_gguf_mtp_generation_matches_greedy(monkeypatch):
+    from mlx_lm.generate import BatchGenerator
+    from test_deepseek_v41_fused_decode import build
+
+    from omlx.patches.mlx_lm_mtp import batch_generator
+
+    batch_generator.apply()
+    model = build(
+        preserve_mtp=True,
+        n_mtp_layers=3,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(2, 3, 4),
+        dspark_n_routed_experts=2,
+        dspark_n_activated_experts=1,
+        dspark_markov_rank=32,
+        compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
+    )
+    for i, blk in enumerate(model.layers):
+        for n in ("wq_a", "wkv", "wq_b", "wo_b"):
+            setattr(blk.attn, n, gguf_module(getattr(blk.attn, n), 8, 11 + i))
+        for n, qt in zip(("w1", "w3", "w2"), (19, 16, 22)):
+            setattr(
+                blk.ffn.experts,
+                n,
+                gguf_module(getattr(blk.ffn.experts, n), qt, 71 + i + qt),
+            )
+            setattr(
+                blk.ffn.shared_experts,
+                n,
+                gguf_module(getattr(blk.ffn.shared_experts, n), 8, 77 + i + qt),
+            )
+    prompt, wanted, cache = [3, 4, 5, 6, 7, 8, 9], [], model.make_cache()
+    ids = mx.array([prompt])
+    for _ in range(8):
+        logits = model(ids, cache=cache)
+        token = int(mx.argmax(logits[0, -1]).item())
+        wanted.append(token)
+        ids = mx.array([[token]])
+    model.configure_mtp(True, 3)
+    calls = []
+    original = type(model).dspark_forward
+
+    def tracked(self, *args, **kwargs):
+        calls.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(model), "dspark_forward", tracked)
+    generator = BatchGenerator(
+        model,
+        max_tokens=8,
+        prefill_step_size=32,
+        sampler=lambda logits: mx.argmax(logits, -1),
+    )
+    result = []
+    try:
+        generator.insert([prompt])
+        for _ in range(64):
+            _, responses = generator.next()
+            result.extend(r.token for r in responses)
+            if len(result) == 8:
+                break
+    finally:
+        generator.close()
+    assert calls, "Exercise actual DSpark proposal execution"
+    assert result == wanted

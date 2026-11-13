@@ -632,6 +632,8 @@ def decode_block_nb(blk, h, pre, caches, shareds, starts, c, together=True):
     """decode_block for B requests at their own positions. h: [B, 1, hc, dim] bf16, pre:
     [B, 1, hc]; caches / shareds / starts: per request. Weight-streaming kernels run once for
     the batch; window, compressor, indexer and attention run per request."""
+    if getattr(blk.attn.wq_a, "mode", None) == "gguf":
+        return _gguf_block(blk, h, pre, caches, shareds, starts, c)
     b_n = h.shape[0]
     hc, dim = c.hc_mult, c.dim
     att = blk.attn
@@ -756,6 +758,8 @@ def decode_block_verify_nb(blk, h, pre, caches, shareds, starts, c):
     matrix tiles whose padded columns never mix), so each request gets the result its own
     decode_block_verify gives. The window, compressor, indexer and attention run per
     request."""
+    if getattr(blk.attn.wq_a, "mode", None) == "gguf":
+        return _gguf_block(blk, h, pre, caches, shareds, starts, c)
     b_n, r_n = h.shape[0], h.shape[1]
     t_n = b_n * r_n
     hc, dim = c.hc_mult, c.dim
@@ -816,9 +820,15 @@ def supported(blk, c):
             and c.dim % 1024 == 0
             and c.head_dim % 256 == 0   # split_attention's layout (V4.1: 512)
             and c.n_heads % 8 == 0
-            and all(_fused_projection(getattr(att, n)) for n in ("wq_a", "wkv", "wq_b", "wo_b"))
             and DM.supported(blk.ffn, _empty((1, 1, c.dim), mx.bfloat16), c)
-            and _woa_mxfp8(att) is not None
+            and (
+                all(getattr(getattr(att, n), "mode", None) == "gguf"
+                    for n in ("wq_a", "wkv", "wq_b", "wo_b"))
+                or (
+                    all(_fused_projection(getattr(att, n)) for n in ("wq_a", "wkv", "wq_b", "wo_b"))
+                    and _woa_mxfp8(att) is not None
+                )
+            )
         )
         object.__setattr__(blk, "_fused_decode_ok", ok)
     return ok
@@ -826,6 +836,8 @@ def supported(blk, c):
 
 def decode_block(blk, h, pre, cache, shared, start, c):
     """Block.__call__ for one token. h: [1, 1, hc, dim] bf16, pre: [1, 1, hc] fp32."""
+    if getattr(blk.attn.wq_a, "mode", None) == "gguf":
+        return _gguf_block(blk, h, pre, [cache], [shared], [start], c)
     hc, dim = c.hc_mult, c.dim
     hf = h.reshape(-1)
     coef_a, x, xq, _ = mix(blk, "attn", c, hf, pre.reshape(-1))
@@ -841,3 +853,23 @@ def decode_block(blk, h, pre, cache, shared, start, c):
     f = blk.sum_ranks(f)
     h3 = hc_post(f, h2, fo, fc, c)
     return h3.reshape(1, 1, hc, dim), fp.reshape(1, 1, hc)
+
+
+def _gguf_block(blk, h, pre, caches, shareds, starts, c):
+    """Fuse HC/norm and MoE while retaining packed-GGUF attention and cache updates."""
+    bn, rn, hc, dim = h.shape
+    hf = h.reshape(bn * rn, hc * dim)
+    coef, x, _, _ = mix_nb(blk, "attn", c, hf, pre.reshape(bn * rn, hc))
+    ap, ao, ac = coef[:, :hc], coef[:, hc : 2 * hc], coef[:, 2 * hc :]
+    x = x.reshape(bn, rn, dim)
+    attn = mx.concatenate(
+        [blk.attn(x[b : b + 1], caches[b], shareds[b], starts[b]) for b in range(bn)],
+        axis=0,
+    ).reshape(bn * rn, dim)
+    coef, x2, _, h2 = mix_nb(
+        blk, "ffn", c, hf, ap, sub=blk.sum_ranks(attn), post=ao, comb=ac
+    )
+    fp, fo, fc = coef[:, :hc], coef[:, hc : 2 * hc], coef[:, 2 * hc :]
+    f = DM.fused_decode_moe_nb(blk.ffn, x2, c)[0]
+    out = hc_post_nb(blk.sum_ranks(f), h2, fo, fc, c)
+    return out.reshape(h.shape), fp.reshape(pre.shape)
