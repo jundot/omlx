@@ -38,6 +38,8 @@ try:
     from mlx_lm.utils import _get_classes
 
     from omlx.patches import minimax_m3_dspark as minimax_dspark
+    from omlx.patches.inkling2 import apply_inkling2_patch
+    from omlx.patches.inkling2 import oq_layout as inkling2_layout
     from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
 
     HAS_MLX = True
@@ -129,6 +131,32 @@ def _muse_spark_passthrough_capture_skip(
     return frozenset(names)
 
 
+def _inkling2_passthrough_capture_skip(
+    all_weights, config: dict, oq_level: float, group_size: int
+) -> frozenset:
+    """Expert modules whose packed source tensors this level passes through.
+
+    Same role as the Muse Spark helper above: their imatrix is never used.
+    Calibration names them as the runtime model does, ``ExpertProj`` paths.
+    """
+    floor_config = {**config, "_oq_boost_map": {}}
+    names = set()
+    layers = int(inkling2_layout.text_config(config)["num_hidden_layers"])
+    for layer in range(layers):
+        for proj in ("w13", "w2"):
+            name = f"model.layers.{layer}.mlp.experts.{proj}"
+            source_key = f"{inkling2_layout.SOURCE_PREFIX}{name[len('model.') :]}"
+            info = all_weights.source_quant_info(f"{source_key}.weight")
+            if info is None:
+                continue
+            bits, _, _ = _get_predicate_bits(
+                f"{name}.weight", floor_config, oq_level, group_size
+            )
+            if bits is not None and bits >= info["bits"]:
+                names.add(name)
+    return frozenset(names)
+
+
 def _muse_spark_folded_scales(
     all_weights, config: dict, oq_level: float, group_size: int
 ) -> frozenset:
@@ -137,9 +165,12 @@ def _muse_spark_folded_scales(
     Those experts are written dequantized or requantized, so their weights take
     the per-expert tensor scale and no ``global_scale`` is written. The output
     then holds plain affine experts that mlx-lm loads as well. Experts passed
-    through as NVFP4 keep their ``global_scale``.
+    through as NVFP4 keep their ``global_scale``. Inkling 2 follows the same
+    rule for its NVFP4 layers.
     """
-    if not _is_muse_spark_modelopt_nvfp4(config):
+    if not (
+        _is_muse_spark_modelopt_nvfp4(config) or inkling2_layout.is_inkling2(config)
+    ):
         return frozenset()
     names = set()
     for name in all_weights.keys():
@@ -375,6 +406,9 @@ def _is_vlm_load(config: dict) -> bool:
     ``mlx_vlm.speculative.drafters.<type>`` lookup and fails.
     """
     model_type = str(config.get("model_type", "")).lower().replace("-", "_")
+    if inkling2_layout.is_inkling2(config):
+        # mlx-lm's Inkling 2 module holds the vision tower too.
+        return False
     return model_type in VLM_NATIVE_TEXT_MODEL_TYPES or (
         _has_vision_subconfig(config)
         and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
@@ -634,6 +668,7 @@ def _is_token_embedding_tensor(path: str) -> bool:
             ".tok_embeddings.weight",
             ".word_embeddings.weight",
             ".wte.weight",
+            f"{inkling2_layout.EMBED_PATH}.weight",
         )
     )
 
@@ -691,6 +726,7 @@ def universal_quant_predicate(
         or tc.get("num_local_experts")
         or config.get("num_experts")
         or tc.get("num_experts", 0)
+        or inkling2_layout.n_routed_experts(config)
         or 0
     )
     hidden_size = config.get("hidden_size") or tc.get("hidden_size", 0)
@@ -857,6 +893,12 @@ def universal_quant_predicate(
     if config.get("model_type") in ("inkling", "inkling_mm_model") and (
         "qkvr_proj" in path
     ):
+        return bits(8)
+
+    # Inkling 2 fuses q, k, v, the relative-bias rows, the output gate and the
+    # attention sink logits into each projection, and the sink rows drive every
+    # softmax. The projections are under 1% of the weights, so keep them at Q8.
+    if inkling2_layout.is_attention_projection(config, path):
         return bits(8)
 
     if any(p in path for p in ("v_proj", "v_a_proj", "v_b_proj")):
@@ -1114,6 +1156,14 @@ def _routed_expert_projection(path: str) -> str | None:
 # other boost.
 _MANDATORY_BOOST_PATTERNS = ("lm_head", "embeddings", "embed_tokens", "wte")
 
+
+def _mandatory_boost_patterns(config: dict) -> tuple[str, ...]:
+    """Head and embedding names; Inkling 2's table is the bare ``model.embed``."""
+    if inkling2_layout.is_inkling2(config):
+        return (*_MANDATORY_BOOST_PATTERNS, inkling2_layout.EMBED_PATH)
+    return _MANDATORY_BOOST_PATTERNS
+
+
 # Dense models below 3-bit lift every decoder tensor to this floor first;
 # wider groups keep it inside the low-level budgets. Widths that 128 does not
 # divide use the default group, which would otherwise leave them unquantized.
@@ -1138,11 +1188,11 @@ def _global_attention_layers(config: dict) -> set[int]:
     return {i for i, kind in enumerate(layer_types) if kind == "full_attention"}
 
 
-def _is_always_on_tensor(path: str) -> bool:
+def _is_always_on_tensor(path: str, config: dict) -> bool:
     """Decoder weights every token runs through: all but routed experts and heads."""
     if _is_routed_expert(path) or _is_vision_tensor(path) or _is_audio_tensor(path):
         return False
-    return not any(p in path for p in _MANDATORY_BOOST_PATTERNS)
+    return not any(p in path for p in _mandatory_boost_patterns(config))
 
 
 def _always_on_candidates(
@@ -1156,7 +1206,7 @@ def _always_on_candidates(
     pred_config = {**config, "_oq_boost_map": {}}
     found = []
     for path, shape in named_shapes.items():
-        if path in fixed_overrides or not _is_always_on_tensor(path):
+        if path in fixed_overrides or not _is_always_on_tensor(path, config):
             continue
         if universal_quant_predicate(path, None, pred_config, oq_level) is False:
             continue
@@ -1419,7 +1469,7 @@ def _build_quant_plan(
         )
         if pred is False:
             continue
-        for pattern in _MANDATORY_BOOST_PATTERNS:
+        for pattern in _mandatory_boost_patterns(config):
             if pattern in path:
                 numel = 1
                 for dim in shape:
@@ -1701,7 +1751,7 @@ def _build_quant_plan(
         for path, shape in named_shapes.items():
             if _is_routed_expert(path) or path in fixed_overrides:
                 continue
-            if any(p in path for p in _MANDATORY_BOOST_PATTERNS):
+            if any(p in path for p in _mandatory_boost_patterns(config)):
                 continue
             cur = boost_map.get(path)
             if cur is None:
@@ -1751,7 +1801,9 @@ def _build_quant_plan(
     # before it reaches routed experts.
     for path in sorted(boost_map, key=lambda p: "lm_head" not in p):
         cur = boost_map[path]
-        if cur["bits"] >= 8 or not any(p in path for p in _MANDATORY_BOOST_PATTERNS):
+        if cur["bits"] >= 8 or not any(
+            p in path for p in _mandatory_boost_patterns(config)
+        ):
             continue
         shape = named_shapes[path]
         full_gs = _gs_for_mode(8, _OQ_DEFAULT_GROUP_SIZE)
@@ -4327,6 +4379,14 @@ def _metal_available_memory_bytes() -> int:
     return max(0, max_working_set - active)
 
 
+def _is_inkling2_dir(path: str | Path) -> bool:
+    try:
+        config = json.loads((Path(path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return inkling2_layout.is_inkling2(config)
+
+
 def _source_weight_files(model_path: str | Path) -> list[Path]:
     source = Path(model_path)
     files = sorted(
@@ -4334,6 +4394,8 @@ def _source_weight_files(model_path: str | Path) -> list[Path]:
         for f in source.glob("*.safetensors")
         if f.name not in DECISION_SIDECAR_WEIGHTS
     )
+    if inkling2_layout.has_bundled_draft(source) and _is_inkling2_dir(source):
+        files = [f for f in files if not inkling2_layout.is_draft_file(f)]
     sidecar = source / "mtp" / "model_mtp.safetensors"
     if sidecar.is_file():
         config = json.loads((source / "config.json").read_text())
@@ -4408,6 +4470,7 @@ def _calibration_memory_budget(
     checkpoint_bytes: int = 0,
     *,
     fallback_system_bytes: int = 0,
+    model_fraction: float = _MAX_MODEL_RAM_FRACTION,
 ) -> dict[str, int | bool]:
     """Return the live memory budget for full-model calibration forwards.
 
@@ -4421,7 +4484,7 @@ def _calibration_memory_budget(
     metal_available = _metal_available_memory_bytes()
     candidates = [value for value in (system_available, metal_available) if value > 0]
     capacity = min(candidates) if candidates else max(0, int(fallback_system_bytes))
-    model_limit = int(capacity * _MAX_MODEL_RAM_FRACTION)
+    model_limit = int(capacity * model_fraction)
     checkpoint_bytes = max(0, int(checkpoint_bytes))
     return {
         "system_available_bytes": int(system_available),
@@ -4749,6 +4812,8 @@ def _build_model_sanitizer(
     normalize_qwen35_text_config(config)
     if _is_muse_spark(config):
         return muse_spark_layout.sanitizer(config, text_only=text_only)
+    if inkling2_layout.is_inkling2(config):
+        return inkling2_layout.sanitizer(config, text_only=text_only)
     if config.get("model_type") == "flint":
         from mlx_vlm.models.flint import Model, ModelConfig
 
@@ -5249,6 +5314,8 @@ def _build_non_quantizable_set(config: dict) -> set:
             model.leaf_modules(), is_leaf=nn.Module.is_module
         ):
             if hasattr(module, "weight") and not hasattr(module, "to_quantized"):
+                if inkling2_layout.is_expert_carrier(module):
+                    continue
                 if getattr(module.weight, "ndim", 0) >= 2:
                     result.add(_normalize_quant_path(path))
 
@@ -6076,9 +6143,12 @@ def _calibration_footprint_bytes(index, storage_bytes: int, config: dict) -> int
     logical BF16 view determines admission. MiniMax MXFP8 and DeepSeek V4 FP4
     sources take the quantized-source sensitivity path and remain packed in
     quantized modules; pricing those as BF16 would force an unnecessary proxy.
+    Inkling 2 calibrates on its packed source model, which is what it stores.
     """
     storage_bytes = max(0, int(storage_bytes))
-    if _uses_quantized_source_sensitivity(config):
+    if _uses_quantized_source_sensitivity(config) or inkling2_layout.is_inkling2(
+        config
+    ):
         return storage_bytes
     return max(storage_bytes, _logical_footprint_bytes(index))
 
@@ -7010,6 +7080,9 @@ def quantize_oq_streaming(
             model_type, and an explicit stream_calibration=True on an
             unsupported layout raises a ValueError up front instead of
             failing deep in the sourcer. Only consulted when enhanced is True.
+            Inkling 2 never builds a proxy: its packed source is calibrated
+            resident and needs that much live memory, and the DSpark draft
+            is copied with the config's mtp_config whatever preserve_mtp says.
         preserve_ngram_table: Write the qwen4_exp N-gram PLE table
             (``ple_embedding.ngram_embedding`` shard tensors) unquantized, in
             the checkpoint dtype, instead of at the selected oQ level. The
@@ -7060,6 +7133,9 @@ def quantize_oq_streaming(
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
+    if inkling2_layout.is_inkling2(config):
+        # The model class is needed before any calibration load registers it.
+        apply_inkling2_patch()
     mimo_multimodal = (
         normalized_model_type in {"mimo_v2", "mimo_v2_flash"}
         and _has_vision_subconfig(config)
@@ -7141,6 +7217,12 @@ def quantize_oq_streaming(
         ),
         config=config,
     )
+    if inkling2_layout.is_inkling2(config):
+        capture_skip = _inkling2_passthrough_capture_skip(
+            all_weights, config, oq_level, group_size
+        )
+        if capture_skip:
+            config["_oq_imatrix_capture_skip"] = capture_skip
     if (
         preserve_mtp
         and not any(_is_mtp_tensor(k) for k in all_weights.keys())
@@ -7173,6 +7255,11 @@ def quantize_oq_streaming(
     _calibration_budget = _calibration_memory_budget(
         _calibration_bytes,
         fallback_system_bytes=_system_ram,
+        # A proxy of Inkling 2 would be as large as its packed source, so only
+        # the live capacity limits calibration.
+        model_fraction=(
+            1.0 if inkling2_layout.is_inkling2(config) else _MAX_MODEL_RAM_FRACTION
+        ),
     )
     _model_requires_proxy = bool(_calibration_budget["requires_proxy"])
     if _model_requires_proxy and static_sensitivity_map is None:
@@ -7203,6 +7290,15 @@ def quantize_oq_streaming(
 
     def _ensure_ram_safe_proxy() -> Path:
         nonlocal _ram_safe_proxy_dir
+        if _ram_safe_proxy_dir is None and inkling2_layout.is_inkling2(config):
+            raise RuntimeError(
+                "Inkling 2 calibrates on its packed source model, which needs "
+                f"{_format_size(_calibration_bytes)} of live memory but only "
+                f"{_format_size(int(_calibration_budget['capacity_bytes']))} is "
+                "available, and no smaller proxy exists. Stop other model "
+                "servers, or pass sensitivity_map_override and an existing "
+                "imatrix cache."
+            )
         if _ram_safe_proxy_dir is None:
             logger.warning(
                 f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
@@ -7534,6 +7630,12 @@ def quantize_oq_streaming(
                 f"{len(all_weights)} output tensors"
             )
         except Exception as e:
+            if inkling2_layout.is_inkling2(config):
+                raise RuntimeError(
+                    f"oQ{oq_level:g}: Inkling 2 sanitize-plan discovery failed "
+                    f"({e}); the eager fallback would materialize the whole "
+                    "model in BF16"
+                ) from e
             if _model_requires_proxy:
                 raise RuntimeError(
                     f"oQ{oq_level:g}: streaming sanitize-plan discovery "
@@ -7925,7 +8027,11 @@ def quantize_oq_streaming(
         output_config.pop(temp_key, None)
     if text_only:
         _normalize_text_only_in_config(output_config)
-    if not preserve_mtp:
+    # The DSpark draft is copied unchanged, so the config keeps declaring it.
+    bundled_draft = inkling2_layout.is_inkling2(config) and (
+        inkling2_layout.has_bundled_draft(source)
+    )
+    if not preserve_mtp and not bundled_draft:
         # Default path: zero out MTP layer counts so the quantized model
         # doesn't claim to have an MTP head while its weights have been
         # stripped. This keeps the output self-consistent — mtp_enabled
@@ -7990,6 +8096,8 @@ def quantize_oq_streaming(
             shutil.copy2(source / name, output / name)
     if not text_only:
         _copy_bundled_drafts(source, output)
+    if inkling2_layout.is_inkling2(config):
+        inkling2_layout.copy_bundled_draft(source, output)
 
     if mimo_multimodal:
         from .patches.mimo_v2.omnimodal import export_sidecars
@@ -8014,7 +8122,7 @@ _OQE_MAX_SAMPLE_MULTIPLIER = 8
 _OQE_MAX_ADAPTIVE_SAMPLES = 1024
 _OQE_MIN_EXPERT_COUNT = 16
 _OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
-_OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
+_OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear", "ExpertProj"}
 
 
 def _is_oqe_switch_module(module) -> bool:
@@ -8311,6 +8419,8 @@ def _find_model_layers(model):
     if getattr(model, "model_type", None) == "muse_spark":
         # mlx-lm's Muse Spark normalizes its token embeddings.
         return model.model.language_model.embed, model.layers
+    if getattr(model, "model_type", None) == inkling2_layout.MODEL_TYPE:
+        return inkling2_layout.embed_fn(model), model.layers
     if getattr(model, "model_type", None) == "spark2_5":
         # afm7 also uses ``embedding`` but keeps kv-reuse blocks outside model.layers.
         return model.model.embedding, model.model.layers
@@ -8356,6 +8466,7 @@ _FLINT_LAYER_STATE_KIND = "flint"
 _DEEPSEEK_V4_LAYER_STATE_KIND = "deepseek_v4"
 _KIMI_K3_LAYER_STATE_KIND = "kimi_k3"
 _LLAMA4_SCALED_LAYER_STATE_KIND = "llama4_attn_scale"
+_INKLING2_LAYER_STATE_KIND = "inkling2"
 
 
 def _find_layer_model(model, layers):
@@ -8627,7 +8738,7 @@ def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None
             state["intermediates"][layer_idx] = aux
     elif state.get("kind") == "glm_moe_dsa":
         state["prev_topk_indices"] = aux if aux is not None else fallback
-    elif state.get("kind") == _KIMI_K3_LAYER_STATE_KIND:
+    elif state.get("kind") in (_KIMI_K3_LAYER_STATE_KIND, _INKLING2_LAYER_STATE_KIND):
         state["blocks"] = aux
 
 
@@ -8716,6 +8827,19 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
                 f"Kimi K3 calibration forward failed at layer {layer_idx}: {e}"
             ) from e
         return result[0], result[1]
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _INKLING2_LAYER_STATE_KIND
+    ):
+        # A copy per call: a layer appends its completed block in place, and the
+        # sensitivity walk runs each block twice on the same inputs.
+        blocks = list(position_ids["blocks"])
+        try:
+            return block(inputs, blocks, cache=None), blocks
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            raise RuntimeError(
+                f"Inkling 2 calibration forward failed at layer {layer_idx}: {e}"
+            ) from e
     if (
         isinstance(position_ids, dict)
         and position_ids.get("kind") == _LLAMA4_SCALED_LAYER_STATE_KIND
@@ -8968,6 +9092,8 @@ def _temporary_quantize_block(
             continue
         if getattr(module.weight, "ndim", 0) < 2:
             continue
+        if inkling2_layout.is_expert_carrier(module):
+            continue
         norm_path = _normalize_quant_path(path)
         if _is_muse_spark(config):
             # The fused qkvg_proj takes the one format oQ gives its parts.
@@ -9028,6 +9154,11 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
     )
     if model_type == "flint":
         return inputs, [None] * len(layers), {"kind": _FLINT_LAYER_STATE_KIND}
+    if model_type == inkling2_layout.MODEL_TYPE:
+        # Layers mix the completed attention-residual blocks of earlier layers,
+        # build their own masks and take no cache.
+        state = {"kind": _INKLING2_LAYER_STATE_KIND, "blocks": []}
+        return inputs, [None] * len(layers), state
     gemma4_inputs = _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs)
     if gemma4_inputs is not None:
         return gemma4_inputs
@@ -9375,7 +9506,11 @@ class OQImatrixCollector:
         try:
             weight_shape = getattr(module.weight, "shape", ())
             n_experts = int(getattr(module, "num_experts", weight_shape[0]))
-            in_dim = int(getattr(module, "input_dims", weight_shape[-1]))
+            if inkling2_layout.is_expert_carrier(module):
+                # Packed carriers store the input width in 32-bit words.
+                in_dim = self._module_in_dim(module)
+            else:
+                in_dim = int(getattr(module, "input_dims", weight_shape[-1]))
             if getattr(x, "shape", ()) and int(x.shape[-1]) != in_dim:
                 return
             mx.eval(x, indices)
@@ -9442,6 +9577,18 @@ def _collect_language_model_lm_head_imatrix(model, hidden, collector) -> bool:
     return _collect_untied_lm_head_imatrix(
         core, hidden, collector, "language_model.lm_head"
     )
+
+
+def _collect_inkling2_lm_head_imatrix(model, hidden, state, collector) -> bool:
+    """Capture the head input: the last layer's mixture of all blocks, normed."""
+    if str(getattr(model, "model_type", "")) != inkling2_layout.MODEL_TYPE:
+        return False
+    module = collector._original_modules.get("lm_head")
+    if module is None or not isinstance(state, dict):
+        return False
+    x = inkling2_layout.head_input(model, hidden, state["blocks"])
+    collector.collect_dense("lm_head", module, x)
+    return "lm_head" in collector.entries
 
 
 def _run_glm5_next_mtp_blocks(blocks, hidden, embed, input_ids) -> None:
@@ -9745,6 +9892,9 @@ def _collect_imatrix_from_model(
 
                 _collect_language_model_lm_head_imatrix(model, inputs, collector)
                 _collect_k2_horizon_lm_head_imatrix(model, inputs, collector)
+                _collect_inkling2_lm_head_imatrix(
+                    model, inputs, position_ids, collector
+                )
 
                 # Match the head's decode-time hidden-state normalization.
                 if _collect_mtp_head_imatrix(

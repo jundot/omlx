@@ -1284,6 +1284,12 @@ def _mtp_compat_for_model(
         if bundled_dspark_path(model_path) is not None:
             return True, ""
         return False, "MiniMax checkpoint has no bundled dspark/ draft"
+    if model_type == "inkling2":
+        from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
+
+        if bundled_inkling2_dspark_path(model_path) is not None:
+            return True, ""
+        return False, "Inkling 2 checkpoint has no bundled mtp.safetensors draft"
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
