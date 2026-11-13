@@ -285,5 +285,3 @@ def normalize_embedding_items(
         normalized.append(normalized_item)
 
     return normalized
-
-
