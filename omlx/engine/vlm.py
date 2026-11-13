@@ -33,6 +33,7 @@ import inspect
 import itertools
 import json
 import logging
+import math
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -67,6 +68,7 @@ from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
+from ..utils import image as _image_utils
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -1523,12 +1525,18 @@ def _smart_resize_tokens(
     return (h_bar // patch_size) * (w_bar // patch_size) // (merge_size ** 2)
 
 
-def _read_image_dims(part: dict) -> Optional[tuple]:
+def _read_image_dims(part: dict, *, strict: bool = False) -> Optional[tuple]:
     """Best-effort, decode-free ``(width, height)`` for an OpenAI image part.
 
     Handles only ``data:`` base64 URIs. Returns ``None`` for anything else so
     callers fall back to the conservative per-image upper bound without opening
-    request-supplied paths or fetching remote URLs."""
+    request-supplied paths or fetching remote URLs.
+
+    ``strict=True`` (used by preflight) instead validates the payload exactly
+    like the decoder does — data-URI envelope, base64, size limit, decodable
+    header — and raises ``InvalidRequestError`` for anything the decode path
+    would reject, so malformed images still surface as an HTTP 400 before the
+    streaming response starts. Pixels are never loaded either way."""
     import base64 as _b64
     import binascii
     import io as _io
@@ -1545,6 +1553,9 @@ def _read_image_dims(part: dict) -> Optional[tuple]:
     )
     if not isinstance(url, str) or not url:
         return None
+
+    if strict:
+        return _image_utils.read_image_dims(url)
 
     raw = None
     s = url.strip()
@@ -1571,15 +1582,58 @@ def _read_image_dims(part: dict) -> Optional[tuple]:
         return None
 
 
+def _read_image_dims_capped(part: dict) -> tuple | None:
+    """Decode-free (width, height) with the decoder's max-side cap applied.
+
+    ``load_image`` downscales to ``get_max_image_side_length()`` before the
+    processor sees the image. Mirror that cap so the token estimate follows
+    the decoded path without opening the pixels; round up so a capped size
+    never estimates fewer tokens than the decoded image.
+    """
+    from PIL import Image as _Image
+
+    image = part.get("image") if isinstance(part, dict) else None
+    dims = (
+        image.size
+        if isinstance(image, _Image.Image)
+        else _read_image_dims(part, strict=True)
+    )
+    if dims is None:
+        return None
+    width, height = dims
+    max_side = _image_utils.get_max_image_side_length()
+    if max_side > 0 and max(width, height) > max_side:
+        scale = max_side / max(width, height)
+        width = max(1, math.ceil(width * scale))
+        height = max(1, math.ceil(height * scale))
+    return (width, height)
+
+
+def _capped_image_dimensions(messages: list[dict[str, Any]]) -> list[tuple | None]:
+    """Dimensions for every image part, in order, without decoding.
+
+    Pass the expanded message list (MiMo turns video parts into in-memory
+    frames) so those frames are counted too."""
+    return [
+        _read_image_dims_capped(part)
+        for msg in messages
+        if isinstance(msg.get("content"), list)
+        for part in msg["content"]
+        if isinstance(part, dict)
+        and part.get("type") in ("image_url", "image", "input_image")
+    ]
+
+
 def _count_image_tokens_real(
     messages: list[dict[str, Any]],
     processor: Any,
     *,
     upper_bound: int = _IMAGE_TOKEN_UPPER_BOUND_FALLBACK,
     images: list[Any] | None = None,
+    dimensions: list[tuple | None] | None = None,
 ) -> int:
-    """Sum per-image tokens using processed images when supplied, otherwise
-    source dimensions, instead of charging every image the model's ``max_pixels``
+    """Sum per-image tokens from supplied dimensions, processed images or the
+    message parts, instead of charging every image the model's ``max_pixels``
     ceiling. Falls back to ``upper_bound`` per image when the dimensions can't
     be read decode-free or the processor isn't a Qwen-style one, so the guard
     still never under-counts."""
@@ -1597,20 +1651,25 @@ def _count_image_tokens_real(
         and isinstance(getattr(ip, "max_image_tokens", None), int)
     )
 
-    if images is not None:
-        dimensions = [image.size for image in images]
-    else:
-        dimensions = []
-        for msg in messages:
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if not isinstance(part, dict):
+    if dimensions is None:
+        if images is not None:
+            dimensions = [image.size for image in images]
+        else:
+            dimensions = []
+            for msg in messages:
+                content = msg.get("content")
+                if not isinstance(content, list):
                     continue
-                if part.get("type") not in ("image_url", "image", "input_image"):
-                    continue
-                dimensions.append(_read_image_dims(part))
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") not in (
+                        "image_url",
+                        "image",
+                        "input_image",
+                    ):
+                        continue
+                    dimensions.append(_read_image_dims(part))
 
     total = 0
     for wh in dimensions:
@@ -5325,7 +5384,14 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
-        _, text_messages, images, _, videos = self._extract_request_media(messages)
+        # Preflight only needs the image count and dimensions. The counter
+        # reads them from the parts (with the same max-side cap the decoder
+        # applies), so the pixels are not decoded on the event loop. Use the
+        # expanded message list: MiMo video parts become in-memory frames that
+        # only exist there, and dropping them would under-count the guard.
+        media_messages, text_messages, images, _, videos = self._extract_request_media(
+            messages, decode_images=False
+        )
         if (
             images
             and self.model_type in {"gemma4", "gemma4_unified", "muse_spark"}
@@ -5366,7 +5432,7 @@ class VLMBatchedEngine(BaseEngine):
         image_tokens = _count_image_tokens_real(
             messages,
             getattr(self, "_processor", None),
-            images=images,
+            dimensions=_capped_image_dimensions(media_messages),
             upper_bound=_derive_image_token_upper_bound(
                 getattr(self, "_processor", None)
             ),
@@ -5589,7 +5655,7 @@ class VLMBatchedEngine(BaseEngine):
         return messages
 
     def _extract_request_media(
-        self, messages: list[dict[str, Any]]
+        self, messages: list[dict[str, Any]], decode_images: bool = True
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list, list, list[str]]:
         """Split a request into text and media, honoring each model's video path.
 
@@ -5603,12 +5669,15 @@ class VLMBatchedEngine(BaseEngine):
         model_type = self.model_type or _read_config_model_type(self._model_name)
         if model_type in {"mimo_v2", "mimo_v2_flash"}:
             media_messages = expand_video_parts(messages)
+        extract_kwargs = {} if decode_images else {"decode_images": False}
         if not getattr(self, "_native_video", False):
-            text_messages, images, audio = extract_images_from_messages(media_messages)
+            text_messages, images, audio = extract_images_from_messages(
+                media_messages, **extract_kwargs
+            )
             return media_messages, text_messages, images, audio, []
 
         text_messages, images, audio, videos = extract_media_from_messages(
-            media_messages
+            media_messages, **extract_kwargs
         )
         # mlx-vlm's Qwen3-VL embedding path takes the grid of one modality per
         # call, so a request that mixes them would silently lose one.

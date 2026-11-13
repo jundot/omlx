@@ -1132,3 +1132,52 @@ class TestImageSizeAndDownscaling:
         monkeypatch.setattr(settings_module, "_global_settings", None)
         assert get_max_image_bytes() == 50 * 1024 * 1024
         assert get_max_image_side_length() == 2048
+
+
+def test_decode_images_false_keeps_the_image_count_without_decoding():
+    b64 = _image_to_base64(_make_test_image())
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                },
+            ],
+        }
+    ]
+
+    text_messages, images, audio = extract_images_from_messages(
+        messages, decode_images=False
+    )
+
+    assert text_messages[0]["content"] == "hi"
+    assert images == [None]
+    assert audio == []
+
+
+def test_read_image_dims_matches_load_image_without_decoding(monkeypatch):
+    from omlx.utils import image as image_module
+    from omlx.utils.image import load_image, read_image_dims
+
+    monkeypatch.setattr(image_module, "get_max_image_side_length", lambda: 0)
+    image_module.clear_image_decode_cache()
+    uri = f"data:image/png;base64,{_image_to_base64(_make_test_image(3000, 2000))}"
+
+    assert read_image_dims(uri) == load_image(uri).size == (3000, 2000)
+
+
+def test_read_image_dims_rejects_input_the_decoder_rejects():
+    import pytest
+
+    from omlx.exceptions import InvalidRequestError
+    from omlx.utils.image import read_image_dims
+
+    with pytest.raises(InvalidRequestError, match="base64 data URIs"):
+        read_image_dims("https://example.com/x.png")
+    with pytest.raises(InvalidRequestError, match="invalid base64"):
+        read_image_dims("data:image/png;base64,not-base64!!")
+    with pytest.raises(InvalidRequestError, match="decodable image"):
+        read_image_dims("data:image/png;base64,aGVsbG8=")
