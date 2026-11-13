@@ -763,6 +763,15 @@ class MLXEmbeddingModel:
 
         return _DEFAULT_EMBEDDING_MAX_LENGTH
 
+    def effective_max_length(self, max_length: int | None = None) -> int:
+        """Per-input token limit that ``embed(max_length=...)`` truncates at."""
+        max_length = self._resolve_max_length(max_length)
+        # Absolute position tables read out of range without an error.
+        position_limit = getattr(self.model, "max_input_length", None)
+        if isinstance(position_limit, int):
+            max_length = min(max_length, position_limit)
+        return max_length
+
     def _prepare_embedding_inputs(
         self,
         processor,
@@ -977,11 +986,7 @@ class MLXEmbeddingModel:
         if not self._loaded:
             self.load()
 
-        max_length = self._resolve_max_length(max_length)
-        # Absolute position tables read out of range without an error.
-        position_limit = getattr(self.model, "max_input_length", None)
-        if isinstance(position_limit, int):
-            max_length = min(max_length, position_limit)
+        max_length = self.effective_max_length(max_length)
         normalized_inputs = self._normalize_embedding_inputs(inputs)
         for item in normalized_inputs:
             image_ref = item.get("image")
