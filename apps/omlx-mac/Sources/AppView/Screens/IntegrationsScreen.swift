@@ -866,8 +866,7 @@ private struct MCPSection: View {
                               comment: "Row label for the MCP config path input"),
                 sublabel: String(localized: "integrations.mcp.config_path.sub",
                                  defaultValue: "Absolute path to an MCP config JSON. Leave blank to disable.",
-                                 comment: "Sublabel describing the MCP config path field"),
-                isLast: true
+                                 comment: "Sublabel describing the MCP config path field")
             ) {
                 TextInput(
                     text: $vm.mcpConfigPath,
@@ -875,6 +874,19 @@ private struct MCPSection: View {
                     mono: true,
                     width: .controlWide
                 )
+            }
+            Row(label: String(localized: "integrations.mcp.expose_tools",
+                              defaultValue: "Expose backend MCP tools to clients",
+                              comment: "Row label for exposing backend MCP tools to clients"),
+                sublabel: String(localized: "integrations.mcp.expose_tools.sub",
+                                 defaultValue: "Merge backend MCP tools into chat completions. Disable if your client has its own MCP servers.",
+                                 comment: "Sublabel for exposing backend MCP tools to clients"),
+                isLast: true) {
+                RowSwitch(isOn: vm.bind($vm.mcpExposeTools, save: {
+                    Task { await vm.save(.mcpExposeTools, client: client) }
+                }))
+                .disabled(vm.savingMCPExposeTools)
+                .accessibilityLabel(Text("integrations.mcp.expose_tools"))
             }
         }
         FooterBar {

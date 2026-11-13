@@ -13475,6 +13475,78 @@
         }
       }
     },
+    "integrations.mcp.expose_tools" : {
+      "comment" : "Row label for exposing backend MCP tools to clients",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backend-MCP-Werkzeuge für Clients bereitstellen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Expose backend MCP tools to clients"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esponi gli strumenti MCP del backend ai client"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Показывать инструменты MCP бэкенда клиентам"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "向客户端公开后端 MCP 工具"
+          }
+        }
+      }
+    },
+    "integrations.mcp.expose_tools.sub" : {
+      "comment" : "Sublabel for exposing backend MCP tools to clients",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backend-MCP-Werkzeuge in Chat-Completions einbinden. Deaktivieren Sie dies, wenn Ihr Client eigene MCP-Server verwendet."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Merge backend MCP tools into chat completions. Disable if your client has its own MCP servers."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Integra gli strumenti MCP del backend nelle risposte della chat. Disattiva se il client dispone di propri server MCP."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "将后端 MCP 工具合并到聊天响应中。如果你的客户端有自己的 MCP 服务器，请禁用此选项。"
+          }
+        }
+      }
+    },
     "integrations.model.select_placeholder" : {
       "comment" : "Placeholder option shown at the top of every per-integration model picker",
       "extractionState" : "manual",
