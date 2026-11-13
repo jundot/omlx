@@ -1038,8 +1038,13 @@ _ANTHROPIC_ERROR_TYPES = {
 
 
 def _is_anthropic_route(request) -> bool:
-    """True for the Anthropic-compatible ``/v1/messages`` endpoints."""
-    return request.url.path.startswith("/v1/messages")
+    """True for the Anthropic-compatible ``/v1/messages`` endpoints.
+
+    Match the route and its subpaths, not a longer path that merely starts with
+    the same text (``/v1/messagesXYZ`` is an unmatched OpenAI-compatible path).
+    """
+    path = request.url.path
+    return path == "/v1/messages" or path.startswith("/v1/messages/")
 
 
 def _anthropic_error_body(message, status_code: int) -> dict:

@@ -171,6 +171,17 @@ def test_unmatched_anthropic_route_returns_anthropic_error_body():
     assert body["error"] == {"type": "not_found_error", "message": "Not Found"}
 
 
+def test_path_that_only_starts_with_messages_keeps_openai_shape():
+    """A longer unmatched path is not an Anthropic route."""
+    client = TestClient(server.app)
+    response = client.post("/v1/messages-extra")
+
+    assert response.status_code == 404
+    body = response.json()
+    assert "type" not in body
+    assert body["error"]["type"] == "not_found_error"
+
+
 def test_v1_messages_errors_are_anthropic_shaped_end_to_end(monkeypatch, tmp_path):
     """Routing, auth and validation all reach the Anthropic envelope."""
     from omlx.admin import auth
