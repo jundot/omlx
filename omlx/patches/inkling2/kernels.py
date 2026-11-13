@@ -453,11 +453,14 @@ def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
         mask = mx.concatenate(parts, axis=-1)
         if lp_ok is not None:
             mask = mx.where(lp_ok, mask, neg)
-        outs.append(
-            mx.fast.scaled_dot_product_attention(
-                q[:, :, i0:i1], kz, vz, scale=scale, mask=mask
-            )
+        out = mx.fast.scaled_dot_product_attention(
+            q[:, :, i0:i1], kz, vz, scale=scale, mask=mask
         )
+        if qb < length:
+            # A lazy graph would hold every block's mask at once (12 GiB at
+            # 64K keys); evaluated block by block, one mask is alive.
+            mx.eval(out)
+        outs.append(out)
     return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
 
 
