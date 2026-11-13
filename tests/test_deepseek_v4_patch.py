@@ -20,6 +20,7 @@ _OVERLAY_ATTRS = {
     "mlx_lm.utils": (
         "load_model",
         "_load_safetensors",
+        "_load_tokenizer",
         "SAFETENSORS_DTYPE_FALLBACKS",
         "MODEL_REMAPPING",
         "sharded_load",
@@ -37,6 +38,10 @@ _OVERLAY_MODULES = (
     "mlx_lm.chat_templates.deepseek_v4",
     "mlx_lm.tool_parsers.deepseek_v4",
 )
+
+# omlx.patches.deepseek_v4 keeps its own idempotency guards.
+_OVERLAY_GUARDS = ("_APPLIED", "_POOLING_APPLIED")
+_SUBPATCH_FLAGS = ("_PATCHED", "_LOAD_PATCHED")
 
 
 def _snapshot_value(value):
@@ -70,6 +75,7 @@ def _restore_value(module, name, saved):
 def _snapshot_overlay():
     """Record the process-wide state apply_deepseek_v4_patch() mutates."""
     from omlx.cache.type_registry import CacheTypeRegistry
+    from omlx.patches import deepseek_v4
 
     snapshots = {}
     for module_name, attr_names in _OVERLAY_ATTRS.items():
@@ -94,30 +100,8 @@ def _snapshot_overlay():
         and module_name.startswith("mlx_lm")
         and hasattr(module, "load_model")
     ]
-    return snapshots, loader_bindings, dict(CacheTypeRegistry._handlers)
 
-
-def _restore_overlay(snapshot):
-    snapshots, loader_bindings, handlers = snapshot
-    from omlx.cache.type_registry import CacheTypeRegistry
-    from omlx.patches import deepseek_v4
-
-    for module, attrs in snapshots.values():
-        for name, saved in attrs.items():
-            _restore_value(module, name, saved)
-    for module, original in loader_bindings:
-        module.load_model = original
-
-    CacheTypeRegistry._handlers.clear()
-    CacheTypeRegistry._handlers.update(handlers)
-
-    for module_name in _OVERLAY_MODULES:
-        sys.modules.pop(module_name, None)
-
-    # Reset the idempotency guards so a later test can apply the overlay
-    # again from a clean state.
-    deepseek_v4._APPLIED = False
-    deepseek_v4._POOLING_APPLIED = False
+    subpatch_flags = {}
     for module_name, module in list(sys.modules.items()):
         if module is None:
             continue
@@ -125,14 +109,81 @@ def _restore_overlay(snapshot):
             "omlx.patches.deepseek_v4."
         ):
             continue
-        for flag in ("_PATCHED", "_LOAD_PATCHED"):
+        flags = {
+            flag: getattr(module, flag)
+            for flag in _SUBPATCH_FLAGS
+            if hasattr(module, flag)
+        }
+        if flags:
+            subpatch_flags[module_name] = (module, flags)
+
+    return {
+        "modules": snapshots,
+        "loader_bindings": loader_bindings,
+        "handlers": dict(CacheTypeRegistry._handlers),
+        "guards": {name: getattr(deepseek_v4, name) for name in _OVERLAY_GUARDS},
+        "subpatch_flags": subpatch_flags,
+        "overlay_modules": {name: sys.modules.get(name) for name in _OVERLAY_MODULES},
+    }
+
+
+def _restore_overlay(snapshot):
+    from omlx.cache.type_registry import CacheTypeRegistry
+    from omlx.patches import deepseek_v4
+
+    for module, attrs in snapshot["modules"].values():
+        for name, saved in attrs.items():
+            _restore_value(module, name, saved)
+    for module, original in snapshot["loader_bindings"]:
+        module.load_model = original
+
+    CacheTypeRegistry._handlers.clear()
+    CacheTypeRegistry._handlers.update(snapshot["handlers"])
+
+    # The overlay may already have been applied by another module before
+    # this one ran.  Put its registrations and idempotency guards back
+    # exactly as they were instead of pretending the process is pristine.
+    for module_name, original in snapshot["overlay_modules"].items():
+        if original is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = original
+
+    for name, value in snapshot["guards"].items():
+        setattr(deepseek_v4, name, value)
+
+    seen = set()
+    for module_name, (module, flags) in snapshot["subpatch_flags"].items():
+        seen.add(module_name)
+        for flag, value in flags.items():
+            setattr(module, flag, value)
+    if snapshot["guards"]["_APPLIED"]:
+        # Already applied elsewhere: apply above was a no-op, so every
+        # guard and registration is already back to its snapshot value.
+        return
+
+    # Submodules imported by this module's own apply start without flags;
+    # reset them so the next module can patch again from a clean state.
+    for module_name, module in list(sys.modules.items()):
+        if module is None or module_name in seen:
+            continue
+        if module_name != "omlx.patches.deepseek_v4" and not module_name.startswith(
+            "omlx.patches.deepseek_v4."
+        ):
+            continue
+        for flag in _SUBPATCH_FLAGS:
             if hasattr(module, flag):
                 setattr(module, flag, False)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module", autouse=True)
 def _pristine_overlay():
-    """Put the shared mlx-lm state back when this module finishes."""
+    """Restore the mlx-lm state this module shares with the rest of the run.
+
+    Autouse so subsets that never request ``applied_patch`` still tear
+    down: some tests apply the overlay through the loader hook
+    (``maybe_apply_pre_load_patches``) instead of the fixture.
+    """
     saved = _snapshot_overlay()
     try:
         yield
@@ -141,7 +192,7 @@ def _pristine_overlay():
 
 
 @pytest.fixture(scope="module")
-def applied_patch(_pristine_overlay):
+def applied_patch():
     """Apply the patch once for the whole module. The patch itself is
     idempotent so repeated calls are safe."""
     from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
@@ -153,7 +204,7 @@ def applied_patch(_pristine_overlay):
 class TestPatchOrchestration:
     """Top-level apply / idempotency / module registration checks."""
 
-    def test_apply_returns_true_first_time(self, _pristine_overlay):
+    def test_apply_returns_true_first_time(self):
         from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch, is_applied
 
         # The patch may have been applied by a previous test run in the
