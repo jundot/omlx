@@ -4,6 +4,12 @@ Server tests live in `tests/` and must not depend on `apps/`: after the full run
 
 Run `node --test` from `apps/omlx-web/tests/` to discover the standalone dashboard script tests. `test_admin_network_auth_ui.py` runs `network_auth_ui_runner.cjs` with backend-generated cases on stdin.
 
+# Dory text model tests
+
+Run `python -m pytest -q tests/test_dory_support.py` for offline synthetic
+architecture registration, cache-count, projection fusion and tokenizer fallback
+checks. These do not load real weights or test server cache reuse.
+
 # Qwen3.5 text-only checkpoint tests
 
 Run `python -m pytest -q tests/test_oq.py -k Qwen35TextCheckpoint` to check

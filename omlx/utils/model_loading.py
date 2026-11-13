@@ -103,7 +103,11 @@ def preflight_text_remote_code(
     # The per-model setting is authoritative. Never let a stale caller-provided
     # dictionary opt into code execution behind the security toggle.
     safe_tokenizer_config["trust_remote_code"] = False
-    lm_utils.load_tokenizer(
+    if config.get("model_type") == "dory":
+        from ..patches.dory import load_tokenizer
+    else:
+        load_tokenizer = lm_utils.load_tokenizer
+    load_tokenizer(
         metadata_path,
         safe_tokenizer_config,
         eos_token_ids=config.get("eos_token_id"),
@@ -121,7 +125,10 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
         tokenizer_config=kwargs.get("tokenizer_config"),
         trust_remote_code=trust_remote_code,
     )
-    from mlx_lm import load
+    if _config_model_type(path_or_repo) == "dory":
+        from ..patches.dory import load
+    else:
+        from mlx_lm import load
     return load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
 
 
@@ -535,6 +542,7 @@ def maybe_apply_pre_load_patches(
     - Ling 3.0 Flash mixed MLA/KDA model when ``config.json`` declares
       ``model_type == "bailing_hybrid"``. The vendored module is registered
       as ``mlx_lm.models.bailing_hybrid`` before mlx-lm resolves its classes.
+    - Dory recurrent text model when ``config.json`` declares ``dory``.
     - Raon-1 mini RDA/MLA hybrid when ``config.json`` declares
       ``model_type == "raon1_mini"``. The checkpoint's ``model_file`` is
       served by the vendored ``mlx_lm.models.raon1_mini`` instead of being
@@ -720,6 +728,11 @@ def maybe_apply_pre_load_patches(
 
         if apply_deepseek_v4_patch():
             logger.info("DeepSeek V4 pre-load patch applied for %s", model_name)
+
+    if model_type == "dory":
+        from ..patches.dory import register_model
+
+        register_model()
 
     if model_type == "step3p7":
         from ..patches.step3p7 import apply_step3p7_patch
