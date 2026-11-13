@@ -18,6 +18,7 @@ import copy
 import gc
 import json
 import logging
+import shlex
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
@@ -42,6 +43,7 @@ from .engine.splash import (
     SplashEngine,
     SplashOptions,
     SplashTarget,
+    _read_config,
     find_splash_binary,
     resolve_splash_target,
     splash_draft_to_download,
@@ -53,6 +55,18 @@ from .engine.splash import (
 )
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
+from .engine.sushi import (
+    SushiEngine,
+    SushiOptions,
+    find_sushi_binary,
+    is_sushi_pack,
+    parse_size_bytes,
+    physical_memory_bytes,
+    resolve_sushi_target,
+    sushi_default_ssd_budget_gb,
+    sushi_memory_estimate,
+    wired_limit_target_mb,
+)
 from .engine.tts import TTSEngine
 from .engine.vlm import OCR_MODEL_GENERATION_DEFAULTS, VLMBatchedEngine
 from .engine_core import get_mlx_executor, shutdown_mlx_executor
@@ -618,7 +632,11 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
-        if self.external_engine_id(entry.model_id, runtime_settings):
+        engine_id = self.external_engine_id(entry.model_id, runtime_settings)
+        if engine_id == "sushi":
+            # Sushi plans its own memory; count weights + KV for its window.
+            return self._sushi_wanted_bytes(entry)
+        if engine_id:
             # Splash plans its own budget; none of the MLX reservations apply.
             target, _ = self.splash_target(entry.model_id, runtime_settings)
             if target is not None:
@@ -2275,7 +2293,12 @@ class EnginePool:
             get_settings = getattr(self._settings_manager, "get_settings", None)
             if callable(get_settings):
                 settings = get_settings(model_id)
-        if self.external_engine_id(model_id, settings):
+        engine_id = self.external_engine_id(model_id, settings)
+        if engine_id == "sushi":
+            await asyncio.to_thread(
+                find_sushi_binary, get_global_settings().integrations.sushi_path
+            )
+        elif engine_id:
             await asyncio.to_thread(
                 find_splash_binary, get_global_settings().integrations.splash_path
             )
@@ -2285,7 +2308,10 @@ class EnginePool:
     ) -> str:
         """Why no external engine can serve ``model_id``; empty when one can."""
         await self._check_splash_launcher(model_id, model_settings)
-        _, reason = self.splash_target(model_id, model_settings)
+        engine_id = self.external_engine_id(model_id, model_settings) or next(
+            iter(EXTERNAL_ENGINES)
+        )
+        _, reason = self.external_engine_target(engine_id, model_id, model_settings)
         return reason
 
     def external_engine_id(
@@ -2293,16 +2319,142 @@ class EnginePool:
     ) -> str | None:
         """The external engine that serves ``model_id``, else None.
 
-        A GGUF, which no in-process engine loads, falls back to the default
-        external engine when its settings pick none.
+        A Sushi pack (EXL3 routed experts, ``expert_quant.format == "exl3"``)
+        and a GGUF, which no in-process engine loads, pick their engine when
+        the settings pick none: Sushi for the pack, the default external
+        engine for a GGUF.
         """
         engine_id = getattr(model_settings, "external_engine", None)
         if engine_id:
             return engine_id
         entry = self._entries.get(model_id)
-        if entry is not None and entry.model_format == "gguf":
+        if entry is None:
+            return None
+        if self._is_sushi_pack(entry):
+            return "sushi"
+        if entry.model_format == "gguf":
             return next(iter(EXTERNAL_ENGINES))
         return None
+
+    @staticmethod
+    def _is_sushi_pack(entry: EngineEntry) -> bool:
+        try:
+            config = _read_config(Path(entry.model_path)) or {}
+        except Exception:  # noqa: BLE001
+            logger.debug("sushi pack check failed", exc_info=True)
+            return False
+        return is_sushi_pack(config)
+
+    def external_engine_target(
+        self, engine_id: str, model_id: str, model_settings: object | None
+    ) -> tuple[object | None, str]:
+        """Whether ``engine_id`` can serve ``model_id``; else why not."""
+        if engine_id == "sushi":
+            return self.sushi_target(model_id)
+        return self.splash_target(model_id, model_settings)
+
+    def sushi_target(self, model_id: str) -> tuple[object | None, str]:
+        """Whether Sushi can serve ``model_id``, and with what; else why not."""
+        entry = self._entries.get(model_id)
+        if entry is None:
+            return None, f"Model '{model_id}' not found"
+        if entry.engine_type not in ("batched", "vlm"):
+            return None, "Sushi serves language models only"
+        integrations = get_global_settings().integrations
+        return resolve_sushi_target(
+            entry.model_path,
+            integrations.sushi_path,
+            auto_install=bool(integrations.sushi_auto_install),
+        )
+
+    @staticmethod
+    def _sushi_options() -> SushiOptions:
+        i = get_global_settings().integrations
+        return SushiOptions(
+            ctx_size=i.sushi_ctx_size,
+            kv_quant=str(i.sushi_kv_quant or "8"),
+            mtp=bool(i.sushi_mtp),
+            mtp_head_kv_quant=bool(i.sushi_mtp_head_kv_quant),
+            prefill_chunk=i.sushi_prefill_chunk,
+            max_tokens=i.sushi_max_tokens,
+            temperature=i.sushi_temperature,
+            prefix_cache_disk=i.sushi_prefix_cache_disk or None,
+            prefix_cache_entries=i.sushi_prefix_cache_entries,
+            prefix_cache_mem=i.sushi_prefix_cache_mem or None,
+            ssd_budget_gb=i.sushi_ssd_budget_gb,
+            extra_args=shlex.split(i.sushi_extra_args or ""),
+            auto_install=bool(i.sushi_auto_install),
+            auto_wired_limit=bool(i.sushi_auto_wired_limit),
+        )
+
+    @staticmethod
+    def _sushi_model_type(entry: EngineEntry) -> str:
+        return str((_read_config(Path(entry.model_path)) or {}).get("model_type") or "")
+
+    def _sushi_ssd_budget_gb(
+        self, entry: EngineEntry, options: SushiOptions
+    ) -> float | None:
+        """The resident budget a streamed load keeps: the setting, else the
+        one Sushi picks itself for this Mac (counting a wired limit oMLX will
+        raise before launch)."""
+        if options.ssd_budget_gb:
+            return options.ssd_budget_gb
+        from .process_memory_enforcer import get_iogpu_wired_limit_bytes
+
+        ram = physical_memory_bytes()
+        wired_mb = get_iogpu_wired_limit_bytes() // 1024**2
+        if options.auto_wired_limit:
+            wired_mb = max(wired_mb, wired_limit_target_mb(0, ram))
+        return sushi_default_ssd_budget_gb(
+            self._sushi_model_type(entry), ram, wired_mb
+        )
+
+    def _sushi_wanted_bytes(self, entry: EngineEntry) -> int:
+        options = self._sushi_options()
+        return sushi_memory_estimate(
+            entry.model_path,
+            options.ctx_size,
+            options.kv_quant,
+            parse_size_bytes(options.prefix_cache_mem),
+            model_type=self._sushi_model_type(entry),
+            ssd_budget_gb=self._sushi_ssd_budget_gb(entry, options),
+        )
+
+    def _sushi_engine_for(self, entry: EngineEntry) -> SushiEngine:
+        target, reason = self.sushi_target(entry.model_id)
+        if target is None:
+            raise ModelLoadingError(
+                entry.model_id, f"Sushi cannot serve '{entry.model_id}': {reason}"
+            )
+        wanted = self._sushi_wanted_bytes(entry)
+        limit = self._splash_admission_target()
+        if limit > 0 and wanted > limit - self._current_model_memory:
+            raise ModelLoadingError(
+                entry.model_id,
+                f"Sushi needs about {wanted / 1024**3:.1f} GiB for "
+                f"'{entry.model_id}' (weights + KV for its context), more than "
+                "the oMLX memory limit leaves; lower sushi_ctx_size or "
+                "sushi_ssd_budget_gb, or unload "
+                "other models",
+            )
+        logger.info(
+            "Serving %s through Sushi %s",
+            entry.model_id,
+            (
+                f"{target.binary.version} ({target.binary.path})"
+                if target.binary
+                else "(installing on first load)"
+            ),
+        )
+        settings = get_global_settings()
+        return SushiEngine(
+            model_name=entry.model_path,
+            model_id=entry.model_id,
+            target=target,
+            log_dir=settings.logging.get_log_dir(settings.base_path) / "sushi",
+            options=self._sushi_options(),
+            memory_budget_bytes=wanted,
+        )
 
     def _selected_splash_target(
         self,
@@ -2324,8 +2476,12 @@ class EnginePool:
             )
         if effective_type not in ("batched", "vlm"):
             raise ModelLoadingError(
-                entry.model_id, "Splash serves language models only"
+                entry.model_id,
+                f"{EXTERNAL_ENGINES[engine_id]} serves language models only",
             )
+        if engine_id == "sushi":
+            # Sushi has no Splash target; _external_engine_for builds it.
+            return None
         target, reason = self.splash_target(entry.model_id, model_settings)
         if target is None:
             raise ModelLoadingError(
@@ -2340,6 +2496,10 @@ class EnginePool:
         effective_type: str,
     ) -> SplashEngine | None:
         """The external engine the model's settings select, else None."""
+        if self.external_engine_id(entry.model_id, model_settings) == "sushi":
+            # Raises for a non-language model, like the Splash path.
+            self._selected_splash_target(entry, model_settings, effective_type)
+            return self._sushi_engine_for(entry)
         target = self._selected_splash_target(entry, model_settings, effective_type)
         if target is None:
             return None
@@ -4815,7 +4975,7 @@ class EnginePool:
             external_engine = None
             if isinstance(e.engine, SplashEngine):
                 # Report the live footprint of the Splash process group.
-                external_engine = "splash"
+                external_engine = getattr(e.engine, "external_engine_id", "splash")
                 actual_size = e.engine.process_memory_bytes() or actual_size
             models.append(
                 {
