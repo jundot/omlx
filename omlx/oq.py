@@ -8097,7 +8097,7 @@ def quantize_oq_streaming(
     if not text_only:
         _copy_bundled_drafts(source, output)
     if inkling2_layout.is_inkling2(config):
-        inkling2_layout.copy_bundled_files(source, output)
+        inkling2_layout.copy_bundled_draft(source, output)
 
     if mimo_multimodal:
         from .patches.mimo_v2.omnimodal import export_sidecars

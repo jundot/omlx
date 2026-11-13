@@ -25,7 +25,6 @@ NVFP4_GLOBAL_SCALE = 448.0 * 6.0
 EMBED_PATH = "model.embed"
 # The DSpark draft ships next to the weights and is never quantized.
 DRAFT_WEIGHTS = "mtp.safetensors"
-_BUNDLED_FILES = (DRAFT_WEIGHTS, "tiktoken")
 
 _ATTENTION_RE = re.compile(r"(?:^|\.)attn\.(?:in_proj|q_proj|k_proj|v_proj|o_proj)$")
 _RENAMES = {
@@ -186,15 +185,10 @@ def has_bundled_draft(source) -> bool:
     return (Path(source) / DRAFT_WEIGHTS).is_file()
 
 
-def copy_bundled_files(source, output) -> None:
-    """Copy the DSpark draft and the tiktoken table next to the output weights."""
-    source, output = Path(source), Path(output)
-    for name in _BUNDLED_FILES:
-        path = source / name
-        if path.is_dir():
-            shutil.copytree(path, output / name, dirs_exist_ok=True)
-        elif path.is_file():
-            shutil.copy2(path, output / name)
+def copy_bundled_draft(source, output) -> None:
+    """Copy the DSpark draft next to the output weights."""
+    if has_bundled_draft(source):
+        shutil.copy2(Path(source) / DRAFT_WEIGHTS, Path(output) / DRAFT_WEIGHTS)
 
 
 def embed_fn(model):
