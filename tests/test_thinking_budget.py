@@ -916,3 +916,203 @@ class TestResolveThinkClosePattern:
         template = "{{ '<channel|>' }} {{ '\\n<channel|>\\n\\n' }}"
         scheduler = self._make_scheduler(template)
         assert scheduler._resolve_think_close_pattern("<channel|>") == ([198], [271])
+
+
+# ---------------------------------------------------------------------------
+# Prompts that end inside an open thinking block
+# ---------------------------------------------------------------------------
+
+IM_START = 1
+THINK = 41
+THINK_END = 42
+NL = 198
+
+
+class _ChatMLTokenizer:
+    """Tokenizer stub with a ChatML turn marker and single-token think tags."""
+
+    think_start = "<think>"
+    think_start_id = THINK
+    think_end_id = THINK_END
+    unk_token_id = None
+
+    def __init__(self, prompt_ids=None):
+        self._prompt_ids = prompt_ids or []
+
+    def convert_tokens_to_ids(self, token):
+        return {"<|im_start|>": IM_START, "<think>": THINK}.get(token)
+
+    def encode(self, prompt, add_special_tokens=False):
+        return list(self._prompt_ids)
+
+
+# <|im_start|>user ... <|im_start|>assistant\n<think>\n
+_GENERATION_PROMPT = [IM_START, 5, 6, 2, IM_START, 7, NL, THINK, NL]
+
+
+class TestThinkingOpenInFinalTurn:
+    def _open(self, ids, **kwargs):
+        from omlx.api.thinking import thinking_open_in_final_turn
+
+        return thinking_open_in_final_turn(
+            ids, [THINK], [THINK_END], frozenset({IM_START}), **kwargs
+        )
+
+    def test_generation_prompt_is_open(self):
+        assert self._open(_GENERATION_PROMPT)
+
+    def test_partial_reasoning_trace_is_open(self):
+        assert self._open(_GENERATION_PROMPT + [10, 11, 12, 13, NL, 14, 15])
+
+    def test_disabled_thinking_is_closed(self):
+        assert not self._open(_GENERATION_PROMPT + [NL, THINK_END, NL])
+
+    def test_closed_trace_with_answer_prefill_is_closed(self):
+        assert not self._open(_GENERATION_PROMPT + [10, 11, THINK_END, NL, 20, 21])
+
+    def test_scan_stops_at_the_final_turn(self):
+        """An unclosed block in an earlier turn does not leak into this one."""
+        ids = [IM_START, 7, NL, THINK, 10, 11, 2, IM_START, 7, NL, 20, 21]
+        assert not self._open(ids)
+
+    def test_no_think_marker_is_closed(self):
+        assert not self._open([IM_START, 7, NL, 20, 21])
+
+    def test_lookback_is_capped(self):
+        ids = [THINK] + [10] * 10
+        assert not self._open(ids, max_lookback=5)
+        assert self._open(ids, max_lookback=20)
+
+    def test_multi_token_markers(self):
+        from omlx.api.thinking import thinking_open_in_final_turn
+
+        start, end = [60, 61], [62, 63]
+        turns = frozenset({IM_START})
+        assert thinking_open_in_final_turn([IM_START, 60, 61, 7, 8], start, end, turns)
+        assert not thinking_open_in_final_turn(
+            [IM_START, 60, 61, 7, 62, 63], start, end, turns
+        )
+        # Half a start marker does not open thinking.
+        assert not thinking_open_in_final_turn([IM_START, 61, 7, 8], start, end, turns)
+
+    def test_turn_start_ids_resolve_known_markers_only(self):
+        from omlx.api.thinking import turn_start_token_ids
+
+        assert turn_start_token_ids(_ChatMLTokenizer()) == frozenset({IM_START})
+        # No convert_tokens_to_ids, or non-int results (mocks): no markers.
+        assert turn_start_token_ids(object()) == frozenset()
+        assert turn_start_token_ids(MagicMock()) == frozenset()
+
+    def test_turn_start_ids_ignore_unk(self):
+        from omlx.api.thinking import turn_start_token_ids
+
+        class Tokenizer:
+            unk_token_id = 0
+
+            def convert_tokens_to_ids(self, token):
+                return 0
+
+        assert turn_start_token_ids(Tokenizer()) == frozenset()
+
+
+class TestPromptOpensThinkingPartialTrace:
+    """Server-side mirror of the scheduler decision (completions prefix strip,
+    chat stream ThinkingParser start state, cluster worker budget)."""
+
+    def test_partial_trace_opens_thinking(self):
+        from omlx.api.thinking import prompt_opens_thinking
+
+        ids = _GENERATION_PROMPT + [10, 11, 12]
+        opens, tag = prompt_opens_thinking(_ChatMLTokenizer(ids), "prompt")
+        assert (opens, tag) == (True, "<think>")
+
+    def test_closed_trace_does_not_open_thinking(self):
+        from omlx.api.thinking import prompt_opens_thinking
+
+        ids = _GENERATION_PROMPT + [10, THINK_END, NL, 20]
+        opens, _ = prompt_opens_thinking(_ChatMLTokenizer(ids), "prompt")
+        assert not opens
+
+    def test_without_turn_marker_only_the_tail_is_checked(self):
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = THINK
+            think_end_id = THINK_END
+
+        ids = [5, THINK, NL, 10, 11, 12]
+        opens, _ = prompt_opens_thinking(Tokenizer(), "p", prompt_token_ids=ids)
+        assert not opens
+        opens, _ = prompt_opens_thinking(Tokenizer(), "p", prompt_token_ids=ids[:3])
+        assert opens
+
+    def test_continuation_lands_in_reasoning(self):
+        """With the prompt marked open, the scheduler's synthetic opener makes
+        the continuation reasoning (chat) and is stripped (completions)."""
+        from omlx.api.thinking import ThinkingParser, extract_thinking
+        from omlx.server import _strip_synthetic_think_prefix
+
+        output = "<think>\n" + " 51, so 391.\n</think>\n\n391"
+        assert extract_thinking(output) == ("51, so 391.", "391")
+
+        parser = ThinkingParser(start_in_thinking=True)
+        reasoning, content = parser.feed(" 51, so 391.\n</think>\n\n391")
+        tail_reasoning, tail_content = parser.finish()
+        assert (reasoning + tail_reasoning).strip() == "51, so 391."
+        assert (content + tail_content).strip() == "391"
+
+        assert _strip_synthetic_think_prefix(output, "<think>").startswith(" 51")
+
+
+class TestSchedulerPartialTraceThinkingBudget:
+    def _make_scheduler(self):
+        scheduler = MagicMock(spec=Scheduler)
+        scheduler._output_parser_factory = None
+        scheduler._xtc_special_tokens = set()
+        scheduler._model_suppress_tokens = set()
+        for name in (
+            "_detect_needs_think_prefix",
+            "_get_think_token_id",
+            "_get_output_parser_thinking_start_text",
+            "_get_output_parser_thinking_end_text",
+            "_encode_thinking_marker",
+            "_resolve_think_end_token_ids",
+            "_resolve_output_parser_thinking_trailing_ids",
+            "_build_sampler_and_processors",
+        ):
+            setattr(scheduler, name, getattr(Scheduler, name).__get__(scheduler))
+        scheduler._resolve_think_close_pattern = MagicMock(return_value=(None, None))
+        scheduler.tokenizer = _ChatMLTokenizer()
+        return scheduler
+
+    def _request(self, ids):
+        return Request(
+            request_id="partial-trace",
+            prompt="prompt",
+            prompt_token_ids=list(ids),
+            num_prompt_tokens=len(ids),
+            sampling_params=SamplingParams(max_tokens=64, thinking_budget=8),
+        )
+
+    @pytest.mark.parametrize(
+        "ids, opened",
+        [
+            (_GENERATION_PROMPT, True),
+            (_GENERATION_PROMPT + [10, 11, 12, NL, 13, 14], True),
+            (_GENERATION_PROMPT + [NL, THINK_END, NL], False),
+            (_GENERATION_PROMPT + [10, THINK_END, NL, 20], False),
+        ],
+    )
+    def test_budget_follows_the_final_turn_thinking_state(self, ids, opened):
+        scheduler = self._make_scheduler()
+        request = self._request(ids)
+
+        request.needs_think_prefix = scheduler._detect_needs_think_prefix(request)
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+
+        assert request.needs_think_prefix is opened
+        budget = [p for p in processors if isinstance(p, ThinkingBudgetProcessor)]
+        assert len(budget) == (1 if opened else 0)
