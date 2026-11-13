@@ -148,13 +148,32 @@ console.log(JSON.stringify({up: up, down: down}));
     assert result["down"] == 4096
 
 
-def test_native_spinner_grid_matches_the_step():
+def test_arrow_keys_land_on_multiples_of_the_step():
+    """From an off-grid value the stepper moves to the next or previous
+    multiple of 1024, and never below 1."""
+    result = _run("""
+const step = (start, direction) => {
+    app.modelSettings.thinking_budget_tokens = start;
+    app.stepThinkingBudgetTokens(direction);
+    return app.modelSettings.thinking_budget_tokens;
+};
+console.log(JSON.stringify([
+    step(1, 1), step(1024, 1), step(1500, 1), step(null, 1),
+    step(1500, -1), step(1024, -1), step(1, -1), step(null, -1),
+]));
+""")
+    assert result == [1024, 2048, 2048, 1024, 1024, 1, 1, 1]
+
+
+def test_native_field_accepts_any_budget():
+    """step=1 keeps browser validation from flagging budgets such as 1000
+    that are not multiples of the arrow-key step."""
     source = CHAT_TEMPLATE.read_text()
     field = re.search(
         r"<input type=\"number\"\n(?:.*\n)*?.*thinking-budget-input", source
     ).group()
-    assert 'step="1024"' in field
-    assert 'min="0"' in field
+    assert 'step="1"' in field
+    assert 'min="1"' in field
 
 
 def test_no_second_writer_is_left_on_the_field():
