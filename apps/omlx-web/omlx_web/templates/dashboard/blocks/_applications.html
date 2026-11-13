@@ -1,224 +1,226 @@
+{# Applications: an icon launcher. A tool's launch command is one click away,
+   so the card stays a compact grid instead of a nine-row list of commands.
+   Claude Code opens its own settings here rather than in a second card: the
+   mode switch, the command it generates, the tier models and the Claude
+   Desktop aliases all belong to the tool the tile names. #}
+{% macro copy_button(command) %}
+<button type="button" x-data="{ copied: false }"
+        @click="copyToClipboard({{ command }}); copied = true; setTimeout(() => copied = false, 2000)"
+        class="shrink-0 rounded-md p-1.5 text-neutral-400 transition-colors hover:bg-neutral-100 hover:text-neutral-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900"
+        :class="copied ? 'text-green-600' : ''"
+        :title="window.t('status.integrations.copy_command_tooltip')"
+        :aria-label="window.t('status.integrations.copy_command_tooltip')">
+    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+</button>
+{% endmacro %}
+
+{# The bar renders one command and copies another when they differ: Claude's
+   command is shown with its auth token masked, and the button still copies
+   the real one. #}
+{% macro command_bar(command, copy_command=None) %}
+<div class="flex items-start gap-2 rounded-lg border border-neutral-200 bg-white py-1 pl-3 pr-1">
+    <code class="min-w-0 flex-1 whitespace-pre-wrap pt-1.5 pb-1 font-mono text-xs leading-relaxed text-neutral-600 [overflow-wrap:anywhere]" x-text="{{ command }}"></code>
+    {{ copy_button(copy_command or command) }}
+</div>
+{% endmacro %}
+
+{% macro tool_tile(tool, icon, label, fit='object-cover') %}
+<button type="button" data-tool="{{ tool }}" aria-controls="integration-panel-{{ tool }}"
+        @click="tool = tool === '{{ tool }}' ? null : '{{ tool }}'"
+        :aria-expanded="tool === '{{ tool }}' ? 'true' : 'false'"
+        :class="tool === '{{ tool }}' ? 'border-neutral-300 bg-neutral-100' : 'border-transparent hover:border-neutral-200 hover:bg-neutral-50'"
+        class="flex flex-col items-center gap-2 rounded-xl border px-1.5 py-2.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900">
+    <span class="grid h-9 w-9 place-items-center overflow-hidden rounded-lg bg-white ring-1 ring-neutral-900/5">
+        <img src="/admin/static/img/integrations/{{ icon }}" alt="" class="h-full w-full {{ fit }}">
+    </span>
+    <span class="line-clamp-2 w-full text-center text-xs font-semibold leading-tight text-neutral-600">{{ label }}</span>
+</button>
+{% endmacro %}
+
+{% macro panel_head(icon, label, fit='object-cover') %}
+<div class="flex items-center gap-2.5">
+    <span class="grid h-7 w-7 shrink-0 place-items-center overflow-hidden rounded-md bg-white ring-1 ring-neutral-900/5">
+        <img src="/admin/static/img/integrations/{{ icon }}" alt="" class="h-full w-full {{ fit }}">
+    </span>
+    <span class="text-sm font-semibold text-neutral-800">{{ label }}</span>
+</div>
+{% endmacro %}
+
+{% macro tool_panel(tool, icon, label, command, fit='object-cover') %}
+<div data-tool-panel="{{ tool }}" id="integration-panel-{{ tool }}" x-show="tool === '{{ tool }}'">
+    {{ panel_head(icon, label, fit) }}
+    <div class="mt-2">{{ command_bar(command) }}</div>
+</div>
+{% endmacro %}
+
+{# One tier row: the model the tier aliases, and the warning when the saved
+   model is no longer served. #}
+{% macro tier_select(tier, label_key, hint_key=None) %}
+<div>
+    <label for="claude-{{ tier }}-model" class="mb-1.5 block text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t(label_key) }}</label>
+    <select id="claude-{{ tier }}-model"
+            x-model="globalSettings.claude_code.{{ tier }}_model"
+            @change="globalSettings.claude_code.{{ tier }}_model = globalSettings.claude_code.{{ tier }}_model || null; saveClaudeCodeSettings()"
+            class="w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm transition-all focus:border-neutral-900 focus:ring-2 focus:ring-neutral-900">
+        <option value="">{{ t('status.claude_code.select_model') }}</option>
+        <template x-for="m in llmModels" :key="m.id">
+            <option :value="m.id" x-text="m.id"></option>
+        </template>
+    </select>
+    <div x-show="globalSettings.claude_code.{{ tier }}_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.{{ tier }}_model)"
+         x-cloak class="mt-1 flex items-center gap-1.5 text-xs text-amber-700">
+        <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+        <span>{{ t('status.claude_code.model_unavailable') }}</span>
+    </div>
+    {% if hint_key %}<p class="mt-1 text-xs text-neutral-400">{{ t(hint_key) }}</p>{% endif %}
+</div>
+{% endmacro %}
+
 <!-- Applications -->
-<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden"
+     x-data="{ tool: null }"
+     @keydown.escape="tool = null">
     <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
         <div class="flex items-center gap-3">
             <i data-lucide="layout-grid" class="w-4 h-4 text-neutral-500"></i>
             <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.integrations.section_label') }}</span>
         </div>
     </div>
-    <div class="divide-y divide-neutral-100">
+    <div class="px-4 py-4 sm:px-6 sm:py-5">
 
-        <!-- Claude Code -->
-        <div class="flex items-center gap-4 px-6 py-4 group">
-            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                <img src="/admin/static/img/integrations/claude.png" alt="{{ t('status.integrations.claude_code') }}" class="w-full h-full object-cover">
-            </div>
-            <div class="flex-1 min-w-0">
-                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.claude_code') }}</div>
-                <div class="flex items-center gap-1">
-                    <code class="text-xs text-neutral-500 font-mono min-w-0 [overflow-wrap:anywhere]" x-text="claudeCommand"></code>
-                    <button x-data="{ copied: false }"
-                            @click="copyToClipboard(claudeCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                            class="p-1 rounded-md transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 flex-shrink-0"
-                            :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
-                            :title="window.t('status.integrations.copy_command_tooltip')">
-                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                    </button>
-                </div>
-            </div>
+        <!-- Tools. Each tile opens its own panel below the grid. -->
+        <div class="grid grid-cols-[repeat(auto-fit,minmax(5.5rem,1fr))] gap-1.5"
+             role="group"
+             aria-label="{{ t('status.integrations.section_label') }}">
+            {{ tool_tile('claude', 'claude.png', t('status.integrations.claude_code')) }}
+            {{ tool_tile('codex', 'codex.png', t('status.integrations.codex')) }}
+            {{ tool_tile('dsh', 'dsh.png', t('status.integrations.dsh')) }}
+            {{ tool_tile('opencode', 'opencode.png', t('status.integrations.opencode')) }}
+            {{ tool_tile('openclaw', 'openclaw.png', t('status.integrations.openclaw')) }}
+            {{ tool_tile('hermes', 'hermes.svg', t('status.integrations.hermes_agent'), 'object-cover dark:invert') }}
+            {{ tool_tile('pi', 'pi.svg', t('status.integrations.pi')) }}
+            {{ tool_tile('vibe', 'vibe.svg', t('status.integrations.vibe'), 'object-contain') }}
+            {{ tool_tile('copilot', 'copilot.svg', t('status.integrations.copilot_cli')) }}
         </div>
 
-        <!-- Codex -->
-        <div class="flex items-start gap-4 px-6 py-4 group">
-            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                <img src="/admin/static/img/integrations/codex.png" alt="{{ t('status.integrations.codex') }}" class="w-full h-full object-cover">
-            </div>
-            <div class="flex-1 min-w-0 space-y-2">
-                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.codex') }}</div>
-                <div class="space-y-1.5">
-                    <div class="flex items-center gap-2 min-w-0">
-                        <span class="w-10 text-caption font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">CLI</span>
-                        <code class="text-xs text-neutral-500 font-mono truncate" x-text="codexCommand"></code>
-                        <button x-data="{ copied: false }"
-                                @click="copyToClipboard(codexCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                                class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 flex-shrink-0"
-                                :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
-                                :title="window.t('status.integrations.copy_command_tooltip')">
-                            <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                            <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                        </button>
+        <!-- One panel per tool; only the selected one is in the layout. -->
+        <div x-show="tool" x-cloak x-transition.opacity.duration.150ms
+             class="mt-3 rounded-xl border border-neutral-200 bg-neutral-50 p-3 sm:p-4">
+
+            <!-- Claude Code: the settings the tool needs to talk to oMLX. -->
+            <div data-tool-panel="claude" id="integration-panel-claude" x-show="tool === 'claude'" class="space-y-3">
+                {{ panel_head('claude.png', t('status.integrations.claude_code')) }}
+
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-start">
+                    <div class="sm:w-44 sm:shrink-0">
+                        <div class="mb-1.5 text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('status.claude_code.mode') }}</div>
+                        <div class="flex items-center gap-2.5">
+                            <button type="button" role="switch"
+                                    aria-label="{{ t('status.claude_code.mode') }}"
+                                    :aria-checked="globalSettings.claude_code.mode === 'local'"
+                                    @click="globalSettings.claude_code.mode = (globalSettings.claude_code.mode === 'cloud' ? 'local' : 'cloud'); saveClaudeCodeSettings()"
+                                    :class="globalSettings.claude_code.mode === 'local' ? 'bg-neutral-900' : 'bg-neutral-200'"
+                                    class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">
+                                <span :class="globalSettings.claude_code.mode === 'local' ? 'translate-x-5' : 'translate-x-0'"
+                                      class="ml-0.5 mt-0.5 inline-block h-5 w-5 transform rounded-full bg-white shadow transition duration-200"></span>
+                            </button>
+                            <span class="text-sm font-medium text-neutral-700" x-text="globalSettings.claude_code.mode === 'cloud' ? window.t('status.claude_code.mode_cloud') : window.t('status.claude_code.mode_local')"></span>
+                        </div>
                     </div>
-                    <div class="flex items-center gap-2 min-w-0">
-                        <span class="w-10 text-caption font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">{{ t('status.integrations.app') }}</span>
-                        <code class="text-xs text-neutral-500 font-mono truncate" x-text="codexAppCommand"></code>
-                        <button x-data="{ copied: false }"
-                                @click="copyToClipboard(codexAppCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                                class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 flex-shrink-0"
-                                :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
-                                :title="window.t('status.integrations.copy_command_tooltip')">
-                            <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                            <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                        </button>
+                    <div class="min-w-0 flex-1">
+                        <div class="mb-1.5 text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('status.claude_code.command') }}</div>
+                        {{ command_bar('claudeCodeCommandDisplay', 'claudeCodeCommand') }}
                     </div>
                 </div>
-            </div>
-        </div>
 
-        <!-- OpenCode -->
-        <div class="flex items-center gap-4 px-6 py-4 group">
-            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                <img src="/admin/static/img/integrations/opencode.png" alt="{{ t('status.integrations.opencode') }}" class="w-full h-full object-cover">
-            </div>
-            <div class="flex-1 min-w-0">
-                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.opencode') }}</div>
-                <div class="flex items-center gap-1">
-                    <code class="text-xs text-neutral-500 font-mono min-w-0 [overflow-wrap:anywhere]" x-text="opencodeCommand"></code>
-                    <button x-data="{ copied: false }"
-                            @click="copyToClipboard(opencodeCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                            class="p-1 rounded-md transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 flex-shrink-0"
-                            :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
-                            :title="window.t('status.integrations.copy_command_tooltip')">
-                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                    </button>
+                <!-- Local mode aliases the three tiers to served models. -->
+                <div x-show="globalSettings.claude_code.mode === 'local'" x-cloak class="border-t border-neutral-200 pt-3">
+                    <div x-show="llmModels.length === 0" x-cloak
+                         class="mb-3 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-700">
+                        <i data-lucide="alert-triangle" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                        <span>{{ t('status.claude_code.no_models_warning') }}</span>
+                    </div>
+                    <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                        {{ tier_select('opus', 'status.claude_code.opus_tier') }}
+                        {{ tier_select('sonnet', 'status.claude_code.sonnet_tier') }}
+                        {{ tier_select('haiku', 'status.claude_code.haiku_tier', 'status.claude_code.haiku_hint') }}
+                    </div>
+                </div>
+
+                <!-- Claude Desktop tier aliases. -->
+                <div class="border-t border-neutral-200 pt-3">
+                    <div class="flex flex-wrap items-center gap-2.5">
+                        <button type="button" role="switch"
+                                aria-label="{{ t('status.claude_code.desktop') }}"
+                                :aria-checked="globalSettings.claude_code.desktop_enabled"
+                                @click="globalSettings.claude_code.desktop_enabled = !globalSettings.claude_code.desktop_enabled; saveClaudeCodeSettings()"
+                                :class="globalSettings.claude_code.desktop_enabled ? 'bg-neutral-900' : 'bg-neutral-200'"
+                                class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">
+                            <span :class="globalSettings.claude_code.desktop_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                  class="ml-0.5 mt-0.5 inline-block h-5 w-5 transform rounded-full bg-white shadow transition duration-200"></span>
+                        </button>
+                        <span class="text-sm font-medium text-neutral-700">{{ t('status.claude_code.desktop') }}</span>
+                        <span class="rounded-full px-2 py-0.5 text-xs"
+                              :class="claudeDesktop.configured ? 'bg-green-100 text-green-700' : 'bg-neutral-100 text-neutral-500'"
+                              x-text="claudeDesktop.configured ? window.t('status.claude_code.desktop_configured') : window.t('status.claude_code.desktop_not_configured')"></span>
+                    </div>
+                    <p class="mt-1.5 text-xs text-neutral-400">{{ t('status.claude_code.desktop_hint') }}</p>
+                    <p class="mt-1 text-xs text-neutral-400">{{ t('status.claude_code.desktop_side_effect') }}</p>
+                    <div class="mt-2 flex flex-wrap items-center gap-2">
+                        <button type="button" @click="reapplyClaudeDesktopConfig()" :disabled="claudeDesktop.working"
+                                class="rounded-lg border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium transition-all hover:bg-neutral-50 disabled:opacity-50">
+                            <span x-text="claudeDesktop.working ? window.t('status.claude_code.desktop_working') : window.t('status.claude_code.desktop_reapply')"></span>
+                        </button>
+                        <button type="button" @click="restoreClaudeDesktopConfig()" :disabled="claudeDesktop.working"
+                                class="rounded-lg border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium transition-all hover:bg-neutral-50 disabled:opacity-50">
+                            <span x-text="claudeDesktop.working ? window.t('status.claude_code.desktop_restoring') : window.t('status.claude_code.desktop_restore')"></span>
+                        </button>
+                        <span x-show="claudeDesktop.message" x-cloak class="text-xs text-neutral-500" x-text="claudeDesktop.message"></span>
+                    </div>
+                    <div class="mt-2">{{ command_bar('claudeDesktopCommand') }}</div>
                 </div>
             </div>
-        </div>
 
-        <!-- OpenClaw -->
-        <div class="flex items-center gap-4 px-6 py-4 group">
-            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                <img src="/admin/static/img/integrations/openclaw.png" alt="{{ t('status.integrations.openclaw') }}" class="w-full h-full object-cover">
-            </div>
-            <div class="flex-1 min-w-0">
-                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.openclaw') }}</div>
-                <div class="flex items-center gap-1">
-                    <code class="text-xs text-neutral-500 font-mono min-w-0 [overflow-wrap:anywhere]" x-text="openclawCommand"></code>
-                    <button x-data="{ copied: false }"
-                            @click="copyToClipboard(openclawCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                            class="p-1 rounded-md transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 flex-shrink-0"
-                            :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
-                            :title="window.t('status.integrations.copy_command_tooltip')">
-                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                    </button>
+            <div data-tool-panel="codex" id="integration-panel-codex" x-show="tool === 'codex'" class="space-y-2.5">
+                {{ panel_head('codex.png', t('status.integrations.codex')) }}
+                <div>
+                    <div class="mb-1 text-caption font-bold uppercase tracking-wider text-neutral-400">CLI</div>
+                    {{ command_bar('codexCommand') }}
+                </div>
+                <div>
+                    <div class="mb-1 text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('status.integrations.app') }}</div>
+                    {{ command_bar('codexAppCommand') }}
                 </div>
             </div>
-            <select x-model="globalSettings.integrations.openclaw_tools_profile"
-                    @change="saveIntegrationSettings()"
-                    class="text-xs border border-neutral-200 rounded-lg px-2 py-1 text-neutral-600 bg-white focus:outline-none focus:ring-1 focus:ring-neutral-300 flex-shrink-0">
-                <option value="minimal">{{ t('status.integrations.tools_profile_minimal') }}</option>
-                <option value="coding">{{ t('status.integrations.tools_profile_coding') }}</option>
-                <option value="messaging">{{ t('status.integrations.tools_profile_messaging') }}</option>
-                <option value="full">{{ t('status.integrations.tools_profile_full') }}</option>
-            </select>
-        </div>
 
-        <!-- Hermes Agent -->
-        <div class="flex items-center gap-4 px-6 py-4 group">
-            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                <img src="/admin/static/img/integrations/hermes.svg" alt="{{ t('status.integrations.hermes_agent') }}" class="w-full h-full object-cover">
-            </div>
-            <div class="flex-1 min-w-0">
-                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.hermes_agent') }}</div>
-                <div class="flex items-center gap-1">
-                    <code class="text-xs text-neutral-500 font-mono min-w-0 [overflow-wrap:anywhere]" x-text="hermesCommand"></code>
-                    <button x-data="{ copied: false }"
-                            @click="copyToClipboard(hermesCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                            class="p-1 rounded-md transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 flex-shrink-0"
-                            :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
-                            :title="window.t('status.integrations.copy_command_tooltip')">
-                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                    </button>
+            {{ tool_panel('dsh', 'dsh.png', t('status.integrations.dsh'), 'dshCommand') }}
+            {{ tool_panel('opencode', 'opencode.png', t('status.integrations.opencode'), 'opencodeCommand') }}
+
+            <div data-tool-panel="openclaw" id="integration-panel-openclaw" x-show="tool === 'openclaw'">
+                {{ panel_head('openclaw.png', t('status.integrations.openclaw')) }}
+                <div class="mt-2">{{ command_bar('openclawCommand') }}</div>
+                <div class="mt-2.5 flex items-center justify-between gap-3">
+                    <label for="openclaw-tools-profile" class="text-xs text-neutral-500">{{ t('status.integrations.tools_profile') }}</label>
+                    <select id="openclaw-tools-profile"
+                            x-model="globalSettings.integrations.openclaw_tools_profile"
+                            @change="saveIntegrationSettings()"
+                            class="text-xs border border-neutral-200 rounded-lg px-2 py-1 text-neutral-600 bg-white focus:outline-none focus:ring-1 focus:ring-neutral-300">
+                        <option value="minimal">{{ t('status.integrations.tools_profile_minimal') }}</option>
+                        <option value="coding">{{ t('status.integrations.tools_profile_coding') }}</option>
+                        <option value="messaging">{{ t('status.integrations.tools_profile_messaging') }}</option>
+                        <option value="full">{{ t('status.integrations.tools_profile_full') }}</option>
+                    </select>
                 </div>
             </div>
+
+            {{ tool_panel('hermes', 'hermes.svg', t('status.integrations.hermes_agent'), 'hermesCommand', 'object-cover dark:invert') }}
+            {{ tool_panel('pi', 'pi.svg', t('status.integrations.pi'), 'piCommand') }}
+            {{ tool_panel('vibe', 'vibe.svg', t('status.integrations.vibe'), 'vibeCommand', 'object-contain') }}
+            {{ tool_panel('copilot', 'copilot.svg', t('status.integrations.copilot_cli'), 'copilotCommand') }}
+
         </div>
 
-        <!-- Pi -->
-        <div class="flex items-center gap-4 px-6 py-4 group">
-            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                <img src="/admin/static/img/integrations/pi.svg" alt="{{ t('status.integrations.pi') }}" class="w-full h-full object-cover">
-            </div>
-            <div class="flex-1 min-w-0">
-                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.pi') }}</div>
-                <div class="flex items-center gap-1">
-                    <code class="text-xs text-neutral-500 font-mono min-w-0 [overflow-wrap:anywhere]" x-text="piCommand"></code>
-                    <button x-data="{ copied: false }"
-                            @click="copyToClipboard(piCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                            class="p-1 rounded-md transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 flex-shrink-0"
-                            :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
-                            :title="window.t('status.integrations.copy_command_tooltip')">
-                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Mistral Vibe -->
-        <div class="flex items-center gap-4 px-6 py-4 group">
-            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                <img src="/admin/static/img/integrations/vibe.svg" alt="{{ t('status.integrations.vibe') }}" class="w-full h-full object-contain">
-            </div>
-            <div class="flex-1 min-w-0">
-                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.vibe') }}</div>
-                <div class="flex items-center gap-1">
-                    <code class="text-xs text-neutral-500 font-mono min-w-0 [overflow-wrap:anywhere]" x-text="vibeCommand"></code>
-                    <button x-data="{ copied: false }"
-                            @click="copyToClipboard(vibeCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                            class="p-1 rounded-md transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 flex-shrink-0"
-                            :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
-                            :title="window.t('status.integrations.copy_command_tooltip')">
-                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Copilot CLI -->
-        <div class="flex items-center gap-4 px-6 py-4 group">
-            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                <img src="/admin/static/img/integrations/copilot.svg" alt="{{ t('status.integrations.copilot_cli') }}" class="w-full h-full object-cover">
-            </div>
-            <div class="flex-1 min-w-0">
-                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.copilot_cli') }}</div>
-                <div class="flex items-center gap-1">
-                    <code class="text-xs text-neutral-500 font-mono min-w-0 [overflow-wrap:anywhere]" x-text="copilotCommand"></code>
-                    <button x-data="{ copied: false }"
-                            @click="copyToClipboard(copilotCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                            class="p-1 rounded-md transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 flex-shrink-0"
-                            :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
-                            :title="window.t('status.integrations.copy_command_tooltip')">
-                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- DeepSeek Harness (dsh) -->
-        <div class="flex items-center gap-4 px-6 py-4 group">
-            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                <img src="/admin/static/img/integrations/dsh.png" alt="{{ t('status.integrations.dsh') }}" class="w-full h-full object-cover">
-            </div>
-            <div class="flex-1 min-w-0">
-                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.dsh') }}</div>
-                <div class="flex items-center gap-1">
-                    <code class="text-xs text-neutral-500 font-mono min-w-0 [overflow-wrap:anywhere]" x-text="dshCommand"></code>
-                    <button x-data="{ copied: false }"
-                            @click="copyToClipboard(dshCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                            class="p-1 rounded-md transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 flex-shrink-0"
-                            :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
-                            :title="window.t('status.integrations.copy_command_tooltip')">
-                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                    </button>
-                </div>
-            </div>
-        </div>
-
+        <p x-show="!tool" class="mt-3 px-1 text-xs text-neutral-400">{{ t('status.integrations.pick_tool') }}</p>
     </div>
 </div>
