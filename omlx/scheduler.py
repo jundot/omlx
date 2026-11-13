@@ -14219,6 +14219,7 @@ class Scheduler:
                 finished_ids.add(request_id)
                 continue
 
+            request.mark_decode_progress(step_now)
             request.last_activity_at = step_now
             self._note_memory_admission_progress(step_now)
             completion_tokens_before = request.num_output_tokens

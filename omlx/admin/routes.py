@@ -96,6 +96,7 @@ from ..patches.moe_offload_compat import moe_offload_compatibility
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.routes import helper_status as prefill_helper_status
 from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
+from ..request import live_decode_rate
 from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_KV_FORMATS,
@@ -7299,8 +7300,13 @@ def _build_active_models_data() -> dict:
             last_activity_age = (
                 max(0.0, now - last_activity_at) if last_activity_at else None
             )
-            tokens_per_second = (
-                generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
+            # Recent speed, so a row shows a speed change within seconds.
+            tokens_per_second = live_decode_rate(
+                getattr(req, "decode_marks", ()),
+                generated_tokens,
+                last_activity_at,
+                started_at,
+                now,
             )
             generating.append(
                 {

@@ -590,6 +590,31 @@ def test_active_models_includes_engine_live_request_rows():
     assert model["generating"] == [generating_row]
 
 
+def test_generating_row_reports_recent_rate_not_lifetime_average():
+    running_request = SimpleNamespace(
+        request_id="gen-1",
+        generation_started_at=100.0,
+        last_activity_at=110.0,
+        num_output_tokens=200,
+        num_prompt_tokens=12,
+        max_tokens=64,
+        decode_marks=((100.0, 0), (107.0, 110), (109.5, 185)),
+    )
+
+    class Engine:
+        scheduler = SimpleNamespace(
+            snapshot_for_admin=lambda: {
+                "running_by_id": {"gen-1": running_request},
+                "waiting": [],
+            }
+        )
+
+    data = _build_with_pool(FakeCorelessPool(Engine()))
+
+    # 200 tokens in 10 s is 20 tok/s overall; the last 3 s ran at 30 tok/s.
+    assert data["models"][0]["generating"][0]["tokens_per_second"] == 30.0
+
+
 def test_active_models_resolves_scheduler_property_without_async_core():
     """The engine exposes a scheduler property instead of an AsyncEngineCore,
     and the snapshot path must still be taken."""
