@@ -1333,6 +1333,7 @@ _DFLASH_BATCHED_MODEL_TYPES = {
     "vlm": (
         "qwen3_5",
         "qwen3_5_moe",
+        "qwen4_exp",
         "minicpmv4_7",
         "glm5_next",
         "gemma4",
@@ -1363,7 +1364,7 @@ def dflash_compatibility(
     if dflash_batched_supported(model_type, engine_type):
         return True, ""
     return False, (
-        "DFlash supports Qwen3, Qwen3.5/3.6, Laguna, MiMo V2, GLM-5.3, Gemma 4, "
+        "DFlash supports Qwen3, Qwen3.5/3.6/3.8, Laguna, MiMo V2, GLM-5.3, Gemma 4, "
         "Muse Glimmer and MiniCPM-V 4.7 models "
         f"(model_type='{model_type or ''}', "
         f"engine='{engine_type}')"

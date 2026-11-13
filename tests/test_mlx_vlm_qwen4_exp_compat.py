@@ -1252,6 +1252,275 @@ def _cache_arrays(cache):
     return arrays
 
 
+@pytest.mark.parametrize("hc_count", [2, 4])
+@pytest.mark.parametrize("defer_write", [False, True])
+@pytest.mark.parametrize("token_ids", [[[2, 3, 4]], [[2]], [[2, 3], [4, 5]]])
+def test_qwen4_dflash_capture_order_and_final_hidden(
+    monkeypatch, hc_count, defer_write, token_ids
+):
+    config = _tiny_config()
+    config.text_config.hc_count = hc_count
+    monkeypatch.setattr(qwen4_language.hc_fused, "write_enabled", lambda: defer_write)
+    model = qwen4_language.LanguageModel(config.text_config, config)
+    tokens = mx.array(token_ids, dtype=mx.int32)
+    baseline = model(tokens, cache=model.make_cache())
+    native_cache = model.make_cache()
+    native = model(tokens, cache=native_cache, return_hidden=True)
+    accepted = [tokens.shape[1] - 1] * tokens.shape[0]
+    if native.gdn_states is not None:
+        model.rollback_speculative_cache(
+            native_cache, native.gdn_states, accepted, tokens.shape[1]
+        )
+    completed = []
+    original = qwen4_language.Qwen4ExpDecoderLayer.__call__
+
+    def record_layer(layer, *args, **kwargs):
+        output = original(layer, *args, **kwargs)
+        if kwargs["defer_write"]:
+            residual, branch, weights = output
+            streams = residual.reshape(*residual.shape[:-1], hc_count, 32)
+            streams = streams + branch[..., None, :] * weights[..., None]
+        else:
+            streams = output.reshape(*output.shape[:-1], hc_count, 32)
+        completed.append(streams)
+        return output
+
+    monkeypatch.setattr(qwen4_language.Qwen4ExpDecoderLayer, "__call__", record_layer)
+    for layer_ids in ([0, 1], [1, 0], [1, 0, 1], [0]):
+        for return_hidden in (False, True):
+            completed.clear()
+            cache = model.make_cache()
+            out = model(
+                tokens,
+                cache=cache,
+                capture_layer_ids=layer_ids,
+                return_hidden=return_hidden,
+            )
+            assert len(out.hidden_states) == len(layer_ids) + int(return_hidden)
+            for actual, index in zip(out.hidden_states, layer_ids):
+                assert actual.shape == (*tokens.shape, 32)
+                assert mx.allclose(actual, completed[index].mean(axis=-2)).item()
+                residual = completed[index].reshape(*tokens.shape, hc_count * 32)
+                mixed = model.model.hyper_connection_mixer(residual)
+                assert not mx.allclose(actual, mixed).item()
+            expected = native if return_hidden else baseline
+            assert mx.allclose(out.logits, expected.logits, atol=1e-6).item()
+            assert mx.array_equal(
+                mx.argmax(out.logits, axis=-1), mx.argmax(expected.logits, axis=-1)
+            ).item()
+            if return_hidden:
+                assert mx.allclose(model.lm_head(out.hidden_states[-1]), out.logits).item()
+                model.rollback_speculative_cache(
+                    cache, out.gdn_states, accepted, tokens.shape[1]
+                )
+            else:
+                assert out.gdn_states is None
+    assert mx.allclose(
+        native.hidden_states[0],
+        completed[-1].reshape(*tokens.shape, hc_count * 32),
+        atol=1e-6,
+    ).item()
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 3])
+def test_qwen4_dflash_rejection_matches_serial_replay(accepted):
+    from omlx.patches.mlx_lm_mtp.batch_generator import _call_backbone_captured
+
+    config = _tiny_config()
+    model = qwen4_language.LanguageModel(config.text_config, config)
+    cache, replay = model.make_cache(), model.make_cache()
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    model(prefix, cache=cache)
+    model(prefix, cache=replay)
+    tokens = mx.array([[5, 6, 7, 8]], dtype=mx.int32)
+    logits, hidden, state, captures = _call_backbone_captured(
+        model, tokens, cache, n_confirmed=1, capture_layer_ids=[1, 0]
+    )
+    assert state is not None and state.active
+    assert hidden.shape == (1, 4, 32)
+    assert [capture.shape for capture in captures] == [(1, 4, 32)] * 2
+    serial = [
+        model(tokens[:, i : i + 1], cache=replay).logits for i in range(accepted + 1)
+    ]
+    assert mx.allclose(
+        logits[:, : accepted + 1],
+        mx.concatenate(serial, axis=1),
+        rtol=1e-3,
+        atol=1e-3,
+    ).item()
+    model.rollback_speculative_cache(cache, state, accepted, 4)
+    assert not state.active
+    _assert_ple_state_matches(cache[0], replay[0])
+    assert cache[1].offset == replay[1].offset
+    actual = model(mx.array([[9]], dtype=mx.int32), cache=cache)
+    expected = model(mx.array([[9]], dtype=mx.int32), cache=replay)
+    assert mx.allclose(actual.logits, expected.logits, rtol=1e-3, atol=1e-3).item()
+
+
+def test_qwen4_dflash_unequal_batch_acceptance_matches_serial_rows():
+    from mlx_vlm.models.cache import ArraysCache
+
+    config = _tiny_config()
+    model = qwen4_language.LanguageModel(config.text_config, config)
+    rows = [model.make_cache() for _ in range(2)]
+    replay = [model.make_cache() for _ in range(2)]
+    for row in range(2):
+        prefix = mx.array([[2 + row, 3, 4]], dtype=mx.int32)
+        model(prefix, cache=rows[row])
+        model(prefix, cache=replay[row])
+    cache = [
+        ArraysCache.merge([row[0] for row in rows]),
+        qwen4_language.BatchQSAKVCache.merge([row[1] for row in rows]),
+    ]
+    tokens = mx.array([[5, 6, 7, 8], [9, 10, 11, 12]], dtype=mx.int32)
+    verified = model(tokens, cache=cache, capture_layer_ids=[1, 0], return_hidden=True)
+    assert verified.gdn_states is not None and verified.gdn_states.active
+    model.rollback_speculative_cache(cache, verified.gdn_states, [0, 2], 4)
+    for row, retained in enumerate([1, 3]):
+        for i in range(retained):
+            model(tokens[row : row + 1, i : i + 1], cache=replay[row])
+        extracted = [entry.extract(row) for entry in cache]
+        _assert_ple_state_matches(extracted[0], replay[row][0])
+        actual = model(mx.array([[13]], dtype=mx.int32), cache=extracted)
+        expected = model(mx.array([[13]], dtype=mx.int32), cache=replay[row])
+        assert mx.allclose(actual.logits, expected.logits, rtol=1e-3, atol=1e-3).item()
+
+
+def test_qwen4_dflash_observes_only_scoped_ordinary_decode():
+    from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
+
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import apply
+    from omlx.speculative.dflash.drafter import DFlashDrafter
+
+    assert apply()
+    config = _tiny_config()
+    model = qwen4_language.LanguageModel(config.text_config, config)
+    draft = DFlash2DraftModel(
+        DFlash2Config(
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=64,
+            max_position_embeddings=128,
+            num_target_layers=2,
+            target_layer_ids=[0, 1],
+            block_size=4,
+            mask_token_id=63,
+            conv_kernel_size=2,
+            conv_group_size=8,
+            selector_rank=8,
+            selector_top_k=4,
+            sliding_window=8,
+        )
+    )
+    draft.bind(SimpleNamespace(language_model=model))
+    drafter = DFlashDrafter(
+        draft,
+        block_size=4,
+        source_path="tiny-qwen4-dflash2",
+    )
+    drafter.observe = MagicMock(wraps=drafter.observe)
+    model._omlx_drafter = drafter
+    cache = model.make_cache()
+    model(mx.array([[2, 3]], dtype=mx.int32), cache=cache)
+    drafter.observe.assert_not_called()
+    with DFlashDrafter.decode_scope(drafter, [17]):
+        out = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+        assert out.gdn_states is None
+        drafter.observe.assert_called_once()
+        scope, captures = drafter.observe.call_args.args
+        assert scope == (17,)
+        assert [hidden.shape for hidden in captures] == [(1, 1, 32)] * 2
+        context = drafter._rows[17].pending[0]
+        assert context.shape == (1, 1, 64)
+        assert drafter._rows[17].pending_len == 1
+        with drafter.decode_scope([17, 18]):
+            model(mx.array([[11]], dtype=mx.int32), cache=cache)
+        drafter.observe.assert_called_once()
+        proposals = draft.draft_block(
+            mx.array([5], dtype=mx.int32),
+            context,
+            draft.make_cache(),
+            4,
+            lambda logits: mx.argmax(logits, axis=-1),
+        )
+        assert proposals.shape == (1, 3)
+        drafter.observe.reset_mock()
+        model(mx.array([[5]], dtype=mx.int32), cache=cache, capture_layer_ids=[0])
+        model(mx.array([[6, 7]], dtype=mx.int32), cache=cache)
+        verified = model(
+            mx.array([[8, 9]], dtype=mx.int32),
+            cache=cache,
+            capture_layer_ids=[1, 0],
+            return_hidden=True,
+        )
+        model.rollback_speculative_cache(cache, verified.gdn_states, 1, 2)
+        drafter.observe.assert_not_called()
+    assert drafter.scope_uids is None
+    model(mx.array([[10]], dtype=mx.int32), cache=cache)
+    drafter.observe.assert_not_called()
+    assert drafter._rows[17].pending_len == 1
+
+
+def test_qwen4_dflash_failed_forward_aborts_cache(monkeypatch):
+    config = _tiny_config()
+    model = qwen4_language.LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
+    before = [mx.array(array) for array in _cache_arrays(cache)]
+    original = qwen4_language.start_speculative_cache
+    transactions = []
+
+    def start(*args, **kwargs):
+        transaction = original(*args, **kwargs)
+        transactions.append(transaction)
+        return transaction
+
+    def fail(_hidden):
+        raise RuntimeError("head failed after cache writes")
+
+    monkeypatch.setattr(qwen4_language, "start_speculative_cache", start)
+    monkeypatch.setattr(model, "lm_head", fail)
+    with pytest.raises(RuntimeError, match="head failed"):
+        model(
+            mx.array([[5, 6]], dtype=mx.int32),
+            cache=cache,
+            capture_layer_ids=[1, 0],
+            return_hidden=True,
+        )
+    assert len(transactions) == 1 and not transactions[0].active
+    assert cache[0]._speculation is None
+    assert getattr(cache[0], "_qwen4_exp_ple_speculative_state", None) is None
+    assert cache[1].offset == 3
+    for actual, expected in zip(_cache_arrays(cache), before):
+        assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize(
+    "method", ["speculative_verify_logits", "speculative_verify_hidden"]
+)
+@pytest.mark.parametrize("window", [1, 2])
+def test_qwen4_native_verify_starts_only_one_transaction(monkeypatch, method, window):
+    config = _tiny_config()
+    model = qwen4_language.LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    model(mx.array([[2, 3]], dtype=mx.int32), cache=cache)
+    start = MagicMock(wraps=qwen4_language.start_speculative_cache)
+    monkeypatch.setattr(qwen4_language, "start_speculative_cache", start)
+    args = (lambda logits: logits,) if method.endswith("logits") else ()
+    tokens = mx.array([[4, 5]], dtype=mx.int32)[:, :window]
+    result = getattr(model, method)(tokens, cache, *args)
+    assert result[0].shape == (1, window, 64)
+    start.assert_called_once()
+    assert result[2].active
+    model.rollback_speculative_cache(cache, result[2], 0, window)
+    assert not result[2].active
+
+
 def test_qwen4_mtp_one_row_step_is_the_serial_decode_step():
     """A Lightning MTP window of one row (activation, depth-0 cycle) has no draft
     to roll back: it must be the serial decode step, cache and all, and leave

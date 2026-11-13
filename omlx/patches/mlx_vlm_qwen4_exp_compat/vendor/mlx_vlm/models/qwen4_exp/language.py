@@ -4814,6 +4814,7 @@ class Qwen4ExpModel(nn.Module):
             ssm_mask = mask
 
         capture = set(capture_layer_ids or [])
+        captured = {}
         target_verify = gdn_sink is not None
         # Each layer's tail residual write stays pending and is applied inside
         # the next hyper-connection norm; ``hidden_states`` is the residual
@@ -4846,16 +4847,15 @@ class Qwen4ExpModel(nn.Module):
             ):
                 mx.async_eval(hidden_states, *(write or ()))
             if hidden_sink is not None and index in capture:
-                if write is None:
-                    mixed = self.hyper_connection_mixer(
-                        hidden_states, target_verify=target_verify
-                    )
-                else:
-                    mixed, hidden_states = self.hyper_connection_mixer(
-                        hidden_states, target_verify=target_verify, write=write
-                    )
+                if write is not None:
+                    hidden_states = _hc_write(hidden_states, *write)
                     write = None
-                hidden_sink.append(mixed)
+                # DFlash2 was trained on the plain mean of completed streams.
+                captured[index] = hidden_states.reshape(
+                    *hidden_states.shape[:-1],
+                    self.args.hc_count,
+                    self.args.hidden_size,
+                ).mean(axis=-2)
 
         mixed = None
         if write is not None:
@@ -4878,10 +4878,13 @@ class Qwen4ExpModel(nn.Module):
                         cache,
                     )
 
-        if hidden_sink is not None and capture_layer_ids == []:
-            # Lightning MTP consumes all residual streams before the final
-            # mixer. Ordinary layer captures retain their mixed representation.
-            hidden_sink.append(hidden_states)
+        if hidden_sink is not None:
+            if capture_layer_ids == []:
+                # Lightning MTP consumes all residual streams before the final
+                # mixer. DFlash captures use the mean of completed streams.
+                hidden_sink.append(hidden_states)
+            else:
+                hidden_sink.extend(captured[index] for index in capture_layer_ids)
 
         if mixed is None:
             mixed = self.hyper_connection_mixer(
@@ -5060,13 +5063,29 @@ class LanguageModel(Qwen3_5LanguageModel):
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         return_hidden = bool(kwargs.get("return_hidden", False))
-        mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
+        # Qwen4 owns verification; the inherited verifier assumes Qwen3.5 layers.
+        speculative_verify = bool(kwargs.pop("speculative_verify", False))
+        drafter = getattr(self, "_omlx_drafter", None)
+        scope = getattr(drafter, "scope_uids", None)
+        observe = (
+            not return_hidden
+            and bool(scope)
+            and inputs is not None
+            and inputs.ndim == 2
+            and inputs.shape[0] == len(scope)
+            and inputs.shape[1] == 1
+            and kwargs.get("capture_layer_ids") is None
+        )
+        if observe:
+            kwargs["capture_layer_ids"] = list(drafter.target_layer_ids)
+        mtp_capture = return_hidden and not kwargs.get("capture_layer_ids")
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
         # One-row windows (the activation step, depth-0 cycles) have no draft to
         # reject, so they run the serial decode step rather than a verify forward.
         one_row_step = (
             mtp_capture
+            and not speculative_verify
             and inputs_embeds is None
             and tuple(inputs.shape) == (1, 1)
             and cache is not None
@@ -5074,7 +5093,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         )
         transaction = (
             start_speculative_cache(cache or [], inputs.shape[1])
-            if mtp_capture and not one_row_step
+            if speculative_verify or (return_hidden and not one_row_step)
             else None
         )
         step = _MTP_ONE_ROW_STEP.set(True) if one_row_step else None
@@ -5083,10 +5102,13 @@ class LanguageModel(Qwen3_5LanguageModel):
             if mtp_capture and output.hidden_states:
                 output.hidden_states = [output.hidden_states[0]]
             output.gdn_states = transaction
+            if observe:
+                drafter.observe(scope, output.hidden_states)
             return output
         except BaseException:
             if transaction is not None:
                 transaction.abort()
+                self._discard_ple_snapshots(cache or [])
             raise
         finally:
             if step is not None:
