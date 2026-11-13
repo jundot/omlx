@@ -394,6 +394,22 @@ class TestParseToolCallsFromTokens:
         assert "thinking" in analysis_text
         assert tool_calls == []
 
+    def test_malformed_tool_header_keeps_completed_analysis(self, encoding):
+        """A tool header that never reaches <|message|> keeps prior messages."""
+        # <|call|> ends generation as a stop token, so the parser never sees it.
+        tokens = encoding.encode(
+            "<|channel|>analysis<|message|>Need to search.<|end|>"
+            "<|start|>assistant<|channel|>commentary to=functions.grep"
+            '>{"pattern":"refresh"}',
+            allowed_special="all",
+        )
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+        assert output_text == ""
+        assert analysis_text == "Need to search."
+        assert tool_calls == []
+
     def test_channel_rules_for_function_recipient(self, monkeypatch):
         """Commentary and JSON-argument analysis recipients become tool calls."""
         messages = [
@@ -431,13 +447,21 @@ class TestParseToolCallsFromTokens:
             def decode(self, token_ids):
                 return "decoded"
 
-            def parse_messages_from_completion_tokens(self, token_ids, role, strict):
-                return messages
+        class FakeParser:
+            def __init__(self, encoding, role, strict):
+                self.messages = messages
+
+            def process(self, token_id):
+                pass
+
+            def process_eos(self):
+                pass
 
         monkeypatch.setattr(
             "omlx.adapter.harmony.load_harmony_gpt_oss_encoding",
             lambda: FakeEncoding(),
         )
+        monkeypatch.setattr("omlx.adapter.harmony.StreamableParser", FakeParser)
 
         output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens([99])
 
