@@ -1841,7 +1841,8 @@ def test_generic_prefill_loop_submits_chunks_with_fixed_reclaim_charge(
     else:
         ns._do_external_prefill(req, prompt, cache)
 
-    assert submitted == [192, 192, 192, 192, 192, 64]
+    # The last 448 tokens end at the prompt end: 3 even forwards, not 192+192+64.
+    assert submitted == [192, 192, 192, 160, 160, 128]
     assert all(layer.offset == len(prompt) - 1 for layer in cache)
     # Sized once for the whole prompt after the first chunk; step growth
     # would have ended at 1216.

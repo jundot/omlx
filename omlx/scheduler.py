@@ -83,6 +83,7 @@ from .prefill.packed import (
 from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
     should_emit_prefill_boundary,
+    spread_throttled_chunk,
 )
 from .prefill_helper.adapter import Capture
 from .prefill_helper.client import HelperError
@@ -4642,6 +4643,7 @@ class Scheduler:
             gathered_core = _chunk_route(n_to_process, cache_tokens)
             try:
                 if not atomic_prefix:
+                    span = n_to_process
                     n_to_process = self._adaptive_chunk_size(
                         n_to_process,
                         request_id=request.request_id,
@@ -4649,6 +4651,15 @@ class Scheduler:
                         kv_len=cache_tokens,
                         gathered_core=gathered_core,
                     )
+                    if Scheduler._prefill_span_ends_at_stop(
+                        cache_tokens + span,
+                        span >= remaining,
+                        block_size if boundary_enabled else 0,
+                        (system_at, tail_at),
+                    ):
+                        n_to_process = spread_throttled_chunk(
+                            n_to_process, span, self._prefill_min_chunk_tokens
+                        )
                 # Check the predicted peak before submitting work to Metal.
                 n_to_process, gathered_core = Scheduler._guard_prefill_chunk_route(
                     self,
@@ -7173,6 +7184,20 @@ class Scheduler:
             self, [Scheduler._plan_prefill_chunk(self, state)]
         )[0]
 
+    @staticmethod
+    def _prefill_span_ends_at_stop(
+        end_tokens: int,
+        reaches_prompt_end: bool,
+        block_size: int,
+        stops: tuple[int | None, ...],
+    ) -> bool:
+        """Whether an unthrottled chunk ends where prefill must stop anyway."""
+        if reaches_prompt_end:
+            return True
+        if block_size > 0 and end_tokens % block_size == 0:
+            return True
+        return end_tokens in stops
+
     def _plan_prefill_chunk(
         self,
         state: _PrefillState,
@@ -7259,6 +7284,15 @@ class Scheduler:
                 kv_len=cache_tokens,
                 gathered_core=gathered_core,
             )
+            if Scheduler._prefill_span_ends_at_stop(
+                cache_tokens + unthrottled,
+                unthrottled >= remaining,
+                state.block_size if state.boundary_enabled else 0,
+                (state.system_at, state.tail_at),
+            ):
+                n = spread_throttled_chunk(
+                    n, unthrottled, self._prefill_min_chunk_tokens
+                )
 
             # Pre-chunk safety guard (mirrors the external loop): never submit a
             # chunk whose predicted peak would trip the uncatchable async Metal OOM.
