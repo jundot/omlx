@@ -200,14 +200,13 @@ enum SettingsSearch {
             ("integrations.websearch.content_truncate", "truncate page context"),
             ("integrations.websearch.content_max_chars", "characters limit"),
         ])
-        add(.integrations, ["integrations.section.claude_code"], [
+        add(.integrations, ["integrations.section.applications"], [
+            ("integrations.tool.claude", "mode local cloud Anthropic tiers"),
             ("integrations.claude.mode", "local cloud Anthropic"),
             ("integrations.claude.opus", "model tier"),
             ("integrations.claude.sonnet", "model tier"),
             ("integrations.claude.haiku", "model tier"),
             ("integrations.claude.desktop", "aliases"),
-        ])
-        add(.integrations, ["integrations.section.other"], [
             ("integrations.tool.codex", "default model CLI desktop"),
             ("integrations.tool.opencode", "default model"),
             ("integrations.tool.openclaw", "default model"),

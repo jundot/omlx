@@ -160,12 +160,6 @@ final class IntegrationsScreenVM {
         return "\(missing)\n\(warning)"
     }
 
-    /// Composed `omlx launch claude` command. Claude tier selections are
-    /// persisted in settings, so the launcher reads them without extra flags.
-    var claudeLaunchCommand: String {
-        "\(cliCommandPrefix) launch claude"
-    }
-
     /// Composed `omlx launch claude_desktop` command. Launches Claude Desktop
     /// pointed at the oMLX gateway. Mirrors `claudeDesktopCommand` in
     /// `omlx/admin/static/js/dashboard.js`.
