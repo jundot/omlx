@@ -1758,6 +1758,8 @@
   "bench.config.batch_tests": "Testy Continuous Batching",
   "bench.config.batch_hint": "Paralelní testy používají PP1024 / TG128",
   "bench.config.run_button": "Spustit benchmark",
+  "bench.config.add_to_queue": "Přidat do fronty",
+  "bench.completed.section_label": "Dokončená spuštění",
   "bench.progress.preparing": "Příprava…",
   "bench.progress.cancel": "Zrušit",
   "bench.confirm.title": "Spustit tento benchmark?",

@@ -528,6 +528,15 @@ final class OMLXClient: ObservableObject {
         try await post(AdminAPI.benchStart, body: body)
     }
 
+    func getActiveThroughputBench() async throws -> BenchActiveResponse {
+        try await get(AdminAPI.benchActive)
+    }
+
+    @discardableResult
+    func removeThroughputQueue(index: Int) async throws -> BenchQueueResponse {
+        try await delete(AdminAPI.benchQueueRemove(index))
+    }
+
     func getBenchResults(benchId: String) async throws -> BenchResultsResponse {
         try await get(AdminAPI.benchResults(benchId))
     }
