@@ -6,6 +6,7 @@ import pytest
 
 from omlx.cluster.pipeline_compat import (
     install_pipeline_compatibility,
+    model_type_of,
     pipeline_assignment_is_honored,
 )
 from omlx.cluster.planner import PipelineAssignment
@@ -32,6 +33,31 @@ def _model_config(tmp_path, model_type):
     model.mkdir()
     (model / "config.json").write_text(json.dumps({"model_type": model_type}))
     return model
+
+
+def test_a_checkpoint_without_a_readable_config_supports_no_split(tmp_path):
+    """Unknown is answered as "cannot divide", never as a guess.
+
+    An unreadable config is the state a half-copied checkpoint leaves behind on
+    a peer, and a plan that assumes a pipeline contract there would be built
+    from nothing.
+    """
+
+    assert model_type_of(tmp_path) == ""
+    assert not pipeline_assignment_is_honored(tmp_path)
+
+
+def test_an_architecture_the_loader_has_no_module_for_is_not_honoured(tmp_path):
+    """Qwen3-Omni is mlx-vlm-native: mlx-lm has no module to hold a stage.
+
+    Calling that an "even split" would describe a mechanism that does not exist,
+    and the refusal an operator gets would tell them to move layers between Macs
+    when no arrangement of layers can run.
+    """
+
+    model = _model_config(tmp_path, "qwen3_omni")
+
+    assert not pipeline_assignment_is_honored(model)
 
 
 def test_standard_pipeline_mixin_has_an_explicit_assignment_contract(tmp_path):

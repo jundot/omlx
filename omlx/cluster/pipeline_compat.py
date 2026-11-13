@@ -27,6 +27,49 @@ def _mark_assignment_contract(method: Any) -> Any:
     return method
 
 
+def model_type_of(model_path: str | Path) -> str:
+    """The architecture a checkpoint declares, or "" when it cannot be read."""
+
+    try:
+        config = json.loads(
+            (Path(model_path).expanduser() / "config.json").read_text()
+        )
+        model_type = config["model_type"]
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    return model_type if isinstance(model_type, str) else ""
+
+
+def _pipeline_module(model_path: str | Path) -> Any | None:
+    """The mlx-lm module that would slice this checkpoint's layers.
+
+    Cluster ranks load through mlx-lm, so a model type with no module there -
+    an mlx-vlm-native architecture whose oMLX adapter was never registered -
+    has nothing that could hold a stage boundary. That is a different answer
+    from "the model has a pipeline method and ignores the plan", and the two
+    need different words: one is a plan to fix, the other is a capability the
+    loader does not have.
+    """
+
+    model_type = model_type_of(model_path)
+    if not model_type:
+        return None
+    if model_type == "qwen4_exp":
+        # The rank adapter is registered by the worker's pre-load patches; a
+        # cold planner has not loaded a checkpoint and must ask the same
+        # question, so register the cheap text-only module first.
+        try:
+            from ..patches.qwen4_exp_mlx_lm import apply_qwen4_exp_mlx_lm_patch
+
+            apply_qwen4_exp_mlx_lm_patch()
+        except Exception:  # noqa: BLE001 - a missing extra stays "none"
+            return None
+    try:
+        return importlib.import_module(f"mlx_lm.models.{model_type}")
+    except ImportError:
+        return None
+
+
 def pipeline_assignment_is_honored(model_path: str | Path) -> bool:
     """Whether this model's installed pipeline hook explicitly consumes the plan.
 
@@ -38,16 +81,9 @@ def pipeline_assignment_is_honored(model_path: str | Path) -> bool:
     Anything unmarked remains fail-closed.
     """
 
-    config_path = Path(model_path).expanduser() / "config.json"
-    try:
-        config = json.loads(config_path.read_text())
-        model_type = config["model_type"]
-        if not isinstance(model_type, str):
-            return False
-        module = importlib.import_module(f"mlx_lm.models.{model_type}")
-    except (ImportError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    module = _pipeline_module(model_path)
+    if module is None:
         return False
-
     return _module_honors_pipeline_assignment(module, seen=frozenset())
 
 
