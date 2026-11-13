@@ -5384,6 +5384,103 @@ def test_final_qwen_recovery_requires_complete_schema_valid_arguments(
     assert result.parse_errors == ("malformed",)
 
 
+@pytest.fixture
+def json_tools_parser():
+    from mlx_lm.tool_parsers.json_tools import parse_tool_call
+
+    tok = SimpleNamespace(
+        has_tool_calling=True,
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        tool_parser=parse_tool_call,
+    )
+    tools = [
+        {
+            "function": {
+                "name": "write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                    "required": ["content"],
+                },
+            }
+        }
+    ]
+    return tok, tools
+
+
+# The capture from #4909: JSON complete except the trailing closers come out
+# in the wrong order, so json.loads raises "Expecting ',' delimiter" and the
+# XML fallback (no <function=> markup inside) cannot recover.
+_MISORDERED_CLOSERS = '{"name": "write", "arguments": {"content": "hi"]}'
+
+
+def test_final_json_tools_parse_failure_reports_malformed(json_tools_parser):
+    """A span the json_tools parser rejects must surface in parse_errors (#5245)."""
+    tok, tools = json_tools_parser
+    raw = f"<tool_call>{_MISORDERED_CLOSERS}</tool_call>"
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert not result.tool_calls
+    assert result.parse_errors == ("malformed",)
+
+
+def test_final_json_tools_sibling_survives_and_failure_reported(json_tools_parser):
+    tok, tools = json_tools_parser
+    good = '{"name": "write", "arguments": {"content": "ok"}}'
+    raw = (
+        f"<tool_call>{good}</tool_call>\n"
+        f"<tool_call>{_MISORDERED_CLOSERS}</tool_call>"
+    )
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert [tc.function.name for tc in result.tool_calls] == ["write"]
+    assert result.parse_errors == ("malformed",)
+
+
+def test_final_json_tools_success_keeps_parse_errors_empty(json_tools_parser):
+    tok, tools = json_tools_parser
+    raw = '<tool_call>{"name": "write", "arguments": {"content": "ok"}}</tool_call>'
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert len(result.tool_calls) == 1
+    assert result.parse_errors == ()
+
+
+def test_final_json_tools_fallback_recovery_keeps_parse_errors_empty(
+    json_tools_parser,
+):
+    """Native parser raises but the XML fallback recovers: not a failure."""
+    tok, tools = json_tools_parser
+    raw = (
+        "<tool_call><function=write><parameter=content>ok</parameter>"
+        "</function></tool_call>"
+    )
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert len(result.tool_calls) == 1
+    assert result.parse_errors == ()
+
+
+def test_json_tools_parse_failure_without_tools_stays_silent(json_tools_parser):
+    """No declared tools means no parse_errors, matching the qwen3_coder gate."""
+    tok, _ = json_tools_parser
+    raw = f"<tool_call>{_MISORDERED_CLOSERS}</tool_call>"
+    result = extract_tool_calls_with_thinking("", raw, tok, None, finish_reason="stop")
+    assert not result.tool_calls
+    assert result.parse_errors == ()
+
+
+@pytest.mark.parametrize("finish_reason", [None, "length"])
+def test_json_tools_parse_failure_reported_only_at_normal_eof(
+    json_tools_parser, finish_reason
+):
+    """Only terminal extraction at finish_reason "stop" reports failures."""
+    tok, tools = json_tools_parser
+    raw = f"<tool_call>{_MISORDERED_CLOSERS}</tool_call>"
+    result = extract_tool_calls_with_thinking(
+        "", raw, tok, tools, finish_reason=finish_reason
+    )
+    assert not result.tool_calls
+    assert result.parse_errors == ()
+
+
 class TestAttributeStyleFunctionDialect:
     """Tests for the attribute-style <function name="..."> dialect (#3429).
 
