@@ -15,6 +15,7 @@ It suits a large model that fits on one Mac with fast memory (good for decoding)
 | Qwen3.8 Flash-Next | `qwen4_exp` | PLE rows are read on this Mac and sent with each chunk |
 | MiniMax M3 / M3.1 | `minimax_m3_vl` | Works with the DSpark drafter |
 | Qwen3.8 27B (Qwen3.5 architecture) | `qwen3_5` | Checkpoints served by the VLM engine. With a context window above the native one, prompts stay on this Mac when the helper holds an attention layer |
+| Inkling 2 Small | `inkling2` | Checkpoints served by the VLM engine; prompts with images stay on this Mac. Works with the DSpark drafter |
 
 Measured on an M3 Ultra (512 GB) with an M5 Max over Thunderbolt 5, for a 64K-token prompt:
 
@@ -24,8 +25,9 @@ Measured on an M3 Ultra (512 GB) with an M5 Max over Thunderbolt 5, for a 64K-to
 | GLM-5.3 Flash oQ4e | 540 tok/s | 1,390 tok/s | 740 tok/s |
 | Qwen3.8 Flash-Next oQ4e | 1,310 tok/s | 3,670 tok/s | 2,860 tok/s |
 | MiniMax M3.1 Flash oQ4e | 300 tok/s | 570 tok/s | 390 tok/s |
+| Inkling 2 Small (NVFP4) | 410 tok/s | 580 tok/s | not measured |
 
-The 64 GB column keeps the helper to the layers a 64 GB M5 Max can hold, on the same GPU. A helper holding fewer layers takes a smaller share of each chunk, so models with large layers gain less from a smaller Mac.
+Inkling 2 Small used its published checkpoint and the Code (Python) benchmark context; an M5 Max 128 GB holds 15 of its 48 layers. The 64 GB column keeps the helper to the layers a 64 GB M5 Max can hold, on the same GPU. A helper holding fewer layers takes a smaller share of each chunk, so models with large layers gain less from a smaller Mac.
 
 DeepSeek V4.1 and Qwen3.8 ran the helper's layers with INT8 Activation Prefill turned on. It changes numerics as it does on a single M5-series Mac. Greedy output matched the helper-off output on the tested prompts for DeepSeek V4.1 (INT8), GLM-5.3, and Qwen3.8 with 16-bit activations on the helper. MiniMax split and whole-model caches were identical on a partial checkpoint with 16-bit activations; MiniMax helper layers use INT8 Activation Prefill too when it is turned on.
 

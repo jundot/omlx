@@ -175,7 +175,7 @@ A paired Mac can also speed up prefill without splitting the model: the
 [Prefill Accelerator](docs/experimental/prefill-accelerator.md) runs the first
 layers of long prompts on the other Mac while the model, its cache and
 decoding stay on this one (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next,
-Qwen3.8 27B and MiniMax M3). The helper can also be a Linux machine with
+Qwen3.8 27B, MiniMax M3 and Inkling 2). The helper can also be a Linux machine with
 NVIDIA GPUs running [omlx-cuda-helper](apps/omlx-cuda-helper/README.md).
 
 ### Vision-Language Models

@@ -496,7 +496,7 @@ _TINY_VISION = dict(
 )
 
 
-def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None):
+def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None, **dims):
     from mlx.utils import tree_flatten
 
     from omlx.patches.inkling2 import model as inkling2
@@ -522,6 +522,7 @@ def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None):
         intermediate_size=64,
         expert_formats=list(formats),
     )
+    text.update(dims)
     model = inkling2.Model(
         inkling2.ModelArgs(model_type="inkling2", text_config=text, vision_config=vision)
     )
