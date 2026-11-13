@@ -10,9 +10,138 @@ from unittest.mock import MagicMock
 
 import pytest
 
+_MISSING = object()
+
+# Shared mlx-lm attributes the overlay replaces or adds.  Keep the list
+# explicit so the restore below cannot hide unrelated test state.
+_OVERLAY_ATTRS = {
+    "mlx_lm.models": ("deepseek_v4", "deepseek_v4_mtp", "hyper_connection"),
+    "mlx_lm.models.cache": ("PoolingCache", "BatchPoolingCache"),
+    "mlx_lm.utils": (
+        "load_model",
+        "_load_safetensors",
+        "SAFETENSORS_DTYPE_FALLBACKS",
+        "MODEL_REMAPPING",
+        "sharded_load",
+    ),
+    "mlx_lm.tokenizer_utils": ("AutoTokenizer", "load"),
+    "mlx_lm.server": ("sharded_load",),
+    "mlx_lm.chat_templates": ("deepseek_v4",),
+    "mlx_lm.tool_parsers": ("deepseek_v4",),
+}
+
+_OVERLAY_MODULES = (
+    "mlx_lm.models.deepseek_v4",
+    "mlx_lm.models.deepseek_v4_mtp",
+    "mlx_lm.models.hyper_connection",
+    "mlx_lm.chat_templates.deepseek_v4",
+    "mlx_lm.tool_parsers.deepseek_v4",
+)
+
+
+def _snapshot_value(value):
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, set):
+        return set(value)
+    return value
+
+
+def _restore_value(module, name, saved):
+    if saved is _MISSING:
+        if hasattr(module, name):
+            delattr(module, name)
+        return
+    current = getattr(module, name, _MISSING)
+    if isinstance(saved, dict) and isinstance(current, dict):
+        current.clear()
+        current.update(saved)
+    elif isinstance(saved, list) and isinstance(current, list):
+        current[:] = saved
+    elif isinstance(saved, set) and isinstance(current, set):
+        current.clear()
+        current.update(saved)
+    else:
+        setattr(module, name, saved)
+
+
+def _snapshot_overlay():
+    """Record the process-wide state apply_deepseek_v4_patch() mutates."""
+    from omlx.cache.type_registry import CacheTypeRegistry
+
+    snapshots = {}
+    for module_name, attr_names in _OVERLAY_ATTRS.items():
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        snapshots[module_name] = (
+            module,
+            {
+                name: _snapshot_value(getattr(module, name, _MISSING))
+                for name in attr_names
+            },
+        )
+
+    # apply_utils_patch() also rebinds load_model on every mlx_lm module
+    # that imported it directly, not just mlx_lm.utils.
+    loader_bindings = [
+        (module, module.load_model)
+        for module_name, module in list(sys.modules.items())
+        if module is not None
+        and module_name.startswith("mlx_lm")
+        and hasattr(module, "load_model")
+    ]
+    return snapshots, loader_bindings, dict(CacheTypeRegistry._handlers)
+
+
+def _restore_overlay(snapshot):
+    snapshots, loader_bindings, handlers = snapshot
+    from omlx.cache.type_registry import CacheTypeRegistry
+    from omlx.patches import deepseek_v4
+
+    for module, attrs in snapshots.values():
+        for name, saved in attrs.items():
+            _restore_value(module, name, saved)
+    for module, original in loader_bindings:
+        module.load_model = original
+
+    CacheTypeRegistry._handlers.clear()
+    CacheTypeRegistry._handlers.update(handlers)
+
+    for module_name in _OVERLAY_MODULES:
+        sys.modules.pop(module_name, None)
+
+    # Reset the idempotency guards so a later test can apply the overlay
+    # again from a clean state.
+    deepseek_v4._APPLIED = False
+    deepseek_v4._POOLING_APPLIED = False
+    for module_name, module in list(sys.modules.items()):
+        if module is None:
+            continue
+        if module_name != "omlx.patches.deepseek_v4" and not module_name.startswith(
+            "omlx.patches.deepseek_v4."
+        ):
+            continue
+        for flag in ("_PATCHED", "_LOAD_PATCHED"):
+            if hasattr(module, flag):
+                setattr(module, flag, False)
+
 
 @pytest.fixture(scope="module")
-def applied_patch():
+def _pristine_overlay():
+    """Put the shared mlx-lm state back when this module finishes."""
+    saved = _snapshot_overlay()
+    try:
+        yield
+    finally:
+        _restore_overlay(saved)
+
+
+@pytest.fixture(scope="module")
+def applied_patch(_pristine_overlay):
     """Apply the patch once for the whole module. The patch itself is
     idempotent so repeated calls are safe."""
     from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
@@ -24,7 +153,7 @@ def applied_patch():
 class TestPatchOrchestration:
     """Top-level apply / idempotency / module registration checks."""
 
-    def test_apply_returns_true_first_time(self):
+    def test_apply_returns_true_first_time(self, _pristine_overlay):
         from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch, is_applied
 
         # The patch may have been applied by a previous test run in the
