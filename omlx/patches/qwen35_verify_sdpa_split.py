@@ -134,7 +134,9 @@ def _vector_plan(key_len: int, gqa_factor: int, rows: int) -> tuple:
     return (2, blocks)
 
 
-def row_exact_causal_sdpa(queries, keys, values, scale, limit: int, mask=None):
+def row_exact_causal_sdpa(
+    queries, keys, values, scale, limit: int, mask=None, sinks=None
+):
     """``_chunked_causal_sdpa`` whose chunks keep every row on the kernel plan
     of its own one-row decode call.
 
@@ -143,7 +145,8 @@ def row_exact_causal_sdpa(queries, keys, values, scale, limit: int, mask=None):
     (one to two passes at 1024 keys, 128 to 512 partitions at 16384 on M5)
     the chunk shrinks, down to the row alone. An array ``mask`` is a
     ``[..., q_len, kv_len]`` keep-mask that already holds causality; each
-    chunk passes its own rows of it.
+    chunk passes its own rows of it. ``sinks`` (per query head) go to every
+    chunk unchanged.
     """
     q_len = queries.shape[-2]
     kv_len = keys.shape[-2]
@@ -173,6 +176,7 @@ def row_exact_causal_sdpa(queries, keys, values, scale, limit: int, mask=None):
                     if isinstance(mask, mx.array)
                     else "causal"
                 ),
+                sinks=sinks,
             )
         )
         c0 = c1

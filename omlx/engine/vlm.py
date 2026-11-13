@@ -2650,6 +2650,7 @@ class VLMBatchedEngine(BaseEngine):
 
         # Flint MoE decode: sigmoid top-k routing and the weighted combine
         # (plus shared expert and residual) in one launch each per layer.
+        # Verify blocks: attention in vector-kernel chunks of four rows.
         if self.model_type == "flint":
             try:
                 from ..patches.flint_decode import apply_flint_decode_patch
@@ -2657,6 +2658,14 @@ class VLMBatchedEngine(BaseEngine):
                 apply_flint_decode_patch()
             except Exception:
                 logger.debug("Flint decode patch not applied", exc_info=True)
+            try:
+                from ..patches.flint_verify_attention import (
+                    apply_flint_verify_attention_patch,
+                )
+
+                apply_flint_verify_attention_patch()
+            except Exception:
+                logger.debug("Flint verify attention patch not applied", exc_info=True)
 
         # LFM3 text tower (shared by LFM3, -VL, -Audio and -Omni): one-launch
         # RoPE instead of about fifteen array ops per q/k call.
