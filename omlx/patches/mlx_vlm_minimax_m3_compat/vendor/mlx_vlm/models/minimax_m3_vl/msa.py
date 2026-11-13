@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
 
 from . import msa_nax
+
+logger = logging.getLogger(__name__)
 
 try:
     from omlx.custom_kernels.sparse_index import fast as _index_fast
@@ -637,77 +640,49 @@ _msa_k1_launchable: bool | None = None
 
 
 def _probe_msa_k1() -> bool:
-    """Whether this device accepts the K1 launch's threadgroup size.
+    """Whether this GPU runs K1's 512-thread threadgroup.
 
-    The kernel's ``maxTotalThreadsPerThreadgroup`` is set per compiled
-    pipeline by register pressure, not per device: ``applegpu_g14d`` (M2
-    Ultra) rejects this launch's 512 threads at 384. Probe one tiny dispatch
-    rather than assume — the dense path takes over when it fails (#5233)."""
+    Metal caps threads per threadgroup per compiled pipeline by register use
+    (384 for K1 on M2), so a tiny launch decides."""
     global _msa_k1_launchable
-    if _msa_k1_launchable is not None:
-        return _msa_k1_launchable
-    try:
-        block_size, q_tokens_per_group, qhead_per_kv, topk = 128, 8, 16, 1
-        dim = 128
-        q = mx.zeros((q_tokens_per_group, qhead_per_kv, dim), dtype=mx.bfloat16)
-        k = mx.zeros((block_size, 1, dim), dtype=mx.bfloat16)
-        v = mx.zeros_like(k)
-        q2k = mx.zeros((1, q_tokens_per_group, topk), dtype=mx.int32)
-        row_ptr, qsplit, _ = build_k2q_csr_b1(
-            q2k,
-            total_k=block_size,
-            block_size=block_size,
-            with_split_counts=False,
-        )
-        groups = (
-            row_ptr[:, 1:] - row_ptr[:, :-1] + q_tokens_per_group - 1
-        ) // q_tokens_per_group
-        group_ptr = mx.concatenate(
-            [mx.zeros((1,), dtype=mx.int32), mx.cumsum(groups.reshape(-1))]
-        ).astype(mx.int32)
-        total_groups = max(int(group_ptr[-1].item()), 1)
-        threadgroup_size = (q_tokens_per_group * qhead_per_kv // 8) * 32
-        o_partial, lse_partial = _MSA_CSR_K1_STEEL_MMA(
-            inputs=[q, k, v, row_ptr, qsplit, group_ptr, 1.0],
-            template=[
-                ("T", q.dtype),
-                ("TOTAL_Q", q_tokens_per_group),
-                ("TOTAL_K", block_size),
-                ("H_Q", qhead_per_kv),
-                ("H_KV", 1),
-                ("D", dim),
-                ("TOPK", topk),
-                ("NNZ_CAP", q_tokens_per_group * topk),
-                ("TOTAL_ROWS", 1),
-                ("BLOCK_SIZE", block_size),
-                ("Q_START", 0),
-                ("QHEAD_PER_KV", qhead_per_kv),
-                ("THREADGROUP_SIZE", threadgroup_size),
-                ("Q_TOKENS_PER_GROUP", q_tokens_per_group),
-                ("M_BLOCK_SIZE", q_tokens_per_group * qhead_per_kv),
-            ],
-            grid=(total_groups * threadgroup_size, 1, 1),
-            threadgroup=(threadgroup_size, 1, 1),
-            output_shapes=[
-                (topk, q_tokens_per_group, qhead_per_kv, dim),
-                (topk, q_tokens_per_group, qhead_per_kv),
-            ],
-            output_dtypes=[q.dtype, mx.float32],
-        )
-        mx.eval(o_partial, lse_partial)
-        _msa_k1_launchable = True
-    except Exception:
-        _msa_k1_launchable = False
+    if _msa_k1_launchable is None:
+        q = mx.zeros((8, 16, 128), dtype=mx.bfloat16)
+        kv = mx.zeros((128, 1, 128), dtype=mx.bfloat16)
+        q2k = mx.zeros((1, 8, 1), dtype=mx.int32)
+        try:
+            mx.eval(
+                msa_sparse_attention_b1(
+                    q, kv, kv, q2k, q_start=0, scale=1.0, block_size=128
+                )
+            )
+            _msa_k1_launchable = True
+        except ValueError:
+            logger.info(
+                "MiniMax MSA prefill kernel exceeds this GPU's threadgroup limit; "
+                "prefill uses the masked sparse path"
+            )
+            _msa_k1_launchable = False
+        except Exception:
+            logger.warning("MiniMax MSA prefill kernel probe failed", exc_info=True)
+            _msa_k1_launchable = False
     return _msa_k1_launchable
 
 
-def msa_prefill_supported(head_dim: int, block_size: int, qhead_per_kv: int) -> bool:
-    """Whether the K1 kernel covers this attention shape (MiniMax M3 and M3.1)."""
+def _msa_prefill_shape_supported(
+    head_dim: int, block_size: int, qhead_per_kv: int
+) -> bool:
     return (
         _MSA_CSR_K1_STEEL_MMA is not None
         and head_dim == 128
         and block_size == 128
         and qhead_per_kv == 16
+    )
+
+
+def msa_prefill_supported(head_dim: int, block_size: int, qhead_per_kv: int) -> bool:
+    """Whether the K1 kernel covers this attention shape (MiniMax M3 and M3.1)."""
+    return (
+        _msa_prefill_shape_supported(head_dim, block_size, qhead_per_kv)
         and _probe_msa_k1()
     )
 
@@ -749,7 +724,9 @@ def msa_sparse_attention_b1(
     if h_q % h_kv != 0:
         raise ValueError("H_q must be divisible by H_kv.")
     qhead_per_kv = h_q // h_kv
-    if total_q < 8 or not msa_prefill_supported(dim, int(block_size), qhead_per_kv):
+    if total_q < 8 or not _msa_prefill_shape_supported(
+        dim, int(block_size), qhead_per_kv
+    ):
         raise RuntimeError(
             "MiniMax MSA prefill attention needs Metal with MLX's steel attention "
             "headers, D=128, block_size=128, 16 query heads per KV head and at "
