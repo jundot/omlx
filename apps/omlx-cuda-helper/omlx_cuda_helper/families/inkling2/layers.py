@@ -449,7 +449,7 @@ class Experts:
         out = (
             mx.tanh(gate / gcap) * gcap * mx.sigmoid(gate) * (mx.tanh(up / ucap) * ucap)
         )
-        return out.astype(mx.bfloat16)
+        return out.astype(y.dtype)
 
     def __call__(self, x: mx.array) -> mx.array:
         shape = x.shape

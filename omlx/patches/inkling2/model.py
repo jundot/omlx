@@ -119,10 +119,11 @@ def _l2_clip(x: mx.array, scale: mx.array, threshold: mx.array) -> mx.array:
 
 @mx.compile
 def _softcapped_swiglu(gate: mx.array, up: mx.array, gcap: mx.array, ucap: mx.array):
+    dtype = gate.dtype
     gate = gate.astype(mx.float32)
     up = up.astype(mx.float32)
     out = mx.tanh(gate / gcap) * gcap * mx.sigmoid(gate) * (mx.tanh(up / ucap) * ucap)
-    return out.astype(mx.bfloat16)
+    return out.astype(dtype)
 
 
 def _gather_sort(x, indices):
