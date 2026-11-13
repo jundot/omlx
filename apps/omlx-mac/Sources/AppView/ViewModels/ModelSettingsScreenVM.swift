@@ -868,7 +868,7 @@ final class ModelSettingsScreenVM {
         }
         var patch = ModelSettingsPatch()
         switch field {
-        case .alias:                   patch.modelAlias = alias.isEmpty ? nil : alias
+        case .alias:                   patch.modelAlias = .some(alias.isEmpty ? nil : alias)
         case .modelType:               patch.modelTypeOverride = modelTypeOverride.isEmpty ? nil : modelTypeOverride
         case .contextLength:           patch.maxContextWindow = Int(contextLength)
         case .maxTokens:               patch.maxTokens = Int(maxTokens)
