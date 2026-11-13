@@ -1525,12 +1525,18 @@ def _smart_resize_tokens(
     return (h_bar // patch_size) * (w_bar // patch_size) // (merge_size ** 2)
 
 
-def _read_image_dims(part: dict) -> Optional[tuple]:
+def _read_image_dims(part: dict, *, strict: bool = False) -> Optional[tuple]:
     """Best-effort, decode-free ``(width, height)`` for an OpenAI image part.
 
     Handles only ``data:`` base64 URIs. Returns ``None`` for anything else so
     callers fall back to the conservative per-image upper bound without opening
-    request-supplied paths or fetching remote URLs."""
+    request-supplied paths or fetching remote URLs.
+
+    ``strict=True`` (used by preflight) instead validates the payload exactly
+    like the decoder does — data-URI envelope, base64, size limit, decodable
+    header — and raises ``InvalidRequestError`` for anything the decode path
+    would reject, so malformed images still surface as an HTTP 400 before the
+    streaming response starts. Pixels are never loaded either way."""
     import base64 as _b64
     import binascii
     import io as _io
@@ -1547,6 +1553,9 @@ def _read_image_dims(part: dict) -> Optional[tuple]:
     )
     if not isinstance(url, str) or not url:
         return None
+
+    if strict:
+        return _image_utils.read_image_dims(url)
 
     raw = None
     s = url.strip()
@@ -1584,7 +1593,11 @@ def _read_image_dims_capped(part: dict) -> tuple | None:
     from PIL import Image as _Image
 
     image = part.get("image") if isinstance(part, dict) else None
-    dims = image.size if isinstance(image, _Image.Image) else _read_image_dims(part)
+    dims = (
+        image.size
+        if isinstance(image, _Image.Image)
+        else _read_image_dims(part, strict=True)
+    )
     if dims is None:
         return None
     width, height = dims
@@ -1597,7 +1610,10 @@ def _read_image_dims_capped(part: dict) -> tuple | None:
 
 
 def _capped_image_dimensions(messages: list[dict[str, Any]]) -> list[tuple | None]:
-    """Dimensions for every image part, in order, without decoding."""
+    """Dimensions for every image part, in order, without decoding.
+
+    Pass the expanded message list (MiMo turns video parts into in-memory
+    frames) so those frames are counted too."""
     return [
         _read_image_dims_capped(part)
         for msg in messages
@@ -5370,8 +5386,10 @@ class VLMBatchedEngine(BaseEngine):
         # preflight and execution on the same template input.
         # Preflight only needs the image count and dimensions. The counter
         # reads them from the parts (with the same max-side cap the decoder
-        # applies), so the pixels are not decoded on the event loop.
-        _, text_messages, images, _, videos = self._extract_request_media(
+        # applies), so the pixels are not decoded on the event loop. Use the
+        # expanded message list: MiMo video parts become in-memory frames that
+        # only exist there, and dropping them would under-count the guard.
+        media_messages, text_messages, images, _, videos = self._extract_request_media(
             messages, decode_images=False
         )
         if (
@@ -5414,7 +5432,7 @@ class VLMBatchedEngine(BaseEngine):
         image_tokens = _count_image_tokens_real(
             messages,
             getattr(self, "_processor", None),
-            dimensions=_capped_image_dimensions(messages),
+            dimensions=_capped_image_dimensions(media_messages),
             upper_bound=_derive_image_token_upper_bound(
                 getattr(self, "_processor", None)
             ),

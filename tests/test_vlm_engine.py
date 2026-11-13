@@ -3662,6 +3662,144 @@ async def test_preflight_uses_processed_image_dimensions(
         image_module.clear_image_decode_cache()
 
 
+def _jpeg_data_uri(
+    width: int, height: int, *, progressive: bool, exif_bytes: bytes | None
+) -> str:
+    from PIL import Image
+
+    buf = io.BytesIO()
+    save_kwargs = {"quality": 90, "progressive": progressive}
+    if exif_bytes is not None:
+        save_kwargs["exif"] = exif_bytes
+    Image.new("RGB", (width, height)).save(buf, format="JPEG", **save_kwargs)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+@pytest.mark.parametrize(
+    "progressive, exif_orientation",
+    [(False, None), (True, None), (False, 6), (False, 8)],
+    ids=["baseline", "progressive", "exif-6", "exif-8"],
+)
+async def test_preflight_estimate_matches_decoded_jpeg(
+    monkeypatch, progressive, exif_orientation
+):
+    """The decode-free estimate must equal the decoded path for JPEGs, including
+    progressive files and EXIF-rotated phone photos."""
+    from PIL import Image
+
+    from omlx.utils import image as image_module
+    from omlx.utils.image import load_image
+
+    exif_bytes = None
+    if exif_orientation is not None:
+        exif = Image.Exif()
+        exif[0x0112] = exif_orientation
+        exif_bytes = exif.tobytes()
+    uri = _jpeg_data_uri(3024, 1964, progressive=progressive, exif_bytes=exif_bytes)
+
+    monkeypatch.setattr(image_module, "get_max_image_side_length", lambda: 2048)
+    image_module.clear_image_decode_cache()
+    try:
+        engine = _make_loaded_engine()
+        engine._processor = _QWEN_PROC
+        engine._apply_chat_template = MagicMock(return_value="test")
+        engine._tokenizer = SimpleNamespace(encode=lambda text: [1])
+        engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+        engine._preflight_or_raise_with_eviction = AsyncMock()
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": uri}}],
+            }
+        ]
+
+        await engine.preflight_chat(messages)
+        estimated = (
+            engine._preflight_or_raise_with_eviction.call_args.kwargs[
+                "num_prompt_tokens"
+            ]
+            - 1
+        )
+
+        decoded_tokens = vlm_module._count_image_tokens_real(
+            messages, _QWEN_PROC, images=[load_image(uri)]
+        )
+        assert estimated == decoded_tokens
+    finally:
+        image_module.clear_image_decode_cache()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+@pytest.mark.parametrize(
+    "url, match",
+    [
+        ("data:image/png;base64,not-base64!!", "invalid base64"),
+        ("https://example.com/x.jpg", "base64 data URIs"),
+        ("/tmp/private.png", "base64 data URIs"),
+        ("data:image/png;base64,aGVsbG8=", "decodable image"),
+    ],
+)
+async def test_preflight_rejects_unloadable_images(url, match):
+    """Skipping the decode must not skip validation: malformed images still
+    raise ``InvalidRequestError`` at preflight (HTTP 400) instead of surfacing
+    from the streaming path after the response started."""
+    engine = _make_loaded_engine()
+    engine._processor = _QWEN_PROC
+    engine._apply_chat_template = MagicMock(return_value="test")
+    engine._tokenizer = SimpleNamespace(encode=lambda text: [1])
+    engine._preflight_or_raise_with_eviction = AsyncMock()
+    messages = [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}
+    ]
+
+    with pytest.raises(InvalidRequestError, match=match):
+        await engine.preflight_chat(messages)
+
+    engine._preflight_or_raise_with_eviction.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+async def test_preflight_counts_mimo_expanded_video_frames():
+    """MiMo turns a video part into in-memory frames during extraction; those
+    frames must reach the token estimate or the memory guard under-counts."""
+    from PIL import Image
+
+    frames = [Image.new("RGB", (640, 480)) for _ in range(4)]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {"url": "data:video/mp4;base64,AAAA"},
+                },
+                {"type": "text", "text": "describe"},
+            ],
+        }
+    ]
+
+    engine = _make_loaded_engine(model_type="mimo_v2_flash")
+    engine._processor = _QWEN_PROC
+    engine._apply_chat_template = MagicMock(return_value="prompt")
+    engine._tokenizer = SimpleNamespace(encode=lambda text: [1])
+    engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+    engine._preflight_or_raise_with_eviction = AsyncMock()
+
+    with patch("omlx.utils.video._decode_video_frames", return_value=frames):
+        await engine.preflight_chat(messages)
+
+    per_frame = vlm_module._smart_resize_tokens(480, 640, 16, 2, 65536, 16777216)
+    assert per_frame == 300
+    assert (
+        engine._preflight_or_raise_with_eviction.call_args.kwargs["num_prompt_tokens"]
+        == 1 + 4 * per_frame
+    )
+
+
 def test_deepseek_v4_packed_vision_features_round_trip():
     engine = _make_loaded_engine(model_type="deepseek_v4")
     engine._vlm_model.config.vision_downsample_ratio = 2

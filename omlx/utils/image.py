@@ -236,6 +236,33 @@ def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
     return _load_image_bytes(img_bytes, field=field)
 
 
+def read_image_dims(url_or_base64: str, *, field: str = "image_url") -> Tuple[int, int]:
+    """Return ``(width, height)`` without decoding the pixels.
+
+    Validates the value exactly like :func:`load_image` (data-URI envelope,
+    base64, payload size, decodable header), so callers that only need the
+    dimensions can still reject a request the decode path would reject. The
+    pixel data is never loaded, so this is much cheaper than a full decode.
+
+    Raises:
+        InvalidRequestError: If the input is not a decodable image data URI
+    """
+    img_bytes = _decode_base64_data_uri(url_or_base64, field=field)
+    try:
+        with Image.open(io.BytesIO(img_bytes)) as image:
+            return image.size
+    except Image.DecompressionBombError as exc:
+        raise InvalidRequestError(
+            f"{field} exceeds maximum allowed image resolution (decompression bomb detected).",
+            field=field,
+        ) from exc
+    except Exception as exc:
+        raise InvalidRequestError(
+            f"{field} does not contain a decodable image.",
+            field=field,
+        ) from exc
+
+
 def _decode_downscaled(image: Image.Image) -> Image.Image:
     """Decode an opened image to RGB, downscaled to the max side length.
 
