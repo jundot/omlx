@@ -2735,6 +2735,61 @@ class TestRotatingCacheMtpUndo:
             lambda: vlm_cache.BatchRotatingKVCache(8, [0]), num_drafts=num_drafts
         )
 
+    @pytest.mark.parametrize("package", ["mlx_lm", "mlx_vlm"])
+    def test_wrapped_batch_window_masks_multi_token_update_like_one_row(self, package):
+        """After a left-padded row's sliding window wraps in place, a
+        verify-sized update attends to the same keys as that row's own cache
+        (the stock mask dropped the row's oldest valid key)."""
+        import importlib
+
+        import mlx.core as mx
+
+        from omlx.patches.mlx_lm_mtp import cache_rollback
+
+        cache_mod = pytest.importorskip(f"{package}.models.cache")
+        create_attention_mask = importlib.import_module(
+            f"{package}.models.base"
+        ).create_attention_mask
+
+        def kv(rows, length, seed):
+            mx.random.seed(seed)
+            shape = (rows, 2, length, 16)
+            return (
+                mx.random.normal(shape).astype(mx.float16),
+                mx.random.normal(shape).astype(mx.float16),
+            )
+
+        def attend(cache, queries, keys, values):
+            mask = create_attention_mask(queries.transpose(0, 2, 1, 3), cache)
+            k, v = cache.update_and_fetch(keys, values)
+            return mx.fast.scaled_dot_product_attention(
+                queries, k, v, scale=0.25, mask=mask
+            )
+
+        cache_rollback.apply()
+        singles, references = [], []
+        for row, length in enumerate([3, 9]):
+            keys, values = kv(1, length, seed=row)
+            for target in (singles, references):
+                cache = cache_mod.RotatingKVCache(max_size=6, keep=0)
+                cache.update_and_fetch(keys, values)
+                target.append(cache)
+        batch = cache_mod.RotatingKVCache.merge(singles)
+
+        # Two one-token steps wrap the window in place; then a 3-token update.
+        for step, length in enumerate([1, 1, 3]):
+            queries = mx.random.normal((2, 2, length, 16))
+            keys, values = kv(2, length, seed=30 + step)
+            out = attend(batch, queries, keys, values)
+            for i, ref in enumerate(references):
+                expected = attend(
+                    ref, queries[i : i + 1], keys[i : i + 1], values[i : i + 1]
+                )
+                assert mx.allclose(
+                    out[i : i + 1], expected, atol=2e-3, rtol=2e-3
+                ).item(), (step, i)
+        assert batch.rotated is False
+
     def test_unarmed_update_keeps_stock_semantics(self):
         import mlx.core as mx
 
