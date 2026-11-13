@@ -481,3 +481,247 @@ def test_controller_observe_time_sample_gate():
     assert c.t == t_before, "keepalive cycle time leaked into t_est"
     c.observe(2, 1, 40.0)
     assert c.t != t_before or c.t[2] == t_before[2]
+
+
+def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6):
+    from mlx.utils import tree_flatten
+
+    from omlx.patches.inkling2 import model as inkling2
+
+    layers = len(formats)
+    text = dict(
+        hidden_size=128,
+        num_hidden_layers=layers,
+        vocab_size=320,
+        unpadded_vocab_size=300,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        swa_num_attention_heads=4,
+        swa_num_key_value_heads=2,
+        swa_head_dim=32,
+        sliding_window_size=8,
+        rel_extent=8,
+        d_rel=8,
+        local_layer_ids=[i for i in range(layers) if (i + 1) % 6],
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        intermediate_size=64,
+        expert_formats=list(formats),
+    )
+    model = inkling2.Model(inkling2.ModelArgs(model_type="inkling2", text_config=text))
+    mx.random.seed(0)
+    weights = []
+    for name, value in tree_flatten(model.parameters()):
+        if value.dtype == mx.uint32:
+            # Small FP8/FP4 codes only: random words would hit E4M3 NaNs.
+            raw = mx.random.randint(0, 0x70, (*value.shape[:-1], value.shape[-1] * 4))
+            weights.append((name, raw.astype(mx.uint8).view(mx.uint32)))
+        elif value.dtype == mx.uint8:
+            weights.append((name, mx.full(value.shape, 120, dtype=mx.uint8)))
+        elif name.endswith("global_scale"):
+            weights.append((name, value))
+        else:
+            noise = mx.random.normal(value.shape) * 0.05
+            weights.append((name, noise.astype(value.dtype)))
+    model.load_weights(weights)
+    return model
+
+
+def test_inkling2_incremental_and_chunked_match_full_forward():
+    model = _inkling2_tiny()
+    ids = mx.random.randint(0, 300, (1, 26))
+    full = model(ids)[..., :300]
+    cache = model.make_cache()
+    steps = [model(ids[:, :18], cache=cache)[:, -1]]
+    for t in range(18, 26):
+        steps.append(model(ids[:, t : t + 1], cache=cache)[:, -1])
+    incremental = mx.stack(steps[1:], axis=1)[..., :300]
+    assert mx.abs(full[:, 18:] - incremental).max().item() < 1e-3
+    chunked = model.make_cache()
+    model(ids[:, :11], cache=chunked)
+    tail = model(ids[:, 11:], cache=chunked)[..., :300]
+    assert mx.abs(full[:, 11:] - tail).max().item() < 1e-3
+
+
+def test_inkling2_verify_rollback_matches_sequential_decode():
+    model = _inkling2_tiny()
+    ids = mx.random.randint(0, 300, (1, 30))
+    reference = model.make_cache()
+    model(ids[:, :20], cache=reference)
+    for t in range(20, 24):
+        model(ids[:, t : t + 1], cache=reference)
+    expected = model(ids[:, 24:25], cache=reference)
+    cache = model.make_cache()
+    model(ids[:, :20], cache=cache)
+    out = model(
+        ids[:, 20:28], cache=cache, return_hidden=True, capture_layer_ids=[5, 12]
+    )
+    assert [h.shape for h in out.hidden_states] == [(1, 8, 128)] * 3
+    # Three of seven drafts accepted: the confirmed token plus three stay.
+    assert model.mtp_partial_rollback(cache, 3, 7)
+    got = model(ids[:, 24:25], cache=cache)
+    assert cache[0][0].offset == reference[0][0].offset == 25
+    assert mx.abs(got[..., :300] - expected[..., :300]).max().item() < 1e-4
+
+
+def test_inkling2_fused_kernels_match_reference():
+    from omlx.patches.inkling2 import kernels
+
+    hidden = 256
+    blocks = [mx.fast.rms_norm(mx.random.normal((2, 3, hidden)), None, 1e-6)] * 4
+    partial = mx.fast.rms_norm(mx.random.normal((2, 3, hidden)), None, 1e-6)
+    query = mx.random.normal((3, hidden)) * 0.1
+    src = mx.stack([*blocks, partial], axis=-2)
+    weights = mx.softmax((src @ query.T) * hidden**-0.5, axis=-2, precise=True)
+    expected = weights.swapaxes(-1, -2) @ src
+    got = kernels.attn_res_mix(blocks, partial, query, hidden**-0.5)
+    assert mx.abs(got - expected).max().item() < 1e-5
+
+    logits = mx.random.normal((5, 64)) * 2
+    bias = mx.random.normal((64,)) * 0.05
+    inds, w = kernels.route_topk(logits, bias, 4, 8.0)
+    scores = mx.sigmoid(logits)
+    ref = mx.argpartition(-(scores + bias), kth=3, axis=-1)[..., :4]
+    assert mx.array_equal(
+        mx.sort(inds.astype(mx.int32), axis=-1), mx.sort(ref.astype(mx.int32), axis=-1)
+    )
+    picked = mx.take_along_axis(scores, inds.astype(mx.int32), axis=-1)
+    assert mx.allclose(w, picked / picked.sum(-1, keepdims=True) * 8.0, atol=1e-5)
+
+
+def test_inkling2_sanitize_maps_original_layout():
+    from omlx.patches.inkling2 import loader
+
+    model = _inkling2_tiny(formats=("mxfp8",) * 6)
+    e, h, i = 8, 128, 64
+    nvfp4 = {
+        "mlp.experts.w13_weight": mx.zeros((e, 2 * i, h // 2), mx.uint8),
+        "mlp.experts.w13_weight_scale": mx.zeros((e, 2 * i, h // 16), mx.uint8),
+        "mlp.experts.w13_weight_amax": mx.full((e,), 0.5),
+        "mlp.experts.w13_weight_outer_scale_denominator": mx.array([1344.0]),
+    }
+    out = {}
+    assert loader._expert_tensors(nvfp4, "w13", out, "p.") == "nvfp4"
+    assert out["p.mlp.experts.w13.weight"].shape == (e, 2 * i, h // 8)
+    # MLX's NVFP4 global scale convention divides by 6 * 448 = 2688.
+    assert mx.allclose(out["p.mlp.experts.w13.global_scale"], mx.full((e,), 1.0))
+    mxfp8 = {
+        "mlp.experts.w2_weight": mx.zeros((e, h, i), mx.uint8),
+        "mlp.experts.w2_weight_scale": mx.zeros((e, h, i // 32), mx.uint8),
+    }
+    assert loader._expert_tensors(mxfp8, "w2", out, "p.") == "mxfp8"
+    assert "p.mlp.experts.w2.global_scale" not in out
+
+    source = {
+        "model.llm.attn_res.attn_queries.4": mx.zeros((3, h)),
+        "model.llm.attn_res.mlp_queries.0": mx.zeros((h,)),
+        "model.llm.unembed.weight": mx.zeros((320, h), mx.bfloat16),
+        "model.visual.proj_in.weight": mx.zeros((4, 4)),
+    }
+    mapped, formats = loader.sanitize_weights(model, source)
+    assert formats == {}
+    # attn_queries[i] belongs to layer i + 1; vision tensors are dropped.
+    assert set(mapped) == {
+        "model.layers.5.attn_input.query",
+        "model.layers.0.mlp_input.query",
+        "lm_head.weight",
+    }
+    assert mapped["model.layers.5.attn_input.query"].shape == (3, h)
+
+
+def test_inkling2_model_is_freed_without_cyclic_gc():
+    import gc
+    import weakref
+
+    model = _inkling2_tiny()
+    ids = mx.random.randint(0, 300, (1, 4))
+    mx.eval(model(ids, cache=model.make_cache()))
+    ref = weakref.ref(model.model.layers[3])
+    gc.disable()
+    try:
+        del model
+        assert ref() is None
+    finally:
+        gc.enable()
+
+
+@pytest.mark.parametrize(
+    "formats, routed",
+    [
+        # Source checkpoint: NVFP4 layers take the NAX expert kernel, MXFP8
+        # layers keep MLX's sorted kernel.
+        (("nvfp4",) * 6 + ("mxfp8",) * 6, {"nvfp4": True, "mxfp8": False}),
+        # oQ output: affine experts take the NAX expert kernel too.
+        (
+            ({"bits": 4, "group_size": 64, "mode": "affine"},) * 6,
+            {"affine": True},
+        ),
+    ],
+)
+def test_inkling2_sorted_experts_route_to_nax_kernel(monkeypatch, formats, routed):
+    from mlx.utils import tree_flatten
+
+    import omlx.patches.m5_gather_qmm as m5
+
+    m5.apply_m5_gather_qmm_workaround()
+    seen = []
+
+    def record(x, w, scales, biases, indices, *, group_size, bits, mode, **kw):
+        ok = m5._nax.supports(x, w, scales, biases, indices, group_size, bits, mode)
+        seen.append((mode, ok))
+        return None  # keep the stock kernel on hosts without tensor units
+
+    monkeypatch.setattr(m5, "_nax_host", True)
+    monkeypatch.setattr(m5._nax, "sorted_gather_qmm", record)
+    model = _inkling2_tiny(formats=formats)
+    # BF16 activations as in the checkpoint; the source FP32 tensors stay FP32.
+    keep = (".query", "router_weight", "router_bias", "global_scale")
+    model.load_weights(
+        [
+            (name, value.astype(mx.bfloat16))
+            for name, value in tree_flatten(model.parameters())
+            if mx.issubdtype(value.dtype, mx.floating) and not name.endswith(keep)
+        ],
+        strict=False,
+    )
+    mx.eval(model(mx.random.randint(0, 300, (1, 40))))
+    assert {mode for mode, _ in seen} == set(routed)
+    for mode, supported in seen:
+        assert supported is routed[mode]
+
+
+@pytest.mark.parametrize(
+    "batch, heads, kv_heads, length, keys, window, extent, left_padding",
+    [
+        (1, 4, 2, 64, 64, 16, 16, None),
+        (1, 4, 2, 37, 300, 16, 16, None),
+        (1, 6, 2, 100, 300, 0, 32, None),
+        (2, 4, 1, 70, 90, 0, 32, [0, 13]),
+    ],
+)
+def test_inkling2_flash_attention_matches_masked_sdpa(
+    batch, heads, kv_heads, length, keys, window, extent, left_padding
+):
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    dim = 128
+    q = (mx.random.normal((batch, heads, length, dim)) * 0.3).astype(mx.bfloat16)
+    # K/V as a strided slice of a larger cache buffer.
+    shape = (batch, kv_heads, keys + 32, dim)
+    kbuf = (mx.random.normal(shape) * 0.3).astype(mx.bfloat16)
+    vbuf = mx.random.normal(shape).astype(mx.bfloat16)
+    k, v = kbuf[:, :, :keys], vbuf[:, :, :keys]
+    rel = mx.random.normal((batch, length, heads, extent)).astype(mx.bfloat16)
+    sink = (mx.random.normal((batch, length, heads)) * 2).astype(mx.bfloat16)
+    lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
+    args = (q, k, v, rel, sink)
+    expected = kernels._masked_attention(*args, dim**-0.5, window, lp)
+    got = kernels.flash_banded_attention(
+        *args, scale=dim**-0.5, window=window, left_padding=lp
+    )
+    assert got.shape == expected.shape
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
+    assert diff.item() < 1e-2

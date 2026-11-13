@@ -19,6 +19,7 @@ _NATIVE_REASONING_MODEL_TYPES = {
     # <|content_thinking|> blocks.
     "inkling",
     "inkling_mm_model",
+    "inkling2",
     # Muse Glimmer's chat template renders history reasoning_content into
     # <|start|>assistant to=self<|message|> blocks.
     "muse_glimmer",
