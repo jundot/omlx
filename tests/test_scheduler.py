@@ -3872,6 +3872,111 @@ class TestSchedulerBoundarySnapshots:
             (4, 6), list(range(9)), stop_at_generation_prompt=False
         ) == (4, None, False)
 
+    def test_boundary_override_keeps_junction_tail_for_its_own_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """The branch-point tail is a terminal only for the side store."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        request = Request(
+            request_id="req-junction-tail",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.generation_prompt_start = 7
+        request.junction_end = 6
+        scheduler.requests[request.request_id] = request
+        raw = {4: object(), 6: object(), 7: object()}
+        extracted = {tc: [{"state": (tc,)}] for tc in raw}
+
+        def extract(raw_cache):
+            for tc, obj in raw.items():
+                if raw_cache is obj:
+                    return extracted[tc], f"config-{tc}"
+            raise AssertionError("unexpected raw cache")
+
+        def override(snapshots, tokens, **kwargs):
+            scheduler._boundary_cache_snapshots[request.request_id] = {
+                tc: raw[tc] for tc in snapshots
+            }
+            with patch.object(scheduler, "_extract_cache_states", side_effect=extract):
+                tokens, _, _, provider = scheduler._get_boundary_store_override(
+                    request.request_id, tokens, **kwargs
+                )
+            return len(tokens), provider.tail_terminal_token_count, 4 in provider
+
+        assert override((4, 6, 7), list(range(9))) == (7, 7, True)
+        assert override((4, 6, 7), list(range(6)), system_tail=True) == (6, 6, False)
+        # Without the generation prompt tail the request's own store stays on the grid.
+        assert override((4, 6), list(range(9)), stop_at_generation_prompt=False) == (
+            4,
+            None,
+            False,
+        )
+
+    @pytest.mark.parametrize(
+        "system_end,junction_end,snapshots,expected",
+        [
+            (0, 6, {6, 7}, 6),
+            (5, 6, {5, 6, 7}, 5),
+            (5, 6, {6, 7}, 6),
+            (0, 6, {7}, 0),
+            (0, 0, {5, 6}, 0),
+        ],
+    )
+    def test_shared_tail_end_follows_the_captured_snapshot(
+        self, mock_model, mock_tokenizer, system_end, junction_end, snapshots, expected
+    ):
+        """The shared-tail store uses the end the prefill actually stopped at."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        request = Request(
+            request_id="req-shared-end",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.system_prefix_end = system_end
+        request.junction_end = junction_end
+        scheduler._boundary_cache_snapshots[request.request_id] = dict.fromkeys(
+            snapshots
+        )
+        assert scheduler._shared_tail_end(request) == expected
+
+    def test_prepare_system_prefix_store_builds_the_junction_payload(
+        self, mock_model, mock_tokenizer
+    ):
+        """A request that stopped at its branch point gets a shared-tail store."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        request = Request(
+            request_id="req-junction-store",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(10))
+        request.junction_end = 6
+        provider = SimpleNamespace(tail_terminal_token_count=6)
+        boundary = [{"state": ("gdn",)}]
+        full = [{"state": ("kv",)}]
+        with patch.object(
+            scheduler,
+            "_get_boundary_store_override",
+            return_value=(list(range(6)), boundary, "config", provider),
+        ) as override:
+            # No snapshot at the branch point: nothing to store.
+            assert scheduler._prepare_system_prefix_store(request, full) is None
+            scheduler._boundary_cache_snapshots[request.request_id] = {6: None}
+            payload = scheduler._prepare_system_prefix_store(request, full)
+        assert override.call_args.args == (request.request_id, list(range(6)))
+        assert override.call_args.kwargs == {"system_tail": True}
+        assert payload == (list(range(6)), boundary, "config", provider)
+
     def test_boundary_override_prefers_aligned_snapshot_past_tail(
         self, mock_model, mock_tokenizer
     ):
