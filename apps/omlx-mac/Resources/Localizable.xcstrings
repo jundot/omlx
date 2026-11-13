@@ -17681,6 +17681,66 @@
         }
       }
     },
+    "menubar.remote.checking" : {
+      "comment" : "Menubar status header while the remote oMLX server is being probed; placeholder is its address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Checking remote server %@…"
+          }
+        }
+      }
+    },
+    "menubar.remote.invalid_address" : {
+      "comment" : "Menubar status header when the remote server address cannot be parsed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote server address is not valid"
+          }
+        }
+      }
+    },
+    "menubar.remote.reachable" : {
+      "comment" : "Menubar status header when the remote oMLX server answers; placeholder is its address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote server: %@"
+          }
+        }
+      }
+    },
+    "menubar.remote.unauthorized" : {
+      "comment" : "Menubar status header when the remote oMLX server rejects the API key; placeholder is its address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote server %@: API key rejected"
+          }
+        }
+      }
+    },
+    "menubar.remote.unreachable" : {
+      "comment" : "Menubar status header when the remote oMLX server cannot be reached; placeholder is its address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote server %@ unreachable"
+          }
+        }
+      }
+    },
     "menubar.stats.alltime_section" : {
       "comment" : "Section header inside the Serving Stats submenu for all-time metrics",
       "extractionState" : "manual",
@@ -29497,6 +29557,90 @@
         }
       }
     },
+    "remote.badge.help" : {
+      "comment" : "Tooltip of the remote server badge; the arguments are the address and its state",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This app manages the oMLX server at %1$@, which is %2$@. Click to change it."
+          }
+        }
+      }
+    },
+    "remote.badge.state.checking" : {
+      "comment" : "Remote server badge tooltip state: the server is being probed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "being checked"
+          }
+        }
+      }
+    },
+    "remote.badge.state.invalid" : {
+      "comment" : "Remote server badge tooltip state: the address cannot be parsed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "not a valid address"
+          }
+        }
+      }
+    },
+    "remote.badge.state.reachable" : {
+      "comment" : "Remote server badge tooltip state: the server answers",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "reachable"
+          }
+        }
+      }
+    },
+    "remote.badge.state.unauthorized" : {
+      "comment" : "Remote server badge tooltip state: the server rejects the API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "rejecting the API key"
+          }
+        }
+      }
+    },
+    "remote.badge.state.unreachable" : {
+      "comment" : "Remote server badge tooltip state: the server does not answer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "unreachable"
+          }
+        }
+      }
+    },
+    "remote.badge.title" : {
+      "comment" : "Label of the badge shown on every screen while the app uses a server on another Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote server"
+          }
+        }
+      }
+    },
     "security.api_key.copy" : {
       "comment" : "Tooltip on the API key copy button",
       "extractionState" : "manual",
@@ -31009,6 +31153,282 @@
         }
       }
     },
+    "server.backend.apply" : {
+      "comment" : "Button that saves the backend choice, stops the local server and reopens the app",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply and Relaunch"
+          }
+        }
+      }
+    },
+    "server.backend.confirm.message.local" : {
+      "comment" : "Confirmation message before switching back to the server on this Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX will reopen and start the server on this Mac."
+          }
+        }
+      }
+    },
+    "server.backend.confirm.message.remote" : {
+      "comment" : "Confirmation message before switching to another server; the argument is its address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX will stop the server on this Mac and reopen using %@."
+          }
+        }
+      }
+    },
+    "server.backend.confirm.title" : {
+      "comment" : "Title of the confirmation shown before the app switches its backend and relaunches",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Switch server?"
+          }
+        }
+      }
+    },
+    "server.backend.insecure" : {
+      "comment" : "Warning when the remote backend is set to plain http",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This address uses http, so the API key and everything this app sends to that server are not encrypted on the network. Use a network you trust, or an https address."
+          }
+        }
+      }
+    },
+    "server.backend.key.hide" : {
+      "comment" : "Tooltip on the eye button when the other server's API key is visible",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hide the API key"
+          }
+        }
+      }
+    },
+    "server.backend.key.show" : {
+      "comment" : "Tooltip on the eye button when the other server's API key is masked",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Show the API key"
+          }
+        }
+      }
+    },
+    "server.backend.remote" : {
+      "comment" : "Segment: this app uses an oMLX server on another Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote server"
+          }
+        }
+      }
+    },
+    "server.backend.row.address" : {
+      "comment" : "Row label for the other oMLX server's address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Address"
+          }
+        }
+      }
+    },
+    "server.backend.row.address.sub" : {
+      "comment" : "Sublabel for the other oMLX server's address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A host, host:port, or https:// address. The default port is 8000."
+          }
+        }
+      }
+    },
+    "server.backend.row.connection" : {
+      "comment" : "Row label for the button that checks the other oMLX server",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connection"
+          }
+        }
+      }
+    },
+    "server.backend.row.key" : {
+      "comment" : "Row label for the other oMLX server's API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API key"
+          }
+        }
+      }
+    },
+    "server.backend.row.key.sub" : {
+      "comment" : "Sublabel for the other oMLX server's API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The main API key of that server. Stored in settings.json with the rest of this install's settings, like the local key."
+          }
+        }
+      }
+    },
+    "server.backend.row.server" : {
+      "comment" : "Row label for the choice between the server on this Mac and another oMLX server",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server"
+          }
+        }
+      }
+    },
+    "server.backend.test" : {
+      "comment" : "Button that checks the other oMLX server's address and API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Test connection"
+          }
+        }
+      }
+    },
+    "server.backend.test.admin_denied" : {
+      "comment" : "Shown when the other oMLX server lists models for the key but refuses admin login",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connected, but this key cannot open the admin API. Use that server's main API key, not a sub key."
+          }
+        }
+      }
+    },
+    "server.backend.test.checking" : {
+      "comment" : "Shown while the app checks the other oMLX server",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Checking…"
+          }
+        }
+      }
+    },
+    "server.backend.test.connected" : {
+      "comment" : "Shown when the other oMLX server answered and the key opens its admin API; the argument is the number of chat models",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connected. Chat models: %lld"
+          }
+        }
+      }
+    },
+    "server.backend.test.invalid_address" : {
+      "comment" : "Shown when the other oMLX server's address is empty or not valid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter a valid address, such as studio.local:8000."
+          }
+        }
+      }
+    },
+    "server.backend.test.key_rejected" : {
+      "comment" : "Shown when the other oMLX server rejects the API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "That server did not accept this API key."
+          }
+        }
+      }
+    },
+    "server.backend.test.needs_key" : {
+      "comment" : "Shown when the other oMLX server requires an API key and none is set",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "That server asks for an API key."
+          }
+        }
+      }
+    },
+    "server.backend.test.unreachable" : {
+      "comment" : "Shown when the other oMLX server cannot be reached; the argument is the error text",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Can't reach that server: %@"
+          }
+        }
+      }
+    },
+    "server.backend.this_mac" : {
+      "comment" : "Segment: this app runs and uses the oMLX server on this Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This Mac"
+          }
+        }
+      }
+    },
     "server.button.apply" : {
       "comment" : "Button to apply pending storage changes",
       "extractionState" : "manual",
@@ -31621,6 +32041,30 @@
         }
       }
     },
+    "server.hero.check_now" : {
+      "comment" : "Hero card button that probes the remote server again",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Check now"
+          }
+        }
+      }
+    },
+    "server.hero.pill.key_rejected" : {
+      "comment" : "Status pill label when the remote server answers but rejects the API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Key rejected"
+          }
+        }
+      }
+    },
     "server.hero.pill.unresponsive" : {
       "comment" : "Status pill label when the server process is alive but not answering health checks",
       "extractionState" : "manual",
@@ -31830,6 +32274,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "未运行"
+          }
+        }
+      }
+    },
+    "server.hero.subtitle.remote_checking" : {
+      "comment" : "Hero subtitle while the remote server is being probed; the argument is its address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Checking %@…"
+          }
+        }
+      }
+    },
+    "server.hero.subtitle.remote_invalid" : {
+      "comment" : "Hero subtitle when the remote server address cannot be parsed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote server address is not valid"
+          }
+        }
+      }
+    },
+    "server.hero.subtitle.remote_unauthorized" : {
+      "comment" : "Hero subtitle when the remote server rejects the API key; the argument is its address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The server at %@ did not accept the API key"
+          }
+        }
+      }
+    },
+    "server.hero.subtitle.remote_unreachable" : {
+      "comment" : "Hero subtitle when the remote server cannot be reached; the argument is its address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Can't reach %@"
+          }
+        }
+      }
+    },
+    "server.hero.subtitle.remote_using" : {
+      "comment" : "Hero subtitle when the remote server is reachable; the argument is its address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Using the server at %@"
           }
         }
       }
@@ -34167,6 +34671,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "高级"
+          }
+        }
+      }
+    },
+    "server.section.backend" : {
+      "comment" : "Section heading for choosing which oMLX server this app uses",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backend"
+          }
+        }
+      }
+    },
+    "server.section.backend.sub" : {
+      "comment" : "Subtitle for the Backend section in Server screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The oMLX server this app uses. With a remote server, nothing runs on this Mac: models, settings and logs are that server's."
           }
         }
       }
@@ -52948,7 +53476,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "The server on this Mac, or another oMLX server on your network, such as a Mac Studio."
+            "value" : "The server on this Mac, or a different oMLX server on your network, such as a Mac Studio."
           }
         },
         "it" : {
@@ -52984,13 +53512,25 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Another server"
+            "value" : "Different server"
           }
         },
         "it" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Un altro server"
+          }
+        }
+      }
+    },
+    "askai.row.server.sub.remote" : {
+      "comment" : "Sublabel for the Ask AI server choice when the app uses a remote backend; the argument is that server's address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The server this app uses (%@), or a different oMLX server on your network."
           }
         }
       }
@@ -53247,6 +53787,18 @@
         }
       }
     },
+    "askai.server.app_server" : {
+      "comment" : "Segment: Ask AI uses the server this app is set to use, which is a remote backend",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX's server"
+          }
+        }
+      }
+    },
     "askai.server.insecure" : {
       "comment" : "Warning when Ask AI is set to another server over plain http",
       "extractionState" : "manual",
@@ -53261,6 +53813,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Questo indirizzo usa http, quindi la chiave API e le tue domande non sono cifrate sulla rete. Usa una rete di cui ti fidi oppure un indirizzo https."
+          }
+        }
+      }
+    },
+    "askai.models.unavailable_app_remote" : {
+      "comment" : "Hint when Ask AI follows the app's remote backend and its model list could not be loaded",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Can't reach the server this app uses. Check it under Server."
           }
         }
       }

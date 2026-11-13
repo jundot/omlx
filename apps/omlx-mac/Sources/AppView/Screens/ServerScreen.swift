@@ -18,6 +18,8 @@ struct ServerScreen: View {
         VStack(alignment: .leading, spacing: 0) {
             ServerHeroCard(vm: vm)
 
+            BackendSection()
+
             SectionHeader(String(localized: "server.section.network",
                                   defaultValue: "Network",
                                   comment: "Section heading for the Network rows in Server screen"))
@@ -60,7 +62,8 @@ struct ServerScreen: View {
             SectionHeader(String(localized: "server.section.endpoints",
                                   defaultValue: "API Endpoints",
                                   comment: "Section heading for the API endpoints list"))
-            APIEndpointsList(host: vm.effectiveHost, port: vm.effectivePort)
+            APIEndpointsList(host: vm.effectiveHost, port: vm.effectivePort,
+                             remote: services.config.endpoint.isRemote ? services.config.endpoint : nil)
 
             SectionHeader(
                 String(localized: "server.section.default_profile",
@@ -364,6 +367,26 @@ struct ServerHeroCard: View {
 
     @ViewBuilder
     private var buttons: some View {
+        if services.isRemoteBackend {
+            // The remote server is managed on its own Mac: nothing to
+            // start, stop or restart from here.
+            Button {
+                Task { await services.refreshRemoteBackend() }
+            } label: {
+                Label(String(localized: "server.hero.check_now",
+                             defaultValue: "Check now",
+                             comment: "Hero card button that re-checks whether the other oMLX server answers"),
+                      systemImage: "arrow.clockwise")
+                    .labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.omlx(.normal))
+        } else {
+            localButtons
+        }
+    }
+
+    @ViewBuilder
+    private var localButtons: some View {
         switch services.serverState {
         case .running, .unresponsive:
             HStack(spacing: 6) {
@@ -422,6 +445,19 @@ struct ServerHeroCard: View {
     }
 
     private var pillStatus: StatusPill.Status {
+        if services.isRemoteBackend {
+            switch services.remoteState {
+            case .reachable:      return .running
+            case .checking:       return .starting
+            case .unauthorized:   return .custom(color: theme.amberDot,
+                                                  label: String(localized: "server.hero.pill.key_rejected",
+                                                                defaultValue: "Key rejected",
+                                                                comment: "Status pill label when the other oMLX server answers but does not accept the API key"),
+                                                  fillBg: true)
+            case .unreachable, .invalidAddress: return .error
+            case .idle:           return .stopped
+            }
+        }
         switch services.serverState {
         case .running:      return .running
         case .starting:     return .starting
@@ -436,7 +472,34 @@ struct ServerHeroCard: View {
         }
     }
 
+    private var remoteSubtitle: String {
+        let address = services.config.endpoint.displayAddress
+        switch services.remoteState {
+        case .reachable:
+            return String(localized: "server.hero.subtitle.remote_using",
+                          defaultValue: "Using the server at \(address)",
+                          comment: "Hero subtitle when the app uses another oMLX server and it answers; the placeholder is its address")
+        case .checking:
+            return String(localized: "server.hero.subtitle.remote_checking",
+                          defaultValue: "Checking \(address)…",
+                          comment: "Hero subtitle while the app checks whether the other oMLX server answers; the placeholder is its address")
+        case .unauthorized:
+            return String(localized: "server.hero.subtitle.remote_unauthorized",
+                          defaultValue: "The server at \(address) did not accept the API key",
+                          comment: "Hero subtitle when the other oMLX server answers but rejects the API key; the placeholder is its address")
+        case .invalidAddress:
+            return String(localized: "server.hero.subtitle.remote_invalid",
+                          defaultValue: "Remote server address is not valid",
+                          comment: "Hero subtitle when the other oMLX server's address cannot be parsed")
+        case .unreachable, .idle:
+            return String(localized: "server.hero.subtitle.remote_unreachable",
+                          defaultValue: "Can't reach \(address)",
+                          comment: "Hero subtitle when the other oMLX server does not answer; the placeholder is its address")
+        }
+    }
+
     private var subtitle: String {
+        if services.isRemoteBackend { return remoteSubtitle }
         let host = services.config.host
         let port = services.config.port
         switch services.serverState {
@@ -470,6 +533,283 @@ struct ServerHeroCard: View {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
         let trimmed = version?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? "oMLX" : "oMLX \(trimmed)"
+    }
+}
+
+// MARK: - Backend
+
+/// Which oMLX server this app uses: the one it runs on this Mac, or one on
+/// another Mac. The choice is read at launch, so Apply writes it and
+/// relaunches the app (`AppServices.applyRemoteBackend`).
+private struct BackendSection: View {
+    @Environment(AppServices.self) private var services
+    @Environment(\.omlxTheme) private var theme
+
+    @State private var useRemote = false
+    @State private var address = ""
+    @State private var apiKey = ""
+    @State private var showKey = false
+    @State private var check = ConnectionCheck.idle
+    @State private var confirming = false
+    @State private var isApplying = false
+    @State private var applyError: String?
+
+    private enum ConnectionCheck: Equatable {
+        case idle
+        case checking
+        case connected(models: Int)
+        /// Reachable and the key lists models, but the admin API refuses it.
+        case adminDenied
+        case failed(String)
+    }
+
+    private var pendingEndpoint: OMLXEndpoint? {
+        OMLXEndpoint(remoteAddress: address, apiKey: apiKey)
+    }
+
+    private var hasPendingChange: Bool {
+        let config = services.config
+        if useRemote != config.remoteEnabled { return true }
+        guard useRemote else { return false }
+        return address.trimmingCharacters(in: .whitespacesAndNewlines)
+            != config.remoteAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+            || AppConfig.cleanedKey(apiKey) != config.remoteAPIKey
+    }
+
+    private var canApply: Bool {
+        hasPendingChange && !isApplying && (!useRemote || pendingEndpoint != nil)
+    }
+
+    var body: some View {
+        SectionHeader(
+            String(localized: "server.section.backend",
+                   defaultValue: "Backend",
+                   comment: "Section heading for choosing which oMLX server this app uses"),
+            subtitle: String(localized: "server.section.backend.sub",
+                             defaultValue: "The oMLX server this app uses. With a remote server, nothing runs on this Mac: models, settings and logs are that server's.",
+                             comment: "Subtitle for the Backend section in Server screen")
+        )
+        ListGroup {
+            Row(
+                label: String(localized: "server.backend.row.server",
+                              defaultValue: "Server",
+                              comment: "Row label for choosing the oMLX server this app uses"),
+                isLast: !useRemote
+            ) {
+                Segmented(
+                    selection: $useRemote,
+                    titleKey: "server.backend.row.server",
+                    options: [
+                        (false, String(localized: "server.backend.this_mac",
+                                       defaultValue: "This Mac",
+                                       comment: "Segment: the app uses the oMLX server it runs on this Mac")),
+                        (true, String(localized: "server.backend.remote",
+                                      defaultValue: "Remote server",
+                                      comment: "Segment: the app uses an oMLX server on another Mac")),
+                    ]
+                )
+                .frame(width: .controlMedium)
+            }
+            if useRemote {
+                Row(
+                    label: String(localized: "server.backend.row.address",
+                                  defaultValue: "Address",
+                                  comment: "Row label for the other oMLX server's address"),
+                    sublabel: String(localized: "server.backend.row.address.sub",
+                                     defaultValue: "A host, host:port, or https:// address. The default port is 8000.",
+                                     comment: "Sublabel for the other oMLX server's address")
+                ) {
+                    TextInput(text: $address, placeholder: "studio.local:8000",
+                              mono: true, width: .controlWide)
+                }
+                Row(
+                    label: String(localized: "server.backend.row.key",
+                                  defaultValue: "API key",
+                                  comment: "Row label for the other oMLX server's API key"),
+                    sublabel: String(localized: "server.backend.row.key.sub",
+                                     defaultValue: "The main API key of that server. Stored in settings.json with the rest of this install's settings, like the local key.",
+                                     comment: "Sublabel for the other oMLX server's API key")
+                ) {
+                    HStack(spacing: 4) {
+                        TextInput(text: $apiKey, placeholder: "sk-omlx-…", isSecure: !showKey,
+                                  mono: true, width: .controlMedium)
+                        Button {
+                            showKey.toggle()
+                        } label: {
+                            Image(systemName: showKey ? "eye.slash" : "eye")
+                                .frame(width: 26, height: 26)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(showKey
+                            ? String(localized: "server.backend.key.hide",
+                                     defaultValue: "Hide the API key",
+                                     comment: "Tooltip on the eye button when the other server's API key is visible")
+                            : String(localized: "server.backend.key.show",
+                                     defaultValue: "Show the API key",
+                                     comment: "Tooltip on the eye button when the other server's API key is masked"))
+                    }
+                }
+                Row(
+                    label: String(localized: "server.backend.row.connection",
+                                  defaultValue: "Connection",
+                                  comment: "Row label for the button that checks the other oMLX server"),
+                    sublabel: connectionSublabel,
+                    warning: connectionWarning,
+                    isLast: true
+                ) {
+                    Button(String(localized: "server.backend.test",
+                                  defaultValue: "Test connection",
+                                  comment: "Button that checks the other oMLX server's address and API key")) {
+                        Task { await testConnection() }
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(check == .checking)
+                }
+            }
+        }
+        .onChange(of: useRemote) { check = .idle }
+        .onChange(of: address) { check = .idle }
+        .onChange(of: apiKey) { check = .idle }
+
+        if useRemote, pendingEndpoint?.sendsKeyInTheClear == true {
+            HintLine(
+                text: String(localized: "server.backend.insecure",
+                             defaultValue: "This address uses http, so the API key and everything this app sends to that server are not encrypted on the network. Use a network you trust, or an https address.",
+                             comment: "Warning when the app is set to use another oMLX server over plain http"),
+                icon: "exclamationmark.triangle"
+            )
+            .padding(.horizontal, 28)
+            .padding(.top, 6)
+        }
+
+        FooterBar(error: applyError) {
+            Button(String(localized: "server.backend.apply",
+                          defaultValue: "Apply and Relaunch",
+                          comment: "Button that saves the backend choice (this Mac or another server) and relaunches the app")) {
+                confirming = true
+            }
+            .buttonStyle(.omlx(.primary))
+            .disabled(!canApply)
+        }
+        .onAppear(perform: seed)
+        .onChange(of: services.config) { seed() }
+        .alert(
+            String(localized: "server.backend.confirm.title",
+                   defaultValue: "Switch server?",
+                   comment: "Title of the confirmation shown before switching the oMLX server this app uses"),
+            isPresented: $confirming
+        ) {
+            Button(String(localized: "common.cancel", defaultValue: "Cancel"), role: .cancel) {}
+            Button(String(localized: "common.ok", defaultValue: "OK")) { apply() }
+        } message: {
+            Text(confirmMessage)
+        }
+    }
+
+    private var confirmMessage: String {
+        if useRemote, let endpoint = pendingEndpoint {
+            let shown = endpoint.displayAddress
+            return String(localized: "server.backend.confirm.message.remote",
+                          defaultValue: "oMLX will stop the server on this Mac and reopen using \(shown).",
+                          comment: "Confirmation message before switching to another oMLX server; the placeholder is its address")
+        }
+        return String(localized: "server.backend.confirm.message.local",
+                      defaultValue: "oMLX will reopen and start the server on this Mac.",
+                      comment: "Confirmation message before switching back to the oMLX server on this Mac")
+    }
+
+    private func seed() {
+        useRemote = services.config.remoteEnabled
+        address = services.config.remoteAddress
+        apiKey = services.config.remoteAPIKey ?? ""
+    }
+
+    private func apply() {
+        let enabled = useRemote
+        let address = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = AppConfig.cleanedKey(apiKey)
+        applyError = nil
+        isApplying = true
+        Task {
+            do {
+                try await services.applyRemoteBackend(enabled: enabled, address: address, apiKey: key)
+            } catch {
+                applyError = error.omlxDescription
+                isApplying = false
+            }
+        }
+    }
+
+    private var connectionSublabel: String? {
+        switch check {
+        case .idle, .failed:
+            nil
+        case .checking:
+            String(localized: "server.backend.test.checking",
+                   defaultValue: "Checking…",
+                   comment: "Shown while the app checks the other oMLX server")
+        case .connected(let models):
+            String(localized: "server.backend.test.connected",
+                   defaultValue: "Connected. Chat models: \(models)",
+                   comment: "Shown when the other oMLX server answered; the argument is the number of chat models")
+        case .adminDenied:
+            String(localized: "server.backend.test.admin_denied",
+                   defaultValue: "Connected, but this key cannot open the admin API. Use that server's main API key, not a sub key.",
+                   comment: "Shown when the other oMLX server accepts the key for models but not for its admin API")
+        }
+    }
+
+    private var connectionWarning: String? {
+        if case .failed(let message) = check { message } else { nil }
+    }
+
+    /// Parse, then `/health`, the model list, and the admin login: the
+    /// screens need the main key, which sub keys do not satisfy.
+    private func testConnection() async {
+        guard let endpoint = pendingEndpoint else {
+            check = .failed(String(localized: "server.backend.test.invalid_address",
+                                   defaultValue: "Enter a valid address, such as studio.local:8000.",
+                                   comment: "Shown when the other oMLX server's address is empty or not valid"))
+            return
+        }
+        check = .checking
+        do {
+            try await endpoint.checkHealth()
+            let all = try await endpoint.models()
+            do {
+                try await endpoint.checkAdminLogin()
+            } catch OMLXClientError.unauthenticated {
+                check = .adminDenied
+                return
+            }
+            check = .connected(models: all.filter {
+                AskAIScreen.isChatModel(type: $0.modelType, virtual: $0.virtual)
+            }.count)
+        } catch {
+            check = .failed(Self.message(for: error))
+        }
+    }
+
+    private static func message(for error: Error) -> String {
+        if let error = error as? OMLXClientError {
+            switch error {
+            case .unauthenticated:
+                return String(localized: "server.backend.test.needs_key",
+                              defaultValue: "That server asks for an API key.",
+                              comment: "Shown when the other oMLX server asks for an API key and none is set")
+            case .http(let status, _) where status == 401 || status == 403:
+                return String(localized: "server.backend.test.key_rejected",
+                              defaultValue: "That server did not accept this API key.",
+                              comment: "Shown when the other oMLX server rejects the API key")
+            default:
+                break
+            }
+        }
+        let detail = error.omlxDescription
+        return String(localized: "server.backend.test.unreachable",
+                      defaultValue: "Can't reach that server: \(detail)",
+                      comment: "Shown when the other oMLX server does not answer; the argument is the error")
     }
 }
 
@@ -646,6 +986,9 @@ private struct ServerDefaultProfileEditor: View {
 private struct APIEndpointsList: View {
     let host: String
     let port: Int
+    /// The other server this app uses, when there is one: its URLs replace
+    /// the local host and port (and keep its scheme).
+    var remote: OMLXEndpoint? = nil
 
     var body: some View {
         ListGroup {
@@ -678,7 +1021,8 @@ private struct APIEndpointsList: View {
     /// raw interpolation would produce. Fall back to interpolation only if the
     /// URL is somehow unconstructable.
     private func endpoint(path: String) -> String {
-        AppConfig.httpURL(host: host, port: port, path: path)?.absoluteString
+        if let remote, let url = remote.httpURL(path: path) { return url.absoluteString }
+        return AppConfig.httpURL(host: host, port: port, path: path)?.absoluteString
             ?? "http://\(host):\(port)\(path)"
     }
 }
