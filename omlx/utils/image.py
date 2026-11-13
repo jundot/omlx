@@ -536,3 +536,22 @@ def compute_per_image_hashes(images: List[Image.Image]) -> List[str]:
         hasher.update(rgb_img.tobytes())
         hashes.append(hasher.hexdigest())
     return hashes
+
+
+def image_hash_prefixes(images: list[Image.Image]) -> list[str]:
+    """Return ``compute_image_hash(images[:k])`` for every k in one pass.
+
+    ``compute_image_hash(images[:k])`` re-hashes every preceding image for
+    each k, which is quadratic in the number of images. This walks the list
+    once, keeping a running SHA256 and snapshotting it per prefix, so each
+    value is byte-identical to the corresponding prefix hash.
+
+    The list aligns with ``images`` and is empty for an empty input.
+    """
+    cumulative = hashlib.sha256()
+    prefixes: list[str] = []
+    for img in images:
+        cumulative.update(f"{img.size[0]}x{img.size[1]}".encode())
+        cumulative.update(img.convert("RGB").tobytes())
+        prefixes.append(cumulative.copy().hexdigest())
+    return prefixes

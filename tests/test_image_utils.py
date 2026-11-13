@@ -15,6 +15,7 @@ from omlx.exceptions import InvalidRequestError
 from omlx.utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
+    image_hash_prefixes,
     extract_images_from_messages,
     extract_media_from_messages,
     load_image,
@@ -543,6 +544,20 @@ class TestComputeImageHash:
         result = compute_image_hash(images)
         assert isinstance(result, str)
         assert len(result) == 64
+
+
+class TestImageHashPrefixes:
+    """Tests for the single-pass prefix hashes."""
+
+    def test_matches_compute_image_hash_prefixes(self):
+        images = [_make_test_image(4, 4, c) for c in ("red", "green", "blue")]
+
+        assert image_hash_prefixes(images) == [
+            compute_image_hash(images[:i]) for i in range(1, len(images) + 1)
+        ]
+
+    def test_empty(self):
+        assert image_hash_prefixes([]) == []
 
 
 class TestComputePerImageHashes:
