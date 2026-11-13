@@ -15,6 +15,7 @@ import logging
 
 import mlx.core as mx
 
+from ..deepseek_v41 import kernels as deepseek
 from ..minimax_m3_vl import kernels as minimax
 from . import layers
 
@@ -24,6 +25,9 @@ logger = logging.getLogger(__name__)
 # partial sum (48 layers in blocks of 6).
 MIX_SOURCES = 9
 _FORMATS = ("nvfp4", "mxfp8")
+# Affine code widths the expert tile takes (64 weights a group): what oQ
+# writes for Inkling 2 experts below 4 bits, and requantized MXFP8 layers.
+_AFFINE_BITS = (2, 3, 4, 8)
 _on: set[str] = set()
 
 
@@ -638,23 +642,35 @@ def static_conv(x, w, state, scale: float):
     return y, window
 
 
-def covers_experts(experts, dtype: mx.Dtype) -> bool:
-    """Whether the expert GEMMs take both banks: FP formats in 128 tiles."""
-    if dtype != mx.bfloat16:
+def _format(bank) -> str | None:
+    """The bank's carrier as the expert GEMMs name it, or None."""
+    quant = bank.quant
+    if quant["mode"] in _FORMATS:
+        return quant["mode"] if bank.scales.dtype == mx.uint8 else None
+    affine = (
+        quant["mode"] == "affine"
+        and quant["group_size"] == 64
+        and quant["bits"] in _AFFINE_BITS
+        and bank.biases is not None
+        and bank.scales.dtype == mx.bfloat16
+    )
+    return f"affine{quant['bits']}" if affine else None
+
+
+def covers_bank(bank, dtype: mx.Dtype) -> bool:
+    """Whether an expert GEMM takes this bank for BF16 rows: a checked carrier
+    in 128 tiles."""
+    inputs = bank.weight.shape[2] * 32 // bank.quant["bits"]
+    if dtype != mx.bfloat16 or inputs % 128 or bank.weight.shape[1] % 128:
         return False
-    for bank in (experts.w13, experts.w2):
-        inputs = bank.weight.shape[2] * 32 // bank.quant["bits"]
-        outputs = bank.weight.shape[1]
-        if bank.quant["mode"] not in _FORMATS or bank.scales.dtype != mx.uint8:
-            return False
-        if inputs % 128 or outputs % 128:
-            return False
-    hidden = experts.w2.weight.shape[1]
-    return hidden <= 8192
+    return f"experts:{_format(bank)}" in _on
 
 
 def gather(x: mx.array, bank, experts: mx.array) -> mx.array:
-    return minimax.gather(x, bank, experts)
+    """``x`` [R, K] rows, sorted by expert, each through its expert of ``bank``."""
+    if bank.quant["mode"] in _FORMATS:
+        return minimax.gather(x, bank, experts)
+    return deepseek.expert_down(x, experts, bank)
 
 
 def weighted_sum(down: mx.array, inverse: mx.array, weights: mx.array) -> mx.array:
@@ -753,23 +769,30 @@ def enable(cfg, dtype: mx.Dtype) -> None:
     got = activation(y, picked, experts.w13.post, experts.caps)
     want = experts.plain_activation(y, picked)
     _check("activation", mx.array_equal(got, want).item(), "not equal to plain ops")
-    # Expert GEMMs: an NVFP4 and an MXFP8 bank against MLX's gather_qmm.
-    worst = 0.0
+    # Expert GEMMs: each carrier against MLX's gather_qmm, which multiplies
+    # with the weights the host's does (mx.dequantize of 3-bit codes differs).
     rows = mx.array([0] * 70 + [1] * 60, dtype=mx.uint32)
     x = mx.random.normal((130, 256)).astype(dtype)
-    for mode in _FORMATS:
-        weight, scales = mx.quantize(mx.random.normal((2, 128, 256)) * 0.05, mode=mode)
-        bank = type("Bank", (), {})()
-        bank.weight, bank.scales = weight, scales
-        bank.quant = {"mode": mode, "bits": 32 * weight.shape[-1] // 256}
-        want = mx.gather_qmm(
-            x[:, None],
-            weight,
-            scales,
-            rhs_indices=rows,
-            transpose=True,
-            mode=mode,
-            sorted_indices=True,
-        )[:, 0]
-        worst = max(worst, _relative(gather(x, bank, rows), want))
-    _check("experts", worst <= 1e-3, f"relative error {worst:.2e}")
+    carriers = [{"mode": m} for m in _FORMATS]
+    carriers += [{"mode": "affine", "bits": b, "group_size": 64} for b in _AFFINE_BITS]
+    for spec in carriers:
+        # BF16 weights, so affine scales and biases are BF16 as checkpoints hold them.
+        w = (mx.random.normal((2, 128, 256)) * 0.05).astype(dtype)
+        weight, scales, *biases = mx.quantize(w, **spec)
+        named = {"b.weight": weight, "b.scales": scales}
+        if biases:
+            named["b.biases"] = biases[0]
+        quant = layers.expert_spec(spec if spec["mode"] == "affine" else spec["mode"])
+        bank = layers.Experts.Bank(named, "b", quant)
+        want = bank(x[:, None], rows)[:, 0]
+        error = _relative(gather(x, bank, rows), want)
+        _check(f"experts:{_format(bank)}", error <= 1e-3, f"relative error {error:.2e}")
+    # The weighted sum of each token's expert rows, a thread per 8 columns.
+    if cfg.hidden <= 8192 and cfg.hidden % 8 == 0:
+        down = mx.random.normal((70 * cfg.top_k, cfg.hidden)).astype(dtype)
+        inverse = mx.random.permutation(70 * cfg.top_k).astype(mx.uint32)
+        weights = mx.random.uniform(0.1, 2.0, (70, cfg.top_k))
+        want = down[inverse].reshape(70, cfg.top_k, -1).astype(mx.float32)
+        want = mx.sum(want * weights[..., None], axis=-2).astype(dtype)
+        error = _relative(weighted_sum(down, inverse, weights), want)
+        _check("weighted_sum", error <= 1e-3, f"relative error {error:.2e}")

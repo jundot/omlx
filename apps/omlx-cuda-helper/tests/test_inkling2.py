@@ -13,6 +13,8 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 from omlx_cuda_helper.families import inkling2  # noqa: E402
+from omlx_cuda_helper.families.inkling2 import kernels  # noqa: E402
+from omlx_cuda_helper.families.inkling2.layers import Config  # noqa: E402
 from omlx_cuda_helper.families.inkling2.stage import load_stage  # noqa: E402
 
 # Recorded by tests/fixtures/record_prefill_contract.py in the oMLX tree.
@@ -193,3 +195,12 @@ def test_the_published_layout_loads_as_the_runtime_layout(tmp_path):
             assert sorted(got) == sorted(want)
             for name in got:
                 np.testing.assert_array_equal(got[name][0], want[name][0], name)
+
+
+@pytest.mark.skipif(not mx.cuda.is_available(), reason="the kernels run on CUDA")
+def test_every_expert_carrier_takes_an_expert_gemm():
+    # The published checkpoint (NVFP4, MXFP8) and the affine codes oQ writes
+    # below 4 bits, each checked against MLX's gather_qmm.
+    kernels.enable(Config.from_text({}), mx.bfloat16)
+    carriers = {f"experts:{c}" for c in ("nvfp4", "mxfp8", "affine2", "affine3")}
+    assert carriers <= kernels._on

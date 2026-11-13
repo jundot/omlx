@@ -361,6 +361,14 @@ class Experts:
                     )
                 self.post = global_scale.astype(mx.float32) * (1.0 / NVFP4_DENOMINATOR)
 
+        @property
+        def spec(self) -> dict:
+            return self.quant
+
+        @property
+        def bits(self) -> int:
+            return self.quant["bits"]
+
         def parameters(self) -> list[mx.array]:
             own = (self.weight, self.scales, self.biases, self.post)
             return [a for a in own if a is not None]
@@ -451,15 +459,21 @@ class Experts:
         flat = inds.reshape(-1)
         order = mx.argsort(flat)
         source, experts, inverse = order // each, flat[order], mx.argsort(order)
-        if kernels.enabled("experts") and kernels.covers_experts(self, x.dtype):
-            y = kernels.gather(rows[source], self.w13, experts)
-            act = self.activation(y, experts)
+        routed = rows[source]
+        # Each bank takes an expert GEMM if one covers its carrier; the
+        # activation is BF16 whatever the row dtype.
+        if kernels.covers_bank(self.w13, routed.dtype):
+            y = kernels.gather(routed, self.w13, experts)
+        else:
+            y = self.w13(routed[:, None, :], experts)[:, 0]
+        act = self.activation(y, experts)
+        if kernels.covers_bank(self.w2, act.dtype):
             down = kernels.gather(act, self.w2, experts)
+        else:
+            down = self.w2(act[:, None, :], experts)[:, 0]
+        if x.dtype == mx.bfloat16 and kernels.enabled("weighted_sum"):
             out = kernels.weighted_sum(down, inverse, weights)
         else:
-            y = self.w13(rows[source][:, None, :], experts)[:, 0]
-            act = self.activation(y, experts)
-            down = self.w2(act[:, None, :], experts)[:, 0]
             down = down[inverse].reshape(*weights.shape, -1)
             out = mx.sum(down.astype(mx.float32) * weights[..., None], axis=-2)
             out = out.astype(x.dtype)

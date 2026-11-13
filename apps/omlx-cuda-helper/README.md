@@ -115,7 +115,7 @@ The same families as the Mac helper. A helper and a Mac work together when they 
 | DeepSeek V4.1 | `deepseek_v41` | 12 of 40 (10 for oQ4e) |
 | Inkling 2 Small | `inkling2` | 10 of 48 |
 
-Layer counts are for the oQ4e checkpoints (oQ3e for DeepSeek V4.1, the published NVFP4 checkpoint for Inkling 2). How many of them a prompt uses is chosen per prompt from the measured speed of both machines and of the link.
+Layer counts are for the oQ4e checkpoints (oQ3e for DeepSeek V4.1, the published NVFP4 checkpoint for Inkling 2). Inkling 2 oQ conversions below 4 bits keep their experts in affine 2- or 3-bit codes, 4.2 to 5.2 GiB a layer, so more layers fit. How many of them a prompt uses is chosen per prompt from the measured speed of both machines and of the link.
 
 ## Two GPUs
 
