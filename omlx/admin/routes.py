@@ -1246,14 +1246,16 @@ def _mtp_compat_for_model(
     ``_checkpoint_has_mtp_weights`` so native nextn layouts
     (``model.layers.<num_hidden_layers + i>.*``, e.g. GLM-5.2) count as
     present (issue #2326). Qwen4-Exp uses its narrower runtime detector,
-    which accepts only embedded ``mtp.*`` tensors. Default mlx-lm converters
-    strip ``mtp.*``; PR 990 ships a separate path that keeps them.
+    which accepts embedded ``mtp.*`` tensors or a matching standalone head.
+    Default mlx-lm converters strip ``mtp.*``; PR 990's conversion path
+    preserves them inside the main checkpoint.
     """
     import json
     from pathlib import Path
 
     from ..utils.model_loading import (
         _checkpoint_has_mtp_weights,
+        _checkpoint_has_qwen4_mtp_weights,
         _has_mtp_heads,
         _is_mtp_compatible,
     )
@@ -1291,7 +1293,7 @@ def _mtp_compat_for_model(
     # qwen4_exp model + mlx_lm_mtp dispatch patch) and never goes through the
     # mlx-lm ``_is_mtp_compatible`` whitelist, which gates the generic
     # text-model patch. Mirroring the runtime, the admin gate accepts
-    # qwen4_exp and relies on the embedded ``mtp.*`` weight check below —
+    # qwen4_exp and relies on the embedded/standalone weight check below —
     # the same condition the runtime path uses.
     if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
         return False, (
@@ -1299,7 +1301,12 @@ def _mtp_compat_for_model(
             "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
             "gemma4, gemma4_unified)"
         )
-    if not _checkpoint_has_mtp_weights(model_path):
+    has_mtp_weights = (
+        _checkpoint_has_qwen4_mtp_weights(model_path)
+        if model_type == "qwen4_exp"
+        else _checkpoint_has_mtp_weights(model_path)
+    )
+    if not has_mtp_weights:
         from ..oq import _resolve_mtplx_sidecar
 
         if _resolve_mtplx_sidecar(Path(model_path), cfg) is not None:
@@ -1311,7 +1318,8 @@ def _mtp_compat_for_model(
             )
         if model_type == "qwen4_exp":
             return False, (
-                "Qwen4-Exp Lightning MTP requires embedded mtp.* tensors; "
+                "Qwen4-Exp Lightning MTP requires embedded mtp.* tensors or a "
+                "matching qwen4_exp_mtp sidecar; "
                 "native nextn layers are not supported by its dedicated runtime."
             )
         return False, (
