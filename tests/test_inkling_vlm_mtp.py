@@ -496,7 +496,7 @@ _TINY_VISION = dict(
 )
 
 
-def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None):
+def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None, **dims):
     from mlx.utils import tree_flatten
 
     from omlx.patches.inkling2 import model as inkling2
@@ -522,6 +522,7 @@ def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None):
         intermediate_size=64,
         expert_formats=list(formats),
     )
+    text.update(dims)
     model = inkling2.Model(
         inkling2.ModelArgs(model_type="inkling2", text_config=text, vision_config=vision)
     )
@@ -655,6 +656,30 @@ def test_inkling2_flash_attention_matches_masked_sdpa(
     assert got.shape == expected.shape
     diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
     assert diff.item() < 1e-2
+
+
+def test_inkling2_masked_attention_holds_one_mask_block(monkeypatch):
+    # NAX hosts run full-attention prefill through the masked path; at 64K
+    # keys the masks of all query blocks once took 12 GiB together.
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal peak memory")
+    heads, length, keys, dim = 4, 256, 4096, 32
+    monkeypatch.setattr(kernels, "_MASK_BUDGET", 1 << 16)
+    q = mx.random.normal((1, heads, length, dim)).astype(mx.bfloat16)
+    k = mx.random.normal((1, 2, keys, dim)).astype(mx.bfloat16)
+    v = mx.random.normal((1, 2, keys, dim)).astype(mx.bfloat16)
+    rel = mx.random.normal((1, length, heads, 32)).astype(mx.bfloat16)
+    sink = mx.random.normal((1, length, heads)).astype(mx.bfloat16)
+    mx.eval(q, k, v, rel, sink)
+    block = heads * 16 * (keys + 1) * 2  # one 16-row bf16 mask
+    mx.reset_peak_memory()
+    base = mx.get_active_memory()
+    mx.eval(kernels._masked_attention(q, k, v, rel, sink, dim**-0.5, 0, None))
+    # One block's mask, scores and the padded K/V take about 4 blocks; the 16
+    # masks held together took over 30.
+    assert mx.get_peak_memory() - base < 10 * block
 
 
 def test_inkling2_image_processor_pads_normalizes_and_orders_blocks():

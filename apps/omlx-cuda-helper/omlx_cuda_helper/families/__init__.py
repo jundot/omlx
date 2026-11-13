@@ -24,6 +24,7 @@ FAMILIES: dict[str, Family] = {
     "glm5_next": Family(1, "omlx_cuda_helper.families.glm5_next"),
     "deepseek_v41": Family(1, "omlx_cuda_helper.families.deepseek_v41"),
     "qwen3_5": Family(1, "omlx_cuda_helper.families.qwen3_5"),
+    "inkling2": Family(1, "omlx_cuda_helper.families.inkling2"),
 }
 
 
