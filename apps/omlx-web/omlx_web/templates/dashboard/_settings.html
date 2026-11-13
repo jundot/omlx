@@ -183,7 +183,7 @@
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.auth.skip_verification') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.auth.skip_verification_hint') }}</p>
-                                        <p class="text-xs text-red-500 mt-0.5"
+                                        <p class="text-xs text-red-600 mt-0.5"
                                            x-show="!isLoopbackBindHost(globalSettings.server.host)" x-cloak>{{ t('settings.auth.skip_verification_warning') }}</p>
                                     </div>
                                     <button type="button"
@@ -250,7 +250,7 @@
                                                 <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72"/><path d="m14 7 3 3"/><path d="M5 6v4"/><path d="M19 14v4"/><path d="M10 2v2"/><path d="M7 8H3"/><path d="M21 16h-4"/><path d="M11 3H9"/></svg>
                                             </button>
                                         </div>
-                                        <div x-show="subKeyError" class="text-xs text-red-500 mb-2" x-text="subKeyError"></div>
+                                        <div x-show="subKeyError" class="text-xs text-red-600 mb-2" x-text="subKeyError"></div>
                                         <button type="button" @click="createSubKey()"
                                                 class="px-4 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-full hover:bg-neutral-800 transition-colors">
                                             {{ t('settings.auth.sub_keys_create') }}
@@ -1368,7 +1368,7 @@
                                                    x-text="globalSettings.external_engines.splash.reason"></p>
                                             </div>
                                         </template>
-                                        <p x-show="splashPath.error" x-cloak class="text-xs text-red-500 mt-1 break-words" x-text="splashPath.error"></p>
+                                        <p x-show="splashPath.error" x-cloak class="text-xs text-red-600 mt-1 break-words" x-text="splashPath.error"></p>
                                     </div>
                                     <template x-if="globalSettings.external_engines.splash.available && !splashPath.editing">
                                         <div class="flex items-center gap-2 flex-shrink-0">
@@ -1455,7 +1455,7 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
-                                <p x-show="splashOptionsError" x-cloak class="px-4 sm:px-6 py-3 text-xs text-red-500 break-words" x-text="splashOptionsError"></p>
+                                <p x-show="splashOptionsError" x-cloak class="px-4 sm:px-6 py-3 text-xs text-red-600 break-words" x-text="splashOptionsError"></p>
                                 <div x-show="globalSettings.external_engines.splash.models.length" x-cloak class="px-4 sm:px-6 py-4">
                                     <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.running') }}</label>
                                     <template x-for="m in globalSettings.external_engines.splash.models" :key="m.id">
@@ -1687,7 +1687,7 @@
                                     <div class="min-w-0">
                                         <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.test_label') }}</label>
                                         <p x-show="webSearchTest.message"
-                                           :class="webSearchTest.ok ? 'text-emerald-600' : 'text-red-500'"
+                                           :class="webSearchTest.ok ? 'text-emerald-600' : 'text-red-600'"
                                            class="text-xs mt-0.5 break-words"
                                            x-text="webSearchTest.message"></p>
                                     </div>
