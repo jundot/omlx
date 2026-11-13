@@ -97,12 +97,18 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Set up Python 3.11
+        id: python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+
       - name: Build and test the macOS app
         shell: bash
         timeout-minutes: 25
         env:
           TEST_RUNNER_OMLX_INTEGRATION: "1"
-          TEST_RUNNER_OMLX_PYTHON_OVERRIDE: /usr/bin/python3
+          TEST_RUNNER_OMLX_PYTHON_OVERRIDE: ${{ steps.python.outputs.python-path }}
           TEST_RUNNER_OMLX_DEV_SERVER_SCRIPT: ${{ github.workspace }}/apps/omlx-mac/Scripts/dev_server.py
           TEST_RUNNER_OMLX_BASE_PATH: ${{ runner.temp }}/omlx-mac-tests
         # The percentage-label assertions expect US formatting.
