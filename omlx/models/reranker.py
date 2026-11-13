@@ -14,6 +14,7 @@ Supports:
 import gc
 import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -1129,10 +1130,12 @@ class MLXRerankerModel:
             last_logits = logits[0, -1, :]
             true_logit = last_logits[self._token_true_id]
             false_logit = last_logits[self._token_false_id]
-            paired = mx.array([false_logit, true_logit])
-            probs = mx.softmax(paired)
-            mx.eval(probs)
-            scores.append(probs[1].item())
+            # Compute P(yes) in Python floats rather than in the logits' bfloat16:
+            # a bf16 softmax rounds every score above ~0.996 to exactly 1.0, so
+            # confident documents tie. softmax([no, yes])[1] == sigmoid(yes - no).
+            yes = true_logit.item()
+            no = false_logit.item()
+            scores.append(1.0 / (1.0 + math.exp(no - yes)))
             total_tokens += len(ids)
 
         # Sort indices by score (descending)

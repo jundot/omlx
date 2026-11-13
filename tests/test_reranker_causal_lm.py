@@ -1531,3 +1531,51 @@ class TestCausalLMSharedPrefix:
 
         assert (result.scores, result.indices, result.total_tokens) == ([], [], 0)
         assert model.runs == []
+
+
+class TestCausalLMScorePrecision:
+    """Scores must not be rounded to the logits' bfloat16 precision.
+
+    A bfloat16 softmax rounds every yes-probability above ~0.996 to exactly
+    1.0, so documents the model clearly orders would come back tied.
+    """
+
+    class _GapModel:
+        """Runs a tiny model for its cache, then returns bfloat16 logits whose
+        yes - no gap at the last position is the next value from `gaps`."""
+
+        def __init__(self, inner, gaps):
+            self.inner = inner
+            self.gaps = list(gaps)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def __call__(self, input_ids, cache=None):
+            shape = self.inner(input_ids, cache=cache).shape
+            logits = np.zeros(shape, dtype=np.float32)
+            logits[0, -1, 1] = self.gaps.pop(0)  # token 1 is "yes", 0 is "no"
+            return mx.array(logits).astype(mx.bfloat16)
+
+    def _rerank(self, tmp_path, gaps):
+        helpers = TestCausalLMSharedPrefix()
+        model = self._GapModel(helpers._tiny_qwen3(), gaps)
+        tokenizer = helpers._PromptTokenizer(helpers._SHARED)
+        reranker = helpers._make_reranker(tmp_path, model, tokenizer)
+        return reranker._rerank_causal_lm("query", ["d"] * len(gaps))
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_confident_documents_do_not_tie(self, tmp_path):
+        # Each gap is a confident "yes"; in bfloat16 all four score 1.0.
+        result = self._rerank(tmp_path, [6.0, 7.0, 8.0, 10.0])
+
+        assert len(set(result.scores)) == 4
+        assert result.indices == [3, 2, 1, 0]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_score_is_the_yes_probability(self, tmp_path):
+        result = self._rerank(tmp_path, [-2.0, 0.0, 3.0, 6.0])
+
+        assert result.scores == pytest.approx(
+            [0.11920292, 0.5, 0.95257413, 0.99752738], abs=1e-7
+        )
