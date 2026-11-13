@@ -964,8 +964,15 @@ def _write_legacy_profile_storage(tmp_path):
     return documents
 
 
-def test_startup_repairs_only_missing_references_with_exact_backups(tmp_path):
+@pytest.mark.parametrize("settings_version", [1, 2])
+def test_startup_repairs_only_missing_references_with_exact_backups(
+    tmp_path, settings_version
+):
     expected = _write_legacy_profile_storage(tmp_path)
+    expected["model_settings.json"]["version"] = settings_version
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps(expected["model_settings.json"])
+    )
     originals = {name: (tmp_path / name).read_bytes() for name in expected}
     mgr = ModelSettingsManager(tmp_path)
     expected["model_profiles.json"]["profiles"]["m"]["orphan"]["source_template"] = None
