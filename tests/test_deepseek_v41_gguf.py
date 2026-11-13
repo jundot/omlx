@@ -126,10 +126,14 @@ def part(path, number, count, total, tensors, config):
 
 
 @pytest.mark.parametrize("preserve_mtp", [False, True])
-def test_load_without_final_shard_retains_original_engram(tmp_path, preserve_mtp):
+def test_load_without_final_shard_retains_original_engram(
+    tmp_path, monkeypatch, preserve_mtp
+):
     from test_deepseek_v41 import write_checkpoint
 
+    from omlx.patches import mlx_lm_mtp
     from omlx.patches.deepseek_v41.loading import load
+    from omlx.utils.model_loading import lightning_mtp_supported
 
     source, reference = write_checkpoint(
         tmp_path,
@@ -216,7 +220,10 @@ def test_load_without_final_shard_retains_original_engram(tmp_path, preserve_mtp
     _register_model(registered, dest, "packed-iq2")
     assert registered["packed-iq2"].engine_type == "vlm"
     assert registered["packed-iq2"].estimated_size == estimate.resident_bytes
-    model, _ = load(dest, preserve_mtp=preserve_mtp)
+    assert lightning_mtp_supported(dest)
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", preserve_mtp)
+    # The engine relies on the construction flag, without a preserve_mtp override.
+    model, _ = load(dest)
     try:
         for name, raw in expected_packed.items():
             value = dict(tree_flatten(model.parameters()))[name]
@@ -233,6 +240,7 @@ def test_load_without_final_shard_retains_original_engram(tmp_path, preserve_mtp
         y = model(mx.array([[3, 4, 3]]))
         assert y.shape == (1, 3, 64) and bool(mx.all(mx.isfinite(y)))
         assert ("mtp" in model.language_model) == preserve_mtp
+        assert model.language_model._omlx_dspark_decode_enabled == preserve_mtp
         if preserve_mtp:
             actual = dict(tree_flatten(model.parameters()))
             for name, value in tree_flatten(reference.parameters()):
