@@ -91,20 +91,46 @@ jobs:
 
   mac-app-build:
     runs-on: macos-26
+    timeout-minutes: 30
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Set up Python 3.11
+        id: python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+
       - name: Build and test the macOS app
+        shell: bash
+        timeout-minutes: 25
+        env:
+          TEST_RUNNER_OMLX_INTEGRATION: "1"
+          TEST_RUNNER_OMLX_PYTHON_OVERRIDE: ${{ steps.python.outputs.python-path }}
+          TEST_RUNNER_OMLX_DEV_SERVER_SCRIPT: ${{ github.workspace }}/apps/omlx-mac/Scripts/dev_server.py
+          TEST_RUNNER_OMLX_BASE_PATH: ${{ runner.temp }}/omlx-mac-tests
         # The percentage-label assertions expect US formatting.
-        run: >-
-          xcodebuild
-          -project apps/omlx-mac/oMLX.xcodeproj
-          -scheme oMLX
-          -configuration Debug
-          -destination 'platform=macOS,arch=arm64'
-          -testLanguage en
-          -testRegion US
-          CODE_SIGNING_ALLOWED=NO
-          test
+        run: |
+          mkdir -p "$TEST_RUNNER_OMLX_BASE_PATH"
+          xcodebuild \
+            -project apps/omlx-mac/oMLX.xcodeproj \
+            -scheme oMLX \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -testLanguage en \
+            -testRegion US \
+            -resultBundlePath "$RUNNER_TEMP/macos-app-tests.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            test 2>&1 | tee "$RUNNER_TEMP/macos-app-build.log"
+
+      - name: Upload macOS app failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-app-test-results
+          path: |
+            ${{ runner.temp }}/macos-app-tests.xcresult
+            ${{ runner.temp }}/macos-app-build.log
+          retention-days: 14
