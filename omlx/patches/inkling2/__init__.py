@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling 2 (``inkling2``) text model registration for mlx-lm."""
+"""Inkling 2 (``inkling2``) model registration for mlx-lm."""
 
 from __future__ import annotations
 

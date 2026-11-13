@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 try:
@@ -483,7 +484,19 @@ def test_controller_observe_time_sample_gate():
     assert c.t != t_before or c.t[2] == t_before[2]
 
 
-def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6):
+_TINY_VISION = dict(
+    hidden_size=32,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    native_patch_size=4,
+    adapter_merge_size=2,
+    posemb_grid_size=4,
+    projection_hidden_dim=64,
+    mlp_ratio=2.0,
+)
+
+
+def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None):
     from mlx.utils import tree_flatten
 
     from omlx.patches.inkling2 import model as inkling2
@@ -509,7 +522,9 @@ def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6):
         intermediate_size=64,
         expert_formats=list(formats),
     )
-    model = inkling2.Model(inkling2.ModelArgs(model_type="inkling2", text_config=text))
+    model = inkling2.Model(
+        inkling2.ModelArgs(model_type="inkling2", text_config=text, vision_config=vision)
+    )
     mx.random.seed(0)
     weights = []
     for name, value in tree_flatten(model.parameters()):
@@ -725,3 +740,88 @@ def test_inkling2_flash_attention_matches_masked_sdpa(
     assert got.shape == expected.shape
     diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
     assert diff.item() < 1e-2
+
+
+def test_inkling2_image_processor_pads_normalizes_and_orders_blocks():
+    from PIL import Image
+
+    from omlx.patches.inkling2.processing import Inkling2ImageProcessor
+
+    pixels = np.arange(50 * 90 * 3, dtype=np.uint8).reshape(50, 90, 3)
+    out = Inkling2ImageProcessor().preprocess([Image.fromarray(pixels)])
+    # 50 x 90 pads to 2 x 3 blocks of 40 px.
+    assert out["image_grid_thw"].tolist() == [[1, 2, 3]]
+    blocks = out["pixel_values"]
+    assert blocks.shape == (6, 40, 40, 3)
+    normalized = (pixels.astype(np.float32) / 255 - 0.5) / 0.5
+    np.testing.assert_allclose(blocks[1, :, :], normalized[:40, 40:80], atol=1e-6)
+    pad = (-1.0 / 255 - 0.5) / 0.5
+    np.testing.assert_allclose(blocks[5, 10:, :], pad, atol=1e-6)
+    np.testing.assert_allclose(blocks[2, :, 10:], pad, atol=1e-6)
+
+
+def test_inkling2_processor_expands_each_placeholder():
+    from omlx.patches.inkling2.processing import Inkling2Processor
+
+    class _Tokenizer:
+        model_input_names = ["input_ids"]
+
+        def convert_tokens_to_ids(self, token):
+            return 7
+
+        def __call__(self, texts, **kwargs):
+            ids = [[7 if part == "<I>" else 1 for part in t.split("|")] for t in texts]
+            return {"input_ids": np.array(ids), "attention_mask": np.ones((1, len(ids[0])))}
+
+    processor = Inkling2Processor(_Tokenizer(), image_token="<I>|")
+    images = [np.zeros((40, 80, 3), np.uint8), np.zeros((90, 40, 3), np.uint8)]
+    out = processor(text="a|<I>|b|<I>|c", images=images)
+    # 1 x 2 and 3 x 1 image tokens.
+    assert (out["input_ids"][0] == 7).sum() == 5
+    assert out["image_grid_thw"].tolist() == [[1, 1, 2], [1, 3, 1]]
+
+
+def test_inkling2_position_table_matches_bilinear_resize():
+    from omlx.patches.inkling2.vision import _bilinear_taps, _grid_coords
+
+    side, rows, cols = 4, 6, 10
+    table = np.random.default_rng(0).normal(size=(side, side)).astype(np.float32)
+
+    def resize(size, i):
+        # F.interpolate(bilinear, align_corners=False): clamped half-pixel source.
+        src = max((i + 0.5) * side / size - 0.5, 0.0)
+        low = min(int(np.floor(src)), side - 1)
+        high = min(low + 1, side - 1)
+        return low, high, src - low
+
+    row, col = _grid_coords(rows, cols, 2)
+    h_taps, h_w = _bilinear_taps(row, rows, side)
+    w_taps, w_w = _bilinear_taps(col, cols, side)
+    got = np.einsum("pa,pb,pab->p", h_w, w_w, table[h_taps[:, :, None], w_taps[:, None, :]])
+    for p, (r, c) in enumerate(zip(row, col)):
+        r0, r1, fr = resize(rows, r)
+        c0, c1, fc = resize(cols, c)
+        top = table[r0, c0] * (1 - fc) + table[r0, c1] * fc
+        bottom = table[r1, c0] * (1 - fc) + table[r1, c1] * fc
+        assert abs(got[p] - (top * (1 - fr) + bottom * fr)) < 1e-5
+
+
+def test_inkling2_vision_encodes_images_independently_and_splices_tokens():
+    model = _inkling2_tiny(formats=("mxfp8",) * 6, vision=_TINY_VISION)
+    first = mx.random.normal((2 * 3, 8, 8, 3))
+    second = mx.random.normal((1 * 2, 8, 8, 3))
+    together = model.encode_image(
+        mx.concatenate([first, second]), [[1, 2, 3], [1, 1, 2]]
+    )
+    assert together.shape == (8, 128)
+    alone = model.encode_image(second, [[1, 1, 2]])
+    assert mx.abs(together[6:] - alone).max().item() < 1e-4
+
+    image = model.args.image_token_id
+    ids = mx.array([[5, image, image, 9]])
+    embeds = model.embed_inputs(ids, second, [[1, 1, 2]])
+    text = model.model.embed_norm(model.model.embed(ids))
+    assert mx.allclose(embeds[0, 0], text[0, 0])
+    assert mx.allclose(embeds[0, 1:3], alone.astype(embeds.dtype))
+    with pytest.raises(ValueError):
+        model.embed_inputs(mx.array([[image, 1]]), second, [[1, 1, 2]])

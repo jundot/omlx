@@ -406,6 +406,9 @@ def _is_vlm_load(config: dict) -> bool:
     ``mlx_vlm.speculative.drafters.<type>`` lookup and fails.
     """
     model_type = str(config.get("model_type", "")).lower().replace("-", "_")
+    if inkling2_layout.is_inkling2(config):
+        # mlx-lm's Inkling 2 module holds the vision tower too.
+        return False
     return model_type in VLM_NATIVE_TEXT_MODEL_TYPES or (
         _has_vision_subconfig(config)
         and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
@@ -4810,7 +4813,7 @@ def _build_model_sanitizer(
     if _is_muse_spark(config):
         return muse_spark_layout.sanitizer(config, text_only=text_only)
     if inkling2_layout.is_inkling2(config):
-        return inkling2_layout.sanitizer(config)
+        return inkling2_layout.sanitizer(config, text_only=text_only)
     if config.get("model_type") == "flint":
         from mlx_vlm.models.flint import Model, ModelConfig
 

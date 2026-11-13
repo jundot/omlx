@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling 2 text model (mlx-lm module registered as ``inkling2``).
+"""Inkling 2 model (mlx-lm module registered as ``inkling2``).
+
+The vision tower is in ``vision.py``; image features replace the image-token
+embeddings before the decoder.
 
 Architecture notes (from the transformers ``inkling2`` reference):
 
@@ -33,6 +36,7 @@ from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
 from . import kernels
 from .loader import sanitize_weights
+from .vision import VisionArgs, VisionTower
 
 _NVFP4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 _MXFP8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
@@ -99,10 +103,14 @@ class ModelArgs(BaseModelArgs):
     vision_config: dict | None = None
     mtp_config: dict | None = None
     eos_token_id: Any = 200006
+    image_token_id: int = 200054
     quantization: dict | None = None
 
     def __post_init__(self):
         self.text = TextArgs.from_dict(self.text_config or {})
+        self.vision = (
+            VisionArgs.from_dict(self.vision_config) if self.vision_config else None
+        )
 
 
 def _unit_rms(x: mx.array, eps: float = 1e-6) -> mx.array:
@@ -647,6 +655,8 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(
             args.text.hidden_size, args.text.vocab_size, bias=False
         )
+        if args.vision is not None:
+            self.vision_tower = VisionTower(args.vision, args.text.hidden_size)
         self._softcap = args.text.final_logit_softcapping
         vocab = args.text.vocab_size
         unpadded = args.text.unpadded_vocab_size
@@ -663,16 +673,66 @@ class Model(nn.Module):
             logits = logits + self._vocab_bias
         return logits
 
+    def encode_image(self, pixel_values: mx.array, image_grid_thw) -> mx.array:
+        """Image-token embeddings for the processor's pixel blocks."""
+        if getattr(self, "vision_tower", None) is None:
+            raise ValueError("This Inkling 2 checkpoint has no vision tower.")
+        return self.vision_tower(pixel_values, image_grid_thw)
+
+    def embed_inputs(
+        self, inputs, pixel_values=None, image_grid_thw=None, features=None
+    ):
+        """Normalized token embeddings with the image features at the image
+        tokens (the features themselves are not normalized)."""
+        embeds = self.model.embed_norm(self.model.embed(inputs))
+        if pixel_values is None and features is None:
+            return embeds
+        if features is None:
+            features = self.encode_image(pixel_values, image_grid_thw)
+        mask = inputs == self.args.image_token_id
+        count = int(mask.sum().item())
+        if count != features.shape[0]:
+            raise ValueError(
+                "Image features and image tokens do not match: "
+                f"tokens={count}, features={features.shape[0]}"
+            )
+        # The feature row of an image token: the image tokens before it.
+        rows = mx.cumsum(mask.flatten()).reshape(mask.shape) - 1
+        rows = features[mx.maximum(rows, 0)].astype(embeds.dtype)
+        return mx.where(mask[..., None], rows, embeds)
+
     def __call__(
         self,
         inputs,
         cache=None,
         input_embeddings=None,
+        pixel_values=None,
+        image_grid_thw=None,
+        **kwargs,
+    ):
+        if pixel_values is not None:
+            input_embeddings = self.embed_inputs(inputs, pixel_values, image_grid_thw)
+        return self.forward(
+            inputs,
+            cache,
+            input_embeddings,
+            drafter=getattr(self, "_omlx_drafter", None),
+            **kwargs,
+        )
+
+    def forward(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings=None,
+        *,
+        drafter=None,
         return_hidden: bool = False,
         capture_layer_ids=None,
         **kwargs,
     ):
-        drafter = getattr(self, "_omlx_drafter", None)
+        """Text forward; ``drafter`` is the block drafter attached to whichever
+        object the generator calls (this model or its VLM language model)."""
         scope = getattr(drafter, "scope_uids", None)
         # An ordinary decode step keeps the committed token in the drafter
         # context.

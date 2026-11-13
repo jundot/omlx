@@ -26,6 +26,7 @@ import mlx.core as mx
 
 MODEL_TYPE = "inkling2"
 SOURCE_PREFIX = "model.llm."
+VISUAL_PREFIX = "model.visual."
 # ModelOpt stores the NVFP4 tensor scale as amax / (E4M3 max x E2M1 max). MLX
 # keeps the amax, and the runtime applies global_scale / NVFP4_GLOBAL_SCALE.
 NVFP4_GLOBAL_SCALE = 448.0 * 6.0
@@ -75,9 +76,14 @@ def cast_predicate(key: str) -> bool:
     return not key.endswith((".query", "router_weight", "router_bias", ".global_scale"))
 
 
-def sanitizer(config: dict):
-    """oQ's sanitize for a source checkpoint, replayable by oQ's streaming plan."""
+def sanitizer(config: dict, *, text_only: bool = False):
+    """oQ's sanitize for a source checkpoint, replayable by oQ's streaming plan.
+
+    The vision tower is renamed to the runtime's ``vision_tower.*`` and kept as
+    is (oQ leaves vision tensors unquantized), unless the output is text only.
+    """
     text = text_config(config)
+    keep_vision = bool(config.get("vision_config")) and not text_only
     hidden = int(text["hidden_size"])
     kernel = int(text.get("sconv_kernel_size") or text.get("conv_kernel_size") or 4)
 
@@ -85,8 +91,11 @@ def sanitizer(config: dict):
         out: dict = {}
         per_layer: dict[int, dict] = {}
         for key, value in weights.items():
+            if key.startswith(VISUAL_PREFIX):
+                if keep_vision:
+                    out["vision_tower." + key[len(VISUAL_PREFIX) :]] = value
+                continue
             if not key.startswith(SOURCE_PREFIX):
-                # The vision tower stays out of the text-only output.
                 continue
             name = key[len(SOURCE_PREFIX) :]
             if name in _RENAMES:

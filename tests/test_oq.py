@@ -12,6 +12,9 @@ import pytest
 try:
     import mlx.core as mx
     import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    from omlx.patches.inkling2.vision import VisionArgs, VisionTower
 
     HAS_MLX = True
 except ImportError:
@@ -9063,6 +9066,16 @@ _INK2_LAYERS = 6
 _INK2_NVFP4_LAYERS = 4
 _INK2_DIMS = {"hidden": 64, "experts": 8, "inter": 64, "vocab": 128}
 _INK2_ATTN = {"heads": 4, "kv": 2, "head_dim": 16, "d_rel": 4, "window": 8, "k": 4}
+_INK2_VISION = {
+    "hidden_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "native_patch_size": 4,
+    "adapter_merge_size": 2,
+    "posemb_grid_size": 4,
+    "projection_hidden_dim": 64,
+    "mlp_ratio": 2.0,
+}
 
 
 def _inkling2_source(path, *, seed=0):
@@ -9144,7 +9157,9 @@ def _inkling2_source(path, *, seed=0):
                 scale = rng.integers(118, 121, (e, rows, cols // 32), dtype=np.uint8)
                 t[ex] = raw(body, "F8_E4M3")
                 t[ex + "_scale"] = raw(scale, "U8")
-    t["model.visual.patch_embed.weight"] = bf16(4, 4)
+    tower = VisionTower(VisionArgs.from_dict(_INK2_VISION), h)
+    for name, value in tree_flatten(tower.parameters()):
+        t["model.visual." + name] = bf16(*value.shape)
     _write_safetensors(str(path / "model.safetensors"), t)
     config = {
         "model_type": "inkling2",
@@ -9169,7 +9184,7 @@ def _inkling2_source(path, *, seed=0):
             "num_experts_per_tok": 2,
             "intermediate_size": inter,
         },
-        "vision_config": {"hidden_size": 4},
+        "vision_config": _INK2_VISION,
         "mtp_config": {"num_hidden_layers": 1},
     }
     (path / "config.json").write_text(json.dumps(config))
@@ -9269,21 +9284,25 @@ class TestInkling2OQ:
         )
         assert mx.array_equal(idx.materialize_virtual(mxfp8_key), expected).item()
 
-    def test_sanitizer_matches_runtime_loader(self, inkling2_source):
+    @pytest.mark.parametrize("text_only", [True, False])
+    def test_sanitizer_matches_runtime_loader(self, inkling2_source, text_only):
         from omlx.patches.inkling2.loader import sanitize_weights
         from omlx.patches.inkling2.model import ModelArgs
 
         config = json.loads((inkling2_source / "config.json").read_text())
         files = _source_weight_files(inkling2_source)
         idx = _LazyTensorIndex(files, config=config)
-        sanitize = _build_model_sanitizer(config, text_only=True)
+        sanitize = _build_model_sanitizer(config, text_only=text_only)
         plan = _DiscoveredPlan(_discover_sanitize_plan(sanitize, idx), idx)
-        assert not any("visual" in key for key in plan.keys())
+        assert any(key.startswith("vision_tower.") for key in plan.keys()) == (
+            not text_only
+        )
         # The runtime's loader maps the raw tensors; oQ replays the same mapping.
         source = _LazyTensorIndex(files)
         raw = {key: source[key] for key in source.keys()}
         model = MagicMock()
         model.args = ModelArgs.from_dict(config)
+        model.vision_tower = None if text_only else object()
         loaded, _ = sanitize_weights(model, raw)
         expected = {
             key: value for key, value in loaded.items() if ".mlp.experts." not in key
@@ -9317,12 +9336,13 @@ class TestInkling2OQ:
         )
         assert (quant["bits"], quant["mode"]) == (4, "affine")
         assert quant["model.embed"]["bits"] == 8
-        assert "vision_config" not in config and "mtp_config" in config
+        assert "vision_config" in config and "mtp_config" in config
         assert sorted(p.name for p in output.iterdir()) == [
             "chat_template.jinja",
             "config.json",
             "model.safetensors",
             "mtp.safetensors",
+            "processor_config.json",
             "tiktoken",
             "tokenizer.json",
         ]
@@ -9581,13 +9601,24 @@ class TestInkling2OQ:
                 "ExpertProj needs a to_quantized hook for converted checkpoints"
             )
         tokens = mx.arange(1, 21)[None]
-        reference = _inkling2_model(inkling2_source)(tokens)[..., :120]
+        # Two images of 2 x 2 and 1 x 3 image tokens, 8 px blocks each.
+        pixels = mx.random.uniform(-1, 1, (7, 8, 8, 3), key=mx.random.key(0))
+        grid = [[1, 2, 2], [1, 1, 3]]
+        source = _inkling2_model(inkling2_source)
+        reference = source(tokens)[..., :120]
+        features = source.encode_image(pixels, grid)
         for level in (4, 8):
             output = tmp_path / f"load{level}"
-            _quantize_inkling2(inkling2_source, output, level)
-            logits = _inkling2_model(output)(tokens)[..., :120]
+            _, weights = _quantize_inkling2(inkling2_source, output, level)
+            # oQ keeps the vision tower unquantized.
+            assert not any(
+                k.startswith("vision_tower.") and k.endswith(".scales") for k in weights
+            )
+            model = _inkling2_model(output)
+            logits = model(tokens)[..., :120]
             assert logits.shape == reference.shape
             assert mx.isfinite(logits).all().item()
+            assert mx.array_equal(model.encode_image(pixels, grid), features).item()
 
 
 class TestGemma4AudioConfigSanitize:

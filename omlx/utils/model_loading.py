@@ -951,7 +951,7 @@ def maybe_apply_pre_load_patches(
         from ..patches.minimax_m3_dspark import bundled_dspark_path
 
         minimax_dspark = bundled_dspark_path(model_name)
-    if not for_vlm and model_type == "inkling2":
+    if model_type == "inkling2":
         from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
 
         # Inkling 2 bundles its DSpark draft as mtp.safetensors.

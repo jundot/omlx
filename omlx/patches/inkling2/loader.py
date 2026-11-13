@@ -12,7 +12,13 @@ from __future__ import annotations
 import mlx.core as mx
 
 _PREFIX = "model.llm."
+_VISUAL_PREFIX = "model.visual."
 _NVFP4_DENOMINATOR = 448.0 * 6.0
+
+
+def _vision_name(key: str) -> str:
+    """``model.visual.{backbone,proj_in,proj_out}.*`` -> ``vision_tower.*``."""
+    return "vision_tower." + key[len(_VISUAL_PREFIX) :]
 
 
 def is_original_layout(weights: dict) -> bool:
@@ -43,12 +49,17 @@ def sanitize_weights(model, weights: dict) -> tuple[dict, dict]:
     if not is_original_layout(weights):
         return weights, {}
     args = model.args.text
+    has_vision = getattr(model, "vision_tower", None) is not None
     hidden = args.hidden_size
     k = args.sconv_kernel_size
     out: dict = {}
     formats: dict[int, str] = {}
     per_layer: dict[int, dict] = {}
     for key, value in weights.items():
+        if key.startswith(_VISUAL_PREFIX):
+            if has_vision:
+                out[_vision_name(key)] = value
+            continue
         if not key.startswith(_PREFIX):
             continue
         name = key[len(_PREFIX) :]
