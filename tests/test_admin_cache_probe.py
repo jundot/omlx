@@ -586,3 +586,117 @@ class TestCacheProbeChatTemplateKwargs:
         assert self._rendered_kwargs(settings, request_kwargs) == (
             merge_chat_template_kwargs(settings, request_kwargs)
         )
+
+
+# ---------------------------------------------------------------------------
+# include_block_hashes (block-hash chain in the response)
+# ---------------------------------------------------------------------------
+
+
+class TestCacheProbeBlockHashes:
+    """include_block_hashes=True returns the chain-hashed block sequence."""
+
+    def test_hashes_absent_by_default(self):
+        """Backward compatibility: no hashes unless explicitly requested."""
+        token_ids = list(range(8))
+        tokenizer = _make_tokenizer(token_ids)
+        scheduler = _make_scheduler()
+        entry = _make_engine_entry(tokenizer, scheduler)
+        pool = _pool_with({MODEL_ID: entry})
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
+            result = asyncio.run(
+                admin_routes.probe_cache(_make_request(), is_admin=True)
+            )
+
+        assert "block_hashes" not in result
+
+    def test_hashes_present_when_requested(self):
+        """Walk visits cached prefix + first cold block; hashes reflect that."""
+        token_ids = list(range(8))  # 2 blocks, both cold (empty scheduler)
+        tokenizer = _make_tokenizer(token_ids)
+        scheduler = _make_scheduler()
+        entry = _make_engine_entry(tokenizer, scheduler)
+        pool = _pool_with({MODEL_ID: entry})
+        request = admin_routes.CacheProbeRequest(
+            model_id=MODEL_ID,
+            messages=[{"role": "user", "content": "hello"}],
+            include_block_hashes=True,
+        )
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
+            result = asyncio.run(
+                admin_routes.probe_cache(request, is_admin=True)
+            )
+
+        # First block is visited and found cold → walk stops: 1 hash.
+        expected = _compute_hashes(token_ids)[:1]
+        assert result["block_hashes"] == [h.hex() for h in expected]
+        assert result["blocks_cold"] == 2
+
+    def test_hashes_match_schedular_addressing(self):
+        """Hashes must be exactly what the scheduler uses to address files."""
+        token_ids = list(range(12))
+        hashes = _compute_hashes(token_ids)
+        ssd_index = _make_ssd_index(set(hashes[:2]))  # first 2 cached
+        tokenizer = _make_tokenizer(token_ids)
+        scheduler = _make_scheduler(ssd_index=ssd_index)
+        entry = _make_engine_entry(tokenizer, scheduler)
+        pool = _pool_with({MODEL_ID: entry})
+        request = admin_routes.CacheProbeRequest(
+            model_id=MODEL_ID,
+            messages=[{"role": "user", "content": "hello"}],
+            include_block_hashes=True,
+        )
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
+            result = asyncio.run(
+                admin_routes.probe_cache(request, is_admin=True)
+            )
+
+        # Walk stops at first cold block; the cold block itself IS visited,
+        # so hashes = 2 cached + 1 cold = 3 entries.
+        assert len(result["block_hashes"]) == 3
+        assert result["block_hashes"] == [h.hex() for h in hashes]
+        assert result["blocks_ssd_disk"] == 2
+
+    def test_deterministic_for_equal_prompts(self):
+        """Equal prompts on the same engine build yield equal chains."""
+        token_ids = list(range(8))
+        chains = []
+        for _ in range(2):
+            tokenizer = _make_tokenizer(token_ids)
+            scheduler = _make_scheduler()
+            entry = _make_engine_entry(tokenizer, scheduler)
+            pool = _pool_with({MODEL_ID: entry})
+            request = admin_routes.CacheProbeRequest(
+                model_id=MODEL_ID,
+                messages=[{"role": "user", "content": "hello"}],
+                include_block_hashes=True,
+            )
+            with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
+                chains.append(
+                    asyncio.run(
+                        admin_routes.probe_cache(request, is_admin=True)
+                    )["block_hashes"]
+                )
+        assert chains[0] == chains[1]
+
+    def test_empty_prompt_returns_empty_list(self):
+        tokenizer = _make_tokenizer([])
+        scheduler = _make_scheduler()
+        entry = _make_engine_entry(tokenizer, scheduler)
+        pool = _pool_with({MODEL_ID: entry})
+        request = admin_routes.CacheProbeRequest(
+            model_id=MODEL_ID,
+            messages=[{"role": "user", "content": "hello"}],
+            include_block_hashes=True,
+        )
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
+            result = asyncio.run(
+                admin_routes.probe_cache(request, is_admin=True)
+            )
+
+        assert result["block_hashes"] == []
+        assert result["total_blocks"] == 0

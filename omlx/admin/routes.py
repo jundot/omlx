@@ -340,6 +340,14 @@ class CacheProbeRequest(BaseModel):
     - Hot SSD (in-RAM copy of SSD cache, ready to mount without disk read)
     - Disk SSD (persisted only, needs disk read to reuse)
     - Cold (fully uncached — would require full prefill)
+
+    When ``include_block_hashes`` is set, the response also carries the
+    chain-hashed block sequence (hex) the walk visited: the cached prefix
+    plus the first cold block (the next one prefill would materialise).
+    Consumers running the same engine build can use these to address
+    paged-SSD cache files directly (e.g. cross-node cache handoff); hashes
+    are deterministic for (model_name, parent, tokens), so equal prompts
+    yield equal chains.
     """
 
     model_id: str
@@ -347,6 +355,7 @@ class CacheProbeRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     thinking_budget: int | None = None
+    include_block_hashes: bool = False
 
 
 def _draft_path_is_unusable(value: str) -> bool:
@@ -7602,6 +7611,52 @@ def _iter_loaded_schedulers():
         yield model_id, scheduler
 
 
+@router.post("/api/ssd-cache/rescan")
+async def rescan_ssd_cache(is_admin: bool = Depends(require_admin)):
+    """Re-scan the paged SSD cache directory of live engines.
+
+    Indexes block files added out-of-band (e.g. copied from another node for a
+    KV handoff) WITHOUT unloading models. Safe to call under traffic: in-flight
+    temp writes are skipped by the stale-tmp rule of the startup scan, and the
+    scan itself is additive - blocks already indexed keep their LRU position.
+
+    Response maps model_id -> scan stats so a caller can verify the imported
+    blocks became discoverable without restarting the engine.
+    """
+    from ..server import _server_state
+
+    if _server_state.engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    pool = _server_state.engine_pool
+    results: dict[str, dict] = {}
+    seen_managers: set[int] = set()
+    for model_id in pool.get_loaded_model_ids():
+        entry = pool._entries.get(model_id)
+        engine = getattr(entry, "engine", None) if entry else None
+        async_core = getattr(engine, "_engine", None)
+        core = getattr(async_core, "engine", None) if async_core is not None else None
+        scheduler = getattr(core, "scheduler", None) if core is not None else None
+        ssd = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd is None:
+            results[model_id] = {"status": "no_ssd_manager"}
+            continue
+        if id(ssd) in seen_managers:
+            continue
+        seen_managers.add(id(ssd))
+        before_count = ssd._tracked_ssd_count()
+        before_size = ssd._tracked_ssd_size()
+        ssd._scan_existing_files()
+        results[model_id] = {
+            "status": "rescanned",
+            "blocks_before": before_count,
+            "blocks_after": ssd._tracked_ssd_count(),
+            "bytes_before": before_size,
+            "bytes_after": ssd._tracked_ssd_size(),
+        }
+    logger.info(f"SSD cache rescan requested via admin API: {results}")
+    return {"rescan": results}
+
+
 @router.post("/api/ssd-cache/clear")
 async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     """Clear all SSD cache files for all loaded models.
@@ -8022,7 +8077,7 @@ async def probe_cache(
 
     total_tokens = len(token_ids)
     if total_tokens == 0:
-        return {
+        response: dict[str, Any] = {
             "model_id": request.model_id,
             "model_loaded": True,
             "total_tokens": 0,
@@ -8034,6 +8089,9 @@ async def probe_cache(
             "ssd_hit_tokens": 0,
             "cold_tokens": 0,
         }
+        if request.include_block_hashes:
+            response["block_hashes"] = []
+        return response
 
     # Compute chain-hashed block sequence.
     from ..cache.paged_cache import compute_block_hash
@@ -8054,6 +8112,7 @@ async def probe_cache(
     blocks_ssd_hot = 0
     blocks_ssd_disk = 0
     ssd_hit_tokens = 0
+    block_hashes: list[str] | None = [] if request.include_block_hashes else None
 
     parent_hash = b""
     total_blocks = (total_tokens + block_size - 1) // block_size
@@ -8071,6 +8130,8 @@ async def probe_cache(
             model_name=model_name,
         )
         parent_hash = block_hash
+        if block_hashes is not None:
+            block_hashes.append(block_hash.hex())
 
         in_ssd_hot = ssd_hot is not None and block_hash in ssd_hot
         in_ssd_disk = False
@@ -8092,7 +8153,7 @@ async def probe_cache(
     cached_blocks = blocks_ssd_hot + blocks_ssd_disk
     blocks_cold = max(total_blocks - cached_blocks, 0)
 
-    return {
+    response: dict[str, Any] = {
         "model_id": request.model_id,
         "model_loaded": True,
         "total_tokens": total_tokens,
@@ -8104,6 +8165,9 @@ async def probe_cache(
         "ssd_hit_tokens": ssd_hit_tokens,
         "cold_tokens": max(total_tokens - ssd_hit_tokens, 0),
     }
+    if block_hashes is not None:
+        response["block_hashes"] = block_hashes
+    return response
 
 
 # =============================================================================
