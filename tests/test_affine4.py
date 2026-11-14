@@ -806,10 +806,15 @@ def test_trim_rows_keeps_each_row_through_filter_and_extend():
     assert same(0, references[2]) and same(1, references[0]) and same(2, joiner)
 
 
-def test_attention_blocks_wide_dim_split():
-    """Head dims of 256 split long caches wider: affine8 from 48K tokens,
-    affine4 from 128K."""
+def test_attention_blocks_wide_dim_split(monkeypatch):
+    """Head dims of 256 split long caches wider on GPUs of up to 20 cores:
+    affine8 from 48K tokens, affine4 from 128K."""
     blocks = affine4._attention_blocks
+    # A larger GPU keeps the stock 168-group target.
+    monkeypatch.setattr(affine4, "_wide_split_gpu", lambda: False)
+    assert blocks(245_000, 4, 256, 8) == 42
+    assert blocks(245_000, 4, 256, 4) == 42
+    monkeypatch.setattr(affine4, "_wide_split_gpu", lambda: True)
     # dim 128 keeps the stock 168-group target.
     assert blocks(245_000, 4, 128, 8) == 42
     assert blocks(245_000, 4, 256, 8) == 168
