@@ -10001,8 +10001,8 @@ def test_streamed_imatrix_embeds_one_round_at_a_time(tmp_path, monkeypatch):
     """The streamed collector embeds each round's own rows, never the whole
     adaptive draw: resident memory is one round whatever the draw size (a
     962 x 2048-token draw of a hyper-connection model is ~45 GB embedded)."""
-    from tests.test_mlx_vlm_muse_glimmer_compat import _spark_oq_source
     import omlx.oq as oq
+    from tests.test_mlx_vlm_muse_glimmer_compat import _spark_oq_source
 
     source = tmp_path / "source"
     _spark_oq_source(source, nvfp4=False)
@@ -10027,7 +10027,8 @@ def test_streamed_imatrix_embeds_one_round_at_a_time(tmp_path, monkeypatch):
 
     monkeypatch.setattr(oq, "_streamed_embed_weight", counting_weight)
     streamed, metadata = oq._collect_imatrix_streaming(
-        source, object(), config, num_samples=2, seq_length=6, calib_data=tokens)
+        source, object(), config, num_samples=2, seq_length=6, calib_data=tokens
+    )
     assert streamed
     assert rows_embedded and max(rows_embedded) <= 2, rows_embedded
     # The table is sourced at stage 0 and again once per round, never kept.
