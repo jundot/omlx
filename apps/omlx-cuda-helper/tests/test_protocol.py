@@ -186,8 +186,10 @@ def test_an_integrated_gpu_holds_its_layers_in_system_ram(monkeypatch):
         True,
     )
     assert (card["free"], card["integrated"]) == (48600 << 20, False)
-    # A prompt goes back to the host before the OS loses its share.
-    assert gpus.memory_limit(spark) == 112 << 30
+    # A prompt goes back to the host before the OS loses its share: the
+    # stage's limit is the free memory it planned with, not the total less
+    # 16 GiB, which the OS and apps can already be using.
+    assert gpus.memory_limit(spark) == spark["free"] == 84 << 30
 
 
 def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
