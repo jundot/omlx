@@ -32,6 +32,18 @@ class SystemOneQuestion(BaseModel):
     """choice: option -> description or null. score: ordered level
     descriptions. noul: optional {"true": ..., "false": ...} descriptions."""
 
+    cutoff: float | None = None
+    """locate: span probability floor in (0, 1]; the checkpoint default applies
+    when null. Raise it to drop weak spans (a 4-bit quant drifts at the release
+    floor)."""
+
+    @field_validator("cutoff")
+    @classmethod
+    def _check_cutoff(cls, value: float | None) -> float | None:
+        if value is not None and not 0 < value <= 1:
+            raise ValueError("cutoff must be in (0, 1]")
+        return value
+
 
 class SystemOneRequest(BaseModel):
     """Request for ``POST /v1/systemone``."""

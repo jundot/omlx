@@ -78,6 +78,8 @@ LOCATE_FORMAT = "pplx-decider-locate-span-v1"
 LOCATE_MARKER = "<|locate|>"
 LOCATE_PROMPT = "Locate verbatim spans:\n"
 LOCATE_MAX_QUESTIONS = 128
+# Span probability floor when the checkpoint config sets none.
+LOCATE_CUTOFF = 0.5
 # Quantization rewrites config.json, so the adapter's base check skips it.
 LOCATE_BASE_SKIP = ("config.json",)
 
@@ -100,11 +102,22 @@ class PplxQuestion:
     texts: list[str]
     # Score levels as given, for the answer legend.
     levels: list[Any] = field(default_factory=list)
+    # Span probability floor for locate; None keeps the checkpoint's cutoff.
+    cutoff: float | None = None
 
 
 def normalize_question(question_id: str, question: dict) -> PplxQuestion:
     kind = question.get("type")
     where = f"questions.{question_id}"
+    cutoff = question.get("cutoff")
+    if cutoff is not None:
+        if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)):
+            raise DecisionRequestError(f"{where}: cutoff must be a number in (0, 1]")
+        if not 0 < float(cutoff) <= 1:
+            raise DecisionRequestError(f"{where}: cutoff must be a number in (0, 1]")
+        cutoff = float(cutoff)
+        if kind != "locate":
+            raise DecisionRequestError(f"{where}: cutoff is a locate option")
     instructions = question.get("instructions")
     if instructions is not None:
         check_json(instructions, f"{where}.instructions")
@@ -156,7 +169,7 @@ def normalize_question(question_id: str, question: dict) -> PplxQuestion:
     if kind == "locate":
         if criteria is not None:
             raise DecisionRequestError(f"{where}: locate takes no criteria")
-        return PplxQuestion(question_id, kind, instructions, [], [])
+        return PplxQuestion(question_id, kind, instructions, [], [], cutoff=cutoff)
     raise DecisionRequestError(
         f"{where}: unsupported question type {kind!r} (choice, noul, score or locate)"
     )
@@ -278,9 +291,18 @@ class LocateSpanHead(nn.Module):
         )
 
     def predict(
-        self, document: mx.array, labels: mx.array, threshold: float, proposals: int
+        self,
+        document: mx.array,
+        labels: mx.array,
+        threshold: float | mx.array,
+        proposals: int,
     ) -> list[list[tuple[int, int, float]]]:
-        """Inclusive token spans whose probability reaches ``threshold``, per label."""
+        """Inclusive token spans whose probability reaches ``threshold``, per label.
+
+        ``threshold`` may be a per-label vector, one floor per question.
+        """
+        if not isinstance(threshold, mx.array):
+            threshold = mx.array(threshold)
         document = document.astype(mx.float32)
         labels = labels.astype(mx.float32)
         ts, te = self.ts(document), self.te(document)
@@ -291,6 +313,7 @@ class LocateSpanHead(nn.Module):
         k = min(proposals, document.shape[0])
         result: list[list[tuple[int, int, float]]] = []
         for index in range(labels.shape[0]):
+            floor = threshold[index] if threshold.ndim == 1 else threshold
             start_values, si = self._topk(start[index], k)
             end_values, ei = self._topk(finish[index], k)
             scores = (ts[si] * mx.tanh(qp[index])[None, :]) @ te[ei].T / self.scale
@@ -308,7 +331,7 @@ class LocateSpanHead(nn.Module):
             )
             scores = mx.where((widths <= 0) | (widths > self.max_span), -mx.inf, scores)
             probabilities = mx.sigmoid(scores - thresholds[index, 2])
-            mask = probabilities >= threshold
+            mask = probabilities >= floor
             flat = mask.reshape(-1)
             picked = mx.sort(
                 mx.where(flat, mx.arange(flat.size, dtype=mx.int32), mx.array(flat.size))
@@ -411,7 +434,7 @@ class LocateAdapter:
         self.head = LocateSpanHead(hidden, int(head["width"]), int(head["max_span"]))
         self.head.load_weights(head_weights)
 
-    def validate(self, state: Any, questions: dict, images: int) -> list[str]:
+    def validate(self, state: Any, questions: dict, images: int) -> list[tuple[str, float]]:
         if images:
             raise DecisionRequestError("locate questions require a text state without images")
         if not isinstance(state, str) or not state:
@@ -420,28 +443,37 @@ class LocateAdapter:
             raise DecisionRequestError(
                 f"locate supports at most {LOCATE_MAX_QUESTIONS} questions"
             )
-        instructions = []
+        pairs = []
         for key, question in questions.items():
             text = question.get("instructions")
             if text is not None and not isinstance(text, str):
                 raise DecisionRequestError(
                     f"questions.{key}: locate instructions must be text or null"
                 )
-            instructions.append(text if text is not None and text.strip() else key)
-        return instructions
+            cutoff = question.get("cutoff")
+            pairs.append(
+                (
+                    text if text is not None and text.strip() else key,
+                    # validate() is also called unbound in tests, hence getattr.
+                    getattr(self, "cutoff", LOCATE_CUTOFF)
+                    if cutoff is None
+                    else float(cutoff),
+                )
+            )
+        return pairs
 
-    def _plan(self, model: "PplxDeciderModel", text: str, instructions: list[str]):
+    def _plan(self, model: "PplxDeciderModel", text: str, pairs: list[tuple[str, float]]):
         try:
-            return [self._encode(model, text, instructions)]
+            return [self._encode(model, text, pairs)]
         except DecisionContextLengthError:
-            if len(instructions) <= 1:
+            if len(pairs) <= 1:
                 raise
-            middle = len(instructions) // 2
-            return self._plan(model, text, instructions[:middle]) + self._plan(
-                model, text, instructions[middle:]
+            middle = len(pairs) // 2
+            return self._plan(model, text, pairs[:middle]) + self._plan(
+                model, text, pairs[middle:]
             )
 
-    def _encode(self, model: "PplxDeciderModel", text: str, instructions: list[str]):
+    def _encode(self, model: "PplxDeciderModel", text: str, pairs: list[tuple[str, float]]):
         tokenizer = model.backbone.tokenizer
         context = model.context_text(text, 0)
         escaped = model._text(text)
@@ -456,8 +488,9 @@ class LocateAdapter:
                 )["input_ids"],
                 self.marker_id,
             ]
-            for value in instructions
+            for value, _ in pairs
         ]
+        cutoffs = [cutoff for _, cutoff in pairs]
         ids = prefix + [token for chunk in chunks for token in chunk]
         limit = model.backbone.max_position_embeddings
         if limit is not None and len(ids) > limit:
@@ -478,7 +511,15 @@ class LocateAdapter:
             (max(0, mapping[index][0] - begin), min(len(escaped), mapping[index][1] - begin))
             for index in state_rows
         ]
-        return ids, state_rows, markers, offsets, len(prefix), [len(chunk) for chunk in chunks]
+        return (
+            ids,
+            state_rows,
+            markers,
+            offsets,
+            len(prefix),
+            [len(chunk) for chunk in chunks],
+            cutoffs,
+        )
 
     @staticmethod
     def _positions(length: int, prefix: int, chunks: list[int]) -> mx.array:
@@ -553,16 +594,16 @@ class LocateAdapter:
             adapter.enabled = enabled
 
     def answers(self, model: "PplxDeciderModel", state: str, questions: dict) -> dict:
-        instructions = self.validate(state, questions, model.pending_images)
-        plans = self._plan(model, state, instructions)
+        pairs = self.validate(state, questions, model.pending_images)
+        plans = self._plan(model, state, pairs)
         spans: list[list[tuple[int, int, float]]] = []
         tokens = 0
-        for ids, state_rows, markers, offsets, prefix, chunks in plans:
+        for ids, state_rows, markers, offsets, prefix, chunks, cutoffs in plans:
             hidden = self._hidden(model, ids, [*state_rows, *markers], prefix, chunks)
             mx.eval(hidden)
             rows = len(state_rows)
             found = self.head.predict(
-                hidden[:rows], hidden[rows:], self.cutoff, self.proposals
+                hidden[:rows], hidden[rows:], mx.array(cutoffs), self.proposals
             )
             tokens += len(ids)
             for field in found:

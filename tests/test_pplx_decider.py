@@ -30,11 +30,13 @@ from omlx.models.decision import (  # noqa: E402
 )
 from omlx.models.pplx_decider import (  # noqa: E402
     CONTEXT_END,
+    LOCATE_CUTOFF,
     LOCATE_ADAPTER_WEIGHTS,
     LOCATE_DIR,
     LOCATE_FORMAT,
     LOCATE_HEAD_WEIGHTS,
     LOCATE_MARKER,
+    normalize_question,
     PplxDeciderModel,
     _locate_sha256,
 )
@@ -752,3 +754,41 @@ def test_backbone_has_vision_needs_processor_and_tower():
     backbone.image_processor = None
     assert backbone.has_vision is False
 
+
+def test_locate_question_cutoff_is_validated(tmp_path):
+    for bad in (0, 1.5, "0.5", True):
+        with pytest.raises(DecisionRequestError, match="cutoff must be a number in"):
+            normalize_question("q", {"type": "locate", "cutoff": bad})
+    question = normalize_question("q", {"type": "locate", "cutoff": 0.65})
+    assert question.cutoff == 0.65
+    assert normalize_question("q", {"type": "locate"}).cutoff is None
+    with pytest.raises(DecisionRequestError, match="cutoff is a locate option"):
+        normalize_question("q", {"type": "noul", "cutoff": 0.5})
+
+
+def test_locate_plan_carries_per_question_cutoffs(tmp_path):
+    model = _loaded_model(tmp_path)
+    plan = model.encode(
+        {
+            "state": "hello",
+            "questions": {
+                "a": {"type": "locate", "instructions": "x", "cutoff": 0.65},
+                "b": {"type": "locate", "instructions": "y"},
+            },
+        }
+    )
+    assert [item.cutoff for item in plan.locate] == [0.65, None]
+
+
+def test_locate_head_predict_takes_a_per_label_threshold():
+    from omlx.models.pplx_decider import LocateSpanHead
+
+    head = LocateSpanHead(4, 8, 16)
+    document = mx.zeros((6, 4))
+    labels = mx.zeros((2, 4))
+    both = head.predict(document, labels, 0.5, proposals=8)
+    assert len(both) == 2
+    assert head.predict(document, labels, mx.array([0.5, 1.0]), proposals=8) == [
+        both[0],
+        [],
+    ]
