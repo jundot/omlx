@@ -16733,7 +16733,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅过滤页面显示，不影响日志文件的保存级别"
+            "value" : "仅过滤页面显示，不影响日志文件的保存级别。"
           }
         }
       }
@@ -42568,7 +42568,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld 个 kwargs"
+            "value" : "%lld 个参数"
           }
         }
       }
@@ -44671,7 +44671,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "服务器空闲——无模型已加载"
+            "value" : "服务器空闲——未加载模型"
           }
         }
       }
@@ -57807,7 +57807,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "网络搜索失败：%@"
+            "value" : "联网搜索失败：%@"
           }
         }
       }
