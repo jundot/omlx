@@ -181,18 +181,43 @@ Product decision recorded 2026-11-14: **PP only in R1 (Qwen4-Exp/Qwen3.8
 included), general tensor-parallel support in R2.** The old note that the Qwen3.8
 PLE VLM is “never planned as PP” described the pre-#5033 state and is withdrawn.
 
-## 8. Corrected PR count
+## 8. Prepared branches (local, committed, tested — ready to push)
 
-- **8 new PRs**: F1, F2, F3, F4, **F5 (cluster-core extras)**, and assistant 1, 2, 3.
-- **2 existing PRs** that must be handled, not re-offered:
-  - **#5024** — rebase onto current main and push as the updated head. That covers
-    the MoE pricing already on the branch **and** the runtime half we have not
-    ported (`inference_worker`, `progressive_loading`, `deepseek_v41/loading.py`,
-    `deepseek_v41_mlx_lm/model.py`).
-  - **#5033** — re-apply onto `rebase/upstream-main` (clean against main) or
-    withdraw.
-- Total tracks: **10**. If F5 rides with the #5024 rebase instead of standing
-  alone: **9**.
+All are based directly on `upstream/main` `624cff0e` (`HEAD^ == 624cff0e`), so each
+push is a clean single-PR branch. None is pushed yet.
+
+| Branch | Commit | Files | +/− | Tests |
+|---|---|---|---:|---|
+| `pr/f1-local-only` | `bda778e0` | 5 | +271/−22 | 244 passed |
+| `pr/f2-test-infra` | `45126fe3` | 6 | +96/−48 | 517 passed, 4 skipped; collection clean (19 969) |
+| `pr/f3-peer-check` | `bbbab9d7` | 2 | +209/−0 | ruff + loopback smoke (no suite) |
+| `pr/f4-mac-helper-dmg` | `be025eee` | 28 | +2380/−22 | 32 + 81 macOS, 13 python |
+| `pr/f5-cluster-core` | `f62d50f0` | 11 | +888/−53 | 1614 cluster |
+
+Notes for the pushes:
+
+- F1 also carries the `force_lm`/VLM fallback guard (same bug: a cluster
+  deployment leaking into a local load); its tests live in the same file.
+- F2 keeps `tests/test_settings.py` and the `test_scheduler.py` import rewrites
+  out (they belong to feature PRs); the root conftest still re-exports
+  `MockTokenizer`, so those call sites work unchanged.
+- F3 had its links to sibling cluster docs removed so it is standalone; the script
+  probes assistant routes by design and reports `OLDER BUILD` on an upstream-only
+  peer — that is the diagnostic, not a defect.
+- F4 adds **7** xcstrings entries to upstream's catalogue (the 78 914-line diff
+  was a re-serialization, not content).
+- F5 extracts exactly one line from `omlx/cluster/routes.py` (the inventory call
+  must use `DEFAULT_REMOTE_PYTHON`, not the hardcoded `~/omlx-distributed` path).
+
+## 9. Corrected PR count
+
+- **8 new PRs**: F1, F2, F3, F4, F5 (cluster-core extras), and assistant 1, 2, 3.
+- **2 existing PRs, both handled**:
+  - **#5024** — rebased onto `624cff0e`, pushed (`bbbf18d2`), and **both halves**
+    mirrored on our branch (pricing in the rebase, runtime in `392aaccb`).
+  - **#5033** — rebased onto `624cff0e`, pushed (`25da70de`), and applied on our
+    branch (`054f92e4`).
+- Total tracks: **10**.
 
 The earlier "8 PRs" was wrong in two ways: it counted F5 as new (it is #5024) and
 it ignored the runtime half of #5024 and the whole of #5033.
