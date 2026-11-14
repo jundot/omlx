@@ -2509,6 +2509,12 @@ def extract_tool_calls_with_thinking(
         )
     else:
         cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
+        if not tool_calls and finish_reason is not None and tools:
+            # A complete tool-call envelope that no parser could read is an
+            # invalid call, not prose: surface it the way the qwen3_coder
+            # branch does so clients see invalid_tool_call instead of a
+            # silent "stop" (#5245).
+            parse_errors = _dropped_tool_call_errors(regular_content, tokenizer)
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer, tools=tools)
     tool_calls_from_thinking = False
 
@@ -2572,6 +2578,27 @@ def extract_tool_calls_with_thinking(
         tool_calls_from_thinking=tool_calls_from_thinking,
         parse_errors=parse_errors,
     )
+
+
+def _dropped_tool_call_errors(text: str, tokenizer: Any) -> tuple[str, ...]:
+    """One ``malformed`` per complete tool-call envelope the generic parsers
+    dropped; ``()`` when the tokenizer declares no marker pair.
+
+    The K2 ``<ifm|tool_calls>`` dialect is exempt: ``parse_tool_calls``
+    routes it to a dedicated parser whose optional grammar deliberately
+    tolerates unparseable spans."""
+    start = getattr(tokenizer, "tool_call_start", None)
+    end = getattr(tokenizer, "tool_call_end", None)
+    if not start or not end or start == "<ifm|tool_calls>":
+        return ()
+    errors, pos = [], 0
+    while (i := text.find(start, pos)) >= 0:
+        found = _find_marker_span_end(text, i + len(start), end)
+        if found is None:
+            break
+        errors.append("malformed")
+        pos = found[1]
+    return tuple(errors)
 
 
 def parse_tool_calls_with_thinking_fallback(

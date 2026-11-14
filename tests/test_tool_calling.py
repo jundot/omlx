@@ -6085,3 +6085,54 @@ def test_think_tags_in_the_answer_survive_for_leading_thinking_models(
     cleaned, calls = parse_tool_calls("Strip ``<think>...</think>`` spans.", tok, None)
     assert calls is None
     assert cleaned == expected
+
+
+def test_generic_parser_drop_reports_malformed_at_stop():
+    """A complete <tool_call> span the generic parsers cannot read is an
+    invalid call, not silent prose — the same parse_errors qwen3_coder
+    reports for a failed envelope (#5245)."""
+    from mlx_lm.tool_parsers.json_tools import parse_tool_call
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = parse_tool_call
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    raw = (
+        '<tool_call>{"name": "write", "arguments": '
+        '{"content": "a "quoted" word"}}</tool_call>'
+    )
+    result = extract_tool_calls_with_thinking(
+        "", raw, tok, tools, finish_reason="stop"
+    )
+    assert not result.tool_calls
+    assert result.parse_errors == ("malformed",)
+
+
+def test_generic_parser_drop_reports_nothing_without_finish_reason():
+    """No finish reason means the stream may still be mid-envelope: nothing
+    is reported yet."""
+    from mlx_lm.tool_parsers.json_tools import parse_tool_call
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = parse_tool_call
+    tools = [{"type": "function", "function": {"name": "write"}}]
+    raw = '<tool_call>{"name": "write", "arguments": {oops}}</tool_call>'
+    result = extract_tool_calls_with_thinking("", raw, tok, tools)
+    assert not result.tool_calls
+    assert not result.parse_errors
