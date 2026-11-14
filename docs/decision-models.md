@@ -51,7 +51,9 @@ their order. Types: `noul` (yes/no), `choice` (one option key), `score` (one
 ordered level), `locate` (verbatim spans of the state). The response carries, per
 question, the winning option and the full probability distribution, so callers can
 threshold instead of taking an argmax. `images` (base64 data URIs) and `videos`
-are oMLX extensions for the backbones that read them.
+are oMLX extensions for the backbones that read them; a checkpoint whose
+conversion dropped the vision tower answers image requests with a
+`the checkpoint has no vision tower` error instead of failing inside the loader.
 
 ### `locate`
 
@@ -74,7 +76,16 @@ curl http://localhost:8000/v1/systemone \
 Each answer is `{"type": "locate", "spans": [{"start", "end", "text", "score"}]}`
 with Unicode character offsets into `state`, `end` exclusive, sorted by position.
 The invariant `state[start:end] == text` holds, and a span is kept when its
-probability reaches the adapter's saved cutoff (0.5).
+probability reaches the cutoff — the adapter's saved value (0.5) unless the
+question overrides it:
+
+```json
+{"amounts": {"type": "locate", "instructions": "every sum of money", "cutoff": 0.8}}
+```
+
+`cutoff` is a number in `(0, 1]`, per question, and applies to `locate` only. A
+4-bit quant drifts at the release floor (a span the reference scores 0.40 is
+scored 0.58 here), so raise it to drop weak spans without re-quantizing.
 
 `locate` runs in a forward pass of its own, with the checkpoint's `locate-span/`
 adapter enabled — an unmerged LoRA over every `nn.Linear` of the language model,
