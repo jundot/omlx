@@ -32,6 +32,7 @@ from .activation import (
 from .cache import DeepseekV41Cache
 from .engram import Engram, NgramHash, build_compressed_token_map
 from .gguf_quant import GGUFProjection
+from .gguf_quant import prefill_plan as gguf_prefill_plan
 from .head import project_logits
 from .hyper_connection import (
     PROJECTION_WIDTH_MULTIPLE,
@@ -575,7 +576,7 @@ class Expert(nn.Module):
         block_plan = None
         block_kind = None
         if sorted_indices and all(isinstance(p, GGUFProjection) for p in projections):
-            block_plan = _build_mxfp4_blocks(indices, self.w1.num_experts, 8)
+            block_plan = gguf_prefill_plan(x, indices, self.w1.num_experts)
         elif sorted_indices:
             kinds = [
                 (

@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.gguf import GgufError
 from omlx.patches.deepseek_v41.gguf import (
     _LAYER,
@@ -298,6 +299,66 @@ def test_packed_matrix_and_gather_tails(qtype):
     np.testing.assert_allclose(
         shared(mx.array(x)), x @ np.asarray(dense[0]).T, atol=1e-3, rtol=1e-4
     )
+
+
+@pytest.mark.skipif(not is_nax_available(), reason="Requires NAX tensor units")
+@pytest.mark.parametrize("qtype", FORMATS)
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_packed_nax_gather_matches_float64_dot(qtype, dtype):
+    from omlx.patches.deepseek_v41.gguf_quant import prefill_plan
+
+    # Q8 has a half K tile; all formats have N/route tails and an empty expert.
+    width = 544 if qtype == 8 else 512
+    raw, rng = packed(qtype, (4, 35, width), 9100 + qtype)
+    block, size, _ = FORMATS[qtype]
+    blocks = raw.reshape(4, 35, width // block, size)
+    offset = {10: 80, 14: 208}.get(qtype, 0)
+    scales = rng.choice(np.array([0, -0.007, 0.01, 2**-24], "<f2"), blocks.shape[:-1])
+    blocks[..., offset : offset + 2] = scales[..., None].view(np.uint8)
+    p = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=width)
+    ids = np.repeat(np.arange(4, dtype=np.int32), [3, 0, 67, 61])
+    # A strided input also checks the caller's contiguous gather contract.
+    x = mx.array(rng.normal(size=(len(ids), width * 2)).astype(np.float32))[:, ::2]
+    x = x.astype(dtype)[:, None]
+    plan = prefill_plan(x, mx.array(ids), p.num_experts)
+    assert plan[2] == 32
+    actual = p(x, mx.array(ids), sorted_indices=True, block_plan=plan)
+    dense = np.asarray(dequantize(p.weight, qtype, (4, 35, width), mx.float32)).astype(
+        np.float64
+    )
+    inp = np.asarray(x.astype(mx.float32))[:, 0].astype(np.float64)
+    reference = np.einsum("rk,rnk->rn", inp, dense[ids])
+    magnitude = np.einsum("rk,rnk->rn", abs(inp), abs(dense[ids]))
+    # Factoring the original group scale changes FP32 summation order only.
+    # Bound that error plus the final output cast, including FP16 subnormals.
+    eps = {mx.float32: 2**-23, mx.float16: 2**-10, mx.bfloat16: 2**-7}[dtype]
+    tolerance = 8 * 2**-23 * magnitude + 0.5 * eps * abs(reference) + 2**-25
+    assert actual.dtype == dtype and actual.shape == (len(ids), 1, 35)
+    error = abs(np.asarray(actual.astype(mx.float32))[:, 0] - reference)
+    assert np.all(error <= tolerance), np.max(error / tolerance)
+    np.testing.assert_array_equal(p.weight, raw)
+
+
+def test_gguf_prefill_plan_keeps_small_batches_and_non_nax_fallback(monkeypatch):
+    from omlx.patches.deepseek_v41 import gguf_quant as q
+
+    x = mx.zeros((1, 1, 256), mx.bfloat16)
+    # Real CED tail: 128 tokens, top-6 routing, 384 experts.
+    assert q.prefill_plan(x, mx.zeros((128 * 6,), mx.int32), 384)[2] == 8
+    monkeypatch.setattr(q, "is_nax_available", lambda: False)
+    assert q.prefill_plan(x, mx.zeros((8192 * 6,), mx.int32), 384)[2] == 8
+    raw, rng = packed(16, (4, 11, 256), 7311)
+    p = GGUFProjection(mx.array(raw), qtype=16, input_dims=256)
+    ids = mx.array(np.repeat(np.arange(4), [5, 17, 0, 45]).astype(np.int32))
+    inp = mx.array(rng.normal(size=(67, 1, 256)).astype(np.float32))
+    # A non-NAX machine must never compile the MPP header/kernel.
+    monkeypatch.setattr(
+        q, "_nax_kernel", lambda *a: pytest.fail("Unexpected NAX dispatch")
+    )
+    actual = p(inp, ids, sorted_indices=True)
+    dense = np.asarray(dequantize(p.weight, 16, (4, 11, 256), mx.float32))
+    expected = np.einsum("rk,rnk->rn", np.asarray(inp)[:, 0], dense[np.asarray(ids)])
+    np.testing.assert_allclose(actual[:, 0], expected, atol=1e-3, rtol=1e-4)
 
 
 def gguf_module(module, qtype, seed):

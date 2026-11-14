@@ -991,18 +991,26 @@ void dequantize_iq1_s(device const block_iq1_s * xb, short il, thread type4x4 & 
 // Contiguous eight-value decode for row dots and simdgroup matrix fragments.
 // Codebook words stay in registers; avoid constructing two 4x4 matrices for
 // every lane/row and reloading their byte-addressed constant pointers.
-template <int QT>
-inline void gguf_decode8(const device uchar* b, uint k, thread float* v) {
+// CODES returns exact integer grid values and their original (scale, offset).
+// IQ1's fractional grid offset is absorbed into integer eighths, without rounding.
+template <int QT, bool CODES = false>
+inline void gguf_decode8(const device uchar* b, uint k, thread float* v,
+                         thread float* factors = nullptr) {
     if constexpr (QT == 8) {
         const float d = float(*reinterpret_cast<const device half*>(b));
-        const float4 a = float4(*reinterpret_cast<const device packed_char4*>(b + 2 + k)) * d;
-        const float4 c = float4(*reinterpret_cast<const device packed_char4*>(b + 6 + k)) * d;
+        const float4 a = float4(*reinterpret_cast<const device packed_char4*>(b + 2 + k)) * (CODES ? 1.0f : d);
+        const float4 c = float4(*reinterpret_cast<const device packed_char4*>(b + 6 + k)) * (CODES ? 1.0f : d);
         for (uint j = 0; j < 4; ++j) { v[j] = a[j]; v[j + 4] = c[j]; }
+        if constexpr (CODES) { factors[0] = d; factors[1] = 0.0f; }
     } else if constexpr (QT == 10) {
         const uint g = k / 16, q = 16 + 32 * (g / 8) + 16 * (g & 1) + k % 16;
         const float d = float(*reinterpret_cast<const device half*>(b + 80)) * float(b[g] & 15);
         const float m = float(*reinterpret_cast<const device half*>(b + 82)) * float(b[g] >> 4);
-        for (uint j = 0; j < 8; ++j) v[j] = d * float((b[q + j] >> (2 * ((g / 2) % 4))) & 3) - m;
+        for (uint j = 0; j < 8; ++j) {
+            const float code = float((b[q + j] >> (2 * ((g / 2) % 4))) & 3);
+            v[j] = CODES ? code : d * code - m;
+        }
+        if constexpr (CODES) { factors[0] = d; factors[1] = -m; }
     } else if constexpr (QT == 13) {
         const uint g = k / 32;
         const device uchar* s = b + 4;
@@ -1013,23 +1021,30 @@ inline void gguf_decode8(const device uchar* b, uint k, thread float* v) {
         for (uint j = 0; j < 8; ++j) {
             const uint i = k % 32 + j;
             const uint q = ((b[48 + 32 * (g / 2) + i] >> (4 * (g & 1))) & 15) | (((b[16 + i] >> g) & 1) << 4);
-            v[j] = d * float(q) - m;
+            v[j] = CODES ? float(q) : d * float(q) - m;
         }
+        if constexpr (CODES) { factors[0] = d; factors[1] = -m; }
     } else if constexpr (QT == 14) {
         const float d = float(*reinterpret_cast<const device half*>(b + 208)) * float(char(b[192 + k / 16]));
         for (uint j = 0; j < 8; ++j) {
             const uint i = k + j, r = i % 128;
             const uint lo = (b[64 * (i / 128) + r % 64] >> (4 * (r / 64))) & 15;
             const uint hi = (b[128 + 32 * (i / 128) + r % 32] >> (2 * (r / 32))) & 3;
-            v[j] = d * float(int(lo | (hi << 4)) - 32);
+            const float code = float(int(lo | (hi << 4)) - 32);
+            v[j] = CODES ? code : d * code;
         }
+        if constexpr (CODES) { factors[0] = d; factors[1] = 0.0f; }
     } else if constexpr (QT == 19) {
         const uint i8 = k / 8, h = reinterpret_cast<const device ushort*>(b + 34)[i8 / 4];
         const uint index = uint(b[2 + i8]) | (((h >> (3 * (i8 % 4))) & 7) << 8);
         const uint grid = iq1s_grid_gpu[index];
         const float d = float(*reinterpret_cast<const device half*>(b)) * float(2 * ((h >> 12) & 7) + 1);
         const float m = d * ((h & 0x8000) ? -1.125f : -0.875f);
-        for (uint j = 0; j < 8; ++j) v[j] = d * float((grid >> (8 * (j % 4) + 4 * (j / 4))) & 15) + m;
+        for (uint j = 0; j < 8; ++j) {
+            const float code = float((grid >> (8 * (j % 4) + 4 * (j / 4))) & 15);
+            v[j] = CODES ? 8.0f * (code - 1.0f) + ((h & 0x8000) ? -1.0f : 1.0f) : d * code + m;
+        }
+        if constexpr (CODES) { factors[0] = d * 0.125f; factors[1] = 0.0f; }
     } else {
         const uint i8 = k / 8, ib = i8 / 4, sub = i8 % 4;
         ulong grid;
@@ -1058,7 +1073,11 @@ inline void gguf_decode8(const device uchar* b, uint k, thread float* v) {
             signs = b[34 + i8];
             d = float(*reinterpret_cast<const device half*>(b)) * (0.5f + float((b[74 + ib] >> (4 * (sub / 2))) & 15)) * 0.25f;
         }
-        for (uint j = 0; j < 8; ++j) v[j] = d * float((grid >> (8 * j)) & 255ul) * ((signs & (1u << j)) ? -1.0f : 1.0f);
+        for (uint j = 0; j < 8; ++j) {
+            const float code = float((grid >> (8 * j)) & 255ul), sign = (signs & (1u << j)) ? -1.0f : 1.0f;
+            v[j] = CODES ? code * sign : d * code * sign;
+        }
+        if constexpr (CODES) { factors[0] = d; factors[1] = 0.0f; }
     }
 }
 
