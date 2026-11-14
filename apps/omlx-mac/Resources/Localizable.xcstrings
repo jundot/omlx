@@ -973,6 +973,24 @@
         }
       }
     },
+    "integrations.claude.desktop.sub" : {
+      "comment" : "Sublabel explaining the Claude Desktop tier-alias toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Expose claude-opus / claude-sonnet / claude-haiku as aliases of the tier models"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "将 claude-opus / claude-sonnet / claude-haiku 暴露为各档位模型的别名"
+          }
+        }
+      }
+    },
     "settings.search.prompt" : {
       "comment" : "Placeholder for the global settings search field",
       "extractionState" : "manual",
@@ -10670,6 +10688,23 @@
         }
       }
     },
+    "common.ok" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OK"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "好"
+          }
+        }
+      }
+    },
     "common.save" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -13423,6 +13458,24 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "CLI"
+          }
+        }
+      }
+    },
+    "integrations.command.copy" : {
+      "comment" : "Tooltip for the copy button on a shell command block",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy command"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制命令"
           }
         }
       }
