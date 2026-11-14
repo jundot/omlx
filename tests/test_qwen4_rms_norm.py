@@ -22,8 +22,22 @@ import pytest
 
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
-compat.apply_mlx_vlm_qwen4_exp_compat_patch()
-language = importlib.import_module("mlx_vlm.models.qwen4_exp.language")
+language = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _qwen4_vendor():
+    """Expose the vendored Qwen4 modules inside the test window.
+
+    Applying the compat overlay at module scope changed the worker during
+    collection: it prepends the vendor tree to ``mlx_vlm.__path__`` and
+    re-imports ``mlx_vlm.models.qwen4_exp``, so a module collected later that
+    imports that package got the overlay's copy instead of the installed one.
+    """
+    global language
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    language = importlib.import_module("mlx_vlm.models.qwen4_exp.language")
+
 
 BF16_ULP = 2.0**-7
 FP32_ULP = 2.0**-23
