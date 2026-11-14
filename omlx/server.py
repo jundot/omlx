@@ -911,6 +911,30 @@ def _register_cluster_routes() -> None:
             Depends(require_distributed_inference_enabled),
         ],
     )
+    # Cluster Assistant: measure-as-a-job, status, and the measurement-driven
+    # plan (POST /admin/api/cluster/assistant/measure, GET .../status,
+    # POST .../plan). Small, deliberate upstream patch — it is mounted with the
+    # same two gates as the cluster router, so the assistant surface cannot be
+    # reachable when the experimental cluster surface is off or the caller is
+    # not an admin. The getters supply the measurement store's base path and
+    # this Mac's own endpoint port; both are resolved lazily because the
+    # settings manager does not exist yet at registration time. Tracked in
+    # docs/cluster-assistant/UPSTREAM.md.
+    from .cluster.assistant.routes import router as cluster_assistant_router
+    from .cluster.assistant.routes import set_assistant_getters
+
+    set_assistant_getters(
+        lambda: _server_state.settings_manager,
+        lambda: _server_state.global_settings.server,
+        lambda: _server_state.global_settings,
+    )
+    app.include_router(
+        cluster_assistant_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
     # Cluster v2 model-sync manifest: admin-gated like the rest of the
     # cluster surface; peers use it to compare model contents before sync.
     from .cluster.modelsync import manifest_router as cluster_manifest_router

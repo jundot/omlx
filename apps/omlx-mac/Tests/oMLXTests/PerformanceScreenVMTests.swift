@@ -233,3 +233,87 @@ final class PerformanceScreenVMTests: XCTestCase {
         XCTAssertEqual(balanced.binding, "dynamic")
     }
 }
+
+extension PerformanceScreenVMTests {
+    /// The privileged command is a fixed sysctl with a validated MiB integer.
+    /// Invalid values are rejected before any AppleScript or admin dialog.
+    func testPrivilegedWiredLimitValidation() throws {
+        XCTAssertEqual(try PrivilegedActions.validatedWiredLimitMB(1024), 1024)
+        for invalid in [0, -1, 1_048_577] {
+            XCTAssertThrowsError(try PrivilegedActions.validatedWiredLimitMB(invalid)) { error in
+                XCTAssertEqual(error as? PrivilegedActionError, .invalidValue)
+            }
+        }
+    }
+
+    /// SMJobBless answers "already installed, success" and never replaces the
+    /// tool, so the app decides from its own ledger whether to bless, reuse or
+    /// remove-and-bless. No admin prompt happens in this test.
+    func testHelperInstallStateDecidesBlessReuseReplace() {
+        XCTAssertEqual(
+            PrivilegedHelper.installState(
+                helperOnDisk: false, recordedVersion: nil, bundledVersion: 1
+            ),
+            .bless
+        )
+        XCTAssertEqual(
+            PrivilegedHelper.installState(
+                helperOnDisk: true, recordedVersion: 1, bundledVersion: 1
+            ),
+            .reuse
+        )
+        // A helper from an older build would otherwise stay installed forever.
+        XCTAssertEqual(
+            PrivilegedHelper.installState(
+                helperOnDisk: true, recordedVersion: 0, bundledVersion: 1
+            ),
+            .replace
+        )
+        // A downgrade of the app also replaces: the ledger is authoritative.
+        XCTAssertEqual(
+            PrivilegedHelper.installState(
+                helperOnDisk: true, recordedVersion: 2, bundledVersion: 1
+            ),
+            .replace
+        )
+        // Installed before the ledger existed: unknown version, so replace.
+        XCTAssertEqual(
+            PrivilegedHelper.installState(
+                helperOnDisk: true, recordedVersion: nil, bundledVersion: 1
+            ),
+            .replace
+        )
+    }
+
+    /// A cancelled prompt or a refused value must not open a second dialog.
+    func testOnlyInstallFailuresFallBackToAppleScript() {
+        XCTAssertFalse(
+            PrivilegedHelper.shouldFallBackToAppleScript(PrivilegedActionError.cancelled)
+        )
+        XCTAssertFalse(
+            PrivilegedHelper.shouldFallBackToAppleScript(PrivilegedActionError.invalidValue)
+        )
+        XCTAssertTrue(
+            PrivilegedHelper.shouldFallBackToAppleScript(
+                PrivilegedActionError.failed("SMJobBless refused to install the helper.")
+            )
+        )
+        XCTAssertTrue(
+            PrivilegedHelper.shouldFallBackToAppleScript(
+                CocoaError(.fileNoSuchFile)
+            )
+        )
+    }
+
+    /// The helper identity is duplicated in the plists and the build script;
+    /// the packaging test `test_privileged_helper_packaging.py` pins it there,
+    /// this pins the Swift side the XPC connection uses.
+    func testHelperIdentityMatchesTheInstalledLayout() {
+        XCTAssertEqual(PrivilegedHelper.helperID, "app.omlx.helper")
+        XCTAssertEqual(
+            PrivilegedHelper.installedPath,
+            "/Library/PrivilegedHelperTools/app.omlx.helper"
+        )
+        XCTAssertGreaterThanOrEqual(PrivilegedHelper.helperBundleVersion, 1)
+    }
+}

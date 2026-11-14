@@ -7071,7 +7071,7 @@ class TestDetectNeedsThinkPrefix:
 
     def _make_scheduler(self, mock_model, think_start_id, think_end_id=None):
         """Create scheduler with think token IDs on the tokenizer."""
-        from conftest import MockTokenizer
+        from tests._tokenizer_support import MockTokenizer
 
         tokenizer = MockTokenizer()
         tokenizer.think_start_id = think_start_id
@@ -7131,7 +7131,7 @@ class TestDetectNeedsThinkPrefix:
 
     def test_no_think_start_id_on_tokenizer(self, mock_model):
         """Tokenizer without think_start_id -> False."""
-        from conftest import MockTokenizer
+        from tests._tokenizer_support import MockTokenizer
 
         tokenizer = MockTokenizer()
         scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
@@ -7160,7 +7160,7 @@ class TestDetectNeedsThinkPrefix:
         """
         from unittest.mock import PropertyMock
 
-        from conftest import MockTokenizer
+        from tests._tokenizer_support import MockTokenizer
 
         tokenizer = MockTokenizer()
         type(tokenizer).think_start_id = PropertyMock(

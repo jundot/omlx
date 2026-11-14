@@ -871,6 +871,79 @@ def test_free_space_is_readable_for_a_path_that_does_not_exist_yet(tmp_path):
     assert free_disk_bytes(tmp_path / "not" / "created" / "yet") > 0
 
 
+def test_is_local_host_accepts_the_macs_own_lan_address(monkeypatch):
+    from omlx.cluster import staging
+
+    staging._cached_local_interface_addresses.cache_clear()
+    monkeypatch.setattr(
+        "omlx.cluster.discovery.local_addr_dicts",
+        lambda: [{"ip": "172.16.1.13", "if_type": "thunderbolt"}],
+    )
+
+    assert staging.is_local_host("127.0.0.1") is True
+    assert staging.is_local_host("172.16.1.13") is True
+    assert staging.is_local_host("172.16.1.12") is False
+    staging._cached_local_interface_addresses.cache_clear()
+
+
+def test_is_local_host_retries_after_a_failed_discovery_read(monkeypatch):
+    """R2: a first-call failure must not poison own-LAN detection forever."""
+
+    from omlx.cluster import staging
+
+    staging._cached_local_interface_addresses.cache_clear()
+    reads = []
+
+    def discovery_not_up_then_up():
+        reads.append(1)
+        if len(reads) == 1:
+            raise RuntimeError("discovery is not up yet")
+        return [{"ip": "172.16.1.13", "if_type": "thunderbolt"}]
+
+    monkeypatch.setattr(
+        "omlx.cluster.discovery.local_addr_dicts", discovery_not_up_then_up
+    )
+
+    assert staging.is_local_host("172.16.1.13") is False, "failed read, not local"
+    assert staging.is_local_host("172.16.1.13") is True, "the next call retries"
+    assert staging.is_local_host("172.16.1.13") is True
+    assert len(reads) == 2, "the successful answer stays cached"
+    staging._cached_local_interface_addresses.cache_clear()
+
+
+def test_remote_free_space_walks_up_to_an_existing_parent(monkeypatch):
+    """A checkpoint not yet copied must not report zero free space.
+
+    ``df -k <model path>`` fails when the model directory does not exist on the
+    destination Mac. The remote probe must walk to the nearest existing parent
+    (``~/Models`` or ``~``) or every not-yet-staged model looks unstageable.
+    """
+
+    from omlx.cluster.staging import free_disk_bytes
+
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="/dev/disk 100 0 123456 0 0 0 0 /Users\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    free = free_disk_bytes(
+        "/Users/alice/Models/absent-model",
+        ssh_target="worker@example.invalid",
+    )
+
+    assert free == 123456 * 1024
+    command = commands[0][-1]
+    assert "while [ ! -e" in command
+    assert 'df -k "$p"' in command
+    assert "/Users/alice/Models/absent-model" in command
+
+
 def test_remote_default_uses_published_worker_shim(monkeypatch):
     from omlx.cluster.staging import run_remote_python
     from omlx.cluster.worker_shim import CLUSTER_PYTHON_SHIM

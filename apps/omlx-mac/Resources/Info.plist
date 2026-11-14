@@ -70,5 +70,14 @@
 		<string>ko</string>
 		<string>ru</string>
 	</array>
+	<key>SMPrivilegedExecutables</key>
+	<dict>
+		<!-- Pins the Developer ID Certification Authority plus the Developer ID
+		     Application leaf marker, not just the team (OU): a plain "Apple
+		     Development" certificate for the same team must not be accepted as
+		     the privileged helper. Mirror of the helper's SMAuthorizedClients. -->
+		<key>app.omlx.helper</key>
+		<string>anchor apple generic and identifier "app.omlx.helper" and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "YB894QRG4W"</string>
+	</dict>
 </dict>
 </plist>

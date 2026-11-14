@@ -832,6 +832,1072 @@
             </div>
         </section>
 
+        <!-- ========================== assistant ========================== -->
+        <!-- The assistant card is mounted independently of wizardState() so a
+             configured deployment never hides its ready/stop/endpoint surface
+             (REVIEW-2026-11-13.md B3). Its own state machine gates the branches. -->
+        <section x-show="assistantSurfaceVisible()" x-cloak
+                 class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                 data-cluster-v2-assistant-section>
+            <div class="p-5 sm:p-6">
+                <!-- Assistant — the one-action path. It renders the assistant
+                     API's answer (recommend → plan → apply → start) and never
+                     computes a plan, a rank order or a coordinator. Each state
+                     carries data-assistant-state so the static contract test
+                     can find every branch. The endpoint URL is only rendered
+                     when assistantReady() (state ready AND endpoint.ready). -->
+                <div class="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3"
+                     data-cluster-v2-assistant>
+                    <div class="flex items-start justify-between gap-3">
+                        <div class="min-w-0">
+                            <div class="text-xs font-semibold text-neutral-900">{{ t('cluster.assistant.title') }}</div>
+                            <div class="text-caption text-neutral-500 mt-0.5">{{ t('cluster.assistant.blurb') }}</div>
+                        </div>
+                        <span class="text-caption font-semibold text-neutral-500 whitespace-nowrap"
+                              data-cluster-v2-assistant-state-label
+                              x-text="assistantStateLabel()"></span>
+                    </div>
+                    <!-- B3: the post-ready measurement is a server setting, not
+                         an edit-JSON step. A button, never an input field. -->
+                    <div class="mt-1 flex items-center gap-2 text-caption text-neutral-500"
+                         data-cluster-v2-assistant-probe-toggle>
+                        <span>Performance probe</span>
+                        <button type="button" @click="toggleAssistantProbe()"
+                                :disabled="assistant.busy"
+                                class="px-2 py-0.5 text-caption font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-full hover:bg-neutral-100 disabled:opacity-40"
+                                data-cluster-v2-assistant-probe-button
+                                x-text="assistantProbeLabel()"></button>
+                    </div>
+
+                    <!-- Reload resume: the last persisted deployment. It is not a plan; it
+                         shows what ran and offers Start again with the stored inputs. -->
+                    <div class="mt-3 rounded-lg border border-neutral-200 bg-white px-3 py-2"
+                         x-show="assistantSessionVisible()" x-cloak
+                         data-cluster-v2-assistant-resume>
+                        <div class="text-caption text-neutral-600">
+                            <span class="font-semibold">Last deployment</span>
+                            <span x-text="assistantSessionLabel()"></span>
+                        </div>
+                        <div class="mt-2 flex items-center gap-2">
+                            <button type="button" x-show="!assistantSessionRunning()"
+                                    @click="runAssistantResume()" :disabled="assistant.busy"
+                                    class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-40"
+                                    data-cluster-v2-assistant-resume-start>
+                                Start again
+                            </button>
+                            <button type="button" x-show="assistantSessionRunning()"
+                                    @click="stopAssistantSession()" :disabled="assistant.busy"
+                                    class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-neutral-900 border border-neutral-300 rounded-full hover:bg-neutral-100 disabled:opacity-40"
+                                    data-cluster-v2-assistant-resume-stop>
+                                Stop
+                            </button>
+                            <a x-show="assistantSessionEndpoint()"
+                               :href="assistantSessionEndpoint()"
+                               class="text-caption font-mono text-neutral-500 break-all"
+                               x-text="assistantSessionEndpoint()"></a>
+                        </div>
+                    </div>
+
+                    <!-- idle: nothing measured yet -->
+                    <div class="mt-3" x-show="assistantState() === 'idle'" x-cloak
+                         data-assistant-state="idle">
+                        <button type="button" @click="startAssistant()"
+                                :disabled="assistantRunning()"
+                                class="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-40"
+                                data-cluster-v2-assistant-entry>
+                            {{ t('cluster.assistant.entry') }}
+                            <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i>
+                        </button>
+                    </div>
+
+                    <!-- Screen 4: the six steps the backend can actually tell
+                         apart (SCREEN-4-PROGRESS.md §2), in its corrected order
+                         — planning precedes staging, and the two pairs it
+                         cannot split are one row each. A row is current only
+                         while a backend value names it; earlier rows are done,
+                         later rows never animate. No percentage, byte total or
+                         token rate is rendered, and an unknown phase keeps the
+                         previous row with the backend's own message under it. -->
+                    <div class="mt-3 space-y-1" x-show="assistantState() !== 'idle'" x-cloak
+                         aria-live="polite"
+                         data-cluster-v2-assistant-progress>
+                        <template x-for="row in assistantProgressRows()" :key="row.key">
+                            <div class="flex items-start gap-2"
+                                 :data-assistant-progress-row="row.key"
+                                 :data-assistant-progress-state="row.state">
+                                <svg x-show="row.state === 'current'" aria-hidden="true" class="mt-0.5 animate-spin h-3 w-3 text-neutral-500" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                <i x-show="row.state === 'done'" data-lucide="check" class="mt-0.5 w-3 h-3 text-green-600" x-cloak></i>
+                                <i x-show="row.state === 'failed'" data-lucide="circle-alert" class="mt-0.5 w-3 h-3 text-red-600" x-cloak></i>
+                                <span x-show="row.state === 'pending'" class="mt-0.5 w-3 h-3 flex items-center justify-center text-caption text-neutral-300">•</span>
+                                <div class="min-w-0">
+                                    <div class="text-caption font-semibold"
+                                         :class="row.state === 'pending' ? 'text-neutral-400' : (row.state === 'failed' ? 'text-red-700' : 'text-neutral-900')"
+                                         x-text="row.label"></div>
+                                    <p class="text-caption text-neutral-500" x-show="row.message" x-text="row.message"></p>
+                                    <p class="text-caption text-neutral-500" x-show="row.count" x-text="row.count"></p>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+
+                    <!-- measuring: checking the Macs -->
+                    <div class="mt-3 flex items-center gap-2 text-xs text-neutral-500"
+                         x-show="assistantState() === 'measuring'" x-cloak
+                         data-assistant-state="measuring">
+                        <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        <span>{{ t('cluster.assistant.measuring') }}</span>
+                    </div>
+
+                    <!-- recommending: choosing the model -->
+                    <div class="mt-3 flex items-center gap-2 text-xs text-neutral-500"
+                         x-show="assistantState() === 'recommending'" x-cloak
+                         data-assistant-state="recommending">
+                        <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        <span>{{ t('cluster.assistant.recommending') }}</span>
+                    </div>
+
+                    <!-- measuring_model: the recommendation named another model,
+                         so it is measured model-bound before plan -->
+                    <div class="mt-3 flex items-center gap-2 text-xs text-neutral-500"
+                         x-show="assistantState() === 'measuring_model'" x-cloak
+                         data-assistant-state="measuring_model">
+                        <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        <span x-text="window.t('cluster.assistant.measuring_model').replace('{model}', assistantModelLabel())"></span>
+                    </div>
+
+                    <!-- planning: the plan summary and Start setup -->
+                    <div class="mt-3" x-show="assistantState() === 'planning'" x-cloak
+                         data-assistant-state="planning">
+                        <div class="flex items-center gap-2 text-xs text-neutral-500"
+                             x-show="!assistant.plan">
+                            <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                            <span>{{ t('cluster.assistant.planning') }}</span>
+                        </div>
+                        <div x-show="assistant.plan" data-cluster-v2-assistant-plan>
+                            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2"
+                                 data-cluster-v2-assistant-summary>
+                                <div class="min-w-0">
+                                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.summary.model') }}</div>
+                                    <div class="text-xs font-semibold text-neutral-900 truncate"
+                                         data-cluster-v2-assistant-model
+                                         x-text="assistantModelLabel()"></div>
+                                </div>
+                                <div class="min-w-0">
+                                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.summary.context') }}</div>
+                                    <div class="text-xs font-semibold text-neutral-900"
+                                         data-cluster-v2-assistant-context
+                                         x-text="assistantContextLabel()"></div>
+                                </div>
+                                <div class="min-w-0">
+                                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.summary.coordinator') }}</div>
+                                    <div class="text-xs font-semibold text-neutral-900 truncate"
+                                         data-cluster-v2-assistant-coordinator
+                                         x-text="assistantCoordinatorName()"></div>
+                                </div>
+                                <div class="min-w-0">
+                                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.summary.macs') }}</div>
+                                    <div class="text-xs font-semibold text-neutral-900"
+                                         data-cluster-v2-assistant-macs
+                                         x-text="window.t('cluster.assistant.summary.macs_value').replace('{count}', String(assistantMacCount()))"></div>
+                                </div>
+                            </div>
+                            <!-- No token rate exists yet: the backend reports
+                                 stage seconds only and observed = null. -->
+                            <p class="text-caption text-neutral-500 mt-2">{{ t('cluster.assistant.speed_unknown') }}</p>
+                            <!-- Phase A: the chosen subset and the resolved
+                                 levers. Every value comes from the plan; a
+                                 levers the backend did not choose is not shown. -->
+                            <div class="mt-2 space-y-0.5 text-caption text-neutral-600"
+                                 data-cluster-v2-assistant-policy>
+                                <p>
+                                    <span class="font-semibold">Macs</span>
+                                    <span data-cluster-v2-assistant-selected
+                                          x-text="assistantSelectionLabel()"></span>
+                                </p>
+                                <p>
+                                    <span class="font-semibold">Tier</span>
+                                    <span data-cluster-v2-assistant-tier
+                                          x-text="assistantTierLabel()"></span>
+                                </p>
+                                <p>
+                                    <span class="font-semibold">Context</span>
+                                    <span data-cluster-v2-assistant-policy-context
+                                          x-text="assistantPolicyContextLabel()"></span>
+                                </p>
+                                <p x-show="assistantOffloadLabel()">
+                                    <span class="font-semibold">Offload</span>
+                                    <span data-cluster-v2-assistant-offload
+                                          x-text="assistantOffloadLabel()"></span>
+                                </p>
+                                <p x-show="assistantExpertsLabel()">
+                                    <span class="font-semibold">Experts</span>
+                                    <span data-cluster-v2-assistant-experts
+                                          x-text="assistantExpertsLabel()"></span>
+                                </p>
+                            </div>
+                            <!-- Decision 2026-11-14: the user chooses the
+                                 tradeoff. The plan is quality-first; when it
+                                 offloads routed experts, the experts-resident
+                                 alternative is offered here (a smaller context)
+                                 and apply uses whichever is selected. No
+                                 upfront context question; only a real trade. -->
+                            <div class="mt-2" x-show="assistantTradeoffs().length" x-cloak
+                                 data-cluster-v2-assistant-tradeoffs>
+                                <p class="text-caption font-semibold text-neutral-600">Context vs speed</p>
+                                <p class="text-caption text-neutral-500">
+                                    Keeping experts resident costs context; keeping context offloads experts (slower).
+                                </p>
+                                <div class="mt-1 flex flex-wrap gap-2">
+                                    <button type="button" @click="assistant.selectedTradeoff = null"
+                                            :class="assistantTradeoffSelected() ? 'bg-white border-neutral-200 text-neutral-700' : 'bg-neutral-900 text-white border-neutral-900'"
+                                            class="px-3 py-1.5 text-caption font-semibold border rounded-full"
+                                            data-cluster-v2-assistant-tradeoff-quality>
+                                        Best quality
+                                    </button>
+                                    <template x-for="(tradeoff, tradeoffIndex) in assistantTradeoffs()" :key="tradeoffIndex">
+                                        <button type="button" @click="assistant.selectedTradeoff = tradeoff"
+                                                :class="assistant.selectedTradeoff === tradeoff ? 'bg-neutral-900 text-white border-neutral-900' : 'bg-white border-neutral-200 text-neutral-700'"
+                                                class="px-3 py-1.5 text-caption font-semibold border rounded-full"
+                                                data-cluster-v2-assistant-tradeoff>
+                                            <span x-text="(tradeoff.context_tokens || 0).toLocaleString() + ' tokens, experts resident'"></span>
+                                        </button>
+                                    </template>
+                                </div>
+                            </div>
+                            <!-- A small Mac cannot hold a workstation reserve;
+                                 the assistant uses it as Headless and says so. -->
+                            <template x-for="(note, noteIndex) in assistantSmallMacNotes()" :key="noteIndex">
+                                <p class="text-caption text-amber-700 mt-1"
+                                   data-cluster-v2-assistant-small-mac x-text="note"></p>
+                            </template>
+                            <button type="button" @click="runAssistantApply()"
+                                    :disabled="assistantRunning()"
+                                    class="mt-3 inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-40"
+                                    data-cluster-v2-assistant-start-setup>
+                                <span>{{ t('cluster.assistant.start_setup') }}</span>
+                                <i data-lucide="play" class="w-3.5 h-3.5"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Run on this Mac: single-node inference, no cluster.
+                         The recommendation's `single_node` answer says this model
+                         fits on this Mac alone (PHASE-2B-RUN.md §22: measured
+                         faster than a pipeline for a model that fits). The
+                         button POSTs one async job; the card polls it and shows
+                         only what the job reports. The endpoint and Open Chat
+                         appear only when the job is ready *and* its own endpoint
+                         says ready; Stop local run posts the job's stop route
+                         once and retires the serving surface. A failure keeps
+                         its one action. This is never a fallback for a refused
+                         cluster plan: the plan keeps its own one action. -->
+                    <div class="mt-3 rounded-lg border border-neutral-200 bg-white px-3 py-2"
+                         x-show="assistantLocalRunVisible()" x-cloak
+                         data-cluster-v2-assistant-local-run>
+                        <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">Run on this Mac</div>
+                        <p class="text-caption text-neutral-500 mt-0.5">
+                            This model fits on this Mac alone. Single-node inference skips the pipeline,
+                            replays the saved tuning preset and serves from this Mac's own engine.
+                        </p>
+                        <div class="mt-2 flex flex-wrap items-center gap-2">
+                            <button type="button" @click="runAssistantLocal()"
+                                    :disabled="assistantRunning() || assistant.localRun.busy || !assistantLocalRunAvailable()"
+                                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-40"
+                                    data-cluster-v2-assistant-local-run-button>
+                                <i data-lucide="play" class="w-3 h-3"></i>
+                                <span>Run on this Mac</span>
+                            </button>
+                            <span class="text-caption text-neutral-500"
+                                  x-show="assistant.localRun.state === 'ready'"
+                                  data-cluster-v2-assistant-local-run-ready>
+                                Running on this Mac
+                            </span>
+                            <!-- Stop/Unload: the job's own stop route unloads
+                                 the model this Mac loaded (or aborts a load in
+                                 flight). One at a time; a stopped job is never
+                                 stopped twice, and the endpoint below is gone
+                                 once it stops. -->
+                            <button type="button" @click="stopAssistantLocalRun()"
+                                    :disabled="assistant.localRun.stopping"
+                                    x-show="assistantLocalRunStoppable()" x-cloak
+                                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-neutral-800 bg-white border border-neutral-300 rounded-full hover:bg-neutral-50 disabled:opacity-40"
+                                    data-cluster-v2-assistant-local-run-stop>
+                                <i data-lucide="square" class="w-3 h-3"></i>
+                                <span x-text="assistant.localRun.stopping ? 'Stopping…' : 'Stop local run'"></span>
+                            </button>
+                            <span class="text-caption text-neutral-500"
+                                  x-show="assistant.localRun.stopped" x-cloak
+                                  data-cluster-v2-assistant-local-run-stopped>
+                                Stopped — this Mac no longer serves the model
+                            </span>
+                        </div>
+
+                        <!-- The backend's own sentence; no percentage. It
+                             narrates the load and the readiness canary, so the
+                             spinner follows the job's own state. -->
+                        <div class="mt-2 flex items-center gap-2 text-xs text-neutral-600"
+                             x-show="assistantLocalRunBusy()" x-cloak
+                             data-cluster-v2-assistant-local-run-busy>
+                            <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                            <span data-cluster-v2-assistant-local-run-progress
+                                  x-text="assistantLocalRunProgressLabel()"></span>
+                        </div>
+
+                        <!-- One refusal: the message and exactly one action. -->
+                        <div class="mt-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-caption text-red-700"
+                             x-show="assistant.localRun.error" x-cloak
+                             data-cluster-v2-assistant-local-run-error>
+                            <p x-text="assistant.localRun.error"></p>
+                            <button type="button"
+                                    @click="assistantActionHandler(assistant.localRun.errorAction)"
+                                    :disabled="assistant.busy"
+                                    x-show="assistant.localRun.errorAction"
+                                    class="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100 disabled:opacity-40"
+                                    data-cluster-v2-assistant-local-run-action
+                                    x-text="assistantActionLabel(assistant.localRun.errorAction)"></button>
+                        </div>
+
+                        <!-- Honest warnings (e.g. the tuning preset outcome). -->
+                        <div class="mt-2" x-show="assistant.localRun.warnings.length" x-cloak
+                             data-cluster-v2-assistant-local-run-warnings>
+                            <template x-for="(warning, warningIndex) in assistant.localRun.warnings" :key="warningIndex">
+                                <p class="text-caption text-neutral-500"
+                                   data-cluster-v2-assistant-local-run-warning
+                                   x-text="warning.message"></p>
+                            </template>
+                        </div>
+
+                        <!-- Ready only: this Mac's endpoint, the serving id and
+                             the existing model-only chat link (Screen 5). -->
+                        <div class="mt-2" x-show="assistantLocalEndpointUrl()" x-cloak
+                             data-cluster-v2-assistant-local-run-endpoint>
+                            <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">Local endpoint</div>
+                            <a :href="assistantLocalEndpointUrl()"
+                               class="text-xs font-semibold text-blue-700 break-all hover:underline"
+                               data-cluster-v2-assistant-local-run-endpoint-url
+                               x-text="assistantLocalEndpointUrl()"></a>
+                            <div class="mt-2 flex flex-wrap items-center gap-2">
+                                <button type="button" @click="openAssistantLocalChat()"
+                                        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800"
+                                        data-cluster-v2-assistant-local-run-open-chat>
+                                    {{ t('cluster.assistant.open_chat') }}
+                                    <i data-lucide="arrow-right" class="w-3 h-3"></i>
+                                </button>
+                            </div>
+                            <p class="mt-1.5 text-caption text-neutral-500">
+                                Serving <code class="font-mono break-all"
+                                             data-cluster-v2-assistant-local-run-model
+                                             x-text="assistant.localRun.modelId"></code>
+                                at
+                                <span data-cluster-v2-assistant-local-run-context
+                                      x-text="(assistant.localRun.contextTokens || 0).toLocaleString() + ' tokens'"></span>.
+                                Stop local run unloads it from this Mac's engine.
+                            </p>
+                        </div>
+                        <!-- Single-node tuning: sampler + MTP on/off/depth with
+                             real completions, redeploying each MTP config
+                             locally. The backend leaves the winning config
+                             loaded and saves it for (model, this Mac); a later
+                             Run on this Mac replays it. -->
+                        <div class="mt-3 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2"
+                             x-show="assistantLocalTunable() || assistant.localTune.busy || assistantLocalTuneRows().length || assistant.localTune.error"
+                             x-cloak data-cluster-v2-assistant-tune-local>
+                            <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">Tune on this Mac</div>
+                            <p class="text-caption text-neutral-500 mt-0.5">
+                                Sweeps the sampler and the MTP switch/depth with real completions, redeploying each MTP config locally. The winning config stays loaded and is saved for this model on this Mac; a later Run on this Mac replays it.
+                            </p>
+                            <div class="mt-2 flex flex-wrap items-center gap-2">
+                                <button type="button" @click="runAssistantTuneLocal()"
+                                        :disabled="assistantRunning() || assistant.localTune.busy || !assistantLocalTunable()"
+                                        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-40"
+                                        data-cluster-v2-assistant-tune-local-button>
+                                    <i data-lucide="sliders-horizontal" class="w-3 h-3"></i>
+                                    <span>Tune on this Mac</span>
+                                </button>
+                            </div>
+                            <div class="mt-2 flex items-center gap-2 text-xs text-neutral-500"
+                                 x-show="assistant.localTune.busy" x-cloak
+                                 data-cluster-v2-assistant-tune-local-busy>
+                                <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                <span data-cluster-v2-assistant-tune-local-progress
+                                      x-text="assistantLocalTuneProgressLabel()"></span>
+                            </div>
+                            <div class="mt-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-caption text-red-700"
+                                 x-show="assistant.localTune.error" x-cloak
+                                 data-cluster-v2-assistant-tune-local-error>
+                                <p x-text="assistant.localTune.error"></p>
+                                <button type="button"
+                                        @click="assistantActionHandler(assistant.localTune.errorAction)"
+                                        :disabled="assistant.busy"
+                                        x-show="assistant.localTune.errorAction"
+                                        class="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100 disabled:opacity-40"
+                                        data-cluster-v2-assistant-tune-local-action
+                                        x-text="assistantActionLabel(assistant.localTune.errorAction)"></button>
+                            </div>
+                            <div class="mt-2" x-show="assistantLocalTuneRows().length"
+                                 data-cluster-v2-assistant-tune-local-rows>
+                                <table class="w-full text-left text-caption">
+                                    <thead>
+                                        <tr class="text-neutral-400">
+                                            <th class="py-0.5 pr-2 font-semibold">Config</th>
+                                            <th class="py-0.5 pr-2 font-semibold">Decode</th>
+                                            <th class="py-0.5 font-semibold">Note</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <template x-for="(row, rowIndex) in assistantLocalTuneRows()" :key="rowIndex">
+                                            <tr class="border-t border-neutral-200" data-cluster-v2-assistant-tune-local-row>
+                                                <td class="py-0.5 pr-2 font-mono" x-text="row.config"></td>
+                                                <td class="py-0.5 pr-2" x-text="assistantLocalTuneRateLabel(row)"></td>
+                                                <td class="py-0.5 text-neutral-500" x-text="row.error || ''"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div class="mt-2 rounded-lg border border-green-200 bg-green-50 px-2.5 py-2"
+                                 x-show="assistant.localTune.best" x-cloak
+                                 data-cluster-v2-assistant-tune-local-best>
+                                <div class="text-caption font-bold uppercase tracking-wider text-green-700">Best measured config</div>
+                                <div class="mt-0.5 text-xs font-semibold text-neutral-900"
+                                     data-cluster-v2-assistant-tune-local-best-label
+                                     x-text="assistantLocalTuneBestLabel()"></div>
+                                <p class="text-caption text-neutral-600">
+                                    The winning config is loaded now and saved for this model on this Mac.
+                                    <span x-show="assistant.localTune.presetKey">Preset <code class="font-mono" x-text="assistant.localTune.presetKey"></code>.</span>
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Search: the automatic constellation loop. An action on
+                         the plan stage, not a new state-machine value. The
+                         backend deploys and measures several constellations and
+                         keeps the best measured; the request is synchronous and
+                         can take minutes, so the button is single-flight and a
+                         busy line is shown. Rates appear only for a measured
+                         constellation, and no endpoint is offered here (the
+                         endpoint stays gated on assistantReady()). Priority and
+                         max-count are buttons, keeping the card input-free. -->
+                    <div class="mt-3 rounded-lg border border-neutral-200 bg-white px-3 py-2"
+                         x-show="assistantState() === 'planning' && assistantSearchAvailable()" x-cloak
+                         data-cluster-v2-assistant-search>
+                        <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.search.title') }}</div>
+                        <p class="text-caption text-neutral-500 mt-0.5">{{ t('cluster.assistant.search.blurb') }}</p>
+
+                        <div class="mt-2 flex flex-wrap items-center gap-2">
+                            <span class="text-caption text-neutral-500">{{ t('cluster.assistant.search.priority_label') }}</span>
+                            <div class="flex flex-wrap items-center gap-1" data-cluster-v2-assistant-search-priority>
+                                <template x-for="option in assistantSearchPriorities()" :key="option.key">
+                                    <button type="button" @click="setAssistantSearchPriority(option.key)"
+                                            :disabled="assistant.search.busy"
+                                            class="px-2 py-0.5 text-caption font-semibold rounded-full border disabled:opacity-40"
+                                            :class="assistant.search.priority === option.key ? 'border-neutral-900 bg-neutral-900 text-white' : 'border-neutral-200 bg-white text-neutral-600 hover:bg-neutral-100'"
+                                            :data-selected="assistant.search.priority === option.key ? 'true' : 'false'"
+                                            :data-priority="option.key"
+                                            x-text="option.label"></button>
+                                </template>
+                            </div>
+                        </div>
+                        <div class="mt-1.5 flex flex-wrap items-center gap-2">
+                            <span class="text-caption text-neutral-500">{{ t('cluster.assistant.search.max_count_label') }}</span>
+                            <div class="flex items-center gap-1" data-cluster-v2-assistant-search-max-count>
+                                <template x-for="count in assistantSearchMaxCounts()" :key="count">
+                                    <button type="button" @click="setAssistantSearchMaxCount(count)"
+                                            :disabled="assistant.search.busy"
+                                            class="w-6 h-6 text-caption font-semibold rounded-full border disabled:opacity-40"
+                                            :class="assistant.search.maxCount === count ? 'border-neutral-900 bg-neutral-900 text-white' : 'border-neutral-200 bg-white text-neutral-600 hover:bg-neutral-100'"
+                                            :data-selected="assistant.search.maxCount === count ? 'true' : 'false'"
+                                            :data-count="count"
+                                            x-text="count"></button>
+                                </template>
+                            </div>
+                            <button type="button" @click="runAssistantSearch()"
+                                    :disabled="assistantRunning() || assistant.search.busy"
+                                    class="ml-auto inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-40"
+                                    data-cluster-v2-assistant-search-button>
+                                <i data-lucide="search" class="w-3.5 h-3.5"></i>
+                                <span>{{ t('cluster.assistant.search.button') }}</span>
+                            </button>
+                        </div>
+
+                        <!-- Busy: the synchronous search can take minutes. -->
+                        <div class="mt-2 flex items-center gap-2 text-xs text-neutral-500"
+                             x-show="assistant.search.busy" x-cloak
+                             data-cluster-v2-assistant-search-busy>
+                            <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                            <span>{{ t('cluster.assistant.search.searching') }}</span>
+                        </div>
+
+                        <!-- Error: a refusal or a failed request, one message. -->
+                        <div class="mt-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-caption text-red-700"
+                             x-show="assistant.search.error" x-cloak
+                             data-cluster-v2-assistant-search-error
+                             x-text="assistant.search.error"></div>
+
+                        <!-- Result: the best measured constellation + the table
+                             of every tested constellation + any errors. -->
+                        <div class="mt-2" x-show="assistant.search.result" x-cloak
+                             data-cluster-v2-assistant-search-result>
+                            <div class="rounded-lg border border-green-200 bg-green-50 px-2.5 py-2"
+                                 x-show="assistantSearchBest()"
+                                 data-cluster-v2-assistant-search-best>
+                                <div class="text-caption font-bold uppercase tracking-wider text-green-700">{{ t('cluster.assistant.search.best_title') }}</div>
+                                <div class="mt-1 text-xs font-semibold text-neutral-900"
+                                     data-cluster-v2-assistant-search-best-rank-order
+                                     x-text="assistantSearchRankOrder(assistantSearchBest())"></div>
+                                <div class="text-caption text-neutral-600"
+                                     data-cluster-v2-assistant-search-best-macs
+                                     x-text="window.t('cluster.assistant.summary.macs_value').replace('{count}', String(assistantSearchBest()?.node_count || 0))"></div>
+                                <div class="text-caption text-neutral-700"
+                                     x-show="assistantSearchMeasuredLabel(assistantSearchBest())"
+                                     data-cluster-v2-assistant-search-best-measured
+                                     x-text="assistantSearchMeasuredLabel(assistantSearchBest())"></div>
+                            </div>
+                            <p class="mt-1 text-caption text-neutral-500"
+                               x-show="!assistantSearchBest()"
+                               data-cluster-v2-assistant-search-no-best>{{ t('cluster.assistant.search.no_best') }}</p>
+
+                            <div class="mt-2" x-show="assistantSearchResults().length"
+                                 data-cluster-v2-assistant-search-results>
+                                <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.search.results_title') }}</div>
+                                <table class="mt-1 w-full text-left text-caption">
+                                    <thead>
+                                        <tr class="text-neutral-400">
+                                            <th class="py-0.5 pr-2 font-semibold">{{ t('cluster.assistant.search.table.constellation') }}</th>
+                                            <th class="py-0.5 pr-2 font-semibold">{{ t('cluster.assistant.search.table.macs') }}</th>
+                                            <th class="py-0.5 pr-2 font-semibold">{{ t('cluster.assistant.search.table.measured') }}</th>
+                                            <th class="py-0.5 font-semibold">{{ t('cluster.assistant.search.table.feasible') }}</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <template x-for="(row, rowIndex) in assistantSearchResults()" :key="rowIndex">
+                                            <tr class="border-t border-neutral-200" data-cluster-v2-assistant-search-row>
+                                                <td class="py-0.5 pr-2 font-mono" x-text="assistantSearchRankOrder(row)"></td>
+                                                <td class="py-0.5 pr-2 font-mono" x-text="row.node_count"></td>
+                                                <td class="py-0.5 pr-2" x-text="assistantSearchRateLabel(row)"></td>
+                                                <td class="py-0.5" x-text="assistantSearchFeasibleLabel(row)"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <div class="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5"
+                                 x-show="assistantSearchErrors().length" x-cloak
+                                 data-cluster-v2-assistant-search-errors>
+                                <div class="text-caption font-semibold text-amber-800">{{ t('cluster.assistant.search.errors_title') }}</div>
+                                <template x-for="(message, errorIndex) in assistantSearchErrors()" :key="errorIndex">
+                                    <p class="text-caption text-amber-700 mt-0.5" x-text="message"></p>
+                                </template>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- applying: the state sentence. The Screen-4 row above
+                         carries the backend's own staging message and Mac count. -->
+                    <div class="mt-3 flex items-center gap-2 text-xs font-semibold text-neutral-900"
+                         x-show="assistantState() === 'applying'" x-cloak
+                         data-assistant-state="applying">
+                        <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        <span>{{ t('cluster.assistant.applying') }}</span>
+                    </div>
+
+                    <!-- starting -->
+                    <div class="mt-3 flex items-center gap-2 text-xs font-semibold text-neutral-900"
+                         x-show="assistantState() === 'starting'" x-cloak
+                         data-assistant-state="starting">
+                        <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        <span x-text="window.t('cluster.assistant.starting').replace('{node}', assistantCoordinatorName())"></span>
+                    </div>
+
+                    <!-- loading -->
+                    <div class="mt-3 flex items-center gap-2 text-xs font-semibold text-neutral-900"
+                         x-show="assistantState() === 'loading'" x-cloak
+                         data-assistant-state="loading">
+                        <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        <span>{{ t('cluster.assistant.loading') }}</span>
+                    </div>
+
+                    <!-- ready: endpoint, copy, Chat and agent only now -->
+                    <div class="mt-3" x-show="assistantState() === 'ready'" x-cloak
+                         data-assistant-state="ready">
+                        <div class="grid grid-cols-2 gap-2">
+                            <div class="min-w-0">
+                                <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.summary.model') }}</div>
+                                <div class="text-xs font-semibold text-neutral-900 truncate"
+                                     x-text="assistantModelLabel()"></div>
+                            </div>
+                            <div class="min-w-0">
+                                <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.summary.context') }}</div>
+                                <div class="text-xs font-semibold text-neutral-900"
+                                     x-text="assistantContextLabel()"></div>
+                            </div>
+                        </div>
+                        <div class="mt-3" x-show="assistantReady()"
+                             data-cluster-v2-assistant-endpoint>
+                            <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.endpoint') }}</div>
+                            <a :href="assistantReady() ? assistant.endpoint.url : null"
+                               class="text-xs font-semibold text-blue-700 break-all hover:underline"
+                               data-cluster-v2-assistant-endpoint-url
+                               x-text="assistant.endpoint ? assistant.endpoint.url : ''"></a>
+                            <div class="mt-2 flex flex-wrap items-center gap-2">
+                                <button type="button" @click="copyAssistantEndpoint()"
+                                        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-full hover:bg-neutral-100"
+                                        data-cluster-v2-assistant-copy-endpoint>
+                                    <i data-lucide="copy" class="w-3 h-3"></i>
+                                    <span x-text="assistant.copied === assistant.endpoint?.url ? window.t('cluster.assistant.copied') : window.t('cluster.assistant.copy_url')"></span>
+                                </button>
+                                <button type="button" @click="openAssistantChat()"
+                                        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800"
+                                        data-cluster-v2-assistant-open-chat>
+                                    {{ t('cluster.assistant.open_chat') }}
+                                    <i data-lucide="arrow-right" class="w-3 h-3"></i>
+                                </button>
+                                <button type="button" @click="toggleAssistantAgent()"
+                                        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-full hover:bg-neutral-100"
+                                        data-cluster-v2-assistant-connect-agent>
+                                    {{ t('cluster.assistant.connect_agent') }}
+                                </button>
+                                <button type="button" @click="refreshAssistantOperation()"
+                                        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-full hover:bg-neutral-100 disabled:opacity-50"
+                                        :disabled="assistant.busy"
+                                        data-cluster-v2-assistant-refresh>
+                                    Refresh
+                                </button>
+                                <button type="button" @click="stopAssistantCluster()"
+                                        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-red-700 bg-white border border-red-200 rounded-full hover:bg-red-50 disabled:opacity-50"
+                                        :disabled="assistant.busy"
+                                        data-cluster-v2-assistant-stop>
+                                    {{ t('cluster.assistant.stop') }}
+                                </button>
+                            </div>
+                            <!-- Remote coordinator: the chat page is that Mac's
+                                 own page, with its own session and key. -->
+                            <p class="mt-2 text-caption text-neutral-500"
+                               x-show="!assistantCoordinatorIsLocal()"
+                               data-cluster-v2-assistant-remote-chat-note
+                               x-text="assistantRemoteChatNote()"></p>
+                            <!-- The one measured line. Present only when the
+                                 backend filled `observed`. -->
+                            <div class="mt-2" x-show="assistantObservedLabel()"
+                                 data-cluster-v2-assistant-observed>
+                                <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.observed.title') }}</div>
+                                <p class="text-caption text-neutral-600"
+                                   data-cluster-v2-assistant-observed-line
+                                   x-text="assistantObservedLabel()"></p>
+                            </div>
+                            <div x-show="assistant.agentOpen" x-cloak
+                                 class="mt-2 rounded-lg border border-neutral-200 bg-white px-3 py-2"
+                                 data-cluster-v2-assistant-agent>
+                                <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.agent.base_url') }}</div>
+                                <code class="block text-caption font-mono text-neutral-800 break-all"
+                                      data-cluster-v2-assistant-agent-base-url
+                                      x-text="assistantAgentBaseUrl()"></code>
+                                <div class="text-caption font-bold uppercase tracking-wider text-neutral-400 mt-1.5">{{ t('cluster.assistant.agent.model') }}</div>
+                                <div class="flex items-center justify-between gap-2">
+                                    <code class="text-caption font-mono text-neutral-800 break-all"
+                                          data-cluster-v2-assistant-agent-model
+                                          x-text="assistantAgentModelId()"></code>
+                                    <button type="button" @click="copyAssistantModel()"
+                                            class="inline-flex items-center gap-1 px-2 py-1 text-caption font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-full hover:bg-neutral-100"
+                                            data-cluster-v2-assistant-copy-model>
+                                        <i data-lucide="copy" class="w-3 h-3"></i>
+                                        <span x-text="assistant.copied === assistantAgentModelId() ? window.t('cluster.assistant.copied') : window.t('cluster.assistant.copy_model_id')"></span>
+                                    </button>
+                                </div>
+                                <p class="text-caption text-neutral-500 mt-1.5"
+                                   x-show="!assistantAgentModelId()"
+                                   data-cluster-v2-assistant-agent-model-unresolved>{{ t('cluster.assistant.agent.model_unresolved') }}</p>
+                                <p class="text-caption text-neutral-500 mt-1.5"
+                                   data-cluster-v2-assistant-agent-note
+                                   x-text="assistantAgentNote()"></p>
+                            </div>
+                        </div>
+                        <!-- Screen 6: the deployment reached Ready and then
+                             stopped. No endpoint, chat or agent link is shown
+                             while it is not serving; Start again re-applies the
+                             frozen plan inputs and starts. -->
+                        <div class="mt-3 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2"
+                             x-show="assistant.stopped" x-cloak
+                             data-cluster-v2-assistant-stopped>
+                            <p class="text-xs font-semibold text-neutral-800">{{ t('cluster.assistant.stopped') }}</p>
+                            <button type="button" @click="startAssistantAgain()"
+                                    class="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-50"
+                                    :disabled="assistant.busy"
+                                    data-cluster-v2-assistant-start-again>
+                                {{ t('cluster.assistant.start_again') }}
+                                <i data-lucide="arrow-right" class="w-3 h-3"></i>
+                            </button>
+                        </div>
+
+                        <!-- Tuning the winning deployment. Fine-tune sweeps
+                             samplers with real completions on the running
+                             cluster and keeps serving. Tune MTP depth redeploys
+                             each MTP config (minutes) and therefore stops the
+                             cluster: the card says so and Start again replays
+                             the saved tuning preset. Every number below is a
+                             measured rate; a knob the backend calls not
+                             applicable says exactly that. -->
+                        <div class="mt-3 rounded-lg border border-neutral-200 bg-white px-3 py-2"
+                             x-show="assistantState() === 'ready'" x-cloak
+                             data-cluster-v2-assistant-tuning>
+                            <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">Tuning</div>
+                            <p class="text-caption text-neutral-500 mt-0.5">
+                                Fine-tune keeps the cluster running and sweeps the sampler with real completions.
+                                Tune MTP depth redeploys every MTP config, so it stops the cluster.
+                            </p>
+                            <div class="mt-2 flex flex-wrap items-center gap-2">
+                                <button type="button" @click="runAssistantTune()"
+                                        :disabled="assistantRunning() || assistantTuneBusy() || !assistantTuneAvailable()"
+                                        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-40"
+                                        data-cluster-v2-assistant-tune>
+                                    <i data-lucide="sliders-horizontal" class="w-3 h-3"></i>
+                                    <span>Fine-tune</span>
+                                </button>
+                                <button type="button" @click="runAssistantTuneRedeploy()"
+                                        :disabled="assistantRunning() || assistantTuneBusy() || !assistantTuneAvailable()"
+                                        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-full hover:bg-neutral-100 disabled:opacity-40"
+                                        data-cluster-v2-assistant-tune-redeploy>
+                                    <i data-lucide="repeat" class="w-3 h-3"></i>
+                                    <span>Tune MTP depth</span>
+                                </button>
+                            </div>
+                            <!-- A stopped cluster has nothing to sweep; the
+                                 existing Start again brings it back first. -->
+                            <p class="mt-1.5 text-caption text-neutral-500"
+                               x-show="!assistantTuneAvailable()"
+                               data-cluster-v2-assistant-tune-needs-start
+                               x-text="assistant.stopped ? 'The cluster is stopped. Use Start again before tuning it.' : 'Tuning needs a ready start operation.'"></p>
+
+                            <!-- Busy: the sampler sweep is quick, the MTP
+                                 sweep redeploys per config. -->
+                            <div class="mt-2 flex items-center gap-2 text-xs text-neutral-500"
+                                 x-show="assistant.tune.busy" x-cloak
+                                 data-cluster-v2-assistant-tune-busy>
+                                <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                <span>Running real completions on the winning cluster…</span>
+                            </div>
+
+                            <!-- One refusal, one message, one action. -->
+                            <div class="mt-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-caption text-red-700"
+                                 x-show="assistant.tune.error" x-cloak
+                                 data-cluster-v2-assistant-tune-error>
+                                <p x-text="assistant.tune.error"></p>
+                                <button type="button"
+                                        @click="assistantActionHandler(assistant.tune.errorAction)"
+                                        :disabled="assistant.busy"
+                                        x-show="assistant.tune.errorAction"
+                                        class="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100 disabled:opacity-40"
+                                        data-cluster-v2-assistant-tune-action
+                                        x-text="assistantActionLabel(assistant.tune.errorAction)"></button>
+                            </div>
+
+                            <!-- The sampler answer: the winner, the knobs it was
+                                 measured with, and the preset Start replays. -->
+                            <div class="mt-2" x-show="assistant.tune.result" x-cloak
+                                 data-cluster-v2-assistant-tune-result>
+                                <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                                    <div class="min-w-0">
+                                        <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">Sampler</div>
+                                        <div class="text-caption text-neutral-800"
+                                             data-cluster-v2-assistant-tune-sampler
+                                             x-text="assistantTuneSamplerLabel()"></div>
+                                    </div>
+                                    <div class="min-w-0">
+                                        <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">Prefill chunk</div>
+                                        <div class="text-caption text-neutral-800"
+                                             data-cluster-v2-assistant-tune-chunk
+                                             x-text="assistantTuneChunkLabel()"></div>
+                                    </div>
+                                    <div class="min-w-0">
+                                        <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">MTP</div>
+                                        <div class="text-caption text-neutral-800"
+                                             data-cluster-v2-assistant-tune-mtp
+                                             x-text="assistantTuneMtpLabel()"></div>
+                                        <div class="text-caption text-neutral-500"
+                                             x-show="assistantTuneMtpRatesLabel()"
+                                             data-cluster-v2-assistant-tune-mtp-rates
+                                             x-text="assistantTuneMtpRatesLabel()"></div>
+                                    </div>
+                                </div>
+                                <p class="mt-1.5 text-caption text-neutral-500">
+                                    Saved preset: <code class="font-mono break-all"
+                                          data-cluster-v2-assistant-tune-preset
+                                          x-text="assistantTunePresetLabel()"></code>
+                                </p>
+                                <p class="text-caption text-neutral-500">Start replays the saved tuning.</p>
+                            </div>
+
+                            <!-- The MTP sweep: honest progress, one row per
+                                 measured config, the measured winner, and the
+                                 fact that the cluster is stopped afterwards. -->
+                            <div class="mt-2"
+                                 x-show="assistant.tuneRedeploy.busy || assistantTuneRedeployRows().length || assistant.tuneRedeploy.error" x-cloak
+                                 data-cluster-v2-assistant-tune-redeploy-panel>
+                                <div class="flex items-center gap-2 text-xs text-neutral-600"
+                                     x-show="assistant.tuneRedeploy.busy"
+                                     data-cluster-v2-assistant-tune-redeploy-busy>
+                                    <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                    <span data-cluster-v2-assistant-tune-redeploy-progress
+                                          x-text="assistantTuneRedeployProgressLabel()"></span>
+                                </div>
+
+                                <div class="mt-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-caption text-red-700"
+                                     x-show="assistant.tuneRedeploy.error" x-cloak
+                                     data-cluster-v2-assistant-tune-redeploy-error>
+                                    <p x-text="assistant.tuneRedeploy.error"></p>
+                                    <button type="button"
+                                            @click="assistantActionHandler(assistant.tuneRedeploy.errorAction)"
+                                            :disabled="assistant.busy"
+                                            x-show="assistant.tuneRedeploy.errorAction"
+                                            class="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100 disabled:opacity-40"
+                                            data-cluster-v2-assistant-tune-redeploy-action
+                                            x-text="assistantActionLabel(assistant.tuneRedeploy.errorAction)"></button>
+                                </div>
+
+                                <div class="mt-2" x-show="assistantTuneRedeployRows().length"
+                                     data-cluster-v2-assistant-tune-redeploy-rows>
+                                    <table class="w-full text-left text-caption">
+                                        <thead>
+                                            <tr class="text-neutral-400">
+                                                <th class="py-0.5 pr-2 font-semibold">Config</th>
+                                                <th class="py-0.5 pr-2 font-semibold">MTP</th>
+                                                <th class="py-0.5 pr-2 font-semibold">Decode</th>
+                                                <th class="py-0.5 font-semibold">Note</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <template x-for="(row, rowIndex) in assistantTuneRedeployRows()" :key="rowIndex">
+                                                <tr class="border-t border-neutral-200" data-cluster-v2-assistant-tune-redeploy-row>
+                                                    <td class="py-0.5 pr-2 font-mono" x-text="row.config"></td>
+                                                    <td class="py-0.5 pr-2 font-mono" x-text="assistantTuneRedeployMtpLabel(row)"></td>
+                                                    <td class="py-0.5 pr-2" x-text="assistantTuneRedeployRateLabel(row)"></td>
+                                                    <td class="py-0.5 text-neutral-500" x-text="row.error || ''"></td>
+                                                </tr>
+                                            </template>
+                                        </tbody>
+                                    </table>
+                                </div>
+
+                                <div class="mt-2 rounded-lg border border-green-200 bg-green-50 px-2.5 py-2"
+                                     x-show="assistantTuneRedeployBest()" x-cloak
+                                     data-cluster-v2-assistant-tune-redeploy-best>
+                                    <div class="text-caption font-bold uppercase tracking-wider text-green-700">Best measured config</div>
+                                    <div class="mt-0.5 text-xs font-semibold text-neutral-900"
+                                         data-cluster-v2-assistant-tune-redeploy-best-label
+                                         x-text="assistantTuneRedeployBestLabel()"></div>
+                                    <p class="text-caption text-neutral-600">Start replays the saved tuning.</p>
+                                </div>
+
+                                <p class="mt-1.5 text-caption text-neutral-600"
+                                   x-show="assistant.tuneRedeploy.state === 'completed' || assistant.tuneRedeploy.state === 'failed'"
+                                   data-cluster-v2-assistant-tune-redeploy-stopped>
+                                    The MTP sweep stops every config it measures, so the cluster is stopped now.
+                                    Use <span class="font-semibold">Start again</span> to run it with the saved tuning.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- failed: one message and exactly one action -->
+                    <div class="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700"
+                         x-show="assistantState() === 'failed'" x-cloak
+                         role="alert"
+                         data-assistant-state="failed"
+                         data-cluster-v2-assistant-error>
+                        <p class="font-semibold" x-text="assistantErrorMessage()"></p>
+                        <p class="mt-1"
+                           x-show="assistant.error?.action === 'retry_coordinator'"
+                           data-cluster-v2-assistant-coordinator-note
+                           x-text="assistantCoordinatorInstruction()"></p>
+                        <button type="button"
+                                @click="assistantActionHandler(assistant.error?.action)"
+                                :disabled="assistant.busy"
+                                class="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100 disabled:opacity-40"
+                                x-show="!(assistant.error?.code === 'topology_incomplete' && assistant.topologyFallback)"
+                                data-cluster-v2-assistant-action
+                                x-text="assistantActionLabel(assistant.error?.action)"></button>
+
+                        <!-- Topology: the measured fabric has no line for the
+                             selected rank order. Show the exact missing cable;
+                             the 2-Mac plan is applied only after this explicit
+                             confirmation (and its signature records it). -->
+                        <div class="mt-2 rounded-lg border border-red-200 bg-white px-2.5 py-2"
+                             x-show="assistant.error?.code === 'topology_incomplete'" x-cloak
+                             data-cluster-v2-assistant-topology>
+                            <p class="font-semibold">The measured fabric has no line for this plan</p>
+                            <p class="mt-1" x-show="assistant.missingLinks?.length"
+                               data-cluster-v2-assistant-missing-links>
+                                Missing link:
+                                <span class="font-mono"
+                                      x-text="(assistant.missingLinks || []).map((pair) => pair.join(' <-> ')).join(', ')"></span>
+                            </p>
+                            <p class="mt-1" x-show="assistant.topologyFallback"
+                               data-cluster-v2-assistant-fallback-summary>
+                                Two Macs fit: <span x-text="(assistant.topologyFallback?.rank_order || []).join(' <-> ')"></span>
+                                at <span x-text="assistant.topologyFallback?.context_tokens"></span> tokens.
+                            </p>
+                            <button type="button"
+                                    @click="confirmAssistantTwoMacFallback()"
+                                    x-show="assistant.topologyFallback"
+                                    class="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100"
+                                    data-cluster-v2-assistant-two-mac-fallback>
+                                Run with 2 Macs
+                            </button>
+                        </div>
+
+                        <!-- Free space: the UI of the one action `free_disk_space`
+                             (PHASE-2B-RUN.md §9). The user picks the Mac first,
+                             so no other Mac's models are ever listed; Delete is
+                             a two-step confirm, and the assistant never deletes
+                             by itself. Sizes come from the measurement, and the
+                             model the cluster is about to run is not offered. -->
+                        <div class="mt-2 rounded-lg border border-red-200 bg-white px-2.5 py-2"
+                             x-show="assistant.error?.action === 'free_disk_space' && assistant.freeSpaceOpen" x-cloak
+                             data-cluster-v2-assistant-free-space>
+                            <p class="font-semibold">{{ t('cluster.assistant.free_space.hint') }}</p>
+                            <div class="mt-1 flex flex-wrap items-center gap-2">
+                                <template x-for="node in assistantFreeSpaceNodes()" :key="node.node_id">
+                                    <button type="button" @click="chooseAssistantFreeSpaceNode(node.node_id)"
+                                            class="px-2.5 py-1 text-caption font-semibold rounded-full border"
+                                            :class="assistant.freeSpaceNode === node.node_id ? 'border-red-300 bg-red-50 text-red-800' : 'border-red-200 bg-white text-red-700 hover:bg-red-50'"
+                                            :data-selected="assistant.freeSpaceNode === node.node_id ? 'true' : 'false'"
+                                            data-cluster-v2-assistant-free-space-node
+                                            x-text="assistantNodeLabel(node.node_id)"></button>
+                                </template>
+                            </div>
+                            <div class="mt-2" x-show="assistant.freeSpaceNode"
+                                 data-cluster-v2-assistant-free-space-models>
+                                <p x-show="!assistantFreeSpaceModels().length"
+                                   class="text-caption text-neutral-500">{{ t('cluster.assistant.free_space.none') }}</p>
+                                <template x-for="model in assistantFreeSpaceModels()" :key="model.model_id">
+                                    <div class="flex items-center justify-between gap-2 py-0.5"
+                                         data-cluster-v2-assistant-free-space-model>
+                                        <span class="min-w-0 truncate text-caption">
+                                            <span class="font-semibold" x-text="model.label"></span>
+                                            <span class="text-neutral-500" x-text="' · ' + model.size"></span>
+                                        </span>
+                                        <button type="button" @click="deleteAssistantModel(model)"
+                                                :disabled="assistant.freeSpaceBusy"
+                                                class="px-2.5 py-1 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100 disabled:opacity-40"
+                                                data-cluster-v2-assistant-free-space-delete
+                                                x-text="assistantDeleteLabel(model)"></button>
+                                    </div>
+                                </template>
+                            </div>
+                            <p class="mt-1 text-caption" x-show="assistant.freeSpaceError"
+                               data-cluster-v2-assistant-free-space-error
+                               x-text="assistant.freeSpaceError"></p>
+                        </div>
+                    </div>
+
+                    <!-- Advanced evidence stays collapsed: stages, rank order,
+                         ids, warnings and the raw operation body. -->
+                    <details class="mt-3" x-show="assistantHasDetails()"
+                             data-cluster-v2-assistant-details>
+                        <summary class="text-caption font-semibold uppercase tracking-wider text-neutral-400 cursor-pointer">{{ t('cluster.assistant.details') }}</summary>
+                        <div class="mt-2 space-y-1 text-caption text-neutral-500">
+                            <p>
+                                <span class="font-semibold">{{ t('cluster.assistant.details.measurement') }}</span>
+                                <code class="font-mono break-all" data-cluster-v2-assistant-measurement x-text="assistant.measurementId"></code>
+                            </p>
+                            <p x-show="assistant.plan">
+                                <span class="font-semibold">{{ t('cluster.assistant.details.signature') }}</span>
+                                <code class="font-mono break-all" data-cluster-v2-assistant-signature x-text="assistant.plan?.plan_signature || ''"></code>
+                            </p>
+                            <div class="mt-1 flex flex-wrap items-center gap-1">
+                                <button type="button" @click="copyAssistantDiagnostics()"
+                                        class="inline-flex items-center gap-1 px-2 py-1 text-caption font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-full hover:bg-neutral-100"
+                                        data-cluster-v2-assistant-copy-diagnostics>
+                                    <i data-lucide="copy" class="w-3 h-3"></i>
+                                    <span>Copy diagnostics</span>
+                                </button>
+                                <button type="button" @click="runAssistantNetworkPreflight()"
+                                        class="inline-flex items-center gap-1 px-2 py-1 text-caption font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-full hover:bg-neutral-100"
+                                        :disabled="assistant.networkPreflightBusy"
+                                        data-cluster-v2-assistant-network-preflight>
+                                    <i data-lucide="network" class="w-3 h-3"></i>
+                                    <span>Network preflight</span>
+                                </button>
+                            </div>
+                            <!-- Read-only: commands are shown for review, never executed here. -->
+                            <div class="mt-2 rounded-lg border border-neutral-200 bg-neutral-50 px-2.5 py-2 text-caption text-neutral-700"
+                                 x-show="assistant.networkPreflight" x-cloak
+                                 data-cluster-v2-assistant-network-plan>
+                                <p class="font-semibold">Read-only network preflight</p>
+                                <p class="mt-1" x-show="assistant.networkPreflight?.warnings?.length"
+                                   x-text="(assistant.networkPreflight?.warnings || []).join(' ')"></p>
+                                <pre class="mt-1 overflow-x-auto font-mono text-caption whitespace-pre-wrap"
+                                     data-cluster-v2-assistant-network-commands
+                                     x-text="(assistant.networkPreflight?.commands || []).join('\n')"></pre>
+                                <p class="mt-1">Nothing is executed. Review the commands before running them; a later helper step will be the only privileged apply.</p>
+                                <button type="button" @click="copyAssistantNetworkCommands()"
+                                        class="mt-1 inline-flex items-center gap-1 px-2 py-1 text-caption font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-full hover:bg-neutral-100"
+                                        data-cluster-v2-assistant-copy-network>
+                                    <i data-lucide="copy" class="w-3 h-3"></i>
+                                    <span>Copy commands</span>
+                                </button>
+                            </div>
+                            <p x-show="assistant.deploymentId">
+                                <span class="font-semibold">{{ t('cluster.assistant.details.deployment') }}</span>
+                                <code class="font-mono break-all" data-cluster-v2-assistant-deployment x-text="assistant.deploymentId"></code>
+                            </p>
+                            <p x-show="assistant.plan">
+                                <span class="font-semibold">{{ t('cluster.assistant.details.rank_order') }}</span>
+                                <code class="font-mono break-all" data-cluster-v2-assistant-rank-order x-text="assistantRankOrderLabel()"></code>
+                            </p>
+                            <div x-show="assistantStages().length" data-cluster-v2-assistant-stages>
+                                <span class="font-semibold">{{ t('cluster.assistant.details.stages') }}</span>
+                                <table class="mt-1 w-full text-left text-caption">
+                                    <thead>
+                                        <tr class="text-neutral-400">
+                                            <th class="py-0.5 pr-2 font-semibold">{{ t('cluster.assistant.details.rank') }}</th>
+                                            <th class="py-0.5 pr-2 font-semibold">{{ t('cluster.assistant.details.mac') }}</th>
+                                            <th class="py-0.5 pr-2 font-semibold">{{ t('cluster.assistant.details.layers') }}</th>
+                                            <th class="py-0.5 font-semibold">{{ t('cluster.assistant.details.headroom') }}</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <template x-for="stage in assistantStages()" :key="stage.rank">
+                                            <tr class="border-t border-neutral-200">
+                                                <td class="py-0.5 pr-2 font-mono" x-text="stage.rank"></td>
+                                                <td class="py-0.5 pr-2 font-mono truncate" x-text="stage.node_id"></td>
+                                                <td class="py-0.5 pr-2 font-mono" x-text="stage.first_layer + '–' + stage.last_layer"></td>
+                                                <td class="py-0.5 font-mono" x-text="Math.round(stage.headroom_gib) + ' GiB'"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div x-show="assistantPlanWarnings().length"
+                                 data-cluster-v2-assistant-warnings>
+                                <span class="font-semibold">{{ t('cluster.assistant.details.warnings') }}</span>
+                                <template x-for="warning in assistantPlanWarnings()" :key="warning.code + warning.node_id">
+                                    <p class="mt-0.5" x-text="warning.message"></p>
+                                </template>
+                            </div>
+                            <!-- Phase A: advanced override. The default is the
+                                 fewest Macs that fit; forcing every Mac is an
+                                 explicit choice and the plan is recomputed. -->
+                            <button type="button"
+                                    class="mt-2 text-caption font-semibold text-neutral-500 underline"
+                                    data-cluster-v2-assistant-use-all-macs
+                                    x-show="assistantCanChangeNodeSelection()"
+                                    @click="toggleAssistantNodeSelection()"
+                                    x-text="assistant.nodeSelection === 'all' ? 'Use the fewest Macs that fit' : 'Use all Macs'">
+                            </button>
+                            <pre class="mt-1 max-h-48 overflow-auto rounded bg-neutral-900 text-neutral-100 p-2 text-caption whitespace-pre-wrap"
+                                 x-show="assistant.operation"
+                                 data-cluster-v2-assistant-operation
+                                 x-text="assistantOperationJson()"></pre>
+                        </div>
+                    </details>
+                </div>
+                <!-- /Assistant -->
+            </div>
+        </section>
+
         <!-- ============================ plan ============================= -->
         <section x-show="wizardState() === 'plan'" x-cloak
                  class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"

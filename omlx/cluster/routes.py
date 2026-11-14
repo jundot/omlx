@@ -62,6 +62,7 @@ from .discovery import (
 )
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
 from .guidance import explain
+from .identity import get_node_identity
 from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
@@ -107,7 +108,6 @@ from .planner import (
 from .probe import collect_cluster_status
 from .rdma.link_routes import cluster_rdma_link_verify, cluster_rdma_links
 from .registry import get_cluster_registry, get_device_registry
-from .identity import get_node_identity
 from .replan import (
     hosts_from_deployment,
     nodes_from_deployment,
@@ -1929,6 +1929,85 @@ def _run_staging_job(
         )
 
 
+def start_cluster_staging(
+    deployment: ClusterDeployment,
+    *,
+    source_host: str = "127.0.0.1",
+    parallel: int = 4,
+) -> dict[str, Any]:
+    """Create and start one observable staging job; return its first snapshot.
+
+    Extracted unchanged out of ``POST /stage`` so the Cluster Assistant's
+    ``apply`` uses this one implementation instead of a second copy: the route
+    and the assistant differ only in who signed the deployment and who polls the
+    job. The caller has already validated the placement.
+    """
+
+    model_path = Path(deployment.model).expanduser()
+    job_id = secrets.token_hex(12)
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "ready": False,
+        "model_path": str(model_path),
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "error": "",
+        "nodes": {
+            assignment.node_id: {
+                "node_id": assignment.node_id,
+                "rank": assignment.rank,
+                "status": "queued",
+                "files_total": 0,
+                "files_completed": 0,
+                "bytes_total": 0,
+                "bytes_completed": 0,
+                "files": {},
+                "error": "",
+            }
+            for assignment in deployment.assignments
+        },
+    }
+    _record_staging_job(job)
+    thread = threading.Thread(
+        target=_run_staging_job,
+        args=(job_id, deployment),
+        kwargs={
+            "source_host": source_host,
+            "parallel": parallel,
+        },
+        name=f"omlx-model-staging-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return _staging_job_snapshot(job_id) or job
+
+
+def read_cluster_staging_job(job_id: str) -> dict[str, Any] | None:
+    """One staging job's current progress, or ``None`` when it is unknown."""
+
+    return _staging_job_snapshot(job_id)
+
+
+def prepare_cluster_deployment(
+    request: ClusterDeploymentRequest,
+) -> tuple[ClusterDeploymentRequest, ClusterDeployment, dict[str, Any]]:
+    """Recompute the deployment and return it with the signature it will carry.
+
+    This is the head of ``_activate_and_report`` exposed as one call, so the
+    Cluster Assistant can stage exactly the placement the activation will
+    launch: same planner, same request, same ``placement_signature`` the
+    approval guard compares. It decides nothing of its own — an invalid request
+    raises exactly what activation would raise.
+    """
+
+    deployment, plan = _create_deployment(request)
+    signed = request.model_copy(
+        update={"approved_placement": _placement_signature(plan)}
+    )
+    return signed, deployment, _plan_with_signature(plan)
+
+
 @router.post("/stage")
 async def cluster_stage(request: ClusterStageRequest):
     """Start an observable, resumable model×node staging job."""
@@ -1950,43 +2029,11 @@ async def cluster_stage(request: ClusterStageRequest):
                 status_code=400,
                 detail="The coordinator does not have the selected model to stage.",
             )
-        job_id = secrets.token_hex(12)
-        job = {
-            "job_id": job_id,
-            "status": "queued",
-            "ready": False,
-            "model_path": str(model_path),
-            "created_at": time.time(),
-            "updated_at": time.time(),
-            "error": "",
-            "nodes": {
-                assignment.node_id: {
-                    "node_id": assignment.node_id,
-                    "rank": assignment.rank,
-                    "status": "queued",
-                    "files_total": 0,
-                    "files_completed": 0,
-                    "bytes_total": 0,
-                    "bytes_completed": 0,
-                    "files": {},
-                    "error": "",
-                }
-                for assignment in deployment.assignments
-            },
-        }
-        _record_staging_job(job)
-        thread = threading.Thread(
-            target=_run_staging_job,
-            args=(job_id, deployment),
-            kwargs={
-                "source_host": source_host,
-                "parallel": request.parallel,
-            },
-            name=f"omlx-model-staging-{job_id[:8]}",
-            daemon=True,
+        return start_cluster_staging(
+            deployment,
+            source_host=source_host,
+            parallel=request.parallel,
         )
-        thread.start()
-        return _staging_job_snapshot(job_id)
     except InsufficientDiskError as exc:
         raise HTTPException(status_code=507, detail=str(exc)) from exc
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -1999,7 +2046,7 @@ async def cluster_stage_status(job_id: str):
 
     if not re.fullmatch(r"[0-9a-f]{24}", job_id):
         raise HTTPException(status_code=404, detail="staging job not found")
-    snapshot = _staging_job_snapshot(job_id)
+    snapshot = read_cluster_staging_job(job_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="staging job not found")
     return snapshot
@@ -3278,7 +3325,7 @@ async def cluster_models(request: ClusterModelInventoryRequest) -> dict[str, Any
                 remote_model_inventory,
                 validated,
                 python_executable=(
-                    host.python_executable or "~/omlx-distributed/.venv/bin/python"
+                    host.python_executable or DEFAULT_REMOTE_PYTHON
                 ),
             )
             source_python = host.python_executable or DEFAULT_REMOTE_PYTHON
@@ -3464,6 +3511,22 @@ async def cluster_catalogue(request: ClusterCatalogueRequest) -> dict[str, Any]:
         "runnable_count": len(runnable),
         "largest_runnable": runnable[0] if runnable else None,
     }
+
+
+@router.post("/performance-probe")
+async def cluster_performance_probe(request: ClusterDeploymentRequest) -> dict[str, Any]:
+    """Run the synthetic compute probe on the placement this caller approved.
+
+    The probe is model-independent: it measures each rank's effective weight
+    rate and the collective link before a model is loaded. The assistant calls
+    it after apply and stores the profiles for its *next* plan; it never
+    rewrites the current plan.
+    """
+
+    _, deployment, _ = await asyncio.to_thread(
+        prepare_cluster_deployment, request
+    )
+    return await asyncio.to_thread(run_cluster_performance_probe, deployment)
 
 
 @router.get("/deployments")

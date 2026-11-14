@@ -168,6 +168,14 @@ def test_no_unreachable_functions_in_the_cluster_package():
         ("registry.py", "reset_configured_device_registry"),
         ("pairing.py", "reset_pairing_manager"),
         ("pairing_routes.py", "set_pairing_manager_getter"),
+        # The tested fold primitive: the measure job attaches a calibration
+        # profile on the node payload directly, so this copy-helper is exercised
+        # only by the measurement tests today.
+        ("measurement.py", "with_calibration"),
+        # The tested key contract for a tuning preset (model signature +
+        # hardware pair); TuningPresetStore already keys by preset_key, so the
+        # comparison has no production caller yet.
+        ("tuning.py", "preset_matches"),
     }
 
     name_counts = Counter(

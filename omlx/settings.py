@@ -215,10 +215,17 @@ class ServerSettings:
     # large resident models). Ticks stop after gpu_keep_warm_idle_window
     # seconds without requests. 0 disables.
     gpu_keep_warm_interval: float = 0.5
-    # Seconds without requests after which the keep-warm ticks stop (default
+# Seconds without requests after which the keep-warm ticks stop (default
     # 5 minutes). A client that talks to the server less often than this pays
     # the first-command stall on every request; raise it to cover that gap.
     gpu_keep_warm_idle_window: float = 300.0
+    # Cluster Assistant: run one real completion after a cluster is ready and
+    # record its measured token rates as the operation's ``observed`` block.
+    # Off by default: the assistant never spends tokens on the user's cluster
+    # unless this Mac's own settings ask it to. It never rewrites ``predicted``
+    # and never changes the approved placement (the assistant keeps auto_tune
+    # off).
+    assistant_performance_probe: bool = False
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -268,8 +275,11 @@ class ServerSettings:
             max_request_body_size=data.get("max_request_body_size", "512MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),
             gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
-            gpu_keep_warm_idle_window=float(
+gpu_keep_warm_idle_window=float(
                 data.get("gpu_keep_warm_idle_window", 300.0)
+            ),
+            assistant_performance_probe=bool(
+                data.get("assistant_performance_probe", False)
             ),
         )
 

@@ -37,6 +37,10 @@
 #   apps/omlx-mac/Scripts/build.sh release --bare     # skip Python embed
 #                                                       (no server, just the
 #                                                       AppView shell)
+#   apps/omlx-mac/Scripts/build.sh release --slim     # Swift app + omlx source,
+#                                                       no Python/MLX layers;
+#                                                       uses the provisioned
+#                                                       runtime venv
 #   apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 #                                                     # build and bundle optional
 #                                                     # native custom kernels
@@ -85,11 +89,13 @@ if [ $# -gt 0 ]; then
 fi
 
 BARE=0
+SLIM=0
 WITH_CUSTOM_KERNEL="${OMLX_WITH_CUSTOM_KERNEL:-0}"
 REBUILD_DONOR=auto    # auto | force | never
 for arg in "$@"; do
     case "$arg" in
         --bare) BARE=1 ;;
+        --slim) SLIM=1 ;;
         --with-custom-kernel) WITH_CUSTOM_KERNEL=1 ;;
         --rebuild-donor) REBUILD_DONOR=force ;;
         --no-rebuild-donor) REBUILD_DONOR=never ;;
@@ -553,6 +559,95 @@ STAGED_APP="$OUTPUT_DIR/oMLX.app"
 log "Staging bundle at $STAGED_APP"
 rm -rf "$STAGED_APP"
 ditto "$XCODE_APP" "$STAGED_APP"
+
+if [ "$SLIM" -eq 1 ]; then
+    RESOURCES_DIR="$STAGED_APP/Contents/Resources"
+    mkdir -p "$RESOURCES_DIR"
+
+    log "Slim build: copying omlx/omlx_web source (no Python/MLX layers)…"
+    rm -rf "$RESOURCES_DIR/omlx" "$RESOURCES_DIR/omlx_web"
+    rsync -a         --exclude='__pycache__' --exclude='*.pyc' --exclude='tests'         --exclude='.git' --exclude='custom_kernels/*/csrc'         --exclude='custom_kernels/include'         "$REPO_ROOT/omlx/" "$RESOURCES_DIR/omlx/"
+    rsync -a         --exclude='__pycache__' --exclude='*.pyc'         "$REPO_ROOT/apps/omlx-web/omlx_web/" "$RESOURCES_DIR/omlx_web/"
+    [ -f "$RESOURCES_DIR/omlx_web/templates/dashboard.html" ]         || die "omlx_web templates are missing from the slim bundle."
+    ok "  + omlx/omlx_web source"
+
+    # First-run installer inputs: the pinned uv binary, the lock/manifest and
+    # the manual fallback script. Python/MLX themselves are downloaded later.
+    RUNTIME_BUNDLE="$RESOURCES_DIR/runtime"
+    PROJECT_BUNDLE="$RESOURCES_DIR/runtime-project"
+    mkdir -p "$RUNTIME_BUNDLE" "$PROJECT_BUNDLE"
+    UV_BIN="${UV_BIN:-$(command -v uv || true)}"
+    if [ -z "$UV_BIN" ] && [ -x "$REPO_ROOT/.venv/bin/uv" ]; then
+        UV_BIN="$REPO_ROOT/.venv/bin/uv"
+    fi
+    [ -n "$UV_BIN" ] && [ -x "$UV_BIN" ] \
+        || die "uv binary not found; set UV_BIN=/path/to/uv"
+    cp "$UV_BIN" "$RUNTIME_BUNDLE/uv"
+    chmod 755 "$RUNTIME_BUNDLE/uv"
+    cp "$REPO_ROOT/pyproject.toml" "$REPO_ROOT/uv.lock" \
+        "$REPO_ROOT/.python-version" "$PROJECT_BUNDLE/"
+    cp "$REPO_ROOT/apps/omlx-mac/Scripts/provision_runtime.sh" "$PROJECT_BUNDLE/"
+    ok "  + runtime installer (uv + lock)"
+
+    # Privileged helper: one signed executable plus its launchd plists. The
+    # app's Info.plist has the matching SMPrivilegedExecutables requirement.
+    HELPER_DIR="$REPO_ROOT/apps/omlx-mac/Helper"
+    HELPER_TOOLS="$STAGED_APP/Contents/Library/LaunchServices"
+    HELPER_DAEMONS="$STAGED_APP/Contents/Library/LaunchDaemons"
+    mkdir -p "$HELPER_TOOLS" "$HELPER_DAEMONS"
+    # SMJobBless reads the helper's Info.plist and launchd plist from the
+    # binary's __TEXT sections, not from files on disk. Embedding the launchd
+    # plist is mandatory: without it SMJobBless cannot find a job to install.
+    # The launchd plist carries only its Label; SMJobBless fills in
+    # ProgramArguments itself.
+    xcrun swiftc -O -target "$(uname -m)-apple-macos15.0" \
+        -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+        -Xlinker "$HELPER_DIR/Info.plist" \
+        -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __launchd_plist \
+        -Xlinker "$HELPER_DIR/app.omlx.helper.bless.plist" \
+        -o "$HELPER_TOOLS/app.omlx.helper" "$HELPER_DIR/main.swift" \
+        || die "privileged helper compilation failed."
+    # Kept for the later SMAppService.daemon(plistName:) path, which reads the
+    # plist from the bundle. SMJobBless ignores this file.
+    cp "$HELPER_DIR/app.omlx.helper.plist" \
+        "$HELPER_DAEMONS/app.omlx.helper.plist"
+    chmod 755 "$HELPER_TOOLS/app.omlx.helper"
+    ok "  + privileged helper (SMJobBless)"
+
+    # The slim app starts the server from the external runtime venv; no
+    # PYTHONHOME and no embedded framework path.
+    for wrapper in omlx-cli omlx-cluster-python; do
+        cat > "$STAGED_APP/Contents/MacOS/$wrapper" <<'WRAPPER'
+#!/bin/sh
+set -eu
+REAL_PATH="$(realpath "$0")"
+APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$REAL_PATH")/.." && pwd)"
+RESOURCES="$APP_ROOT/Resources"
+RUNTIME_DIR="${OMLX_RUNTIME_DIR:-$HOME/Library/Application Support/oMLX/runtime}"
+PYTHON="$RUNTIME_DIR/venv/bin/python3"
+if [ ! -x "$PYTHON" ]; then
+    echo "oMLX runtime missing at $PYTHON; run apps/omlx-mac/Scripts/provision_runtime.sh" >&2
+    exit 1
+fi
+export PYTHONDONTWRITEBYTECODE=1
+if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="$RESOURCES:$PYTHONPATH"
+else
+    export PYTHONPATH="$RESOURCES"
+fi
+WRAPPER
+    done
+    cat >> "$STAGED_APP/Contents/MacOS/omlx-cli" <<'WRAPPER'
+exec "$PYTHON" -m omlx.cli "$@"
+WRAPPER
+    cat >> "$STAGED_APP/Contents/MacOS/omlx-cluster-python" <<'WRAPPER'
+exec "$PYTHON" "$@"
+WRAPPER
+    chmod 755 "$STAGED_APP/Contents/MacOS/omlx-cli"         "$STAGED_APP/Contents/MacOS/omlx-cluster-python"
+    ok "  + slim runtime wrappers"
+    ok "Bundle ready: $STAGED_APP"
+    exit 0
+fi
 
 if [ "$BARE" -eq 1 ]; then
     warn "--bare set: skipping Python embed. The server will fail to spawn."

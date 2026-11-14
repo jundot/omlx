@@ -2894,6 +2894,11 @@
             // Model State
             availableModels: [],
             currentModel: null,
+            // The Cluster Assistant's handoff link: /chat?model=<serving id>.
+            // Read once, applied on the first loaded model list, and never
+            // written back into history or the URL.
+            requestedModelParam: null,
+            requestedModelApplied: false,
 
             // Streaming State
             streamSessions: {},
@@ -3414,6 +3419,35 @@
                 } else {
                     this.currentModel = this.resolveGatewayModelId(this.currentModel);
                 }
+            },
+
+            /** The one query parameter the Cluster Assistant link carries. */
+            requestedModelFromUrl() {
+                if (this.requestedModelParam !== null) return this.requestedModelParam;
+                let value = '';
+                try {
+                    const params = new URLSearchParams(window.location.search || '');
+                    value = String(params.get('model') || '').trim();
+                } catch (e) {
+                    value = '';
+                }
+                this.requestedModelParam = value;
+                return value;
+            },
+
+            /**
+             * Select a known ?model= once the list is loaded. An unknown value
+             * leaves the normal default selection untouched, and a later reload
+             * is the only thing that applies it again (the parameter is in the
+             * URL; nothing is pushed into history here).
+             */
+            applyRequestedModelFromUrl() {
+                if (this.requestedModelApplied) return;
+                if (!this.availableModels?.length) return;
+                this.requestedModelApplied = true;
+                const requested = this.requestedModelFromUrl();
+                if (!requested || !this.isModelAvailableOnServer(requested)) return;
+                this.currentModel = this.resolveGatewayModelId(requested);
             },
 
             /** Keep messages through the user turn that precedes endIndex (drops assistant + tool rows). */
@@ -5291,6 +5325,7 @@
             }
 
             this.reconcileCurrentModelAfterLoad(defaultModel);
+            this.applyRequestedModelFromUrl();
         } catch (error) {
             console.error('Error loading models:', error);
         }

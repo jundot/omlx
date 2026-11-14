@@ -79,6 +79,119 @@ function clusterV2Wizard() {
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}/unload`,
     };
 
+    // The Cluster Assistant surface: seven admin routes, and nothing else.
+    // SCREEN-3-MINIMAL.md §2: the browser never launches, stages, deploys or
+    // starts inference itself — it calls these and renders the answer.
+    // A 32 GB Mac cannot spare the 32 GiB workstation reserve and still hold a
+    // pipeline stage; the assistant treats it as Headless (see assistantRoles).
+    const ASSISTANT_SMALL_MAC_RAM_GB = 64;
+    // The backend's recommend route accepts at most this many candidates
+    // (models.py MAX_RECOMMENDATION_CANDIDATES). A larger catalogue is narrowed
+    // client-side, never sent and refused.
+    const ASSISTANT_MAX_CANDIDATES = 32;
+    // A minutes-long measurement/launch must survive a transient network blip:
+    // tolerate this many consecutive poll errors (with backoff) before failing.
+    const ASSISTANT_POLL_MAX_ERRORS = 3;
+
+    const ASSISTANT_API = {
+        measure: '/admin/api/cluster/assistant/measure',
+        status: '/admin/api/cluster/assistant/status',
+        recommend: '/admin/api/cluster/assistant/recommend',
+        plan: '/admin/api/cluster/assistant/plan',
+        apply: '/admin/api/cluster/assistant/apply',
+        start: '/admin/api/cluster/assistant/start',
+        // The automatic constellation search: ranks, deploys and measures
+        // several constellations, keeps the best measured and stops the losers.
+        // POST returns a job handle immediately; the loop runs in the background
+        // and searchStatus(jobId) polls progress + the outcome (minutes-long).
+        search: '/admin/api/cluster/assistant/search',
+        searchStatus: (jobId) => `/admin/api/cluster/assistant/search/${jobId}`,
+        // Tuning the winning deployment (AGENTS.md §2 "Tuning is a saved
+        // preset"): /tune is a quick per-request sampler sweep on the running
+        // cluster; /tune-redeploy sweeps the per-model MTP switch + depth by
+        // redeploying each config (minutes, background job, polled).
+        tune: '/admin/api/cluster/assistant/tune',
+        tuneRedeploy: '/admin/api/cluster/assistant/tune-redeploy',
+        tuneRedeployStatus: (jobId) =>
+            `/admin/api/cluster/assistant/tune-redeploy/${encodeURIComponent(jobId)}`,
+        // The last deployment a reloaded card can show and start again.
+        session: '/admin/api/cluster/assistant/session',
+        // The redacted support bundle. The browser only asks; redaction happens
+        // on the backend, and the local text is the fallback when it is down.
+        // Read-only local interface preflight; it returns commands and never
+        // executes them.
+        networkPreflight: '/admin/api/cluster/assistant/network-preflight',
+        diagnostics: (measurementId, operationId) => {
+            const params = new URLSearchParams();
+            if (measurementId) params.set('measurement_id', measurementId);
+            if (operationId) params.set('operation_id', operationId);
+            const query = params.toString();
+            return `/admin/api/cluster/assistant/diagnostics${query ? `?${query}` : ''}`;
+        },
+        // The in-app switch for the post-ready performance measurement.
+        performanceProbe: '/admin/api/cluster/assistant/performance-probe',
+        // "Run on this Mac": single-node inference on the origin Mac, without a
+        // cluster. A separate async job, because the engine-pool load blocks for
+        // minutes. The browser never launches anything; it polls the job.
+        runLocal: '/admin/api/cluster/assistant/run-local',
+        runLocalStatus: (jobId) =>
+            `/admin/api/cluster/assistant/run-local/${encodeURIComponent(jobId)}`,
+        // Stop/Unload for that job: unloads the model this Mac loaded (or
+        // aborts a queued/running load). Idempotent on the backend, and the
+        // browser still posts at most one stop per click.
+        runLocalStop: (jobId) =>
+            `/admin/api/cluster/assistant/run-local/${encodeURIComponent(jobId)}/stop`,
+        // Tune the ready local run: sampler + MTP on/off/depth, redeploying each
+        // config locally, then save the (model, this Mac) preset and leave the
+        // winner loaded. A separate async job (minutes).
+        tuneLocal: '/admin/api/cluster/assistant/tune-local',
+        tuneLocalStatus: (tuneJobId) =>
+            `/admin/api/cluster/assistant/tune-local/${encodeURIComponent(tuneJobId)}`,
+        // Screen 6: the coordinator's own unload route, relayed by the
+        // assistant backend so the browser never dials another Mac's admin API.
+        stop: '/admin/api/cluster/assistant/stop',
+        operation: (id) =>
+            `/admin/api/cluster/assistant/operations/${encodeURIComponent(id)}`,
+        // The free-space relay (PHASE-2B-RUN.md §9): one model, on one measured
+        // Mac, deleted by that Mac's own route. The browser asks; it never
+        // reaches a disk or an SSH target itself.
+        models: (nodeId, modelId) =>
+            `/admin/api/cluster/assistant/models/${encodeURIComponent(nodeId)}/${encodeURIComponent(modelId)}`,
+    };
+
+    // Screen 4 (docs/cluster-assistant/SCREEN-4-PROGRESS.md §2): the six steps
+    // the backend can actually distinguish, in its corrected order — planning
+    // precedes staging. The two pairs it cannot split are one row each
+    // (runtime prepare + model copy, load + readiness canary).
+    const ASSISTANT_PROGRESS_ROWS = [
+        { key: 'checking', label: 'cluster.assistant.progress.checking' },
+        { key: 'planning', label: 'cluster.assistant.progress.planning' },
+        { key: 'preparing', label: 'cluster.assistant.progress.preparing' },
+        { key: 'starting', label: 'cluster.assistant.progress.starting' },
+        { key: 'loading', label: 'cluster.assistant.progress.loading' },
+        { key: 'ready', label: 'cluster.assistant.progress.ready' },
+    ];
+
+    // Which operation phase may narrate which row. A phase this build does not
+    // know (a newer coordinator) narrates no row: the row already shown stays,
+    // and the raw message is rendered underneath it (§5). Guessing is not an
+    // option and neither is blanking the row.
+    const ASSISTANT_ROW_PHASES = {
+        preparing: ['staging', 'applied'],
+        starting: ['starting'],
+        loading: ['loading'],
+        ready: ['ready'],
+    };
+    const ASSISTANT_KNOWN_PHASES = [
+        'queued',
+        'staging',
+        'applied',
+        'starting',
+        'loading',
+        'ready',
+        'failed',
+    ];
+
     // exo-style data layer: one snapshot endpoint polled once per second
     // while the tab is visible; the UI is a pure function of the snapshot.
     const CLUSTER_V2_POLL_MS = 1000;
@@ -237,6 +350,169 @@ function clusterV2Wizard() {
         // The chooser opened by itself after pairing, not from Change setup.
         purposeAuto: false,
 
+        // ---- assistant (the minimal Screen-3 slice) --------------------------
+        // One card inside the plan section that drives measure → recommend →
+        // plan → apply → start through the assistant admin API. It renders the
+        // backend's answer; it never derives a plan, a rank order, a coordinator
+        // or an admission, and it never launches anything itself.
+        assistant: {
+            // idle → measuring → recommending → measuring_model → planning →
+            // applying → starting → loading → ready, plus failed.
+            state: 'idle',
+            // Which measurement is being taken: the entry measurement (then
+            // recommend) or the model-bound one for the recommended model.
+            phase: 'recommend',
+            busy: false,
+            generation: 0,
+            measurementId: '',
+            measurementModel: '',
+            recommendation: null,
+            selectedModel: '',
+            selectedModelId: '',
+            selectedModelLabel: '',
+            selectedContextTokens: null,
+            // Phase A: "minimal" uses the fewest Macs that fit; "all" is the
+            // advanced override. The solver still shows every lever.
+            nodeSelection: 'minimal',
+            // The user explicitly accepted the offered 2-Mac fallback after a
+            // topology_incomplete refusal. It is part of the plan signature, so
+            // it is sent to plan and apply unchanged.
+            confirmTwoMacFallback: false,
+            topologyFallback: null,
+            missingLinks: [],
+            // The read-only bridge plan from the network preflight, or null.
+            networkPreflight: null,
+            networkPreflightBusy: false,
+            plan: null,
+            // Frozen plan-time inputs: the exact object sent to plan and apply.
+            inputs: null,
+            operation: null,
+            operationId: '',
+            applyOperationId: '',
+            applyState: '',
+            progress: null,
+            endpoint: null,
+            // The one measured rate block, or null when no probe answered.
+            // Rendering a rate is conditional on this being present.
+            observed: null,
+            // Screen 6: the deployment a ready start launched, and whether it
+            // was stopped. `state` stays ready; no state machine value exists
+            // for a stop, so the backend reports this boolean.
+            deploymentId: '',
+            stopped: false,
+            // The persisted last deployment, read once after a reload. It is
+            // not a plan: it only names what ran and the inputs to start again.
+            session: null,
+            // The server setting for the post-ready measurement (B3).
+            probeEnabled: false,
+            // Screen 4: the last row the backend actually reported. A failure
+            // keeps it so the user can see where it stopped; nothing advances
+            // it without a value from SCREEN-4-PROGRESS.md §2.
+            failedRow: '',
+            // The measured Macs from the last status poll, with each Mac's own
+            // model list. Only the Mac the user picks is ever listed for delete.
+            measurementNodes: [],
+            freeSpaceOpen: false,
+            freeSpaceNode: '',
+            freeSpaceConfirm: '',
+            freeSpaceBusy: false,
+            freeSpaceError: '',
+            warnings: [],
+            error: null,
+            measureTimer: null,
+            operationTimer: null,
+            measurePollBusy: false,
+            operationPollBusy: false,
+            // Bounded retry on transient poll errors: consecutive failures and
+            // the ticks to skip before the next attempt (1, 2, 4 … backoff).
+            measurePollErrors: 0,
+            measurePollSkip: 0,
+            operationPollErrors: 0,
+            operationPollSkip: 0,
+            agentOpen: false,
+            copied: '',
+            // The automatic constellation search: an action on this card, not a
+            // new state-machine value. Its own busy flag plus the shared
+            // generation guard keep the background job single-flight and drop a
+            // stale answer. priority/maxCount are the user's picks; progress
+            // tracks the job, result/error hold the final outcome.
+            search: {
+                busy: false,
+                priority: 'balanced',
+                maxCount: 3,
+                progress: '',
+                result: null,
+                error: '',
+            },
+            // Tuning the winning deployment. Both are actions on this card, not
+            // state-machine values, and each keeps its own busy flag and
+            // generation counter so a late answer cannot overwrite a newer one.
+            // `tune` is the quick per-request sampler sweep on the running
+            // cluster; `tuneRedeploy` is the minutes-long MTP sweep that stops
+            // each config, so its completion leaves the cluster stopped.
+            tune: {
+                busy: false,
+                result: null,
+                error: '',
+                errorAction: '',
+            },
+            tuneRedeploy: {
+                busy: false,
+                jobId: '',
+                generation: 0,
+                state: '',
+                total: 0,
+                done: 0,
+                message: '',
+                rows: [],
+                best: null,
+                presetKey: '',
+                mtpApplicable: true,
+                error: '',
+                errorAction: '',
+            },
+            // "Run on this Mac": single-node inference on this Mac, no cluster.
+            // Its own job surface (queued → running → ready | failed), not a
+            // new assistant state-machine value: the cluster states are frozen
+            // and the backend reports this job with the five fields below.
+            localRun: {
+                busy: false,
+                jobId: '',
+                generation: 0,
+                state: '',
+                message: '',
+                modelId: '',
+                contextTokens: null,
+                mtp: false,
+                endpoint: null,
+                warnings: [],
+                error: '',
+                errorAction: '',
+                // One stop at a time, and a stopped job is never stopped twice.
+                stopping: false,
+                stopped: false,
+            },
+            // Tuning a ready local run (sampler + MTP on/off/depth). One job at
+            // a time; the backend leaves the winning config loaded and saves the
+            // (model, this Mac) preset so a later run replays it.
+            localTune: {
+                busy: false,
+                jobId: '',
+                generation: 0,
+                state: '',
+                total: 0,
+                done: 0,
+                message: '',
+                rows: [],
+                best: null,
+                sampler: null,
+                mtpApplicable: true,
+                presetKey: '',
+                error: '',
+                errorAction: '',
+            },
+        },
+
         // ---- plan ------------------------------------------------------------
         modelOptions: [],
         modelsLoading: false,
@@ -332,6 +608,8 @@ function clusterV2Wizard() {
             if (this.pollTimer !== null) return;
             this.tick();
             this.pollTimer = setInterval(() => this.tick(), CLUSTER_V2_POLL_MS);
+            this.loadAssistantSession();
+            this.loadAssistantProbeSetting();
         },
 
         wizardVisible() {
@@ -364,6 +642,8 @@ function clusterV2Wizard() {
             if (this.pollTimer !== null) clearInterval(this.pollTimer);
             this.pollTimer = null;
             this.runtimeRevision += 1;
+            this.assistant.generation += 1;
+            this.stopAssistantPolls();
             this.dismissStaging();
         },
 
@@ -381,19 +661,29 @@ function clusterV2Wizard() {
             }
             if (!response.ok) {
                 let detail = `${response.status} ${response.statusText}`;
+                let payload = null;
                 try {
-                    const payload = await response.json();
+                    payload = await response.json();
                     if (payload && payload.detail) {
                         detail =
                             typeof payload.detail === 'string'
                                 ? payload.detail
                                 : JSON.stringify(payload.detail);
+                    } else if (payload && payload.message) {
+                        // The assistant routes refuse with a flat
+                        // {code, message, action} body (no FastAPI `detail`),
+                        // and the UI renders that message and action verbatim.
+                        detail = String(payload.message);
                     }
                 } catch (ignored) {
                     /* non-JSON error body */
                 }
                 const error = new Error(detail);
                 error.status = response.status;
+                // Keep the machine-readable refusal so the assistant card can
+                // render error.code / error.message / error.action without
+                // parsing prose.
+                error.payload = payload;
                 throw error;
             }
             if (response.status === 204) return null;
@@ -1050,9 +1340,24 @@ function clusterV2Wizard() {
             if (this.devicesUnreachable) return 'error';
             // A durable deployment keeps its management panel mounted, but its
             // badge is driven by deploymentRuntimeState(), not by persistence.
+            // An explicit model change (choosingModel) still reopens the picker
+            // even when a deployment exists — the shortcut must not hide it.
+            if (this.configuredDeployment() && !this.choosingModel) return 'active';
+            // An incoming join request (or an open pairing form / an active
+            // local join) must show its controls immediately, even when the
+            // wizard already advanced to checks/plan/purpose. Otherwise only
+            // the device label changes and the code input stays hidden until
+            // a reload resets `stage`.
+            if (
+                this.pairing.target ||
+                this.pendingApprovals().length ||
+                this.joinActive()
+            ) {
+                return 'pairing';
+            }
             if (this.choosingModel && this.stage === 'plan') return 'plan';
             if (this.configuredDeployment()) return 'active';
-            if (this.stage === 'plan' && this.splitDevices().length) {
+            if (this.stage === 'plan' && this.pairedDevices().length) {
                 return 'plan';
             }
             if (this.stage === 'checks' && this.splitDevices().length) {
@@ -1066,13 +1371,6 @@ function clusterV2Wizard() {
                 this.pairedDevices().length
             ) {
                 return this.stage;
-            }
-            if (
-                this.pairing.target ||
-                this.pendingApprovals().length ||
-                this.joinActive()
-            ) {
-                return 'pairing';
             }
             if (this.stage === null && this.helperRoleHost()) return 'helper';
             if (
@@ -3904,7 +4202,6 @@ function clusterV2Wizard() {
             }
         },
 
-        // =====================================================================
         // Feedback — toasts, never modals
         // =====================================================================
         notify(type, message, timeoutMs = 6000) {

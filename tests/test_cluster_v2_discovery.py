@@ -14,6 +14,8 @@ import struct
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from omlx.cluster.discovery import (
     _TX_FAIL_RESET_ROUNDS,
     MULTICAST_GROUP,
@@ -162,14 +164,64 @@ def test_wassup_codec_roundtrip():
         "node_id": "node-1",
         "http_port": 8000,
         "loopback_only": False,
+        "friendly_name": "",
+        "caps": {},
+        "addrs": [],
     }
     assert decode_wassup(encode_wassup(7, "node-1", 8000, True))["loopback_only"]
-    # Older peers do not send the flag.
+    # An older peer sends neither the flag, the name nor the capabilities.
     legacy = (
         b"OMLXW"
         + json.dumps({"nonce": 7, "node_id": "node-1", "http_port": 8000}).encode()
     )
-    assert decode_wassup(legacy)["loopback_only"] is False
+    decoded = decode_wassup(legacy)
+    assert decoded["loopback_only"] is False
+    assert decoded["friendly_name"] == ""
+    assert decoded["caps"] == {}
+    assert decoded["addrs"] == []
+
+
+def test_wassup_carries_the_display_identity():
+    """mDNS is not available on every network; the fallback must still name a Mac.
+
+    Without the name and the capability snapshot a discovered peer could only be
+    drawn as a UUID with "Memory unknown" (Screen 2 requires friendly names).
+    """
+
+    payload = encode_wassup(
+        7,
+        "node-1",
+        8000,
+        friendly_name="MacStudio-von-Andreas-2",
+        caps={"chip": "Apple M1 Max", "ram_gb": 32.0, "thunderbolt": True},
+    )
+
+    decoded = decode_wassup(payload)
+
+    assert decoded["friendly_name"] == "MacStudio-von-Andreas-2"
+    assert decoded["caps"]["chip"] == "Apple M1 Max"
+    assert decoded["caps"]["ram_gb"] == 32.0
+    # Junk in the optional keys is ignored, never fatal.
+    assert decode_wassup(
+        b"OMLXW"
+        + json.dumps(
+            {
+                "nonce": 7,
+                "node_id": "node-1",
+                "http_port": 8000,
+                "friendly_name": 5,
+                "caps": "nope",
+            }
+        ).encode()
+    ) == {
+        "nonce": 7,
+        "node_id": "node-1",
+        "http_port": 8000,
+        "loopback_only": False,
+        "friendly_name": "",
+        "caps": {},
+        "addrs": [],
+    }
 
 
 def test_wassup_codec_rejects_garbage():
@@ -195,9 +247,23 @@ def test_cluster_hash_is_blake2s_prefix():
 # -- HELLO handling -----------------------------------------------------------
 
 
-def test_hello_from_same_cluster_sets_multicast_ok_and_replies_wassup():
+def test_hello_from_same_cluster_sets_multicast_ok_and_replies_wassup(monkeypatch):
+    monkeypatch.setattr(
+        "omlx.cluster.discovery.local_addr_dicts",
+        lambda: [
+            {"ip": "172.16.1.14", "if_type": "lan"},
+            {"ip": "fe80::99", "if_type": "lan"},
+        ],
+    )
     sock = FakeSocket()
-    service, clock = _service(socket_factory=lambda: sock)
+    service, clock = _service(
+        socket_factory=lambda: sock,
+        config=DiscoveryConfig(
+            cluster_name="omlx",
+            http_port=8000,
+            caps=PeerCaps(chip="Apple M1 Max", ram_gb=32.0),
+        ),
+    )
     assert service.multicast_ok is False
 
     service._handle_hello(123, service._cluster_hash, ("fe80::99", 53413), sock)
@@ -205,12 +271,19 @@ def test_hello_from_same_cluster_sets_multicast_ok_and_replies_wassup():
     assert service.multicast_ok is True
     assert len(sock.sent) == 1
     reply = decode_wassup(sock.sent[0][1] and sock.sent[0][0])
-    assert reply == {
-        "nonce": 123,
-        "node_id": "aaaa-node",
-        "http_port": 8000,
-        "loopback_only": False,
-    }
+    assert reply["nonce"] == 123
+    assert reply["node_id"] == "aaaa-node"
+    assert reply["http_port"] == 8000
+    assert reply["loopback_only"] is False
+    # The reply carries the display identity too, so a peer on a network without
+    # mDNS is not shown as a bare machine ID with "Memory unknown".
+    assert reply["friendly_name"]
+    assert reply["caps"]["chip"] == "Apple M1 Max"
+    # ...and the IPv4 address, without which that peer cannot be probed at all
+    # and the card reads "Unreachable" on an IPv6 link-local address.
+    # Announced addresses carry their kind now, so the receiver can say
+    # "Thunderbolt" instead of "Network".
+    assert reply["addrs"] == [{"ip": "172.16.1.14", "if_type": "lan"}]
     assert sock.sent[0][1] == ("fe80::99", 53413)
 
 
@@ -270,6 +343,96 @@ def test_wassup_creates_peer_and_candidate():
     assert peers[0].http_port == 8000
     assert peers[0].addrs == [{"ip": "fe80::99", "if_type": "unknown"}]
     assert ("fe80::99", 8000) in service._candidates
+
+
+def test_wassup_names_the_peer_without_mdns():
+    """The fallback announcement must carry the name and the chip."""
+
+    service, _ = _service("aaaa-node")
+    _announce_nonce(service)
+
+    service._handle_wassup(
+        decode_wassup(
+            encode_wassup(
+                42,
+                "bbbb-node",
+                8000,
+                friendly_name="MacStudio-von-Andreas-2",
+                caps={"chip": "Apple M1 Max", "ram_gb": 32.0, "thunderbolt": True},
+            )
+        ),
+        ("fe80::99", 53413),
+    )
+
+    peer = service.peers()[0]
+    assert peer.friendly_name == "MacStudio-von-Andreas-2"
+    assert peer.caps.chip == "Apple M1 Max"
+    assert peer.caps.ram_gb == pytest.approx(32.0)
+    assert peer.caps.thunderbolt is True
+
+
+def test_wassup_records_the_announced_ipv4_and_probes_it():
+    """An IPv6-only address list is why a discovered Mac reads "Unreachable"."""
+
+    service, _ = _service("aaaa-node")
+    _announce_nonce(service)
+
+    service._handle_wassup(
+        decode_wassup(
+            encode_wassup(
+                42,
+                "bbbb-node",
+                8000,
+                addrs=[{"ip": "172.16.1.14", "if_type": "thunderbolt"}],
+            )
+        ),
+        ("fe80::99", 53413),
+    )
+
+    peer = service.peers()[0]
+    assert {"ip": "172.16.1.14", "if_type": "thunderbolt"} in peer.addrs
+    assert ("172.16.1.14", 8000) in service._candidates
+    # The card's link kind comes from the address kind.
+    assert peer.link == "tb"
+
+
+def test_wassup_accepts_plain_string_addrs_from_an_older_peer():
+    service, _ = _service("aaaa-node")
+    _announce_nonce(service)
+
+    decoded = decode_wassup(
+        b"OMLXW"
+        + json.dumps(
+            {"nonce": 42, "node_id": "bbbb-node", "http_port": 8000,
+             "addrs": ["172.16.1.14"]}
+        ).encode()
+    )
+    service._handle_wassup(decoded, ("fe80::99", 53413))
+
+    peer = service.peers()[0]
+    assert {"ip": "172.16.1.14", "if_type": "unknown"} in peer.addrs
+    assert peer.link == "unknown"
+
+
+def test_wassup_without_a_name_does_not_erase_a_known_one():
+    """An older peer, or a second announcement, must not blank what is known."""
+
+    service, _ = _service("aaaa-node")
+    _announce_nonce(service)
+    service._handle_wassup(
+        decode_wassup(
+            encode_wassup(42, "bbbb-node", 8000, friendly_name="Known-Name")
+        ),
+        ("fe80::99", 53413),
+    )
+    _announce_nonce(service)
+
+    service._handle_wassup(
+        {"nonce": 42, "node_id": "bbbb-node", "http_port": 8000},
+        ("fe80::99", 53413),
+    )
+
+    assert service.peers()[0].friendly_name == "Known-Name"
 
 
 def test_loopback_only_peer_is_marked_from_wassup_reply():
@@ -1402,3 +1565,33 @@ def test_address_health_does_not_inherit_other_node_identity():
     service._add_candidate("192.0.2.1", 8000, node_id="peer", if_type="manual")
     service._probe_candidate("192.0.2.1", 8000)
     assert service.address_health("peer") == {}
+
+
+def test_a_thunderbolt_address_is_classified_from_metadata_not_latency():
+    """A slow probe must not turn a cable into "wifi".
+
+    Live, a Thunderbolt-bridge peer was rendered as "wifi" because one probe
+    answered in more than 10 ms; the address itself said `thunderbolt`.
+    """
+
+    from omlx.cluster.discovery import _classify_link
+
+    assert _classify_link("172.16.1.14", "thunderbolt", 0.042) == "tb"
+    assert _classify_link("172.16.1.14", "tb", None) == "tb"
+    # Without that metadata the heuristic still applies.
+    assert _classify_link("172.16.1.14", "lan", 0.042) == "wifi"
+    assert _classify_link("172.16.1.14", "lan", 0.0005) == "tb"
+
+
+def test_a_peer_reachable_over_several_paths_keeps_the_best_one():
+    """One slow answer over Ethernet must not relabel a Thunderbolt peer."""
+
+    from omlx.cluster.discovery import _best_link
+
+    assert _best_link("tb", "wifi") == "tb"
+    assert _best_link("wifi", "tb") == "tb"
+    assert _best_link("unknown", "ethernet") == "ethernet"
+    assert _best_link("ethernet", "unknown") == "ethernet"
+    # The new link ranking puts a direct Thunderbolt path ahead of a
+    # Tailscale overlay (lower rank = faster path).
+    assert _best_link("tb", "tailscale") == "tb"

@@ -92,8 +92,20 @@ class TestServerSettings:
             "max_request_body_size": "512MB",
             "max_image_side_length": 2048,
             "gpu_keep_warm_interval": 0.5,
-            "gpu_keep_warm_idle_window": 300.0,
+"gpu_keep_warm_idle_window": 300.0,
+            "assistant_performance_probe": False,
         }
+
+    def test_from_dict_assistant_performance_probe_is_opt_in(self):
+        assert (
+            ServerSettings.from_dict({}).assistant_performance_probe is False
+        )
+        assert (
+            ServerSettings.from_dict(
+                {"assistant_performance_probe": True}
+            ).assistant_performance_probe
+            is True
+        )
 
     def test_from_dict_distributed_inference_is_opt_in(self):
         assert ServerSettings.from_dict({}).distributed_inference_enabled is False
