@@ -37,15 +37,15 @@ Both were folded into the old base pin `1e27576a`; the rebase's delta replay doe
 not carry them. Both are now rebased onto current `upstream/main` and pushed:
 
 - **#5024** `feat(cluster-moe-offload)` — head **`bbbf18d2`**, 4 commits,
-  +619/−16, 16 files, now **mergeable** (`mergeable_state: unstable` only because
-  the CI jobs were still running). Rebased via the local branch
+  +619/−16, 16 files, **`mergeable: true` / `clean`**, both CI checks green
+  (`test (3.11)` and `mac-app-build`). Rebased via the local branch
   `rebase/moe-offload-main`; `c74f1b18..624cff0e` has no cluster changes, so the
   rebase was conflict-free and its 358 focused tests pass locally.
   **Both halves are on our branch**: the pricing was ported during the rebase,
   the runtime half was mirrored from `bbbf18d2` in commit `392aaccb`.
 - **#5033** `feat/qwen4-exp-cluster` — head **`25da70de`**, 8 commits, +1689/−77,
-  15 files, **`mergeable: true` / `clean`**. Rebased conflict-free; 163 focused
-  tests pass locally.
+  15 files, **`mergeable: true` / `clean`**, both CI checks green. Rebased
+  conflict-free; 163 focused tests pass locally.
 
 Both PR heads are `upstream/main + PR content only` — our fork delta is not mixed
 in, which is what allows a fast merge.
