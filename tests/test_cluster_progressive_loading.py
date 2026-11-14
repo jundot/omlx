@@ -548,6 +548,62 @@ def test_progressive_loader_checks_tokenizer_trust_before_model_load(tmp_path):
     assert calls == [("tokenizer", {"trust_remote_code": False})]
 
 
+def test_a_stage_loader_receives_the_moe_resident_fraction(tmp_path, monkeypatch):
+    calls = []
+    module = SimpleNamespace(
+        load_pipeline_stage=lambda path, group, engram_ssd_offload,
+        moe_expert_offload_resident_fraction: calls.append(
+            (
+                path,
+                group,
+                engram_ssd_offload,
+                moe_expert_offload_resident_fraction,
+            )
+        )
+        or "stage"
+    )
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.moe_format", module)
+    utils = SimpleNamespace(
+        _download=lambda _repo, allow_patterns=None: tmp_path,
+        load_config=lambda _path: {"model_type": "moe_format"},
+        load_tokenizer=lambda *_args, **_kwargs: "tokenizer",
+    )
+    group = SimpleNamespace()
+
+    loaded = progressive_sharded_load(
+        tmp_path,
+        pipeline_group=group,
+        engram_ssd_offload=True,
+        moe_expert_offload_resident_fraction=0.125,
+        utils_module=utils,
+        mx_module=_FakeMX(),
+    )
+
+    assert loaded == ("stage", "tokenizer")
+    assert calls == [(tmp_path, group, True, 0.125)]
+
+
+def test_a_stage_loader_without_moe_support_is_refused(tmp_path, monkeypatch):
+    module = SimpleNamespace(
+        load_pipeline_stage=lambda path, group, engram_ssd_offload: "stage"
+    )
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.no_moe_format", module)
+    utils = SimpleNamespace(
+        _download=lambda _repo, allow_patterns=None: tmp_path,
+        load_config=lambda _path: {"model_type": "no_moe_format"},
+        load_tokenizer=lambda *_args, **_kwargs: "tokenizer",
+    )
+
+    with pytest.raises(ValueError, match="does not support MoE expert offload"):
+        progressive_sharded_load(
+            tmp_path,
+            pipeline_group=SimpleNamespace(),
+            moe_expert_offload_resident_fraction=0.125,
+            utils_module=utils,
+            mx_module=_FakeMX(),
+        )
+
+
 def test_a_model_with_its_own_stage_loader_bypasses_mlx_lm_loading(
     tmp_path, monkeypatch
 ):
