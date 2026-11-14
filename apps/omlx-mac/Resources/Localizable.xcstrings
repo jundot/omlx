@@ -1958,6 +1958,12 @@
     },
     "": {
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": ""
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -4380,6 +4386,12 @@
     },
     "—": {
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "—"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -4396,6 +4408,12 @@
     },
     "@%@": {
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "@%@"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -4446,6 +4464,12 @@
     },
     "%@/": {
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@/"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -4462,6 +4486,12 @@
     },
     "%lld%%": {
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld%%"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -4478,6 +4508,12 @@
     },
     "<namespace>/": {
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "<namespace>/"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -7619,19 +7655,31 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Prefill-Priorität"
+            "value": "Umgang mit langen Prompts"
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Prefill Priority"
+            "value": "Long Prompt Handling"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gestione dei prompt lunghi"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Обработка длинных промптов"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "预填充优先级"
+            "value": "长提示词处理"
           }
         }
       }
@@ -10212,6 +10260,12 @@
             "value": "Zum Kopieren klicken"
           }
         },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fai clic per copiare"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -10232,6 +10286,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Fenster schließen"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chiudi finestra"
           }
         },
         "ru": {
@@ -13035,6 +13095,12 @@
     },
     "enable_thinking": {
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "enable_thinking"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -19483,6 +19549,12 @@
             "value": "oMLX"
           }
         },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "oMLX"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -21124,19 +21196,31 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Prefill-Priorität"
+            "value": "Umgang mit langen Prompts"
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Prefill Priority"
+            "value": "Long Prompt Handling"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gestione dei prompt lunghi"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Обработка длинных промптов"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "预填充优先级"
+            "value": "长提示词处理"
           }
         }
       }
@@ -21148,19 +21232,31 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "„Maximaler Kontext“ ermöglicht bei Speicherdruck größere Prompts auf Kosten der Prefill-Geschwindigkeit. „Geschwindigkeit“ behält die volle Prefill-Geschwindigkeit bei und lehnt Prompts ab, die nicht in den Speicher passen."
+            "value": "Bei Speicherdruck nimmt „Maximaler Kontext“ längere Prompts mit langsamerem Prefill an. „Volle Geschwindigkeit“ hält den Prefill schnell und lehnt Prompts ab, die nicht passen."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Max Context trades prefill speed for larger prompts under memory pressure; Speed keeps full prefill speed and rejects prompts that would not fit."
+            "value": "Under memory pressure, Max Context accepts longer prompts at a slower prefill speed. Full Speed keeps prefill at full speed and rejects prompts that would not fit."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Con poca memoria, Contesto massimo accetta prompt più lunghi con un prefill più lento; Massima velocità mantiene il prefill veloce e rifiuta i prompt che non entrano."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "При нехватке памяти «Максимальный контекст» принимает более длинные промпты ценой более медленного префилла. «Полная скорость» сохраняет скорость префилла и отклоняет промпты, которые не помещаются."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "最大上下文在内存压力下以预填充速度换取更大的提示；速度保持完整预填充速度并拒绝不适合的提示。"
+            "value": "内存紧张时，“最大上下文”会降低预填充速度以接受更长的提示词，“全速”保持预填充全速并拒绝放不下的提示词。"
           }
         }
       }
@@ -21208,19 +21304,31 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Geschwindigkeit"
+            "value": "Volle Geschwindigkeit"
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Speed"
+            "value": "Full Speed"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Massima velocità"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Полная скорость"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "速度"
+            "value": "全速"
           }
         }
       }
@@ -26520,6 +26628,12 @@
     "quant.error.cancel_failed": {
       "comment": "Banner error when cancelling a quant task throws. Placeholder is the underlying error",
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Annullamento non riuscito: %@"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -26537,6 +26651,12 @@
     "quant.error.load_models": {
       "comment": "Banner error message when listing OQ models fails. Placeholder is the underlying error",
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Impossibile caricare i modelli: %@"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -26554,6 +26674,12 @@
     "quant.error.remove_failed": {
       "comment": "Banner error when removing a quant task throws. Placeholder is the underlying error",
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rimozione non riuscita: %@"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -26607,6 +26733,12 @@
     "quant.error.start_failed": {
       "comment": "Banner error when starting a quant job throws. Placeholder is the underlying error",
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Impossibile avviare: %@"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -29036,6 +29168,12 @@
     "quant.upload.error.cancel_failed": {
       "comment": "Error when cancelling an upload task throws. Placeholder is the underlying error",
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Annullamento non riuscito: %@"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -29089,6 +29227,12 @@
     "quant.upload.error.remove_failed": {
       "comment": "Error when removing an upload task throws. Placeholder is the underlying error",
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rimozione non riuscita: %@"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -29393,6 +29537,12 @@
     },
     "reasoning_effort": {
       "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "reasoning_effort"
+          }
+        },
         "ru": {
           "stringUnit": {
             "state": "translated",
@@ -35513,13 +35663,19 @@
       }
     },
     "settings.acceleration.prefill_helper.update": {
-      "comment": "Picker suffix for a paired Mac on another oMLX version",
+      "comment": "Picker suffix for a paired helper that needs an update",
       "extractionState": "manual",
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "needs the same oMLX version"
+            "value": "needs an update"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "richiede un aggiornamento"
           }
         }
       }
