@@ -170,7 +170,17 @@ final class IntegrationsScreenVM {
     /// Env-var recipe that runs the real `claude` binary directly. Mirrors
     /// `claudeCodeCommand` in dashboard.js — cloud form unsets the Anthropic
     /// vars, local form sets them to point at the oMLX server.
-    var claudeEnvRecipe: String {
+    var claudeEnvRecipe: String { claudeEnvRecipe(authToken: serverApiKey) }
+
+    /// The recipe with the server API key replaced by dots, for display only.
+    /// Mirrors `claudeCodeCommandDisplay` in dashboard.js: the panel never
+    /// prints the key, and the block's copy button still copies the real
+    /// command. Local mode is the only form that carries a token.
+    var claudeEnvRecipeDisplay: String {
+        claudeEnvRecipe(authToken: serverApiKey.isEmpty ? "" : "••••••••")
+    }
+
+    private func claudeEnvRecipe(authToken: String) -> String {
         if claudeMode == "cloud" {
             return "env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN "
                  + "-u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL "
@@ -183,8 +193,8 @@ final class IntegrationsScreenVM {
         var parts: [String] = []
         parts.append(Self.shellEnvAssign("ANTHROPIC_BASE_URL",
                                          "http://\(formatDisplayHost(serverHost)):\(serverPort)"))
-        if !serverApiKey.isEmpty {
-            parts.append(Self.shellEnvAssign("ANTHROPIC_AUTH_TOKEN", serverApiKey))
+        if !authToken.isEmpty {
+            parts.append(Self.shellEnvAssign("ANTHROPIC_AUTH_TOKEN", authToken))
         }
         parts.append(Self.shellEnvAssign("ANTHROPIC_DEFAULT_OPUS_MODEL",   opus))
         parts.append(Self.shellEnvAssign("ANTHROPIC_DEFAULT_SONNET_MODEL", sonnet))
