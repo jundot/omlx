@@ -227,6 +227,9 @@ def test_devices_merges_pending_pairing_requests(_configured_stores, monkeypatch
     assert len(pending) == 1
     assert pending[0]["state"] == "awaiting_approval"
     assert pending[0]["friendly_name"] == "studio-2"
+    assert pending[0]["addrs"] == [
+        {"ip": "192.168.1.11", "if_type": "unknown"}
+    ]
 
 
 def test_cluster_name_persisted_config(tmp_path, monkeypatch):
@@ -459,6 +462,9 @@ def test_devices_pending_request_wins_over_stale_discovered_record(
     assert len(pending) == 1
     assert pending[0]["state"] == "awaiting_approval"
     assert pending[0]["friendly_name"] == "studio-2"
+    assert pending[0]["addrs"] == [
+        {"ip": "192.168.1.11", "if_type": "unknown"}
+    ]
     configure_discovery_service(None)
 
 
