@@ -94,31 +94,58 @@ Notes:
 | P4 | xcstrings delta 84 lines → **+28 entries**; Swift/shell/docs unchanged (`+2 296`). | Do not send the 78 914-line catalogue diff. Cut P4 from our 28 entries on top of upstream's catalogue, or the PR is unreviewable. |
 | P5 | `planner.py` **109 → 253** added lines; `routes.py` 102/39 → 334/42; `deployment.py` +10. | Upstream **removed routed-expert (MoE) offload from the planner**. It is **restored on upstream's refactored pipeline** (`plan_hybrid`, `plan_unequal_pipeline`, `_finish_pipeline_plan`, `_held_layer_bytes`, `PipelineAssignment.moe_offload_*`) so the assistant's MoE lever and the context-vs-experts tradeoff work; the `()` default reproduces upstream exactly. The coordinator plan path is threaded too (`_saved_moe_offload`/`_moe_offload_layer_bytes`/`_moe_offload_for_plan` feed `_create_cluster_plan`, autoconfigure and `_build_performance_plan`; `deployment._assignment_from_dict` decodes the fields so `planned_weight_bytes` does not re-charge streamed experts). Also on top: Qwen4 PLE table detection (`_qwen4_ple_layer_ids`, `_is_qwen4_ple_tensor`), `_declared_context_tokens`, and `_saved_engram_ssd_offload` PLE parity in `routes.py`. |
 | P6 | `cluster_v2.js` 3 532/9 → **3 962/132**; `policy.py` 1 553 → 1 574; assistant tests +39. | The assistant UI is our base again, with the upstream pieces the merged tests need ported in (`splitDevices`, `deviceHelperOnly`, `pairingStepOne`, `cudaGuide*`, helper-aware `restoreAccelerator`/`planNodes`/`inventoryHosts`/`versionMismatches`, helper pairing → `startAccelerator`, helper-aware `acceleratorRows`). Ports cut **both** ways, so a P6 PR must be split per upstream area, not dropped in whole. |
-| P6 | **Dropped with upstream:** `omlx/patches/qwen4_exp_mlx_lm/` (adapter), `tests/test_qwen4_cluster_adapter.py`, `docs/experimental/qwen4-exp-cluster.md`. | These files no longer exist, so no package carries them. Upstream-owned Qwen4 pieces (`omlx/patches/mlx_vlm_qwen4_exp_compat/**`, `apps/omlx-cuda-helper/**`, the remaining `test_qwen4_*`) stay untouched — do not re-add the adapter. |
+| P6 | **Not replayed: our own open PR #5033** (`omlx/patches/qwen4_exp_mlx_lm/`, `tests/test_qwen4_cluster_adapter.py`, `docs/experimental/qwen4-exp-cluster.md`). | These files never existed in upstream history; they came from our open PR #5033 via the old base pin. The rebase replays only our delta (`1e27576a..feat`), so they are gone. The Qwen4 **PLE table detection** survived in F5 (`_qwen4_ple_layer_ids`/`_is_qwen4_ple_tensor`), and upstream's `mlx_vlm_qwen4_exp_compat` is untouched. Consequence: no Qwen4-Exp **pipeline** across Macs on this branch (the Qwen3.8 path is single-node `run-local`). See §7. |
 
 ---
 
-## 4. Offering order (discussion → issues → PRs)
+## 4. The new PRs (concrete cut)
 
-1. **Discuss** the broad idea (a short issue): cluster setup inside oMLX for
-   models that do not fit one Mac, plus the standalone fixes we found along the
-   way.
-2. **Issues** for the independent packages P1–P4 (small, easy to accept).
-3. **PRs** P1 → P2 → P3 → P4 (each references its issue; each merges alone).
-4. **Issue + design** for P5 and P6; PR P5, then P6 in stages
-   (measurement → election/plan → apply/start → tuning/run-local → UI).
-5. Track status per package below (draft / issue # / PR # / merged / fork-only).
+Fixes first (independent), then the assistant as a **chain** — each step is green
+and useful when it lands, but 2 and 3 need their predecessors. Note that the MoE
+planner pricing the assistant needs lives in **open PR #5024**, not in F5 (see §7).
+
+| # | PR | Contents | Code ≈ | Depends on |
+|---|---|---|---:|---|
+| F1 | `local_only` model load | `engine_pool`, `admin/routes`, its tests | 85 | — |
+| F2 | Test infra | `tests/conftest.py` (MockTokenizer collision), `_tokenizer_support.py`, native-indexer skip, `.editorconfig`, `.gitignore`, `.python-version`. **Trimmable**: the two dotfiles are opinions upstream may decline; `test_settings.py`/`test_scheduler.py` belong to the feature PRs, not here. | 80 (tests) | — |
+| F3 | Peer version check | `scripts/check_peer_versions.py` + `PEER-VERSIONS.md` | 90 | — |
+| F4 | macOS helper / DMG | Helper plists + `main.swift`, `Scripts/*`, `PerformanceScreenVM`, `PythonRuntime`, `WelcomeWindow`, menubar, mac tests, **+28 xcstring entries** | 877 | — |
+| F5 | **Cluster-core extras** (not in #5024) | `discovery` +183/−18 (fallback carries name/chip/RAM), `model_inventory` +86/−7, `staging` +71/−7, `performance_worker` +55/−7, `discovery_routes` +21, `catalogue` +5/−3, its tests | ~200 logical (421 raw) | — |
+| 1 | **Assistant plans** | A1 measure (`measurement`, `state`, `calibration`, `models`, `/measure`, `/status`) + A2 recommend/plan (`recommendation`, `evaluation`, `election`, `policy`, `topology`, `/recommend`, `/plan`) + `search` + `DELETE /models/{node}/{model}` (the recommendation emits `free_disk_space`) + U1 (UI up to `planning`) + `CLUSTER-ASSISTANT.md` | ~5 600 | **#5024 (planner half), hard** |
+| 2 | **Assistant runs** | A3 apply/start/stop (`provisioning`, `start`, `operations`, `/apply`, `/start`, `/stop`, `/session`, `/operations/*`) + A4 tuning (`tuning`, `tuning_store`, `redeploy_tuning`, `performance_store`, `/tune*`) + `diagnostics` (only start emits it), `network-preflight`, `performance-probe` + U2 (apply/ready/stop/tuning) | ~4 900 | PR 1 |
+| 3 | **Run on one Mac** | `run-local`, `run-local/{id}/stop`, `tune-local` (+ statuses) and the small UI card | ~400 | PR 1 + 2 |
+
+Order: **F1–F4 in any order → #5024 (rebased) and F5 → PR 1 → PR 2 → PR 3.** F2 may
+ride along with F1. If F5 rides with the #5024 rebase, one track disappears.
+
+Rules:
+
+- Every PR must build and pass its own tests on `rebase/upstream-main`, alone.
+- No PR may reference a route another PR adds (no dangling `error.action`): that is
+  why `DELETE /models/...` is in PR 1 and `diagnostics` in PR 2.
+- Never include generated churn: cut `Localizable.xcstrings` to its 28 entries,
+  `i18n/*.json` to the keys a PR actually introduces, `tailwind.css` to its rebuild.
+- `AGENTS.md` (705 lines) is fork-internal and is **not** offered. Most of
+  `docs/cluster-assistant/**` is internal design documentation; offer only the
+  user-facing part, with its feature PR.
+
+PR 1 is a clean stop point: it measures, recommends, plans, shows the
+context-vs-speed tradeoff and can free disk — it starts nothing.
 
 ## 5. Status (fill in as we go)
 
 | # | Status | Upstream issue | Upstream PR | Notes |
 |---|---|---|---|---|
-| P1 | draft | — | — | re-cut on upstream/main; 293 lines, no conflict |
-| P2 | draft | — | — | 161 lines |
-| P3 | draft | — | — | 209 lines, script + doc |
-| P4 | draft | — | — | app maintainers; cut the 28 xcstring entries only |
-| P5 | discuss | — | — | needs a resource-policy decision; coordinator MoE threading done |
-| P6 | discuss | — | — | staged series; split the web/i18n part out |
+| F1 | draft | — | — | re-cut on upstream/main; no conflict |
+| F2 | draft | — | — | trimmable; two dotfiles optional |
+| F3 | draft | — | — | script + doc |
+| F4 | draft | — | — | app maintainers; cut the 28 xcstring entries only |
+| F5 | draft | — | — | cluster-core extras (discovery/inventory/staging/probe/catalogue) |
+| 1 | discuss | — | — | hard dependency on #5024's planner pricing |
+| 2 | discuss | — | — | after 1 |
+| 3 | discuss | — | — | after 1+2 |
+| #5024 | **open** (dirty) | — | #5024 | rebase onto current main; add the runtime half |
+| #5033 | **open** (clean) | — | #5033 | re-apply onto the branch, or withdraw |
 
 ## 6. Hard prerequisites
 
@@ -132,3 +159,38 @@ Notes:
   locale, rebuilt CSS), or the PR is unreviewable.
 - Never include fork-only product decisions as if they were upstream defaults;
   call them out in the issue and let maintainers decide.
+
+---
+
+## 7. Our two open upstream PRs — verified 2026-11-14
+
+Both are **open** in `jundot/omlx` (checked via the GitHub API), and both were
+folded into the old base pin `1e27576a`. Because the rebase replays only our delta
+(`1e27576a..feat`), their status matters. They are **not** additional packages,
+but they are not "done" either:
+
+| PR | Verified state | What it contains | What our branch has | Action |
+|---|---|---|---|---|
+| **#5024** `feat(cluster-moe-offload`<br>“carry MoE expert offload into pipeline ranks” | open, 4 commits, **+619/−16, 16 files, `mergeable_state: dirty`** (conflicts with upstream's planner refactor) | planner +118, routes +127, deployment, autoconfigure, **inference_worker +23, progressive_loading +24, `deepseek_v41/loading.py`, `deepseek_v41_mlx_lm/model.py`**, docs, 6 test files | **Only the planner/routes/deployment pricing half** (our F5). The **runtime half is missing**: `inference_worker`, `progressive_loading`, `deepseek_v41/loading.py`, `deepseek_v41_mlx_lm/model.py` — so a plan can price expert offload while a pipeline rank does not yet stream it. | **Rebase #5024 onto current main and push it as the updated head.** That *is* F5 plus the runtime half. Do **not** open a separate "F5" PR. |
+| **#5033** `feat/qwen4-exp-cluster`<br>“make Qwen4-Exp pipeline-parallel” | open, 8 commits, **+1689/−77, 15 files, `mergeable: true` (clean)** | `qwen4_exp_mlx_lm` adapter (335), `pipeline_compat` +45, planner +233, routes, vendor `language.py` +118, `model_loading`, 3 tests (+804), doc | **Nothing** — dropped by the rebase | **Re-apply onto `rebase/upstream-main`** (it is clean against main, so this is low-risk) and keep the PR, **or** withdraw it if single-node Qwen3.8 is the accepted answer. |
+
+Consequence if we leave both as-is: the branch has the MoE offload *pricing* but not
+its *runtime* on pipeline ranks, and it has no Qwen4-Exp pipeline. The current live
+path (GLM-5.3 cluster, Qwen3.8 single-node at 40.3 tok/s) works, but a DeepSeek-MoE
+cluster plan and a multi-Mac Qwen3.8 run would not.
+
+## 8. Corrected PR count
+
+- **8 new PRs**: F1, F2, F3, F4, **F5 (cluster-core extras)**, and assistant 1, 2, 3.
+- **2 existing PRs** that must be handled, not re-offered:
+  - **#5024** — rebase onto current main and push as the updated head. That covers
+    the MoE pricing already on the branch **and** the runtime half we have not
+    ported (`inference_worker`, `progressive_loading`, `deepseek_v41/loading.py`,
+    `deepseek_v41_mlx_lm/model.py`).
+  - **#5033** — re-apply onto `rebase/upstream-main` (clean against main) or
+    withdraw.
+- Total tracks: **10**. If F5 rides with the #5024 rebase instead of standing
+  alone: **9**.
+
+The earlier "8 PRs" was wrong in two ways: it counted F5 as new (it is #5024) and
+it ignored the runtime half of #5024 and the whole of #5033.

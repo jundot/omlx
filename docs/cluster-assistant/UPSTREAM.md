@@ -27,8 +27,26 @@ What the rebase changed in the fork:
   `acceleratorRows`).
 - `Localizable.xcstrings` is **upstream-preferred** (upstream base + feat-only
   keys) so the compiled catalogue stays complete.
-- **Dropped** (upstream removed them): `qwen4_exp_mlx_lm` adapter, `qwen4`
-  cluster/pipeline tests, the experimental doc.
+- **Not replayed** (**they live only in our open PR #5033; never upstream**):
+  `qwen4_exp_mlx_lm` adapter, `qwen4` cluster/pipeline tests, the experimental
+  doc. No Qwen4-Exp pipeline on this branch; Qwen3.8 is single-node `run-local`.
+
+## PR status of our own branches (verified via GitHub API, 2026-11-14)
+
+Both were folded into the old base pin `1e27576a`, so the rebase's delta replay
+does not carry them:
+
+- **#5024** `feat(cluster-moe-offload` — **open**, 4 commits, +619/−16, 16 files,
+  `mergeable_state: dirty`. Its planner/routes/deployment pricing is on our branch
+  (restored after upstream's refactor), but its **runtime half**
+  (`inference_worker`, `progressive_loading`, `deepseek_v41/loading.py`,
+  `deepseek_v41_mlx_lm/model.py`) is **not** ported. Action: rebase onto current
+  main and push as the updated head.
+- **#5033** `feat/qwen4-exp-cluster` — **open**, 8 commits, +1689/−77, 15 files,
+  `mergeable: true` (clean, rebased onto main on 2026-11-12). Nothing of it is on
+  this branch. Action: re-apply onto `rebase/upstream-main`, or withdraw.
+
+Details and the per-file effect: `UPSTREAM-PACKAGES.md` §7.
 
 Local evidence and the full conflict list: `REBASE-2026-11-14.md`.
 
