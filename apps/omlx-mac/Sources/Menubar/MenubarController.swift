@@ -93,6 +93,7 @@ final class MenubarController: NSObject {
     private var memoryPanelHost: NSHostingView<AnyView>?
     private var adminPanelItem: NSMenuItem!
     private var webAdminItem: NSMenuItem!
+    private var clusterAssistantItem: NSMenuItem!
     private var chatItem: NSMenuItem!
     private var updateItem: NSMenuItem!
 
@@ -318,6 +319,18 @@ final class MenubarController: NSObject {
                             symbol: "globe")
         menu.addItem(webAdminItem)
 
+        // The Cluster Assistant is not a second window or control plane: it
+        // deep-links the existing dashboard's Cluster tab, where the assistant
+        // card already lives.
+        clusterAssistantItem = item(
+            String(localized: "menubar.item.cluster_assistant",
+                   defaultValue: "Cluster Assistant",
+                   comment: "Menubar item that opens the existing web dashboard on the Cluster Assistant tab"),
+            action: #selector(openClusterAssistant),
+            symbol: "network"
+        )
+        menu.addItem(clusterAssistantItem)
+
         chatItem = item(String(localized: "menubar.item.chat",
                                defaultValue: "Chat with oMLX",
                                comment: "Menubar item that opens the browser-based chat dashboard"),
@@ -420,6 +433,7 @@ final class MenubarController: NSObject {
         let availability = MenubarController.menuAvailability(for: state)
         adminPanelItem.isEnabled = availability.settings
         webAdminItem.isEnabled = availability.webDashboard
+        clusterAssistantItem.isEnabled = availability.webDashboard
         chatItem.isEnabled = availability.chat
 
         refreshUpdateMenuItem()
@@ -1019,6 +1033,19 @@ final class MenubarController: NSObject {
         NSWorkspace.shared.open(url)
     }
 
+    @objc private func openClusterAssistant() {
+        guard serverIsRunning else { return }
+        let host = MenubarController.displayHost(server: server, fallback: config.host)
+        let port = MenubarController.displayPort(server: server, fallback: config.port)
+        guard let url = MenubarController.webAdminURL(
+            host: host,
+            port: port,
+            apiKey: config.apiKey,
+            redirect: MenubarController.clusterAssistantRedirect
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     @objc private func openChat() {
         guard serverIsRunning else { return }
         let host = MenubarController.displayHost(server: server, fallback: config.host)
@@ -1411,6 +1438,10 @@ extension MenubarController {
     ///
     /// Internal (not private) so `MenubarControllerPortTests` can exercise
     /// it without a live `NSStatusBar`.
+    /// The existing dashboard's Cluster tab. The app has no second cluster
+    /// window; this is a deep link into the same page.
+    static let clusterAssistantRedirect = "/admin/dashboard?tab=cluster"
+
     static func webAdminURL(
         host: String, port: Int, apiKey: String?, redirect: String = "/admin/dashboard"
     ) -> URL? {

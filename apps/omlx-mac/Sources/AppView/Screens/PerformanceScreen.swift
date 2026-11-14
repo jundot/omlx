@@ -168,6 +168,7 @@ private struct SchedulerSection: View {
 private struct MemoryLifecycleSection: View {
     @Bindable var vm: PerformanceScreenVM
     @Environment(\.omlxTheme) private var theme
+    @Environment(AppServices.self) private var services
 
     var body: some View {
         SectionHeader(
@@ -298,7 +299,16 @@ private struct MemoryLifecycleSection: View {
                                 .font(.omlxText(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.text)
                                 .fixedSize(horizontal: false, vertical: true)
-                            CodeChip(value: vm.wiredLimitCommand)
+                            HStack(spacing: 8) {
+                                CodeChip(value: vm.wiredLimitCommand)
+                                Button(String(localized: "performance.memory.wired_limit_apply",
+                                              defaultValue: "Apply with Admin…",
+                                              comment: "Button that raises the Metal wired limit with one system admin dialog")) {
+                                    Task { await vm.applyWiredLimit(client: services.client) }
+                                }
+                                .buttonStyle(.omlx(.normal))
+                                .disabled(vm.isLoading || vm.isSaving)
+                            }
                         }
                         Spacer(minLength: 0)
                     }
