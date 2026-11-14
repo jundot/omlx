@@ -152,6 +152,14 @@ Resolved implementation decisions:
   `plan_signature`). The user picks; `apply` uses the chosen `resource_policy` and
   signature. There is no upfront context-ceiling oracle and no silent context
   drop.
+- **Routed-expert (MoE) offload is priced again after the 2026-11-14 rebase.**
+  Upstream removed it from the planner; it is restored on upstream's refactored
+  pipeline (`plan_hybrid`/`plan_unequal_pipeline`/`_finish_pipeline_plan`/
+  `_held_layer_bytes` + `PipelineAssignment.moe_offload_*`; a `()` default equals
+  upstream) and threaded through the coordinator plan path
+  (`routes._saved_moe_offload`/`_moe_offload_layer_bytes`/`_moe_offload_for_plan`)
+  and `deployment._assignment_from_dict`. DeepSeek-V4.1 only; other families keep
+  upstream's resident plan; TP > 1 is refused; never invent bytes.
 - **A stale cluster deployment is never auto-unloaded across coordinators
   (2026-11-14).** `local_only` on a model load (`POST /api/models/{id}/load
   ?local_only=true`) already prevents the real bug: a single-Mac load adopting a
@@ -671,7 +679,7 @@ the answer here.
 | Decision | Recorded answer |
 |---|---|
 | Product/repo name | **oMLX Cluster Assistant** (oMLX brand, feature name). |
-| Fork / upstream / pin | **Focused fork, now on `upstream/main` `624cff0e`** (rebased 2026-11-14, branch `rebase/upstream-main`; `feat/cluster-assistant` and `backup/pre-rebase-2026-11-14` keep the pre-rebase tree). Our net work from the old pin `1e27576a` was squash-reapplied. Upstream removed routed-expert (MoE) offload from the planner; it is restored on top of upstream's refactored pipeline so the assistant MoE lever and the context-vs-experts tradeoff work (`()` default reproduces upstream). Dropped with upstream: `qwen4_exp_mlx_lm`, qwen4 cluster/pipeline tests, experimental doc. The coordinator-side MoE threading (`routes.py`/`deployment.py`) is the one documented follow-up. See `REBASE-2026-11-14.md`. Tests: `tests/` 19863 passed, `apps/omlx-web/tests` 559 passed, macOS `xcodebuild test … -testLanguage en`. |
+| Fork / upstream / pin | **Focused fork, now on `upstream/main` `624cff0e`** (rebased 2026-11-14, branch `rebase/upstream-main`; `feat/cluster-assistant` and `backup/pre-rebase-2026-11-14` keep the pre-rebase tree). Our net work from the old pin `1e27576a` was squash-reapplied. Upstream removed routed-expert (MoE) offload from the planner; it is restored on top of upstream's refactored pipeline **and threaded through the coordinator plan path and the deployment decode**, so the assistant MoE lever and the context-vs-experts tradeoff work (`()` default reproduces upstream). Dropped with upstream: `qwen4_exp_mlx_lm`, qwen4 cluster/pipeline tests, experimental doc. See `REBASE-2026-11-14.md` and `CLUSTER-TEST-RUNBOOK.md`. Tests: `tests/` 20392 passed / 254 skipped (native kernels built), `apps/omlx-web/tests` 559 passed, macOS `xcodebuild test … -testLanguage en`. |
 | Rank-0 rule | Best feasible plan; free admission is a strong preference, not the only criterion (already frozen). |
 | Coordinator / rank 0 | Co-located in the MVP (already frozen). |
 | RDMA default | **Ring over TCP only**; RDMA/JACCL is the later advanced path. |
