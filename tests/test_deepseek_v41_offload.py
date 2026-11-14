@@ -884,7 +884,21 @@ def test_parallel_pages_preserve_order_short_reads_and_warm_hits(tmp_path, monke
     assert reader._seen_pages is None
 
 
-def test_decode_rows_prefetch_their_pages(tmp_path, monkeypatch):
+class _RecordingMap(storage.mmap.mmap):
+    """An mmap that records the pages it is advised to read."""
+
+    events: list = []
+
+    def madvise(self, option, *span):
+        if option == storage.mmap.MADV_WILLNEED:
+            start, length = span
+            self.events.append((start, start + length))
+        return super().madvise(option, *span)
+
+
+def test_decode_rows_advise_their_pages_and_skip_the_pool(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage.mmap, "mmap", _RecordingMap)
+    _RecordingMap.events = []
     reader, raw = page_table(tmp_path)
     original = storage.os.pread
     calls = []
@@ -895,13 +909,50 @@ def test_decode_rows_prefetch_their_pages(tmp_path, monkeypatch):
 
     monkeypatch.setattr(storage.os, "pread", counted)
     try:
-        # One decode token selects 24 Engram rows per table.
-        ids = np.arange(24)
+        # One decode token selects 24 Engram rows per table, spread out.
+        ids = np.arange(24) * 160
         actual, _ = reader.read("w", ids)
         np.testing.assert_array_equal(actual, raw[ids])
-        assert calls
+        assert not calls
+        for row in ids:
+            offset = reader._start + int(row) * raw.shape[1]
+            assert any(low <= offset < high for low, high in _RecordingMap.events)
+        # Rows already read count as warm for later wide reads.
+        assert reader._seen_pages is not None and reader._seen_pages.any()
     finally:
         reader.close()
+
+
+def test_engram_lookup_advises_every_tensor_before_copying(tmp_path, monkeypatch):
+    path = tmp_path / "affine.safetensors"
+    weights = np.arange(4096 * 16, dtype=np.uint32).reshape(4096, 16)
+    scales = np.ones((4096, 4), dtype=np.float16)
+    biases = np.zeros((4096, 4), dtype=np.float16)
+    raw_safetensors(
+        path, {"w": (weights, "U32"), "s": (scales, "F16"), "b": (biases, "F16")}
+    )
+    embed = storage.DiskEngramEmbedding(
+        path, "w", "s", bias_key="b", bits=4, group_size=32
+    )
+    order = []
+    for name in ("advise_rows", "read"):
+        original = getattr(storage.TensorFile, name)
+
+        def wrapped(self, key, *args, _name=name, _original=original, **kwargs):
+            order.append((_name, key))
+            return _original(self, key, *args, **kwargs)
+
+        monkeypatch.setattr(storage.TensorFile, name, wrapped)
+    try:
+        embed._read_rows(np.array([[1, 900, 3000]]))
+        assert order[:3] == [
+            ("advise_rows", "w"),
+            ("advise_rows", "s"),
+            ("advise_rows", "b"),
+        ]
+        assert [name for name, _ in order[3:]] == ["read"] * 3
+    finally:
+        embed.close()
 
 
 def test_wide_mixed_reads_only_read_rows_on_new_pages(tmp_path, monkeypatch):
@@ -928,16 +979,12 @@ def test_wide_mixed_reads_only_read_rows_on_new_pages(tmp_path, monkeypatch):
         actual, _ = reader.read("w", rows)
         np.testing.assert_array_equal(actual, raw[rows])
         assert calls == [(offset, offset + row_bytes)]
-        # Narrow mixed reads, such as decode, still read every row.
+        # Narrow reads, such as decode, copy every row from the mapping.
         calls.clear()
         narrow = np.array([2, 3000, 15])
         actual, _ = reader.read("w", narrow)
         np.testing.assert_array_equal(actual, raw[narrow])
-        for row in narrow:
-            begin = reader._start + int(row) * row_bytes
-            assert any(
-                low <= begin and begin + row_bytes <= high for low, high in calls
-            )
+        assert not calls
     finally:
         reader.close()
 

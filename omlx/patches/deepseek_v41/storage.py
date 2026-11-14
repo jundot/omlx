@@ -47,6 +47,11 @@ _PAGE_IO_POOL = ThreadPoolExecutor(
 # Rows per positional read, and the largest hole read through instead of split.
 # On a cold SSD one read across a hole up to 64KiB is faster than two reads.
 ROW_BATCH_ROWS = 256
+# Up to this many rows (a decode token's lookups, or a short MTP verify block)
+# are advised to the kernel and copied from the mapping instead of read
+# through the I/O pool: the kernel starts every missing page at once, and the
+# copy waits about one drive latency without waking pool threads.
+ADVISE_MAX_ROWS = 64
 ROW_BATCH_MAX_GAP = 65536
 ROW_READ_RETRY_SECONDS = 60.0
 
@@ -157,7 +162,39 @@ class TensorFile:
             self._file.close()
             raise
 
-    def read(self, key, rows=None, *, metal_backed=False):
+    def advise_rows(self, key, rows):
+        """Ask the kernel to start reading ``rows`` of ``key`` in the background.
+
+        Copying the rows from the mapping faults their missing pages in one at
+        a time, a drive round trip each. Advising every page first lets the
+        reads overlap.
+        """
+        with self._lock:
+            if self._mapping is None or not hasattr(self._mapping, "madvise"):
+                return
+            entry = self.header[key]
+            start, end = entry["data_offsets"]
+            count = entry["shape"][0]
+            if not count:
+                return
+            row_bytes = (end - start) // count
+            base = self._start + start
+            pages = set()
+            for row in np.asarray(rows, dtype=np.int64).reshape(-1).tolist():
+                if not 0 <= row < count:
+                    raise IndexError("Engram row outside table")
+                first = (base + row * row_bytes) // PAGE_SIZE
+                last = (base + (row + 1) * row_bytes - 1) // PAGE_SIZE
+                pages.update(range(first, last + 1))
+            for page in sorted(pages):
+                self._mapping.madvise(mmap.MADV_WILLNEED, page * PAGE_SIZE, PAGE_SIZE)
+
+    def read(self, key, rows=None, *, metal_backed=False, advised=False):
+        """Rows of ``key``, or the whole tensor when ``rows`` is None.
+
+        ``advised`` says the caller already called ``advise_rows`` for these
+        rows (to overlap several tensors' reads).
+        """
         with self._lock:
             if self._mapping is None:
                 raise RuntimeError("Engram tensor file is closed")
@@ -212,6 +249,15 @@ class TensorFile:
                 gather_rows = rows.size
                 copied = None
                 row_bytes = (end - start) // view.shape[0] if view.shape[0] else 0
+                if rows.size <= ADVISE_MAX_ROWS and 0 < row_bytes <= PAGE_SIZE:
+                    if not advised:
+                        self.advise_rows(key, rows)
+                    fresh, _ = self._unseen_rows(
+                        rows.reshape(-1), self._start + start, row_bytes
+                    )
+                    copied = view[rows]  # Waits for the advised pages.
+                    self._seen_pages[fresh] = 1
+                    return copied, dtype
                 if rows.size and 0 < row_bytes <= PAGE_SIZE:
                     base = self._start + start
                     flat = rows.reshape(-1)
@@ -441,16 +487,23 @@ class DiskEngramEmbedding(nn.Module):
         with self._lock:
             if self._closed:
                 raise RuntimeError("Engram embedding is closed")
-            result = []
-            for reader, key in (
+            pairs = (
                 (self._weights, self._weight_key),
                 (self._scales, self._scale_key),
                 (self._scales, self._bias_key),
-            ):
+            )
+            advised = self._resident is None and host.size <= ADVISE_MAX_ROWS
+            if advised:
+                # Start every page of all three tensors before copying any.
+                for reader, key in pairs:
+                    if key is not None:
+                        reader.advise_rows(key, host)
+            result = []
+            for reader, key in pairs:
                 if key is None:
                     continue
                 if self._resident is None:
-                    result.append(reader.read(key, host.reshape(-1)))
+                    result.append(reader.read(key, host.reshape(-1), advised=advised))
                 else:
                     raw, dtype = self._resident[key]
                     rows = host.reshape(-1)
