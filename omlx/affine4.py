@@ -874,7 +874,15 @@ def _native_attention(
         mask = mx.array(True)
     else:
         return None
-    valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
+    # Rows of a ragged speculative rollback (BatchTurboQuantKVCache.trim_rows)
+    # end at their own columns; the kernels stop each row there, so a decode
+    # step without a mask (Qwen3.5's left-padded decode) never reads the
+    # dropped tokens of a shorter row.
+    row_ends = getattr(cache, "_row_ends", None) if is_batch else None
+    if row_ends is not None and len(row_ends) == batch:
+        valid_ends = mx.array([min(int(e), tokens) for e in row_ends], dtype=mx.int32)
+    else:
+        valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
 
     blocks = _attention_blocks(tokens, kv_heads, dim)
     partition_tiles = ((tokens + 63) // 64 + blocks - 1) // blocks
@@ -1142,6 +1150,7 @@ class Affine4KVCache(TurboQuantKVCache):
         self.key_codec = self.codec_class(key_dim, seed) if key_dim else None
         self.value_codec = self.codec_class(value_dim, seed + 1) if value_dim else None
         if hasattr(self, "left_padding"):
+            self._row_ends = None
             self._phys_end = offset
             self.offset = offset - self.left_padding
         else:
@@ -1468,6 +1477,7 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
     @BatchTurboQuantKVCache.state.setter
     def state(self, value):
         Affine4KVCache.state.fset(self, value)
+        self._row_ends = None
         self._phys_end = self.offset
         self.offset = self._phys_end - self.left_padding
 
@@ -1527,5 +1537,6 @@ class BatchAffine8KVCache(BatchAffine4KVCache, Affine8KVCache):
     @BatchTurboQuantKVCache.state.setter
     def state(self, value):
         Affine8KVCache.state.fset(self, value)
+        self._row_ends = None
         self._phys_end = self.offset
         self.offset = self._phys_end - self.left_padding

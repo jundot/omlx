@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import logging
 import time
@@ -37,7 +38,45 @@ def _supports_batch_rollback(cache):
             and type(cache) in (vlm_cache.ArraysCache, vlm_cache.BatchKVCache)
         )
         or getattr(type(cache), "_omlx_mtp_batch_rollback_cache", False)
+        # Quantized batch caches (affine/turboquant) drop a different count per
+        # row in place (trim_rows); _ragged_trim_rows applies it below.
+        or getattr(type(cache), "_omlx_ragged_trim", False)
     )
+
+
+@contextlib.contextmanager
+def _ragged_trim_rows(cache, accepted, depth):
+    """Roll back ragged-trim batch caches per row, outside the model's rollback.
+
+    The verify block appended ``depth + 1`` tokens to every row; row ``b``
+    keeps ``accepted[b] + 1``. Caches with ``trim_rows`` drop the rest of each
+    row in place (no packed state moves; their attention stops each row at its
+    own end). While the model's own rollback runs they read as speculating, so
+    mlx-vlm's append-cache trim (a uniform trim or a right-pad roll of the
+    whole cache) skips them.
+    """
+    leaves = []
+    stack = list(cache)
+    while stack:
+        entry = stack.pop()
+        if entry is None:
+            continue
+        subs = getattr(entry, "caches", None)
+        if subs is not None:
+            stack.extend(subs)
+        elif getattr(type(entry), "_omlx_ragged_trim", False) and not getattr(
+            entry, "is_speculating", False
+        ):
+            leaves.append(entry)
+    drops = [max(0, int(depth) - int(a)) for a in accepted]
+    for entry in leaves:
+        entry.trim_rows(drops)
+        entry.is_speculating = True
+    try:
+        yield
+    finally:
+        for entry in leaves:
+            entry.__dict__.pop("is_speculating", None)
 
 
 def _independent_verify(model):
@@ -332,9 +371,9 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         # The model updates KV padding and selects each row's GDN state in
         # place. No extraction or merge is needed for the next target call.
         started = time.perf_counter()
-        batch.model.rollback_speculative_cache(
-            cache, gdn, [accepted for accepted, _ in deferred], depth + 1
-        )
+        accepted_rows = [accepted for accepted, _ in deferred]
+        with _ragged_trim_rows(cache, accepted_rows, depth):
+            batch.model.rollback_speculative_cache(cache, gdn, accepted_rows, depth + 1)
         commit_ms = (time.perf_counter() - started) * 1000 / len(rows)
         for (index, row, _), (_, finish) in zip(rows, deferred):
             bg._set_singleton_mrope_delta(row)
