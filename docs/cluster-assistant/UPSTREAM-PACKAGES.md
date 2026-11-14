@@ -108,11 +108,10 @@ planner pricing the assistant needs lives in **open PR #5024**, not in F5 (see �
 |---|---|---|---:|---|
 | F1 | `local_only` model load | `engine_pool`, `admin/routes`, its tests | 85 | — |
 | F2 | Test infra | `tests/conftest.py` (MockTokenizer collision), `_tokenizer_support.py`, native-indexer skip, `.editorconfig`, `.gitignore`, `.python-version`. **Trimmable**: the two dotfiles are opinions upstream may decline; `test_settings.py`/`test_scheduler.py` belong to the feature PRs, not here. | 80 (tests) | — |
-| F3 | Peer version check | `scripts/check_peer_versions.py` + `PEER-VERSIONS.md` | 90 | — |
 | F4 | macOS helper / DMG | Helper plists + `main.swift`, `Scripts/*`, `PerformanceScreenVM`, `PythonRuntime`, `WelcomeWindow`, menubar, mac tests, **+7 xcstring entries** | ~880 (+ tests) | — |
 | F5 | **Cluster-core extras** (not in #5024) | `discovery` +183/−18 (fallback carries name/chip/RAM), `model_inventory` +86/−7, `staging` +71/−7, `performance_worker` +55/−7, `discovery_routes` +21, `catalogue` +5/−3, its tests | ~200 logical (421 raw) | — |
 | 1 | **Assistant plans** | A1 measure (`measurement`, `state`, `calibration`, `models`, `/measure`, `/status`) + A2 recommend/plan (`recommendation`, `evaluation`, `election`, `policy`, `topology`, `/recommend`, `/plan`) + `search` + `DELETE /models/{node}/{model}` (the recommendation emits `free_disk_space`) + U1 (UI up to `planning`) + `CLUSTER-ASSISTANT.md` | ~5 600 | **#5024 (planner half), hard** |
-| 2 | **Assistant runs** | A3 apply/start/stop (`provisioning`, `start`, `operations`, `/apply`, `/start`, `/stop`, `/session`, `/operations/*`) + A4 tuning (`tuning`, `tuning_store`, `redeploy_tuning`, `performance_store`, `/tune*`) + `diagnostics` (only start emits it), `network-preflight`, `performance-probe` + U2 (apply/ready/stop/tuning) | ~4 900 | PR 1 |
+| 2 | **Assistant runs** | A3 apply/start/stop (`provisioning`, `start`, `operations`, `/apply`, `/start`, `/stop`, `/session`, `/operations/*`) + A4 tuning (`tuning`, `tuning_store`, `redeploy_tuning`, `performance_store`, `/tune*`) + `diagnostics` (only start emits it), `network-preflight`, `performance-probe`, the read-only peer check (folded F3) + U2 (apply/ready/stop/tuning) | ~4 900 | PR 1 |
 | 3 | **Run on one Mac** | `run-local`, `run-local/{id}/stop`, `tune-local` (+ statuses) and the small UI card | ~400 | PR 1 + 2 |
 
 Order: **F1–F4 in any order → #5024 (rebased) and F5 → PR 1 → PR 2 → PR 3.** F2 may
@@ -138,7 +137,6 @@ context-vs-speed tradeoff and can free disk — it starts nothing.
 |---|---|---|---|---|
 | F1 | draft | — | — | re-cut on upstream/main; no conflict |
 | F2 | draft | — | — | trimmable; two dotfiles optional |
-| F3 | draft | — | — | script + doc |
 | F4 | draft | — | — | app maintainers; cut the 7 xcstring entries only |
 | F5 | draft | — | — | cluster-core extras (discovery/inventory/staging/probe/catalogue) |
 | 1 | discuss | — | — | hard dependency on #5024's planner pricing |
@@ -183,55 +181,84 @@ PLE VLM is “never planned as PP” described the pre-#5033 state and is withdr
 
 ## 8. Prepared branches (local, committed, tested — ready to push)
 
-All are based directly on `upstream/main` `624cff0e` (`HEAD^ == 624cff0e`), so each
-push is a clean single-PR branch. None is pushed yet.
+Fixes are based directly on `upstream/main` `624cff0e` (`HEAD^ == 624cff0e`), so
+each push is a clean single-PR branch. The assistant series is stacked on a local
+integration base (§8.1). None is pushed yet.
 
 | Branch | Commit | Files | +/− | Tests |
 |---|---|---|---:|---|
 | `pr/f1-local-only` | `bda778e0` | 5 | +271/−22 | 244 passed |
-| `pr/f2-test-infra` | `45126fe3` | 6 | +96/−48 | 517 passed, 4 skipped; collection clean (19 969) |
-| `pr/f3-peer-check` | `bbbab9d7` | 2 | +209/−0 | ruff + loopback smoke (no suite) |
+| `pr/f2-test-infra` | `c819ec74` | 3 | +74/−48 | 517 passed, 4 skipped; collection clean (19 969) |
 | `pr/f4-mac-helper-dmg` | `be025eee` | 28 | +2380/−22 | 32 + 81 macOS, 13 python |
 | `pr/f5-cluster-core` | `f62d50f0` | 11 | +888/−53 | 1614 cluster |
+| `pr/a0-cluster-base` (not offered) | `34b2fc6c` | 47 | +4471/−258 | 295 focused (F1+F2+F5+#5024+#5033) |
+| `pr/a1-assistant-plan` | `5b3cafae` | 62 | +22 884/−79 **vs a0** | 312 assistant + 473 web |
+| `pr/a2-assistant-run` | `7e53f41b` | 83 | +23 315/−570 **vs a1** | 615 assistant + 547 web |
+| `pr/a3-run-local` | `417ef95d` | 13 | +4268/−16 **vs a2** | 646 assistant + 559 web |
 
-Notes for the pushes:
+### 8.1 Why the assistant series has a local base
+
+A fork PR can only be based on a branch in the **target** repo, so A1 cannot be
+"based on A0" at GitHub. Instead:
+
+- `pr/a0-cluster-base` exists only locally: `upstream/main` + F1 + F2 + F5 +
+  #5024 + #5033, i.e. **all prerequisites** in one mergeable state. It is what
+  the assistant needs to import and run today.
+- A1/A2/A3 are stacked on it and contain **only assistant content** (verified:
+  every diff is a subset of `omlx/cluster/assistant/**`, `tests/cluster_assistant/**`,
+  `apps/omlx-web/**`, `CLUSTER-ASSISTANT.md`, `omlx/server.py`, `omlx/settings.py`
+  and two assistant tests). No prerequisite code is duplicated or reverted.
+- So they are opened **after** F5 + #5024 + #5033 land (the phased decision), at
+  which point `pr/a0-cluster-base` is simply `upstream/main` and A1 rebases onto
+  it unchanged in size. Opening them today would duplicate ~4.5k prerequisite
+  lines in the PR diff.
+
+### 8.2 Notes a reviewer needs
 
 - F1 also carries the `force_lm`/VLM fallback guard (same bug: a cluster
   deployment leaking into a local load); its tests live in the same file.
-- F2 keeps `tests/test_settings.py` and the `test_scheduler.py` import rewrites
-  out (they belong to feature PRs); the root conftest still re-exports
-  `MockTokenizer`, so those call sites work unchanged.
-- F3 had its links to sibling cluster docs removed so it is standalone; the script
-  probes assistant routes by design and reports `OLDER BUILD` on an upstream-only
-  peer — that is the diagnostic, not a defect.
+- F2 is trimmed to the three real test-infra files (conftest collision,
+  `_tokenizer_support.py`, native-indexer skip). The dotfiles (`.editorconfig`,
+  `.python-version`) and the `.gitignore` change were dropped by decision; the
+  root conftest still re-exports `MockTokenizer`, so existing call sites work.
+- F3 (peer check) was **folded into A2** by decision: the script probes the
+  assistant's operations/tuning routes, which only exist there. Its links to
+  sibling cluster docs were removed so it stands alone inside A2.
 - F4 adds **7** xcstrings entries to upstream's catalogue (the 78 914-line diff
-  was a re-serialization, not content).
+  was a re-serialization of the same 1704 entries, not content).
 - F5 extracts exactly one line from `omlx/cluster/routes.py` (the inventory call
   must use `DEFAULT_REMOTE_PYTHON`, not the hardcoded `~/omlx-distributed` path).
+- A1 deliberately ends at the plan: the card has no start-setup button, no
+  progress rows, no endpoint/session/stop/tuning — and
+  `/admin/api/cluster/performance-probe` is allowlisted in the UI seam test with
+  the reason that its caller ships with A2.
+- A1 needs the F2 conftest fix because the nested
+  `tests/cluster_assistant/conftest.py` shadows the root `conftest` module; that
+  is why F2 is in the base and offered first.
 
-Upload (once the assistant branches are added below; no PR is open yet):
+### 8.3 Upload
 
 ```sh
-# from the main repo — branches live in the shared object database
-for b in pr/f1-local-only pr/f2-test-infra pr/f3-peer-check \
-         pr/f4-mac-helper-dmg pr/f5-cluster-core; do
+# phase 1 — fixes, in any order
+for b in pr/f1-local-only pr/f2-test-infra pr/f4-mac-helper-dmg; do
   git push origin "$b:$b"
 done
+# phase 2 — cluster core
+git push origin pr/f5-cluster-core:pr/f5-cluster-core
+# phase 3 (after F5, #5024, #5033 are merged) — rebase then push
+git rebase --onto origin/main pr/a0-cluster-base pr/a1-assistant-plan
+git push origin pr/a1-assistant-plan:pr/a1-assistant-plan
+# then A2, A3 the same way (A2's base becomes A1, A3's base becomes A2;
+# open all three as drafts and merge bottom-up)
 ```
 
-Push the assistant stack in order (`a1` → `a2` → `a3`); each later branch is based
-on the previous one, so its PR must target that branch (or the series is merged
-bottom-up).
+## 9. Final PR count
 
-## 9. Corrected PR count
-
-- **8 new PRs**: F1, F2, F3, F4, F5 (cluster-core extras), and assistant 1, 2, 3.
+- **7 new PRs**: F1, F2, F4, F5, A1, A2 (includes the folded peer check), A3.
 - **2 existing PRs, both handled**:
-  - **#5024** — rebased onto `624cff0e`, pushed (`bbbf18d2`), and **both halves**
+  - **#5024** — rebased onto `624cff0e`, pushed (`bbbf18d2`), **both halves**
     mirrored on our branch (pricing in the rebase, runtime in `392aaccb`).
-  - **#5033** — rebased onto `624cff0e`, pushed (`25da70de`), and applied on our
+  - **#5033** — rebased onto `624cff0e`, pushed (`25da70de`), applied on our
     branch (`054f92e4`).
-- Total tracks: **10**.
-
-The earlier "8 PRs" was wrong in two ways: it counted F5 as new (it is #5024) and
-it ignored the runtime half of #5024 and the whole of #5033.
+- Total tracks: **9** (7 new + 2 existing), plus the non-offered local base
+  `pr/a0-cluster-base`.
