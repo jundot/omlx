@@ -8,15 +8,11 @@ import pytest
 from omlx import affine4
 from omlx.affine4 import BatchAffine4KVCache, BatchAffine8KVCache
 from omlx.patches.mlx_lm_mtp import fused_batch
+from tests.test_affine4 import require_tensor_ops
 
 
 def random(shape, seed=0):
     return mx.random.normal(shape, key=mx.random.key(seed)).astype(mx.bfloat16)
-
-
-def require_tensor_ops():
-    if not affine4._tensor_ops_available():
-        pytest.skip("Metal TensorOps attention is unavailable")
 
 
 def row_reference(cache, queries, ends, causal_rows=0):
