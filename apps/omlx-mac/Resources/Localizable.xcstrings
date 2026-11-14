@@ -206,7 +206,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "一次 web_search 调用返回多少个来源（1-10）。"
+            "value" : "一次 web_search 调用返回多少个来源（1–10）。"
           }
         }
       }
@@ -3701,7 +3701,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仪表盘"
+            "value" : "控制台"
           }
         }
       }
@@ -4421,7 +4421,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "运行时间"
+            "value" : "运行时长"
           }
         }
       }
@@ -4817,7 +4817,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Apple 的数组计算框架 — 驱动每个模型的引擎"
+            "value" : "Apple 的数组计算框架——驱动每个模型的引擎"
           }
         }
       }
@@ -7757,7 +7757,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "已加载或未加载 — 服务器将按需加载"
+            "value" : "已加载或未加载——服务器将按需加载"
           }
         }
       }
@@ -7823,7 +7823,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "镜像全局设置并立即保存 — 服务使用相同模式，因此测量值保持有效"
+            "value" : "镜像全局设置并立即保存——服务使用相同模式，因此测量值保持有效"
           }
         }
       }
@@ -8033,7 +8033,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "此基准测试可能需要很长时间 — 验证会在测量大小处预填充真实提示，对于大型模型可能需要很多分钟。开始时所有已加载的模型都会被卸载，中断活动请求。完成后，结果会自动应用到模型的上下文窗口设置。"
+            "value" : "此基准测试可能需要很长时间——验证会在测量大小处预填充真实提示，对于大型模型可能需要很多分钟。开始时所有已加载的模型都会被卸载，中断活动请求。完成后，结果会自动应用到模型的上下文窗口设置。"
           }
         }
       }
@@ -9173,7 +9173,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "已加载或未加载 — 服务器将按需加载"
+            "value" : "已加载或未加载——服务器将按需加载"
           }
         }
       }
@@ -10700,7 +10700,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "好"
+            "value" : "确定"
           }
         }
       }
@@ -11635,7 +11635,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "这是一个 LoRA 适配器。它需要兼容的基座模型才能运行 — 单独下载无法在 oMLX 中加载。"
+            "value" : "这是一个 LoRA 适配器。它需要兼容的基座模型才能运行——单独下载无法在 oMLX 中加载。"
           }
         }
       }
@@ -13691,7 +13691,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工具配置"
+            "value" : "工具配置档"
           }
         }
       }
@@ -14153,7 +14153,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "拒绝大于此大小的文档附件。"
+            "value" : "转换前拒绝大于此大小的文档附件。"
           }
         }
       }
@@ -14675,7 +14675,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "高级 — 直接运行 `claude`"
+            "value" : "高级——直接运行 `claude`"
           }
         }
       }
@@ -16949,7 +16949,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "好"
+            "value" : "确定"
           }
         }
       }
@@ -18065,7 +18065,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "打开 Web 仪表盘"
+            "value" : "打开 Web 控制台"
           }
         }
       }
@@ -20793,7 +20793,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "只为 macOS 保留 2% 内存（1.5-4 GB），并可压缩其他应用的内存，让 oMLX 几乎可以使用全部内存。"
+            "value" : "只为 macOS 保留 2% 内存（1.5–4 GB），并可压缩其他应用的内存，让 oMLX 几乎可以使用全部内存。"
           }
         }
       }
@@ -20865,7 +20865,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "保留约 8% 内存（3-8 GB）空闲，供 oMLX 运行时的日常应用使用。"
+            "value" : "保留约 8% 内存（3–8 GB）空闲，供 oMLX 运行时的日常应用使用。"
           }
         }
       }
@@ -21009,7 +21009,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "保留约 20% 内存（6-16 GB）空闲，让较重的应用也能与 oMLX 同时运行。"
+            "value" : "保留约 20% 内存（6–16 GB）空闲，让较重的应用也能与 oMLX 同时运行。"
           }
         }
       }
@@ -22197,7 +22197,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "另存为新配置"
+            "value" : "另存为新配置档"
           }
         }
       }
@@ -22305,7 +22305,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "无配置"
+            "value" : "无配置档"
           }
         }
       }
@@ -22341,7 +22341,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%@ 配置 · 在此模型上处于活动状态"
+            "value" : "%@ 配置档 · 在此模型上处于活动状态"
           }
         }
       }
@@ -22449,7 +22449,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工作配置"
+            "value" : "工作配置档"
           }
         }
       }
@@ -23133,7 +23133,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工作配置的基础"
+            "value" : "工作配置档的基础"
           }
         }
       }
@@ -23709,7 +23709,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "此配置未覆盖任何设置。"
+            "value" : "此配置档未覆盖任何设置。"
           }
         }
       }
@@ -23781,7 +23781,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "此配置中的引擎级设置仅在应用于基础模型时生效 — 它们不会更改暴露的模型。"
+            "value" : "此配置档中的引擎级设置仅在应用于基础模型时生效——它们不会更改暴露的模型。"
           }
         }
       }
@@ -23817,7 +23817,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在 /v1/models 上将此配置作为其自己的模型 ID 提供服务，共享基础模型的引擎"
+            "value" : "在 /v1/models 上将此配置档作为其自己的模型 ID 提供服务，共享基础模型的引擎"
           }
         }
       }
@@ -24285,7 +24285,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "未设置配置或配置字段留空时回退到此"
+            "value" : "未设置配置档或配置档字段留空时回退到此"
           }
         }
       }
@@ -24321,7 +24321,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%1$@ 配置 · 设置：%2$lld"
+            "value" : "%1$@ 配置档 · 设置：%2$lld"
           }
         }
       }
@@ -24357,7 +24357,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置"
+            "value" : "配置档"
           }
         }
       }
@@ -24393,7 +24393,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工作配置 · 基于 %1$@（%2$@）"
+            "value" : "工作配置档 · 基于 %1$@（%2$@）"
           }
         }
       }
@@ -24429,7 +24429,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工作配置 · 基于服务器默认值"
+            "value" : "工作配置档 · 基于服务器默认值"
           }
         }
       }
@@ -24573,7 +24573,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "尚无 %@ 配置。"
+            "value" : "尚无 %@ 配置档。"
           }
         }
       }
@@ -24645,7 +24645,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "将当前另存为新配置"
+            "value" : "将当前另存为新配置档"
           }
         }
       }
@@ -24681,7 +24681,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置名称"
+            "value" : "配置档名称"
           }
         }
       }
@@ -24717,7 +24717,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "将当前配置另存为"
+            "value" : "将当前配置档另存为"
           }
         }
       }
@@ -26337,7 +26337,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "不可用 — 源模型没有 MTP 头"
+            "value" : "不可用——源模型没有 MTP 头"
           }
         }
       }
@@ -26409,7 +26409,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "排除视觉编码器权重（约小 2-3%，仅文本输出）"
+            "value" : "排除视觉编码器权重（约小 2–3%，仅文本输出）"
           }
         }
       }
@@ -31789,7 +31789,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "无更改可应用 — 两个字段均匹配当前配置。"
+            "value" : "无更改可应用——两个字段均匹配当前配置。"
           }
         }
       }
@@ -33046,7 +33046,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅限单个模型 — 在配置上设置。"
+            "value" : "仅对单个模型生效——在配置档上设置。"
           }
         }
       }
@@ -33118,7 +33118,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅限单个模型。"
+            "value" : "仅对单个模型生效。"
           }
         }
       }
@@ -33190,7 +33190,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅限单个模型。"
+            "value" : "仅对单个模型生效。"
           }
         }
       }
@@ -33334,7 +33334,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "服务器默认值不包含 min_p；在模型配置上设置。"
+            "value" : "服务器默认值不包含 min_p；在模型配置档上设置。"
           }
         }
       }
@@ -33370,7 +33370,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅限单个模型"
+            "value" : "仅对单个模型生效"
           }
         }
       }
@@ -33442,7 +33442,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅限单个模型 — 参见“模型”→“[模型]”→“高级”。"
+            "value" : "仅对单个模型生效——参见“模型”→“[模型]”→“高级”。"
           }
         }
       }
@@ -33514,7 +33514,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅限单个模型。"
+            "value" : "仅对单个模型生效。"
           }
         }
       }
@@ -33730,7 +33730,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅限单个模型 — 参见“模型”→“[模型]”→“高级”。"
+            "value" : "仅对单个模型生效——参见“模型”→“[模型]”→“高级”。"
           }
         }
       }
@@ -34018,7 +34018,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅限单个模型 — 参见“模型”→“[模型]”→“基础”。"
+            "value" : "仅对单个模型生效——参见“模型”→“[模型]”→“基础”。"
           }
         }
       }
@@ -34591,7 +34591,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "默认配置"
+            "value" : "默认配置档"
           }
         }
       }
@@ -34627,7 +34627,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "当模型没有配置，或配置字段留空时使用的回退值"
+            "value" : "当模型没有配置档，或配置档字段留空时使用的回退值"
           }
         }
       }
@@ -35644,7 +35644,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在 Web 仪表盘中，于两台 Mac 上开启“全局设置 → 高级 → 启用分布式推理”并重启 oMLX，然后在“集群”标签中配对一台 Mac。"
+            "value" : "在 Web 控制台中，于两台 Mac 上开启“全局设置 → 高级 → 启用分布式推理”并重启 oMLX，然后在“集群”标签中配对一台 Mac。"
           }
         }
       }
@@ -35956,7 +35956,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "上次提示词 %1$lld Token，用时 %2$@ 秒"
+            "value" : "上次提示词 %1$lld tok，用时 %2$@ 秒"
           }
         }
       }
@@ -38086,7 +38086,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "执行 HuggingFace 自定义模型代码。仅对你信任的模型启用。仅限单个模型 — 不会从配置继承。"
+            "value" : "执行 HuggingFace 自定义模型代码。仅对你信任的模型启用。仅对单个模型生效——不会从配置档继承。"
           }
         }
       }
@@ -40936,7 +40936,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "常驻内存的专家权重比例（5-95%）。"
+            "value" : "常驻内存的专家权重比例（5–95%）。"
           }
         }
       }
@@ -41872,7 +41872,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "全局配置"
+            "value" : "全局配置档"
           }
         }
       }
@@ -41908,7 +41908,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "模型配置 · %@"
+            "value" : "模型配置档 · %@"
           }
         }
       }
@@ -41944,7 +41944,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "无配置"
+            "value" : "无配置档"
           }
         }
       }
@@ -41980,7 +41980,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预设配置"
+            "value" : "预设配置档"
           }
         }
       }
@@ -42016,7 +42016,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "服务器默认配置"
+            "value" : "服务器默认配置档"
           }
         }
       }
@@ -42052,7 +42052,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "未设置配置或配置字段留空时使用"
+            "value" : "未设置配置档或配置档字段留空时使用"
           }
         }
       }
@@ -42124,7 +42124,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工作配置"
+            "value" : "工作配置档"
           }
         }
       }
@@ -42196,7 +42196,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置"
+            "value" : "配置档"
           }
         }
       }
@@ -42568,7 +42568,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld 个参数"
+            "value" : "%lld 个 kwargs"
           }
         }
       }
@@ -44671,7 +44671,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "服务器空闲 — 无模型已加载"
+            "value" : "服务器空闲——无模型已加载"
           }
         }
       }
@@ -49857,7 +49857,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "此密钥也是你的 Web 仪表盘登录密码。"
+            "value" : "此密钥也是你的 Web 控制台登录密码。"
           }
         }
       }
@@ -50073,7 +50073,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "打开 Web 仪表盘"
+            "value" : "打开 Web 控制台"
           }
         }
       }
@@ -50181,7 +50181,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "oMLX 正在本地 http://127.0.0.1:%@ 上运行。打开 Web 仪表盘下载第一个模型、管理设置并连接你的编程工具。"
+            "value" : "oMLX 正在本地 http://127.0.0.1:%@ 上运行。打开 Web 控制台下载第一个模型、管理设置并连接你的编程工具。"
           }
         }
       }
@@ -50217,7 +50217,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "服务器已启动。仪表盘已就绪。"
+            "value" : "服务器已启动。控制台已就绪。"
           }
         }
       }
@@ -50901,7 +50901,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "选择模型存储位置、选择端口，并创建你将从应用和 Web 仪表盘使用的 API 密钥。"
+            "value" : "选择模型存储位置、选择端口，并创建你将从应用和 Web 控制台使用的 API 密钥。"
           }
         }
       }
@@ -52773,7 +52773,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "已应用设置"
+            "value" : "已应用的设置"
           }
         }
       }
@@ -53421,7 +53421,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "⌘↩ 追问   ⌘N 新对话   ⇧⌘C 复制"
+            "value" : "⌘↩ 追问   ⌘N 新聊天   ⇧⌘C 复制"
           }
         }
       }
@@ -53493,7 +53493,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "↩ 追问   ⇧↩ 换行   ⌘N 新对话   ⇧⌘C 复制"
+            "value" : "↩ 追问   ⇧↩ 换行   ⌘N 新聊天   ⇧⌘C 复制"
           }
         }
       }
@@ -54693,7 +54693,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "多久后开始新对话"
+            "value" : "多久后开始新聊天"
           }
         }
       }
@@ -54729,7 +54729,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在此时间内重新打开提问栏，会保留上一段对话以便追问。"
+            "value" : "在此时间内重新打开提问栏，会保留上一段聊天以便追问。"
           }
         }
       }
@@ -56367,7 +56367,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "每 Token 能耗"
+            "value" : "每个 Token 的能耗"
           }
         }
       }
@@ -56799,7 +56799,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "若不想每次对话都被询问，请打开“系统设置 → 隐私与安全性”，为 oMLX 选择“始终允许”。"
+            "value" : "若不想每次聊天都被询问，请打开“系统设置 → 隐私与安全性”，为 oMLX 选择“始终允许”。"
           }
         }
       }
@@ -57087,7 +57087,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "占位符会在对话开始时填入。点击即可添加。"
+            "value" : "占位符会在聊天开始时填入。点击即可添加。"
           }
         }
       }
@@ -58203,7 +58203,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "网络搜索"
+            "value" : "联网搜索"
           }
         }
       }
@@ -58239,7 +58239,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用 Web 仪表盘 → 设置 → 集成中设置的搜索服务。"
+            "value" : "使用 Web 控制台 → 设置 → 集成中的搜索服务。"
           }
         }
       }
@@ -59571,7 +59571,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在任意应用中通过全局快捷键与语音模型对话。"
+            "value" : "在任意应用中通过全局快捷键与语音模型聊天。"
           }
         }
       }
@@ -59607,7 +59607,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "语音对话期间限制整台 Mac 的 GPU 功率（2 至 1000 W）。限制过低可能使回复开始变慢或断断续续。若模型也设有限制，则以较低者为准。"
+            "value" : "语音聊天期间限制整台 Mac 的 GPU 功率（2 至 1000 W）。限制过低可能使回复开始变慢或断断续续。若模型也设有限制，则以较低者为准。"
           }
         }
       }
@@ -59679,7 +59679,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "再次按下或按 Esc 结束对话。按空格键结束你的发言。"
+            "value" : "再次按下或按 Esc 结束聊天。按空格键结束你的发言。"
           }
         }
       }
@@ -59931,7 +59931,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "请在“系统设置 → 录屏与系统录音”中允许 oMLX，然后重新启动 oMLX。"
+            "value" : "请在“系统设置 → 屏幕与系统音频录制”中允许 oMLX，然后重新启动 oMLX。"
           }
         }
       }
@@ -60003,7 +60003,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "暂时无法对话"
+            "value" : "暂时无法聊天"
           }
         }
       }
