@@ -597,3 +597,20 @@ def test_systemone_large_questions_compose_multiple_rounds(kind):
     assert result["input_tokens"] == sum(
         len(call["messages"][0]["content"]) for call in engine.calls
     )
+
+
+
+def test_systemone_question_takes_a_locate_cutoff():
+    request = _systemone(
+        a={"type": "locate", "instructions": "the sum", "cutoff": 0.65},
+        b={"type": "locate", "instructions": "the date"},
+    )
+    assert request.questions["a"].cutoff == 0.65
+    assert request.questions["b"].cutoff is None
+    assert request.model_dump()["questions"]["a"]["cutoff"] == 0.65
+
+
+def test_systemone_question_rejects_a_cutoff_out_of_range():
+    for bad in (0, 1.5, -0.1):
+        with pytest.raises(ValidationError):
+            _systemone(a={"type": "locate", "instructions": "x", "cutoff": bad})
