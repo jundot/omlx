@@ -15078,6 +15078,15 @@ class Scheduler:
                                     )
                                 )
                                 with self._phase_timer("store_cache_main_collect"):
+                                    # The payload is a view of the batch buffer
+                                    # the request decoded in. Cut it to the
+                                    # tokens not stored yet, so the rows still
+                                    # decoding do not need a copy of their KV
+                                    # while the store worker runs.
+                                    if system_store is None and self.block_aware_cache.trim_store_payload(
+                                        request_id, cache_to_store
+                                    ):
+                                        request._extracted_cache = cache_to_store
                                     pre_eval_arrays = (
                                         self._collect_arrays_from_extracted_cache(
                                             cache_to_store

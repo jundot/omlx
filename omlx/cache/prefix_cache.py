@@ -241,6 +241,20 @@ class BlockCacheEntry:
     last_access: float
 
 
+def _payload_token_base(cache_data: Any) -> int:
+    """First token held by the attention layers of a store payload (0 = all)."""
+    if not isinstance(cache_data, list):
+        return 0
+    return max(
+        (
+            int(layer.get("token_base", 0) or 0)
+            for layer in cache_data
+            if isinstance(layer, dict)
+        ),
+        default=0,
+    )
+
+
 class BlockAwarePrefixCache(CacheManager):
     """
     Prefix cache that uses PagedCacheManager for block-based storage.
@@ -1069,6 +1083,20 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Determine tokens we need to cache (not already in block_table)
         existing_tokens = block_table.num_tokens
+        # A payload cut by trim_store_payload holds its attention layers from
+        # token_base on. Blocks before that cannot be cut from it.
+        cache_token_base = _payload_token_base(cache_data) if is_tensor_data else 0
+        if cache_token_base > existing_tokens:
+            logger.debug(
+                "store_cache for %s: payload starts at token %d, block table "
+                "holds %d; nothing to store",
+                request_id,
+                cache_token_base,
+                existing_tokens,
+            )
+            self._last_partial_tokens_skipped = 0
+            self._last_tokens_to_next_block = 0
+            return block_table
         new_tokens = tokens[existing_tokens:]
 
         if not new_tokens:
@@ -1453,7 +1481,10 @@ class BlockAwarePrefixCache(CacheManager):
                 cache_uses_global_indices = existing_tokens > 0 and cache_seq_len >= (
                     existing_tokens + 1
                 )
-                if cache_uses_global_indices:
+                if cache_token_base:
+                    cache_start = global_start - cache_token_base
+                    cache_end = global_end - cache_token_base
+                elif cache_uses_global_indices:
                     cache_start = global_start
                     cache_end = global_end
                 else:
@@ -3220,6 +3251,91 @@ class BlockAwarePrefixCache(CacheManager):
         table = self.paged_cache.detach_block_table(request_id)
         if table is not None:
             self.paged_cache.release_for_eviction(table.block_ids)
+
+    def stored_prefix_tokens(self, request_id: str) -> int:
+        """Tokens of ``request_id``'s block table that ``store_cache`` builds on.
+
+        Mirrors ``store_cache``: a fetched tail off the block grid is dropped
+        before new blocks are cut, so it does not count.
+        """
+        table = self.paged_cache.get_block_table(request_id)
+        if not table or not table.block_ids:
+            return 0
+        tokens = table.num_tokens
+        last = self.paged_cache.allocated_blocks.get(table.block_ids[-1])
+        if last is not None and 0 < last.token_count < self.block_size:
+            tokens -= last.token_count
+        return max(0, tokens)
+
+    def trim_store_payload(self, request_id: str, cache_data: list[Any]) -> int:
+        """Cut the attention layers of a store payload to the tokens not stored yet.
+
+        A finished row's payload is a view of the batch buffer it decoded in.
+        The store only cuts blocks past the request's block table, but the
+        whole view keeps that buffer alive until the store worker is done,
+        so the rows still decoding need a copy of their KV in the meantime.
+        Here each attention layer is replaced, in place, by a copy of its
+        tokens from the stored prefix on, and every layer records that start
+        as ``token_base``. Recurrent and windowed layers are left as they are.
+
+        Returns the start token, or 0 when the payload was left unchanged:
+        no stored prefix, a prefix at least as long as the payload, or a
+        layer layout this does not handle.
+        """
+        if not HAS_MLX or not isinstance(cache_data, list) or not cache_data:
+            return 0
+        base = self.stored_prefix_tokens(request_id)
+        if base <= 0:
+            return 0
+        from ..turboquant_kv import _copy_state, _slice_state_range, _state_length
+
+        plan: list[tuple[dict[str, Any], str, Any, Any]] = []
+        lengths: set[int] = set()
+        for layer in cache_data:
+            if not isinstance(layer, dict) or "state" not in layer:
+                return 0
+            name = layer.get("class_name") or layer.get("cache_type") or "KVCache"
+            state = layer["state"]
+            if name in _PACKED_CACHE_TYPES:
+                if not isinstance(state, (list, tuple)) or len(state) != 2:
+                    return 0
+                ks, vs = (getattr(st, "_state", st) for st in state)
+                length = _state_length(ks)
+                if _state_length(vs) != length:
+                    return 0
+                plan.append((layer, "packed", ks, vs))
+                lengths.add(length)
+                continue
+            handler = CacheTypeRegistry.get_handler_by_class_name(name)
+            if not handler.supports_block_slicing:
+                continue
+            if (
+                not isinstance(state, (list, tuple))
+                or len(state) != 2
+                or not all(isinstance(st, mx.array) and st.ndim == 4 for st in state)
+            ):
+                return 0
+            plan.append((layer, "kv", state[0], state[1]))
+            lengths.add(int(state[0].shape[2]))
+        if not plan or len(lengths) != 1:
+            return 0
+        length = lengths.pop()
+        if length <= base:
+            return 0
+        for layer, kind, keys, values in plan:
+            if kind == "packed":
+                layer["state"] = (
+                    _copy_state(_slice_state_range(keys, base, length)),
+                    _copy_state(_slice_state_range(values, base, length)),
+                )
+            else:
+                layer["state"] = (
+                    mx.contiguous(keys[:, :, base:, :]),
+                    mx.contiguous(values[:, :, base:, :]),
+                )
+        for layer in cache_data:
+            layer["token_base"] = base
+        return base
 
     def clear_request_entry(self, request_id: str) -> None:
         """
