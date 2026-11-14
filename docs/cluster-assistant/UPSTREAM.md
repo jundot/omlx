@@ -31,20 +31,25 @@ What the rebase changed in the fork:
   `qwen4_exp_mlx_lm` adapter, `qwen4` cluster/pipeline tests, the experimental
   doc. No Qwen4-Exp pipeline on this branch; Qwen3.8 is single-node `run-local`.
 
-## PR status of our own branches (verified via GitHub API, 2026-11-14)
+## PR status of our own branches (updated 2026-11-14, both rebased onto `624cff0e`)
 
-Both were folded into the old base pin `1e27576a`, so the rebase's delta replay
-does not carry them:
+Both were folded into the old base pin `1e27576a`; the rebase's delta replay does
+not carry them. Both are now rebased onto current `upstream/main` and pushed:
 
-- **#5024** `feat(cluster-moe-offload` — **open**, 4 commits, +619/−16, 16 files,
-  `mergeable_state: dirty`. Its planner/routes/deployment pricing is on our branch
-  (restored after upstream's refactor), but its **runtime half**
+- **#5024** `feat(cluster-moe-offload)` — head **`bbbf18d2`**, 4 commits,
+  +619/−16, 16 files, now **mergeable** (`mergeable_state: unstable` only because
+  the CI jobs were still running). Rebased via the local branch
+  `rebase/moe-offload-main`; `c74f1b18..624cff0e` has no cluster changes, so the
+  rebase was conflict-free and its 358 focused tests pass locally.
+  Our branch has only its **pricing half**; the **runtime half**
   (`inference_worker`, `progressive_loading`, `deepseek_v41/loading.py`,
-  `deepseek_v41_mlx_lm/model.py`) is **not** ported. Action: rebase onto current
-  main and push as the updated head.
-- **#5033** `feat/qwen4-exp-cluster` — **open**, 8 commits, +1689/−77, 15 files,
-  `mergeable: true` (clean, rebased onto main on 2026-11-12). Nothing of it is on
-  this branch. Action: re-apply onto `rebase/upstream-main`, or withdraw.
+  `deepseek_v41_mlx_lm/model.py`, `moe_offload.py`) still has to be applied here.
+- **#5033** `feat/qwen4-exp-cluster` — head **`25da70de`**, 8 commits, +1689/−77,
+  15 files, **`mergeable: true` / `clean`**. Rebased conflict-free; 163 focused
+  tests pass locally.
+
+Both PR heads are `upstream/main + PR content only` — our fork delta is not mixed
+in, which is what allows a fast merge.
 
 Details and the per-file effect: `UPSTREAM-PACKAGES.md` §7.
 

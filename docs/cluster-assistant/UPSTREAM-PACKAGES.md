@@ -162,22 +162,24 @@ context-vs-speed tradeoff and can free disk — it starts nothing.
 
 ---
 
-## 7. Our two open upstream PRs — verified 2026-11-14
+## 7. Our two open upstream PRs — updated 2026-11-14
 
-Both are **open** in `jundot/omlx` (checked via the GitHub API), and both were
-folded into the old base pin `1e27576a`. Because the rebase replays only our delta
-(`1e27576a..feat`), their status matters. They are **not** additional packages,
-but they are not "done" either:
+Both were **open** in `jundot/omlx` and folded into the old base pin `1e27576a`.
+Both are now **rebased onto `upstream/main` `624cff0e` and pushed**, so each PR
+head is `upstream/main + PR content only` — no fork delta mixed in:
 
-| PR | Verified state | What it contains | What our branch has | Action |
+| PR | Verified state (2026-11-14) | What it contains | What our branch has | Action |
 |---|---|---|---|---|
-| **#5024** `feat(cluster-moe-offload`<br>“carry MoE expert offload into pipeline ranks” | open, 4 commits, **+619/−16, 16 files, `mergeable_state: dirty`** (conflicts with upstream's planner refactor) | planner +118, routes +127, deployment, autoconfigure, **inference_worker +23, progressive_loading +24, `deepseek_v41/loading.py`, `deepseek_v41_mlx_lm/model.py`**, docs, 6 test files | **Only the planner/routes/deployment pricing half** (our F5). The **runtime half is missing**: `inference_worker`, `progressive_loading`, `deepseek_v41/loading.py`, `deepseek_v41_mlx_lm/model.py` — so a plan can price expert offload while a pipeline rank does not yet stream it. | **Rebase #5024 onto current main and push it as the updated head.** That *is* F5 plus the runtime half. Do **not** open a separate "F5" PR. |
-| **#5033** `feat/qwen4-exp-cluster`<br>“make Qwen4-Exp pipeline-parallel” | open, 8 commits, **+1689/−77, 15 files, `mergeable: true` (clean)** | `qwen4_exp_mlx_lm` adapter (335), `pipeline_compat` +45, planner +233, routes, vendor `language.py` +118, `model_loading`, 3 tests (+804), doc | **Nothing** — dropped by the rebase | **Re-apply onto `rebase/upstream-main`** (it is clean against main, so this is low-risk) and keep the PR, **or** withdraw it if single-node Qwen3.8 is the accepted answer. |
+| **#5024** `feat(cluster-moe-offload)`<br>“carry MoE expert offload into pipeline ranks” | head **`bbbf18d2`**, 4 commits, **+619/−16, 16 files**, `mergeable: true` (`mergeable_state: unstable` = CI still running) | planner +118, routes +127, deployment, autoconfigure, **inference_worker +23, progressive_loading +24, `deepseek_v41/loading.py`, `deepseek_v41_mlx_lm/model.py`, `moe_offload.py`**, docs, 6 test files | **Only the planner/routes/deployment pricing half.** The runtime half is still missing here — apply it before shipping a DeepSeek-MoE cluster. | **Done** (rebased + pushed). Remaining: mirror the runtime half onto `rebase/upstream-main`. |
+| **#5033** `feat/qwen4-exp-cluster`<br>“make Qwen4-Exp pipeline-parallel” | head **`25da70de`**, 8 commits, **+1689/−77, 15 files**, **`mergeable: true` / `clean`** | `qwen4_exp_mlx_lm` adapter (335), `pipeline_compat`, planner +233, routes, vendor `language.py`, `model_loading`, 3 tests (+804), doc | applied to `rebase/upstream-main` (the PR is the source of truth) | **Done** — ready to merge. |
 
-Consequence if we leave both as-is: the branch has the MoE offload *pricing* but not
-its *runtime* on pipeline ranks, and it has no Qwen4-Exp pipeline. The current live
-path (GLM-5.3 cluster, Qwen3.8 single-node at 40.3 tok/s) works, but a DeepSeek-MoE
-cluster plan and a multi-Mac Qwen3.8 run would not.
+Rebase evidence: `c74f1b18..624cff0e` contains **no** `omlx/cluster/` changes, so
+both rebases were conflict-free. Focused tests in a clean worktree:
+#5024 **358 passed**, #5033 **163 passed**.
+
+Product decision recorded 2026-11-14: **PP only in R1 (Qwen4-Exp/Qwen3.8
+included), general tensor-parallel support in R2.** The old note that the Qwen3.8
+PLE VLM is “never planned as PP” described the pre-#5033 state and is withdrawn.
 
 ## 8. Corrected PR count
 

@@ -193,9 +193,13 @@ Resolved implementation decisions:
 - **Pipeline capability is part of the plan.** `inspect_safetensors_layout`
   applies oMLX's pre-load architecture patches before capability detection, and
   `solve_cluster_plan` refuses a multi-Mac plan for a checkpoint whose
-  `supports_pipeline` is false with `choose_pipeline_model`. A non-PP
-  checkpoint (for example the Qwen3.8 PLE VLM) is never planned as PP; the
-  PLE table detection stays, so a pipeline-capable PLE checkpoint still works.
+  `supports_pipeline` is false with `choose_pipeline_model`. **Qwen4-Exp /
+  Qwen3.8 is PP-capable on this branch** (upstream PR #5033 is applied):
+  `supports_pipeline` is true for that family and the assistant may plan it as a
+  pipeline; the PLE table detection stays alongside. **Release rule (user
+  decision, 2026-11-14): PP only in R1 — Qwen included; general tensor-parallel
+  support comes in R2.** The earlier note that the Qwen3.8 PLE VLM is "never
+  planned as PP" described the pre-#5033 state and is withdrawn.
 - The synthetic distributed compute probe runs **after `apply`**, on the
   elected coordinator, through the coordinator's
   `POST /admin/api/cluster/performance-probe`; its profiles are stored on the
@@ -692,6 +696,7 @@ the answer here.
 | Measured compute | Run the existing **synthetic distributed probe after apply** (staged, before start); use its profiles for the **next** plan. Never rewrite the current `predicted`, never gate the start. |
 | TTFT / prefill | **One streaming measurement after ready** reads the final usage chunk; the probe stays off by default. |
 | Gate scope | **P0/P1 only.** macOS app/tray, full helper, telemetry, TP and >4 Macs are P2, after Chapter 10. |
+| Parallelism per release | **PP only in R1 — Qwen4-Exp/Qwen3.8 included** (upstream PR #5033 applied: `supports_pipeline` true for that family). General tensor-parallel support is **R2**; no TP UI in R1. |
 | P2 start (2026-11-07) | **macOS menu/tray entry first**, opening the **existing** Cluster tab in the existing web dashboard; no new window, app, wizard or control plane, and no status/stop in the tray in this slice. The menu item and the Welcome button deep-link `/admin/dashboard?tab=cluster`; both build and the focused Xcode tests pass. Helper: **Developer ID team `YB894QRG4W`**, **one standard macOS admin dialog**, wired limit + network setup scope. The first slice is a one-shot `sysctl iogpu.wired_limit_mb` action from Performance, a **read-only** network preflight (`GET /assistant/network-preflight`, exact commands, `executed: false`), a **SMJobBless** helper for the wired limit (one admin prompt, signed; helper install test pending), and the **first-run runtime installer** in Welcome (bundled `uv` + lock, explicit click, progress; clean-first-run test pending). The privileged network apply is open (bridge/STP policy). Distribution is a direct **slim** DMG (72 MB with helper/installer; no embedded Python/MLX; `SLIM-RUNTIME.md`/`DISTRIBUTION.md`); signing setup is `SIGNING.md`. Telemetry stays none; TP, >4 Macs, HA and multi-tenancy stay out. |
 
 If blocked by an environmental unknown (paths, credentials, hardware), ask once
