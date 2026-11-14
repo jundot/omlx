@@ -216,6 +216,41 @@ def _read_config_model_type(model_path: str | Path) -> str | None:
     return model_type if isinstance(model_type, str) else None
 
 
+class _VLMPreparedPrompt(tuple):
+    """``(prompt, token_ids)`` rendered by the generation path for one request.
+
+    ``source`` keeps the request inputs the pair was built from, so that
+    ``_process_chat_messages`` reuses the ids only for the same request.
+    """
+
+    source: tuple[Any, ...]
+
+    def __new__(
+        cls, prompt: str, token_ids: list[int], source: tuple[Any, ...]
+    ) -> "_VLMPreparedPrompt":
+        instance = super().__new__(cls, (prompt, token_ids))
+        instance.source = source
+        return instance
+
+    def matches(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        is_partial: bool | None,
+    ) -> bool:
+        p_messages, p_tools, p_kwargs, p_partial = self.source
+        same_kwargs = p_kwargs is chat_template_kwargs or not (
+            p_kwargs or chat_template_kwargs
+        )
+        return (
+            p_messages is messages
+            and p_tools is tools
+            and same_kwargs
+            and p_partial == is_partial
+        )
+
+
 def _is_missing_chat_template_error(exc: ValueError) -> bool:
     """True when apply_chat_template failed because no chat template is set.
 
@@ -5677,9 +5712,15 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        # The ids below come from mlx-vlm's own render; the prepared prompt only
-        # covers the checks made before generation.
-        kwargs.pop("_prepared_prompt", None)
+        prepared = kwargs.pop("_prepared_prompt", None)
+        # A text-only request was already rendered and encoded for generation
+        # in the worker thread; skip doing it again on this executor.
+        if (
+            isinstance(prepared, _VLMPreparedPrompt)
+            and not (images or audio or videos)
+            and prepared.matches(messages, tools, ct_kwargs, partial)
+        ):
+            return list(prepared[1]), None, None, None, 0, []
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -6178,19 +6219,43 @@ class VLMBatchedEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
     ) -> tuple[str, list[int]]:
-        """Render and tokenize the text-only prompt for reuse within one request.
+        """Render and tokenize the prompt for reuse within one request.
 
-        Unlike ``BatchedEngine``, the result never reaches generation:
-        ``_prepare_vision_inputs`` renders through mlx-vlm and encodes without
-        special tokens. It only serves the context check, the preflight and
-        thinking detection.
+        A text-only request is rendered and encoded the way
+        ``_prepare_vision_inputs`` does, so ``_process_chat_messages`` can hand
+        the ids to generation instead of rendering again on the MLX executor.
+        A request with media gets the text-only approximation, which only serves
+        the context check, the preflight and thinking detection.
         """
         # Extract text-only version for token counting through the same media
         # split as the real request, so video parts are not rejected here
         # before they reach the multimodal path.
-        _, text_messages, _, _, _ = self._extract_request_media(messages)
+        _, text_messages, images, audio, videos = self._extract_request_media(messages)
 
         template_tools = convert_tools_for_template(tools) if tools else None
+        # Diffusion checkpoints are rendered by their own path at generation.
+        if not (images or audio or videos or self.is_diffusion_model):
+            prompt = self._render_vlm_prompt(
+                text_messages,
+                model_type=self.model_type
+                or _read_config_model_type(self._model_name)
+                or "",
+                num_images=0,
+                num_audios=0,
+                num_videos=0,
+                chat_template_kwargs=chat_template_kwargs,
+                tools=template_tools,
+                is_partial=is_partial,
+            )[0]
+            if isinstance(prompt, str):
+                token_ids = list(
+                    self._tokenizer.encode(prompt, add_special_tokens=False)
+                )
+                return _VLMPreparedPrompt(
+                    prompt,
+                    token_ids,
+                    (messages, tools, chat_template_kwargs, is_partial),
+                )
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,
