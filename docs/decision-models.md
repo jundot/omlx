@@ -48,10 +48,51 @@ curl http://localhost:8000/v1/systemone \
 
 `questions` is a mapping of names to typed questions, answered independently of
 their order. Types: `noul` (yes/no), `choice` (one option key), `score` (one
-ordered level). The response carries, per question, the winning option and the
-full probability distribution, so callers can threshold instead of taking an
-argmax. `images` (base64 data URIs) and `videos` are oMLX extensions for the
-backbones that read them.
+ordered level), `locate` (verbatim spans of the state). The response carries, per
+question, the winning option and the full probability distribution, so callers can
+threshold instead of taking an argmax. `images` (base64 data URIs) and `videos`
+are oMLX extensions for the backbones that read them.
+
+### `locate`
+
+Perplexity Decider v1.3 only. The question key is the default label;
+`instructions` replaces it:
+
+```bash
+curl http://localhost:8000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "model": "pplx-decider-v1.3",
+        "state": "Договор подписан 11.03.2024 между ООО «Ромашка» и Nikolai Gusev на 1 250 000 RUB.",
+        "questions": {
+          "dates": {"type": "locate", "instructions": "every date mentioned"},
+          "amounts": {"type": "locate", "instructions": "every sum of money"}
+        }
+      }'
+```
+
+Each answer is `{"type": "locate", "spans": [{"start", "end", "text", "score"}]}`
+with Unicode character offsets into `state`, `end` exclusive, sorted by position.
+The invariant `state[start:end] == text` holds, and a span is kept when its
+probability reaches the adapter's saved cutoff (0.5).
+
+`locate` runs in a forward pass of its own, with the checkpoint's `locate-span/`
+adapter enabled — an unmerged LoRA over every `nn.Linear` of the language model,
+its own FP32 embedding row for the `<|locate|>` marker, and a query-conditioned
+span head read at the state and marker hidden rows. The adapter is disabled for
+every other question type, so decision answers and their probabilities are those
+of a plain Decider. Questions may be mixed with `noul`/`choice`/`score` in one
+request.
+
+The forward keeps the release's isolated-question layout: a block mask on every
+full-attention layer (the context attends everything, a question block attends the
+context and itself), a restart of every linear-attention block from the context's
+final recurrent memory, and a position restart inside each question block. A
+single question needs none of it — that is plain non-causal attention.
+
+Requirements: a text state without images, at most 128 questions. The whole state
+is kept per group, and questions are split in half only when the state and the
+group exceed `max_length` together.
 
 ### `mode`
 
@@ -80,16 +121,14 @@ output is rejected because the vision tower is part of the model.
 ## Tests
 
 `tests/test_d1_lfm2.py` and `tests/test_pplx_decider.py` cover detection, config
-validation, prompt construction, both modes and the answer shape without real
-weights; the neighbouring `tests/test_d1_lfm2.py`, `tests/test_model_discovery.py`
-and `tests/test_systemone.py` cover the shared plumbing.
+validation, prompt construction, both modes, the `locate` adapter (its format and
+base checks, the marker id, the LoRA wrapping, the span grid) and the answer
+shape without real weights; the neighbouring `tests/test_model_discovery.py` and
+`tests/test_systemone.py` cover the shared plumbing.
 
 ## Limits
 
-- The Perplexity Decider `locate` (span) adapter is not wired up yet; only
-  `noul`, `choice` and `score` questions are served, and a `locate` question is
-  rejected by the request schema. The release runs it in its own forward pass
-  with an unmerged LoRA and a span head over the state tokens and a `<|locate|>`
-  marker, returning `{start, end, text, score}` spans.
+- `locate` needs a text state (no images) and at most 128 questions, and it costs
+  one extra forward pass per group with the adapter enabled.
 - `d1` on the LFM2-VL backbone is supported through the existing mlx-vlm
   `models.d1` class; LFM3-VL and LFM3-Omni backbones use the oMLX class.
