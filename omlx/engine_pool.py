@@ -570,8 +570,18 @@ class EnginePool:
         await asyncio.gather(task, return_exceptions=True)
 
     def _distributed_deployment_for_entry(
-        self, entry: EngineEntry
+        self, entry: EngineEntry, *, local_only: bool = False
     ) -> ClusterDeployment | None:
+        """The registry deployment this entry would be launched as, if any.
+
+        ``local_only`` is the documented "this Mac alone" load
+        (``POST /api/models/{id}/load?local_only=true``): a registry
+        deployment is ignored, so the load either fits here or fails here. It
+        never silently becomes a distributed launch across paired Macs.
+        """
+
+        if local_only:
+            return None
         if entry.engine is not None:
             # A newly activated registry record must not retroactively relabel
             # an already-loaded local engine. The deployment applies only
@@ -585,13 +595,17 @@ class EnginePool:
             return None
         return registry.get_for_model(entry.model_path)
 
-    def _entry_resident_size(self, entry: EngineEntry) -> int:
+    def _entry_resident_size(
+        self, entry: EngineEntry, *, local_only: bool = False
+    ) -> int:
         """Return this process's planned weights, not the full cluster model."""
 
         if entry.runtime_estimated_size is not None:
             return entry.runtime_estimated_size
 
-        deployment = self._distributed_deployment_for_entry(entry)
+        deployment = self._distributed_deployment_for_entry(
+            entry, local_only=local_only
+        )
         if deployment is None:
             return entry.estimated_size
         assignment = next(
@@ -612,15 +626,25 @@ class EnginePool:
         base_size: int | None = None,
         include_ane_reservation: bool = True,
         log_decision: bool = True,
+        local_only: bool = False,
     ) -> int:
         """Include Engram runtime storage and optional K2 ANE reservations.
 
         ``log_decision=False`` sizes hypothetical settings without logging or
-        recording forced offload decisions.
+        recording forced offload decisions. ``local_only`` keeps a cluster
+        deployment out of a "this Mac alone" load, so the PLE/Engram table
+        offload is priced into the local admission like any other local model.
         """
 
-        base = self._entry_resident_size(entry) if base_size is None else base_size
-        if self._distributed_deployment_for_entry(entry) is not None:
+        base = (
+            self._entry_resident_size(entry, local_only=local_only)
+            if base_size is None
+            else base_size
+        )
+        if (
+            self._distributed_deployment_for_entry(entry, local_only=local_only)
+            is not None
+        ):
             return base
         if self.external_engine_id(entry.model_id, runtime_settings):
             # Splash plans its own budget; none of the MLX reservations apply.
@@ -2697,12 +2721,20 @@ class EnginePool:
         return bool(await reachable())
 
     def _acquire_loaded_engine(
-        self, model_id, force_lm, lease, runtime_settings, reload_failed=False
+        self,
+        model_id,
+        force_lm,
+        lease,
+        runtime_settings,
+        reload_failed=False,
+        local_only=False,
     ):
         """Lease a ready engine without waiting for another model's disk drain.
 
         This path has no await: the unload marker and lease update are atomic
         on the pool's event loop. Loads and settings changes still take the lock.
+        A ``local_only`` request never leases a distributed engine: that would
+        report a cluster launch as this Mac's own model.
         """
         entry = self._entries.get(model_id)
         if (
@@ -2713,6 +2745,10 @@ class EnginePool:
             or model_id in self._unloading_models
             or (force_lm and isinstance(entry.engine, VLMBatchedEngine))
             or (reload_failed and self._runtime_failed_engine(entry.engine))
+            or (
+                local_only
+                and self._distributed_deployment_for_entry(entry) is not None
+            )
         ):
             return None
         expected = self._engine_runtime_signature(model_id, runtime_settings)
@@ -2738,6 +2774,7 @@ class EnginePool:
         force_lm: bool = False,
         _lease: bool = False,
         runtime_settings: object | None = None,
+        local_only: bool = False,
     ) -> (
         BaseEngine
         | EmbeddingEngine
@@ -2764,6 +2801,11 @@ class EnginePool:
                 load. When its engine-construction signature differs from the
                 currently loaded engine, the old engine is unloaded and the new
                 variant is loaded without mutating persisted model settings.
+            local_only: Load on this Mac alone. A registry deployment for the
+                model is ignored, so a model that does not fit here is refused
+                here instead of launching across paired Macs. An already-loaded
+                distributed engine is unloaded (or refused when busy) rather
+                than reported as this Mac's own.
 
         Returns:
             The loaded engine (BaseEngine for LLM, EmbeddingEngine for embeddings)
@@ -2781,7 +2823,7 @@ class EnginePool:
         reload_failed = await self._reloadable_failed_engine(model_id)
         await self._check_splash_launcher(model_id, runtime_settings)
         ready = self._acquire_loaded_engine(
-            model_id, force_lm, _lease, runtime_settings, reload_failed
+            model_id, force_lm, _lease, runtime_settings, reload_failed, local_only
         )
         if ready is not None:
             return ready
@@ -2855,6 +2897,22 @@ class EnginePool:
                     )
                     await self._unload_engine(model_id)
                     unloaded_for_admission = True
+                elif (
+                    entry.engine is not None
+                    and local_only
+                    and self._distributed_deployment_for_entry(entry) is not None
+                ):
+                    # A local-only load must never hand back a cluster engine:
+                    # the caller asked for this Mac alone. Unload it (refusing a
+                    # busy one) and load it locally.
+                    self._raise_if_reload_busy(entry, "reload as a local engine")
+                    logger.info(
+                        "Unloading distributed engine for %s "
+                        "(local_only=True, reloading on this Mac alone)",
+                        model_id,
+                    )
+                    await self._unload_engine(model_id)
+                    unloaded_for_admission = True
                 elif entry.engine is not None:
                     self._validate_llm_engine_ready(model_id, entry.engine)
                     if entry.runtime_settings_signature is None:
@@ -2893,8 +2951,10 @@ class EnginePool:
             # engine_type to "batched") loads only its language weights, so
             # admit that path by the text-only estimate instead of the
             # vision-inclusive file size (#2385).
-            deployment = self._distributed_deployment_for_entry(entry)
-            admission_size = self._entry_resident_size(entry)
+            deployment = self._distributed_deployment_for_entry(
+                entry, local_only=local_only
+            )
+            admission_size = self._entry_resident_size(entry, local_only=local_only)
             if (
                 deployment is None
                 and entry.text_only_size
@@ -2925,6 +2985,7 @@ class EnginePool:
                 entry,
                 load_settings,
                 base_size=admission_size,
+                local_only=local_only,
             )
             admission_kind = "local shard" if deployment is not None else "model"
 
@@ -3088,6 +3149,7 @@ class EnginePool:
                 model_id,
                 force_lm=force_lm,
                 runtime_settings=runtime_load_settings,
+                local_only=local_only,
             )
 
             loaded = self._entries[model_id]
@@ -4136,6 +4198,7 @@ class EnginePool:
         model_id: str,
         force_lm: bool = False,
         runtime_settings: object | None = None,
+        local_only: bool = False,
     ) -> None:
         """
         Load an engine for the specified model.
@@ -4143,6 +4206,8 @@ class EnginePool:
         Args:
             model_id: The model ID to load
             force_lm: Force loading as BatchedEngine even for VLM models.
+            local_only: Load on this Mac alone; never adopt a registry
+                deployment, so no remote rank is launched.
 
         Raises:
             ModelLoadingError: If model is already being loaded
@@ -4159,7 +4224,7 @@ class EnginePool:
         load_completed = False
         entry_detached = False
         entry.abort_loading = False
-        resident_size = self._entry_resident_size(entry)
+        resident_size = self._entry_resident_size(entry, local_only=local_only)
         pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
@@ -4184,7 +4249,9 @@ class EnginePool:
             if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
-            deployment = self._distributed_deployment_for_entry(entry)
+            deployment = self._distributed_deployment_for_entry(
+                entry, local_only=local_only
+            )
             if getattr(model_settings, "lora_adapter", None) and (
                 deployment is not None or effective_type not in ("batched", "vlm")
             ):
@@ -4192,7 +4259,9 @@ class EnginePool:
                     "A LoRA adapter applies only to a language or vision-language "
                     f"model served on this Mac; remove it from {model_id}'s settings"
                 )
-            base_resident_size = self._entry_resident_size(entry)
+            base_resident_size = self._entry_resident_size(
+                entry, local_only=local_only
+            )
             if (
                 deployment is None
                 and entry.text_only_size
@@ -4203,6 +4272,7 @@ class EnginePool:
                 entry,
                 model_settings,
                 base_size=base_resident_size,
+                local_only=local_only,
             )
             entry.runtime_estimated_size = resident_size
             entry.runtime_settle_size = self._entry_runtime_resident_size(
@@ -4210,6 +4280,7 @@ class EnginePool:
                 model_settings,
                 base_size=base_resident_size,
                 include_ane_reservation=False,
+                local_only=local_only,
             )
 
             # Wire the correct model_id / model_path into the shared scheduler
@@ -4380,9 +4451,11 @@ class EnginePool:
                     # start() already stopped Splash; its error carries the
                     # tail of the Splash log. There is no MLX fallback.
                     raise
-                if force_lm and entry.engine_type == "vlm":
+                if deployment is None and force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
                     # load this VLM model -- fall back to VLMBatchedEngine.
+                    # A deployment engine is not a BatchedEngine, so its failure
+                    # must not be converted into a local VLM load.
                     logger.warning(
                         f"LM loading failed for VLM model {model_id} "
                         f"(force_lm=True), falling back to VLM engine: "
@@ -4418,8 +4491,16 @@ class EnginePool:
                         f"Successfully loaded {model_id} as VLM "
                         f"(fallback from force_lm)"
                     )
-                elif entry.engine_type == "vlm" and self._has_mlx_lm_path(entry):
-                    # VLM loading failed -- fall back to LLM (BatchedEngine)
+                elif (
+                    deployment is None
+                    and entry.engine_type == "vlm"
+                    and self._has_mlx_lm_path(entry)
+                ):
+                    # VLM loading failed -- fall back to LLM (BatchedEngine).
+                    # A failed *deployment* is not a VLM capability problem: its
+                    # error is the cluster's launch/preflight verdict, and a text
+                    # loader would only replace it with "N parameters not in
+                    # model" (the vision/PLE tensors). Let that error surface.
                     logger.warning(
                         f"VLM loading failed for {model_id}, "
                         f"falling back to LLM: {start_error}"
