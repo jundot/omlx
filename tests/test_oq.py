@@ -9995,3 +9995,41 @@ class TestLfm3OmniSanitize:
         actual = model.embedding_norm(hidden)
         expected = model(tokens)
         assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+
+
+def test_streamed_imatrix_embeds_one_round_at_a_time(tmp_path, monkeypatch):
+    """The streamed collector embeds each round's own rows, never the whole
+    adaptive draw: resident memory is one round whatever the draw size (a
+    962 x 2048-token draw of a hyper-connection model is ~45 GB embedded)."""
+    from tests.test_mlx_vlm_muse_glimmer_compat import _spark_oq_source
+    import omlx.oq as oq
+
+    source = tmp_path / "source"
+    _spark_oq_source(source, nvfp4=False)
+    config = json.loads((source / "config.json").read_text())
+    tokens = mx.array([[1 + i + 6 * r for i in range(6)] for r in range(8)])
+    monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+    monkeypatch.setattr(oq, "load_mlx_lm_tokenizer", lambda *a, **kw: object())
+    rows_embedded = []
+    real_embed = oq._streamed_embed
+
+    def recording_embed(weight, data, cfg):
+        rows_embedded.append(int(data.shape[0]))
+        return real_embed(weight, data, cfg)
+
+    monkeypatch.setattr(oq, "_streamed_embed", recording_embed)
+    resident_tables = []
+    real_weight = oq._streamed_embed_weight
+
+    def counting_weight(src, cfg):
+        resident_tables.append(1)
+        return real_weight(src, cfg)
+
+    monkeypatch.setattr(oq, "_streamed_embed_weight", counting_weight)
+    streamed, metadata = oq._collect_imatrix_streaming(
+        source, object(), config, num_samples=2, seq_length=6, calib_data=tokens)
+    assert streamed
+    assert rows_embedded and max(rows_embedded) <= 2, rows_embedded
+    # The table is sourced at stage 0 and again once per round, never kept.
+    rounds = len(metadata.get("rounds") or []) or 1
+    assert len(resident_tables) == 1 + rounds, (resident_tables, rounds)
