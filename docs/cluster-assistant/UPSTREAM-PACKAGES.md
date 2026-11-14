@@ -209,6 +209,20 @@ Notes for the pushes:
 - F5 extracts exactly one line from `omlx/cluster/routes.py` (the inventory call
   must use `DEFAULT_REMOTE_PYTHON`, not the hardcoded `~/omlx-distributed` path).
 
+Upload (once the assistant branches are added below; no PR is open yet):
+
+```sh
+# from the main repo — branches live in the shared object database
+for b in pr/f1-local-only pr/f2-test-infra pr/f3-peer-check \
+         pr/f4-mac-helper-dmg pr/f5-cluster-core; do
+  git push origin "$b:$b"
+done
+```
+
+Push the assistant stack in order (`a1` → `a2` → `a3`); each later branch is based
+on the previous one, so its PR must target that branch (or the series is merged
+bottom-up).
+
 ## 9. Corrected PR count
 
 - **8 new PRs**: F1, F2, F3, F4, F5 (cluster-core extras), and assistant 1, 2, 3.
