@@ -34,7 +34,7 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev", "d3", "d1", "d1_lfm2"]
+DecisionKind = Literal["clef", "openjev", "d3", "pplx_decider", "d1", "d1_lfm2"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -124,12 +124,24 @@ _OPENJEV_HELPER = Path("helper/shim.py")
 D3_READOUT_WEIGHTS = "readout.safetensors"
 D3_DECISION_CONFIG = "decision_config.json"
 D3_FORMAT_ID = "d3-code-readout-v1"
+# Perplexity Decider (pplx-decider) checkpoints: the same readout layout
+# under the chunked joint protocol of the release runtime.
+PPLX_READOUT_WEIGHTS = "readout.safetensors"
+PPLX_JOINT_CONFIG = "joint_config.json"
+PPLX_DECISION_CONFIG = "decision_config.json"
+PPLX_TEMPLATE = "joint-chunked-readout-v1"
+PPLX_LOCATE_DIR = "locate-span"
 # Files of a decision head, not of the backbone. Quantizers copy them as is.
 DECISION_SIDECAR_WEIGHTS = (CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS)
+# Directories of a decision head: the Perplexity Decider locate adapter is a
+# directory of its own (unmerged LoRA, span head, config), copied as a tree.
+DECISION_SIDECAR_DIRS = (PPLX_LOCATE_DIR,)
 DECISION_SIDECAR_FILES = (
     *DECISION_SIDECAR_WEIGHTS,
     CLEF_HEAD_CONFIG,
     D3_DECISION_CONFIG,
+    PPLX_JOINT_CONFIG,
+    PPLX_DECISION_CONFIG,
 )
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
@@ -517,6 +529,14 @@ def _is_d1_config(config: dict) -> bool:
     ).endswith("D1Model")
 
 
+def _is_pplx_joint_config(path: Path) -> bool:
+    try:
+        with open(path) as f:
+            return json.load(f).get("template") == PPLX_TEMPLATE
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
     """Return the decision-model family of a checkpoint, or None.
 
@@ -535,6 +555,10 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
         model_path / D3_DECISION_CONFIG
     ):
         return "d3"
+    if (model_path / PPLX_READOUT_WEIGHTS).is_file() and _is_pplx_joint_config(
+        model_path / PPLX_JOINT_CONFIG
+    ):
+        return "pplx_decider"
     if config is None:
         try:
             with open(model_path / "config.json") as f:

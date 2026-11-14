@@ -47,6 +47,10 @@ class SystemOneRequest(BaseModel):
     videos: list[str] | None = None
     """Base64 video data URIs, for models that read video (Decision 3.0)."""
 
+    mode: Literal["separate", "isolated"] = "separate"
+    """Decider models only: one sequence per question (``separate``) or one
+    sequence for the whole request (``isolated``, cheaper on long states)."""
+
     truncate: bool = True
     """Clef only: cut the state to fit the context instead of returning 413."""
 
