@@ -80,6 +80,7 @@ def test_remote_inventory_runs_the_peers_own_discovery(monkeypatch):
                 "engine_type": "batched",
                 "estimated_size": 10,
                 "config_model_type": "llama",
+                "mtp_compatible": True,
             },
             {
                 "model_id": "embed",
@@ -95,9 +96,156 @@ def test_remote_inventory_runs_the_peers_own_discovery(monkeypatch):
     models = remote_model_inventory("studio")
 
     assert [item["id"] for item in models] == ["m"]
+    assert models[0]["mtp_compatible"] is True
     assert captured["host"] == "studio"
     assert "discover_models_from_dirs" in captured["snippet"]
     assert "GlobalSettings.load" in captured["snippet"]
+    assert "mtp_compatible_for_model" in captured["snippet"]
+
+
+def _fake_peer_package(root, *, with_mtp_helper):
+    """A stand-in ``omlx`` package as a peer would expose it over SSH.
+
+    ``with_mtp_helper=False`` models a stock-oMLX peer that predates this
+    fork: ``omlx.cluster.model_inventory`` does not exist there.
+    """
+
+    package = root / "omlx"
+    (package / "cluster").mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "cluster" / "__init__.py").write_text("")
+    (package / "settings.py").write_text(
+        "class GlobalSettings:\n"
+        "    @staticmethod\n"
+        "    def load():\n"
+        "        return GlobalSettings()\n"
+        "    def get_effective_model_dirs(self):\n"
+        "        return ['/models']\n"
+    )
+    (package / "model_discovery.py").write_text(
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class DiscoveredModel:\n"
+        "    model_id: str\n"
+        "    model_path: str\n"
+        "    model_type: str\n"
+        "    estimated_size: int\n"
+        "def discover_models_from_dirs(dirs):\n"
+        "    return {\n"
+        "        'm': DiscoveredModel('m', '/models/m', 'llm', 10),\n"
+        "        'plain': DiscoveredModel('plain', '/models/plain', 'llm', 20),\n"
+        "    }\n"
+    )
+    if with_mtp_helper:
+        (package / "cluster" / "model_inventory.py").write_text(
+            "def mtp_compatible_for_model(model_path):\n"
+            "    return model_path == '/models/m'\n"
+        )
+    return root
+
+
+def _run_snippet_on_fake_peer(snippet, peer_root):
+    """Execute the snippet the way ``run_remote_python`` does on the peer.
+
+    The command line is shell-quoted exactly like the SSH hop builds it;
+    ``-S`` keeps the installed fork out of the subprocess, so the stub
+    package is the peer's whole omlx. No SSH, no real model.
+    """
+
+    import shlex
+    import subprocess
+    import sys
+
+    command = f"{shlex.quote(sys.executable)} -S -c {shlex.quote(snippet)} inventory"
+    result = subprocess.run(
+        ["sh", "-c", command],
+        cwd=peer_root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_inventory_snippet_keeps_its_json_shape_on_a_stock_peer(tmp_path):
+    """R1: a missing fork helper costs the MTP fact, never the whole list."""
+
+    peer = _fake_peer_package(tmp_path, with_mtp_helper=False)
+
+    payload = _run_snippet_on_fake_peer(
+        model_inventory._REMOTE_MODEL_INVENTORY_SNIPPET, peer
+    )
+
+    assert isinstance(payload, list) and len(payload) == 2
+    assert all(isinstance(item, dict) for item in payload)
+    assert all(item["mtp_compatible"] is False for item in payload)
+
+
+def test_remote_inventory_survives_a_peer_without_the_mtp_helper(tmp_path, monkeypatch):
+    peer = _fake_peer_package(tmp_path, with_mtp_helper=False)
+
+    def fake_run(host, snippet, argument, **kwargs):
+        return _run_snippet_on_fake_peer(snippet, peer)
+
+    monkeypatch.setattr(model_inventory, "run_remote_python", fake_run)
+
+    models = remote_model_inventory("stock-peer")
+
+    assert [item["id"] for item in models] == ["m", "plain"]
+    assert all(item["mtp_compatible"] is False for item in models)
+
+
+def test_remote_inventory_carries_the_real_mtp_fact_from_a_forked_peer(
+    tmp_path, monkeypatch
+):
+    peer = _fake_peer_package(tmp_path, with_mtp_helper=True)
+
+    def fake_run(host, snippet, argument, **kwargs):
+        return _run_snippet_on_fake_peer(snippet, peer)
+
+    monkeypatch.setattr(model_inventory, "run_remote_python", fake_run)
+
+    models = remote_model_inventory("forked-peer")
+
+    assert {item["id"]: item["mtp_compatible"] for item in models} == {
+        "m": True,
+        "plain": False,
+    }
+
+
+def test_local_pool_inventory_reports_mtp_compatibility(monkeypatch):
+    monkeypatch.setattr(
+        model_inventory,
+        "mtp_compatible_for_model",
+        lambda path: path == "/models/m3",
+    )
+
+    class Pool:
+        def get_status(self):
+            return {
+                "models": [
+                    {
+                        "id": "m3",
+                        "model_path": "/models/m3",
+                        "model_type": "vlm",
+                        "config_model_type": "minimax_m3_vl",
+                        "estimated_size": 236,
+                    },
+                    {
+                        "id": "plain",
+                        "model_path": "/models/plain",
+                        "model_type": "llm",
+                        "config_model_type": "llama",
+                        "estimated_size": 10,
+                    },
+                ]
+            }
+
+    models = engine_pool_model_inventory(Pool())
+
+    assert models[0]["mtp_compatible"] is True
+    assert models[1]["mtp_compatible"] is False
 
 
 def test_local_pool_inventory_keeps_vlms_for_cluster_compatibility():
@@ -219,6 +367,40 @@ def test_cluster_inventory_reads_a_peer_without_a_probed_python(monkeypatch):
     assert response.json()["errors"] == []
     assert [model["id"] for model in response.json()["models"]] == ["m3"]
     assert commands[0].startswith(f"{DEFAULT_REMOTE_PYTHON} -c ")
+
+
+def test_cluster_inventory_defaults_to_the_published_worker_shim(monkeypatch):
+    from omlx.cluster import routes
+
+    class Pool:
+        def get_status(self):
+            return {"models": [_model(size=62, path="/models/m3")]}
+
+    captured = {}
+
+    def remote(host, *, python_executable):
+        captured["host"] = host
+        captured["python_executable"] = python_executable
+        return [_model(size=236, path="/models/m3")]
+
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: Pool())
+    monkeypatch.setattr(routes, "remote_model_inventory", remote)
+
+    response = _client().post(
+        "/admin/api/cluster/models",
+        json={
+            "hosts": [
+                {"node_id": "MacBook", "ssh": "127.0.0.1"},
+                {"node_id": "Mac Studio", "ssh": "studio"},
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["host"] == "studio"
+    # The legacy default was "~/omlx-distributed/.venv/bin/python"; the remote
+    # probe rejects that non-absolute path, leaving the model list empty.
+    assert captured["python_executable"] == routes.DEFAULT_REMOTE_PYTHON
 
 
 def test_catalogue_measures_a_peer_owned_model_on_the_peer(monkeypatch):

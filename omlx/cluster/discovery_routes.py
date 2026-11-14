@@ -59,6 +59,24 @@ class ProbeRateLimiter:
 probe_rate_limiter = ProbeRateLimiter()
 
 
+def _address_rows(values: Any) -> list[dict[str, Any]]:
+    """Normalize discovery and pairing addresses to the devices contract.
+
+    Pending pairing requests carry ``list[str]`` while discovery rows carry
+    ``[{"ip", "if_type"}]``. Merging the two must not change the shape halfway
+    through the devices payload; address consumers would silently see none.
+    """
+
+    rows: list[dict[str, Any]] = []
+    for value in values or []:
+        if isinstance(value, str):
+            if value:
+                rows.append({"ip": value, "if_type": "unknown"})
+        elif isinstance(value, dict) and value.get("ip"):
+            rows.append(dict(value))
+    return rows
+
+
 def discovery_service_or_none():
     from .discovery import get_discovery_service
 
@@ -381,6 +399,9 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
         for pending in pairing_manager.pending_requests():
             row = dict(discovered_records.get(pending["node_id"], {}))
             row.update(pending)
+            pending_addrs = _address_rows(pending.get("addrs"))
+            if pending_addrs:
+                row["addrs"] = pending_addrs
             row["state"] = "awaiting_approval"
             discovered_records[pending["node_id"]] = row
 
