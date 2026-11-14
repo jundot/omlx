@@ -315,10 +315,20 @@ def _saved_lightning_mtp(model_path: str) -> bool | None:
 
 
 def _saved_engram_ssd_offload(model_path: str | None) -> bool:
-    """Whether the saved settings keep DeepSeek V4.1 Engram tables on SSD."""
+    """Whether the saved settings keep a lookup table on SSD.
+
+    Honours both the DeepSeek V4.1 Engram switch and the Qwen4 PLE switch, so
+    either table-capable checkpoint is planned with its table offloaded (the
+    one table-offload-parity rule).
+    """
 
     settings = _saved_model_settings(model_path) if model_path else None
-    return bool(getattr(settings, "deepseek_v41_engram_ssd_offload", False))
+    if settings is None:
+        return False
+    return bool(
+        getattr(settings, "deepseek_v41_engram_ssd_offload", False)
+        or getattr(settings, "qwen4_ple_ssd_offload", False)
+    )
 
 
 def _cluster_mtp(

@@ -138,6 +138,45 @@ def test_routed_expert_offload_turns_a_refusal_into_a_plan(monkeypatch) -> None:
     assert 0 < selection.policy.moe_resident_fraction <= 1
 
 
+def test_expert_offload_is_priced_into_the_stage_plan(monkeypatch) -> None:
+    """The lever is only real if the planner holds the offloaded bytes back.
+
+    A plan that names a resident fraction but charges every expert byte would
+    still refuse (or refuse later) a model the coordinator can launch, so the
+    stage's residency — not just the policy flag — is what this asserts.
+    """
+
+    monkeypatch.setattr(
+        policy_module,
+        "moe_offload_layer_bytes",
+        lambda model, fraction, mtp=False: (GIB,) * model.layer_count,
+    )
+    nodes = [
+        facts("a", capacity_gib=20.0, admission_gib=20.0, p50_gib=20.0, p95_gib=20.0),
+        facts("b", capacity_gib=20.0, admission_gib=20.0, p50_gib=20.0, p95_gib=20.0),
+    ]
+    model = layout(
+        layers=20, layer_gib=1.5, fixed_gib=1.0, kv_bytes_per_token_per_layer=4096
+    )
+
+    selection = solve(nodes, model, target_context_tokens=1_048_576)
+    assert selection.policy.moe_expert_offload is True
+    plan = selection.election.selected.shard_plan
+    assert plan is not None
+    for assignment in plan.assignments:
+        # One GiB per layer is streamed, so only half the layer stays resident.
+        assert assignment.moe_offload_weight_bytes == GIB * assignment.layer_count
+        assert (
+            assignment.moe_expert_offload_resident_fraction
+            == selection.policy.moe_resident_fraction
+        )
+        assert assignment.planned_weight_bytes == (
+            int(1.0 * GIB)
+            + int(0.5 * GIB) * assignment.layer_count
+            + assignment.kv_cache_bytes
+        )
+
+
 def test_raising_the_memory_tier_turns_a_refusal_into_a_plan() -> None:
     nodes = [
         facts("a", admission_gib=10.0, p50_gib=10.0, p95_gib=24.0),

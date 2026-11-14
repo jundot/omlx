@@ -48,7 +48,7 @@ from dataclasses import dataclass, replace
 from itertools import combinations
 from typing import Any
 
-from ...patches.deepseek_v41.moe_offload import offload_layer_bytes
+from ...patches.deepseek_v41.moe_offload import _plan
 from ..catalogue import _CONTEXT_LADDER
 from ..performance import ExecutionProfileName
 from ..planner import ModelLayout, _held_layer_bytes
@@ -467,7 +467,25 @@ def moe_offload_layer_bytes(
         config = json.loads((Path(source) / "config.json").read_text())
         if str(config.get("model_type", "")).lower() != "deepseek_v41":
             return ()
-        layer_bytes = offload_layer_bytes(source, float(fraction), mtp_resident=mtp)
+        # Upstream refactored the MoE offload API: `offload_layer_bytes` is gone
+        # and `ExpertOffloadPlan` (via `_plan`) now owns the per-layer expert
+        # bytes. Derive the per-layer SSD bytes the same way the plan does:
+        # full expert bytes minus the resident slots (capacity/count per layer).
+        plan = _plan(source, float(fraction), mtp_resident=mtp)
+        count = int(plan.count) or 0
+        capacity = int(plan.capacity)
+        per_layer = [0] * model.layer_count
+        for prefix, full in plan.layer_bytes.items():
+            parts = prefix.split(".")
+            try:
+                index = int(parts[2])
+            except (IndexError, ValueError):
+                continue
+            if not 0 <= index < model.layer_count:
+                continue
+            resident = full * capacity // count if count else 0
+            per_layer[index] += int(full) - int(resident)
+        layer_bytes = tuple(per_layer)
     except Exception:
         # A checkpoint whose expert layout cannot be read is not offloadable.
         # The solver then keeps the resident policy and the near miss says the
@@ -1160,6 +1178,9 @@ def _subset_cannot_fit(
     extra = rank0_extra_bytes + (model.mtp_weight_bytes if mtp else 0)
     fixed_total = len(subset) * model.fixed_weight_bytes
     for lever in levers:
+        # The same per-layer expert bytes `plan_hybrid` subtracts, read through
+        # the one helper so the bound cannot drift from the plan. Engram/PLE
+        # table offload is priced as well; the two are independent savings.
         moe_bytes = (
             memo.moe_bytes(model, lever.moe_resident_fraction, mtp=mtp)
             if lever.moe_expert_offload
