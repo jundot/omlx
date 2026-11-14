@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
 
 from omlx.engine.decision import _MODEL_CLASSES  # noqa: E402
 from omlx.model_discovery import decision_kind, detect_model_type  # noqa: E402
@@ -27,7 +28,13 @@ from omlx.models.decision import (  # noqa: E402
 )
 from omlx.models.pplx_decider import (  # noqa: E402
     CONTEXT_END,
+    LOCATE_ADAPTER_WEIGHTS,
+    LOCATE_DIR,
+    LOCATE_FORMAT,
+    LOCATE_HEAD_WEIGHTS,
+    LOCATE_MARKER,
     PplxDeciderModel,
+    _locate_sha256,
 )
 
 MARKER = "<|fim_suffix|>"
@@ -52,7 +59,20 @@ class StubTokenizer:
         }
         self.all_special_tokens = list(self.specials)
         self._reverse = {value: key for key, value in self.specials.items()}
+        self._next = 900
         self._ordered = sorted(self.specials.items(), key=lambda kv: -len(kv[0]))
+
+    def add_special_tokens(self, mapping, replace_extra_special_tokens=True):
+        for token in mapping.get("extra_special_tokens", []):
+            if token not in self.specials:
+                self.specials[token] = self._next
+                self._next += 1
+                self.all_special_tokens = list(self.specials)
+                self._reverse[self.specials[token]] = token
+                self._ordered = sorted(self.specials.items(), key=lambda kv: -len(kv[0]))
+
+    def get_vocab(self):
+        return dict(self.specials)
 
     def encode(self, text, add_special_tokens=False):
         ids, index = [], 0
@@ -101,6 +121,7 @@ class StubBackbone:
 
     def __init__(self, tokenizer=None, limit=262144):
         self.tokenizer = tokenizer or StubTokenizer()
+        self._text_model = StubTextModel()
         self.config = {"text_config": {"hidden_size": HIDDEN}}
         self.image_processor = None
         self.max_position_embeddings = limit
@@ -431,3 +452,259 @@ def test_locate_adapter_dir_is_a_decision_sidecar():
     from omlx.model_discovery import DECISION_SIDECAR_DIRS, PPLX_LOCATE_DIR
 
     assert PPLX_LOCATE_DIR in DECISION_SIDECAR_DIRS
+
+
+# --------------------------------------------------------------------------
+# locate (verbatim span extraction)
+
+
+class StubTextModel(nn.Module):
+    """Stand-in for ``backbone._text_model``: one Linear to wrap plus an embedding."""
+
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(16, HIDDEN)
+        self.linear = nn.Linear(HIDDEN, HIDDEN)
+        self.norm = nn.RMSNorm(HIDDEN)
+
+
+def _locate_dir(
+    model_dir,
+    *,
+    marker_id=900,
+    alpha=4.0,
+    rank=2,
+    width=4,
+    max_span=6,
+    proposals=8,
+    base=None,
+    fmt=LOCATE_FORMAT,
+    lora=None,
+    targets=("linear",),
+):
+    directory = model_dir / LOCATE_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    config = {
+        "format": fmt,
+        "marker_id": marker_id,
+        "head": {"name": "span", "width": width, "max_span": max_span, "proposals": proposals},
+        "lora": lora or {"alpha": alpha, "rank": rank, "layers": 0, "merged": False},
+        "base": base or {},
+        "thresholds": {"default": 0.5},
+    }
+    (directory / "locate_config.json").write_text(json.dumps(config))
+    weights = {"language_model.embed_tokens.locate": mx.zeros((HIDDEN,))}
+    for target in targets:
+        weights[f"language_model.{target}.lora_a"] = mx.zeros((rank, HIDDEN))
+        weights[f"language_model.{target}.lora_b"] = mx.zeros((HIDDEN, rank))
+    mx.save_safetensors(str(directory / LOCATE_ADAPTER_WEIGHTS), weights)
+    head = {}
+    for name in ("ts", "te", "qs", "qe", "qp"):
+        head[f"{name}.weight"] = mx.zeros((width, HIDDEN))
+        head[f"{name}.bias"] = mx.zeros((width,))
+    head["thresholds.weight"] = mx.zeros((3, HIDDEN))
+    head["thresholds.bias"] = mx.zeros((3,))
+    head["width_bias.weight"] = mx.zeros((32, 1))
+    head["start_bias"] = mx.zeros((1,))
+    head["end_bias"] = mx.zeros((1,))
+    mx.save_safetensors(str(directory / LOCATE_HEAD_WEIGHTS), head)
+    return directory
+
+
+def test_normalize_question_accepts_locate():
+    from omlx.models.pplx_decider import normalize_question
+
+    question = normalize_question("q", {"type": "locate"})
+    assert question.kind == "locate"
+    assert question.keys == []
+    assert question.texts == []
+    with pytest.raises(DecisionRequestError, match="no criteria"):
+        normalize_question("q", {"type": "locate", "criteria": ["a"]})
+
+
+def test_locate_is_a_valid_question_type(tmp_path):
+    model = _loaded_model(tmp_path)
+    plan = model.encode({"state": "hello", "questions": {"q": {"type": "locate"}}})
+    assert [item.kind for item in plan.locate] == ["locate"]
+    # No decision chunk left to read out, so the decision pass is skipped.
+    assert plan.sequences == []
+    assert plan.state == "hello"
+
+
+def test_locate_mixed_with_decisions_keeps_the_decisions(tmp_path):
+    model = _loaded_model(tmp_path)
+    plan = model.encode(
+        {
+            "state": "hello",
+            "questions": {"q": {"type": "locate"}, "u": {"type": "noul"}},
+        }
+    )
+    assert [item.kind for item in plan.locate] == ["locate"]
+    assert plan.sequences[0].keys == ("u",)
+
+
+def test_locate_rejects_more_than_the_question_limit(tmp_path):
+    model = _loaded_model(tmp_path)
+    questions = {f"q{index}": {"type": "locate"} for index in range(129)}
+    with pytest.raises(DecisionRequestError, match="at most"):
+        model.encode({"state": "hello", "questions": questions})
+
+
+def test_locate_rejects_images(tmp_path):
+    """The adapter was trained on a text state, so media is a request error."""
+    model = _loaded_model(tmp_path)
+    request = {"state": "hello", "questions": {"q": {"type": "locate"}}, "images": [_png_data_uri()]}
+    with pytest.raises(DecisionRequestError, match="without images"):
+        model.encode(request)
+    mixed = {"state": "hello", "questions": {"q": {"type": "locate"}, "u": {"type": "noul"}},
+             "images": [_png_data_uri()]}
+    with pytest.raises(DecisionRequestError, match="without images"):
+        model.encode(mixed)
+
+
+def test_locate_adapter_loads_and_wraps_the_backbone(tmp_path):
+    model = _loaded_model(tmp_path)
+    _locate_dir(tmp_path / "checkpoint")
+    adapter = model.locate
+    assert model.locate_ready
+    assert adapter.marker_id == 900
+    assert [type(wrapper).__name__ for wrapper in adapter.adapters] == ["LocateLoRA"]
+    assert adapter.head.max_span == 6
+    # The marker joins the escapes, so user text cannot fake it.
+    assert LOCATE_MARKER in model._escapes
+
+
+def test_locate_adapter_rejects_a_foreign_marker_id(tmp_path):
+    model = _loaded_model(tmp_path)
+    _locate_dir(tmp_path / "checkpoint", marker_id=901)
+    with pytest.raises(ValueError, match="trained with 901"):
+        model.locate
+
+
+def test_locate_adapter_rejects_a_foreign_base(tmp_path):
+    model = _loaded_model(tmp_path)
+    _locate_dir(
+        tmp_path / "checkpoint",
+        base={"sha256": {"readout.safetensors": "0" * 64}},
+    )
+    with pytest.raises(ValueError, match="another base"):
+        model.locate
+
+
+def test_locate_adapter_skips_the_quantized_config_in_the_base_check(tmp_path):
+    """A quantizer rewrites config.json, so its hash cannot be verified."""
+    model = _loaded_model(tmp_path)
+    _locate_dir(
+        tmp_path / "checkpoint",
+        base={"sha256": {"config.json": "0" * 64, "readout.safetensors": _locate_sha256(tmp_path / "checkpoint" / "readout.safetensors")}},
+    )
+    assert model.locate.marker_id == 900
+
+
+def test_locate_adapter_rejects_a_merged_or_partial_lora(tmp_path):
+    model = _loaded_model(tmp_path)
+    _locate_dir(tmp_path / "checkpoint", lora={"alpha": 4.0, "rank": 2, "layers": 3})
+    with pytest.raises(ValueError, match="all-layer unmerged"):
+        model.locate
+
+
+def test_locate_adapter_rejects_an_unknown_format(tmp_path):
+    model = _loaded_model(tmp_path)
+    _locate_dir(tmp_path / "checkpoint", fmt="pplx-decider-locate-span-v0")
+    with pytest.raises(ValueError, match="v0"):
+        model.locate
+
+
+def test_locate_adapter_rejects_unmatched_lora_tensors(tmp_path):
+    model = _loaded_model(tmp_path)
+    directory = _locate_dir(tmp_path / "checkpoint")
+    weights = dict(mx.load(str(directory / LOCATE_ADAPTER_WEIGHTS)))
+    weights["language_model.ghost.lora_a"] = mx.zeros((2, HIDDEN))
+    weights["language_model.ghost.lora_b"] = mx.zeros((HIDDEN, 2))
+    mx.save_safetensors(str(directory / LOCATE_ADAPTER_WEIGHTS), weights)
+    with pytest.raises(ValueError, match="did not match"):
+        model.locate
+
+
+def test_locate_validate_rules():
+    from omlx.models.pplx_decider import LocateAdapter
+
+    validate = LocateAdapter.validate
+    assert validate(None, "state", {"q": {"type": "locate"}}, 0) == ["q"]
+    assert validate(None, "state", {"q": {"type": "locate", "instructions": "x"}}, 0) == ["x"]
+    assert validate(None, "state", {"q": {"type": "locate", "instructions": "  "}}, 0) == ["q"]
+    with pytest.raises(DecisionRequestError, match="without images"):
+        validate(None, "state", {"q": {"type": "locate"}}, 1)
+    with pytest.raises(DecisionRequestError, match="nonempty text state"):
+        validate(None, "", {"q": {"type": "locate"}}, 0)
+    with pytest.raises(DecisionRequestError, match="must be text or null"):
+        validate(None, "state", {"q": {"type": "locate", "instructions": 7}}, 0)
+    with pytest.raises(DecisionRequestError, match="at most"):
+        validate(None, "state", {f"q{index}": {} for index in range(129)}, 0)
+
+
+def test_locate_span_head_filters_by_width_and_threshold():
+    from omlx.models.pplx_decider import LocateSpanHead
+
+    head = LocateSpanHead(HIDDEN, 4, max_span=2)
+    head.thresholds.bias = mx.zeros((3,))
+    head.width_bias.weight = mx.zeros((32, 1))
+    head.ts.weight, head.ts.bias = mx.zeros((4, HIDDEN)), mx.zeros((4,))
+    head.te.weight, head.te.bias = mx.zeros((4, HIDDEN)), mx.zeros((4,))
+    head.qs.weight, head.qs.bias = mx.zeros((4, HIDDEN)), mx.zeros((4,))
+    head.qe.weight, head.qe.bias = mx.zeros((4, HIDDEN)), mx.zeros((4,))
+    head.qp.weight, head.qp.bias = mx.zeros((4, HIDDEN)), mx.zeros((4,))
+    document = mx.zeros((3, HIDDEN))
+    labels = mx.zeros((2, HIDDEN))
+    # Every pair scores exactly 0.5, so only the width and the cutoff filter.
+    found = head.predict(document, labels, 0.5, proposals=8)
+    assert [sorted(field) for field in found] == [
+        [(0, 0, 0.5), (0, 1, 0.5), (1, 1, 0.5), (1, 2, 0.5), (2, 2, 0.5)],
+        [(0, 0, 0.5), (0, 1, 0.5), (1, 1, 0.5), (1, 2, 0.5), (2, 2, 0.5)],
+    ]
+    assert head.predict(document, labels, 0.5001, proposals=8) == [[], []]
+
+
+def test_locate_topk_is_descending_with_matching_indices():
+    from omlx.models.pplx_decider import LocateSpanHead
+
+    values, indices = LocateSpanHead._topk(mx.array([0.5, 2.0, 1.0, 3.0]), 2)
+    assert values.tolist() == [3.0, 2.0]
+    assert indices.tolist() == [3, 1]
+
+
+def test_locate_lora_is_inert_until_enabled():
+    from omlx.models.pplx_decider import LocateLoRA
+
+    base = nn.Linear(HIDDEN, HIDDEN)
+    wrapper = LocateLoRA(
+        base, mx.full((2, HIDDEN), 0.5), mx.full((HIDDEN, 2), 2.0), alpha=4.0
+    )
+    inputs = mx.full((1, HIDDEN), 0.25)
+    plain = base(inputs)
+    assert mx.allclose(wrapper(inputs), plain).item()
+    wrapper.enabled = True
+    # Per element: sum_rank(inputs * lora_a) * lora_b * alpha / rank = 8 * 2 * 2.
+    assert mx.allclose(wrapper(inputs), plain + 8.0).item()
+    wrapper.enabled = False
+    assert mx.allclose(wrapper(inputs), plain).item()
+
+
+def test_locate_isolation_mask_blocks_questions_from_each_other():
+    """The release layout: the context attends everything, a question only itself."""
+    from omlx.models.pplx_decider import isolation_mask
+
+    assert isolation_mask(3, [2]) is None
+    allowed = isolation_mask(2, [2, 2])[0, 0].tolist()
+    assert allowed[0] == [True] * 6 and allowed[1] == [True] * 6
+    assert allowed[2] == [True, True, True, True, False, False]
+    assert allowed[3] == [True, True, True, True, False, False]
+    assert allowed[4] == [True, True, False, False, True, True]
+    assert allowed[5] == [True, True, False, False, True, True]
+
+
+def test_locate_positions_restart_in_every_question_block():
+    from omlx.models.pplx_decider import LocateAdapter
+
+    positions = LocateAdapter._positions(7, 3, [2, 2])[:, 0, :]
+    assert positions.tolist() == [[0, 1, 2, 3, 4, 3, 4]] * 3
