@@ -3006,13 +3006,27 @@ class Scheduler:
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
 
+    def _shared_tail_end(self, request: "Request") -> int:
+        """Token count of the shared tail this request captured, or 0.
+
+        That is the end of its system prefix or its branch point, whichever the
+        prefill stopped at.
+        """
+        snapshots = self._boundary_cache_snapshots.get(request.request_id) or {}
+        for end in (
+            getattr(request, "system_prefix_end", 0) or 0,
+            getattr(request, "junction_end", 0) or 0,
+        ):
+            if end > 0 and end in snapshots:
+                return end
+        return 0
+
     def _prepare_system_prefix_store(
         self, request: "Request", full_cache: list[Any]
     ) -> tuple[list[int], list[Any], Any, Any] | None:
-        """Build the shared system-prefix tail payload on the inference thread."""
-        system_end = getattr(request, "system_prefix_end", 0) or 0
-        snapshots = self._boundary_cache_snapshots.get(request.request_id) or {}
-        if system_end <= 0 or system_end not in snapshots:
+        """Build the shared-tail payload (system prefix or branch point)."""
+        system_end = self._shared_tail_end(request)
+        if system_end <= 0:
             return None
         try:
             override = self._get_boundary_store_override(
@@ -3022,7 +3036,7 @@ class Scheduler:
             )
         except Exception as e:
             logger.debug(
-                "System prefix snapshot unavailable for %s: %s", request.request_id, e
+                "Shared tail snapshot unavailable for %s: %s", request.request_id, e
             )
             return None
         if override is None:
@@ -3046,7 +3060,7 @@ class Scheduler:
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool,
     ) -> None:
-        """Store the shared system-prefix tail beside the request's own chain."""
+        """Store the shared tail (system prefix or branch point) by the request."""
         tokens, cache, model_cache_config, provider = system_store
         store_id = f"{request_id}#system"
         block_size = self.config.paged_cache_block_size
@@ -3079,7 +3093,7 @@ class Scheduler:
                 _store_shared_tail=True,
             )
         except Exception as e:
-            logger.debug("System prefix store failed for %s: %s", request_id, e)
+            logger.debug("Shared tail store failed for %s: %s", request_id, e)
         finally:
             table = (
                 self.paged_cache_manager.detach_block_table(store_id)
@@ -8477,6 +8491,46 @@ class Scheduler:
         if 0 < n < limit and n % block_size:
             request.system_prefix_end = n
 
+    # Fewest re-prefill tokens a branch point must save to get a shared tail:
+    # below it the re-prefill costs less than the snapshot and its two SSD files.
+    _JUNCTION_MIN_TOKENS = 512
+
+    def _resolve_junction_end(self, request: "Request") -> None:
+        """Plan a shared tail where this prompt leaves a recently stored sequence.
+
+        A hybrid model resumes only at a block boundary or at a stored tail. A
+        prompt that shares more tokens with a recent sequence than the lookup
+        could restore re-prefills the gap, and so does every later prompt that
+        branches at the same place. This prefill stops at the branch point so
+        the store keeps a tail the next one resumes from.
+        """
+        block_size = self.config.paged_cache_block_size
+        lookup = getattr(self, "_last_prefix_cache_lookup", None)
+        if (
+            block_size <= 0
+            or not lookup
+            or lookup.get("request_id") != request.request_id
+            or not self._detect_boundary_snapshot_need()
+        ):
+            return
+        branch = lookup.get("common_prefix_tokens", 0)
+        prompt_len = len(request.prompt_token_ids or [])
+        limit = getattr(request, "generation_prompt_start", 0) or prompt_len - 1
+        if (
+            branch - (request.cached_tokens or 0) < self._JUNCTION_MIN_TOKENS
+            or branch % block_size == 0
+            or branch >= limit
+        ):
+            return
+        request.junction_end = branch
+        logger.info(
+            "prefix cache: request %s leaves a stored prompt at token %d "
+            "(reused %d); its prefill stops there to keep a shared tail",
+            request.request_id,
+            branch,
+            request.cached_tokens or 0,
+        )
+
     def _minimum_prefill_prefix(self, request: "Request") -> int:
         prompt_token_ids = getattr(request, "prompt_token_ids", None)
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
@@ -8518,14 +8572,24 @@ class Scheduler:
         n_tokens: int,
         boundary_enabled: bool,
     ) -> int | None:
-        """Return the shared system-prefix stop when this prefill crosses it."""
-        system_end = getattr(request, "system_prefix_end", 0) or 0
+        """Return the shared-tail stop this prefill crosses, if any.
+
+        The shared system prefix comes first; the branch point (junction) only
+        takes the stop when no system prefix needs it, so a prefill never
+        stops twice for shared tails.
+        """
+        if not boundary_enabled:
+            return None
         prefill_end = base_size + n_tokens - 1
-        if not boundary_enabled or not base_size < system_end < prefill_end:
-            return None
-        if system_end < self._minimum_prefill_prefix(request):
-            return None
-        return system_end
+        for end in (
+            getattr(request, "system_prefix_end", 0) or 0,
+            getattr(request, "junction_end", 0) or 0,
+        ):
+            if base_size < end < prefill_end and end >= self._minimum_prefill_prefix(
+                request
+            ):
+                return end
+        return None
 
     def _emit_prefill_tail_snapshot(
         self,
@@ -9688,9 +9752,9 @@ class Scheduler:
         """
         Return boundary-aligned cache payload when final request ends on partial block.
 
-        The shared system-prefix tail is a terminal only with ``system_tail``;
-        it carries no intermediate snapshots because its store reuses the
-        cached full blocks.
+        A shared tail (system prefix or branch point) is a terminal only with
+        ``system_tail``; it carries no intermediate snapshots because its store
+        reuses the cached full blocks.
 
         Returns:
             Tuple of (truncated_tokens, extracted_cache, model_cache_config,
@@ -9739,13 +9803,16 @@ class Scheduler:
         valid_counts = sorted(
             tc for tc in snapshots if 0 < tc <= limit and tc % block_size == 0
         )
-        system_end = getattr(request, "system_prefix_end", 0) or 0
+        shared_ends = {
+            getattr(request, "system_prefix_end", 0) or 0,
+            getattr(request, "junction_end", 0) or 0,
+        }
         tail_counts = [
             tc
             for tc in snapshots
             if 0 < tc <= limit
             and tc % block_size != 0
-            and (tc == system_end) == system_tail
+            and (tc in shared_ends) == system_tail
         ]
         if not valid_counts and not tail_counts:
             miss("no_aligned_snapshots", len(snapshots))
@@ -11345,6 +11412,7 @@ class Scheduler:
         # sequences: one INFO line for large re-prefills (#2333/#2349
         # triage), decoded token context at DEBUG (issue #1003).
         self._log_prefix_divergence(request)
+        self._resolve_junction_end(request)
 
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
