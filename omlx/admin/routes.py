@@ -797,6 +797,7 @@ class GlobalSettingsRequest(BaseModel):
     ssd_cache_max_size: str | None = None
     hot_cache_only: bool | None = None
     hot_cache_write_through: bool | None = None
+    hot_cache_eviction_policy: str | None = None  # "lru" | "chain_aware_lru"
     ane_compile_cache: bool | None = None
     gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
@@ -1570,6 +1571,9 @@ async def _apply_cache_settings_runtime(
     pool._scheduler_config.hot_cache_only = global_settings.cache.hot_cache_only
     pool._scheduler_config.hot_cache_write_through = (
         global_settings.cache.hot_cache_write_through
+    )
+    pool._scheduler_config.hot_cache_eviction_policy = (
+        global_settings.cache.hot_cache_eviction_policy
     )
     pool._scheduler_config.gdn_ssd_split_enabled = (
         global_settings.cache.get_gdn_ssd_split_enabled()
@@ -4897,6 +4901,7 @@ def _global_settings_response(global_settings):
             "ssd_cache_auto_size_bytes": get_auto_ssd_cache_size(Path(cache_dir)),
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
+            "hot_cache_eviction_policy": global_settings.cache.hot_cache_eviction_policy,
             "ane_compile_cache": global_settings.cache.ane_compile_cache,
             "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
             "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
@@ -5599,6 +5604,19 @@ async def update_global_settings(
             global_settings.cache.hot_cache_write_through = (
                 request.hot_cache_write_through
             )
+            cache_changed = True
+    if request.hot_cache_eviction_policy is not None:
+        from ..settings import VALID_HOT_CACHE_EVICTION_POLICIES
+
+        policy = request.hot_cache_eviction_policy.strip().lower()
+        if policy not in VALID_HOT_CACHE_EVICTION_POLICIES:
+            raise HTTPException(
+                status_code=400,
+                detail="hot_cache_eviction_policy must be one of: "
+                + ", ".join(VALID_HOT_CACHE_EVICTION_POLICIES),
+            )
+        if policy != global_settings.cache.hot_cache_eviction_policy:
+            global_settings.cache.hot_cache_eviction_policy = policy
             cache_changed = True
     if requested_storage is not None:
         if requested_storage != global_settings.cache.get_gdn_snapshot_storage():

@@ -616,3 +616,15 @@ def test_shared_tail_is_not_deleted_while_referenced(tmp_path):
     assert ssd.has_block(tail1)
     held = cache.paged_cache.cached_block_hash_to_block.get_block(tail1)
     assert held is not None and held.ref_count == 1
+
+
+def test_stripped_block_keeps_parent_hash(tmp_path):
+    """The forget+save rewrite must keep the block's lineage: chain-aware
+    eviction and SSD prefix-closure rely on parent_hash."""
+    cache, ssd = _make_cache(tmp_path)
+    tables = [_store_turn(cache, t, num_blocks=t + 1) for t in (1, 2, 3)]
+    tip1 = _block_hash(cache, tables[0], -1)
+    parent_of_tip1 = _block_hash(cache, tables[0], -2)
+    assert _rotating_layer_shape(ssd, tip1) == PLACEHOLDER_SHAPE  # stripped
+    parent, _tail = ssd.get_block_lineage(tip1)
+    assert parent == parent_of_tip1

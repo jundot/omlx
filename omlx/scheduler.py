@@ -1991,6 +1991,8 @@ class SchedulerConfig:
     # RAM *and* persisted to SSD immediately, instead of deferring the SSD
     # write to hot-cache eviction or shutdown.
     hot_cache_write_through: bool = False
+    # "lru" or "chain_aware_lru" (see settings.VALID_HOT_CACHE_EVICTION_POLICIES)
+    hot_cache_eviction_policy: str = "lru"
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     paged_ssd_cache_auto_size: bool = False
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
@@ -11503,6 +11505,7 @@ class Scheduler:
                     hot_cache_max_bytes=self.config.hot_cache_max_size,
                     hot_cache_only=self.config.hot_cache_only,
                     hot_cache_write_through=self.config.hot_cache_write_through,
+                    hot_cache_eviction_policy=self.config.hot_cache_eviction_policy,
                     hot_cache_budget=self.config.hot_cache_budget,
                     expected_model_name=name,
                     expected_num_layers=len(draft_cache_list),
@@ -17005,6 +17008,7 @@ class Scheduler:
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
                 hot_cache_write_through=self.config.hot_cache_write_through,
+                hot_cache_eviction_policy=self.config.hot_cache_eviction_policy,
                 hot_cache_budget=self.config.hot_cache_budget,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
                 expected_model_name=self.config.model_name or "",

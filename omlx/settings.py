@@ -416,6 +416,8 @@ class CacheSettings:
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
     # sessions without losing SSD durability for old ones.
     hot_cache_write_through: bool = False
+    # See VALID_HOT_CACHE_EVICTION_POLICIES.
+    hot_cache_eviction_policy: str = "lru"
     # Reuse Apple's AOT-compiled ANE programs across server restarts
     # (OMLX_QWEN35_ANE_COMPILE_CACHE=1). The native gate reads the env var
     # once, at the first ANE compile, so a change applies on restart.
@@ -528,6 +530,7 @@ class CacheSettings:
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
             "hot_cache_write_through": self.hot_cache_write_through,
+            "hot_cache_eviction_policy": self.hot_cache_eviction_policy,
             "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
@@ -578,9 +581,21 @@ class CacheSettings:
             hot_cache_write_through=bool(
                 data.get("hot_cache_write_through", False)
             ),
+            # Invalid values are kept for validate() to report.
+            hot_cache_eviction_policy=str(
+                data.get("hot_cache_eviction_policy", "lru")
+            ).strip().lower(),
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
+
+
+# Hot-tier eviction policies. "lru" evicts the least recently used entry.
+# "chain_aware_lru" only evicts entries no other hot entry builds on (leaves of
+# the prefix-chain forest; unreachable orphans first) and refuses to admit a
+# block when nothing else can be evicted, so a cached chain is never broken in
+# the middle.
+VALID_HOT_CACHE_EVICTION_POLICIES: tuple[str, ...] = ("lru", "chain_aware_lru")
 
 
 MemoryGuardTier = Literal["safe", "balanced", "aggressive", "custom"]
@@ -1869,6 +1884,12 @@ class GlobalSettings:
                 "auto, ssd_sidecar, embedded"
             )
 
+        if self.cache.hot_cache_eviction_policy not in VALID_HOT_CACHE_EVICTION_POLICIES:
+            errors.append(
+                "hot_cache_eviction_policy must be one of: "
+                + ", ".join(VALID_HOT_CACHE_EVICTION_POLICIES)
+            )
+
         if self.cache.ssd_cache_max_size.lower() != "auto":
             try:
                 size = parse_size(self.cache.ssd_cache_max_size)
@@ -2020,6 +2041,7 @@ class GlobalSettings:
             paged_ssd_cache_auto_size=self.cache.ssd_cache_max_size.lower() == "auto",
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
+            hot_cache_eviction_policy=self.cache.hot_cache_eviction_policy,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size
