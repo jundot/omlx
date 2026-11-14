@@ -2,16 +2,18 @@
 """Multi-row affine kernels for batched decode projections.
 
 Stock affine ``quantized_matmul`` reads the weights once per ``qmv_wide`` tile
-of up to five rows, then switches to a qmm, so a decode step of 8 or 16
-requests costs far more than one of four. The verify kernels in
-``qwen35_verify_qmm`` (``vk`` at 6 rows, ``sg8`` up to 8 rows, ``mma`` up to
-24) read each weight tile once for every row, and they serve one-token decode
-rows too.
+of up to five rows (once per row on applegpu_g13), then switches to a qmm, so
+a decode step of 8 or 16 requests costs far more than one of four. The verify
+kernels in ``qwen35_verify_qmm`` (``vk`` at 6 rows, ``sg8`` up to 8 rows,
+``mma`` up to 24) read each weight tile once for every row, and they serve
+one-token decode rows too.
 
-Only (rows, 1, K) inputs with at least ``MIN_ROWS`` rows are routed, and only
+Only (rows, 1, K) inputs with at least two rows are routed, and only
 while no speculative verify or one-row exactness mode is armed. Those modes
 own their (rows, 1, K) calls. Prefill chunks and single-request decode keep
-their paths. On GPUs with the NAX tensor unit, mma stops at 16 rows.
+their paths. Below ``MIN_ROWS`` rows only the M1-class kernels serve, which
+are measured faster than stock from two rows. On GPUs with the NAX tensor
+unit, mma stops at 16 rows.
 """
 
 from __future__ import annotations
@@ -30,7 +32,9 @@ logger = logging.getLogger(__name__)
 # On M3 Ultra sg8 is slower than stock qmv_wide at four decode rows.
 MIN_ROWS = 6
 # vk takes the 6-row layers sg8 cannot read (8-bit), which mma starts above.
-_ROUTES = ("sg8", "mma", "m1_mma", "vk")
+_ROUTES = ("m1", "sg8", "mma", "m1_mma", "vk")
+# applegpu_g13 kernels; stock reads the weights once per row on that GPU.
+_SMALL_ROWS_ROUTES = ("m1", "m1_mma")
 
 _PATCHED = False
 _ENABLED = False
@@ -47,7 +51,9 @@ def _route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
         rows, K, N, bits, group_size, dtype
     ):
         return "mma"
-    return route if route in _ROUTES else None
+    if route not in _ROUTES or (rows < MIN_ROWS and route not in _SMALL_ROWS_ROUTES):
+        return None
+    return route
 
 
 def _exactness_armed() -> bool:
@@ -73,7 +79,7 @@ def apply_batched_decode_qmm_patch() -> bool:
             not _ENABLED
             or x.ndim != 3
             or x.shape[1] != 1
-            or x.shape[0] < MIN_ROWS
+            or x.shape[0] < 2
             or getattr(self, "mode", "affine") != "affine"
             or self.scales.dtype != x.dtype
             or _exactness_armed()
