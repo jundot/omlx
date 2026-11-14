@@ -16,14 +16,8 @@ import pytest
 
 pytest.importorskip("mlx_vlm.models.deepseek_v4")
 
-from omlx.patches.mlx_vlm_glm5_next_compat import (
-    apply_mlx_vlm_glm5_next_compat_patch,
-)
-
-if not apply_mlx_vlm_glm5_next_compat_patch():
-    pytest.importorskip("mlx_vlm.models.glm5_next")
-
 import copy
+import importlib
 import os
 import subprocess
 import sys
@@ -32,7 +26,6 @@ from types import MethodType, SimpleNamespace
 
 from mlx.utils import tree_flatten
 from mlx_vlm.models.cache import ArraysCache
-from mlx_vlm.models.glm5_next import language
 from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
 from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
 
@@ -40,10 +33,41 @@ from omlx.patches import mlx_lm_mtp
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
 from omlx.patches.mlx_lm_mtp import batched_head
 from omlx.patches.mlx_lm_mtp import prompt_priming as pp
+from omlx.patches.mlx_vlm_glm5_next_compat import (
+    apply_mlx_vlm_glm5_next_compat_patch,
+    is_applied,
+)
 from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
 from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime  # noqa: E402
 from omlx.patches.mlx_vlm_mtp.glm5_next_batch_rollback import rollback_rows
 from omlx.speculative import dflash as dd
+
+# Bound by _glm5_next_vendor() before the first test runs.
+language = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _glm5_next_vendor():
+    """Install the vendor overlay inside the test window, not at import.
+
+    Applying it at module scope changed the worker during collection: the
+    overlay prepends its vendor tree to ``mlx_vlm.__path__`` and re-imports
+    ``mlx_vlm.models.glm5_next``, so any module collected later that imports
+    that package got this overlay's copy instead of the installed one.
+    """
+    global language
+    # False means "already installed" as well as "failed"; only skip when the
+    # overlay is not in effect at all.
+    if not apply_mlx_vlm_glm5_next_compat_patch() and not is_applied():
+        pytest.skip("mlx-vlm glm5_next vendor overlay unavailable")
+    language = importlib.import_module("mlx_vlm.models.glm5_next.language")
+
+
+@pytest.fixture
+def requires_nax():
+    if not language.nax_sparse_mla_available():
+        pytest.skip("split-K decode needs NAX")
+
 
 N_MAIN = 45
 N_MTP = 1
@@ -798,9 +822,7 @@ def test_vector_restore_and_continuation_match_scalar(size, depth, dtype):
         assert_row_states(cache, expected, size)
 
 
-@pytest.mark.skipif(
-    not language.nax_sparse_mla_available(), reason="split-K decode needs NAX"
-)
+@pytest.mark.usefixtures("requires_nax")
 @pytest.mark.parametrize("lengths", [[2051, 2057], [2057]])
 def test_split_k_batched_decode_matches_rows_alone(monkeypatch, lengths):
     mx.random.seed(4242)

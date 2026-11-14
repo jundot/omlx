@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import tempfile
 import threading
+
+import pytest
 
 from omlx.cluster.rdma.daemon import DaemonStatus, PeerStatus, parse_status, read_status
 from omlx.cluster.rdma.links import NodeAddress, discover_links
@@ -39,8 +42,21 @@ def test_lab_daemon_status_lines_still_parse_without_extras():
     assert peers == (PeerStatus("link1s", True, 3, 0, 1),)
 
 
-def _serve(lines):
+@pytest.fixture
+def rpcd_dir():
+    """A short /tmp directory for the control socket, removed on teardown.
+
+    Unix socket paths are short on macOS, so this cannot live under
+    pytest's tmp_path.
+    """
     directory = tempfile.mkdtemp(prefix="rpcd-", dir="/tmp")
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _serve(lines, directory):
     path = os.path.join(directory, "c.sock")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(path)
@@ -57,8 +73,8 @@ def _serve(lines):
     return path
 
 
-def test_status_is_read_over_the_control_socket():
-    status = read_status(_serve(_V1))
+def test_status_is_read_over_the_control_socket(rpcd_dir):
+    status = read_status(_serve(_V1, rpcd_dir))
     assert status.reachable and status.version == "0.1.19"
     assert status.reason == "1 of 2 peer links up"
     assert status.peer("linkb").up is False
@@ -78,17 +94,14 @@ def test_a_daemon_speaking_another_protocol_is_not_used():
     )
 
 
-def test_an_absent_daemon_is_a_reason_not_an_error():
-    # Unix socket paths are short on macOS, so this cannot live under pytest's tmp_path.
-    status = read_status(
-        os.path.join(tempfile.mkdtemp(prefix="rpcd-", dir="/tmp"), "missing.sock")
-    )
+def test_an_absent_daemon_is_a_reason_not_an_error(rpcd_dir):
+    status = read_status(os.path.join(rpcd_dir, "missing.sock"))
     assert not status.reachable
     assert "mcdma-rpcd is not running" in status.reason
 
 
-def test_a_daemon_with_no_peers_is_reported():
-    status = read_status(_serve(["END"]))
+def test_a_daemon_with_no_peers_is_reported(rpcd_dir):
+    status = read_status(_serve(["END"], rpcd_dir))
     assert status.reachable and not status.peers
     assert "serves no peers" in status.reason
 

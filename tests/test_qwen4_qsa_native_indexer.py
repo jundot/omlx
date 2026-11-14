@@ -14,9 +14,21 @@ from omlx.custom_kernels.attention import fast as attention_fast
 from omlx.custom_kernels.sparse_index import fast
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
+qsa_fast = None
 
-compat.apply_mlx_vlm_qwen4_exp_compat_patch()
-qsa_fast = importlib.import_module("mlx_vlm.models.qwen4_exp.qsa_fast")
+
+@pytest.fixture(scope="module", autouse=True)
+def _qwen4_vendor():
+    """Expose the vendored Qwen4 modules inside the test window.
+
+    Applying the compat overlay at module scope changed the worker during
+    collection: it prepends the vendor tree to ``mlx_vlm.__path__`` and
+    re-imports ``mlx_vlm.models.qwen4_exp``, so a module collected later that
+    imports that package got the overlay's copy instead of the installed one.
+    """
+    global qsa_fast
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    qsa_fast = importlib.import_module("mlx_vlm.models.qwen4_exp.qsa_fast")
 
 
 def _native_available() -> bool:
