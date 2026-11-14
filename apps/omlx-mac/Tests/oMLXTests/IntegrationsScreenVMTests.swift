@@ -287,6 +287,46 @@ final class IntegrationsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.webSearchTestOK, false)
         XCTAssertEqual(vm.webSearchTestMessage, "Provider rate limited")
     }
+
+    /// The Claude panel prints the env recipe, so local mode must show the
+    /// server API key masked while the command it copies keeps the real value —
+    /// the same split `claudeCodeCommandDisplay` / `claudeCodeCommand` give the
+    /// web panel.
+    func testClaudeEnvRecipeMasksTheApiKeyInLocalModeOnly() async throws {
+        let (client, session) = try makeClient()
+        defer { session.invalidateAndCancel() }
+        server.setApiKey("sk-live-secret")
+        let vm = IntegrationsScreenVM()
+        await vm.load(client: client)
+        XCTAssertEqual(vm.serverApiKey, "sk-live-secret")
+
+        vm.claudeMode = "local"
+        XCTAssertTrue(vm.claudeEnvRecipe.contains("sk-live-secret"))
+        XCTAssertFalse(vm.claudeEnvRecipeDisplay.contains("sk-live-secret"))
+        XCTAssertTrue(vm.claudeEnvRecipeDisplay.contains("ANTHROPIC_AUTH_TOKEN='••••••••'"))
+        // Everything except the token is identical, so the panel still shows
+        // the command the copy button hands over.
+        XCTAssertEqual(vm.claudeEnvRecipeDisplay.replacingOccurrences(of: "••••••••", with: "sk-live-secret"),
+                       vm.claudeEnvRecipe)
+
+        // Cloud mode unsets the token, so there is nothing to mask.
+        vm.claudeMode = "cloud"
+        XCTAssertEqual(vm.claudeEnvRecipe, vm.claudeEnvRecipeDisplay)
+        XCTAssertFalse(vm.claudeEnvRecipe.contains("sk-live-secret"))
+    }
+
+    /// With no key configured both forms stay identical: no empty `''`
+    /// assignment and no dots.
+    func testClaudeEnvRecipeHasNoTokenWithoutServerKey() async throws {
+        let (client, session) = try makeClient()
+        defer { session.invalidateAndCancel() }
+        let vm = IntegrationsScreenVM()
+        await vm.load(client: client)
+        vm.claudeMode = "local"
+        XCTAssertEqual(vm.claudeEnvRecipe, vm.claudeEnvRecipeDisplay)
+        XCTAssertFalse(vm.claudeEnvRecipe.contains("ANTHROPIC_AUTH_TOKEN="))
+        XCTAssertFalse(vm.claudeEnvRecipe.contains("•"))
+    }
 }
 
 private final class IntegrationsSettingsServer: @unchecked Sendable {
@@ -300,6 +340,9 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
     private var heldPost: (@Sendable () -> Void)?
     private var recordedSearchRequests: [[String: Any]] = []
     private var searchResponse: [String: Any] = [:]
+    /// Body for `GET /admin/api/stats`. The command builders read `host`,
+    /// `port`, `api_key` and `cli_prefix` from it.
+    private var stats: [String: Any] = [:]
 
     var searchRequests: [[String: Any]] { lock.withLock { recordedSearchRequests } }
     var patches: [[String: Any]] { lock.withLock { recordedPatches } }
@@ -319,8 +362,23 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
             heldPost = nil
             recordedSearchRequests = []
             searchResponse = ["ok": true, "results": [["title": "Example", "url": "https://example.com", "snippet": "Example result"]]]
+            stats = Self.statsBody(apiKey: "")
         }
     }
+
+    /// Minimal `GET /admin/api/stats` payload: the required aggregates plus the
+    /// four fields the command builders read.
+    private static func statsBody(apiKey: String) -> [String: Any] {
+        [
+            "total_tokens_served": 0, "total_cached_tokens": 0, "cache_efficiency": 0.0,
+            "total_prompt_tokens": 0, "total_completion_tokens": 0, "total_requests": 0,
+            "avg_prefill_tps": 0.0, "avg_generation_tps": 0.0, "uptime_seconds": 0.0,
+            "host": "127.0.0.1", "port": 8000, "api_key": apiKey, "cli_prefix": "omlx",
+            "active_models": ["models": [Any]()],
+        ]
+    }
+
+    func setApiKey(_ apiKey: String) { lock.withLock { stats = Self.statsBody(apiKey: apiKey) } }
 
     func setSearchResponse(_ body: [String: Any]) { lock.withLock { searchResponse = body } }
 
@@ -353,6 +411,8 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
         switch (request.httpMethod, request.url?.path) {
         case ("GET", "/admin/api/global-settings"):
             body = settings
+        case ("GET", "/admin/api/stats"):
+            body = stats
         case ("GET", "/admin/api/models"):
             modelReadCount += 1
             if modelReadsRejected {

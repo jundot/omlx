@@ -13727,78 +13727,6 @@
         }
       }
     },
-    "integrations.section.claude_code" : {
-      "comment" : "Section header for the Claude Code integration",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code"
-          }
-        }
-      }
-    },
-    "integrations.section.claude_code.sub" : {
-      "comment" : "Subtitle for the Claude Code section",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Leitet Anfragen von Claude Code an lokale Modelle oder die Cloud weiter"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Route Claude Code requests to local models or the cloud"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Instrada le richieste di Claude Code verso i modelli locali o il cloud"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Направлять запросы Claude Code в локальные модели или облако"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "将 Claude Code 请求路由到本地模型或云端"
-          }
-        }
-      }
-    },
     "integrations.section.markitdown" : {
       "comment" : "Section header for MarkItDown document conversion",
       "extractionState" : "manual",
@@ -14183,6 +14111,126 @@
         }
       }
     },
+    "integrations.section.applications" : {
+      "comment" : "Section header for the per-tool launcher grid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applications"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "應用"
+          }
+        }
+      }
+    },
+    "integrations.section.applications.sub" : {
+      "comment" : "Subtitle for the Applications section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model and launcher command for each tool that talks to oMLX."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每个对接 oMLX 的工具的默认模型与启动命令。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每個對接 oMLX 的工具的預設模型與啟動指令。"
+          }
+        }
+      }
+    },
+    "integrations.tool.claude" : {
+      "comment" : "Display name for the Claude Code integration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        }
+      }
+    },
+    "integrations.applications.hint" : {
+      "comment" : "Hint under the tool grid while no tool is selected",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pick a tool to see its launcher command."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "点击工具查看它的启动命令。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "點選工具查看它的啟動指令。"
+          }
+        }
+      }
+    },
+    "integrations.panel.model" : {
+      "comment" : "Row label for the per-tool default model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Default model"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "默认模型"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "預設模型"
+          }
+        }
+      }
+    },
     "integrations.section.mcp" : {
       "comment" : "Section header for the MCP config path row",
       "extractionState" : "manual",
@@ -14255,114 +14303,6 @@
         }
       }
     },
-    "integrations.section.other" : {
-      "comment" : "Section header for the additional integrations list",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Weitere Integrationen"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Other Integrations"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Altre integrazioni"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Другие интеграции"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "其他集成"
-          }
-        }
-      }
-    },
-    "integrations.section.other.sub" : {
-      "comment" : "Subtitle for the Other Integrations section",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Standardmodell und Startbefehl für jede benannte Integration"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Default model + launcher command for each named integration"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Modello predefinito + comando di avvio per ogni integrazione"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Модель по умолчанию и команда запуска для каждой интеграции"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "每个命名集成的默认模型 + 启动器命令"
-          }
-        }
-      }
-    },
-    "integrations.section.setup_command" : {
-      "comment" : "Section header for the Claude Code setup command block",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Einrichtungsbefehl"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Setup Command"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Comando di configurazione"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Команда настройки"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "设置命令"
-          }
-        }
-      }
-    },
     "integrations.setup.advanced.cloud" : {
       "comment" : "Explanation of the advanced env recipe in cloud mode",
       "extractionState" : "manual",
@@ -14395,42 +14335,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "重置 Anthropic 环境变量，使真正的 `claude` 二进制文件与云端通信。"
-          }
-        }
-      }
-    },
-    "integrations.setup.advanced.label" : {
-      "comment" : "Disclosure label revealing the advanced env-var recipe for running claude directly",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Erweitert: claude direkt ausführen"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Advanced — run `claude` directly"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Avanzate — esegui `claude` direttamente"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Дополнительно — запускать `claude` напрямую"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "高级 — 直接运行 `claude`"
           }
         }
       }
