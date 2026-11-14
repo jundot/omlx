@@ -20,7 +20,11 @@ from typing import Any
 
 from ..model_discovery import _VISION_WEIGHT_PREFIXES
 from .node_role import ROLES
-from .performance import ExecutionProfileName, NodePerformanceProfile
+from .performance import (
+    ExecutionProfileName,
+    NodePerformanceProfile,
+    execution_profile,
+)
 from .staging import DEFAULT_REMOTE_PYTHON, is_local_host, run_remote_python
 from .tensor_strategies import (
     native_shard_is_layer_local,
@@ -112,6 +116,21 @@ class ModelLayout:
     # MLA models keep one latent cache per layer that every tensor-parallel
     # member holds whole; sharding divides the heads, not this cache.
     kv_replicated_across_tp: bool = False
+    # Prefill peak one attention chunk adds on top of the resident weights and
+    # KV, expressed per token of context and priced at
+    # ``_PREFILL_REFERENCE_CHUNK``. A plan charges ``per_token × context ×
+    # chunk / reference`` to the stage that prefills it, so a throughput plan
+    # (4096-token chunks) reserves four times the transient of an interactive
+    # one instead of the same zero every profile used to get.
+    # The price is ``MemoryMonitor.estimate_prefill_peak_bytes`` on the generic
+    # SDPA path — the transient the rank guard refuses a request over. Models
+    # with a prefill profile of their own (Qwen4 QSA, GLM-5 sparse MLA,
+    # DeepSeek V4.1) are admitted by the guard against that profile instead,
+    # which prices a bounded key set and comes out smaller, so a plan is
+    # conservative against admission rather than optimistic.
+    # MLA layouts keep 0: the generic formula cannot price a packed latent
+    # cache, and that is a known gap, not a claim that their prefill is free.
+    prefill_transient_bytes_per_context_token: int = 0
     supports_tensor_parallel: bool = False
     # Whether mlx-lm can split this architecture into pipeline stages. False
     # means the model runs on one node or not at all, however well it fits.
@@ -165,6 +184,10 @@ class ModelLayout:
             raise ValueError("tensor_parallel_kv_heads must be non-negative")
         if self.kv_bytes_per_token_per_layer < 0:
             raise ValueError("kv_bytes_per_token_per_layer must be non-negative")
+        if self.prefill_transient_bytes_per_context_token < 0:
+            raise ValueError(
+                "prefill_transient_bytes_per_context_token must be non-negative"
+            )
         if self.tensor_parallel_kv_heads == 0:
             object.__setattr__(
                 self, "tensor_parallel_kv_heads", self.tensor_parallel_heads
@@ -214,6 +237,19 @@ class ModelLayout:
         ssd = self.tensor_parallel_ssd_layer_bytes or (0,) * self.layer_count
         return tuple(whole - part for whole, part in zip(self.layer_weight_bytes, ssd))
 
+    def prefill_transient_bytes(self, context_tokens: int, chunk_tokens: int) -> int:
+        """Prefill peak one rank must hold above its resident weights and KV.
+
+        Zero when the checkpoint's prefill shape is unknown, which keeps every
+        plan that predates this reservation byte-for-byte identical.
+        """
+
+        per_token = self.prefill_transient_bytes_per_context_token
+        if per_token <= 0 or context_tokens <= 0 or chunk_tokens <= 0:
+            return 0
+        scaled = per_token * int(context_tokens) * int(chunk_tokens)
+        return -(-scaled // _PREFILL_REFERENCE_CHUNK)
+
     def to_dict(self) -> dict[str, Any]:
         payload = {
             "source": self.source,
@@ -231,6 +267,11 @@ class ModelLayout:
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
         }
+        # Omitted when 0 so existing plan hashes stay the same.
+        if self.prefill_transient_bytes_per_context_token:
+            payload["prefill_transient_bytes_per_context_token"] = (
+                self.prefill_transient_bytes_per_context_token
+            )
         # Omitted when unrestricted so existing plan hashes stay the same.
         if self.pipeline_stage_starts:
             payload["pipeline_stage_starts"] = list(self.pipeline_stage_starts)
@@ -283,6 +324,9 @@ class ModelLayout:
                 ),
                 kv_replicated_across_tp=bool(
                     payload.get("kv_replicated_across_tp", False)
+                ),
+                prefill_transient_bytes_per_context_token=int(
+                    payload.get("prefill_transient_bytes_per_context_token", 0)
                 ),
                 supports_tensor_parallel=bool(
                     payload.get("supports_tensor_parallel", False)
@@ -421,6 +465,12 @@ class PipelineAssignment:
     # resident memory: weights that fit alone still OOM once a long prompt
     # fills the cache, which is how a 22-layer stage took a 128 GiB Mac down.
     kv_cache_bytes: int = 0
+    # Peak prefill transient this stage must be able to allocate above its
+    # resident weights and KV (one attention chunk, priced by
+    # ``MemoryMonitor.estimate_prefill_peak_bytes``). Part of
+    # ``planned_weight_bytes``: a stage that cannot hold its own chunk cannot
+    # serve the context the plan promises, however well the weights fit.
+    prefill_transient_bytes: int = 0
     # Bytes of KV this stage adds per token of context, and the largest context
     # this node could hold if the rest of its memory went to cache. The second
     # is the number that decides whether a long prompt works, so it is reported
@@ -461,6 +511,8 @@ class PipelineAssignment:
             raise ValueError(
                 "moe_offload_weight_bytes requires a resident fraction"
             )
+        if self.prefill_transient_bytes < 0:
+            raise ValueError("prefill_transient_bytes must be non-negative")
 
     @property
     def layer_count(self) -> int:
@@ -478,6 +530,7 @@ class PipelineAssignment:
             - self.ssd_weight_bytes
             - self.moe_offload_weight_bytes
             + self.kv_cache_bytes
+            + self.prefill_transient_bytes
         )
 
     @property
@@ -510,6 +563,7 @@ class PipelineAssignment:
             "sharded_weight_bytes": self.sharded_weight_bytes,
             "ssd_weight_bytes": self.ssd_weight_bytes,
             "kv_cache_bytes": self.kv_cache_bytes,
+            "prefill_transient_bytes": self.prefill_transient_bytes,
             "kv_bytes_per_token": self.kv_bytes_per_token,
             "max_context_tokens": self.max_context_tokens,
         }
@@ -928,16 +982,36 @@ def _model_source(model_type: str) -> str:
     return ""
 
 
-def _cluster_unloaded_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
-    """Weight prefixes an oMLX-registered rank module never loads."""
+def _cluster_rank_module(config: dict[str, Any]) -> Any | None:
+    """The mlx-lm module a cluster rank would load, registering known adapters.
+
+    A cold planner process has not loaded a checkpoint yet, so the adapter is
+    not in ``sys.modules`` when it reads the unloaded and MTP prefixes. Qwen4's
+    adapter is cheap to register and makes those answers match what the rank
+    will actually load.
+    """
 
     model_type = config.get("model_type")
     if not isinstance(model_type, str):
-        return ()
+        return None
+    qualified = f"mlx_lm.models.{model_type}"
+    module = sys.modules.get(qualified)
+    if module is None and model_type == "qwen4_exp":
+        try:
+            from ..patches.qwen4_exp_mlx_lm import apply_qwen4_exp_mlx_lm_patch
+
+            apply_qwen4_exp_mlx_lm_patch()
+            module = sys.modules.get(qualified)
+        except Exception:  # noqa: BLE001 - planning must survive a missing extra
+            return None
+    return module
+
+
+def _cluster_unloaded_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
+    """Weight prefixes an oMLX-registered rank module never loads."""
+
     prefixes = getattr(
-        sys.modules.get(f"mlx_lm.models.{model_type}"),
-        "CLUSTER_UNLOADED_WEIGHT_PREFIXES",
-        (),
+        _cluster_rank_module(config), "CLUSTER_UNLOADED_WEIGHT_PREFIXES", ()
     )
     return tuple(prefixes)
 
@@ -945,13 +1019,8 @@ def _cluster_unloaded_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
 def _cluster_mtp_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
     """Weight prefixes of the draft head a registered rank module can load."""
 
-    model_type = config.get("model_type")
-    if not isinstance(model_type, str):
-        return ()
     prefixes = getattr(
-        sys.modules.get(f"mlx_lm.models.{model_type}"),
-        "CLUSTER_MTP_WEIGHT_PREFIXES",
-        (),
+        _cluster_rank_module(config), "CLUSTER_MTP_WEIGHT_PREFIXES", ()
     )
     return tuple(prefixes)
 
@@ -959,12 +1028,7 @@ def _cluster_mtp_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
 def _pipeline_stage_starts(config: dict[str, Any]) -> tuple[int, ...]:
     """Layers a later stage may start at, when the model's module restricts them."""
 
-    model_type = config.get("model_type")
-    if not isinstance(model_type, str):
-        return ()
-    starts = getattr(
-        sys.modules.get(f"mlx_lm.models.{model_type}"), "pipeline_stage_starts", None
-    )
+    starts = getattr(_cluster_rank_module(config), "pipeline_stage_starts", None)
     return tuple(starts(config)) if callable(starts) else ()
 
 
@@ -1124,6 +1188,84 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     return _hybrid_kv_average(kv_heads * head_dim * 2 * dtype_size, config)
 
 
+_PREFILL_REFERENCE_CHUNK = 4096
+_PREFILL_REFERENCE_CONTEXT = 8192
+
+
+def _prefill_transient_bytes_per_context_token(config: dict[str, Any]) -> int:
+    """Prefill peak one chunk adds on top of weights and KV, per context token.
+
+    Loading a stage is only half of admitting it: one prefill chunk allocates
+    an attention score matrix that is gone again by the time the next chunk
+    starts, so it never shows up in resident weights or KV and the plan used to
+    price it at zero. That is how a split with 13 GiB of plan headroom died in
+    prefill.
+
+    The number is ``MemoryMonitor.estimate_prefill_peak_bytes`` on the generic
+    SDPA path, which is what the rank guard refuses a request over when the
+    model has no prefill profile of its own. Profile models (Qwen4 QSA, GLM-5
+    sparse MLA, DeepSeek V4.1) are admitted against a gathered/selected key set
+    instead and price lower, so this reservation is an upper bound on that
+    admission rather than a match for it.
+
+    The peak is linear in the chunk and (for the dense and tiled SDPA paths)
+    linear in the context, so one number priced at
+    ``_PREFILL_REFERENCE_CHUNK`` / ``_PREFILL_REFERENCE_CONTEXT`` scales to the
+    chunk the execution profile will really use.
+
+    Returns 0 for checkpoints whose cache the generic formula cannot price —
+    MLA stores one latent per layer, and over-charging it by an order of
+    magnitude would refuse splits that work; the guard still prices those
+    through their profile, so the plan under-reserves them by that transient —
+    and when the dims are unreadable.
+    """
+
+    if _kv_cache_replicated_across_tp(config):
+        return 0
+    text_config = config.get("text_config")
+    layer_config = text_config if isinstance(text_config, dict) else config
+    heads = _config_int(layer_config, "num_attention_heads", 0)
+    kv_heads = _config_int(layer_config, "num_key_value_heads", heads)
+    if heads <= 0 or kv_heads <= 0:
+        return 0
+    head_dim = _config_int(layer_config, "head_dim", 0)
+    if head_dim <= 0:
+        hidden = _config_int(layer_config, "hidden_size", 0, maximum=1_000_000)
+        head_dim = hidden // heads if hidden and heads and hidden % heads == 0 else 0
+    if not 0 < head_dim <= 4096:
+        return 0
+    layers = _config_int(layer_config, "num_hidden_layers", 0)
+    if layers <= 0:
+        return 0
+    # Hybrid stacks only grow a cache in their attention layers, and the guard
+    # knows that because it classified them from the loaded cache.
+    layer_types = layer_config.get("layer_types")
+    kv_layers = layers
+    if isinstance(layer_types, list) and layer_types:
+        kv_layers = sum(1 for kind in layer_types if kind != "linear_attention")
+    if kv_layers <= 0:
+        return 0
+    try:
+        from ..memory_monitor import MemoryMonitor
+    except Exception:  # noqa: BLE001 - planning must not need the inference stack
+        return 0
+    monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=layers,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        # Activations stay bf16/fp16 whatever the weights were quantised to.
+        dtype_size=2,
+        num_attention_heads=heads,
+        num_kv_cache_layers=kv_layers,
+        compute_dtype_size=2,
+    )
+    peak = monitor.estimate_prefill_peak_bytes(
+        _PREFILL_REFERENCE_CONTEXT, _PREFILL_REFERENCE_CHUNK
+    )
+    return -(-int(peak) // _PREFILL_REFERENCE_CONTEXT)
+
+
 def _hybrid_kv_average(per_layer: int, config: dict[str, Any]) -> int:
     """Average per-layer KV bytes when only the attention layers grow a cache.
 
@@ -1274,6 +1416,17 @@ def _model_weight_files(
         raise PlanningError(f"no safetensors weights found in {model_path}")
     side = tuple(_weight_file(root, name) for name in sorted(set(side_files) - names))
     return files, side
+
+
+def _is_ssd_table_tensor(name: str, engram_names: frozenset[str]) -> bool:
+    """Whether this tensor belongs to a lookup table that can live on SSD.
+
+    DeepSeek V4.1 names its tables in the converted config; Qwen4-Exp keeps
+    the PLE n-gram table inline with the shard under ``ngram_embedding``. Both
+    are gathered row-by-row, so a rank can mmap them instead of wiring them.
+    """
+
+    return name in engram_names or ".ngram_embedding." in name
 
 
 def _engram_tables(config: dict[str, Any]) -> tuple[frozenset[str], tuple[str, ...]]:
@@ -1505,6 +1658,9 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         pipeline_stage_starts=_pipeline_stage_starts(config) if loadable else (),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(config),
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(config),
+        prefill_transient_bytes_per_context_token=(
+            _prefill_transient_bytes_per_context_token(config)
+        ),
         tensor_parallel_ssd_layer_bytes=(
             tuple(ssd_sizes.get(index, 0) for index in expected_indices)
             if ssd_sizes
@@ -1703,6 +1859,7 @@ def _partition_layers(
     workload_profile: ExecutionProfileName = "balanced",
     microbatch_size: int = 1,
     stage_starts: Sequence[int] = (),
+    node_overhead_bytes: int = 0,
 ) -> tuple[tuple[int, int], ...]:
     """Minimize the bottleneck stage while retaining contiguous layers.
 
@@ -1711,6 +1868,9 @@ def _partition_layers(
     a layer's context-dependent KV cache as well. Keeping the two separate is
     essential: a performance pass is allowed to move weights toward a faster
     Mac, but never so far that the resulting stage cannot hold its KV cache.
+    ``node_overhead_bytes`` is memory every stage needs but no layer owns — the
+    prefill chunk transient — so it is subtracted from each node's budget
+    without inflating the weight ceiling or the split target.
     """
 
     layer_count = len(layer_sizes)
@@ -1760,7 +1920,9 @@ def _partition_layers(
                 layer_bytes = weight_prefix[end] - weight_prefix[start]
                 resident_layer_bytes = resident_prefix[end] - resident_prefix[start]
                 planned_weight_bytes = fixed_weight_bytes + layer_bytes
-                planned_resident_bytes = fixed_weight_bytes + resident_layer_bytes
+                planned_resident_bytes = (
+                    fixed_weight_bytes + resident_layer_bytes + node_overhead_bytes
+                )
                 if planned_weight_bytes > node.weight_ceiling_bytes:
                     continue
                 if planned_resident_bytes > node.usable_bytes:
@@ -1810,7 +1972,8 @@ def _partition_layers(
     final = states.get(layer_count)
     if final is None:
         resident_capacity = sum(
-            max(0, node.usable_bytes - fixed_weight_bytes) for node in pipeline_nodes
+            max(0, node.usable_bytes - fixed_weight_bytes - node_overhead_bytes)
+            for node in pipeline_nodes
         )
         weight_capacity = sum(
             max(0, node.weight_ceiling_bytes - fixed_weight_bytes)
@@ -1922,6 +2085,9 @@ def plan_unequal_pipeline(
         engram_ssd_offload,
         moe_offload_layer_bytes=moe_offload_layer_bytes,
     )
+    prefill_bytes = _prefill_transient_bytes(
+        model, context_tokens=context_tokens, workload_profile=workload_profile
+    )
     try:
         ranges = _partition_layers(
             held_layer_bytes,
@@ -1934,12 +2100,14 @@ def plan_unequal_pipeline(
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
             stage_starts=model.pipeline_stage_starts,
+            node_overhead_bytes=prefill_bytes,
         )
     except PlanningError as exc:
-        if kv_bytes_per_layer:
+        if kv_bytes_per_layer or prefill_bytes:
             raise PlanningError(
-                f"model weights and KV cache for {context_tokens} tokens do not "
-                f"fit the supplied per-node budgets: {exc}"
+                f"model weights, KV cache for {context_tokens} tokens and the "
+                f"prefill transient for {_prefill_chunk_tokens(workload_profile)}"
+                f"-token chunks do not fit the supplied per-node budgets: {exc}"
             ) from exc
         raise
     return _finish_pipeline_plan(
@@ -1954,6 +2122,7 @@ def plan_unequal_pipeline(
         engram_ssd_offload=engram_ssd_offload,
         moe_offload_layer_bytes=moe_offload_layer_bytes,
         moe_expert_offload_resident_fraction=moe_expert_offload_resident_fraction,
+        prefill_transient_bytes=prefill_bytes,
     )
 
 
@@ -1984,6 +2153,33 @@ def _held_layer_bytes(
     return tuple(
         max(0, weight - int(offloaded))
         for weight, offloaded in zip(held, moe_offload_layer_bytes)
+    )
+
+
+def _prefill_chunk_tokens(workload_profile: ExecutionProfileName) -> int:
+    """The prefill chunk this workload profile runs, as the rank will size it."""
+
+    return int(
+        execution_profile(workload_profile, auto_tune=False).prefill_step_size
+    )
+
+
+def _prefill_transient_bytes(
+    model: ModelLayout,
+    *,
+    context_tokens: int,
+    workload_profile: ExecutionProfileName,
+) -> int:
+    """Peak prefill transient this plan reserves on every stage.
+
+    A pipeline stage holds its own layers only, but the rank guard prices the
+    transient for the stage it runs (one attention chunk, not the model's
+    layers), so one number sized from the plan's chunk and context is the
+    quantity every stage must be able to hold.
+    """
+
+    return model.prefill_transient_bytes(
+        context_tokens, _prefill_chunk_tokens(workload_profile)
     )
 
 
@@ -2103,6 +2299,9 @@ def plan_proportional_pipeline(
         engram_ssd_offload=engram_ssd_offload,
         moe_offload_layer_bytes=moe_offload_layer_bytes,
         moe_expert_offload_resident_fraction=moe_expert_offload_resident_fraction,
+        prefill_transient_bytes=_prefill_transient_bytes(
+            model, context_tokens=context_tokens, workload_profile=workload_profile
+        ),
     )
 
 
@@ -2119,6 +2318,7 @@ def _finish_pipeline_plan(
     engram_ssd_offload: bool = False,
     moe_offload_layer_bytes: Sequence[int] = (),
     moe_expert_offload_resident_fraction: float = 0.0,
+    prefill_transient_bytes: int = 0,
 ) -> ShardPlan:
     """Assignments, per-node fit checks, and the signed hash for a partition."""
 
@@ -2151,13 +2351,16 @@ def _finish_pipeline_plan(
         ssd_bytes = sum(engram_layer_bytes[start:end])
         moe_bytes = sum(moe_offload_layer_bytes[start:end])
         kv_bytes = _kv_bytes_for_stage(model, end - start, context_tokens)
-        planned = model.fixed_weight_bytes + held_bytes + kv_bytes
+        planned = (
+            model.fixed_weight_bytes + held_bytes + kv_bytes + prefill_transient_bytes
+        )
         if planned > node.usable_bytes:
             raise PlanningError(
                 f"stage does not fit node {node.node_id} once KV cache for "
-                f"{context_tokens} tokens is reserved: {planned} > "
-                f"{node.usable_bytes} (weights {held_bytes}, "
-                f"KV {kv_bytes})"
+                f"{context_tokens} tokens and the prefill transient are "
+                f"reserved: {planned} > {node.usable_bytes} "
+                f"(weights {held_bytes}, KV {kv_bytes}, "
+                f"prefill {prefill_transient_bytes})"
             )
         compute_seconds, send_seconds, stage_seconds = _predict_stage_seconds(
             held_bytes,
@@ -2185,6 +2388,7 @@ def _finish_pipeline_plan(
                 ),
                 moe_offload_weight_bytes=moe_bytes,
                 kv_cache_bytes=kv_bytes,
+                prefill_transient_bytes=prefill_transient_bytes,
                 kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, end - start),
                 max_context_tokens=_max_context_for_stage(
                     model,

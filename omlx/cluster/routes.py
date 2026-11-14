@@ -314,12 +314,15 @@ def _saved_lightning_mtp(model_path: str) -> bool | None:
     return None if settings is None else bool(settings.mtp_enabled)
 
 
-def _saved_engram_ssd_offload(model_path: str | None) -> bool:
-    """Whether the saved settings keep a lookup table on SSD.
+def _saved_ssd_offload(model_path: str | None) -> bool:
+    """Whether the saved settings stream this model's big tables from SSD.
 
-    Honours both the DeepSeek V4.1 Engram switch and the Qwen4 PLE switch, so
-    either table-capable checkpoint is planned with its table offloaded (the
-    one table-offload-parity rule).
+    DeepSeek V4.1 Engram and Qwen4-Exp PLE are the same problem: one table far
+    larger than the weights around it, read per token instead of held resident.
+    Both settings mean "keep it on SSD", and a checkpoint only ever honours the
+    one its architecture uses — so planning may treat either as offloaded. With
+    neither set, the table is charged as resident and a Qwen4-Exp pipeline plan
+    can never fit (a 37 GiB PLE layer in a 117 GiB model).
     """
 
     settings = _saved_model_settings(model_path) if model_path else None
@@ -329,6 +332,10 @@ def _saved_engram_ssd_offload(model_path: str | None) -> bool:
         getattr(settings, "deepseek_v41_engram_ssd_offload", False)
         or getattr(settings, "qwen4_ple_ssd_offload", False)
     )
+
+
+# Kept for callers and tests that still use the older, narrower name.
+_saved_engram_ssd_offload = _saved_ssd_offload
 
 
 def _saved_moe_offload(model_path: str | None) -> tuple[bool, float]:
@@ -1035,7 +1042,7 @@ def _create_cluster_plan(request: ClusterPlanRequest):
     )
     pipeline_model = with_mtp_head(model) if request.mtp else model
     head_bytes = model.mtp_weight_bytes if request.mtp else 0
-    engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
+    engram_ssd_offload = _saved_ssd_offload(request.model_path)
     # The saved routed-expert offload setting is priced here too: the assistant
     # elects from it, so the coordinator's own plan must not re-charge experts
     # the loader streams. A tensor-parallel request is refused, because every
@@ -1375,7 +1382,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         mtp = _cluster_mtp(request.mtp, model, request.model_path)
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
+    engram_ssd_offload = _saved_ssd_offload(request.model_path)
     # Same saved-setting derivation the assistant elects from: a DeepSeek-V4.1
     # MoE with expert offload on is priced by pipeline stage, so the coordinator
     # cannot re-charge streamed experts when it re-plans the approved split.
