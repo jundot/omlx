@@ -2,6 +2,7 @@
 """Tests for authenticated cluster admin route handlers."""
 
 import base64
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -769,6 +770,174 @@ def test_cluster_plan_follows_the_saved_engram_ssd_offload_setting(monkeypatch):
         offloaded.json()["placement_signature"]
         != resident.json()["placement_signature"]
     )
+
+
+def test_cluster_plan_prices_the_saved_moe_expert_offload_setting(
+    tmp_path, monkeypatch
+):
+    """The coordinator's own plan must not re-charge streamed experts.
+
+    The assistant elects from the same saved setting, so a coordinator plan
+    that priced every expert resident would refuse a placement the election
+    approved (or vice versa).
+    """
+
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(4 * gib,) * 4,
+            supports_pipeline=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+        lambda _path: (True, ""),
+    )
+    calls = []
+
+    def fake_plan(path, fraction, mtp_resident=False):
+        calls.append((str(path), fraction, mtp_resident))
+        # Half of each layer's experts stay resident, so half stream (2 GiB).
+        return SimpleNamespace(
+            count=8,
+            capacity=4,
+            layer_bytes={
+                f"language_model.layers.{index}.ffn.experts": gib
+                for index in range(4)
+            },
+        )
+
+    monkeypatch.setattr(
+        "omlx.patches.deepseek_v41.moe_offload._plan",
+        fake_plan,
+    )
+    saved = {
+        "v41": SimpleNamespace(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.5,
+            deepseek_v41_engram_ssd_offload=False,
+            mtp_enabled=False,
+        )
+    }
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {"id": "v41", "model_path": str(tmp_path), "model_type": "llm"}
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: saved[model_id],
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+    body = {
+        "model_path": str(tmp_path),
+        "nodes": [
+            {"node_id": "local", "capacity_bytes": 128 * gib, "reserve_bytes": 2 * gib}
+        ],
+    }
+
+    offloaded = _client().post("/admin/api/cluster/plan", json=body)
+    saved["v41"].moe_expert_offload_enabled = False
+    resident = _client().post("/admin/api/cluster/plan", json=body)
+
+    assert offloaded.status_code == resident.status_code == 200
+    assignment = offloaded.json()["assignments"][0]
+    assert assignment["moe_expert_offload_resident_fraction"] == 0.5
+    assert assignment["moe_offload_weight_bytes"] == 2 * gib
+    assert assignment["layer_weight_bytes"] == 16 * gib
+    assert assignment["planned_weight_bytes"] == gib + 16 * gib - 2 * gib
+    assert calls == [(str(tmp_path), 0.5, False)]
+
+    untouched = resident.json()["assignments"][0]
+    assert untouched["layer_weight_bytes"] == 16 * gib
+    assert untouched["planned_weight_bytes"] == gib + 16 * gib
+    assert "moe_offload_weight_bytes" not in untouched
+
+
+def test_cluster_plan_keeps_upstream_pricing_for_other_moe_families(
+    tmp_path, monkeypatch
+):
+    """Another MoE family keeps upstream's resident plan.
+
+    The planner only has a per-layer expert map for DeepSeek V4.1; charging a
+    GLM/Qwen MoE resident is the conservative direction, and it must not invent
+    a saving the planner cannot size.
+    """
+
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm5_next"}))
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(4 * gib,) * 4,
+            supports_pipeline=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+        lambda _path: (True, ""),
+    )
+    calls = []
+    monkeypatch.setattr(
+        "omlx.patches.deepseek_v41.moe_offload._plan",
+        lambda *args, **kwargs: calls.append(args),
+    )
+    saved = {
+        "glm": SimpleNamespace(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.5,
+            deepseek_v41_engram_ssd_offload=False,
+            mtp_enabled=False,
+        )
+    }
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {"id": "glm", "model_path": str(tmp_path), "model_type": "llm"}
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: saved[model_id],
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+
+    response = _client().post(
+        "/admin/api/cluster/plan",
+        json={
+            "model_path": str(tmp_path),
+            "nodes": [
+                {
+                    "node_id": "local",
+                    "capacity_bytes": 128 * gib,
+                    "reserve_bytes": 2 * gib,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assignment = response.json()["assignments"][0]
+    assert assignment["planned_weight_bytes"] == gib + 16 * gib
+    assert "moe_offload_weight_bytes" not in assignment
+    assert calls == []
 
 
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
@@ -2120,6 +2289,113 @@ def test_autoconfigure_lightning_mtp_plan_is_the_one_activation_recomputes(
     activation = body["activation"]
     assert activation["mtp"] is True
     # Placing ranks rebuilds the plan; it must still carry the head.
+    assert activation["approved_placement"] == _approval_for(activation)
+
+
+def test_autoconfigure_plan_prices_the_saved_moe_expert_offload(tmp_path, monkeypatch):
+    """The split the preview shows is the split activation recomputes.
+
+    Both derive the expert-offload saving from the same saved setting, so the
+    signed placement cannot differ from the launched one by the streamed bytes.
+    """
+
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=0,
+            layer_weight_bytes=(8 * gib,) * 8,
+            supports_pipeline=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+        lambda _path: (True, ""),
+    )
+    monkeypatch.setattr(
+        "omlx.patches.deepseek_v41.moe_offload._plan",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            count=8,
+            capacity=4,
+            layer_bytes={
+                f"language_model.layers.{index}.ffn.experts": 4 * gib
+                for index in range(8)
+            },
+        ),
+    )
+    saved = {
+        "experts": SimpleNamespace(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.5,
+            deepseek_v41_engram_ssd_offload=False,
+            mtp_enabled=False,
+        )
+    }
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {"id": "experts", "model_path": str(tmp_path), "model_type": "llm"}
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: saved[model_id],
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces("127.0.0.1", [("en4", "10.0.1.1", 30)]),
+            "studio.local": _interfaces("studio.local", [("en5", "10.0.1.2", 30)]),
+        },
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+
+    body = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_path": str(tmp_path),
+                "strategy": "pipeline",
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * gib}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {"node_id": "node-0", "ssh": "127.0.0.1", "ips": ["10.0.1.1"]},
+                    {"node_id": "node-1", "ssh": "studio.local", "ips": ["10.0.1.2"]},
+                ],
+            },
+        )
+        .json()
+    )
+
+    assignments = body["plan"]["assignments"]
+    assert len(assignments) == 2
+    for assignment in assignments:
+        assert assignment["moe_expert_offload_resident_fraction"] == 0.5
+        assert assignment["moe_offload_weight_bytes"] == (
+            2 * gib * assignment["layer_count"]
+        )
+        assert assignment["planned_weight_bytes"] == (
+            assignment["fixed_weight_bytes"]
+            + assignment["layer_weight_bytes"]
+            - assignment["moe_offload_weight_bytes"]
+            + assignment["kv_cache_bytes"]
+        )
+    # Half of every layer's experts stream, so the plan keeps 48 of 64 GiB.
+    assert sum(item["moe_offload_weight_bytes"] for item in assignments) == 16 * gib
+
+    activation = body["activation"]
     assert activation["approved_placement"] == _approval_for(activation)
 
 
