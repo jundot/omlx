@@ -131,6 +131,9 @@ final class WelcomeViewModel: ObservableObject {
     @Published var lastError: String?
     @Published var isStarting: Bool = false
     @Published var startCompleted: Bool = false
+    @Published var runtimeInstalling: Bool = false
+    @Published var runtimeLog: String = ""
+    @Published var runtimeError: String?
 
     var onFinish: ((AppConfig, ServerProcess?) -> Void)?
     var onOpenDashboard: (() -> Void)?
@@ -147,6 +150,31 @@ final class WelcomeViewModel: ObservableObject {
         self.modelDir = cfg.modelDir
         self.portText = String(cfg.port)
         self.apiKey = cfg.apiKey ?? ""
+    }
+
+    /// The slim app ships no Python/MLX; the user installs the pinned runtime
+    /// once. This is a large download, so it never starts without this click.
+    var runtimeMissing: Bool {
+        !RuntimeInstaller.isInstalled
+    }
+
+    func installRuntime() async {
+        guard !runtimeInstalling else { return }
+        runtimeInstalling = true
+        runtimeLog = ""
+        runtimeError = nil
+        defer { runtimeInstalling = false }
+        do {
+            try await RuntimeInstaller.install { [weak self] text in
+                guard let self else { return }
+                self.runtimeLog += text
+                if self.runtimeLog.count > 6000 {
+                    self.runtimeLog = String(self.runtimeLog.suffix(6000))
+                }
+            }
+        } catch {
+            runtimeError = error.localizedDescription
+        }
     }
 
     /// Single-page validation gate — runs Storage + API-key checks in
@@ -384,11 +412,25 @@ final class WelcomeViewModel: ObservableObject {
     /// Signs in with the key set in the setup step, like the menubar item.
     @discardableResult
     func openWebDashboard() -> Bool {
+        openDashboard(redirect: "/admin/dashboard")
+    }
+
+    /// Opens the existing dashboard on the Cluster tab. The Welcome screen does
+    /// not grow a second cluster UI; this is the same page and the same
+    /// assistant card the menubar item opens.
+    @discardableResult
+    func openClusterAssistant() -> Bool {
+        openDashboard(redirect: MenubarController.clusterAssistantRedirect)
+    }
+
+    @discardableResult
+    private func openDashboard(redirect: String) -> Bool {
         guard let services else { return false }
         guard let url = MenubarController.webAdminURL(
             host: services.config.host,
             port: services.config.port,
-            apiKey: services.config.apiKey
+            apiKey: services.config.apiKey,
+            redirect: redirect
         ) else {
             return false
         }
@@ -554,6 +596,55 @@ private struct WelcomeSetupBody: View {
                                  defaultValue: "oMLX binds to 127.0.0.1 on first run, so clients on this Mac can use it without exposing the server to your network.",
                                  comment: "Body for the local server setup card")
                 )
+
+                if vm.runtimeMissing {
+                    VStack(alignment: .leading, spacing: 8) {
+                        WelcomeNotice(
+                            icon: "shippingbox.fill",
+                            title: String(localized: "welcome.runtime.title",
+                                          defaultValue: "Python runtime required",
+                                          comment: "Title for the first-run runtime installer card"),
+                            text: String(localized: "welcome.runtime.body",
+                                         defaultValue: "Python and MLX are not bundled in the app. Install the pinned runtime once; it downloads Python and the locked dependencies (about 1 GB) into your Application Support folder.",
+                                         comment: "Body for the first-run runtime installer card")
+                        )
+                        HStack(spacing: 10) {
+                            Button {
+                                Task { await vm.installRuntime() }
+                            } label: {
+                                Label(
+                                    String(localized: "welcome.runtime.install",
+                                           defaultValue: "Install Runtime…",
+                                           comment: "Button that provisions the external Python runtime"),
+                                    systemImage: "arrow.down.circle"
+                                )
+                            }
+                            .buttonStyle(.omlx(.primary, size: .small))
+                            .disabled(vm.runtimeInstalling || vm.isStarting)
+                            if vm.runtimeInstalling {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                        }
+                        if !vm.runtimeLog.isEmpty {
+                            ScrollView {
+                                Text(vm.runtimeLog)
+                                    .font(.omlxMono(10))
+                                    .foregroundStyle(WelcomeStyle.muted)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(maxHeight: 86)
+                            .padding(8)
+                            .background(WelcomeStyle.fill)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
+                        if let error = vm.runtimeError {
+                            Text(error)
+                                .font(.omlxText(DesignTokens.FontSize.caption))
+                                .foregroundStyle(Color(nsColor: .systemRed))
+                        }
+                    }
+                }
 
                 VStack(spacing: 0) {
                     SettingRow(
@@ -786,14 +877,25 @@ private struct WelcomeFooter: View {
             .disabled(vm.isStarting)
 
         case .complete:
-            WelcomeCTA(
-                title: String(localized: "welcome.button.open_dashboard",
-                              defaultValue: "Open Web Dashboard",
-                              comment: "Footer button that opens the local web dashboard"),
-                systemImage: "arrow.up.right",
-                width: 210
-            ) {
-                _ = vm.openWebDashboard()
+            HStack(spacing: 10) {
+                WelcomeCTA(
+                    title: String(localized: "welcome.button.cluster_assistant",
+                                  defaultValue: "Cluster Assistant",
+                                  comment: "Footer button that opens the existing Cluster Assistant tab"),
+                    systemImage: "network",
+                    width: 190
+                ) {
+                    _ = vm.openClusterAssistant()
+                }
+                WelcomeCTA(
+                    title: String(localized: "welcome.button.open_dashboard",
+                                  defaultValue: "Open Web Dashboard",
+                                  comment: "Footer button that opens the local web dashboard"),
+                    systemImage: "arrow.up.right",
+                    width: 210
+                ) {
+                    _ = vm.openWebDashboard()
+                }
             }
         }
     }

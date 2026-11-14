@@ -17381,6 +17381,18 @@
         }
       }
     },
+    "menubar.item.cluster_assistant" : {
+      "comment" : "Menubar item that opens the existing web dashboard on the Cluster Assistant tab",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cluster Assistant"
+          }
+        }
+      }
+    },
     "menubar.item.downloading_update" : {
       "comment" : "Menubar update item while an app update is downloading; placeholder is the percent",
       "extractionState" : "extracted_with_value",
@@ -21113,6 +21125,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "启动引擎前预检预填充内存。丢弃会导致 OOM 的请求。"
+          }
+        }
+      }
+    },
+    "performance.memory.wired_limit_applied" : {
+      "comment" : "Confirmation after the admin dialog raised the Metal wired limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The wired limit was raised. Restart oMLX if it is already serving."
+          }
+        }
+      }
+    },
+    "performance.memory.wired_limit_apply" : {
+      "comment" : "Button that raises the Metal wired limit with one system admin dialog",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply with Admin…"
+          }
+        }
+      }
+    },
+    "performance.memory.wired_limit_cancelled" : {
+      "comment" : "Error when the user cancels the admin dialog",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The administrator prompt was cancelled; the wired limit was not changed."
+          }
+        }
+      }
+    },
+    "performance.memory.wired_limit_failed" : {
+      "comment" : "Prefix for a failed privileged wired-limit action",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not set the wired limit."
+          }
+        }
+      }
+    },
+    "performance.memory.wired_limit_invalid" : {
+      "comment" : "Error when the requested Metal wired limit is invalid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The wired-limit value is outside the supported range."
           }
         }
       }
@@ -49271,6 +49343,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "浏览…"
+          }
+        }
+      }
+    },
+    "welcome.button.cluster_assistant" : {
+      "comment" : "Footer button that opens the existing Cluster Assistant tab",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cluster Assistant"
           }
         }
       }

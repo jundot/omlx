@@ -70,5 +70,17 @@
 		<string>ko</string>
 		<string>ru</string>
 	</array>
+	<key>SMPrivilegedExecutables</key>
+	<dict>
+		<!-- Pins the Developer ID Certification Authority plus the Developer ID
+		     Application leaf marker, not just the team (OU): a plain "Apple
+		     Development" certificate for the same team must not be accepted as
+		     the privileged helper. Mirror of the helper's SMAuthorizedClients.
+		     The team (OU) is substituted at build time from OMLX_TEAM_ID
+		     (see apps/omlx-mac/Scripts/build.sh); unset leaves it empty, which
+		     matches no certificate — an unsigned build cannot bless. -->
+		<key>app.omlx.helper</key>
+		<string>anchor apple generic and identifier "app.omlx.helper" and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "$(OMLX_TEAM_ID)"</string>
+	</dict>
 </dict>
 </plist>
