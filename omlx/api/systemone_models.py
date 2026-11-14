@@ -18,8 +18,12 @@ from pydantic import BaseModel, Field, field_validator
 class SystemOneQuestion(BaseModel):
     """One typed question about the state."""
 
-    type: Literal["noul", "choice", "score"]
-    """noul: yes/no probability. choice: one option key. score: ordered level."""
+    type: Literal["noul", "choice", "score", "locate"]
+    """noul: yes/no probability. choice: one option key. score: ordered level.
+
+    locate: verbatim spans of the state (Perplexity Decider only); the question
+    key is the default label and ``instructions`` replaces it.
+    """
 
     instructions: Any = None
     """The question text, or any JSON value."""

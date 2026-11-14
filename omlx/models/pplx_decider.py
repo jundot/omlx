@@ -20,6 +20,7 @@ on long states), at the cost of the state attending to the questions (the
 release measures 1.5-2.2% of top answers differing from ``separate``).
 """
 
+import hashlib
 import json
 import math
 from collections.abc import Generator
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from ..model_discovery import (
@@ -67,6 +69,17 @@ IMAGE_TOKEN = "<|image_pad|>"
 VIDEO_TOKEN = "<|video_pad|>"
 IMAGE_MIN_PIXELS = 65_536
 DEFAULT_MAX_PIXELS = 1_638_400
+
+LOCATE_DIR = "locate-span"
+LOCATE_CONFIG = "locate_config.json"
+LOCATE_ADAPTER_WEIGHTS = "adapter.safetensors"
+LOCATE_HEAD_WEIGHTS = "head.safetensors"
+LOCATE_FORMAT = "pplx-decider-locate-span-v1"
+LOCATE_MARKER = "<|locate|>"
+LOCATE_PROMPT = "Locate verbatim spans:\n"
+LOCATE_MAX_QUESTIONS = 128
+# Quantization rewrites config.json, so the adapter's base check skips it.
+LOCATE_BASE_SKIP = ("config.json",)
 
 
 def canonical(value: Any) -> str:
@@ -140,8 +153,12 @@ def normalize_question(question_id: str, question: dict) -> PplxQuestion:
             )
         keys = [str(index) for index in range(len(texts))]
         return PplxQuestion(question_id, kind, instructions, keys, texts, criteria)
+    if kind == "locate":
+        if criteria is not None:
+            raise DecisionRequestError(f"{where}: locate takes no criteria")
+        return PplxQuestion(question_id, kind, instructions, [], [])
     raise DecisionRequestError(
-        f"{where}: unsupported question type {kind!r} (choice, noul or score)"
+        f"{where}: unsupported question type {kind!r} (choice, noul, score or locate)"
     )
 
 
@@ -165,6 +182,411 @@ class PplxPlan:
     sequences: list[PplxSequence]
     image_pixels: np.ndarray | None = None
     image_grids: np.ndarray | None = None
+    state: Any = None
+    locate: tuple[PplxQuestion, ...] = ()
+
+
+def isolation_mask(prefix: int, chunks: list[int]) -> mx.array | None:
+    """Block mask of the release question layout (``True`` = attend).
+
+    The context attends itself and every question, a question block attends the
+    context and itself. One question block needs no mask: that is plain
+    non-causal attention, which is what a single-chunk forward already does.
+    """
+    if len(chunks) < 2:
+        return None
+    length = prefix + sum(chunks)
+    segments = np.full(length, -1, dtype=np.int32)
+    cursor = prefix
+    for index, size in enumerate(chunks):
+        segments[cursor : cursor + size] = index
+        cursor += size
+    query, key = segments[:, None], segments[None, :]
+    allowed = (query == -1) | (key == -1) | (query == key)
+    return mx.array(allowed)[None, None]
+
+
+def _locate_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+class LocateLoRA(nn.Module):
+    """``base(x) + B(A(x)) * alpha / rank``, applied only while ``enabled``.
+
+    The release adapter is unmerged: the backbone keeps its own weights and the
+    update is switched on for locate forwards only, so decision answers stay
+    those of a plain Decider.
+    """
+
+    def __init__(self, base: nn.Module, lora_a: mx.array, lora_b: mx.array, alpha: float):
+        super().__init__()
+        self.base = base
+        self.lora_a = lora_a
+        self.lora_b = lora_b
+        self.scale = alpha / lora_a.shape[0]
+        self.enabled = False
+
+    def __call__(self, inputs: mx.array) -> mx.array:
+        result = self.base(inputs)
+        if not self.enabled:
+            return result
+        values = inputs.astype(mx.float32)
+        update = (values @ self.lora_a.T) @ self.lora_b.T
+        return result + (update * self.scale).astype(result.dtype)
+
+
+class LocateSpanHead(nn.Module):
+    """Query-conditioned start/end scores and a top-k span grid (release recipe v3)."""
+
+    def __init__(self, hidden: int, width: int, max_span: int):
+        super().__init__()
+        self.max_span = max_span
+        self.ts = nn.Linear(hidden, width)
+        self.te = nn.Linear(hidden, width)
+        self.qs = nn.Linear(hidden, width)
+        self.qe = nn.Linear(hidden, width)
+        self.qp = nn.Linear(hidden, width)
+        self.width_bias = nn.Embedding(32, 1)
+        self.thresholds = nn.Linear(hidden, 3)
+        self.start_bias = mx.zeros((1,))
+        self.end_bias = mx.zeros((1,))
+        self.scale = math.sqrt(width)
+
+    def load_weights(self, weights: dict) -> None:
+        for name in ("ts", "te", "qs", "qe", "qp", "thresholds"):
+            module = getattr(self, name)
+            module.weight = weights[f"{name}.weight"]
+            module.bias = weights[f"{name}.bias"]
+        self.width_bias.weight = weights["width_bias.weight"]
+        self.start_bias = weights["start_bias"]
+        self.end_bias = weights["end_bias"]
+        mx.eval(*self.parameters().values())
+
+    @staticmethod
+    def _topk(values: mx.array, k: int) -> tuple[mx.array, mx.array]:
+        """Descending top-k values and indices (``mx.topk`` returns values only)."""
+        indices = mx.argpartition(-values, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
+        picked = mx.take_along_axis(values, indices, axis=-1)
+        order = mx.argsort(-picked, axis=-1)
+        return (
+            mx.take_along_axis(picked, order, axis=-1),
+            mx.take_along_axis(indices, order, axis=-1),
+        )
+
+    def predict(
+        self, document: mx.array, labels: mx.array, threshold: float, proposals: int
+    ) -> list[list[tuple[int, int, float]]]:
+        """Inclusive token spans whose probability reaches ``threshold``, per label."""
+        document = document.astype(mx.float32)
+        labels = labels.astype(mx.float32)
+        ts, te = self.ts(document), self.te(document)
+        qs, qe, qp = self.qs(labels), self.qe(labels), self.qp(labels)
+        start = (qs @ ts.T) / self.scale + self.start_bias
+        finish = (qe @ te.T) / self.scale + self.end_bias
+        thresholds = self.thresholds(labels)
+        k = min(proposals, document.shape[0])
+        result: list[list[tuple[int, int, float]]] = []
+        for index in range(labels.shape[0]):
+            start_values, si = self._topk(start[index], k)
+            end_values, ei = self._topk(finish[index], k)
+            scores = (ts[si] * mx.tanh(qp[index])[None, :]) @ te[ei].T / self.scale
+            widths = ei[None, :] - si[:, None] + 1
+            buckets = mx.clip(
+                mx.floor(mx.log2(mx.maximum(widths, 1).astype(mx.float32))).astype(mx.int32),
+                0,
+                31,
+            )
+            scores = (
+                scores
+                + start_values[:, None]
+                + end_values[None, :]
+                + self.width_bias(buckets).squeeze(-1)
+            )
+            scores = mx.where((widths <= 0) | (widths > self.max_span), -mx.inf, scores)
+            probabilities = mx.sigmoid(scores - thresholds[index, 2])
+            mask = probabilities >= threshold
+            flat = mask.reshape(-1)
+            picked = mx.sort(
+                mx.where(flat, mx.arange(flat.size, dtype=mx.int32), mx.array(flat.size))
+            )
+            count = int(mx.sum(mask))
+            rows = (picked[:count] // mask.shape[1]).tolist()
+            cols = (picked[:count] % mask.shape[1]).tolist()
+            result.append(
+                [
+                    (
+                        int(si[int(row)]),
+                        int(ei[int(col)]),
+                        float(probabilities[int(row), int(col)]),
+                    )
+                    for row, col in zip(rows, cols, strict=True)
+                ]
+            )
+        return result
+
+
+class LocateAdapter:
+    """The checkpoint's ``locate-span/`` adapter: unmerged LoRA, marker row and span head."""
+
+    def __init__(self, model: "PplxDeciderModel", directory: Path):
+        config = json.loads((directory / LOCATE_CONFIG).read_text())
+        if config.get("format") != LOCATE_FORMAT:
+            raise ValueError(
+                f"{LOCATE_CONFIG} is not a {LOCATE_FORMAT} adapter "
+                f"(found {config.get('format')!r})"
+            )
+        head = config["head"]
+        if head.get("name") != "span":
+            raise ValueError(f"{LOCATE_CONFIG}: unsupported head {head.get('name')!r}")
+        lora = config["lora"]
+        if lora.get("merged") or int(lora.get("layers", 0)) != 0:
+            raise ValueError(f"{LOCATE_CONFIG}: only all-layer unmerged adapters are supported")
+        for name, expected in (config.get("base") or {}).get("sha256", {}).items():
+            candidate = Path(model.model_path) / name
+            if name in LOCATE_BASE_SKIP or not candidate.is_file():
+                continue
+            if _locate_sha256(candidate) != expected:
+                raise ValueError(f"{LOCATE_DIR} was trained on another base: {name} differs")
+        self.config = config
+        self.proposals = int(head["proposals"])
+        self.cutoff = float((config.get("thresholds") or {}).get("default", 0.5))
+
+        tokenizer = model.backbone.tokenizer
+        if LOCATE_MARKER not in tokenizer.get_vocab():
+            tokenizer.add_special_tokens(
+                {"extra_special_tokens": [LOCATE_MARKER]},
+                replace_extra_special_tokens=False,
+            )
+        self.marker_id = model._single_token(LOCATE_MARKER)
+        if self.marker_id != int(config["marker_id"]):
+            raise ValueError(
+                f"{LOCATE_MARKER} resolves to {self.marker_id}, the adapter was trained "
+                f"with {config['marker_id']}"
+            )
+        model.add_escape(LOCATE_MARKER)
+
+        text_model = model.backbone._text_model
+        weights = mx.load(str(directory / LOCATE_ADAPTER_WEIGHTS))
+        head_weights = mx.load(str(directory / LOCATE_HEAD_WEIGHTS))
+        locate_keys = [key for key in weights if key.endswith(".locate")]
+        if len(locate_keys) != 1:
+            raise ValueError(f"{LOCATE_ADAPTER_WEIGHTS}: expected one marker row")
+        self.marker_row = weights[locate_keys[0]]
+        self.adapters: list[LocateLoRA] = []
+        wrapped: set[str] = set()
+        modules = dict(text_model.named_modules())
+        for name, module in modules.items():
+            if not isinstance(module, (nn.Linear, nn.QuantizedLinear)):
+                continue
+            key = f"language_model.{name}"
+            if f"{key}.lora_a" not in weights:
+                continue
+            parent_path, _, leaf = name.rpartition(".")
+            parent = modules.get(parent_path) if parent_path else text_model
+            setattr(
+                parent,
+                leaf,
+                LocateLoRA(
+                    module,
+                    weights[f"{key}.lora_a"],
+                    weights[f"{key}.lora_b"],
+                    float(lora["alpha"]),
+                ),
+            )
+            self.adapters.append(getattr(parent, leaf))
+            wrapped.update((f"{key}.lora_a", f"{key}.lora_b"))
+        if not self.adapters:
+            raise ValueError(f"{LOCATE_ADAPTER_WEIGHTS}: no LoRA target matched the backbone")
+        expected = {key for key in weights if key.endswith((".lora_a", ".lora_b"))}
+        if wrapped != expected:
+            raise ValueError(
+                f"{LOCATE_ADAPTER_WEIGHTS}: {len(expected - wrapped)} adapter tensors "
+                "did not match the backbone"
+            )
+        hidden = (model.backbone.config.get("text_config") or model.backbone.config)["hidden_size"]
+        self.head = LocateSpanHead(hidden, int(head["width"]), int(head["max_span"]))
+        self.head.load_weights(head_weights)
+
+    def validate(self, state: Any, questions: dict, images: int) -> list[str]:
+        if images:
+            raise DecisionRequestError("locate questions require a text state without images")
+        if not isinstance(state, str) or not state:
+            raise DecisionRequestError("locate questions require a nonempty text state")
+        if len(questions) > LOCATE_MAX_QUESTIONS:
+            raise DecisionRequestError(
+                f"locate supports at most {LOCATE_MAX_QUESTIONS} questions"
+            )
+        instructions = []
+        for key, question in questions.items():
+            text = question.get("instructions")
+            if text is not None and not isinstance(text, str):
+                raise DecisionRequestError(
+                    f"questions.{key}: locate instructions must be text or null"
+                )
+            instructions.append(text if text is not None and text.strip() else key)
+        return instructions
+
+    def _plan(self, model: "PplxDeciderModel", text: str, instructions: list[str]):
+        try:
+            return [self._encode(model, text, instructions)]
+        except DecisionContextLengthError:
+            if len(instructions) <= 1:
+                raise
+            middle = len(instructions) // 2
+            return self._plan(model, text, instructions[:middle]) + self._plan(
+                model, text, instructions[middle:]
+            )
+
+    def _encode(self, model: "PplxDeciderModel", text: str, instructions: list[str]):
+        tokenizer = model.backbone.tokenizer
+        context = model.context_text(text, 0)
+        escaped = model._text(text)
+        begin = len(context) - len(escaped)
+        tokens = tokenizer(context, add_special_tokens=False, return_offsets_mapping=True)
+        prefix = [*tokens["input_ids"], model.separator_id]
+        chunks = [
+            [
+                *tokenizer(
+                    "Question:\n" + LOCATE_PROMPT + model._text(value),
+                    add_special_tokens=False,
+                )["input_ids"],
+                self.marker_id,
+            ]
+            for value in instructions
+        ]
+        ids = prefix + [token for chunk in chunks for token in chunk]
+        limit = model.backbone.max_position_embeddings
+        if limit is not None and len(ids) > limit:
+            raise DecisionContextLengthError(
+                f"locate input needs {len(ids)} tokens; the limit is {limit}"
+            )
+        markers, cursor = [], len(prefix)
+        for chunk in chunks:
+            cursor += len(chunk)
+            markers.append(cursor - 1)
+        mapping = tokens["offset_mapping"]
+        state_rows = [
+            index
+            for index, (start, stop) in enumerate(mapping)
+            if start < len(context) and stop > begin and start < stop
+        ]
+        offsets = [
+            (max(0, mapping[index][0] - begin), min(len(escaped), mapping[index][1] - begin))
+            for index in state_rows
+        ]
+        return ids, state_rows, markers, offsets, len(prefix), [len(chunk) for chunk in chunks]
+
+    @staticmethod
+    def _positions(length: int, prefix: int, chunks: list[int]) -> mx.array:
+        """Positions that restart after the context in every question block."""
+        flat = np.arange(length, dtype=np.int32)
+        cursor = prefix + chunks[0]
+        for size in chunks[1:]:
+            flat[cursor : cursor + size] = prefix + np.arange(size, dtype=np.int32)
+            cursor += size
+        return mx.array(np.tile(flat, (3, 1)))[:, None, :]
+
+    def _hidden(
+        self,
+        model: "PplxDeciderModel",
+        ids: list[int],
+        rows: list[int],
+        prefix: int,
+        chunks: list[int],
+    ) -> mx.array:
+        """Run the backbone in the release's isolated-question layout."""
+        backbone = model.backbone
+        text_model = backbone._text_model
+        tokens = np.asarray(ids, dtype=np.int32)
+        embeds = backbone.embed_tokens(tokens)
+        marker = mx.array(tokens) == self.marker_id
+        embeds = mx.where(marker[None, :, None], self.marker_row.astype(embeds.dtype), embeds)
+        positions = self._positions(len(ids), prefix, chunks)
+        mask = isolation_mask(prefix, chunks)
+        blocks, cursor = [], prefix
+        for size in chunks:
+            blocks.append(slice(cursor, cursor + size))
+            cursor += size
+        restarts = blocks[1:] if len(chunks) > 1 else []
+        position_embeddings = None
+        for layer in text_model.layers:
+            if not layer.is_linear:
+                rotary = layer.self_attn.rotary_emb
+                if not rotary.fused_apply:
+                    position_embeddings = rotary(embeds, positions)
+                break
+        self.enable(True)
+        try:
+            hidden = embeds
+            for layer in text_model.layers:
+                if layer.is_linear:
+                    # The SSM layer builds its own mask; only full attention takes the block mask.
+                    out = layer(hidden, mask=None, cache=None)
+                    for block in restarts:
+                        # Restart the block from the context's final recurrent memory.
+                        restarted = layer(
+                            mx.concatenate([hidden[:, :prefix], hidden[:, block]], axis=1),
+                            mask=None,
+                            cache=None,
+                        )
+                        out[:, block] = restarted[:, prefix:]
+                else:
+                    out = layer(
+                        hidden,
+                        mask=mask,
+                        cache=None,
+                        position_ids=positions,
+                        position_embeddings=position_embeddings,
+                    )
+                hidden = out
+                mx.eval(hidden)
+            return text_model.norm(hidden[0][mx.array(np.asarray(rows, dtype=np.int32))])
+        finally:
+            self.enable(False)
+
+    def enable(self, enabled: bool) -> None:
+        for adapter in self.adapters:
+            adapter.enabled = enabled
+
+    def answers(self, model: "PplxDeciderModel", state: str, questions: dict) -> dict:
+        instructions = self.validate(state, questions, model.pending_images)
+        plans = self._plan(model, state, instructions)
+        spans: list[list[tuple[int, int, float]]] = []
+        tokens = 0
+        for ids, state_rows, markers, offsets, prefix, chunks in plans:
+            hidden = self._hidden(model, ids, [*state_rows, *markers], prefix, chunks)
+            mx.eval(hidden)
+            rows = len(state_rows)
+            found = self.head.predict(
+                hidden[:rows], hidden[rows:], self.cutoff, self.proposals
+            )
+            tokens += len(ids)
+            for field in found:
+                unique: dict[tuple[int, int], float] = {}
+                for first, last, score in field:
+                    start, stop = offsets[first][0], offsets[last][1]
+                    while start < stop and state[start].isspace():
+                        start += 1
+                    while stop > start and state[stop - 1].isspace():
+                        stop -= 1
+                    if start < stop:
+                        unique[(start, stop)] = max(score, unique.get((start, stop), 0.0))
+                spans.append([(a, b, score) for (a, b), score in sorted(unique.items())])
+        answers = {
+            key: {
+                "type": "locate",
+                "spans": [
+                    {"start": a, "end": b, "text": state[a:b], "score": score}
+                    for a, b, score in found
+                ],
+            }
+            for key, found in zip(questions, spans, strict=True)
+        }
+        return {"answers": answers, "input_tokens": tokens}
 
 
 class PplxDeciderModel:
@@ -182,6 +604,8 @@ class PplxDeciderModel:
         self._escapes: list[str] = []
         self._image_token_id = 0
         self._video_token_id = 0
+        self._locate: LocateAdapter | None = None
+        self.pending_images = 0
 
     @property
     def has_vision(self) -> bool:
@@ -282,6 +706,23 @@ class PplxDeciderModel:
             text = text.replace(token, token.replace("<", "\uff1c").replace(">", "\uff1e"))
         return text
 
+    def add_escape(self, token: str) -> None:
+        """Also neutralize a token in user text (the locate marker)."""
+        if token not in self._escapes:
+            self._escapes = sorted({*self._escapes, token}, key=len, reverse=True)
+
+    @property
+    def locate_ready(self) -> bool:
+        return (Path(self.model_path) / LOCATE_DIR).is_dir()
+
+    @property
+    def locate(self) -> LocateAdapter:
+        if self._locate is None:
+            if not self.locate_ready:
+                raise DecisionRequestError(f"{LOCATE_DIR} is missing from the checkpoint")
+            self._locate = LocateAdapter(self, Path(self.model_path) / LOCATE_DIR)
+        return self._locate
+
     def state_text(self, state: Any) -> str:
         empty = state is None or (isinstance(state, str) and not state)
         return "State:\n" + (EMPTY_STATE if empty else self._text(state))
@@ -341,8 +782,24 @@ class PplxDeciderModel:
                     f"questions.{item.question_id}: {len(item.keys)} options, at most "
                     f"{min(MAX_OPTIONS, len(self.codes))} are supported"
                 )
-        plan = PplxPlan(questions, [])
+        plan = PplxPlan(questions, [], state=state)
+        plan.locate = tuple(item for item in items if item.kind == "locate")
+        items = [item for item in items if item.kind != "locate"]
         images = decode_images(request.get("images"))
+        self.pending_images = len(images)
+        if plan.locate:
+            if len(questions) > LOCATE_MAX_QUESTIONS:
+                raise DecisionRequestError(
+                    f"locate supports at most {LOCATE_MAX_QUESTIONS} questions"
+                )
+            if images:
+                # The adapter was trained on a text state; the release rejects media.
+                raise DecisionRequestError(
+                    "locate questions require a text state without images"
+                )
+        if not items:
+            # A locate-only request has no decision chunk to read out.
+            return plan
         merge = 0
         image_counts: list[int] = []
         if images:
@@ -435,6 +892,17 @@ class PplxDeciderModel:
         markers: list[int],
     ) -> Generator[int, None, mx.array]:
         """Run every layer non-causally; return the normed hidden rows at markers."""
+        return (yield from self._hidden_at(embeds, positions, markers, chunk_size))
+
+    def _hidden_at(
+        self,
+        embeds: mx.array,
+        positions: mx.array | None,
+        rows_at: list[int],
+        chunk_size: ChunkSize,
+        mask: mx.array | None = None,
+    ) -> Generator[int, None, mx.array]:
+        """Run every layer non-causally; return the normed hidden rows at ``rows_at``."""
         text_model = self.backbone._text_model
         layers = text_model.layers
         depth = len(layers)
@@ -453,7 +921,8 @@ class PplxDeciderModel:
             for layer in layers[done:end]:
                 hidden = layer(
                     hidden,
-                    mask=None,
+                    # The SSM layers build their own mask; only full attention takes the block mask.
+                    mask=None if layer.is_linear else mask,
                     cache=None,
                     position_ids=positions,
                     position_embeddings=position_embeddings,
@@ -461,7 +930,7 @@ class PplxDeciderModel:
             mx.eval(hidden)
             yield length * end // depth - length * done // depth
             done = end
-        rows = mx.array(np.asarray(markers, dtype=np.int32))
+        rows = mx.array(np.asarray(rows_at, dtype=np.int32))
         return text_model.norm(hidden[0][rows])
 
     def run(self, plan: PplxPlan, chunk_size: ChunkSize) -> Generator[int, None, dict]:
@@ -475,6 +944,14 @@ class PplxDeciderModel:
 
         answers: dict[str, dict] = {}
         input_tokens = 0
+        if plan.locate:
+            located = self.locate.answers(
+                self,
+                plan.state,
+                {item.question_id: plan.questions[item.question_id] for item in plan.locate},
+            )
+            answers.update(located["answers"])
+            input_tokens += located["input_tokens"]
         for encoded in plan.sequences:
             ids = encoded.ids
             embeds = backbone.embed_tokens(ids)
