@@ -99,13 +99,91 @@ def test_patched_layer_matches_stock_decode():
     assert mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max().item() < 0.05
 
 
-def test_patched_layer_keeps_multi_row_path(monkeypatch):
+@pytest.mark.parametrize("rows", [2, 5, 16])
+def test_router_rows_match_one_row_router(rows):
+    mx.random.seed(rows)
+    logits = mx.random.normal((1, rows, 256)).astype(mx.bfloat16)
+    bias = mx.random.uniform(-0.05, 0.05, (256,))
+    idx, w = flint_decode.fused_router(logits, bias, 6)
+    assert idx.shape == (1, rows, 6) and w.shape == (1, rows, 6)
+    for r in range(rows):
+        one_idx, one_w = flint_decode.fused_router(logits[0, r], bias, 6)
+        assert idx[0, r].tolist() == one_idx.tolist()
+        assert mx.array_equal(w[0, r], one_w).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_combine_rows_matches_stock_roundings(dtype):
+    mx.random.seed(5)
+    rows, top_k, dim = 5, 6, 2048
+    routed = mx.random.normal((1, rows, top_k, dim)).astype(dtype)
+    weights = mx.softmax(mx.random.normal((1, rows, top_k)), axis=-1)
+    shared = mx.random.normal((1, rows, dim)).astype(dtype)
+    residual = mx.random.normal((1, rows, dim)).astype(dtype)
+    moe = (routed.astype(mx.float32) * weights[..., None]).sum(axis=-2).astype(dtype)
+    ref = residual + (moe + shared)
+    out = flint_decode.fused_combine(routed, weights, shared, residual)
+    assert out.shape == ref.shape and out.dtype == dtype
+    assert mx.array_equal(out, ref).item()
+
+
+def test_patched_verify_rows_match_one_token_steps():
+    """A verify block routes and combines each row like its one-token step."""
+    layer = _tiny_layer()
+    assert flint_decode.apply_flint_decode_patch()
+    x = mx.random.normal((1, 4, 256)).astype(mx.bfloat16)
+    block = layer(x, mask="causal")
+    ref = flint.DecoderLayer._omlx_flint_original_call(layer, x, mask="causal")
+    assert block.shape == ref.shape and block.dtype == ref.dtype
+    assert mx.abs(block.astype(mx.float32) - ref.astype(mx.float32)).max().item() < 0.05
+
+
+def test_patched_layer_keeps_prefill_path(monkeypatch):
     layer = _tiny_layer()
     assert flint_decode.apply_flint_decode_patch()
 
     def fail(*args, **kwargs):
-        raise AssertionError("multi-row calls must keep the stock body")
+        raise AssertionError("prefill calls must keep the stock body")
 
     monkeypatch.setattr(flint_decode, "fused_router", fail)
-    out = layer(mx.random.normal((1, 3, 256)).astype(mx.bfloat16), mask="causal")
-    assert out.shape == (1, 3, 256)
+    rows = flint_decode._MAX_ROWS + 1
+    out = layer(mx.random.normal((1, rows, 256)).astype(mx.bfloat16), mask="causal")
+    assert out.shape == (1, rows, 256)
+    out = layer(
+        mx.random.normal((2, rows // 2 + 1, 256)).astype(mx.bfloat16), mask="causal"
+    )
+    assert out.shape == (2, rows // 2 + 1, 256)
+
+
+@pytest.mark.parametrize("shape", [(2, 1), (3, 1), (3, 5)])
+def test_patched_batch_rows_match_stock(shape):
+    """Batched decode / verify rows take the fused path and match the stock body."""
+    layer = _tiny_layer()
+    assert flint_decode.apply_flint_decode_patch()
+    x = mx.random.normal((*shape, 256)).astype(mx.bfloat16)
+    mask = "causal" if shape[1] > 1 else None
+    calls = []
+    router = flint_decode.fused_router
+
+    def counted(*args, **kwargs):
+        calls.append(args[0].shape)
+        return router(*args, **kwargs)
+
+    flint_decode.fused_router = counted
+    try:
+        out = layer(x, mask=mask)
+    finally:
+        flint_decode.fused_router = router
+    assert calls, "batched rows should use the fused router"
+    ref = flint.DecoderLayer._omlx_flint_original_call(layer, x, mask=mask)
+    assert out.shape == ref.shape and out.dtype == ref.dtype
+    assert mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max().item() < 0.05
+    # Each sequence's rows route as they would alone.
+    for b in range(shape[0]):
+        alone = layer(x[b : b + 1], mask=mask)
+        assert (
+            mx.abs(alone.astype(mx.float32) - out[b : b + 1].astype(mx.float32))
+            .max()
+            .item()
+            < 0.05
+        )
