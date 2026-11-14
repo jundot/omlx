@@ -850,6 +850,15 @@ def detect_model_type(model_path: Path) -> ModelType:
                 break
             return "vlm"
 
+    # Force the VLM engine for text-only models that must run on mlx-vlm
+    # (e.g. MiniCPM5-2B with a bundled DSpark drafter).  This is set in the
+    # model config.json by the user or by model_settings.json; it lets a
+    # plain llama run on the VLM engine so the block-drafter (DFlash) path
+    # is available even though llama is not a native VLM model type.
+    if config.get("omlx_force_engine") == "vlm":
+        logger.info(f"{model_type} forced to VLM engine (omlx_force_engine=vlm)")
+        return "vlm"
+
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
     # Text-only quants won't carry a vision sub-config. gemma4_unified,

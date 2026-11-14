@@ -182,6 +182,36 @@ def _add_mla_split_quant_keys(quant: dict) -> None:
     quant.update(extras)
 
 
+def _merge_qc_per_path_into_quantization(cfg: dict) -> None:
+    """Merge ``quantization_config`` per-path entries into ``quantization``.
+
+    Pre-quantized checkpoints (MiniCPM5-2B, mixed bit-width) put the
+    per-layer quantization spec in ``quantization_config`` while
+    ``quantization`` holds only the global default. mlx-vlm's
+    ``nn.quantize`` class_predicate reads only ``config["quantization"]``,
+    so merge the per-path entries so it can build each layer at the correct
+    bit-width.
+    """
+    quant = cfg.get("quantization")
+    qc = cfg.get("quantization_config")
+    if not isinstance(quant, dict) or not isinstance(qc, dict):
+        return
+    # Only merge when quantization is a bare global default (no per-path).
+    if any(isinstance(v, dict) or v is False for v in quant.values()):
+        return
+    per_path = {
+        k: v for k, v in qc.items()
+        if isinstance(v, dict) or v is False
+    }
+    if not per_path:
+        return
+    # Preserve the global defaults as the top-level recipe.
+    merged = dict(quant)
+    for k, v in per_path.items():
+        merged.setdefault(k, v)
+    cfg["quantization"] = merged
+
+
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
     """Add module-tree-path variants of per-layer quantization keys.
 
@@ -464,6 +494,7 @@ def _patch_mlx_lm_load_config() -> None:
         normalize_hy_v3_rope_config(cfg)
         # Cluster ranks load MiniMax through mlx-lm, not the patched mlx-vlm.
         adopt_expert_global_scales(cfg)
+        _merge_qc_per_path_into_quantization(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
@@ -962,7 +993,29 @@ def maybe_apply_pre_load_patches(
 
         # Inkling 2 bundles its DSpark draft as mtp.safetensors.
         minimax_dspark = bundled_inkling2_dspark_path(model_name)
-    if _is_mtp_compatible(config, model_type) or dflash_batched or minimax_dspark:
+    # MiniCPM5: text-only llama served on the VLM engine with a bundled
+    # DSpark drafter.  Its llama LanguageModel needs capture/rollback hooks,
+    # provided by the single-file monkey-patch; without those the DFlash
+    # block-drafter path cannot attach.
+    minicpm5_dspark = None
+    if model_type == "llama" and for_vlm:
+        try:
+            from ..patches.minicpm5_dspark import (
+                apply as minicpm5_apply,
+                bundled_dspark_path as bundled_minicpm5_path,
+            )
+
+            if bundled_minicpm5_path(model_name) is not None:
+                if minicpm5_apply():
+                    minicpm5_dspark = bundled_minicpm5_path(model_name)
+        except Exception as exc:
+            logger.warning("MiniCPM5 DSpark apply failed: %s", exc)
+    if (
+        _is_mtp_compatible(config, model_type)
+        or dflash_batched
+        or minimax_dspark
+        or minicpm5_dspark
+    ):
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
@@ -1021,7 +1074,7 @@ def maybe_apply_pre_load_patches(
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
-                if minimax_dspark is not None:
+                if minimax_dspark is not None or minicpm5_dspark is not None:
                     backend = "bundled DSpark"
                 elif _has_dspark_heads(config):
                     backend = "embedded DSpark"
@@ -1355,6 +1408,11 @@ _DFLASH_BATCHED_MODEL_TYPES = {
         "gemma4",
         "gemma4_unified",
         "muse_glimmer",
+        # Text-only llama (e.g. MiniCPM5-2B) loaded via mlx-vlm so the
+        # block-drafter (DFlash/DSpark) path is available; its LanguageModel
+        # carries capture_layer_ids / rollback_speculative_cache through
+        # omlx.patches.minicpm5_dspark.
+        "llama",
     ),
     "batched": (
         "qwen3_5",
