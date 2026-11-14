@@ -41,9 +41,8 @@ not carry them. Both are now rebased onto current `upstream/main` and pushed:
   the CI jobs were still running). Rebased via the local branch
   `rebase/moe-offload-main`; `c74f1b18..624cff0e` has no cluster changes, so the
   rebase was conflict-free and its 358 focused tests pass locally.
-  Our branch has only its **pricing half**; the **runtime half**
-  (`inference_worker`, `progressive_loading`, `deepseek_v41/loading.py`,
-  `deepseek_v41_mlx_lm/model.py`, `moe_offload.py`) still has to be applied here.
+  **Both halves are on our branch**: the pricing was ported during the rebase,
+  the runtime half was mirrored from `bbbf18d2` in commit `392aaccb`.
 - **#5033** `feat/qwen4-exp-cluster` — head **`25da70de`**, 8 commits, +1689/−77,
   15 files, **`mergeable: true` / `clean`**. Rebased conflict-free; 163 focused
   tests pass locally.
