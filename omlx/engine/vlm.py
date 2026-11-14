@@ -3107,6 +3107,146 @@ class VLMBatchedEngine(BaseEngine):
             return getattr(self._processor, "tokenizer", self._processor)
         return self._processor
 
+    def _render_vlm_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model_type: str,
+        num_images: int,
+        num_audios: int,
+        num_videos: int,
+        chat_template_kwargs: dict[str, Any] | None,
+        tools: list[dict] | None,
+        is_partial: bool | None,
+    ) -> tuple[Any, list[tuple[int, int]], list[Any], Any]:
+        """Format ``messages`` for the VLM and render the chat template.
+
+        Returns ``(prompt, image_message_ranges, formatted_messages,
+        template_target)``.
+        """
+        from mlx_vlm.prompt_utils import apply_chat_template, get_chat_template
+
+        # Apply VLM-specific chat template with image placeholders.
+        # Build per-message placeholders in oMLX so image-bearing turns always
+        # receive image tokens, regardless of conversation history shape.
+        try:
+            formatted_messages, image_message_ranges = (
+                self._format_messages_for_vlm_template(
+                    messages,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    num_videos=num_videos,
+                )
+            )
+        except Exception as e:
+            # The upstream formatter has no video placeholders; falling back
+            # would send frames the prompt never references.
+            if num_videos:
+                raise
+            logger.debug(
+                "Falling back to mlx-vlm apply_chat_template for VLM formatting: %s",
+                e,
+            )
+            # Fallback to upstream formatter for unknown model/format edge cases.
+            formatted_messages = apply_chat_template(
+                self._processor,
+                self._vlm_model.config,
+                messages,
+                num_images=num_images,
+                num_audios=num_audios,
+                return_messages=True,
+            )
+            image_message_ranges = []
+            for idx, msg in enumerate(messages):
+                if not isinstance(msg, dict):
+                    continue
+                image_count = self._count_content_parts(
+                    msg.get("content"), {"image", "image_url", "input_image"}
+                )
+                if image_count > 0:
+                    image_message_ranges.append((idx, image_count))
+
+        if is_partial is None:
+            # get_message_json() keeps only (role, content), so the flag has to
+            # be read from the pre-format messages for direct engine callers.
+            is_partial = detect_and_strip_partial(messages)
+        # Tool and reasoning_content turns are appended verbatim by
+        # _format_messages_for_vlm_template(), so a residual key can survive
+        # formatting; the chat template must never see the non-standard field.
+        detect_and_strip_partial(formatted_messages)
+        # Prompt-only formats have no chat template. Like mlx-vlm
+        # apply_chat_template(), use the last rendered message as the prompt.
+        prompt_only = bool(formatted_messages) and all(
+            isinstance(message, str) for message in formatted_messages
+        )
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": not is_partial,
+        }
+        if is_partial:
+            template_kwargs["continue_final_message"] = True
+        if self._enable_thinking is not None:
+            template_kwargs["enable_thinking"] = self._enable_thinking
+        # Per-model/request kwargs override global defaults (e.g. enable_thinking,
+        # reasoning_effort).  This mirrors the text-only _apply_chat_template().
+        if tools:
+            template_kwargs["tools"] = tools
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+
+        template_target = self._chat_template_target(model_type)
+        if prompt_only:
+            prompt = formatted_messages[-1]
+        else:
+            try:
+                prompt = apply_chat_template_with_reasoning_effort_fallback(
+                    template_target,
+                    formatted_messages,
+                    template_kwargs,
+                    is_harmony=model_type == "gpt_oss",
+                )
+            except TypeError:
+                # Fallback: template doesn't support some kwargs
+                if chat_template_kwargs:
+                    for key in chat_template_kwargs:
+                        template_kwargs.pop(key, None)
+                template_kwargs.pop("enable_thinking", None)
+                prompt = template_target.apply_chat_template(
+                    formatted_messages, **template_kwargs
+                )
+            except ValueError as exc:
+                if not _is_missing_chat_template_error(exc):
+                    raise
+                # Processor/tokenizer has apply_chat_template but no chat_template
+                # set. Some OCR checkpoints (e.g. raw baidu/Unlimited-OCR) ship no
+                # chat template at all. mlx-vlm's get_chat_template handles this by
+                # rendering the messages into a plain prompt (the <image> tokens are
+                # already in the message content from get_message_json), preferring
+                # processor.chat_template -> processor.tokenizer.chat_template ->
+                # plain rendering, so it subsumes the tokenizer fallback too.
+                template_kwargs.pop("tokenize", None)
+                template_kwargs.pop("add_generation_prompt", None)
+                # get_chat_template() has no continue_final_message equivalent, so
+                # partial mode cannot be honoured on this fallback. Drop the kwarg
+                # and say so rather than passing it through as an unknown argument.
+                template_kwargs.pop("continue_final_message", None)
+                if is_partial:
+                    logger.warning(
+                        "Partial mode requested but %s exposes no chat template; "
+                        "mlx-vlm plain rendering always starts a new assistant "
+                        "turn, so the final message will not be continued.",
+                        self._model_name,
+                    )
+                prompt = get_chat_template(
+                    self._processor,
+                    formatted_messages,
+                    add_generation_prompt=True,
+                    **template_kwargs,
+                )
+
+        return prompt, image_message_ranges, formatted_messages, template_target
+
     def _video_cache_identity(self, video_hashes: list[str]) -> str:
         """Prefix-cache identity for a request's clips.
 
@@ -4121,7 +4261,6 @@ class VLMBatchedEngine(BaseEngine):
             - image_cache_key_start: Token index where media-aware keying begins
             - image_cache_key_ranges: Media boundaries with cumulative hashes
         """
-        from mlx_vlm.prompt_utils import apply_chat_template, get_chat_template
         from mlx_vlm.utils import load_audio as _load_audio
         from mlx_vlm.utils import prepare_inputs
 
@@ -4179,124 +4318,18 @@ class VLMBatchedEngine(BaseEngine):
                 f"Please use only 1 image."
             )
 
-        # Apply VLM-specific chat template with image placeholders.
-        # Build per-message placeholders in oMLX so image-bearing turns always
-        # receive image tokens, regardless of conversation history shape.
-        try:
-            formatted_messages, image_message_ranges = (
-                self._format_messages_for_vlm_template(
-                    messages,
-                    num_images=num_images,
-                    num_audios=num_audios,
-                    num_videos=num_videos,
-                )
-            )
-        except Exception as e:
-            # The upstream formatter has no video placeholders; falling back
-            # would send frames the prompt never references.
-            if num_videos:
-                raise
-            logger.debug(
-                "Falling back to mlx-vlm apply_chat_template for VLM formatting: %s",
-                e,
-            )
-            # Fallback to upstream formatter for unknown model/format edge cases.
-            formatted_messages = apply_chat_template(
-                self._processor,
-                self._vlm_model.config,
+        prompt, image_message_ranges, formatted_messages, template_target = (
+            self._render_vlm_prompt(
                 messages,
+                model_type=model_type,
                 num_images=num_images,
                 num_audios=num_audios,
-                return_messages=True,
+                num_videos=num_videos,
+                chat_template_kwargs=chat_template_kwargs,
+                tools=tools,
+                is_partial=is_partial,
             )
-            image_message_ranges = []
-            for idx, msg in enumerate(messages):
-                if not isinstance(msg, dict):
-                    continue
-                image_count = self._count_content_parts(
-                    msg.get("content"), {"image", "image_url", "input_image"}
-                )
-                if image_count > 0:
-                    image_message_ranges.append((idx, image_count))
-
-        if is_partial is None:
-            # get_message_json() keeps only (role, content), so the flag has to
-            # be read from the pre-format messages for direct engine callers.
-            is_partial = detect_and_strip_partial(messages)
-        # Tool and reasoning_content turns are appended verbatim by
-        # _format_messages_for_vlm_template(), so a residual key can survive
-        # formatting; the chat template must never see the non-standard field.
-        detect_and_strip_partial(formatted_messages)
-        # Prompt-only formats have no chat template. Like mlx-vlm
-        # apply_chat_template(), use the last rendered message as the prompt.
-        prompt_only = bool(formatted_messages) and all(
-            isinstance(message, str) for message in formatted_messages
         )
-        template_kwargs = {
-            "tokenize": False,
-            "add_generation_prompt": not is_partial,
-        }
-        if is_partial:
-            template_kwargs["continue_final_message"] = True
-        if self._enable_thinking is not None:
-            template_kwargs["enable_thinking"] = self._enable_thinking
-        # Per-model/request kwargs override global defaults (e.g. enable_thinking,
-        # reasoning_effort).  This mirrors the text-only _apply_chat_template().
-        if tools:
-            template_kwargs["tools"] = tools
-        if chat_template_kwargs:
-            template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
-
-        template_target = self._chat_template_target(model_type)
-        if prompt_only:
-            prompt = formatted_messages[-1]
-        else:
-            try:
-                prompt = apply_chat_template_with_reasoning_effort_fallback(
-                    template_target,
-                    formatted_messages,
-                    template_kwargs,
-                    is_harmony=model_type == "gpt_oss",
-                )
-            except TypeError:
-                # Fallback: template doesn't support some kwargs
-                if chat_template_kwargs:
-                    for key in chat_template_kwargs:
-                        template_kwargs.pop(key, None)
-                template_kwargs.pop("enable_thinking", None)
-                prompt = template_target.apply_chat_template(
-                    formatted_messages, **template_kwargs
-                )
-            except ValueError as exc:
-                if not _is_missing_chat_template_error(exc):
-                    raise
-                # Processor/tokenizer has apply_chat_template but no chat_template
-                # set. Some OCR checkpoints (e.g. raw baidu/Unlimited-OCR) ship no
-                # chat template at all. mlx-vlm's get_chat_template handles this by
-                # rendering the messages into a plain prompt (the <image> tokens are
-                # already in the message content from get_message_json), preferring
-                # processor.chat_template -> processor.tokenizer.chat_template ->
-                # plain rendering, so it subsumes the tokenizer fallback too.
-                template_kwargs.pop("tokenize", None)
-                template_kwargs.pop("add_generation_prompt", None)
-                # get_chat_template() has no continue_final_message equivalent, so
-                # partial mode cannot be honoured on this fallback. Drop the kwarg
-                # and say so rather than passing it through as an unknown argument.
-                template_kwargs.pop("continue_final_message", None)
-                if is_partial:
-                    logger.warning(
-                        "Partial mode requested but %s exposes no chat template; "
-                        "mlx-vlm plain rendering always starts a new assistant "
-                        "turn, so the final message will not be continued.",
-                        self._model_name,
-                    )
-                prompt = get_chat_template(
-                    self._processor,
-                    formatted_messages,
-                    add_generation_prompt=True,
-                    **template_kwargs,
-                )
 
         # Images with cached features and grids skip the image processor.
         fast_cached_features = None
