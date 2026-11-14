@@ -28,7 +28,6 @@ from mlx_vlm.turboquant import (
     TurboQuantPolarState,
     TurboQuantProdState,
     TurboQuantSplitState,
-    _allocate_state_like,
     _build_codec,
     _concat_state,
     _QuantizedStateProxy,
@@ -235,12 +234,84 @@ def _concat_state_batch(states):
     raise TypeError(f"Unsupported state type: {type(first)!r}")
 
 
-def _pad_state_left(state, pad_length: int):
-    """Prepend zeros along the token dimension (axis 2) of a state."""
-    if state is None or pad_length <= 0:
-        return state
-    pad = _allocate_state_like(state, pad_length)
-    return _concat_state(pad, state)
+# A quantized cache grows by copying its whole packed state into a larger
+# buffer, and the buffer it leaves has a size nothing else asks for. At the
+# stock 256-token step a 245K-token cache is copied on its first append after
+# a restore or a join and again every 256 tokens. Long caches therefore grow
+# by 1/64 of their length, and a cache built from stored or joined states
+# starts with that much room.
+_MIN_GROWTH_STEP = 256
+
+
+def _growth_step(tokens: int) -> int:
+    """Capacity step of a quantized cache that holds ``tokens``."""
+    return max(_MIN_GROWTH_STEP, (tokens >> 6) // _MIN_GROWTH_STEP * _MIN_GROWTH_STEP)
+
+
+def _spare_capacity(tokens: int) -> int:
+    """Token capacity for a state of ``tokens`` that is about to be appended to."""
+    step = _growth_step(tokens)
+    return (tokens // step + 2) * step
+
+
+def _state_rows(state) -> int:
+    """Batch rows of a packed state."""
+    first = state[0]
+    return int(first.shape[0]) if isinstance(first, mx.array) else _state_rows(first)
+
+
+def _allocate_state_rows(state, rows: int, capacity: int):
+    """Zero state shaped like ``state`` with ``rows`` rows and ``capacity`` tokens."""
+    fields = [
+        (
+            mx.zeros((rows, a.shape[1], capacity, *a.shape[3:]), dtype=a.dtype)
+            if isinstance(a, mx.array)
+            else _allocate_state_rows(a, rows, capacity)
+        )
+        for a in state
+    ]
+    return type(state)(*fields) if hasattr(state, "_fields") else tuple(fields)
+
+
+def _write_state_block(dst, src, row: int, start: int) -> None:
+    """Write ``src`` into ``dst`` at batch row ``row`` and token column ``start``.
+
+    Every leaf array of a packed state has the batch axis first and the token
+    axis third, so each takes the same row and column window.
+    """
+    for dst_field, src_field in zip(dst, src):
+        if isinstance(dst_field, mx.array):
+            rows, length = src_field.shape[0], src_field.shape[2]
+            dst_field[row : row + rows, :, start : start + length] = src_field
+        else:
+            _write_state_block(dst_field, src_field, row, start)
+
+
+def _place_states(reference, placements, rows: int, capacity: int):
+    """Build one state of ``rows`` x ``capacity`` from ``(state, row, start)``.
+
+    The states are written into one zero buffer, so nothing is padded or
+    concatenated on the way and the result has room to grow.
+    """
+    out = _allocate_state_rows(reference, rows, capacity)
+    for state, row, start in placements:
+        if state is not None:
+            _write_state_block(out, state, row, start)
+    return out
+
+
+def _join_state_token_axis(states, capacity: int):
+    """Concatenate states along the token axis into a buffer of ``capacity``."""
+    states = [
+        state._state if isinstance(state, _QuantizedStateProxy) else state
+        for state in states
+    ]
+    placements = []
+    start = 0
+    for state in states:
+        placements.append((state, 0, start))
+        start += _state_length(state)
+    return _place_states(states[0], placements, _state_rows(states[0]), capacity)
 
 
 def _roll_state(state, shifts, axis: int = 2):
@@ -289,16 +360,6 @@ def _roll_state(state, shifts, axis: int = 2):
             _roll_state(state.high, shifts, axis=axis),
         )
     raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
-
-
-def _empty_state_batch_like(state, batch_size: int):
-    """Allocate an empty token state with the requested batch size."""
-    if state is None:
-        return None
-    row = _filter_state(_allocate_state_like(state, 0), slice(0, 1))
-    if batch_size == 1:
-        return row
-    return _concat_state_batch([row] * batch_size)
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +419,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
     def _idx(self):
         # mlx-vlm uses this cursor for rollback and padded attention masks.
         return self.offset if isinstance(self.offset, int) else self._phys_end
+
+    @property
+    def cache_step(self):
+        # See _growth_step: every growth copies the whole batch state.
+        return _growth_step(_state_length(self.keys) if self.keys is not None else 0)
 
     def trim(self, n):
         position = self._idx
@@ -507,12 +573,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         min_left_pad = int(self.left_padding.min().item())
         if min_left_pad > 0:
             if self.keys is not None:
-                self.keys = _slice_state_range(
-                    self.keys, min_left_pad, self._phys_end
-                )
-                self.values = _slice_state_range(
-                    self.values, min_left_pad, self._phys_end
-                )
+                # Keep the spare columns past the written end: cutting them
+                # off makes the next token copy the whole state again.
+                capacity = _state_length(self.keys)
+                self.keys = _slice_state_range(self.keys, min_left_pad, capacity)
+                self.values = _slice_state_range(self.values, min_left_pad, capacity)
             self._phys_end -= min_left_pad
             self.left_padding = self.left_padding - min_left_pad
         self._cached_state = None
@@ -530,36 +595,46 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         other._ensure_array_offset()
         # Align on the WRITTEN ends: _state_length is step-allocated capacity,
         # and padding a joining row by capacity difference would bury its
-        # content behind unwritten columns. _pad_and_trim also slices each
-        # side down to its written end, normalizing any over-allocation.
+        # content behind unwritten columns. _trim also slices each side down
+        # to its written end, normalizing any over-allocation.
         s_idx = self._phys_end if self.keys is not None else 0
         o_idx = other._phys_end if other.keys is not None else 0
         max_idx = max(s_idx, o_idx)
         ref_keys = self.keys if self.keys is not None else other.keys
         ref_values = self.values if self.values is not None else other.values
 
-        def _pad_and_trim(c, idx):
-            batch_size = int(c.offset.shape[0])
+        def _trim(c, idx):
+            # Written part of each side; an empty side joins as zero rows.
             if c.keys is None:
-                if max_idx > 0 and ref_keys is not None:
-                    ks = _empty_state_batch_like(ref_keys, batch_size)
-                    vs = _empty_state_batch_like(ref_values, batch_size)
-                else:
-                    ks = None
-                    vs = None
-            else:
-                ks = _slice_state(c.keys, idx)
-                vs = _slice_state(c.values, idx)
-            left = max_idx - idx
-            if left > 0 and ks is not None:
-                ks = _pad_state_left(ks, left)
-                vs = _pad_state_left(vs, left)
-            return ks, vs, c.offset, c.left_padding + left
+                return None, None
+            return _slice_state(c.keys, idx), _slice_state(c.values, idx)
 
-        s_ks, s_vs, s_off, s_lp = _pad_and_trim(self, s_idx)
-        o_ks, o_vs, o_off, o_lp = _pad_and_trim(other, o_idx)
+        s_rows = int(self.offset.shape[0])
+        o_rows = int(other.offset.shape[0])
+        s_off, s_lp = self.offset, self.left_padding + (max_idx - s_idx)
+        o_off, o_lp = other.offset, other.left_padding + (max_idx - o_idx)
+        s_ks, s_vs = _trim(self, s_idx)
+        o_ks, o_vs = _trim(other, o_idx)
 
-        if s_ks is not None and o_ks is not None:
+        if max_idx > 0 and ref_keys is not None:
+            # Both sides go end-aligned into one buffer with room to grow,
+            # instead of a padded copy of the shorter side plus a batch concat.
+            capacity = _spare_capacity(max_idx)
+            rows = s_rows + o_rows
+            self.keys = _place_states(
+                ref_keys,
+                [(s_ks, 0, max_idx - s_idx), (o_ks, s_rows, max_idx - o_idx)],
+                rows,
+                capacity,
+            )
+            self.values = _place_states(
+                ref_values,
+                [(s_vs, 0, max_idx - s_idx), (o_vs, s_rows, max_idx - o_idx)],
+                rows,
+                capacity,
+            )
+        elif s_ks is not None and o_ks is not None:
+            # Nothing written on either side yet.
             self.keys = _concat_state_batch([s_ks, o_ks])
             self.values = _concat_state_batch([s_vs, o_vs])
         elif o_ks is not None:
@@ -653,28 +728,27 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 )
                 break
 
+        # Each request's state goes end-aligned into its row of one buffer
+        # with room to grow; an empty request leaves its row zero.
+        rows = 0
         for p, c in zip(padding, caches):
             ks, vs = c.state
             if ks is None:
                 if max_length > 0 and reference_key_state is not None:
-                    key_states.append(
-                        _allocate_state_like(reference_key_state, max_length)
-                    )
-                    value_states.append(
-                        _allocate_state_like(reference_value_state, max_length)
-                    )
+                    rows += 1
                 continue
             ks = ks._state if isinstance(ks, _QuantizedStateProxy) else ks
             vs = vs._state if isinstance(vs, _QuantizedStateProxy) else vs
-            if p > 0:
-                ks = _pad_state_left(ks, p)
-                vs = _pad_state_left(vs, p)
-            key_states.append(ks)
-            value_states.append(vs)
+            key_states.append((ks, rows, p))
+            value_states.append((vs, rows, p))
+            rows += _state_rows(ks)
 
-        if key_states:
-            batch.keys = _concat_state_batch(key_states)
-            batch.values = _concat_state_batch(value_states)
+        if rows:
+            capacity = _spare_capacity(max_length)
+            batch.keys = _place_states(reference_key_state, key_states, rows, capacity)
+            batch.values = _place_states(
+                reference_value_state, value_states, rows, capacity
+            )
             mx.eval(batch.keys, batch.values)
 
         batch.offset += max_length

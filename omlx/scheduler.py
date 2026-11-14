@@ -57,7 +57,11 @@ from .cache.deepseek_v41_delta import is_delta as is_deepseek_v41_delta
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
-from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
+from .cache.prefix_cache import (
+    _RESTORE_POOL_FLUSH_BYTES,
+    BlockAwarePrefixCache,
+    cachelist_pm_member_plan,
+)
 from .decode_activity import get_decode_activity
 from .exceptions import (
     InvalidRequestError,
@@ -1128,6 +1132,9 @@ def _extend_cache_layer(cache_a: Any, cache_b: Any) -> Any:
     return cache_a
 
 
+_JOIN_POOL_FLUSH_BYTES = _RESTORE_POOL_FLUSH_BYTES
+
+
 def _patched_merge_caches(caches):
     if not caches:
         return []
@@ -1143,7 +1150,40 @@ def _patched_merge_caches(caches):
                     f"{type(layer_cache)} does not yet support batching with history"
                 )
         return merged
-    return _original_merge_caches(caches)
+    # Merge one layer at a time and let go of each donor layer once its batch
+    # layer exists. The stock loop keeps every request's whole cache alive
+    # next to the batch it was copied into until the last layer is merged.
+    merged = []
+    # Indexed on purpose: zip and enumerate keep their last tuple, which
+    # would hold a donor layer for another iteration or two.
+    for i in range(len(caches[0])):
+        if not hasattr(caches[0][i], "merge"):
+            raise ValueError(
+                f"{type(caches[0][i])} does not yet support batching with history"
+            )
+        layer = caches[0][i].merge([c[i] for c in caches])
+        for c in caches:
+            if isinstance(c, list):
+                c[i] = None
+        _eval_cache_layer(layer)
+        merged.append(layer)
+    return merged
+
+
+def _eval_cache_layer(layer: Any) -> None:
+    """Materialize a merged or joined cache layer so its donors can be freed.
+
+    The donors' buffers have sizes the batch never asks for again, so they
+    would wait in the MLX pool until the next clear. The pool is cleared here
+    under the same size gate as a restore's.
+    """
+    try:
+        state = layer.state
+    except (AttributeError, NotImplementedError):
+        state = None
+    if state is not None:
+        mx.eval(state)
+    BlockAwarePrefixCache._flush_restore_pool_if_over(_JOIN_POOL_FLUSH_BYTES)
 
 
 def _patched_extend_cache(cache_a, cache_b):
@@ -1154,17 +1194,19 @@ def _patched_extend_cache(cache_a, cache_b):
     # Materialize one layer before joining the next; otherwise all old,
     # padded and joined banks coexist in the lazy graph. The donor is consumed.
     extended = []
-    for i, (ca, cb) in enumerate(zip(cache_a, cache_b)):
+    # Indexed on purpose: zip and enumerate keep their last tuple, which
+    # would hold a donor layer for another iteration or two.
+    for i in range(min(len(cache_a), len(cache_b))):
+        ca, cb = cache_a[i], cache_b[i]
         layer = _extend_cache_layer(ca, cb)
         if isinstance(cache_b, list):
             cache_b[i] = None
+        # A singleton layer was copied into a new batch layer. Drop the old
+        # one too, or it stays alive in the caller's list until the join ends.
+        if isinstance(cache_a, list) and layer is not ca:
+            cache_a[i] = None
         del ca, cb
-        try:
-            state = layer.state
-        except (AttributeError, NotImplementedError):
-            state = None
-        if state is not None:
-            mx.eval(state)
+        _eval_cache_layer(layer)
         extended.append(layer)
     return extended
 

@@ -18,7 +18,7 @@ from mlx_vlm.turboquant import (
     _unpack_lowbit,
 )
 
-from .turboquant_kv import BatchTurboQuantKVCache
+from .turboquant_kv import BatchTurboQuantKVCache, _growth_step
 from .utils.fatal import is_command_buffer_error
 
 logger = logging.getLogger(__name__)
@@ -1036,6 +1036,11 @@ class Affine4KVCache(TurboQuantKVCache):
             )
         super().__init__(bits=self.bits, seed=int(seed))
         self._key_dim = self._value_dim = 0
+
+    @property
+    def cache_step(self):
+        # Every growth copies the whole packed state (see _growth_step).
+        return _growth_step(_state_length(self.keys) if self.keys is not None else 0)
 
     @classmethod
     def _contiguous_packed_state(cls, state):
