@@ -23,8 +23,10 @@ nn = pytest.importorskip("mlx.nn")
 from omlx.engine.decision import _MODEL_CLASSES  # noqa: E402
 from omlx.model_discovery import decision_kind, detect_model_type  # noqa: E402
 from omlx.models.decision import (  # noqa: E402
+    DecisionBackbone,
     DecisionContextLengthError,
     DecisionRequestError,
+    has_vision_module,
 )
 from omlx.models.pplx_decider import (  # noqa: E402
     CONTEXT_END,
@@ -630,9 +632,14 @@ def test_locate_validate_rules():
     from omlx.models.pplx_decider import LocateAdapter
 
     validate = LocateAdapter.validate
-    assert validate(None, "state", {"q": {"type": "locate"}}, 0) == ["q"]
-    assert validate(None, "state", {"q": {"type": "locate", "instructions": "x"}}, 0) == ["x"]
-    assert validate(None, "state", {"q": {"type": "locate", "instructions": "  "}}, 0) == ["q"]
+    assert validate(None, "state", {"q": {"type": "locate"}}, 0) == [("q", LOCATE_CUTOFF)]
+    assert validate(None, "state", {"q": {"type": "locate", "instructions": "x"}}, 0) == [
+        ("x", LOCATE_CUTOFF)
+    ]
+    assert validate(None, "state", {"q": {"type": "locate", "instructions": "  "}}, 0) == [
+        ("q", LOCATE_CUTOFF)
+    ]
+    assert validate(None, "state", {"q": {"type": "locate", "cutoff": 0.65}}, 0) == [("q", 0.65)]
     with pytest.raises(DecisionRequestError, match="without images"):
         validate(None, "state", {"q": {"type": "locate"}}, 1)
     with pytest.raises(DecisionRequestError, match="nonempty text state"):
@@ -708,3 +715,40 @@ def test_locate_positions_restart_in_every_question_block():
 
     positions = LocateAdapter._positions(7, 3, [2, 2])[:, 0, :]
     assert positions.tolist() == [[0, 1, 2, 3, 4, 3, 4]] * 3
+
+
+# --------------------------------------------------------------------------
+# vision tower presence
+
+
+def test_has_vision_module_sees_a_dropped_tower():
+    """mlx-vlm sets a weightless top-level module to None; this must be seen."""
+    assert has_vision_module(None) is False
+    assert has_vision_module(nn.Linear(2, 2)) is False
+    for name in ("vision_tower", "visual", "vision_model", "vision_encoder"):
+        holder = nn.Linear(2, 2)
+        setattr(holder, name, nn.Linear(2, 2))
+        assert has_vision_module(holder) is True
+    dropped = nn.Linear(2, 2)
+    dropped.vision_tower = None
+    assert has_vision_module(dropped) is False
+
+
+def test_backbone_has_vision_needs_processor_and_tower():
+    """An image processor alone does not make a checkpoint multimodal.
+
+    mlx-vlm drops a module the checkpoint has no weights for, and the Qwen3.5
+    path reads ``self.vision_tower.patch_embed`` without a None guard, so
+    ``has_vision`` has to require the tower object too.
+    """
+    backbone = DecisionBackbone("nowhere")
+    assert backbone.has_vision is False
+    backbone.image_processor = object()
+    assert backbone.has_vision is False
+    backbone.model = nn.Linear(2, 2)
+    assert backbone.has_vision is False
+    backbone.model.vision_tower = nn.Linear(2, 2)
+    assert backbone.has_vision is True
+    backbone.image_processor = None
+    assert backbone.has_vision is False
+
