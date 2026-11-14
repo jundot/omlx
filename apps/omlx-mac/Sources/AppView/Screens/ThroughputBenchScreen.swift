@@ -55,7 +55,7 @@ struct ThroughputBenchScreen: View {
                                  comment: "Throughput Bench screen subtitle describing the measurement sweep")
             )
 
-            if let device = vm.device {
+            if !vm.externalEnabled, let device = vm.device {
                 DeviceChip(device: device)
             }
 
@@ -68,6 +68,11 @@ struct ThroughputBenchScreen: View {
                 promptLengths: $vm.promptLengths,
                 genLength: $vm.genLength,
                 batchSizes: $vm.batchSizes,
+                forceLmEngine: $vm.forceLmEngine,
+                externalEnabled: $vm.externalEnabled,
+                externalBaseUrl: $vm.externalBaseUrl,
+                externalApiKey: $vm.externalApiKey,
+                externalModel: $vm.externalModel,
                 running: vm.running,
                 canRun: vm.canRun,
                 pendingFlags: vm.pendingFeatureFlags,
@@ -82,6 +87,14 @@ struct ThroughputBenchScreen: View {
             }
 
             MessageBanner(error: vm.lastError)
+
+            if let description = vm.runDescription {
+                Text(description)
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 14)
+            }
 
             if !vm.singleResults.isEmpty {
                 SingleResultsTable(results: vm.singleResults)
@@ -166,12 +179,18 @@ private struct ConfigurationSection: View {
     @Binding var promptLengths: Set<Int>
     @Binding var genLength: String
     @Binding var batchSizes: Set<Int>
+    @Binding var forceLmEngine: Bool
+    @Binding var externalEnabled: Bool
+    @Binding var externalBaseUrl: String
+    @Binding var externalApiKey: String
+    @Binding var externalModel: String
     let running: Bool
     let canRun: Bool
     let pendingFlags: [String]
     let onRun: () -> Void
     let onCancel: () -> Void
 
+    @State private var advancedOpen = false
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -200,8 +219,11 @@ private struct ConfigurationSection: View {
                     width: .controlWide,
                     options: modelOptions
                 )
+                .disabled(running || externalEnabled)
             }
-            GPUPowerBenchNotice(model: models.first { $0.id == selectedModelId })
+            if !externalEnabled {
+                GPUPowerBenchNotice(model: models.first { $0.id == selectedModelId })
+            }
 
             Row(label: String(localized: "bench.throughput.row.context.label",
                               defaultValue: "Benchmark Context",
@@ -222,7 +244,7 @@ private struct ConfigurationSection: View {
             Row(label: String(localized: "bench.throughput.row.warmup.label",
                               defaultValue: "Warm-up",
                               comment: "Row label for the throughput benchmark warm-up mode"),
-                sublabel: String(localized: "bench.throughput.row.warmup.sub",
+                sublabel: externalEnabled ? nil : String(localized: "bench.throughput.row.warmup.sub",
                                  defaultValue: "The full block compiles and exercises the 2,048-token ANE prefill path before timing starts.",
                                  comment: "Explanation of the throughput benchmark warm-up options")) {
                 Segmented(selection: $warmupMode, options: [
@@ -272,6 +294,7 @@ private struct ConfigurationSection: View {
                     mono: true,
                     width: .controlCompact
                 )
+                .disabled(running)
             }
 
             Row(label: String(localized: "bench.throughput.row.batch_sizes.title",
@@ -285,6 +308,65 @@ private struct ConfigurationSection: View {
                     selection: $batchSizes,
                     format: { "\($0)" }
                 )
+                .disabled(running)
+            }
+
+            FreeRow {
+                DisclosureGroup(isExpanded: $advancedOpen) {
+                    VStack(spacing: 0) {
+                        Row(label: String(localized: "bench.throughput.advanced.force_lm",
+                                          defaultValue: "Force mlx-lm engine",
+                                          comment: "Throughput benchmark option to force the LM engine"),
+                            sublabel: String(localized: "bench.throughput.advanced.force_lm_hint",
+                                             defaultValue: "Use mlx-lm for this benchmark. VLM MTP drafters are ignored, so results measure the LM-only baseline.",
+                                             comment: "Explanation of the force mlx-lm benchmark option")) {
+                            RowSwitch(isOn: $forceLmEngine)
+                                .disabled(externalEnabled)
+                                .accessibilityLabel(String(localized: "bench.throughput.advanced.force_lm"))
+                        }
+                        Row(label: String(localized: "bench.throughput.advanced.external",
+                                          defaultValue: "Use external OpenAI-compatible endpoint",
+                                          comment: "Throughput benchmark option to target an external API"),
+                            sublabel: String(localized: "bench.throughput.advanced.external_hint",
+                                             defaultValue: "Benchmark a remote model. The endpoint must support streamed token usage. Results stay local.",
+                                             comment: "Requirements and upload behavior for external throughput benchmarks"),
+                            isLast: !externalEnabled) {
+                            RowSwitch(isOn: $externalEnabled)
+                                .accessibilityLabel(String(localized: "bench.throughput.advanced.external"))
+                        }
+                        if externalEnabled {
+                            Row(label: String(localized: "bench.throughput.advanced.base_url",
+                                              defaultValue: "Base URL",
+                                              comment: "External benchmark API base URL field label")) {
+                                TextInput("bench.throughput.advanced.base_url", text: $externalBaseUrl,
+                                          placeholder: "https://api.openai.com/v1", width: .controlWide)
+                            }
+                            Row(label: String(localized: "bench.throughput.advanced.api_key",
+                                              defaultValue: "API key",
+                                              comment: "External benchmark API key field label")) {
+                                TextInput("bench.throughput.advanced.api_key", text: $externalApiKey,
+                                          placeholder: String(localized: "bench.throughput.advanced.optional",
+                                                              defaultValue: "Optional",
+                                                              comment: "Placeholder for the optional external benchmark API key"),
+                                          isSecure: true, width: .controlWide)
+                            }
+                            Row(label: String(localized: "bench.throughput.advanced.model",
+                                              defaultValue: "Model ID",
+                                              comment: "External benchmark model identifier field label"),
+                                isLast: true) {
+                                TextInput("bench.throughput.advanced.model", text: $externalModel,
+                                          placeholder: "gpt-4o-mini", width: .controlWide)
+                            }
+                        }
+                    }
+                    .padding(.top, 6)
+                } label: {
+                    Text(String(localized: "bench.throughput.advanced.title",
+                                defaultValue: "Advanced options",
+                                comment: "Disclosure label for advanced throughput benchmark options"))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                        .foregroundStyle(theme.text)
+                }
                 .disabled(running)
             }
 
@@ -925,9 +1007,7 @@ private struct OwnerHashRow: View {
     }
 }
 
-/// Kept for the external-endpoint case, which still skips. Not reachable from
-/// this screen today (BenchStartRequest has no `external` field), but the
-/// server state exists and a silent EmptyView would be worse.
+/// External endpoint results measure remote hardware and are not uploaded.
 private struct SkippedBanner: View {
     let reason: String?
 
