@@ -5582,8 +5582,11 @@
             },
 
             // The server starts the next queued run once this one has finished.
+            // A finished run keeps its queue task busy while it uploads, and the
+            // upload can outlast the run by a while, so wait as long as entries
+            // are still waiting (two minutes at 500 ms is the safety net).
             async _benchFollowQueue() {
-                for (let i = 0; i < 20; i++) {
+                for (let i = 0; i < 240; i++) {
                     await new Promise(r => setTimeout(r, 500));
                     let data;
                     try {

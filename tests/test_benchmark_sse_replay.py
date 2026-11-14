@@ -494,6 +494,109 @@ class TestConcurrentStartQueueing:
         assert ran == ["model-a", "model-b"]
         assert get_queue() == []
 
+    @pytest.mark.asyncio
+    async def test_queue_drains_when_a_run_raises(self, bench_client, monkeypatch):
+        from omlx.admin import benchmark as bench_module
+
+        ran = []
+
+        async def _fake_run(run, pool):
+            ran.append(run.request.model_id)
+            if run.request.model_id == "model-a":
+                raise RuntimeError("engine exploded")
+            run.status = "completed"
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _fake_run)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+        )
+        await bench_module.run_queue(first, None)
+        # A failing run is reported on that run, and the next one still runs.
+        assert ran == ["model-a", "model-b"]
+        assert first.error_message == "engine exploded"
+        assert get_queue() == []
+
+    @pytest.mark.asyncio
+    async def test_queue_drops_idle_power_cap_per_promoted_run(
+        self, bench_client, monkeypatch
+    ):
+        from omlx.admin import benchmark as bench_module
+
+        drops = []
+
+        async def _fake_run(run, pool):
+            run.status = "completed"
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _fake_run)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-c", prompt_lengths=[1024])
+        )
+        # The caller drops the cap for the first run itself; the queue has to
+        # do it for every run it promotes.
+        await bench_module.run_queue(first, None, on_start=lambda: drops.append(1))
+        assert drops == [1, 1]
+        assert get_queue() == []
+
+    @pytest.mark.asyncio
+    async def test_queue_still_runs_what_arrived_after_a_cancel(
+        self, bench_client, monkeypatch
+    ):
+        from omlx.admin import benchmark as bench_module
+
+        ran = []
+
+        async def _fake_run(run, pool):
+            ran.append(run.request.model_id)
+            if run.request.model_id == "model-a":
+                # Mirrors the cancel route: the run is cancelled and the
+                # queue cleared, then the user queues another request
+                # before the task gets to exit.
+                run.status = "cancelled"
+                bench_module.clear_queue()
+                bench_module.add_to_queue(
+                    BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+                )
+                return
+            run.status = "completed"
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _fake_run)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        await bench_module.run_queue(first, None)
+        assert ran == ["model-a", "model-b"]
+        assert get_queue() == []
+
+    @pytest.mark.asyncio
+    async def test_queue_is_not_left_waiting_without_a_task(
+        self, bench_client, monkeypatch
+    ):
+        from omlx.admin import benchmark as bench_module
+
+        async def _never_finishes(run, pool):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _never_finishes)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+        )
+        # Cancelling the queue task must not leave entries that nothing runs.
+        with pytest.raises(asyncio.CancelledError):
+            await bench_module.run_queue(first, None)
+        assert get_queue() == []
+
     def test_start_allowed_when_previous_completed(self, bench_client, monkeypatch):
         # A completed prior run must not block a fresh start.
         finished = BenchmarkRun(

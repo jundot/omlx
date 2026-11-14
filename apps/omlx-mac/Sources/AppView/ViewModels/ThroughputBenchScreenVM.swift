@@ -354,8 +354,22 @@ final class ThroughputBenchScreenVM {
                     self.pollResults(client: client)
                     return
                 }
-                self.queuedAhead = Self.position(of: queueId, in: active.queue)
-                    ?? self.queuedAhead
+                guard let ahead = Self.position(of: queueId, in: active.queue) else {
+                    // The entry is gone without ever running — removed from
+                    // the web UI, or lost with a server restart. Stop waiting
+                    // instead of polling forever and cancelling by a stale
+                    // index.
+                    self.pendingQueueId = nil
+                    self.queuedAhead = nil
+                    self.running = false
+                    self.lastError = String(
+                        localized: "bench.throughput.error.queue_removed",
+                        defaultValue: "The queued run is no longer in the server queue.",
+                        comment: "Throughput Bench error when a queued run disappears from the server queue"
+                    )
+                    return
+                }
+                self.queuedAhead = ahead
             }
         }
     }

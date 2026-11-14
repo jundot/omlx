@@ -9817,7 +9817,11 @@ async def start_benchmark(
     total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes) * 2
 
     _drop_idle_gpu_power_cap()
-    run.task = asyncio.create_task(run_queue(run, engine_pool))
+    # Queued runs start inside the previous run's release delay, so the
+    # queue gets the same power-cap drop as a direct start.
+    run.task = asyncio.create_task(
+        run_queue(run, engine_pool, on_start=_drop_idle_gpu_power_cap)
+    )
     bench_module._queue_task = run.task
 
     logger.info(

@@ -12,6 +12,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
@@ -681,16 +682,43 @@ def get_queue() -> list[dict]:
     ]
 
 
-async def run_queue(run: BenchmarkRun, engine_pool: Any) -> None:
-    """Run `run`, then each queued request in turn, stopping on cancel."""
-    while True:
-        await run_benchmark(run, engine_pool)
-        if run.status == "cancelled" or not _queue:
-            return
-        cleanup_old_runs()
-        queue_id, request = _queue.pop(0)
-        run = create_run(request, queue_id=queue_id)
-        run.task = asyncio.current_task()
+async def run_queue(
+    run: BenchmarkRun,
+    engine_pool: Any,
+    on_start: Callable[[], None] | None = None,
+) -> None:
+    """Run `run`, then each queued request in turn until the queue is empty.
+
+    Cancel stops the chain by clearing the queue, so the queue itself is
+    the end condition: a request queued after a cancel still runs instead
+    of dying with the task.
+
+    `on_start` runs before each request the queue promotes, because a
+    promoted run begins inside the previous run's release delay (the
+    caller uses it to drop a GPU power cap left over from the last run).
+    """
+    try:
+        while True:
+            try:
+                await run_benchmark(run, engine_pool)
+            except Exception as e:  # noqa: BLE001
+                # One failing run must not strand the rest of the queue.
+                logger.error(
+                    f"Benchmark queue: run {run.bench_id} raised: {e}", exc_info=True
+                )
+                run.status = "error"
+                run.error_message = str(e)
+            if not _queue:
+                return
+            cleanup_old_runs()
+            queue_id, request = _queue.pop(0)
+            run = create_run(request, queue_id=queue_id)
+            run.task = asyncio.current_task()
+            if on_start is not None:
+                on_start()
+    finally:
+        # Nothing may stay queued once the task that would run it is gone.
+        _queue.clear()
 
 
 # Bundled corpora for benchmark prompts. They contain long-form code or prose,
