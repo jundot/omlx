@@ -24,6 +24,7 @@ from .planner import (
     PipelineAssignment,
     normalize_memory_guard_tier,
     normalize_node_role,
+    tensor_split_from_dict,
 )
 from .rdma.stage_plan import StageLink, validate_stage_links
 
@@ -314,6 +315,9 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             kv_cache_bytes=int(payload.get("kv_cache_bytes", 0)),
             kv_bytes_per_token=int(payload.get("kv_bytes_per_token", 0)),
             max_context_tokens=int(payload.get("max_context_tokens", 0)),
+            tensor_parallel_split=tensor_split_from_dict(
+                payload.get("tensor_parallel_split")
+            ),
             **predicted,
         )
     except (TypeError, ValueError) as exc:

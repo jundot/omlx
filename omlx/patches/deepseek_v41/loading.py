@@ -55,8 +55,15 @@ _TENSOR_ROWS = ("attn.wq_b", "attn.wo_a", "experts.w1", "experts.w3")
 _TENSOR_COLUMNS = ("attn.wo_b", "experts.w2")
 
 
-def tensor_slice(key, value, rank, size):
-    """This rank's part of checkpoint tensor ``key``."""
+_EXPERT_PROJECTIONS = ("experts.w1", "experts.w2", "experts.w3")
+
+
+def tensor_slice(key, value, rank, size, split=None):
+    """This rank's part of checkpoint tensor ``key``.
+
+    ``split`` (a ``TensorSplit``) gives each rank its own share of the
+    attention and expert axes instead of an equal one.
+    """
     module = key.rpartition(".")[0]
     if key.endswith("attn.attn_sink"):
         axis = 0
@@ -66,7 +73,13 @@ def tensor_slice(key, value, rank, size):
         axis = -1
     else:
         return value
-    return mx.contiguous(mx.split(value, size, axis=axis)[rank])
+    if split is None:
+        return mx.contiguous(mx.split(value, size, axis=axis)[rank])
+    kind = "experts" if module.endswith(_EXPERT_PROJECTIONS) else "attention"
+    start, end = split.bounds(kind, rank, value.shape[axis])
+    view = [slice(None)] * value.ndim
+    view[axis] = slice(start, end)
+    return mx.contiguous(value[tuple(view)])
 
 
 def set_module(model, path, module):
@@ -94,6 +107,7 @@ def load(
     stage=None,
     tensor=None,
     mtp_head=False,
+    tensor_split=None,
 ):
     """Load a converted or source checkpoint.
 
@@ -102,7 +116,8 @@ def load(
     ``tensor`` (a distributed group) makes a tensor-parallel rank that reads
     only its slice of the split projections. ``mtp_head`` keeps the DSpark
     stages on the cluster rank that drafts; a tensor-parallel rank holds them
-    whole, since drafting runs there alone.
+    whole, since drafting runs there alone. ``tensor_split`` (a
+    ``TensorSplit``) gives the tensor-parallel ranks uneven shares.
     """
     path = Path(path)
     if (path / "conversion.inprogress.json").exists():
@@ -134,7 +149,9 @@ def load(
         config.preserve_mtp = bool(mtp_head and stage is not None)
         config.vision_n_layers = 0
     if tensor is not None:
-        config = config.tensor_shard(tensor.size())
+        config = config.tensor_shard(tensor.size(), tensor.rank(), tensor_split)
+    elif tensor_split is not None:
+        raise ValueError("A DeepSeek V4.1 tensor split needs a tensor-parallel group")
     if source_checkpoint and preserve_mtp is None:
         from ..mlx_lm_mtp import is_mtp_active
 
@@ -316,7 +333,11 @@ def load(
                                 value
                                 if key.startswith("language_model.mtp.")
                                 else tensor_slice(
-                                    key, value, tensor.rank(), tensor.size()
+                                    key,
+                                    value,
+                                    tensor.rank(),
+                                    tensor.size(),
+                                    tensor_split,
                                 )
                             )
                             for key, value in values.items()

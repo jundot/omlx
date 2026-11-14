@@ -45,7 +45,7 @@ from .pipeline_compat import (
     install_pipeline_compatibility,
     pipeline_assignment_is_honored,
 )
-from .planner import PipelineAssignment
+from .planner import PipelineAssignment, tensor_split_to_dict
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
 from .rdma.stage_transport import install_stage_links
@@ -717,20 +717,27 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
     )
 
 
-def _tensor_shard_options(execution: ExecutionSettings) -> dict[str, Any]:
-    """Prefill paths DeepSeek V4.1's tensor-parallel loader builds a rank with.
+def _tensor_shard_options(
+    execution: ExecutionSettings, assignment: Any = None
+) -> dict[str, Any]:
+    """Options DeepSeek V4.1's tensor-parallel loader builds a rank with.
 
-    The coordinator turns them on only for that model, so other model-owned
-    loaders get no options.
+    The coordinator turns the prefill paths on only for that model, and only
+    its planner produces an uneven split, so other model-owned loaders get no
+    options.
     """
 
-    if not (execution.ced_prefill or execution.a8_prefill):
-        return {}
-    return {
-        "ced_prefill": execution.ced_prefill,
-        "a8_prefill": execution.a8_prefill,
-        "a8_prefill_min_tokens": execution.a8_prefill_min_tokens,
-    }
+    options: dict[str, Any] = {}
+    if execution.ced_prefill or execution.a8_prefill:
+        options.update(
+            ced_prefill=execution.ced_prefill,
+            a8_prefill=execution.a8_prefill,
+            a8_prefill_min_tokens=execution.a8_prefill_min_tokens,
+        )
+    split = getattr(assignment, "tensor_parallel_split", ())
+    if split:
+        options["tensor_split"] = tensor_split_to_dict(split)
+    return options
 
 
 def _prompt_cache_ssd_dir(
@@ -1617,7 +1624,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         },
                     ),
                     engram_ssd_offload=assignment.ssd_weight_bytes > 0,
-                    tensor_shard_options=_tensor_shard_options(execution),
+                    tensor_shard_options=_tensor_shard_options(execution, assignment),
                 ),
             ):
                 provider.load_default()
