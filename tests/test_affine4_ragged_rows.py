@@ -187,3 +187,21 @@ def test_affine8_batch_cache_trims_rows_without_moving_state():
     assert batch._row_ends is None
     got = batch.extract(1).state
     assert mx.array_equal(got[1].norms, references[0].state[1].norms).item()
+
+
+def test_mixed_ragged_and_plain_kv_takes_the_vector_rollback():
+    """A prompt cache that mixes ragged-trim caches with a plain batch KV cache
+    (turboquant_skip_last: the last attention layer stays unquantized) is a
+    mixed batch wherever the plain layer sits. It takes the vector rollback and
+    is realigned after it (tests/test_mixed_batch_rollback.py)."""
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache
+
+    quantized = BatchAffine8KVCache([0, 0])
+    plain = BatchKVCache([0, 0])
+    recurrent = ArraysCache(2)
+    assert fused_batch._supports_batch_rollback_all([recurrent, quantized, quantized])
+    assert fused_batch._supports_batch_rollback_all([recurrent, plain, plain])
+    assert fused_batch._supports_batch_rollback_all([recurrent, quantized, plain])
+    assert fused_batch._ragged_mixed_with_plain_kv([recurrent, quantized, plain])
+    assert fused_batch._ragged_mixed_with_plain_kv([quantized, plain, quantized])
+    assert not fused_batch._ragged_mixed_with_plain_kv([recurrent, quantized])

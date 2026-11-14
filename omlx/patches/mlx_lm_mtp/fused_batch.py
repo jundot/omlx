@@ -44,6 +44,67 @@ def _supports_batch_rollback(cache):
     )
 
 
+def _cache_leaves(caches):
+    """Leaf caches of a prompt cache list (CacheList parts flattened)."""
+    leaves, stack = [], list(caches)
+    while stack:
+        entry = stack.pop()
+        if entry is None:
+            continue
+        subs = getattr(entry, "caches", None)
+        if subs is not None:
+            stack.extend(subs)
+        else:
+            leaves.append(entry)
+    return leaves
+
+
+def _ragged_mixed_with_plain_kv(caches):
+    """Whether ``caches`` mixes ragged-trim caches with a plain batch KV cache.
+
+    Ragged-trim caches keep each row at its own end, while a plain batch KV
+    cache is trimmed by the model's rollback (a uniform trim and a right-pad
+    roll that ends every row at ``_idx``). The model builds one attention mask
+    for all its attention layers, so the two kinds must not keep different
+    layouts. That happens when a model quantizes all but its last attention
+    layer (``turboquant_skip_last``, on by default).
+    """
+    leaves = _cache_leaves(caches)
+    ragged = any(getattr(type(c), "_omlx_ragged_trim", False) for c in leaves)
+    plain_kv = any(
+        type(c) is BatchKVCache
+        or (vlm_cache is not None and type(c) is vlm_cache.BatchKVCache)
+        for c in leaves
+    )
+    return ragged and plain_kv
+
+
+def _supports_batch_rollback_all(caches):
+    """Whether one vector rollback can roll back every layer of ``caches``."""
+    return all(_supports_batch_rollback(c) for c in caches)
+
+
+def _align_mixed_rows(caches):
+    """End every row at the last column again, in every attention layer.
+
+    After a ragged rollback of a mixed batch the quantized layers keep each
+    row at its own end and the plain layers are rolled (or keep a deferred
+    tail). Rolling the quantized rows too, one layer at a time, gives every
+    layer the layout the model's single mask describes, without the deepcopy
+    of the whole batch cache the scalar rollback makes.
+    """
+    deferred = None
+    for leaf in _cache_leaves(caches):
+        if getattr(type(leaf), "_omlx_ragged_trim", False):
+            align = getattr(leaf, "_align_row_ends", None)
+            if callable(align):
+                align()
+        elif getattr(leaf, "__dict__", {}).get("_omlx_tail"):
+            if deferred is None:
+                from .. import qwen35_deferred_realign as deferred
+            deferred.realign(leaf)
+
+
 @contextlib.contextmanager
 def _ragged_trim_rows(cache, accepted, depth):
     """Roll back ragged-trim batch caches per row, outside the model's rollback.
@@ -55,19 +116,12 @@ def _ragged_trim_rows(cache, accepted, depth):
     mlx-vlm's append-cache trim (a uniform trim or a right-pad roll of the
     whole cache) skips them.
     """
-    leaves = []
-    stack = list(cache)
-    while stack:
-        entry = stack.pop()
-        if entry is None:
-            continue
-        subs = getattr(entry, "caches", None)
-        if subs is not None:
-            stack.extend(subs)
-        elif getattr(type(entry), "_omlx_ragged_trim", False) and not getattr(
-            entry, "is_speculating", False
-        ):
-            leaves.append(entry)
+    leaves = [
+        entry
+        for entry in _cache_leaves(cache)
+        if getattr(type(entry), "_omlx_ragged_trim", False)
+        and not getattr(entry, "is_speculating", False)
+    ]
     drops = [max(0, int(depth) - int(a)) for a in accepted]
     for entry in leaves:
         entry.trim_rows(drops)
@@ -314,7 +368,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     vector_rollback = isinstance(gdn, SpeculativeCacheTransaction) or (
         whole_batch
         and gdn is not None
-        and all(_supports_batch_rollback(layer) for layer in cache)
+        and _supports_batch_rollback_all(cache)
         and any(
             getattr(host, "_omlx_mtp_batch_rollback", False)
             for host in (batch.model, getattr(batch.model, "_language_model", None))
@@ -379,6 +433,8 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         accepted_rows = [accepted for accepted, _ in deferred]
         with _ragged_trim_rows(cache, accepted_rows, depth):
             batch.model.rollback_speculative_cache(cache, gdn, accepted_rows, depth + 1)
+        if _ragged_mixed_with_plain_kv(cache):
+            _align_mixed_rows(cache)
         commit_ms = (time.perf_counter() - started) * 1000 / len(rows)
         for (index, row, _), (_, finish) in zip(rows, deferred):
             bg._set_singleton_mrope_delta(row)

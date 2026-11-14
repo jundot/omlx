@@ -1352,7 +1352,7 @@ def _initial_batch_forward(gen_batch):
     copies the whole KV bank at each activation, join, finish and unpark.
     Rows still sample in order from their own logits, as on that fallback.
     """
-    from .fused_batch import _supports_batch_rollback
+    from .fused_batch import _supports_batch_rollback_all
 
     host = getattr(gen_batch.model, "_language_model", None)
     chain, _, head_clone = _resolve_mtp_chain_depth(gen_batch.model)
@@ -1362,7 +1362,7 @@ def _initial_batch_forward(gen_batch):
         and not head_clone
         and getattr(host, "_omlx_mtp_batch_rollback", False)
         and gen_batch._next_tokens is not None
-        and all(_supports_batch_rollback(c) for c in gen_batch.prompt_cache)
+        and _supports_batch_rollback_all(gen_batch.prompt_cache)
         and not any(
             _row_value(gen_batch.logits_processors, i)
             for i in range(len(gen_batch.uids))
