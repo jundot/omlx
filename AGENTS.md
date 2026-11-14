@@ -44,8 +44,14 @@ If a task appears to require changing one of these, stop and ask for an explicit
 
 ## 2. Repository baseline
 
-- Base: oMLX `1e27576af5e10c8f4459e0fdcb05c5cf59245d44` (tag `cluster-assistant-base-2026-11-07`)
-- Branch: `feat/cluster-assistant`
+- Upstream base: `upstream/main` `624cff0e` (rebased 2026-11-14; `upstream/main` is
+  an ancestor of HEAD).
+- Branch: **`rebase/upstream-main`** — current working branch, the fork replayed
+  onto `upstream/main`. Pre-rebase history is kept untouched on
+  `feat/cluster-assistant` (`28245931`) and `backup/pre-rebase-2026-11-14`.
+- Historical base: oMLX `1e27576af5e10c8f4459e0fdcb05c5cf59245d44` (tag
+  `cluster-assistant-base-2026-11-07`). It is no longer the pin; see
+  `docs/cluster-assistant/REBASE-2026-11-14.md`.
 - Origin: <https://github.com/digitalfactory-ako/omlx>
 - Upstream: <https://github.com/jundot/omlx>
 - Patch/PR status: `docs/cluster-assistant/UPSTREAM.md`
@@ -665,7 +671,7 @@ the answer here.
 | Decision | Recorded answer |
 |---|---|
 | Product/repo name | **oMLX Cluster Assistant** (oMLX brand, feature name). |
-| Fork / upstream / pin | **Focused fork.** The new pin is `1e27576a` (`cluster-assistant-base`, tag `cluster-assistant-base-2026-11-07`): #5024 + #5033 + rank-0-over-SSH + launch reliability + the MoE fit hint. Do not rebase again without a decision. |
+| Fork / upstream / pin | **Focused fork, now on `upstream/main` `624cff0e`** (rebased 2026-11-14, branch `rebase/upstream-main`; `feat/cluster-assistant` and `backup/pre-rebase-2026-11-14` keep the pre-rebase tree). Our net work from the old pin `1e27576a` was squash-reapplied. Upstream removed routed-expert (MoE) offload from the planner; it is restored on top of upstream's refactored pipeline so the assistant MoE lever and the context-vs-experts tradeoff work (`()` default reproduces upstream). Dropped with upstream: `qwen4_exp_mlx_lm`, qwen4 cluster/pipeline tests, experimental doc. The coordinator-side MoE threading (`routes.py`/`deployment.py`) is the one documented follow-up. See `REBASE-2026-11-14.md`. Tests: `tests/` 19863 passed, `apps/omlx-web/tests` 559 passed, macOS `xcodebuild test … -testLanguage en`. |
 | Rank-0 rule | Best feasible plan; free admission is a strong preference, not the only criterion (already frozen). |
 | Coordinator / rank 0 | Co-located in the MVP (already frozen). |
 | RDMA default | **Ring over TCP only**; RDMA/JACCL is the later advanced path. |

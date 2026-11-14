@@ -1,8 +1,40 @@
 # Upstream and patch status
 
-Status date: 2026-11-13
+Status date: 2026-11-14
 
-New project base: `1e27576af5e10c8f4459e0fdcb05c5cf59245d44`
+## 2026-11-14: rebased onto `upstream/main`
+
+The fork is now based on `upstream/main` `624cff0e` (branch
+`rebase/upstream-main`); `upstream/main` is an ancestor of HEAD. The pre-rebase
+tree is untouched on `feat/cluster-assistant` (`28245931`) and
+`backup/pre-rebase-2026-11-14`. Our net work from the old pin
+`1e27576a..feat/cluster-assistant` was squash-reapplied (not a 154/158-commit
+replay), so it can still be curated into upstream packages.
+
+What the rebase changed in the fork:
+
+- Upstream **removed routed-expert (MoE) offload from the planner**. It is
+  restored on top of upstream's refactored pipeline (`plan_hybrid` /
+  `plan_unequal_pipeline` / `_finish_pipeline_plan` / `_held_layer_bytes` +
+  `PipelineAssignment` fields); a `()` default reproduces upstream exactly. The
+  coordinator-side threading is the one documented follow-up.
+- Upstream **added the Qwen4 PLE switch path**; `_saved_engram_ssd_offload`
+  honours Engram or PLE (table-offload parity restored).
+- Upstream **refactored the cluster wizard** device model; the merged
+  `cluster_v2.js` keeps the assistant UI and ports the upstream helper stages
+  (`splitDevices`, `deviceHelperOnly`, `pairingStepOne`, CUDA guide, helper-aware
+  `restoreAccelerator`/`planNodes`/`inventoryHosts`/`versionMismatches`/
+  `acceleratorRows`).
+- `Localizable.xcstrings` is **upstream-preferred** (upstream base + feat-only
+  keys) so the compiled catalogue stays complete.
+- **Dropped** (upstream removed them): `qwen4_exp_mlx_lm` adapter, `qwen4`
+  cluster/pipeline tests, the experimental doc.
+
+Local evidence and the full conflict list: `REBASE-2026-11-14.md`.
+
+## Pre-rebase status (2026-11-13)
+
+Historical base: `1e27576af5e10c8f4459e0fdcb05c5cf59245d44`
 (tag `cluster-assistant-base-2026-11-07`)
 
 The project pin is unchanged. Only the PR branch was rebased on 2026-11-12:
