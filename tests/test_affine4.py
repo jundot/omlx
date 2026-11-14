@@ -663,3 +663,23 @@ def test_bounded_prefill_peak_memory():
     temporary = mx.get_peak_memory() - baseline
     assert temporary < 600 * 1024**2, f"Prefill allocated {temporary / 1024**2:.1f} MiB"
     assert mx.all(mx.isfinite(output)).item()
+
+
+def test_attention_blocks_wide_dim_split(monkeypatch):
+    """Head dims of 256 split long caches wider on GPUs of up to 20 cores:
+    affine8 from 48K tokens, affine4 from 128K."""
+    blocks = affine4._attention_blocks
+    # A larger GPU keeps the stock 168-group target.
+    monkeypatch.setattr(affine4, "_wide_split_gpu", lambda: False)
+    assert blocks(245_000, 4, 256, 8) == 42
+    assert blocks(245_000, 4, 256, 4) == 42
+    monkeypatch.setattr(affine4, "_wide_split_gpu", lambda: True)
+    # dim 128 keeps the stock 168-group target.
+    assert blocks(245_000, 4, 128, 8) == 42
+    assert blocks(245_000, 4, 256, 8) == 168
+    assert blocks(245_000, 4, 256, 4) == 84
+    assert blocks(64_000, 4, 256, 4) == 42
+    assert blocks(64_000, 4, 256, 8) == 168
+    assert blocks(32_000, 4, 256, 8) == 42
+    # Never more blocks than 64-token tiles.
+    assert blocks(1_000, 4, 256, 8) == (1_000 + 63) // 64

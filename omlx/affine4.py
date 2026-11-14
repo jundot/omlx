@@ -20,6 +20,7 @@ from mlx_vlm.turboquant import (
 
 from .turboquant_kv import BatchTurboQuantKVCache
 from .utils.fatal import is_command_buffer_error
+from .utils.hardware import get_gpu_core_count
 
 logger = logging.getLogger(__name__)
 
@@ -764,9 +765,38 @@ def _padded_rows(active_rows: int) -> int:
     return max(8, ((active_rows + 7) // 8) * 8)
 
 
-def _attention_blocks(tokens: int, kv_heads: int, dim: int) -> int:
+# Split-K target (threadgroups over all KV heads) for head dims of 256 and up:
+# each 64-token tile carries 2x the bytes and FLOPs of dim 128, so a wider
+# split keeps more cores busy. Measured at Qwen3.8-27B geometry (4 KV heads,
+# 6 query heads each), 245K tokens, M5 Pro: affine8 672 groups cuts widths
+# 1/3/5 from 2.49/5.31/4.54 to 2.27/4.76/3.89 ms per layer (128K gains,
+# 32K does not, hence the threshold); affine4 gains at long caches only
+# (336 groups from 128K tokens). An 80-core GPU (M5 Ultra) already runs the
+# stock split at full speed and loses about 3.5% decode with the wider one, so
+# it applies up to the 20 cores it was measured on.
+_WIDE_DIM = 256
+_WIDE_GROUPS_AFFINE8 = 672
+_WIDE_GROUPS_AFFINE4 = 336
+_WIDE_AFFINE8_MIN_TOKENS = 48 * 1024
+_WIDE_AFFINE4_MIN_TOKENS = 128 * 1024
+_WIDE_MAX_GPU_CORES = 20
+
+
+@cache
+def _wide_split_gpu() -> bool:
+    """Whether this GPU is in the class the wider split was measured on."""
+    cores = get_gpu_core_count()
+    return cores is not None and cores <= _WIDE_MAX_GPU_CORES
+
+
+def _attention_blocks(tokens: int, kv_heads: int, dim: int, bits: int = 0) -> int:
     token_tiles = (tokens + 63) // 64
     target_groups = 256 if dim <= 64 else 168
+    if dim >= _WIDE_DIM:
+        if bits == 8 and tokens >= _WIDE_AFFINE8_MIN_TOKENS and _wide_split_gpu():
+            target_groups = _WIDE_GROUPS_AFFINE8
+        elif bits == 4 and tokens >= _WIDE_AFFINE4_MIN_TOKENS and _wide_split_gpu():
+            target_groups = _WIDE_GROUPS_AFFINE4
     return min(token_tiles, max(1, (target_groups + kv_heads - 1) // kv_heads))
 
 
@@ -876,7 +906,7 @@ def _native_attention(
         return None
     valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
 
-    blocks = _attention_blocks(tokens, kv_heads, dim)
+    blocks = _attention_blocks(tokens, kv_heads, dim, cache.key_codec.bits)
     partition_tiles = ((tokens + 63) // 64 + blocks - 1) // blocks
     # Normalized probabilities are <= 1. Keep FP16 partials only when the
     # signed-code bound leaves headroom below 65,504.
