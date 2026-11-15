@@ -136,6 +136,72 @@ def test_a_failed_policy_write_fails_apply_with_one_action(api, monkeypatch) -> 
     assert body["error"]["action"] == "diagnostics"
 
 
+def test_the_approved_memory_guard_tier_is_written_on_every_selected_mac(
+    api, monkeypatch
+) -> None:
+    """The plan prices the tier, so apply must put the tier on the Macs.
+
+    A stage priced at `aggressive` met a launch preflight reading a guard still
+    at `balanced` and was refused by the reserve difference (rank 1: "needs
+    40.9 GiB but can admit 40.4 GiB right now") although the plan had been
+    applied cleanly. The tier write is Mac-wide, so it happens on every
+    selected Mac before staging, not just on the coordinator.
+    """
+
+    tier_writes: list[tuple[str, Mapping[str, Any]]] = []
+    model_writes: list[str] = []
+
+    def write_tier(target: Any, patch: Mapping[str, Any]) -> None:
+        tier_writes.append((target.node_id, dict(patch)))
+
+    def write_model(target: Any, model_path: str, patch: Mapping[str, Any]) -> None:
+        model_writes.append(target.node_id)
+
+    client, _, _ = api(
+        coordinator=FakeCoordinator().factory(),
+        settings_writer=write_model,
+        global_settings_writer=write_tier,
+    )
+    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", table_layout)
+    measurement_id = take_measurement(client)
+    plan = take_plan(client, measurement_id, memory_guard_tier="aggressive")
+
+    assert plan["resource_policy"]["memory_guard_tier"] == "aggressive"
+
+    response = client.post(APPLY_URL, json=apply_payload(measurement_id, plan))
+    assert response.status_code == 200, response.text
+    body = wait_for_operation(client, response.json()["operation_id"])
+
+    assert body["state"] == "applied"
+    assert {node_id for node_id, _ in tier_writes} == set(plan["rank_order"])
+    assert all(patch == {"memory_guard_tier": "aggressive"} for _, patch in tier_writes)
+    # The Mac-wide write is not a substitute for the per-model levers.
+    assert model_writes
+
+
+def test_an_unwritable_tier_fails_apply_before_staging(api, monkeypatch) -> None:
+    def refuse(target: Any, patch: Mapping[str, Any]) -> None:
+        raise RuntimeError("that Mac refused the settings write")
+
+    client, _, _ = api(
+        coordinator=FakeCoordinator().factory(), global_settings_writer=refuse
+    )
+    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", table_layout)
+    measurement_id = take_measurement(client)
+    plan = take_plan(client, measurement_id, memory_guard_tier="aggressive")
+
+    response = client.post(APPLY_URL, json=apply_payload(measurement_id, plan))
+    assert response.status_code == 200, response.text
+    body = wait_for_operation(client, response.json()["operation_id"])
+
+    assert body["state"] == "failed"
+    assert body["error"]["code"] == "policy_settings_failed"
+    assert body["error"]["action"] == "diagnostics"
+    # The write happens before prepare/staging, so nothing was placed yet.
+    assert not body.get("placement_signature")
+    assert "memory-guard tier" in body["error"]["message"]
+
+
 def context_limited_layout(path: str) -> ModelLayout:
     """The KV cache only fits at half the requested context on the small Mac."""
 

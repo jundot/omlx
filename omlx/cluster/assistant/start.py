@@ -140,6 +140,12 @@ MODELS_PATH = "/admin/api/models"
 RELOAD_PATH = "/admin/api/reload"
 DEVICES_PATH = "/api/cluster/devices"
 MODEL_SETTINGS_PATH = "/admin/api/models/{model_id}/settings"
+# oMLX's own Mac-wide settings route. Used for levers that are not per model —
+# today the memory-guard tier, which decides the ceiling a Mac admits. It is
+# written on every selected Mac before staging, because the launch preflight
+# reads that Mac's *live* ceiling: a plan priced at `aggressive` and a Mac
+# still guarding at `balanced` is a stage refused by the reserve difference.
+GLOBAL_SETTINGS_PATH = "/admin/api/global-settings"
 # oMLX's own manual load route: the single-node ("run on this Mac") flow asks
 # this Mac's server to load the checkpoint into its engine pool. It is the same
 # route the dashboard uses; the assistant never launches a process itself.
@@ -703,6 +709,7 @@ def run_apply_job(
         if pairing:
             _fail(store, operation_id, "node_not_paired", pairing, ACTION_PAIR_MAC)
             return
+        _write_tier_settings(plan, plan.rank_order)
         _write_policy_settings(plan, [plan.coordinator.node_id])
         # A checkpoint copied/staged outside the coordinator's pool is on
         # disk but not in its in-memory catalogue yet; the settings file is
@@ -818,6 +825,45 @@ def _coordinator_pairing_failure(
         f"{names} is not paired with coordinator {plan.coordinator.node_id}; "
         "pair it with that Mac and apply again"
     )
+
+
+def _write_tier_settings(plan: ApplyPlan, node_ids: Sequence[str]) -> None:
+    """Write the plan's memory-guard tier on the given selected Macs, or fail.
+
+    The plan prices every stage with the tier it shows the user
+    (``election.budget_for(..., tier=…)``) and the rank processes are launched
+    with that tier as a flag, but the Mac's own server — the one whose live
+    ceiling the launch preflight reads — kept whatever tier was last saved. A
+    plan that raised the tier to `aggressive` then met a guard still reserving
+    `balanced`: rank 1 of a clean apply was refused at "needs 40.9 GiB but can
+    admit 40.4 GiB right now", which is exactly the reserve difference.
+
+    So the lever is applied where it is priced, on every selected Mac, and it
+    runs **before** staging because it changes the ceiling the start preflight
+    will read. A Mac that cannot be written fails apply with one action: a
+    half-raised cluster must never start.
+    """
+
+    policy = plan.inputs.resource_policy
+    tier = "" if policy is None else str(policy.memory_guard_tier or "").strip()
+    if not tier or plan.global_settings_writer is None:
+        # No tier was chosen, so each Mac keeps its own saved tier and the
+        # election priced it that way. Nothing to write, nothing to claim.
+        return
+    patch = {"memory_guard_tier": tier}
+    for node_id in node_ids:
+        target = plan.target_for(node_id)
+        try:
+            plan.global_settings_writer(target, patch)
+        except ProvisioningError:
+            raise
+        except Exception as exc:
+            raise ProvisioningError(
+                "policy_settings_failed",
+                f"the approved memory-guard tier ({tier}) could not be written "
+                f"on {node_id}: {_redacted(exc)}",
+                ACTION_DIAGNOSTICS,
+            ) from exc
 
 
 def _write_policy_settings(plan: ApplyPlan, node_ids: Sequence[str] | None = None) -> None:
