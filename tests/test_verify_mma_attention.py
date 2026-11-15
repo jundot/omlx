@@ -160,7 +160,10 @@ def test_apply_leaves_the_hook_off_when_the_kernel_cannot_run(monkeypatch):
     # metal_kernel compiles and launches lazily, at mx.eval: a try/except around
     # the call in the hook cannot see a Metal failure. apply() probes once.
     saved = _save_hooks()
-    stock = mlx_base.scaled_dot_product_attention
+    # Another test in the same process may have left the hook installed (apply()
+    # is idempotent and then skips the probe); start from a plain function.
+    stock = lambda *args, **kwargs: None  # noqa: E731
+    mlx_base.scaled_dot_product_attention = stock
     monkeypatch.setattr(vma, "_probe_ok", lambda: False)
     try:
         assert vma.apply() is False
