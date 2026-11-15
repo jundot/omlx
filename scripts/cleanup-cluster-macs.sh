@@ -119,7 +119,17 @@ clean_here() {
             sudo launchctl bootout system/app.omlx.helper >/dev/null 2>&1
             sudo rm -f /Library/PrivilegedHelperTools/app.omlx.helper \
                        /Library/LaunchDaemons/app.omlx.helper.plist
-            echo "  removed the privileged helper"
+            # Never claim a removal that did not happen: sudo over a
+            # non-interactive SSH session has no terminal to ask for the
+            # password, and the old code printed "removed" anyway.
+            if [ -e /Library/PrivilegedHelperTools/app.omlx.helper ] || \
+               [ -e /Library/LaunchDaemons/app.omlx.helper.plist ]; then
+                echo "  helper NOT removed (sudo failed — no terminal for the password)"
+                echo "    run this at the Mac, or with a cached sudo:"
+                echo "    sudo launchctl bootout system/app.omlx.helper; sudo rm -f /Library/PrivilegedHelperTools/app.omlx.helper /Library/LaunchDaemons/app.omlx.helper.plist"
+            else
+                echo "  removed the privileged helper"
+            fi
         else
             echo "  helper STILL INSTALLED (root-owned): add --with-helper, or run"
             echo "    sudo launchctl bootout system/app.omlx.helper"
