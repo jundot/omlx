@@ -274,8 +274,8 @@ _DIFF = """diff --git a/app.py b/app.py
 """
 
 
-def _real_d1_dir():
-    """A real d1 checkpoint on disk, if this machine has one."""
+def _d1_candidates():
+    """Candidate d1 directories on this machine, in probe order."""
     import os
     from pathlib import Path
 
@@ -285,8 +285,16 @@ def _real_d1_dir():
     models = Path.home() / ".omlx" / "models"
     if models.is_dir():
         candidates.extend(sorted(p for p in models.iterdir() if p.is_dir()))
-    for path in candidates:
-        if (path / "config.json").is_file() and decision_kind(path) == "d1_lfm2":
+    return [p for p in candidates if (p / "config.json").is_file()]
+
+
+def _real_d1_dir():
+    """A real d1 checkpoint on disk of the family this probe needs, if any."""
+    import os
+    from pathlib import Path
+
+    for path in _d1_candidates():
+        if decision_kind(path) == "d1_lfm2":
             return path
     return None
 
@@ -302,10 +310,20 @@ def test_calibration_probe_handle_leak_is_safe():
     the verdict here moves it on a borderline case, not on an obvious one. It
     is not an assertion about the model, so a checkpoint that answers `bug` is
     a finding, not a test failure.
+
+    Needs the LFM2-VL family specifically: d1 also ships on an LFM3 backbone,
+    which ``decision_kind()`` reports as ``d1`` and this probe declines, so on
+    such an install the probe always skips. Point ``OMLX_D1_MODEL_DIR`` at an
+    lfm2_vl d1 checkpoint to actually run it.
     """
     path = _real_d1_dir()
     if path is None:
-        pytest.skip("no d1 checkpoint on disk (set OMLX_D1_MODEL_DIR)")
+        other = sorted({k for k in map(decision_kind, _d1_candidates()) if k})
+        pytest.skip(
+            "needs a d1_lfm2 (LFM2-VL) d1 checkpoint; set OMLX_D1_MODEL_DIR to one "
+            + (f"(found other families on disk: {other})" if other
+               else "(no d1 checkpoint on disk)")
+        )
 
     engine = DecisionEngine(str(path))
     asyncio.run(engine.start())

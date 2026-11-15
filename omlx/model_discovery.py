@@ -543,7 +543,7 @@ def _is_pplx_joint_config(path: Path) -> bool:
         return False
 
 
-def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
+def decision_kind(model_path: Path | str, config: dict | None = None) -> DecisionKind | None:
     """Return the decision-model family of a checkpoint, or None.
 
     Clef is identified by its joint head files and Decision 3.0 by its
@@ -553,6 +553,7 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
     plain Qwen3.5 checkpoint, so it is identified by its helper directory or,
     for MLX conversions without the helper, by the directory name.
     """
+    model_path = Path(model_path)
     if (model_path / CLEF_HEAD_WEIGHTS).is_file() and (
         model_path / CLEF_HEAD_CONFIG
     ).is_file():
