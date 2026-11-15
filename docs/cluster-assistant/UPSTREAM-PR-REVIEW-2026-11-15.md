@@ -439,4 +439,6 @@ Verification after the fixes:
 - `pr/feature-mac-helper-dmg`: build succeeds with and without `OMLX_TEAM_ID`; 36 macOS tests green; `apps/omlx-mac/Tests/python` 29 passed / 2 skipped without a team, 31 passed with one; `git grep YB894QRG4W` returns nothing.
 - Assistant chain parents verified: A1→a0, A2→A1, A3→A2; every branch still contains only its own slice.
 
+Test run after the fixes: combined `tests/` + `apps/omlx-web/tests` **20 981 passed, 0 failed**; macOS python 27 passed; `xcodebuild test … -testLanguage en` **TEST SUCCEEDED**; local end-to-end run on this Mac (measure → recommend → model-bound measure → plan → run-local → real completion → stop) succeeded — see `REBASE-2026-11-14.md`.
+
 Still open: R8 screenshots, R9 (further split), R10 (F1 concerns), R12 (plan B), R13 (branch names on push), R14 (A1 commit granularity).
