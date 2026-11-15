@@ -787,6 +787,30 @@ the answer here.
 | Parallelism per release | **PP only in R1 — Qwen4-Exp/Qwen3.8 included** (upstream PR #5033 applied: `supports_pipeline` true for that family). General tensor-parallel support is **R2**; no TP UI in R1. |
 | P2 start (2026-11-07) | **macOS menu/tray entry first**, opening the **existing** Cluster tab in the existing web dashboard; no new window, app, wizard or control plane, and no status/stop in the tray in this slice. The menu item and the Welcome button deep-link `/admin/dashboard?tab=cluster`; both build and the focused Xcode tests pass. Helper: **Developer ID team `YB894QRG4W`**, **one standard macOS admin dialog**, wired limit + network setup scope. The first slice is a one-shot `sysctl iogpu.wired_limit_mb` action from Performance, a **read-only** network preflight (`GET /assistant/network-preflight`, exact commands, `executed: false`), a **SMJobBless** helper for the wired limit (one admin prompt, signed; helper install test pending), and the **first-run runtime installer** in Welcome (bundled `uv` + lock, explicit click, progress; clean-first-run test pending). The privileged network apply is open (bridge/STP policy). Distribution is a direct **slim** DMG (72 MB with helper/installer; no embedded Python/MLX; `SLIM-RUNTIME.md`/`DISTRIBUTION.md`); signing setup is `SIGNING.md`. Telemetry stays none; TP, >4 Macs, HA and multi-tenancy stay out. |
 
+### Acceptance decisions (answered 2026-11-15, `ROADMAP-ACCEPTANCE-2026-11-16.md` §7)
+
+Asked once, answered with the recommendation; do not re-open without an explicit
+request. They govern W1–W6 of the acceptance package:
+
+1. **Back scope (D2):** the model/context/tier/offload/pin may be changed back up
+   to a green **`applied`**; everything downstream becomes **`stale`**, never
+   silently kept. A running cluster (`ready`) stays frozen (Screen-6 rules).
+2. **Retry scope (D2):** a failed **`start`** may be retried **in place** against
+   the same applied deployment after the cause is fixed — re-validate the
+   placement and start again; no forced re-apply.
+3. **Manual path (D3):** keep the existing oMLX wizard behind a collapsed
+   **`Manual setup`** disclosure; the assistant is the primary top-to-bottom
+   flow. No second wizard, no dissolved frozen UI.
+4. **Models on uninstall (D1):** models and `cluster/identity.json` are **kept by
+   default**; model deletion is opt-in **per directory**. Confirms the frozen
+   Uninstall row above.
+5. **Helper install timing (D6):** the helper is a first-class capability — a
+   **System helper** step in Welcome (one admin prompt while the person is
+   already clicking) **and** a permanent Install/Reinstall row in Performance,
+   independent of the wired-limit warning. One seam
+   `PrivilegedHelper.status → {installed, version, wiredLimitCurrentMB,
+   wiredLimitRequestedMB}`; idempotent and versioned.
+
 If blocked by an environmental unknown (paths, credentials, hardware), ask once
 instead of inventing an answer.
 
