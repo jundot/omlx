@@ -105,6 +105,11 @@ Discussion draft (R12) if appetite is unclear:
 
 ## 7. Still open
 
+- **Onboarding (noted 2026-11-15):** the helper + wired-limit step belongs in the
+  Welcome/first-run screen next to the dependency installer, and the web
+  *Settings → Performance* page must not look like the terminal command is the
+  only way (the button is app-only). Recorded in `ROADMAP-TO-CHAPTER-10.md` §9.
+
 - **R8** screenshots (needs the cluster and a browser session).
 - **R16/R17** to confirm during the run.
 - **R9** further split of the plan slice (measured: A2 changes the shared modules

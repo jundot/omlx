@@ -500,6 +500,18 @@ credentials and privilege model are open.
 - signed/notarized helper, wired-limit/network setup, auto-update;
 - telemetry/diagnostics;
 - tensor parallelism, >4 Macs, HA failover, multi-tenancy.
+- **First-run onboarding should install the helper and set the hardware limits
+  (noted 2026-11-15).** Today the wired-limit helper is installed from
+  *Performance → “Apply with Admin…”* in the macOS app, and the web dashboard's
+  *Settings → Performance* shows only the terminal command
+  (`sudo sysctl iogpu.wired_limit_mb=…`) — the button is **app-only**, which a new
+  user misses exactly when they need it (a 128 GB Mac runs with a 107.5 GB Metal
+  cap until then). The Welcome window already runs the **runtime installer** for
+  the dependencies, so it is the natural place for the same one-admin-dialog step:
+  bless the helper, apply the recommended `iogpu.wired_limit_mb`, and show the
+  resulting ceiling. One prompt, at the screen where the user is already
+  installing things. The web page should then either deep-link into the app or
+  spell out the two-step; it must not look like the command is the only option.
 
 ---
 
