@@ -187,3 +187,39 @@ def test_engaged_counter_and_log_prove_the_route(patched, caplog):
     q1, bk1, bv1 = _verify_block(cache, 1)
     mlx_base.scaled_dot_product_attention(q1, bk1, bv1, cache, D**-0.5, "causal")
     assert vma.engaged_count() == before + 1
+
+
+def test_failed_probe_is_false_and_not_rerun(monkeypatch):
+    calls = []
+
+    def boom(*args, **kwargs):
+        calls.append(1)
+        raise RuntimeError("metal compile failed")
+
+    monkeypatch.setattr(vmk, "mma_verify_sdpa", boom)
+    monkeypatch.setattr(vma, "_probe_result", None)  # forget any earlier probe
+    assert vma._probe_ok() is False
+    assert vma._probe_ok() is False
+    assert len(calls) == 1
+
+
+def test_keys_slice_shorter_than_the_cache_offset_stays_on_stock(patched):
+    cache = _filled_cache()
+    q, bk, bv = _verify_block(cache, 4)
+    assert vma.route_ok(q, bk, bv, cache, "causal", None)  # control: full slice routes
+    assert not vma.route_ok(q, bk[:, :, :-1], bv[:, :, :-1], cache, "causal", None)
+
+
+def test_buffer_dtype_must_match_the_queries(patched):
+    cache = _filled_cache(dtype=mx.float16)
+    q, bk, bv = _verify_block(cache, 4, dtype=mx.float16)
+    assert vma.route_ok(q, bk, bv, cache, "causal", None)  # control: same dtype routes
+    assert not vma.route_ok(q.astype(mx.bfloat16), bk, bv, cache, "causal", None)
+
+
+@pytest.mark.parametrize("hq,rows,routes", [(32, 4, True), (44, 3, False)])
+def test_gqa_times_rows_limit_is_32(patched, hq, rows, routes):
+    # one MMA group serves at most 32 rows: gqa 8 x 4 = 32 routes, 11 x 3 = 33 does not
+    cache = _filled_cache(hkv=4)
+    q, bk, bv = _verify_block(cache, rows, hq=hq, hkv=4)
+    assert vma.route_ok(q, bk, bv, cache, "causal", None) is routes
