@@ -184,6 +184,12 @@ PLE VLM is “never planned as PP” described the pre-#5033 state and is withdr
 
 ## 8. Prepared branches (local, committed, tested — ready to push)
 
+> **Before pushing:** work through
+> [`UPSTREAM-PR-REVIEW-2026-11-15.md`](UPSTREAM-PR-REVIEW-2026-11-15.md) — it lists
+> three P0 blockers (private scratch files in the assistant branches, a hard-coded
+> signing identity in the feature branch, and a redundant macOS "fix") plus the
+> pre-push gate. The table below is the inventory, not a green light.
+
 Fixes are based directly on `upstream/main` `624cff0e` (`HEAD^ == 624cff0e`), so
 each push is a clean single-PR branch. The assistant series is stacked on a local
 integration base (§8.1). None is pushed yet.
