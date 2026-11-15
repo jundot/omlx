@@ -708,3 +708,39 @@ Do not start Chapter 10 until its gate is met. Its resource-planning phase is
 the recorded response to the “too conservative planning / thin-layer parity”
 defect; port LocalInferenz’s planning logic and measured policy, never its app
 or UI.
+
+---
+
+## 11. Environment rules (settled — do not re-open these in a session)
+
+These come back in every cluster session; the answers are decided:
+
+- **The app runs interactively on every node.** Copying the DMG over SSH/scp and
+  replacing `/Applications/oMLX.app` is fine — but the app is **started by a
+  person at that Mac** (Spotlight/Dock), never with `open -a` or a CLI server
+  over SSH as the way a node comes up. macOS ties the **Local Network** permission,
+  the **SMJobBless helper** prompt and the **first-run runtime installer** to the
+  logged-in GUI session, so an SSH launch produces a node that silently cannot
+  probe the LAN or bless its helper. SSH stays the **control plane** for staging,
+  rank start and probes — not for launching the app.
+- **The helper is notarized and blessed by that dialog.** The wired-limit helper
+  is installed through one admin prompt while the app is open at the Mac. A node
+  where nobody accepted the prompt has no helper; do not fake it with `sudo`,
+  `launchctl` or an SSH equivalent.
+- **If a step needs a click, ask the user.** Local Network, helper blessing and
+  the runtime installer are exactly those steps. Never work around a TCC prompt.
+- **"Cleanup" means everything is gone — disk and processes.** Cleaning the
+  cluster (or the nodes) means **both**:
+  1. **Processes:** every oMLX process — the app, `omlx-server`, servers spawned by
+     tests, `pytest`/`xcodebuild`/`XCTRunner`, and the `dns-sd` advertiser — is
+     terminated, and the port (8099) is free.
+  2. **Disk:** `~/.omlx/cluster/*` is removed (devices, deployments, measurements,
+     operations, tuning presets, pairing keys, incidents, benchmarks) **and** the
+     `runtime/` staging cache (multi-GB). `identity.json` is **kept** — deleting it
+     only re-rolls the node id and invalidates every pairing.
+  Back up the JSON state first (`~/.omlx/backup-cluster-<date>/`), then verify: no
+  processes, port free, and the cluster directory contains only `identity.json`
+  plus backups. This applies to `.11` and to every peer.
+- **Verify the version on every Mac before a cluster run.** A mixed-build cluster
+  is not a test of this tree (`CLUSTER-TEST-RUNBOOK.md` §1.5): `GET
+  /api/cluster/node_id` must report the same `version` on all nodes.

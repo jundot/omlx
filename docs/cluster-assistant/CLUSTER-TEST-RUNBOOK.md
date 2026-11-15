@@ -150,8 +150,13 @@ the elected coordinator over SSH.
    ssh andreaskolb@<peer> 'rm -rf /Applications/oMLX.app && ditto /Volumes/oMLX/oMLX.app /Applications/oMLX.app'
    ssh andreaskolb@<peer> 'hdiutil detach /Volumes/oMLX'
    ```
-4. Start it: `ssh <peer> 'open -a /Applications/oMLX.app'` (the app starts its
-   server), then wait for `/health` on `http://<peer>:8099`.
+4. **Start it at the Mac, interactively** — open `/Applications/oMLX.app` in
+   Spotlight/Dock and accept the **Local Network** prompt (and the one-time
+   **helper** admin dialog). Do **not** launch it with `open -a` or a CLI server
+   over SSH: macOS binds the Local Network permission, the SMJobBless helper and
+   the first-run runtime installer to the GUI session, so an SSH launch yields a
+   node that cannot probe the LAN or bless its helper (`AGENTS.md` §11). Then wait
+   for `/health` on `http://<peer>:8099`.
 5. Verify the version on all four Macs (§2.2) before continuing.
 6. Only then pair (§1) and run §3.
 
