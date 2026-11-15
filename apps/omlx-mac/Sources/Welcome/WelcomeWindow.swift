@@ -615,7 +615,18 @@ private struct WelcomeSetupBody: View {
     @ObservedObject var vm: WelcomeViewModel
     @State private var keyVisible: Bool = false
 
+    // The Welcome window is a fixed 680×620 and not resizable. The setup cards
+    // (runtime installer + system helper + storage rows) can exceed the height
+    // above the footer, so the body scrolls instead of overflowing into the
+    // footer. The footer itself stays pinned below this ScrollView.
     var body: some View {
+        ScrollView {
+            setupContent
+        }
+        .disabled(vm.isStarting)
+    }
+
+    private var setupContent: some View {
         VStack(spacing: 22) {
             WelcomeIcon(size: 70)
 
@@ -837,7 +848,7 @@ private struct WelcomeSetupBody: View {
         .padding(.horizontal, 48)
         .padding(.top, 18)
         .padding(.bottom, 6)
-        .disabled(vm.isStarting)
+        .frame(maxWidth: .infinity)
     }
 }
 
