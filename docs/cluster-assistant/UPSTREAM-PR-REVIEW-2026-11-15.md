@@ -501,3 +501,17 @@ again through the API:
   serving.
 - `run-local/{id}/stop` → `stopped: true`; `network-preflight` → `executed: false`;
   `diagnostics` returned `app/events/generated_at/health/measurement/operation`.
+
+## 12. R18 — the macOS feature branch needs the fixes PR
+
+Measured with the full suite (`xcodebuild test -scheme oMLX CODE_SIGNING_ALLOWED=NO
+-testLanguage en`, 2026-11-15): 410 tests, **7 assertion failures in three
+tests**, all of them the defects the separate fixes PR repairs:
+
+- `ThemeTests.testLightWindowBackgroundUsesStandardWindowColor`
+- `ModelSettingsScreenVMTests.testK2AnePresetsKeepOneThirdAndExistingValues`
+- `ModelSettingsScreenVMTests.testK2SharedPresetsKeepLoadedStringSelection`
+
+The feature branch intentionally excludes those fixes, so this is a **dependency**,
+not a regression: merge `fix/macos-theme-locale-xctest` first (or expect the three
+on macOS 27). Recorded in the feature PR body.
