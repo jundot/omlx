@@ -299,3 +299,53 @@ def test_remote_write_still_goes_through_run_remote_python(monkeypatch) -> None:
     payload = json.loads(captured["argument"])
     assert payload["model_id"] == "qwen"
     assert payload["patch"] == {"mtp_enabled": True}
+
+
+def test_the_mac_wide_tier_write_uses_the_global_settings_route(monkeypatch) -> None:
+    """The tier is Mac-wide, so it goes to ``/admin/api/global-settings``.
+
+    It must also work without a model id: that is what lets apply write it
+    before staging, where it changes the ceiling the launch preflight reads.
+    """
+
+    from omlx.cluster.assistant import start
+
+    calls: list[tuple[str, str, object, str]] = []
+
+    def fake_local(port, path, body=None, *, method="GET", timeout=30.0):
+        calls.append(("local", path, body, method))
+        return {"status": "success"}
+
+    def fake_remote(ssh, port, path, body, *, method="POST", timeout=120.0):
+        calls.append((ssh, path, body, method))
+        return {"status": "success"}
+
+    monkeypatch.setattr(start, "_local_admin", fake_local)
+    monkeypatch.setattr(start, "remote_admin", fake_remote)
+
+    provisioning.write_global_settings_on_mac(
+        _local_target(), {"memory_guard_tier": "aggressive"}
+    )
+    provisioning.write_global_settings_on_mac(
+        _remote_target(), {"memory_guard_tier": "aggressive"}
+    )
+
+    assert calls == [
+        ("local", start.GLOBAL_SETTINGS_PATH, {"memory_guard_tier": "aggressive"}, "POST"),
+        (
+            "user@172.16.1.14",
+            start.GLOBAL_SETTINGS_PATH,
+            {"memory_guard_tier": "aggressive"},
+            "POST",
+        ),
+    ]
+
+
+def test_a_mac_wide_write_without_a_port_is_one_action() -> None:
+    target = NodeTarget(node_id="m1", address="172.16.1.14", ssh="u@h", local=False, port=0)
+
+    with pytest.raises(ProvisioningError) as raised:
+        provisioning.write_global_settings_on_mac(target, {"memory_guard_tier": "safe"})
+
+    assert raised.value.code == "configure_endpoint"
+    assert raised.value.action == "configure_endpoint"

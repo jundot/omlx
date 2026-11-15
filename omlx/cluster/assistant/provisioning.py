@@ -146,6 +146,9 @@ class ApplyPlan:
     #: the seams so tests never touch a Mac; ``None`` means "no settings write",
     #: which is only correct for an older coordinator or a pure test.
     settings_writer: Any | None = None
+    #: Writes the Mac-wide levers (the memory-guard tier) on one selected Mac,
+    #: before staging. Same injection rule as ``settings_writer``.
+    global_settings_writer: Any | None = None
     selection: ClusterPlanSelection | None = None
 
     @property
@@ -195,6 +198,15 @@ class ProvisioningSeams:
     settings_writer: Callable[[NodeTarget, str, Mapping[str, Any]], None] | None = (
         None
     )
+    #: (target, Mac-wide patch) -> None. Writes levers that are not per model —
+    #: today the memory-guard tier — on one selected Mac through the same admin
+    #: seam. Separate from ``settings_writer`` because it needs no model id, so
+    #: it can run before staging, which is where it must run: the tier changes
+    #: the ceiling that Mac's launch preflight reports. ``None`` keeps the
+    #: older-coordinator behaviour of not writing it.
+    global_settings_writer: Callable[[NodeTarget, Mapping[str, Any]], None] | None = (
+        None
+    )
 
 
 def default_provisioning_seams() -> ProvisioningSeams:
@@ -236,6 +248,7 @@ def default_provisioning_seams() -> ProvisioningSeams:
         device_record=device_record,
         local_addresses=local_addresses,
         settings_writer=write_model_settings_on_mac,
+        global_settings_writer=write_global_settings_on_mac,
     )
 
 
@@ -307,6 +320,43 @@ def write_model_settings_on_mac(
         if exc.status != 404:
             raise
         _write_model_settings_file(target, model_id, patch)
+
+
+def write_global_settings_on_mac(
+    target: NodeTarget,
+    patch: Mapping[str, Any],
+) -> None:
+    """Write Mac-wide levers (the memory-guard tier) on a selected Mac.
+
+    Unlike the per-model route this one needs no model id, so it can run before
+    staging — which is where it must run, because the tier decides the ceiling
+    that Mac reports to the launch preflight. The coordinator is reached on
+    loopback with the key it stores, a worker through the same SSH seam apply
+    and start already use; nothing here reads, returns or stores a key.
+    """
+
+    if not patch:
+        return
+    from .start import (
+        GLOBAL_SETTINGS_PATH,
+        _local_admin,
+        remote_admin,
+    )
+
+    port = target.port
+    if not 1 <= int(port) <= 65535:
+        raise ProvisioningError(
+            "configure_endpoint",
+            f"the endpoint port on {target.node_id} was not measured, so its "
+            "settings cannot be written; measure again",
+            ACTION_CONFIGURE_ENDPOINT,
+        )
+    if target.local:
+        _local_admin(port, GLOBAL_SETTINGS_PATH, dict(patch), method="POST")
+    else:
+        remote_admin(
+            target.ssh, port, GLOBAL_SETTINGS_PATH, dict(patch), method="POST"
+        )
 
 
 # The worker copy of the fallback below. It runs as a bare ``python -c`` on the
@@ -684,6 +734,7 @@ def plan_apply(
         endpoint=endpoint,
         warnings=_plan_warnings(record, selection),
         settings_writer=seams.settings_writer,
+        global_settings_writer=seams.global_settings_writer,
         selection=selection,
     )
 
