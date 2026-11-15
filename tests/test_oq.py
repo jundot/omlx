@@ -8727,6 +8727,170 @@ class TestEstimateBpwPostSanitizeNames:
         assert est["effective_bpw"] < 8.0, est
 
 
+_QWEN3_5_STREAM_TEXT = {
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 8,
+    "linear_num_value_heads": 4,
+    "linear_num_key_heads": 2,
+    # The gated-delta Metal kernel needs a key head dim of 32.
+    "linear_key_head_dim": 32,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
+    # Layers 0 and 2 are gated delta nets, 1 and 3 full attention.
+    "full_attention_interval": 2,
+    "rms_norm_eps": 1e-6,
+    "vocab_size": 128,
+    "max_position_embeddings": 256,
+    "tie_word_embeddings": False,
+    "rope_parameters": {
+        "rope_type": "default",
+        "mrope_section": [2, 1, 1],
+        "rope_theta": 10000,
+        "partial_rotary_factor": 1.0,
+    },
+}
+_QWEN3_5_STREAM_EXPERTS = {
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 32,
+}
+
+
+def _qwen3_5_stream_source(path, model_type, *, vlm, mtp):
+    """Save a tiny BF16 Qwen3.5 checkpoint in the Hugging Face layout.
+
+    VLM checkpoints keep the text tower under ``model.language_model`` and
+    load through mlx-vlm, text-only ones under ``model`` through mlx-lm, as
+    oQ's resident collector loads them. Experts are fused
+    (``experts.gate_up_proj``), and the conv weights and the MTP head are
+    stored as Hugging Face ships them. The vision tower is left out because
+    calibration never runs it.
+    """
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from omlx.patches.mlx_lm_mtp import (
+        apply_mlx_lm_mtp_patch,
+        is_mtp_active,
+        set_mtp_active,
+    )
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    moe = model_type == "qwen3_5_moe"
+    text = {
+        **_QWEN3_5_STREAM_TEXT,
+        **(_QWEN3_5_STREAM_EXPERTS if moe else {}),
+        "model_type": f"{model_type}_text",
+        "mtp_num_hidden_layers": int(mtp),
+    }
+    prefix = "Qwen3_5Moe" if moe else "Qwen3_5"
+    if vlm:
+        vision = {
+            "model_type": model_type,
+            "depth": 1,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "out_hidden_size": 32,
+            "num_heads": 4,
+            "patch_size": 14,
+            "in_channels": 3,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "num_position_embeddings": 16,
+            "deepstack_visual_indexes": [],
+        }
+        config = {
+            "model_type": model_type,
+            "architectures": [f"{prefix}ForConditionalGeneration"],
+            "text_config": text,
+            "vision_config": vision,
+        }
+    else:
+        config = {**text, "architectures": [f"{prefix}ForCausalLM"]}
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(config))
+    mx.random.seed(5)
+    was_active = is_mtp_active()
+    try:
+        if vlm:
+            from mlx_vlm.utils import get_model_and_args, update_module_configs
+
+            from omlx.patches.mlx_vlm_mtp import (
+                apply_mlx_vlm_mtp_runtime_patch,
+                set_mtp_attach_enabled,
+            )
+
+            maybe_apply_pre_load_patches(str(path), for_vlm=True)
+            apply_mlx_vlm_mtp_runtime_patch(model_type)
+            set_mtp_attach_enabled(True)
+            cfg = json.loads(json.dumps(config))
+            model_class, _ = get_model_and_args(config=cfg, model_path=path)
+            model_config = update_module_configs(
+                model_class.ModelConfig.from_dict(cfg),
+                model_class,
+                cfg,
+                ["text", "vision", "perceiver", "projector", "audio"],
+            )
+            model = model_class.Model(model_config)
+            root = "model.language_model."
+        else:
+            from mlx_lm.models import qwen3_5, qwen3_5_moe
+
+            apply_mlx_lm_mtp_patch()
+            set_mtp_active(mtp)
+            module = qwen3_5_moe if moe else qwen3_5
+            model = module.Model(module.ModelArgs.from_dict(config))
+            root = "model."
+    finally:
+        set_mtp_active(was_active)
+    model.set_dtype(mx.bfloat16)
+    params = dict(tree_flatten(model.parameters()))
+    assert any(".mtp." in key for key in params) == mtp
+    weights = {}
+    for key, value in params.items():
+        if key.startswith("vision_tower.") or ".switch_mlp.up_proj." in key:
+            continue
+        if key.endswith(".conv1d.weight"):
+            value = mx.moveaxis(value, 2, 1)
+        if ".switch_mlp." in key:
+            layer, projection = key.split(".switch_mlp.")
+            if projection.startswith("gate_proj"):
+                up = params[f"{layer}.switch_mlp.up_proj.weight"]
+                key = f"{layer}.experts.gate_up_proj"
+                value = mx.concatenate([value, up], axis=-2)
+            else:
+                key = f"{layer}.experts.down_proj"
+        for old, new in (
+            ("language_model.model.", root),
+            ("language_model.mtp.", "mtp."),
+            ("language_model.lm_head.", "lm_head."),
+        ):
+            if key.startswith(old):
+                key = new + key[len(old) :]
+        weights[key] = value
+    mx.save_safetensors(str(path / "model.safetensors"), weights)
+    vocab = {f"t{i}": i for i in range(text["vocab_size"])}
+    tokenizer = Tokenizer(WordLevel(vocab, unk_token="t0"))
+    PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="t0").save_pretrained(
+        path
+    )
+    return config
+
+
+_QWEN3_5_STREAM_CASES = [
+    pytest.param("qwen3_5_moe", True, True, id="moe-vlm-mtp"),
+    pytest.param("qwen3_5", True, True, id="dense-vlm-mtp"),
+    pytest.param("qwen3_5_moe", False, True, id="moe-text-mtp"),
+    pytest.param("qwen3_5", False, False, id="dense-text"),
+]
+
+
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestStreamedCalibration:
     @pytest.fixture
@@ -8894,6 +9058,12 @@ class TestStreamedCalibration:
             (None, "qwen4_exp", False, False),
             (False, "qwen4_exp", True, False),
             (True, "qwen4_exp", False, True),
+            (None, "qwen3_5_moe", True, True),
+            (None, "qwen3_5", True, True),
+            (None, "qwen3_5_moe_text", True, True),
+            (None, "qwen3_5_text", True, True),
+            (None, "qwen3_5_moe", False, False),
+            (True, "qwen3_5", False, True),
         ],
     )
     def test_selection(self, explicit, kind, over_budget, expected):
@@ -9058,6 +9228,117 @@ class TestStreamedCalibration:
         for key, entry in resident.items():
             np.testing.assert_array_equal(streamed[key].counts, entry.counts)
             np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2)
+
+    @pytest.mark.parametrize(
+        "micro_batch", [pytest.param(None, id="batched"), pytest.param(1, id="row")]
+    )
+    @pytest.mark.parametrize("model_type,vlm,mtp", _QWEN3_5_STREAM_CASES)
+    def test_qwen3_5_collection_matches_resident(
+        self, tmp_path, monkeypatch, model_type, vlm, mtp, micro_batch
+    ):
+        """Streamed Qwen3.5 layers match the resident collector bit for bit.
+
+        Gated delta net layers take no mask, attention layers one MRoPE
+        position row per batch row, and the MTP head runs on the normed trunk
+        output under the resident names. Streaming runs first so it applies
+        every patch it needs itself.
+
+        The resident walk runs mlx-vlm's MTP head on whole micro-batches,
+        where its attention reads MRoPE positions out of range for every row
+        after the first; streaming runs that head one row at a time. Its
+        attention output and everything after it therefore match the resident
+        statistics only with one-row micro-batches.
+        """
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        config = _qwen3_5_stream_source(source, model_type, vlm=vlm, mtp=mtp)
+        # As many tokens as rows: a causal mask a gated delta net received would
+        # pass its batch check and be applied as a padding mask.
+        tokens = (mx.arange(16).reshape(4, 4) * 7 % 120 + 1).astype(mx.int32)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        if micro_batch is not None:
+            plan = oq._oqe_calibration_batch_plan
+
+            def one_row_plan(*args, **kwargs):
+                return {**plan(*args, **kwargs), "micro_batch_size": micro_batch}
+
+            monkeypatch.setattr(oq, "_oqe_calibration_batch_plan", one_row_plan)
+        streamed, metadata = oq._collect_imatrix_streaming(
+            source,
+            object(),
+            json.loads(json.dumps(config)),
+            num_samples=4,
+            seq_length=4,
+            calib_data=tokens,
+            measure_sensitivity=True,
+            sensitivity_oq_level=4,
+            sensitivity_num_samples=4,
+            sensitivity_seq_length=4,
+        )
+        resident, _ = oq._collect_imatrix(
+            str(source), json.loads(json.dumps(config)), num_samples=4, seq_length=4
+        )
+        layers = "language_model.model.layers."
+        assert layers + "0.linear_attn.in_proj_qkv" in resident
+        assert layers + "1.self_attn.q_proj" in resident
+        moe = model_type == "qwen3_5_moe"
+        assert (layers + "1.mlp.switch_mlp.gate_proj" in resident) == moe
+        assert ("language_model.mtp.fc" in resident) == mtp
+        assert streamed.keys() == resident.keys()
+        for key, entry in resident.items():
+            batched_head = vlm and micro_batch is None and ".mtp." in key
+            if batched_head and (".self_attn.o_proj" in key or ".mlp." in key):
+                continue
+            np.testing.assert_array_equal(streamed[key].counts, entry.counts, key)
+            if batched_head:
+                # Row-wise calls only regroup the fp32 token sums.
+                np.testing.assert_allclose(
+                    streamed[key].in_sum2, entry.in_sum2, rtol=1e-6, err_msg=key
+                )
+            else:
+                np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2, key)
+        reference = oq._measure_sensitivity(
+            str(source),
+            json.loads(json.dumps(config)),
+            4,
+            num_samples=4,
+            seq_length=4,
+        )
+        assert reference and metadata["sensitivity_map"].keys() == reference.keys()
+        for key, value in reference.items():
+            assert metadata["sensitivity_map"][key] == pytest.approx(value, rel=1e-3)
+
+    @pytest.mark.parametrize(
+        "vlm", [pytest.param(True, id="vlm"), pytest.param(False, id="text")]
+    )
+    def test_qwen3_5_streamed_imatrix_covers_quantized_mtp(
+        self, tmp_path, monkeypatch, vlm
+    ):
+        """Streamed MTP entries carry the names quantization looks up."""
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        _qwen3_5_stream_source(source, "qwen3_5_moe", vlm=vlm, mtp=True)
+        tokens = (mx.arange(32).reshape(4, 8) * 7 % 120 + 1).astype(mx.int32)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        output = tmp_path / "output"
+        oq.quantize_oq_streaming(
+            str(source),
+            str(output),
+            4,
+            group_size=32,
+            enhanced=True,
+            stream_calibration=True,
+            imatrix_num_samples=2,
+            imatrix_seq_length=8,
+            sensitivity_map_override={i: 1.0 for i in range(4)},
+            preserve_mtp=True,
+        )
+        report = json.loads((output / "oq_imatrix_report.json").read_text())
+        assert any(".mtp." in name for name in report["applied"])
+        assert report["missing"] == ["language_model.lm_head"]
+        assert not report["mismatched"]
 
 
 # Tiny Inkling 2 source in the original layout. Layers 0-3 hold NVFP4 experts and
