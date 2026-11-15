@@ -29,6 +29,11 @@ This module is that decision, and nothing else. It owns:
   signature are the ones the full enumeration would choose.
 * ``context_ladder`` / ``largest_context_for`` — the context dimension of the
   search, shared with ``recommendation.py``.
+* ``diverse_candidates`` — the best feasible plan for each cluster size
+  (2..4 Macs), ranked by the election's own scoring, for the measurement
+  search loop. It reuses the same solver machinery as ``solve_cluster_plan``
+  and never changes what that solver elects: it only keeps every size's best
+  instead of stopping at the fewest Macs that fit.
 
 The solver is pure and deterministic: no HTTP, no SSH, no model loading, no
 settings writes. The one filesystem access is ``moe_offload_layer_bytes``
@@ -48,11 +53,14 @@ from ..catalogue import _CONTEXT_LADDER
 from ..performance import ExecutionProfileName
 from ..planner import ModelLayout, _held_layer_bytes
 from .election import (
+    MAX_CANDIDATE_NODES,
     ElectionResult,
     NodeFacts,
     NoFeasiblePlanError,
+    PlanCandidate,
     budget_for,
     elect,
+    rank_candidates,
 )
 
 GIB = 1024**3
@@ -831,6 +839,112 @@ def solve_cluster_plan(
         ),
         excluded_nodes=(),
     )
+
+
+def diverse_candidates(
+    nodes: Sequence[NodeFacts],
+    model: ModelLayout,
+    *,
+    target_context_tokens: int,
+    rank0_extra_bytes: int = 0,
+    mtp: bool = False,
+    execution_profile: ExecutionProfileName = "balanced",
+    microbatch_size: int = 1,
+    saved: SavedPolicy | None = None,
+    fabric_links: Sequence[Sequence[str]] | None = None,
+    allow_optimistic_admission: bool = False,
+    max_count: int = 3,
+) -> list[PlanCandidate]:
+    """The best deployable plan per cluster size, for the measurement search.
+
+    The search loop needs DIVERSE constellations to measure: the best feasible
+    plan for 2 Macs, for 3, for 4 — a different node count is the fewer-nodes
+    vs more-context tradeoff. ``solve_cluster_plan`` stops at the fewest Macs
+    that fit and returns only that one; this asks the same solver machinery for
+    every size from ``MIN_CLUSTER_NODES`` up to ``min(len(nodes), 4)`` and keeps
+    each size's best, so no size is silently skipped just because a smaller one
+    already fit.
+
+    Pure and additive: it reuses ``_best_for_size`` / ``_plans_for_subset`` /
+    ``elect`` / ``plan_hybrid`` (the planner still owns every layer split) and
+    changes nothing about what ``solve_cluster_plan`` or ``elect`` return. Each
+    returned candidate carries its ``shard_plan`` and ``plan_hash`` so a caller
+    can deploy it. Sizes with no feasible plan are skipped; a one-Mac "plan" is
+    never a cluster and is never returned. The result is ranked best-first by
+    the election's own scoring (``rank_candidates``) and capped at ``max_count``.
+
+    ``fabric_links`` is respected exactly as in the election: a rank order is
+    only feasible when every consecutive pair has a measured link. An
+    infeasible model (or one mlx-lm cannot pipeline) yields an empty list, not
+    an error — the search simply has nothing worth measuring.
+    """
+
+    node_list = list(nodes)
+    if not node_list:
+        raise ValueError("at least one node is required")
+    node_ids = [facts.node_id for facts in node_list]
+    if len(set(node_ids)) != len(node_ids):
+        raise ValueError("node IDs must be unique")
+    if target_context_tokens <= 0:
+        raise ValueError("target_context_tokens must be positive")
+    if microbatch_size < 1:
+        raise ValueError("microbatch_size must be positive")
+    if max_count <= 0:
+        return []
+    saved = saved or SavedPolicy()
+
+    # A checkpoint mlx-lm cannot pipeline never yields a deployable multi-Mac
+    # candidate (the solver refuses it with ``choose_pipeline_model``); the
+    # search gets an empty list rather than a plan that can never stage.
+    if (
+        len(node_list) > 1
+        and (model.source or "") != "synthetic"
+        and not model.supports_pipeline
+    ):
+        return []
+
+    largest = min(len(node_list), MAX_CANDIDATE_NODES)
+    if largest < MIN_CLUSTER_NODES:
+        return []
+
+    memo = _SolverMemo()
+    levers = _levers(
+        saved,
+        model,
+        allow_optimistic_admission,
+        memo=memo,
+    )
+    ladder = context_ladder(
+        target=target_context_tokens,
+        declared=_declared_context(model, saved),
+    )
+
+    bests: list[PlanCandidate] = []
+    for size in range(MIN_CLUSTER_NODES, largest + 1):
+        best, _size_error = _best_for_size(
+            node_list,
+            size,
+            model,
+            ladder=ladder,
+            levers=levers,
+            rank0_extra_bytes=rank0_extra_bytes,
+            mtp=mtp,
+            execution_profile=execution_profile,
+            origin_node=None,
+            fabric_links=fabric_links,
+            two_mac_fallback=False,
+            microbatch_size=microbatch_size,
+            memo=memo,
+        )
+        if best is None:
+            continue
+        candidate = best[2].selected
+        if candidate is not None and candidate.feasible:
+            # Carry the resolved policy so the search loop's plan_apply
+            # re-elects the identical signature (best[3] is the ResourcePolicy).
+            bests.append(replace(candidate, resource_policy=best[3]))
+
+    return list(rank_candidates(bests, node_list)[:max_count])
 
 
 def _best_for_size(

@@ -76,7 +76,7 @@ function clusterWizard() {
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}/unload`,
     };
 
-    // The Cluster Assistant surface: five admin routes, and nothing else.
+    // The Cluster Assistant surface: seven admin routes, and nothing else.
     // the first UI slice notes: the browser never launches, stages, deploys or
     // starts inference itself — it calls these and renders the answer.
     // A 32 GB Mac cannot spare the 32 GiB workstation reserve and still hold a
@@ -86,7 +86,7 @@ function clusterWizard() {
     // (models.py MAX_RECOMMENDATION_CANDIDATES). A larger catalogue is narrowed
     // client-side, never sent and refused.
     const ASSISTANT_MAX_CANDIDATES = 32;
-    // A minutes-long measurement must survive a transient network blip:
+    // A minutes-long measurement/launch must survive a transient network blip:
     // tolerate this many consecutive poll errors (with backoff) before failing.
     const ASSISTANT_POLL_MAX_ERRORS = 3;
 
@@ -95,12 +95,82 @@ function clusterWizard() {
         status: '/admin/api/cluster/assistant/status',
         recommend: '/admin/api/cluster/assistant/recommend',
         plan: '/admin/api/cluster/assistant/plan',
+        apply: '/admin/api/cluster/assistant/apply',
+        start: '/admin/api/cluster/assistant/start',
+        // The automatic constellation search: ranks, deploys and measures
+        // several constellations, keeps the best measured and stops the losers.
+        // POST returns a job handle immediately; the loop runs in the background
+        // and searchStatus(jobId) polls progress + the outcome (minutes-long).
+        search: '/admin/api/cluster/assistant/search',
+        searchStatus: (jobId) => `/admin/api/cluster/assistant/search/${jobId}`,
+        // Tuning the winning deployment (AGENTS.md the notes "Tuning is a saved
+        // preset"): /tune is a quick per-request sampler sweep on the running
+        // cluster; /tune-redeploy sweeps the per-model MTP switch + depth by
+        // redeploying each config (minutes, background job, polled).
+        tune: '/admin/api/cluster/assistant/tune',
+        tuneRedeploy: '/admin/api/cluster/assistant/tune-redeploy',
+        tuneRedeployStatus: (jobId) =>
+            `/admin/api/cluster/assistant/tune-redeploy/${encodeURIComponent(jobId)}`,
+        // The last deployment a reloaded card can show and start again.
+        session: '/admin/api/cluster/assistant/session',
+        // The redacted support bundle. The browser only asks; redaction happens
+        // on the backend, and the local text is the fallback when it is down.
+        // Read-only local interface preflight; it returns commands and never
+        // executes them.
+        networkPreflight: '/admin/api/cluster/assistant/network-preflight',
+        diagnostics: (measurementId, operationId) => {
+            const params = new URLSearchParams();
+            if (measurementId) params.set('measurement_id', measurementId);
+            if (operationId) params.set('operation_id', operationId);
+            const query = params.toString();
+            return `/admin/api/cluster/assistant/diagnostics${query ? `?${query}` : ''}`;
+        },
+        // The in-app switch for the post-ready performance measurement.
+        performanceProbe: '/admin/api/cluster/assistant/performance-probe',
+        // Screen 6: the coordinator's own unload route, relayed by the
+        // assistant backend so the browser never dials another Mac's admin API.
+        stop: '/admin/api/cluster/assistant/stop',
+        operation: (id) =>
+            `/admin/api/cluster/assistant/operations/${encodeURIComponent(id)}`,
         // The free-space relay (the live-run notes): one model, on one measured
         // Mac, deleted by that Mac's own route. The browser asks; it never
         // reaches a disk or an SSH target itself.
         models: (nodeId, modelId) =>
             `/admin/api/cluster/assistant/models/${encodeURIComponent(nodeId)}/${encodeURIComponent(modelId)}`,
     };
+
+    // Screen 4 (the progress notes): the six steps
+    // the backend can actually distinguish, in its corrected order — planning
+    // precedes staging. The two pairs it cannot split are one row each
+    // (runtime prepare + model copy, load + readiness canary).
+    const ASSISTANT_PROGRESS_ROWS = [
+        { key: 'checking', label: 'cluster.assistant.progress.checking' },
+        { key: 'planning', label: 'cluster.assistant.progress.planning' },
+        { key: 'preparing', label: 'cluster.assistant.progress.preparing' },
+        { key: 'starting', label: 'cluster.assistant.progress.starting' },
+        { key: 'loading', label: 'cluster.assistant.progress.loading' },
+        { key: 'ready', label: 'cluster.assistant.progress.ready' },
+    ];
+
+    // Which operation phase may narrate which row. A phase this build does not
+    // know (a newer coordinator) narrates no row: the row already shown stays,
+    // and the raw message is rendered underneath it (the notes). Guessing is not an
+    // option and neither is blanking the row.
+    const ASSISTANT_ROW_PHASES = {
+        preparing: ['staging', 'applied'],
+        starting: ['starting'],
+        loading: ['loading'],
+        ready: ['ready'],
+    };
+    const ASSISTANT_KNOWN_PHASES = [
+        'queued',
+        'staging',
+        'applied',
+        'starting',
+        'loading',
+        'ready',
+        'failed',
+    ];
 
     // exo-style data layer: one snapshot endpoint polled once per second
     // while the tab is visible; the UI is a pure function of the snapshot.
@@ -212,12 +282,12 @@ function clusterWizard() {
 
         // ---- assistant (the minimal Screen-3 slice) --------------------------
         // One card inside the plan section that drives measure → recommend →
-        // plan through the assistant admin API. It renders the backend's
-        // answer; it never derives a plan, a rank order, a coordinator or an
-        // admission, and it never launches anything itself.
+        // plan → apply → start through the assistant admin API. It renders the
+        // backend's answer; it never derives a plan, a rank order, a coordinator
+        // or an admission, and it never launches anything itself.
         assistant: {
-            // idle → measuring → recommending → measuring_model → planning,
-            // plus failed.
+            // idle → measuring → recommending → measuring_model → planning →
+            // applying → starting → loading → ready, plus failed.
             state: 'idle',
             // Which measurement is being taken: the entry measurement (then
             // recommend) or the model-bound one for the recommended model.
@@ -235,13 +305,40 @@ function clusterWizard() {
             // advanced override. The solver still shows every lever.
             nodeSelection: 'minimal',
             // The user explicitly accepted the offered 2-Mac fallback after a
-            // topology_incomplete refusal. It is part of the plan signature.
+            // topology_incomplete refusal. It is part of the plan signature, so
+            // it is sent to plan and apply unchanged.
             confirmTwoMacFallback: false,
             topologyFallback: null,
             missingLinks: [],
+            // The read-only bridge plan from the network preflight, or null.
+            networkPreflight: null,
+            networkPreflightBusy: false,
             plan: null,
-            // Frozen plan-time inputs: the exact object sent to plan.
+            // Frozen plan-time inputs: the exact object sent to plan and apply.
             inputs: null,
+            operation: null,
+            operationId: '',
+            applyOperationId: '',
+            applyState: '',
+            progress: null,
+            endpoint: null,
+            // The one measured rate block, or null when no probe answered.
+            // Rendering a rate is conditional on this being present.
+            observed: null,
+            // Screen 6: the deployment a ready start launched, and whether it
+            // was stopped. `state` stays ready; no state machine value exists
+            // for a stop, so the backend reports this boolean.
+            deploymentId: '',
+            stopped: false,
+            // The persisted last deployment, read once after a reload. It is
+            // not a plan: it only names what ran and the inputs to start again.
+            session: null,
+            // The server setting for the post-ready measurement (B3).
+            probeEnabled: false,
+            // Screen 4: the last row the backend actually reported. A failure
+            // keeps it so the user can see where it stopped; nothing advances
+            // it without a value from the progress notes
+            failedRow: '',
             // The measured Macs from the last status poll, with each Mac's own
             // model list. Only the Mac the user picks is ever listed for delete.
             measurementNodes: [],
@@ -253,12 +350,57 @@ function clusterWizard() {
             warnings: [],
             error: null,
             measureTimer: null,
+            operationTimer: null,
             measurePollBusy: false,
+            operationPollBusy: false,
             // Bounded retry on transient poll errors: consecutive failures and
             // the ticks to skip before the next attempt (1, 2, 4 … backoff).
             measurePollErrors: 0,
             measurePollSkip: 0,
+            operationPollErrors: 0,
+            operationPollSkip: 0,
+            agentOpen: false,
             copied: '',
+            // The automatic constellation search: an action on this card, not a
+            // new state-machine value. Its own busy flag plus the shared
+            // generation guard keep the background job single-flight and drop a
+            // stale answer. priority/maxCount are the user's picks; progress
+            // tracks the job, result/error hold the final outcome.
+            search: {
+                busy: false,
+                priority: 'balanced',
+                maxCount: 3,
+                progress: '',
+                result: null,
+                error: '',
+            },
+            // Tuning the winning deployment. Both are actions on this card, not
+            // state-machine values, and each keeps its own busy flag and
+            // generation counter so a late answer cannot overwrite a newer one.
+            // `tune` is the quick per-request sampler sweep on the running
+            // cluster; `tuneRedeploy` is the minutes-long MTP sweep that stops
+            // each config, so its completion leaves the cluster stopped.
+            tune: {
+                busy: false,
+                result: null,
+                error: '',
+                errorAction: '',
+            },
+            tuneRedeploy: {
+                busy: false,
+                jobId: '',
+                generation: 0,
+                state: '',
+                total: 0,
+                done: 0,
+                message: '',
+                rows: [],
+                best: null,
+                presetKey: '',
+                mtpApplicable: true,
+                error: '',
+                errorAction: '',
+            },
         },
 
         // ---- plan ------------------------------------------------------------
@@ -372,7 +514,9 @@ function clusterWizard() {
         init() {
             if (this.pollTimer !== null) return;
             this.tick();
-            this.pollTimer = setInterval(() => this.tick(), CLUSTER_POLL_MS);
+            this.pollTimer = setInterval(() => this.tick(), CLUSTER_V2_POLL_MS);
+            this.loadAssistantSession();
+            this.loadAssistantProbeSetting();
         },
 
         wizardVisible() {
@@ -4230,21 +4374,37 @@ function clusterWizard() {
         assistantRunning() {
             return (
                 this.assistant.busy ||
-                ['measuring', 'recommending', 'measuring_model'].includes(
-                    this.assistant.state,
-                )
+                [
+                    'measuring',
+                    'recommending',
+                    'measuring_model',
+                    'applying',
+                    'starting',
+                    'loading',
+                ].includes(this.assistant.state)
             );
         },
 
-        // The assistant card is mounted independently of wizardState(): the
-        // entry must stay reachable on a Mac that already has a saved setup.
-        // Show it once there is a paired peer to assist, or any assistant
-        // state exists.
+        assistantReady() {
+            return (
+                this.assistant.state === 'ready' &&
+                this.assistant.endpoint?.ready === true &&
+                !this.assistant.stopped
+            );
+        },
+
+        // The assistant card is mounted independently of wizardState(): a
+        // configured deployment (wizardState 'active') must not hide the
+        // assistant's own ready/stop/endpoint surface, and the entry must stay
+        // reachable on a Mac that already has a saved setup. Show it once there
+        // is a paired peer to assist, or any assistant state exists.
         assistantSurfaceVisible() {
             return Boolean(
                 this.pairedDevices().length ||
                     this.assistant.measurementId ||
-                    this.assistant.plan,
+                    this.assistant.plan ||
+                    this.assistant.operation ||
+                    this.assistant.session,
             );
         },
 
@@ -4257,6 +4417,10 @@ function clusterWizard() {
                     'cluster.assistant.state.measuring_model',
                 ),
                 planning: window.t('cluster.assistant.state.planning'),
+                applying: window.t('cluster.assistant.state.applying'),
+                starting: window.t('cluster.assistant.state.starting'),
+                loading: window.t('cluster.assistant.state.loading'),
+                ready: window.t('cluster.assistant.state.ready'),
                 failed: window.t('cluster.assistant.state.failed'),
             };
             return labels[this.assistant.state] || '';
@@ -4290,12 +4454,130 @@ function clusterWizard() {
         // both, so the handoff resolves the id here instead of inventing one.
         // An unresolved id links without a ``model`` parameter; it never falls
         // back to a different model silently.
+        assistantServingModelPath() {
+            return this.assistant.selectedModel || this.selectedModelPath || '';
+        },
+
+        assistantServingModelId() {
+            const path = this.assistantServingModelPath();
+            if (!path) return '';
+            const match = this.modelOptions.find(
+                (model) => model?.model_path === path && model?.id,
+            );
+            return match ? String(match.id) : '';
+        },
+
+        assistantCoordinatorNodeId() {
+            return (
+                this.assistant.endpoint?.node ||
+                this.assistant.operation?.coordinator_node ||
+                this.assistant.plan?.coordinator_node ||
+                ''
+            );
+        },
+
+        assistantCoordinatorIsLocal() {
+            const nodeId = this.assistantCoordinatorNodeId();
+            const selfId = this.selfDevice()?.node_id || '';
+            return Boolean(nodeId) && Boolean(selfId) && nodeId === selfId;
+        },
+
         // ``/chat`` is a page of the server that owns the endpoint. When that
         // Mac is this Mac the browser already talks to it, so a relative link
         // keeps the session; when it is another Mac the link is that Mac's own
         // page, because the origin has no key and must not proxy.
+        assistantChatBase() {
+            const url = String(this.assistant.endpoint?.url || '').replace(
+                /\/+$/,
+                '',
+            );
+            if (!url) return '';
+            return this.assistantCoordinatorIsLocal() ? '/chat' : `${url}/chat`;
+        },
+
+        assistantChatUrl() {
+            if (!this.assistantReady()) return '';
+            const base = this.assistantChatBase();
+            if (!base) return '';
+            const modelId = this.assistantServingModelId();
+            return modelId
+                ? `${base}?model=${encodeURIComponent(modelId)}`
+                : base;
+        },
+
+        assistantAgentBaseUrl() {
+            const url = String(this.assistant.endpoint?.url || '').replace(
+                /\/+$/,
+                '',
+            );
+            return url ? `${url}/v1` : '';
+        },
+
+        assistantAgentModelId() {
+            return this.assistantServingModelId();
+        },
+
+        assistantAgentNote() {
+            return window
+                .t('cluster.assistant.agent.note')
+                .replace('{node}', this.assistantCoordinatorLabel());
+        },
+
+        assistantRemoteChatNote() {
+            if (this.assistantCoordinatorIsLocal()) return '';
+            return window
+                .t('cluster.assistant.chat_remote_note')
+                .replace('{node}', this.assistantCoordinatorLabel());
+        },
+
+        assistantCoordinatorLabel() {
+            return (
+                this.assistantCoordinatorName() ||
+                window.t('cluster.assistant.the_coordinator')
+            );
+        },
+
         // One line, only when the backend measured it. No rate is ever derived
         // from the readiness canary or a prediction.
+        assistantObservedLabel() {
+            const observed = this.assistant.observed;
+            if (!observed) return '';
+            const parts = [];
+            const decode = Number(observed.decode_tok_per_s);
+            if (Number.isFinite(decode) && decode > 0) {
+                parts.push(
+                    window
+                        .t('cluster.assistant.observed.decode')
+                        .replace('{rate}', decode.toFixed(1)),
+                );
+            }
+            const prefill = Number(observed.prefill_tok_per_s);
+            if (Number.isFinite(prefill) && prefill > 0) {
+                parts.push(
+                    window
+                        .t('cluster.assistant.observed.prefill')
+                        .replace('{rate}', prefill.toFixed(1)),
+                );
+            }
+            if (!parts.length) return '';
+            const ttft = Number(observed.ttft_ms);
+            if (Number.isFinite(ttft) && ttft > 0) {
+                parts.push(
+                    window
+                        .t('cluster.assistant.observed.ttft')
+                        .replace('{ms}', ttft.toFixed(0)),
+                );
+            }
+            if (observed.measured_at) {
+                parts.push(
+                    window
+                        .t('cluster.assistant.observed.measured_at')
+                        .replace('{when}', String(observed.measured_at)),
+                );
+            }
+            return parts.join(' · ');
+        },
+
         assistantMacCount() {
             const plan = this.assistant.plan;
             if (Array.isArray(plan?.rank_order) && plan.rank_order.length) {
@@ -4353,6 +4635,28 @@ function clusterWizard() {
 
         // The plan or the chosen tradeoff: which signature/coordinator/order
         // apply and start must use. A tradeoff carries its own signature.
+        assistantPlanSource() {
+            const plan = this.assistant.plan;
+            if (!plan) return null;
+            const tradeoff = this.assistant.selectedTradeoff;
+            if (!tradeoff) {
+                return {
+                    plan_signature: plan.plan_signature,
+                    coordinator_node: plan.coordinator_node,
+                    rank_order: plan.rank_order,
+                    resource_policy: plan.resource_policy,
+                    context_tokens: plan.context_tokens,
+                };
+            }
+            return {
+                plan_signature: tradeoff.plan_signature,
+                coordinator_node: tradeoff.coordinator_node,
+                rank_order: tradeoff.rank_order,
+                resource_policy: tradeoff.resource_policy,
+                context_tokens: tradeoff.context_tokens,
+            };
+        },
+
         assistantTradeoffs() {
             return this.assistant.plan?.tradeoffs || [];
         },
@@ -4404,7 +4708,10 @@ function clusterWizard() {
         },
 
         assistantCoordinatorName() {
-            const nodeId = this.assistant.plan?.coordinator_node || '';
+            const nodeId =
+                this.assistant.plan?.coordinator_node ||
+                this.assistant.operation?.coordinator_node ||
+                '';
             if (!nodeId) return '';
             const device = this.allDevices().find(
                 (item) => item.node_id === nodeId,
@@ -4429,14 +4736,98 @@ function clusterWizard() {
         // already reports. The row that is current is the *last* one a backend
         // value named: a failure keeps it, an unknown phase keeps it, and no
         // timer, interval or optimistic step ever moves it.
+        assistantReportedRow() {
+            const state = this.assistant.state;
+            if (state === 'measuring' || state === 'measuring_model') {
+                return 'checking';
+            }
+            if (state === 'recommending' || state === 'planning') {
+                return 'planning';
+            }
+            // ``applying`` is only ever set for an apply operation, and
+            // ``starting``/``loading`` only for a start operation.
+            if (state === 'applying') return 'preparing';
+            if (state === 'starting') return 'starting';
+            if (state === 'loading') return 'loading';
+            // A ``ready`` operation whose endpoint is not ready has not proven
+            // readiness: the last proven row (load + canary) stays, and the
+            // endpoint stays hidden.
+            if (state === 'ready') {
+                // A stopped deployment reached Ready and then stopped; the row
+                // does not regress to Loading, and the stopped block says so.
+                if (this.assistant.stopped) return 'ready';
+                return this.assistantReady() ? 'ready' : 'loading';
+            }
+            return '';
+        },
+
+        assistantProgressRow() {
+            if (this.assistant.state === 'failed') {
+                return this.assistant.failedRow || '';
+            }
+            return this.assistantReportedRow();
+        },
+
+        assistantProgressRows() {
+            const current = this.assistantProgressRow();
+            const index = ASSISTANT_PROGRESS_ROWS.findIndex(
+                (row) => row.key === current,
+            );
+            const failed = this.assistant.state === 'failed';
+            return ASSISTANT_PROGRESS_ROWS.map((row, position) => {
+                let state = 'pending';
+                if (index >= 0) {
+                    if (position < index) state = 'done';
+                    else if (position === index) {
+                        state = failed ? 'failed' : 'current';
+                    }
+                }
+                const isCurrent = position === index;
+                return {
+                    key: row.key,
+                    label: window.t(row.label),
+                    state,
+                    message: isCurrent ? this.assistantRowMessage(row.key) : '',
+                    count: isCurrent ? this.assistantRowCount(row.key) : '',
+                };
+            });
+        },
+
         // The backend's own sentence under the current row. A known phase that
         // belongs to another row never labels this one; an unknown phase is
         // shown as-is, because it is the only thing the coordinator said.
+        assistantRowMessage(rowKey) {
+            const progress = this.assistant.progress;
+            if (!progress || !rowKey) return '';
+            const phase = String(progress.phase || '');
+            const owns = (ASSISTANT_ROW_PHASES[rowKey] || []).includes(phase);
+            if (!owns && ASSISTANT_KNOWN_PHASES.includes(phase)) return '';
+            return String(progress.message || '');
+        },
+
         // Staging is the only phase that reports per-Mac counts. "2 of 3 Macs"
         // is a count the backend reported; it is never turned into a
         // percentage.
+        assistantRowCount(rowKey) {
+            if (rowKey !== 'preparing') return '';
+            return this.assistantProgressCount();
+        },
+
+        assistantProgressCount() {
+            const progress = this.assistant.progress;
+            const total = Number(progress?.nodes_total || 0);
+            if (!total) return '';
+            return window
+                .t('cluster.assistant.progress_nodes')
+                .replace('{ready}', String(Number(progress?.nodes_ready || 0)))
+                .replace('{total}', String(total));
+        },
+
         assistantPlanWarnings() {
-            const warnings = this.assistant.plan?.warnings || [];
+            const warnings =
+                this.assistant.operation?.warnings ||
+                this.assistant.plan?.warnings ||
+                [];
             return Array.isArray(warnings) ? warnings : [];
         },
 
@@ -4451,8 +4842,184 @@ function clusterWizard() {
         },
 
         assistantHasDetails() {
-            return Boolean(this.assistant.measurementId || this.assistant.plan);
+            return Boolean(
+                this.assistant.measurementId ||
+                    this.assistant.plan ||
+                    this.assistant.operation,
+            );
         },
+
+        assistantOperationJson() {
+            const operation = this.assistant.operation;
+            if (!operation) return '';
+            // The collapsed debug pane mirrors the card's endpoint gate: the
+            // URL is shown only when assistantReady() (ready and not stopped),
+            // and a port-0 URL is never rendered. Before that it is redacted.
+            const url = String(operation.endpoint?.url || '');
+            const renderable =
+                this.assistantReady() && Boolean(url) && !/:0(?=$|\/)/.test(url);
+            const shown = renderable
+                ? operation
+                : { ...operation, endpoint: null };
+            return JSON.stringify(shown, null, 2);
+        },
+
+        // One copyable diagnostics block: IDs, the resolved policy and the
+        // operation's state. No key, token, SSH target or full path.
+        assistantDiagnosticsText() {
+            const plan = this.assistant.plan;
+            const session = this.assistant.session;
+            const operation = this.assistant.operation;
+            const policy = plan?.resource_policy || session?.resource_policy || {};
+            const selected =
+                plan?.selected_node_ids || session?.rank_order || [];
+            const excluded = (plan?.excluded_nodes || [])
+                .map((item) => item.node_id)
+                .join(', ');
+            const warnings = (this.assistantPlanWarnings() || [])
+                .map((item) => item.code)
+                .filter(Boolean)
+                .join(', ');
+            const topology = plan?.topology || null;
+            const missingLinks = (
+                topology?.missing_links ||
+                this.assistant.missingLinks ||
+                []
+            )
+                .map((pair) => pair.join(' <-> '))
+                .join(', ');
+            const model =
+                this.assistantModelLabel() ||
+                String(session?.model_path || '').split('/').pop() ||
+                '-';
+            return [
+                'oMLX Cluster Assistant',
+                `measurement: ${this.assistant.measurementId || session?.measurement_id || '-'}`,
+                `plan: ${plan?.plan_signature || session?.plan_signature || '-'}`,
+                `model: ${model}`,
+                `context: ${plan?.context_tokens || session?.context_tokens || this.assistant.selectedContextTokens || this.targetContextTokens || '-'}`,
+                `coordinator: ${this.assistantCoordinatorName() || '-'}`,
+                `rank_order: ${(plan?.rank_order || session?.rank_order || []).join(' -> ') || '-'}`,
+                `selected: ${selected.join(', ') || '-'}`,
+                `excluded: ${excluded || '-'}`,
+                `tier: ${policy.memory_guard_tier || 'saved'}`,
+                `table_offload: ${policy.table_offload || 'none'}`,
+                `moe: ${
+                    policy.moe_expert_offload
+                        ? `${Math.round(Number(policy.moe_resident_fraction || 0) * 100)}% resident`
+                        : 'off'
+                }`,
+                `admission: ${policy.admission || 'p50'}`,
+                `topology: ${
+                    topology?.measured
+                        ? topology.complete
+                            ? 'line'
+                            : 'incomplete'
+                        : 'not measured'
+                }`,
+                `missing_links: ${missingLinks || '-'}`,
+                `two_mac_fallback: ${
+                    topology?.fallback_used ||
+                    this.assistant.confirmTwoMacFallback
+                        ? 'yes'
+                        : 'no'
+                }`,
+                `operation: ${operation?.operation_id || this.assistant.operationId || session?.operation_id || '-'} ${operation?.state || session?.state || '-'}`,
+                `phase: ${operation?.progress?.phase || this.assistant.progress?.phase || '-'}`,
+                `deployment: ${this.assistant.deploymentId || session?.deployment_id || '-'}`,
+                `endpoint: ${this.assistant.endpoint?.url || session?.endpoint?.url || '-'}`,
+                `observed: ${this.assistantObservedLabel() || 'not measured'}`,
+                `warnings: ${warnings || '-'}`,
+            ].join('\n');
+        },
+
+        async runAssistantNetworkPreflight() {
+            if (this.assistant.networkPreflightBusy) return null;
+            this.assistant.networkPreflightBusy = true;
+            try {
+                const plan = await this.apiFetch(
+                    ASSISTANT_API.networkPreflight,
+                );
+                this.assistant.networkPreflight = plan || null;
+                return plan;
+            } catch (error) {
+                this.notify(
+                    'error',
+                    error?.message ||
+                        window.t('cluster.assistant.err.generic'),
+                );
+                return null;
+            } finally {
+                this.assistant.networkPreflightBusy = false;
+            }
+        },
+
+        async copyAssistantNetworkCommands() {
+            const commands = this.assistant.networkPreflight?.commands || [];
+            if (!commands.length) return;
+            try {
+                if (navigator.clipboard?.writeText) {
+                    await navigator.clipboard.writeText(commands.join('\n'));
+                    this.notify(
+                        'success',
+                        window.t('cluster.assistant.copied'),
+                    );
+                } else {
+                    this.notify(
+                        'error',
+                        window.t('cluster.assistant.err.generic'),
+                    );
+                }
+            } catch (error) {
+                this.notify(
+                    'error',
+                    window.t('cluster.assistant.err.generic'),
+                );
+            }
+        },
+
+        async copyAssistantDiagnostics() {
+            let text = this.assistantDiagnosticsText();
+            const measurementId =
+                this.assistant.measurementId ||
+                this.assistant.session?.measurement_id;
+            const operationId =
+                this.assistant.operationId ||
+                this.assistant.session?.operation_id;
+            if (measurementId || operationId) {
+                try {
+                    const bundle = await this.apiFetch(
+                        ASSISTANT_API.diagnostics(measurementId, operationId),
+                    );
+                    text = JSON.stringify(bundle, null, 2);
+                } catch (error) {
+                    // The local block is still useful when the backend is down.
+                }
+            }
+            try {
+                if (
+                    typeof navigator !== 'undefined' &&
+                    navigator.clipboard?.writeText
+                ) {
+                    await navigator.clipboard.writeText(text);
+                    this.notify(
+                        'success',
+                        window.t('cluster.assistant.copied'),
+                    );
+                } else {
+                    this.notify(
+                        'error',
+                        window.t('cluster.assistant.err.generic'),
+                    );
+                }
+            } catch (error) {
+                this.notify(
+                    'error',
+                    window.t('cluster.assistant.err.generic'),
+                );
+            }
+        },
+
         assistantRecommendedCandidate() {
             const response = this.assistant.recommendation;
             const candidates = Array.isArray(response?.candidates)
@@ -4582,8 +5149,182 @@ function clusterWizard() {
         // and generation-guarded exactly like the polls; a stale answer is
         // dropped. A future async-job refactor is the proper long-running model.
         // -----------------------------------------------------------------
+        assistantSearchAvailable() {
+            // The route needs a model-bound measurement (it refuses a
+            // hardware-only one). Offer search once the chosen model has been
+            // measured or a plan exists.
+            return Boolean(this.assistant.measurementId) &&
+                Boolean(this.assistant.measurementModel || this.assistant.plan);
+        },
+
+        assistantSearchPriorities() {
+            return ['balanced', 'speed', 'ttft', 'quality', 'context'].map(
+                (key) => ({
+                    key,
+                    label: window.t(`cluster.assistant.search.priority.${key}`),
+                }),
+            );
+        },
+
+        setAssistantSearchPriority(key) {
+            if (this.assistant.search.busy) return;
+            this.assistant.search.priority = key;
+        },
+
+        assistantSearchMaxCounts() {
+            return [1, 2, 3, 4];
+        },
+
+        setAssistantSearchMaxCount(count) {
+            if (this.assistant.search.busy) return;
+            this.assistant.search.maxCount = count;
+        },
+
+        async runAssistantSearch() {
+            // Double-click / concurrent-flow guard: the first click already set
+            // busy; a second must not POST the same minutes-long search again.
+            if (this.assistantRunning() || this.assistant.search.busy) return null;
+            if (!this.assistantSearchAvailable()) return null;
+            const generation = ++this.assistant.generation;
+            this.assistant.search.busy = true;
+            this.assistant.busy = true;
+            this.assistant.search.error = '';
+            this.assistant.search.result = null;
+            const searchModel =
+                this.assistant.selectedModel || this.selectedModelPath;
+            const payload = {
+                measurement_id: this.assistant.measurementId,
+                context_tokens: Math.max(
+                    1,
+                    Number(
+                        this.assistant.selectedContextTokens ||
+                            this.targetContextTokens,
+                    ) || 32768,
+                ),
+                priority: this.assistant.search.priority,
+                max_count: this.assistant.search.maxCount,
+                mtp: this.assistantMtpFor(searchModel),
+                execution_profile: this.executionProfile,
+            };
+            try {
+                const handle = await this.apiFetch(ASSISTANT_API.search, {
+                    method: 'POST',
+                    body: JSON.stringify(payload),
+                });
+                if (generation !== this.assistant.generation) return null;
+                const jobId = handle?.job_id;
+                if (!jobId) {
+                    this.assistant.search.error = window.t(
+                        'cluster.assistant.search.failed',
+                    );
+                    return null;
+                }
+                // Poll the background job (generation-guarded single-flight):
+                // the loop deploys + measures several constellations over minutes.
+                for (;;) {
+                    if (generation !== this.assistant.generation) return null;
+                    const snapshot = await this.apiFetch(
+                        ASSISTANT_API.searchStatus(jobId),
+                    );
+                    if (generation !== this.assistant.generation) return null;
+                    this.assistant.search.progress = snapshot?.message || '';
+                    if (snapshot?.state === 'completed') {
+                        this.assistant.search.result = snapshot;
+                        return snapshot;
+                    }
+                    if (snapshot?.state === 'failed') {
+                        this.assistant.search.error =
+                            snapshot?.message ||
+                            window.t('cluster.assistant.search.failed');
+                        return null;
+                    }
+                    await new Promise((resolve) =>
+                        setTimeout(resolve, CLUSTER_V2_POLL_MS),
+                    );
+                }
+            } catch (error) {
+                if (generation !== this.assistant.generation) return null;
+                const refusal = error?.payload || {};
+                this.assistant.search.error =
+                    refusal.message ||
+                    error?.message ||
+                    window.t('cluster.assistant.search.failed');
+                return null;
+            } finally {
+                if (generation === this.assistant.generation) {
+                    this.assistant.search.busy = false;
+                    this.assistant.busy = false;
+                }
+            }
+        },
+
+        assistantSearchBest() {
+            return this.assistant.search.result?.best || null;
+        },
+
+        assistantSearchResults() {
+            const results = this.assistant.search.result?.results;
+            return Array.isArray(results) ? results : [];
+        },
+
+        assistantSearchErrors() {
+            const errors = this.assistant.search.result?.errors;
+            return Array.isArray(errors) ? errors : [];
+        },
+
+        assistantSearchRankOrder(row) {
+            const order = row?.rank_order;
+            if (!Array.isArray(order)) return '';
+            return order
+                .map((nodeId) => this.assistantNodeName(nodeId))
+                .join(' → ');
+        },
+
         // Only a measured constellation has a rate; an unmeasured one never
         // shows a number (never invent a rate). Reuses the observed.* wording.
+        assistantSearchMeasuredLabel(row) {
+            if (!row || row.measured !== true) return '';
+            const parts = [];
+            const decode = Number(row.decode_tok_per_s);
+            if (Number.isFinite(decode) && decode > 0) {
+                parts.push(
+                    window
+                        .t('cluster.assistant.observed.decode')
+                        .replace('{rate}', decode.toFixed(1)),
+                );
+            }
+            const prefill = Number(row.prefill_tok_per_s);
+            if (Number.isFinite(prefill) && prefill > 0) {
+                parts.push(
+                    window
+                        .t('cluster.assistant.observed.prefill')
+                        .replace('{rate}', prefill.toFixed(1)),
+                );
+            }
+            const ttft = Number(row.ttft_ms);
+            if (Number.isFinite(ttft) && ttft > 0) {
+                parts.push(
+                    window
+                        .t('cluster.assistant.observed.ttft')
+                        .replace('{ms}', ttft.toFixed(0)),
+                );
+            }
+            return parts.join(' · ');
+        },
+
+        assistantSearchRateLabel(row) {
+            return (
+                this.assistantSearchMeasuredLabel(row) ||
+                window.t('cluster.assistant.search.not_measured')
+            );
+        },
+
+        assistantSearchFeasibleLabel(row) {
+            return row?.feasible
+                ? window.t('cluster.assistant.search.yes')
+                : window.t('cluster.assistant.search.no');
+        },
+
         // -----------------------------------------------------------------
         // Tuning — the winning deployment's own knobs (AGENTS.md the notes "Tuning is
         // a saved preset, not a re-tune on every Start")
@@ -4601,11 +5342,323 @@ function clusterWizard() {
         // and a config that measured nothing says "not measured" — the card
         // never invents a rate.
         // -----------------------------------------------------------------
+        assistantTuneBusy() {
+            return this.assistant.tune.busy || this.assistant.tuneRedeploy.busy;
+        },
+
+        assistantTuneAvailable() {
+            // Tuning tunes a running deployment: it needs the ready start
+            // operation whose deployment it may measure, and a stopped cluster
+            // has nothing to sweep.
+            return (
+                this.assistantState() === 'ready' &&
+                Boolean(this.assistant.operationId) &&
+                !this.assistant.stopped
+            );
+        },
+
         // Only a rate the backend really measured is a rate: null, 0 and
         // unparsable values are "not measured", never 0.0 tok/s.
+        assistantTuneRate(value) {
+            if (value === null || value === undefined || value === '') {
+                return null;
+            }
+            const rate = Number(value);
+            return Number.isFinite(rate) && rate > 0 ? rate : null;
+        },
+
+        assistantTuneDecodeLabel(rate) {
+            return window
+                .t('cluster.assistant.observed.decode')
+                .replace('{rate}', rate.toFixed(1));
+        },
+
+        async runAssistantTune() {
+            // Double-click / concurrent-flow guard: the first click already set
+            // busy, and a second must not sweep the same cluster twice.
+            if (this.assistantRunning() || this.assistantTuneBusy()) return null;
+            if (!this.assistantTuneAvailable()) return null;
+            const generation = this.assistant.generation;
+            this.assistant.tune.busy = true;
+            this.assistant.busy = true;
+            this.assistant.tune.error = '';
+            this.assistant.tune.errorAction = '';
+            this.assistant.tune.result = null;
+            try {
+                const result = await this.apiFetch(ASSISTANT_API.tune, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        operation_id: this.assistant.operationId,
+                    }),
+                });
+                if (generation !== this.assistant.generation) return null;
+                this.assistant.tune.result = result || null;
+                return this.assistant.tune.result;
+            } catch (error) {
+                if (generation !== this.assistant.generation) return null;
+                // A refusal keeps its message and its one action; the card
+                // renders both instead of swallowing the 409.
+                const refusal = error?.payload || {};
+                this.assistant.tune.error =
+                    refusal.message ||
+                    error?.message ||
+                    'Fine-tuning did not answer';
+                this.assistant.tune.errorAction = String(refusal.action || '');
+                return null;
+            } finally {
+                if (generation === this.assistant.generation) {
+                    this.assistant.tune.busy = false;
+                    this.assistant.busy = false;
+                }
+            }
+        },
+
+        async runAssistantTuneRedeploy() {
+            if (this.assistantRunning() || this.assistantTuneBusy()) return null;
+            if (!this.assistantTuneAvailable()) return null;
+            const job = this.assistant.tuneRedeploy;
+            // One generation per job: a late snapshot from a replaced job is
+            // dropped instead of overwriting the newer one (pollStagingJob's
+            // rule, kept for this job's own loop).
+            const generation = ++job.generation;
+            job.busy = true;
+            job.jobId = '';
+            job.state = 'queued';
+            job.total = 0;
+            job.done = 0;
+            job.message = '';
+            job.rows = [];
+            job.best = null;
+            job.presetKey = '';
+            job.mtpApplicable = true;
+            job.error = '';
+            job.errorAction = '';
+            this.assistant.busy = true;
+            try {
+                const handle = await this.apiFetch(ASSISTANT_API.tuneRedeploy, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        operation_id: this.assistant.operationId,
+                    }),
+                });
+                if (generation !== job.generation) return null;
+                job.jobId = String(handle?.job_id || '');
+                job.state = String(handle?.state || 'queued');
+                job.total = Number(handle?.total) || 0;
+                job.mtpApplicable = handle?.mtp_applicable !== false;
+                if (!job.jobId) {
+                    job.error = 'The tuning job did not return an id';
+                    return null;
+                }
+                return await this.pollAssistantTuneRedeploy(generation);
+            } catch (error) {
+                if (generation !== job.generation) return null;
+                const refusal = error?.payload || {};
+                job.error =
+                    refusal.message ||
+                    error?.message ||
+                    'The tuning job did not start';
+                job.errorAction = String(refusal.action || '');
+                job.state = 'failed';
+                return null;
+            } finally {
+                if (generation === job.generation) {
+                    job.busy = false;
+                    this.assistant.busy = false;
+                }
+            }
+        },
+
         // One job, one loop, one answer at a time: GET the job, apply the
         // snapshot, stop at completed/failed. A snapshot from an older
         // generation never lands.
+        async pollAssistantTuneRedeploy(generation) {
+            const job = this.assistant.tuneRedeploy;
+            for (;;) {
+                if (generation !== job.generation) return null;
+                let snapshot;
+                try {
+                    snapshot = await this.apiFetch(
+                        ASSISTANT_API.tuneRedeployStatus(job.jobId),
+                    );
+                } catch (error) {
+                    if (generation !== job.generation) return null;
+                    const refusal = error?.payload || {};
+                    job.error =
+                        refusal.message ||
+                        error?.message ||
+                        'The tuning job stopped answering';
+                    job.errorAction = String(refusal.action || '');
+                    job.state = 'failed';
+                    return null;
+                }
+                if (generation !== job.generation) return null;
+                this.applyAssistantTuneRedeploy(snapshot);
+                if (job.state === 'completed') return snapshot;
+                if (job.state === 'failed') {
+                    job.error = job.error || job.message || 'The tuning job failed';
+                    return null;
+                }
+                await new Promise((resolve) =>
+                    setTimeout(resolve, CLUSTER_V2_POLL_MS),
+                );
+            }
+        },
+
+        applyAssistantTuneRedeploy(snapshot) {
+            const job = this.assistant.tuneRedeploy;
+            const data = snapshot || {};
+            if (data.job_id) job.jobId = String(data.job_id);
+            if (data.state) job.state = String(data.state);
+            if (data.total !== undefined) job.total = Number(data.total) || 0;
+            if (data.done !== undefined) job.done = Number(data.done) || 0;
+            if (data.message !== undefined) job.message = String(data.message || '');
+            if (Array.isArray(data.rows)) job.rows = data.rows;
+            if (data.best !== undefined) job.best = data.best || null;
+            if (data.preset_key !== undefined) {
+                job.presetKey = String(data.preset_key || '');
+            }
+            if (data.mtp_applicable !== undefined) {
+                job.mtpApplicable = data.mtp_applicable !== false;
+            }
+            // The sweep is not the running cluster: the backend unloads the
+            // deployment before its first config and stops each config after its
+            // own measurement. A finished (or failed) job therefore leaves the
+            // cluster stopped, and the card must not keep claiming it serves.
+            if (job.state === 'completed' || job.state === 'failed') {
+                this.markAssistantTunedClusterStopped();
+            }
+        },
+
+        markAssistantTunedClusterStopped() {
+            this.assistant.stopped = true;
+            this.assistant.endpoint = null;
+            this.assistant.observed = null;
+            if (this.assistant.operation) {
+                this.assistant.operation = {
+                    ...this.assistant.operation,
+                    stopped: true,
+                    endpoint: null,
+                    observed: null,
+                };
+            }
+        },
+
+        assistantTuneSamplerLabel() {
+            const sampler = this.assistant.tune.result?.sampler || null;
+            const name = sampler?.sampler ? String(sampler.sampler) : '';
+            if (!name) return 'not measured';
+            const knobs = [];
+            if (sampler.temperature !== null && sampler.temperature !== undefined) {
+                knobs.push(`temperature ${sampler.temperature}`);
+            }
+            if (sampler.top_p !== null && sampler.top_p !== undefined) {
+                knobs.push(`top_p ${sampler.top_p}`);
+            }
+            if (sampler.top_k !== null && sampler.top_k !== undefined) {
+                knobs.push(`top_k ${sampler.top_k}`);
+            }
+            const rate = this.assistantTuneRate(sampler.tok_per_s);
+            const detail = knobs.length ? ` (${knobs.join(', ')})` : '';
+            const measured =
+                rate === null ? '' : ` · ${this.assistantTuneDecodeLabel(rate)}`;
+            return `${name}${detail}${measured}`;
+        },
+
+        assistantTuneChunkLabel() {
+            const result = this.assistant.tune.result;
+            if (!result) return '';
+            if (result.chunk_applicable === false) return 'not applicable';
+            const chunk = Number(result.chunk);
+            return Number.isFinite(chunk) && chunk > 0
+                ? String(chunk)
+                : 'not measured';
+        },
+
+        assistantTuneMtpLabel() {
+            const result = this.assistant.tune.result;
+            if (!result) return '';
+            if (result.mtp_applicable === false) return 'not applicable';
+            if (result.mtp === true) return 'on';
+            if (result.mtp === false) return 'off';
+            return 'not measured';
+        },
+
+        assistantTuneMtpRatesLabel() {
+            const rates = this.assistant.tune.result?.mtp_rates || {};
+            const parts = [];
+            for (const [key, label] of [
+                ['false', 'off'],
+                ['true', 'on'],
+            ]) {
+                const rate = this.assistantTuneRate(rates?.[key]);
+                if (rate === null) continue;
+                parts.push(`${label} ${rate.toFixed(1)} tok/s`);
+            }
+            return parts.join(' · ');
+        },
+
+        assistantTunePresetLabel() {
+            return String(this.assistant.tune.result?.preset_key || '') || 'not saved';
+        },
+
+        assistantTuneRedeployRows() {
+            const rows = this.assistant.tuneRedeploy.rows;
+            return Array.isArray(rows) ? rows : [];
+        },
+
+        assistantTuneRedeployProgressLabel() {
+            const job = this.assistant.tuneRedeploy;
+            // The backend narrates which config it is measuring right now; an
+            // older job body falls back to the counters it did report.
+            if (job.message) return job.message;
+            if (!job.total) return job.state === 'queued' ? 'queued' : '';
+            const step = Math.min(job.done + 1, job.total);
+            return `measuring config ${step} of ${job.total}`;
+        },
+
+        assistantTuneRedeployRateLabel(row) {
+            const rate = this.assistantTuneRate(row?.decode_tok_per_s);
+            return rate === null ? 'not measured' : this.assistantTuneDecodeLabel(rate);
+        },
+
+        assistantTuneRedeployMtpLabel(row) {
+            if (row?.mtp === false) return 'off';
+            if (row?.mtp !== true) return '';
+            const depth = row?.mtp_depth;
+            return depth === null || depth === undefined
+                ? 'adaptive'
+                : `depth ${depth}`;
+        },
+
+        assistantTuneRedeployBest() {
+            const best = this.assistant.tuneRedeploy.best;
+            return best && best.config ? best : null;
+        },
+
+        assistantTuneRedeployBestRow() {
+            const best = this.assistantTuneRedeployBest();
+            if (!best) return null;
+            return (
+                this.assistantTuneRedeployRows().find(
+                    (row) => String(row?.config || '') === String(best.config),
+                ) || null
+            );
+        },
+
+        assistantTuneRedeployBestLabel() {
+            const best = this.assistantTuneRedeployBest();
+            if (!best) return '';
+            // The job's `best` names the winning config; its rate comes from
+            // the measured row with that label, never from a guess.
+            const rate = this.assistantTuneRate(
+                this.assistantTuneRedeployBestRow()?.decode_tok_per_s,
+            );
+            return rate === null
+                ? String(best.config)
+                : `${best.config} · ${this.assistantTuneDecodeLabel(rate)}`;
+        },
+
         // -----------------------------------------------------------------
         // Run on this Mac — single-node inference, no cluster
         //
@@ -4667,6 +5720,7 @@ function clusterWizard() {
             if (!modelPath || this.assistantRunning()) {
                 return this.reopenAssistantPicker();
             }
+            this.assistant.session = null;
             this.assistant.selectedModel = modelPath;
             this.selectedModelPath = modelPath;
             return this.startAssistant();
@@ -4683,9 +5737,21 @@ function clusterWizard() {
             this.assistant.plan = null;
             this.assistant.selectedTradeoff = null;
             this.assistant.inputs = null;
+            this.assistant.operation = null;
+            this.assistant.operationId = '';
+            this.assistant.applyOperationId = '';
+            this.assistant.applyState = '';
+            this.assistant.progress = null;
+            this.assistant.endpoint = null;
+            this.assistant.observed = null;
+            this.assistant.deploymentId = '';
+            this.assistant.stopped = false;
+            this.assistant.failedRow = '';
             this.assistant.measurementNodes = [];
             this.assistant.measurePollErrors = 0;
             this.assistant.measurePollSkip = 0;
+            this.assistant.operationPollErrors = 0;
+            this.assistant.operationPollSkip = 0;
             this.assistant.freeSpaceOpen = false;
             this.assistant.freeSpaceNode = '';
             this.assistant.freeSpaceConfirm = '';
@@ -4693,7 +5759,33 @@ function clusterWizard() {
             this.assistant.freeSpaceError = '';
             this.assistant.warnings = [];
             this.assistant.error = null;
+            this.assistant.agentOpen = false;
             this.assistant.copied = '';
+            // A fresh measurement retires any previous search answer. The
+            // priority/maxCount picks are user preferences and survive.
+            this.assistant.search.busy = false;
+            this.assistant.search.result = null;
+            this.assistant.search.error = '';
+            // A tuning answer (and a minutes-long MTP sweep) belongs to the
+            // deployment this run replaces: drop the result, and bump the job
+            // generation so a late snapshot cannot land on the new run.
+            this.assistant.tune.busy = false;
+            this.assistant.tune.result = null;
+            this.assistant.tune.error = '';
+            this.assistant.tune.errorAction = '';
+            this.assistant.tuneRedeploy.generation += 1;
+            this.assistant.tuneRedeploy.busy = false;
+            this.assistant.tuneRedeploy.jobId = '';
+            this.assistant.tuneRedeploy.state = '';
+            this.assistant.tuneRedeploy.total = 0;
+            this.assistant.tuneRedeploy.done = 0;
+            this.assistant.tuneRedeploy.message = '';
+            this.assistant.tuneRedeploy.rows = [];
+            this.assistant.tuneRedeploy.best = null;
+            this.assistant.tuneRedeploy.presetKey = '';
+            this.assistant.tuneRedeploy.mtpApplicable = true;
+            this.assistant.tuneRedeploy.error = '';
+            this.assistant.tuneRedeploy.errorAction = '';
             this.assistant.state = 'idle';
         },
 
@@ -4887,7 +5979,8 @@ function clusterWizard() {
             return (
                 Boolean(this.assistant.measurementId) &&
                 !this.assistantRunning() &&
-                this.assistant.state !== 'ready'
+                this.assistant.state !== 'ready' &&
+                !this.assistant.stopped
             );
         },
 
@@ -4929,7 +6022,7 @@ function clusterWizard() {
                 this.assistant.selectedTradeoff = null;
                 // The backend returns the salted fallback plan only when the
                 // consent was sent. Keep the flag exactly as the plan used it,
-                // so the shown plan is the one the signature names.
+                // so apply cannot replay a different signature.
                 const usedFallback = !!plan?.topology?.fallback_used;
                 this.assistant.confirmTwoMacFallback = usedFallback;
                 this.assistant.inputs = {
@@ -4961,8 +6054,128 @@ function clusterWizard() {
             return this.runAssistantPlan(generation);
         },
 
+        async runAssistantApply() {
+            if (this.assistantRunning()) return null;
+            const plan = this.assistant.plan;
+            const source = this.assistantPlanSource();
+            const inputs = this.assistant.inputs;
+            if (!plan?.feasible || !source?.plan_signature || !inputs) {
+                this.failAssistant(
+                    'plan_required',
+                    window.t('cluster.assistant.err.plan_required'),
+                    'plan',
+                );
+                return null;
+            }
+            this.stopAssistantPolls();
+            const generation = ++this.assistant.generation;
+            this.assistant.state = 'applying';
+            this.assistant.busy = true;
+            this.assistant.error = null;
+            this.assistant.operation = null;
+            this.assistant.operationId = '';
+            this.assistant.applyOperationId = '';
+            this.assistant.applyState = '';
+            this.assistant.progress = null;
+            this.assistant.endpoint = null;
+            try {
+                const handle = await this.apiFetch(ASSISTANT_API.apply, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        ...inputs,
+                        // The resolved context may be lower than the target.
+                        context_tokens:
+                            source.resource_policy?.context_tokens ||
+                            inputs.context_tokens,
+                        plan_signature: source.plan_signature,
+                        coordinator_node: source.coordinator_node,
+                        rank_order: source.rank_order,
+                        // The plan's resolved levers (or the chosen tradeoff's)
+                        // are repeated on apply so the election re-proves
+                        // exactly them; a drift is a plan_mismatch, never a
+                        // silent re-plan.
+                        target_context_tokens:
+                            source.resource_policy?.target_context_tokens ||
+                            inputs.context_tokens,
+                        table_offload:
+                            source.resource_policy?.table_offload || 'none',
+                        table_kind: source.resource_policy?.table_kind || '',
+                        moe_expert_offload:
+                            source.resource_policy?.moe_expert_offload || false,
+                        moe_resident_fraction:
+                            source.resource_policy?.moe_resident_fraction || 1,
+                        memory_guard_tier:
+                            source.resource_policy?.memory_guard_tier || null,
+                        admission: source.resource_policy?.admission || 'p50',
+                    }),
+                });
+                if (generation !== this.assistant.generation) return;
+                this.assistant.operationId = handle?.operation_id || '';
+                this.assistant.operation = {
+                    operation_id: this.assistant.operationId,
+                    kind: 'apply',
+                    state: handle?.state || 'applying',
+                };
+                this.startAssistantOperationPoll(generation);
+            } catch (error) {
+                if (generation !== this.assistant.generation) return;
+                this.failAssistantFrom(error, 'apply');
+            } finally {
+                if (generation === this.assistant.generation) {
+                    this.assistant.busy = false;
+                }
+            }
+        },
+
+        // start is only ever posted for an applied operation. The placement and
+        // the coordinator come from the approved plan verbatim.
+        async runAssistantStart(generation = this.assistant.generation) {
+            if (generation !== this.assistant.generation) return;
+            const plan = this.assistant.plan;
+            const source = this.assistantPlanSource();
+            const inputs = this.assistant.inputs;
+            if (!source?.plan_signature || !inputs) {
+                this.failAssistant(
+                    'plan_required',
+                    window.t('cluster.assistant.err.plan_required'),
+                    'plan',
+                );
+                return;
+            }
+            this.assistant.state = 'starting';
+            this.assistant.busy = true;
+            this.assistant.error = null;
+            try {
+                const handle = await this.apiFetch(ASSISTANT_API.start, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        measurement_id: inputs.measurement_id,
+                        plan_signature: source.plan_signature,
+                        coordinator_node: source.coordinator_node,
+                        operation_id:
+                            this.assistant.applyOperationId || undefined,
+                    }),
+                });
+                if (generation !== this.assistant.generation) return;
+                this.assistant.operationId = handle?.operation_id || '';
+                this.assistant.operation = {
+                    operation_id: this.assistant.operationId,
+                    kind: 'start',
+                    state: handle?.state || 'starting',
+                };
+                this.startAssistantOperationPoll(generation);
+            } catch (error) {
+                if (generation !== this.assistant.generation) return;
+                this.failAssistantFrom(error, 'start');
+            } finally {
+                if (generation === this.assistant.generation) {
+                    this.assistant.busy = false;
+                }
+            }
+        },
+
         // -----------------------------------------------------------------
-        // Single-flight poll loop (one measurement, generation-guarded)
+        // Single-flight poll loops (one per job, generation-guarded)
         // -----------------------------------------------------------------
         startAssistantMeasurePoll(generation) {
             if (generation !== this.assistant.generation) return;
@@ -4982,8 +6195,27 @@ function clusterWizard() {
             }
         },
 
+        startAssistantOperationPoll(generation) {
+            if (generation !== this.assistant.generation) return;
+            this.stopAssistantOperationPoll();
+            this.assistant.operationPollErrors = 0;
+            this.assistant.operationPollSkip = 0;
+            this.assistant.operationTimer = setInterval(
+                () => this.pollAssistantOperation(),
+                CLUSTER_V2_POLL_MS,
+            );
+        },
+
+        stopAssistantOperationPoll() {
+            if (this.assistant.operationTimer) {
+                clearInterval(this.assistant.operationTimer);
+                this.assistant.operationTimer = null;
+            }
+        },
+
         stopAssistantPolls() {
             this.stopAssistantMeasurePoll();
+            this.stopAssistantOperationPoll();
         },
 
         async pollAssistantMeasurement() {
@@ -5062,12 +6294,122 @@ function clusterWizard() {
             await this.runAssistantRecommend(generation);
         },
 
+        async pollAssistantOperation() {
+            if (this.assistant.operationPollBusy) return;
+            if (this.assistant.operationPollSkip > 0) {
+                this.assistant.operationPollSkip -= 1;
+                return;
+            }
+            const generation = this.assistant.generation;
+            const operationId = this.assistant.operationId;
+            if (!operationId) {
+                this.stopAssistantOperationPoll();
+                return;
+            }
+            let snapshot;
+            this.assistant.operationPollBusy = true;
+            try {
+                snapshot = await this.apiFetch(
+                    ASSISTANT_API.operation(operationId),
+                );
+            } catch (error) {
+                if (generation !== this.assistant.generation) return;
+                // Same transient-error tolerance as the measurement poll.
+                this.assistant.operationPollErrors += 1;
+                if (this.assistant.operationPollErrors < ASSISTANT_POLL_MAX_ERRORS) {
+                    this.assistant.operationPollSkip =
+                        2 ** (this.assistant.operationPollErrors - 1);
+                    return;
+                }
+                this.stopAssistantOperationPoll();
+                this.failAssistantFrom(error, 'status');
+                return;
+            } finally {
+                this.assistant.operationPollBusy = false;
+            }
+            this.assistant.operationPollErrors = 0;
+            if (
+                generation !== this.assistant.generation ||
+                operationId !== this.assistant.operationId
+            ) {
+                return;
+            }
+            await this.applyAssistantOperation(snapshot, generation);
+        },
+
+        async applyAssistantOperation(snapshot, generation) {
+            if (generation !== this.assistant.generation) return;
+            this.assistant.operation = snapshot || null;
+            this.assistant.progress = snapshot?.progress || null;
+            if (Array.isArray(snapshot?.warnings)) {
+                this.assistant.warnings = snapshot.warnings;
+            }
+            if (snapshot?.endpoint) {
+                this.assistant.endpoint = snapshot.endpoint;
+            }
+            this.assistant.observed = snapshot?.observed || null;
+            this.assistant.deploymentId = snapshot?.deployment_id || '';
+            this.assistant.stopped = snapshot?.stopped === true;
+            const state = String(snapshot?.state || '');
+            if (snapshot?.kind === 'apply') {
+                this.assistant.applyState = state;
+                this.assistant.state = 'applying';
+                if (state === 'applied') {
+                    this.assistant.applyOperationId =
+                        snapshot.operation_id || this.assistant.operationId;
+                    this.stopAssistantOperationPoll();
+                    if (this.assistant.plan && this.assistant.inputs) {
+                        await this.runAssistantStart(generation);
+                        return;
+                    }
+                    // A resumed apply has no plan-time inputs (they are not
+                    // persisted). Rest on the session surface — its "Start
+                    // again" re-applies the stored inputs — instead of failing
+                    // a healthy applied cluster with plan_required.
+                    this.assistant.operationId = '';
+                    this.assistant.operation = null;
+                    this.assistant.state = 'idle';
+                    this.assistant.busy = false;
+                    await this.loadAssistantSession();
+                    return;
+                }
+                if (state === 'failed' || snapshot?.error) {
+                    this.stopAssistantOperationPoll();
+                    this.failAssistantOperation(snapshot);
+                }
+                return;
+            }
+            if (state === 'ready') {
+                this.stopAssistantOperationPoll();
+                this.assistant.state = 'ready';
+                this.assistant.endpoint =
+                    snapshot?.endpoint || this.assistant.endpoint;
+                this.assistant.busy = false;
+                return;
+            }
+            if (state === 'failed' || snapshot?.error) {
+                this.stopAssistantOperationPoll();
+                this.failAssistantOperation(snapshot);
+                return;
+            }
+            if (state === 'loading') {
+                this.assistant.state = 'loading';
+            } else {
+                this.assistant.state = 'starting';
+            }
+        },
+
         // -----------------------------------------------------------------
         // Failures: exactly one action, taken from error.action
         // -----------------------------------------------------------------
         failAssistant(code, message, action) {
             this.stopAssistantPolls();
             this.assistant.busy = false;
+            // Keep the row the backend last named: a failure must say where it
+            // stopped, and it may never invent a later phase to look further
+            // along than the backend got.
+            this.assistant.failedRow =
+                this.assistantReportedRow() || this.assistant.failedRow;
             this.assistant.state = 'failed';
             this.assistant.error = {
                 code: String(code || 'request_failed'),
@@ -5080,6 +6422,11 @@ function clusterWizard() {
 
         failAssistantFrom(error, fallbackAction) {
             const payload = error?.payload || {};
+            // A 409 operation_in_progress names the running operation so the
+            // "status" action can poll it instead of guessing.
+            if (payload.operation_id) {
+                this.assistant.operationId = payload.operation_id;
+            }
             // A 409 measurement_in_progress names the running measurement the
             // same way; without adopting it the "status"/"measure" recovery
             // had no ID and looped on the same refusal forever.
@@ -5101,6 +6448,16 @@ function clusterWizard() {
             );
         },
 
+        failAssistantOperation(snapshot) {
+            const error = snapshot?.error || {};
+            this.failAssistant(
+                error.code || 'operation_failed',
+                error.message ||
+                    window.t('cluster.assistant.err.operation_failed'),
+                error.action || 'diagnostics',
+            );
+        },
+
         // -----------------------------------------------------------------
         // One action per failure — dispatch only, never a fallback selection
         // -----------------------------------------------------------------
@@ -5108,6 +6465,8 @@ function clusterWizard() {
             const known = [
                 'measure',
                 'plan',
+                'apply',
+                'start',
                 'status',
                 'add_mac',
                 'pair_mac',
@@ -5152,6 +6511,10 @@ function clusterWizard() {
                     return this.startAssistant();
                 case 'plan':
                     return this.runAssistantPlan();
+                case 'apply':
+                    return this.runAssistantApply();
+                case 'start':
+                    return this.runAssistantStart();
                 case 'status':
                     return this.resumeAssistantPolling();
                 case 'retry_coordinator':
@@ -5161,10 +6524,7 @@ function clusterWizard() {
                     return this.openAssistantPairing();
                 case 'configure_endpoint':
                 case 'diagnostics':
-                    // The redacted assistant bundle belongs to the run
-                    // backend; this slice points at oMLX's own cluster
-                    // diagnostics export, which already exists.
-                    return this.downloadClusterDiagnostics();
+                    return this.openAssistantDiagnostics();
                 case 'adjust_model_or_context':
                 // The recommendation names the next thing worth changing. Every
                 // one of these means "change the model, the context or what
@@ -5182,10 +6542,10 @@ function clusterWizard() {
                 // picked.
                 case 'free_disk_space':
                     return this.openAssistantFreeSpace();
-                // ``copy_model`` means "use this model": the assistant selects
-                // it and runs the flow again. Staging the copy is the run
-                // backend's job, source-first from a complete peer copy; the
-                // browser never downloads or deletes anything.
+                // ``copy_model`` is a real flow now: the assistant measures,
+                // recommends, plans and applies, and apply stages the model
+                // source-first from a complete peer copy. It never downloads
+                // and never deletes the last cluster copy.
                 case 'copy_model': {
                     const candidate = this.assistantRecommendedCandidate();
                     return this.startAssistantForModel(
@@ -5200,23 +6560,23 @@ function clusterWizard() {
             }
         },
 
-        // Retry on the same elected coordinator. Nothing here names this Mac:
-        // the plan is re-requested for the same measured Macs.
-        async retryAssistantCoordinator() {
-            const generation = ++this.assistant.generation;
-            this.assistant.error = null;
-            if (this.assistant.inputs && this.assistant.plan) {
-                await this.runAssistantPlan(generation);
-                return;
-            }
-            await this.runAssistantMeasure();
-        },
-
-        // Resume the running measurement after a refusal that named it, and
-        // clear the failure banner; without this the same 409 repeats forever
-        // behind a stale "failed".
         resumeAssistantPolling() {
             const generation = this.assistant.generation;
+            if (this.assistant.operationId) {
+                // Restore the state the operation is in and clear the failure
+                // banner; otherwise the card polls behind a stale "failed".
+                this.assistant.error = null;
+                const opState = String(this.assistant.operation?.state || '');
+                if (this.assistant.operation?.kind === 'apply') {
+                    this.assistant.state = 'applying';
+                } else if (opState === 'loading') {
+                    this.assistant.state = 'loading';
+                } else {
+                    this.assistant.state = 'starting';
+                }
+                this.startAssistantOperationPoll(generation);
+                return;
+            }
             if (this.assistant.measurementId && !this.assistant.plan) {
                 this.assistant.error = null;
                 this.assistant.state =
@@ -5227,8 +6587,25 @@ function clusterWizard() {
             }
         },
 
+        // Retry on the same elected coordinator: re-post start when the plan
+        // is applied, otherwise re-run apply for the same frozen plan. It never
+        // changes coordinator_node and never names this Mac.
+        async retryAssistantCoordinator() {
+            const generation = ++this.assistant.generation;
+            this.assistant.error = null;
+            if (this.assistant.applyState === 'applied') {
+                await this.runAssistantStart(generation);
+                return;
+            }
+            if (this.assistant.inputs && this.assistant.plan) {
+                await this.runAssistantApply();
+                return;
+            }
+            await this.runAssistantMeasure();
+        },
+
         // Open the existing pairing surface. Pairing itself stays where it
-        // already lives; nothing is measured, planned or started here.
+        // already lives; nothing is measured, applied or started here.
         openAssistantPairing() {
             this.assistant.error = null;
             this.assistant.state = 'idle';
@@ -5382,23 +6759,285 @@ function clusterWizard() {
             }
         },
 
+        async openAssistantDiagnostics() {
+            this.assistant.error = null;
+            if (!this.advancedOpen) await this.toggleAdvancedTools();
+            this.notify('info', window.t('cluster.assistant.diagnostics_open'));
+        },
+
         // -----------------------------------------------------------------
         // Reload resume: the last persisted deployment, no re-election.
         // -----------------------------------------------------------------
+        async loadAssistantSession() {
+            if (this.assistant.plan || this.assistant.operationId || this.assistant.busy) {
+                return;
+            }
+            try {
+                const payload = await this.apiFetch(ASSISTANT_API.session);
+                this.assistant.session = payload?.session || null;
+            } catch (error) {
+                this.assistant.session = null;
+            }
+        },
+
+        assistantSessionVisible() {
+            return Boolean(
+                this.assistant.session &&
+                    !this.assistant.plan &&
+                    !this.assistant.operationId &&
+                    this.assistant.state === 'idle',
+            );
+        },
+
+        assistantSessionRunning() {
+            const session = this.assistant.session;
+            return session?.state === 'ready' && !session?.stopped;
+        },
+
+        assistantSessionEndpoint() {
+            // A stopped session hides its endpoint (Screen 6), exactly like
+            // the main card; a dead link is never offered.
+            return this.assistantSessionRunning()
+                ? this.assistant.session?.endpoint?.url || ''
+                : '';
+        },
+
+        assistantSessionLabel() {
+            const session = this.assistant.session;
+            if (!session) return '';
+            const model =
+                String(session.model_path || '').split('/').pop() ||
+                session.model_path;
+            const state = session.stopped
+                ? 'Stopped'
+                : session.state === 'ready'
+                  ? 'Running'
+                  : 'Applied';
+            const context = Number(session.context_tokens || 0).toLocaleString();
+            const coordinator = this.assistantNodeName(session.coordinator_node);
+            return `${model} · ${context} tokens · ${coordinator} · ${state}`;
+        },
+
+        async runAssistantResume() {
+            const session = this.assistant.session;
+            if (!session || this.assistantRunning()) return;
+            const policy = session.resource_policy || {};
+            this.assistant.inputs = {
+                measurement_id: session.measurement_id,
+                model_path: session.model_path,
+                context_tokens: session.context_tokens,
+                target_context_tokens:
+                    session.target_context_tokens || session.context_tokens,
+                mtp: session.mtp,
+                rank0_extra_bytes: session.rank0_extra_bytes,
+                execution_profile: session.execution_profile,
+                microbatch_size: session.microbatch_size || null,
+                node_selection: 'minimal',
+                confirm_two_mac_fallback: !!session.two_mac_fallback,
+                admission: policy.admission || 'p50',
+            };
+            this.assistant.plan = {
+                feasible: true,
+                plan_signature: session.plan_signature,
+                coordinator_node: session.coordinator_node,
+                rank_order: session.rank_order,
+                context_tokens: session.context_tokens,
+                resource_policy: session.resource_policy,
+                warnings: [],
+            };
+            this.assistant.selectedModel = session.model_path;
+            this.assistant.measurementId = session.measurement_id;
+            this.assistant.session = null;
+            await this.runAssistantApply();
+        },
+
+        async stopAssistantSession() {
+            const session = this.assistant.session;
+            if (!session?.operation_id || this.assistant.busy) return;
+            this.assistant.busy = true;
+            try {
+                await this.apiFetch(ASSISTANT_API.stop, {
+                    method: 'POST',
+                    body: JSON.stringify({ operation_id: session.operation_id }),
+                });
+                this.notify('success', window.t('cluster.assistant.stop.done'));
+            } catch (error) {
+                const payload = error?.payload || {};
+                this.notify(
+                    'error',
+                    payload.message ||
+                        error?.message ||
+                        window.t('cluster.assistant.stop.failed'),
+                );
+                return;
+            } finally {
+                this.assistant.busy = false;
+            }
+            // Reload only after busy is cleared: loadAssistantSession is
+            // busy-guarded, so reloading inside the try was suppressed and the
+            // strip vanished instead of showing Stopped + Start again.
+            this.assistant.session = null;
+            await this.loadAssistantSession();
+        },
+
+        async loadAssistantProbeSetting() {
+            try {
+                const payload = await this.apiFetch(
+                    ASSISTANT_API.performanceProbe,
+                );
+                this.assistant.probeEnabled = Boolean(payload?.enabled);
+            } catch (error) {
+                this.assistant.probeEnabled = false;
+            }
+        },
+
+        assistantProbeLabel() {
+            return this.assistant.probeEnabled ? 'On' : 'Off';
+        },
+
+        async toggleAssistantProbe() {
+            if (this.assistant.busy) return;
+            const enabled = !this.assistant.probeEnabled;
+            this.assistant.busy = true;
+            try {
+                const payload = await this.apiFetch(
+                    ASSISTANT_API.performanceProbe,
+                    {
+                        method: 'POST',
+                        body: JSON.stringify({ enabled }),
+                    },
+                );
+                this.assistant.probeEnabled = Boolean(payload?.enabled);
+                this.notify(
+                    'success',
+                    enabled
+                        ? 'Performance probe enabled for the next start'
+                        : 'Performance probe disabled',
+                );
+            } catch (error) {
+                const payload = error?.payload || {};
+                this.notify(
+                    'error',
+                    payload.message || error?.message || 'Probe setting failed',
+                );
+            } finally {
+                this.assistant.busy = false;
+            }
+        },
+
         // B3: one bounded read, so a probe that landed after the ready poll is
         // visible without a reload. It reuses the poll's applier so state and
         // progress stay in sync (a stale `loading` could otherwise survive a
         // ready snapshot), and the generation guard drops a late response. On
         // the ready surface it never starts anything.
+        async refreshAssistantOperation() {
+            const operationId =
+                this.assistant.operationId ||
+                this.assistant.session?.operation_id;
+            if (!operationId || this.assistant.busy) return;
+            const generation = this.assistant.generation;
+            this.assistant.busy = true;
+            try {
+                const body = await this.apiFetch(
+                    ASSISTANT_API.operation(operationId),
+                );
+                if (generation !== this.assistant.generation) return;
+                this.assistant.operationId = operationId;
+                await this.applyAssistantOperation(body, generation);
+            } catch (error) {
+                const payload = error?.payload || {};
+                this.notify(
+                    'error',
+                    payload.message || error?.message || 'Status refresh failed',
+                );
+            } finally {
+                this.assistant.busy = false;
+            }
+        },
+
         // -----------------------------------------------------------------
         // Ready-only affordances
         // -----------------------------------------------------------------
+        openAssistantChat() {
+            if (!this.assistantReady()) return;
+            const url = this.assistantChatUrl();
+            if (!url) return;
+            if (typeof window === 'undefined' || !window.location) return;
+            if (typeof window.location.assign === 'function') {
+                window.location.assign(url);
+            } else {
+                window.location.href = url;
+            }
+        },
+
+        toggleAssistantAgent() {
+            if (!this.assistantReady()) return;
+            this.assistant.agentOpen = !this.assistant.agentOpen;
+        },
+
         // Screen 6: state + stop/restart, nothing more. The browser calls one
         // assistant route; the backend relays to the coordinator's own unload
         // route with that Mac's key. The endpoint is closed afterwards, so no
         // Chat/agent link survives a stop.
+        async stopAssistantCluster() {
+            if (this.assistant.busy || !this.assistantReady() || this.assistant.stopped) return;
+            const operationId = this.assistant.operationId;
+            if (!operationId) return;
+            this.assistant.busy = true;
+            try {
+                await this.apiFetch(ASSISTANT_API.stop, {
+                    method: 'POST',
+                    body: JSON.stringify({ operation_id: operationId }),
+                });
+                this.assistant.stopped = true;
+                this.assistant.endpoint = null;
+                this.assistant.observed = null;
+                // Keep the Details snapshot honest: it must not still read as a
+                // live ready endpoint after a stop. `state` stays ready (the
+                // frozen machine has no stopped value); `stopped` is the flag.
+                if (this.assistant.operation) {
+                    this.assistant.operation = {
+                        ...this.assistant.operation,
+                        stopped: true,
+                        endpoint: null,
+                        observed: null,
+                    };
+                }
+                this.notify('success', window.t('cluster.assistant.stop.done'));
+            } catch (error) {
+                const payload = error?.payload || {};
+                // The cluster is still running, so the card stays on the
+                // running surface; Stop remains the retry, and a diagnostics
+                // action is still one sentence away in Details.
+                this.notify(
+                    'error',
+                    payload.message ||
+                        error?.message ||
+                        window.t('cluster.assistant.stop.failed'),
+                );
+            } finally {
+                this.assistant.busy = false;
+            }
+        },
+
         // Re-apply the frozen in-memory plan inputs, then the existing poll
         // starts it. No re-planning, no model/context edit, no Mac changes.
+        async startAssistantAgain() {
+            if (this.assistantRunning()) return;
+            if (!this.assistant.plan?.plan_signature || !this.assistant.inputs) {
+                this.failAssistant(
+                    'plan_required',
+                    window.t('cluster.assistant.err.plan_required'),
+                    'plan',
+                );
+                return;
+            }
+            this.assistant.stopped = false;
+            this.assistant.observed = null;
+            this.assistant.endpoint = null;
+            await this.runAssistantApply();
+        },
+
         copyAssistantValue(value) {
             const text = String(value || '');
             if (!text) return;
@@ -5421,6 +7060,14 @@ function clusterWizard() {
             } else {
                 failed();
             }
+        },
+
+        copyAssistantEndpoint() {
+            this.copyAssistantValue(this.assistant.endpoint?.url);
+        },
+
+        copyAssistantModel() {
+            this.copyAssistantValue(this.assistantAgentModelId());
         },
 
         // =====================================================================

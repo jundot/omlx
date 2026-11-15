@@ -110,9 +110,6 @@ ALLOWED_ENDPOINTS = {
     # Tuning: the quick sampler sweep and the minutes-long MTP depth sweep.
     "/admin/api/cluster/assistant/tune",
     "/admin/api/cluster/assistant/tune-redeploy",
-    "/admin/api/cluster/assistant/tune-local",
-    # Run on this Mac: single-node inference on the origin Mac, as an async job.
-    "/admin/api/cluster/assistant/run-local",
 }
 
 
@@ -3258,6 +3255,10 @@ ASSISTANT_STATES = (
     "recommending",
     "measuring_model",
     "planning",
+    "applying",
+    "starting",
+    "loading",
+    "ready",
     "failed",
 )
 
@@ -3266,14 +3267,34 @@ ASSISTANT_ENDPOINTS = {
     "/admin/api/cluster/assistant/status",
     "/admin/api/cluster/assistant/recommend",
     "/admin/api/cluster/assistant/plan",
+    "/admin/api/cluster/assistant/apply",
+    "/admin/api/cluster/assistant/start",
+    # The automatic constellation search (synchronous, minutes-long).
+    "/admin/api/cluster/assistant/search",
+    "/admin/api/cluster/assistant/operations",
+    # Screen 6: the stop relay to the elected coordinator's own unload route.
+    "/admin/api/cluster/assistant/stop",
+    # Reload resume: the last persisted deployment (read-only).
+    "/admin/api/cluster/assistant/session",
+    # The redacted support bundle (read-only).
+    "/admin/api/cluster/assistant/diagnostics",
+    # The read-only local network preflight.
+    "/admin/api/cluster/assistant/network-preflight",
+    # The in-app switch for the post-ready measurement.
+    "/admin/api/cluster/assistant/performance-probe",
     # The free-space relay (the live-run notes): the only assistant route that
     # changes another Mac's disk.
     "/admin/api/cluster/assistant/models",
+    # Tuning: the quick sampler sweep and the minutes-long MTP depth sweep.
+    "/admin/api/cluster/assistant/tune",
+    "/admin/api/cluster/assistant/tune-redeploy",
 }
 
 ASSISTANT_ACTIONS = (
     "measure",
     "plan",
+    "apply",
+    "start",
     "status",
     "add_mac",
     "pair_mac",
@@ -3371,10 +3392,10 @@ def test_assistant_primary_path_has_no_ip_ssh_rank_layer_or_model_path_field():
     assert "<input" not in card
     assert "<select" not in card
     assert "x-model" not in card
-    assert "data-cluster-assistant-entry" in card
-    assert "data-cluster-assistant-plan" in card
+    assert "data-cluster-v2-assistant-entry" in card
+    assert "data-cluster-v2-assistant-start-setup" in card
     # The plan-time inputs are the component's frozen object, not inputs.
-    assert "runAssistantPlan()" not in card
+    assert "runAssistantApply()" in card
     assert "assistantModelLabel()" in card
     assert "assistantContextLabel()" in card
 
@@ -3452,7 +3473,7 @@ def test_the_two_mac_fallback_is_explicit_and_signed():
     assert "confirm_two_mac_fallback" in inputs
     # The fallback is re-planned, never applied straight from the refusal body.
     confirm = javascript.split("confirmAssistantTwoMacFallback() {", 1)[1].split(
-        "// Resume the running measurement", 1
+        "async runAssistantApply", 1
     )[0]
     assert "runAssistantPlan" in confirm
     assert "topologyFallback" in confirm
@@ -3461,8 +3482,53 @@ def test_the_two_mac_fallback_is_explicit_and_signed():
     assert "assistant.missingLinks" in template
 
 
+def test_the_network_preflight_shows_commands_and_executes_nothing():
+    javascript = _read(JAVASCRIPT)
+    template = _read(TEMPLATE)
+
+    assert "runAssistantNetworkPreflight()" in javascript
+    assert "copyAssistantNetworkCommands()" in javascript
+    assert "data-cluster-v2-assistant-network-preflight" in template
+    assert "data-cluster-v2-assistant-network-commands" in template
+    assert "Nothing is executed" in template
+    block = javascript.split("runAssistantNetworkPreflight() {", 1)[1].split(
+        "copyAssistantNetworkCommands", 1
+    )[0]
+    for forbidden in ("exec(", "spawn(", "child_process", "osascript"):
+        assert forbidden not in block
+    # The response is only stored and rendered; there is no apply call.
+    assert "ASSISTANT_API.networkPreflight" in block
+    assert "assistant.networkPreflight = plan" in block
+
+
+def test_copy_diagnostics_is_one_block_without_secrets():
+    javascript = _read(JAVASCRIPT)
+    template = _read(TEMPLATE)
+
+    block = javascript.split("assistantDiagnosticsText() {", 1)[1].split(
+        "copyAssistantDiagnostics() {", 1
+    )[0]
+    for field in (
+        "measurement:",
+        "plan:",
+        "coordinator:",
+        "rank_order:",
+        "excluded:",
+        "table_offload:",
+        "admission:",
+        "observed:",
+        "warnings:",
+    ):
+        assert field in block
+    for forbidden in ("api_key", "password", "authorization", "ssh"):
+        assert forbidden not in block.lower()
+    assert "data-cluster-v2-assistant-copy-diagnostics" in template
+    # The backend bundle is the source; the local block is the offline fallback.
+    assert "ASSISTANT_API.diagnostics" in javascript
+
+
 def test_copy_model_action_runs_the_assistant_flow():
-    """`copy_model` is not a toast any more: it selects the model and re-runs."""
+    """`copy_model` is not a toast any more: apply stages from a peer copy."""
 
     javascript = _read(JAVASCRIPT)
     handler_block = javascript.split("assistantActionHandler(action) {", 1)[1].split(
@@ -3473,7 +3539,7 @@ def test_copy_model_action_runs_the_assistant_flow():
     )[0]
     assert "startAssistantForModel" in copy_block
     assert "assistantRecommendedCandidate" in copy_block
-    # The message-only fallback is gone: a copy re-runs the real flow.
+    # The message-only fallback is gone: a copy is the real apply/stage flow.
     assert "action.other" not in copy_block
     assert "startAssistantForModel(modelPath) {" in javascript
 
@@ -3502,11 +3568,132 @@ def test_assistant_plans_lightning_mtp_from_the_model_catalogue():
     assert "this.selectedModelPath" in helper
 
 
+def test_assistant_endpoint_is_unreachable_until_ready():
+    card = _assistant_card()
+    javascript = _read(JAVASCRIPT)
+
+    assert 'x-show="assistantState() === \'ready\'"' in card
+    assert 'x-show="assistantReady()"' in card
+    assert "assistantReady() ? assistant.endpoint.url : null" in card
+    assert "data-cluster-v2-assistant-open-chat" in card
+    assert "data-cluster-v2-assistant-connect-agent" in card
+
+    ready = javascript.split("assistantReady() {", 1)[1].split("},", 1)[0]
+    assert "state === 'ready'" in ready
+    assert "endpoint?.ready === true" in ready
+    assert "!this.assistant.stopped" in ready
+
+
 # --- Cluster Assistant: the automatic constellation search --------------------
 #
 # Search is an action on the existing card (plan stage), not a new wizard or
 # assistant state. The route is synchronous and minutes-long, so the UI is
 # single-flight + generation-guarded and only renders measured rates.
+
+
+def test_assistant_search_affordance_and_api_map_entry_exist():
+    javascript = _read(JAVASCRIPT)
+    card = _assistant_card()
+
+    # The route is declared in the assistant API map (the allowlist source) and
+    # in both contract allowlists.
+    assert "search: '/admin/api/cluster/assistant/search'" in javascript
+    assert "/admin/api/cluster/assistant/search" in ASSISTANT_ENDPOINTS
+    assert "/admin/api/cluster/assistant/search" in ALLOWED_ENDPOINTS
+
+    # The affordance lives inside the assistant card, gated to the plan stage.
+    assert "data-cluster-v2-assistant-search" in card
+    assert "data-cluster-v2-assistant-search-button" in card
+    assert "runAssistantSearch()" in card
+    assert "assistantSearchAvailable()" in card
+    assert "assistantState() === 'planning' && assistantSearchAvailable()" in card
+    # Priority + max-count controls (buttons, keeping the card input-free).
+    assert "data-cluster-v2-assistant-search-priority" in card
+    assert "data-cluster-v2-assistant-search-max-count" in card
+    assert "setAssistantSearchPriority(option.key)" in card
+    assert "setAssistantSearchMaxCount(count)" in card
+    # Result, busy and error surfaces.
+    assert "data-cluster-v2-assistant-search-busy" in card
+    assert "data-cluster-v2-assistant-search-best" in card
+    assert "data-cluster-v2-assistant-search-results" in card
+    assert "data-cluster-v2-assistant-search-errors" in card
+    assert "data-cluster-v2-assistant-search-error" in card
+    # The card's primary path stays input-free.
+    assert "<select" not in card
+    assert "<input" not in card
+    assert "x-model" not in card
+
+
+def test_assistant_search_strings_exist_and_are_mirrored():
+    catalog = json.loads(
+        (ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8")
+    )
+    keys = [
+        "cluster.assistant.search.title",
+        "cluster.assistant.search.blurb",
+        "cluster.assistant.search.button",
+        "cluster.assistant.search.searching",
+        "cluster.assistant.search.priority_label",
+        "cluster.assistant.search.max_count_label",
+        "cluster.assistant.search.best_title",
+        "cluster.assistant.search.no_best",
+        "cluster.assistant.search.results_title",
+        "cluster.assistant.search.table.constellation",
+        "cluster.assistant.search.table.macs",
+        "cluster.assistant.search.table.measured",
+        "cluster.assistant.search.table.feasible",
+        "cluster.assistant.search.yes",
+        "cluster.assistant.search.no",
+        "cluster.assistant.search.not_measured",
+        "cluster.assistant.search.errors_title",
+        "cluster.assistant.search.failed",
+    ]
+    priorities = [
+        f"cluster.assistant.search.priority.{p}"
+        for p in ("balanced", "speed", "ttft", "quality", "context")
+    ]
+    for key in keys + priorities:
+        assert catalog.get(key), key
+    # Mirrored into every locale with the English fallback (no translation).
+    for path in sorted((ROOT / "omlx_web/i18n").glob("*.json")):
+        locale = json.loads(path.read_text(encoding="utf-8"))
+        assert set(locale) == set(catalog), path.name
+        for key in keys + priorities:
+            assert locale.get(key) == catalog[key], (path.name, key)
+
+
+def test_assistant_search_is_single_flight_generation_guarded_and_measured_only():
+    javascript = _read(JAVASCRIPT)
+    block = _assistant_method("runAssistantSearch")
+    # Busy guard prevents a double POST of the minutes-long request.
+    assert "this.assistant.search.busy" in block
+    assert "assistantRunning()" in block
+    # Generation guard mirrors the polls; a stale answer is dropped.
+    assert "++this.assistant.generation" in block
+    assert "generation !== this.assistant.generation" in block
+    # The search is a background job: POST returns a handle, then the UI polls
+    # searchStatus(jobId) until the job completes (generation-guarded).
+    assert "ASSISTANT_API.search" in block
+    assert "ASSISTANT_API.searchStatus" in block
+    assert "job_id" in block
+    # The request carries the measurement and the chosen options.
+    assert "measurement_id: this.assistant.measurementId" in block
+    assert "priority: this.assistant.search.priority" in block
+    assert "max_count: this.assistant.search.maxCount" in block
+
+    # Rates are rendered only for a measured constellation (never invented).
+    measured = _assistant_method("assistantSearchMeasuredLabel")
+    assert "row.measured !== true" in measured
+
+    # No endpoint is offered from a search result: the endpoint stays gated on
+    # assistantReady(), and search never transitions the state machine.
+    card = _assistant_card()
+    search_block = card.split("data-cluster-v2-assistant-search>", 1)[1].split(
+        'data-assistant-state="applying"', 1
+    )[0]
+    assert "assistant.endpoint" not in search_block
+    assert "assistantReady()" not in search_block
+    assert "assistant.state =" not in block
 
 
 # --- Screen 5: the handoff (the handoff notes) ------------------------------
@@ -3540,6 +3727,96 @@ def _assistant_method(name: str) -> str:
     raise AssertionError(f"unterminated method {name}")
 
 
+def test_assistant_handoff_links_come_from_the_endpoint_and_the_serving_id():
+    card = _assistant_card()
+    javascript = _read(JAVASCRIPT)
+
+    # One URL each, built by the component, never typed into the markup.
+    assert "data-cluster-v2-assistant-open-chat" in card
+    assert "data-cluster-v2-assistant-connect-agent" in card
+    assert "data-cluster-v2-assistant-agent-base-url" in card
+    assert "assistantAgentBaseUrl()" in card
+    assert "assistantAgentModelId()" in card
+    assert "assistantChatUrl()" in javascript
+
+    chat = _assistant_method("assistantChatUrl")
+    assert "assistantReady()" in chat
+    assert "assistantServingModelId()" in chat
+    assert "encodeURIComponent" in chat
+    # An unresolved id links without the parameter; it never guesses one.
+    assert "return modelId" in chat
+
+    base = _assistant_method("assistantChatBase")
+    assert "endpoint?.url" in base
+    assert "assistantCoordinatorIsLocal() ? '/chat' : `${url}/chat`" in base
+
+    serving = _assistant_method("assistantServingModelId")
+    assert "model_path === path" in serving
+    assert "model?.id" in serving
+    # The planner path is never presented as a serving id.
+    assert "selectedModelId" not in serving
+
+    agent = _assistant_method("assistantAgentBaseUrl")
+    assert "`${url}/v1`" in agent
+
+    open_chat = _assistant_method("openAssistantChat")
+    assert "assistantChatUrl()" in open_chat
+    assert "'/chat'" not in open_chat
+
+
+def test_assistant_handoff_is_ready_gated_and_carries_no_secret():
+    card = _assistant_card()
+    ready = card.index('x-show="assistantState() === \'ready\'"')
+    endpoint = card.index('x-show="assistantReady()"')
+    chat = card.index("data-cluster-v2-assistant-open-chat")
+    agent = card.index("data-cluster-v2-assistant-connect-agent")
+    assert ready < endpoint < chat < agent
+
+    # The endpoint stays null until the operation proves it, and no key, token
+    # or storage access is rendered in the card.
+    assert "assistantReady() ? assistant.endpoint.url : null" in card
+    for forbidden in ("api_key", "Authorization", "Bearer", "localStorage"):
+        assert forbidden not in card, forbidden
+
+
+def test_the_chat_page_preselection_is_the_only_new_behaviour():
+    template = _read(CHAT_TEMPLATE)
+
+    method = template.split("applyRequestedModelFromUrl() {", 1)[1].split(
+        "\n            },", 1
+    )[0]
+    assert "requestedModelApplied" in method
+    assert "isModelAvailableOnServer(requested)" in method
+    assert "resolveGatewayModelId(requested)" in method
+    # An unknown value falls through to the normal default selection.
+    assert "if (!requested || !this.isModelAvailableOnServer(requested)) return;" in method
+
+    reader = template.split("requestedModelFromUrl() {", 1)[1].split(
+        "\n            },", 1
+    )[0]
+    assert "URLSearchParams(window.location.search" in reader
+    assert "params.get('model')" in reader
+    # Reading the handoff parameter never writes history, fetches, redirects or
+    # carries a credential.
+    for forbidden in (
+        "history.",
+        "pushState",
+        "replaceState",
+        "fetch(",
+        "assign(",
+        "apiKey",
+        "endpoint",
+    ):
+        assert forbidden not in reader, forbidden
+        assert forbidden not in method, forbidden
+
+    # It runs once the model list is non-empty, after the normal default.
+    load_models = template.split("async loadModels() {", 1)[1]
+    load_models = load_models.split("\n            },\n", 1)[0]
+    assert "reconcileCurrentModelAfterLoad(defaultModel);" in load_models
+    assert "this.applyRequestedModelFromUrl();" in load_models
+
+
 def test_assistant_component_never_stages_deploys_or_launches():
     javascript = _read(JAVASCRIPT)
     start = javascript.index("// Assistant — the minimal Screen-3 slice")
@@ -3559,9 +3836,10 @@ def test_assistant_component_never_stages_deploys_or_launches():
     ):
         assert forbidden not in block, forbidden
     assert "ASSISTANT_API" in block
-    # One generation-guarded, single-flight poll loop (the measurement job).
-    assert block.count("setInterval(") == 1
+    # One poll loop per job, generation-guarded and single-flight.
+    assert block.count("setInterval(") == 2
     assert "measurePollBusy" in block
+    assert "operationPollBusy" in block
     assert "generation !== this.assistant.generation" in block
 
 
@@ -3626,6 +3904,53 @@ def test_assistant_fixtures_pin_the_backend_payload_shapes():
     assert plan["endpoint"]["ready"] is False
     assert plan["coordinator_node"] in plan["rank_order"]
 
+    operation_fields = {
+        "operation_id",
+        "kind",
+        "state",
+        "measurement_id",
+        "plan_signature",
+        "coordinator_node",
+        "progress",
+        "endpoint",
+        "deployment_id",
+        "stopped",
+        "observed",
+        "warnings",
+        "error",
+    }
+    for name in (
+        "assistant_operation_applying.json",
+        "assistant_operation_loading.json",
+        "assistant_operation_ready.json",
+        # Screen 4: the row that is current has a payload per phase, plus the
+        # unknown phase and the free-space failure the card must survive.
+        "assistant_operation_starting.json",
+        "assistant_operation_unknown_phase.json",
+        "assistant_error_free_disk_space.json",
+    ):
+        assert operation_fields <= set(fixtures[name])
+    assert fixtures["assistant_operation_applying.json"]["state"] == "applying"
+    assert fixtures["assistant_operation_applying.json"]["endpoint"] is None
+    loading = fixtures["assistant_operation_loading.json"]
+    assert loading["state"] == "loading"
+    assert loading["endpoint"]["ready"] is False
+    ready_operation = fixtures["assistant_operation_ready.json"]
+    assert ready_operation["state"] == "ready"
+    assert ready_operation["endpoint"]["ready"] is True
+    assert ready_operation["observed"] is None
+    # Screen 5: a measured operation carries the one rate block, and nothing
+    # else in the payload does.
+    measured = fixtures["assistant_operation_ready_observed.json"]
+    assert measured["observed"]["decode_tok_per_s"] > 0
+    assert measured["observed"]["measured_at"]
+    # Screen 6: a ready operation knows its deployment; a stopped one says so
+    # while its state stays ready.
+    stopped = fixtures["assistant_operation_ready_stopped.json"]
+    assert stopped["state"] == "ready"
+    assert stopped["stopped"] is True
+    assert stopped["deployment_id"]
+
     retry = fixtures["assistant_error_retry_coordinator.json"]
     assert retry["state"] == "failed"
     assert retry["error"]["action"] == "retry_coordinator"
@@ -3656,6 +3981,191 @@ def test_a_small_mac_is_forced_to_headless_and_says_so():
     assert "cluster.assistant.small_mac_note" in notes
     assert "data-cluster-assistant-small-mac" in card
     assert "assistantSmallMacNotes()" in card
+
+
+# --- Cluster Assistant: Screen 4 (the progress surface) -----------------------
+#
+# the progress notes maps eight labels onto six observable rows. These tests
+# pin that mapping, the two combined pairs, the unknown-phase fallback, the
+# failure row and the absence of any invented progress. The behaviour of the
+# rows under a running flow is covered under Node in
+# tests/test_cluster_ui_integration_ui.py.
+
+SCREEN_4_ROWS = (
+    "checking",
+    "planning",
+    "preparing",
+    "starting",
+    "loading",
+    "ready",
+)
+
+
+def _row_table() -> str:
+    return _read(JAVASCRIPT).split("const ASSISTANT_PROGRESS_ROWS = [", 1)[1].split(
+        "];", 1
+    )[0]
+
+
+def test_screen_4_rows_are_six_labels_in_the_corrected_order():
+    javascript = _read(JAVASCRIPT)
+    card = _assistant_card()
+    table = _row_table()
+
+    keys = re.findall(r"key: '(\w+)'", table)
+    assert tuple(keys) == SCREEN_4_ROWS
+    # Planning precedes staging: the plan is what staging stages.
+    assert keys.index("planning") < keys.index("preparing")
+
+    # Every row is labelled, and the two pairs the backend cannot split are one
+    # row each — never a separate "Copying" or "Verifying" row.
+    catalog = json.loads(_read("omlx_web/i18n/en.json"))
+    labels = re.findall(r"label: '(cluster\.assistant\.progress\.\w+)'", table)
+    assert len(labels) == len(SCREEN_4_ROWS)
+    for key in labels:
+        assert catalog[key]
+    assert not {"copying", "verifying", "staged", "applied"} & set(keys)
+    assert "copying the model" in catalog["cluster.assistant.progress.preparing"]
+    assert "verifying the endpoint" in catalog["cluster.assistant.progress.loading"]
+
+    # The card renders the rows; the component owns the mapping.
+    assert "data-cluster-v2-assistant-progress" in card
+    assert "assistantProgressRows()" in card
+    assert "ASSISTANT_PROGRESS_ROWS" in javascript
+
+
+def test_screen_4_each_row_is_driven_by_one_backend_value():
+    """Exactly one predicate per row, and no timer may ever advance one."""
+
+    javascript = _read(JAVASCRIPT)
+    reported = javascript.split("assistantReportedRow() {", 1)[1].split(
+        "assistantProgressRow() {", 1
+    )[0]
+
+    # 1–2 are the assistant's own states, which the poll sets from the job.
+    assert "state === 'measuring' || state === 'measuring_model'" in reported
+    assert "'checking'" in reported
+    assert "state === 'recommending' || state === 'planning'" in reported
+    assert "'planning'" in reported
+    # 3–5 are the operation's kind and state, never a guess.
+    assert "state === 'applying'" in reported
+    assert "'preparing'" in reported
+    assert "state === 'starting'" in reported
+    assert "'starting'" in reported
+    assert "state === 'loading'" in reported
+    assert "'loading'" in reported
+    # 6 needs both the ready operation and a proven endpoint.
+    assert "state === 'ready'" in reported
+    assert "this.assistantReady() ? 'ready' : 'loading'" in reported
+
+    for forbidden in ("setTimeout", "setInterval", "Date.now", "performance.now"):
+        assert forbidden not in reported
+        assert forbidden not in javascript.split(
+            "assistantProgressRows() {", 1
+        )[1].split("assistantRowMessage(rowKey) {", 1)[0]
+
+
+def test_screen_4_ready_row_is_unreachable_without_a_ready_endpoint():
+    card = _assistant_card()
+
+    # The endpoint block is still gated on assistantReady(), and the Ready row
+    # itself is only current when that same predicate is true.
+    assert 'x-show="assistantReady()"' in card
+    assert "assistantReady() ? assistant.endpoint.url : null" in card
+    javascript = _read(JAVASCRIPT)
+    ready = javascript.split("assistantReady() {", 1)[1].split("},", 1)[0]
+    assert "state === 'ready'" in ready
+    assert "endpoint?.ready === true" in ready
+    assert "!this.assistant.stopped" in ready
+
+
+def test_screen_4_unknown_phase_keeps_the_previous_row_and_shows_the_message():
+    javascript = _read(JAVASCRIPT)
+    fixture = _fixtures()["assistant_operation_unknown_phase.json"]
+
+    # The fixture is a real operation payload whose phase this build cannot map.
+    assert fixture["progress"]["phase"] == "future_phase"
+    assert fixture["state"] == "loading"
+    operation_fields = {
+        "operation_id",
+        "kind",
+        "state",
+        "progress",
+        "endpoint",
+        "error",
+    }
+    assert operation_fields <= set(fixture)
+
+    known = javascript.split("const ASSISTANT_KNOWN_PHASES = [", 1)[1].split(
+        "];", 1
+    )[0]
+    assert "staging" in known and "loading" in known
+    assert "future_phase" not in known
+    message = javascript.split("assistantRowMessage(rowKey) {", 1)[1].split(
+        "},", 1
+    )[0]
+    # An unknown phase narrates no row, so the row already shown stays and its
+    # raw message is rendered underneath. A known phase of another row never
+    # labels this one.
+    assert "ASSISTANT_KNOWN_PHASES.includes(phase)" in message
+    assert "progress.message" in message
+    # Nothing blanks the row list when the phase is unknown.
+    rows = javascript.split("assistantProgressRows() {", 1)[1].split(
+        "},", 1
+    )[0]
+    assert "const current = this.assistantProgressRow();" in rows
+
+
+def test_screen_4_failure_keeps_the_last_phase_and_one_action():
+    javascript = _read(JAVASCRIPT)
+    card = _assistant_card()
+    fixture = _fixtures()["assistant_error_free_disk_space.json"]
+
+    fail = javascript.split("failAssistant(code, message, action) {", 1)[1].split(
+        "failAssistantFrom(", 1
+    )[0]
+    # The row the backend last named is captured before the state becomes
+    # "failed", so a failure can say where it stopped.
+    assert "this.assistant.failedRow =" in fail
+    assert "this.assistantReportedRow() || this.assistant.failedRow" in fail
+    assert fail.index("failedRow") < fail.index("state = 'failed'")
+    assert "'failed'" in javascript.split("assistantProgressRows() {", 1)[1].split(
+        "},", 1
+    )[0]
+
+    assert fixture["state"] == "failed"
+    assert fixture["error"]["action"] == "free_disk_space"
+    assert fixture["progress"]["phase"] == "staging"
+    # The failure row keeps the staging row it stopped in.
+    assert fixture["progress"]["message"]
+
+    # Still exactly one action button, labelled from error.action.
+    assert card.count("data-cluster-v2-assistant-action") == 1
+    assert "assistantActionHandler(assistant.error?.action)" in card
+
+
+def test_screen_4_never_renders_a_rate_a_percentage_or_an_eta():
+    # HTML comments are not rendered; the visible markup is what must stay free
+    # of invented progress.
+    card = re.sub(r"<!--.*?-->", "", _assistant_card(), flags=re.S)
+
+    for forbidden in (
+        "%",
+        "tok/s",
+        "token rate",
+        "ETA",
+        "percent",
+        "bytes copied",
+        "predicted.measured",
+    ):
+        assert forbidden not in card, forbidden
+    # A rate may only come from a measured `observed` block, so the ready card
+    # renders one line through this helper and the template carries no number.
+    assert "assistantObservedLabel()" in card
+    assert "cluster.assistant.observed.title" in card
+    # The only count is the one the backend reports, as "N of M Macs".
+    assert "cluster.assistant.progress_nodes" in _read(JAVASCRIPT)
+    assert "assistantProgressCount()" in _read(JAVASCRIPT)
 
 
 # --- Cluster Assistant: the free-space affordance ----------------------------
@@ -3765,6 +4275,63 @@ SCREEN_6_STRINGS = (
 )
 
 
+def test_screen_6_stop_and_start_again_are_ready_gated():
+    card = _assistant_card()
+
+    assert "data-cluster-v2-assistant-stop" in card
+    assert "data-cluster-v2-assistant-stopped" in card
+    assert "data-cluster-v2-assistant-start-again" in card
+    assert "stopAssistantCluster()" in card
+    assert "startAssistantAgain()" in card
+
+    ready = card.index('x-show="assistantState() === \'ready\'"')
+    stop = card.index("data-cluster-v2-assistant-stop")
+    assert ready < stop
+    # The stopped block is hidden until the backend (or a successful stop)
+    # reports `stopped`; Start again lives only inside it.
+    assert 'x-show="assistant.stopped"' in card
+    stopped = card.index("data-cluster-v2-assistant-stopped")
+    again = card.index("data-cluster-v2-assistant-start-again")
+    assert stopped < again
+
+
+def test_screen_6_stop_relays_and_never_unloads_from_the_browser():
+    javascript = _read(JAVASCRIPT)
+
+    assert "stop: '/admin/api/cluster/assistant/stop'" in javascript
+    block = _assistant_method("stopAssistantCluster")
+    assert "ASSISTANT_API.stop" in block
+    assert "operation_id" in block
+    for forbidden in ("/deployments", "/unload", "fetch(", "ssh", "CLUSTER_V2_API"):
+        assert forbidden not in block, forbidden
+
+
+def test_screen_6_start_again_reuses_the_frozen_plan_inputs():
+    block = _assistant_method("startAssistantAgain")
+
+    assert "this.assistant.inputs" in block
+    assert "this.assistant.plan?.plan_signature" in block
+    assert "this.runAssistantApply()" in block
+    # No re-plan, no model/context edit, no Mac changes.
+    assert "runAssistantPlan" not in block
+    assert "selectedModelPath" not in block
+    assert "targetContextTokens" not in block
+
+
+def test_screen_6_a_stopped_ready_operation_does_not_regress_to_loading():
+    reported = _assistant_method("assistantReportedRow")
+
+    assert "if (this.assistant.stopped) return 'ready';" in reported
+
+
+def test_screen_6_strings_carry_the_english_copy():
+    catalog = json.loads(
+        (ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8")
+    )
+    for key in SCREEN_6_STRINGS:
+        assert catalog.get(key), key
+
+
 # --- Cluster Assistant: review slice 1 (template safety + flow guards) -------
 #
 # REVIEW-2026-11-13.md U1/U3/U4/U5 and the small-Mac note: one character-class
@@ -3825,6 +4392,31 @@ process.stdout.write(JSON.stringify({checked: bindings.length, broken}));
     assert payload["broken"] == []
 
 
+def test_assistant_session_endpoint_is_hidden_when_stopped():
+    """U5: a stopped session never offers its dead endpoint link (Screen 6)."""
+
+    result = _run_wizard(
+        """
+component.assistant.session = {
+  state: 'ready', stopped: false, endpoint: {url: 'http://172.16.1.11:8099'},
+};
+const running = component.assistantSessionEndpoint();
+component.assistant.session.stopped = true;
+const stopped = component.assistantSessionEndpoint();
+component.assistant.session = {
+  state: 'applied', stopped: false, endpoint: {url: 'http://172.16.1.11:8099'},
+};
+const applied = component.assistantSessionEndpoint();
+process.stdout.write(JSON.stringify({running, stopped, applied}));
+"""
+    )
+    assert result == {
+        "running": "http://172.16.1.11:8099",
+        "stopped": "",
+        "applied": "",
+    }
+
+
 def test_assistant_small_mac_notes_render_for_a_32_gb_mac():
     """The headless explanation uses the module constant, not this.constructor."""
 
@@ -3857,9 +4449,15 @@ const afterFirst = {
   calls: planCalls.length,
   gen: component.assistant.generation,
 };
+component.assistant.state = 'ready';
+component.toggleAssistantNodeSelection();
+component.assistant.state = 'planning';
 component.assistant.busy = true;
 component.toggleAssistantNodeSelection();
 component.assistant.busy = false;
+component.assistant.stopped = true;
+component.toggleAssistantNodeSelection();
+component.assistant.stopped = false;
 component.assistant.measurementId = '';
 component.toggleAssistantNodeSelection();
 process.stdout.write(JSON.stringify({
@@ -3874,7 +4472,7 @@ process.stdout.write(JSON.stringify({
         "calls": 1,
         "gen": result["genBefore"] + 1,
     }
-    # busy and unmeasured both refuse the override.
+    # ready, busy, stopped and unmeasured all refuse the override.
     assert result["finalSelection"] == "all"
     assert result["totalCalls"] == 1
 
@@ -3960,3 +4558,27 @@ def test_assistant_card_is_mounted_independently_of_the_wizard_state():
     assert template.index("data-cluster-assistant-section>") < template.index(
         "data-cluster-plan>"
     )
+
+
+def test_assistant_card_announces_progress_and_failures_and_hides_spinners():
+    """L5: the progress rows are a polite live region, the failure banner is an
+    alert, and the decorative spinner SVGs are hidden from assistive tech (the
+    adjacent text already names the state)."""
+
+    card = _assistant_card()
+
+    progress = re.search(r"<div[^>]*data-cluster-v2-assistant-progress>", card)
+    assert progress, "progress container missing"
+    assert 'aria-live="polite"' in progress.group(0)
+
+    banner = re.search(r"<div[^>]*data-cluster-v2-assistant-error>", card)
+    assert banner, "failure banner missing"
+    assert 'role="alert"' in banner.group(0)
+
+    spinners = [
+        tag for tag in re.findall(r"<svg\b[^>]*>", card) if "animate-spin" in tag
+    ]
+    # One per Screen-4 current row plus the seven busy state sentences.
+    assert len(spinners) >= 8
+    for tag in spinners:
+        assert 'aria-hidden="true"' in tag, tag

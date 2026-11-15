@@ -639,8 +639,45 @@ def test_the_router_exposes_the_assistant_routes(api) -> None:
         (STATUS_URL, ["GET"]),
         (RECOMMEND_URL, ["POST"]),
         (PLAN_URL, ["POST"]),
+        (APPLY_URL, ["POST"]),
+        (START_URL, ["POST"]),
+        # Screen 6: stop the one deployment a ready start launched, on the
+        # elected coordinator, through the same local/remote seam.
+        (STOP_URL, ["POST"]),
+        # The automatic constellation search loop: rank, oMLX plans+starts,
+        # measure, pick the best measured, stop the losers.
+        (SEARCH_URL, ["POST"]),
+        (SEARCH_URL + "/{job_id}", ["GET"]),
+        # Fine-tune the winning constellation (chunk/sampler/MTP) with real
+        # completions on its coordinator. One synchronous answer, no poll.
+        (TUNE_URL, ["POST"]),
+        # Tune the per-model knobs (MTP on/off + depth) by redeploying each
+        # config once; the winner is saved per (model, node config).
+        (REDEPLOY_URL, ["POST"]),
+        (REDEPLOY_URL + "/{job_id}", ["GET"]),
+        # Read-only: the saved tuning preset for an operation's model + node set,
+        # so a later Start's replay is visible (never a key or SSH target).
+        (TUNING_PRESET_URL, ["GET"]),
+        # Read-only: the probe switch, and its one write.
+        (PERFORMANCE_PROBE_URL, ["GET"]),
+        (PERFORMANCE_PROBE_URL, ["POST"]),
+        # Read-only: the last persisted deployment, so a reloaded card can show
+        # Running/Stopped and offer Start again.
+        (SESSION_URL, ["GET"]),
+        # Read-only: the redacted support bundle for the last measurement and
+        # operation (no key, SSH target, model path, prompt or completion).
+        ("/admin/api/cluster/assistant/diagnostics", ["GET"]),
+        # Read-only: local interface evidence and commands; never executed.
+        ("/admin/api/cluster/assistant/network-preflight", ["GET"]),
+        # Read-only: lets a second origin ask the elected coordinator whether it
+        # is already running an apply/start (the cluster-wide operation lock).
+        (OPERATIONS_URL + "/active", ["GET"]),
+        # Server-to-server: the origin mirrors its running operation onto the
+        # elected coordinator so a second origin sees the cluster-wide lock.
+        (OPERATIONS_URL + "/mirror", ["POST"]),
+        (OPERATIONS_URL + "/{operation_id}", ["GET"]),
         # The free-space affordance: one model, on one measured Mac, through that
-        # Mac's own delete route.
+        # Mac's own delete route (the live-run notes).
         (
             "/admin/api/cluster/assistant/models/{node_id}/{model_id:path}",
             ["DELETE"],
