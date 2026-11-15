@@ -112,3 +112,20 @@ Discussion draft (R12) if appetite is unclear:
 - **R18** the macOS feature branch needs the fixes PR merged first.
 
 Review of all findings: [`UPSTREAM-PR-REVIEW-2026-11-15.md`](UPSTREAM-PR-REVIEW-2026-11-15.md).
+## 8. Fresh rollout order (after the 2026-11-15 wipe)
+
+Every Mac is bare (no app, no `~/.omlx`, no helper; models and this repo kept).
+The notarized `build/oMLX-0.8.0rc1.dmg` is the artefact to install.
+
+1. Copy + install the DMG on each Mac (§1.5 steps 2–3 of the runbook; SSH/scp is
+   fine for the copy).
+2. **Open the app at the Mac, interactively** — Local Network: allow. Then
+   `/health` must answer on port 8099.
+3. **Bless the helper once per Mac**: Performance → “Apply with Admin…”, accept the
+   admin dialog, and confirm
+   `/Library/PrivilegedHelperTools/app.omlx.helper` +
+   `/Library/LaunchDaemons/app.omlx.helper.plist` exist and
+   `launchctl print system/app.omlx.helper` lists the job. This also lifts the
+   107.5 GB Metal cap on the 128 GB Mac.
+4. Version gate: `GET /api/cluster/node_id` → same `version` on all four.
+5. Then pair (§1) and run §3.

@@ -151,12 +151,27 @@ the elected coordinator over SSH.
    ssh andreaskolb@<peer> 'hdiutil detach /Volumes/oMLX'
    ```
 4. **Start it at the Mac, interactively** — open `/Applications/oMLX.app` in
-   Spotlight/Dock and accept the **Local Network** prompt (and the one-time
-   **helper** admin dialog). Do **not** launch it with `open -a` or a CLI server
-   over SSH: macOS binds the Local Network permission, the SMJobBless helper and
-   the first-run runtime installer to the GUI session, so an SSH launch yields a
-   node that cannot probe the LAN or bless its helper (`AGENTS.md` §11). Then wait
-   for `/health` on `http://<peer>:8099`.
+   Spotlight/Dock and accept the **Local Network** prompt. Do **not** launch it
+   with `open -a` or a CLI server over SSH: macOS binds the Local Network
+   permission, the SMJobBless helper and the first-run runtime installer to the
+   GUI session, so an SSH launch yields a node that cannot probe the LAN or bless
+   its helper (`AGENTS.md` §11). Then wait for `/health` on
+   `http://<peer>:8099`.
+4b. **Bless the privileged helper on every Mac (one admin dialog each).** The
+   helper ships inside the app (`Contents/Library/LaunchServices/app.omlx.helper`,
+   Developer ID + hardened runtime, requirement pinned to team `YB894QRG4W`) but
+   it is **not** installed until someone triggers it: open **Performance** and
+   press **“Apply with Admin…”**. SMJobBless then asks once and installs it. This
+   is also what raises the Metal wired limit — without it a 128 GB Mac runs with a
+   107.5 GB cap and large models lose headroom. Verify per Mac:
+   ```sh
+   ls -l /Library/PrivilegedHelperTools/app.omlx.helper
+   ls -l /Library/LaunchDaemons/app.omlx.helper.plist
+   sudo launchctl print system/app.omlx.helper | head -5
+   codesign -dv /Library/PrivilegedHelperTools/app.omlx.helper 2>&1 | grep Authority
+   ```
+   A node without those two files has no helper — say so, do not fake it with
+   `sudo` or `launchctl` over SSH.
 5. Verify the version on all four Macs (§2.2) before continuing.
 6. Only then pair (§1) and run §3.
 
