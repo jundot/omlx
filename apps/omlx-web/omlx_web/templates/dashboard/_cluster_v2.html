@@ -1887,6 +1887,23 @@
                                     @click="toggleAssistantNodeSelection()"
                                     x-text="assistant.nodeSelection === 'all' ? 'Use the fewest Macs that fit' : 'Use all Macs'">
                             </button>
+                            <!-- Rank 0 holds the tail (it runs the sampler) and
+                                 the MVP keeps rank 0, coordinator and endpoint on
+                                 one Mac, so pinning rank 0 is how the endpoint
+                                 stays on one host. "Automatic" is the default;
+                                 a pin is refused rather than silently moved. -->
+                            <label class="mt-2 flex items-center gap-2 text-caption text-neutral-500">
+                                <span x-text="t('cluster.assistant.coordinator.label')"></span>
+                                <select class="rounded border border-neutral-300 bg-transparent px-1 py-0.5 text-caption"
+                                        data-cluster-v2-assistant-coordinator
+                                        :disabled="!assistantCanChangeNodeSelection()"
+                                        @change="setAssistantCoordinator($event.target.value)">
+                                    <template x-for="option in assistantCoordinatorOptions()" :key="option.id">
+                                        <option :value="option.id" :selected="option.id === (assistant.preferredCoordinator || '')"
+                                                x-text="option.label"></option>
+                                    </template>
+                                </select>
+                            </label>
                             <pre class="mt-1 max-h-48 overflow-auto rounded bg-neutral-900 text-neutral-100 p-2 text-caption whitespace-pre-wrap"
                                  x-show="assistant.operation"
                                  data-cluster-v2-assistant-operation

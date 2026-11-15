@@ -420,6 +420,10 @@ function clusterV2Wizard() {
             // The measured Macs from the last status poll, with each Mac's own
             // model list. Only the Mac the user picks is ever listed for delete.
             measurementNodes: [],
+            // The user's explicit rank-0 pin (and with it the endpoint host).
+            // '' is "automatic". Plan and apply both send it, so the approved
+            // placement is the one the election re-proves.
+            preferredCoordinator: '',
             freeSpaceOpen: false,
             freeSpaceNode: '',
             freeSpaceConfirm: '',
@@ -6601,8 +6605,45 @@ function clusterV2Wizard() {
                 // is an explicit user override here.
                 node_selection: this.assistant.nodeSelection || 'minimal',
                 confirm_two_mac_fallback: !!this.assistant.confirmTwoMacFallback,
+                // The user's explicit rank-0 pin (and with it the endpoint
+                // host). Empty means "automatic"; the plan refuses rather than
+                // electing a different Mac when the pin cannot hold the tail.
+                preferred_coordinator: this.assistant.preferredCoordinator || null,
                 admission: 'p50',
             };
+        },
+
+        // Rank-0 options for the pin: "Automatic" plus every Mac the current
+        // measurement covers. Names come from the device list, not the plan, so
+        // the list does not change when a plan is recomputed.
+        assistantCoordinatorOptions() {
+            const options = [
+                {
+                    id: '',
+                    label: window.t('cluster.assistant.coordinator.automatic'),
+                },
+            ];
+            for (const node of this.assistantFreeSpaceNodes()) {
+                options.push({
+                    id: node.node_id,
+                    label: this.assistantNodeName(node.node_id),
+                });
+            }
+            return options;
+        },
+
+        // Changing the pin re-plans, because the plan the user would approve is
+        // the one built with it. Anything running keeps its own flow.
+        setAssistantCoordinator(nodeId) {
+            const next = String(nodeId || '');
+            if (next === (this.assistant.preferredCoordinator || '')) return;
+            this.assistant.preferredCoordinator = next;
+            if (
+                this.assistant.measurementId &&
+                this.assistantCanChangeNodeSelection()
+            ) {
+                this.runAssistantPlan();
+            }
         },
 
         // Phase A advanced override: re-plan with the other node selection.
@@ -7481,6 +7522,9 @@ function clusterV2Wizard() {
             this.assistant.inputs = {
                 measurement_id: session.measurement_id,
                 model_path: session.model_path,
+                // The pin the approved plan was built with, so "Start again"
+                // re-elects the same Mac and the same endpoint host.
+                preferred_coordinator: session.preferred_coordinator || null,
                 context_tokens: session.context_tokens,
                 target_context_tokens:
                     session.target_context_tokens || session.context_tokens,

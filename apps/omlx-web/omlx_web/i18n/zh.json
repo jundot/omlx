@@ -2655,5 +2655,8 @@
   "settings.theme.contrast_low": "低于 4.5:1，未达到正文文字的 WCAG AA 最低要求",
   "status.claude_code.copy_command_tooltip": "复制命令",
   "status.claude_code.section_label": "Claude Code 与 oMLX",
-  "status.layout.block.claude_code": "Claude Code"
+  "status.layout.block.claude_code": "Claude Code",
+  "cluster.assistant.action.raise_wired_limit": "Raise the GPU limit in the oMLX app (Performance → Apply with Admin…)",
+  "cluster.assistant.coordinator.label": "Rank 0 (endpoint)",
+  "cluster.assistant.coordinator.automatic": "Automatic"
 }

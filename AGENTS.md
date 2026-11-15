@@ -305,6 +305,20 @@ Resolved implementation decisions:
   dialog); the browser has no privileged path and only names the step. A
   refusal that already chose a specific step (a checkpoint mlx-lm cannot split)
   keeps it — more memory does not make an architecture pipeline-capable.
+- **Rank 0 can be pinned, and the pin is never overridden silently (user
+  decision, 2026-11-15).** `preferred_coordinator` names the Mac that must host
+  rank 0 — and with it the endpoint, because rank 0, coordinator and endpoint
+  stay co-located. The election restricts candidate generation to that Mac, the
+  solver keeps only subsets that contain it, and when no legal split exists with
+  it in front the plan refuses with the Mac named (never a different coordinator).
+  It is a plan-time input: the request, `PlanInputs`, the operation record and
+  the card all carry it, so apply re-elects with it and the approved placement is
+  the launched one. The pin cannot make an infeasible split feasible: oMLX's rank
+  0 runs the sampler and must own the tail, so pinning a Mac that cannot hold the
+  tail is a refusal, not a reordering. On the live 2-Mac GLM run that is why
+  `.12` had rank 0: `.12` cannot hold the 66.1 GiB head stage, so the only
+  feasible order is `.12` = tail. Pinning `.11` there needs a smaller
+  (unbalanced, slower) tail — an explicit choice, not a silent one.
 - The measurement records each Mac's own catalogue (`NodeFacts.model_paths`), so
   a recommendation answers "already present" for **any** candidate from measured
   facts. Empty `model_paths` means "not measured" and keeps the honest
