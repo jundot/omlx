@@ -132,6 +132,8 @@
         let dashObserver = null;
         let dashRefitFrame = null;
         let dashRefitTimer = null;
+        // Rendered serving-stat tiles keyed by tile id; see servingStatTiles.
+        const servingTileCache = new Map();
         return {
             // Theme
             theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
@@ -4358,12 +4360,22 @@
                 return ids.map(id => {
                     const tile = SERVING_STAT_TILES[id];
                     const raw = source[tile.field] ?? 0;
-                    return {
-                        id,
-                        label: window.t(tile.label),
-                        value: tile.unit === '%' ? raw.toFixed(1) : this.formatServingCount(raw),
-                        unit: tile.unit || '',
-                    };
+                    const label = window.t(tile.label);
+                    const value = tile.unit === '%' ? raw.toFixed(1) : this.formatServingCount(raw);
+                    const unit = tile.unit || '';
+                    // x-for hands each tile object to its row and x-text rewrites
+                    // the text when that object changes. The stats poll runs every
+                    // 500ms, so rebuilding the tiles each time would collapse a
+                    // selection on a tile whose number did not move. Reuse the
+                    // object unless the rendered content actually changed.
+                    const cached = servingTileCache.get(id);
+                    if (cached && cached.label === label && cached.unit === unit
+                        && cached.value === value) {
+                        return cached;
+                    }
+                    const next = { id, label, value, unit };
+                    servingTileCache.set(id, next);
+                    return next;
                 });
             },
             get servingStatGridClass() {
