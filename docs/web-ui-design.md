@@ -76,7 +76,7 @@ The Preview header's Save as image button writes both modes, every editable toke
 | Large | `text-base`, `text-lg` | 16px, 18px | Emphasis, card titles |
 | Heading | `text-xl`, `text-2xl` | 20px, 24px | Page headings, stat figures |
 
-Do not use pixel sizes such as `text-[11px]`, including inside a `<style>` block. The serving stat figures (`lg:text-[32px]`) and the 16px iOS input are the only exceptions. Enhanced Readability raises `text-caption` and badge text to 12px. The off-ramp sizes still on the chat page (11px inline; 13px and 14.4px, written as `0.8125rem` and `0.9rem`) and the two display sizes (30 and 36px) are tracked in #4400.
+Do not use pixel sizes such as `text-[11px]`, including inside a `<style>` block. The serving stat figures (`lg:text-[32px]`) and the 16px iOS input are the only exceptions. Enhanced Readability raises `text-caption` and badge text to 12px. The off-ramp sizes still on the chat page (11px inline; 13px and 14.4px, written as `0.8125rem` and `0.9rem`) and the two display sizes (30px in the bench context, 36px on login) are tracked in #4400.
 
 ## Buttons
 
