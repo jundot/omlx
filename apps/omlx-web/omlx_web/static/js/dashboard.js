@@ -421,6 +421,9 @@
                     disk_max_bytes: 0,
                 },
             },
+            // Rendered engine rows ([key, engine] pairs). Kept next to `stats`
+            // so the 500ms poll can reuse the same tuples (see syncEngineEntries).
+            engineEntries: [],
             alltimeStats: {
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
@@ -4959,6 +4962,69 @@
                 }
             },
 
+            // Stable identity for an item of a polled stats list. Model rows and
+            // request rows (prefill/generate/waiting/activity) use different names.
+            statsItemKey(item) {
+                if (!item || typeof item !== 'object') return null;
+                const key = item.request_id ?? item.id;
+                if (typeof key === 'number') return key;
+                return typeof key === 'string' && key ? key : null;
+            },
+
+            // Merge a list from the 500ms stats poll into the live one without
+            // swapping the items when membership is unchanged. Alpine's x-for
+            // hands each row its item object and x-text re-assigns textContent
+            // (replacing the text node) whenever that object changes; the status
+            // tab polls every 500ms, so replacing the list would collapse any
+            // text selection the user has inside these rows (#4346). Only when a
+            // model loads/unloads or a request appears/finishes is the list
+            // replaced, so the UI still follows real membership changes.
+            mergeStatsList(current, next) {
+                if (!Array.isArray(current) || !Array.isArray(next)
+                    || current.length !== next.length) {
+                    return next;
+                }
+                const keys = next.map((item) => this.statsItemKey(item));
+                if (keys.some((key) => key === null) || new Set(keys).size !== keys.length) {
+                    return next;
+                }
+                if (keys.some((key, index) => this.statsItemKey(current[index]) !== key)) {
+                    return next;
+                }
+                next.forEach((item, index) => this.mergeStatsItem(current[index], item));
+                return current;
+            },
+
+            mergeStatsItem(live, fresh) {
+                Object.keys(fresh).forEach((field) => {
+                    const value = fresh[field];
+                    // Nested polled lists (a model's request rows) get the same
+                    // in-place treatment so their rows are not rebuilt either.
+                    if (Array.isArray(value)) {
+                        live[field] = this.mergeStatsList(live[field], value);
+                    } else {
+                        live[field] = value;
+                    }
+                });
+            },
+
+            // Engine rows are an object, so x-for iterates Object.entries(),
+            // which builds brand-new [key, engine] tuples on every run. Keep the
+            // rendered list stable while the engines are unchanged; rebuild it
+            // only when an engine is added/removed or its values change.
+            syncEngineEntries(engines) {
+                const entries = Object.entries(engines || {});
+                const cached = this.engineEntries;
+                const unchanged = cached.length === entries.length && entries.every(([key, engine], index) => {
+                    const [cachedKey, cachedEngine] = cached[index];
+                    return cachedKey === key
+                        && JSON.stringify(cachedEngine) === JSON.stringify(engine);
+                });
+                if (!unchanged) {
+                    this.engineEntries = entries;
+                }
+            },
+
             async loadStats(includeAlltime = true) {
                 try {
                     const params = new URLSearchParams();
@@ -4969,7 +5035,22 @@
                     const response = await fetch(url);
                     if (response.ok) {
                         const data = await response.json();
+                        if (data.active_models && Array.isArray(data.active_models.models)) {
+                            data.active_models.models = this.mergeStatsList(
+                                this.stats.active_models?.models,
+                                data.active_models.models,
+                            );
+                        }
+                        if (data.runtime_cache && Array.isArray(data.runtime_cache.models)) {
+                            data.runtime_cache.models = this.mergeStatsList(
+                                this.stats.runtime_cache?.models,
+                                data.runtime_cache.models,
+                            );
+                        }
                         this.stats = { ...this.stats, ...data };
+                        if (data.engines) {
+                            this.syncEngineEntries(data.engines);
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
