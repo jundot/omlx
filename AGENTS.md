@@ -651,16 +651,39 @@ Setup that works (`.idea` is gitignored, so re-create it per clone):
   (`.venv`, `__pycache__`, `.pytest_cache` usually already are).
 - **Custom scope `localDev`** (Settings → Appearance & Behavior → Scopes):
   ```
-  file:omlx//*||file:tests//*||file:apps/omlx-web/omlx_web//*.py
+  (file:omlx//*||file:tests//*||file:apps/omlx-web/omlx_web//*.py
   ||file:apps/omlx-web/omlx_web/templates//*||file:apps/omlx-web/omlx_web/static/js/cluster_v2.js
   ||file:apps/omlx-web/tests//*||file:apps/omlx-mac/Sources//*||file:apps/omlx-mac/Tests//*
-  ||file:scripts//*||file:Formula//*
+  ||file:scripts//*||file:Formula//*)
+  &&!file:omlx/patches/mlx_vlm_<name>_compat/vendor//*   (seven vendored trees)
   ```
+- **Curate the profile.** Even inside that scope a run reported **58 126**
+  findings, ~57 000 of them unactionable here: `PyCompatibility` against a 3.9
+  target (27 502 — the project runs 3.12 only), missing docstrings (6 159),
+  MLX/native unresolved references, argument-equals-default (2 649), unused
+  parameters, protected-member access in tests, name shadowing, PEP8 naming,
+  broad-except (deliberate and `noqa`-ed), Alpine-template attribute checks and
+  the 74 legacy JS style rules. Those are off in the project profile; the
+  bug-level ones stay on (unused imports, unreachable code, calling
+  non-callable, argument lists, inconsistent returns, comparison with `None`,
+  redeclaration, unbound locals, string format, property access, unresolved
+  references, `JSUnresolved*`/`JSUndefinedPropertyAssignment`).
+  Of the first real run, three findings were genuine and are fixed: a duplicate
+  `_is_ssd_table_tensor` in `planner.py`, and a missing `Sequence` import in
+  `assistant/models.py` and `assistant/tuning.py`. Everything else in our files
+  was narrowing/setter false positives that must not be "fixed" — e.g.
+  `pipeline_compat.py` deliberately writes `seen = seen | {…}` instead of
+  `|=`, because the parameter may be a caller-owned `set`.
 - Then **Code → Inspect Code…** with scope `localDev` (PyCharm remembers it), and
   run `ruff check` / `node --check` from the CLI for the rest.
 
-Not in the scope on purpose: `docs/**` (prose), `i18n/*.json` and
-`static/js/*.min.js` + `static/css/tailwind.css` (generated/vendored).
+Not in the scope on purpose: `docs/**` (prose), `i18n/*.json`,
+`static/js/*.min.js`, `static/css/tailwind.css` (generated/vendored) and the
+vendored `mlx_vlm` model trees under `omlx/patches/*_compat/vendor/`.
+
+Inspection exports land in the **repo root** as one `<Inspection>.xml` per class
+(PyCharm's "Export" dialog) — 98 files, many MB. Move them out of the working
+tree when done; they are untracked but they pollute the root and `git status`.
 
 Do not install packages globally with pip.
 

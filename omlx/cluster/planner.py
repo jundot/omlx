@@ -1478,17 +1478,6 @@ def _qwen4_ple_layer_ids(config: dict[str, Any]) -> tuple[int, ...]:
     return tuple(sorted(layers))
 
 
-def _is_ssd_table_tensor(name: str, engram_names: frozenset[str]) -> bool:
-    """Whether this tensor belongs to a lookup table that can live on SSD.
-
-    DeepSeek V4.1 names its tables in the converted config; Qwen4-Exp keeps
-    the PLE n-gram table inline with the shard under ``ngram_embedding``. Both
-    are gathered row-by-row, so a rank can mmap them instead of wiring them.
-    """
-
-    return name in engram_names or ".ngram_embedding." in name
-
-
 def _is_qwen4_ple_tensor(name: str, layers: tuple[int, ...]) -> bool:
     if not layers:
         return False

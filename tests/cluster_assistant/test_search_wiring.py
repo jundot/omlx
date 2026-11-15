@@ -11,8 +11,6 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-import pytest
-
 from omlx.cluster.assistant import search_wiring
 from omlx.cluster.assistant.election import PlanCandidate
 from omlx.cluster.assistant.operations import (

@@ -20,7 +20,7 @@ hardware pair and must never be reused across hardware.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 
 # Golden prompts with checkable answers (no judge model). Ported from the
