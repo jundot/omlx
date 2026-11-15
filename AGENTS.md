@@ -790,6 +790,12 @@ the answer here.
 If blocked by an environmental unknown (paths, credentials, hardware), ask once
 instead of inventing an answer.
 
+**The next gate is acceptance, then the PRs:**
+`docs/cluster-assistant/ROADMAP-ACCEPTANCE-2026-11-16.md` (work packages D1 uninstall,
+D6 helper, D4 error placement, D2 steps/back/retry, D3 layout, D5 manual-path proof;
+the acceptance gate A1-A7; the single fold-into-the-series step and the push order).
+The defect package behind it is `PACKAGE-2026-11-15-ACCEPTANCE.md`.
+
 The gap-closing plan that precedes Chapter 10 is
 [`docs/cluster-assistant/ROADMAP-TO-CHAPTER-10.md`](docs/cluster-assistant/ROADMAP-TO-CHAPTER-10.md).
 Do not start Chapter 10 until its gate is met. Its resource-planning phase is
