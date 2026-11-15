@@ -44,10 +44,22 @@ curl -H "Authorization: Bearer $OMLX_API_KEY" http://127.0.0.1:8000/admin/api/st
 | `GET /admin/api/logs?lines=&file=` | Tail of the server log |
 | `GET /admin/api/device-info` | Chip, GPU cores, and memory |
 | `POST /admin/api/ssd-cache/clear`, `POST /admin/api/hot-cache/clear` | Clear the SSD or in-memory KV cache |
+| `POST /admin/api/ssd-cache/rescan` | Index block files placed into the paged SSD cache out of band, without unloading engines |
 
 Inference responses (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`) carry the engine request id in the `X-oMLX-Request-ID` header. Streaming responses send it before prefill starts, so a client can find its request in the `waiting` and `prefilling` rows of `activity` by `request_id` while it waits. A `/v1/completions` request with a list of prompts has no single id and gets no header.
 
 The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The request still reuses any cached prefix, but its own prompt and output are not stored in the hot or SSD cache, so one-shot calls such as summaries do not evict prefixes that other requests reuse. Other values, or no header, keep the default behavior. Anthropic `cache_control` blocks and HTTP `Cache-Control` headers do not change what the engine stores.
+
+`ssd-cache/rescan` covers block files that arrive while the server is running —
+copied from another node for a KV handoff — since the startup scan is one-shot.
+The scan is additive: blocks already indexed keep their LRU position, and
+in-flight temporary writes are skipped by the same stale-tmp rule the startup
+scan uses. The response maps `model_id` to scan counters so a caller can confirm
+the imported blocks became discoverable. Two things are easy to misread:
+`bytes_after` counts the blocks the scan sees (K and V separately), which is not
+the size of the files that were copied, and `require_admin` also accepts the
+inference API key as a bearer token, which is convenient for testing an endpoint
+whose name suggests an admin session.
 
 ### Models
 
