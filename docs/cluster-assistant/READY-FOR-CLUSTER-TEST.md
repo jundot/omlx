@@ -48,9 +48,18 @@ branch (`054f92e4` #5033, `392aaccb` #5024 runtime).
 
 - Combined suite on `rebase/upstream-main`: **20 981 passed / 0 failed**;
   macOS python 27; Xcode `TEST SUCCEEDED` (`-testLanguage en`).
-- DMG: `build/oMLX-0.8.0rc1.dmg`, 78 MB, `hdiutil verify` VALID, Developer-ID
-  signed, Gatekeeper correctly "Unnotarized Developer ID" (no notarization by
-  design for the dry run).
+- DMG: `build/oMLX-0.8.0rc1.dmg`, 79 MB, `hdiutil verify` VALID, Developer-ID
+  signed **and notarized + stapled** (`spctl` → `accepted, source=Notarized
+  Developer ID`), SHA256
+  `f0868504fa05eed9dd3687580fe976d268e8609cc8777e2760c1d24c4da12c5e`. This
+  rebuild contains the R23 tier fix (apply writes the approved memory-guard tier)
+  and the R25 launcher-signing fix; the previous dry-run DMG was neither
+  notarized nor fixed.
+- Live 2-Mac cluster run (2026-11-15, any-to-any): `ready` on a remote
+  coordinator, one real completion at 18.76 tok/s, clean stop — evidence, IDs and
+  the plan split in `PHASE-2B-RUN.md` §29. That run still mixed builds (the
+  coordinator ran the installed 0.8.0rc1, the origin this tree), so it is not the
+  §1.5-clean repeat.
 - Local end-to-end on `.11` with a wiped cluster state: hardware measure →
   recommend (`dev-1.5b` @ 8192, single-node, 96.1 GiB headroom) → model-bound
   measure → plan (`7179c6975b`) → `run-local` ready → real completion
@@ -110,11 +119,31 @@ Discussion draft (R12) if appetite is unclear:
   *Settings → Performance* page must not look like the terminal command is the
   only way (the button is app-only). Recorded in `ROADMAP-TO-CHAPTER-10.md` §9.
 
+- **Helper install is proven, the preflight is not (R5).** The one-prompt
+  SMJobBless install ran on all four Macs during the 0.8.0rc1 rollout (helper +
+  LaunchDaemon present, wired limit raised to 122 880 / 60 293 / 29 696 /
+  29 696 MB) — see `HELPER.md`. What is still missing is the *plan-side*
+  wired-limit preflight: `wired_limit_mb` is measured and reported in the
+  diagnostics, but nothing refuses a plan whose stage does not fit a Mac still at
+  the macOS default with one action ("apply it in the app"), so the user only
+  sees `choose_smaller_model`. That is the next P1 slice after the PRs are
+  pushed; it needs no new endpoint.
+
+- **R24 (origin hard-kill during a failed start)** is recorded, not explained:
+  no traceback, no crash report, not reproducible. Capture the next occurrence
+  with `log show` + `sample` (`UPSTREAM-PR-REVIEW-2026-11-15.md` §17).
+
 - **R8** screenshots (needs the cluster and a browser session).
 - **R16/R17** to confirm during the run.
 - **R9** further split of the plan slice (measured: A2 changes the shared modules
   by only ~5 %, so it is not urgent).
 - **R18** the macOS feature branch needs the fixes PR merged first.
+- **Rank-0 pinning** is a product question, not a bug: oMLX's rank 0 is the
+  sampler's process and must own the tail, so the tail must fit the Mac that
+  serves the endpoint. On GLM-5.3 at 32k that made `.12` rank 0 because `.11`
+  alone cannot hold the tail plus head. An explicit "coordinator on this Mac"
+  preference (refused, never silently moved, when infeasible) is the way to give
+  the user control; it is not implemented yet.
 
 Review of all findings: [`UPSTREAM-PR-REVIEW-2026-11-15.md`](UPSTREAM-PR-REVIEW-2026-11-15.md).
 ## 8. Fresh rollout order (after the 2026-11-15 wipe)
@@ -132,5 +161,10 @@ The notarized `build/oMLX-0.8.0rc1.dmg` is the artefact to install.
    `/Library/LaunchDaemons/app.omlx.helper.plist` exist and
    `launchctl print system/app.omlx.helper` lists the job. This also lifts the
    107.5 GB Metal cap on the 128 GB Mac.
-4. Version gate: `GET /api/cluster/node_id` → same `version` on all four.
+4. Version gate: `GET /api/cluster/node_id` → same `version` on all four. The
+   version string stays `0.8.0rc1` for this rebuild, so also compare the **app
+   binary hash** on every Mac (`shasum -a 256
+   /Applications/oMLX.app/Contents/MacOS/oMLX`) — a missed reinstall is invisible
+   in the version gate alone. The DMG's own hash is
+   `f0868504fa05eed9dd3687580fe976d268e8609cc8777e2760c1d24c4da12c5e`.
 5. Then pair (§1) and run §3.

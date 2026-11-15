@@ -6,6 +6,17 @@ verified offline; the **one-prompt SMJobBless install is still not exercised**
 because it needs a click in the signed app. Privileged network setup is not
 implemented.
 
+**Live status 2026-11-15 (this supersedes "not exercised").** The one-prompt
+install ran at each of the four Macs during the 0.8.0rc1 rollout: after the
+admin dialog, `/Library/PrivilegedHelperTools/app.omlx.helper` and its
+LaunchDaemon existed, and the wired limit was raised by the app on every node
+(`iogpu.wired_limit_mb` = 122 880 on the 128 GiB M5 Max, 60 293 on the 64 GiB
+M2 Ultra, 29 696 on both 32 GiB M1 Max). The helper path is therefore proven on
+real machines; what is still missing is (a) an automated test of the install
+(needs the dialog, so it stays a manual step) and (b) the **wired-limit
+preflight** in the plan (R5 below), so a Mac whose limit is still at the macOS
+default is told to apply it instead of only reporting "choose a smaller model".
+
 ## Recorded decisions
 
 - Team: **Andreas Kolb — `YB894QRG4W`** (Developer ID).

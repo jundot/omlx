@@ -52,6 +52,28 @@ if [ -n "$SIGN_IDENTITY" ]; then
     # unsigned nested binary makes notarization fail with "not signed with a
     # valid Developer ID certificate" + "signature does not include a secure
     # timestamp".
+    # `Contents/MacOS` may hold our own launcher scripts (the slim runtime
+    # wrappers `omlx-cli` and `omlx-cluster-python`). A bundle cannot be sealed
+    # while a subcomponent there is unsigned: codesign reports "code object is
+    # not signed at all" and names the script — which is exactly what blocked
+    # the first slim DMG after the inside-out signing change. A non-Mach-O
+    # executable takes a Developer ID signature in its extended attributes,
+    # which the bundle seal and the ditto copy into the DMG both keep. They are
+    # signed *before* the nested Mach-O pass, because signing the bundle's main
+    # executable first validates the siblings and fails on an unsigned one.
+    LAUNCHER_COUNT=0
+    for launcher in "$APP_PATH/Contents/MacOS/"*; do
+        [ -f "$launcher" ] || continue
+        [ -x "$launcher" ] || continue
+        case "$(file -b "$launcher")" in
+            *Mach-O*) continue ;;
+        esac
+        codesign --force --options runtime --timestamp \
+            --sign "$SIGN_IDENTITY" "$launcher"
+        LAUNCHER_COUNT=$((LAUNCHER_COUNT + 1))
+    done
+    echo "  signed $LAUNCHER_COUNT MacOS launchers"
+
     echo "signing nested Mach-O binaries"
     NESTED_LIST="$(mktemp "${TMPDIR:-/tmp}/omlx-nested.XXXXXX")"
     find "$APP_PATH" -type f \
@@ -59,9 +81,16 @@ if [ -n "$SIGN_IDENTITY" ]; then
         -print0 > "$NESTED_LIST.0"
     tr '\0' '\n' < "$NESTED_LIST.0" > "$NESTED_LIST"
     rm -f "$NESTED_LIST.0"
+    # The bundle's own main executable is sealed by the bundle signature below;
+    # signing it here would validate the still-unsigned siblings first.
+    MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)"
     NESTED_COUNT=0
     while IFS= read -r binary; do
         [ -n "$binary" ] || continue
+        if [ -n "$MAIN_EXECUTABLE" ] && \
+            [ "$binary" = "$APP_PATH/Contents/MacOS/$MAIN_EXECUTABLE" ]; then
+            continue
+        fi
         case "$(file -b "$binary")" in
             *Mach-O*)
                 codesign --force --options runtime --timestamp \

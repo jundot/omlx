@@ -1789,3 +1789,89 @@ waited out (never measured with the old settings); if the winner cannot be left
 loaded the job fails with one action and saves no preset. The card has a "Tune on
 this Mac" block (button + honest progress + per-config rows + winner + preset).
 Tests: 15 backend + 2 UI.
+
+## 29. First fully green 2-Mac cluster run, with any-to-any start (2026-11-15)
+
+The 0.8.0rc1 rollout (runbook §1.5) paired the four Macs fresh and carried
+measure → recommend → plan → apply → start to a running endpoint. It also found
+and fixed the last plan/start disagreement (R23, §16 of
+`UPSTREAM-PR-REVIEW-2026-11-15.md`).
+
+Nodes: `.11` `c09cc74f-c164-4c62-80fb-49de94eba8ee` (M5 Max, 128 GiB), `.12`
+`9078f858-d20b-43dc-b420-d54031bf2943` (M2 Ultra, 64 GiB), `.13` `2dd48599-…`
+and `.14` `8092d5d1-…` (M1 Max, 32 GiB each). Origin `.11`; coordinator **`.12`**
+— the origin is *not* rank 0.
+
+Hardware-only measurement, then the model-bound one for
+`/Users/andreaskolb/Models/GLM-5.3-Flash-oQ2e-mtp` with `mtp=true`:
+`ms-20261115T190346Z-000131c5` (ready).
+
+Plan `c587ce6071529eda…`: minimal 2-Mac set, topology `line` / complete /
+measured, `resource_policy.memory_guard_tier = aggressive` (warning
+`tier_raised`), `admission = p50`, context 32 768, warnings `tier_raised` +
+`macs_not_needed` (`.13`/`.14` excluded). Predicted critical stage 0.929 s on
+rank 1.
+
+| Rank | Mac | Layers | resident | admission | headroom | predicted |
+|---|---|---|---:|---:|---:|---:|
+| 0 (coordinator, endpoint) | `.12` | 31–45 (14) | 37.2 GiB | 39.8 GiB | 2.6 GiB | 0.927 s |
+| 1 | `.11` | 0–31 (31) | 66.1 GiB | 99.8 GiB | 33.8 GiB | **0.929 s** (critical) |
+
+Rank 0 additionally holds 4.0 GiB of head/coordinator memory (LM head + MTP
+draft head). The plan states it itself: `rank 0 holds layers 31-45 with 2.6 GiB
+headroom inside 39.8 GiB admission`.
+
+The split is forced, not preferred. oMLX spawns rank 0 as the sampler's process
+and the planner requires rank 0 to own the tail, so the tail must fit the Mac
+that becomes rank 0. `.12` cannot hold the 66.1 GiB head stage, so the only
+feasible 2-Mac order is `.12` = tail/rank 0. Pinning `.11` as rank 0 would need
+a smaller (unbalanced, slower) tail; that is a product decision, not a bug.
+
+apply `op-20261115T190433Z-apply-000192aa` → `applied`; start
+`op-20261115T190519Z-start-00026aff` → `starting` → `loading` → **`ready`** in
+~50 s, endpoint `http://172.16.1.12:8099`, warnings `performance_unmeasured` +
+`chat_profile_applied`. The origin drove a *remote* coordinator over the SSH
+control plane (any-to-any) and the coordinator spawned its own rank 0 locally.
+
+One real completion through the endpoint (`/v1/chat/completions`,
+non-streaming):
+
+```text
+model  GLM-5.3-Flash-oQ2e-mtp
+text   17 × 23 equals 391.
+usage  prompt 25, completion 66 (55 reasoning), 3.52 s, generation 18.76 tok/s
+```
+
+`observed` stayed `null` (the performance probe is off by default), so the
+operation claims no rate; the number above is the server's own `usage`. TTFT and
+prefill therefore remain unmeasured for this build — the next run turns the
+probe on so prefill can be attributed per stage.
+
+Stop (Screen 6): `POST /admin/api/cluster/assistant/stop` with the ready start
+operation → `stopped: true`, deployment `GLM-5.3-Flash-oQ2e-mtp-f8ef5eced870`;
+`.12` then reported `loaded: 0`, `current_model_memory: 0` and no rank
+processes. `GET /assistant/session` returned the same ready start with its
+frozen inputs, coordinator `.12` and `stopped: false` before the stop — the
+resume surface works for a remote coordinator too.
+
+**The fix this run needed (R23).** The first three start attempts failed on a
+cleanly applied plan:
+
+```text
+503: rank 1 (9078f858-…) needs 40.9 GiB but can admit 40.4 GiB right now
+```
+
+40.9 GiB did not move when the context dropped to 24 576 (weights dominate), and
+the reported admission wandered between 40.4 and 40.8 GiB. The plan priced the
+stage with `memory_guard_tier = aggressive` while the launch preflight read the
+Mac's *live* ceiling from a server still guarding at `balanced`; the reserve
+difference is exactly that gap. apply now writes the approved tier through
+oMLX's own `/admin/api/global-settings` route on every selected Mac before
+staging, and the refusal names the tier it read. `memory_guard_tier` was
+`aggressive` on both `.12` and `.11` afterwards.
+
+**Mixed builds.** The coordinator `.12` ran the installed 0.8.0rc1 while the
+origin `.11` ran this tree, because only the origin needs the new apply code and
+the rank processes are launched by the coordinator's own interpreter. That is
+not a §1.5-clean cluster: the rebuilt DMG that contains this fix is installed on
+all four Macs before the repeated run.

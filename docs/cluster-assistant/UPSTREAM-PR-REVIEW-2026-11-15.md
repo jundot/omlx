@@ -589,3 +589,103 @@ the bundle without `--deep`. The helper is still signed first.
 
 This belongs to the macOS feature PR (`Scripts/package_dmg.sh`); the same change
 must be mirrored there before it is offered.
+
+## 16. R23 — the plan priced the memory tier, the launch check did not (fixed)
+
+**Symptom (live, 2026-11-15).** A cleanly applied 2-Mac plan refused to start
+three times in a row:
+
+```text
+503: Model does not fit the current per-node memory limits; no ranks were
+started. rank 1 (9078f858-…) needs 40.9 GiB but can admit 40.4 GiB right now
+```
+
+`action: retry_coordinator`. At 24 576 context the requirement was still
+40.9 GiB — the stage is weights-dominated, so "lower the context" (the
+message's own advice) cannot fix it.
+
+**Cause.** Two different numbers for the same Mac:
+
+- `plan` prices each stage with `election.budget_for(facts, rank=…, tier=…)`.
+  The solver had raised the tier to `aggressive` (warning `tier_raised`), which
+  is a real lever: it shrinks the guard's reserve.
+- `cluster/launch.py:_validate_deployment_admission` compares the stage against
+  `memory_guard.stage_budget(ceiling, role=…, safety=…)`, where `ceiling` is the
+  *live* ceiling the Mac reports in preflight — computed with the tier that
+  Mac's server is **actually** running.
+
+Nothing wrote the planned tier anywhere. The rank process receives
+`--memory-guard-tier` at launch, but the preflight ceiling comes from the Mac's
+already-running server, which still held `balanced`: reserve 5.12 GiB instead of
+1.5 GiB on a 64 GiB Studio — exactly the 0.5–0.7 GiB the check was short by.
+`start.py` never mentioned `memory_guard_tier` at all, so the documented rule
+"every lever is shown in the plan and applied on Start setup" did not hold for
+the tier.
+
+**Fix (applied, A2 `6c37cacc`).**
+
+- `provisioning.write_global_settings_on_mac(target, patch)` writes Mac-wide
+  levers through oMLX's existing `POST /admin/api/global-settings` route over the
+  same local/SSH admin seam the per-model writes use. It needs no model id, so it
+  can run **before** staging — which is where it must run.
+- `start._write_tier_settings` writes `{"memory_guard_tier": <policy tier>}` on
+  every **selected** Mac at the start of apply, before `prepare` and staging, and
+  fails the operation with one action (`policy_settings_failed` + `diagnostics`)
+  if a Mac cannot be written. A plan with no explicit tier (`None` = "each Mac's
+  own saved tier") writes nothing and claims nothing.
+- `_validate_deployment_admission` names the tier it read, so the next refusal
+  cannot be mistaken for a stale plan:
+  `… but can admit 40.4 GiB right now at memory tier balanced`.
+- Tests: the API suite asserts the tier write reaches every selected Mac and that
+  a refused write fails apply before staging; a provisioning test pins the route,
+  the POST method and the one-action refusal for an unmeasured port.
+
+**Live verification.** After the fix the same plan applied and started: tier
+`aggressive` on both `.12` and `.11`, `ready` in ~50 s and a real 18.76 tok/s
+completion (`PHASE-2B-RUN.md` §29).
+
+## 17. R24 — the origin process disappeared during a failed start
+
+During the third failing start attempt the origin server (a `uv run omlx serve`
+process on `.11`) was gone when the next poll ran. There is no Python traceback,
+no macOS crash report for it, `~/.omlx/logs/crash.log` is empty and the log ends
+mid model-registration. Restarting the same binary against the same state worked,
+and no later attempt (including the successful start and stop) reproduced it.
+
+It is recorded rather than explained: the failing path is the launch preflight
+that runs *before* any rank loads, so a memory kill of the origin has no obvious
+trigger of its own, and the assistant's start path does not stop a process. The
+next occurrence should be captured with `log show --last 5m --predicate 'process
+== "omlx-server"'` plus a `sample` of the process if it is still alive.
+
+## 18. R25 — the slim DMG could not be sealed after R22 (fixed)
+
+**Symptom.** The rebuild of the release DMG stopped while signing:
+
+```text
+signing nested Mach-O binaries
+…/Contents/MacOS/oMLX: code object is not signed at all
+In subcomponent: …/Contents/MacOS/omlx-cluster-python
+```
+
+**Cause.** Two things met. The slim stage (`build.sh release --slim`) writes
+`omlx-cli` and `omlx-cluster-python` into `Contents/MacOS` as **shell scripts**
+and `exit 0`s before the "ad-hoc re-sign" block, so they shipped unsigned. R22
+then replaced `codesign --deep` on the bundle with an inside-out pass plus a
+plain bundle signature — and a bundle cannot be sealed while an executable
+subcomponent in `Contents/MacOS` carries no signature. The nested pass also
+signed the bundle's own main executable first, which made it validate those
+unsigned siblings and fail.
+
+**Fix (applied, F6 `0b57194a`, mirrored on `rebase/upstream-main`).**
+
+- `package_dmg.sh` signs non-Mach-O executables in `Contents/MacOS` with the
+  Developer ID identity **before** the Mach-O pass (codesign accepts a script and
+  keeps the signature in extended attributes, which the bundle seal and the
+  `ditto` copy into the DMG both preserve), and skips the bundle's main
+  executable there — the bundle signature seals it.
+- `build.sh --slim` ad-hoc signs the two launchers, so a staged slim app is
+  coherent on its own instead of only after the release step.
+
+Verified by the rebuilt, notarized DMG (`spctl` accepts it, both launchers carry
+a Developer ID signature inside the packaged app).

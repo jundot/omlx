@@ -644,6 +644,13 @@ WRAPPER
 exec "$PYTHON" "$@"
 WRAPPER
     chmod 755 "$STAGED_APP/Contents/MacOS/omlx-cli"         "$STAGED_APP/Contents/MacOS/omlx-cluster-python"
+    # These two are shell scripts, so the later "Re-sign ad-hoc" block below
+    # (which only runs on the embedded-Python path) never reaches them. A file
+    # in `Contents/MacOS` must carry a signature or the bundle cannot be
+    # sealed at release time, so sign them ad-hoc here; `package_dmg.sh`
+    # re-signs them with the Developer ID identity before it seals the app.
+    codesign --force --sign - "$STAGED_APP/Contents/MacOS/omlx-cli" \
+        "$STAGED_APP/Contents/MacOS/omlx-cluster-python" >/dev/null 2>&1 || true
     ok "  + slim runtime wrappers"
     ok "Bundle ready: $STAGED_APP"
     exit 0
