@@ -1,21 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Admin API for the Cluster Assistant: measure, status, recommend, plan.
+"""Admin API for the Cluster Assistant: measure, plan, then apply and start.
 
-Five routes, the whole decision surface of the assistant::
+Twenty-two routes: the browser's assistant surface, plus the two read/write routes
+a second origin and the origin itself exchange with the elected coordinator —
+the cluster-wide "one apply/start at a time" lock — and the redacted support
+bundle::
 
-    POST   /admin/api/cluster/assistant/measure              start a job, return immediately
-    GET    /admin/api/cluster/assistant/status               poll that job
-    POST   /admin/api/cluster/assistant/recommend            which model should we run?
-    POST   /admin/api/cluster/assistant/plan                 plan from the stored facts
-    DELETE /admin/api/cluster/assistant/models/{node}/{id}   free space on a short Mac
+    POST   /admin/api/cluster/assistant/measure             start a job, return immediately
+    GET    /admin/api/cluster/assistant/status              poll that job
+    POST   /admin/api/cluster/assistant/recommend           which model should we run?
+    POST   /admin/api/cluster/assistant/plan                plan from the stored facts
+    POST   /admin/api/cluster/assistant/apply               stage the approved plan
+    POST   /admin/api/cluster/assistant/start               start it on the elected Mac
+    GET    /admin/api/cluster/assistant/session             last deployment after reload
+    POST   /admin/api/cluster/assistant/stop                stop the ready deployment
+    GET    /admin/api/cluster/assistant/performance-probe   read the probe switch
+    POST   /admin/api/cluster/assistant/performance-probe   write the probe switch
+    GET    /admin/api/cluster/assistant/operations/active   is the coordinator busy?
+    POST   /admin/api/cluster/assistant/operations/mirror   register/release another origin's operation
+    GET    /admin/api/cluster/assistant/operations/{id}     poll that operation
+    DELETE /admin/api/cluster/assistant/models/{node}/{id}  free space on a short Mac
+    GET    /admin/api/cluster/assistant/diagnostics         redacted support bundle
+    GET    /admin/api/cluster/assistant/network-preflight   read-only local network plan
 
-Why the measurement is a job: the probes read memory ceilings, model
-inventories and links over SSH, which takes seconds and fails in ways a plan
-may not hide. So ``measure`` persists a ``MeasurementSet`` under a
-``measurement_id`` and returns before the first probe finishes, and neither
-``recommend`` nor ``plan`` probes at all — they load the record and decide. A
-slow probe can therefore never look like a hung plan, and a plan can never be
-justified by a number it measured itself.
+Why the split exists: the probes measure memory ceilings, model inventories and
+links over SSH, which takes seconds and fails in ways a plan may not hide. So
+``measure`` persists a ``MeasurementSet`` under a ``measurement_id`` and returns
+before the first probe finishes, and neither ``recommend`` nor ``plan`` probes at
+all — they load the record and decide. A slow probe can therefore never look
+like a hung plan, and a plan can never be justified by a number it measured
+itself.
 
 ``recommend`` and ``plan`` answer different questions (the notes). Recommendation
 reads only the hardware half of a measurement and may evaluate any candidate
@@ -27,36 +41,50 @@ The measurement job does not stage, launch, register a deployment or write the
 device registry: it reads budgets, profiles, links, model inventories and disk
 space through oMLX's existing probes, and runs the small calibration model on
 each Mac that holds it (one warmup plus one measured completion, through the
-same admin seam a later post-``ready`` observe measurement will use) so ranking
-rests on real compute. Only one job runs at a time; a second ``measure`` is
-refused with ``409 measurement_in_progress`` rather than joined, because joining
-would hand its caller a measurement of a different node set or model.
+same seam the post-ready observe measurement uses) so ranking rests on real
+compute. Only one job runs at a time; a second ``measure`` is refused with
+``409 measurement_in_progress`` rather than joined, because joining would hand
+its caller a measurement of a different node set or model.
+
+``apply`` and ``start`` are the only routes that touch the cluster, and they are
+jobs for the same reason: staging copies tens of gigabytes and the coordinator
+loads weights for minutes. ``apply`` stages and starts nothing; ``start`` stages
+nothing and launches only on the elected coordinator. Both re-elect from the
+stored measurement and refuse a signature that the election does not reproduce,
+so a client-supplied stage table is never obeyed.
 
 Tensor parallelism is refused with an explicit 4xx rather than planned as PP
 behind the caller's back (the notes); a candidate that would need it is reported as
-unsupported with one action, never offered. Refusals are distinguishable
-without parsing prose: ``stale_measurement`` (no usable measurement — one
-action: measure), ``no_feasible_candidate`` (measured cluster, no model fits —
-choose a different model) and ``no_feasible_plan`` (measured cluster and chosen
-model, no legal split — change the context or model). Nothing in this module can
-name the app origin as a fallback coordinator: the election has no such branch
-and these routes add none.
+unsupported with one action, never offered. Refusals are distinguishable without
+parsing prose: ``stale_measurement`` (no usable measurement — one action:
+measure), ``no_feasible_candidate`` (measured cluster, no model fits — choose a
+different model), ``no_feasible_plan`` (measured cluster and chosen model, no
+legal split — change the context or model), ``plan_mismatch`` (the approved plan
+is not the election's — plan again), ``single_node_plan`` (add a Mac),
+``node_not_paired`` (pair it), ``operation_not_applied`` (apply first) and
+``operation_in_progress`` (poll the running one). Nothing in this module can name
+the app origin as a fallback coordinator: the election has no such branch and
+these routes add none.
 """
 
 from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import logging
 import threading
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi import Path as PathParam
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..deployment import validate_ssh_target
 from ..performance import NodePerformanceProfile
@@ -71,6 +99,7 @@ from .calibration import (
     calibrate_node,
     calibration_weight_bytes,
 )
+from .diagnostics import build_diagnostics
 from .election import (
     ComputeProfile,
     ElectionError,
@@ -92,40 +121,90 @@ from .models import (
     ACTION_ADJUST_PLAN,
     ACTION_CONFIGURE_ENDPOINT,
     NO_FEASIBLE_CANDIDATE_CODE,
+    AssistantApplyRequest,
+    AssistantDiagnosticsResponse,
     AssistantMeasurementStatus,
     AssistantMeasureNode,
     AssistantMeasureRequest,
     AssistantMeasureResponse,
+    AssistantOperationHandle,
+    AssistantOperationStatus,
+    AssistantPerformanceProbeRequest,
     AssistantPlanRequest,
     AssistantPlanResponse,
     AssistantRecommendRequest,
     AssistantRecommendResponse,
+    AssistantStartRequest,
+    AssistantStopRequest,
+    AssistantStopResponse,
+    NetworkPreflightResponse,
     build_plan_response,
     build_recommend_response,
     measurement_status,
+    operation_handle,
+    operation_status,
     plan_error_payload,
+    session_view,
 )
+from .network_preflight import build_network_preflight
 from .operations import (
+    ACTION_APPLY,
     ACTION_DIAGNOSTICS,
     ACTION_FREE_DISK_SPACE,
     ACTION_PAIR_MAC,
     ACTION_PLAN,
     ACTION_RETRY_COORDINATOR,
     ACTION_STATUS,
+    KIND_APPLY,
+    KIND_START,
+    OPERATION_IN_PROGRESS_CODE,
+    OPERATION_NOT_FOUND_CODE,
+    STATE_APPLIED,
+    STATE_APPLYING,
+    STATE_READY,
+    STATE_STARTING,
+    OperationInProgressError,
+    OperationProgress,
+    OperationRecord,
+    OperationStore,
+    OperationWarning,
 )
 from .performance_store import AssistantPerformanceStore
 from .policy import (
     SavedPolicy,
     solve_cluster_plan,
 )
-from .provisioning import ProvisioningSeams, model_layout_for
+from .provisioning import (
+    ApplyPlan,
+    PlanInputs,
+    ProvisioningError,
+    ProvisioningSeams,
+    model_layout_for,
+    plan_apply,
+)
 from .recommendation import (
     ModelCandidate,
     RecommendationResult,
     load_model_candidate,
     recommend,
 )
-from .start import RemoteAdminError, delete_model_on_mac, stream_completion
+from .start import (
+    ACTIVE_OPERATION_PATH,
+    COORDINATOR_REFUSALS,
+    CoordinatorOps,
+    RemoteAdminError,
+    _local_admin,
+    coordinator_ops,
+    delete_model_on_mac,
+    remote_admin,
+    run_apply_job,
+    run_start_job,
+    start_inputs,
+    stream_completion,
+)
+from .start import (
+    coordinator_active_operation as active_operation,
+)
 from .state import (
     ACTION_MEASURE,
     STALE_MEASUREMENT_CODE,
@@ -136,6 +215,8 @@ from .state import (
     measurement_refusal,
 )
 from .topology import missing_line_links
+from .tuning import hardware_key
+from .tuning_store import KEEP, TuningPresetStore, merge_preset
 
 router = APIRouter(prefix="/admin/api/cluster/assistant", tags=["cluster-assistant"])
 
@@ -151,6 +232,8 @@ STALE_MEASUREMENT_STATUS = 409
 NO_FEASIBLE_CANDIDATE_STATUS = 409
 # One measurement job at a time; the caller polls the running one instead.
 MEASUREMENT_IN_PROGRESS_STATUS = 409
+# One apply/start at a time; the caller polls the running operation instead.
+OPERATION_IN_PROGRESS_STATUS = 409
 MEASUREMENT_NOT_FOUND_STATUS = 404
 # A well-formed request the MVP cannot serve, i.e. tensor parallelism.
 UNSUPPORTED_PARALLELISM_STATUS = 400
@@ -221,28 +304,36 @@ _lock = threading.RLock()
 _store: MeasurementStore | None = None
 _probes: MeasureProbes | None = None
 _performance: AssistantPerformanceStore | None = None
+_tuning: TuningPresetStore | None = None
+_operations: OperationStore | None = None
 _seams: ProvisioningSeams | None = None
+_coordinator: Callable[[ApplyPlan], CoordinatorOps] | None = None
 _get_settings_manager: Callable[[], Any] | None = None
 _get_server_settings: Callable[[], Any] | None = None
+_get_global_settings: Callable[[], Any] | None = None
 _tasks: set[asyncio.Task[Any]] = set()
 
 
 def set_assistant_getters(
     settings_manager_getter: Callable[[], Any] | None = None,
     server_settings_getter: Callable[[], Any] | None = None,
+    global_settings_getter: Callable[[], Any] | None = None,
 ) -> None:
     """Inject server-owned dependencies without importing ``omlx.server``.
 
     Called once next to ``set_cluster_getters`` in
     ``omlx/server.py::_register_cluster_routes``: the settings manager supplies
-    the base path the measurement store lives under and the server settings
-    supply this Mac's own endpoint port. Both are read lazily, because the
-    cluster routes are registered before the settings manager exists.
+    the base path the measurement store lives under, the server settings
+    supply this Mac's own endpoint port and probe flag, and the global settings
+    let the performance-probe toggle persist without an edit-JSON step. All are
+    read lazily, because the cluster routes are registered before the settings
+    manager exists.
     """
 
-    global _get_settings_manager, _get_server_settings
+    global _get_settings_manager, _get_server_settings, _get_global_settings
     _get_settings_manager = settings_manager_getter
     _get_server_settings = server_settings_getter
+    _get_global_settings = global_settings_getter
 
 
 def configure_assistant_measurements(
@@ -280,17 +371,49 @@ def configure_assistant_performance(
             _performance = store
 
 
-def configure_assistant_seams(seams: ProvisioningSeams | None = None) -> None:
-    """Point target resolution at injected read-only lookups.
+def configure_assistant_tuning(store: TuningPresetStore | None = None) -> None:
+    """Point the tuning-preset store at a store, or let it resolve lazily."""
 
-    Production resolves the registry and this Mac's addresses lazily; tests
-    pass fakes so no test reads a real registry or the network.
+    global _tuning
+    with _lock:
+        if store is not None:
+            _tuning = store
+
+
+def configure_assistant_operations(
+    store: OperationStore | None = None,
+    *,
+    provisioning: ProvisioningSeams | None = None,
+    coordinator: Callable[[ApplyPlan], CoordinatorOps] | None = None,
+) -> None:
+    """Point apply/start at an operation store, lookup seams and coordinator.
+
+    Production resolves all three lazily (settings manager base path, device
+    registry, elected coordinator). Tests pass a temporary store and fakes so no
+    test writes to the user's real ``~/.omlx`` or reaches a Mac.
     """
 
-    global _seams
+    global _operations, _seams, _coordinator
     with _lock:
-        if seams is not None:
-            _seams = seams
+        if store is not None:
+            _operations = store
+        if provisioning is not None:
+            _seams = provisioning
+        if coordinator is not None:
+            _coordinator = coordinator
+
+
+def _operation_store() -> OperationStore:
+    """The process-wide operation store, resolved once."""
+
+    with _lock:
+        if _operations is not None:
+            return _operations
+        manager = _get_settings_manager() if _get_settings_manager else None
+        base = getattr(manager, "base_path", None)
+        store = OperationStore(Path(base) if base else Path.home() / ".omlx")
+        configure_assistant_operations(store)
+        return store
 
 
 def _provisioning_seams() -> ProvisioningSeams:
@@ -303,6 +426,21 @@ def _provisioning_seams() -> ProvisioningSeams:
         return _seams
 
 
+def _coordinator_ops(plan: ApplyPlan) -> CoordinatorOps:
+    """How this apply/start reaches the elected coordinator.
+
+    Defaults to ``start.coordinator_ops``: the coordinator's own pipeline in
+    this process when it is this Mac, and the coordinator's admin API over the
+    existing SSH seam when it is not.
+    """
+
+    factory = _coordinator or coordinator_ops
+    return factory(plan)
+
+
+def _schedule(task: Any) -> None:
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
 
 
 def default_measure_probes() -> MeasureProbes:
@@ -431,6 +569,37 @@ def _performance_store() -> AssistantPerformanceStore:
         return store
 
 
+def _tuning_store() -> TuningPresetStore:
+    """The process-wide tuning-preset store, resolved once."""
+
+    global _tuning
+    with _lock:
+        if _tuning is not None:
+            return _tuning
+        manager = _get_settings_manager() if _get_settings_manager else None
+        base = getattr(manager, "base_path", None)
+        store = TuningPresetStore(Path(base) if base else Path.home() / ".omlx")
+        configure_assistant_tuning(store)
+        return store
+
+
+def _global_settings() -> Any | None:
+    """This Mac's ``GlobalSettings``, so the probe toggle can persist."""
+
+    getter = _get_global_settings
+    if getter is None:
+        try:
+            from omlx.settings import get_settings
+
+            return get_settings()
+        except Exception:
+            return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
 def _server_settings() -> Any | None:
     """This Mac's ``ServerSettings``, or ``None`` when it cannot be read.
 
@@ -450,6 +619,25 @@ def _server_settings() -> Any | None:
         return getter()
     except Exception:
         return None
+
+
+def _performance_probe_enabled() -> bool:
+    """Whether this Mac's settings ask for the post-``ready`` measurement.
+
+    Default off. The flag is read on the Mac that posts ``start`` (the origin),
+    because that is the Mac whose operation record receives ``observed``; the
+    probe itself still runs on the elected coordinator through the existing
+    seam. ``auto_tune`` stays false regardless, so the approved placement is the
+    launched placement.
+    """
+
+    settings = _server_settings()
+    return bool(getattr(settings, "assistant_performance_probe", False))
+
+
+# ---------------------------------------------------------------------------
+# measure
+# ---------------------------------------------------------------------------
 
 
 @router.post("/measure", response_model=AssistantMeasureResponse)
@@ -938,10 +1126,10 @@ def _measure_performance(
 def _stored_performance_profiles(
     request: AssistantMeasureRequest,
 ) -> dict[str, NodePerformanceProfile]:
-    """Measured compute from an earlier measurement, for the Macs it covered.
+    """Measured compute from the last apply, for the Macs it covered.
 
-    The synthetic probe runs a plan's Macs once and its profiles are stored on
-    this Mac; the next measurement reads them. A stored profile is still a measurement
+    The synthetic probe runs after apply; its profiles are stored on this Mac
+    and used by the next measurement. A stored profile is still a measurement
     (with its own ``measured_at``), never an estimate. A malformed or mismatched
     record is skipped, so that node keeps ``unmeasured_compute``.
     """
@@ -1929,6 +2117,1389 @@ def _redacted(exc: BaseException) -> str:
 # ---------------------------------------------------------------------------
 
 
+@router.post("/apply", response_model=AssistantOperationHandle)
+async def cluster_assistant_apply(request: AssistantApplyRequest) -> Any:
+    """Stage the approved plan on the elected coordinator. Starts nothing.
+
+    The plan is not persisted (Chapter 3 kept ``plan`` pure), so this route
+    re-elects from the stored measurement with the same plan-time inputs and
+    refuses a signature the election does not reproduce. Staging runs on the
+    coordinator through oMLX's existing staging job; the request returns before
+    the first byte is copied.
+    """
+
+    try:
+        identity = request.model_identity()
+    except PlanningError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_apply_request", "message": str(exc)},
+        ) from exc
+
+    resolved = _usable_measurement(
+        request.measurement_id,
+        node_ids=request.rank_order,
+        identity=identity,
+    )
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    record = resolved
+
+    planned = await _plan_with_auto_free(record, request.plan_inputs())
+    plan, reclaim_warnings = planned
+    if isinstance(plan, JSONResponse):
+        return plan
+
+    busy = await asyncio.to_thread(_busy_on_coordinator, plan)
+    if busy is not None:
+        return _operation_in_progress_elsewhere(busy)
+
+    store = _operation_store()
+    try:
+        operation = store.start(
+            kind=KIND_APPLY,
+            measurement_id=record.measurement_id,
+            plan_signature=request.plan_signature,
+            coordinator_node=plan.coordinator.node_id,
+            coordinator_local=plan.coordinator.local,
+            rank_order=plan.rank_order,
+            context_tokens=request.context_tokens,
+            target_context_tokens=(
+                request.target_context_tokens or request.context_tokens
+            ),
+            model_path=request.model_path or "",
+            rank0_extra_bytes=request.rank0_extra_bytes,
+            microbatch_size=request.microbatch_size or 1,
+            mtp=request.mtp,
+            execution_profile=request.execution_profile,
+            two_mac_fallback=request.confirm_two_mac_fallback,
+            policy=request.resource_policy().to_dict(),
+            endpoint=plan.endpoint,
+        )
+    except OperationInProgressError as exc:
+        return _operation_in_progress_response(exc)
+
+    _begin(
+        store,
+        operation.operation_id,
+        STATE_APPLYING,
+        "staging",
+        plan.coordinator.node_id,
+        nodes_total=len(plan.rank_order),
+    )
+    try:
+        ops = _coordinator_ops(plan)
+    except Exception as exc:  # a resolved target that cannot be dialled
+        store.fail(
+            operation.operation_id,
+            code="coordinator_unreachable",
+            message=_redacted(exc),
+            action=ACTION_RETRY_COORDINATOR,
+        )
+        return operation_handle(store.get(operation.operation_id) or operation)
+
+    _schedule(
+        asyncio.create_task(
+            asyncio.to_thread(
+                run_apply_job,
+                store,
+                operation.operation_id,
+                plan,
+                ops,
+                performance_store=_performance_store(),
+                pre_warnings=reclaim_warnings,
+            )
+        )
+    )
+    return operation_handle(store.get(operation.operation_id) or operation)
+
+
+# ---------------------------------------------------------------------------
+# start
+# ---------------------------------------------------------------------------
+
+
+@router.post("/start", response_model=AssistantOperationHandle)
+async def cluster_assistant_start(request: AssistantStartRequest) -> Any:
+    """Start the staged deployment on the elected coordinator.
+
+    Only an applied plan may start: the deployment that staging prepared is the
+    deployment that launches, and a changed placement is refused rather than
+    launched. The request returns a handle; readiness is proven later.
+    """
+
+    store = _operation_store()
+    applied = _applied_operation(store, request)
+    if applied is None:
+        return _refusal_response(
+            "operation_not_applied",
+            "no applied plan matches this measurement, signature and "
+            "coordinator; apply it before starting it",
+            ACTION_APPLY,
+        )
+
+    resolved = _usable_measurement(request.measurement_id, node_ids=None, identity=None)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    record = resolved
+
+    planned = await asyncio.to_thread(
+        _planned_deployment, record, start_inputs(applied, model=record.model)
+    )
+    if isinstance(planned, JSONResponse):
+        return planned
+    plan = planned
+
+    busy = await asyncio.to_thread(_busy_on_coordinator, plan)
+    if busy is not None:
+        return _operation_in_progress_elsewhere(busy)
+
+    try:
+        operation = store.start(
+            kind=KIND_START,
+            measurement_id=record.measurement_id,
+            plan_signature=applied.plan_signature,
+            coordinator_node=plan.coordinator.node_id,
+            coordinator_local=plan.coordinator.local,
+            rank_order=plan.rank_order,
+            context_tokens=applied.context_tokens,
+            target_context_tokens=applied.target_context_tokens,
+            model_path=applied.model_path,
+            rank0_extra_bytes=applied.rank0_extra_bytes,
+            microbatch_size=applied.microbatch_size,
+            mtp=applied.mtp,
+            execution_profile=applied.execution_profile,
+            two_mac_fallback=applied.two_mac_fallback,
+            policy=dict(applied.policy),
+            endpoint=plan.endpoint,
+        )
+    except OperationInProgressError as exc:
+        return _operation_in_progress_response(exc)
+
+    _begin(
+        store,
+        operation.operation_id,
+        STATE_STARTING,
+        "starting",
+        plan.coordinator.node_id,
+        nodes_total=len(plan.rank_order),
+    )
+    try:
+        ops = _coordinator_ops(plan)
+    except Exception as exc:
+        store.fail(
+            operation.operation_id,
+            code="coordinator_unreachable",
+            message=_redacted(exc),
+            action=ACTION_RETRY_COORDINATOR,
+        )
+        return operation_handle(store.get(operation.operation_id) or operation)
+
+    _schedule(
+        asyncio.create_task(
+            run_start_job(
+                store,
+                operation.operation_id,
+                plan.request,
+                ops,
+                expected_placement=applied.placement_signature,
+                probe_enabled=_performance_probe_enabled(),
+                # The saved tuning preset for this model + node config is
+                # written by the job before activation, so its MTP depth is the
+                # one the launch uses. Best-effort; never blocks the start.
+                preset=_saved_preset_patch(applied),
+            )
+        )
+    )
+    return operation_handle(store.get(operation.operation_id) or operation)
+
+
+# ---------------------------------------------------------------------------
+# stop (Screen 6: state + stop/restart, nothing more)
+# ---------------------------------------------------------------------------
+
+STOP_DEPLOYMENT_PATH = "/admin/api/cluster/deployments/{deployment_id}/unload"
+STOP_TIMEOUT_SECONDS = 300.0
+WARNING_DEPLOYMENT_STOPPED = "deployment_stopped"
+
+
+def _coordinator_admin(
+    record: OperationRecord,
+    path: str,
+    *,
+    body: Mapping[str, Any] | None = None,
+    method: str = "POST",
+    timeout: float = STOP_TIMEOUT_SECONDS,
+) -> Mapping[str, Any]:
+    """Call one admin route on the operation's coordinator, local or over SSH.
+
+    The coordinator is known from the operation record: no re-election, so a
+    stale measurement cannot prevent a stop or a status question. This Mac uses
+    its own loopback admin key; another Mac is reached through the existing SSH
+    seam, which authenticates locally on that Mac. The key never crosses the
+    assistant API.
+    """
+
+    endpoint = record.endpoint
+    port = 0 if endpoint is None else int(endpoint.port)
+    if not 1 <= port <= 65535:
+        raise ProvisioningError(
+            "configure_endpoint",
+            "the coordinator's endpoint port is not known; open oMLX on it and "
+            "retry the coordinator",
+            ACTION_CONFIGURE_ENDPOINT,
+        )
+    if record.coordinator_local:
+        return _local_admin(port, path, body, method=method, timeout=timeout)
+    device = _paired_device_record(record.coordinator_node) or {}
+    ssh_user = str(device.get("ssh_user") or "").strip()
+    host = "" if endpoint is None else str(endpoint.host or "").strip()
+    if not host:
+        raise ProvisioningError(
+            "configure_endpoint",
+            "the coordinator's address is not known; open oMLX on it and retry "
+            "the coordinator",
+            ACTION_CONFIGURE_ENDPOINT,
+        )
+    if not device:
+        raise ProvisioningError(
+            "node_not_paired",
+            f"{record.coordinator_node} has no paired SSH target on this Mac; "
+            "pair it again and retry the coordinator",
+            ACTION_PAIR_MAC,
+        )
+    target = f"{ssh_user}@{host}" if ssh_user else host
+    return remote_admin(
+        validate_ssh_target(target),
+        port,
+        path,
+        body,
+        method=method,
+        timeout=timeout,
+    )
+
+
+def _coordinator_active_operation(record: OperationRecord) -> str:
+    """The operation the coordinator is running, or ``""`` when unanswerable.
+
+    An unanswered question is not a lock: the stop then runs and reports the
+    real refusal, rather than turning a diagnostic problem into a fake busy.
+    """
+
+    try:
+        reply = _coordinator_admin(
+            record, ACTIVE_OPERATION_PATH, method="GET", timeout=30.0
+        )
+    except Exception:  # noqa: BLE001 - unanswerable is not "busy"
+        return ""
+    if not isinstance(reply, Mapping):
+        return ""
+    operation = reply.get("operation")
+    if not isinstance(operation, Mapping):
+        return ""
+    running = operation.get("running")
+    operation_id = operation.get("operation_id")
+    if running is False or not isinstance(operation_id, str):
+        return ""
+    return operation_id
+
+
+def _stop_on_coordinator(
+    record: OperationRecord, deployment_id: str
+) -> Mapping[str, Any]:
+    """Unload one deployment on the elected coordinator through the same seam."""
+
+    path = STOP_DEPLOYMENT_PATH.format(
+        deployment_id=quote(str(deployment_id).strip(), safe="")
+    )
+    return _coordinator_admin(record, path)
+
+
+@router.post("/stop", response_model=AssistantStopResponse)
+async def cluster_assistant_stop(request: AssistantStopRequest) -> Any:
+    """Stop the deployment a ready start operation launched.
+
+    Idempotent: a second stop answers the stored record instead of relaying
+    again. ``state`` stays ``ready`` (the frozen state machine has no stopped
+    value); ``stopped`` is what the Screen-6 card reads.
+    """
+
+    store = _operation_store()
+    active = store.active()
+    if active is not None:
+        # "One apply/start at a time" is cluster-wide. A stop must not unload a
+        # deployment while another operation is staging or launching; the user
+        # polls the running one instead.
+        return _operation_in_progress_response(
+            OperationInProgressError(active.operation_id, active.kind)
+        )
+    record = store.get(request.operation_id)
+    if record is None:
+        return JSONResponse(
+            status_code=404,
+            content=plan_error_payload(
+                "unknown_operation",
+                f"no operation {request.operation_id} is stored; poll the "
+                "operation you started",
+                ACTION_STATUS,
+            ),
+        )
+    if record.kind != KIND_START or record.state != "ready" or not record.deployment_id:
+        return _refusal_response(
+            "operation_not_ready",
+            "only a start operation that is ready and knows its deployment can "
+            "be stopped",
+            ACTION_STATUS,
+        )
+    if record.stopped:
+        return AssistantStopResponse(
+            operation_id=record.operation_id,
+            deployment_id=record.deployment_id,
+            stopped=True,
+            warnings=operation_status(record).warnings,
+        )
+    busy = (
+        ""
+        if record.coordinator_local
+        else await asyncio.to_thread(_coordinator_active_operation, record)
+    )
+    if busy and busy != record.operation_id:
+        return _operation_in_progress_elsewhere(busy)
+    try:
+        reply = await asyncio.to_thread(
+            _stop_on_coordinator, record, record.deployment_id
+        )
+    except ProvisioningError as exc:
+        return _refusal_response(exc.code, exc.message, exc.action)
+    except RemoteAdminError as exc:
+        if exc.status == 404:
+            # The coordinator no longer has this deployment: it is already
+            # stopped, which is the state the caller asked for.
+            reply = {"ok": True, "stopped": True}
+        elif exc.status in COORDINATOR_REFUSALS:
+            return _refusal_response(
+                "coordinator_unreachable",
+                f"{record.coordinator_node} did not answer; open oMLX on it and "
+                "retry the coordinator",
+                ACTION_RETRY_COORDINATOR,
+            )
+        else:
+            return _refusal_response(
+                "stop_failed",
+                f"the coordinator refused to stop {record.deployment_id}: "
+                f"{exc.detail}",
+                ACTION_DIAGNOSTICS,
+            )
+    except OSError as exc:  # a refused loopback port is "no answer"
+        return _refusal_response(
+            "coordinator_unreachable",
+            f"{record.coordinator_node} did not answer: {_redacted(exc)}; open "
+            "oMLX on it and retry the coordinator",
+            ACTION_RETRY_COORDINATOR,
+        )
+    if not isinstance(reply, Mapping) or reply.get("stopped") is not True:
+        return _refusal_response(
+            "stop_failed",
+            f"the coordinator did not confirm that {record.deployment_id} "
+            "stopped",
+            ACTION_DIAGNOSTICS,
+        )
+    updated = store.mark_stopped(
+        record.operation_id,
+        warning=OperationWarning(
+            code=WARNING_DEPLOYMENT_STOPPED,
+            node_id=record.deployment_id,
+            message=(
+                f"the deployment on {record.coordinator_node} was stopped; the "
+                "cluster is not serving"
+            ),
+        ),
+    )
+    return AssistantStopResponse(
+        operation_id=updated.operation_id,
+        deployment_id=updated.deployment_id,
+        stopped=updated.stopped,
+        warnings=operation_status(updated).warnings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# search (the automatic constellation optimization loop)
+# ---------------------------------------------------------------------------
+
+
+class AssistantSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    measurement_id: str = Field(min_length=1, max_length=128)
+    context_tokens: int = Field(default=32768, ge=1)
+    priority: Literal["balanced", "speed", "ttft", "quality", "context"] = "balanced"
+    max_count: int = Field(default=3, ge=1, le=4)
+    mtp: bool = False
+    execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
+    rank0_extra_bytes: int = Field(default=0, ge=0)
+    microbatch_size: int | None = Field(default=None, ge=1)
+
+
+def _constellation_view(row: Any) -> dict[str, Any]:
+    return {
+        "rank_order": list(row.rank_order),
+        "model_path": row.model_path,
+        "context_tokens": row.context_tokens,
+        "plan_signature": row.plan_signature,
+        "node_count": row.node_count,
+        "feasible": row.feasible,
+        "measured": row.measured,
+        "decode_tok_per_s": row.decode_tok_per_s,
+        "prefill_tok_per_s": row.prefill_tok_per_s,
+        "ttft_ms": row.ttft_ms,
+        "deployment_id": row.deployment_id,
+        "coordinator_node": row.coordinator_node,
+    }
+
+
+@router.post("/search")
+async def cluster_assistant_search(request: AssistantSearchRequest) -> Any:
+    """Measure up to ``max_count`` diverse constellations, keep the best measured.
+
+    The loop ranks beforehand from the measurement (hardware estimate), then oMLX
+    plans + starts each constellation, measures it for real, picks the best
+    measured and stops the losers. oMLX's planner owns every layer split; this
+    only chooses rank orders / subsets and measures. One apply/start at a time
+    (the cluster-wide lock); a failed constellation is recorded, never fatal.
+    """
+
+    from .policy import diverse_candidates
+    from .search_wiring import evaluate_constellation
+
+    record = _measurement_store().get(request.measurement_id)
+    if record is None:
+        return _stale_measurement_response(
+            "unknown",
+            f"no measurement {request.measurement_id} is stored; start one",
+            request.measurement_id,
+        )
+    refusal = measurement_refusal(record, model=record.model)
+    if refusal is not None:
+        return _stale_measurement_response(
+            refusal.reason, refusal.message, record.measurement_id
+        )
+    model = record.model_layout()
+    if model is None:
+        return _refusal_response(
+            "no_model_layout",
+            "the measurement has no model layout; measure the chosen model first",
+            ACTION_MEASURE,
+        )
+    candidates = await asyncio.to_thread(
+        diverse_candidates,
+        record.measurement_set().nodes,
+        model,
+        target_context_tokens=request.context_tokens,
+        rank0_extra_bytes=request.rank0_extra_bytes,
+        mtp=request.mtp,
+        execution_profile=request.execution_profile,
+        microbatch_size=request.microbatch_size or 1,
+        fabric_links=record.fabric_links if record.fabric_measured else None,
+        max_count=request.max_count,
+    )
+    if not candidates:
+        return _refusal_response(
+            "no_feasible_plan",
+            "no constellation fits this model on the measured Macs; choose a "
+            "smaller model, less context, or add a Mac",
+            ACTION_ADJUST_PLAN,
+        )
+
+    store = _operation_store()
+    seams = _provisioning_seams()
+    performance_store = _performance_store()
+    probe_enabled = _performance_probe_enabled()
+
+    async def evaluate(candidate: Any) -> Any:
+        return await evaluate_constellation(
+            candidate,
+            record=record,
+            store=store,
+            seams=seams,
+            ops_for=_coordinator_ops,
+            mtp=request.mtp,
+            execution_profile=request.execution_profile,
+            rank0_extra_bytes=request.rank0_extra_bytes,
+            microbatch_size=request.microbatch_size,
+            performance_store=performance_store,
+            probe_enabled=probe_enabled,
+        )
+
+    async def stop(result: Any) -> None:
+        op = store.get(result.operation_id)
+        if op is not None and result.deployment_id:
+            await asyncio.to_thread(_stop_on_coordinator, op, result.deployment_id)
+            store.mark_stopped(op.operation_id)
+
+    job_id = _create_search_job(total=len(candidates))
+    _schedule(
+        asyncio.create_task(
+            _run_search_job(job_id, candidates, evaluate, stop, request)
+        )
+    )
+    return {
+        "job_id": job_id,
+        "state": "queued",
+        "total": len(candidates),
+        "poll": f"/admin/api/cluster/assistant/search/{job_id}",
+    }
+
+
+# The search loop runs for minutes (it deploys + measures several constellations),
+# so it is a background job, not a blocking request: POST /search returns a handle
+# immediately and GET /search/{job_id} polls progress + the final outcome. Jobs
+# are ephemeral (in-memory): a server restart loses a running search, which the
+# caller restarts; the deployments it created remain in the operation store.
+_search_jobs: dict[str, dict[str, Any]] = {}
+_search_jobs_lock = threading.Lock()
+
+
+def _create_search_job(*, total: int) -> str:
+    job_id = f"search-{uuid.uuid4().hex[:12]}"
+    with _search_jobs_lock:
+        _search_jobs[job_id] = {
+            "job_id": job_id,
+            "state": "queued",
+            "total": total,
+            "done": 0,
+            "message": "queued",
+            "results": [],
+            "best": None,
+            "tested": [],
+            "stopped": [],
+            "errors": [],
+        }
+    return job_id
+
+
+def _update_search_job(job_id: str, **fields: Any) -> None:
+    with _search_jobs_lock:
+        job = _search_jobs.get(job_id)
+        if job is not None:
+            job.update(fields)
+
+
+async def _run_search_job(
+    job_id: str,
+    candidates: list,
+    evaluate: Callable,
+    stop: Callable,
+    request: AssistantSearchRequest,
+) -> None:
+    from .search import run_search
+
+    _update_search_job(job_id, state="running", message="measuring constellations")
+    done = 0
+    partial: list = []
+
+    async def progress_evaluate(candidate: Any) -> Any:
+        nonlocal done
+        _update_search_job(
+            job_id,
+            message=f"measuring constellation {done + 1} of {len(candidates)}",
+        )
+        result = await evaluate(candidate)
+        done += 1
+        partial.append(result)
+        _update_search_job(
+            job_id,
+            done=done,
+            results=[_constellation_view(row) for row in partial],
+        )
+        return result
+
+    try:
+        outcome = await run_search(
+            candidates,
+            evaluate=progress_evaluate,
+            stop=stop,
+            max_count=request.max_count,
+            priority=request.priority,
+        )
+        _update_search_job(
+            job_id,
+            state="completed",
+            message="done",
+            best=_constellation_view(outcome.best) if outcome.best else None,
+            results=[_constellation_view(row) for row in outcome.results],
+            tested=[list(candidate.rank_order) for candidate in outcome.tested],
+            stopped=[_constellation_view(row) for row in outcome.stopped],
+            errors=list(outcome.errors),
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed search is a failed job
+        _update_search_job(job_id, state="failed", message=str(exc)[:300])
+
+
+@router.get("/search/{job_id}")
+async def cluster_assistant_search_status(job_id: str = PathParam(min_length=1, max_length=128)) -> Any:
+    """Poll a running search job: state, progress, and the final outcome."""
+
+    with _search_jobs_lock:
+        job = _search_jobs.get(job_id)
+        snapshot = dict(job) if job is not None else None
+    if snapshot is None:
+        return _refusal_response(
+            "search_not_found",
+            f"no search job {job_id}; start one with POST /search",
+            ACTION_STATUS,
+        )
+    return snapshot
+
+
+# ---------------------------------------------------------------------------
+# tune (fine-tune the winning constellation with real completions)
+# ---------------------------------------------------------------------------
+
+
+class AssistantTuneRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operation_id: str = Field(min_length=1, max_length=128)
+
+
+def _tune_mtp_capable(model_path: str) -> bool:
+    """Whether this model has an MTP head (so the MTP A/B is meaningful).
+
+    A model without an MTP head cannot draft, so the tune skips the A/B instead
+    of measuring two identical no-ops. Unreadable → False (not proven capable).
+    """
+
+    if not model_path:
+        return False
+    try:
+        from ..model_inventory import mtp_compatible_for_model
+
+        return bool(mtp_compatible_for_model(model_path))
+    except Exception:  # noqa: BLE001 - an unproven head is treated as absent
+        return False
+
+
+@router.post("/tune")
+async def cluster_assistant_tune(request: AssistantTuneRequest) -> Any:
+    """Fine-tune the deployment a ready start operation launched.
+
+    Sweeps prefill chunk, sampler (golden-prompt quality) and MTP on the winning
+    coordinator through the same completion seam the calibration uses, with REAL
+    completions. The planner is not involved; this only tunes the running model.
+    """
+
+    from pathlib import Path
+
+    from .start import stream_completion
+    from .tuning_wiring import fine_tune_constellation
+
+    store = _operation_store()
+    record = store.get(request.operation_id)
+    if record is None or record.kind != KIND_START or record.state != STATE_READY:
+        return _refusal_response(
+            "operation_not_ready",
+            "tuning needs a ready start operation; run the search and pick a "
+            "winner first",
+            ACTION_STATUS,
+        )
+    endpoint = record.endpoint
+    port = int(endpoint.port) if endpoint is not None else 0
+    if not 1 <= port <= 65535:
+        return _refusal_response(
+            "coordinator_unresolved",
+            "the winning coordinator's port is unknown; cannot tune it",
+            ACTION_CONFIGURE_ENDPOINT,
+        )
+    if record.coordinator_local:
+        target = ""
+    else:
+        device = _provisioning_seams().device_record(record.coordinator_node) or {}
+        addrs = [
+            str(item).strip()
+            for item in (device.get("last_addrs") or ())
+            if isinstance(item, str) and str(item).strip()
+        ]
+        ssh_user = str(device.get("ssh_user") or "").strip()
+        # Fall back to the measured endpoint host when the device record carries
+        # no address (resolve_targets does the same); the SSH user defaults to
+        # the login user when the record does not name one.
+        host = addrs[0] if addrs else (endpoint.host if endpoint is not None else "")
+        target = f"{ssh_user}@{host}" if host and ssh_user else host
+        if not target:
+            return _refusal_response(
+                "node_not_paired",
+                f"{record.coordinator_node} has no paired SSH target; pair it "
+                "again to tune it",
+                ACTION_PAIR_MAC,
+            )
+
+    async def complete(body: dict) -> Any:
+        # Tuning bodies carry only the sampling knobs; force a streamed
+        # completion so the server returns the usage chunk (decode/TTFT) the
+        # tuning reads. stream_completion is blocking I/O, so run it off the
+        # event loop too (else the server cannot serve the stream).
+        streamed = {
+            **body,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        return await asyncio.to_thread(
+            stream_completion, port=port, body=streamed, target=target
+        )
+
+    model_id = Path(record.model_path).name if record.model_path else ""
+    result = await fine_tune_constellation(
+        complete,
+        model_id=model_id,
+        mtp_capable=_tune_mtp_capable(record.model_path),
+        # The chunk is a per-model setting, not a chat-request field; a
+        # per-request sweep would measure noise. Tuning it for real needs a
+        # redeploy per chunk, so the route marks it not-applicable here.
+        chunk_applicable=False,
+    )
+    preset_key = _save_tuning_preset(record, result)
+    return {
+        "operation_id": record.operation_id,
+        "model_id": model_id,
+        "chunk": result.chunk,
+        "chunk_applicable": result.chunk_applicable,
+        "sampler": result.sampler,
+        "mtp": result.mtp,
+        "mtp_applicable": result.mtp_applicable,
+        "chunk_rows": result.chunk_rows,
+        "sampler_rows": result.sampler_rows,
+        "mtp_rates": {str(k): v for k, v in result.mtp_rates.items()},
+        "preset_key": preset_key,
+    }
+
+
+def _save_tuning_preset(record: Any, result: Any) -> str:
+    """Merge the tuned sampler (and MTP switch) into the model's preset.
+
+    Best-effort: a failed save never fails the tune, and a missing model path or
+    rank order simply skips persistence. Returns the preset key ("" when skipped).
+    The save merges: ``/tune`` does not measure the MTP depth, so a depth a
+    redeploy sweep saved is kept (and vice versa the sampler is kept by the
+    sweep), giving one combined preset a Start can replay.
+    """
+
+    return _merge_and_save_preset(
+        record,
+        chunk=_measured(result.chunk),
+        mtp=_measured(result.mtp),
+        sampler=_measured(result.sampler),
+    )
+
+
+def _measured(value: Any) -> Any:
+    """A tuner value as a merge input: an absent measurement keeps the preset."""
+
+    return KEEP if value is None else value
+
+
+def _merge_and_save_preset(
+    record: Any,
+    *,
+    chunk: Any = KEEP,
+    mtp: Any = KEEP,
+    mtp_depth: Any = KEEP,
+    sampler: Any = KEEP,
+) -> str:
+    """One combined preset per (model, node set): merge the measured knobs.
+
+    ``/tune`` and ``/tune-redeploy`` each measure only part of the tuning, so
+    both save through here: an existing field is kept unless this call measured
+    it. That is what makes "redeploy for MTP depth, then tune the sampler" — and
+    the reverse order — end with both knobs in one preset.
+    """
+
+    return _merge_and_save_preset_for(
+        str(getattr(record, "model_path", "") or ""),
+        tuple(getattr(record, "rank_order", ()) or ()),
+        chunk=chunk,
+        mtp=mtp,
+        mtp_depth=mtp_depth,
+        sampler=sampler,
+    )
+
+
+def _merge_and_save_preset_for(
+    model_path: str,
+    node_ids: Sequence[str],
+    *,
+    chunk: Any = KEEP,
+    mtp: Any = KEEP,
+    mtp_depth: Any = KEEP,
+    sampler: Any = KEEP,
+) -> str:
+    """The same save for any (model, node set), cluster or one-Mac local run.
+
+    The key is ``preset_key(model_path, hardware_key(node_ids))`` — the same one
+    ``_tuning_preset_patch`` reads back — so a preset saved by a local tune is
+    the preset a one-Mac run replays, and a cluster Start keys its own on
+    its elected node set. Returns "" when nothing could be saved (no model path,
+    no nodes, or an unwritable store): tuning never fails on a preset write.
+    """
+
+    from datetime import UTC, datetime
+
+    if not model_path or not node_ids:
+        return ""
+    node_key = hardware_key(node_ids)
+    try:
+        existing = _tuning_store().get(model_path, node_key)
+    except OSError:
+        existing = None
+    preset = merge_preset(
+        existing,
+        model_signature=model_path,
+        hardware_key=node_key,
+        chunk=chunk,
+        mtp=mtp,
+        mtp_depth=mtp_depth,
+        sampler=sampler,
+        measured_at=datetime.now(UTC).isoformat(),
+    )
+    try:
+        _tuning_store().save(preset)
+    except OSError:
+        return ""
+    return preset.key
+
+
+def _saved_preset_patch(record: Any) -> dict[str, Any] | None:
+    """The saved tuning preset for this model + node config, as a settings patch.
+
+    Only the knobs that are real ``ModelSettings`` fields are returned: the MTP
+    adaptive depth and the sampler (temperature/top_p/top_k). The chunk is not a
+    model setting in this build, so it is not resumed from a preset. No preset,
+    or a preset whose knobs are all ``None``, yields ``None`` and Start behaves
+    exactly as before.
+    """
+
+    model_path = str(getattr(record, "model_path", "") or "")
+    rank_order = getattr(record, "rank_order", ()) or ()
+    return _tuning_preset_patch(model_path, rank_order)
+
+
+def _tuning_preset_patch(
+    model_path: str, node_ids: Sequence[str]
+) -> dict[str, Any] | None:
+    """The same patch for any (model, node set) — one lookup for Start and tune.
+
+    Start replays the preset for the elected rank order; a single-Mac set
+    replays it for that one Mac (``hardware_key([this_mac])``). Both must read
+    the store the same way, or a model tuned on one Mac set would be replayed
+    differently by the two paths.
+    """
+
+    nodes = tuple(node_ids)
+    if not model_path or not nodes:
+        return None
+    preset = _tuning_store().get(model_path, hardware_key(nodes))
+    if preset is None:
+        return None
+    patch: dict[str, Any] = {}
+    if preset.mtp_depth is not None:
+        patch["mtp_adaptive_max_depth"] = preset.mtp_depth
+    if isinstance(preset.sampler, Mapping):
+        for key in ("temperature", "top_p", "top_k"):
+            value = preset.sampler.get(key)
+            if value is not None:
+                patch[key] = value
+    return patch or None
+
+
+# ---------------------------------------------------------------------------
+# tune-redeploy (MTP on/off + MTP depth need a redeploy per config)
+# ---------------------------------------------------------------------------
+
+
+class AssistantRedeployTuneRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operation_id: str = Field(min_length=1, max_length=128)
+
+
+# A redeploy sweep deploys + measures the winning constellation once per config
+# (MTP off, MTP adaptive, one per depth). That is minutes, so it is a background
+# job like /search: POST returns a handle, GET polls. Jobs are ephemeral.
+_redeploy_jobs: dict[str, dict[str, Any]] = {}
+_redeploy_jobs_lock = threading.Lock()
+
+
+def _create_redeploy_job(*, total: int) -> str:
+    job_id = f"redeploy-{uuid.uuid4().hex[:12]}"
+    with _redeploy_jobs_lock:
+        _redeploy_jobs[job_id] = {
+            "job_id": job_id,
+            "state": "queued",
+            "total": total,
+            "done": 0,
+            "message": "queued",
+            "rows": [],
+            "best": None,
+            "preset_key": "",
+        }
+    return job_id
+
+
+def _update_redeploy_job(job_id: str, **fields: Any) -> None:
+    with _redeploy_jobs_lock:
+        job = _redeploy_jobs.get(job_id)
+        if job is not None:
+            job.update(fields)
+
+
+@router.post("/tune-redeploy")
+async def cluster_assistant_tune_redeploy(
+    request: AssistantRedeployTuneRequest,
+) -> Any:
+    """Tune the per-model knobs (MTP on/off, MTP depth) by redeploying per config.
+
+    The sampler is a per-request knob and lives in ``/tune``; the MTP switch and
+    the adaptive depth are per-model settings, so the only honest sweep is to
+    deploy each config and measure its real rate (mtplx does the same; a one-off
+    cost). The winner is persisted per (model, node config) so a later Start
+    replays it without re-tuning.
+    """
+
+    from .redeploy_tuning import plan_configs
+
+    store = _operation_store()
+    record = store.get(request.operation_id)
+    if record is None or record.kind != KIND_START or record.state != STATE_READY:
+        return _refusal_response(
+            "operation_not_ready",
+            "redeploy tuning needs a ready start operation; run the search and "
+            "pick a winner first",
+            ACTION_STATUS,
+        )
+    measurement = _measurement_store().get(record.measurement_id)
+    if measurement is None or measurement.model_layout() is None:
+        return _stale_measurement_response(
+            "unknown",
+            "the winning operation's measurement is gone; measure the model "
+            "again before redeploy tuning",
+            record.measurement_id,
+        )
+
+    mtp_capable = _tune_mtp_capable(record.model_path)
+    configs = plan_configs(mtp_capable=mtp_capable)
+    job_id = _create_redeploy_job(total=len(configs))
+    _schedule(
+        asyncio.create_task(
+            _run_redeploy_tune_job(
+                job_id, store, record, measurement, configs, mtp_capable
+            )
+        )
+    )
+    return {
+        "job_id": job_id,
+        "state": "queued",
+        "total": len(configs),
+        "mtp_applicable": mtp_capable,
+        "poll": f"/admin/api/cluster/assistant/tune-redeploy/{job_id}",
+    }
+
+
+@router.get("/tune-redeploy/{job_id}")
+async def cluster_assistant_tune_redeploy_status(
+    job_id: str = PathParam(min_length=1, max_length=128),
+) -> Any:
+    """Poll a redeploy tuning job: state, progress rows and the winning config."""
+
+    with _redeploy_jobs_lock:
+        job = _redeploy_jobs.get(job_id)
+        snapshot = dict(job) if job is not None else None
+    if snapshot is None:
+        return _refusal_response(
+            "redeploy_not_found",
+            f"no redeploy tune job {job_id}; start one with POST /tune-redeploy",
+            ACTION_STATUS,
+        )
+    return snapshot
+
+
+async def _run_redeploy_tune_job(
+    job_id: str,
+    store: Any,
+    record: Any,
+    measurement: Any,
+    configs: list,
+    mtp_capable: bool,
+) -> None:
+    """Deploy each config once, measure it, stop it, and rank the real rates."""
+
+    from .policy import diverse_candidates
+    from .redeploy_tuning import RedeployRow, choose_candidate, sweep
+    from .search_wiring import evaluate_constellation
+
+    seams = _provisioning_seams()
+    performance_store = _performance_store()
+    probe_enabled = _performance_probe_enabled()
+    model = measurement.model_layout()
+    nodes = measurement.measurement_set().nodes
+    fabric = measurement.fabric_links if measurement.fabric_measured else None
+    wanted_order = tuple(record.rank_order)
+    wanted_context = record.context_tokens
+
+    _update_redeploy_job(job_id, state="running", message="measuring configs")
+    # Tuning takes over the cluster: the ready deployment this operation launched
+    # still holds the model in memory, so a bare redeploy would be refused with
+    # "does not fit ... right now". Unload it once before the first config loads;
+    # each config is stopped after its own measurement.
+    if getattr(record, "deployment_id", ""):
+        _update_redeploy_job(job_id, message="stopping the running cluster first")
+        try:
+            await asyncio.to_thread(
+                _stop_on_coordinator, record, record.deployment_id
+            )
+            store.mark_stopped(record.operation_id)
+        except Exception:  # a failed unload is reported by the next deploy
+            pass
+    done = 0
+    rows: list[RedeployRow] = []
+
+    async def measure(config: Any) -> RedeployRow:
+        nonlocal done
+        _update_redeploy_job(
+            job_id,
+            message=f"measuring {config.label} ({done + 1} of {len(configs)})",
+        )
+        generation_error = ""
+        try:
+            candidates = await asyncio.to_thread(
+                diverse_candidates,
+                nodes,
+                model,
+                target_context_tokens=wanted_context,
+                rank0_extra_bytes=record.rank0_extra_bytes,
+                mtp=config.mtp,
+                execution_profile=record.execution_profile,
+                microbatch_size=record.microbatch_size or 1,
+                fabric_links=fabric,
+            )
+        except Exception as exc:  # a bad config is a row, never fatal
+            candidates = []
+            generation_error = f"{type(exc).__name__}: {exc}"
+        chosen = choose_candidate(
+            candidates,
+            wanted_order=wanted_order,
+            wanted_context=wanted_context,
+        )
+        if chosen is None:
+            row = RedeployRow(
+                config=config,
+                feasible=False,
+                error=(
+                    generation_error
+                    or "the winner's rank order/context is infeasible at this "
+                    "config"
+                ),
+            )
+        else:
+            result = await evaluate_constellation(
+                chosen,
+                record=measurement,
+                store=store,
+                seams=seams,
+                ops_for=_coordinator_ops,
+                mtp=config.mtp,
+                execution_profile=record.execution_profile,
+                rank0_extra_bytes=record.rank0_extra_bytes,
+                microbatch_size=record.microbatch_size,
+                performance_store=performance_store,
+                probe_enabled=probe_enabled,
+                model_settings_patch=config.settings_patch() or None,
+            )
+            # The sweep is not the running cluster: stop each measured config so
+            # the next one can deploy and the caller's cluster is not left
+            # dangling. A failed stop is reported by the next deploy, not hidden.
+            op = store.get(result.operation_id)
+            if op is not None and result.deployment_id:
+                try:
+                    await asyncio.to_thread(
+                        _stop_on_coordinator, op, result.deployment_id
+                    )
+                    store.mark_stopped(op.operation_id)
+                except Exception:
+                    pass
+            row = RedeployRow(
+                config=config,
+                feasible=result.feasible,
+                decode_tok_per_s=result.decode_tok_per_s,
+                prefill_tok_per_s=result.prefill_tok_per_s,
+                ttft_ms=result.ttft_ms,
+                operation_id=result.operation_id,
+            )
+        done += 1
+        rows.append(row)
+        _update_redeploy_job(job_id, done=done, rows=[r.to_dict() for r in rows])
+        return row
+
+    try:
+        outcome = await sweep(measure, configs, mtp_capable=mtp_capable)
+        preset_key = _save_redeploy_preset(record, outcome)
+        _update_redeploy_job(
+            job_id,
+            state="completed",
+            message="done",
+            rows=[r.to_dict() for r in outcome.rows],
+            best=None
+            if outcome.best is None
+            else {
+                "config": outcome.best.label,
+                "mtp": outcome.best.mtp,
+                "mtp_depth": outcome.best.mtp_depth,
+            },
+            mtp_applicable=outcome.mtp_applicable,
+            preset_key=preset_key,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed job is a failed job
+        _update_redeploy_job(job_id, state="failed", message=str(exc)[:300])
+
+
+def _save_redeploy_preset(record: Any, outcome: Any) -> str:
+    """Merge the redeploy winner (mtp + depth) into the model's tuning preset.
+
+    The sampler preset from ``/tune`` is kept, so one Start applies both. A model
+    without an MTP head keeps its previous mtp fields and saves only the row it
+    measured. When the sweep measured a winner, its depth is the answer even if
+    that answer is ``None`` (the adaptive config won) — a leftover depth from an
+    earlier sweep must not outlive the measurement that replaced it.
+    """
+
+    best = outcome.best
+    if best is None:
+        return _merge_and_save_preset(record)
+    return _merge_and_save_preset(
+        record,
+        mtp=best.mtp,
+        mtp_depth=best.mtp_depth,
+    )
+
+
+# ---------------------------------------------------------------------------
+# operations
+# ---------------------------------------------------------------------------
+
+
+@router.get("/tuning-preset")
+async def cluster_assistant_tuning_preset(
+    operation_id: str = Query(min_length=1, max_length=128),
+) -> Any:
+    """Read the saved tuning preset for an operation's model + node set.
+
+    The UI shows what a later Start will replay, so it reads the preset through
+    the same key Start uses: the operation's ``model_path`` and the *sorted* node
+    set (not the rank order, so a flipped rank 0 still finds it). Any apply or
+    start operation id is accepted. ``{"preset": null}`` means "nothing tuned for
+    this model on these Macs yet" — never an error. No key, SSH target or secret
+    is in the answer.
+    """
+
+    store = _operation_store()
+    record = store.get(operation_id)
+    if record is None:
+        return _refusal_response(
+            "operation_not_found",
+            f"no operation {operation_id}; use a known apply or start operation id",
+            ACTION_STATUS,
+        )
+    model_path = str(getattr(record, "model_path", "") or "")
+    rank_order = getattr(record, "rank_order", ()) or ()
+    if not model_path or not rank_order:
+        return {"preset": None}
+    preset = _tuning_store().get(model_path, hardware_key(rank_order))
+    if preset is None:
+        return {"preset": None}
+    return preset.to_dict()
+
+
+@router.get("/performance-probe")
+async def get_assistant_performance_probe() -> Any:
+    """Whether the post-``ready`` measurement is on for this Mac."""
+
+    return {"enabled": _performance_probe_enabled()}
+
+
+@router.post("/performance-probe")
+async def set_assistant_performance_probe(
+    request: AssistantPerformanceProbeRequest,
+) -> Any:
+    """Turn the post-``ready`` measurement on/off and persist the setting.
+
+    It is a server setting, so it lives in ``settings.json``; this route is the
+    in-app switch the Screen-6 card uses instead of an edit-JSON step. It never
+    touches a running deployment.
+    """
+
+    settings = _global_settings()
+    if settings is None:
+        raise HTTPException(
+            status_code=503,
+            detail="global settings are not available on this server",
+        )
+    settings.server.assistant_performance_probe = bool(request.enabled)
+    await asyncio.to_thread(settings.save)
+    return {"enabled": bool(settings.server.assistant_performance_probe)}
+
+
+@router.get("/session")
+async def cluster_assistant_session() -> Any:
+    """The last deployment, so a reloaded card can show Running/Stopped.
+
+    Reads the persisted operation store only: no re-election, no probe, no
+    secret. The returned inputs are enough to post apply and start again.
+    """
+
+    record = _operation_store().latest_session()
+    return {
+        "session": None if record is None else session_view(record).model_dump(mode="json")
+    }
+
+
+@router.get("/diagnostics", response_model=AssistantDiagnosticsResponse)
+async def cluster_assistant_diagnostics(
+    measurement_id: str | None = Query(None, min_length=1, max_length=128),
+    operation_id: str | None = Query(None, min_length=1, max_length=128),
+) -> Any:
+    """A redacted support bundle for the last measurement and operation.
+
+    Reads only the persisted records: no re-election, probe, stage or launch.
+    An unknown id is an app-only bundle, never a 404, so a user can copy
+    diagnostics even after the record was pruned. No key, token, SSH target,
+    model path, prompt or completion is copied.
+    """
+
+    operations = _operation_store()
+    if operation_id:
+        operation = operations.get(operation_id)
+    elif measurement_id:
+        # Explicitly ask about one measurement: never mix it with the latest
+        # operation of a different measurement.
+        operation = None
+    else:
+        operation = operations.latest_session()
+    if measurement_id:
+        record = _measurement_store().get(measurement_id)
+    elif operation is not None:
+        record = _measurement_store().get(operation.measurement_id)
+    else:
+        records = _measurement_store().list()
+        record = records[-1] if records else None
+    return build_diagnostics(record, operation)
+
+
+@router.get("/network-preflight", response_model=NetworkPreflightResponse)
+async def cluster_assistant_network_preflight() -> Any:
+    """Read the local interfaces and return exact bridge commands.
+
+    Read-only by construction: the only work is ``ifconfig``/``networksetup``
+    reads through the existing transport probe. Nothing is executed, no admin
+    dialog opens and no peer is touched. The card shows the commands and asks
+    the user to review them; the eventual privileged apply is a separate step.
+    """
+
+    return build_network_preflight(("127.0.0.1",))
+
+
+@router.get("/operations/active")
+async def cluster_assistant_active_operation() -> Any:
+    """The apply/start this Mac is running, if any. Read-only.
+
+    One origin's store cannot see another origin's, so a second Mac driving the
+    same coordinator has to ask *the coordinator* this question before it
+    activates. Declared before ``/operations/{operation_id}`` so "active" is not
+    read as an operation id.
+    """
+
+    record = _operation_store().active()
+    if record is None:
+        return {"operation": None}
+    return {
+        "operation": {
+            "operation_id": record.operation_id,
+            "kind": record.kind,
+            "state": record.state,
+            "coordinator_node": record.coordinator_node,
+            "running": True,
+        }
+    }
+
+
+class AssistantOperationMirrorRequest(BaseModel):
+    """One lifecycle state of another origin's operation (server-to-server).
+
+    The browser never calls this: the origin mirrors its apply/start onto the
+    elected coordinator through the admin seam so the coordinator's own store
+    can answer ``operations/active`` — the cluster-wide lock (the apply/start chapter).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation_id: str = Field(min_length=1, max_length=128)
+    kind: str = Field(min_length=1, max_length=16)
+    coordinator_node: str = Field(min_length=1, max_length=128)
+    state: str = Field(min_length=1, max_length=16)
+    model_path: str = Field(default="", max_length=512)
+    context_tokens: int = Field(default=0, ge=0)
+
+
+@router.post("/operations/mirror")
+async def cluster_assistant_mirror_operation(
+    request: AssistantOperationMirrorRequest,
+) -> Any:
+    """Register or release another origin's operation on this coordinator.
+
+    Server-to-server (origin → coordinator over the admin seam); never called
+    by the browser. A running mirror takes the cluster-wide lock and a terminal
+    mirror releases it; both reuse the operation store, so ``operations/active``
+    answers unchanged. Mirrors are lock markers, not this Mac's sessions.
+    Declared before ``/operations/{operation_id}`` so "mirror" is not read as
+    an operation id.
+    """
+
+    store = _operation_store()
+    try:
+        record = store.mirror(
+            request.operation_id,
+            request.kind,
+            request.coordinator_node,
+            request.state,
+            model_path=request.model_path,
+            context_tokens=request.context_tokens,
+        )
+    except OperationInProgressError as exc:
+        return _operation_in_progress_response(exc)
+    except ValueError as exc:
+        return _refusal_response(
+            "invalid_mirror_request", str(exc), ACTION_STATUS, status_code=400
+        )
+    return {"operation_id": record.operation_id, "running": record.running}
+
+
+@router.get("/operations/{operation_id}", response_model=AssistantOperationStatus)
+async def cluster_assistant_operation_status(
+    operation_id: str = PathParam(min_length=1, max_length=128),
+) -> Any:
+    """Report one apply/start. Reads the store; changes nothing."""
+
+    record = _operation_store().get(operation_id)
+    if record is None:
+        return JSONResponse(
+            status_code=404,
+            content=plan_error_payload(
+                OPERATION_NOT_FOUND_CODE,
+                f"no operation {operation_id} is stored; apply the plan first",
+                ACTION_APPLY,
+            ),
+        )
+    return operation_status(record)
+
+
 # ---------------------------------------------------------------------------
 # free space (the live-run notes: the delete affordance is a relay)
 # ---------------------------------------------------------------------------
@@ -1947,7 +3518,7 @@ async def cluster_assistant_delete_model(
     that step and nothing else: it deletes exactly one model, only on a Mac the
     named measurement covered, only one that Mac itself listed, and never the
     checkpoint that measurement is about to run. The deleting is oMLX's own per
-    Mac route, reached over the assistant's admin seam (``start.py``), so the
+    Mac route, reached over the admin seam apply/start already use, so the
     browser never touches SSH and a worker — the Mac that actually runs out of
     room — is as reachable as the coordinator.
 
@@ -2122,8 +3693,9 @@ def _delete_target(
 ) -> tuple[str, int] | JSONResponse:
     """Where to send the delete: ``(ssh target, admin port)``, empty = this Mac.
 
-    Resolved from the measured address, the measurement's endpoint and the
-    paired record — because "which Mac can I reach" must not have two answers. A Mac that was never paired is
+    The same evidence apply/start resolve a target from — the measured address,
+    the measurement's endpoint and the paired record — because "which Mac can I
+    reach" must not have two answers. A Mac that was never paired is
     ``pair_mac``; a paired Mac with no address is ``configure_endpoint``; in
     neither case is this Mac substituted for it, and an unknown port is a
     refusal rather than a guessed 8099.
@@ -2182,6 +3754,263 @@ def _delete_target(
 # shared apply/start helpers
 # ---------------------------------------------------------------------------
 
+
+def _usable_measurement(
+    measurement_id: str,
+    *,
+    node_ids: Sequence[str] | None,
+    identity: ModelIdentity | None,
+) -> MeasurementRecord | JSONResponse:
+    """The stored measurement, or the flat 409 ``plan`` returns for no answer.
+
+    One shape for every reason (unknown, running, failed, stale, wrong node set,
+    wrong model, wrong MTP) so a client cannot mistake "measure again" for a plan
+    and does not have to parse prose.
+    """
+
+    record = _measurement_store().get(measurement_id)
+    if record is None:
+        return _stale_measurement_response(
+            "unknown",
+            f"no measurement {measurement_id} is stored; start one",
+            measurement_id,
+        )
+    refusal = measurement_refusal(
+        record,
+        node_ids=node_ids,
+        model=identity if identity is not None else record.model,
+    )
+    if refusal is not None:
+        return _stale_measurement_response(
+            refusal.reason, refusal.message, record.measurement_id
+        )
+    return record
+
+
+WARNING_SPACE_FREED = "space_freed"
+
+
+async def _plan_with_auto_free(
+    record: MeasurementRecord, inputs: PlanInputs
+) -> tuple[ApplyPlan | JSONResponse, list[OperationWarning]]:
+    """Plan; if a Mac is short of disk, free safe models per the rule, then retry.
+
+    Decision 2026-11-14: the delete rule is enforced automatically when a model
+    must be distributed, instead of returning ``insufficient_disk`` and stopping.
+    The rule itself is unchanged and lives in ``reclaim.deletable_models``: only
+    a model that Mac listed, never the checkpoint the cluster is about to run,
+    never the last cluster copy, largest first. A Mac that cannot free enough is
+    left short and the retry returns the same one-action refusal.
+    """
+
+    planned = await asyncio.to_thread(_planned_deployment, record, inputs)
+    if not isinstance(planned, JSONResponse):
+        return planned, []
+    try:
+        body = json.loads(planned.body)
+    except (TypeError, ValueError):
+        return planned, []
+    details = body.get("details")
+    if body.get("code") != "insufficient_disk" or not isinstance(details, Mapping):
+        return planned, []
+
+    deleted, freed_by_node = await _auto_free_space(record, details)
+    if not freed_by_node:
+        return planned, []
+    retried = await asyncio.to_thread(
+        _planned_deployment, record, inputs, free_override=freed_by_node
+    )
+    warnings: list[OperationWarning] = []
+    if deleted:
+        names = ", ".join(str(item.get("model_id") or "") for item in deleted)
+        warnings.append(
+            OperationWarning(
+                code=WARNING_SPACE_FREED,
+                node_id=str(details.get("node_id") or ""),
+                message=(
+                    "the assistant freed space on the short Mac before staging by "
+                    f"deleting unused model(s) per the delete rule: {names}"
+                ),
+            )
+        )
+    return retried, warnings
+
+
+async def _auto_free_space(
+    record: MeasurementRecord, details: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Delete the safe models that cover one short Mac's shortfall."""
+
+    from .reclaim import deletable_models, select_for_space
+
+    node_id = str(details.get("node_id") or "")
+    needed = int(details.get("needed_bytes") or 0)
+    free = int(details.get("free_bytes") or 0)
+    if not node_id or needed <= 0:
+        return [], {}
+    candidates = deletable_models(record, node_id)
+    selected = select_for_space(candidates, max(0, needed - free))
+    if not selected:
+        return [], {}
+    target = _delete_target(record, node_id)
+    if isinstance(target, JSONResponse):
+        return [], {}
+    ssh, port = target
+    deleted: list[dict[str, Any]] = []
+    freed = 0
+    for entry in selected:
+        try:
+            await asyncio.to_thread(
+                delete_model_on_mac,
+                port=port,
+                model_name=entry.model_id,
+                target=ssh,
+            )
+        except Exception:  # a delete that fails leaves the shortfall in place
+            continue
+        deleted.append(entry.to_dict())
+        freed += entry.size_bytes
+    return deleted, ({node_id: freed} if freed else {})
+
+
+def _planned_deployment(
+    record: MeasurementRecord,
+    inputs: PlanInputs,
+    *,
+    free_override: Mapping[str, int] | None = None,
+) -> ApplyPlan | JSONResponse:
+    """Re-elect and build the deployment, or the one refusal that answers it.
+
+    An ``insufficient_disk`` refusal carries the short Mac's numbers in
+    ``details`` so the route can free space per the frozen rule and retry.
+    """
+
+    try:
+        return plan_apply(
+            record,
+            inputs,
+            seams=_provisioning_seams(),
+            free_override=free_override,
+        )
+    except ProvisioningError as exc:
+        if exc.code == "insufficient_disk" and exc.details is not None:
+            body = plan_error_payload(exc.code, exc.message, exc.action)
+            body["details"] = exc.details
+            return JSONResponse(status_code=409, content=body)
+        return _refusal_response(exc.code, exc.message, exc.action)
+    except NoFeasiblePlanError as exc:
+        body = plan_error_payload("no_feasible_plan", str(exc), exc.action)
+        body["measurement_id"] = record.measurement_id
+        return JSONResponse(status_code=NO_FEASIBLE_PLAN_STATUS, content=body)
+    except UnsupportedParallelismError as exc:
+        return _refusal_response(
+            "unsupported_parallelism", str(exc), ACTION_ADJUST_PLAN
+        )
+    except (ElectionError, PlanningError) as exc:
+        return _refusal_response("planning_error", str(exc), ACTION_PLAN)
+    except ValueError as exc:
+        return _refusal_response("invalid_apply_request", str(exc), ACTION_PLAN)
+
+
+def _applied_operation(
+    store: OperationStore, request: AssistantStartRequest
+) -> OperationRecord | None:
+    """The applied plan a start may launch, matched by every identity it has."""
+
+    if request.operation_id:
+        record = store.get(request.operation_id)
+        if (
+            record is None
+            or record.kind != KIND_APPLY
+            or record.state != STATE_APPLIED
+            or record.measurement_id != request.measurement_id
+            or record.plan_signature != request.plan_signature
+            or record.coordinator_node != request.coordinator_node
+        ):
+            return None
+        return record
+    return store.applied(
+        measurement_id=request.measurement_id,
+        plan_signature=request.plan_signature,
+        coordinator_node=request.coordinator_node,
+    )
+
+
+def _busy_on_coordinator(plan: ApplyPlan) -> str | None:
+    """The operation another origin is running on this plan's coordinator.
+
+    An unanswerable question is not a busy coordinator: the operation then runs
+    and reports the real reason the coordinator refused.
+    """
+
+    try:
+        operation_id = active_operation(plan)
+    except Exception:  # noqa: BLE001 - never turn a probe failure into a lock
+        return None
+    return operation_id or None
+
+
+def _operation_in_progress_elsewhere(operation_id: str) -> JSONResponse:
+    """409 for "the coordinator is already running something".
+
+    Same code and action as the per-origin refusal, because the next step is the
+    same: poll the operation that is running.
+    """
+
+    return JSONResponse(
+        status_code=OPERATION_IN_PROGRESS_STATUS,
+        content={
+            **plan_error_payload(
+                OPERATION_IN_PROGRESS_CODE,
+                f"operation {operation_id} is running on the elected "
+                "coordinator; poll it instead of starting a second one",
+                ACTION_STATUS,
+            ),
+            "operation_id": operation_id,
+        },
+    )
+
+
+def _operation_in_progress_response(exc: OperationInProgressError) -> JSONResponse:
+    return JSONResponse(
+        status_code=OPERATION_IN_PROGRESS_STATUS,
+        content={
+            **plan_error_payload(
+                OPERATION_IN_PROGRESS_CODE,
+                f"{exc.kind} operation {exc.operation_id} is still running; poll "
+                "it instead of starting a second one",
+                ACTION_STATUS,
+            ),
+            "operation_id": exc.operation_id,
+        },
+    )
+
+
+def _begin(
+    store: OperationStore,
+    operation_id: str,
+    state: str,
+    phase: str,
+    coordinator: str,
+    *,
+    nodes_total: int = 2,
+) -> None:
+    """Mark the job as started before the handle is returned.
+
+    A client that polls immediately must not read ``queued`` for a job that is
+    already running, and the state is forward-only, so this can only ever move
+    the record.
+    """
+
+    store.advance(
+        operation_id,
+        state,
+        progress=OperationProgress(
+            phase=phase,
+            message=f"the operation is running on {coordinator}",
+            nodes_total=nodes_total,
+        ),
+    )
 
 
 def _refusal_response(

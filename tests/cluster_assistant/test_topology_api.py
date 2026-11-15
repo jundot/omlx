@@ -10,12 +10,16 @@ the signature.
 from __future__ import annotations
 
 from assistant_harness import (
+    APPLY_URL,
     GIB,
     SSH,
+    FakeCoordinator,
+    apply_payload,
     assistant_api,
     plan_payload,
     seed_measurement,
     take_measurement,
+    wait_for_operation,
 )
 
 from omlx.cluster.assistant.measurement import (
@@ -158,6 +162,41 @@ def test_only_an_explicit_confirmation_returns_the_two_mac_plan(
     assert any(
         warning["code"] == "two_mac_fallback" for warning in plan["warnings"]
     )
+
+
+def test_apply_repeats_the_fallback_consent(tmp_path, monkeypatch) -> None:
+    fake = FakeCoordinator()
+    with assistant_api(
+        tmp_path, monkeypatch, coordinator=fake.factory()
+    ) as (client, store, _operations):
+        measurement_id = seed_three_node_measurement(
+            store, fabric_links=[("m5", "m1")]
+        )
+        plan = client.post(
+            PLAN_URL,
+            json=plan_payload(
+                measurement_id,
+                model_path=MODEL_PATH,
+                node_selection="all",
+                confirm_two_mac_fallback=True,
+            ),
+        ).json()
+
+        without_consent = client.post(
+            APPLY_URL, json=apply_payload(measurement_id, plan)
+        )
+        with_consent = client.post(
+            APPLY_URL,
+            json=apply_payload(
+                measurement_id, plan, confirm_two_mac_fallback=True
+            ),
+        )
+        body = wait_for_operation(client, with_consent.json()["operation_id"])
+
+    assert without_consent.status_code == 409
+    assert without_consent.json()["code"] == "plan_mismatch"
+    assert with_consent.status_code == 200, with_consent.text
+    assert body["state"] == "applied"
 
 
 def test_a_two_mac_plan_without_its_link_is_refused(tmp_path, monkeypatch) -> None:

@@ -9,6 +9,7 @@ noise. The live evidence for the same levers belongs in ``the live-run notes``.
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -369,6 +370,31 @@ def test_the_settings_patch_only_enables_what_the_policy_uses() -> None:
     assert policy_model_settings(
         ResourcePolicy(context_tokens=8192, table_kind="engram")
     ) == {"deepseek_v41_engram_ssd_offload": False}
+
+
+def test_the_ple_and_engram_switches_are_both_honoured(monkeypatch) -> None:
+    from omlx.cluster import routes as cluster_routes
+
+    monkeypatch.setattr(
+        cluster_routes,
+        "_saved_model_settings",
+        lambda path: SimpleNamespace(qwen4_ple_ssd_offload=True),
+    )
+    assert cluster_routes._saved_ssd_offload("/models/qwen") is True
+
+    monkeypatch.setattr(
+        cluster_routes,
+        "_saved_model_settings",
+        lambda path: SimpleNamespace(deepseek_v41_engram_ssd_offload=True),
+    )
+    assert cluster_routes._saved_ssd_offload("/models/ds") is True
+
+    monkeypatch.setattr(
+        cluster_routes,
+        "_saved_model_settings",
+        lambda path: SimpleNamespace(),
+    )
+    assert cluster_routes._saved_ssd_offload("/models/plain") is False
 
 
 def test_the_solver_honours_the_requested_microbatch():

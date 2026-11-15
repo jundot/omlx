@@ -1,0 +1,38 @@
+{
+  "_state": "assistant_ready",
+  "_source": "omlx/cluster/assistant/models.py::AssistantOperationStatus",
+  "operation_id": "op-2b8e5f10",
+  "kind": "start",
+  "state": "ready",
+  "created_at": "2026-11-03T10:17:05Z",
+  "updated_at": "2026-11-03T10:19:12Z",
+  "measurement_id": "msr-a1b2c3d4",
+  "plan_signature": "3f9a1c7d20b45e68",
+  "placement_signature": "3f9a1c7d20b45e68",
+  "coordinator_node": "node-b",
+  "rank_order": ["node-b", "node-a"],
+  "context_tokens": 32768,
+  "rank0_extra_bytes": 0,
+  "microbatch_size": 1,
+  "mtp": false,
+  "execution_profile": "balanced",
+  "progress": {
+    "phase": "ready",
+    "message": "the readiness canary passed on node-b",
+    "nodes_ready": 2,
+    "nodes_total": 2
+  },
+  "endpoint": {
+    "node": "node-b",
+    "host": "172.16.1.11",
+    "port": 8099,
+    "url": "http://172.16.1.11:8099",
+    "ready": true
+  },
+  "warnings": [],
+  "error": null,
+  "deployment_id": "dev-1.5b-abc123",
+  "stopped": false,
+  "coordinator_local": true,
+  "observed": null
+}

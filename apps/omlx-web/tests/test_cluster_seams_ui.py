@@ -92,10 +92,6 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
         "/admin/api/cluster/link-status",
         "/admin/api/cluster/pairing-token",
         "/admin/api/cluster/peer-health",
-        # The assistant's measured-speed probe toggle is part of the run slice
-        # (PR 2/3); the route exists with the cluster core, the UI that calls it
-        # arrives with apply/start.
-        "/admin/api/cluster/performance-probe",
         "/admin/api/cluster/pipeline-smoke",
         "/admin/api/cluster/plan",
         "/admin/api/cluster/ssh-key",
@@ -107,6 +103,24 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
         "/admin/api/cluster/transports",
         "/admin/api/cluster/verify-pairing-token",
         "/admin/api/cluster/worker-smoke",
+        # Not for the browser: the elected coordinator answers another origin's
+        # "are you already running an apply/start?" over the admin seam (the
+        # cluster-wide operation lock). The card still calls the eight it owns,
+        # including the free-space relay (the live-run notes).
+        "/admin/api/cluster/assistant/operations/active",
+        # Not for the browser either: the origin mirrors its running operation
+        # onto the elected coordinator over the same admin seam, so a second
+        # origin sees the cluster-wide lock (the apply/start chapter). Server-to-server.
+        "/admin/api/cluster/assistant/operations/mirror",
+        # Read-only: the saved tuning preset for an operation's model + node set.
+        # The card shows the preset key the tune/tune-redeploy responses already
+        # return; this route serves API clients and a future on-load display, so
+        # the browser does not call it yet.
+        "/admin/api/cluster/assistant/tuning-preset",
+        # Not for the browser: the assistant origin asks the elected
+        # coordinator's own route for the synthetic compute probe after apply
+        # (Phase B1). The browser only sees the assistant's session/operation.
+        "/admin/api/cluster/performance-probe",
     }
     unreachable = _registered_routes() - _js_called_paths() - allowed_without_caller
     assert not unreachable, (

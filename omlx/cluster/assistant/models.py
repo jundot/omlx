@@ -39,7 +39,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..planner import PlanningError
 from .election import ElectionResult
-from .policy import ClusterPlanSelection
+from .operations import (
+    OperationEndpoint,
+    OperationObserved,
+    OperationProgress,
+    OperationRecord,
+    OperationWarning,
+)
+from .policy import ClusterPlanSelection, ResourcePolicy
+from .provisioning import PlanInputs
 from .recommendation import (
     MAX_RECOMMENDATION_CANDIDATES,
     ModelRecommendation,
@@ -1084,6 +1092,447 @@ def _recommended_model(item: ModelRecommendation) -> RecommendedModel:
 
 def _warning(item: RecommendationWarningData) -> RecommendationWarning:
     return RecommendationWarning(
+        code=item.code,
+        node_id=item.node_id,
+        message=item.message,
+        action=item.action,
+    )
+
+
+# ---------------------------------------------------------------------------
+# apply / start / operation status (the design notes, the apply/start chapter)
+# ---------------------------------------------------------------------------
+
+OPERATIONS_PATH = "/admin/api/cluster/assistant/operations"
+
+
+class AssistantApplyRequest(BaseModel):
+    """Approve one elected plan for staging. Starts no inference.
+
+    Everything measured — the Macs, admission, compute, links, endpoints, model
+    and MTP setting — comes from the stored measurement. The fields here are the
+    plan-time inputs that change the election without changing what was
+    measured, plus the signature the caller approved: ``apply`` re-elects and
+    refuses anything that does not produce the same signature, so the request is
+    a claim to be checked, not a stage table to be obeyed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    measurement_id: str = Field(min_length=1, max_length=128)
+    # The election's plan hash from ``/plan``.
+    plan_signature: str = Field(min_length=16, max_length=64)
+    model_path: str | None = Field(default=None, max_length=4096)
+    model_size_bytes: int | None = Field(default=None, gt=0, le=1 << 60)
+    layer_count: int = Field(default=80, gt=0, le=MAX_LAYER_COUNT)
+    context_tokens: int = Field(default=8192, ge=1, le=MAX_CONTEXT_TOKENS)
+    rank0_extra_bytes: int = Field(default=0, ge=0, le=1 << 60)
+    mtp: bool = False
+    execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
+    microbatch_size: int | None = Field(default=None, ge=1, le=MAX_MICROBATCH)
+    # The plan's own answer, carried for validation only: a request that names a
+    # different coordinator or order than the election produces is refused.
+    coordinator_node: str = Field(min_length=1, max_length=128)
+    rank_order: list[str] = Field(min_length=1, max_length=MAX_REQUEST_NODES)
+    # Where the user was sitting. Recorded for diagnostics; never a fallback.
+    origin_node: str | None = Field(default=None, max_length=255)
+    # The resource policy the plan approved. It is repeated on apply so the
+    # election re-proves the same levers; a drift is ``plan_mismatch``.
+    target_context_tokens: int | None = Field(default=None, ge=1, le=MAX_CONTEXT_TOKENS)
+    table_offload: Literal["engram", "ple", "none"] = "none"
+    table_kind: Literal["engram", "ple", ""] = ""
+    moe_expert_offload: bool = False
+    moe_resident_fraction: float = Field(default=1.0, gt=0, le=1)
+    memory_guard_tier: Literal["safe", "balanced", "aggressive", "custom"] | None = (
+        None
+    )
+    admission: Literal["p05", "p50", "p95"] = "p50"
+    #: Carried from the plan inputs for compatibility; the approved rank order,
+    #: not this field, decides the subset on apply.
+    node_selection: Literal["minimal", "all"] = "minimal"
+    #: The user's explicit consent to the 2-Mac fallback; it is part of the
+    #: signature that apply re-proves.
+    confirm_two_mac_fallback: bool = False
+
+    def model_identity(self) -> ModelIdentity:
+        return request_model_identity(
+            model_path=self.model_path,
+            model_size_bytes=self.model_size_bytes,
+            layer_count=self.layer_count,
+            mtp=self.mtp,
+        )
+
+    def resource_policy(self) -> ResourcePolicy:
+        """The approved policy, in the one type plan/apply/start share."""
+
+        return ResourcePolicy(
+            context_tokens=self.context_tokens,
+            target_context_tokens=self.target_context_tokens or self.context_tokens,
+            table_offload=self.table_offload,
+            table_kind=self.table_kind,
+            moe_expert_offload=self.moe_expert_offload,
+            moe_resident_fraction=self.moe_resident_fraction,
+            memory_guard_tier=self.memory_guard_tier,
+            microbatch_size=self.microbatch_size or 1,
+            admission=self.admission,
+        )
+
+    def plan_inputs(self) -> PlanInputs:
+        """The pure input bundle ``provisioning`` re-elects from."""
+
+        return PlanInputs(
+            measurement_id=self.measurement_id,
+            plan_signature=self.plan_signature,
+            model=self.model_identity(),
+            context_tokens=self.context_tokens,
+            execution_profile=self.execution_profile,
+            rank0_extra_bytes=self.rank0_extra_bytes,
+            mtp=self.mtp,
+            coordinator_node=self.coordinator_node,
+            rank_order=tuple(self.rank_order),
+            microbatch_size=self.microbatch_size or 1,
+            origin_node=self.origin_node or "",
+            target_context_tokens=self.target_context_tokens,
+            resource_policy=self.resource_policy(),
+            two_mac_fallback=self.confirm_two_mac_fallback,
+        )
+
+
+class AssistantStartRequest(BaseModel):
+    """Start the deployment ``apply`` staged. Never stages anything itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    measurement_id: str = Field(min_length=1, max_length=128)
+    plan_signature: str = Field(min_length=16, max_length=64)
+    coordinator_node: str = Field(min_length=1, max_length=128)
+    # The apply operation whose staged deployment this starts. When omitted the
+    # one applied operation for this measurement and signature is used, and a
+    # missing one is a 409 with one action.
+    operation_id: str | None = Field(default=None, max_length=128)
+
+
+class AssistantPerformanceProbeRequest(BaseModel):
+    """The in-app switch for the post-ready performance measurement."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+
+
+class AssistantStopRequest(BaseModel):
+    """Stop the deployment one ready start operation launched.
+
+    The operation is the only input: it carries the elected coordinator, the
+    port and the deployment ID the coordinator assigned, so the route never has
+    to guess a target or re-elect from a possibly stale measurement. Stopping is
+    idempotent.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation_id: str = Field(min_length=1, max_length=128)
+
+
+class AssistantStopResponse(BaseModel):
+    """The one deployment a stop asked the coordinator to unload."""
+
+    operation_id: str
+    deployment_id: str
+    stopped: bool
+    warnings: list[OperationWarningView]
+
+
+class AssistantOperationHandle(BaseModel):
+    """What a started apply/start returns: a handle, not a result."""
+
+    operation_id: str
+    state: str
+    poll: str
+
+
+class AssistantSessionResponse(BaseModel):
+    """A reloaded card's last deployment, with enough inputs to start again.
+
+    No key, SSH target or host is stored: only the approved plan inputs and the
+    coordinator/deployment identity the operation record already holds.
+    """
+
+    operation_id: str
+    kind: str
+    state: str
+    stopped: bool = False
+    measurement_id: str
+    plan_signature: str
+    model_path: str = ""
+    context_tokens: int = 0
+    target_context_tokens: int = 0
+    rank0_extra_bytes: int = 0
+    mtp: bool = False
+    execution_profile: str = "balanced"
+    microbatch_size: int = 1
+    coordinator_node: str
+    rank_order: list[str]
+    #: The explicit 2-Mac fallback consent, so Start again re-proves the same
+    #: signature after a reload.
+    two_mac_fallback: bool = False
+    resource_policy: PlanResourcePolicy | None = None
+    deployment_id: str = ""
+    endpoint: OperationEndpointView | None = None
+    updated_at: str
+
+
+class AssistantDiagnosticsResponse(BaseModel):
+    """One redacted support bundle. Read-only; a missing record is not an error."""
+
+    generated_at: str
+    app: dict[str, str]
+    measurement: dict[str, Any] | None = None
+    operation: dict[str, Any] | None = None
+    plan: dict[str, Any] | None = None
+    topology: dict[str, Any] | None = None
+    health: dict[str, Any] | None = None
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    redactions: list[str] = Field(default_factory=list)
+
+
+class NetworkPreflightHost(BaseModel):
+    """One host's read-only addressing evidence."""
+
+    host: str
+    bridges: list[str] = Field(default_factory=list)
+    thunderbolt_interfaces: list[str] = Field(default_factory=list)
+    rdma_interfaces: list[str] = Field(default_factory=list)
+    addresses: list[dict[str, Any]] = Field(default_factory=list)
+    self_assigned_interfaces: list[str] = Field(default_factory=list)
+    link_local_addresses: dict[str, str] = Field(default_factory=dict)
+    media_speeds: dict[str, int] = Field(default_factory=dict)
+
+
+class NetworkPreflightResponse(BaseModel):
+    """A read-only bridge plan; ``executed`` is always false."""
+
+    generated_at: str
+    hosts: list[NetworkPreflightHost]
+    commands: list[str]
+    warnings: list[str]
+    confirmation_required: bool = True
+    executed: bool = False
+
+
+class OperationProgressView(BaseModel):
+    """Progress a UI can render without inventing anything."""
+
+    phase: str
+    message: str
+    nodes_ready: int
+    nodes_total: int
+
+
+class OperationEndpointView(BaseModel):
+    """The coordinator's endpoint. ``ready`` is false until health and smoke."""
+
+    node: str
+    host: str
+    port: int = Field(ge=1, le=65535)
+    url: str
+    ready: bool
+
+
+class OperationObservedView(BaseModel):
+    """The one measured rate block, or ``None`` on the operation.
+
+    Filled only after ``ready`` by a real completion the coordinator served.
+    A client must render it as measured and timestamped; it is never a promise
+    and never fills ``predicted``.
+    """
+
+    prefill_tok_per_s: float | None = None
+    decode_tok_per_s: float | None = None
+    ttft_ms: float | None = None
+    measured_at: str = ""
+
+
+class OperationWarningView(BaseModel):
+    code: str
+    node_id: str = ""
+    message: str
+    action: str = ""
+
+
+class OperationErrorView(BaseModel):
+    """Why an operation failed, and the one thing to do about it."""
+
+    code: str
+    message: str
+    action: str
+
+
+class AssistantOperationStatus(BaseModel):
+    """The operation status object (the apply/start chapter).
+
+    Deliberately separate from the measurement status: a measurement job can be
+    ready while no deployment exists, and an operation can be ready while its
+    measurement has since expired. There is no token-rate field anywhere: the
+    operation reports readiness, never throughput.
+    """
+
+    operation_id: str
+    kind: str
+    state: str
+    created_at: str
+    updated_at: str
+    measurement_id: str
+    plan_signature: str
+    placement_signature: str
+    coordinator_node: str
+    #: Whether the coordinator was this Mac; the stop route uses this record.
+    coordinator_local: bool = False
+    rank_order: list[str]
+    context_tokens: int
+    rank0_extra_bytes: int
+    microbatch_size: int
+    mtp: bool
+    execution_profile: str
+    #: The approved resource policy (engram/ple, MoE offload, tier, context).
+    resource_policy: PlanResourcePolicy | None = None
+    progress: OperationProgressView
+    endpoint: OperationEndpointView | None = None
+    #: The coordinator's deployment ID, known after a start reports ready.
+    deployment_id: str = ""
+    #: True after a successful stop; ``state`` remains ``ready``.
+    stopped: bool = False
+    #: Measured after ``ready``, or ``None`` when no probe ran/finished.
+    observed: OperationObservedView | None = None
+    warnings: list[OperationWarningView]
+    error: OperationErrorView | None = None
+
+
+def operation_handle(record: OperationRecord) -> AssistantOperationHandle:
+    """The handle an apply/start request returns immediately."""
+
+    return AssistantOperationHandle(
+        operation_id=record.operation_id,
+        state=record.state,
+        poll=f"{OPERATIONS_PATH}/{record.operation_id}",
+    )
+
+
+def operation_status(record: OperationRecord) -> AssistantOperationStatus:
+    """The status payload for one persisted operation. Reads only."""
+
+    return AssistantOperationStatus(
+        operation_id=record.operation_id,
+        kind=record.kind,
+        state=record.state,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        measurement_id=record.measurement_id,
+        plan_signature=record.plan_signature,
+        placement_signature=record.placement_signature,
+        coordinator_node=record.coordinator_node,
+        coordinator_local=record.coordinator_local,
+        rank_order=list(record.rank_order),
+        context_tokens=record.context_tokens,
+        rank0_extra_bytes=record.rank0_extra_bytes,
+        microbatch_size=record.microbatch_size,
+        mtp=record.mtp,
+        execution_profile=record.execution_profile,
+        resource_policy=_policy_view(record.policy),
+        progress=_progress_view(record.progress),
+        endpoint=_endpoint_view(record.endpoint),
+        deployment_id=record.deployment_id,
+        stopped=record.stopped,
+        observed=_observed_view(record.observed),
+        warnings=[_operation_warning(item) for item in record.warnings],
+        error=(
+            None
+            if record.error is None
+            else OperationErrorView(
+                code=record.error.code,
+                message=record.error.message,
+                action=record.error.action,
+            )
+        ),
+    )
+
+
+def _progress_view(progress: OperationProgress) -> OperationProgressView:
+    return OperationProgressView(
+        phase=progress.phase,
+        message=progress.message,
+        nodes_ready=progress.nodes_ready,
+        nodes_total=progress.nodes_total,
+    )
+
+
+def _policy_view(policy: Any) -> PlanResourcePolicy | None:
+    if not policy:
+        return None
+    return PlanResourcePolicy(
+        context_tokens=int(policy.get("context_tokens") or 0),
+        target_context_tokens=int(policy.get("target_context_tokens") or 0),
+        table_offload=str(policy.get("table_offload") or "none"),
+        table_kind=str(policy.get("table_kind") or ""),
+        moe_expert_offload=bool(policy.get("moe_expert_offload", False)),
+        moe_resident_fraction=float(policy.get("moe_resident_fraction") or 1.0),
+        memory_guard_tier=policy.get("memory_guard_tier"),
+        microbatch_size=int(policy.get("microbatch_size") or 1),
+        admission=str(policy.get("admission") or "p50"),
+    )
+
+
+def session_view(record: OperationRecord) -> AssistantSessionResponse:
+    """The last deployment a reloaded card can show, with no re-election."""
+
+    return AssistantSessionResponse(
+        operation_id=record.operation_id,
+        kind=record.kind,
+        state=record.state,
+        stopped=record.stopped,
+        measurement_id=record.measurement_id,
+        plan_signature=record.plan_signature,
+        model_path=record.model_path,
+        context_tokens=record.context_tokens,
+        target_context_tokens=record.target_context_tokens or record.context_tokens,
+        rank0_extra_bytes=record.rank0_extra_bytes,
+        mtp=record.mtp,
+        execution_profile=record.execution_profile,
+        microbatch_size=record.microbatch_size,
+        coordinator_node=record.coordinator_node,
+        rank_order=list(record.rank_order),
+        two_mac_fallback=record.two_mac_fallback,
+        resource_policy=_policy_view(record.policy),
+        deployment_id=record.deployment_id,
+        endpoint=_endpoint_view(record.endpoint),
+        updated_at=record.updated_at,
+    )
+
+
+def _observed_view(observed: OperationObserved | None) -> OperationObservedView | None:
+    if observed is None:
+        return None
+    return OperationObservedView(
+        prefill_tok_per_s=observed.prefill_tok_per_s,
+        decode_tok_per_s=observed.decode_tok_per_s,
+        ttft_ms=observed.ttft_ms,
+        measured_at=observed.measured_at,
+    )
+
+
+def _endpoint_view(endpoint: OperationEndpoint | None) -> OperationEndpointView | None:
+    if endpoint is None:
+        return None
+    return OperationEndpointView(
+        node=endpoint.node,
+        host=endpoint.host,
+        port=endpoint.port,
+        url=endpoint.url,
+        ready=endpoint.ready,
+    )
+
+
+def _operation_warning(item: OperationWarning) -> OperationWarningView:
+    return OperationWarningView(
         code=item.code,
         node_id=item.node_id,
         message=item.message,
