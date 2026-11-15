@@ -645,6 +645,7 @@ def solve_cluster_plan(
     max_size: int | None = None,
     two_mac_fallback: bool = False,
     exclude_expert_offload: bool = False,
+    preferred_coordinator: str | None = None,
 ) -> ClusterPlanSelection:
     """Bring this model up on the fewest Macs that fit.
 
@@ -681,6 +682,11 @@ def solve_cluster_plan(
         raise ValueError(f"unknown node selection: {node_selection!r}")
 
     facts_by_id = {facts.node_id: facts for facts in node_list}
+    pin = (preferred_coordinator or "").strip()
+    if pin and pin not in facts_by_id:
+        raise ValueError(
+            f"preferred_coordinator {pin!r} is not one of the measured Macs"
+        )
 
     # The MVP plans pipeline parallelism only. mlx-lm cannot split an
     # architecture that does not implement the pipeline forward path, and the
@@ -714,6 +720,7 @@ def solve_cluster_plan(
             origin_node=origin_node,
             fabric_links=fabric_links,
             two_mac_fallback=two_mac_fallback,
+            preferred_coordinator=pin or None,
         )
         excluded = _excluded(selection_nodes, node_list, policy, result)
         warnings = policy_warnings(
@@ -775,6 +782,7 @@ def solve_cluster_plan(
             fabric_links=fabric_links,
             two_mac_fallback=two_mac_fallback,
             microbatch_size=microbatch_size,
+            preferred_coordinator=pin or None,
             memo=memo,
         )
         if size_error is not None:
@@ -977,6 +985,7 @@ def _best_for_size(
     two_mac_fallback: bool,
     microbatch_size: int,
     memo: _SolverMemo,
+    preferred_coordinator: str | None = None,
 ) -> tuple[
     tuple[int, int, ElectionResult, ResourcePolicy] | None,
     NoFeasiblePlanError | None,
@@ -995,8 +1004,14 @@ def _best_for_size(
 
     options: list[tuple[int, int, ElectionResult, ResourcePolicy]] = []
     size_error: NoFeasiblePlanError | None = None
+    pin = (preferred_coordinator or "").strip()
     for subset in combinations(candidates, size):
         subset = tuple(sorted(subset, key=lambda facts: facts.node_id))
+        if pin and all(facts.node_id != pin for facts in subset):
+            # A pinned rank 0 must be in the set that runs the model: a subset
+            # without it cannot honour the request, and electing a Mac the user
+            # did not choose would be the silent fallback this forbids.
+            continue
         try:
             for option in _plans_for_subset(
                 subset,
@@ -1010,6 +1025,7 @@ def _best_for_size(
                 fabric_links=fabric_links,
                 two_mac_fallback=two_mac_fallback,
                 microbatch_size=microbatch_size,
+                preferred_coordinator=pin or None,
                 memo=memo,
             ):
                 options.append(option)
@@ -1034,6 +1050,7 @@ def _plans_for_subset(
     fabric_links: Sequence[Sequence[str]] | None = None,
     two_mac_fallback: bool = False,
     microbatch_size: int = 1,
+    preferred_coordinator: str | None = None,
     memo: _SolverMemo | None = None,
 ) -> list[tuple[int, int, ElectionResult, ResourcePolicy]]:
     """Every feasible plan for this subset, best context first.
@@ -1082,6 +1099,7 @@ def _plans_for_subset(
                 origin_node=origin_node,
                 fabric_links=fabric_links,
                 two_mac_fallback=two_mac_fallback,
+                preferred_coordinator=preferred_coordinator,
                 memo=memo,
             )
         except NoFeasiblePlanError as exc:
@@ -1118,6 +1136,7 @@ def _plans_for_subset(
                         origin_node=origin_node,
                         fabric_links=fabric_links,
                         two_mac_fallback=two_mac_fallback,
+                        preferred_coordinator=preferred_coordinator,
                         memo=memo,
                     )
                 except NoFeasiblePlanError as exc:
@@ -1263,6 +1282,7 @@ def _elect_one(
     origin_node: str | None,
     fabric_links: Sequence[Sequence[str]] | None = None,
     two_mac_fallback: bool = False,
+    preferred_coordinator: str | None = None,
     memo: _SolverMemo | None = None,
 ) -> ElectionResult:
     """One subset, one policy: still the election's verdict, never a copy."""
@@ -1303,6 +1323,7 @@ def _elect_one(
             ),
             fabric_links=fabric_links,
             two_mac_fallback=two_mac_fallback,
+            preferred_coordinator=preferred_coordinator,
         )
 
     if memo is None:
@@ -1322,6 +1343,7 @@ def _elect_one(
         if fabric_links is None
         else tuple(tuple(pair) for pair in fabric_links),
         two_mac_fallback,
+        preferred_coordinator,
     )
     return memo.election(key, evaluate)
 

@@ -695,6 +695,7 @@ def elect(
     moe_expert_offload_resident_fraction: float = 0.0,
     fabric_links: Sequence[Sequence[str]] | None = None,
     two_mac_fallback: bool = False,
+    preferred_coordinator: str | None = None,
 ) -> ElectionResult:
     """Elect the coordinator/rank 0 and return the plan that justifies it.
 
@@ -719,6 +720,14 @@ def elect(
     means the fabric was not measured and keeps the nominal-ring behaviour.
     ``two_mac_fallback`` is the user's explicit acceptance of the offered 2-Mac
     plan; it salts the signature so apply/start must repeat that consent.
+
+    ``preferred_coordinator`` is the user's explicit *pin* of rank 0 (and with
+    it the endpoint host, because the MVP keeps rank 0, coordinator and endpoint
+    on one Mac). It is not a hint: candidate generation is restricted to that
+    Mac, and if no legal split exists with it in front the election refuses with
+    a message naming it instead of quietly electing a different Mac. The pin is
+    a plan-time input, so apply/start must carry it; the plan signature then
+    pins the placement that launch will use.
     """
 
     _reject_tensor_parallel(tensor_parallel_size)
@@ -754,10 +763,16 @@ def elect(
     facts_by_id = {facts.node_id: facts for facts in nodes}
     extra = rank0_extra_bytes + (model.mtp_weight_bytes if mtp else 0)
 
+    pin = (preferred_coordinator or "").strip()
+    if pin and pin not in facts_by_id:
+        raise ValueError(
+            f"preferred_coordinator {pin!r} is not one of the measured Macs"
+        )
+
     considered: list[PlanCandidate] = []
     rejected: list[RejectedCandidate] = []
 
-    for candidate in nodes:
+    for candidate in ([facts_by_id[pin]] if pin else nodes):
         refusal = _ineligible_reason(candidate, model)
         if refusal:
             rejected.append(
@@ -847,8 +862,16 @@ def elect(
             tensor_parallel_size=1,
         )
         hint = wired_limit_hint(nodes)
+        # A pin is never silently dropped: the refusal names the Mac the user
+        # chose and why it cannot hold rank 0, so the next step is visible.
+        pin_note = (
+            f"rank 0 is pinned to {pin} on request, but "
+            if pin
+            else ""
+        )
         raise NoFeasiblePlanError(
-            "no feasible coordinator: "
+            pin_note
+            + "no feasible coordinator: "
             + _summarize_failures([item.reason for item in rejected])
             + (f". {hint}" if hint else ""),
             result,
@@ -879,7 +902,15 @@ def elect(
         policy=resolved_policy,
         origin_node=origin_node or "",
         plan_signature=signature,
-        reasons=_reasons(selected, runner_up, facts_by_id, rejected, resolved_policy),
+        reasons=(
+            (
+                f"rank 0 is pinned to {pin} on request; the plan is feasible "
+                "there",
+            )
+            if pin
+            else ()
+        )
+        + _reasons(selected, runner_up, facts_by_id, rejected, resolved_policy),
         tensor_parallel_size=1,
     )
     return result

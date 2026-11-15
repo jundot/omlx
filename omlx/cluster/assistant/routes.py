@@ -1967,6 +1967,10 @@ def _solve_plan(
         max_size=max_size,
         two_mac_fallback=two_mac_fallback,
         exclude_expert_offload=exclude_expert_offload,
+        # The user's explicit rank-0 pin (and with it the endpoint host). It is
+        # a plan-time input, so apply/start send it as well; an unknown Mac is
+        # a ValueError and surfaces as a 422 rather than a silent fallback.
+        preferred_coordinator=request.preferred_coordinator,
     )
 
 
@@ -2198,6 +2202,7 @@ async def cluster_assistant_apply(request: AssistantApplyRequest) -> Any:
             mtp=request.mtp,
             execution_profile=request.execution_profile,
             two_mac_fallback=request.confirm_two_mac_fallback,
+            preferred_coordinator=request.preferred_coordinator or "",
             policy=request.resource_policy().to_dict(),
             endpoint=plan.endpoint,
         )
@@ -2295,6 +2300,7 @@ async def cluster_assistant_start(request: AssistantStartRequest) -> Any:
             mtp=applied.mtp,
             execution_profile=applied.execution_profile,
             two_mac_fallback=applied.two_mac_fallback,
+            preferred_coordinator=applied.preferred_coordinator,
             policy=dict(applied.policy),
             endpoint=plan.endpoint,
         )

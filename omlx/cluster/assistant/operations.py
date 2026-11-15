@@ -340,6 +340,10 @@ class OperationRecord:
     #: The user's explicit consent to the 2-Mac fallback. It is part of the
     #: plan signature, so start must carry it when it re-proves the plan.
     two_mac_fallback: bool = False
+    #: The rank-0 pin the plan was approved with (and with it the endpoint
+    #: host). Stored so ``start`` re-elects the same plan without trusting the
+    #: request body; empty means "automatic".
+    preferred_coordinator: str = ""
     #: The resource policy the approved plan used (engram/ple, MoE offload,
     #: tier, context, admission). Persisted so ``start`` re-elects the same plan
     #: after a reload without trusting the request body.
@@ -390,6 +394,7 @@ class OperationRecord:
             "mtp": self.mtp,
             "execution_profile": self.execution_profile,
             "two_mac_fallback": self.two_mac_fallback,
+            "preferred_coordinator": self.preferred_coordinator,
             "policy": dict(self.policy),
             "progress": self.progress.to_dict(),
             "endpoint": None if self.endpoint is None else self.endpoint.to_dict(),
@@ -443,6 +448,7 @@ class OperationRecord:
             mtp=bool(payload.get("mtp", False)),
             execution_profile=str(payload.get("execution_profile") or "balanced"),
             two_mac_fallback=bool(payload.get("two_mac_fallback", False)),
+            preferred_coordinator=str(payload.get("preferred_coordinator") or ""),
             policy=_policy_from_dict(payload.get("policy")),
             progress=OperationProgress.from_dict(payload.get("progress") or {}),
             endpoint=(
@@ -620,6 +626,7 @@ class OperationStore:
         mtp: bool = False,
         execution_profile: str = "balanced",
         two_mac_fallback: bool = False,
+        preferred_coordinator: str = "",
         policy: Mapping[str, Any] | None = None,
         endpoint: OperationEndpoint | None = None,
         now: datetime | None = None,
@@ -659,6 +666,7 @@ class OperationStore:
                 mtp=mtp,
                 execution_profile=execution_profile,
                 two_mac_fallback=two_mac_fallback,
+                preferred_coordinator=preferred_coordinator,
                 policy=dict(policy or {}),
                 progress=OperationProgress(
                     phase=STATE_QUEUED,

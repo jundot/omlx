@@ -1338,6 +1338,9 @@ def start_inputs(record: Any, *, model: Any) -> PlanInputs:
         ),
         resource_policy=ResourcePolicy.from_dict(record.policy),
         two_mac_fallback=bool(getattr(record, "two_mac_fallback", False)),
+        preferred_coordinator=str(
+            getattr(record, "preferred_coordinator", "") or ""
+        ),
     )
 
 

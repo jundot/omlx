@@ -212,6 +212,43 @@ def take_measurement(client: TestClient, **overrides: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+def test_a_preferred_coordinator_is_rank_zero_and_named_in_the_plan(api) -> None:
+    """The pin decides the endpoint host; the plan says it did."""
+
+    client, _ = api()
+    measurement_id = take_measurement(client)
+
+    response = client.post(
+        PLAN_URL,
+        json=plan_payload(measurement_id, preferred_coordinator="m5"),
+    )
+
+    assert response.status_code == 200, response.text
+    plan = response.json()
+    assert plan["coordinator_node"] == "m5"
+    assert plan["rank_order"][0] == "m5"
+    assert any("pinned" in reason for reason in plan["reasons"])
+
+
+def test_a_pin_that_cannot_hold_rank_zero_is_a_refusal_that_names_it(api) -> None:
+    """Never a silent fallback: the answer says which Mac was pinned."""
+
+    client, _ = api()
+    measurement_id = take_measurement(client)
+
+    response = client.post(
+        PLAN_URL,
+        json=plan_payload(
+            measurement_id,
+            preferred_coordinator="m1",
+            rank0_extra_bytes=70 * GIB,
+        ),
+    )
+
+    assert response.status_code == 409, response.text
+    assert "pinned to m1" in response.text
+
+
 def test_plan_elects_the_remote_mac_when_the_origin_tail_does_not_fit(api) -> None:
     """§7.6 at the API boundary, through a stored measurement: M1 cannot hold
     tail + head, M5 can, and the app origin does not decide it."""

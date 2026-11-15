@@ -242,6 +242,11 @@ class AssistantPlanRequest(BaseModel):
     # Explicit consent to the offered 2-Mac plan when the selected fabric is
     # incomplete. It salts the signature, so apply/start must repeat it.
     confirm_two_mac_fallback: bool = False
+    # Pin rank 0 — and with it the endpoint host, because the MVP keeps rank 0,
+    # coordinator and endpoint on one Mac. Not a hint: the election refuses
+    # rather than electing a different Mac. A plan-time input, so apply/start
+    # carry it too.
+    preferred_coordinator: str | None = Field(default=None, max_length=255)
 
     def model_identity(self) -> ModelIdentity:
         return request_model_identity(
@@ -1177,6 +1182,9 @@ class AssistantApplyRequest(BaseModel):
     #: The user's explicit consent to the 2-Mac fallback; it is part of the
     #: signature that apply re-proves.
     confirm_two_mac_fallback: bool = False
+    #: The rank-0 pin the approved plan was built with. Part of the plan-time
+    #: inputs, so apply re-elects with it and the record keeps it for start.
+    preferred_coordinator: str | None = Field(default=None, max_length=255)
 
     def model_identity(self) -> ModelIdentity:
         return request_model_identity(
@@ -1219,6 +1227,7 @@ class AssistantApplyRequest(BaseModel):
             target_context_tokens=self.target_context_tokens,
             resource_policy=self.resource_policy(),
             two_mac_fallback=self.confirm_two_mac_fallback,
+            preferred_coordinator=self.preferred_coordinator or "",
         )
 
 

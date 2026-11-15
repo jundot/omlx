@@ -127,6 +127,9 @@ class PlanInputs:
     #: The user's explicit consent to the 2-Mac fallback. It salts the plan
     #: signature, so apply/start must carry it or the signature will not match.
     two_mac_fallback: bool = False
+    #: The rank-0 pin (and with it the endpoint host). Also a plan-time input:
+    #: the election must run with the same pin or the plan cannot be re-proved.
+    preferred_coordinator: str = ""
 
 
 @dataclass(frozen=True)
@@ -551,6 +554,7 @@ def elect_for_apply(
         origin_node=inputs.origin_node or None,
         fabric_links=fabric_links,
         two_mac_fallback=inputs.two_mac_fallback,
+        preferred_coordinator=inputs.preferred_coordinator or None,
     )
     return selection.election, selection
 

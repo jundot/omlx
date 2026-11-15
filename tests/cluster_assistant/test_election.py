@@ -687,6 +687,54 @@ def test_the_wired_limit_only_counts_when_it_is_what_caps_the_mac() -> None:
     # for. "Not measured" is None and never reads as too low.
     assert wired_limit_binds(never_raised) is True
 
+def test_a_pinned_coordinator_is_rank_zero_and_says_so() -> None:
+    """Pin: the endpoint host is the user's choice, not the ranking's."""
+
+    model = layout(layers=24, layer_gib=1.0)
+    big = facts("big", capacity_gib=128, admission_gib=100, decode_gib_per_s=2.0)
+    small = facts("small", capacity_gib=64, admission_gib=48, decode_gib_per_s=1.0)
+
+    automatic = elect([big, small], model, context_tokens=8192)
+    pinned = elect(
+        [big, small], model, context_tokens=8192, preferred_coordinator="small"
+    )
+
+    assert pinned.coordinator_node == "small"
+    assert pinned.rank_order[0] == "small"
+    assert pinned.endpoint is not None and pinned.endpoint.node_id == "small"
+    assert any("pinned" in reason for reason in pinned.reasons)
+    assert automatic.coordinator_node  # the ranking still answers on its own
+
+
+def test_an_unknown_pin_is_a_refusal_not_a_silent_election() -> None:
+    with pytest.raises(ValueError, match="preferred_coordinator"):
+        elect(
+            [m1(), m5()],
+            layout(layers=8, layer_gib=1.0),
+            context_tokens=1024,
+            preferred_coordinator="not-a-measured-mac",
+        )
+
+
+def test_a_pin_that_cannot_hold_rank_zero_is_named_in_the_refusal() -> None:
+    """The frozen rule: never silently elect a different Mac than the pin."""
+
+    model = layout(layers=8, layer_gib=4.0)
+    tiny = facts("tiny", capacity_gib=16, admission_gib=8)
+    big = facts("big", capacity_gib=128, admission_gib=100)
+
+    with pytest.raises(NoFeasiblePlanError) as caught:
+        elect(
+            [tiny, big],
+            model,
+            context_tokens=8192,
+            rank0_extra_bytes=10 * GIB,
+            preferred_coordinator="tiny",
+        )
+
+    assert "pinned to tiny" in str(caught.value)
+
+
 
 def test_a_refusal_names_the_wired_limit_and_offers_to_raise_it() -> None:
     """A too-small Mac gets the click that helps, not only "choose a model"."""
