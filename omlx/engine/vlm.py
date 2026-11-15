@@ -5427,8 +5427,10 @@ class VLMBatchedEngine(BaseEngine):
                     type(e).__name__,
                 )
                 return
-        # Use the decoded dimensions, including resizing and EXIF orientation,
-        # so the memory estimate matches the images passed to the processor.
+        # The dimensions come from the image header, capped the same way the
+        # decoder caps them, so the estimate never under-counts without paying
+        # for a decode. The resizer is symmetric per axis, so the un-transposed
+        # EXIF orientation gives the same token count.
         image_tokens = _count_image_tokens_real(
             messages,
             getattr(self, "_processor", None),
