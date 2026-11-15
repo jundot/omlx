@@ -288,9 +288,27 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/rerank` | Document reranking |
 | `POST /v1/systemone` | Typed decisions with decision models or chat models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
+| `POST /v1/audio/transcriptions` | Speech-to-text, including speaker labels when supported |
 | `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
 
 The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
+
+#### Transcription with speaker labels
+
+Select an installed speech model that supports timed speaker attribution, such as VibeVoice-ASR or Nemotron 3.5 Transcribe. Send a multipart request with the model ID from `GET /v1/models`:
+
+```sh
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer $OMLX_API_KEY" \
+  -F "file=@meeting.wav" \
+  -F "model=$MODEL_ID" \
+  -F "response_format=diarized_json" \
+  -F "chunking_strategy=auto"
+```
+
+The response includes text, the audio duration, and segments with `speaker`, `start`, `end`, and `text`. Speaker labels identify speakers within that recording. Nemotron uses its native speaker-attributed task and requires the timestamp-alignment files from the checkpoint.
+
+For this format, oMLX supports non-streaming requests with `chunking_strategy=auto` or the field omitted. It passes the entire file to the model, subject to the model's input limit and the server's upload limit. If the engine returns no speaker labels, oMLX returns HTTP 422. Incomplete labels or invalid timing return HTTP 502.
 
 ### Tool Calling & Structured Output
 
