@@ -56,6 +56,13 @@ switch. Models are **never** removed unless the user opts in per directory.
   A missing icon is part of "uninstalled", not cosmetics.
 - `scripts/cleanup-cluster-macs.sh` stays the lab/CI equivalent, same scope set.
 
+**Helper state must be visible.** A person cannot tell whether the helper is
+installed, which wired limit is in force, or why no button shows. The
+Performance screen gets one line — `Helper: installed (vX) · wired limit
+122 880 MB of 122 880 MB requested` — and the Apply button stays hidden only
+when the kernel cap already meets the request. Today a raised limit hides the
+button, which is correct but indistinguishable from "the feature is missing".
+
 **Acceptance.** XCTest drives the model layer without deleting anything real
 (paths injected): every default removes exactly its scope, models survive, the
 identity survives, and a cancelled helper step leaves the rest done. On a real

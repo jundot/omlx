@@ -31,10 +31,12 @@ PEERS=(172.16.1.12 172.16.1.13 172.16.1.14)
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 ALL=0
 KEEP_SETTINGS=0
+WITH_HELPER=0
 for arg in "$@"; do
     case "$arg" in
         --all) ALL=1 ;;
         --keep-settings) KEEP_SETTINGS=1 ;;
+        --with-helper) WITH_HELPER=1 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -104,6 +106,26 @@ clean_here() {
     done
     find "${TMPDIR:-/tmp}" /tmp -maxdepth 1 \( -name 'oMLX-*.dmg' -o -name 'omlx-dmg.*' \) \
         -exec rm -rf {} + 2>/dev/null
+
+    # ---- privileged helper (root-owned; needs the one admin dialog) -----
+    # The helper lives in /Library and belongs to root. A cleanup that silently
+    # left it behind means the next launch never prompts again — which reads as
+    # "the helper was never removed" and hides whether the wired limit is still
+    # forced. Report it, and remove it only when the caller asks for the admin
+    # dialog.
+    if [ -e /Library/PrivilegedHelperTools/app.omlx.helper ] || \
+       [ -e /Library/LaunchDaemons/app.omlx.helper.plist ]; then
+        if [ "$WITH_HELPER" -eq 1 ]; then
+            sudo launchctl bootout system/app.omlx.helper >/dev/null 2>&1
+            sudo rm -f /Library/PrivilegedHelperTools/app.omlx.helper \
+                       /Library/LaunchDaemons/app.omlx.helper.plist
+            echo "  removed the privileged helper"
+        else
+            echo "  helper STILL INSTALLED (root-owned): add --with-helper, or run"
+            echo "    sudo launchctl bootout system/app.omlx.helper"
+            echo "    sudo rm -f /Library/PrivilegedHelperTools/app.omlx.helper /Library/LaunchDaemons/app.omlx.helper.plist"
+        fi
+    fi
 
     # ---- LaunchServices / Launchpad -------------------------------------
     # `-gc` alone keeps records for paths that no longer exist, which is what
