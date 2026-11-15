@@ -49,6 +49,8 @@ def apply() -> bool:
 
     def sanitize(self, weights):
         weights = dequantize_fp8_weights(weights)
+        if hasattr(self, "score"):
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         # Detect raw-HF input via unsanitized conv1d shape (matches
         # mlx_lm_mtp/qwen35_model.py). Already-sanitized checkpoints

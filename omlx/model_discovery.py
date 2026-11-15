@@ -34,7 +34,7 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev", "d3", "d1"]
+DecisionKind = Literal["clef", "openjev", "d3", "d1", "minicpm_jev"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -124,6 +124,9 @@ _OPENJEV_HELPER = Path("helper/shim.py")
 D3_READOUT_WEIGHTS = "readout.safetensors"
 D3_DECISION_CONFIG = "decision_config.json"
 D3_FORMAT_ID = "d3-code-readout-v1"
+MINICPM_JEV_FORMAT_ID = "minicpm-ocr-jev-v1"
+MINICPM_JEV_PROMPT_TEMPLATE_MD5 = "9aab68e8ba8ab4da17ba9752bddb199c"
+MINICPM_JEV_IMAGES_PER_PROMPT = 2
 # Files of a decision head, not of the backbone. Quantizers copy them as is.
 DECISION_SIDECAR_WEIGHTS = (CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS)
 DECISION_SIDECAR_FILES = (
@@ -506,6 +509,32 @@ def _is_d3_decision_config(path: Path) -> bool:
         return False
 
 
+def _is_qwen35_classifier(config: dict) -> bool:
+    return str(config.get("model_type") or "").lower() == "qwen3_5" and (
+        "Qwen3_5ForSequenceClassification" in (config.get("architectures") or ())
+        or config.get("problem_type") == "single_label_classification"
+    )
+
+
+def _is_minicpm_jev_config(config: dict, model_path: Path) -> bool:
+    if str(config.get("model_type") or "").lower() == "minicpm_ocr_jev":
+        return True
+    if not _is_qwen35_classifier(config):
+        return False
+    # Binary classification alone cannot identify the OCR prompt contract.
+    # The official release and unmarked conversions need this adapter sidecar.
+    try:
+        with open(model_path / D3_DECISION_CONFIG) as f:
+            marker = json.load(f)
+        return isinstance(marker, dict) and (
+            marker.get("format_id") == MINICPM_JEV_FORMAT_ID
+            and marker.get("prompt_template_md5") == MINICPM_JEV_PROMPT_TEMPLATE_MD5
+            and marker.get("images_per_prompt") == MINICPM_JEV_IMAGES_PER_PROMPT
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
     """Return the decision-model family of a checkpoint, or None.
 
@@ -513,7 +542,8 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
     readout and decision config. LiquidAI d1 declares ``D1Model`` on an
     LFM3-VL or LFM3-Omni config. OpenJev is a plain Qwen3.5 checkpoint, so it
     is identified by its helper directory or, for MLX conversions without the
-    helper, by the directory name.
+    helper, by the directory name. MiniCPM-OCR-Jev requires explicit model-family
+    or adapter identity metadata.
     """
     if (model_path / CLEF_HEAD_WEIGHTS).is_file() and (
         model_path / CLEF_HEAD_CONFIG
@@ -535,6 +565,8 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
         or str((config.get("auto_map") or {}).get("AutoModel", "")).endswith("D1Model")
     ):
         return "d1"
+    if _is_minicpm_jev_config(config, model_path):
+        return "minicpm_jev"
     if model_type != "qwen3_5":
         return None
     if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
@@ -745,6 +777,14 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     if decision_kind(model_path, config) is not None:
         return "decision"
+    if _is_qwen35_classifier(config):
+        logger.warning(
+            "Qwen3.5 classifier at %s has no recognized decision adapter identity. "
+            "For MiniCPM-OCR-Jev, including the official release, verify the OCR "
+            "contract and add decision_config.json as described in "
+            "docs/minicpm-ocr-jev.md before serving decisions.",
+            model_path,
+        )
 
     # Check architectures field for reranker first (more specific)
     architectures = config.get("architectures", [])

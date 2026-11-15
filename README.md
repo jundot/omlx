@@ -290,6 +290,8 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `GET /v1/models` | List available models |
 | `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
 
+For MiniCPM-OCR-Jev OCR verification, see the [model setup and request example](docs/minicpm-ocr-jev.md).
+
 The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
 
 ### Tool Calling & Structured Output

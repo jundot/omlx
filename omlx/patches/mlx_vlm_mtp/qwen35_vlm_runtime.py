@@ -334,6 +334,19 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         kwargs.pop("n_confirmed", None)
+        if return_hidden and kwargs.get("skip_logits", False):
+            # Classifier/scoring callers (e.g. minicpm_ocr_jev) ask for
+            # post-norm hidden states without logits or speculative state.
+            return original_call(
+                self,
+                inputs,
+                inputs_embeds,
+                mask,
+                cache,
+                return_hidden=return_hidden,
+                return_shared_kv=return_shared_kv,
+                **kwargs,
+            )
         if not return_hidden:
             drafter = getattr(self, "_omlx_drafter", None)
             scope = getattr(drafter, "scope_uids", None)

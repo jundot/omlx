@@ -2,8 +2,8 @@
 """
 Decision engine for oMLX.
 
-Serves decision models (Clef, OpenJev, Decision 3.0, d1) through
-``/v1/systemone``. A request runs prompt forwards and no decoding. The engine
+Serves decision models (Clef, OpenJev, Decision 3.0, d1, MiniCPM-OCR-Jev) through
+``/v1/decisions`` and ``/v1/systemone``. A request runs prompt forwards and no decoding. The engine
 steps the model's generator one chunk per executor call, so active chat
 decodes get the GPU between chunks.
 """
@@ -23,6 +23,7 @@ from ..model_discovery import decision_kind
 from ..models.clef import ClefModel
 from ..models.d1 import D1Model
 from ..models.d3 import D3Model
+from ..models.minicpm_jev import MiniCPMJevModel
 from ..models.openjev import OpenJevModel
 from ..scheduler import _CONTENDED_CHUNK_FLOOR, SchedulerConfig
 from .base import BaseNonStreamingEngine
@@ -35,12 +36,13 @@ _MODEL_CLASSES = {
     "openjev": OpenJevModel,
     "d3": D3Model,
     "d1": D1Model,
+    "minicpm_jev": MiniCPMJevModel,
 }
-DecisionModel = ClefModel | OpenJevModel | D3Model | D1Model
+DecisionModel = ClefModel | OpenJevModel | D3Model | D1Model | MiniCPMJevModel
 
 
 class DecisionEngine(BaseNonStreamingEngine):
-    """Engine for ``/v1/systemone`` decision models."""
+    """Engine for typed decision models on both decision API endpoints."""
 
     def __init__(
         self,
@@ -82,7 +84,7 @@ class DecisionEngine(BaseNonStreamingEngine):
         if kind is None:
             raise ValueError(
                 f"{self._model_name} is not a supported decision model "
-                "(Clef, OpenJev, Decision 3.0 or d1)"
+                "(Clef, OpenJev, Decision 3.0, d1 or MiniCPM-OCR-Jev)"
             )
         logger.info(f"Starting decision engine ({kind}): {self._model_name}")
         model = _MODEL_CLASSES[kind](
