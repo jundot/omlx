@@ -42,8 +42,15 @@ APP_PATH="$STATAGE" OUT_DIR="$ROOT/build" \
     apps/omlx-mac/Scripts/package_dmg.sh || exit 1
 clean_staged_apps
 
-DMG="$ROOT/build/oMLX-$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
-    "$ROOT/apps/omlx-mac/Resources/Info.plist" 2>/dev/null || echo 0.0.0).dmg"
+# package_dmg.sh names the artefact from the *built* app's expanded version.
+# The source Resources/Info.plist still carries the literal $(MARKETING_VERSION)
+# build variable, so reading it here yields a wrong path and silently skips
+# --install. Pick the newest DMG package_dmg.sh actually produced instead.
+DMG="$(ls -t "$ROOT"/build/oMLX-*.dmg 2>/dev/null | head -1)"
+if [ -z "$DMG" ]; then
+    echo "build-release-dmg: no DMG found under build/" >&2
+    exit 1
+fi
 echo "build-release-dmg: $(shasum -a 256 "$DMG" | cut -d' ' -f1)  $DMG"
 echo "build-release-dmg: apps on disk now: $(ls -d /Applications/oMLX*.app 2>/dev/null | wc -l | tr -d ' ')" \
      "| LS records: $("$LSREGISTER" -dump 2>/dev/null | grep -c 'oMLX\.app')"
