@@ -1187,3 +1187,76 @@ inline void gguf_mma16(W w, uint row0, X x, uint xs, uint lane, uint ks,
     gguf_mma8<K, KS, 8, QT, BLOCK, BYTES>(w, row0, x, xs, lane, ks, red, tile0);
     gguf_mma8<K, KS, NB - 8, QT, BLOCK, BYTES>(w, row0, x + 8 * xs, xs, lane, ks, red, tile1);
 }
+
+struct GGUFQuarter { uint4 a; uint2 b; };
+
+inline uint gguf_u32(const device uchar* p) {
+    const device ushort* s = reinterpret_cast<const device ushort*>(p);
+    return uint(s[0]) | (uint(s[1]) << 16);
+}
+
+template <int QT>
+inline GGUFQuarter gguf_quarter(const device uchar* p, uint owner) {
+    GGUFQuarter q = {uint4(0), uint2(0)};
+    if constexpr (QT == 16 || QT == 17 || QT == 18) {
+        const device uchar* a = p + 2 + owner * 16;
+        q.a = uint4(gguf_u32(a), gguf_u32(a + 4), gguf_u32(a + 8), gguf_u32(a + 12));
+        if constexpr (QT == 17) q.b.x = *reinterpret_cast<const device ushort*>(p + 66 + 2 * owner);
+        if constexpr (QT == 18) q.b = uint2(gguf_u32(p + 66 + 8 * owner), gguf_u32(p + 70 + 8 * owner));
+    } else if constexpr (QT == 19) {
+        q.a = uint4(gguf_u32(p + 2 + 8 * owner), gguf_u32(p + 6 + 8 * owner), gguf_u32(p + 34 + 4 * owner), 0);
+    } else { // IQ2_S: eight indices, eight signs, two high bytes and two scale bytes.
+        q.a = uint4(gguf_u32(p + 2 + 8 * owner), gguf_u32(p + 6 + 8 * owner),
+                    gguf_u32(p + 34 + 8 * owner), gguf_u32(p + 38 + 8 * owner));
+        q.b.x = uint(*reinterpret_cast<const device ushort*>(p + 66 + 2 * owner)) |
+                (uint(*reinterpret_cast<const device ushort*>(p + 74 + 2 * owner)) << 16);
+    }
+    return q;
+}
+
+template <int QT>
+inline half4 gguf_quarter_coeff4(thread const GGUFQuarter& q, uint k, uint lane) {
+    const uint owner = k / 64;
+    const uint src = (lane & ~9u) | (owner & 1) | ((owner & 2) << 2);
+    const uint sub = (k / 8) % 4;
+    uint grid4, signs, mult;
+    if constexpr (QT == 16) {
+        const uint words = simd_shuffle((k & 32) ? q.a.z : q.a.x, src);
+        const uint h = simd_shuffle((k & 32) ? q.a.w : q.a.y, src);
+        const ulong grid = iq2xxs_grid[(words >> (8 * sub)) & 255];
+        grid4 = uint(grid >> (8 * (k & 7)));
+        signs = ksigns_iq2xs[(h >> (7 * sub)) & 127]; mult = 2 * (h >> 28) + 1;
+    } else if constexpr (QT == 17) {
+        const uint word = simd_shuffle(q.a[(k / 16) & 3], src);
+        const uint v = (word >> (16 * ((k / 8) & 1))) & 65535;
+        const uint s = simd_shuffle(q.b.x, src);
+        grid4 = uint(iq2xs_grid[v & 511] >> (8 * (k & 7)));
+        signs = ksigns_iq2xs[v >> 9]; mult = 2 * ((s >> (8 * ((k / 32) & 1) + 4 * (sub / 2))) & 15) + 1;
+    } else if constexpr (QT == 18) {
+        const uint word = simd_shuffle(q.a[(k / 16) & 3], src);
+        const uint h = simd_shuffle((k & 32) ? q.b.y : q.b.x, src);
+        grid4 = iq3xxs_grid[(word >> (8 * ((k / 4) & 3))) & 255];
+        signs = ksigns_iq2xs[(h >> (7 * sub)) & 127]; mult = 2 * (h >> 28) + 1;
+    } else if constexpr (QT == 19) {
+        const uint word = simd_shuffle((k & 32) ? q.a.y : q.a.x, src);
+        const uint h = (simd_shuffle(q.a.z, src) >> (16 * ((k / 32) & 1))) & 65535;
+        const uint idx = ((word >> (8 * sub)) & 255) | (((h >> (3 * sub)) & 7) << 8);
+        const uint grid = iq1s_grid_gpu[idx];
+        half4 v;
+        _Pragma("clang loop unroll(full)")
+        for (uint j = 0; j < 4; ++j)
+            v[j] = half((8 * (int((grid >> (8 * j + (k & 4))) & 15) - 1) + ((h & 32768) ? -1 : 1)) * int(2 * ((h >> 12) & 7) + 1));
+        return v;
+    } else {
+        const uint word = simd_shuffle((k & 32) ? q.a.y : q.a.x, src);
+        const uint sw = simd_shuffle((k & 32) ? q.a.w : q.a.z, src);
+        const uint h = simd_shuffle(q.b.x, src), ib = (k / 32) & 1;
+        const uint idx = ((word >> (8 * sub)) & 255) | (((h >> (8 * ib + 2 * sub)) & 3) << 8);
+        grid4 = uint(iq2s_grid[idx] >> (8 * (k & 7)));
+        signs = (sw >> (8 * sub)) & 255; mult = 2 * ((h >> (16 + 8 * ib + 4 * (sub / 2))) & 15) + 1;
+    }
+    half4 v = half4(as_type<uchar4>(grid4));
+    _Pragma("clang loop unroll(full)")
+    for (uint j = 0; j < 4; ++j) v[j] *= half((signs & (1u << ((k & 7) + j))) ? -int(mult) : int(mult));
+    return v;
+}

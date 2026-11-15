@@ -305,14 +305,16 @@ def test_packed_matrix_and_gather_tails(qtype):
 @pytest.mark.parametrize("qtype", FORMATS)
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("counts", [(3, 0, 67, 61), (3, 0, 131, 129)])
-def test_packed_nax_gather_matches_float64_dot(qtype, dtype, counts):
+def test_packed_nax_gather_matches_float64_dot(
+    qtype, dtype, counts, width=None, n=35, activation_scale=1.0
+):
     from omlx.patches.deepseek_v41.gguf_quant import prefill_plan
 
     # Q8 has a half K tile; all formats have N/route tails and an empty expert.
-    width = 544 if qtype == 8 else 512
-    raw, rng = packed(qtype, (4, 35, width), 9100 + qtype)
+    width = width or (544 if qtype == 8 else 512)
+    raw, rng = packed(qtype, (4, n, width), 9100 + qtype)
     block, size, _ = FORMATS[qtype]
-    blocks = raw.reshape(4, 35, width // block, size)
+    blocks = raw.reshape(4, n, width // block, size)
     offset = {10: 80, 14: 208}.get(qtype, 0)
     scales = rng.choice(np.array([0, -0.007, 0.01, 2**-24], "<f2"), blocks.shape[:-1])
     blocks[..., offset : offset + 2] = scales[..., None].view(np.uint8)
@@ -320,11 +322,11 @@ def test_packed_nax_gather_matches_float64_dot(qtype, dtype, counts):
     ids = np.repeat(np.arange(4, dtype=np.int32), counts)
     # A strided input also checks the caller's contiguous gather contract.
     x = mx.array(rng.normal(size=(len(ids), width * 2)).astype(np.float32))[:, ::2]
-    x = x.astype(dtype)[:, None]
+    x = (x.astype(dtype) * activation_scale).astype(dtype)[:, None]
     plan = prefill_plan(x, mx.array(ids), p.num_experts)
     assert plan[2] == (64 if len(ids) >= 256 else 32)
     actual = p(x, mx.array(ids), sorted_indices=True, block_plan=plan)
-    dense = np.asarray(dequantize(p.weight, qtype, (4, 35, width), mx.float32)).astype(
+    dense = np.asarray(dequantize(p.weight, qtype, (4, n, width), mx.float32)).astype(
         np.float64
     )
     inp = np.asarray(x.astype(mx.float32))[:, 0].astype(np.float64)
@@ -333,18 +335,41 @@ def test_packed_nax_gather_matches_float64_dot(qtype, dtype, counts):
     # Factoring the original group scale changes FP32 summation order only.
     # Bound that error plus the final output cast, including FP16 subnormals.
     eps = {mx.float32: 2**-23, mx.float16: 2**-10, mx.bfloat16: 2**-7}[dtype]
-    tolerance = 8 * 2**-23 * magnitude + 0.5 * eps * abs(reference) + 2**-25
-    assert actual.dtype == dtype and actual.shape == (len(ids), 1, 35)
+    tolerance = 8 * 2**-23 * magnitude + 0.5 * eps * abs(reference)
+    if dtype == mx.float16:
+        tolerance += 2**-25
+    assert actual.dtype == dtype and actual.shape == (len(ids), 1, n)
     error = abs(np.asarray(actual.astype(mx.float32))[:, 0] - reference)
     assert np.all(error <= tolerance), np.max(error / tolerance)
     np.testing.assert_array_equal(p.weight, raw)
 
 
 @pytest.mark.skipif(not is_nax_available(), reason="Requires NAX tensor units")
+@pytest.mark.parametrize("qtype,width", [(16, 5120), (22, 2304)])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_packed_nax_register_wide_and_swizzled_tails(qtype, width, dtype):
+    # Fifteen route tiles cross the eight-tile group, with M/N tails and
+    # an odd block count (two-byte, rather than four-byte, row alignment).
+    test_packed_nax_gather_matches_float64_dot(
+        qtype, dtype, (3, 0, 387, 385), width=width, n=137
+    )
+
+
+@pytest.mark.skipif(not is_nax_available(), reason="Requires NAX tensor units")
+@pytest.mark.parametrize("activation_scale", [2.0**-80, 2.0**80])
+def test_packed_nax_register_preserves_bfloat16_range(activation_scale):
+    test_packed_nax_gather_matches_float64_dot(
+        16, mx.bfloat16, (3, 0, 387, 385), n=137, activation_scale=activation_scale
+    )
+
+
+@pytest.mark.skipif(not is_nax_available(), reason="Requires NAX tensor units")
 @pytest.mark.parametrize("qtype", FORMATS)
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("shape", [(64,), (3, 43)])
-def test_packed_nax_dense_without_weight_materialization(qtype, dtype, shape, monkeypatch):
+def test_packed_nax_dense_without_weight_materialization(
+    qtype, dtype, shape, monkeypatch
+):
     from omlx.patches.deepseek_v41 import gguf_quant as q
 
     width = 544 if qtype == 8 else 512

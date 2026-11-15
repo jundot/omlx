@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from omlx.custom_kernels.nax import is_nax_available
+from omlx.custom_kernels.nax_tiles import NAX_TILE_HEADER
 
 from .gguf import FORMATS, row_bytes
 
@@ -90,10 +91,12 @@ def _matrix_kernel(qtype, gathered):
         if gathered
         else """
         const uint start = threadgroup_position_in_grid.y * 8;
-        const uint expert = 0, valid = min(8u, uint(M) - start);
+        const uint expert = 0, valid = min(8u, uint(x_shape[0]) - start);
         """
     )
-    source = select + f"""
+    source = (
+        select
+        + f"""
         const uint lane = thread_index_in_simdgroup;
         const uint r0 = threadgroup_position_in_grid.x * 32 + simdgroup_index_in_threadgroup * 8;
         const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
@@ -121,6 +124,7 @@ def _matrix_kernel(qtype, gathered):
             if (fn + 1 < valid) out[size_t(start + fn + 1) * N + r0 + fm] = O(acc.thread_elements()[1]);
         }}
     """
+    )
     return mx.fast.metal_kernel(
         name=f"v41_gguf_{name}_matrix_{int(gathered)}",
         input_names=["x", "w", "meta", "count"],
@@ -145,7 +149,7 @@ def _nax_kernel(qt, rows, gathered=True):
         if gathered
         else f"""
             const uint start = threadgroup_position_in_grid.y * {bm};
-            const uint expert = 0, valid = min({bm}u, uint(M) - start);
+            const uint expert = 0, valid = min({bm}u, uint(x_shape[0]) - start);
         """
     )
     return mx.fast.metal_kernel(
@@ -154,7 +158,8 @@ def _nax_kernel(qt, rows, gathered=True):
         output_names=["out"],
         header="#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
         + header(),
-        source=select + f"""
+        source=select
+        + f"""
             const uint tid = thread_index_in_threadgroup;
             const uint n0 = threadgroup_position_in_grid.x * {bn};
             threadgroup half ws[{bn * bk}], us[{bn * bk if two else 1}];
@@ -210,6 +215,120 @@ def _nax_kernel(qt, rows, gathered=True):
                 if (xy[1] < valid && n0 + xy[0] < N)
                     out[size_t(start + xy[1]) * N + n0 + xy[0]] = O(acc[i]);
             }}
+        """,
+    )
+
+
+@cache
+def _nax_register_kernel(qt, rows, gathered=True):
+    """Decode IQ coefficients in SIMD registers; apply base scales in FP32."""
+    _, size, name = FORMATS[qt]
+    mm, sm, cols = (16, 16, 64) if rows == 32 else (32, 64, 128)
+    scale = 0.25 if qt == 18 else 0.125
+    # Group row tiles on grid x to reuse activations across output columns.
+    swizzled = gathered and rows == 64
+    tile = (
+        "(threadgroup_position_in_grid.y / ((N + 127) / 128)) * 8 + threadgroup_position_in_grid.x"
+        if swizzled
+        else "threadgroup_position_in_grid.y"
+    )
+    column = (
+        "threadgroup_position_in_grid.y % ((N + 127) / 128)"
+        if swizzled
+        else "threadgroup_position_in_grid.x"
+    )
+    select = (
+        f"""
+        const uint bi = {tile};
+        if (bi >= uint(count[0])) return;
+        const uint start = meta[bi*3], expert = meta[bi*3+1], valid = meta[bi*3+2];
+        """
+        if gathered
+        else f"""
+        const uint start = threadgroup_position_in_grid.y * {rows};
+        const uint expert = 0, valid = min({rows}u, uint(x_shape[0]) - start);
+        """
+    )
+    ctype = "op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a)>, metal::remove_addrspace_t<decltype(b)>, float>()"
+    totals = "\n".join(
+        f"auto t{m} = {ctype}; for(uint i=0;i<{mm};++i) t{m}[i]=0.0f;"
+        for m in range(sm // mm)
+    )
+    parts = "\n".join(
+        f"auto p{m} = {ctype}; for(uint i=0;i<{mm};++i) p{m}[i]=0.0f;"
+        for m in range(sm // mm)
+    )
+    run = "\n".join(
+        f"""
+        if ({m * mm} < nr) {{
+            _Pragma("clang loop unroll(full)")
+            for (uint h=0;h<{mm // 4};++h) {{
+                const uint row=min({m * mm}+sc.y+(h&1)*8+(h/4)*16,nr-1);
+                const auto v=*reinterpret_cast<const device vec<O,4>*>(x+size_t(start+m0+row)*K+base+kk+sc.x+((h/2)&1)*16);
+                _Pragma("clang loop unroll(full)")
+                for(uint j=0;j<4;++j) a[h*4+j]=v[j];
+            }}
+            op.run(a,b,p{m});
+        }}"""
+        for m in range(sm // mm)
+    )
+    accumulate = "\n".join(f"t{m}[i] += p{m}[i] * d;" for m in range(sm // mm))
+    output = "\n".join(
+        f"if ({m * mm}+xy[1]<nr && n0+xy[0]<N) out[size_t(start+m0+{m * mm}+xy[1])*N+n0+xy[0]]=O(t{m}[i]);"
+        for m in range(sm // mm)
+    )
+    return mx.fast.metal_kernel(
+        name=f"v41_gguf_register_{name}_{rows}_{int(gathered)}",
+        input_names=["x", "w", "meta", "count"],
+        output_names=["out"],
+        header=NAX_TILE_HEADER + header(),
+        source=select
+        + f"""
+        const uint sg=simdgroup_index_in_threadgroup, lane=thread_index_in_simdgroup;
+        const uint m0=(sg/({cols}/32))*{sm}, n0=({column})*{cols}+(sg%({cols}/32))*32;
+        if(m0>=valid || n0>=N) return;
+        const uint nr=min({sm}u,valid-m0);
+        const short2 sc=omlx_nax::BaseNAXFrag::get_coord();
+        constexpr auto desc=mpp::tensor_ops::matmul2d_descriptor({mm},32,32,false,true,false,mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc,execution_simdgroup> op;
+        auto a=op.template get_left_input_cooperative_tensor<O,half,float>();
+        auto b=op.template get_right_input_cooperative_tensor<O,half,float>();
+        {totals}
+        for(uint base=0;base<K;base+=256) {{
+            GGUFQuarter packed[4];
+            _Pragma("clang loop unroll(full)")
+            for(uint q=0;q<4;++q) {{
+                const uint n=n0+sc.y+(q&1)*8+(q>>1)*16;
+                packed[q]={{uint4(0),uint2(0)}};
+                if(n<N) {{
+                    const size_t at=((size_t(expert)*N+n)*(K/256)+base/256)*{size};
+                    packed[q]=gguf_quarter<{qt}>(w+at,sc.x/4);
+                }}
+            }}
+            {parts}
+            for(uint kk=0;kk<256;kk+=32) {{
+                _Pragma("clang loop unroll(full)")
+                for(uint q=0;q<8;++q) {{
+                    const half4 v=gguf_quarter_coeff4<{qt}>(packed[q&3],kk+sc.x+(q/4)*16,lane);
+                    _Pragma("clang loop unroll(full)")
+                    for(uint j=0;j<4;++j) b[q*4+j]=v[j];
+                }}
+                {run}
+            }}
+            _Pragma("clang loop unroll(full)")
+            for(uint i=0;i<{mm};++i) {{
+                const auto xy=t0.get_multidimensional_index(i);
+                if(n0+xy[0]>=N) continue;
+                const size_t at=((size_t(expert)*N+n0+xy[0])*(K/256)+base/256)*{size};
+                const float d=float(*reinterpret_cast<const device half*>(w+at))*{scale}f;
+                {accumulate}
+            }}
+        }}
+        _Pragma("clang loop unroll(full)")
+        for(uint i=0;i<{mm};++i) {{
+            const auto xy=t0.get_multidimensional_index(i);
+            {output}
+        }}
         """,
     )
 
@@ -338,25 +457,41 @@ class GGUFProjection(nn.Module):
                 else (ids, ids, 64 if ids.size >= 64 else 8)
             )
             nax = rows >= 32
-            cols = 64 if rows == 32 else 32
-            kernel = (
-                _nax_kernel(self.qtype, rows, indices is not None)
-                if nax
-                else _matrix_kernel(self.qtype, indices is not None)
+            registers = (
+                nax
+                and self.qtype in (16, 17, 18, 19, 22)
+                and x.dtype in (mx.bfloat16, mx.float16)
+            )
+            cols = 128 if registers and rows == 64 else 64 if rows == 32 else 32
+            if registers:
+                kernel = _nax_register_kernel(self.qtype, rows, indices is not None)
+            elif nax:
+                kernel = _nax_kernel(self.qtype, rows, indices is not None)
+            else:
+                kernel = _matrix_kernel(self.qtype, indices is not None)
+            grid = (
+                (
+                    8 * 128,
+                    (meta.shape[0] + 7) // 8 * ((self.output_dims + 127) // 128),
+                    1,
+                )
+                if registers and indices is not None and rows == 64
+                else (
+                    (self.output_dims + cols - 1) // cols * 128,
+                    meta.shape[0]
+                    if indices is not None
+                    else (ids.size + rows - 1) // rows,
+                    1,
+                )
             )
             return kernel(
                 inputs=[x, self.weight, meta, count],
                 template=[
                     ("K", self.input_dims),
                     ("N", self.output_dims),
-                    ("M", ids.size),
                     ("O", x.dtype),
                 ],
-                grid=(
-                    (self.output_dims + cols - 1) // cols * 128,
-                    meta.shape[0] if indices is not None else (ids.size + rows - 1) // rows,
-                    1,
-                ),
+                grid=grid,
                 threadgroup=(128, 1, 1),
                 output_shapes=[shape],
                 output_dtypes=[x.dtype],
