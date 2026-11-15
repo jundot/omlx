@@ -2204,6 +2204,12 @@ def _parse_tool_calls_impl(
                         _built = _build_tool_call(name, arguments)
                         if _built is not None:
                             tool_calls.append(_built)
+                        elif parse_errors is not None:
+                            # The parser accepted the span but validation
+                            # dropped the call, which never reaches the
+                            # "Dropping match" branch below.  Same outcome
+                            # for the client, so same report (#5245).
+                            parse_errors.append("malformed")
                 except (
                     ValueError,
                     json.JSONDecodeError,
@@ -2234,6 +2240,8 @@ def _parse_tool_calls_impl(
                                 _built = _build_tool_call(name, arguments)
                                 if _built is not None:
                                     tool_calls.append(_built)
+                                elif parse_errors is not None:
+                                    parse_errors.append("malformed")
                             gemma4_handled = True
                         except (
                             ValueError,
@@ -2270,7 +2278,14 @@ def _parse_tool_calls_impl(
                             primary_err,
                             match[:200],
                         )
-                        if parse_errors is not None:
+                        # Report only a span that names a declared tool.  A
+                        # broken call keeps its name and breaks in the
+                        # arguments; a model writing the marker pair in
+                        # prose ("wrapped like <tool_call>...</tool_call>")
+                        # does not, and must stay a normal reply (#5245).
+                        if parse_errors is not None and any(
+                            name in match for name in _extract_tool_names(tools or [])
+                        ):
                             parse_errors.append("malformed")
                     continue
 
