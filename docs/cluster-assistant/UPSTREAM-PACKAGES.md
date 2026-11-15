@@ -60,7 +60,8 @@ old-pin measurement for comparison. "Tests" are counted in the package size.
 | P1 | **`local_only` model load** | `omlx/engine_pool.py`, `omlx/admin/routes.py`, `tests/{test_engine_pool,test_admin_load_errors,test_cluster_engine_pool}.py` | **293** (107 code, 164 tests, 22 deleted), 5 files | 293 (identical) | **Yes** | `POST /api/models/{id}/load?local_only=true` loads a model on this Mac alone: a registry cluster deployment is ignored, an already-loaded distributed engine is unloaded (or refused when busy) instead of being reported as this Mac's own, and the PLE/Engram table is priced into local admission. Generic fix for anyone who wants a single-Mac load. |
 | P2 | **Test-infra fixes** | `tests/conftest.py`, `tests/_tokenizer_support.py`, `tests/test_glm5_next_mtp.py`, `tests/{test_scheduler,test_settings}.py`, `.editorconfig`, `.gitignore`, `.python-version` | **161**, 8 files | 159 | **Yes** | The `conftest` name-collision fix (`MockTokenizer` → uniquely named module) and the native-indexer skip keep the suite stable; no product behaviour. |
 | P3 | **Peer version check** | `scripts/check_peer_versions.py`, `docs/cluster-assistant/PEER-VERSIONS.md` | **209** (141 tool, 68 doc), 2 files | 209 (identical) | **Yes** | A read-only tool that detects a mixed-version cluster (405/404 on the assistant operations/tuning routes). Useful even without the assistant; it sends no key and writes nothing. |
-| P4 | **macOS helper / DMG fixes** | `apps/omlx-mac/**` (Helper plists + `main.swift`, `Scripts/{build,package_dmg,provision_runtime}.sh`, `PerformanceScreenVM`, `PythonRuntime`, `WelcomeWindow`, menubar, mac tests, +7 xcstrings entries), `docs/cluster-assistant/{HELPER,DISTRIBUTION,SIGNING,SLIM-RUNTIME}.md` | **2 380 + 7 xcstring entries**, 28 files | 2 402 | **Yes** | The SMJobBless helper could never install (launchd plist not embedded, trust requirements wrong) and the DMG was unsigned. Broadly useful to the app, independent of clustering. |
+| P4 | **macOS helper / DMG productization — fork-only, not offered** | `apps/omlx-mac/Helper/**` (new), `Scripts/{package_dmg,provision_runtime}.sh` (new), `build.sh`, `PerformanceScreenVM`, `PythonRuntime`, `WelcomeWindow`, `MenubarController`, `Resources/Info.plist` (`SMPrivilegedExecutables`), `RuntimeInstallerTests`, the python packaging test, 4 docs, +7 xcstring entries | **2 380 + 7 entries**, 28 files | 2 402 | **No (product)** | **Not an upstream fix.** The helper, the runtime installer and the DMG packaging do not exist on upstream — this is our app productization (privileged wired-limit helper, first-run installer, Cluster Assistant menu entry). Offer it only as a product proposal, if at all. The real upstream value is the small fix set below. |
+| P4-fixes | **macOS fixes** | `ServerProcess.swift` (create the logs directory on a fresh install), `ThemeTests.swift` (macOS 27 underPage colour), `ModelSettingsScreenVMTests.swift` (localized percent separator), `MenubarVisibilityWatcher.swift` (skip the menu-bar probe under XCTest) | **32**, 4 files | — | **Yes** | Four genuine, independent defects that also bite upstream users/tests on current macOS. |
 | P5 | **Cluster planner / resource-policy parity** | `omlx/cluster/{planner,routes,deployment,discovery,model_inventory,staging,performance_worker,discovery_routes,catalogue}.py` + 5 cluster test modules | **1 567** (1 114 core, 453 tests), 14 files | 1 253 | Mostly | Measured admission, memory tier, table (`engram`/Qwen4 PLE)-aware planning, **routed-expert (MoE) offload restored on upstream's refactored pipeline and now threaded through the coordinator plan path and the deployment decode**, discovery fallback that carries name/chip/RAM. Useful to the cluster core; the assistant consumes it but does not own it. |
 | P6 | **Cluster Assistant** | `omlx/cluster/assistant/**` (19 344), `tests/cluster_assistant/**` (17 763), assistant web UI + its tests (11 122), `docs/cluster-assistant/**` minus P3/P4 docs (11 832), `AGENTS.md` + `CLUSTER-ASSISTANT.md` (908), `omlx/server.py` + `omlx/settings.py` mount (38), +185 i18n keys × 11 locales, +7 xcstrings entries | **≈63 070** (61 007 without the i18n/xcstring content), 132 files | 61 743 | No (feature) | The product feature. Needs a **discussion + design issue first**, then a staged PR series (measurement → election/plan → apply/start → tuning/run-local → UI). Depends on P1 (`local_only`) and P5. |
 
@@ -108,7 +109,7 @@ planner pricing the assistant needs lives in **open PR #5024**, not in F5 (see �
 |---|---|---|---:|---|
 | F1 | `local_only` model load | `engine_pool`, `admin/routes`, its tests | 85 | — |
 | F2 | Test infra | `tests/conftest.py` (MockTokenizer collision), `_tokenizer_support.py`, native-indexer skip, `.editorconfig`, `.gitignore`, `.python-version`. **Trimmable**: the two dotfiles are opinions upstream may decline; `test_settings.py`/`test_scheduler.py` belong to the feature PRs, not here. | 80 (tests) | — |
-| F4 | macOS helper / DMG | Helper plists + `main.swift`, `Scripts/*`, `PerformanceScreenVM`, `PythonRuntime`, `WelcomeWindow`, menubar, mac tests, **+7 xcstring entries** | ~880 (+ tests) | — |
+| F4 | **macOS fixes** | `ServerProcess` (fresh-install logs dir), `ThemeTests` (macOS 27 colour), `ModelSettingsScreenVMTests` (percent separator), `MenubarVisibilityWatcher` (XCTest probe) | 32 | — |
 | F5 | **Cluster-core extras** (not in #5024) | `discovery` +183/−18 (fallback carries name/chip/RAM), `model_inventory` +86/−7, `staging` +71/−7, `performance_worker` +55/−7, `discovery_routes` +21, `catalogue` +5/−3, its tests | ~200 logical (421 raw) | — |
 | 1 | **Assistant plans** | A1 measure (`measurement`, `state`, `calibration`, `models`, `/measure`, `/status`) + A2 recommend/plan (`recommendation`, `evaluation`, `election`, `policy`, `topology`, `/recommend`, `/plan`) + `search` + `DELETE /models/{node}/{model}` (the recommendation emits `free_disk_space`) + U1 (UI up to `planning`) + `CLUSTER-ASSISTANT.md` | ~5 600 | **#5024 (planner half), hard** |
 | 2 | **Assistant runs** | A3 apply/start/stop (`provisioning`, `start`, `operations`, `/apply`, `/start`, `/stop`, `/session`, `/operations/*`) + A4 tuning (`tuning`, `tuning_store`, `redeploy_tuning`, `performance_store`, `/tune*`) + `diagnostics` (only start emits it), `network-preflight`, `performance-probe`, the read-only peer check (folded F3) + U2 (apply/ready/stop/tuning) | ~4 900 | PR 1 |
@@ -137,7 +138,7 @@ context-vs-speed tradeoff and can free disk — it starts nothing.
 |---|---|---|---|---|
 | F1 | draft | — | — | re-cut on upstream/main; no conflict |
 | F2 | draft | — | — | trimmable; two dotfiles optional |
-| F4 | draft | — | — | app maintainers; cut the 7 xcstring entries only |
+| F4 | draft | — | — | four small macOS fixes; the helper/DMG productization is fork-only |
 | F5 | draft | — | — | cluster-core extras (discovery/inventory/staging/probe/catalogue) |
 | 1 | discuss | — | — | hard dependency on #5024's planner pricing |
 | 2 | discuss | — | — | after 1 |
@@ -189,7 +190,7 @@ integration base (§8.1). None is pushed yet.
 |---|---|---|---:|---|
 | `pr/f1-local-only` | `bda778e0` | 5 | +271/−22 | 244 passed |
 | `pr/f2-test-infra` | `c819ec74` | 3 | +74/−48 | 517 passed, 4 skipped; collection clean (19 969) |
-| `pr/f4-mac-helper-dmg` | `be025eee` | 28 | +2380/−22 | 32 + 81 macOS, 13 python |
+| `pr/f4-mac-fixes` | `fbde666e` | 4 | +32/−3 | 76 macOS |
 | `pr/f5-cluster-core` | `f62d50f0` | 11 | +888/−53 | 1614 cluster |
 | `pr/a0-cluster-base` (not offered) | `34b2fc6c` | 47 | +4471/−258 | 295 focused (F1+F2+F5+#5024+#5033) |
 | `pr/a1-assistant-plan` | `5b3cafae` | 62 | +22 884/−79 **vs a0** | 312 assistant + 473 web |
@@ -224,8 +225,13 @@ A fork PR can only be based on a branch in the **target** repo, so A1 cannot be
 - F3 (peer check) was **folded into A2** by decision: the script probes the
   assistant's operations/tuning routes, which only exist there. Its links to
   sibling cluster docs were removed so it stands alone inside A2.
-- F4 adds **7** xcstrings entries to upstream's catalogue (the 78 914-line diff
-  was a re-serialization of the same 1704 entries, not content).
+- F4 is now **fixes only**: four independent defects (`ServerProcess`,
+  `ThemeTests`, `ModelSettingsScreenVMTests`, `MenubarVisibilityWatcher`).
+  The helper/runtime-installer/DMG productization is **fork-only**
+  (`pr/f4-mac-productization`); its 7 xcstrings entries, the
+  `SMPrivilegedExecutables` entitlement and the Cluster Assistant menu entry stay
+  with it. The 78 914-line catalogue diff was never content — it was the same
+  1704 entries re-serialized.
 - F5 extracts exactly one line from `omlx/cluster/routes.py` (the inventory call
   must use `DEFAULT_REMOTE_PYTHON`, not the hardcoded `~/omlx-distributed` path).
 - A1 deliberately ends at the plan: the card has no start-setup button, no
@@ -240,7 +246,7 @@ A fork PR can only be based on a branch in the **target** repo, so A1 cannot be
 
 ```sh
 # phase 1 — fixes, in any order
-for b in pr/f1-local-only pr/f2-test-infra pr/f4-mac-helper-dmg; do
+for b in pr/f1-local-only pr/f2-test-infra pr/f4-mac-fixes; do
   git push origin "$b:$b"
 done
 # phase 2 — cluster core
