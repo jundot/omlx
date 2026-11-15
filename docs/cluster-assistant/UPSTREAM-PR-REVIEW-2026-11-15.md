@@ -566,3 +566,26 @@ Deleting it is the clean answer the seam test itself suggests.
 
 `make web` is a no-op on all three assistant branches. The full-suite pass is what
 surfaced R19–R21; the focused runs had not.
+
+## 15. R22 — the release DMG could not be notarized
+
+First notarized build (`0.8.0rc1`) was **rejected** by Apple:
+
+```
+status: Invalid — Archive contains critical validation errors
+oMLX.app/Contents/Resources/omlx/custom_kernels/{attention,sparse_index,quant_matmul}/_ext.cpython-312-darwin.so
+  The binary is not signed with a valid Developer ID certificate.
+  The signature does not include a secure timestamp.
+```
+
+Cause: `package_dmg.sh` signed the bundle with `codesign --deep`, which does not
+seal arbitrary Mach-O files under `Contents/Resources` — and the compiled custom
+kernels are exactly that. The signed-but-not-notarized dry run had hidden it.
+
+Fix (applied): sign every nested Mach-O file **inside-out** first
+(`find … -name '*.so' -o -name '*.dylib' -o -name '*.node' -o -perm -111`, keep
+only `Mach-O` per `file`), each with `--options runtime --timestamp`, then sign
+the bundle without `--deep`. The helper is still signed first.
+
+This belongs to the macOS feature PR (`Scripts/package_dmg.sh`); the same change
+must be mirrored there before it is offered.

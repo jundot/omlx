@@ -46,8 +46,35 @@ if [ -n "$SIGN_IDENTITY" ]; then
             --sign "$SIGN_IDENTITY" "$HELPER"
         codesign --verify --strict --verbose=2 "$HELPER"
     fi
+    # Sign nested Mach-O binaries inside-out first. `codesign --deep` on the
+    # bundle does not reliably seal arbitrary Mach-O files under
+    # Contents/Resources (the compiled custom kernels are exactly that), and an
+    # unsigned nested binary makes notarization fail with "not signed with a
+    # valid Developer ID certificate" + "signature does not include a secure
+    # timestamp".
+    echo "signing nested Mach-O binaries"
+    NESTED_LIST="$(mktemp "${TMPDIR:-/tmp}/omlx-nested.XXXXXX")"
+    find "$APP_PATH" -type f \
+        \( -name "*.so" -o -name "*.dylib" -o -name "*.node" -o -perm -111 \) \
+        -print0 > "$NESTED_LIST.0"
+    tr '\0' '\n' < "$NESTED_LIST.0" > "$NESTED_LIST"
+    rm -f "$NESTED_LIST.0"
+    NESTED_COUNT=0
+    while IFS= read -r binary; do
+        [ -n "$binary" ] || continue
+        case "$(file -b "$binary")" in
+            *Mach-O*)
+                codesign --force --options runtime --timestamp \
+                    --sign "$SIGN_IDENTITY" "$binary"
+                NESTED_COUNT=$((NESTED_COUNT + 1))
+                ;;
+        esac
+    done < "$NESTED_LIST"
+    rm -f "$NESTED_LIST"
+    echo "  signed $NESTED_COUNT nested binaries"
+
     echo "signing $APP_PATH"
-    codesign --force --deep --options runtime \
+    codesign --force --options runtime \
         --entitlements "$ROOT/apps/omlx-mac/Resources/oMLX.entitlements" \
         --sign "$SIGN_IDENTITY" "$APP_PATH"
     codesign --verify --deep --strict --verbose=2 "$APP_PATH"
