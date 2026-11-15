@@ -428,5 +428,3 @@ def stream_completion(
     if target:
         return remote_stream_observe(validate_ssh_target(target), port, body=body)
     return _local_stream_observe(port, body=body)
-
-

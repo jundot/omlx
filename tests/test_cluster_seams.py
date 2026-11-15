@@ -117,6 +117,13 @@ def test_no_unreachable_functions_in_the_cluster_package():
     """
 
     allowed_uncalled = {
+        ("deployment.py", "decode_worker_plan"),
+        # Shipped with the run slice (2/3): calibration and the seam wiring are
+        # called by the apply/start and tuning endpoints, which this slice does
+        # not contain yet.
+        ("measurement.py", "with_calibration"),
+        ("policy.py", "policy_model_settings"),
+        ("routes.py", "configure_assistant_seams"),
         # Maintainer-only real-collective regression gate. It deliberately is
         # not exposed in the GUI or production route surface.
         ("collective.py", "_run_local_minimax_decode_smoke"),

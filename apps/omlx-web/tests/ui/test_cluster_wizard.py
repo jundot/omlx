@@ -3960,5 +3960,3 @@ def test_assistant_card_is_mounted_independently_of_the_wizard_state():
     assert template.index("data-cluster-v2-assistant-section>") < template.index(
         "data-cluster-v2-plan>"
     )
-
-
