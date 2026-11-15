@@ -36,7 +36,8 @@ constant constexpr float NEG_MAX = -3.402823466e38f;
 # gqa*T rows of one KV head. Grid threadgroups (Hkv, B, BLOCKS).
 # Fragment layout of an 8x8 simdgroup matrix: lane holds row fm, columns
 # fn and fn+1; the four lanes of a row differ in lane bits 0 and 3.
-# params = [N, cap_k, cap_v, blocks] (int32). q is pre-scaled on the host.
+# params = [N, cap_k, cap_v, blocks] (int32). qscale[0] is the softmax
+# scale (fp32); it is applied to q in fp32 here, as stock SDPA does.
 _PASS1_SRC = """
     const int BLOCKS = params[3];
     constexpr int D = {head_dim};
@@ -76,8 +77,8 @@ _PASS1_SRC = """
     simdgroup_float8x8 o[ND];
     _Pragma("clang loop unroll(full)")
     for (int d8 = 0; d8 < ND; d8++) {{
-        qf[d8].thread_elements()[0] = row_ok ? static_cast<float>(qp[d8 * 8 + fn]) : 0.0f;
-        qf[d8].thread_elements()[1] = row_ok ? static_cast<float>(qp[d8 * 8 + fn + 1]) : 0.0f;
+        qf[d8].thread_elements()[0] = row_ok ? static_cast<float>(qp[d8 * 8 + fn]) * qscale[0] : 0.0f;
+        qf[d8].thread_elements()[1] = row_ok ? static_cast<float>(qp[d8 * 8 + fn + 1]) * qscale[0] : 0.0f;
         o[d8] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }}
     float m = NEG_MAX;
@@ -169,9 +170,9 @@ _PASS2_SRC = """
     const int o_off = threadgroup_position_in_grid.x * threadgroups_per_grid.y
         + threadgroup_position_in_grid.y;
     const int d = thread_position_in_threadgroup.x;
-    const device float* mp = maxs + (size_t)o_off * BLOCKS;
-    const device float* sp = sums + (size_t)o_off * BLOCKS;
-    const device float* pp = partials + (size_t)o_off * BLOCKS * D + d;
+    auto mp = maxs + (size_t)o_off * BLOCKS;
+    auto sp = sums + (size_t)o_off * BLOCKS;
+    auto pp = partials + (size_t)o_off * BLOCKS * D + d;
 
     float gmax = NEG_MAX;
     for (int i = 0; i < BLOCKS; i++) {{
@@ -196,7 +197,7 @@ def _pass1():
     if _kernel is None:
         _kernel = mx.fast.metal_kernel(
             name=f"omlx_mma_verify_sdpa_p1_d{_HEAD_DIM}",
-            input_names=["q", "k", "v", "params"],
+            input_names=["q", "k", "v", "params", "qscale"],
             output_names=["partials", "sums", "maxs"],
             header=_HEADER,
             source=_PASS1_SRC.format(head_dim=_HEAD_DIM),
@@ -209,6 +210,11 @@ def _params(n_keys: int, cap_k: int, cap_v: int, blocks: int):
     # Every layer of a forward shares these four ints: build the device
     # array once per (n_keys, ...) rather than once per layer.
     return mx.array([n_keys, cap_k, cap_v, blocks], dtype=mx.int32)
+
+
+@functools.lru_cache(maxsize=16)
+def _scale_array(scale: float):
+    return mx.array([scale], dtype=mx.float32)
 
 
 def _pass2():
@@ -239,12 +245,13 @@ def mma_verify_sdpa(queries, k_buf, v_buf, n_keys: int, scale: float):
     if gqa * T > _MAX_ROWS:
         raise ValueError(f"gqa * rows = {gqa * T} exceeds {_MAX_ROWS}")
     tiles = -(-gqa * T // 8)
-    q = queries * scale if scale != 1.0 else queries
+    q = queries
+    qscale = _scale_array(scale)
 
     blocks = max(1, min(_MAX_BLOCKS, -(-_TARGET_GROUPS // (hkv * B)), -(-n_keys // 16)))
     params = _params(n_keys, k_buf.shape[2], v_buf.shape[2], blocks)
     partials, sums, maxs = _pass1()(
-        inputs=[q, k_buf, v_buf, params],
+        inputs=[q, k_buf, v_buf, params, qscale],
         template=[("T", q.dtype), ("TR", T), ("G", gqa)],
         grid=(32 * hkv, tiles * B, blocks),
         threadgroup=(32, tiles, 1),
