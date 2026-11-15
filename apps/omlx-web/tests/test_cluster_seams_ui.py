@@ -21,12 +21,19 @@ _CLUSTER_URL = re.compile(
 
 def _registered_routes() -> set[str]:
     from omlx.cluster import routes
+    from omlx.cluster.assistant import routes as assistant_routes
 
-    return {
+    # The tab now drives both the existing cluster admin router and the
+    # Cluster Assistant router (measure/recommend/plan plus the free-space
+    # relay). A URL is real when either registers it, so keep this seam honest
+    # across both mounts.
+    registered = {
         re.sub(r"\{[^{}]+\}", "{parameter}", route.path)
-        for route in routes.router.routes
+        for router in (routes.router, assistant_routes.router)
+        for route in router.routes
         if getattr(route, "path", None)
     }
+    return registered
 
 
 def _js_called_paths() -> set[str]:
@@ -85,6 +92,10 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
         "/admin/api/cluster/link-status",
         "/admin/api/cluster/pairing-token",
         "/admin/api/cluster/peer-health",
+        # The assistant's measured-speed probe toggle is part of the run slice
+        # (PR 2/3); the route exists with the cluster core, the UI that calls it
+        # arrives with apply/start.
+        "/admin/api/cluster/performance-probe",
         "/admin/api/cluster/pipeline-smoke",
         "/admin/api/cluster/plan",
         "/admin/api/cluster/ssh-key",
