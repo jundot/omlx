@@ -637,6 +637,31 @@ cd apps/omlx-web
 python build_css.py
 ```
 
+### PyCharm: inspections only on source, never the whole tree
+
+A whole-project *Inspect Code* used to run for many minutes: `packaging/` (1.7 GB)
+and `build/` were indexed, and the profile enables ~128 inspections, including
+spell/grammar over 13k lines of docs, packaging/requirements resolution,
+`PyCompatibility`, external JS linters over vendored/minified assets and 74 legacy
+JS style rules that fire on the Alpine templates.
+
+Setup that works (`.idea` is gitignored, so re-create it per clone):
+
+- **Exclude** `packaging/`, `build/`, `omlx.egg-info/`, `apps/omlx-mac/build/`
+  (`.venv`, `__pycache__`, `.pytest_cache` usually already are).
+- **Custom scope `localDev`** (Settings → Appearance & Behavior → Scopes):
+  ```
+  file:omlx//*||file:tests//*||file:apps/omlx-web/omlx_web//*.py
+  ||file:apps/omlx-web/omlx_web/templates//*||file:apps/omlx-web/omlx_web/static/js/cluster_v2.js
+  ||file:apps/omlx-web/tests//*||file:apps/omlx-mac/Sources//*||file:apps/omlx-mac/Tests//*
+  ||file:scripts//*||file:Formula//*
+  ```
+- Then **Code → Inspect Code…** with scope `localDev` (PyCharm remembers it), and
+  run `ruff check` / `node --check` from the CLI for the rest.
+
+Not in the scope on purpose: `docs/**` (prose), `i18n/*.json` and
+`static/js/*.min.js` + `static/css/tailwind.css` (generated/vendored).
+
 Do not install packages globally with pip.
 
 ---
