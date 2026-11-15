@@ -131,21 +131,30 @@ def _matrix_kernel(qtype, gathered):
 
 
 @cache
-def _nax_kernel(qt, rows):
+def _nax_kernel(qt, rows, gathered=True):
     bm, bn, bk = (32, 64, 64) if rows == 32 else (64, 32, 128)
     block, size, name = FORMATS[qt]
     two = qt in (10, 13, 14)
     bk = min(block, bk)
+    select = (
+        """
+            const uint bi = threadgroup_position_in_grid.y;
+            if (bi >= uint(count[0])) return;
+            const uint start = meta[bi*3], expert = meta[bi*3+1], valid = meta[bi*3+2];
+        """
+        if gathered
+        else f"""
+            const uint start = threadgroup_position_in_grid.y * {bm};
+            const uint expert = 0, valid = min({bm}u, uint(M) - start);
+        """
+    )
     return mx.fast.metal_kernel(
-        name=f"v41_gguf_block_{name}_{bm}_{bn}_{bk}",
+        name=f"v41_gguf_block_{name}_{bm}_{bn}_{bk}" + ("" if gathered else "_dense"),
         input_names=["x", "w", "meta", "count"],
         output_names=["out"],
         header="#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
         + header(),
-        source=f"""
-            const uint bi = threadgroup_position_in_grid.y;
-            if (bi >= uint(count[0])) return;
-            const uint start = meta[bi*3], expert = meta[bi*3+1], valid = meta[bi*3+2];
+        source=select + f"""
             const uint tid = thread_index_in_threadgroup;
             const uint n0 = threadgroup_position_in_grid.x * {bn};
             threadgroup half ws[{bn * bk}], us[{bn * bk if two else 1}];
@@ -292,9 +301,13 @@ class GGUFProjection(nn.Module):
                     output_shapes=[shape],
                     output_dtypes=[x.dtype],
                 )[0]
-            if x.size // self.input_dims >= 64:
-                # One temporary projection, not a resident dequantized model.
-                # FP32 preserves GGUF scales/codes without another quantization.
+            if rows >= 64 and not (
+                x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+                and mx.default_device() != mx.cpu
+                and is_nax_available()
+            ):
+                # Non-NAX fallback: one temporary projection, with FP32
+                # preserving GGUF scales/codes without another quantization.
                 dense = dequantize(
                     self.weight,
                     self.qtype,
@@ -319,11 +332,15 @@ class GGUFProjection(nn.Module):
         ):
             if indices is not None and block_plan is None:
                 block_plan = prefill_plan(x, ids, self.num_experts)
-            meta, count, rows = block_plan if block_plan is not None else (ids, ids, 8)
+            meta, count, rows = (
+                block_plan
+                if block_plan is not None
+                else (ids, ids, 64 if ids.size >= 64 else 8)
+            )
             nax = rows >= 32
             cols = 64 if rows == 32 else 32
             kernel = (
-                _nax_kernel(self.qtype, rows)
+                _nax_kernel(self.qtype, rows, indices is not None)
                 if nax
                 else _matrix_kernel(self.qtype, indices is not None)
             )
@@ -337,7 +354,7 @@ class GGUFProjection(nn.Module):
                 ],
                 grid=(
                     (self.output_dims + cols - 1) // cols * 128,
-                    meta.shape[0] if indices is not None else (ids.size + 7) // 8,
+                    meta.shape[0] if indices is not None else (ids.size + rows - 1) // rows,
                     1,
                 ),
                 threadgroup=(128, 1, 1),

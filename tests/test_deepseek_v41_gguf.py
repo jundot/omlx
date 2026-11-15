@@ -340,6 +340,41 @@ def test_packed_nax_gather_matches_float64_dot(qtype, dtype, counts):
     np.testing.assert_array_equal(p.weight, raw)
 
 
+@pytest.mark.skipif(not is_nax_available(), reason="Requires NAX tensor units")
+@pytest.mark.parametrize("qtype", FORMATS)
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("shape", [(64,), (3, 43)])
+def test_packed_nax_dense_without_weight_materialization(qtype, dtype, shape, monkeypatch):
+    from omlx.patches.deepseek_v41 import gguf_quant as q
+
+    width = 544 if qtype == 8 else 512
+    raw, rng = packed(qtype, (35, width), 11200 + qtype)
+    block, size, _ = FORMATS[qtype]
+    blocks = raw.reshape(35, width // block, size)
+    offset = {10: 80, 14: 208}.get(qtype, 0)
+    scales = rng.choice(np.array([0, -0.007, 0.01, 2**-24], "<f2"), blocks.shape[:-1])
+    blocks[..., offset : offset + 2] = scales[..., None].view(np.uint8)
+    p = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=width)
+    dense = np.asarray(dequantize(p.weight, qtype, (35, width), mx.float32)).astype(
+        np.float64
+    )
+    x = mx.array(rng.normal(size=(*shape, width * 2)).astype(np.float32))[..., ::2]
+    x = x.astype(dtype)
+    inp = np.asarray(x.astype(mx.float32)).astype(np.float64)
+    reference = inp @ dense.T
+    magnitude = abs(inp) @ abs(dense.T)
+    monkeypatch.setattr(
+        q, "dequantize", lambda *a: pytest.fail("Dense weights must stay packed")
+    )
+    actual = p(x)
+    eps = {mx.float32: 2**-23, mx.float16: 2**-10, mx.bfloat16: 2**-7}[dtype]
+    tolerance = 8 * 2**-23 * magnitude + 0.5 * eps * abs(reference) + 2**-25
+    assert actual.dtype == dtype and actual.shape == (*shape, 35)
+    error = abs(np.asarray(actual.astype(mx.float32)) - reference)
+    assert np.all(error <= tolerance), np.max(error / tolerance)
+    np.testing.assert_array_equal(p.weight, raw)
+
+
 def test_gguf_prefill_plan_keeps_small_batches_and_non_nax_fallback(monkeypatch):
     from omlx.patches.deepseek_v41 import gguf_quant as q
 
@@ -360,6 +395,10 @@ def test_gguf_prefill_plan_keeps_small_batches_and_non_nax_fallback(monkeypatch)
     dense = np.asarray(dequantize(p.weight, 16, (4, 11, 256), mx.float32))
     expected = np.einsum("rk,rnk->rn", np.asarray(inp)[:, 0], dense[np.asarray(ids)])
     np.testing.assert_allclose(actual[:, 0], expected, atol=1e-3, rtol=1e-4)
+    shared = GGUFProjection(p.weight[0], qtype=16, input_dims=256)
+    np.testing.assert_allclose(
+        shared(inp), np.asarray(inp) @ dense[0].T, atol=1e-3, rtol=1e-4
+    )
 
 
 def test_gguf_fused_query_norm_keeps_unquantized_input():
