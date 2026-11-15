@@ -112,6 +112,24 @@ To see where an offloaded layer's time goes, start the server with `OMLX_MOE_OFF
 
 In decode, a slow read no longer leaves the GPU idle. The routing readback classifies the step's routes and the missing experts' reads are issued as before. If the first of them has not arrived 0.5 ms later, the step overlaps: the resident routes' `gather_qmm` is dispatched while the reads continue, a trivial kernel keeps the GPU busy until they finish, the missing routes are gathered once they are installed, and the layer's output is dispatched as soon as it is built. Each route is computed once, by the same kernel as the serial gather (`gather_qmm` is per-row), so the output is bit-identical. The resident gather is evaluated before the first slot write, because a write into an array a pending gather still references copies the whole array. The resident gather is only a fraction of a millisecond of GPU time, while a slow step waits a few milliseconds on its reads, and Apple GPUs lower their clock after a couple of milliseconds idle, which slows the next layer's work as well; keeping the GPU busy through the wait is what pays. Reads that arrive within 0.5 ms (page cache, fast internal storage) keep the serial order: an idle gap that short barely lowers the clock, and splitting the gather would cost more than it hides. Measured on `Qwen3.8-Flash-Next-oQ4e` (`qwen4_exp`, 48 layers wrapped), experts on a USB4 SSD, M4 Air 32 GB, greedy, output byte-identical with and without the overlap: 480 tokens after a 480-token warm-up at 18.8% residency, 3.56 tok/s serial and 5.03 with the overlap (two runs each, the drive's throttle stalls excluded); replaying two coding-agent sessions request by request (1.6k to 6k-token prompts with tool calls), 2.94 to 3.70 tok/s at 18.8% residency and 2.64 to 2.61 at 12.5%, where each decode step waits on about three misses and the reads set the pace. Time to first token is unchanged: prefill does not take this path.
 
+## Reading from more than one copy
+
+A missing expert is read from the checkpoint, so a decode step that misses waits on the disk the checkpoint is on. If a byte-identical copy of the checkpoint is on another disk, the reads can use both disks. List the other copies in `moe_expert_offload_mirrors` through the settings API:
+
+```json
+{"moe_expert_offload_enabled": true, "moe_expert_offload_mirrors": ["/Volumes/disk2/models/Qwen3.8-Flash-Next-oQ4e"]}
+```
+
+The model directory stays the first copy and the mirrors follow in the order given. Changing the list triggers an engine reload. The dashboard has no field for it, and model profiles do not carry it, because the paths belong to one machine.
+
+Every mirror must hold each `*.safetensors` shard of the model directory with the same size and the same safetensors header, which together fix every tensor's name, dtype, shape and byte range. A mirror that is missing a shard or differs in either is refused, both when the setting is saved and when the model loads. The tensor bytes themselves are not compared, so make a mirror with a copy that verifies them (`rsync --checksum`, or compare `shasum` output).
+
+Each read goes to the copy expected to finish it first. The estimate for a copy is the bytes already waiting on it plus the new read, divided by the throughput that copy has shown, measured as completed bytes over the time the copy had at least one read in flight. A copy with no reading yet gets one read as a probe, and further reads prefer measured copies until the probe returns. A reading expires after the copy has been idle for one second, so a disk that was slow for a while is tried again. A read that fails occupies its copy but adds no bytes to its throughput; the error reaches the request as it does without mirrors.
+
+With mirrors configured, the server logs a second line per finished request with the megabytes each copy served, model directory first: `MoE offload copies: request=<id> served_mb=[812.4, 640.1]`. The counters belong to the engine, like those of the first line.
+
+Mirrors apply to the adapters that read through the common checkpoint store: the common adapter, GLM-5.x and DeepSeek V4. DeepSeek V4.1 reads experts through its own storage and rejects the setting. Tables that move to SSD (Qwen4-Exp PLE, DeepSeek V4.1 Engram) are read from the model directory only. Expert reads go through the page cache, so a mirror only helps reads the page cache does not already hold.
+
 ## Supported models
 
 The experimental toggle is available for `deepseek_v41`, `deepseek_v4`, `qwen4_exp`, `qwen3_5_moe` (Qwen3.5/3.6), `gemma4` MoE, `olmoe`, `glm_moe_dsa`, and `glm5_next` checkpoints whose expert tensor layout passes validation. Dense Gemma models and other model types do not show the toggle. The settings API and model loader use the same eligibility check.

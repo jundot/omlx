@@ -407,6 +407,10 @@ class BatchedEngine(BaseEngine):
                     mtp_resident=bool(
                         getattr(self._model_settings, "mtp_enabled", False)
                     ),
+                    mirrors=getattr(
+                        self._model_settings, "moe_expert_offload_mirrors", None
+                    )
+                    or (),
                 ),
                 self._model,
                 self._model_name,

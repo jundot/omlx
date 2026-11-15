@@ -466,6 +466,7 @@ class ModelSettingsRequest(BaseModel):
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool | None = None
     moe_expert_offload_resident_fraction: float | None = None
+    moe_expert_offload_mirrors: list[str] | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -1131,6 +1132,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_skip_last"] = True
     settings["moe_expert_offload_enabled"] = False
     settings["moe_expert_offload_resident_fraction"] = 0.25
+    settings["moe_expert_offload_mirrors"] = None
     settings["specprefill_enabled"] = False
     settings["external_engine"] = None
     settings["dflash_enabled"] = False
@@ -1205,6 +1207,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_skip_last = True
     settings.moe_expert_offload_enabled = False
     settings.moe_expert_offload_resident_fraction = 0.25
+    settings.moe_expert_offload_mirrors = None
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -3368,6 +3371,10 @@ async def update_model_settings(
             if request.moe_expert_offload_resident_fraction is None
             else request.moe_expert_offload_resident_fraction
         )
+    if "moe_expert_offload_mirrors" in sent:
+        current_settings.moe_expert_offload_mirrors = (
+            request.moe_expert_offload_mirrors or None
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
@@ -3813,6 +3820,12 @@ def _validate_model_settings(entry, settings):
             supported, reason = moe_offload_compatibility(entry.model_path)
             if not supported:
                 raise ValueError(reason)
+            if settings.get("moe_expert_offload_mirrors"):
+                from ..patches.moe_offload_mirror import require_identical_mirrors
+
+                require_identical_mirrors(
+                    entry.model_path, settings["moe_expert_offload_mirrors"]
+                )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 

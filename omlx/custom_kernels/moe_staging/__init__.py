@@ -72,7 +72,14 @@ class Staging:
             return self
 
     def read(self, plan):
-        lease = self.pool.read(plan.fd, plan.offset, plan.nbytes)
+        if plan.copies is None:
+            lease = self.pool.read(plan.fd, plan.offset, plan.nbytes)
+        else:
+            # A read the pool declines returns None: the mirror router then
+            # counts no bytes for it, and the bytes path below routes again.
+            lease = plan.copies.read(
+                plan.nbytes, lambda fd: self.pool.read(fd, plan.offset, plan.nbytes)
+            )
         return (
             StagedRead(plan, lease) if lease is not None else self.original_read(plan)
         )

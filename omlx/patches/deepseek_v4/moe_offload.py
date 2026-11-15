@@ -32,6 +32,7 @@ unavailable.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from concurrent.futures import wait
 from pathlib import Path
 
@@ -327,6 +328,7 @@ def apply_deepseek_v4_moe_expert_offload(
     resident_fraction: float = 0.25,
     *,
     mtp_resident: bool = False,
+    mirrors: Sequence[str | Path] = (),
 ) -> int:
     """Wrap every covered DeepSeek V4 SwitchGLU; returns the number wrapped.
 
@@ -347,7 +349,7 @@ def apply_deepseek_v4_moe_expert_offload(
     if model_dir is None:
         return 0
     minimum = _minimum_experts(model_dir)
-    store = CheckpointExpertStore(model_dir)
+    store = CheckpointExpertStore(model_dir, mirrors)
     if not store:
         logger.warning(
             "deepseek_v4 moe expert offload: no safetensors under %s", model_dir

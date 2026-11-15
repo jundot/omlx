@@ -11857,6 +11857,13 @@ class Scheduler:
             request.num_prompt_tokens,
             request.num_output_tokens,
         )
+        if "copy_bytes" in now:
+            served = zip(now["copy_bytes"], start["copy_bytes"])
+            logger.info(
+                "MoE offload copies: request=%s served_mb=%s",
+                request.request_id,
+                [round((after - before) / 1e6, 1) for after, before in served],
+            )
         timeline = _moe_offload_timeline.flush()
         if timeline:
             logger.info("MoE offload timeline: %s", timeline)

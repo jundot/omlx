@@ -53,8 +53,21 @@ def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -
         or not 0 < fraction <= 1
     ):
         raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
+    mirrors = settings.get("moe_expert_offload_mirrors")
+    if mirrors is not None and (
+        not isinstance(mirrors, list)
+        or not all(isinstance(mirror, str) and mirror for mirror in mirrors)
+    ):
+        raise ValueError("moe_expert_offload_mirrors must be a list of directory paths")
     if not settings.get("moe_expert_offload_enabled"):
         return
+    # DeepSeek V4.1 reads experts through its own storage, not the store the
+    # mirrors are attached to.
+    if mirrors and (model_type or "").replace("-", "_").lower() == "deepseek_v41":
+        raise ValueError(
+            "moe_expert_offload_mirrors is not supported for deepseek_v41 "
+            "checkpoints; remove the mirrors first."
+        )
     # Offload slots live outside the module tree, so the recast leaves them bf16.
     if settings.get("activation_fp16_enabled"):
         raise ValueError(
@@ -354,6 +367,9 @@ class ModelSettings:
             models larger than memory; costs decode speed). Requires reload.
         moe_expert_offload_resident_fraction: Fraction of each layer's experts
             kept resident (0 < f <= 1, default 0.25).
+        moe_expert_offload_mirrors: Directories holding byte-identical copies
+            of the checkpoint on other disks. Expert reads are spread over the
+            model directory and these copies. Requires reload.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -513,6 +529,7 @@ class ModelSettings:
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool = False
     moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
+    moe_expert_offload_mirrors: Optional[list[str]] = None
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
