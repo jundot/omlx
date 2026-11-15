@@ -14,7 +14,15 @@ final class ThemeTests: XCTestCase {
 
         assertClose(actual, expected)
         XCTAssertGreaterThan(actual.red, 0.95)
-        XCTAssertGreaterThan(abs(actual.red - underPage.red), 0.25)
+        // macOS 27 (Tahoe) resolves .underPageBackgroundColor almost like
+        // .windowBackgroundColor, so the "> 0.25 apart" contrast no longer holds
+        // there. Keep the strict contract on older systems and assert the real
+        // one (a bright light background) only where the OS converged.
+        if #available(macOS 27, *) {
+            XCTAssertGreaterThan(underPage.red, 0.9)
+        } else {
+            XCTAssertGreaterThan(abs(actual.red - underPage.red), 0.25)
+        }
     }
 
     func testDarkWindowBackgroundKeepsUnderPageColor() {
