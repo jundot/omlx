@@ -657,6 +657,18 @@ uv run pytest tests/test_cluster_ui_integration.py
 uv run pytest apps/omlx-web/tests/test_cluster_ui_integration_ui.py
 ```
 
+Never run `apps/omlx-mac/Scripts/build.sh` + `package_dmg.sh` by hand: every run
+stages `Build/Products/*/oMLX.app` and `SlimStage/oMLX.app`, LaunchServices
+registers each one, and the user gets extra oMLX icons in Launchpad (measured
+three times). Use the wrapper, which cleans and deregisters before **and** after
+packaging and prints the DMG hash:
+
+```sh
+scripts/build-release-dmg.sh              # build + notarize + clean
+scripts/build-release-dmg.sh --install    # and install on this Mac
+scripts/cleanup-cluster-macs.sh --all     # wipe state on all four Macs (~9 s)
+```
+
 Web CSS after template changes:
 
 ```sh
