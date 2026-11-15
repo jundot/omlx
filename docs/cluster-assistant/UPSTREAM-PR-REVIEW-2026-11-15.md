@@ -20,15 +20,15 @@ before any branch is pushed.
 
 | Branch | Commit | Base | Files | +/− | Kind |
 |---|---|---|---:|---|---|
-| `pr/f1-local-only` | `bda778e0` | `upstream/main` | 5 | +271/−22 | fix |
-| `pr/f2-test-infra` | `c819ec74` | `upstream/main` | 3 | +74/−48 | fix (tests) |
-| `pr/f4-mac-fixes` | `fbde666e` | `upstream/main` | 4 | +32/−3 | fix |
-| `pr/f5-cluster-core` | `f62d50f0` | `upstream/main` | 11 | +888/−53 | fix/core |
-| `pr/feature-mac-helper-dmg` | `05e5dfe3` | `upstream/main` | 24 | +2348/−19 | feature (optional) |
-| `pr/a0-cluster-base` | `34b2fc6c` | `upstream/main` | 47 | +4471/−258 | local only, never offered |
-| `pr/a1-assistant-plan` | `5b3cafae` | a0 | 62 | +22 884/−79 | feature 1/3 |
-| `pr/a2-assistant-run` | `7e53f41b` | a1 | 83 | +23 315/−570 | feature 2/3 |
-| `pr/a3-run-local` | `417ef95d` | a2 | 13 | +4268/−16 | feature 3/3 |
+| `fix/local-only-load` | `bda778e0` | `upstream/main` | 5 | +271/−22 | fix |
+| `fix/test-infra-conftest` | `c819ec74` | `upstream/main` | 3 | +74/−48 | fix (tests) |
+| `fix/macos-theme-locale-xctest` | `fbde666e` | `upstream/main` | 4 | +32/−3 | fix |
+| `fix/cluster-discovery-inventory` | `f62d50f0` | `upstream/main` | 11 | +888/−53 | fix/core |
+| `feat/macos-helper-dmg` | `05e5dfe3` | `upstream/main` | 24 | +2348/−19 | feature (optional) |
+| `base/cluster-prereqs` | `34b2fc6c` | `upstream/main` | 47 | +4471/−258 | local only, never offered |
+| `feat/cluster-assistant-plan` | `5b3cafae` | a0 | 62 | +22 884/−79 | feature 1/3 |
+| `feat/cluster-assistant-run` | `7e53f41b` | a1 | 83 | +23 315/−570 | feature 2/3 |
+| `feat/cluster-assistant-run-local` | `417ef95d` | a2 | 13 | +4268/−16 | feature 3/3 |
 | upstream #5024 | `bbbf18d2` | `upstream/main` | 16 | +619/−16 | open, clean, CI green |
 | upstream #5033 | `25da70de` | `upstream/main` | 15 | +1689/−77 | open, clean, CI green |
 
@@ -50,12 +50,12 @@ worktree removal.
 | R6 | P1 | F5 | Private lab IPs (`172.16.1.x`) used as test fixtures | **fixed** |
 | R7 | P1 | F4 | ThemeTests fix weakens the assertion for all macOS versions | **fixed** |
 | R8 | P2 | all UI branches | PR template not satisfied (Validation, before/after screenshots, `make web`/`make app`) | bodies written; screenshots open |
-| R9 | P2 | A1, A2 | Still very large; A1 ships partial modules that A2 replaces (review churn) | open |
-| R10 | P2 | F1 | Two concerns in one PR (`local_only` + VLM fallback guard) | open |
+| R9 | P2 | A1, A2 | Still very large; A1 ships partial modules that A2 replaces (review churn) | **accepted, measured** |
+| R10 | P2 | F1 | Two concerns in one PR (`local_only` + VLM fallback guard) | **resolved: one concern** |
 | R11 | P2 | feature | Docs live in `docs/cluster-assistant/` and describe our fork workflow | **fixed** |
-| R12 | P2 | series | No plan B if maintainers decline #5024/#5033/F5 | open |
-| R13 | P2 | all | Branch names `pr/…` are unusual for upstream | open |
-| R14 | P2 | A1 | Single 22.9k-line commit; per-commit review is impossible | open |
+| R12 | P2 | series | No plan B if maintainers decline #5024/#5033/F5 | **discussion draft ready** |
+| R13 | P2 | all | Branch names `pr/…` are unusual for upstream | **fixed** (renamed) |
+| R14 | P2 | A1 | Single 22.9k-line commit; per-commit review is impossible | **fixed** (3 commits) |
 | R15 | P3 | process | Root cause of R1: `git add -A` on a foreign base whose `.gitignore` lacks our local rules | prevention applied (`info/exclude`); rest open |
 
 Verified **not** a problem (do not "fix" these):
@@ -82,13 +82,13 @@ Verified **not** a problem (do not "fix" these):
 **Evidence**
 
 ```
-git diff --name-only upstream/main..pr/a1-assistant-plan | grep '^\.'
+git diff --name-only upstream/main..feat/cluster-assistant-plan | grep '^\.'
 .live_prefill_driver.py
 .live_prefill_driver3.py
 .local-3rank-2026-11-13.md
 ```
 
-Same three files in `pr/a2-assistant-run` and `pr/a3-run-local`. Introduced by
+Same three files in `feat/cluster-assistant-run` and `feat/cluster-assistant-run-local`. Introduced by
 `34b2fc6c` (the a0 base) and inherited by all three assistant branches.
 
 `.local-3rank-2026-11-13.md` is **German** and states verbatim: *"Diese Datei ist
@@ -105,18 +105,18 @@ English-only product rule. Pushing this would be a disclosure, not just a blemis
 
 ```sh
 cd /tmp/pr-assistant
-git checkout pr/a1-assistant-plan
+git checkout feat/cluster-assistant-plan
 git rm -q .live_prefill_driver.py .live_prefill_driver3.py .local-3rank-2026-11-13.md
 git commit -q --amend --no-edit
-git checkout pr/a2-assistant-run && git rebase pr/a1-assistant-plan
-git checkout pr/a3-run-local     && git rebase pr/a2-assistant-run
+git checkout feat/cluster-assistant-run && git rebase feat/cluster-assistant-plan
+git checkout feat/cluster-assistant-run-local     && git rebase feat/cluster-assistant-run
 # a0 carries them too; rebuild or strip it the same way (it is never pushed)
 ```
 
 **Verify**
 
 ```sh
-for b in pr/a0-cluster-base pr/a1-assistant-plan pr/a2-assistant-run pr/a3-run-local; do
+for b in base/cluster-prereqs feat/cluster-assistant-plan feat/cluster-assistant-run feat/cluster-assistant-run-local; do
   git diff --name-only upstream/main..$b | grep '^\.' && echo "LEAK in $b"
 done
 uv run pytest tests/cluster_assistant -q          # per assistant branch
@@ -181,7 +181,7 @@ credibility of the whole series.
 
 ```sh
 cd /tmp/pr-f4
-git checkout pr/f4-mac-fixes
+git checkout fix/macos-theme-locale-xctest
 git checkout upstream/main -- apps/omlx-mac/Sources/Server/ServerProcess.swift
 git commit -q --amend -m "fix(macos): macOS 27 theme colour, locale percent separator, XCTest menubar probe"
 ```
@@ -199,7 +199,7 @@ F4 becomes **3 files, ~26 added lines**. Update `UPSTREAM-PACKAGES.md` (§2 P4-f
 
 ### R4 · Name drift: `_saved_engram_ssd_offload`
 
-**Evidence**: `pr/a2-assistant-run:tests/cluster_assistant/test_policy.py` lines
+**Evidence**: `feat/cluster-assistant-run:tests/cluster_assistant/test_policy.py` lines
 **383, 390, 397** call `cluster_routes._saved_engram_ssd_offload(...)`.
 
 Upstream #5033 renames the function to `_saved_ssd_offload`. The old name survives
@@ -240,7 +240,7 @@ sentences) or to reference the PR/issue number. Mechanical sweep:
 
 ```sh
 git grep -nE "PHASE-2B-RUN|PROJECT-BRIEF|CHAPTER-5|SCREEN-[0-9]|ROADMAP-TO-CHAPTER-10" \
-  pr/a1-assistant-plan -- omlx apps tests
+  feat/cluster-assistant-plan -- omlx apps tests
 ```
 
 Keep the design docs in the fork; do not ship them.
@@ -421,24 +421,45 @@ which is in any case waiting for #5024/#5033/F5 to merge.
 
 | Finding | What changed | New commit |
 |---|---|---|
-| R1 | The three scratch files removed from a0 and all three assistant branches (rebuilt + rebased); `.git/info/exclude` now ignores them for every worktree | a0 `23cc45b7`, A1 `5dec259f`, A2 `3fc4491e`, A3 `409a0dba` |
-| R3 | ServerProcess hunk dropped (upstream already calls `ensureDir`); F4 is now 3 files | `pr/f4-mac-fixes` `1c1674c2` |
+| R1 | The three scratch files removed from a0 and all three assistant branches (rebuilt + rebased); `.git/info/exclude` now ignores them for every worktree | a0 `23cc45b7`, A1 `9a335e40`, A2 `ede28463`, A3 `00f53315` |
+| R3 | ServerProcess hunk dropped (upstream already calls `ensureDir`); F4 is now 3 files | `fix/macos-theme-locale-xctest` `1c1674c2` |
 | R7 | ThemeTests keeps the strict `>0.25` contrast below macOS 27 and only relaxes on 27+ (`#available`) | same commit |
-| R4 | `_saved_ssd_offload` used in A2 and A3 (3 call sites each) | A2 `3fc4491e`, A3 `409a0dba` |
-| R5 | ~85 comment/docstring lines swept: file names replaced with self-contained noun phrases ("the live-run notes", "the design notes"), section markers dropped; `grep` for the old tokens returns nothing | A1 `5dec259f`, A2 `3fc4491e`, A3 `409a0dba` |
-| R6 | Lab addresses replaced with RFC 5737 ranges (`192.0.2.10/11/12`), semantics unchanged | `pr/f5-cluster-core` `ef0b09fd` |
-| R2 | Team id is `$(OMLX_TEAM_ID)`; the helper plists are rendered from the same marker at build time; the packaging test skips without a team and asserts the requirement structure | `pr/feature-mac-helper-dmg` `3248f848` |
+| R4 | `_saved_ssd_offload` used in A2 and A3 (3 call sites each) | A2 `ede28463`, A3 `00f53315` |
+| R5 | ~85 comment/docstring lines swept: file names replaced with self-contained noun phrases ("the live-run notes", "the design notes"), section markers dropped; `grep` for the old tokens returns nothing | A1 `9a335e40`, A2 `ede28463`, A3 `00f53315` |
+| R6 | Lab addresses replaced with RFC 5737 ranges (`192.0.2.10/11/12`), semantics unchanged | `fix/cluster-discovery-inventory` `ef0b09fd` |
+| R2 | Team id is `$(OMLX_TEAM_ID)`; the helper plists are rendered from the same marker at build time; the packaging test skips without a team and asserts the requirement structure | `feat/macos-helper-dmg` `3248f848` |
 | R11 | Docs moved to `docs/macos/`, team and host references neutralised | same commit |
 | R8 | PR bodies written from upstream's template, with real sizes and validation | `docs/cluster-assistant/PR-BODIES-2026-11-15.md` |
 
 Verification after the fixes:
 
-- `pr/a1-assistant-plan`: 312 assistant + 473 web, green. `pr/a2-assistant-run`: 615 + 547, green. `pr/a3-run-local`: 646 + 559, green.
-- `pr/f5-cluster-core`: 200 focused cluster tests green.
-- `pr/f4-mac-fixes`: 52 macOS tests green, `TEST SUCCEEDED`.
-- `pr/feature-mac-helper-dmg`: build succeeds with and without `OMLX_TEAM_ID`; 36 macOS tests green; `apps/omlx-mac/Tests/python` 29 passed / 2 skipped without a team, 31 passed with one; `git grep YB894QRG4W` returns nothing.
+- `feat/cluster-assistant-plan`: 312 assistant + 473 web, green. `feat/cluster-assistant-run`: 615 + 547, green. `feat/cluster-assistant-run-local`: 646 + 559, green.
+- `fix/cluster-discovery-inventory`: 200 focused cluster tests green.
+- `fix/macos-theme-locale-xctest`: 52 macOS tests green, `TEST SUCCEEDED`.
+- `feat/macos-helper-dmg`: build succeeds with and without `OMLX_TEAM_ID`; 36 macOS tests green; `apps/omlx-mac/Tests/python` 29 passed / 2 skipped without a team, 31 passed with one; `git grep YB894QRG4W` returns nothing.
 - Assistant chain parents verified: A1→a0, A2→A1, A3→A2; every branch still contains only its own slice.
 
 Test run after the fixes: combined `tests/` + `apps/omlx-web/tests` **20 981 passed, 0 failed**; macOS python 27 passed; `xcodebuild test … -testLanguage en` **TEST SUCCEEDED**; local end-to-end run on this Mac (measure → recommend → model-bound measure → plan → run-local → real completion → stop) succeeded — see `REBASE-2026-11-14.md`.
 
-Still open: R8 screenshots, R9 (further split), R10 (F1 concerns), R12 (plan B), R13 (branch names on push), R14 (A1 commit granularity).
+Resolved in this second pass:
+
+- **R13** — branches renamed to upstream-conventional names: `fix/local-only-load`,
+  `fix/test-infra-conftest`, `fix/macos-theme-locale-xctest`,
+  `fix/cluster-discovery-inventory`, `feat/macos-helper-dmg`,
+  `feat/cluster-assistant-plan`, `feat/cluster-assistant-run`,
+  `feat/cluster-assistant-run-local`; the local base is `base/cluster-prereqs`.
+- **R14** — A1 is now three commits (backend 15 files / 9 862 lines, card 24 files,
+  tests 23 files); the tip tree is byte-identical to the single-commit version
+  (verified by tree hash), so the test evidence still holds.
+- **R10** — measured and resolved: the whole F1 diff is the `local_only` path. The
+  VLM/`force_lm` code the subagent flagged is the *test vehicle* for the measured
+  Qwen3.8 failure, not a second concern. No split.
+- **R9** — measured: A2 changes the five shared modules with **+6 301 / −309**
+  lines, i.e. about 5 % of that is replaced code; the rest is A2's own new code.
+  A further split would double the stack depth for little review gain, so the
+  3-commit A1 plus this measurement is the answer unless maintainers ask.
+- **R12** — `DISCUSSION-PROPOSAL-2026-11-15.md` is ready to post: appetite
+  question, scope, and what happens if only the five fixes are taken.
+
+Only R8 (UI screenshots) is still blocked: it needs a real browser session and
+must be done by a person.

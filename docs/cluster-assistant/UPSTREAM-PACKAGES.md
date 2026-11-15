@@ -196,22 +196,22 @@ integration base (§8.1). None is pushed yet.
 
 | Branch | Commit | Files | +/− | LOC (code / tests / i18n / docs) | What it does | Tests |
 |---|---|---:|---|---|---|---|
-| `pr/f1-local-only` | `bda778e0` | 5 | +271/−22 | 107 / 164 / – / – | `POST /api/models/{id}/load?local_only=true`: a single-Mac load ignores a registry cluster deployment instead of silently launching ranks; also stops rewriting the cluster's verdict into an mlx-lm load error. | 244 passed |
-| `pr/f2-test-infra` | `c819ec74` | 3 | +74/−48 | 0 / 74 / – / – | Root `conftest` no longer defines a second module named `conftest`; the shared `MockTokenizer` moves to `tests/_tokenizer_support.py` (re-exported, so call sites keep working); the native-indexer test skips when the kernel is absent. | 517 passed, 4 skipped; collection clean (19 969) |
-| `pr/f4-mac-fixes` | `1c1674c2` | 3 | +29/−3 | 10 / 19 / – / – | Three independent defects: macOS 27 underPage colour breaks the theme assertion (strict check kept below 27); localized percent labels use U+202F/U+00A0; the menubar probe runs inside the XCTest host and raises a Full Disk Access dialog. | 52 macOS |
-| `pr/f5-cluster-core` | `ef0b09fd` | 11 | +888/−53 | 422 / 466 / – / – | Discovery identity fallback carries name/chip/RAM; inventory reports the MTP fact and can read a peer layout; staging gains the free-space path; the performance probe becomes bandwidth-bound; catalogue doc fix. | 1614 cluster |
-| `pr/feature-mac-helper-dmg` (feature, optional) | `3248f848` | 24 | +2472/−19 | 1124 / 496 / 84 / 644 | **Product feature, not a fix:** SMJobBless helper raises the Metal wired limit behind one admin dialog; first-run runtime installer (bundled `uv` + lock); slim DMG carrying helper+installer; Performance "Apply with Admin…"; Cluster Assistant menubar entry that deep-links the existing dashboard Cluster tab. | 68 macOS |
-| `pr/a0-cluster-base` (**local only, never offered**) | `23cc45b7` | 44 | +4047/−258 | 2283 / 1948 / – / 240 | Integration base = `upstream/main` + F1 + F2 + F5 + #5024 + #5033. Exists because a fork PR cannot be based on another fork branch at GitHub; the assistant branches sit on it so they contain only assistant content. Becomes plain `upstream/main` once the prerequisites merge. | 295 focused |
-| `pr/a1-assistant-plan` | `5dec259f` | 62 | +22 884/−79 (vs a0) | 11 909 / 10 172 / 693 / 110 | **Measure** each Mac's real admission and inventory; **recommend** a model + context (incl. the single-node answer); **plan** the fewest Macs, rank order, resource policy and the context-vs-experts tradeoff with a signature; plus the free-space delete route a recommendation can ask for. UI stops at the plan (no start button). | 312 assistant + 473 web |
-| `pr/a2-assistant-run` | `3fc4491e` | 83 | +23 315/−570 (vs a1) | 10 815 / 11 647 / 715 / 138 | **Apply** (stage to the selected Macs, write the approved policy), **start** the supervisor on the elected coordinator, report the endpoint only when ready, **stop** and resume after reload, **tune** (+ redeploy + saved preset), diagnostics, network preflight, performance probe, search, and the read-only peer check. Adds the progress rows and the chat handoff. | 615 assistant + 547 web |
-| `pr/a3-run-local` | `409a0dba` | 13 | +4268/−16 (vs a2) | 2231 / 2019 / – / 18 | **Run a model on this Mac** when it fits one: load through the local engine pool with a readiness canary, and **tune locally** (sampler sweep + MTP on/off) with preset replay. Adds the "Run on this Mac" card. | 646 assistant + 559 web |
+| `fix/local-only-load` | `bda778e0` | 5 | +271/−22 | 107 / 164 / – / – | `POST /api/models/{id}/load?local_only=true`: a single-Mac load ignores a registry cluster deployment instead of silently launching ranks; also stops rewriting the cluster's verdict into an mlx-lm load error. | 244 passed |
+| `fix/test-infra-conftest` | `c819ec74` | 3 | +74/−48 | 0 / 74 / – / – | Root `conftest` no longer defines a second module named `conftest`; the shared `MockTokenizer` moves to `tests/_tokenizer_support.py` (re-exported, so call sites keep working); the native-indexer test skips when the kernel is absent. | 517 passed, 4 skipped; collection clean (19 969) |
+| `fix/macos-theme-locale-xctest` | `1c1674c2` | 3 | +29/−3 | 10 / 19 / – / – | Three independent defects: macOS 27 underPage colour breaks the theme assertion (strict check kept below 27); localized percent labels use U+202F/U+00A0; the menubar probe runs inside the XCTest host and raises a Full Disk Access dialog. | 52 macOS |
+| `fix/cluster-discovery-inventory` | `ef0b09fd` | 11 | +888/−53 | 422 / 466 / – / – | Discovery identity fallback carries name/chip/RAM; inventory reports the MTP fact and can read a peer layout; staging gains the free-space path; the performance probe becomes bandwidth-bound; catalogue doc fix. | 1614 cluster |
+| `feat/macos-helper-dmg` (feature, optional) | `3248f848` | 24 | +2472/−19 | 1124 / 496 / 84 / 644 | **Product feature, not a fix:** SMJobBless helper raises the Metal wired limit behind one admin dialog; first-run runtime installer (bundled `uv` + lock); slim DMG carrying helper+installer; Performance "Apply with Admin…"; Cluster Assistant menubar entry that deep-links the existing dashboard Cluster tab. | 68 macOS |
+| `base/cluster-prereqs` (**local only, never offered**) | `23cc45b7` | 44 | +4047/−258 | 2283 / 1948 / – / 240 | Integration base = `upstream/main` + F1 + F2 + F5 + #5024 + #5033. Exists because a fork PR cannot be based on another fork branch at GitHub; the assistant branches sit on it so they contain only assistant content. Becomes plain `upstream/main` once the prerequisites merge. | 295 focused |
+| `feat/cluster-assistant-plan` | `9a335e40` | 62 | +22 884/−79 (vs a0) | 11 909 / 10 172 / 693 / 110 | **Measure** each Mac's real admission and inventory; **recommend** a model + context (incl. the single-node answer); **plan** the fewest Macs, rank order, resource policy and the context-vs-experts tradeoff with a signature; plus the free-space delete route a recommendation can ask for. UI stops at the plan (no start button). | 312 assistant + 473 web |
+| `feat/cluster-assistant-run` | `ede28463` | 83 | +23 315/−570 (vs a1) | 10 815 / 11 647 / 715 / 138 | **Apply** (stage to the selected Macs, write the approved policy), **start** the supervisor on the elected coordinator, report the endpoint only when ready, **stop** and resume after reload, **tune** (+ redeploy + saved preset), diagnostics, network preflight, performance probe, search, and the read-only peer check. Adds the progress rows and the chat handoff. | 615 assistant + 547 web |
+| `feat/cluster-assistant-run-local` | `00f53315` | 13 | +4268/−16 (vs a2) | 2231 / 2019 / – / 18 | **Run a model on this Mac** when it fits one: load through the local engine pool with a readiness canary, and **tune locally** (sampler sweep + MTP on/off) with preset replay. Adds the "Run on this Mac" card. | 646 assistant + 559 web |
 
 ### 8.1 Why the assistant series has a local base
 
 A fork PR can only be based on a branch in the **target** repo, so A1 cannot be
 "based on A0" at GitHub. Instead:
 
-- `pr/a0-cluster-base` exists only locally: `upstream/main` + F1 + F2 + F5 +
+- `base/cluster-prereqs` exists only locally: `upstream/main` + F1 + F2 + F5 +
   #5024 + #5033, i.e. **all prerequisites** in one mergeable state. It is what
   the assistant needs to import and run today.
 - A1/A2/A3 are stacked on it and contain **only assistant content** (verified:
@@ -219,7 +219,7 @@ A fork PR can only be based on a branch in the **target** repo, so A1 cannot be
   `apps/omlx-web/**`, `CLUSTER-ASSISTANT.md`, `omlx/server.py`, `omlx/settings.py`
   and two assistant tests). No prerequisite code is duplicated or reverted.
 - So they are opened **after** F5 + #5024 + #5033 land (the phased decision), at
-  which point `pr/a0-cluster-base` is simply `upstream/main` and A1 rebases onto
+  which point `base/cluster-prereqs` is simply `upstream/main` and A1 rebases onto
   it unchanged in size. Opening them today would duplicate ~4.5k prerequisite
   lines in the PR diff.
 
@@ -234,8 +234,8 @@ A fork PR can only be based on a branch in the **target** repo, so A1 cannot be
 - F3 (peer check) was **folded into A2** by decision: the script probes the
   assistant's operations/tuning routes, which only exist there. Its links to
   sibling cluster docs were removed so it stands alone inside A2.
-- The macOS work is **split**: `pr/f4-mac-fixes` holds the three independent
-  defects and is the PR to lead with; `pr/feature-mac-helper-dmg` holds the
+- The macOS work is **split**: `fix/macos-theme-locale-xctest` holds the three independent
+  defects and is the PR to lead with; `feat/macos-helper-dmg` holds the
   helper/runtime-installer/DMG/UI feature (7 xcstrings entries,
   `SMPrivilegedExecutables`, Cluster Assistant menu entry) and is offered
   separately as a **feature**, never as a fix. The feature branch does not
@@ -255,25 +255,25 @@ A fork PR can only be based on a branch in the **target** repo, so A1 cannot be
 
 ```sh
 # phase 1 — fixes, in any order
-for b in pr/f1-local-only pr/f2-test-infra pr/f4-mac-fixes; do
+for b in fix/local-only-load fix/test-infra-conftest fix/macos-theme-locale-xctest; do
   git push origin "$b:$b"
 done
 # phase 2 — cluster core
-git push origin pr/f5-cluster-core:pr/f5-cluster-core
+git push origin fix/cluster-discovery-inventory:fix/cluster-discovery-inventory
 # phase 3 (after F5, #5024, #5033 are merged) — rebase then push
-git rebase --onto origin/main pr/a0-cluster-base pr/a1-assistant-plan
-git push origin pr/a1-assistant-plan:pr/a1-assistant-plan
+git rebase --onto origin/main base/cluster-prereqs feat/cluster-assistant-plan
+git push origin feat/cluster-assistant-plan:feat/cluster-assistant-plan
 # then A2, A3 the same way (A2's base becomes A1, A3's base becomes A2;
 # open all three as drafts and merge bottom-up)
 ```
 
 ## 9. Final PR count
 
-- **7 new PRs**: F1, F2, F4 (macOS fixes), F5, A1, A2 (includes the folded peer check), A3; plus **1 optional feature PR** (`pr/feature-mac-helper-dmg`).
+- **7 new PRs**: F1, F2, F4 (macOS fixes), F5, A1, A2 (includes the folded peer check), A3; plus **1 optional feature PR** (`feat/macos-helper-dmg`).
 - **2 existing PRs, both handled**:
   - **#5024** — rebased onto `624cff0e`, pushed (`bbbf18d2`), **both halves**
     mirrored on our branch (pricing in the rebase, runtime in `392aaccb`).
   - **#5033** — rebased onto `624cff0e`, pushed (`25da70de`), applied on our
     branch (`054f92e4`).
 - Total tracks: **9** (7 new + 2 existing), plus the non-offered local base
-  `pr/a0-cluster-base`.
+  `base/cluster-prereqs`.
