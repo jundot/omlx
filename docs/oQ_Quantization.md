@@ -42,8 +42,9 @@ Both use the same bit plan and produce models of the same size and speed. The di
 
 - For each group it searches for the scale and offset that give the smallest importance-weighted error.
 - It then refits the scale and offset by weighted least squares, repeating a few times, and keeps the refit only when it lowers the error.
+- After the model is written, it runs the sample prompts through the original model again, one layer at a time, and re-picks the rounded values of every group. The imatrix looks at each input channel on its own, but channels that move together can cancel each other's rounding errors. oQe moves a few percent of the values to the neighbouring level wherever that lowers the error of the layer's output. Scales and offsets stay as they are, so the model loads anywhere a plain oQe model loads.
 
-oQe takes longer to make, but the extra work happens only once. On an M3 Ultra, Qwen3.5-9B takes about 2.5 minutes for the first oQe run and about 1 minute after that, and Qwen3.6-35B-A3B about 5 and 2.5 minutes.
+oQe takes longer to make, but the extra work happens only once. On an M3 Ultra, Qwen3.5-9B takes about 7 minutes for the first oQe run and about 5.5 minutes after that, and Qwen3.6-35B-A3B about 10 and 7 minutes. The output-error step reads the original model again for every build, so it is not cached. If the model does not fit in memory, only the model types that oQe can stream one layer at a time get this step. The others, and DeepSeek V4.1, Muse Spark and Inkling 2, skip it and keep the plain oQe values. `oq_imatrix_report.json` in the output records whether it ran.
 
 The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix` inside your model directory. Making another level of the same model, for example oQ3e after oQ4e, reuses it.
 
@@ -53,7 +54,8 @@ The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix`
 2. **Measures layer sensitivity.** It runs built-in calibration prompts through the model and compares each layer's quantized output with the original.
 3. **Plans the bits.** It gives extra bits to the most sensitive tensors until the level's size budget is used.
 4. **Collects the imatrix** (oQe only).
-5. **Quantizes and saves** each tensor, then writes the config, tokenizer and chat template next to the weights.
+5. **Quantizes and saves** each tensor.
+6. **Re-picks the rounded values against each layer's output error** (oQe only), then writes the config, tokenizer and chat template next to the weights.
 
 ### What gets protected
 
@@ -73,6 +75,7 @@ Both data sets ship with oMLX, so nothing is downloaded.
 
 - **Sensitivity:** 600 samples of code, English, Korean, Chinese and Japanese text, tool calling and reasoning. oQ uses 128 sequences of 256 tokens.
 - **oQe imatrix:** about 2,700 samples covering tool calling, chat, reasoning, code and English, Korean, Chinese and Japanese text. oQe uses 128 sequences of 512 tokens. For MoE models it keeps sampling, up to 1,024 sequences, until every expert has seen enough tokens.
+- **oQe rounding refinement:** 176 sequences of 512 tokens from the imatrix data, plus 16 sequences each of German, French and Spanish Wikipedia articles and 16 more code sequences, 240 in total. Without the European text the refinement learned channel patterns that did not hold for those languages.
 
 Sample selection uses a fixed seed, so repeated runs on the same model see the same calibration text.
 
@@ -147,4 +150,4 @@ Muse Spark Open NVFP4 checkpoints keep their NVFP4 routed experts unchanged at o
 
 ## Acknowledgments
 
-The importance matrix follows the imatrix approach used by llama.cpp. The least-squares refit was prompted by the 3-bit quantizer in @tacos8me's m5-ultra project.
+The importance matrix follows the imatrix approach used by llama.cpp. The least-squares refit was prompted by the 3-bit quantizer in @tacos8me's m5-ultra project. The rounding refinement follows the Flip-Refinement step of MACaQ (Huawei Computing Systems Lab, arXiv 2611.10649).

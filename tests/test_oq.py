@@ -79,6 +79,10 @@ from omlx.oq import (
     _TrackedTensor,
     _validate_oq_dtype_for_model,
     _uses_minimax_mxfp8_scale_inv_source,
+    _OQGramCollector,
+    _OQRefineWriter,
+    _refine_affine_codes,
+    _shrunk_gram,
     _weighted_lsq_refit,
     _weighted_lsq_refit_metal,
     estimate_bpw_and_size,
@@ -3144,6 +3148,90 @@ class TestQuantizeChunked:
         same = (out[0] == ref[0]) & (out[1] == ref[1])
         assert mx.mean(same.astype(mx.float32)).item() > 0.98
         assert abs(mx.sum(out_err).item() / mx.sum(ref_err).item() - 1) < 1e-4
+
+    @pytest.mark.skipif(
+        not HAS_MLX or not mx.metal.is_available(), reason="Metal not available"
+    )
+    @pytest.mark.parametrize("shape", [(48, 256), (3, 16, 128)])
+    def test_code_refinement_lowers_hessian_error(self, shape):
+        mx.random.seed(2)
+        w = mx.random.normal(shape).astype(mx.bfloat16)
+        mixing = mx.random.normal((shape[-1], shape[-1]))
+        x = mx.random.normal((512, shape[-1])) @ mixing
+        gram = mx.broadcast_to(x.T @ x, (*shape[:-2], shape[-1], shape[-1]))
+        hessian = _shrunk_gram(gram)
+        packed, scales, biases = mx.quantize(w, group_size=64, bits=3)
+
+        out = _refine_affine_codes(w, packed, scales, biases, hessian, 3, 64)
+
+        def hessian_error(p):
+            err = mx.dequantize(p, scales, biases, group_size=64, bits=3) - w
+            err = err.astype(mx.float32).reshape(-1, *shape[-2:])
+            return mx.sum((err @ hessian) * err).item()
+
+        assert out is not None
+        new_packed, before, after = out
+        assert after < before
+        assert hessian_error(new_packed) < hessian_error(packed)
+
+    @pytest.mark.skipif(
+        not HAS_MLX or not mx.metal.is_available(), reason="Metal not available"
+    )
+    def test_gram_collector_builds_per_expert_grams_in_chunks(self, monkeypatch):
+        monkeypatch.setattr("omlx.oq._OQE_REFINE_EXPERT_BYTES", 3 * 20 * 16 * 4)
+        module = nn.Module()
+        module.weight = mx.zeros((6, 8, 16))
+        routes = mx.random.randint(0, 6, (2, 10, 2))
+        shared = mx.random.normal((2, 10, 1, 1, 16))
+        per_route = mx.random.normal((2, 10, 2, 1, 16))
+        collector = _OQGramCollector()
+        collector.collect_switch("experts", module, shared, routes)
+        collector.collect_switch("experts", module, per_route, routes + 0)
+
+        ranges = list(collector.expert_ranges("experts", 6, 16))
+        grams = [collector.switch_gram("experts", a, b) for a, b in ranges]
+
+        def bf16_rows(x):
+            return np.array(x.astype(mx.bfloat16).astype(mx.float32)).reshape(-1, 16)
+
+        rows = np.concatenate(
+            [np.repeat(bf16_rows(shared), 2, axis=0), bf16_rows(per_route)]
+        )
+        experts = np.tile(np.array(routes).reshape(-1), 2)
+        ref = np.stack([rows[experts == e].T @ rows[experts == e] for e in range(6)])
+        assert len(ranges) > 1
+        assert ranges[0][0] == 0 and ranges[-1][1] == 6
+        np.testing.assert_allclose(
+            np.array(mx.concatenate(grams)), ref, rtol=1e-4, atol=1e-4
+        )
+
+    def test_refine_writer_rewrites_a_shard_after_its_last_layer(self, tmp_path):
+        w = mx.random.normal((8, 64))
+        packed, scales, biases = mx.quantize(w, group_size=64, bits=4)
+        tensors = {"model.norm.weight": mx.ones((64,))}
+        parts = {"weight": packed, "scales": scales, "biases": biases}
+        for layer in (0, 1):
+            for part, value in parts.items():
+                tensors[f"model.layers.{layer}.mlp.down_proj.{part}"] = value
+        path = tmp_path / "model.safetensors"
+        mx.save_safetensors(str(path), tensors)
+        quantization = {"bits": 4, "group_size": 64, "mode": "affine"}
+        writer = _OQRefineWriter(
+            tmp_path, {k: path.name for k in tensors}, quantization
+        )
+        refined = mx.zeros_like(packed)
+
+        writer.write("model.layers.0.mlp.down_proj", refined)
+        writer.layer_done(0)
+        early = mx.load(str(path))["model.layers.0.mlp.down_proj.weight"]
+        writer.layer_done(1)
+        out = mx.load(str(path))
+
+        assert mx.array_equal(early, packed)
+        assert mx.array_equal(out["model.layers.0.mlp.down_proj.weight"], refined)
+        assert mx.array_equal(out["model.layers.0.mlp.down_proj.scales"], scales)
+        assert mx.array_equal(out["model.layers.1.mlp.down_proj.weight"], packed)
+        assert mx.array_equal(out["model.norm.weight"], tensors["model.norm.weight"])
 
     def test_weighted_3d_expert_importance_chunked(self, monkeypatch):
         monkeypatch.setattr("omlx.oq._QUANTIZE_CHUNK_BYTES", 128)
