@@ -26,6 +26,29 @@ _MIN_ROWS = 3
 _MAX_ROWS = 8
 _HEAD_DIM = 128
 _DTYPES = (mx.bfloat16, mx.float16)
+_engaged = 0
+
+
+def engaged_count() -> int:
+    """Calls this process served with the MMA kernel (0 means stock only)."""
+    return _engaged
+
+
+def _probe_ok() -> bool:
+    """Run the kernel once on a tiny block and evaluate it.
+
+    ``metal_kernel`` compiles and launches lazily, at ``mx.eval``, so only an
+    eval here can show that Metal accepts the kernel on this machine.
+    """
+    try:
+        d = _HEAD_DIM
+        q = mx.zeros((1, 1, _MIN_ROWS, d), dtype=mx.bfloat16)
+        kv = mx.zeros((1, 1, 16, d), dtype=mx.bfloat16)
+        mx.eval(_kernel.mma_verify_sdpa(q, kv, kv, 16, 1.0))
+        return True
+    except Exception:
+        logger.warning("MMA verify kernel probe failed; verify SDPA stays stock", exc_info=True)
+        return False
 
 
 def route_ok(queries, keys, values, cache, mask, sinks) -> bool:
@@ -72,15 +95,23 @@ def apply() -> bool:
     original = mlx_base.scaled_dot_product_attention
     if getattr(original, "_omlx_verify_mma", False):
         return True
+    if not _probe_ok():
+        return False
 
     def patched(queries, keys, values, cache, scale, mask, sinks=None):
         if route_ok(queries, keys, values, cache, mask, sinks):
-            try:
-                return _kernel.mma_verify_sdpa(
-                    queries, cache.keys, cache.values, keys.shape[2], scale
+            global _engaged
+            out = _kernel.mma_verify_sdpa(
+                queries, cache.keys, cache.values, keys.shape[2], scale
+            )
+            if _engaged == 0:
+                logger.info(
+                    "MMA verify attention engaged (rows=%d, keys=%d, plain KVCache)",
+                    queries.shape[2],
+                    keys.shape[2],
                 )
-            except Exception:
-                logger.warning("MMA verify kernel failed; using stock SDPA", exc_info=True)
+            _engaged += 1
+            return out
         return original(queries, keys, values, cache, scale, mask, sinks)
 
     patched._omlx_verify_mma = True

@@ -45,6 +45,7 @@ def patched(monkeypatch):
 
     monkeypatch.setattr(vmk, "mma_verify_sdpa", spy)
     assert vma.apply() is True
+    calls.clear()  # drop apply()'s probe call
     vq.set_verify_qmm_armed(True)  # the MTP verify forward arms this flag
     yield calls
     vq.set_verify_qmm_armed(False)
@@ -153,3 +154,36 @@ def test_mtp_patch_installs_the_hook():
     finally:
         for mod, original in saved.values():
             mod.scaled_dot_product_attention = original
+
+
+def test_apply_leaves_the_hook_off_when_the_kernel_cannot_run(monkeypatch):
+    # metal_kernel compiles and launches lazily, at mx.eval: a try/except around
+    # the call in the hook cannot see a Metal failure. apply() probes once.
+    saved = _save_hooks()
+    stock = mlx_base.scaled_dot_product_attention
+    monkeypatch.setattr(vma, "_probe_ok", lambda: False)
+    try:
+        assert vma.apply() is False
+        assert mlx_base.scaled_dot_product_attention is stock
+    finally:
+        for mod, original in saved.values():
+            mod.scaled_dot_product_attention = original
+
+
+def test_probe_runs_the_kernel_for_real():
+    assert vma._probe_ok() is True
+
+
+def test_engaged_counter_and_log_prove_the_route(patched, caplog):
+    import logging
+
+    before = vma.engaged_count()
+    cache = _filled_cache()
+    q, bk, bv = _verify_block(cache, 4)
+    with caplog.at_level(logging.INFO, logger=vma.logger.name):
+        mlx_base.scaled_dot_product_attention(q, bk, bv, cache, D**-0.5, "causal")
+    assert vma.engaged_count() == before + 1
+    # a call that stays on stock does not count
+    q1, bk1, bv1 = _verify_block(cache, 1)
+    mlx_base.scaled_dot_product_attention(q1, bk1, bv1, cache, D**-0.5, "causal")
+    assert vma.engaged_count() == before + 1
