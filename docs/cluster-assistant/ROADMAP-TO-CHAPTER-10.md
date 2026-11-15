@@ -163,6 +163,7 @@ Priorities: **P0** blocks the gate, **P1** closes a recorded capability gap,
 | **D1** | Stale docs: §22 still “open”, AGENTS “observed stays null”, Screen-5 “Screen 6 later”, “three chapters” | audit | **closed 2026-11-07** | E |
 | **D2** | Product decisions: name, fork/pin, RDMA default, default context/model, helper timing, telemetry | AGENTS §10 / Brief §22 | **closed 2026-11-07** | E |
 | **U1** | PR #5024/#5033 waiting on upstream | UPSTREAM.md | dependency | E |
+| **R26** | **In-app uninstall** with explicit keep options (models, cluster pairing/identity, settings, diagnostics) — a button, not a shell script; the script is only for CI/lab | user request 2026-11-15 | **P1** | F |
 | **F1** | macOS app/menu/tray, signed helper, auto-update, network setup | Phase 4/5 | **P2** | F |
 | **F2** | Tensor parallelism, >4 Macs, HA, multi-tenancy | out of scope | **P2** | F |
 

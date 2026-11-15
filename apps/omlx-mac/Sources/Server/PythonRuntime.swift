@@ -51,6 +51,13 @@ struct PythonRuntime {
         }
     }
 
+    static func resolveOrNil() -> PythonRuntime? {
+        // `nil` when no interpreter can be found. The launch decision uses it:
+        // a returning user without a runtime gets the first-run wizard (which
+        // installs it) instead of a server spawn that cannot work.
+        try? resolve()
+    }
+
     static func resolve() throws -> PythonRuntime {
         let env = ProcessInfo.processInfo.environment
         var tried: [String] = []
