@@ -469,13 +469,35 @@ must be done by a person.
 Not defects of the prepared PRs, but found while trying to capture UI screenshots
 on 2026-11-15; both need the cluster run to confirm:
 
-- **R16 — `/admin/auto-login` sets no session cookie in this build.** The endpoint
-  redirects to `/admin` instead of the requested page, so the menubar deep link
-  cannot sign in. The bearer key works on every API route at the same time, so the
-  key is valid; the admin router's `_get_global_settings()` (set by
-  `set_admin_getters`) appears not to see the running server's settings.
-- **R17 — the assistant card can report `no_model` on a cold start** ("No model is
-  available on this Mac") even though `~/models` is the configured model
-  directory and the API can plan a model there. Likely the model inventory was
-  not populated yet when the card asked; needs a check whether the card should
-  wait/refresh or whether the inventory is genuinely empty.
+- **R16 — `/admin/auto-login` sets no session cookie in this build.** Reproduced
+  twice: the endpoint answers 302 to `/admin` with no `Set-Cookie`, while the same
+  key authenticates every API route. Hypothesis (from the code's own comment
+  about issue #2282): the CLI path imports `omlx.server` once for
+  `init_server()`, and uvicorn then imports `omlx.server:app` as a second module
+  instance, so the admin router's module-level `set_admin_getters(...)` lambdas
+  point at the *other* `_server_state`, whose `global_settings` has no API key.
+  That alias guard exists only for `python -m omlx.server`. Not isolated further;
+  needs a run with a debug print in `auto_login`.
+- **R17 — the assistant card can report `no_model`** ("No model is available on
+  this Mac"). Measured on a fresh state: `GET /admin/api/models` returns **7**
+  models immediately, while `GET /admin/api/cluster/catalogue` returns **0**
+  entries. The card does not use that GET, it posts to
+  `/admin/api/cluster/catalogue` for per-node fit (`cluster_v2.js:546`), so this
+  is **not yet confirmed** as the cause — needs the UI session during the cluster
+  run to see what candidates it actually sends.
+
+### Local test run on a wiped cluster state (2026-11-15)
+
+After the reset (§0.5 of the runbook), the whole single-Mac path was exercised
+again through the API:
+
+- devices: self only, 0 paired; `GET /admin/api/models` 7 entries; catalogue GET 0.
+- hardware `measure` → ready; `recommend` → `dev-1.5b` @ 8192 with `single_node`
+  feasible; model-bound `measure` → ready; `plan` → 1 node, signature `7179c6975b`.
+- `run-local` → ready; real completion "Hello world." (3 completion tokens).
+- **`tune-local`** → `completed`, preset `f1b39c284bddb746` written
+  (`mtp: false`, the only config a model without an MTP head offers).
+- completion **after** tuning → "wave", so the unload/load cycle left the model
+  serving.
+- `run-local/{id}/stop` → `stopped: true`; `network-preflight` → `executed: false`;
+  `diagnostics` returned `app/events/generated_at/health/measurement/operation`.
