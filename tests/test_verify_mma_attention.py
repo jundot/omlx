@@ -10,6 +10,7 @@ import pytest
 from mlx_lm.models import base as mlx_base
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 
+from omlx.patches import qwen35_verify_qmm as vq
 from omlx.patches import verify_mma_attention as vma
 from omlx.patches import verify_mma_kernel as vmk
 
@@ -20,17 +21,21 @@ pytestmark = pytest.mark.skipif(
 D = 128
 
 
-@pytest.fixture
-def patched(monkeypatch):
-    """Patched mlx_lm sdpa with the kernel replaced by a call-counting spy."""
-    # apply() re-points every mlx_lm module that imported the hook by name;
-    # put them all back afterwards.
-    saved = {
+def _save_hooks():
+    return {
         name: (mod, mod.scaled_dot_product_attention)
         for name, mod in list(sys.modules.items())
         if name.startswith("mlx_lm.models.")
         and getattr(mod, "scaled_dot_product_attention", None) is not None
     }
+
+
+@pytest.fixture
+def patched(monkeypatch):
+    """Patched mlx_lm sdpa with the kernel replaced by a call-counting spy."""
+    # apply() re-points every mlx_lm module that imported the hook by name;
+    # put them all back afterwards.
+    saved = _save_hooks()
     calls = []
     real = vmk.mma_verify_sdpa
 
@@ -40,7 +45,9 @@ def patched(monkeypatch):
 
     monkeypatch.setattr(vmk, "mma_verify_sdpa", spy)
     assert vma.apply() is True
+    vq.set_verify_qmm_armed(True)  # the MTP verify forward arms this flag
     yield calls
+    vq.set_verify_qmm_armed(False)
     for mod, original in saved.values():
         mod.scaled_dot_product_attention = original
 
@@ -70,6 +77,23 @@ def test_verify_block_routes_to_kernel_and_matches_stock(patched, T):
     mx.eval(got, want)
     assert len(patched) == 1
     assert mx.abs(got.astype(mx.float32) - want.astype(mx.float32)).max().item() < 2e-2
+
+
+@pytest.mark.parametrize("state", ["unarmed", "row_exact"])
+def test_routes_only_while_the_verify_flag_is_armed(patched, state):
+    # Outside a verify forward (prefill chunks, plain decode) and in row-exact
+    # verify (output must equal one-row decode) the stock kernel serves it.
+    if state == "unarmed":
+        vq.set_verify_qmm_armed(False)
+    else:
+        vq.set_verify_qmm_armed(True, row_exact=True)
+    cache = _filled_cache()
+    q, bk, bv = _verify_block(cache, 4)
+    got = mlx_base.scaled_dot_product_attention(q, bk, bv, cache, D**-0.5, "causal")
+    want = mx.fast.scaled_dot_product_attention(q, bk, bv, scale=D**-0.5, mask="causal")
+    mx.eval(got, want)
+    assert patched == []
+    assert mx.array_equal(got, want).item()
 
 
 def test_modules_that_imported_the_hook_by_name_are_rerouted(patched):
@@ -117,3 +141,15 @@ def test_everything_else_stays_on_stock(patched, why):
         mask = mx.zeros((T, bk.shape[2]), dtype=dtype)
     mlx_base.scaled_dot_product_attention(q, bk, bv, cache, D**-0.5, mask)
     assert patched == []
+
+
+def test_mtp_patch_installs_the_hook():
+    saved = _save_hooks()
+    try:
+        from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+
+        assert apply_mlx_lm_mtp_patch() is True
+        assert getattr(mlx_base.scaled_dot_product_attention, "_omlx_verify_mma", False)
+    finally:
+        for mod, original in saved.values():
+            mod.scaled_dot_product_attention = original

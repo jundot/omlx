@@ -2,7 +2,8 @@
 """Route speculative-verify attention to the MMA multi-row kernel.
 
 Hooks ``mlx_lm.models.base.scaled_dot_product_attention`` (and every model
-module that imported it by name). A verify forward carries 3..8 new query
+module that imported it by name). It acts only while the verify flag is
+armed (``qwen35_verify_qmm.set_verify_qmm_armed``). A verify forward carries 3..8 new query
 rows over a plain ``KVCache``; those go to ``verify_mma_kernel`` with the
 cache's backing buffer, everything else (one row, two rows, prefill, array
 masks, quantized or rotating caches, other head widths) stays on stock MLX.
@@ -17,6 +18,7 @@ import sys
 import mlx.core as mx
 
 from . import verify_mma_kernel as _kernel
+from .qwen35_verify_qmm import _is_armed as _verify_armed
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,11 @@ def route_ok(queries, keys, values, cache, mask, sinks) -> bool:
     """True when this attention call is a verify block the kernel can serve."""
     from mlx_lm.models.cache import KVCache
 
+    # Only inside a speculative verify forward (the flag the MTP loop arms for
+    # the verify-shape qmm kernels). Not armed: prefill chunks and plain decode.
+    # Row-exact verify leaves it unarmed too: its output must equal one-row decode.
+    if not _verify_armed():
+        return False
     if sinks is not None or not isinstance(mask, str) or mask != "causal":
         return False
     if type(cache) is not KVCache:
