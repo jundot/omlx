@@ -102,6 +102,31 @@ separate with Apply whenever current ≠ requested; idempotent, versioned blessi
 
 **Done when:** A5 holds and the five status states are tested.
 
+**Implementation status (2026-11-15):** W1 and W2 are implemented on
+`rebase/upstream-main` (commits `a62c29d9` D6, `6f0bf259` D1, `804ad2c1`
+decisions). The five §7 decisions are answered and recorded in AGENTS §10.
+
+- W2: one seam `PrivilegedHelper.status → {installed, version,
+  wiredLimitCurrentMB, wiredLimitRequestedMB}`; `ensureInstalled`
+  (bless/reuse/replace, injectable); a permanent **System Helper** row in
+  Performance with Install/Reinstall independent of the warning, a separate
+  wired-limit row with Apply whenever current ≠ requested, and a **System
+  helper** step in Welcome. The five D6 states are tested without a prompt.
+- W1: `Sources/AppView/Utils/Uninstall.swift` (locator/plan/runner, injectable)
+  + `AdvancedScreen.swift` (Settings → Advanced → Uninstall… sheet). Keep switch
+  per scope, per-directory model opt-in, byte summary, kept dirs named verbatim;
+  models + `cluster/identity.json` kept by default; helper = one admin dialog,
+  cancel leaves the rest done; LS hygiene then quit last. XCTests drive temp
+  dirs + a recording seam, deleting nothing real.
+- Suites: `tests/cluster_assistant` **658 passed**; macOS python packaging
+  **27 passed**; full Xcode `xcodebuild test -scheme oMLX CODE_SIGNING_ALLOWED=NO
+  -testLanguage en` **441 passed / 0 failed** (5 skipped); `make web` no-op.
+- **Still open: the live A5/A6 proof** — it needs a person at each Mac (open the
+  app, Local Network, the helper admin dialog, the runtime installer). The
+  notarized DMG is rebuilt through `scripts/build-release-dmg.sh --install` and
+  rolled out per `CLUSTER-TEST-RUNBOOK.md` §1.5; the five helper states and the
+  uninstall scopes are then observed live and recorded in `PHASE-2B-RUN.md`.
+
 ### W3 — D4 Error placement (0.5–1 day)
 
 One surface: inline at the failing step, `error.step` + `error.code` + one action,
