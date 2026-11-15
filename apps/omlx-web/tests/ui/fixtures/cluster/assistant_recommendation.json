@@ -1,0 +1,184 @@
+{
+  "_state": "assistant_planning",
+  "_source": "omlx/cluster/assistant/models.py::AssistantRecommendResponse",
+  "measurement_id": "msr-5f2a9c31",
+  "measurement_timestamp": "2026-11-03T10:15:41Z",
+  "measurement_model": "/models/qwen3-32b",
+  "hardware_only": false,
+  "target_context_tokens": 32768,
+  "mtp": false,
+  "execution_profile": "balanced",
+  "feasible": true,
+  "selected_model": "mlx-community/Qwen3-32B-4bit",
+  "selected_context_tokens": 32768,
+  "candidates": [
+    {
+      "model_id": "mlx-community/Qwen3-32B-4bit",
+      "label": "Qwen3 32B 4-bit",
+      "model_path": "/models/qwen3-32b-4bit",
+      "feasible": true,
+      "pp_supported": true,
+      "pipeline_stages": 2,
+      "nodes_required": 2,
+      "weight_bytes": 18253611008,
+      "download_bytes": 0,
+      "download_gib": 0.0,
+      "max_context_tokens": 32768,
+      "declared_context_tokens": 131072,
+      "context_limited": true,
+      "headroom_bytes": 4294967296,
+      "headroom_gib": 4.0,
+      "rank0_node": "node-b",
+      "rank_order": ["node-b", "node-a"],
+      "stages": [
+        {
+          "rank": 0,
+          "node_id": "node-b",
+          "first_layer": 0,
+          "last_layer": 39,
+          "layer_count": 40,
+          "resident_bytes": 9663676416,
+          "resident_gib": 9.0,
+          "admission_bytes": 127560237056,
+          "headroom_bytes": 4294967296,
+          "headroom_gib": 4.0,
+          "predicted_seconds": null,
+          "critical": true
+        },
+        {
+          "rank": 1,
+          "node_id": "node-a",
+          "first_layer": 40,
+          "last_layer": 79,
+          "layer_count": 40,
+          "resident_bytes": 8589934592,
+          "resident_gib": 8.0,
+          "admission_bytes": 65927716864,
+          "headroom_bytes": 2147483648,
+          "headroom_gib": 2.0,
+          "predicted_seconds": null,
+          "critical": false
+        }
+      ],
+      "nodes": [
+        {
+          "node_id": "node-b",
+          "model_present": true,
+          "stage_bytes": 9663676416,
+          "disk_free_bytes": 274877906944,
+          "can_stage": true
+        },
+        {
+          "node_id": "node-a",
+          "model_present": false,
+          "stage_bytes": 8589934592,
+          "disk_free_bytes": 137438953472,
+          "can_stage": true
+        }
+      ],
+      "critical_stage_rank": 0,
+      "critical_stage_seconds": null,
+      "measured_speed": false,
+      "plan_signature": "3f9a1c7d20b45e68",
+      "failure_kind": "",
+      "reasons": [],
+      "warnings": [
+        {
+          "code": "copy_at_activation",
+          "node_id": "node-a",
+          "message": "node-a does not hold this model; it is copied at activation",
+          "action": "copy_model"
+        }
+      ],
+      "action": ""
+    },
+    {
+      "model_id": "mlx-community/Qwen3-235B-A22B-4bit",
+      "label": "Qwen3 235B A22B 4-bit",
+      "model_path": "/models/qwen3-235b-a22b-4bit",
+      "feasible": false,
+      "pp_supported": true,
+      "pipeline_stages": 2,
+      "nodes_required": 2,
+      "weight_bytes": 131533373440,
+      "download_bytes": 131533373440,
+      "download_gib": 122.5,
+      "max_context_tokens": 8192,
+      "declared_context_tokens": 131072,
+      "context_limited": true,
+      "headroom_bytes": 0,
+      "headroom_gib": 0.0,
+      "rank0_node": "",
+      "rank_order": [],
+      "stages": [],
+      "nodes": [],
+      "critical_stage_rank": null,
+      "critical_stage_seconds": null,
+      "measured_speed": false,
+      "plan_signature": "",
+      "failure_kind": "no_feasible_plan",
+      "reasons": ["no Mac can hold rank 0 for this model at this context"],
+      "warnings": [],
+      "action": "adjust_model_or_context"
+    }
+  ],
+  "single_node": {
+    "model_id": "mlx-community/Qwen3-32B-4bit",
+    "label": "Qwen3 32B 4-bit",
+    "model_path": "/models/qwen3-32b-4bit",
+    "feasible": true,
+    "pp_supported": true,
+    "pipeline_stages": 1,
+    "nodes_required": 1,
+    "weight_bytes": 18253611008,
+    "download_bytes": 0,
+    "download_gib": 0.0,
+    "max_context_tokens": 32768,
+    "declared_context_tokens": 131072,
+    "context_limited": true,
+    "headroom_bytes": 8589934592,
+    "headroom_gib": 8.0,
+    "rank0_node": "node-a",
+    "rank_order": ["node-a"],
+    "stages": [
+      {
+        "rank": 0,
+        "node_id": "node-a",
+        "first_layer": 0,
+        "last_layer": 79,
+        "layer_count": 80,
+        "resident_bytes": 18253611008,
+        "resident_gib": 17.0,
+        "admission_bytes": 137438953472,
+        "headroom_bytes": 8589934592,
+        "headroom_gib": 8.0,
+        "predicted_seconds": null,
+        "critical": true
+      }
+    ],
+    "nodes": [
+      {
+        "node_id": "node-a",
+        "model_present": true,
+        "stage_bytes": 0,
+        "disk_free_bytes": 274877906944,
+        "can_stage": true
+      }
+    ],
+    "critical_stage_rank": 0,
+    "critical_stage_seconds": null,
+    "measured_speed": false,
+    "plan_signature": "",
+    "failure_kind": "",
+    "reasons": [
+      "Qwen3 32B 4-bit fits on one Mac (node-a) at 32,768 tokens of context — single-node inference, no pipeline overhead"
+    ],
+    "warnings": [],
+    "action": "",
+    "resource_policy": null,
+    "excluded_nodes": ["node-b"],
+    "mode": "single"
+  },
+  "reasons": [],
+  "warnings": []
+}

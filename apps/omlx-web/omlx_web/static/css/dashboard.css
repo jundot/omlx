@@ -93,6 +93,34 @@
         background: rgb(var(--palette-zinc-200));
     }
 
+    /* === Cluster Assistant (Screen 3) === */
+    /* The assistant summary is operational data, not helper copy: keep its
+       labels and collapsed evidence readable in dark mode like the active
+       panel above. */
+    [data-theme="dark"] [data-cluster-v2-assistant] .text-neutral-500,
+    [data-theme="dark"] [data-cluster-v2-assistant] .text-neutral-400 {
+        color: rgb(var(--palette-zinc-300)) !important;
+    }
+    [data-theme="dark"] [data-cluster-v2-assistant] .bg-neutral-50 {
+        background-color: var(--bg-secondary) !important;
+    }
+    [data-cluster-v2-assistant-details] > summary {
+        list-style: none;
+        cursor: pointer;
+    }
+    [data-cluster-v2-assistant-details] > summary::-webkit-details-marker {
+        display: none;
+    }
+    [data-cluster-v2-assistant-details] > summary::before {
+        content: '▸';
+        display: inline-block;
+        margin-right: 0.375rem;
+        transition: transform 120ms ease-out;
+    }
+    [data-cluster-v2-assistant-details][open] > summary::before {
+        transform: rotate(90deg);
+    }
+
     /* === Log viewer: keep dark === */
     [data-theme="dark"] div.bg-neutral-900 { background-color: rgb(var(--palette-night-950)) !important; }
     [data-theme="dark"] textarea.bg-neutral-900 { background-color: rgb(var(--palette-night-950)) !important; color: rgb(var(--palette-green-400)) !important; }

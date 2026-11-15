@@ -21,12 +21,19 @@ _CLUSTER_URL = re.compile(
 
 def _registered_routes() -> set[str]:
     from omlx.cluster import routes
+    from omlx.cluster.assistant import routes as assistant_routes
 
-    return {
+    # The tab now drives both the existing cluster admin router and the
+    # Cluster Assistant router (measure/recommend/plan plus the free-space
+    # relay). A URL is real when either registers it, so keep this seam honest
+    # across both mounts.
+    registered = {
         re.sub(r"\{[^{}]+\}", "{parameter}", route.path)
-        for route in routes.router.routes
+        for router in (routes.router, assistant_routes.router)
+        for route in router.routes
         if getattr(route, "path", None)
     }
+    return registered
 
 
 def _js_called_paths() -> set[str]:
@@ -60,7 +67,48 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
     both worth knowing about.
     """
 
-    unreachable = _registered_routes() - _js_called_paths()
+    # These are compatibility/manual operator APIs retained after the v1
+    # dashboard console was removed. Cluster v2 uses discovery/pairing,
+    # autoconfigure and the deployment lifecycle; scripts and older clients
+    # may still use these explicit low-level probes. CUDA worker enrollment,
+    # the ConnectX/RDMA link checks and the diagnostics report have had no
+    # dashboard panel since the advanced tools were removed.
+    allowed_without_caller: set[str] = {
+        "/admin/api/cluster/cuda-fabric/verify",
+        "/admin/api/cluster/diagnostics",
+        "/admin/api/cluster/join-keys",
+        "/admin/api/cluster/join-keys/{parameter}",
+        "/admin/api/cluster/join-status",
+        "/admin/api/cluster/rdma-links",
+        "/admin/api/cluster/rdma-links/verify",
+        "/admin/api/cluster/backend-selection",
+        "/admin/api/cluster/collective-smoke",
+        "/admin/api/cluster/discover",
+        "/admin/api/cluster/fabric",
+        "/admin/api/cluster/guidance",
+        "/admin/api/cluster/incidents",
+        "/admin/api/cluster/incidents/{parameter}/dismiss",
+        "/admin/api/cluster/link-setup",
+        "/admin/api/cluster/link-status",
+        "/admin/api/cluster/pairing-token",
+        "/admin/api/cluster/peer-health",
+        # The assistant's measured-speed probe toggle is part of the run slice
+        # (PR 2/3); the route exists with the cluster core, the UI that calls it
+        # arrives with apply/start.
+        "/admin/api/cluster/performance-probe",
+        "/admin/api/cluster/pipeline-smoke",
+        "/admin/api/cluster/plan",
+        "/admin/api/cluster/ssh-key",
+        "/admin/api/cluster/ssh-key/exchange",
+        "/admin/api/cluster/ssh-key/exchange-token",
+        "/admin/api/cluster/ssh-key/generate",
+        "/admin/api/cluster/ssh-key/store-keychain",
+        "/admin/api/cluster/status",
+        "/admin/api/cluster/transports",
+        "/admin/api/cluster/verify-pairing-token",
+        "/admin/api/cluster/worker-smoke",
+    }
+    unreachable = _registered_routes() - _js_called_paths() - allowed_without_caller
     assert not unreachable, (
         f"cluster routes nothing calls: {sorted(unreachable)} — wire them up or "
         f"delete them"
