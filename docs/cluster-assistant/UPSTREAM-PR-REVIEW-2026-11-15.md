@@ -42,17 +42,17 @@ worktree removal.
 
 | ID | Severity | Scope | Finding | Status |
 |---|---|---|---|---|
-| R1 | **P0 blocker** | a0, A1, A2, A3 | Private scratch files committed (German live-run notes + drivers) | open |
-| R2 | **P0 blocker** | feature | Signing identity hard-coded (team ID in project, entitlement, test) | open |
-| R3 | **P0 blocker** | F4 | The headline "fresh-install logs dir" fix is redundant upstream | open |
-| R4 | P1 | A2 (and A3 by inheritance) | Test calls `_saved_engram_ssd_offload`, a name that only exists via our fork alias | open |
-| R5 | P1 | A1, A2, A3 | Code/comments reference fork-only docs (PHASE-2B-RUN, PROJECT-BRIEF, CHAPTER-5, SCREEN-*) | open |
-| R6 | P1 | F5 | Private lab IPs (`172.16.1.x`) used as test fixtures | open |
-| R7 | P1 | F4 | ThemeTests fix weakens the assertion for all macOS versions | open |
-| R8 | P2 | all UI branches | PR template not satisfied (Validation, before/after screenshots, `make web`/`make app`) | open |
+| R1 | **P0 blocker** | a0, A1, A2, A3 | Private scratch files committed (German live-run notes + drivers) | **fixed** |
+| R2 | **P0 blocker** | feature | Signing identity hard-coded (team ID in project, entitlement, test) | **fixed** |
+| R3 | **P0 blocker** | F4 | The headline "fresh-install logs dir" fix is redundant upstream | **fixed** |
+| R4 | P1 | A2 (and A3 by inheritance) | Test calls `_saved_engram_ssd_offload`, a name that only exists via our fork alias | **fixed** |
+| R5 | P1 | A1, A2, A3 | Code/comments reference fork-only docs (PHASE-2B-RUN, PROJECT-BRIEF, CHAPTER-5, SCREEN-*) | **fixed** |
+| R6 | P1 | F5 | Private lab IPs (`172.16.1.x`) used as test fixtures | **fixed** |
+| R7 | P1 | F4 | ThemeTests fix weakens the assertion for all macOS versions | **fixed** |
+| R8 | P2 | all UI branches | PR template not satisfied (Validation, before/after screenshots, `make web`/`make app`) | bodies written; screenshots open |
 | R9 | P2 | A1, A2 | Still very large; A1 ships partial modules that A2 replaces (review churn) | open |
 | R10 | P2 | F1 | Two concerns in one PR (`local_only` + VLM fallback guard) | open |
-| R11 | P2 | feature | Docs live in `docs/cluster-assistant/` and describe our fork workflow | open |
+| R11 | P2 | feature | Docs live in `docs/cluster-assistant/` and describe our fork workflow | **fixed** |
 | R12 | P2 | series | No plan B if maintainers decline #5024/#5033/F5 | open |
 | R13 | P2 | all | Branch names `pr/…` are unusual for upstream | open |
 | R14 | P2 | A1 | Single 22.9k-line commit; per-commit review is impossible | open |
@@ -415,3 +415,28 @@ which is in any case waiting for #5024/#5033/F5 to merge.
   `()` default reproduces upstream exactly.
 - Every branch has a recorded test result; the local app is green end-to-end
   (20 752 passed) and the DMG builds, signs and verifies.
+---
+
+## 10. Fix log (2026-11-15)
+
+| Finding | What changed | New commit |
+|---|---|---|
+| R1 | The three scratch files removed from a0 and all three assistant branches (rebuilt + rebased); `.git/info/exclude` now ignores them for every worktree | a0 `23cc45b7`, A1 `5dec259f`, A2 `3fc4491e`, A3 `409a0dba` |
+| R3 | ServerProcess hunk dropped (upstream already calls `ensureDir`); F4 is now 3 files | `pr/f4-mac-fixes` `1c1674c2` |
+| R7 | ThemeTests keeps the strict `>0.25` contrast below macOS 27 and only relaxes on 27+ (`#available`) | same commit |
+| R4 | `_saved_ssd_offload` used in A2 and A3 (3 call sites each) | A2 `3fc4491e`, A3 `409a0dba` |
+| R5 | ~85 comment/docstring lines swept: file names replaced with self-contained noun phrases ("the live-run notes", "the design notes"), section markers dropped; `grep` for the old tokens returns nothing | A1 `5dec259f`, A2 `3fc4491e`, A3 `409a0dba` |
+| R6 | Lab addresses replaced with RFC 5737 ranges (`192.0.2.10/11/12`), semantics unchanged | `pr/f5-cluster-core` `ef0b09fd` |
+| R2 | Team id is `$(OMLX_TEAM_ID)`; the helper plists are rendered from the same marker at build time; the packaging test skips without a team and asserts the requirement structure | `pr/feature-mac-helper-dmg` `3248f848` |
+| R11 | Docs moved to `docs/macos/`, team and host references neutralised | same commit |
+| R8 | PR bodies written from upstream's template, with real sizes and validation | `docs/cluster-assistant/PR-BODIES-2026-11-15.md` |
+
+Verification after the fixes:
+
+- `pr/a1-assistant-plan`: 312 assistant + 473 web, green. `pr/a2-assistant-run`: 615 + 547, green. `pr/a3-run-local`: 646 + 559, green.
+- `pr/f5-cluster-core`: 200 focused cluster tests green.
+- `pr/f4-mac-fixes`: 52 macOS tests green, `TEST SUCCEEDED`.
+- `pr/feature-mac-helper-dmg`: build succeeds with and without `OMLX_TEAM_ID`; 36 macOS tests green; `apps/omlx-mac/Tests/python` 29 passed / 2 skipped without a team, 31 passed with one; `git grep YB894QRG4W` returns nothing.
+- Assistant chain parents verified: A1→a0, A2→A1, A3→A2; every branch still contains only its own slice.
+
+Still open: R8 screenshots, R9 (further split), R10 (F1 concerns), R12 (plan B), R13 (branch names on push), R14 (A1 commit granularity).
