@@ -741,6 +741,15 @@ These come back in every cluster session; the answers are decided:
   Back up the JSON state first (`~/.omlx/backup-cluster-<date>/`), then verify: no
   processes, port free, and the cluster directory contains only `identity.json`
   plus backups. This applies to `.11` and to every peer.
+- **A real cleanup also removes every oMLX *copy* and its Launchpad entry.** Delete
+  `/Applications/oMLX*.app`, the **Xcode DerivedData products**
+  (`~/Library/Developer/Xcode/DerivedData/oMLX-*`), **Trash copies**, app-support
+  and cache dirs, `~/omlx-pr` / `~/omlx-distributed`, mounted DMG volumes and
+  `/tmp` images — then garbage-collect Launch Services
+  (`lsregister -gc -f -r -domain user -domain local`) and `killall Dock`, or
+  Launchpad keeps showing icons for apps that no longer exist. Keep the **models**
+  (`~/models`, `~/Models`) and this repository (source + the notarized DMG under
+  `build/`); the gitignored `apps/omlx-mac/build/` is a build product and goes.
 - **Verify the version on every Mac before a cluster run.** A mixed-build cluster
   is not a test of this tree (`CLUSTER-TEST-RUNBOOK.md` §1.5): `GET
   /api/cluster/node_id` must report the same `version` on all nodes.
