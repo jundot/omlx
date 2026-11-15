@@ -10056,16 +10056,17 @@ def _collect_imatrix_from_model(
 _STREAM_TEXT_LAYER_PREFIX = "language_model.model.layers."
 _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
 
-# Only these checkpoint model_types have a streamed sourcer. Every other layout
-# keeps the RAM-safe proxy calibration path: the auto rule never streams them,
-# and an explicit stream_calibration request for one fails fast (see
-# _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
 # Qwen3.5 / 3.6 and their text-only Hugging Face names. VLM checkpoints stream
 # mlx-vlm's decoder blocks and text-only ones mlx-lm's, the classes the
 # resident collector loads for each (_is_vlm_load).
 _QWEN3_5_STREAM_MODEL_TYPES = frozenset(
     {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
 )
+
+# Only these checkpoint model_types have a streamed sourcer. Every other layout
+# keeps the RAM-safe proxy calibration path: the auto rule never streams them,
+# and an explicit stream_calibration request for one fails fast (see
+# _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
 _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset(
     {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark", "flint"}
     | _QWEN3_5_STREAM_MODEL_TYPES
