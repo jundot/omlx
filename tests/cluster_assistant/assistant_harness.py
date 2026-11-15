@@ -463,6 +463,7 @@ def assistant_api(
     inventory: Callable[..., list[dict[str, Any]]] | None = None,
     performance_probe: bool = False,
     settings_writer: Callable[..., None] | None = None,
+    global_settings_writer: Callable[..., None] | None = None,
     model_settings: Callable[[str], Mapping[str, Any]] | None = None,
     transports: Callable[[Sequence[str]], TransportMatrix] | None = None,
 ):
@@ -500,6 +501,7 @@ def assistant_api(
             device_record=device,
             local_addresses=lambda: tuple(local_addresses),
             settings_writer=settings_writer,
+            global_settings_writer=global_settings_writer,
         ),
         coordinator=coordinator or unexpected_coordinator,
     )

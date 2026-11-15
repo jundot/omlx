@@ -2590,6 +2590,11 @@ def _validate_deployment_admission(
     by_rank = {int(item.get("rank", -1)): item for item in preflight}
     failures: list[str] = []
     gib = 1024**3
+    # Named in the failure: the tier is a real lever the plan shows and apply
+    # writes on every selected Mac, so a refusal that does not say which tier
+    # the ceiling was read under cannot be told apart from a stale plan.
+    tier = str(getattr(deployment, "memory_guard_tier", "") or "").strip()
+    tier_clause = f" at memory tier {tier}" if tier else ""
     for assignment in sorted(deployment.assignments, key=lambda item: item.rank):
         status = by_rank.get(assignment.rank, {})
         ceiling = int(status.get("admission_ceiling_bytes") or 0)
@@ -2619,7 +2624,7 @@ def _validate_deployment_admission(
             failures.append(
                 f"rank {assignment.rank} ({assignment.node_id}) needs "
                 f"{required / gib:.1f} GiB but can admit "
-                f"{admissible / gib:.1f} GiB right now"
+                f"{admissible / gib:.1f} GiB right now{tier_clause}"
             )
     if failures:
         raise DistributedLaunchError(
