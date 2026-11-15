@@ -33,7 +33,10 @@ def _quantized(k, n, bits, group_size, dtype, seed=0):
     return mx.quantize(weight, group_size=group_size, bits=bits)
 
 
-@pytest.mark.parametrize("bits,rows", [(4, 2), (4, 3), (4, 4), (5, 2), (5, 3)])
+@pytest.mark.parametrize(
+    "bits,rows",
+    [(4, 2), (4, 3), (4, 4), (5, 2), (5, 3), (6, 2), (6, 4), (8, 2), (8, 4)],
+)
 @pytest.mark.parametrize("group_size", [64, 128])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_qmv_matches_fp32_reference(qmv_only, bits, rows, group_size, dtype):
@@ -64,8 +67,11 @@ def test_row_and_shape_gating(qmv_only):
     assert not m1_verify_qmv.eligible(5, 2048, 1024, 4, 64, f16)
     assert m1_verify_qmv.eligible(3, 2048, 1024, 5, 64, f16)
     assert not m1_verify_qmv.eligible(4, 2048, 1024, 5, 64, f16)
+    assert m1_verify_qmv.eligible(4, 2048, 1024, 6, 64, f16)
+    assert m1_verify_qmv.eligible(4, 2048, 1024, 8, 64, f16)
+    assert not m1_verify_qmv.eligible(5, 2048, 1024, 6, 64, f16)
     # unsupported bit width, small N, K off the lane block, fp32 rows
-    assert not m1_verify_qmv.eligible(2, 2048, 1024, 8, 64, f16)
+    assert not m1_verify_qmv.eligible(2, 2048, 1024, 3, 64, f16)
     assert not m1_verify_qmv.eligible(2, 2048, 512, 4, 64, f16)
     assert not m1_verify_qmv.eligible(2, 2048 + 64, 1024, 4, 64, f16)
     assert not m1_verify_qmv.eligible(2, 2048, 1024, 4, 64, mx.float32)
