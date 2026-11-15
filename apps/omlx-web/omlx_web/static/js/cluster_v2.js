@@ -7117,6 +7117,10 @@ function clusterV2Wizard() {
                 'choose_pipeline_model',
                 'check_model_path',
                 'free_disk_space',
+                // R5: the GPU wired limit, not RAM or pressure, caps a Mac.
+                // The app applies the recommended limit from Performance; the
+                // browser can only name that step.
+                'raise_wired_limit',
             ];
             if (!known.includes(action)) {
                 return window.t('cluster.assistant.action.unknown');
@@ -7176,6 +7180,12 @@ function clusterV2Wizard() {
                 // picked.
                 case 'free_disk_space':
                     return this.openAssistantFreeSpace();
+                // ``raise_wired_limit`` is a click in the macOS app, not in
+                // this page: the browser has no privileged path and must not
+                // fake one. Diagnostics names the Mac, its current MB value and
+                // the step, and the picker restores the entry button.
+                case 'raise_wired_limit':
+                    return this.openAssistantDiagnostics();
                 // ``copy_model`` is a real flow now: the assistant measures,
                 // recommends, plans and applies, and apply stages the model
                 // source-first from a complete peer copy. It never downloads

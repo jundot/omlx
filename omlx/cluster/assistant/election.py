@@ -46,9 +46,53 @@ from ..planner import (
     normalize_memory_guard_tier,
     plan_hybrid,
 )
+from .operations import ACTION_RAISE_WIRED_LIMIT
 from .topology import missing_line_links
 
 GIB = 1024**3
+
+#: A Mac's admitted ceiling is never above its ``iogpu.wired_limit_mb``:
+#: ``capacity_bytes`` is the minimum of the static, the live and the GPU
+#: ceiling. Being within this much of the GPU cap therefore means the cap — not
+#: RAM and not live pressure — is what a bigger stage would have to beat, and
+#: that Mac is the one to send to Performance → "Apply with Admin…".
+WIRED_LIMIT_HEADROOM_BYTES = 1 * GIB
+
+
+def wired_limit_binds(facts: NodeFacts) -> bool:
+    """Whether raising this Mac's GPU wired limit could admit more.
+
+    ``None`` is "not measured" and never reads as "too low": nobody sends a Mac
+    to an admin dialog on a guess. A measured ``0`` is the macOS default, i.e.
+    the limit was never raised, which is exactly the case the preflight exists
+    for.
+    """
+
+    if facts.wired_limit_mb is None:
+        return False
+    wired = int(facts.wired_limit_mb) * 1024**2
+    if wired <= 0:
+        return True
+    return facts.capacity_bytes >= wired - WIRED_LIMIT_HEADROOM_BYTES
+
+
+def wired_limit_hint(nodes: Sequence[NodeFacts]) -> str:
+    """One sentence naming the Macs whose GPU cap is the constraint."""
+
+    binding = [facts for facts in nodes if wired_limit_binds(facts)]
+    if not binding:
+        return ""
+    named = ", ".join(
+        f"{facts.node_id} ({int(facts.wired_limit_mb or 0):,} MB)"
+        for facts in binding
+    )
+    return (
+        "the GPU wired limit is what caps "
+        + named
+        + ": raise it in the app (Performance → Apply with Admin…, one admin "
+        "dialog) and measure again; if it still does not fit, choose a smaller "
+        "model or context"
+    )
 
 # Leave a little admission for the supervisor/HTTP and for the difference
 # between the measurement's p50 and the live ceiling at Start. A live GLM 32k
@@ -802,10 +846,13 @@ def elect(
             ),
             tensor_parallel_size=1,
         )
+        hint = wired_limit_hint(nodes)
         raise NoFeasiblePlanError(
             "no feasible coordinator: "
-            + _summarize_failures([item.reason for item in rejected]),
+            + _summarize_failures([item.reason for item in rejected])
+            + (f". {hint}" if hint else ""),
             result,
+            action=(ACTION_RAISE_WIRED_LIMIT if hint else "adjust_model_or_context"),
         )
 
     selected = ordered[0]

@@ -111,6 +111,11 @@ ACTION_FREE_DISK_SPACE = "free_disk_space"
 ACTION_CONFIGURE_ENDPOINT = "configure_endpoint"
 ACTION_RETRY_COORDINATOR = "retry_coordinator"
 ACTION_DIAGNOSTICS = "diagnostics"
+#: The one next step when ``iogpu.wired_limit_mb`` — not RAM and not live
+#: pressure — is what caps a Mac's admitted ceiling. The app applies the
+#: recommended limit from Performance → "Apply with Admin…"; the web page can
+#: only show the command, so this remains an app-side click.
+ACTION_RAISE_WIRED_LIMIT = "raise_wired_limit"
 
 OPERATION_IN_PROGRESS_CODE = "operation_in_progress"
 OPERATION_NOT_FOUND_CODE = "operation_not_found"

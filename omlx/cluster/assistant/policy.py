@@ -61,7 +61,9 @@ from .election import (
     budget_for,
     elect,
     rank_candidates,
+    wired_limit_hint,
 )
+from .operations import ACTION_RAISE_WIRED_LIMIT
 
 GIB = 1024**3
 
@@ -808,9 +810,22 @@ def solve_cluster_plan(
         )
 
     if last_error is not None:
+        # The wired-limit diagnosis belongs on the refusal the user actually
+        # reads. The subset pre-check refuses a too-small Mac before any
+        # election runs, so the election's own hint never reaches this path;
+        # ask the same question here. A refusal that already chose a specific
+        # step (a checkpoint mlx-lm cannot split) keeps it — more memory does
+        # not make an architecture pipeline-capable.
+        inherited = getattr(last_error, "action", "adjust_model_or_context")
+        hint = (
+            wired_limit_hint(node_list)
+            if inherited == "adjust_model_or_context"
+            else ""
+        )
         raise NoFeasiblePlanError(
-            _combined_refusal(refusals, last_error),
+            _combined_refusal(refusals, last_error) + (f". {hint}" if hint else ""),
             last_error.result,
+            action=(ACTION_RAISE_WIRED_LIMIT if hint else inherited),
         ) from last_error
     # No subset produced an election at all (one measured Mac that cannot hold
     # the model, for instance). Ask the election for its own refusal so the

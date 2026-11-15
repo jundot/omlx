@@ -150,7 +150,7 @@ Priorities: **P0** blocks the gate, **P1** closes a recorded capability gap,
 | **R2** | Memory tier (safe/balanced/aggressive) not chosen or passed | new defect + `budget_for`/`build_deployment_request` | **P0** | A |
 | **R3** | No joint tier × context × chunk × offload solver for a user-selected model | new defect + `recommend`/`plan` | **P0** | A |
 | **R4** | Offload switches are not applied on every Mac before launch; Qwen PLE switch absent in this checkout | new defect + `routes._saved_engram_ssd_offload` | **P0** | A |
-| **R5** | Wired-limit / admission preflight for large models | new defect + thin-layer `wired_limit_mib` | **P1** | A |
+| **R5** | Wired-limit / admission preflight for large models | new defect + thin-layer `wired_limit_mib` | **P1 — implemented 2026-11-15**: `wired_limit_binds()` + action `raise_wired_limit` on the plan refusal | A |
 | **R6** | Plan summary/UI does not show the chosen tier, context, offload or MoE fraction | new defect | **P0** | A |
 | **R7** | The election always uses **every measured Mac**; no “fewest Macs that fit” / least-hop selection | new requirement | **P0** | A |
 | **M1** | No measured compute for election (`unmeasured_compute`, `compute=None`) | audit | **P1** | B |

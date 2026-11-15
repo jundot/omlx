@@ -289,9 +289,22 @@ Resolved implementation decisions:
   configure_endpoint | retry_coordinator | diagnostics | adjust_model_or_context`)
   **plus the recommendation's four near-miss actions**
   (`choose_smaller_model`, `choose_pipeline_model`, `check_model_path`,
-  `free_disk_space`), which the card renders with their own labels. A refusal's
-  single action is taken from the first near miss whose failure is about the
-  cluster, never from a candidate that is merely `model_unreadable`.
+  `free_disk_space`), which the card renders with their own labels, **plus
+  `raise_wired_limit`** (R5, decided 2026-11-15). A refusal's single action is
+  taken from the first near miss whose failure is about the cluster, never from
+  a candidate that is merely `model_unreadable`.
+- **The wired limit is a preflight, not a guess (R5, 2026-11-15).**
+  `election.wired_limit_binds(facts)` is true only when a Mac's admitted ceiling
+  sits at its `iogpu.wired_limit_mb` — `capacity_bytes` is the minimum of the
+  static, live and GPU ceilings, so being *at* the cap is the one case where
+  raising the limit admits more. `None` (not measured) never reads as too low; a
+  measured `0` is the macOS default nobody raised, which is the case this exists
+  for. When no plan fits and a measured Mac's cap binds, the refusal names that
+  Mac and its MB value, and its action is `raise_wired_limit`: the app applies
+  the recommended limit from Performance → "Apply with Admin…" (one admin
+  dialog); the browser has no privileged path and only names the step. A
+  refusal that already chose a specific step (a checkpoint mlx-lm cannot split)
+  keeps it — more memory does not make an architecture pipeline-capable.
 - The measurement records each Mac's own catalogue (`NodeFacts.model_paths`), so
   a recommendation answers "already present" for **any** candidate from measured
   facts. Empty `model_paths` means "not measured" and keeps the honest

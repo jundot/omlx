@@ -119,15 +119,16 @@ Discussion draft (R12) if appetite is unclear:
   *Settings → Performance* page must not look like the terminal command is the
   only way (the button is app-only). Recorded in `ROADMAP-TO-CHAPTER-10.md` §9.
 
-- **Helper install is proven, the preflight is not (R5).** The one-prompt
-  SMJobBless install ran on all four Macs during the 0.8.0rc1 rollout (helper +
-  LaunchDaemon present, wired limit raised to 122 880 / 60 293 / 29 696 /
-  29 696 MB) — see `HELPER.md`. What is still missing is the *plan-side*
-  wired-limit preflight: `wired_limit_mb` is measured and reported in the
-  diagnostics, but nothing refuses a plan whose stage does not fit a Mac still at
-  the macOS default with one action ("apply it in the app"), so the user only
-  sees `choose_smaller_model`. That is the next P1 slice after the PRs are
-  pushed; it needs no new endpoint.
+- **Helper install is proven; the wired-limit preflight is built (R5).** The
+  one-prompt SMJobBless install ran on all four Macs during the 0.8.0rc1 rollout
+  (helper + LaunchDaemon present, wired limit raised to 122 880 / 60 293 /
+  29 696 / 29 696 MB) — see `HELPER.md`. The plan-side half is implemented
+  2026-11-15: `election.wired_limit_binds()` recognises the Mac whose GPU cap
+  (not RAM or pressure) sets its ceiling, and a refusal on that Mac names it and
+  its MB value with the action **`raise_wired_limit`** (Performance → “Apply with
+  Admin…” in the app; the card only names the step). What remains is a real run
+  on a Mac whose limit is still at the macOS default — the rollout machines all
+  have theirs raised already.
 
 - **R24 (origin hard-kill during a failed start)** is recorded, not explained:
   no traceback, no crash report, not reproducible. Capture the next occurrence

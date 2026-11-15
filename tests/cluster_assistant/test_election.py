@@ -39,6 +39,7 @@ from omlx.cluster.assistant.election import (
     budget_for,
     elect,
     rank_candidates,
+    wired_limit_binds,
 )
 from omlx.cluster.planner import ModelLayout, ShardPlan
 
@@ -662,3 +663,56 @@ def test_implausible_compute_is_treated_as_unmeasured() -> None:
     assert budget_for(implausible, rank=1, admission="p50").performance is None
     plausible = facts("m2", capacity_gib=128, admission_gib=100, decode_gib_per_s=2.0)
     assert budget_for(plausible, rank=1, admission="p50").performance is not None
+
+
+def test_the_wired_limit_only_counts_when_it_is_what_caps_the_mac() -> None:
+    """R5: a Mac whose ceiling sits at its GPU cap can be helped by raising it.
+
+    ``capacity_bytes`` is the minimum of the static, live and GPU ceilings, so
+    being *at* the cap is the one case where more limit means more plan. A Mac
+    capped by RAM or by live pressure is not sent to an admin dialog.
+    """
+
+    at_cap = facts("cap", capacity_gib=48, admission_gib=44, wired_limit_mb=48 * 1024)
+    below_cap = facts(
+        "ram", capacity_gib=40, admission_gib=36, wired_limit_mb=48 * 1024
+    )
+    unmeasured = facts("unknown", capacity_gib=48, admission_gib=44)
+    never_raised = facts("default", capacity_gib=48, admission_gib=44, wired_limit_mb=0)
+
+    assert wired_limit_binds(at_cap) is True
+    assert wired_limit_binds(below_cap) is False
+    assert wired_limit_binds(unmeasured) is False
+    # 0 is the macOS default (nobody raised it) — the case the preflight exists
+    # for. "Not measured" is None and never reads as too low.
+    assert wired_limit_binds(never_raised) is True
+
+
+def test_a_refusal_names_the_wired_limit_and_offers_to_raise_it() -> None:
+    """A too-small Mac gets the click that helps, not only "choose a model"."""
+
+    model = layout(layers=32, layer_gib=6.0)  # needs far more than 48 GiB
+    capped = facts("capped", capacity_gib=48, admission_gib=44, wired_limit_mb=48_000)
+    other = facts("other", capacity_gib=48, admission_gib=44, wired_limit_mb=48_000)
+
+    with pytest.raises(NoFeasiblePlanError) as caught:
+        elect([capped, other], model, context_tokens=8192)
+
+    error = caught.value
+    assert error.action == "raise_wired_limit"
+    assert "Performance" in str(error)
+    assert "48,000 MB" in str(error)
+
+
+def test_a_refusal_stays_adjust_model_when_the_cap_is_not_the_constraint() -> None:
+    model = layout(layers=32, layer_gib=6.0)
+    pressured = facts(
+        "pressure", capacity_gib=40, admission_gib=36, wired_limit_mb=96 * 1024
+    )
+    other = facts("other", capacity_gib=40, admission_gib=36, wired_limit_mb=96 * 1024)
+
+    with pytest.raises(NoFeasiblePlanError) as caught:
+        elect([pressured, other], model, context_tokens=8192)
+
+    assert caught.value.action == "adjust_model_or_context"
+    assert "Performance" not in str(caught.value)
