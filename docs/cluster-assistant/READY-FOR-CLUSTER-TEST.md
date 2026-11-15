@@ -51,7 +51,7 @@ branch (`054f92e4` #5033, `392aaccb` #5024 runtime).
 - DMG: `build/oMLX-0.8.0rc1.dmg`, 79 MB, `hdiutil verify` VALID, Developer-ID
   signed **and notarized + stapled** (`spctl` → `accepted, source=Notarized
   Developer ID`), SHA256
-  `f0868504fa05eed9dd3687580fe976d268e8609cc8777e2760c1d24c4da12c5e`. This
+  `857fdb690610195419fa30d1c9bb98e81f51c722775fe859620b82c69c1296be`. This
   rebuild contains the R23 tier fix (apply writes the approved memory-guard tier)
   and the R25 launcher-signing fix; the previous dry-run DMG was neither
   notarized nor fixed.
@@ -167,5 +167,5 @@ The notarized `build/oMLX-0.8.0rc1.dmg` is the artefact to install.
    binary hash** on every Mac (`shasum -a 256
    /Applications/oMLX.app/Contents/MacOS/oMLX`) — a missed reinstall is invisible
    in the version gate alone. The DMG's own hash is
-   `f0868504fa05eed9dd3687580fe976d268e8609cc8777e2760c1d24c4da12c5e`.
+   `857fdb690610195419fa30d1c9bb98e81f51c722775fe859620b82c69c1296be`.
 5. Then pair (§1) and run §3.
