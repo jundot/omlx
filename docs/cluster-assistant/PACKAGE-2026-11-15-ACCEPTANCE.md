@@ -174,11 +174,57 @@ advanced preview.
 
 ---
 
+## D6. The helper is a capability, not a side effect of a low wired limit
+
+**User's point (2026-11-15).** „aber der helper muss doch installiert werden egal
+ob limit passt oder nicht, das ist doch der clou" — correct, and today it cannot
+be.
+
+**What the code does.** The only path that installs the helper is
+`PerformanceScreenVM.applyWiredLimit` → `PrivilegedHelper.setWiredLimit` (SMJobBless
+on demand), and the button that reaches it is rendered **only** while the wired
+limit warning is visible, i.e. while `kernel iogpu.wired_limit_mb` < the value
+oMLX requested (`PerformanceScreen.swift:292`, `PerformanceScreenVM:507`). The
+Welcome wizard has **no** helper step at all (grep: no `PrivilegedHelper` in
+`Welcome/`).
+
+So on a Mac whose limit is already raised — or after a cleanup that removed the
+helper while the limit stayed high — there is **no way in the UI to install it**.
+The capability that makes privileged actions possible is hidden behind a
+condition that says privileged actions are not needed.
+
+**What it must be**
+
+- **Welcome, first run:** a "System helper" step next to the runtime installer —
+  Install with Admin…, one standard dialog, state shown afterwards. It is part
+  of setting the Mac up, not of an error.
+- **Performance screen:** a permanent row
+  `Helper: installed (vX) · not installed` with **Install helper…** /
+  **Reinstall…** (one dialog). Independently, the wired-limit row shows
+  `122 880 MB of 122 880 MB requested` and offers **Apply with Admin…** whenever
+  current and requested differ — including "apply again" on a raised limit.
+- **Idempotent and versioned:** a helper from another build is removed and
+  re-blessed; the same build answers "already installed, success" without a
+  prompt; a failed removal is not fatal but is reported.
+- **Never conditional on the warning.** No state may make the install
+  unreachable. The warning may *ask* for the helper; it may not *own* it.
+- **Observable:** one seam (`PrivilegedHelper.status → {installed, version,
+  wiredLimitCurrentMB, wiredLimitRequestedMB}`) so the screens and tests read the
+  same truth, and so support can answer "is the helper there?" without a shell.
+
+**Acceptance.** XCTest with an injected status: `not installed` → Install is
+visible and enabling it blesses; `installed, same version` → state shown, no
+prompt; `installed, other version` → reinstall offered; `limit == requested` →
+Apply hidden but Install still visible; `limit < requested` → both visible.
+
+---
+
 ## D5. Package order and effort
 
 | # | Item | Depends on | Rough size |
 |---|---|---|---|
 | 1 | D1 uninstall (button, sheet, tests, DMG) | — | 1 day |
+| 1b | D6 helper install as a first-class step (Welcome + Performance, status seam) | — | 0.5–1 day |
 | 2 | D4 error placement (rules + rendering) | — | 0.5–1 day |
 | 3 | D2 steps/back/retry (state machine + card) | D4 | 2–3 days |
 | 4 | D3 layout (one flow, manual behind a disclosure) | D2 | 1–2 days |
