@@ -62,14 +62,19 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             .environment(services)
 
         let hosting = NSHostingController(rootView: root)
-        hosting.view.frame = NSRect(x: 0, y: 0, width: 680, height: 620)
+        hosting.view.frame = NSRect(x: 0, y: 0, width: 680, height: 660)
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 620),
-            styleMask: [.titled, .closable, .fullSizeContentView],
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 660),
+            styleMask: [.titled, .closable, .fullSizeContentView, .resizable],
             backing: .buffered,
             defer: false
         )
+        // The setup rows and the first-run runtime installer must fit without
+        // hiding an input behind the footer, and a person can always enlarge
+        // the window; the content then reflows instead of layering over the
+        // footer. Shrinking below the compact layout stays refused.
+        win.minSize = NSSize(width: 680, height: 620)
         win.title = String(localized: "welcome.window.title",
                            defaultValue: "Welcome to oMLX",
                            comment: "Window title bar text for the Welcome wizard")
@@ -182,22 +187,24 @@ final class WelcomeViewModel: ObservableObject {
         }
     }
 
-    /// The helper status line shown after the install step. No server is up
-    /// yet in Welcome, so the wired-limit pair is nil; installed/version are
-    /// the local truth.
-    var helperStatusLine: String {
+    /// The helper row's subtitle: status plus purpose, one line of truth. No
+    /// server is up yet in Welcome, so the wired-limit pair is nil; the
+    /// installed/version pair is the local truth.
+    var helperRowSubtitle: String {
+        let status: String
         if helperStatus.installed {
-            let version = helperStatus.version.map { "v\($0)" }
-                ?? String(localized: "performance.helper.unknown_version",
-                          defaultValue: "unknown version",
-                          comment: "Helper version label when the install ledger has no version")
-            return String(localized: "performance.helper.installed_line",
-                          defaultValue: "Helper: installed (\(version))",
-                          comment: "Permanent Performance row when the privileged helper is installed")
+            let version = helperStatus.version.map { "v\($0)" } ?? "unknown version"
+            status = String(localized: "welcome.helper.status_installed",
+                            defaultValue: "Installed (\(version))",
+                            comment: "Status fragment for the installed system helper")
+        } else {
+            status = String(localized: "welcome.helper.status_not_installed",
+                            defaultValue: "Not installed",
+                            comment: "Status fragment for the absent system helper")
         }
-        return String(localized: "performance.helper.not_installed_line",
-                      defaultValue: "Helper: not installed",
-                      comment: "Permanent Performance row when the privileged helper is absent")
+        return String(localized: "welcome.helper.row_sub",
+                      defaultValue: "\(status) — raises the GPU memory limit with one admin dialog.",
+                      comment: "Sublabel of the Welcome system helper row")
     }
 
     var helperInstallTitle: String {
@@ -537,7 +544,7 @@ struct WelcomeView: View {
             }
         }
         .omlxThemed()
-        .frame(width: 680, height: 620)
+        .frame(minWidth: 680, minHeight: 620)
     }
 }
 
@@ -615,10 +622,11 @@ private struct WelcomeSetupBody: View {
     @ObservedObject var vm: WelcomeViewModel
     @State private var keyVisible: Bool = false
 
-    // The Welcome window is a fixed 680×620 and not resizable. The setup cards
-    // (runtime installer + system helper + storage rows) can exceed the height
-    // above the footer, so the body scrolls instead of overflowing into the
-    // footer. The footer itself stays pinned below this ScrollView.
+    // The setup page is one compact panel: every input row (port, model
+    // directory, API key, system helper) stays inside the visible area above
+    // the footer, so a validation error can never point at a hidden field.
+    // The ScrollView is the safety net (runtime-install log), not the plan;
+    // the window is resizable so a person can always make room.
     var body: some View {
         ScrollView {
             setupContent
@@ -627,14 +635,14 @@ private struct WelcomeSetupBody: View {
     }
 
     private var setupContent: some View {
-        VStack(spacing: 22) {
-            WelcomeIcon(size: 70)
+        VStack(spacing: 16) {
+            WelcomeIcon(size: 44)
 
             VStack(spacing: 6) {
                 Text(String(localized: "welcome.setup.title",
                             defaultValue: "Set up your local server",
                             comment: "Heading on the Welcome setup page"))
-                    .font(.omlxDisplay(24, weight: .semibold))
+                    .font(.omlxDisplay(22, weight: .semibold))
                     .foregroundStyle(WelcomeStyle.text)
                 Text(String(localized: "welcome.intro",
                             defaultValue: "Choose where models live, pick a port, and create the API key you'll use from apps and the web dashboard.",
@@ -646,101 +654,7 @@ private struct WelcomeSetupBody: View {
                     .frame(maxWidth: 480)
             }
 
-            VStack(alignment: .leading, spacing: 18) {
-                WelcomeNotice(
-                    icon: "memorychip.fill",
-                    title: String(localized: "welcome.setup.local.title",
-                                  defaultValue: "Local server",
-                                  comment: "Title for the local server setup card"),
-                    text: String(localized: "welcome.setup.local.body",
-                                 defaultValue: "oMLX binds to 127.0.0.1 on first run, so clients on this Mac can use it without exposing the server to your network.",
-                                 comment: "Body for the local server setup card")
-                )
-
-                if vm.runtimeMissing {
-                    VStack(alignment: .leading, spacing: 8) {
-                        WelcomeNotice(
-                            icon: "shippingbox.fill",
-                            title: String(localized: "welcome.runtime.title",
-                                          defaultValue: "Python runtime required",
-                                          comment: "Title for the first-run runtime installer card"),
-                            text: String(localized: "welcome.runtime.body",
-                                         defaultValue: "Python and MLX are not bundled in the app. Install the pinned runtime once; it downloads Python and the locked dependencies (about 1 GB) into your Application Support folder.",
-                                         comment: "Body for the first-run runtime installer card")
-                        )
-                        HStack(spacing: 10) {
-                            Button {
-                                Task { await vm.installRuntime() }
-                            } label: {
-                                Label(
-                                    String(localized: "welcome.runtime.install",
-                                           defaultValue: "Install Runtime…",
-                                           comment: "Button that provisions the external Python runtime"),
-                                    systemImage: "arrow.down.circle"
-                                )
-                            }
-                            .buttonStyle(.omlx(.primary, size: .small))
-                            .disabled(vm.runtimeInstalling || vm.isStarting)
-                            if vm.runtimeInstalling {
-                                ProgressView()
-                                    .controlSize(.small)
-                            }
-                        }
-                        if !vm.runtimeLog.isEmpty {
-                            ScrollView {
-                                Text(vm.runtimeLog)
-                                    .font(.omlxMono(10))
-                                    .foregroundStyle(WelcomeStyle.muted)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 86)
-                            .padding(8)
-                            .background(WelcomeStyle.fill)
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        }
-                        if let error = vm.runtimeError {
-                            Text(error)
-                                .font(.omlxText(DesignTokens.FontSize.caption))
-                                .foregroundStyle(Color(nsColor: .systemRed))
-                        }
-                    }
-                }
-
-                // D6: a "System helper" step next to the runtime installer.
-                // Always visible — the capability is never hidden behind a
-                // wired-limit condition. One admin dialog, idempotent.
-                VStack(alignment: .leading, spacing: 8) {
-                    WelcomeNotice(
-                        icon: "lock.shield.fill",
-                        title: String(localized: "welcome.helper.title",
-                                      defaultValue: "System helper",
-                                      comment: "Title for the first-run system helper install card"),
-                        text: String(localized: "welcome.helper.body",
-                                     defaultValue: "oMLX uses a small signed helper to raise the Metal wired limit when a model needs more GPU memory. Install it once with a standard admin dialog; it stays across restarts.",
-                                     comment: "Body for the first-run system helper install card")
-                    )
-                    HStack(spacing: 10) {
-                        Button {
-                            Task { await vm.installHelper() }
-                        } label: {
-                            Label(vm.helperInstallTitle, systemImage: "lock.shield")
-                        }
-                        .buttonStyle(.omlx(.primary, size: .small))
-                        .disabled(vm.helperInstalling || vm.isStarting)
-                        if vm.helperInstalling {
-                            ProgressView().controlSize(.small)
-                        }
-                        Text(vm.helperStatusLine)
-                            .font(.omlxText(DesignTokens.FontSize.caption))
-                            .foregroundStyle(WelcomeStyle.muted)
-                    }
-                    if let error = vm.helperError {
-                        Text(error)
-                            .font(.omlxText(DesignTokens.FontSize.caption))
-                            .foregroundStyle(Color(nsColor: .systemRed))
-                    }
-                }
-
+            VStack(alignment: .leading, spacing: 14) {
                 VStack(spacing: 0) {
                     SettingRow(
                         icon: "number",
@@ -828,6 +742,56 @@ private struct WelcomeSetupBody: View {
                         }
                         .buttonStyle(.omlx(.plain, size: .small))
                     }
+
+                    if vm.runtimeMissing {
+                        WelcomeDivider()
+                        SettingRow(
+                            icon: "shippingbox",
+                            title: String(localized: "welcome.runtime.title",
+                                          defaultValue: "Python runtime required",
+                                          comment: "Row title for the first-run runtime installer"),
+                            subtitle: String(localized: "welcome.runtime.sub",
+                                             defaultValue: "Python and MLX are not bundled. Downloads about 1 GB into your Application Support folder.",
+                                             comment: "Sublabel for the first-run runtime installer row")
+                        ) {
+                            HStack(spacing: 8) {
+                                if vm.runtimeInstalling {
+                                    ProgressView().controlSize(.small)
+                                }
+                                Button(String(localized: "welcome.runtime.install",
+                                               defaultValue: "Install Runtime…",
+                                               comment: "Button that provisions the external Python runtime")) {
+                                    Task { await vm.installRuntime() }
+                                }
+                                .buttonStyle(.omlx(.primary, size: .small))
+                                .disabled(vm.runtimeInstalling || vm.isStarting)
+                            }
+                        }
+                    }
+
+                    WelcomeDivider()
+
+                    // D6: the helper is part of setting the Mac up — a plain
+                    // row, never hidden behind a wired-limit condition, one
+                    // admin dialog, idempotent.
+                    SettingRow(
+                        icon: "lock.shield",
+                        title: String(localized: "welcome.helper.title",
+                                      defaultValue: "System helper",
+                                      comment: "Row title for the first-run system helper install"),
+                        subtitle: vm.helperRowSubtitle
+                    ) {
+                        HStack(spacing: 8) {
+                            if vm.helperInstalling {
+                                ProgressView().controlSize(.small)
+                            }
+                            Button(vm.helperInstallTitle) {
+                                Task { await vm.installHelper() }
+                            }
+                            .buttonStyle(.omlx(.primary, size: .small))
+                            .disabled(vm.helperInstalling || vm.isStarting)
+                        }
+                    }
                 }
                 .background(WelcomeStyle.panel)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -836,9 +800,32 @@ private struct WelcomeSetupBody: View {
                         .strokeBorder(WelcomeStyle.panelBorder.opacity(0.45), lineWidth: 0.5)
                 )
 
+                if vm.runtimeMissing && !vm.runtimeLog.isEmpty {
+                    ScrollView {
+                        Text(vm.runtimeLog)
+                            .font(.omlxMono(10))
+                            .foregroundStyle(WelcomeStyle.muted)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 72)
+                    .padding(8)
+                    .background(WelcomeStyle.fill)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                if let error = vm.runtimeError {
+                    Text(error)
+                        .font(.omlxText(DesignTokens.FontSize.caption))
+                        .foregroundStyle(Color(nsColor: .systemRed))
+                }
+                if let error = vm.helperError {
+                    Text(error)
+                        .font(.omlxText(DesignTokens.FontSize.caption))
+                        .foregroundStyle(Color(nsColor: .systemRed))
+                }
+
                 Text(String(localized: "welcome.hint.settings_path",
-                            defaultValue: "Settings are stored in ~/.omlx/settings.json.",
-                            comment: "Hint line under the API key section pointing to settings.json"))
+                            defaultValue: "oMLX binds to 127.0.0.1 on this Mac. Settings are stored in ~/.omlx/settings.json.",
+                            comment: "Hint line under the settings panel: local binding and where settings live"))
                     .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(WelcomeStyle.faint)
                     .frame(maxWidth: .infinity, alignment: .center)

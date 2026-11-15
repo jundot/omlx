@@ -122,8 +122,7 @@ final class WelcomeViewModelTests: XCTestCase {
             helperOnDisk: false, recordedVersion: nil,
             wiredLimitCurrentMB: nil, wiredLimitRequestedMB: nil
         )
-        XCTAssertEqual(vm.helperStatusLine,
-                       Self.localized("performance.helper.not_installed_line", "Helper: not installed"))
+        XCTAssertTrue(vm.helperRowSubtitle.contains("Not installed"))
         XCTAssertEqual(vm.helperInstallTitle,
                        Self.localized("welcome.helper.install", "Install with Admin…"))
     }
@@ -134,8 +133,7 @@ final class WelcomeViewModelTests: XCTestCase {
             helperOnDisk: true, recordedVersion: 1,
             wiredLimitCurrentMB: nil, wiredLimitRequestedMB: nil
         )
-        XCTAssertEqual(vm.helperStatusLine,
-                       Self.localized("performance.helper.installed_line", "Helper: installed (v1)"))
+        XCTAssertTrue(vm.helperRowSubtitle.contains("Installed (v1)"))
         XCTAssertEqual(vm.helperInstallTitle,
                        Self.localized("performance.helper.reinstall", "Reinstall…"))
     }
