@@ -532,7 +532,10 @@ def test_gguf_fused_moe_rejects_incompatible_shared_input_and_k_split(inter):
 
 @pytest.mark.parametrize("batch,rows", [(1, 1), (1, 6), (2, 6)])
 @pytest.mark.parametrize("ratio", [0, 2])
-def test_gguf_fused_block_and_mtp_verify_match_unfused(monkeypatch, batch, rows, ratio):
+@pytest.mark.parametrize("exact", [False, True])
+def test_gguf_fused_block_and_mtp_verify_match_unfused(
+    monkeypatch, batch, rows, ratio, exact
+):
     from test_deepseek_v41_fused_decode import build
 
     from omlx.patches.deepseek_v41 import decode_fused
@@ -545,6 +548,7 @@ def test_gguf_fused_block_and_mtp_verify_match_unfused(monkeypatch, batch, rows,
         candidate_source_layer=-1,
     )
     c, blk = model._config, model.layers[0]
+    object.__setattr__(blk, "_omlx_verify_exact", exact)
     for n in ("wq_a", "wkv", "wq_b", "wo_b"):
         setattr(blk.attn, n, gguf_module(getattr(blk.attn, n), 8, 11))
     for n, qt in zip(("w1", "w3", "w2"), (19, 16, 22)):
@@ -587,6 +591,68 @@ def test_gguf_verify_projection_reuses_weights_without_changing_rows(qtype):
     x = mx.array(rng.normal(size=(6, 512)).astype(np.float32)).astype(mx.bfloat16)
     expected = mx.concatenate([p(x[r : r + 1]) for r in range(6)])
     np.testing.assert_array_equal(p(x).astype(mx.float32), expected.astype(mx.float32))
+
+
+@pytest.mark.parametrize("qtype", FORMATS)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+def test_gguf_attention_matrix_precision_and_row_consistency(qtype, dtype, monkeypatch):
+    from types import SimpleNamespace
+
+    from omlx.patches.deepseek_v41 import decode_fused as df
+
+    used = []
+    original = df.DL.kernel
+
+    def tracked(name, formats=()):
+        used.append(name)
+        return original(name, formats)
+
+    monkeypatch.setattr(df.DL, "kernel", tracked)
+    # Q8's odd group count also checks the K-split fallback to one SIMD group.
+    width = 544 if qtype == 8 else 512
+    raw, rng = packed(qtype, (16, width), 1981 + qtype)
+    a = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=width)
+    other, _ = packed(8, (8, width), 2111 + qtype)
+    b = GGUFProjection(mx.array(other), qtype=8, input_dims=width)
+    x = mx.array(rng.normal(size=(16, width)).astype(np.float32)).astype(dtype)
+    inp = np.asarray(x.astype(mx.float32)).astype(np.float64)
+    dense = [
+        np.asarray(
+            dequantize(p.weight, p.qtype, (p.output_dims, width), mx.float32)
+        ).astype(np.float64)
+        for p in (a, b)
+    ]
+    single = [df.gemv_fp8_nb(x[i : i + 1], a, b, mma=True) for i in range(16)]
+    c = SimpleNamespace(n_heads=2, head_dim=8, rope_head_dim=4, q_lora_rank=width)
+    att = SimpleNamespace(wq_b=a)
+    angle = mx.arange(32, dtype=mx.float32).reshape(16, 2) * 0.03
+    cos, sin = mx.cos(angle), mx.sin(angle)
+    rope_single = mx.concatenate(
+        [
+            df.wqb_rope_nb(att, x[i : i + 1], cos[i : i + 1], sin[i : i + 1], c, True)
+            for i in range(16)
+        ]
+    )
+    for rows in (1, 2, 5, 6, 9, 16):
+        actual = df.gemv_fp8_nb(x[:rows], a, b, mma=True)
+        for j, values in enumerate(actual):
+            reference = inp[:rows] @ dense[j].T
+            magnitude = abs(inp[:rows]) @ abs(dense[j].T)
+            tolerance = 8 * 2**-23 * magnitude + 0.5 * 2**-7 * abs(reference)
+            assert np.all(
+                abs(np.asarray(values.astype(mx.float32)) - reference) <= tolerance
+            )
+            np.testing.assert_array_equal(
+                values.astype(mx.float32),
+                mx.concatenate([v[j] for v in single[:rows]]).astype(mx.float32),
+            )
+        np.testing.assert_array_equal(
+            df.wqb_rope_nb(att, x[:rows], cos[:rows], sin[:rows], c, True).astype(
+                mx.float32
+            ),
+            rope_single[:rows].astype(mx.float32),
+        )
+    assert set(used) == {"gemv_fp8_mma", "wqb_rope_mma"}
 
 
 def test_gguf_mtp_generation_matches_greedy(monkeypatch):

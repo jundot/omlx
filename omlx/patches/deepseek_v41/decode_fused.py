@@ -437,21 +437,30 @@ def gemv_fp8_nb(x, a, b=None, mma=None):
     """gemv_fp8 for x [B, K]: one weight read for all B vectors. MXFP8: bit for bit gemv_fp8
     per vector without matrix tiles (mma=False); default DM.use_mma(B). Affine projections
     always run on matrix tiles (rows kernels are ALU bound there), which give a vector the
-    same result for any B, as gemv_fp8(tiles=True) does."""
+    same result for any B, as gemv_fp8(tiles=True) does. GGUF uses matrix tiles
+    from six rows by default, or when requested for MTP decode consistency."""
     b_n = x.shape[0]
     na, k = a.weight.shape[0], a.input_dims
     nb = 0 if b is None else b.weight.shape[0]
     assert na % 4 == 0 and nb % 4 == 0
     formats = _pair_formats(a, b)
     affine = _affine(formats)
+    gguf = all(f[0] == "gguf" for f in formats)
     if (
-        (affine or ((DM.use_mma(b_n) if mma is None else mma) and formats == (DM.MXFP8, DM.MXFP8)))
+        (affine
+         or (gguf and (b_n >= 6 if mma is None else mma))
+         or ((DM.use_mma(b_n) if mma is None else mma) and formats == (DM.MXFP8, DM.MXFP8)))
         and na % 8 == 0
         and nb % 8 == 0
     ):
         tiles = (na + nb) // 8
         group = max(f[2] for f in formats)
-        ks = _aff_mma_split(tiles, k // group) if affine else _mma_split(tiles, k // 32)
+        if gguf:
+            # Fixed per projection, including one-row MTP decode. Small K may
+            # not divide the preferred split (e.g. seventeen Q8 groups).
+            ks = next(s for s in ((4, 2, 1) if b is not None else (2, 1)) if k % (32 * s) == 0)
+        else:
+            ks = _aff_mma_split(tiles, k // group) if affine else _mma_split(tiles, k // 32)
         ya, yb = DL.kernel("gemv_fp8_mma", formats)(
             inputs=_pair_inputs(x, a, b),
             template=[("NA", na), ("NB_ROWS", nb), ("K", k), ("NB", b_n), ("KS", ks)],
@@ -486,14 +495,17 @@ def attn_mid_nb(att, qa, kv_in, cos, sin, c, quantize_query=True):
 
 def wqb_rope_nb(att, qrq, cos, sin, c, mma):
     """wqb_rope for B rows: bit for bit per row without matrix tiles (mma=False); affine
-    wq_b always runs on matrix tiles (as gemv_fp8_nb)."""
+    wq_b always runs on matrix tiles (as gemv_fp8_nb). GGUF honors mma without
+    rounding its normalized query to FP8 or changing the packed weight."""
     b_n = qrq.shape[0]
     nq = c.n_heads * c.head_dim
     tmpl = [("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", b_n)]
     fmt = DM.weight_format(att.wq_b)
     affine = _affine((fmt,))
-    if affine or (mma and fmt == DM.MXFP8):
-        ks = (_aff_mma_split if affine else _mma_split)(nq // 8, c.q_lora_rank // fmt[2])
+    if affine or (mma and fmt[0] in ("mxfp8", "gguf")):
+        ks = (next(s for s in (2, 1) if c.q_lora_rank % (32 * s) == 0)
+              if fmt[0] == "gguf"
+              else (_aff_mma_split if affine else _mma_split)(nq // 8, c.q_lora_rank // fmt[2]))
         return DL.kernel("wqb_rope_mma", (fmt,))(
             inputs=[qrq, *_wb(att.wq_b), cos, sin], template=tmpl + [("KS", ks)],
             grid=(nq // 8 * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
@@ -862,13 +874,16 @@ def _gguf_block(blk, h, pre, caches, shareds, starts, c):
     coef, x, _, _ = mix_nb(blk, "attn", c, hf, pre.reshape(bn * rn, hc))
     ap, ao, ac = coef[:, :hc], coef[:, hc : 2 * hc], coef[:, 2 * hc :]
     att = blk.attn
+    # MTP asks its one-token decode to use the verification projection order.
+    # Otherwise keep row dots below the measured six-row crossover.
+    tiles = getattr(blk, "_omlx_verify_exact", False) or bn * rn >= 6
     if att.wo_a.weight.dtype == mx.bfloat16:
-        qa, kv_in = gemv_fp8_nb(x, att.wq_a, att.wkv, mma=False)
+        qa, kv_in = gemv_fp8_nb(x, att.wq_a, att.wkv, mma=tiles)
         ratio = c.compress_ratios[att._layer]
         positions = [start + j for start in starts for j in range(rn)]
         cos, sin = _cos_sin_nb(c, bool(ratio), positions)
         qr, qrq, packed = attn_mid_nb(att, qa, kv_in, cos, sin, c, quantize_query=False)
-        q = wqb_rope_nb(att, qrq, cos, sin, c, False)
+        q = wqb_rope_nb(att, qrq, cos, sin, c, tiles)
         outputs = []
         for b in range(bn):
             sl = slice(b * rn, (b + 1) * rn)
@@ -888,7 +903,7 @@ def _gguf_block(blk, h, pre, caches, shareds, starts, c):
         grouped = mx.concatenate(outputs).astype(mx.bfloat16).reshape(bn, rn, c.o_groups, -1)
         weight = att.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
         latent = mx.einsum("bsgd,grd->bsgr", grouped, weight).reshape(bn * rn, -1)
-        attn = gemv_fp8_nb(latent, att.wo_b, mma=False)[0]
+        attn = gemv_fp8_nb(latent, att.wo_b, mma=tiles)[0]
     else:
         x = x.reshape(bn, rn, dim)
         attn = mx.concatenate(
