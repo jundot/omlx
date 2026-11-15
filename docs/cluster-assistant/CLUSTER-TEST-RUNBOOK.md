@@ -127,6 +127,38 @@ than this file:
 
 ---
 
+## 1.5 Roll out the same build to every Mac (before any cluster run)
+
+A cluster test with mixed builds is not a test of this tree. `0.7.4.dev1` peers
+lack routes this branch relies on, and a plan approved here must be drivable on
+the elected coordinator over SSH.
+
+**Gate: every Mac reports the same `version` in `GET /api/cluster/node_id`
+(§2.2). Do not run the flow before that.**
+
+1. Build and notarize on this Mac (§7.2). The DMG must pass
+   `codesign --verify --deep --strict`, `xcrun stapler validate` and
+   `spctl -a -t open --context context:primary-signature` **before** it is copied.
+   Note R22: the packaged app must sign its nested Mach-O files (the compiled
+   custom kernels), or Apple rejects the build.
+2. Stop the old server on each peer:
+   `ssh <peer> 'pkill -f "omlx serve"; pkill -f oMLX.app'`.
+3. Copy and install:
+   ```sh
+   scp build/oMLX-<version>.dmg andreaskolb@<peer>:/tmp/
+   ssh andreaskolb@<peer> 'hdiutil attach -nobrowse -readonly /tmp/oMLX-<version>.dmg'
+   ssh andreaskolb@<peer> 'rm -rf /Applications/oMLX.app && ditto /Volumes/oMLX/oMLX.app /Applications/oMLX.app'
+   ssh andreaskolb@<peer> 'hdiutil detach /Volumes/oMLX'
+   ```
+4. Start it: `ssh <peer> 'open -a /Applications/oMLX.app'` (the app starts its
+   server), then wait for `/health` on `http://<peer>:8099`.
+5. Verify the version on all four Macs (§2.2) before continuing.
+6. Only then pair (§1) and run §3.
+
+The first run of a slim build may want its runtime provisioned. If the app does
+not come up on a peer, say so and provision it there before pairing rather than
+testing a half-installed Mac.
+
 ## 2. Start the origin and check the peer builds
 
 ### 2.1 Origin server
