@@ -17,10 +17,13 @@ gqa * T <= 32.
 
 from __future__ import annotations
 
+import functools
+
 import mlx.core as mx
 
 _MAX_BLOCKS = 128  # most key blocks (pass-1 threadgroups per KV head)
-_KEYS_PER_BLOCK = 256  # fewer, longer blocks keep the fp32 partials small
+_TARGET_GROUPS = 256  # threadgroups per dispatch: layers run back to back, so a
+# small grid leaves the GPU idle (measured: 32 blocks x 8 KV heads beat 16 and 64)
 _HEAD_DIM = 128
 _MAX_ROWS = 32  # four 8-row tiles, one simdgroup each
 
@@ -161,7 +164,7 @@ _PASS1_SRC = """
 # Threadgroup (D, 1, 1); grid threadgroups (B * Hq, T). One lane per output
 # element; every lane re-reads the (small) per-block max / sum arrays.
 _PASS2_SRC = """
-    const int BLOCKS = params[0];
+    const int BLOCKS = params[3];
     constexpr int D = {head_dim};
     const int o_off = threadgroup_position_in_grid.x * threadgroups_per_grid.y
         + threadgroup_position_in_grid.y;
@@ -201,6 +204,13 @@ def _pass1():
     return _kernel
 
 
+@functools.lru_cache(maxsize=16)
+def _params(n_keys: int, cap_k: int, cap_v: int, blocks: int):
+    # Every layer of a forward shares these four ints: build the device
+    # array once per (n_keys, ...) rather than once per layer.
+    return mx.array([n_keys, cap_k, cap_v, blocks], dtype=mx.int32)
+
+
 def _pass2():
     global _kernel2
     if _kernel2 is None:
@@ -231,8 +241,8 @@ def mma_verify_sdpa(queries, k_buf, v_buf, n_keys: int, scale: float):
     tiles = -(-gqa * T // 8)
     q = queries * scale if scale != 1.0 else queries
 
-    blocks = max(1, min(_MAX_BLOCKS, -(-n_keys // _KEYS_PER_BLOCK)))
-    params = mx.array([n_keys, k_buf.shape[2], v_buf.shape[2], blocks], dtype=mx.int32)
+    blocks = max(1, min(_MAX_BLOCKS, -(-_TARGET_GROUPS // (hkv * B)), -(-n_keys // 16)))
+    params = _params(n_keys, k_buf.shape[2], v_buf.shape[2], blocks)
     partials, sums, maxs = _pass1()(
         inputs=[q, k_buf, v_buf, params],
         template=[("T", q.dtype), ("TR", T), ("G", gqa)],
@@ -246,7 +256,7 @@ def mma_verify_sdpa(queries, k_buf, v_buf, n_keys: int, scale: float):
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
     (out,) = _pass2()(
-        inputs=[partials, sums, maxs, mx.array([blocks], dtype=mx.int32)],
+        inputs=[partials, sums, maxs, params],
         template=[("T", q.dtype)],
         grid=(head_dim * B * hq, T, 1),
         threadgroup=(head_dim, 1, 1),
