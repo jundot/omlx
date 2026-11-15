@@ -9309,6 +9309,43 @@ class TestStreamedCalibration:
         for key, value in reference.items():
             assert metadata["sensitivity_map"][key] == pytest.approx(value, rel=1e-3)
 
+    @pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5"])
+    def test_qwen3_5_vlm_mtp_rows_keep_their_positions(self, tmp_path, model_type):
+        """Two identical rows give the MTP head exactly twice one row's statistics.
+
+        Run as one batch, mlx-vlm's head would read MRoPE positions out of
+        range for the second row.
+        """
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        config = _qwen3_5_stream_source(source, model_type, vlm=True, mtp=True)
+        mx.random.seed(3)
+        hidden = mx.random.normal((1, 6, 32)).astype(mx.bfloat16)
+        tokens = mx.array([[5, 9, 2, 7, 11, 4]], dtype=mx.int32)
+        entries = []
+        for rows in (1, 2):
+            collector = OQImatrixCollector()
+            oq._collect_streamed_qwen3_5_mtp(
+                source,
+                json.loads(json.dumps(config)),
+                collector,
+                mx.repeat(tokens, rows, axis=0),
+                [mx.repeat(hidden, rows, axis=0)],
+                [(0, rows)],
+            )
+            entries.append(collector.entries)
+        one, two = entries
+        assert "language_model.mtp.layers.0.self_attn.o_proj" in one
+        assert one.keys() == two.keys()
+        for key, entry in one.items():
+            np.testing.assert_array_equal(two[key].counts, 2 * entry.counts, key)
+            # Expert kernels may regroup the fp32 sums; wrong positions move
+            # the statistics by tens of percent.
+            np.testing.assert_allclose(
+                two[key].in_sum2, 2 * entry.in_sum2, rtol=1e-6, err_msg=key
+            )
+
     @pytest.mark.parametrize(
         "vlm", [pytest.param(True, id="vlm"), pytest.param(False, id="text")]
     )
