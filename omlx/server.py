@@ -1048,11 +1048,19 @@ def _is_anthropic_route(request) -> bool:
 
 
 def _anthropic_error_body(message, status_code: int) -> dict:
-    """Build an Anthropic-compatible error response body."""
+    """Build an Anthropic-compatible error response body.
+
+    A status the table does not name (405, 409, 422, …) still gets a type from
+    its class, so a client that branched on ``invalid_request_error`` is not
+    handed ``api_error`` for a 4xx.
+    """
+    error_type = _ANTHROPIC_ERROR_TYPES.get(status_code)
+    if error_type is None:
+        error_type = "invalid_request_error" if 400 <= status_code < 500 else "api_error"
     return {
         "type": "error",
         "error": {
-            "type": _ANTHROPIC_ERROR_TYPES.get(status_code, "api_error"),
+            "type": error_type,
             "message": str(message),
         },
     }

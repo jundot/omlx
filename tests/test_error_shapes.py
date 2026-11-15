@@ -161,6 +161,29 @@ async def test_other_api_route_invalid_request_keeps_openai_shape():
     assert body["error"]["param"] == "logprobs"
 
 
+def test_unmapped_4xx_status_falls_back_to_invalid_request_error():
+    body = server._anthropic_error_body("Method Not Allowed", 405)
+
+    assert body["error"]["type"] == "invalid_request_error"
+
+
+def test_unmapped_5xx_status_falls_back_to_api_error():
+    body = server._anthropic_error_body("Insufficient Storage", 507)
+
+    assert body["error"]["type"] == "api_error"
+
+
+def test_method_not_allowed_on_anthropic_route_keeps_anthropic_shape():
+    client = TestClient(server.app)
+    response = client.put("/v1/messages")
+
+    assert response.status_code == 405
+    assert response.headers["allow"] == "POST"
+    body = response.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "invalid_request_error"
+
+
 def test_unmatched_anthropic_route_returns_anthropic_error_body():
     client = TestClient(server.app)
     response = client.post("/v1/messages/does-not-exist")
