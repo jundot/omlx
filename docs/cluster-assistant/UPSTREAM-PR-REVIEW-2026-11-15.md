@@ -515,3 +515,28 @@ tests**, all of them the defects the separate fixes PR repairs:
 The feature branch intentionally excludes those fixes, so this is a **dependency**,
 not a regression: merge `fix/macos-theme-locale-xctest` first (or expect the three
 on macOS 27). Recorded in the feature PR body.
+
+## 13. R19/R20 — found by the full-suite run (fixed)
+
+**R19 — the nested assistant `conftest.py` shadowed `tests/conftest.py`.**
+The full suite on the plan slice failed 10 tests, 9 of them
+`tests/test_scheduler.py::TestDetectNeedsThinkPrefix` with
+`ImportError: cannot import name 'MockTokenizer' from 'conftest'`: the scheduler
+helper imports `conftest` lazily, and once `tests/cluster_assistant/conftest.py`
+is collected it occupies that module name. Fixed in the plan slice by importing
+`MockTokenizer` from `_tokenizer_support` explicitly (3 call sites). This is the
+rewrite the test-infra PR deliberately did not carry; it belongs to the slice that
+introduces the nested conftest.
+
+The tenth failure was `tests/test_cluster_seams.py` flagging three functions the
+plan slice ships but cannot call yet (`measurement.with_calibration`,
+`policy.policy_model_settings`, `routes.configure_assistant_seams`); added to
+`allowed_uncalled` with the reason "ships with the run slice".
+
+**R20 — the stylesheet was stale in the run slices.** `make web` changed
+`static/css/tailwind.css` by one line in the run (and initially the run-local)
+slice: the added markup used utilities that the copied stylesheet did not contain.
+Rebuilt and committed in the run slice; the run-local slice inherits it.
+
+Both are exactly the kind of cross-effect the focused runs could not see, which is
+why the full suites per branch were worth running.
