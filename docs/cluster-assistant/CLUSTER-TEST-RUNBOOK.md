@@ -31,6 +31,30 @@ operation and deployment IDs. Live evidence lives there, never in the test suite
 
 ---
 
+## 0.4 Running the suite in a git worktree
+
+The native custom kernels are build artefacts (`omlx/custom_kernels/*/*.so`,
+`*.metallib`, gitignored), so a fresh worktree has none and two tests fail for
+environmental reasons:
+
+```
+tests/test_glm5_next_mtp.py::test_split_k_batched_decode_matches_rows_alone[lengths0]
+tests/test_glm5_next_mtp.py::test_split_k_batched_decode_matches_rows_alone[lengths1]
+```
+
+Neither touches cluster code; they pass in the main checkout where `make kernels`
+ran. In a worktree either run `make kernels PYTHON=<worktree>/.venv/bin/python`
+or copy the four `.so` files and their `.metallib` from the main checkout:
+
+```sh
+for t in attention lowbit quant_matmul sparse_index; do
+  mkdir -p <worktree>/omlx/custom_kernels/$t
+  cp omlx/custom_kernels/$t/* <worktree>/omlx/custom_kernels/$t/
+done
+```
+
+After that the file is green (98 passed, verified 2026-11-15).
+
 ## 0.5 Reset to a clean cluster state (done 2026-11-15)
 
 Before a from-scratch run (find devices → pair → measure → plan → apply → start,
