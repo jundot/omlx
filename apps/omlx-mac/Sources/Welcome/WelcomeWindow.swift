@@ -135,6 +135,11 @@ final class WelcomeViewModel: ObservableObject {
     @Published var runtimeLog: String = ""
     @Published var runtimeError: String?
 
+    // D6: the system helper is part of setting the Mac up, not of an error.
+    @Published var helperInstalling: Bool = false
+    @Published var helperError: String?
+    @Published var helperStatus: HelperStatus = PrivilegedHelper.currentStatus()
+
     var onFinish: ((AppConfig, ServerProcess?) -> Void)?
     var onOpenDashboard: (() -> Void)?
     var onClose: (() -> Void)?
@@ -174,6 +179,50 @@ final class WelcomeViewModel: ObservableObject {
             }
         } catch {
             runtimeError = error.localizedDescription
+        }
+    }
+
+    /// The helper status line shown after the install step. No server is up
+    /// yet in Welcome, so the wired-limit pair is nil; installed/version are
+    /// the local truth.
+    var helperStatusLine: String {
+        if helperStatus.installed {
+            let version = helperStatus.version.map { "v\($0)" }
+                ?? String(localized: "performance.helper.unknown_version",
+                          defaultValue: "unknown version",
+                          comment: "Helper version label when the install ledger has no version")
+            return String(localized: "performance.helper.installed_line",
+                          defaultValue: "Helper: installed (\(version))",
+                          comment: "Permanent Performance row when the privileged helper is installed")
+        }
+        return String(localized: "performance.helper.not_installed_line",
+                      defaultValue: "Helper: not installed",
+                      comment: "Permanent Performance row when the privileged helper is absent")
+    }
+
+    var helperInstallTitle: String {
+        helperStatus.installed
+            ? String(localized: "performance.helper.reinstall",
+                     defaultValue: "Reinstall…",
+                     comment: "Button that re-blesses the privileged helper with one admin dialog")
+            : String(localized: "welcome.helper.install",
+                     defaultValue: "Install with Admin…",
+                     comment: "Welcome button that installs the system helper with one admin dialog")
+    }
+
+    /// One standard admin dialog while the person is already clicking through
+    /// setup. Idempotent: a same-build helper is a no-prompt reuse.
+    func installHelper() async {
+        guard !helperInstalling else { return }
+        helperInstalling = true
+        helperError = nil
+        defer { helperInstalling = false }
+        do {
+            try PrivilegedHelper.ensureInstalled()
+            helperStatus = PrivilegedHelper.currentStatus()
+        } catch {
+            helperError = error.localizedDescription
+            helperStatus = PrivilegedHelper.currentStatus()
         }
     }
 
@@ -643,6 +692,41 @@ private struct WelcomeSetupBody: View {
                                 .font(.omlxText(DesignTokens.FontSize.caption))
                                 .foregroundStyle(Color(nsColor: .systemRed))
                         }
+                    }
+                }
+
+                // D6: a "System helper" step next to the runtime installer.
+                // Always visible — the capability is never hidden behind a
+                // wired-limit condition. One admin dialog, idempotent.
+                VStack(alignment: .leading, spacing: 8) {
+                    WelcomeNotice(
+                        icon: "lock.shield.fill",
+                        title: String(localized: "welcome.helper.title",
+                                      defaultValue: "System helper",
+                                      comment: "Title for the first-run system helper install card"),
+                        text: String(localized: "welcome.helper.body",
+                                     defaultValue: "oMLX uses a small signed helper to raise the Metal wired limit when a model needs more GPU memory. Install it once with a standard admin dialog; it stays across restarts.",
+                                     comment: "Body for the first-run system helper install card")
+                    )
+                    HStack(spacing: 10) {
+                        Button {
+                            Task { await vm.installHelper() }
+                        } label: {
+                            Label(vm.helperInstallTitle, systemImage: "lock.shield")
+                        }
+                        .buttonStyle(.omlx(.primary, size: .small))
+                        .disabled(vm.helperInstalling || vm.isStarting)
+                        if vm.helperInstalling {
+                            ProgressView().controlSize(.small)
+                        }
+                        Text(vm.helperStatusLine)
+                            .font(.omlxText(DesignTokens.FontSize.caption))
+                            .foregroundStyle(WelcomeStyle.muted)
+                    }
+                    if let error = vm.helperError {
+                        Text(error)
+                            .font(.omlxText(DesignTokens.FontSize.caption))
+                            .foregroundStyle(Color(nsColor: .systemRed))
                     }
                 }
 

@@ -61,6 +61,11 @@ final class PerformanceScreenVM {
     /// `memoryGuardBreakdownHTML` / `memoryGuardShowWiredLimitWarning`).
     var systemInfo: GlobalSettingsDTO.SystemInfo? = nil
 
+    /// D6: the one helper truth. Refreshed on load and after install/apply;
+    /// settable so tests can inject the five status states without a disk read.
+    var helperStatus: HelperStatus = PrivilegedHelper.currentStatus()
+    private(set) var helperInstalling = false
+
     var hasPendingChanges: Bool {
         parsedMaxConcurrent != loadedMaxConcurrent
             || parsedEmbeddingBatchSize != loadedEmbeddingBatchSize
@@ -226,10 +231,17 @@ final class PerformanceScreenVM {
                 self.loadedInitialCacheBlocks = cache.initialCacheBlocks
             }
             self.systemInfo = s.system
+            self.refreshHelperStatus()
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
         }
+    }
+
+    /// Re-read the helper truth from the local ledger plus the latest server
+    /// snapshot. Called on load and after any privileged action.
+    func refreshHelperStatus() {
+        helperStatus = PrivilegedHelper.currentStatus(systemInfo: systemInfo)
     }
 
     func save(client: OMLXClient) async {
@@ -556,6 +568,83 @@ final class PerformanceScreenVM {
         }
     }
 
+    // MARK: Helper capability (D6)
+
+    var helperPresentation: HelperPresentation {
+        PrivilegedHelper.presentation(for: helperStatus)
+    }
+
+    /// "Helper: installed (vX)" / "Helper: not installed" — the permanent row.
+    var helperStatusLine: String {
+        if helperStatus.installed {
+            let version = helperStatus.version.map { "v\($0)" }
+                ?? String(localized: "performance.helper.unknown_version",
+                          defaultValue: "unknown version",
+                          comment: "Helper version label when the install ledger has no version")
+            return String(localized: "performance.helper.installed_line",
+                          defaultValue: "Helper: installed (\(version))",
+                          comment: "Permanent Performance row when the privileged helper is installed")
+        }
+        return String(localized: "performance.helper.not_installed_line",
+                      defaultValue: "Helper: not installed",
+                      comment: "Permanent Performance row when the privileged helper is absent")
+    }
+
+    var helperInstallTitle: String {
+        helperPresentation.installAction == .reinstall
+            ? String(localized: "performance.helper.reinstall",
+                     defaultValue: "Reinstall…",
+                     comment: "Button that re-blesses the privileged helper with one admin dialog")
+            : String(localized: "performance.helper.install",
+                     defaultValue: "Install helper…",
+                     comment: "Button that installs the privileged helper with one admin dialog")
+    }
+
+    /// "122880 MB of 122880 MB requested" — nil when the server reported no
+    /// request (nothing to apply). Independent of the memory-guard warning.
+    var wiredLimitStatusLine: String? {
+        guard let requested = helperStatus.wiredLimitRequestedMB, requested > 0 else { return nil }
+        // Plain digits (no locale grouping) so the English-only UI reads the
+        // same on every host: "29696 MB of 122880 MB requested".
+        let current = String(helperStatus.wiredLimitCurrentMB ?? 0)
+        let target = String(requested)
+        return String(localized: "performance.helper.wired_limit_line",
+                      defaultValue: "\(current) MB of \(target) MB requested",
+                      comment: "Wired-limit row showing the kernel cap against oMLX's request, in MB")
+    }
+
+    var wiredLimitApplyVisible: Bool { helperPresentation.applyVisible }
+
+    /// Install or reinstall the helper from the permanent Performance row.
+    /// Never conditional on the wired-limit warning. A same-build reinstall is
+    /// a no-prompt reuse and says so.
+    func installHelper(client: OMLXClient) async {
+        guard !helperInstalling else { return }
+        helperInstalling = true
+        defer { helperInstalling = false }
+        do {
+            let state = try PrivilegedHelper.ensureInstalled()
+            await load(client: client)
+            switch state {
+            case .reuse:
+                lastError = String(localized: "performance.helper.already_installed",
+                                   defaultValue: "The system helper is already installed.",
+                                   comment: "Confirmation when reinstalling the same helper build needs no prompt")
+            case .bless:
+                lastError = String(localized: "performance.helper.installed",
+                                   defaultValue: "The system helper was installed.",
+                                   comment: "Confirmation after the admin dialog installed the helper")
+            case .replace:
+                lastError = String(localized: "performance.helper.reinstalled",
+                                   defaultValue: "The system helper was reinstalled.",
+                                   comment: "Confirmation after the admin dialog replaced an older helper")
+            }
+        } catch {
+            lastError = error.localizedDescription
+            refreshHelperStatus()
+        }
+    }
+
 }
 
 // MARK: - Privileged actions
@@ -613,6 +702,63 @@ enum PrivilegedActions {
 }
 
 
+// MARK: - Helper capability (D6)
+
+/// The one observable truth about the privileged helper. `installed` and
+/// `version` come from the on-disk tool plus the app's install ledger; the
+/// wired-limit pair comes from the server's system snapshot. Welcome,
+/// Performance and the tests all read this same shape, so "is the helper
+/// there?" never needs a shell. The helper is a capability, not a side effect
+/// of a low wired limit: nothing here is conditional on the warning.
+struct HelperStatus: Equatable, Sendable {
+    let installed: Bool
+    /// The version the app recorded when it blessed the tool; `nil` when the
+    /// tool is absent or predates the ledger. The XPC tool exposes no version
+    /// query, so the ledger is the authoritative installed version.
+    let version: Int?
+    let wiredLimitCurrentMB: Int?
+    let wiredLimitRequestedMB: Int?
+
+    var installState: PrivilegedHelper.InstallState {
+        PrivilegedHelper.installState(
+            helperOnDisk: installed,
+            recordedVersion: version,
+            bundledVersion: PrivilegedHelper.helperBundleVersion
+        )
+    }
+
+    /// Apply is offered whenever a request exists and the kernel cap differs
+    /// from it — including "apply again" after a raise. Equal => hidden, but
+    /// the Install/Reinstall affordance stays visible regardless.
+    var wiredLimitApplyVisible: Bool {
+        guard let requested = wiredLimitRequestedMB, requested > 0 else { return false }
+        return wiredLimitCurrentMB != requested
+    }
+}
+
+/// The button the permanent Helper row shows. It is never hidden: a person
+/// must always be able to install or reinstall the capability (D6).
+enum HelperInstallAction: Equatable, Sendable {
+    case install
+    case reinstall
+}
+
+struct HelperPresentation: Equatable, Sendable {
+    let installAction: HelperInstallAction
+    let applyVisible: Bool
+    /// Whether invoking install will actually open an admin prompt (bless or
+    /// replace) or be a no-prompt reuse. Drives the confirmation text only.
+    let willPrompt: Bool
+}
+
+/// Outcome of the uninstall's single helper-removal dialog. A cancel or a
+/// failure leaves the rest of the uninstall done and is reported, not fatal.
+enum HelperRemovalOutcome: Equatable, Sendable {
+    case removed
+    case cancelled
+    case failed(String)
+}
+
 // MARK: - Persistent SMJobBless helper
 
 @objc(OMLXHelperProtocol)
@@ -654,6 +800,112 @@ enum PrivilegedHelper {
         return .reuse
     }
 
+    /// Pure status builder so the five D6 states are testable without a disk
+    /// read or an admin prompt. An absent tool never carries a stale ledger
+    /// version.
+    static func status(
+        helperOnDisk: Bool,
+        recordedVersion: Int?,
+        wiredLimitCurrentMB: Int?,
+        wiredLimitRequestedMB: Int?
+    ) -> HelperStatus {
+        HelperStatus(
+            installed: helperOnDisk,
+            version: helperOnDisk ? recordedVersion : nil,
+            wiredLimitCurrentMB: wiredLimitCurrentMB,
+            wiredLimitRequestedMB: wiredLimitRequestedMB
+        )
+    }
+
+    /// The real-world reader both screens call. `systemInfo` is the server's
+    /// snapshot (nil in Welcome / before load => the wired-limit pair is nil,
+    /// the installed/version pair is still local truth).
+    static func currentStatus(
+        defaults: UserDefaults = .standard,
+        systemInfo: GlobalSettingsDTO.SystemInfo? = nil,
+        helperOnDisk: Bool? = nil
+    ) -> HelperStatus {
+        let exists = helperOnDisk
+            ?? FileManager.default.fileExists(atPath: installedPath)
+        return status(
+            helperOnDisk: exists,
+            recordedVersion: defaults.object(forKey: installedVersionKey) as? Int,
+            wiredLimitCurrentMB: mb(fromBytes: systemInfo?.iogpuWiredLimitBytes),
+            wiredLimitRequestedMB: mb(fromBytes: systemInfo?.omlxWiredLimitRequestBytes)
+        )
+    }
+
+    private static func mb(fromBytes bytes: Int64?) -> Int? {
+        guard let bytes, bytes > 0 else { return nil }
+        return Int((Double(bytes) / 1_048_576.0).rounded(.up))
+    }
+
+    /// The permanent row's decision: an install affordance is always present;
+    /// Apply appears only when the kernel cap differs from the request.
+    static func presentation(for status: HelperStatus) -> HelperPresentation {
+        HelperPresentation(
+            installAction: status.installed ? .reinstall : .install,
+            applyVisible: status.wiredLimitApplyVisible,
+            willPrompt: status.installState != .reuse
+        )
+    }
+
+    /// Install or reinstall the helper without touching the wired limit — the
+    /// Welcome step and the Performance "Install helper…/Reinstall…" button.
+    /// Idempotent and versioned: same build => `.reuse` (no prompt), another
+    /// build => remove then bless. The bless/remove effects are injectable so
+    /// the sequence is testable without an admin dialog. Returns the action
+    /// taken so the caller can report "already installed" vs "installed".
+    @discardableResult
+    static func ensureInstalled(
+        defaults: UserDefaults = .standard,
+        bundledVersion: Int = helperBundleVersion,
+        helperOnDisk: Bool? = nil,
+        bless: () throws -> Void = { try install() },
+        remove: () throws -> Void = { try uninstall() }
+    ) throws -> InstallState {
+        let exists = helperOnDisk
+            ?? FileManager.default.fileExists(atPath: installedPath)
+        let state = installState(
+            helperOnDisk: exists,
+            recordedVersion: defaults.object(forKey: installedVersionKey) as? Int,
+            bundledVersion: bundledVersion
+        )
+        switch state {
+        case .reuse:
+            break
+        case .bless:
+            try bless()
+            defaults.set(bundledVersion, forKey: installedVersionKey)
+        case .replace:
+            // A failed removal is not fatal: bless refuses to overwrite, so
+            // the call below then fails rather than silently keeping the old
+            // tool. The caller reports the failure.
+            try? remove()
+            try bless()
+            defaults.set(bundledVersion, forKey: installedVersionKey)
+        }
+        return state
+    }
+
+    /// The uninstall's one helper-removal dialog (SMJobRemove bootouts the
+    /// daemon and removes the blessed tool). A cancel or failure is reported
+    /// and never aborts the rest of the uninstall.
+    static func removeForUninstall(
+        defaults: UserDefaults = .standard,
+        remove: () throws -> Void = { try uninstall() }
+    ) -> HelperRemovalOutcome {
+        do {
+            try remove()
+            defaults.removeObject(forKey: installedVersionKey)
+            return .removed
+        } catch PrivilegedActionError.cancelled {
+            return .cancelled
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
     /// A cancelled admin prompt or an out-of-range value must never open a
     /// second prompt: the user already answered, and the AppleScript path
     /// validates the same range. Only an installation or XPC failure falls
@@ -673,27 +925,13 @@ enum PrivilegedHelper {
         helperOnDisk: Bool? = nil
     ) async throws {
         let value = try PrivilegedActions.validatedWiredLimitMB(mb)
-        let exists = helperOnDisk
-            ?? FileManager.default.fileExists(atPath: installedPath)
-        let state = installState(
-            helperOnDisk: exists,
-            recordedVersion: defaults.object(forKey: installedVersionKey) as? Int,
-            bundledVersion: bundledVersion
+        // One install path for both "Apply with Admin…" and the standalone
+        // Install/Reinstall button: bless/reuse/replace, then set the limit.
+        try ensureInstalled(
+            defaults: defaults,
+            bundledVersion: bundledVersion,
+            helperOnDisk: helperOnDisk
         )
-        switch state {
-        case .reuse:
-            break
-        case .bless:
-            try install()
-            defaults.set(bundledVersion, forKey: installedVersionKey)
-        case .replace:
-            // A failed removal is not fatal: bless refuses to overwrite, so
-            // the call below then fails into the AppleScript fallback rather
-            // than leaving the user with no wired-limit path.
-            try? uninstall()
-            try install()
-            defaults.set(bundledVersion, forKey: installedVersionKey)
-        }
         try await call(value)
     }
 

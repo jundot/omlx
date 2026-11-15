@@ -25,6 +25,7 @@ struct PerformanceScreen: View {
         VStack(alignment: .leading, spacing: 0) {
             SchedulerSection(vm: vm)
             MemoryLifecycleSection(vm: vm)
+            SystemHelperSection(vm: vm)
             CacheSection(vm: vm)
 
             FooterBar(error: vm.lastError) {
@@ -320,6 +321,68 @@ private struct MemoryLifecycleSection: View {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .strokeBorder(theme.warningText.opacity(0.25), lineWidth: 0.5)
                     )
+                }
+            }
+        }
+    }
+}
+
+// MARK: - System helper (D6)
+
+/// The helper is a capability, not a side effect of a low wired limit. This
+/// section is permanent: the Install/Reinstall affordance is always visible,
+/// and the wired-limit row offers Apply whenever the kernel cap differs from
+/// oMLX's request — independent of the memory-guard warning above.
+private struct SystemHelperSection: View {
+    @Bindable var vm: PerformanceScreenVM
+    @Environment(AppServices.self) private var services
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        SectionHeader(
+            String(localized: "performance.section.helper",
+                   defaultValue: "System Helper",
+                   comment: "Section header for the privileged helper capability"),
+            subtitle: String(localized: "performance.section.helper.sub",
+                             defaultValue: "Lets oMLX raise the Metal wired limit with one admin dialog. Install it once; it stays across restarts.",
+                             comment: "Subtitle explaining what the privileged helper is for")
+        )
+
+        ListGroup {
+            Row(
+                label: String(localized: "performance.helper.row_label",
+                              defaultValue: "System Helper",
+                              comment: "Row label for the privileged helper status"),
+                sublabel: vm.helperStatusLine
+            ) {
+                HStack(spacing: 8) {
+                    if vm.helperInstalling {
+                        ProgressView().controlSize(.small)
+                    }
+                    Button(vm.helperInstallTitle) {
+                        Task { await vm.installHelper(client: services.client) }
+                    }
+                    .buttonStyle(.omlx(.normal))
+                    .disabled(vm.helperInstalling || vm.isLoading)
+                }
+            }
+            if let line = vm.wiredLimitStatusLine {
+                Row(
+                    label: String(localized: "performance.helper.wired_limit_label",
+                                  defaultValue: "Metal Wired Limit",
+                                  comment: "Row label for the kernel Metal wired limit versus the request"),
+                    sublabel: line,
+                    isLast: !vm.wiredLimitApplyVisible
+                ) {
+                    if vm.wiredLimitApplyVisible {
+                        Button(String(localized: "performance.memory.wired_limit_apply",
+                                      defaultValue: "Apply with Admin…",
+                                      comment: "Button that raises the Metal wired limit with one system admin dialog")) {
+                            Task { await vm.applyWiredLimit(client: services.client) }
+                        }
+                        .buttonStyle(.omlx(.normal))
+                        .disabled(vm.isLoading || vm.isSaving)
+                    }
                 }
             }
         }

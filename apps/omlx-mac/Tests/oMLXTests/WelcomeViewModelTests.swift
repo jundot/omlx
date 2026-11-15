@@ -111,4 +111,32 @@ final class WelcomeViewModelTests: XCTestCase {
         XCTAssertFalse(vm.validateSetup())
         XCTAssertEqual(vm.lastError, Self.localized("welcome.error.key_non_ascii", "API key must contain only printable ASCII."))
     }
+
+    // MARK: - D6 system helper step
+
+    /// The helper step is part of setup, not of an error: it shows Install when
+    /// the tool is absent, independent of the runtime installer's state.
+    func testHelperStepShowsInstallWhenAbsent() {
+        let vm = makeVM()
+        vm.helperStatus = PrivilegedHelper.status(
+            helperOnDisk: false, recordedVersion: nil,
+            wiredLimitCurrentMB: nil, wiredLimitRequestedMB: nil
+        )
+        XCTAssertEqual(vm.helperStatusLine,
+                       Self.localized("performance.helper.not_installed_line", "Helper: not installed"))
+        XCTAssertEqual(vm.helperInstallTitle,
+                       Self.localized("welcome.helper.install", "Install with Admin…"))
+    }
+
+    func testHelperStepShowsReinstallWhenPresent() {
+        let vm = makeVM()
+        vm.helperStatus = PrivilegedHelper.status(
+            helperOnDisk: true, recordedVersion: 1,
+            wiredLimitCurrentMB: nil, wiredLimitRequestedMB: nil
+        )
+        XCTAssertEqual(vm.helperStatusLine,
+                       Self.localized("performance.helper.installed_line", "Helper: installed (v1)"))
+        XCTAssertEqual(vm.helperInstallTitle,
+                       Self.localized("performance.helper.reinstall", "Reinstall…"))
+    }
 }
