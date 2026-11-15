@@ -16,7 +16,7 @@ from omlx.patches import (
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
-K, N = 2048, 1024
+K, N = 2048, 4096
 
 
 @pytest.fixture
@@ -32,10 +32,10 @@ def m1_batched_decode(monkeypatch):
     batched_decode_qmm._CHECKED.clear()
 
 
-def _linear(bits, dtype):
+def _linear(bits, dtype, n=N):
     mx.random.seed(0)
-    linear = nn.QuantizedLinear(K, N, bias=False, group_size=64, bits=bits)
-    weight = (mx.random.normal((N, K)) * 0.05).astype(dtype)
+    linear = nn.QuantizedLinear(K, n, bias=False, group_size=64, bits=bits)
+    weight = (mx.random.normal((n, K)) * 0.05).astype(dtype)
     linear.weight, linear.scales, linear.biases = mx.quantize(
         weight, group_size=64, bits=bits
     )
@@ -86,9 +86,19 @@ def test_one_row_and_mismatched_dtype_keep_the_stock_path(
     )
     assert taken == []
     taken, _ = _routes_taken(
-        monkeypatch, _linear(4, mx.float16), mx.ones((3, 1, K), dtype=mx.bfloat16)
+        monkeypatch, _linear(4, mx.float16), mx.ones((4, 1, K), dtype=mx.bfloat16)
     )
     assert taken == []
+
+
+@pytest.mark.parametrize("rows", [2, 3, 4, 5])
+def test_small_projections_keep_the_stock_path(m1_batched_decode, rows):
+    # 512x2048 is eligible for the M1 kernels but measured slower than stock.
+    assert qwen35_verify_qmm._verify_route(rows, 512, 2048, 4, 64, mx.float16) in (
+        "m1",
+        "m1_mma",
+    )
+    assert batched_decode_qmm._route(rows, 512, 2048, 4, 64, mx.float16) is None
 
 
 def test_other_routes_stay_off_below_six_rows(monkeypatch, m1_batched_decode):
@@ -126,10 +136,10 @@ def test_routed_rows_keep_the_bias(monkeypatch, m1_batched_decode):
         weight, group_size=64, bits=4
     )
     linear.bias = mx.random.normal((N,)).astype(mx.float16)
-    x = mx.random.normal((3, 1, K)).astype(mx.float16)
+    x = mx.random.normal((4, 1, K)).astype(mx.float16)
     stock = (
         mx.quantized_matmul(
-            x.reshape(3, K),
+            x.reshape(4, K),
             linear.weight,
             linear.scales,
             linear.biases,
@@ -138,7 +148,7 @@ def test_routed_rows_keep_the_bias(monkeypatch, m1_batched_decode):
             bits=4,
         )
         + linear.bias
-    ).reshape(3, 1, N)
+    ).reshape(4, 1, N)
     taken, routed = _routes_taken(monkeypatch, linear, x)
     assert taken == ["m1"]
     assert mx.allclose(routed, stock, atol=2e-2, rtol=2e-2).item()
