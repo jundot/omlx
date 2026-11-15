@@ -131,12 +131,13 @@ def _matrix_kernel(qtype, gathered):
 
 
 @cache
-def _nax_kernel(qtype):
-    block, size, name = FORMATS[qtype]
-    group = 16 if qtype in (10, 14, 17, 22) else 32
-    affine = str(qtype in (10, 13)).lower()
+def _nax_kernel(qt, rows):
+    bm, bn, bk = (32, 64, 64) if rows == 32 else (64, 32, 128)
+    block, size, name = FORMATS[qt]
+    two = qt in (10, 13, 14)
+    bk = min(block, bk)
     return mx.fast.metal_kernel(
-        name=f"v41_gguf_{name}_nax",
+        name=f"v41_gguf_block_{name}_{bm}_{bn}_{bk}",
         input_names=["x", "w", "meta", "count"],
         output_names=["out"],
         header="#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
@@ -145,82 +146,60 @@ def _nax_kernel(qtype):
             const uint bi = threadgroup_position_in_grid.y;
             if (bi >= uint(count[0])) return;
             const uint start = meta[bi*3], expert = meta[bi*3+1], valid = meta[bi*3+2];
-            const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
-            const uint n0 = threadgroup_position_in_grid.x * 64;
-            const uint tm = (sg / 2) * 16, tn = (sg % 2) * 32;
-            // Integer codes are exact in either operand type. BF16 inputs use
-            // native byte operands; FP16/FP32 retain their input precision.
-            using R = metal::conditional_t<metal::is_same_v<O, bfloat16_t>, int8_t, bfloat16_t>;
-            threadgroup R ws[64 * 72];
-            threadgroup float ds[64 * {64 // group}], ms[64 * {64 // group}];
-            threadgroup float xs[32 * {64 // group}];
+            const uint tid = thread_index_in_threadgroup;
+            const uint n0 = threadgroup_position_in_grid.x * {bn};
+            threadgroup half ws[{bn * bk}], us[{bn * bk if two else 1}];
+            threadgroup float ds[{bn}], ms[{bn if two else 1}];
+            // MPP requires an unqualified tensor element type; run only reads x.
+            auto tx = tensor(const_cast<device O*>(x) + size_t(start) * K,
+                             dextents<int, 2>(K, valid), array<int, 2>{{1, K}});
+            auto tw = tensor(ws, dextents<int, 2>({bk}, {bn}));
             constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-                16, 32, {group}, false, true, false,
+                {bm}, {bn}, {bk}, false, true, false,
                 mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-            auto a = op.template get_left_input_cooperative_tensor<O, R, float>();
-            auto b = op.template get_right_input_cooperative_tensor<O, R, float>();
-            auto acc = op.template get_destination_cooperative_tensor<
-                metal::remove_addrspace_t<decltype(a)>, metal::remove_addrspace_t<decltype(b)>, float>();
+            mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+            auto acc = op.template get_destination_cooperative_tensor<decltype(tx), decltype(tw), float>();
             for (uint i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
-            for (uint base = 0; base < K; base += 64) {{
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                // Decode each packed tile once, shared by all 32 routed rows.
-                for (uint z = tid * 8; z < 64 * 64; z += 128 * 8) {{
-                    const uint row = z / 64, k = z % 64;
-                    float v[8] = {{0,0,0,0,0,0,0,0}}, factors[2] = {{0,0}};
-                    if (n0 + row < N && base + k < K) {{
-                        const size_t offset = ((size_t(expert) * N + n0 + row) * (K/{block})
-                                               + (base + k)/{block}) * {size};
-                        gguf_decode8<{qtype}, true>(w + offset, (base + k) % {block}, v, factors);
+            for (uint base = 0; base < K; base += {block}) {{
+                auto part = acc, other = acc;
+                for (uint i = 0; i < part.get_capacity(); ++i) {{ part[i] = 0.0f; other[i] = 0.0f; }}
+                for (uint kk = 0; kk < {block}; kk += {bk}) {{
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint z = tid * 8; z < {bn * bk}; z += 128 * 8) {{
+                        const uint row = z / {bk}, k = z % {bk};
+                        float v[8] = {{0}}, u[8] = {{0}}, f[2] = {{0}};
+                        if (n0 + row < N && base + kk + k < K) {{
+                            const size_t offset = ((size_t(expert) * N + n0 + row) * (K/{block})
+                                                   + (base + kk + k)/{block}) * {size};
+                            gguf_block8<{qt}>(w + offset, (kk + k) % {block}, v, u, f);
+                        }}
+                        for (uint j = 0; j < 8; ++j) {{
+                            ws[row * {bk} + k + j] = half(v[j]);
+                            if constexpr ({str(two).lower()}) us[row * {bk} + k + j] = half(u[j]);
+                        }}
+                        if (kk == 0 && k == 0) {{
+                            ds[row] = f[0];
+                            if constexpr ({str(two).lower()}) ms[row] = f[1];
+                        }}
                     }}
-                    for (uint j = 0; j < 8; ++j) ws[row * 72 + k + j] = R(v[j]);
-                    if (k % {group} == 0) {{
-                        ds[row * {64 // group} + k/{group}] = factors[0];
-                        ms[row * {64 // group} + k/{group}] = factors[1];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    auto left = tx.slice(base + kk, 0);
+                    op.run(left, tw, part);
+                    if constexpr ({str(two).lower()}) {{
+                        auto tu = tensor(us, dextents<int, 2>({bk}, {bn}));
+                        op.run(left, tu, other);
                     }}
                 }}
-                if constexpr ({affine}) {{
-                    for (uint z = tid; z < 32 * {64 // group}; z += 128) {{
-                        const uint row = z / {64 // group}, g = z % {64 // group};
-                        float sum = 0.0f;
-                        for (uint j = 0; j < {group}; ++j)
-                            if (row < valid && base + g * {group} + j < K)
-                                sum += float(x[size_t(start + row) * K + base + g * {group} + j]);
-                        xs[z] = sum;
-                    }}
-                }}
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                #pragma unroll
-                for (uint kk = 0; kk < 64; kk += {group}) {{
-                    #pragma unroll
-                    for (uint i = 0; i < a.get_capacity(); ++i) {{
-                        auto xy = a.get_multidimensional_index(i);
-                        const uint row = tm + xy[1], k = base + kk + xy[0];
-                        a[i] = row < valid && k < K ? x[size_t(start + row) * K + k] : O(0);
-                    }}
-                    #pragma unroll
-                    for (uint i = 0; i < b.get_capacity(); ++i) {{
-                        auto xy = b.get_multidimensional_index(i);
-                        b[i] = ws[(tn + xy[1]) * 72 + kk + xy[0]];
-                    }}
-                    auto part = acc;
-                    for (uint i = 0; i < part.get_capacity(); ++i) part[i] = 0.0f;
-                    op.run(a, b, part);
-                    #pragma unroll
-                    for (uint i = 0; i < acc.get_capacity(); ++i) {{
-                        auto xy = acc.get_multidimensional_index(i);
-                        const uint z = (tn + xy[0]) * {64 // group} + kk/{group};
-                        acc[i] += part[i] * ds[z];
-                        if constexpr ({affine})
-                            acc[i] += ms[z] * xs[(tm + xy[1]) * {64 // group} + kk/{group}];
-                    }}
+                for (uint i = 0; i < acc.get_capacity(); ++i) {{
+                    auto xy = acc.get_multidimensional_index(i);
+                    acc[i] += part[i] * ds[xy[0]];
+                    if constexpr ({str(two).lower()}) acc[i] += other[i] * ms[xy[0]];
                 }}
             }}
             for (uint i = 0; i < acc.get_capacity(); ++i) {{
                 auto xy = acc.get_multidimensional_index(i);
-                const uint row = tm + xy[1], col = n0 + tn + xy[0];
-                if (row < valid && col < N) out[size_t(start + row) * N + col] = O(acc[i]);
+                if (xy[1] < valid && n0 + xy[0] < N)
+                    out[size_t(start + xy[1]) * N + n0 + xy[0]] = O(acc[i]);
             }}
         """,
     )
@@ -232,8 +211,8 @@ def prefill_plan(x, indices, num_experts):
     # Average occupancy: wider tiles lose to the SIMD path on sparse/CED tails.
     # Per-block tile selection is the upgrade path for severely skewed routing.
     rows = (
-        32
-        if indices.size >= max(64, 16 * num_experts)
+        (64 if indices.size >= 64 * num_experts else 32)
+        if indices.size >= max(64, 8 * num_experts)
         and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
         and mx.default_device() != mx.cpu
         and is_nax_available()
@@ -341,10 +320,10 @@ class GGUFProjection(nn.Module):
             if indices is not None and block_plan is None:
                 block_plan = prefill_plan(x, ids, self.num_experts)
             meta, count, rows = block_plan if block_plan is not None else (ids, ids, 8)
-            nax = rows == 32
-            cols = 64 if nax else 32
+            nax = rows >= 32
+            cols = 64 if rows == 32 else 32
             kernel = (
-                _nax_kernel(self.qtype)
+                _nax_kernel(self.qtype, rows)
                 if nax
                 else _matrix_kernel(self.qtype, indices is not None)
             )

@@ -1081,6 +1081,50 @@ inline void gguf_decode8(const device uchar* b, uint k, thread float* v,
     }
 }
 
+// Exact block coefficients for tensor matmul: IQ subscales and codes combine
+// into integers <= 1922, exactly representable in FP16. Q2/Q5 have a second
+// plane for their independent minimum; Q6 uses an exact FP16 high/low pair.
+// The original base scale is applied once per 256 weights (32 for Q8).
+
+template <int QT>
+inline void gguf_block8(const device uchar* b, uint k, thread float* v,
+                        thread float* u, thread float* factors) {
+    float unused[2];
+    gguf_decode8<QT, true>(b, k, v, unused);
+    float d = float(*reinterpret_cast<const device half*>(b + (QT == 10 ? 80 : QT == 14 ? 208 : 0)));
+    float m = 0.0f, mult = 1.0f;
+    factors[1] = 0.0f;
+    if constexpr (QT == 10) {
+        mult = float(b[k / 16] & 15); m = -float(b[k / 16] >> 4);
+        factors[1] = float(*reinterpret_cast<const device half*>(b + 82));
+    } else if constexpr (QT == 13) {
+        const uint g = k / 32;
+        const device uchar* s = b + 4;
+        mult = float(g < 4 ? (s[g] & 63) : ((s[g + 4] & 15) | ((s[g - 4] >> 6) << 4)));
+        m = -float(g < 4 ? (s[g + 4] & 63) : ((s[g + 4] >> 4) | ((s[g] >> 6) << 4)));
+        factors[1] = float(*reinterpret_cast<const device half*>(b + 2));
+    } else if constexpr (QT == 14) {
+        mult = float(char(b[192 + k / 16])); factors[1] = d;
+    } else if constexpr (QT == 19) {
+        const uint h = reinterpret_cast<const device ushort*>(b + 34)[k / 32];
+        mult = float(2 * ((h >> 12) & 7) + 1); d *= 0.125f;
+    } else if constexpr (QT == 16 || QT == 18) {
+        const uint ib = k / 32;
+        const device ushort* s = reinterpret_cast<const device ushort*>(b + (QT == 16 ? 6 + 8 * ib : 66 + 4 * ib));
+        const uint h = uint(s[0]) | (uint(s[1]) << 16);
+        mult = float(2 * (h >> 28) + 1); d *= QT == 16 ? 0.125f : 0.25f;
+    } else if constexpr (QT == 17 || QT == 22) {
+        const uint ib = k / 32, sub = (k / 8) % 4;
+        mult = float(2 * ((b[(QT == 17 ? 66 : 74) + ib] >> (4 * (sub / 2))) & 15) + 1); d *= 0.125f;
+    }
+    factors[0] = d;
+    for (uint j = 0; j < 8; ++j) {
+        const float code = v[j] * mult;
+        v[j] = float(half(code));
+        u[j] = QT == 14 ? code - v[j] : m;
+    }
+}
+
 template <int K, int ROWS, int NB, int QT, int BLOCK, int BYTES, typename W, typename X>
 inline void gguf_rows_nb(W w, uint row0, X x, uint xs, uint lane, thread float* acc) {
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;

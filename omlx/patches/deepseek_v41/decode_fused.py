@@ -99,8 +99,8 @@ def _fused_projection(p):
 
 
 def _wb(p):
-    """(weight, scales, biases) kernel inputs of a projection; MXFP passes a dummy bias."""
-    return p.weight, p.scales, DM._biases(p)
+    """Projection inputs, with cached dummy scales/biases where the format omits them."""
+    return p.weight, DM._scales(p), DM._biases(p)
 
 
 def mix(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
@@ -146,7 +146,7 @@ def attn_mid(att, qa, kv_in, cos, sin, c):
     eps, _ = _scalars(c)
     return DL.kernel("attn_mid")(
         inputs=[qa, kv_in, att.q_norm.weight, att.kv_norm.weight, cos, sin, eps],
-        template=[("QR", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim)],
+        template=[("QR", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("QUANTIZE_QUERY", True)],
         grid=(1024, 1, 1), threadgroup=(1024, 1, 1),
         output_shapes=[(c.q_lora_rank,), (c.q_lora_rank,), (c.head_dim + c.head_dim // 32,)],
         output_dtypes=[mx.bfloat16, mx.float32, mx.uint8])
@@ -471,13 +471,13 @@ def _cos_sin_nb(c, compressed, starts):
     return mx.stack([t[0] for t in trig]), mx.stack([t[1] for t in trig])
 
 
-def attn_mid_nb(att, qa, kv_in, cos, sin, c):
-    """attn_mid for B rows (each row: the single-row kernel)."""
+def attn_mid_nb(att, qa, kv_in, cos, sin, c, quantize_query=True):
+    """attn_mid for B rows; GGUF retains the normalized query without FP8 rounding."""
     b_n = qa.shape[0]
     eps, _ = _scalars(c)
     qr, qrq, packed = DL.kernel("attn_mid_b")(
         inputs=[qa, kv_in, att.q_norm.weight, att.kv_norm.weight, cos, sin, eps],
-        template=[("QR", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim)],
+        template=[("QR", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("QUANTIZE_QUERY", quantize_query)],
         grid=(1024, b_n, 1), threadgroup=(1024, 1, 1),
         output_shapes=[(b_n * c.q_lora_rank,), (b_n * c.q_lora_rank,), (b_n * (c.head_dim + c.head_dim // 32),)],
         output_dtypes=[mx.bfloat16, mx.float32, mx.uint8])
@@ -856,16 +856,45 @@ def decode_block(blk, h, pre, cache, shared, start, c):
 
 
 def _gguf_block(blk, h, pre, caches, shareds, starts, c):
-    """Fuse HC/norm and MoE while retaining packed-GGUF attention and cache updates."""
+    """Fuse HC, GGUF attention and MoE while preserving activation and cache policies."""
     bn, rn, hc, dim = h.shape
     hf = h.reshape(bn * rn, hc * dim)
     coef, x, _, _ = mix_nb(blk, "attn", c, hf, pre.reshape(bn * rn, hc))
     ap, ao, ac = coef[:, :hc], coef[:, hc : 2 * hc], coef[:, 2 * hc :]
-    x = x.reshape(bn, rn, dim)
-    attn = mx.concatenate(
-        [blk.attn(x[b : b + 1], caches[b], shareds[b], starts[b]) for b in range(bn)],
-        axis=0,
-    ).reshape(bn * rn, dim)
+    att = blk.attn
+    if att.wo_a.weight.dtype == mx.bfloat16:
+        qa, kv_in = gemv_fp8_nb(x, att.wq_a, att.wkv, mma=False)
+        ratio = c.compress_ratios[att._layer]
+        positions = [start + j for start in starts for j in range(rn)]
+        cos, sin = _cos_sin_nb(c, bool(ratio), positions)
+        qr, qrq, packed = attn_mid_nb(att, qa, kv_in, cos, sin, c, quantize_query=False)
+        q = wqb_rope_nb(att, qrq, cos, sin, c, False)
+        outputs = []
+        for b in range(bn):
+            sl = slice(b * rn, (b + 1) * rn)
+            if rn == 1:
+                outputs.append(attention_core(
+                    att, x[sl].reshape(-1), qr[sl].reshape(-1), q[sl].reshape(-1),
+                    packed[sl].reshape(-1), caches[b], shareds[b], starts[b],
+                    cos[sl].reshape(-1), sin[sl].reshape(-1), c,
+                )[None])
+            else:
+                outputs.append(_verify_attention(
+                    att, x[sl], qr[sl], q[sl], packed[sl], cos[sl], sin[sl],
+                    caches[b], shareds[b], starts[b], c,
+                ))
+        # Attention's output quantization is unchanged. GGUF wo_a remains the
+        # original BF16 tensor; the following wo_b input is not FP8-rounded.
+        grouped = mx.concatenate(outputs).astype(mx.bfloat16).reshape(bn, rn, c.o_groups, -1)
+        weight = att.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
+        latent = mx.einsum("bsgd,grd->bsgr", grouped, weight).reshape(bn * rn, -1)
+        attn = gemv_fp8_nb(latent, att.wo_b, mma=False)[0]
+    else:
+        x = x.reshape(bn, rn, dim)
+        attn = mx.concatenate(
+            [att(x[b : b + 1], caches[b], shareds[b], starts[b]) for b in range(bn)],
+            axis=0,
+        ).reshape(bn * rn, dim)
     coef, x2, _, h2 = mix_nb(
         blk, "ffn", c, hf, ap, sub=blk.sum_ranks(attn), post=ao, comb=ac
     )

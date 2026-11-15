@@ -304,7 +304,8 @@ def test_packed_matrix_and_gather_tails(qtype):
 @pytest.mark.skipif(not is_nax_available(), reason="Requires NAX tensor units")
 @pytest.mark.parametrize("qtype", FORMATS)
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
-def test_packed_nax_gather_matches_float64_dot(qtype, dtype):
+@pytest.mark.parametrize("counts", [(3, 0, 67, 61), (3, 0, 131, 129)])
+def test_packed_nax_gather_matches_float64_dot(qtype, dtype, counts):
     from omlx.patches.deepseek_v41.gguf_quant import prefill_plan
 
     # Q8 has a half K tile; all formats have N/route tails and an empty expert.
@@ -316,12 +317,12 @@ def test_packed_nax_gather_matches_float64_dot(qtype, dtype):
     scales = rng.choice(np.array([0, -0.007, 0.01, 2**-24], "<f2"), blocks.shape[:-1])
     blocks[..., offset : offset + 2] = scales[..., None].view(np.uint8)
     p = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=width)
-    ids = np.repeat(np.arange(4, dtype=np.int32), [3, 0, 67, 61])
+    ids = np.repeat(np.arange(4, dtype=np.int32), counts)
     # A strided input also checks the caller's contiguous gather contract.
     x = mx.array(rng.normal(size=(len(ids), width * 2)).astype(np.float32))[:, ::2]
     x = x.astype(dtype)[:, None]
     plan = prefill_plan(x, mx.array(ids), p.num_experts)
-    assert plan[2] == 32
+    assert plan[2] == (64 if len(ids) >= 256 else 32)
     actual = p(x, mx.array(ids), sorted_indices=True, block_plan=plan)
     dense = np.asarray(dequantize(p.weight, qtype, (4, 35, width), mx.float32)).astype(
         np.float64
@@ -359,6 +360,31 @@ def test_gguf_prefill_plan_keeps_small_batches_and_non_nax_fallback(monkeypatch)
     dense = np.asarray(dequantize(p.weight, 16, (4, 11, 256), mx.float32))
     expected = np.einsum("rk,rnk->rn", np.asarray(inp)[:, 0], dense[np.asarray(ids)])
     np.testing.assert_allclose(actual[:, 0], expected, atol=1e-3, rtol=1e-4)
+
+
+def test_gguf_fused_query_norm_keeps_unquantized_input():
+    from test_deepseek_v41_fused_decode import build
+
+    from omlx.patches.deepseek_v41.decode_fused import attn_mid_nb
+
+    model = build(
+        n_layers=1,
+        compress_ratios=(0,),
+        kv_source_layers=(),
+        index_source_layers=(),
+        candidate_source_layer=-1,
+    )
+    att, c = model.layers[0].attn, model._config
+    mx.random.seed(141)
+    qa = mx.random.normal((4, c.q_lora_rank)).astype(mx.bfloat16)
+    kv = mx.random.normal((4, c.head_dim)).astype(mx.bfloat16)
+    cos = mx.ones((4, c.rope_head_dim // 2))
+    sin = mx.zeros_like(cos)
+    qr, plain, packed = attn_mid_nb(att, qa, kv, cos, sin, c, quantize_query=False)
+    _, rounded, quantized_kv = attn_mid_nb(att, qa, kv, cos, sin, c)
+    np.testing.assert_array_equal(plain, qr.astype(mx.float32))
+    assert not bool(mx.array_equal(plain, rounded).item())
+    np.testing.assert_array_equal(packed, quantized_kv)
 
 
 def gguf_module(module, qtype, seed):
@@ -441,16 +467,17 @@ def test_gguf_fused_moe_rejects_incompatible_shared_input_and_k_split(inter):
 
 
 @pytest.mark.parametrize("batch,rows", [(1, 1), (1, 6), (2, 6)])
-def test_gguf_fused_block_and_mtp_verify_match_unfused(monkeypatch, batch, rows):
+@pytest.mark.parametrize("ratio", [0, 2])
+def test_gguf_fused_block_and_mtp_verify_match_unfused(monkeypatch, batch, rows, ratio):
     from test_deepseek_v41_fused_decode import build
 
     from omlx.patches.deepseek_v41 import decode_fused
 
     model = build(
         n_layers=1,
-        compress_ratios=(0,),
-        kv_source_layers=(),
-        index_source_layers=(),
+        compress_ratios=(ratio,),
+        kv_source_layers=(0,) if ratio else (),
+        index_source_layers=(0,) if ratio else (),
         candidate_source_layer=-1,
     )
     c, blk = model._config, model.layers[0]
