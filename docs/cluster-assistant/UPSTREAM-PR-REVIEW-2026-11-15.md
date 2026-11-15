@@ -547,3 +547,22 @@ whose only coverage was its own test, and whose entry in `tests/test_cluster_sea
 existed only to silence the check. Removed from the slice and from
 `rebase/upstream-main` (function, its three assertions, and the allowlist entry).
 Deleting it is the clean answer the seam test itself suggests.
+
+## 14. Full-suite results per branch (2026-11-15)
+
+`uv run pytest tests apps/omlx-web/tests -q` with the native kernels present
+(§0.4 of the runbook):
+
+| Branch | Result |
+|---|---|
+| `fix/local-only-load` `bda778e0` | 20 154 passed, 254 skipped, **0 failed** |
+| `fix/test-infra-conftest` `c819ec74` | 20 147 passed, 254 skipped, **0 failed** |
+| `fix/cluster-discovery-inventory` `ef0b09fd` | 19 640 passed; 2 failed only without the native kernels (98/98 with them) |
+| `feat/cluster-assistant-plan` `da13ab2e` | 20 555 passed, **0 failed** |
+| `feat/cluster-assistant-run` `a9836644` | 20 933 passed, **0 failed** |
+| `feat/cluster-assistant-run-local` `f21a6e0f` | 20 976 passed, **0 failed** |
+| `fix/macos-theme-locale-xctest` `1c1674c2` | 401 Xcode tests, **0 failures** |
+| `feat/macos-helper-dmg` `3248f848` | 410 Xcode tests, 7 failures in the 3 tests the fixes PR repairs (R18) |
+
+`make web` is a no-op on all three assistant branches. The full-suite pass is what
+surfaced R19–R21; the focused runs had not.
