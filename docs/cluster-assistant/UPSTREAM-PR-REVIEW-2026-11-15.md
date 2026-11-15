@@ -540,3 +540,10 @@ Rebuilt and committed in the run slice; the run-local slice inherits it.
 
 Both are exactly the kind of cross-effect the focused runs could not see, which is
 why the full suites per branch were worth running.
+
+**R21 — dead helper hidden by an allowlist.** The run slice flagged
+`tuning.preset_matches` as unreachable: a one-line predicate nothing called,
+whose only coverage was its own test, and whose entry in `tests/test_cluster_seams.py`
+existed only to silence the check. Removed from the slice and from
+`rebase/upstream-main` (function, its three assertions, and the allowlist entry).
+Deleting it is the clean answer the seam test itself suggests.
