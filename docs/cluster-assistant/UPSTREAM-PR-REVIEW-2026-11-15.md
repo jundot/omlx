@@ -463,3 +463,19 @@ Resolved in this second pass:
 
 Only R8 (UI screenshots) is still blocked: it needs a real browser session and
 must be done by a person.
+
+## 11. Observations from the screenshot attempt (verify with the cluster)
+
+Not defects of the prepared PRs, but found while trying to capture UI screenshots
+on 2026-11-15; both need the cluster run to confirm:
+
+- **R16 — `/admin/auto-login` sets no session cookie in this build.** The endpoint
+  redirects to `/admin` instead of the requested page, so the menubar deep link
+  cannot sign in. The bearer key works on every API route at the same time, so the
+  key is valid; the admin router's `_get_global_settings()` (set by
+  `set_admin_getters`) appears not to see the running server's settings.
+- **R17 — the assistant card can report `no_model` on a cold start** ("No model is
+  available on this Mac") even though `~/models` is the configured model
+  directory and the API can plan a model there. Likely the model inventory was
+  not populated yet when the card asked; needs a check whether the card should
+  wait/refresh or whether the inventory is genuinely empty.

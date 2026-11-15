@@ -31,6 +31,47 @@ operation and deployment IDs. Live evidence lives there, never in the test suite
 
 ---
 
+## 0.5 Reset to a clean cluster state (done 2026-11-15)
+
+Before a from-scratch run (find devices → pair → measure → plan → apply → start,
+manually and through the assistant), the origin holds no cluster state:
+
+- **Kept:** `~/.omlx/cluster/identity.json` — this Mac's node identity. Deleting it
+  would give the Mac a new `node_id` and invalidate every pairing for no benefit.
+- **Deleted (backed up first):** `devices.json`, `deployments.json`,
+  `assistant-measurements.json`, `assistant-operations.json`,
+  `assistant-performance.json`, `assistant-tuning-presets.json`, `incidents.json`,
+  `join-session.json`, `pairing-keys.json`, `pairing-audit.jsonl`,
+  `strategy-benchmarks.json`, and the whole `~/.omlx/cluster/runtime/` staging
+  cache (27 GB).
+- **Backup:** `~/.omlx/backup-cluster-2026-11-15/` holds the eleven JSON files.
+
+To repeat it later:
+
+```sh
+BK=~/.omlx/backup-cluster-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$BK"
+cd ~/.omlx/cluster
+cp -a devices.json deployments.json assistant-*.json incidents.json \
+      join-session.json pairing-*.json* strategy-benchmarks.json "$BK"/ 2>/dev/null
+rm -f devices.json deployments.json assistant-*.json incidents.json \
+      join-session.json pairing-*.json* strategy-benchmarks.json
+rm -rf runtime                      # the staged model copies
+```
+
+Verify with the server running:
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8099/api/cluster/devices   # paired: 0
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8099/admin/api/cluster/deployments  # []
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8099/admin/api/cluster/assistant/session  # {"session":null}
+```
+
+Not reset: `~/.omlx/settings.json` (API key, model dirs, bind) and
+`~/.omlx/model_settings.json` (per-model preferences such as MTP and table
+offload). Reset the latter only deliberately — it is model state, not cluster
+state, and a stale switch would otherwise influence a plan.
+
 ## 1. Preconditions
 
 - Repo on `rebase/upstream-main`, clean tree, `uv sync --extra cluster` done.
