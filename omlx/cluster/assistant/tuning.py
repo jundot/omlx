@@ -96,10 +96,6 @@ def hardware_key(node_ids: Sequence[str]) -> str:
     return ",".join(sorted(str(node_id) for node_id in node_ids))
 
 
-def preset_matches(key: str, model_signature: str, hardware_key: str) -> bool:
-    return key == preset_key(model_signature, hardware_key)
-
-
 async def sweep_chunks(
     seam: CompletionSeam,
     *,

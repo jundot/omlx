@@ -175,7 +175,6 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # The tested key contract for a tuning preset (model signature +
         # hardware pair); TuningPresetStore already keys by preset_key, so the
         # comparison has no production caller yet.
-        ("tuning.py", "preset_matches"),
     }
 
     name_counts = Counter(
