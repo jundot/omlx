@@ -257,3 +257,73 @@ def test_wrapper_has_vision_and_plan_shape(tiny_lfm2):
     assert plan.branches == []
     hidden = np.array(tiny_lfm2.model.language_model.model.embed_tokens(mx.array([plan.trunk])))
     assert hidden.shape[0] == 1
+
+
+# --------------------------------------------------------------------------
+# Calibration probe (needs the real checkpoint, hence slow)
+
+
+_DIFF = """diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -1,3 +1,4 @@
+ def read(p):
+-    return open(p).read()
++    f = open(p)
++    return f.read()
+"""
+
+
+def _real_d1_dir():
+    """A real d1 checkpoint on disk, if this machine has one."""
+    import os
+    from pathlib import Path
+
+    candidates = []
+    if os.environ.get("OMLX_D1_MODEL_DIR"):
+        candidates.append(Path(os.environ["OMLX_D1_MODEL_DIR"]))
+    models = Path.home() / ".omlx" / "models"
+    if models.is_dir():
+        candidates.extend(sorted(p for p in models.iterdir() if p.is_dir()))
+    for path in candidates:
+        if (path / "config.json").is_file() and decision_kind(path) == "d1_lfm2":
+            return path
+    return None
+
+
+@pytest.mark.slow
+def test_calibration_probe_handle_leak_is_safe():
+    """A recorded probe, not a property: needs the real checkpoint.
+
+    The diff drops the file object without closing it. Two independent runs of
+    the real checkpoint call it `safe` (0.719/0.281 and 0.742/0.258 against
+    `bug`), while a strict reading of the same diff calls the missing close a
+    bug. That is what makes it a useful calibration point: a change that moves
+    the verdict here moves it on a borderline case, not on an obvious one. It
+    is not an assertion about the model, so a checkpoint that answers `bug` is
+    a finding, not a test failure.
+    """
+    path = _real_d1_dir()
+    if path is None:
+        pytest.skip("no d1 checkpoint on disk (set OMLX_D1_MODEL_DIR)")
+
+    engine = DecisionEngine(str(path))
+    asyncio.run(engine.start())
+    try:
+        plan = asyncio.run(engine.encode({
+            "state": _DIFF,
+            "questions": {"verdict": {
+                "type": "choice",
+                "instructions": "does this patch introduce a bug",
+                "criteria": {"safe": "no bug", "bug": "introduces a bug"},
+            }},
+        }))
+        payload = asyncio.run(engine.systemone(plan))
+    finally:
+        asyncio.run(engine.stop())
+
+    assert payload["input_tokens"] > 0
+    verdict = payload["answers"]["verdict"]
+    assert verdict["type"] == "choice"
+    assert set(verdict["probabilities"]) == {"safe", "bug"}
+    assert verdict["choice"] == "safe"
