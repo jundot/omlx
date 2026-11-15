@@ -256,8 +256,23 @@ struct UninstallActions {
                 runProcess(path, ["-gc", "-f", "-r", "-domain", "user", "-domain", "local"])
             },
             repaintDock: { runProcess("/usr/bin/killall", ["Dock"]) },
-            quitApp: { NSApp.terminate(nil) }
+            quitApp: { quitAppNow() }
         )
+    }
+
+    /// `NSApp.terminate` is ignored inside a sheet button's action and returns
+    /// without quitting while a sheet is attached — the same lesson
+    /// `UpdateController.performSwap` already encodes. The uninstall's final
+    /// "Quit oMLX" therefore ends every attached sheet first (which also
+    /// re-enables the window's close button) and terminates deferred, so the
+    /// app and its menu-bar item really go away after the last step.
+    static func quitAppNow() {
+        DispatchQueue.main.async {
+            for sheet in NSApp.windows where sheet.sheetParent != nil {
+                sheet.sheetParent?.endSheet(sheet)
+            }
+            NSApp.terminate(nil)
+        }
     }
 
     /// Synchronous, fire-and-forget helper for the LS hygiene commands. A

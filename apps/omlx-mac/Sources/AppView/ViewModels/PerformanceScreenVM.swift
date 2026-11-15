@@ -699,6 +699,30 @@ enum PrivilegedActions {
         }
         return mb
     }
+
+    /// The uninstall's one helper-removal command. Fixed strings only — never
+    /// built from UI text — mirroring the lab-proven cleanup script
+    /// (`scripts/cleanup-cluster-macs.sh`): SMJobRemove deregisters the
+    /// launchd job but leaves the root-owned tool files behind, so the removal
+    /// bootouts the job and deletes both files in the same admin dialog.
+    static func removeHelperTool() throws {
+        let script = "do shell script \"launchctl bootout system/app.omlx.helper 2>/dev/null; "
+            + "rm -f /Library/PrivilegedHelperTools/app.omlx.helper "
+            + "/Library/LaunchDaemons/app.omlx.helper.plist\" "
+            + "with administrator privileges"
+        guard let appleScript = NSAppleScript(source: script) else {
+            throw PrivilegedActionError.failed("")
+        }
+        var error: NSDictionary?
+        _ = appleScript.executeAndReturnError(&error)
+        guard let error else { return }
+        let code = error[NSAppleScript.errorNumber] as? Int ?? 0
+        if code == -128 {
+            throw PrivilegedActionError.cancelled
+        }
+        let message = error[NSAppleScript.errorMessage] as? String ?? ""
+        throw PrivilegedActionError.failed(message)
+    }
 }
 
 
@@ -888,12 +912,14 @@ enum PrivilegedHelper {
         return state
     }
 
-    /// The uninstall's one helper-removal dialog (SMJobRemove bootouts the
-    /// daemon and removes the blessed tool). A cancel or failure is reported
-    /// and never aborts the rest of the uninstall.
+    /// The uninstall's one helper-removal dialog. One fixed admin command that
+    /// bootouts the launchd job AND removes both root-owned files (the
+    /// lab-proven cleanup-script path — SMJobRemove alone deregisters the job
+    /// and leaves the tool behind). A cancel or failure is reported and never
+    /// aborts the rest of the uninstall.
     static func removeForUninstall(
         defaults: UserDefaults = .standard,
-        remove: () throws -> Void = { try uninstall() }
+        remove: () throws -> Void = { try PrivilegedActions.removeHelperTool() }
     ) -> HelperRemovalOutcome {
         do {
             try remove()
