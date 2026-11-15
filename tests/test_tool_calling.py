@@ -5436,6 +5436,56 @@ def test_final_json_tools_sibling_survives_and_failure_reported(json_tools_parse
     assert result.parse_errors == ("malformed",)
 
 
+def test_final_json_tools_validation_drop_reports_malformed(
+    json_tools_parser, monkeypatch
+):
+    """A span the parser accepts but ``_build_tool_call`` drops is reported too.
+
+    That drop never reaches the "Dropping match" branch, so it needs its own
+    report (#5245).
+    """
+    import omlx.api.tool_calling as mod
+
+    tok, tools = json_tools_parser
+    monkeypatch.setattr(mod, "_build_tool_call", lambda name, arguments: None)
+    raw = '<tool_call>{"name": "write", "arguments": {"content": "ok"}}</tool_call>'
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert not result.tool_calls
+    assert result.parse_errors == ("malformed",)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["...", "", "\nPLACEHOLDER\n", "` and `"],
+    ids=["ellipsis", "empty", "placeholder", "backticks"],
+)
+def test_final_json_tools_marker_pair_in_prose_is_not_reported(
+    json_tools_parser, payload
+):
+    """A model writing the marker pair in prose is not a failed call.
+
+    The payloads are the ones Qwen3-8B-4bit produced when asked to describe
+    the format.  None names a declared tool, so the reply stays a normal
+    finish instead of becoming invalid_tool_call (#5245).
+    """
+    tok, tools = json_tools_parser
+    raw = f"A tool call is wrapped like <tool_call>{payload}</tool_call> here."
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert not result.tool_calls
+    assert result.parse_errors == ()
+
+
+def test_final_json_tools_unparseable_span_naming_a_tool_is_reported(
+    json_tools_parser,
+):
+    """The other side of the prose rule: a declared name marks a call attempt."""
+    tok, tools = json_tools_parser
+    raw = "<tool_call>write the file please</tool_call>"
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert not result.tool_calls
+    assert result.parse_errors == ("malformed",)
+
+
 def test_final_json_tools_success_keeps_parse_errors_empty(json_tools_parser):
     tok, tools = json_tools_parser
     raw = '<tool_call>{"name": "write", "arguments": {"content": "ok"}}</tool_call>'
