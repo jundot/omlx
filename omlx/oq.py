@@ -11156,10 +11156,37 @@ def _collect_imatrix_streaming(
         # The mmap PLE configure happens inside _iter_streamed_layer_blocks,
         # AFTER the pre-load patches that could re-install the module.
         _qwen4_exp_apply_compat_patch()
+    def embed_rows(weight, lo: int, hi: int):
+        """Layer-0 inputs for draw rows [lo, hi): embedded, then the same
+        per-family transform the whole draw used to get at stage 0."""
+        rows = _streamed_embed(weight, calib_data[lo:hi], config)
+        if is_qwen4_exp:
+            rows, _, _ = _streamed_qwen4_exp_state(config, calib_data[lo:hi], rows)
+        elif is_glm5_next:
+            rows, _ = _streamed_glm5_next_state(config, rows)
+        mx.eval(rows)
+        return rows
+
     embed_weight = _streamed_embed_weight(source, config)
     # One row, only to derive the per-family masks and state below.
     embedded = _streamed_embed(embed_weight, calib_data[:1], config)
     mx.eval(embedded)
+    # Report the draw's layer-0 footprint up front, so a run that cannot fit
+    # is visible before the imatrix pass instead of at the guard.
+    row_bytes = int(embed_rows(embed_weight, 0, 1).nbytes)
+    logger.info(
+        "oQe imatrix streaming: draw %d samples x %d tokens = %d tokens; "
+        "layer-0 inputs %s per sample, %s for the whole draw, %s per round "
+        "of %d (active-memory limit %s)",
+        int(calib_data.shape[0]),
+        int(calib_data.shape[1]),
+        int(calib_data.shape[0]) * int(calib_data.shape[1]),
+        _format_size(row_bytes),
+        _format_size(row_bytes * int(calib_data.shape[0])),
+        _format_size(row_bytes * min(int(num_samples), int(calib_data.shape[0]))),
+        min(int(num_samples), int(calib_data.shape[0])),
+        _format_size(_OQE_STREAM_ACTIVE_LIMIT_BYTES),
+    )
     sens_state = None
     if measure_sensitivity:
         # Build the sensitivity boundary while the embedding table is still
@@ -11213,17 +11240,6 @@ def _collect_imatrix_streaming(
         mask = layer_masks[0]
 
     del embedded
-
-    def embed_rows(weight, lo: int, hi: int):
-        """Layer-0 inputs for draw rows [lo, hi): embedded, then the same
-        per-family transform the whole draw used to get at stage 0."""
-        rows = _streamed_embed(weight, calib_data[lo:hi], config)
-        if is_qwen4_exp:
-            rows, _, _ = _streamed_qwen4_exp_state(config, calib_data[lo:hi], rows)
-        elif is_glm5_next:
-            rows, _ = _streamed_glm5_next_state(config, rows)
-        mx.eval(rows)
-        return rows
 
     text_config = config.get("text_config") or {}
     total_layers = int(
