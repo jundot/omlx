@@ -16,7 +16,6 @@ from omlx.cluster.assistant.tuning import (
     best_sampler,
     fine_tune,
     preset_key,
-    preset_matches,
     score_quality,
     sweep_chunks,
     sweep_mtp,
@@ -110,9 +109,8 @@ def test_sweep_mtp_neither_measured_is_none() -> None:
 
 def test_preset_key_is_hardware_bound() -> None:
     key = preset_key("model-sig", "m5max+m2ultra")
-    assert preset_matches(key, "model-sig", "m5max+m2ultra")
-    assert not preset_matches(key, "model-sig", "m1max+m1max")  # other hardware
-    assert not preset_matches(key, "other-model", "m5max+m2ultra")
+    assert key != preset_key("model-sig", "m1max+m1max")  # other hardware
+    assert key != preset_key("other-model", "m5max+m2ultra")
     assert preset_key("model-sig", "hw") == preset_key("model-sig", "hw")
 
 
