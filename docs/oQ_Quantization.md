@@ -150,4 +150,4 @@ Muse Spark Open NVFP4 checkpoints keep their NVFP4 routed experts unchanged at o
 
 ## Acknowledgments
 
-The importance matrix follows the imatrix approach used by llama.cpp. The least-squares refit was prompted by the 3-bit quantizer in @tacos8me's m5-ultra project. The rounding refinement follows the Flip-Refinement step of MACaQ (Huawei Computing Systems Lab, arXiv 2611.10649).
+The importance matrix follows the imatrix approach used by llama.cpp. The least-squares refit was prompted by the 3-bit quantizer in @tacos8me's m5-ultra project. The rounding refinement follows the Flip-Refinement step of [MACaQ](https://arxiv.org/abs/2611.10649) (Huawei Computing Systems Lab).
