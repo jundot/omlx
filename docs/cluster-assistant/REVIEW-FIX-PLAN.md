@@ -1,4 +1,4 @@
-# Fix plan — review findings (2026-11-13)
+r# Fix plan — review findings (2026-11-13)
 
 Execution plan for [`REVIEW-2026-11-13.md`](REVIEW-2026-11-13.md).
 Finding IDs (B…, U…, R…, D…) reference the review; this plan tracks progress
@@ -34,7 +34,7 @@ Finding IDs (B…, U…, R…, D…) reference the review; this plan tracks prog
 | E2 | **D1 dotfiles**: untrack `.live_prefill_driver*.py` + `.local-3rank-2026-11-13.md` via `git rm --cached` + `.gitignore`. Rewrite history? | **Untrack only**, no history rewrite (the internal IPs remain in history, but the repo is private; a rewrite would be costlier and riskier). | **Decided 2026-11-13: untrack only. Done in slice 0.** |
 | E3 | **B5 lock design**: create the operation record on the coordinator through the admin seam (option A) vs. a separate lock route on the coordinator (option B). | **Option A**: `_remote_ops` creates an assistant operation record on the coordinator at start and updates it; `operations/active` then works without a new route. Fits the frozen architecture (same seam, no new control plane). Short design note in CHAPTER-5.md before implementation. | Recommended; design note pending in slice 7. |
 | E4 | **B10 probe weighting**: election ranks by measured critical stage today (frozen). Improve the probe's physical plausibility and/or use the probe only as a tie-break? | **Two steps**: first make the probe physically plausible (kernel/iterations) + document its latency nature; a weight change only with an explicit decision, since it touches the frozen ranking. | **Decided 2026-11-13: option B** — make the probe bandwidth-bound (live-validated via E5) AND add a plausibility guard: an implausible/missing probe is treated as unknown compute → the frozen headroom preference + `unmeasured_compute`. Trustworthy probes still rank by critical stage. |
-| E5 | **Live gate**: bring the paused cluster back up at the end for a smoke + optional A/B run? | Yes, but only after P0/P1 and only with an explicit go; evidence into `PHASE-2B-RUN.md`. | Open — needs the user's go. |
+| E5 | **Live gate**: bring the paused cluster back up at the end for a smoke + optional A/B run? | Yes, but only after P0/P1 and only with an explicit go; evidence into `PHASE-2B-RUN.md`. | **Granted** for the 2026-11-13/14 runs; evidence in `PHASE-2B-RUN.md` §17–§27. The one live-gate check without recorded evidence is the B1 chat-profile case with a user-set value. |
 
 ---
 
@@ -53,11 +53,11 @@ L ≈ a day+ (agent work incl. tests).
 | 5 Settings fallback | B4 | M | — | ☑ `c5487f92` |
 | 6 Always-mounted card + wizard order | B3, U6 | L | 1 (test net) | ☑ `2bffa7b9` |
 | 7 Cluster-wide lock | B5 | L | E3, 4 | ☑ `549fe8ff` |
-| 8 Event loop & SSH robustness | B8, B9, B13 | M | 3, 7 (start.py) | ☑ |
+| 8 Event loop & SSH robustness | B8, B9, B13 | M | 3, 7 (start.py) | ☑ `9f39d67b` |
 | 9 Harden the upstream patches | R1, R2, R3 | M | 0 (UPSTREAM.md) | ☑ `e7c033fe` |
 | 10 Efficiency | B11, B12, solver pruning/bisect, polling/fsync, B10 | L (split) | 8, E4 | ◐ 10a/b/c/e done; 10d deferred |
 | 11 Remaining mediums/lows + test gaps + CI Node | API/UI mediums, T1–T9, session runtime tests | M–L | 1–9 | ◐ UI + test + nodes_total done; rest deferred |
-| Live gate | Smoke + optional A/B | S | P0/P1 done, E5 | ◐ probe (§17) + inert stack (§18) live validated; apply/start deployment pending (GUI session) |
+| Live gate | Smoke + optional A/B | S | P0/P1 done, E5 | ◐ probe (§17), inert stack (§18), stop/Start again (§13) and the full measure→plan→apply→start→ready→tune chain (§21, §23, §27) are live; only the B1 chat-profile check with a user-set value has no recorded evidence |
 
 ### Slice 0 — Hygiene & doc alignment (S) ☑
 
@@ -97,7 +97,14 @@ L ≈ a day+ (agent work incl. tests).
   known U6 marker (stays red until slice 6); the new expression test green;
   the assistant suite unchanged green.
 
-### Slice 2 — Measurement recovery & poll robustness (M)
+### Slice 2 — Measurement recovery & poll robustness (M) ☑ `159f51b0`
+
+> **Verified 2026-11-15**: U2/U7 and the bounded retry are all in the tree —
+> `test_cluster_ui_integration_ui.py:1071` (409 recovery adopts the
+> measurement id), `:1130` (`measure` resumes a named running measurement),
+> `:1175` (transient errors survived, then `failed` after the limit), `:1213`
+> (a resumed apply without inputs rests on the session); backoff at
+> `cluster_v2.js:101/435` (`measurePollErrors`, `2 ** (n-1)` skip).
 
 - **U2**: `failAssistantFrom` adopts `payload.measurement_id`; the `measure`
   action resumes a named running measurement instead of resetting; runtime
@@ -111,7 +118,12 @@ L ≈ a day+ (agent work incl. tests).
 - **Acceptance**: the reproduced 409 loop from the review is covered by a
   runtime test and green.
 
-### Slice 3 — Chat profile & reload (M)
+### Slice 3 — Chat profile & reload (M) ☑ `e8bb3509`
+
+> **Verified 2026-11-15**: `tests/cluster_assistant/test_chat_profile_contract.py`
+> (5 tests, incl. `test_a_user_temperature_in_the_real_shape_is_never_overwritten`
+> and the all-or-nothing merge); the conditional reload is
+> `start.py:1599` (`_model_entry(...) is not None` → skip `ops.reload()`).
 
 - **B1, red first**: bring the fakes (`assistant_harness.py:301`,
   `test_start_api.py:657/684`) to the real catalogue shape (sampling under
@@ -129,7 +141,12 @@ L ≈ a day+ (agent work incl. tests).
   prove the catalogue shape + merge behaviour; no unconditional reload left
   in apply/start.
 
-### Slice 4 — Persistence & operation ordering (S–M)
+### Slice 4 — Persistence & operation ordering (S–M) ☑ `2ef20f66`
+
+> **Verified 2026-11-15**: `operations.py:997` `applied()` scans
+> `reversed(records)` (newest match wins, like `latest_session`);
+> `test_operations.py:288` pins it; `test_store_failures.py` has 9 tests
+> (ready/applied/stop not rolled back, an unwritable store, a pruned record).
 
 - **B7**: `OperationStore.applied()` searches backwards (like
   `latest_session`); a test with two applies → the newest wins.
@@ -138,7 +155,12 @@ L ≈ a day+ (agent work incl. tests).
   swallowed silently; a test with an unwritable store directory.
 - **Acceptance**: the assistant suite green incl. the new failure-path tests.
 
-### Slice 5 — Settings fallback (M)
+### Slice 5 — Settings fallback (M) ☑ `c5487f92`
+
+> **Verified 2026-11-15**: `provisioning.py:369` merges or **aborts** (never
+> wipes) and writes `<name>.<uuid>.tmp` (`:395`); the remote snippet resolves the
+> canonical path; `test_provisioning_settings.py` (12 tests: moved base path,
+> corrupt JSON, permission denied, unique temp name).
 
 - **B4**: resolve the path from the server configuration (local) or pass it
   in the remote snippet payload instead of hardcoding `~/.omlx`; a read
@@ -149,7 +171,12 @@ L ≈ a day+ (agent work incl. tests).
 - **Acceptance**: the assistant suite green; no code path left that replaces
   an existing settings file on a read error.
 
-### Slice 6 — Always-mounted card + wizard order (L, highest UI risk)
+### Slice 6 — Always-mounted card + wizard order (L, highest UI risk) ☑ `2bffa7b9`
+
+> **Verified 2026-11-15**: `test_cluster_ui_integration_ui.py:118`
+> (`test_model_change_keeps_other_saved_setup_and_opens_picker`), `:140`/`:167`
+> (the surface stays visible with a configured deployment / a session); the
+> order guard is `cluster_v2.js:1365` (`configuredDeployment() && !choosingModel`).
 
 - **B3**: lift the assistant card (TPL 835–1367) out of the `plan` section
   into an always-mounted block; the `data-assistant-state` markers stay; no
@@ -165,7 +192,12 @@ L ≈ a day+ (agent work incl. tests).
   (`test_model_change_keeps_other_saved_setup_and_opens_picker`); a manual
   browser smoke (local server, no cluster start) for idle → ready → stop.
 
-### Slice 7 — Cluster-wide lock (L)
+### Slice 7 — Cluster-wide lock (L) ☑ `549fe8ff`
+
+> **Verified 2026-11-15**: `test_two_origin_lock.py` (12 tests; T1 is
+> `test_a_second_origin_is_refused_while_the_first_applies`); the route is
+> `routes.py:4856` (`/operations/active`, the one assistant route the browser
+> does not call) and the origin mirrors through `start.py:133`.
 
 - A short design note in CHAPTER-5.md (E3, option A).
 - **T1 first (red)**: a two-origin test — origin A starts remotely on
@@ -177,7 +209,14 @@ L ≈ a day+ (agent work incl. tests).
 - **Acceptance**: T1 green; a second origin gets `409 operation_in_progress`
   + action `status`; the assistant suite green.
 
-### Slice 8 — Event loop & SSH robustness (M)
+### Slice 8 — Event loop & SSH robustness (M) ☑ `9f39d67b`
+
+> **Verified 2026-11-15**: plan/apply/busy/stop/recommend run in
+> `asyncio.to_thread` (`routes.py:1634/1736/2178/2494/2662`); the SSH keepalive
+> is wired (`staging.py:1228`, `launch.py:1723` pass `keepalive=True`);
+> `test_start_robustness.py` pins the staging deadline, an unknown local job and
+> a save failure, and `_advance`/`_fail` catch `OSError`
+> (`start.py:1327/1347`, the B6 follow-up).
 
 - **B8/B9**: `plan`, the apply re-election, `_topology_refusal`, the busy
   checks into `asyncio.to_thread` (pattern: `recommend`, routes.py:1403).
@@ -193,7 +232,17 @@ L ≈ a day+ (agent work incl. tests).
   green; no synchronous solver/SSH call left in an async handler (grep
   check).
 
-### Slice 9 — Harden the upstream patches (M)
+### Slice 9 — Harden the upstream patches (M) ☑ `e7c033fe`
+
+> **Verified 2026-11-15**: R1 — the inventory snippet's
+> `mtp_compatible_for_model` import is guarded with a fail-closed fallback
+> (`model_inventory.py:28`) and pinned by
+> `test_inventory_snippet_keeps_its_json_shape_on_a_stock_peer`; R2 — a failed
+> discovery read is not cached (`staging.py:66–89`) and pinned by
+> `test_is_local_host_retries_after_a_failed_discovery_read`; R3 — the
+> side-effect note at `planner.py:1537` plus
+> `test_qwen4_exp_is_pipeline_capable_after_registration` pin the registration
+> `inspect_safetensors_layout` performs before capability detection.
 
 - **R1**: the remote inventory snippet imports `mtp_compatible_for_model`
   guarded (try/except ImportError → fallback), so stock-oMLX peers keep their
@@ -207,15 +256,22 @@ L ≈ a day+ (agent work incl. tests).
 - **Acceptance**: the upstream + assistant suites green; UPSTREAM.md
   complete.
 
-### Slice 10 — Efficiency (L, split into sub-slices)
+### Slice 10 — Efficiency (L, split into sub-slices) ◐
 
-Progress: **10a done** (`549fe8ff`, recommendation ranking), **10b done**
-(`112dffb6`, microbatch). 10c delegated (solver cost). 10d waits for slice 8
-(shared `start.py`/`routes.py`).
-**10e (probe physical plausibility) is deferred to the live gate**: improving
-the GEMV kernel/iterations needs a real measurement to confirm the rates are
-plausible, and the cluster is paused; the election-weighting part additionally
-needs decision E4. No token-rate estimates are added (frozen).
+Progress (**reconciled 2026-11-15**): **10a done** (`549fe8ff`, recommendation
+ranking), **10b done** (`112dffb6`, microbatch), **10c done** (`ea7395ff`:
+a subset whose summed admission cannot hold the model is refused before its
+ladder is descended and identical subproblems are memoized for one call —
+`policy.py:626` docstring, pinned equal to the full descent by
+`test_policy.py:565/587/692/764`; the planned **ladder bisect was not needed**
+once the prune removed that cost). **10e done** (`ffff5f8a`, bandwidth-bound
+probe + the E4=B plausibility guard; live-validated in PHASE-2B-RUN §17/§19,
+`test_probe_spec_expectations.py`, `election.py:159/1008`). No token-rate
+estimates are added (frozen).
+**10d stays deferred — open because** the poll still reads the full record (no
+lightweight status projection exists) and the interval is still ~2 s without a
+visibility gate; the transient-error backoff wanted here landed with slice 2
+(`cluster_v2.js:101/435`), so only the projection and the interval remain.
 
 - **10a Recommendation ranking (B11)**: away from `weight_bytes`, towards
   "fits + usable context + estimated critical stage"; the A/B script shows
@@ -237,7 +293,24 @@ needs decision E4. No token-rate estimates are added (frozen).
   PHASE-2B-RUN.md).
 - **Acceptance**: the A/B numbers improved/equal, all suites green.
 
-### Slice 11 — Remaining mediums/lows + test gaps (M–L)
+### Slice 11 — Remaining mediums/lows + test gaps (M–L) ◐
+
+> **Status 2026-11-15 — still ◐ on purpose.** Landed: dynamic `nodes_total`
+> (`start.py:698` uses `len(plan.rank_order)`), the delete-model hardening
+> (`test_delete_model_api.py`, 14 tests incl. loopback and the last-copy rule),
+> the clipboard failure path (`cluster_v2.js:7699`), Refresh routed through
+> `applyAssistantOperation` (`cluster_v2.js:6971/7592`), the session-card runtime
+> coverage (UITEST 1902/2063) and the `test_observed_api.py` flake fix (the wait
+> now looks for the *streaming* merge, line 227). **Open because**
+> (a) `runAssistantResume` still hardcodes `node_selection: 'minimal'`
+> (`cluster_v2.js:7481`) and `AssistantSessionResponse` carries no
+> `node_selection` field (`models.py:1276`), so a resumed “all Macs” session
+> re-elects the minimal subset and cannot reproduce its approved signature;
+> (b) `routes._redacted` is still a 300-character truncation, not a redaction
+> (`routes.py:2133`; a real `_redact_text` exists only in `diagnostics.py:104`);
+> (c) `routes.py` is still one 5 471-line module; (d) the UI runtime suite still
+> **skips** instead of failing when Node is absent
+> (`test_cluster_ui_integration_ui.py:1424`).
 
 - API: the one-job check into the store, `_redacted` real redaction, delete
   target resolution (loopback protection, TTL), remove or implement the

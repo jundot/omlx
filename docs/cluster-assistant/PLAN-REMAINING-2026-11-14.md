@@ -1,4 +1,4 @@
-# Remaining plan — .11-only, to the finish (2026-11-14)
+lich # Remaining plan — .11-only, to the finish (2026-11-14)
 
 Scope: everything that can be done on `.11` alone. **Excluded on purpose**
 (separate, cluster work): cleaning up the nodes, rolling the latest version out to
@@ -96,8 +96,10 @@ cluster validation**.
       discrepancy, LLM fallback `3748 params not in model` (W-A). FIXED in code
       2026-11-14 (local_only load, `_single_node_fit` resident bytes, no false
       LLM fallback) + tested; the live `.11` run-local load is being verified.
-- [ ] Qwen3.8 PP `rank 1` TypeError (`list indices ... NoneType`) — code bug; fix
-      or file as an upstream/oMLX issue (needs a cluster to reproduce).
+- [ ] Qwen3.8 PP `rank 1` TypeError (`list indices ... NoneType`) — **still open,
+      needs a cluster**: reproduce on the next 2-Mac run, then fix it or file it
+      as an oMLX issue. The cluster test that covers it is scheduled
+      (`READY-FOR-CLUSTER-TEST.md` §5 item 4, `CLUSTER-TEST-RUNBOOK.md` §3).
 - [x] run-local stop/unload + readiness canary + UI (W-A/W-C), 2026-11-14:
       `POST …/run-local/{job_id}/stop`, one canary completion before ready, card
       Stop button; fake-tested.
@@ -115,16 +117,86 @@ cluster validation**.
       unload (`/deployments/{id}/unload`, Screen 6) plus the `diagnostics` action
       on a memory-pressure start; the cluster stays the authority on its own
       registry.
-- [ ] Peer build parity: documented operational step (not a code gap) — confirm.
+- [~] Peer build parity: **in progress (2026-11-15)** — all three peers were
+      reset (processes + cluster state, `CLUSTER-TEST-RUNBOOK.md` §0.5, the
+      §1.5 rollout step), the **notarized `0.8.0rc1` DMG** was rolled out and
+      `.12` already reports `version: 0.8.0rc1` on
+      `GET /api/cluster/node_id` (`.11` does too), and the app is being started
+      **interactively** at each node — the one-time helper admin dialog and the
+      Local Network prompt are clicks at that Mac, never an SSH launch
+      (`AGENTS.md` §11, runbook §1.5 step 4). Still open: `.13`/`.14` must answer
+      the same version before the cluster test (`scripts/check_peer_versions.py`
+      exit 0). Operational step, not a code gap.
 - [x] TODO/FIXME/`NotImplemented` sweep (2026-11-14): **0** in
       `omlx/cluster/assistant/**` and `cluster_v2.js`. (Upstream oMLX's own TODOs
       are upstream's, not this fork's surface.)
 - [x] glm5 split-K: not a bug — the kernel is bitwise-correct; the test only
       fails without the native `dsa_topk_indices` extension (needs the Metal
       Toolchain). Skip-guard added (`0470861d`). W5 (build for real) is optional.
-- [~] Docs reconcile: AGENTS / PROJECT-BRIEF / ROADMAP / PHASE-2B-RUN / UPSTREAM
-      agree with the code and the decisions (ongoing each slice).
+- [~] Docs reconcile: **AGENTS, UPSTREAM.md, ROADMAP-TO-CHAPTER-10 and
+      CLUSTER-TEST-RUNBOOK now agree with the tree** (AGENTS §2 decisions incl.
+      Qwen4-Exp PP; new AGENTS §11 environment rules `3e2f5883`; runbook §1.5
+      same-build rollout `e74ef88e`). **Still missing (two one-line fixes, not in
+      this plan's files):** UPSTREAM.md lines 30–32 still say the
+      `qwen4_exp_mlx_lm` adapter and the Qwen4 cluster/pipeline tests were “not
+      replayed … no Qwen4-Exp pipeline on this branch”, although `054f92e4`
+      applied #5033 (`omlx/patches/qwen4_exp_mlx_lm/model.py:46
+      SUPPORTS_PIPELINE = True`, `tests/test_qwen4_pipeline.py`,
+      `tests/test_qwen4_cluster_adapter.py`); and DISTRIBUTION.md does not yet
+      record the notarized `0.8.0rc1` artifact (its table still stops at the
+      2026-11-14 audit DMG).
 - [x] Xcode host-dependent test failures fixed 2026-11-14 (macOS 27 narrow
       no-break space before %, and the under-page/window color assumption).
 - Separate cluster validation (not code gaps): node cleanup, version rollout,
   cluster up/test, 2nd MTP model sweep, auto-free-disk live, 3/4-node live.
+
+---
+
+## Status 2026-11-15
+
+Green tree, notarized app, peers rolling out. Numbers below are recorded
+evidence, not re-assertions: `READY-FOR-CLUSTER-TEST.md` §2/§4,
+`REBASE-2026-11-14.md` §“Final verification”, `UPSTREAM-PR-REVIEW-2026-11-15.md`
+§13/§15.
+
+### Suites
+
+| Tree | Full suite (`tests/` + `apps/omlx-web/tests`) |
+|---|---|
+| `rebase/upstream-main` (this tree) | **20 981 passed, 0 failed** |
+| `fix/local-only-load` (F1) | **20 154 passed, 0 failed** |
+| `fix/test-infra-conftest` (F2) | **20 147 passed, 0 failed** |
+| `fix/cluster-discovery-inventory` (F5) | 19 640 passed; the 2 remaining split-K tests need the native kernels a worktree does not build (§0.4) — 98/98 green with them |
+| `feat/cluster-assistant-plan` (A1) | **20 555 passed, 0 failed** |
+| `feat/cluster-assistant-run` (A2) | **20 933 passed, 0 failed** |
+| `feat/cluster-assistant-run-local` (A3) | **20 976 passed, 0 failed** |
+| `fix/macos-theme-locale-xctest` (macOS fix) | **401 Xcode tests, 0 failures** |
+| `feat/macos-helper-dmg` (feature) | 410 Xcode tests, 7 failures in the 3 tests the fixes PR repairs — the known **R18** dependency |
+
+`make web` (`build_css.py` + `normalize_i18n.py`) produces no diff on the three
+assistant trees, as `docs/CONTRIBUTING.md` requires.
+
+### App
+
+`build/oMLX-0.8.0rc1.dmg` (82 630 736 bytes): `xcrun stapler validate` →
+“worked”, `spctl -a -t open --context context:primary-signature` → **accepted,
+`Notarized Developer ID`** (`Andreas Kolb, YB894QRG4W`), `hdiutil verify` →
+VALID. The notarization blocker is fixed (`da8e30af`, R22).
+
+### R19–R22 (`UPSTREAM-PR-REVIEW-2026-11-15.md` §13/§15)
+
+- **R19** — the nested assistant `conftest.py` shadowed `tests/conftest.py`
+  (whole-directory runs collected the wrong fixtures); fixed, focused runs had
+  not seen it.
+- **R20** — the stylesheet was stale in the run slices; `make web` is clean now.
+- **R21** — dead `preset_matches` helper removed (`6eaf3f75`).
+- **R22** — the packaged app did not sign its nested Mach-O kernels, so Apple
+  rejected the build; fixed (`da8e30af`) and the `0.8.0rc1` image is notarized.
+
+### Live cluster state
+
+`.11` and `.12` answer `version: 0.8.0rc1` on `GET /api/cluster/node_id`;
+`.13`/`.14` had not answered when this was written, so the same-build gate
+(`CLUSTER-TEST-RUNBOOK.md` §1.5) is still open — that is the remaining item of
+the peer-parity row above, and the precondition for the Qwen3.8 PP `rank 1`
+cluster test.
