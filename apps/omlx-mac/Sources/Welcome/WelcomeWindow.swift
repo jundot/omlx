@@ -168,6 +168,20 @@ final class WelcomeViewModel: ObservableObject {
         !RuntimeInstaller.isInstalled
     }
 
+    /// The runtime row's subtitle — same "capability, always visible" rule as
+    /// the system helper (D6): the row never disappears, so a Mac that is set
+    /// up shows "Installed" instead of a system that never had the row.
+    var runtimeRowSubtitle: String {
+        if RuntimeInstaller.isInstalled {
+            return String(localized: "welcome.runtime.status_installed",
+                          defaultValue: "Installed — Python and MLX are ready.",
+                          comment: "Status of the pinned Python runtime when it is present")
+        }
+        return String(localized: "welcome.runtime.status_not_installed",
+                      defaultValue: "Not installed — downloads about 1 GB into your Application Support folder.",
+                      comment: "Status of the pinned Python runtime when it is missing")
+    }
+
     func installRuntime() async {
         guard !runtimeInstalling else { return }
         runtimeInstalling = true
@@ -743,17 +757,21 @@ private struct WelcomeSetupBody: View {
                         .buttonStyle(.omlx(.plain, size: .small))
                     }
 
-                    if vm.runtimeMissing {
-                        WelcomeDivider()
-                        SettingRow(
-                            icon: "shippingbox",
-                            title: String(localized: "welcome.runtime.title",
-                                          defaultValue: "Python runtime required",
-                                          comment: "Row title for the first-run runtime installer"),
-                            subtitle: String(localized: "welcome.runtime.sub",
-                                             defaultValue: "Python and MLX are not bundled. Downloads about 1 GB into your Application Support folder.",
-                                             comment: "Sublabel for the first-run runtime installer row")
-                        ) {
+                    WelcomeDivider()
+
+                    // The runtime is a capability like the helper (D6): the
+                    // row is always present, installed or not, so every Mac
+                    // shows the same requirement and its state instead of a
+                    // button that appears on one system and never existed on
+                    // another.
+                    SettingRow(
+                        icon: "shippingbox",
+                        title: String(localized: "welcome.runtime.title",
+                                      defaultValue: "Python runtime",
+                                      comment: "Row title for the pinned Python runtime requirement"),
+                        subtitle: vm.runtimeRowSubtitle
+                    ) {
+                        if vm.runtimeMissing {
                             HStack(spacing: 8) {
                                 if vm.runtimeInstalling {
                                     ProgressView().controlSize(.small)
