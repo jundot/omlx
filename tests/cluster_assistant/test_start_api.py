@@ -191,14 +191,16 @@ def test_start_launches_on_the_elected_coordinator(api) -> None:
     assert operation["endpoint"]["url"] == "http://172.16.1.11:8099"
     assert operation["error"] is None
     assert fake.health_checks == 1
-    # The coordinator received the signed request. Rank 0 is spawned on the
-    # coordinator through its own LAN address (the macOS Tahoe ring workaround),
-    # never on another Mac.
+    # The coordinator received the signed request. Rank 0 is spawned as the
+    # coordinator's own local child: `ClusterDeployment` requires
+    # `hosts[0].ssh == "127.0.0.1"`, and the validation cluster runs as a line,
+    # so the macOS Tahoe ring workaround (rank 0 over SSH to the coordinator's
+    # own LAN address) is neither allowed by the contract nor needed.
     assert len(fake.activated) == 1
     activated = fake.activated[0]
     assert activated.approved_placement == fake.placement
     assert activated.hosts[0].node_id == "m5"
-    assert activated.hosts[0].ssh == "172.16.1.11"
+    assert activated.hosts[0].ssh == "127.0.0.1"
     assert [host.node_id for host in activated.hosts] == ["m5", "m1"]
     assert [node.capacity_bytes for node in activated.nodes] == [
         int(107.5 * GIB),

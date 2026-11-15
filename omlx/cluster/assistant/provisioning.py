@@ -893,13 +893,13 @@ def build_deployment_request(
         hosts.append(
             ClusterHostRequest(
                 node_id=node_id,
-                # Rank 0 runs on the coordinator. On macOS Tahoe a local child
-                # cannot join the ring ("[ring] Couldn't connect (error: 60)");
-                # the same hostfile joins when rank 0 is spawned over SSH to the
-                # coordinator's *own* LAN address. This is still the coordinator
-                # spawning its own rank 0, never another Mac — the address is one
-                # this Mac owns, proven by `resolve_targets`.
-                ssh=(target.address if rank == 0 else target.ssh),
+                # Rank 0 runs on the coordinator as its own local child. The
+                # deployment contract requires exactly "127.0.0.1" here
+                # (``ClusterDeployment``), and the validation cluster runs as a
+                # *line* rather than a macOS bridge ring, so the Tahoe ring
+                # workaround (spawn rank 0 over SSH to this Mac's own LAN
+                # address) does not apply and would be rejected.
+                ssh=("127.0.0.1" if rank == 0 else target.ssh),
                 ips=[target.address],
                 # The interpreter that Mac itself reported to the measurement.
                 # Rank 0 is spawned by the MLX launcher over SSH to the
