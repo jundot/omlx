@@ -6710,6 +6710,56 @@ class TestMeasureSensitivityVlmMtp:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestNemotronImatrix:
+    @pytest.mark.parametrize(
+        "config, layer_walk",
+        [
+            ({"model_type": "nemotron_h"}, "nemotron_h_ssm_mask_lm_head_v1"),
+            ({"model_type": "nemotron_h_puzzle"}, "nemotron_h_ssm_mask_lm_head_v1"),
+            (
+                {
+                    "model_type": "nemotron_h_omni",
+                    "llm_config": {"model_type": "nemotron_h_puzzle"},
+                },
+                "nemotron_h_ssm_mask_lm_head_v1",
+            ),
+            (
+                {
+                    "model_type": "nemotron_h_omni",
+                    "text_config": {"model_type": "nemotron_h_puzzle"},
+                },
+                "nemotron_h_ssm_mask_lm_head_v1",
+            ),
+            ({"model_type": "llama"}, "native_inputs_v1"),
+            ({"model_type": "mamba"}, "native_inputs_v1"),
+            ({"model_type": "mamba2"}, "native_inputs_v1"),
+            (
+                {"model_type": "unrelated", "llm_config": {"model_type": "lfm3"}},
+                "native_inputs_v1",
+            ),
+            (
+                {"model_type": "gemma4", "num_kv_shared_layers": 1},
+                "gemma4_shared_kv_v1",
+            ),
+            ({"model_type": "lfm2"}, "conv_mask_v1"),
+            ({"model_type": "qwen4_exp"}, "qwen4_mtp_batch_positions_v1"),
+            ({"model_type": "glm5_next"}, "glm5_next_hc_moe_lm_head_v4"),
+            ({"model_type": "deepseek_v41"}, "deepseek_v41_full_forward_v1"),
+        ],
+    )
+    def test_imatrix_signature_revises_only_nemotron_h(
+        self, tmp_path, config, layer_walk
+    ):
+        signature = _source_imatrix_signature(
+            tmp_path,
+            config,
+            num_samples=2,
+            seq_length=8,
+            calib_dataset="oqe_code_multilingual",
+        )
+
+        assert signature["layer_walk"] == layer_walk
+        assert signature["format"] == "omlx-oqe-imatrix-cache"
+
     @pytest.fixture
     def bolt(self, monkeypatch):
         from mlx_vlm.utils import get_model_and_args
@@ -6890,7 +6940,9 @@ class TestNemotronImatrix:
             isinstance(m, oq._ImatrixCaptureWrapper) for _, m in model.named_modules()
         )
 
-    def test_proxy_cache_and_quantization(self, bolt, tmp_path, monkeypatch):
+    def test_proxy_recollects_stale_imatrix_and_reuses_new_cache(
+        self, bolt, tmp_path, monkeypatch
+    ):
         from mlx_vlm.utils import load_model
 
         import omlx.oq as oq
@@ -6926,17 +6978,40 @@ class TestNemotronImatrix:
             return str(proxy)
 
         cache_path = str(tmp_path / "imatrix.npz")
+        entries, collection = oq._collect_imatrix_from_model(
+            model,
+            object(),
+            config,
+            calib_dataset=oq._OQE_CALIB_DATASET,
+            num_samples=2,
+            seq_length=8,
+        )
+        signature = oq._source_imatrix_signature(
+            source,
+            config,
+            num_samples=2,
+            seq_length=8,
+            calib_dataset=oq._OQE_CALIB_DATASET,
+        )
+        # Otherwise valid observations must not hide the obsolete walk revision.
+        oq._save_oqe_imatrix(
+            Path(cache_path),
+            entries,
+            {**signature, "layer_walk": "native_inputs_v1", "collection": collection},
+        )
         cache = oq._load_or_collect_imatrix(
             str(source),
             config,
             cache_path=cache_path,
-            reuse_cache=False,
+            reuse_cache=True,
             num_samples=2,
             seq_length=8,
             strict=True,
             trust_remote_code=False,
             load_path_factory=build_proxy,
         )
+        assert cache.reused is False
+        assert cache.metadata["layer_walk"] == "nemotron_h_ssm_mask_lm_head_v1"
         assert len(cache.entries) == 21
         assert cache.metadata["collection"]["skipped_layer_forwards"] == 0
         assert cache.metadata["collection"]["coverage_sufficient"] is True
@@ -6944,6 +7019,19 @@ class TestNemotronImatrix:
         assert isinstance(
             loaded.language_model.backbone.layers[0].mixer.in_proj, nn.QuantizedLinear
         )
+        reused = oq._load_or_collect_imatrix(
+            str(source),
+            config,
+            cache_path=cache_path,
+            reuse_cache=True,
+            num_samples=2,
+            seq_length=8,
+            strict=True,
+            trust_remote_code=False,
+            load_path_factory=build_proxy,
+        )
+        assert reused.reused is True
+        assert reused.metadata == cache.metadata
         # Every quantized text projection must resolve under strict coverage.
         for name, module in model.language_model.named_modules():
             if OQImatrixCollector._is_capture_module(module):

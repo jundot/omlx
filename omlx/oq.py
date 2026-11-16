@@ -6265,6 +6265,14 @@ def _source_imatrix_signature(
         # GLM-5.3 needs its mHC-expanded layer walk plus the untied output-head
         # capture. Older caches completed without either and must not be reused.
         signature["layer_walk"] = "glm5_next_hc_moe_lm_head_v4"
+    elif model_type in ("nemotron_h", "nemotron_h_puzzle") or (
+        isinstance(config.get("llm_config"), dict)
+        and str(config["llm_config"].get("model_type", "")).lower()
+        in ("nemotron_h", "nemotron_h_puzzle")
+    ):
+        # The generic walk used attention masks for Mamba and omitted the
+        # norm_f-normalized LM head. Bolt's source still uses llm_config here.
+        signature["layer_walk"] = "nemotron_h_ssm_mask_lm_head_v1"
     else:
         # The first layer input from the model's own forward, blocks bound by
         # parameter name, boolean and sliding-window masks, per-row position
