@@ -1,10 +1,11 @@
 # Chapter 10 — DAU acceptance, diagnostics and the live proof
 
-Status: **offline work in progress (2026-11-07)**. The Chapter-10 gate is closed
-offline; the only open gate item is live evidence, deferred until the cluster is
-reachable again. This repository had no earlier Chapter-10 specification; this
-document defines the chapter from `PROJECT-BRIEF.md` Phase 4, §16.4 and §17.1,
-plus the recorded decision that P2 stays after Chapter 10.
+Status: **offline work done; the live block is the only open item (2026-11-16)**.
+The Chapter-10 gate is closed offline; the only open gate item is live evidence —
+the U1–U6 acceptance run A1–A7 on a wiped, identical-build cluster. This
+repository had no earlier Chapter-10 specification; this document defines the
+chapter from `PROJECT-BRIEF.md` Phase 4, §16.4 and §17.1, plus the recorded
+decision that P2 stays after Chapter 10.
 
 ## 1. Scope
 
@@ -187,31 +188,37 @@ distributed path.
   web dashboard. No new window, app, wizard, chat or control plane; no
   status/stop in the tray in this slice.
 - **Helper:** Developer ID signing plus network setup is the chosen scope. The
-  signing identity/notarization credentials and the helper privilege model are
-  still open; the helper is not started.
+  signed SMJobBless helper is **implemented and live-blessed** on all four Macs
+  (D6, 2026-11-15): one admin dialog, `PrivilegedHelper.status →
+  {installed, version, wiredLimitCurrentMB, wiredLimitRequestedMB}` as the one
+  truth, a **System helper** step in Welcome and a permanent Install/Reinstall
+  row in Performance independent of the wired-limit warning. The **privileged
+  network setup** (bridge/STP) remains open; it is deferred by decision.
 - **Telemetry:** remains none. **TP, >4 Macs, HA, multi-tenancy:** remain out.
 
-The menu item, the Welcome button and the deep link are implemented. Xcode was
-installed on 2026-11-08: the app builds and `MenubarControllerPortTests`,
-`LocalizationSmokeTests` and `PerformanceScreenVMTests` pass.
-
-The first helper slice is implemented: the Performance screen can raise
-`iogpu.wired_limit_mb` through one standard macOS admin dialog. The read-only
-network preflight is implemented as `GET /assistant/network-preflight` and a
-card panel; it shows exact commands and executes nothing. A persistent signed
-helper and the privileged network apply remain open; see
-[`HELPER.md`](HELPER.md). Distribution is a direct **slim** DMG (58 MB, external Python runtime) rather
-than the 1.6 GB embedded app; see [`SLIM-RUNTIME.md`](SLIM-RUNTIME.md),
-[`DISTRIBUTION.md`](DISTRIBUTION.md) and [`SIGNING.md`](SIGNING.md).
+The menu item, the Welcome button and the deep link are implemented, and the
+macOS app builds and tests green (2026-11-16: `xcodebuild test -scheme oMLX
+CODE_SIGNING_ALLOWED=NO -testLanguage en` → 441 passed / 0 failed, 5 skipped),
+including the D1 in-app uninstall (Settings → Advanced → Uninstall… with one
+keep switch per scope). The read-only network preflight is implemented as
+`GET /assistant/network-preflight` and a card panel; it shows exact commands and
+executes nothing. Distribution is a direct **slim** DMG (79 MB, external Python
+runtime) rather than the 1.6 GB embedded app; the 2026-11-16 artefact is
+Developer-ID signed, notarized and stapled; see [`HELPER.md`](HELPER.md),
+[`SLIM-RUNTIME.md`](SLIM-RUNTIME.md), [`DISTRIBUTION.md`](DISTRIBUTION.md) and
+[`SIGNING.md`](SIGNING.md).
 
 ## 7. Exit criteria
 
 - Offline: §3.1–3.4 done; suites green; docs reconciled.
 - Live: §5.3 passes on 2–4 Apple Silicon Macs over the validation line; evidence
-  in `PHASE-2B-RUN.md`.
-- P2 app/tray slice: source, catalog and unit test in place; Xcode build/test
-  still open.
-- P2 helper: not started; credentials and privilege model open.
+  in `PHASE-2B-RUN.md`. The U1–U6 acceptance gate (A1–A7 in
+  [`ROADMAP-ACCEPTANCE-2026-11-16.md`](ROADMAP-ACCEPTANCE-2026-11-16.md) §2) is
+  the remaining block and runs from a wiped four-Mac state with one identical
+  build.
+- P2 app/tray slice: source, catalog and Xcode tests in place and green.
+- P2 helper: implemented (signed, one admin dialog, live-blessed); the
+  privileged network apply is the only open P2 privilege item.
 
 The next agent should start with the live block, not with a new feature. A
 failure in the block is fixed in the existing assistant surface; it is not a

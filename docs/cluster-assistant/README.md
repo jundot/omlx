@@ -9,12 +9,26 @@ This directory holds the project-specific material for the oMLX Cluster Assistan
 3. `../../CLUSTER-ASSISTANT.md` — short repository orientation.
 4. `CHAPTER-5.md` — apply/start implementation brief.
 5. `SCREEN-3-MINIMAL.md` — minimal UI contract for the first end-to-end slice.
-6. `CHAPTER-10.md` — current chapter: DAU acceptance, the redacted support
-   bundle and the deferred live matrix.
-7. `HELPER.md` — the P2 privileged-helper first slice and its open points.
-8. `DISTRIBUTION.md` — direct-DMG release plan and open credentials.
-9. `SIGNING.md` — Developer ID and notarization setup checklist.
-10. `SLIM-RUNTIME.md` — external Python runtime instead of the 1.6 GB embed.
+6. `ROADMAP-TO-CHAPTER-10.md` — the resource-planning gate plan (closed offline).
+7. `CHAPTER-10.md` — DAU acceptance, the redacted support bundle and the live
+   matrix.
+8. **Current session:**
+   - `PLAN-REMAINING-2026-11-16.md` — **the checklist for what is left** (live
+     acceptance, deferred matrix, fold/push, cleanup) with a done-when per line.
+   - `ROADMAP-ACCEPTANCE-2026-11-16.md` — the acceptance gate A1–A7 (W1–W6),
+     the five recorded decisions and the PR path.
+   - `ASSISTANT-UI-SPEC-2026-11-16.md` — the code-level contract of the one-flow
+     Cluster tab (screens, markers, semantics, test matrix).
+   - `ASSISTANT-UI-IMPLEMENTATION-PLAN-2026-11-16.md` — U1–U6 log and the
+     recorded deviations.
+   - `PR-READY-2026-11-16.md` — what is committed, the fold into the PR series,
+     the DMG artefact and what is still open.
+   - `READY-FOR-CLUSTER-TEST.md` — rollout order, per-branch suite numbers, DMG
+     and the wipe/install steps.
+9. `HELPER.md` — the privilege capability and its open points.
+10. `DISTRIBUTION.md` — direct-DMG release plan and open credentials.
+11. `SIGNING.md` — Developer ID and notarization setup checklist.
+12. `SLIM-RUNTIME.md` — external Python runtime instead of the 1.6 GB embed.
 
 ## Scope in one sentence
 
@@ -22,13 +36,28 @@ A DAU-friendly, English-only, PP-first cluster mode inside oMLX for 2–4 Macs o
 
 ## Current milestone
 
-Chapter 10 — DAU acceptance. The Chapter-10 gate is closed offline: election,
-measurement, recommendation, plan, apply/start, the Screen-3–6 surfaces,
-hardware-only measurement, source-first copy, the resource-policy solver, the
-measured compute/TTFT probes, the connected-line topology and the consented
-2-Mac fallback all exist and are fake-driven tested. The redacted support bundle
-is implemented. The only open gate item is the live evidence block, deferred
-until the cluster is reachable.
+Chapter 10 — DAU acceptance, and it is down to one block: **the live acceptance
+run**. The offline gate is closed: election, measurement, recommendation,
+plan/apply/start, the Screen-3–6 surfaces, hardware-only measurement,
+source-first copy, the resource-policy solver, the measured compute/TTFT probes,
+the connected-line topology with the consented 2-Mac fallback, the reload resume
+and the cluster-wide operation lock all exist and are fake-driven tested
+(`tests/cluster_assistant` **658 passed**).
+
+Since 2026-11-15/16 the acceptance package itself is implemented:
+
+- **D1** in-app uninstall with one keep switch per scope (models and
+  `cluster/identity.json` kept by default) — `caa3901a`, live-checked.
+- **D6** the helper is a capability (`PrivilegedHelper.status`, Welcome step,
+  permanent Performance row) — `a62c29d9`, live-checked.
+- **D2/D3/D4** steps, back/`stale`, in-place retry, error placement and the
+  one-flow Cluster tab (`Assistant` / `Manual setup`) — `0c6e7479`, U1–U6,
+  `apps/omlx-web/tests` **578 passed**.
+- Distributed inference is **on by default** (`a6758008`).
+
+Still open: **A1–A7** on a wiped four-Mac cluster with one identical build
+(`ROADMAP-ACCEPTANCE-2026-11-16.md` §2, `PR-READY-2026-11-16.md` §5), then the
+fold into the PR series and the push.
 
 Read:
 
@@ -58,7 +87,7 @@ Read:
 
 Still later:
 
-- tensor parallelism (TP), which stays out of the MVP.
+- tensor parallelism (TP): R2, after R1 ships PP only.
 
 ## Key non-goals
 
@@ -72,7 +101,10 @@ Still later:
 ## Reference pin
 
 ```text
-1e27576af5e10c8f4459e0fdcb05c5cf59245d44
+upstream/main = 624cff0e   (rebase/upstream-main is this fork replayed onto it)
 ```
 
-If you move the pin, re-audit the oMLX cluster routes and UI before reusing assumptions from this brief.
+The historical base `1e27576af5e10c8f4459e0fdcb05c5cf59245d44` (tag
+`cluster-assistant-base-2026-11-07`) is no longer the pin; see
+`REBASE-2026-11-14.md`. If you move the pin, re-audit the oMLX cluster routes
+and UI before reusing assumptions from this brief.

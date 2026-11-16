@@ -551,14 +551,14 @@ applied to). Phase C and D can proceed in parallel with B.
       `GLM-5.3-Flash-oQ2e-mtp` (107.8 GiB) planned on `.12`+`.11`, named `.14`
       and `.13` as not needed, started and served a completion; a DeepSeek V4.1
       Engram start (`.11`+`.12`) served a completion; a routed-expert 25 %
-      start served a completion. **Qwen4 PLE:** its table is detected, but the
-      checkpoint is not pipeline-capable, so plan now refuses it with
-      `choose_pipeline_model` (a real bug fixed by enforcing
-      `supports_pipeline` and applying the pre-load patches in
-      `inspect_safetensors_layout`). A pipeline-capable 150 GiB-class
-      checkpoint is not present on the validation cluster; the 4-Mac *start* of
-      a >100 GiB model remains Phase D disk/`.13` environment work. See
-      `PHASE-2B-RUN.md` §14.
+      start served a completion. **Qwen4 PLE:** its table is detected.
+      **Updated 2026-11-16:** with upstream PR #5033 applied, Qwen4-Exp/Qwen3.8
+      is **pipeline-capable** on this branch (`supports_pipeline` true) and may
+      be planned as a pipeline; the earlier `choose_pipeline_model` refusal for
+      that family is withdrawn (R1 = PP only, TP = R2). A pipeline-capable
+      150 GiB-class checkpoint is not present on the validation cluster; the
+      4-Mac *start* of a >100 GiB model remains Phase D disk/`.13` environment
+      work. See `PHASE-2B-RUN.md` §14 and §27.
 - [x] `M1–M3` closed (2026-11-07): the synthetic compute probe runs after apply
       on the coordinator, its profiles are stored and used by the next
       measurement/plan; one streaming completion after ready fills TTFT and
@@ -594,6 +594,13 @@ Only then start Chapter 10.
 **2026-11-07:** the offline gate is closed; live evidence is deferred. Chapter 10
 has started as the DAU acceptance/support chapter — see
 [`CHAPTER-10.md`](CHAPTER-10.md). P2 stays out.
+
+**2026-11-16:** the offline gate stays closed and the acceptance package (D1,
+D6, D2, D3, D4) is implemented and tested. The remaining gate item is the live
+acceptance run A1–A7 on a wiped, identical-build four-Mac cluster
+([`ROADMAP-ACCEPTANCE-2026-11-16.md`](ROADMAP-ACCEPTANCE-2026-11-16.md) §2),
+then the one-step fold into the PR series and the push — tracked as a checklist
+in [`PLAN-REMAINING-2026-11-16.md`](PLAN-REMAINING-2026-11-16.md).
 
 ---
 

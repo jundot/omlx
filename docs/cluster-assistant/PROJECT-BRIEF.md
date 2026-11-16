@@ -1793,20 +1793,26 @@ If upstream is not possible, maintain a focused fork with a small patch surface.
   offload for a checkpoint that has one, apply writes the switch `false` on the
   selected Macs. The plan showed the lever and Start setup is the confirmation;
   this is not a silent overwrite.
-- **A too-low wired limit is a preflight refusal** with the action `diagnostics`
-  and the exact `sudo sysctl iogpu.wired_limit_mb=…` command. The signed helper
-  that raises it automatically remains Phase 5.
+- **A too-low wired limit is a preflight refusal** with the action
+  `raise_wired_limit` (R5, 2026-11-15): the refusal names the Mac and its MB
+  value, and the step is Performance → “Apply with Admin…” in the app — one
+  admin dialog through the signed helper. The browser has no privileged path and
+  only names the step. A measured `0` is the macOS default nobody raised;
+  `None` (not measured) never reads as too low.
 - **Live Phase A evidence (2026-11-07).** `.12` was paired through the existing
   join/approve API; `.14` was synced to this branch and restarted. A four-Mac
   measurement of `GLM-5.3-Flash-oQ2e-mtp` (107.8 GiB) planned on `.12`+`.11`,
   named `.14`/`.13` as not needed, started and served a completion. A DeepSeek
   V4.1 Engram start (`.11`+`.12`, 4k context) and a routed-expert 25 % start
-  both served completions. The Qwen4 PLE checkpoint's table is detected, but
-  the VLM is not pipeline-capable; the assistant now refuses it with
-  `choose_pipeline_model` instead of returning an unstartable plan. A
-  pipeline-capable 150 GiB-class checkpoint is not present; the 4-Mac start of
-  a >100 GiB model stays Phase D environment work (`.13` disk/admission).
-  Evidence is in `PHASE-2B-RUN.md` §14.
+  both served completions. The Qwen4 PLE checkpoint's table is detected.
+  **Updated 2026-11-16:** with upstream PR #5033 applied, Qwen4-Exp/Qwen3.8 is
+  **pipeline-capable** on this branch and the assistant may plan it as a
+  pipeline; the earlier “not pipeline-capable / `choose_pipeline_model`”
+  statement described the pre-#5033 state and is withdrawn (R1 = PP only,
+  TP = R2). A pipeline-capable 150 GiB-class checkpoint is not present on the
+  validation cluster; the 4-Mac start of a >100 GiB model stays Phase D
+  environment work (`.13` disk/admission). Evidence is in `PHASE-2B-RUN.md` §14
+  and §27.
 
 If a new product decision appears, ask once and record it here; do not silently
 decide it.
@@ -1888,7 +1894,11 @@ This appendix exists so a new agent can start without the prior conversation. It
 11. Feasibility wins over performance; a candidate with no legal split is discarded.
 12. Free admission is a strong rank-0 preference, not the sole criterion.
 13. If the elected coordinator fails, do not silently fall back to the local Mac.
-14. First code milestone is the election library and tests, not UI.
+14. The election library and its tests were the **first** milestone (long done).
+    **Current state (2026-11-16):** every product surface exists and is tested;
+    the single open item is the live acceptance run A1–A7, then the PR fold and
+    push. Do not start a new feature — follow
+    [`PLAN-REMAINING-2026-11-16.md`](PLAN-REMAINING-2026-11-16.md).
 
 ### A.2 Reference workspaces
 
@@ -1901,8 +1911,8 @@ Current reference environment on this machine:
 | Installed oMLX checkout | `~/Library/Application Support/LocalInferenzMachine/src/omlx` |
 | oMLX upstream | `https://github.com/jundot/omlx` |
 | Project fork | `https://github.com/digitalfactory-ako/omlx` |
-| Pinned oMLX commit | `1e27576af5e10c8f4459e0fdcb05c5cf59245d44` (`cluster-assistant-base-2026-11-07`) |
-| Pinned oMLX base | `e47101f36c10e8b3b99f74d632f403cf01d1e313` |
+| Pinned oMLX commit | `upstream/main` `624cff0e` — this fork is replayed onto it (`rebase/upstream-main`, rebased 2026-11-14) |
+| Historical pin | `1e27576af5e10c8f4459e0fdcb05c5cf59245d44` (tag `cluster-assistant-base-2026-11-07`, no longer used) |
 
 Patch/PR status is tracked in `docs/cluster-assistant/UPSTREAM.md`. The base
 includes merged #4985 and #4974 plus the local MoE/MTP series; it does **not**

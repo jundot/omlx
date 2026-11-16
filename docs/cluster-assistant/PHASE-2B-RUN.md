@@ -1657,7 +1657,9 @@ The rule stays unit-tested until such a Mac exists.
 **Item 6 — a second MTP model, live.** Only `GLM-5.3-Flash-oQ2e-mtp` (103 GiB)
 fits the 2-Mac admission (`.11` 108 + `.12` 47 GiB) and is live-swept (§27).
 `GLM-5.3-Flash-MLX-4bit-MTP` (169 GiB) and `DeepSeek-V4.1-Flash` (366 GiB)
-exceed that budget; `Qwen3.8-Flash-Next-oQ5e-mtp` is not pipeline-capable. A
+exceed that budget; `Qwen3.8-Flash-Next-oQ5e-mtp` was not pipeline-capable at
+the time of this entry (2026-11-14 — superseded by #5033, which is applied on
+this branch since 2026-11-16, so the family is PP-capable now). A
 4-Mac `GLM-4bit` plan is memory-marginal (185 GiB summed admission for a 169 GiB
 model + KV) and would need six ~169 GiB redeploys — hours of staging — so it is
 an explicit opt-in, not a default validation step. The preset key is already the
