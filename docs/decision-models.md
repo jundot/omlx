@@ -93,6 +93,16 @@ quant drift — a caller filtering at 0.9 keeps the dates and silently loses the
 amount. Pick the floor per question with the kind of span you are after rather
 than reusing one global value.
 
+The instruction is matched against the state, not translated into it. On a
+Russian-language state the English `customer name` returned no span at all while
+`название клиента` returned one, and the same English instruction on an
+English-language state worked — so ask in the state's language. Ask with the
+state's own term too: `customer number` finds nothing when the state calls the
+same digits a contract number (`№4711`), and on a state naming two parties the
+answer flips between them with the question's language. Cost is one forward pass
+per locate group: ~0.3–0.4 s per question on a short state, ~1.5 s for five
+questions in one request.
+
 `locate` runs in a forward pass of its own, with the checkpoint's `locate-span/`
 adapter enabled — an unmerged LoRA over every `nn.Linear` of the language model,
 its own FP32 embedding row for the `<|locate|>` marker, and a query-conditioned
