@@ -11,6 +11,12 @@ from omlx.utils.install import get_cli_command_prefix
 
 CLAUDE_CODE_MIN_CONTEXT_WINDOW = 48 * 1024
 
+# Claude Code only accepts CLAUDE_CODE_AUTO_COMPACT_WINDOW in this range and
+# warns at startup for anything outside it (values below the minimum are
+# treated as the minimum). CLAUDE_CODE_MAX_CONTEXT_TOKENS has no such limit.
+_CLAUDE_AUTO_COMPACT_MIN_TOKENS = 100_000
+_CLAUDE_AUTO_COMPACT_MAX_TOKENS = 1_000_000
+
 # Claude Code treats these flags as enabled whenever their value is non-empty,
 # including values such as "0" and "false".
 _CROSS_SESSION_NONEMPTY_BLOCKING_VARS = (
@@ -146,7 +152,12 @@ class ClaudeCodeIntegration(Integration):
             env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent_model
 
         if ctx.context_window:
-            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)
+            if (
+                _CLAUDE_AUTO_COMPACT_MIN_TOKENS
+                <= ctx.context_window
+                <= _CLAUDE_AUTO_COMPACT_MAX_TOKENS
+            ):
+                env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)
             # Claude Code (2.1.220+) reads CLAUDE_CODE_MAX_CONTEXT_TOKENS to
             # set the *detected* context window for custom model IDs that
             # don't canonicalize to "claude-*"; auto-compact then fires at
@@ -155,6 +166,9 @@ class ClaudeCodeIntegration(Integration):
             # keeps reported usage and the auto-compact denominator on the
             # same scale with no scaling math and no reliance on the
             # internal/undocumented CLAUDE_AUTOCOMPACT_PCT_OVERRIDE test hook.
+            # CLAUDE_CODE_AUTO_COMPACT_WINDOW is only set inside Claude Code's
+            # accepted [100k, 1M] range; outside it, auto-compact is already
+            # governed by CLAUDE_CODE_MAX_CONTEXT_TOKENS alone.
             # Caveat (confirmed live): this is ignored for model IDs that
             # canonicalize to "claude-*" — Claude Code trusts its own
             # built-in context window for those regardless of this variable.
