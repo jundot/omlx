@@ -1,10 +1,12 @@
 # Cluster Assistant UI — implementation spec and roadmap (2026-11-16)
 
-Status: **ready for implementation.** This turns the approved mock
+Status: **implemented 2026-11-16 (U1–U6).** This turned the approved mock
 (`mockups/assistant-flow-klickstrecke.html`) and its design doc
 (`UX-FLOW-REDESIGN-2026-11-15.md`) into code. It is the UI half of the
 acceptance package: **W3 (D4 error placement) + W4 (D2 steps/back/retry) +
 W5 (D3 one flow, one page)** in `ROADMAP-ACCEPTANCE-2026-11-16.md`.
+The implementation log, test counts and the handful of recorded deviations
+live in `ASSISTANT-UI-IMPLEMENTATION-PLAN-2026-11-16.md` §7.
 
 Read order for the implementing agent:
 

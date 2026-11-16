@@ -1881,6 +1881,8 @@ const url = 'http://172.16.1.11:8099';
 const base = {endpoint: {ready: true, url}};
 component.assistant.session = Object.assign({}, base, {state: 'ready', stopped: false});
 const running = component.assistantSessionEndpoint();
+component.assistant.session = {state: 'ready', stopped: false, endpoint: {ready: false, url}};
+const notReady = component.assistantSessionEndpoint();
 component.assistant.session = Object.assign({}, base, {state: 'ready', stopped: true});
 const stopped = component.assistantSessionEndpoint();
 component.assistant.session = Object.assign({}, base, {state: 'applied', stopped: false});
@@ -1889,10 +1891,11 @@ component.assistant.session = {state: 'ready', stopped: false};   // no endpoint
 const noEndpoint = component.assistantSessionEndpoint();
 component.assistant.session = null;
 const noSession = component.assistantSessionEndpoint();
-process.stdout.write(JSON.stringify({running, stopped, applied, noEndpoint, noSession}));
+process.stdout.write(JSON.stringify({running, notReady, stopped, applied, noEndpoint, noSession}));
 """
     )
     assert result["running"] == "http://172.16.1.11:8099"
+    assert result["notReady"] == ""
     assert result["stopped"] == ""
     assert result["applied"] == ""
     assert result["noEndpoint"] == ""
@@ -3862,3 +3865,575 @@ def test_assistant_local_tune_markup_and_wiring_are_declared():
         "data-cluster-v2-assistant-tune-local-best",
     ):
         assert marker in template, marker
+
+
+# --- Assistant UI spec 2026-11-16 (U1-U6) ------------------------------------
+#
+# The screens are a render-mode on the frozen state machine. These tests drive
+# the shipped methods with the same fake seams as the rest of this file: no
+# real Mac, model or endpoint appears here (AGENTS: live evidence lives in
+# PHASE-2B-RUN.md).
+
+
+def test_assistant_screen_is_exactly_one_per_backend_state():
+    result = _run_wizard(
+        """
+(() => {
+  const out = {};
+  const set = (state, extra = {}) => {
+    Object.assign(component.assistant, {
+      state, plan: null, stopped: false, busy: false,
+    }, extra);
+    component.assistantChooseOpen = false;
+    return component.assistantScreen();
+  };
+  out.idle = set('idle');
+  out.measuring = set('measuring');
+  out.recommending = set('recommending');
+  out.measuringModel = set('measuring_model');
+  out.planningWait = set('planning');
+  out.planningPlan = set('planning', {plan: {feasible: true}});
+  out.applying = set('applying');
+  out.starting = set('starting');
+  out.loading = set('loading');
+  out.ready = set('ready');
+  out.stopped = set('ready', {stopped: true});
+  out.failed = set('failed');
+  component.assistant.plan = {feasible: true};
+  component.assistantChooseOpen = true;
+  out.choose = component.assistantScreen();
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+    )
+
+    assert result == {
+        "idle": "start",
+        "measuring": "check",
+        "recommending": "check",
+        "measuringModel": "check",
+        "planningWait": "check",
+        "planningPlan": "plan",
+        "applying": "launch",
+        "starting": "launch",
+        "loading": "launch",
+        "ready": "ready",
+        "stopped": "stopped",
+        "failed": "failed",
+        "choose": "choose",
+    }
+
+
+def test_choose_re_measures_only_a_changed_model_and_replans_on_context():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  component.modelOptions = [
+    { id: 'a', model_path: '/models/a', display_name: 'A', model_context_length: 32768 },
+    { id: 'b', model_path: '/models/b', display_name: 'B', model_context_length: 131072 },
+  ];
+  component.selectedModelPath = component.assistant.selectedModel;
+
+  // Unchanged confirm: the screen closes and nothing is posted.
+  component.assistantOpenChoose();
+  const opened = {
+    screen: component.assistantScreen(),
+    draft: component.assistantChooseDraft.model_path,
+  };
+  let mark = calls.length;
+  await component.assistantConfirmChoose();
+  const unchanged = {
+    screen: component.assistantScreen(),
+    posted: calls.slice(mark).map((call) => call.url),
+  };
+
+  // Context only: the hardware and model measurements are reused, plan runs.
+  component.assistantOpenChoose();
+  component.assistantChooseContext(16384);
+  mark = calls.length;
+  await component.assistantConfirmChoose();
+  const contextOnly = {
+    posted: calls.slice(mark).map((call) => call.url),
+    context: component.assistant.selectedContextTokens,
+    model: component.assistant.selectedModel,
+    state: component.assistantState(),
+  };
+
+  // Model change: measured model-bound again before plan.
+  component.assistantOpenChoose();
+  component.assistantChooseModel('/models/b');
+  mark = calls.length;
+  await component.assistantConfirmChoose();
+  const modelChange = {
+    posted: calls.slice(mark).map((call) => call.url),
+    body: calls.slice(mark).map((call) => call.body),
+    model: component.assistant.selectedModel,
+    state: component.assistantState(),
+  };
+  process.stdout.write(JSON.stringify({ opened, unchanged, contextOnly, modelChange }));
+})();
+"""
+        )
+    )
+
+    assert result["opened"]["screen"] == "choose"
+    assert result["unchanged"] == {"screen": "plan", "posted": []}
+    assert result["contextOnly"]["posted"] == ["/admin/api/cluster/assistant/plan"]
+    assert result["contextOnly"]["context"] == 16384
+    assert result["contextOnly"]["state"] == "planning"
+    assert result["modelChange"]["posted"] == ["/admin/api/cluster/assistant/measure"]
+    assert result["modelChange"]["body"][0]["model_path"] == "/models/b"
+    assert result["modelChange"]["body"][0]["mtp"] is False
+    assert result["modelChange"]["model"] == "/models/b"
+    assert result["modelChange"]["state"] == "measuring_model"
+
+
+def test_changed_inputs_are_stale_and_never_applied_against_the_old_plan():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  const fresh = component.assistantInputsStale();
+  component.assistant.selectedContextTokens = 16384;
+  const stale = component.assistantInputsStale();
+  const staleRow = component.assistantRowStale('planning');
+  const freshRow = component.assistantRowStale('checking');
+  const mark = calls.length;
+  await component.runAssistantApply();
+  const posted = calls.slice(mark).map((call) => call.url);
+  const after = {
+    state: component.assistantState(),
+    stale: component.assistantInputsStale(),
+  };
+  process.stdout.write(JSON.stringify({
+    fresh, stale, staleRow, freshRow, posted, after,
+    applyState: component.assistant.applyState,
+  }));
+})();
+"""
+        )
+    )
+
+    assert result["fresh"] is False
+    assert result["stale"] is True
+    assert result["staleRow"] is True
+    assert result["freshRow"] is False
+    # Start setup re-planned first; apply was never posted against the old plan.
+    assert result["posted"] == ["/admin/api/cluster/assistant/plan"]
+    assert result["after"]["stale"] is False
+    assert result["applyState"] == ""
+
+
+def test_back_is_refused_while_a_step_is_running_and_returns_to_the_plan():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  const planState = component.assistantState();
+  component.assistant.state = 'starting';
+  component.assistant.busy = true;
+  const refused = component.assistantBackAllowed();
+  component.assistantBackToPlan();
+  const kept = {
+    state: component.assistantState(),
+    screen: component.assistantScreen(),
+  };
+  component.assistant.busy = false;
+  component.assistant.state = 'failed';
+  component.assistant.error = { code: 'plan', message: 'x', action: 'plan' };
+  const allowed = component.assistantBackAllowed();
+  component.assistantBackToPlan();
+  const back = {
+    state: component.assistantState(),
+    screen: component.assistantScreen(),
+    error: component.assistant.error,
+  };
+  process.stdout.write(JSON.stringify({ planState, refused, kept, allowed, back }));
+})();
+"""
+        )
+    )
+
+    assert result["planState"] == "planning"
+    assert result["refused"] is False
+    assert result["kept"] == {"state": "starting", "screen": "launch"}
+    assert result["allowed"] is True
+    assert result["back"] == {"state": "planning", "screen": "plan", "error": None}
+
+
+def test_a_failed_start_retries_in_place_against_the_applied_deployment():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  component.assistant.applyOperationId = 'op-apply';
+  component.assistant.applyState = 'applied';
+  component.assistant.operationId = 'op-apply';
+  component.assistant.error = {
+    code: 'coordinator_unreachable', message: 'no answer', action: 'start',
+  };
+  component.assistant.state = 'failed';
+  const step = component.assistantFailureStep();
+  const label = component.assistantRetryLabel();
+  const mark = calls.length;
+  await component.retryAssistantStep();
+  const posted = calls.slice(mark);
+  process.stdout.write(JSON.stringify({
+    step, label, state: component.assistantState(),
+    url: posted.length ? posted[0].url : '',
+    operationId: posted.length ? posted[0].body.operation_id : '',
+  }));
+})();
+"""
+        )
+    )
+
+    assert result["step"] == "start"
+    assert result["url"] == "/admin/api/cluster/assistant/start"
+    assert result["operationId"] == "op-apply"
+    assert result["state"] == "starting"
+
+
+def test_assistant_entry_loads_the_catalogue_before_the_entry_measurement():
+    """Assistant mode never visits the manual plan step, so the catalogue has to
+    be loaded here: candidates and the MTP head come from it."""
+
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  const inner = component.apiFetch;
+  component.apiFetch = async (url, options = {}) => {
+    if (url.endsWith('/admin/api/cluster/models')) {
+      calls.push({ url, method: 'POST', body: null });
+      return {
+        models: [{
+          id: 'qwen', model_path: '/models/qwen3-32b',
+          display_name: 'Qwen3 32B', model_context_length: 131072,
+          mtp_compatible: true,
+        }],
+      };
+    }
+    return inner(url, options);
+  };
+  component.modelOptions = [];
+  await component.startAssistant();
+  process.stdout.write(JSON.stringify({
+    models: component.modelOptions.length,
+    mtp: component.assistantMtpFor('/models/qwen3-32b'),
+    state: component.assistantState(),
+    urls: calls.map((call) => call.url),
+  }));
+})();
+"""
+        )
+    )
+
+    assert result["models"] == 1
+    assert result["mtp"] is True
+    assert result["state"] == "measuring"
+    assert result["urls"].index("/admin/api/cluster/models") < result["urls"].index(
+        "/admin/api/cluster/assistant/measure"
+    )
+
+
+def test_pairing_from_a_failure_switches_to_manual_setup():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + "\n"
+        + """
+(() => {
+  component.devicesPayload.discovered = [{
+    node_id: 'node-c', friendly_name: 'Node C', paired: false,
+    state: 'discovered', caps: { ram_gb: 64 }, addrs: [],
+  }];
+  component.setClusterMode('assistant');
+  const visibleBefore = component.manualSectionsVisible();
+  component.assistant.error = { code: 'node_not_paired', message: 'x', action: 'pair_mac' };
+  component.assistant.state = 'failed';
+  component.openAssistantPairing();
+  process.stdout.write(JSON.stringify({
+    visibleBefore,
+    mode: component.clusterMode,
+    visibleAfter: component.manualSectionsVisible(),
+    target: component.pairing.target,
+    state: component.assistantState(),
+  }));
+})();
+"""
+    )
+
+    assert result["visibleBefore"] is False
+    assert result["mode"] == "manual"
+    assert result["visibleAfter"] is True
+    assert result["target"]["node_id"] == "node-c"
+    assert result["state"] == "idle"
+
+
+def test_diagnostics_keeps_the_failure_message_and_unfolds_the_payload():
+    result = _run_wizard(
+        """
+(() => {
+  component.assistant.state = 'failed';
+  component.assistant.error = {
+    code: 'insufficient_memory', message: 'Mac Studio (.13) has no room',
+    action: 'diagnostics',
+  };
+  component.openAssistantDiagnostics();
+  process.stdout.write(JSON.stringify({
+    state: component.assistantState(),
+    message: component.assistant.error && component.assistant.error.message,
+    open: component.assistantFailureOpen,
+    title: component.assistantFailureTitle(),
+  }));
+})();
+"""
+    )
+
+    assert result["state"] == "failed"
+    assert result["message"] == "Mac Studio (.13) has no room"
+    assert result["open"] is True
+    assert result["title"] == "The model does not fit in memory"
+
+
+def test_the_failed_screen_does_not_duplicate_the_primary_action():
+    result = _run_wizard(
+        """
+(() => {
+  const cases = {};
+  const set = (action, applyState) => {
+    component.assistant.applyState = applyState;
+    component.assistant.plan = { feasible: true };
+    component.assistant.error = { code: 'x', message: 'x', action };
+    component.assistant.state = 'failed';
+    return {
+      step: component.assistantFailureStep(),
+      duplicate: component.assistantRetryDuplicatesAction(),
+      label: component.assistantRetryLabel(),
+    };
+  };
+  cases.plan = set('plan', '');
+  cases.measure = set('measure', '');
+  cases.apply = set('apply', '');
+  cases.start = set('start', 'applied');
+  cases.retryCoordinator = set('retry_coordinator', 'applied');
+  cases.wired = set('raise_wired_limit', '');
+  cases.freeDisk = set('free_disk_space', '');
+  process.stdout.write(JSON.stringify(cases));
+})();
+"""
+    )
+
+    assert result["plan"]["duplicate"] is True
+    assert result["measure"]["duplicate"] is True
+    assert result["apply"]["duplicate"] is True
+    assert result["start"]["duplicate"] is True
+    assert result["retryCoordinator"]["duplicate"] is True
+    # The one-action steps that are *not* the primary keep a retry link.
+    assert result["wired"]["duplicate"] is False
+    assert result["wired"]["label"] == "Plan again"
+    assert result["freeDisk"]["duplicate"] is False
+
+
+def test_a_model_change_through_choose_reads_stale_until_the_new_plan():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  component.modelOptions = [
+    { id: 'b', model_path: '/models/b', display_name: 'B', model_context_length: 131072 },
+  ];
+  const before = component.assistantInputsStale();
+  component.assistantOpenChoose();
+  component.assistantChooseModel('/models/b');
+  await component.assistantConfirmChoose();
+  const during = {
+    state: component.assistantState(),
+    stale: component.assistantInputsStale(),
+    stalePlanRow: component.assistantRowStale('planning'),
+    staleCheckRow: component.assistantRowStale('checking'),
+  };
+  await component.pollAssistantMeasurement();   // model-bound ready → plan
+  const after = {
+    state: component.assistantState(),
+    stale: component.assistantInputsStale(),
+    model: component.assistant.inputs.model_path,
+  };
+  process.stdout.write(JSON.stringify({ before, during, after }));
+})();
+"""
+        )
+    )
+
+    assert result["before"] is False
+    assert result["during"]["state"] == "measuring_model"
+    assert result["during"]["stale"] is True
+    assert result["during"]["stalePlanRow"] is True
+    assert result["during"]["staleCheckRow"] is False
+    assert result["after"] == {
+        "state": "planning",
+        "stale": False,
+        "model": "/models/b",
+    }
+
+
+def test_failed_branch_affordances_stay_inside_the_failure_screen():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  component.assistant.state = 'failed';
+  component.assistant.busy = false;
+  component.assistant.error = {
+    code: 'insufficient_disk', message: 'no room', action: 'free_disk_space',
+  };
+  component.assistant.measurementNodes = [
+    { node_id: 'node-b', model_paths: ['/models/old'] },
+  ];
+  component.assistantActionHandler('free_disk_space');
+  const free = {
+    open: component.assistant.freeSpaceOpen,
+    error: component.assistant.error && component.assistant.error.action,
+    state: component.assistantState(),
+    screen: component.assistantScreen(),
+  };
+
+  component.assistant.state = 'failed';
+  component.assistant.error = {
+    code: 'topology_incomplete', message: 'no line', action: 'plan',
+  };
+  component.assistant.topologyFallback = {
+    rank_order: ['node-a', 'node-b'], context_tokens: 32768,
+  };
+  component.assistant.missingLinks = [['node-b', 'node-c']];
+  component.assistant.measurementId = 'm1';
+  component.assistant.selectedModel = '/models/qwen3-32b';
+  component.assistant.selectedContextTokens = 32768;
+  const mark = calls.length;
+  await component.confirmAssistantTwoMacFallback();
+  const topology = {
+    posted: calls.slice(mark).map((call) => call.url),
+    body: calls.slice(mark).map((call) => call.body),
+    state: component.assistantState(),
+  };
+  process.stdout.write(JSON.stringify({ free, topology }));
+})();
+"""
+        )
+    )
+
+    assert result["free"] == {
+        "open": True,
+        "error": "free_disk_space",
+        "state": "failed",
+        "screen": "failed",
+    }
+    assert result["topology"]["posted"] == ["/admin/api/cluster/assistant/plan"]
+    assert result["topology"]["body"][0]["confirm_two_mac_fallback"] is True
+    assert result["topology"]["state"] == "planning"
+
+
+ASSISTANT_FAILURE_ACTIONS = (
+    "measure",
+    "plan",
+    "apply",
+    "start",
+    "status",
+    "add_mac",
+    "pair_mac",
+    "copy_model",
+    "configure_endpoint",
+    "retry_coordinator",
+    "diagnostics",
+    "adjust_model_or_context",
+    "choose_smaller_model",
+    "choose_pipeline_model",
+    "check_model_path",
+    "free_disk_space",
+    "raise_wired_limit",
+)
+
+
+def test_every_error_action_renders_on_the_failed_screen_with_one_label():
+    """U3/A7: every action of the frozen vocabulary (plus the recommendation's
+    near misses and R5) keeps the failure on the card with a real label."""
+
+    result = _run_wizard(
+        """
+(() => {
+  const actions = %s;
+  const out = {};
+  for (const action of actions) {
+    component.assistant.state = 'failed';
+    component.assistant.busy = false;
+    component.assistant.plan = { feasible: true };
+    component.assistant.applyState = '';
+    component.assistant.error = { code: 'x', message: 'a plain cause', action };
+    out[action] = {
+      screen: component.assistantScreen(),
+      label: component.assistantActionLabel(action),
+      title: component.assistantFailureTitle(),
+      message: component.assistantErrorMessage(),
+      duplicate: component.assistantRetryDuplicatesAction(),
+      step: component.assistantFailureStep(),
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+        % json.dumps(list(ASSISTANT_FAILURE_ACTIONS))
+    )
+
+    assert set(result) == set(ASSISTANT_FAILURE_ACTIONS)
+    for action, row in result.items():
+        assert row["screen"] == "failed", action
+        # A label always comes from the catalogue, never the raw key.
+        assert row["label"], action
+        assert not row["label"].startswith("cluster.assistant."), action
+        assert row["title"], action
+        assert row["message"] == "a plain cause", action
+        assert row["step"] in ("measure", "plan", "apply", "start"), action
+
+
+def test_plan_warnings_never_colour_a_progress_row():
+    """A7: warnings stay notes on the plan; no row becomes `failed` because of
+    one, and the stale marking is amber — never red."""
+
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  component.assistant.warnings = [
+    { code: 'tier_raised', message: 'tier raised for headroom' },
+  ];
+  component.assistant.plan.warnings = [
+    { code: 'macs_not_needed', node_id: 'node-b', message: 'Mac not needed' },
+  ];
+  const rows = component.assistantProgressRows();
+  process.stdout.write(JSON.stringify({
+    state: component.assistantState(),
+    screen: component.assistantScreen(),
+    states: rows.map((row) => row.state),
+    failedRows: rows.filter((row) => row.state === 'failed').length,
+    warnings: component.assistantPlanWarnings().length,
+    stale: rows.filter((row) => component.assistantRowStale(row.key)).length,
+  }));
+})();
+"""
+        )
+    )
+
+    assert result["state"] == "planning"
+    assert result["screen"] == "plan"
+    assert result["warnings"] == 1
+    assert result["failedRows"] == 0
+    assert "failed" not in result["states"]
+    # Nothing is stale here, so no row claims it either.
+    assert result["stale"] == 0

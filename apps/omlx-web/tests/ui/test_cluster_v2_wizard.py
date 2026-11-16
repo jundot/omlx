@@ -4437,20 +4437,24 @@ def test_assistant_session_endpoint_is_hidden_when_stopped():
     result = _run_wizard(
         """
 component.assistant.session = {
-  state: 'ready', stopped: false, endpoint: {url: 'http://172.16.1.11:8099'},
+  state: 'ready', stopped: false, endpoint: {ready: true, url: 'http://172.16.1.11:8099'},
 };
 const running = component.assistantSessionEndpoint();
+component.assistant.session.endpoint.ready = false;
+const notReady = component.assistantSessionEndpoint();
+component.assistant.session.endpoint.ready = true;
 component.assistant.session.stopped = true;
 const stopped = component.assistantSessionEndpoint();
 component.assistant.session = {
-  state: 'applied', stopped: false, endpoint: {url: 'http://172.16.1.11:8099'},
+  state: 'applied', stopped: false, endpoint: {ready: true, url: 'http://172.16.1.11:8099'},
 };
 const applied = component.assistantSessionEndpoint();
-process.stdout.write(JSON.stringify({running, stopped, applied}));
+process.stdout.write(JSON.stringify({running, notReady, stopped, applied}));
 """
     )
     assert result == {
         "running": "http://172.16.1.11:8099",
+        "notReady": "",
         "stopped": "",
         "applied": "",
     }
@@ -4621,3 +4625,232 @@ def test_assistant_card_announces_progress_and_failures_and_hides_spinners():
     assert len(spinners) >= 8
     for tag in spinners:
         assert 'aria-hidden="true"' in tag, tag
+
+
+# --- Assistant UI spec 2026-11-16 (U1-U6) ------------------------------------
+#
+# The assistant card is a render-mode on the frozen state machine: exactly one
+# `data-assistant-screen` div per state, a mode split that keeps today's wizard
+# byte-identical behind `Manual setup`, failure screens that own the card, and a
+# client-side back/stale model. No backend state is added.
+
+ASSISTANT_SCREENS = (
+    "start",
+    "check",
+    "plan",
+    "launch",
+    "ready",
+    "stopped",
+    "failed",
+    "choose",
+)
+
+
+def test_assistant_renders_one_screen_per_backend_state():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    table = re.findall(r"const ASSISTANT_SCREENS = \[(.*?)\];", javascript, re.S)
+    assert table, "ASSISTANT_SCREENS missing"
+    assert tuple(re.findall(r"'(\w+)'", table[0])) == ASSISTANT_SCREENS
+
+    for name in ASSISTANT_SCREENS:
+        assert template.count(f'data-assistant-screen="{name}"') == 1, name
+        assert re.search(
+            rf"x-show=\"assistantScreen\(\) === '{name}'\"[^>]*"
+            rf'data-assistant-screen="{name}"',
+            template,
+        ), name
+
+    # One function decides the screen; it adds no state and calls no backend.
+    body = javascript.split("assistantScreen() {", 1)[1].split(
+        "assistantEyebrow() {", 1
+    )[0]
+    for screen in ASSISTANT_SCREENS:
+        assert f"'{screen}'" in body, screen
+    assert "apiFetch" not in body
+    assert "assistant.state =" not in body
+
+
+def test_the_assistant_is_the_default_flow_and_manual_setup_is_one_click():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "clusterMode: 'assistant'" in javascript
+    assert "const CLUSTER_MODE_KEY = 'clusterV2.mode';" in javascript
+    # The Node component tests construct the factory without localStorage; an
+    # unguarded read would break every one of them.
+    assert "typeof localStorage !== 'undefined'" in javascript
+    assert "setClusterMode(mode) {" in javascript
+
+    for marker in (
+        "data-cluster-v2-mode",
+        "data-cluster-v2-mode-assistant",
+        "data-cluster-v2-mode-manual",
+        "data-cluster-v2-assistant-manual-link",
+        "data-cluster-v2-manual-progress",
+        "data-cluster-v2-manual-sections>",
+        "data-cluster-v2-manual-plan>",
+    ):
+        assert marker in template, marker
+
+    # The assistant section is the first thing after the header; the wizard
+    # tiles and both manual regions follow it.
+    assistant = template.index("data-cluster-v2-assistant-section>")
+    for manual in (
+        "data-cluster-v2-manual-progress>",
+        "data-cluster-v2-manual-sections>",
+        "data-cluster-v2-manual-plan>",
+    ):
+        assert assistant < template.index(manual), manual
+
+    # Manual content is shown in Manual mode, and in Assistant mode only when
+    # the assistant cannot render yet (a fresh Mac still has to pair/install).
+    assert "clusterMode === 'manual' || !this.assistantSurfaceVisible()" in javascript
+
+    # Manual mode keeps today's markup: every wizard state section still exists.
+    for state in (
+        "empty",
+        "discovering",
+        "device_card",
+        "pairing",
+        "purpose",
+        "helper",
+        "accelerator",
+        "checks",
+        "plan",
+        "active",
+    ):
+        assert template.count(f'data-cluster-v2-state="{state}"') >= 1, state
+
+
+def test_the_choose_screen_re_measures_only_a_changed_model():
+    javascript = _read(JAVASCRIPT)
+
+    choose = _assistant_card().split('data-assistant-screen="choose"', 1)[1]
+    assert "<input" not in choose
+    assert "x-model" not in choose
+    assert "<select" not in choose
+    for marker in (
+        "data-cluster-v2-assistant-choose-candidate",
+        "data-cluster-v2-assistant-choose-context",
+        "data-cluster-v2-assistant-choose-context-option",
+        "data-cluster-v2-assistant-choose-back",
+        "data-cluster-v2-assistant-choose-continue",
+    ):
+        assert marker in choose, marker
+
+    body = javascript.split("async assistantConfirmChoose() {", 1)[1].split(
+        "assistantInputsStale() {", 1
+    )[0]
+    assert body.count("runAssistantModelMeasure(") == 1
+    assert "assistant.selectedModel = draft.model_path" in body
+    assert "runAssistantPlan(" in body
+    assert "apiFetch" not in body
+    # The draft is the only thing the buttons change until Confirm.
+    assert "assistantChooseDraft.model_path = modelPath" in javascript
+    assert "assistantChooseDraft.context_tokens = value" in javascript
+
+
+def test_a_failure_owns_the_card_with_one_action_and_a_way_back():
+    card = _assistant_card()
+    failed = card.split('data-assistant-screen="failed"', 1)[1].split(
+        'data-assistant-screen="choose"', 1
+    )[0]
+
+    assert "data-cluster-v2-assistant-error" in failed
+    assert failed.count("data-cluster-v2-assistant-action") == 1
+    assert "assistantActionHandler(assistant.error?.action)" in failed
+    assert "data-cluster-v2-assistant-retry" in failed
+    assert "data-cluster-v2-assistant-back" in failed
+    assert "data-cluster-v2-assistant-failure-details" in failed
+    assert "data-cluster-v2-assistant-topology" in failed
+    assert "data-cluster-v2-assistant-free-space" in failed
+    # No other screen's primary action lives inside the failure.
+    assert "data-cluster-v2-assistant-start-setup" not in failed
+    assert "data-cluster-v2-assistant-open-chat" not in failed
+
+    # Warnings are amber notes on the plan, never an error (A7).
+    warnings = re.search(
+        r"<div[^>]*data-cluster-v2-assistant-plan-warnings", card
+    )
+    assert warnings, "plan warnings missing"
+    assert "amber" in warnings.group(0)
+
+
+def test_back_reaches_applied_and_retry_reenters_the_failed_step():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    back = javascript.split("assistantBackAllowed() {", 1)[1].split(
+        "assistantCanChoose() {", 1
+    )[0]
+    assert "!this.assistantRunning()" in back
+    assert "this.assistant.state !== 'ready'" in back
+    assert "!this.assistant.stopped" in back
+
+    retry = javascript.split("async retryAssistantStep() {", 1)[1].split(
+        "assistantFailureDetails() {", 1
+    )[0]
+    assert "runAssistantStart(generation)" in retry
+    assert "runAssistantApply()" in retry
+    assert "runAssistantPlan(generation)" in retry
+    assert "startAssistant()" in retry
+    # An applied deployment is retried in place, never re-applied.
+    step = javascript.split("assistantFailureStep() {", 1)[1].split(
+        "assistantRetryLabel() {", 1
+    )[0]
+    assert "applyState === 'applied'" in step
+    assert "return 'start'" in step
+
+    # Start setup re-plans a stale plan instead of applying it.
+    assert (
+        "assistantInputsStale() ? runAssistantPlan() : runAssistantApply()"
+        in template
+    )
+
+    stale = javascript.split("assistantInputsStale() {", 1)[1].split(
+        "assistantRowStale(rowKey) {", 1
+    )[0]
+    assert "this.assistant.inputs" in stale
+    assert "selectedModel" in stale
+    assert "selectedContextTokens" in stale
+    assert "preferred_coordinator" in stale
+
+    # Going back from a failure returns to the plan review, not to idle.
+    back_to_plan = javascript.split("assistantBackToPlan() {", 1)[1].split(
+        "assistantOpenChoose() {", 1
+    )[0]
+    assert "this.assistant.error = null" in back_to_plan
+    assert "this.assistant.state = 'planning'" in back_to_plan
+
+
+def test_assistant_screen_copy_exists_in_the_english_catalog():
+    catalog = json.loads(_read("omlx_web/i18n/en.json"))
+    for key in (
+        "cluster.assistant.mode.assistant",
+        "cluster.assistant.mode.manual",
+        "cluster.assistant.mode.manual_link",
+        "cluster.assistant.screen.check.title",
+        "cluster.assistant.screen.plan.title",
+        "cluster.assistant.screen.launch.title",
+        "cluster.assistant.screen.ready.title",
+        "cluster.assistant.screen.stopped.title",
+        "cluster.assistant.screen.failed.title",
+        "cluster.assistant.screen.choose.title",
+        "cluster.assistant.screen.choose.continue",
+        "cluster.assistant.back.plan",
+        "cluster.assistant.stale.banner",
+        "cluster.assistant.stale.step",
+        "cluster.assistant.retry.plan",
+        "cluster.assistant.retry.start",
+        "cluster.assistant.stepper.checking",
+        "cluster.assistant.stepper.ready",
+        "cluster.assistant.macs.combined",
+        "cluster.assistant.macs.measured_ago",
+        "cluster.assistant.performance.title",
+        "cluster.assistant.failure.topology",
+        "cluster.assistant.failure.wired",
+        "cluster.assistant.show_details",
+    ):
+        assert catalog.get(key), key

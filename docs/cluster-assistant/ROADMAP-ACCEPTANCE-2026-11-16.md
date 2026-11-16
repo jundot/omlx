@@ -135,6 +135,13 @@ focus moves there; never only in the advanced `<pre>`; warnings never red.
 **Done when:** A7 holds and every backend failure code has a test that it renders
 at its step.
 
+**Implementation status (2026-11-16):** implemented as the assistant's `failed`
+screen (`data-assistant-screen="failed"`). The failure owns the card, the
+primary action is `error.action`, retry re-enters the failed step, the topology
+consent and free-space picker render inside it, warnings are amber on the plan,
+and the raw payload is collapsed but never the only copy. See
+`ASSISTANT-UI-IMPLEMENTATION-PLAN-2026-11-16.md` §7.
+
 ### W4 — D2 Steps, back, retry (2–3 days, the big one)
 
 Explicit steps (`measure`, `model`, `plan`, `apply`, `start`, `ready`) with
@@ -145,6 +152,13 @@ corrected field applied; `ready` keeps today's Screen-6 rules.
 **Done when:** A3 and A4 hold, and the card tests cover: model change after a
 green plan, corrected apply after a refused tier, back refused while `starting`.
 
+**Implementation status (2026-11-16):** implemented as a client-side step model
+on top of `assistantState()`; `choose` is the back screen, `assistantInputsStale()`
+derives `stale` from the frozen plan inputs, `assistantBackAllowed()` refuses
+while a step runs and at `ready`/`stopped`, and a failed `start` retries in
+place with the applied `operation_id`. Fake-driven tests cover model change,
+context-only change, stale → re-plan, back refusal and in-place retry.
+
 ### W5 — D3 One flow, one page (1–2 days)
 
 Assistant is the flow, top to bottom; the manual wizard collapses behind
@@ -152,6 +166,12 @@ Assistant is the flow, top to bottom; the manual wizard collapses behind
 
 **Done when:** a screenshot review shows each step once and the manual path one
 click away.
+
+**Implementation status (2026-11-16):** implemented. `clusterMode`
+(`localStorage('clusterV2.mode')`, default `assistant`) gates today's wizard
+blocks unchanged behind `Manual setup`; the assistant card sits above them and
+renders exactly one `data-assistant-screen` per state. The manual path stays
+visible in Assistant mode only when the assistant cannot render yet (fresh Mac).
 
 ### W6 — D5 Manual path proof + live acceptance run (0.5 day + cluster time)
 

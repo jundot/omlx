@@ -200,6 +200,26 @@ function clusterV2Wizard() {
         'failed',
     ];
 
+    // D3 (2026-11-16): one tab, two modes. Assistant is the flow; Manual setup
+    // is today's wizard, unchanged and one click away. The preference is a UI
+    // choice only — it never touches a backend state, a route or a poll.
+    const CLUSTER_MODE_KEY = 'clusterV2.mode';
+    const CLUSTER_MODES = ['assistant', 'manual'];
+
+    // The render-mode screens (ASSISTANT-UI-SPEC-2026-11-16.md §2). A screen is
+    // a coarser gate on top of assistantState(); exactly one is mounted because
+    // each is gated by equality on assistantScreen().
+    const ASSISTANT_SCREENS = [
+        'start',
+        'check',
+        'plan',
+        'launch',
+        'ready',
+        'stopped',
+        'failed',
+        'choose',
+    ];
+
     // exo-style data layer: one snapshot endpoint polled once per second
     // while the tab is visible; the UI is a pure function of the snapshot.
     const CLUSTER_V2_POLL_MS = 1000;
@@ -374,6 +394,9 @@ function clusterV2Wizard() {
             generation: 0,
             measurementId: '',
             measurementModel: '',
+            // When the last ready measurement was taken (backend clock). Only
+            // used for the "measured N min ago" chip; never for a prediction.
+            measurementMeasuredAt: '',
             recommendation: null,
             selectedModel: '',
             selectedModelId: '',
@@ -431,6 +454,13 @@ function clusterV2Wizard() {
             freeSpaceError: '',
             warnings: [],
             error: null,
+            // The failed screen's raw payload is collapsed by default; the
+            // "diagnostics" action unfolds it without dropping the message.
+            assistantFailureOpen: false,
+            // Which tradeoff the user picked on the plan screen (null = the
+            // quality-first plan). Declared here so every screen reads the same
+            // field; apply resolves it through assistantPlanSource().
+            selectedTradeoff: null,
             measureTimer: null,
             operationTimer: null,
             measurePollBusy: false,
@@ -524,6 +554,17 @@ function clusterV2Wizard() {
                 errorAction: '',
             },
         },
+
+        // ---- mode split (D3, 2026-11-16) ------------------------------------
+        // Assistant is the default flow; Manual setup is the existing wizard,
+        // gated by this field and nothing else. Restored from localStorage in
+        // init() with a guard, because the Node test sandbox has no storage.
+        clusterMode: 'assistant',
+        // The choose screen is client-side only: a draft the user edits before
+        // anything is measured or planned. The frozen plan inputs stay untouched
+        // until Confirm.
+        assistantChooseOpen: false,
+        assistantChooseDraft: null,
 
         // ---- plan ------------------------------------------------------------
         modelOptions: [],
@@ -638,8 +679,42 @@ function clusterV2Wizard() {
             if (this.pollTimer !== null) return;
             this.tick();
             this.pollTimer = setInterval(() => this.tick(), CLUSTER_V2_POLL_MS);
+            this.restoreClusterMode();
             this.loadAssistantSession();
             this.loadAssistantProbeSetting();
+        },
+
+        // The mode is a remembered UI choice, never a backend fact. The guard
+        // keeps the Node component tests working (they have no localStorage).
+        restoreClusterMode() {
+            try {
+                const stored =
+                    typeof localStorage !== 'undefined'
+                        ? localStorage.getItem(CLUSTER_MODE_KEY)
+                        : null;
+                if (CLUSTER_MODES.includes(stored)) this.clusterMode = stored;
+            } catch (error) {
+                this.clusterMode = 'assistant';
+            }
+        },
+
+        setClusterMode(mode) {
+            if (!CLUSTER_MODES.includes(mode)) return;
+            this.clusterMode = mode;
+            try {
+                if (typeof localStorage !== 'undefined') {
+                    localStorage.setItem(CLUSTER_MODE_KEY, mode);
+                }
+            } catch (error) {
+                // A blocked storage must not break the flow.
+            }
+        },
+
+        // Manual content is shown in Manual mode, and in Assistant mode only
+        // when the assistant cannot render yet (a fresh Mac still has to pair,
+        // install and be checked). The assistant card itself stays mounted.
+        manualSectionsVisible() {
+            return this.clusterMode === 'manual' || !this.assistantSurfaceVisible();
         },
 
         wizardVisible() {
@@ -4567,6 +4642,491 @@ function clusterV2Wizard() {
             return labels[this.assistant.state] || '';
         },
 
+        // ---- render-mode: one screen per backend state (D3/W5) -------------
+        // A screen is a coarser gate on top of assistantState(); it adds no
+        // state and drives no request. `choose` is the one client-side screen
+        // (the back affordance), everything else maps 1:1.
+        assistantScreen() {
+            if (this.assistantChooseOpen) return 'choose';
+            const state = this.assistant.state;
+            if (state === 'idle') return 'start';
+            if (['measuring', 'recommending', 'measuring_model'].includes(state)) {
+                return 'check';
+            }
+            if (state === 'planning') return this.assistant.plan ? 'plan' : 'check';
+            if (['applying', 'starting', 'loading'].includes(state)) return 'launch';
+            if (state === 'ready') return this.assistant.stopped ? 'stopped' : 'ready';
+            if (state === 'failed') return 'failed';
+            return 'start';
+        },
+
+        assistantEyebrow() {
+            return t('cluster.assistant.mode.assistant');
+        },
+
+        assistantScreenTitle() {
+            const titles = {
+                start: 'cluster.assistant.title',
+                check: 'cluster.assistant.screen.check.title',
+                plan: 'cluster.assistant.screen.plan.title',
+                launch: 'cluster.assistant.screen.launch.title',
+                ready: 'cluster.assistant.screen.ready.title',
+                stopped: 'cluster.assistant.screen.stopped.title',
+                failed: 'cluster.assistant.screen.failed.title',
+                choose: 'cluster.assistant.screen.choose.title',
+            };
+            return t(titles[this.assistantScreen()] || 'cluster.assistant.title');
+        },
+
+        assistantScreenSubtitle() {
+            if (this.assistantScreen() === 'start') return t('cluster.assistant.blurb');
+            if (this.assistantScreen() === 'choose') {
+                return t('cluster.assistant.screen.choose.sub');
+            }
+            return '';
+        },
+
+        // The failure's own title. The backend's message stays the cause; this
+        // only names the class of refusal in plain language. Never a code.
+        assistantFailureTitle() {
+            const error = this.assistant.error || {};
+            const code = String(error.code || '');
+            const action = String(error.action || '');
+            const keys = {
+                topology_incomplete: 'cluster.assistant.failure.topology',
+                insufficient_disk: 'cluster.assistant.failure.disk',
+                stale_measurement: 'cluster.assistant.failure.stale',
+                plan_mismatch: 'cluster.assistant.failure.placement',
+                placement_changed: 'cluster.assistant.failure.placement',
+                insufficient_memory:
+                    action === 'raise_wired_limit'
+                        ? 'cluster.assistant.failure.wired'
+                        : 'cluster.assistant.failure.memory',
+            };
+            const key =
+                keys[code] ||
+                (action === 'raise_wired_limit'
+                    ? 'cluster.assistant.failure.wired'
+                    : 'cluster.assistant.failure.generic');
+            return t(key);
+        },
+
+        // D2 retry scope: which step the failure belongs to. Used by the one
+        // secondary retry affordance; the primary stays error.action.
+        assistantFailureStep() {
+            const error = this.assistant.error || {};
+            const code = String(error.code || '');
+            const action = String(error.action || '');
+            if (
+                code.startsWith('measure') ||
+                code === 'no_nodes' ||
+                action === 'measure'
+            ) {
+                return 'measure';
+            }
+            if (this.assistant.applyState === 'applied') return 'start';
+            if (action === 'apply' || action === 'start') return 'apply';
+            if (this.assistant.plan) return 'plan';
+            return 'measure';
+        },
+
+        assistantRetryLabel() {
+            return t(`cluster.assistant.retry.${this.assistantFailureStep()}`);
+        },
+
+        // The secondary retry must not duplicate the primary `error.action`
+        // button (spec §5.1: one primary + secondary links). True when the
+        // failed step is exactly the request the primary already sends.
+        assistantRetryDuplicatesAction() {
+            const action = String(this.assistant.error?.action || '');
+            const step = this.assistantFailureStep();
+            if (step === 'plan') return action === 'plan';
+            if (step === 'apply') return action === 'apply';
+            if (step === 'measure') return action === 'measure';
+            if (step === 'start') {
+                return action === 'start' || action === 'retry_coordinator';
+            }
+            return false;
+        },
+
+        // Re-enter at the failed step, never at the top (spec §4). The backend's
+        // strict signature match is what actually proves the placement.
+        async retryAssistantStep() {
+            if (this.assistant.busy) return null;
+            const step = this.assistantFailureStep();
+            this.assistant.error = null;
+            if (step === 'start') {
+                const generation = ++this.assistant.generation;
+                return this.runAssistantStart(generation);
+            }
+            if (step === 'apply') return this.runAssistantApply();
+            if (step === 'plan') {
+                const generation = ++this.assistant.generation;
+                return this.runAssistantPlan(generation);
+            }
+            return this.startAssistant();
+        },
+
+        assistantFailureDetails() {
+            return JSON.stringify(
+                {
+                    code: this.assistant.error?.code || '',
+                    message: this.assistant.error?.message || '',
+                    action: this.assistant.error?.action || '',
+                    step: this.assistantFailureStep(),
+                    measurement_id: this.assistant.measurementId || '',
+                    operation_id: this.assistant.operationId || '',
+                },
+                null,
+                2,
+            );
+        },
+
+        // Back is legal up to a green applied; a running cluster stays frozen
+        // (Screen-6 rules) and an in-flight request is never navigated away.
+        // The search/tune/local-run jobs are backend work too: a second job
+        // must not start while one owns the cluster.
+        assistantBackAllowed() {
+            return (
+                !this.assistantRunning() &&
+                !this.assistant.search.busy &&
+                !this.assistant.tune.busy &&
+                !this.assistant.tuneRedeploy.busy &&
+                !this.assistant.localRun.busy &&
+                !this.assistant.localTune.busy &&
+                this.assistant.state !== 'ready' &&
+                !this.assistant.stopped
+            );
+        },
+
+        assistantCanChoose() {
+            return (
+                Boolean(this.assistant.plan || this.assistant.recommendation) &&
+                this.assistantBackAllowed()
+            );
+        },
+
+        assistantBackToPlan() {
+            if (!this.assistantBackAllowed() || !this.assistant.plan) return;
+            this.assistant.error = null;
+            // A computed plan rests in `planning` with assistant.plan set
+            // (frozen machine); this is a render re-entry, not a new state.
+            this.assistant.state = 'planning';
+        },
+
+        // D2: the card's frozen inputs stay untouched until Confirm. A model
+        // change re-measures model-bound; a context-only change re-plans; no
+        // change just closes.
+        assistantOpenChoose() {
+            if (!this.assistantCanChoose()) return;
+            // The candidate list is the catalogue; load it if the manual plan
+            // step never ran in this session.
+            this.ensureAssistantModels();
+            this.assistantChooseDraft = {
+                model_path: this.assistant.selectedModel,
+                context_tokens: Math.max(
+                    1,
+                    Number(
+                        this.assistant.selectedContextTokens ||
+                            this.targetContextTokens ||
+                            0,
+                    ) || 0,
+                ),
+            };
+            this.assistantChooseOpen = true;
+        },
+
+        assistantCloseChoose() {
+            this.assistantChooseOpen = false;
+            // "Back to plan" from a failure re-enters the plan review instead
+            // of dropping the user back onto the red screen.
+            if (this.assistant.state === 'failed' && this.assistant.plan) {
+                this.assistantBackToPlan();
+            }
+        },
+
+        assistantChooseModel(modelPath) {
+            if (!this.assistantChooseDraft) return;
+            const candidate = this.assistantCandidates().find(
+                (item) => item.model_path === modelPath,
+            );
+            const limit = Math.max(
+                1,
+                Number(candidate?.declared_context_tokens || 0),
+            );
+            const context = Number(
+                this.assistantChooseDraft.context_tokens || 0,
+            );
+            this.assistantChooseDraft.model_path = modelPath;
+            if (limit && context > limit) {
+                this.assistantChooseDraft.context_tokens = limit;
+            }
+        },
+
+        // The ladder is the same standard ladder the manual picker uses, capped
+        // by the chosen model's declared context. Buttons only: the card stays
+        // input-free.
+        assistantChooseContextOptions() {
+            const draft = this.assistantChooseDraft || {};
+            const candidate = this.assistantCandidates().find(
+                (item) => item.model_path === draft.model_path,
+            );
+            const limit = Math.max(
+                1,
+                Number(candidate?.declared_context_tokens || 1_048_576),
+            );
+            const standard = [8192, 32768, 131072, 262144, 524288, 1_048_576];
+            const values = standard.filter((value) => value <= limit);
+            if (!values.includes(limit)) values.push(limit);
+            return [...new Set(values)].sort((left, right) => left - right);
+        },
+
+        assistantChooseContext(tokens) {
+            if (!this.assistantChooseDraft) return;
+            const value = Math.max(1, Number(tokens) || 0);
+            if (!value) return;
+            this.assistantChooseDraft.context_tokens = value;
+        },
+
+        assistantChooseDraftLabel() {
+            const draft = this.assistantChooseDraft || {};
+            const option = this.modelOptions.find(
+                (model) => model?.model_path === draft.model_path,
+            );
+            if (option) return this.displayModelName(option);
+            const candidate = this.assistantCandidates().find(
+                (item) => item.model_path === draft.model_path,
+            );
+            return candidate?.friendly_name || draft.model_path || '';
+        },
+
+        assistantChooseContinueLabel() {
+            return t('cluster.assistant.screen.choose.continue').replace(
+                '{model}',
+                this.assistantChooseDraftLabel(),
+            );
+        },
+
+        assistantChooseCandidateDetail(candidate) {
+            const parts = [];
+            if (candidate?.declared_context_tokens) {
+                parts.push(
+                    t('cluster.assistant.screen.choose.declared').replace(
+                        '{context}',
+                        this.contextReservationLabel(
+                            candidate.declared_context_tokens,
+                        ),
+                    ),
+                );
+            }
+            parts.push(
+                this.assistantMtpFor(candidate?.model_path)
+                    ? t('cluster.assistant.screen.choose.mtp')
+                    : t('cluster.assistant.screen.choose.no_mtp'),
+            );
+            const present = (this.assistant.measurementNodes || []).some((node) =>
+                (node?.model_paths || []).includes(candidate?.model_path),
+            );
+            if (present) parts.push(t('cluster.assistant.screen.choose.present'));
+            return parts.join(' · ');
+        },
+
+        async assistantConfirmChoose() {
+            const draft = this.assistantChooseDraft;
+            if (!draft?.model_path) {
+                this.assistantChooseOpen = false;
+                return null;
+            }
+            // A fast Confirm can beat the catalogue request started by the
+            // picker; `mtp` must still come from the real catalogue.
+            await this.ensureAssistantModels();
+            const modelChanged =
+                draft.model_path !== this.assistant.selectedModel;
+            const contextChanged =
+                Number(draft.context_tokens) !==
+                Number(this.assistant.selectedContextTokens);
+            this.assistantChooseOpen = false;
+            this.assistantChooseDraft = null;
+            if (modelChanged) {
+                const option = this.modelOptions.find(
+                    (model) => model?.model_path === draft.model_path,
+                );
+                this.assistant.selectedModel = draft.model_path;
+                this.assistant.selectedModelId = option?.id || '';
+                this.assistant.selectedModelLabel = option
+                    ? this.displayModelName(option)
+                    : draft.model_path;
+                this.assistant.selectedContextTokens =
+                    Number(draft.context_tokens) || null;
+                this.selectedModelPath = draft.model_path;
+                if (this.assistant.selectedContextTokens) {
+                    this.targetContextTokens = this.assistant.selectedContextTokens;
+                }
+                // A plan for the old model is not kept as the current plan; the
+                // new measurement re-plans. The frozen inputs stay in place
+                // until plan replaces them, so the downstream rows visibly read
+                // `stale` while the re-measure runs.
+                this.assistant.plan = null;
+                const generation = ++this.assistant.generation;
+                return this.runAssistantModelMeasure(generation, draft.model_path);
+            }
+            if (contextChanged) {
+                this.assistant.selectedContextTokens = Number(
+                    draft.context_tokens,
+                );
+                this.targetContextTokens = this.assistant.selectedContextTokens;
+                const generation = ++this.assistant.generation;
+                return this.runAssistantPlan(generation);
+            }
+            return null;
+        },
+
+        // Inputs are stale when the current selection no longer matches the
+        // frozen plan-time object. Pure comparison: no backend state, no timer.
+        assistantInputsStale() {
+            const inputs = this.assistant.inputs;
+            if (!inputs) return false;
+            if (
+                (inputs.model_path || '') !==
+                (this.assistant.selectedModel || '')
+            ) {
+                return true;
+            }
+            if (
+                Number(inputs.context_tokens || 0) !==
+                Number(this.assistant.selectedContextTokens || 0)
+            ) {
+                return true;
+            }
+            if (
+                (inputs.preferred_coordinator || '') !==
+                (this.assistant.preferredCoordinator || '')
+            ) {
+                return true;
+            }
+            if (
+                (inputs.node_selection || 'minimal') !==
+                (this.assistant.nodeSelection || 'minimal')
+            ) {
+                return true;
+            }
+            if (
+                Boolean(inputs.mtp) !==
+                Boolean(this.assistantMtpFor(this.assistant.selectedModel))
+            ) {
+                return true;
+            }
+            if (
+                (inputs.execution_profile || '') !==
+                (this.executionProfile || '')
+            ) {
+                return true;
+            }
+            if (
+                (inputs.measurement_id || '') !==
+                (this.assistant.measurementId || '')
+            ) {
+                return true;
+            }
+            return (
+                Boolean(inputs.confirm_two_mac_fallback) !==
+                Boolean(this.assistant.confirmTwoMacFallback)
+            );
+        },
+
+        // Downstream of a changed input is stale, visibly (D2). The plan row
+        // and everything after it are no longer proven.
+        assistantRowStale(rowKey) {
+            if (!this.assistantInputsStale()) return false;
+            return ['planning', 'preparing', 'starting', 'loading', 'ready'].includes(
+                rowKey,
+            );
+        },
+
+        // The compact stepper reuses the six Screen-4 rows' keys, so there is
+        // one truth for what the backend reported; only the label is shorter.
+        assistantStepperLabel(row) {
+            return t(`cluster.assistant.stepper.${row.key}`);
+        },
+
+        assistantScreenEyebrow() {
+            return this.assistantScreen() === 'failed'
+                ? t('cluster.assistant.screen.failed.eyebrow')
+                : t('cluster.assistant.mode.assistant');
+        },
+
+        // The plan-row headline. Headroom is the plan's own number; without
+        // stages the screen says nothing rather than guessing.
+        assistantFitHeadline() {
+            const stages = this.assistantStages();
+            const headrooms = stages
+                .map((stage) => Number(stage?.headroom_gib))
+                .filter((value) => Number.isFinite(value));
+            if (!headrooms.length) return t('cluster.assistant.screen.plan.fits');
+            return t('cluster.assistant.screen.plan.fit').replace(
+                '{gib}',
+                String(Math.round(Math.min(...headrooms))),
+            );
+        },
+
+        assistantMacChipList() {
+            const chips = [];
+            const self = this.selfDevice();
+            if (self) {
+                chips.push({
+                    id: self.node_id || 'self',
+                    name: this.deviceName(self),
+                    self: true,
+                    chip: this.deviceChipLabel(self),
+                    ram: this.deviceRamGb(self),
+                });
+            }
+            for (const device of this.pairedDevices()) {
+                chips.push({
+                    id: device.node_id || this.deviceName(device),
+                    name: this.deviceName(device),
+                    self: false,
+                    chip: this.deviceChipLabel(device),
+                    ram: this.deviceRamGb(device),
+                });
+            }
+            return chips;
+        },
+
+        assistantCombinedRamLabel() {
+            const chips = this.assistantMacChipList();
+            // "combined" is only honest when every chip's RAM is known.
+            if (!chips.length || chips.some((mac) => !Number(mac.ram))) {
+                return '';
+            }
+            const total = chips.reduce(
+                (sum, mac) => sum + (Number(mac.ram) || 0),
+                0,
+            );
+            if (!total) return '';
+            return t('cluster.assistant.macs.combined').replace(
+                '{gib}',
+                String(total),
+            );
+        },
+
+        // "measured 3 min ago" only when the backend gave a timestamp; never a
+        // derived freshness claim.
+        assistantMeasurementAgeLabel() {
+            const stamp = Date.parse(
+                this.assistant.measurementMeasuredAt || '',
+            );
+            if (!Number.isFinite(stamp)) return '';
+            const minutes = Math.max(
+                0,
+                Math.round((Date.now() - stamp) / 60000),
+            );
+            return t('cluster.assistant.macs.measured_ago').replace(
+                '{minutes}',
+                String(minutes),
+            );
+        },
+
         // Lightning MTP is a plan input, not a display preference: the draft
         // head has to fit beside rank 0's layers, so the plan and the
         // measurement that feeds it must agree on it. The catalogue says
@@ -4811,6 +5371,28 @@ function clusterV2Wizard() {
             if (!policy) return '';
             const tier = policy.memory_guard_tier || 'saved';
             return tier.charAt(0).toUpperCase() + tier.slice(1);
+        },
+
+        // The MTP state the plan was computed with (frozen inputs win): a chip
+        // may never claim a draft head the plan did not price.
+        // The choose screen and the model-bound measurement read the catalogue, and in
+// Assistant mode the manual `enterPlan()` step (the old loader) is never
+// reached. Without this the recommendation had no candidates and MTP was
+// silently false. The guard matches enterPlan's.
+        async ensureAssistantModels() {
+            if (this.modelOptions.length || this.modelsLoading) return;
+            await this.loadModels();
+        },
+
+        assistantMtpLabel() {
+            const mtp = this.assistant.inputs
+                ? this.assistant.inputs.mtp === true
+                : this.assistantMtpFor(this.assistant.selectedModel);
+            return t(
+                mtp
+                    ? 'cluster.assistant.screen.plan.mtp_on'
+                    : 'cluster.assistant.screen.plan.mtp_off',
+            );
         },
 
         assistantPolicyContextLabel() {
@@ -6333,6 +6915,12 @@ function clusterV2Wizard() {
             this.assistant.confirmTwoMacFallback = false;
             this.assistant.topologyFallback = null;
             this.assistant.missingLinks = [];
+            this.assistantChooseOpen = false;
+            this.assistantChooseDraft = null;
+            // The recommendation and `mtp` come from the catalogue; load it
+            // before the entry measurement (Assistant mode never visits the
+            // manual plan step that used to be the only loader).
+            await this.ensureAssistantModels();
             return this.runAssistantMeasure();
         },
 
@@ -6349,8 +6937,12 @@ function clusterV2Wizard() {
         },
 
         resetAssistant() {
+            this.assistantChooseOpen = false;
+            this.assistantChooseDraft = null;
+            this.assistantFailureOpen = false;
             this.assistant.measurementId = '';
             this.assistant.measurementModel = '';
+            this.assistant.measurementMeasuredAt = '';
             this.assistant.recommendation = null;
             this.assistant.selectedModel = '';
             this.assistant.selectedModelId = '';
@@ -6554,6 +7146,9 @@ function clusterV2Wizard() {
             if (generation !== this.assistant.generation) return;
             this.assistant.state = 'measuring_model';
             this.assistant.phase = 'plan';
+            // The previous model's measurement age no longer describes this
+            // one; the poll fills the new timestamp when it is ready.
+            this.assistant.measurementMeasuredAt = '';
             this.assistant.busy = true;
             try {
                 const nodes = this.assistantNodes();
@@ -6731,6 +7326,13 @@ function clusterV2Wizard() {
 
         async runAssistantApply() {
             if (this.assistantRunning()) return null;
+            // D2: changed inputs are never applied against an old signature.
+            // Start setup re-plans first and the backend's strict match stays
+            // the authority.
+            if (this.assistantInputsStale()) {
+                const staleGeneration = ++this.assistant.generation;
+                return this.runAssistantPlan(staleGeneration);
+            }
             const plan = this.assistant.plan;
             const source = this.assistantPlanSource();
             const inputs = this.assistant.inputs;
@@ -6939,6 +7541,11 @@ function clusterV2Wizard() {
                 this.stopAssistantMeasurePoll();
                 this.assistant.measurementModel =
                     snapshot?.model || this.assistant.measurementModel;
+                // A ready measurement carries its own timestamp; the start
+                // screen says how old it is and nothing more.
+                this.assistant.measurementMeasuredAt = String(
+                    snapshot?.measured_at || '',
+                );
                 // The measured Macs, each with the models its own catalogue
                 // listed. The free-space affordance may only show a Mac the
                 // user picked from this list.
@@ -7086,6 +7693,7 @@ function clusterV2Wizard() {
             this.assistant.failedRow =
                 this.assistantReportedRow() || this.assistant.failedRow;
             this.assistant.state = 'failed';
+            this.assistantFailureOpen = false;
             this.assistant.error = {
                 code: String(code || 'request_failed'),
                 message: String(
@@ -7208,12 +7816,17 @@ function clusterV2Wizard() {
                 // The recommendation names the next thing worth changing. Every
                 // one of these means "change the model, the context or what
                 // each Mac contributes, then start again", and the picker is
-                // where those controls live. Returning the card to idle also
-                // restores the entry button: without that a refusal was a dead
-                // end that only a page reload could clear.
+                // where those controls live. D2: with a computed plan that is
+                // the choose screen (the hardware measurement is reused); a
+                // refusal without a plan falls back to the entry button, so a
+                // dead end is never left behind.
                 case 'choose_smaller_model':
                 case 'choose_pipeline_model':
                 case 'check_model_path':
+                    this.assistant.error = null;
+                    if (this.assistant.plan && this.assistantBackAllowed()) {
+                        return this.assistantOpenChoose();
+                    }
                     return this.reopenAssistantPicker();
                 // ``free_disk_space`` is the one failure with a written step:
                 // delete an unused model on the Mac that is short, then
@@ -7294,6 +7907,10 @@ function clusterV2Wizard() {
         openAssistantPairing() {
             this.assistant.error = null;
             this.assistant.state = 'idle';
+            // Pairing lives in the manual region (the existing surface). In
+            // Assistant mode that region is hidden, so the action switches to
+            // Manual setup instead of toasting into a hidden card.
+            this.setClusterMode('manual');
             const target =
                 this.discoveredDevices()[0] ||
                 this.pendingApprovals()[0] ||
@@ -7457,8 +8074,10 @@ function clusterV2Wizard() {
         },
 
         async openAssistantDiagnostics() {
-            this.assistant.error = null;
-            if (!this.advancedOpen) await this.toggleAdvancedTools();
+            // Keep the failure on the card: the message names the Mac/number the
+            // user has to act on. Diagnostics only unfolds the raw payload (the
+            // manual advanced panel is hidden in Assistant mode).
+            this.assistantFailureOpen = true;
             this.notify('info', window.t('cluster.assistant.diagnostics_open'));
         },
 
@@ -7493,9 +8112,11 @@ function clusterV2Wizard() {
 
         assistantSessionEndpoint() {
             // A stopped session hides its endpoint (Screen 6), exactly like
-            // the main card; a dead link is never offered.
-            return this.assistantSessionRunning()
-                ? this.assistant.session?.endpoint?.url || ''
+            // the main card; a dead link is never offered. `ready` is the
+            // backend's own gate (AGENTS §2), not a display preference.
+            const endpoint = this.assistant.session?.endpoint;
+            return this.assistantSessionRunning() && endpoint?.ready === true
+                ? endpoint.url || ''
                 : '';
         },
 
@@ -7546,6 +8167,14 @@ function clusterV2Wizard() {
                 warnings: [],
             };
             this.assistant.selectedModel = session.model_path;
+            this.assistant.selectedContextTokens =
+                Number(session.context_tokens) || null;
+            // A resumed apply must not look "stale" against its own frozen
+            // inputs: the session *is* the approved plan's selection.
+            this.assistant.preferredCoordinator =
+                session.preferred_coordinator || '';
+            this.assistant.nodeSelection = 'minimal';
+            this.assistant.confirmTwoMacFallback = !!session.two_mac_fallback;
             this.assistant.measurementId = session.measurement_id;
             this.assistant.session = null;
             await this.runAssistantApply();

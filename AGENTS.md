@@ -243,6 +243,18 @@ Resolved implementation decisions:
   starting → loading → ready`, plus `failed`; `applying/starting/loading` mirror
   the operation states one-for-one and no state exists that the backend cannot
   report. A computed plan rests in `planning` with `assistant.plan` set.
+- **The Cluster tab is one flow with a render-mode (2026-11-16).** The UI spec
+  `ASSISTANT-UI-SPEC-2026-11-16.md` is implemented in U1–U6: one
+  `data-assistant-screen` div (`start|check|plan|launch|ready|stopped|failed|
+  choose`) per backend state, gated only by `assistantScreen()`; `clusterMode`
+  (`localStorage('clusterV2.mode')`, default `assistant`) keeps today's wizard
+  blocks unchanged behind `Manual setup`; `choose` is the only client-side
+  screen and is entered from "Change model or context". `stale` is derived from
+  the frozen plan inputs (`assistantInputsStale()`), Back is refused while a
+  step runs, and a failed `start` retries in place against the applied
+  `operation_id`. Errors own the card with exactly one `error.action`; no
+  backend state, route, poll or SSE was added. Implementation log and
+  deviations: `ASSISTANT-UI-IMPLEMENTATION-PLAN-2026-11-16.md` §7.
 - Endpoint visibility: `endpoint.url` is rendered (link, copy, Open Chat,
   Connect agent) only when `assistantState() === 'ready'` **and**
   `endpoint.ready === true`; an unresolved endpoint stays `null` and is never a
