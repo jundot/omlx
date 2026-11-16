@@ -2056,6 +2056,28 @@ Loading it manually through `POST /admin/api/cluster/deployments/{id}/load`
 succeeded, canary 4 tokens, and a real completion ran at **22.59 tok/s** — which
 also proves the "Load weights" route itself works.
 
+**It runs — the lever that closed it was the workstation reserve.** With `.11`
+(128 GiB) set to **Headless** the 2-Mac plan fit and started:
+
+| | |
+|---|---|
+| Start | `op-20261116T155839Z-start-00023011` → **ready** |
+| Deployment | `GLM-5.3-Flash-oQ2e-mtp-e80d893b17a6` |
+| Ranks | `.12` (rank 0, tail + endpoint) → `.11` (rank 1), `.13` not needed |
+| Endpoint | `http://172.16.1.12:8000` |
+| Plan | `01c40abbb52b…`, context 32768, MTP on |
+| Warnings | `performance_unmeasured`, `chat_profile_applied` |
+| Completion | 40 tokens at **25.01 tok/s** (generation 1.6 s) — the best of the session (8.42 → 22.59 → 25.01) |
+
+The 32 GiB (or 50 %) workstation reserve is the first lever to try when a 2-Mac
+plan does not fit: it is a *feasibility* lever, not a bug. The "Your Macs" panel
+(`25926ccb`) now shows Workstation/Headless per Mac and Safe/Balanced/Aggressive
+for the memory tier **before** any plan, in both modes — the earlier hunt through
+the manual plan step is gone.
+
+**Still open for the gate:** A1 in the manual flow (the assistant path is what
+ran here), A4, A5, A6, A7 and the screenshots.
+
 **Gate**
 
 | # | Criterion | Result | Evidence |
