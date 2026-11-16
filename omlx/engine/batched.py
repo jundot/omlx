@@ -27,6 +27,7 @@ from ..patches.mlx_lm_mtp import drafter_target
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.tokenizer import get_tokenizer_config, is_mimo_tool_template
+from ..utils.prefix_tokens import encode_prompt, prefix_token_cache_for
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -101,6 +102,7 @@ class BatchedEngine(BaseEngine):
 
         self._model = None
         self._tokenizer = None
+        self._prefix_tokens = None
         self._engine = None
         self._loaded = False
         self._dflash_drafter: Any | None = None
@@ -361,6 +363,7 @@ class BatchedEngine(BaseEngine):
         # this tokenizer. Repair it here only for MiMo-format templates (#4933).
         if is_mimo_tool_template(getattr(self._tokenizer, "chat_template", None)):
             repair_tool_parser(self._tokenizer)
+        self._prefix_tokens = prefix_token_cache_for(self._tokenizer)
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
@@ -1079,7 +1082,7 @@ class BatchedEngine(BaseEngine):
             add_generation_prompt=add_generation_prompt,
         )
         if add_special_tokens is None:
-            return prompt, list(self._tokenizer.encode(prompt))
+            return prompt, encode_prompt(self._tokenizer, self._prefix_tokens, prompt)
         return prompt, list(
             self._tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
         )
