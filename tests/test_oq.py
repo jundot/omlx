@@ -2,6 +2,7 @@
 """Tests for oQ (oMLX Universal Dynamic Quantization)."""
 
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -7577,6 +7578,34 @@ class TestTextOnlyMultimodalMetadata:
 
         assert (out / "preprocessor_config.json").exists()
         assert (out / "processor_config.json").exists()
+
+    @pytest.mark.skipif(
+        not hasattr(os, "chflags"), reason="file flags are a BSD/macOS feature"
+    )
+    def test_copies_sidecars_whose_flags_cannot_be_set(self, tmp_path, monkeypatch):
+        """SMB sources carry SF_ARCHIVED, which only root may set.
+
+        ``shutil.copy2`` then fails in ``chflags`` with EPERM after the
+        whole model was quantized. The sidecar must still be copied.
+        """
+        import errno
+
+        from omlx.oq import _copy_model_sidecars
+
+        def refuse_flags(*args, **kwargs):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+
+        src = self._make_source(tmp_path)
+        (src / "audio_tokenizer").mkdir()
+        (src / "audio_tokenizer" / "config.json").write_text("{}")
+        out = tmp_path / "out"
+        out.mkdir()
+        monkeypatch.setattr(os, "chflags", refuse_flags)
+
+        _copy_model_sidecars(src, out, model_type="lfm3_omni")
+
+        assert (out / "tokenizer.json").read_text() == "{}"
+        assert (out / "audio_tokenizer" / "config.json").is_file()
 
     def test_text_only_keeps_processor_config_holding_a_chat_template(
         self, tmp_path

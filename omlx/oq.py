@@ -5253,6 +5253,40 @@ def _holds_chat_template(path: Path) -> bool:
         return True
 
 
+def _copy_sidecar_file(src, dst, *, follow_symlinks: bool = True):
+    """Copy a sidecar file with its contents, mode and timestamps.
+
+    Like :func:`shutil.copy2`, except that metadata the destination
+    refuses is skipped instead of failing the copy. Files on SMB shares
+    carry the ``SF_ARCHIVED`` flag, which only root may set, so
+    ``copy2`` raises ``EPERM`` from ``chflags`` after the contents are
+    already written. These copies run after the whole model has been
+    quantized, and a failed job removes its output directory.
+    """
+    shutil.copyfile(src, dst, follow_symlinks=follow_symlinks)
+    try:
+        shutil.copystat(src, dst, follow_symlinks=follow_symlinks)
+    except OSError as e:
+        logger.debug("oQ: kept %s without its source metadata (%s)", dst, e)
+    return dst
+
+
+def _copy_sidecar_tree(src, dst, **kwargs) -> None:
+    """``shutil.copytree`` with :func:`_copy_sidecar_file` semantics.
+
+    ``copytree`` applies each directory's metadata after its contents and
+    collects a refused ``chflags`` as an error. Those are dropped; any
+    error on a file is still raised.
+    """
+    try:
+        shutil.copytree(src, dst, copy_function=_copy_sidecar_file, **kwargs)
+    except shutil.Error as e:
+        remaining = [err for err in e.args[0] if not Path(err[0]).is_dir()]
+        if remaining:
+            raise shutil.Error(remaining) from e
+        logger.debug("oQ: copied %s without its directory metadata", dst)
+
+
 def _copy_model_sidecars(
     source: Path, output: Path, *, text_only: bool = False, model_type: str = ""
 ) -> None:
@@ -5266,23 +5300,23 @@ def _copy_model_sidecars(
     """
     for pattern in _SIDECAR_PATTERNS:
         for src_file in source.glob(pattern):
-            shutil.copy2(src_file, output / src_file.name)
+            _copy_sidecar_file(src_file, output / src_file.name)
 
     for pattern in _MULTIMODAL_SIDECAR_PATTERNS:
         for src_file in source.glob(pattern):
             if text_only and not _holds_chat_template(src_file):
                 continue
-            shutil.copy2(src_file, output / src_file.name)
+            _copy_sidecar_file(src_file, output / src_file.name)
 
     for py_file in source.glob("*.py"):
-        shutil.copy2(py_file, output / py_file.name)
+        _copy_sidecar_file(py_file, output / py_file.name)
 
     # LFM3 speech decoding loads its codec separately from the model weights.
     if not text_only and model_type == "lfm3_omni":
         for name in ("audio_tokenizer", "audio_detokenizer"):
             codec = source / name
             if codec.is_dir():
-                shutil.copytree(codec, output / name)
+                _copy_sidecar_tree(codec, output / name)
 
 
 def _copy_bundled_drafts(source: Path, output: Path) -> None:
@@ -5293,7 +5327,7 @@ def _copy_bundled_drafts(source: Path, output: Path) -> None:
     """
     draft = minimax_dspark.bundled_dspark_path(source)
     if draft is not None:
-        shutil.copytree(draft, output / draft.name, dirs_exist_ok=True)
+        _copy_sidecar_tree(draft, output / draft.name, dirs_exist_ok=True)
 
 
 def _build_non_quantizable_set(config: dict) -> set:
@@ -8093,7 +8127,7 @@ def quantize_oq_streaming(
     )
     for name in DECISION_SIDECAR_FILES:
         if (source / name).is_file():
-            shutil.copy2(source / name, output / name)
+            _copy_sidecar_file(source / name, output / name)
     if not text_only:
         _copy_bundled_drafts(source, output)
     if inkling2_layout.is_inkling2(config):
