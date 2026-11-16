@@ -2004,6 +2004,13 @@ lists it, and it stays *unpaired* although its mDNS advertisement is visible.
    (and `distributed`) flags from `/v1/models/status` and prefers a loaded model,
    a running cluster model first, before falling back to the first row.
 
+**A1 first attempt (2026-11-16, build `911afb52…`) reached `ready`** and found
+the two chat bugs above instead of a chat: plan `9bf9c137…`, rank order `.11` →
+`.12` (`.13` not needed), context 32768, MTP on, tier aggressive, endpoint
+`http://172.16.1.11:8000`, deployment `GLM-5.3-Flash-oQ2e-mtp-2da9fbab75c6`,
+`performance_unmeasured`. Both fixes shipped in build `5e2c2738…`, and the run is
+repeated on that build so the whole gate uses one identical binary.
+
 **Gate**
 
 | # | Criterion | Result | Evidence |
