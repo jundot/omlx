@@ -909,13 +909,27 @@ raise SystemExit(2)
         return normalized or None
 
     @staticmethod
-    def _join_reasoning_and_content(reasoning: Any, content: Any) -> str:
-        """Carry private structured reasoning through GenerationOutput safely."""
+    def _join_reasoning_and_content(
+        reasoning: Any,
+        content: Any,
+        tool_calls: Any = None,
+        finish_reason: str | None = None,
+    ) -> str:
+        """Carry private structured reasoning through GenerationOutput safely.
+
+        When the backend filed the whole answer under reasoning and nothing
+        else followed (no content, no tool calls, not cut off by the length
+        limit), leave the think block unclosed: extract_thinking's
+        malformed-open recovery then surfaces the answer as content, matching
+        the local engine's behavior for templates that pre-open thinking.
+        """
 
         reasoning_text = reasoning if isinstance(reasoning, str) else ""
         content_text = content if isinstance(content, str) else ""
         if reasoning_text:
-            return f"<think>{reasoning_text}</think>{content_text}"
+            if content_text or tool_calls or finish_reason == "length":
+                return f"<think>{reasoning_text}</think>{content_text}"
+            return f"<think>{reasoning_text}"
         return content_text
 
     async def _enter_request(self, request_id: str | None = None) -> str:
@@ -1314,6 +1328,8 @@ raise SystemExit(2)
             text = self._join_reasoning_and_content(
                 message.get("reasoning") or message.get("reasoning_content"),
                 message.get("content"),
+                tool_calls=tool_calls,
+                finish_reason=choice.get("finish_reason"),
             )
             return GenerationOutput(
                 text=text,
@@ -1569,12 +1585,15 @@ raise SystemExit(2)
             await self._leave_request(request_id)
 
         pending_final_text = ""
-        if reasoning_open:
-            pending_final_text = "</think>"
-            full_text += pending_final_text
         tool_calls = self._normalize_backend_tool_calls(
             [backend_tool_calls[index] for index in sorted(backend_tool_calls)]
         )
+        # A still-open think block with no tool calls and no length cut means
+        # the backend filed the whole answer under reasoning; leave the block
+        # unclosed so ThinkingParser.finish() recovers the answer as content.
+        if reasoning_open and (tool_calls or finish_reason == "length"):
+            pending_final_text = "</think>"
+            full_text += pending_final_text
         finished_at = time.monotonic()
         await self._record_strategy_benchmark(
             prompt_tokens=prompt_tokens,
