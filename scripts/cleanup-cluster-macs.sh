@@ -22,9 +22,18 @@
 # Usage:
 #   scripts/cleanup-cluster-macs.sh              # this Mac
 #   scripts/cleanup-cluster-macs.sh --all        # this Mac + the three peers
+#   scripts/cleanup-cluster-macs.sh --all --with-helper     # also remove the
+#                                                            # root-owned helper
+#                                                            # (one admin dialog
+#                                                            # per Mac)
 #   scripts/cleanup-cluster-macs.sh --all --keep-settings   # keep settings.json
-#                                                            (keeps model dirs,
-#                                                            but skips Welcome)
+#                                                            # and
+#                                                            # model_settings.json
+#                                                            # (skips Welcome)
+#
+# Before the state is wiped, its JSON files are copied to
+# ~/.omlx/backup-cluster-<date>/; that backup is never deleted by this script
+# (AGENTS.md §11: back up first, then wipe).
 set -uo pipefail
 
 PEERS=(172.16.1.12 172.16.1.13 172.16.1.14)
@@ -54,6 +63,7 @@ clean_here() {
     pkill -f 'dns-sd -R oMLX' 2>/dev/null
     pkill -f 'app\.omlx\.helper' 2>/dev/null
     pkill -f 'XCTRunner' 2>/dev/null
+    pkill -f 'xcodebuild.*oMLX' 2>/dev/null
     sleep 2
     if pgrep -f 'MacOS/oMLX|omlx-server|omlx serve|dns-sd -R oMLX' >/dev/null 2>&1; then
         pkill -9 -f 'MacOS/oMLX|omlx-server|omlx serve|dns-sd -R oMLX' 2>/dev/null
@@ -63,11 +73,33 @@ clean_here() {
          "| port 8099: $(lsof -nP -iTCP:8099 -sTCP:LISTEN 2>/dev/null | wc -l | tr -d ' ')"
 
     # ---- oMLX state ------------------------------------------------------
+    # AGENTS.md §11: back up the JSON state first, then wipe. The backup is a
+    # sibling of cluster/ and is never deleted here, so a wiped Mac can still be
+    # inspected afterwards. The staging runtime (multi-GB) is not backed up.
+    if [ -d "$HOME/.omlx/cluster" ]; then
+        local backup
+        backup="$HOME/.omlx/backup-cluster-$(date +%Y-%m-%d)"
+        mkdir -p "$backup"
+        find "$HOME/.omlx" -mindepth 1 -maxdepth 1 -type f -name '*.json' \
+            -exec cp -p {} "$backup/" \; 2>/dev/null
+        if [ -n "$(find "$HOME/.omlx/cluster" -mindepth 1 -maxdepth 1 \
+                ! -name identity.json ! -name runtime -print -quit 2>/dev/null)" ]; then
+            mkdir -p "$backup/cluster"
+            find "$HOME/.omlx/cluster" -mindepth 1 -maxdepth 1 \
+                ! -name identity.json ! -name runtime \
+                -exec cp -Rp {} "$backup/cluster/" \; 2>/dev/null
+        fi
+        echo "  state backed up to $backup"
+    fi
     if [ -d "$HOME/.omlx" ]; then
-        find "$HOME/.omlx" -mindepth 1 -maxdepth 1 \
-            ! -name cluster ! -name 'backup-cluster-*' -exec rm -rf {} + 2>/dev/null
-        if [ "$KEEP_SETTINGS" -eq 0 ]; then
-            find "$HOME/.omlx" -mindepth 1 -maxdepth 1 -name 'backup-cluster-*' \
+        if [ "$KEEP_SETTINGS" -eq 1 ]; then
+            find "$HOME/.omlx" -mindepth 1 -maxdepth 1 \
+                ! -name cluster ! -name 'backup-cluster-*' \
+                ! -name settings.json ! -name model_settings.json \
+                -exec rm -rf {} + 2>/dev/null
+        else
+            find "$HOME/.omlx" -mindepth 1 -maxdepth 1 \
+                ! -name cluster ! -name 'backup-cluster-*' \
                 -exec rm -rf {} + 2>/dev/null
         fi
         find "$HOME/.omlx/cluster" -mindepth 1 -maxdepth 1 \
@@ -116,9 +148,9 @@ clean_here() {
     if [ -e /Library/PrivilegedHelperTools/app.omlx.helper ] || \
        [ -e /Library/LaunchDaemons/app.omlx.helper.plist ]; then
         if [ "$WITH_HELPER" -eq 1 ]; then
-            sudo launchctl bootout system/app.omlx.helper >/dev/null 2>&1
+            sudo launchctl bootout system/app.omlx.helper </dev/null >/dev/null 2>&1
             sudo rm -f /Library/PrivilegedHelperTools/app.omlx.helper \
-                       /Library/LaunchDaemons/app.omlx.helper.plist
+                       /Library/LaunchDaemons/app.omlx.helper.plist </dev/null
             # Never claim a removal that did not happen: sudo over a
             # non-interactive SSH session has no terminal to ask for the
             # password, and the old code printed "removed" anyway.
@@ -156,11 +188,15 @@ clean_here() {
          "| LS records: $("$LSREGISTER" -dump 2>/dev/null | grep -c 'oMLX\.app')"
 }
 
+PEER_ARGS=""
+[ "$KEEP_SETTINGS" -eq 1 ] && PEER_ARGS="$PEER_ARGS --keep-settings"
+[ "$WITH_HELPER" -eq 1 ] && PEER_ARGS="$PEER_ARGS --with-helper"
+
 if [ "$ALL" -eq 1 ]; then
     for host in "${PEERS[@]}"; do
         scp -q -o BatchMode=yes "$0" "andreaskolb@$host:/tmp/cleanup-cluster-macs.sh" \
             && ssh -o BatchMode=yes "andreaskolb@$host" \
-                "bash /tmp/cleanup-cluster-macs.sh $([ "$KEEP_SETTINGS" -eq 1 ] && echo --keep-settings); rm -f /tmp/cleanup-cluster-macs.sh" &
+                "bash /tmp/cleanup-cluster-macs.sh$PEER_ARGS; rm -f /tmp/cleanup-cluster-macs.sh" &
     done
     clean_here
     wait

@@ -72,12 +72,18 @@ code.
 
 ## 3. Phase 1 — rollout and the acceptance gate (needs people at the Macs)
 
+> **Rollout bewusst zurückgestellt (2026-11-16):** erst die PyCharm-Inspection
+> abwarten und die echten Findings im Code bereinigen, dann das DMG ausrollen.
+> Die Macs sind inzwischen vollständig gewischt (§6), also ist der Rollout der
+> nächste Schritt, sobald der Code sauber ist.
+
 Precondition: a person at each Mac (Local Network prompt, helper dialog, runtime
 installer). Do not drive these over SSH.
 
-- [ ] **1.1 Wipe** — `scripts/cleanup-cluster-macs.sh --all --with-helper`
+- [x] **1.1 Wipe** — `scripts/cleanup-cluster-macs.sh --all --with-helper`
       (backs up to `~/.omlx/backup-cluster-<date>/`, keeps models +
-      `cluster/identity.json`, kills processes, frees 8099).
+      `cluster/identity.json`, kills processes, frees 8099). Done 2026-11-16 on
+      all four Macs; the helper still needs its admin dialog (see §6).
 - [ ] **1.2 Roll out** — copy `build/oMLX-0.8.0rc1.dmg` to all four Macs,
       install, open the app **interactively**, let Local Network, the runtime
       installer and the helper dialog through.
@@ -181,16 +187,31 @@ Only after Phase 1 (the roadmap order: acceptance first, PRs second).
 
 ## 6. Phase 4 — cleanup and hygiene
 
+**Stand 2026-11-16 (bereits gelaufen):** `scripts/cleanup-cluster-macs.sh --all
+--with-helper` über alle vier Macs. Verifiziert auf `.11`, `.12`, `.13`, `.14`:
+0 Prozesse, Port 8099 frei, `~/.omlx` = `cluster/identity.json` + der State-Backup
+`backup-cluster-2026-11-16/`, 0 App-Kopien, Runtime/Venv entfernt, 0 DerivedData,
+0 Trash-Kopien, 0 LaunchServices-Records. Die Modelle (902 GB) und das notarized
+DMG unter `build/` sind unverändert.
+**Offen bleibt nur der root-eigene Helper** (auf allen vier noch installiert und
+geladen) — er braucht an jedem Mac einen Admin-Dialog, und der sollte **vor** dem
+Abnahmelauf weg, damit A5 einen echten Erst-Install zeigt. Ebenso bleibt der
+Wired-Limit-Wert im Kernel stehen (122 880 / 60 293 / 29 696 / 29 696 MB).
+
 - [ ] **4.1 Cluster state** wiped again on every Mac after the run; verify: no
       oMLX/`omlx-server`/`pytest`/`xcodebuild`/`dns-sd` processes, port 8099
       free, `~/.omlx/cluster/` contains only `identity.json` (plus backups).
-- [ ] **4.2 Disk**: remove `apps/omlx-mac/build/`, the Xcode DerivedData product
-      (`~/Library/Developer/Xcode/DerivedData/oMLX-*`, currently **2.0 GB**),
-      Trash copies, mounted DMG volumes and `/tmp` images.
-- [ ] **4.3 Launchpad**: `lsregister -gc -f -r -domain user -domain local` +
-      `killall Dock`; confirm one `/Applications/oMLX.app` and one LS record.
-- [ ] **4.4 Keep**: models (`~/Models`), this repository, the notarized DMG under
-      `build/`, `cluster/identity.json`, the state backup directory.
+- [x] **4.2 Disk**: `apps/omlx-mac/build/`, the Xcode DerivedData products
+      (`DerivedData/oMLX-*`, was 2.0 GB), runtime venv, Trash copies, mounted
+      DMG volumes and `/tmp` images removed (2026-11-16).
+- [x] **4.3 Launchpad**: `lsregister -gc -f -r -domain user -domain local` +
+      `killall Dock`; 0 app copies and 0 LS records on all four Macs.
+- [ ] **4.4 Helper**: remove `/Library/PrivilegedHelperTools/app.omlx.helper` +
+      `/Library/LaunchDaemons/app.omlx.helper.plist` at each Mac (one admin
+      dialog each, no passwordless sudo in the cluster).
+- [x] **4.4 Keep**: models (`~/Models`, 902 GB), this repository, the notarized
+      DMG under `build/` (`9400d290…`), `cluster/identity.json`, state backup
+      `~/.omlx/backup-cluster-2026-11-16/`.
 - [ ] **4.5 Docs**: `README.md` / `AGENTS.md` §2 baseline (HEAD, branch, DMG
       hash) point at the final state; this plan's boxes are all ticked or the
       leftovers are moved into a dated follow-up.
