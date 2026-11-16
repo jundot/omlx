@@ -2715,5 +2715,7 @@
   "cluster.assistant.failure.wired": "No plan fits with the current memory settings",
   "cluster.assistant.failure.memory": "The model does not fit in memory",
   "cluster.assistant.failure.generic": "The step did not finish",
-  "cluster.assistant.show_details": "Show details"
+  "cluster.assistant.show_details": "Show details",
+  "cluster.v2.levers.title": "Your Macs",
+  "cluster.v2.levers.hint": "roles apply at the next measurement"
 }

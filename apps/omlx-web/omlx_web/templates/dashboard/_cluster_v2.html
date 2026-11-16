@@ -32,6 +32,65 @@
                     data-cluster-v2-mode-manual>{{ t('cluster.assistant.mode.manual') }}</button>
         </div>
 
+        <!-- Your Macs: the two levers that decide how much of each Mac the
+             cluster may take. Visible in BOTH modes and before any plan, so
+             nobody has to hunt for them inside the wizard's plan step. A role
+             change applies at the next measurement; the tier at the next plan. -->
+        <div class="mb-4 rounded-xl border border-neutral-200 bg-white px-3 py-2.5"
+             x-show="planRoleDevices().length > 0 && !clusterLifecycleBusy" x-cloak
+             data-cluster-v2-mac-levers
+             data-cluster-v2-node-roles>
+            <div class="flex items-center justify-between gap-3">
+                <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">
+                    {{ t('cluster.v2.levers.title') }}
+                </div>
+                <div class="text-caption text-neutral-400">{{ t('cluster.v2.levers.hint') }}</div>
+            </div>
+            <div class="mt-2 space-y-2">
+                <template x-for="device in planRoleDevices()" :key="device.node_id">
+                    <div class="flex items-center justify-between gap-3 rounded-lg border border-neutral-200 px-3 py-2">
+                        <div class="min-w-0">
+                            <div class="text-xs font-semibold text-neutral-900 truncate"
+                                 x-text="deviceName(device)"></div>
+                            <div class="text-caption text-neutral-500 mt-0.5"
+                                 x-text="deviceRamLabel(device) + ' · ' + usableGbLabel(device)"
+                                 data-cluster-v2-usable-budget></div>
+                        </div>
+                        <div class="segmented segmented--sm flex-shrink-0"
+                             data-cluster-v2-role-picker>
+                            <button type="button" @click="setNodeRole(device, 'workstation')"
+                                    :class="nodeRole(device.node_id, !!device.is_self) === 'workstation'
+                                        ? 'segmented__item--active'
+                                        : ''"
+                                    class="segmented__item"
+                                    data-cluster-v2-role-workstation>{{ t('cluster.v2.plan.role_workstation') }}</button>
+                            <button type="button" @click="setNodeRole(device, 'headless')"
+                                    :class="nodeRole(device.node_id, !!device.is_self) === 'headless'
+                                        ? 'segmented__item--active'
+                                        : ''"
+                                    class="segmented__item"
+                                    data-cluster-v2-role-headless>{{ t('cluster.v2.plan.role_headless') }}</button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+            <div class="mt-2 flex items-center justify-between gap-3">
+                <span class="text-caption font-bold uppercase tracking-wider text-neutral-400">Memory</span>
+                <div class="segmented segmented--sm" data-cluster-v2-plan-tier>
+                    <template x-for="option in ['safe', 'balanced', 'aggressive']" :key="option">
+                        <button type="button"
+                                @click="setPlanMemoryTier(option)"
+                                class="segmented__item"
+                                :class="planMemoryTier === option ? 'segmented__item--active' : ''"
+                                :data-selected="planMemoryTier === option ? 'true' : 'false'"
+                                :data-tier="option"
+                                x-text="window.t('settings.resource.guard_tier.' + option)"></button>
+                    </template>
+                </div>
+            </div>
+        </div>
+
+
         <div x-show="pairedDevices().length || configuredDeployment()" x-cloak class="mb-4 flex flex-wrap gap-2">
             <button type="button" @click="forgetCluster()"
                     :disabled="clusterLifecycleBusy"
@@ -2500,59 +2559,6 @@
                         {{ t('cluster.v2.plan.ssd_evict') }}
                     </span>
                 </label>
-
-                <!-- Per-node roles: how much of each Mac the cluster may take.
-                     Default is unchanged (this Mac = Workstation, peers =
-                     Headless); changing one re-runs the plan. -->
-                <div class="mt-4" data-cluster-v2-node-roles>
-                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400 mb-2">{{ t('cluster.v2.plan.memory_contributes') }}</div>
-                    <div class="space-y-2">
-                        <template x-for="device in planRoleDevices()" :key="device.node_id">
-                            <div class="flex items-center justify-between gap-3 rounded-xl border border-neutral-200 px-3 py-2">
-                                <div class="min-w-0">
-                                    <div class="text-xs font-semibold text-neutral-900 truncate"
-                                         x-text="deviceName(device)"></div>
-                                    <div class="text-caption text-neutral-500 mt-0.5"
-                                         x-text="deviceRamLabel(device) + ' · ' + usableGbLabel(device)"
-                                         data-cluster-v2-usable-budget></div>
-                                </div>
-                                <div class="segmented segmented--sm flex-shrink-0"
-                                     data-cluster-v2-role-picker>
-                                    <button type="button" @click="setNodeRole(device, 'workstation')"
-                                            :class="nodeRole(device.node_id, !!device.is_self) === 'workstation'
-                                                ? 'segmented__item--active'
-                                                : ''"
-                                            class="segmented__item"
-                                            data-cluster-v2-role-workstation>{{ t('cluster.v2.plan.role_workstation') }}</button>
-                                    <button type="button" @click="setNodeRole(device, 'headless')"
-                                            :class="nodeRole(device.node_id, !!device.is_self) === 'headless'
-                                                ? 'segmented__item--active'
-                                                : ''"
-                                            class="segmented__item"
-                                            data-cluster-v2-role-headless>{{ t('cluster.v2.plan.role_headless') }}</button>
-                                </div>
-                            </div>
-                        </template>
-                    </div>
-                </div>
-
-                <!-- Memory tier for the whole split: the plan's own lever. The
-                     solver may raise it when nothing else fits, and the plan
-                     then reports tier_raised instead of hiding it. -->
-                <div class="mt-3 flex items-center justify-between gap-3" data-cluster-v2-plan-tier>
-                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.resource.guard_tier.label') }}</div>
-                    <div class="segmented segmented--sm">
-                        <template x-for="option in ['safe', 'balanced', 'aggressive']" :key="option">
-                            <button type="button"
-                                    @click="setPlanMemoryTier(option)"
-                                    class="segmented__item"
-                                    :class="planMemoryTier === option ? 'segmented__item--active' : ''"
-                                    :data-selected="planMemoryTier === option ? 'true' : 'false'"
-                                    :data-tier="option"
-                                    x-text="window.t('settings.resource.guard_tier.' + option)"></button>
-                        </template>
-                    </div>
-                </div>
 
                 <!-- Planning progress / error -->
                 <div class="mt-4 flex items-center gap-2 text-xs text-neutral-500" x-show="planLoading">
