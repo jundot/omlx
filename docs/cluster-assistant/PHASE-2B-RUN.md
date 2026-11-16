@@ -2008,7 +2008,7 @@ lists it, and it stays *unpaired* although its mDNS advertisement is visible.
 the two chat bugs above instead of a chat: plan `9bf9c137…`, rank order `.11` →
 `.12` (`.13` not needed), context 32768, MTP on, tier aggressive, endpoint
 `http://172.16.1.11:8000`, deployment `GLM-5.3-Flash-oQ2e-mtp-2da9fbab75c6`,
-`performance_unmeasured`. Both fixes shipped in build `b0f2b41b…`, and the run is
+`performance_unmeasured`. Both fixes shipped in build `8571bc55…`, and the run is
 repeated on that build so the whole gate uses one identical binary.
 
 **Live finding (2026-11-16, blocked a fresh plan): the resident calibration
