@@ -10241,9 +10241,15 @@ def _streamed_layer_keys(dp, layer_idx: int, skip_key=None) -> tuple[list, int]:
 
 
 def _stream_prefetch_enabled() -> bool:
-    """``OMLX_OQ_STREAM_PREFETCH=0`` reads each layer only when it is needed."""
-    value = os.environ.get("OMLX_OQ_STREAM_PREFETCH", "1").strip().lower()
-    return value not in ("0", "off", "false", "no")
+    """``OMLX_OQ_STREAM_PREFETCH=1`` reads layer N+1 while layer N computes.
+
+    Off by default: on a local SSD the read is a small fraction of the layer
+    compute, so overlapping it saves nothing measurable. It pays off on slow
+    sources such as a network share, where reading a layer takes about as
+    long as computing it.
+    """
+    value = os.environ.get("OMLX_OQ_STREAM_PREFETCH", "0").strip().lower()
+    return value in ("1", "on", "true", "yes")
 
 
 def _read_streamed_sources(reads: dict) -> tuple[dict, float]:
@@ -10312,7 +10318,7 @@ def _iter_streamed_layer_blocks(
     next layer so at most one layer's weights are ever resident here.
 
     Each source tensor of a layer is read once (``_DiscoveredPlan.stage``).
-    With prefetch on (``OMLX_OQ_STREAM_PREFETCH``, default on), a background
+    With prefetch on (``OMLX_OQ_STREAM_PREFETCH=1``, default off), a background
     thread reads layer N+1's raw bytes while the caller computes on layer N;
     conversion to MLX arrays stays on this thread. At most one layer is read
     ahead, and only if ``_stream_prefetch_admitted`` allows it.
