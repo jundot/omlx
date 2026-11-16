@@ -82,6 +82,10 @@ from .model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from .patches.inkling2.dspark import (
+    bundled_inkling2_dspark_path,
+    load_inkling2_dspark_drafter,
+)
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
 from .prefill_helper.adapters import adapter_for_model as prefill_stage_adapter
@@ -718,6 +722,14 @@ class EnginePool:
             dspark_path = bundled_dspark_path(entry.model_path)
             if dspark_path is not None:
                 extra += self._dflash_drafter_estimated_bytes(str(dspark_path), None)
+        elif (
+            getattr(runtime_settings, "mtp_enabled", False)
+            and entry.config_model_type == "inkling2"
+        ):
+            draft = bundled_inkling2_dspark_path(entry.model_path)
+            if draft is not None:
+                # BF16 draft weights plus the folded [vocab, rank] Markov head.
+                extra += draft.stat().st_size + 201024 * 256 * 2
         return base + extra
 
     def _dflash_drafter_estimated_bytes(
@@ -4528,6 +4540,34 @@ class EnginePool:
                     except Exception as e:
                         logger.warning(
                             f"MiniMax DSpark drafter load raised for {model_id}: "
+                            f"{e} -- Lightning MTP stays off"
+                        )
+                    else:
+                        engine.set_dflash_drafter(drafter)
+
+            # Inkling 2 bundles its DSpark draft as mtp.safetensors.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "mtp_enabled", False)
+                and entry.config_model_type == "inkling2"
+                and hasattr(engine, "prepare_dflash_target")
+            ):
+                draft_path = bundled_inkling2_dspark_path(entry.model_path)
+                fixed = getattr(model_settings, "mtp_fixed_depth", None)
+                depth = fixed or getattr(model_settings, "mtp_adaptive_max_depth", None)
+                if draft_path is not None:
+                    try:
+                        drafter = await asyncio.get_running_loop().run_in_executor(
+                            get_mlx_executor(),
+                            load_inkling2_dspark_drafter,
+                            entry.model_path,
+                            engine.prepare_dflash_target(),
+                            depth,
+                            bool(fixed),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Inkling 2 DSpark drafter load raised for {model_id}: "
                             f"{e} -- Lightning MTP stays off"
                         )
                     else:

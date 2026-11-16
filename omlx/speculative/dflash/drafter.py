@@ -371,6 +371,11 @@ class DFlashDrafter:
 
     def release(self, uids: Iterable[Any]) -> None:
         self._predraft = None
+        uids = list(uids)
+        forget = getattr(getattr(self.model, "markov_head", None), "forget", None)
+        if forget is not None:
+            # Recurrent Markov heads keep per-row state between blocks.
+            forget(uids)
         for uid in uids:
             row = self._rows.pop(uid, None)
             if row is None:
@@ -601,10 +606,12 @@ class DFlashDrafter:
         capacity = self.capacity
         batch = len(rows)
         block = self.block_size
-        fc = model.encoder.fc if hasattr(model, "encoder") else model.fc
-        dtype = fc.weight.dtype if hasattr(fc, "weight") else mx.bfloat16
-        if hasattr(fc, "scales"):
-            dtype = fc.scales.dtype
+        dtype = getattr(model, "context_dtype", None)
+        if dtype is None:
+            fc = model.encoder.fc if hasattr(model, "encoder") else model.fc
+            dtype = fc.weight.dtype if hasattr(fc, "weight") else mx.bfloat16
+            if hasattr(fc, "scales"):
+                dtype = fc.scales.dtype
 
         # Context segments: keep at most ``slots`` newest tokens per row and
         # count the rest as skipped so absolute positions stay aligned. A
@@ -761,7 +768,9 @@ class DFlashDrafter:
             queries, ctx_keys, ctx_values, prop_keys, prop_values = (
                 variants.project_qkv(attn, x, h_ctx)
             )
-            ctx_keys = attn.k_norm(
+            # Inkling 2 normalizes context keys with their own weights.
+            ctx_k_norm = getattr(attn, "k_norm_ctx", attn.k_norm)
+            ctx_keys = ctx_k_norm(
                 ctx_keys.reshape(batch, width, attn.n_kv_heads, attn.head_dim)
             ).transpose(0, 2, 1, 3)
             ctx_values = ctx_values.reshape(
@@ -842,6 +851,11 @@ class DFlashDrafter:
         samplers = [sampler for *_, sampler in rows]
         selector = getattr(model, "candidate_selector", None)
         if markov is not None:
+            prepare = getattr(markov, "prepare_block", None)
+            if prepare is not None:
+                # Recurrent Markov heads start each block from the newest
+                # committed context row.
+                prepare(draft_hidden, h_ctx, lengths, uids)
             proposals = selection.select_markov(markov, logits, anchors, samplers)
         elif selector is not None and selection.fused_select_eligible(
             selector, draft_hidden

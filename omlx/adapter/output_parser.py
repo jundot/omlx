@@ -817,7 +817,7 @@ class MiniMaxM3OutputParserSession:
         )
 
 
-_INKLING_MODEL_TYPES = {"inkling", "inkling_mm_model"}
+_INKLING_MODEL_TYPES = {"inkling", "inkling_mm_model", "inkling2"}
 _INKLING_MESSAGE_MODEL = "<|message_model|>"
 _INKLING_CONTENT_THINKING = "<|content_thinking|>"
 _INKLING_CONTENT_TEXT = "<|content_text|>"
