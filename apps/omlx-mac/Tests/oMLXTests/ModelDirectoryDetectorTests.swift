@@ -78,6 +78,24 @@ final class ModelDirectoryDetectorTests: XCTestCase {
         XCTAssertEqual(found.first?.path, home.appendingPathComponent("mlx-models").standardizedFileURL.path)
     }
 
+    func testRealModelFolderBeatsALargerHuggingFaceCache() throws {
+        // Measured 2026-11-16 on .11: the cache held more `models--*` entries
+        // than ~/Models had checkpoints, and the wizard adopted the cache.
+        try makeModel("Models/GLM5")
+        for name in ["a", "b", "c", "d", "e"] {
+            let snapshots = home.appendingPathComponent(
+                ".cache/huggingface/hub/models--org--\(name)/snapshots/abc", isDirectory: true)
+            try fm.createDirectory(at: snapshots, withIntermediateDirectories: true)
+        }
+
+        let found = ModelDirectoryDetector.detect(home: home, fileManager: fm)
+
+        XCTAssertEqual(found.first?.path,
+                       home.appendingPathComponent("Models").standardizedFileURL.path)
+        XCTAssertEqual(found.first?.isHuggingFaceCache, false)
+        XCTAssertEqual(found.count, 2)
+    }
+
     func testOneFolderIsReportedOnceAcrossCaseInsensitiveRoots() throws {
         // `~/Models` and `~/models` are the same folder on a default APFS
         // volume; the detector must not count it twice.

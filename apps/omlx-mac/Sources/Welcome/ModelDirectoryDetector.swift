@@ -85,8 +85,16 @@ enum ModelDirectoryDetector {
                 )
             )
         }
+        // A real model folder always beats a package cache, whatever the
+        // counts say: the HuggingFace hub is shards keyed by repo name, and
+        // adopting it over `~/Models` on 2026-11-16 pointed a first run at the
+        // cache instead of the user's own checkpoints (measured on .11, which
+        // listed more `models--*` entries than it had models).
         return found
             .sorted { left, right in
+                if left.directory.isHuggingFaceCache != right.directory.isHuggingFaceCache {
+                    return !left.directory.isHuggingFaceCache
+                }
                 if left.directory.modelCount != right.directory.modelCount {
                     return left.directory.modelCount > right.directory.modelCount
                 }
