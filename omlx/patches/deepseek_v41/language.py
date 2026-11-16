@@ -28,6 +28,7 @@ from .activation import (
     quantize_paired_swiglu_activation,
     quantize_swiglu_activation,
     rope_activation,
+    swiglu_activation,
 )
 from .cache import DeepseekV41Cache
 from .engram import Engram, NgramHash, build_compressed_token_map
@@ -686,6 +687,20 @@ class Expert(nn.Module):
                 else quantize_swiglu_activation(gate, up, weights, dtype, self._limit)
             )
             return self.w2.project_quantized(y, indices, sorted_indices, block_plan)
+        if (
+            isinstance(self.w2, GGUFProjection)
+            and gate.size
+            and gate.shape == up.shape
+            and dtype in (mx.float32, mx.float16, mx.bfloat16)
+            and mx.default_device() != mx.cpu
+            and (weights is None or weights.size == gate.size // gate.shape[-1])
+        ):
+            # One pass for clamp, SwiGLU, route weight and the dtype cast; the
+            # packed down projection consumes the activation in its own dtype.
+            return project(
+                self.w2,
+                swiglu_activation(gate, up, weights, dtype, self._limit),
+            )
         gate, up = gate.astype(mx.float32), up.astype(mx.float32)
         if self._limit:
             gate = mx.minimum(gate, self._limit)

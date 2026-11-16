@@ -46,6 +46,21 @@ def dense_weight(name):
     ) or name.endswith(".wo_a.weight")
 
 
+def dual_weight(name):
+    """Projections the fused decode kernels read packed and prefill reads dense."""
+    return name.endswith(
+        (
+            ".attn.wq_a.weight",
+            ".attn.wkv.weight",
+            ".attn.wq_b.weight",
+            ".attn.wo_b.weight",
+            ".ffn.shared_experts.w1.weight",
+            ".ffn.shared_experts.w3.weight",
+            ".ffn.shared_experts.w2.weight",
+        )
+    )
+
+
 _ENGRAM = "per_layer_token_embd.weight"
 _ROOT = {
     "output.weight": "head.weight",
@@ -297,7 +312,9 @@ def iter_weights(folder, source, raw, mapping, expected_shapes, preserve_mtp):
             else:
                 spec = {
                     name.removesuffix(".weight"): dict(
-                        qtype=qtype, input_dims=shape[-1]
+                        qtype=qtype,
+                        input_dims=shape[-1],
+                        dense=dual_weight(name),
                     )
                 }
         values = {name: value}

@@ -324,7 +324,9 @@ def test_packed_nax_gather_matches_float64_dot(
     x = mx.array(rng.normal(size=(len(ids), width * 2)).astype(np.float32))[:, ::2]
     x = (x.astype(dtype) * activation_scale).astype(dtype)[:, None]
     plan = prefill_plan(x, mx.array(ids), p.num_experts)
-    assert plan[2] == (64 if len(ids) >= 256 else 32)
+    assert plan[2] == (
+        64 if len(ids) >= 32 * p.num_experts else 32 if len(ids) >= 128 else 8
+    )
     actual = p(x, mx.array(ids), sorted_indices=True, block_plan=plan)
     dense = np.asarray(dequantize(p.weight, qtype, (4, n, width), mx.float32)).astype(
         np.float64
@@ -400,12 +402,14 @@ def test_packed_nax_dense_without_weight_materialization(
     np.testing.assert_array_equal(p.weight, raw)
 
 
-def test_gguf_prefill_plan_keeps_small_batches_and_non_nax_fallback(monkeypatch):
+def test_gguf_prefill_plan_uses_occupancy_and_non_nax_fallback(monkeypatch):
     from omlx.patches.deepseek_v41 import gguf_quant as q
 
     x = mx.zeros((1, 1, 256), mx.bfloat16)
-    # Real CED tail: 128 tokens, top-6 routing, 384 experts.
-    assert q.prefill_plan(x, mx.zeros((128 * 6,), mx.int32), 384)[2] == 8
+    # Real CED tail: 128 tokens, top-6 routing, 384 experts: below 32 routes
+    # per expert, but enough routes for the 32-row tile.
+    assert q.prefill_plan(x, mx.zeros((128 * 6,), mx.int32), 384)[2] == 32
+    assert q.prefill_plan(x, mx.zeros((64,), mx.int32), 384)[2] == 8
     monkeypatch.setattr(q, "is_nax_available", lambda: False)
     assert q.prefill_plan(x, mx.zeros((8192 * 6,), mx.int32), 384)[2] == 8
     raw, rng = packed(16, (4, 11, 256), 7311)
@@ -771,3 +775,107 @@ def test_gguf_mtp_generation_matches_greedy(monkeypatch):
         generator.close()
     assert calls, "Exercise actual DSpark proposal execution"
     assert result == wanted
+
+
+def test_gguf_dense_copy_stays_out_of_parameters_and_matches_packed():
+    from mlx.utils import tree_flatten
+
+    from omlx.patches.deepseek_v41.gguf import dual_weight
+
+    raw, _ = packed(8, (32, 512), 20500)
+    dense = GGUFProjection(mx.array(raw), qtype=8, input_dims=512, dense=True)
+    assert [name for name, _ in tree_flatten(dense.parameters())] == ["weight"]
+    assert getattr(dense, "_dense", None) is not None
+    x = mx.random.normal((64, 512), key=mx.random.key(7)).astype(mx.bfloat16)
+    actual = dense(x)
+    packed_out = GGUFProjection(mx.array(raw), qtype=8, input_dims=512)(x)
+    mx.eval(actual, packed_out)
+    # The copy rounds the Q8 values to BF16; the packed decode keeps them exact.
+    a = np.asarray(actual.astype(mx.float32))
+    p = np.asarray(packed_out.astype(mx.float32))
+    assert np.abs(a - p).max() <= 0.01 * np.abs(p).max()
+    with pytest.raises(ValueError, match="rank two"):
+        GGUFProjection(
+            mx.zeros((2, 32, row_bytes(512, 8)), mx.uint8),
+            qtype=8,
+            input_dims=512,
+            dense=True,
+        )
+    for name in (
+        "language_model.layers.0.attn.wq_a.weight",
+        "language_model.layers.0.attn.wkv.weight",
+        "language_model.layers.0.attn.wq_b.weight",
+        "language_model.layers.0.attn.wo_b.weight",
+        "language_model.layers.0.ffn.shared_experts.w1.weight",
+        "language_model.layers.0.ffn.shared_experts.w3.weight",
+        "language_model.layers.0.ffn.shared_experts.w2.weight",
+    ):
+        assert dual_weight(name)
+    assert not dual_weight("language_model.layers.0.ffn.experts.w1.weight")
+    assert not dual_weight("language_model.layers.0.attn.wo_a.weight")
+
+
+def test_gguf_swiglu_fusion_matches_the_fp32_reference():
+    import mlx.nn as nn
+
+    from omlx.patches.deepseek_v41.activation import swiglu_activation
+
+    gate = mx.random.normal((513, 1, 96), key=mx.random.key(8)).astype(mx.bfloat16)
+    up = mx.random.normal((513, 1, 96), key=mx.random.key(9)).astype(mx.bfloat16)
+    weights = mx.random.uniform(0, 1, (513,), key=mx.random.key(10))
+    for limit in (0.0, 10.0):
+        g, u = gate.astype(mx.float32), up.astype(mx.float32)
+        if limit:
+            g, u = mx.minimum(g, limit), mx.clip(u, -limit, limit)
+        expected = ((nn.silu(g) * u) * weights[..., None, None]).astype(mx.bfloat16)
+        actual = swiglu_activation(gate, up, weights, mx.bfloat16, limit)
+        np.testing.assert_array_equal(
+            actual.astype(mx.float32), expected.astype(mx.float32)
+        )
+    unweighted = swiglu_activation(gate, up, None, mx.bfloat16, 10.0)
+    g, u = mx.minimum(gate.astype(mx.float32), 10.0), mx.clip(
+        up.astype(mx.float32), -10.0, 10.0
+    )
+    np.testing.assert_array_equal(
+        unweighted.astype(mx.float32),
+        (nn.silu(g) * u).astype(mx.bfloat16).astype(mx.float32),
+    )
+
+
+def test_gguf_expert_prefill_routes_through_the_fused_swiglu(monkeypatch):
+    from test_deepseek_v41 import tiny
+
+    from omlx.patches.deepseek_v41 import language
+
+    c = tiny(
+        dim=256,
+        moe_inter_dim=256,
+        n_routed_experts=16,
+        n_activated_experts=6,
+        swiglu_limit=10,
+    )
+    expert = language.Expert(c, True)
+    for name, qtype in (("w1", 16), ("w3", 19), ("w2", 17)):
+        raw, _ = packed(qtype, (16, 256, 256), 21000 + qtype)
+        setattr(
+            expert, name, GGUFProjection(mx.array(raw), qtype=qtype, input_dims=256)
+        )
+    ids = mx.array(np.repeat(np.arange(4, dtype=np.int32), (3, 0, 40, 39)))
+    weights = mx.linspace(0, 1, ids.size).astype(mx.float32)
+    x = mx.random.normal((ids.size, 1, 256), key=mx.random.key(11)).astype(mx.bfloat16)
+    expected = expert(x, ids, weights, sorted_indices=True)
+    calls = []
+    original = language.swiglu_activation
+
+    def spy(gate, up, route_weights, dtype, limit):
+        result = original(gate, up, route_weights, dtype, limit)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(language, "swiglu_activation", spy)
+    actual = expert(x, ids, weights, sorted_indices=True)
+    mx.eval(actual, expected)
+    assert len(calls) == 1
+    np.testing.assert_array_equal(
+        np.asarray(actual.astype(mx.float32)), np.asarray(expected.astype(mx.float32))
+    )

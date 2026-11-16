@@ -128,6 +128,7 @@ def _estimate(model_path, signature):
                 FORMATS,
                 backbone_tensors,
                 dense_weight,
+                dual_weight,
                 supplementary,
                 target_name,
             )
@@ -137,6 +138,11 @@ def _estimate(model_path, signature):
                     prod(t["shape"]) * 2
                     if t["qtype"] in FORMATS and dense_weight(target_name(t["name"]))
                     else t["size"]
+                )
+                + (
+                    prod(t["shape"]) * 2
+                    if t["qtype"] in FORMATS and dual_weight(target_name(t["name"]))
+                    else 0
                 )
                 for t in backbone_tensors(gguf["path"], ModelConfig.from_dict(config))
             )

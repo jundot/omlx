@@ -336,11 +336,13 @@ def _nax_register_kernel(qt, rows, gathered=True):
 def prefill_plan(x, indices, num_experts):
     from ..deepseek_v4.switch_layers import _build_mxfp4_blocks
 
-    # Average occupancy: wider tiles lose to the SIMD path on sparse/CED tails.
-    # Per-block tile selection is the upgrade path for severely skewed routing.
+    # Average occupancy, measured on the real checkpoint: a 32-row tile beats
+    # the matrix kernel from about 128 routes, and 64-row tiles win from
+    # roughly 32 routes per expert. Below 128 routes the matrix kernel is at
+    # least as fast, so the tiny decode-shaped tails keep it.
     rows = (
-        (64 if indices.size >= 64 * num_experts else 32)
-        if indices.size >= max(64, 8 * num_experts)
+        (64 if indices.size >= 32 * num_experts else 32)
+        if indices.size >= 128
         and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
         and mx.default_device() != mx.cpu
         and is_nax_available()
@@ -373,7 +375,7 @@ def _rows_kernel(qtype):
 class GGUFProjection(nn.Module):
     """Packed dense or expert projection with the same gather contract as SwitchLinear."""
 
-    def __init__(self, weight, *, qtype, input_dims):
+    def __init__(self, weight, *, qtype, input_dims, dense=False):
         super().__init__()
         if weight.dtype != mx.uint8 or weight.ndim not in (2, 3):
             raise ValueError(
@@ -386,6 +388,19 @@ class GGUFProjection(nn.Module):
         self.qtype, self.input_dims = qtype, input_dims
         self.output_dims = weight.shape[-2]
         self.quantize_input = False
+        # Dense consumers (shared experts, attention) re-read the whole weight
+        # for every prefill row. A BF16 copy lets MLX matmul run them while the
+        # packed weight stays for the fused decode kernels.
+        if dense:
+            if weight.ndim != 2:
+                raise ValueError("Dense GGUF projection must be rank two")
+            # A derived constant, not a parameter: keep it out of the module
+            # dict so checkpoints, quantizers and updates never see it.
+            object.__setattr__(
+                self,
+                "_dense",
+                dequantize(weight, qtype, (self.output_dims, input_dims), mx.bfloat16),
+            )
         if weight.ndim == 3:
             self.num_experts = weight.shape[0]
 
@@ -420,6 +435,16 @@ class GGUFProjection(nn.Module):
                     output_shapes=[shape],
                     output_dtypes=[x.dtype],
                 )[0]
+            dense = getattr(self, "_dense", None)
+            if (
+                rows >= 32
+                and dense is not None
+                and x.dtype == mx.bfloat16
+                and mx.default_device() != mx.cpu
+            ):
+                # Prefill re-reads a dense weight for every row; MLX matmul on
+                # the BF16 copy beats decoding the packed blocks per tile.
+                return x @ dense.T
             if rows >= 64 and not (
                 x.dtype in (mx.bfloat16, mx.float16, mx.float32)
                 and mx.default_device() != mx.cpu
@@ -442,12 +467,10 @@ class GGUFProjection(nn.Module):
             x = mx.broadcast_to(x, (*indices.shape, 1, self.input_dims))
             ids = indices.reshape(-1).astype(mx.uint32)
         x = mx.contiguous(x.reshape(-1, self.input_dims))
-        # Eight-column expert tiles waste work below four routes per expert.
-        # This average assumes ordinary routing; a per-block choice can handle skew.
         if (indices is None and ids.size >= 32) or (
             indices is not None
             and sorted_indices
-            and ids.size >= max(64, 4 * self.num_experts)
+            and ids.size >= 128
         ):
             if indices is not None and block_plan is None:
                 block_plan = prefill_plan(x, ids, self.num_experts)
