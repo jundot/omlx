@@ -1,0 +1,881 @@
+"""Synthetic packed GGUF checks; no model downloads or gguf dependency."""
+
+import json
+import struct
+
+import mlx.core as mx
+import numpy as np
+import pytest
+from mlx.utils import tree_flatten
+
+from omlx.custom_kernels.nax import is_nax_available
+from omlx.gguf import GgufError
+from omlx.patches.deepseek_v41.gguf import (
+    _LAYER,
+    _ROOT,
+    backbone_tensors,
+    prepare,
+    read_header,
+)
+from omlx.patches.deepseek_v41.gguf_quant import (
+    FORMATS,
+    GGUFProjection,
+    dequantize,
+    row_bytes,
+)
+
+# Recorded independently with llama.cpp gguf-py CPU dequantize + NumPy dot.
+# Each seed exercises every block's grid/sign/scale bytes, two expert choices,
+# two blocks per row and tail output rows. No upstream checkout is needed.
+_EXPECTED = {
+    8: [[1.1008341, -34.3133774, 29.1364708], [-5.4555197, -11.1512699, -2.8665476]],
+    10: [[-3.2740026, 0.9873986, 3.904026], [-9.4498959, 1.3240428, -0.8963728]],
+    13: [
+        [-90.5944824, -260.4677429, -1.8368226],
+        [126.7198334, 22.7707634, 159.5210266],
+    ],
+    14: [
+        [-742.0026855, 144.9895782, -18.4693451],
+        [290.0865479, -188.8960266, 354.407074],
+    ],
+    16: [[-17.837059, 3.6467731, 0.0851333], [6.784008, 1.6515222, -11.0491123]],
+    17: [[6.7956161, -0.8044491, -0.6864071], [17.9276123, 9.4605827, -16.1722946]],
+    18: [[28.2220955, 49.6144447, 1.2364564], [32.4849396, 48.3264542, 26.399353]],
+    19: [[0.9451886, 1.4143728, 0.4916597], [0.6244406, -0.0008309, 0.2853332]],
+    22: [[4.7803683, 11.6624737, -5.4103909], [-0.5960388, -6.1177526, 11.5483284]],
+}
+
+
+def packed(qtype, shape, seed):
+    block, size, _ = FORMATS[qtype]
+    rng = np.random.default_rng(seed)
+    data = rng.integers(0, 256, (*shape[:-1], shape[-1] // block, size), np.uint8)
+    offset = {10: 80, 14: 208}.get(qtype, 0)
+    data[..., offset : offset + 2] = np.array([0.01], "<f2").view(np.uint8)
+    if qtype in (10, 13):
+        offset = 82 if qtype == 10 else 2
+        data[..., offset : offset + 2] = np.array([0.003], "<f2").view(np.uint8)
+    return data.reshape(*shape[:-1], -1), rng
+
+
+@pytest.mark.parametrize("qtype", FORMATS)
+def test_packed_projection_matches_cpu_golden(qtype):
+    data, rng = packed(qtype, (2, 3, 512), 4100 + qtype)
+    x = rng.normal(size=(2, 512)).astype(np.float32)
+    p = GGUFProjection(mx.array(data), qtype=qtype, input_dims=512)
+    y = p(mx.array(x[:, None]), mx.array([1, 0]))
+    np.testing.assert_allclose(y[:, 0], _EXPECTED[qtype], atol=2e-4, rtol=2e-5)
+    dense = dequantize(p.weight, qtype, (2, 3, 512), mx.float32)
+    decoded_dot = np.einsum("rk,rnk->rn", x, np.asarray(dense)[[1, 0]])
+    np.testing.assert_allclose(decoded_dot, _EXPECTED[qtype], atol=2e-4, rtol=2e-5)
+    # Gather broadcasting (decode) and already sorted rows (prefill) agree.
+    ids = mx.array([[1, 0], [0, 1]])
+    broadcast = p(mx.array(x[:, None, None]), ids)
+    selected = mx.repeat(mx.array(x), 2, axis=0)[:, None]
+    sorted_rows = p(selected, ids.reshape(-1), sorted_indices=True)
+    np.testing.assert_array_equal(broadcast.reshape(4, 1, 3), sorted_rows)
+    shared = GGUFProjection(p.weight[0], qtype=qtype, input_dims=512)
+    bf16 = mx.array(x).astype(mx.bfloat16)
+    np.testing.assert_array_equal(
+        shared(bf16).astype(mx.float32),
+        shared(bf16, sorted_indices=True).astype(mx.float32),
+    )
+    np.testing.assert_allclose(
+        shared(bf16).astype(mx.float32),
+        (bf16.astype(mx.float32) @ dense[0].T).astype(mx.bfloat16).astype(mx.float32),
+        atol=0.01,
+        rtol=0.01,
+    )
+    assert p.weight.nbytes == data.nbytes
+
+
+def string(value):
+    data = value.encode()
+    return struct.pack("<Q", len(data)) + data
+
+
+def part(path, number, count, total, tensors, config):
+    meta = {
+        "general.architecture": "deepseek41",
+        "split.no": number,
+        "split.count": count,
+        "split.tensors.count": total,
+        "deepseek41.block_count": config.n_layers,
+        "deepseek41.embedding_length": config.dim,
+        "deepseek41.expert_count": config.n_routed_experts,
+        "deepseek41.attention.head_count": config.n_heads,
+        "deepseek41.expert_feed_forward_length": config.moe_inter_dim,
+    }
+    if number:
+        # Real split GGUFs put model/tokenizer metadata only in part zero.
+        meta = {key: value for key, value in meta.items() if key.startswith("split.")}
+    data = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(meta)))
+    for key, value in meta.items():
+        data += string(key) + struct.pack("<I", 8 if isinstance(value, str) else 4)
+        data += string(value) if isinstance(value, str) else struct.pack("<I", value)
+    payload = bytearray()
+    for name, shape, qtype, value in tensors:
+        payload += bytes(-len(payload) % 32)
+        data += string(name) + struct.pack("<I", len(shape))
+        data += struct.pack("<" + "Q" * len(shape), *reversed(shape))
+        data += struct.pack("<IQ", qtype, len(payload))
+        payload += value
+    data += bytes(-len(data) % 32) + payload
+    file = path / f"synthetic-{number + 1:05}-of-{count:05}.gguf"
+    file.write_bytes(data)
+    return file
+
+
+@pytest.mark.parametrize("preserve_mtp", [False, True])
+def test_load_without_final_shard_retains_original_engram(
+    tmp_path, monkeypatch, preserve_mtp
+):
+    from test_deepseek_v41 import write_checkpoint
+
+    from omlx.patches import mlx_lm_mtp
+    from omlx.patches.deepseek_v41.loading import load
+    from omlx.utils.model_loading import lightning_mtp_supported
+
+    source, reference = write_checkpoint(
+        tmp_path,
+        vision=True,
+        dim=256,
+        moe_inter_dim=256,
+        n_layers=1,
+        compress_ratios=(0, 0),
+        preserve_mtp=True,
+        n_mtp_layers=1,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(0,),
+        dspark_n_routed_experts=2,
+        dspark_n_activated_experts=1,
+        dspark_markov_rank=32,
+        kv_source_layers=(),
+        index_source_layers=(),
+        candidate_source_layer=-1,
+        candidate_topk_blocks=0,
+        candidate_block_size=0,
+        engram_layer_ids=(0,),
+        engram_num_embeddings=(72,),
+        engram_vocab_size=5,
+        engram_max_ngram_size=4,
+        engram_n_heads=2,
+        engram_head_dim=32,
+        engram_compressed_vocab_size=64,
+    )
+    before = (source / "model.safetensors").read_bytes()
+    folder, dest = tmp_path / "UD-IQ2_XXS", tmp_path / "mlx"
+    # This must work before the GGUF download starts.
+    prepare(folder, source, dest)
+    spec = json.loads((dest / "config.json").read_text())["omlx_deepseek_v41"]
+    assert spec["engram_tables"]["language_model.layers.0.engram.embed"][
+        "weight_file"
+    ] == str(source / "model.safetensors")
+    with pytest.raises(FileNotFoundError, match="No GGUF parts"):
+        backbone_tensors(folder, reference.config)
+    folder.mkdir()
+    inverse = {v: k for k, v in _ROOT.items()}
+    inverse_layer = {v: k for k, v in _LAYER.items()}
+    tensors, expected_packed = [], {}
+    for name, value in tree_flatten(reference.parameters()):
+        if (
+            not name.startswith("language_model.")
+            or name.startswith("language_model.mtp.")
+            or ".engram.embed." in name
+            or name.endswith(".engram.k_weight")
+        ):
+            continue
+        original = name.removeprefix("language_model.")
+        if original.startswith("layers."):
+            _, layer, rest = original.split(".", 2)
+            ggname = f"blk.{layer}." + inverse_layer[rest]
+        else:
+            ggname = inverse[original]
+        qtype = 0
+        raw = np.asarray(value.astype(mx.float32))
+        if ".experts.w" in name:
+            qtype = {"w1": 16, "w2": 22, "w3": 19}[name.split(".")[-2]]
+            raw, _ = packed(qtype, value.shape, len(tensors))
+            expected_packed[name] = raw
+        tensors.append((ggname, value.shape, qtype, raw.tobytes()))
+    count = len(tensors) + 1
+    part(folder, 0, 3, count, [], reference.config)
+    weights = part(folder, 1, 3, count, tensors, reference.config)
+    assert len(backbone_tensors(folder, reference.config)) == len(tensors)
+    from omlx.model_discovery import _register_model, estimate_model_size
+    from omlx.patches.deepseek_v41.residency import deepseek_v41_residency_estimate
+
+    estimate = deepseek_v41_residency_estimate(dest)
+    extra_bytes = sum(
+        v.nbytes
+        for k, v in tree_flatten(reference.parameters())
+        if k.startswith(("vision.", "aligner.", "image_", "language_model.mtp."))
+    )
+    table_bytes = reference.language_model.layers[0].engram.embed.weight.nbytes
+    expected_bytes = sum(len(t[3]) for t in tensors) + extra_bytes + table_bytes
+    assert estimate.resident_bytes == int(expected_bytes * 1.05)
+    assert estimate.engram_bytes == table_bytes
+    assert estimate_model_size(dest) == estimate.resident_bytes
+    registered = {}
+    _register_model(registered, dest, "packed-iq2")
+    assert registered["packed-iq2"].engine_type == "vlm"
+    assert registered["packed-iq2"].estimated_size == estimate.resident_bytes
+    assert lightning_mtp_supported(dest)
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", preserve_mtp)
+    # The engine relies on the construction flag, without a preserve_mtp override.
+    model, _ = load(dest)
+    try:
+        for name, raw in expected_packed.items():
+            value = dict(tree_flatten(model.parameters()))[name]
+            np.testing.assert_array_equal(value, raw)
+        table = model.language_model.layers[0].engram.embed
+        ids = mx.array([0, 3, 71])
+        np.testing.assert_array_equal(
+            table(ids).astype(mx.float32),
+            reference.language_model.layers[0]
+            .engram.embed(ids)
+            .astype(mx.bfloat16)
+            .astype(mx.float32),
+        )
+        y = model(mx.array([[3, 4, 3]]))
+        assert y.shape == (1, 3, 64) and bool(mx.all(mx.isfinite(y)))
+        assert ("mtp" in model.language_model) == preserve_mtp
+        assert model.language_model._omlx_dspark_decode_enabled == preserve_mtp
+        if preserve_mtp:
+            actual = dict(tree_flatten(model.parameters()))
+            for name, value in tree_flatten(reference.parameters()):
+                if name.startswith(
+                    ("vision.", "aligner.", "image_", "language_model.mtp.")
+                ):
+                    np.testing.assert_array_equal(actual[name], value)
+    finally:
+        model.close()
+        reference.close()
+    assert (source / "model.safetensors").read_bytes() == before
+    # Present final Engram part is ignored, with no payload read.
+    final = part(
+        folder,
+        2,
+        3,
+        count,
+        [("per_layer_token_embd.weight", (144, 32), 13, b"")],
+        reference.config,
+    )
+    assert len(backbone_tensors(folder, reference.config)) == len(tensors)
+    assert deepseek_v41_residency_estimate(dest) == estimate
+    # Neither a missing backbone part nor a truncated tensor is excused.
+    saved = weights.read_bytes()
+    weights.unlink()
+    with pytest.raises(GgufError, match="Missing required GGUF backbone"):
+        backbone_tensors(folder, reference.config)
+    weights.write_bytes(saved[:-1])
+    with pytest.raises(GgufError, match="Truncated or overlapping"):
+        read_header(weights)
+    final.unlink()
+
+
+def test_packed_row_validation():
+    with pytest.raises(ValueError, match="not divisible"):
+        row_bytes(255, 16)
+    with pytest.raises(ValueError, match="row length"):
+        GGUFProjection(mx.zeros((2, 65), mx.uint8), qtype=16, input_dims=256)
+
+
+@pytest.mark.parametrize("qtype", FORMATS)
+def test_packed_matrix_and_gather_tails(qtype):
+    raw, rng = packed(qtype, (4, 11, 512), 6500 + qtype)
+    p = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=512)
+    dense = dequantize(p.weight, qtype, (4, 11, 512), mx.float32)
+    ids = np.repeat(np.arange(4, dtype=np.int32), [5, 17, 0, 45])
+    x = rng.normal(size=(len(ids), 512)).astype(np.float32)
+    actual = p(mx.array(x[:, None]), mx.array(ids), sorted_indices=True)[:, 0]
+    expected = np.einsum("rk,rnk->rn", x, np.asarray(dense)[ids])
+    np.testing.assert_allclose(actual, expected, atol=1e-3, rtol=1e-4)
+    shared = GGUFProjection(p.weight[0], qtype=qtype, input_dims=512)
+    np.testing.assert_allclose(
+        shared(mx.array(x[:33])), x[:33] @ np.asarray(dense[0]).T, atol=1e-3, rtol=1e-4
+    )
+    np.testing.assert_allclose(
+        shared(mx.array(x)), x @ np.asarray(dense[0]).T, atol=1e-3, rtol=1e-4
+    )
+
+
+@pytest.mark.skipif(not is_nax_available(), reason="Requires NAX tensor units")
+@pytest.mark.parametrize("qtype", FORMATS)
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("counts", [(3, 0, 67, 61), (3, 0, 131, 129)])
+def test_packed_nax_gather_matches_float64_dot(
+    qtype, dtype, counts, width=None, n=35, activation_scale=1.0
+):
+    from omlx.patches.deepseek_v41.gguf_quant import prefill_plan
+
+    # Q8 has a half K tile; all formats have N/route tails and an empty expert.
+    width = width or (544 if qtype == 8 else 512)
+    raw, rng = packed(qtype, (4, n, width), 9100 + qtype)
+    block, size, _ = FORMATS[qtype]
+    blocks = raw.reshape(4, n, width // block, size)
+    offset = {10: 80, 14: 208}.get(qtype, 0)
+    scales = rng.choice(np.array([0, -0.007, 0.01, 2**-24], "<f2"), blocks.shape[:-1])
+    blocks[..., offset : offset + 2] = scales[..., None].view(np.uint8)
+    p = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=width)
+    ids = np.repeat(np.arange(4, dtype=np.int32), counts)
+    # A strided input also checks the caller's contiguous gather contract.
+    x = mx.array(rng.normal(size=(len(ids), width * 2)).astype(np.float32))[:, ::2]
+    x = (x.astype(dtype) * activation_scale).astype(dtype)[:, None]
+    plan = prefill_plan(x, mx.array(ids), p.num_experts)
+    assert plan[2] == (
+        64 if len(ids) >= 32 * p.num_experts else 32 if len(ids) >= 128 else 8
+    )
+    actual = p(x, mx.array(ids), sorted_indices=True, block_plan=plan)
+    dense = np.asarray(dequantize(p.weight, qtype, (4, n, width), mx.float32)).astype(
+        np.float64
+    )
+    inp = np.asarray(x.astype(mx.float32))[:, 0].astype(np.float64)
+    reference = np.einsum("rk,rnk->rn", inp, dense[ids])
+    magnitude = np.einsum("rk,rnk->rn", abs(inp), abs(dense[ids]))
+    # Factoring the original group scale changes FP32 summation order only.
+    # Bound that error plus the final output cast, including FP16 subnormals.
+    eps = {mx.float32: 2**-23, mx.float16: 2**-10, mx.bfloat16: 2**-7}[dtype]
+    tolerance = 8 * 2**-23 * magnitude + 0.5 * eps * abs(reference)
+    if dtype == mx.float16:
+        tolerance += 2**-25
+    assert actual.dtype == dtype and actual.shape == (len(ids), 1, n)
+    error = abs(np.asarray(actual.astype(mx.float32))[:, 0] - reference)
+    assert np.all(error <= tolerance), np.max(error / tolerance)
+    np.testing.assert_array_equal(p.weight, raw)
+
+
+@pytest.mark.skipif(not is_nax_available(), reason="Requires NAX tensor units")
+@pytest.mark.parametrize("qtype,width", [(16, 5120), (22, 2304)])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_packed_nax_register_wide_and_swizzled_tails(qtype, width, dtype):
+    # Fifteen route tiles cross the eight-tile group, with M/N tails and
+    # an odd block count (two-byte, rather than four-byte, row alignment).
+    test_packed_nax_gather_matches_float64_dot(
+        qtype, dtype, (3, 0, 387, 385), width=width, n=137
+    )
+
+
+@pytest.mark.skipif(not is_nax_available(), reason="Requires NAX tensor units")
+@pytest.mark.parametrize("activation_scale", [2.0**-80, 2.0**80])
+def test_packed_nax_register_preserves_bfloat16_range(activation_scale):
+    test_packed_nax_gather_matches_float64_dot(
+        16, mx.bfloat16, (3, 0, 387, 385), n=137, activation_scale=activation_scale
+    )
+
+
+@pytest.mark.skipif(not is_nax_available(), reason="Requires NAX tensor units")
+@pytest.mark.parametrize("qtype", FORMATS)
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("shape", [(64,), (3, 43)])
+def test_packed_nax_dense_without_weight_materialization(
+    qtype, dtype, shape, monkeypatch
+):
+    from omlx.patches.deepseek_v41 import gguf_quant as q
+
+    width = 544 if qtype == 8 else 512
+    raw, rng = packed(qtype, (35, width), 11200 + qtype)
+    block, size, _ = FORMATS[qtype]
+    blocks = raw.reshape(35, width // block, size)
+    offset = {10: 80, 14: 208}.get(qtype, 0)
+    scales = rng.choice(np.array([0, -0.007, 0.01, 2**-24], "<f2"), blocks.shape[:-1])
+    blocks[..., offset : offset + 2] = scales[..., None].view(np.uint8)
+    p = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=width)
+    dense = np.asarray(dequantize(p.weight, qtype, (35, width), mx.float32)).astype(
+        np.float64
+    )
+    x = mx.array(rng.normal(size=(*shape, width * 2)).astype(np.float32))[..., ::2]
+    x = x.astype(dtype)
+    inp = np.asarray(x.astype(mx.float32)).astype(np.float64)
+    reference = inp @ dense.T
+    magnitude = abs(inp) @ abs(dense.T)
+    monkeypatch.setattr(
+        q, "dequantize", lambda *a: pytest.fail("Dense weights must stay packed")
+    )
+    actual = p(x)
+    eps = {mx.float32: 2**-23, mx.float16: 2**-10, mx.bfloat16: 2**-7}[dtype]
+    tolerance = 8 * 2**-23 * magnitude + 0.5 * eps * abs(reference) + 2**-25
+    assert actual.dtype == dtype and actual.shape == (*shape, 35)
+    error = abs(np.asarray(actual.astype(mx.float32)) - reference)
+    assert np.all(error <= tolerance), np.max(error / tolerance)
+    np.testing.assert_array_equal(p.weight, raw)
+
+
+def test_gguf_prefill_plan_uses_occupancy_and_non_nax_fallback(monkeypatch):
+    from omlx.patches.deepseek_v41 import gguf_quant as q
+
+    x = mx.zeros((1, 1, 256), mx.bfloat16)
+    # Real CED tail: 128 tokens, top-6 routing, 384 experts: below 32 routes
+    # per expert, but enough routes for the 32-row tile.
+    assert q.prefill_plan(x, mx.zeros((128 * 6,), mx.int32), 384)[2] == 32
+    assert q.prefill_plan(x, mx.zeros((64,), mx.int32), 384)[2] == 8
+    monkeypatch.setattr(q, "is_nax_available", lambda: False)
+    assert q.prefill_plan(x, mx.zeros((8192 * 6,), mx.int32), 384)[2] == 8
+    raw, rng = packed(16, (4, 11, 256), 7311)
+    p = GGUFProjection(mx.array(raw), qtype=16, input_dims=256)
+    ids = mx.array(np.repeat(np.arange(4), [5, 17, 0, 45]).astype(np.int32))
+    inp = mx.array(rng.normal(size=(67, 1, 256)).astype(np.float32))
+    # A non-NAX machine must never compile the MPP header/kernel.
+    monkeypatch.setattr(
+        q, "_nax_kernel", lambda *a: pytest.fail("Unexpected NAX dispatch")
+    )
+    actual = p(inp, ids, sorted_indices=True)
+    dense = np.asarray(dequantize(p.weight, 16, (4, 11, 256), mx.float32))
+    expected = np.einsum("rk,rnk->rn", np.asarray(inp)[:, 0], dense[np.asarray(ids)])
+    np.testing.assert_allclose(actual[:, 0], expected, atol=1e-3, rtol=1e-4)
+    shared = GGUFProjection(p.weight[0], qtype=16, input_dims=256)
+    np.testing.assert_allclose(
+        shared(inp), np.asarray(inp) @ dense[0].T, atol=1e-3, rtol=1e-4
+    )
+
+
+def test_gguf_fused_query_norm_keeps_unquantized_input():
+    from test_deepseek_v41_fused_decode import build
+
+    from omlx.patches.deepseek_v41.decode_fused import attn_mid_nb
+
+    model = build(
+        n_layers=1,
+        compress_ratios=(0,),
+        kv_source_layers=(),
+        index_source_layers=(),
+        candidate_source_layer=-1,
+    )
+    att, c = model.layers[0].attn, model._config
+    mx.random.seed(141)
+    qa = mx.random.normal((4, c.q_lora_rank)).astype(mx.bfloat16)
+    kv = mx.random.normal((4, c.head_dim)).astype(mx.bfloat16)
+    cos = mx.ones((4, c.rope_head_dim // 2))
+    sin = mx.zeros_like(cos)
+    qr, plain, packed = attn_mid_nb(att, qa, kv, cos, sin, c, quantize_query=False)
+    _, rounded, quantized_kv = attn_mid_nb(att, qa, kv, cos, sin, c)
+    np.testing.assert_array_equal(plain, qr.astype(mx.float32))
+    assert not bool(mx.array_equal(plain, rounded).item())
+    np.testing.assert_array_equal(packed, quantized_kv)
+
+
+def gguf_module(module, qtype, seed):
+    shape = (
+        *module.weight.shape[:-1],
+        getattr(module, "input_dims", module.weight.shape[-1]),
+    )
+    raw, _ = packed(qtype, shape, seed)
+    blocks = raw.reshape(*shape[:-1], shape[-1] // FORMATS[qtype][0], FORMATS[qtype][1])
+    offset = {10: 80, 14: 208}.get(qtype, 0)
+    blocks[..., offset : offset + 2] = np.array([0.0002], "<f2").view(np.uint8)
+    if qtype in (10, 13):
+        offset = 82 if qtype == 10 else 2
+        blocks[..., offset : offset + 2] = np.array([0.00003], "<f2").view(np.uint8)
+    return GGUFProjection(mx.array(raw), qtype=qtype, input_dims=shape[-1])
+
+
+@pytest.mark.parametrize(
+    "formats", [(19, 19, 10, 8), (16, 16, 17, 8), (22, 22, 18, 13)]
+)
+@pytest.mark.parametrize("rows", [1, 6, 16])
+def test_gguf_fused_moe_keeps_unquantized_activations(formats, rows):
+    from test_deepseek_v41 import tiny
+
+    from omlx.patches.deepseek_v41 import decode_moe as dm
+    from omlx.patches.deepseek_v41.language import MoE
+
+    c = tiny(dim=1024, moe_inter_dim=768, swiglu_limit=10)
+    moe = MoE(c)
+    for n, qt in zip(("w1", "w3", "w2"), formats[:3]):
+        setattr(moe.experts, n, gguf_module(getattr(moe.experts, n), qt, 92 + qt))
+        setattr(
+            moe.shared_experts,
+            n,
+            gguf_module(getattr(moe.shared_experts, n), formats[3], 71 + qt),
+        )
+    mx.random.seed(21)
+    moe.gate.weight = mx.random.normal(moe.gate.weight.shape) * 0.05
+    moe.gate.bias = mx.array([0.01, -0.02, 0.03, -0.04])
+    x = mx.random.normal((rows, c.dim)).astype(mx.bfloat16)
+    assert dm.supported(moe, x[:1], c)
+    expected = moe(x[None], None)[0]
+    actual, ids, weights = dm.fused_decode_moe_nb(moe, x, c)
+    np.testing.assert_allclose(
+        actual.astype(mx.float32), expected.astype(mx.float32), atol=2e-4, rtol=0.015
+    )
+    wanted_ids, wanted_weights = moe.gate(x, None)
+    np.testing.assert_array_equal(ids, wanted_ids)
+    np.testing.assert_allclose(weights, wanted_weights, atol=1e-6, rtol=1e-5)
+    individual = mx.concatenate(
+        [dm.fused_decode_moe_nb(moe, x[r : r + 1], c)[0] for r in range(rows)]
+    )
+    exact = dm.fused_decode_moe_nb(moe, x, c, mma=False)[0]
+    np.testing.assert_array_equal(
+        exact.astype(mx.float32), individual.astype(mx.float32)
+    )
+    np.testing.assert_allclose(
+        actual.astype(mx.float32), exact.astype(mx.float32), atol=2e-4, rtol=0.015
+    )
+    for mma, reference in [(None, actual), (False, exact)]:
+        reused = dm.fused_decode_moe_nb(moe, x, c, mma=mma, reuse_routes=True)
+        for value, wanted in zip(reused, (reference, ids, weights)):
+            np.testing.assert_array_equal(
+                value.astype(mx.float32), wanted.astype(mx.float32)
+            )
+
+
+@pytest.mark.parametrize("rows", [4, 6, 16])
+@pytest.mark.parametrize("pattern", ["distinct", "same", "mixed"])
+def test_gguf_route_pairs_preserve_every_original_slot(rows, pattern):
+    from omlx.patches.deepseek_v41 import decode_moe as dm
+
+    topk, ne = 6, rows * 6
+    wanted_ids = np.array(
+        [
+            np.arange(topk) + topk * (b if pattern == "distinct" else b // 3)
+            if pattern != "same"
+            else np.arange(topk)
+            for b in range(rows)
+        ],
+        dtype=np.int32,
+    )
+    scores = np.full((rows, ne), 0.001, np.float32)
+    ranked = np.arange(topk, 0, -1, dtype=np.float32)
+    scores[np.arange(rows)[:, None], wanted_ids] = ranked
+    groups, ids, weights = dm._gguf_route_plan_kernel()(
+        inputs=[mx.array(scores), mx.zeros(ne), mx.array([1.25])],
+        template=[("NB", rows), ("NE", ne), ("TOPK", topk)],
+        grid=(rows * 32, 1, 1),
+        threadgroup=(rows * 32, 1, 1),
+        output_shapes=[(rows * topk * 3,), (rows * topk,), (rows * topk,)],
+        output_dtypes=[mx.uint32, mx.int32, mx.float32],
+    )
+    flat = wanted_ids.reshape(-1)
+    wanted = np.full((len(flat), 3), np.iinfo(np.uint32).max, np.uint32)
+    wanted[:, 0] = flat
+    for expert in np.unique(flat):
+        slots = np.flatnonzero(flat == expert)
+        for i in range(0, len(slots), 2):
+            wanted[slots[i], 1] = slots[i]
+            if i + 1 < len(slots):
+                wanted[slots[i], 2] = slots[i + 1]
+    np.testing.assert_array_equal(np.asarray(groups).reshape(-1, 3), wanted)
+    np.testing.assert_array_equal(np.asarray(ids).reshape(rows, topk), wanted_ids)
+    np.testing.assert_allclose(
+        np.asarray(weights).reshape(rows, topk),
+        np.broadcast_to(ranked / ranked.sum() * 1.25, (rows, topk)),
+        rtol=1e-7,
+    )
+
+
+@pytest.mark.parametrize("inter", [768, 800])
+def test_gguf_fused_moe_rejects_incompatible_shared_input_and_k_split(inter):
+    from test_deepseek_v41 import tiny
+
+    from omlx.patches.deepseek_v41 import decode_moe as dm
+    from omlx.patches.deepseek_v41.language import MoE
+
+    c = tiny(dim=1024, moe_inter_dim=inter)
+    moe = MoE(c)
+    for n in ("w1", "w3", "w2"):
+        setattr(moe.experts, n, gguf_module(getattr(moe.experts, n), 8, 10))
+    x = mx.zeros((1, c.dim), mx.bfloat16)
+    assert not dm.supported(moe, x, c)
+    for n in ("w1", "w3", "w2"):
+        setattr(
+            moe.shared_experts, n, gguf_module(getattr(moe.shared_experts, n), 8, 11)
+        )
+    assert dm.supported(moe, x, c) == (inter % 64 == 0)
+
+
+@pytest.mark.parametrize("batch,rows", [(1, 1), (1, 6), (2, 6)])
+@pytest.mark.parametrize("ratio", [0, 2])
+@pytest.mark.parametrize("exact", [False, True])
+def test_gguf_fused_block_and_mtp_verify_match_unfused(
+    monkeypatch, batch, rows, ratio, exact
+):
+    from test_deepseek_v41_fused_decode import build
+
+    from omlx.patches.deepseek_v41 import decode_fused
+
+    model = build(
+        n_layers=1,
+        compress_ratios=(ratio,),
+        kv_source_layers=(0,) if ratio else (),
+        index_source_layers=(0,) if ratio else (),
+        candidate_source_layer=-1,
+    )
+    c, blk = model._config, model.layers[0]
+    object.__setattr__(blk, "_omlx_verify_exact", exact)
+    for n in ("wq_a", "wkv", "wq_b", "wo_b"):
+        setattr(blk.attn, n, gguf_module(getattr(blk.attn, n), 8, 11))
+    for n, qt in zip(("w1", "w3", "w2"), (19, 16, 22)):
+        setattr(
+            blk.ffn.experts, n, gguf_module(getattr(blk.ffn.experts, n), qt, 71 + qt)
+        )
+        setattr(
+            blk.ffn.shared_experts,
+            n,
+            gguf_module(getattr(blk.ffn.shared_experts, n), 8, 77 + qt),
+        )
+    assert decode_fused.supported(blk, c)
+    expected_caches = [model.make_cache()[0] for _ in range(batch)]
+    actual_caches = [model.make_cache()[0] for _ in range(batch)]
+    mx.random.seed(91)
+    h = mx.random.normal((batch, rows, c.hc_mult, c.dim)).astype(mx.bfloat16)
+    pre = mx.ones((batch, rows, c.hc_mult), mx.float32)
+    with monkeypatch.context() as patch:
+        patch.setattr(decode_fused, "supported", lambda *args: False)
+        expected = [
+            blk(h[b : b + 1], pre[b : b + 1], expected_caches[b], {}, 0, None)
+            for b in range(batch)
+        ]
+        expected_h = mx.concatenate([v[0] for v in expected])
+        expected_pre = mx.concatenate([v[1] for v in expected])
+        mx.eval(expected_h, expected_pre)
+    actual_h, actual_pre = decode_fused.decode_block_verify_nb(
+        blk, h, pre, actual_caches, [{} for _ in range(batch)], [0] * batch, c
+    )
+    np.testing.assert_allclose(
+        actual_h.astype(mx.float32), expected_h.astype(mx.float32), atol=0.02, rtol=0.01
+    )
+    np.testing.assert_allclose(actual_pre, expected_pre, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("qtype", [8, 14])
+def test_gguf_verify_projection_reuses_weights_without_changing_rows(qtype):
+    raw, rng = packed(qtype, (8192, 512), 381 + qtype)
+    p = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=512)
+    x = mx.array(rng.normal(size=(6, 512)).astype(np.float32)).astype(mx.bfloat16)
+    expected = mx.concatenate([p(x[r : r + 1]) for r in range(6)])
+    np.testing.assert_array_equal(p(x).astype(mx.float32), expected.astype(mx.float32))
+
+
+@pytest.mark.parametrize("qtype", FORMATS)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+def test_gguf_attention_matrix_precision_and_row_consistency(qtype, dtype, monkeypatch):
+    from types import SimpleNamespace
+
+    from omlx.patches.deepseek_v41 import decode_fused as df
+
+    used = []
+    original = df.DL.kernel
+
+    def tracked(name, formats=()):
+        used.append(name)
+        return original(name, formats)
+
+    monkeypatch.setattr(df.DL, "kernel", tracked)
+    # Q8's odd group count also checks the K-split fallback to one SIMD group.
+    width = 544 if qtype == 8 else 512
+    raw, rng = packed(qtype, (16, width), 1981 + qtype)
+    a = GGUFProjection(mx.array(raw), qtype=qtype, input_dims=width)
+    other, _ = packed(8, (8, width), 2111 + qtype)
+    b = GGUFProjection(mx.array(other), qtype=8, input_dims=width)
+    x = mx.array(rng.normal(size=(16, width)).astype(np.float32)).astype(dtype)
+    inp = np.asarray(x.astype(mx.float32)).astype(np.float64)
+    dense = [
+        np.asarray(
+            dequantize(p.weight, p.qtype, (p.output_dims, width), mx.float32)
+        ).astype(np.float64)
+        for p in (a, b)
+    ]
+    single = [df.gemv_fp8_nb(x[i : i + 1], a, b, mma=True) for i in range(16)]
+    c = SimpleNamespace(n_heads=2, head_dim=8, rope_head_dim=4, q_lora_rank=width)
+    att = SimpleNamespace(wq_b=a)
+    angle = mx.arange(32, dtype=mx.float32).reshape(16, 2) * 0.03
+    cos, sin = mx.cos(angle), mx.sin(angle)
+    rope_single = mx.concatenate(
+        [
+            df.wqb_rope_nb(att, x[i : i + 1], cos[i : i + 1], sin[i : i + 1], c, True)
+            for i in range(16)
+        ]
+    )
+    for rows in (1, 2, 5, 6, 9, 16):
+        actual = df.gemv_fp8_nb(x[:rows], a, b, mma=True)
+        for j, values in enumerate(actual):
+            reference = inp[:rows] @ dense[j].T
+            magnitude = abs(inp[:rows]) @ abs(dense[j].T)
+            tolerance = 8 * 2**-23 * magnitude + 0.5 * 2**-7 * abs(reference)
+            assert np.all(
+                abs(np.asarray(values.astype(mx.float32)) - reference) <= tolerance
+            )
+            np.testing.assert_array_equal(
+                values.astype(mx.float32),
+                mx.concatenate([v[j] for v in single[:rows]]).astype(mx.float32),
+            )
+        np.testing.assert_array_equal(
+            df.wqb_rope_nb(att, x[:rows], cos[:rows], sin[:rows], c, True).astype(
+                mx.float32
+            ),
+            rope_single[:rows].astype(mx.float32),
+        )
+    assert set(used) == {"gemv_fp8_mma", "wqb_rope_mma"}
+
+
+def test_gguf_mtp_generation_matches_greedy(monkeypatch):
+    from mlx_lm.generate import BatchGenerator
+    from test_deepseek_v41_fused_decode import build
+
+    from omlx.patches.mlx_lm_mtp import batch_generator
+
+    batch_generator.apply()
+    model = build(
+        preserve_mtp=True,
+        n_mtp_layers=3,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(2, 3, 4),
+        dspark_n_routed_experts=2,
+        dspark_n_activated_experts=1,
+        dspark_markov_rank=32,
+        compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
+    )
+    for i, blk in enumerate(model.layers):
+        for n in ("wq_a", "wkv", "wq_b", "wo_b"):
+            setattr(blk.attn, n, gguf_module(getattr(blk.attn, n), 8, 11 + i))
+        for n, qt in zip(("w1", "w3", "w2"), (19, 16, 22)):
+            setattr(
+                blk.ffn.experts,
+                n,
+                gguf_module(getattr(blk.ffn.experts, n), qt, 71 + i + qt),
+            )
+            setattr(
+                blk.ffn.shared_experts,
+                n,
+                gguf_module(getattr(blk.ffn.shared_experts, n), 8, 77 + i + qt),
+            )
+    prompt, wanted, cache = [3, 4, 5, 6, 7, 8, 9], [], model.make_cache()
+    ids = mx.array([prompt])
+    for _ in range(8):
+        logits = model(ids, cache=cache)
+        token = int(mx.argmax(logits[0, -1]).item())
+        wanted.append(token)
+        ids = mx.array([[token]])
+    model.configure_mtp(True, 3)
+    calls = []
+    original = type(model).dspark_forward
+
+    def tracked(self, *args, **kwargs):
+        calls.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(model), "dspark_forward", tracked)
+    generator = BatchGenerator(
+        model,
+        max_tokens=8,
+        prefill_step_size=32,
+        sampler=lambda logits: mx.argmax(logits, -1),
+    )
+    result = []
+    try:
+        generator.insert([prompt])
+        for _ in range(64):
+            _, responses = generator.next()
+            result.extend(r.token for r in responses)
+            if len(result) == 8:
+                break
+    finally:
+        generator.close()
+    assert calls, "Exercise actual DSpark proposal execution"
+    assert result == wanted
+
+
+def test_gguf_dense_copy_stays_out_of_parameters_and_matches_packed():
+    from mlx.utils import tree_flatten
+
+    from omlx.patches.deepseek_v41.gguf import dual_weight
+
+    raw, _ = packed(8, (32, 512), 20500)
+    dense = GGUFProjection(mx.array(raw), qtype=8, input_dims=512, dense=True)
+    assert [name for name, _ in tree_flatten(dense.parameters())] == ["weight"]
+    assert getattr(dense, "_dense", None) is not None
+    x = mx.random.normal((64, 512), key=mx.random.key(7)).astype(mx.bfloat16)
+    actual = dense(x)
+    packed_out = GGUFProjection(mx.array(raw), qtype=8, input_dims=512)(x)
+    mx.eval(actual, packed_out)
+    # The copy rounds the Q8 values to BF16; the packed decode keeps them exact.
+    a = np.asarray(actual.astype(mx.float32))
+    p = np.asarray(packed_out.astype(mx.float32))
+    assert np.abs(a - p).max() <= 0.01 * np.abs(p).max()
+    with pytest.raises(ValueError, match="rank two"):
+        GGUFProjection(
+            mx.zeros((2, 32, row_bytes(512, 8)), mx.uint8),
+            qtype=8,
+            input_dims=512,
+            dense=True,
+        )
+    for name in (
+        "language_model.layers.0.attn.wq_a.weight",
+        "language_model.layers.0.attn.wkv.weight",
+        "language_model.layers.0.attn.wq_b.weight",
+        "language_model.layers.0.attn.wo_b.weight",
+        "language_model.layers.0.ffn.shared_experts.w1.weight",
+        "language_model.layers.0.ffn.shared_experts.w3.weight",
+        "language_model.layers.0.ffn.shared_experts.w2.weight",
+    ):
+        assert dual_weight(name)
+    assert not dual_weight("language_model.layers.0.ffn.experts.w1.weight")
+    assert not dual_weight("language_model.layers.0.attn.wo_a.weight")
+
+
+def test_gguf_swiglu_fusion_matches_the_fp32_reference():
+    import mlx.nn as nn
+
+    from omlx.patches.deepseek_v41.activation import swiglu_activation
+
+    gate = mx.random.normal((513, 1, 96), key=mx.random.key(8)).astype(mx.bfloat16)
+    up = mx.random.normal((513, 1, 96), key=mx.random.key(9)).astype(mx.bfloat16)
+    weights = mx.random.uniform(0, 1, (513,), key=mx.random.key(10))
+    for limit in (0.0, 10.0):
+        g, u = gate.astype(mx.float32), up.astype(mx.float32)
+        if limit:
+            g, u = mx.minimum(g, limit), mx.clip(u, -limit, limit)
+        expected = ((nn.silu(g) * u) * weights[..., None, None]).astype(mx.bfloat16)
+        actual = swiglu_activation(gate, up, weights, mx.bfloat16, limit)
+        np.testing.assert_array_equal(
+            actual.astype(mx.float32), expected.astype(mx.float32)
+        )
+    unweighted = swiglu_activation(gate, up, None, mx.bfloat16, 10.0)
+    g, u = mx.minimum(gate.astype(mx.float32), 10.0), mx.clip(
+        up.astype(mx.float32), -10.0, 10.0
+    )
+    np.testing.assert_array_equal(
+        unweighted.astype(mx.float32),
+        (nn.silu(g) * u).astype(mx.bfloat16).astype(mx.float32),
+    )
+
+
+def test_gguf_expert_prefill_routes_through_the_fused_swiglu(monkeypatch):
+    from test_deepseek_v41 import tiny
+
+    from omlx.patches.deepseek_v41 import language
+
+    c = tiny(
+        dim=256,
+        moe_inter_dim=256,
+        n_routed_experts=16,
+        n_activated_experts=6,
+        swiglu_limit=10,
+    )
+    expert = language.Expert(c, True)
+    for name, qtype in (("w1", 16), ("w3", 19), ("w2", 17)):
+        raw, _ = packed(qtype, (16, 256, 256), 21000 + qtype)
+        setattr(
+            expert, name, GGUFProjection(mx.array(raw), qtype=qtype, input_dims=256)
+        )
+    ids = mx.array(np.repeat(np.arange(4, dtype=np.int32), (3, 0, 40, 39)))
+    weights = mx.linspace(0, 1, ids.size).astype(mx.float32)
+    x = mx.random.normal((ids.size, 1, 256), key=mx.random.key(11)).astype(mx.bfloat16)
+    expected = expert(x, ids, weights, sorted_indices=True)
+    calls = []
+    original = language.swiglu_activation
+
+    def spy(gate, up, route_weights, dtype, limit):
+        result = original(gate, up, route_weights, dtype, limit)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(language, "swiglu_activation", spy)
+    actual = expert(x, ids, weights, sorted_indices=True)
+    mx.eval(actual, expected)
+    assert len(calls) == 1
+    np.testing.assert_array_equal(
+        np.asarray(actual.astype(mx.float32)), np.asarray(expected.astype(mx.float32))
+    )

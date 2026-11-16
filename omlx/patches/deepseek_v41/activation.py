@@ -72,7 +72,7 @@ _SOURCE = r"""
     const float v = i < n ? float(x[i]) : 0.0f;
 """ + _ROUND
 
-_TAIL_SOURCE = r"""
+_SWIGLU = r"""
     const uint i = thread_position_in_grid.x;
     uint n = 1;
     for (int dim = 0; dim < gate_ndim; ++dim) n *= gate_shape[dim];
@@ -90,7 +90,9 @@ _TAIL_SOURCE = r"""
         if (WEIGHTED) value *= weights[i / D];
         v = float(T(value));
     }
-""" + _ROUND
+"""
+
+_TAIL_SOURCE = _SWIGLU + _ROUND
 
 
 @cache
@@ -130,6 +132,41 @@ def quantize_fp8_activation(x):
 
 def quantize_swiglu_activation(gate, up, weights, dtype, limit):
     return _kernel(tail=True)(
+        inputs=[
+            gate,
+            up,
+            weights if weights is not None else mx.ones((1,)),
+            mx.array([float(limit or 0)], mx.float32),
+        ],
+        template=[
+            ("T", dtype),
+            ("D", gate.shape[-1]),
+            ("WEIGHTED", weights is not None),
+        ],
+        grid=(gate.size, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[gate.shape],
+        output_dtypes=[dtype],
+    )[0]
+
+
+@cache
+def _swiglu_kernel():
+    return mx.fast.metal_kernel(
+        name="v41_swiglu_activation",
+        input_names=["gate", "up", "weights", "limit"],
+        output_names=["y"],
+        source=_SWIGLU + "    if (i < n) y[i] = T(v);\n",
+    )
+
+
+def swiglu_activation(gate, up, weights, dtype, limit):
+    """One pass over gate/up for consumers that keep the activation in its own dtype.
+
+    Same arithmetic as the FP8 kernel without the act_quant round trip, so the
+    plain GGUF projections can skip the fp32 elementwise chain.
+    """
+    return _swiglu_kernel()(
         inputs=[
             gate,
             up,

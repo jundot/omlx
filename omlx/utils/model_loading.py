@@ -1333,6 +1333,25 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     ``mtp/model_mtp.safetensors`` sidecar. If neither contains MTP weights,
     callers skip attaching the MTP module.
     """
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, ValueError):
+        config = {}
+    spec = config.get("omlx_deepseek_v41") if isinstance(config, dict) else None
+    if (
+        isinstance(spec, dict)
+        and config.get("model_type") == "deepseek_v41"
+        and spec.get("version") == 1
+        and isinstance(spec.get("gguf"), dict)
+    ):
+        # Native GGUF wrappers load DSpark from the original checkpoint,
+        # through gguf.supplementary(), rather than from local weight files.
+        source = spec["gguf"].get("source")
+        return (
+            isinstance(source, str)
+            and bool(source)
+            and _checkpoint_weight_prefix(source, ("mtp.",)) is not None
+        )
     prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(model_path)
     if _checkpoint_weight_prefix(model_path, prefixes) is not None:
         return True

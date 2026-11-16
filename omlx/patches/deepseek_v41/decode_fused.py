@@ -99,8 +99,8 @@ def _fused_projection(p):
 
 
 def _wb(p):
-    """(weight, scales, biases) kernel inputs of a projection; MXFP passes a dummy bias."""
-    return p.weight, p.scales, DM._biases(p)
+    """Projection inputs, with cached dummy scales/biases where the format omits them."""
+    return p.weight, DM._scales(p), DM._biases(p)
 
 
 def mix(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
@@ -146,7 +146,7 @@ def attn_mid(att, qa, kv_in, cos, sin, c):
     eps, _ = _scalars(c)
     return DL.kernel("attn_mid")(
         inputs=[qa, kv_in, att.q_norm.weight, att.kv_norm.weight, cos, sin, eps],
-        template=[("QR", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim)],
+        template=[("QR", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("QUANTIZE_QUERY", True)],
         grid=(1024, 1, 1), threadgroup=(1024, 1, 1),
         output_shapes=[(c.q_lora_rank,), (c.q_lora_rank,), (c.head_dim + c.head_dim // 32,)],
         output_dtypes=[mx.bfloat16, mx.float32, mx.uint8])
@@ -437,21 +437,35 @@ def gemv_fp8_nb(x, a, b=None, mma=None):
     """gemv_fp8 for x [B, K]: one weight read for all B vectors. MXFP8: bit for bit gemv_fp8
     per vector without matrix tiles (mma=False); default DM.use_mma(B). Affine projections
     always run on matrix tiles (rows kernels are ALU bound there), which give a vector the
-    same result for any B, as gemv_fp8(tiles=True) does."""
+    same result for any B, as gemv_fp8(tiles=True) does. GGUF uses matrix tiles
+    from six rows by default, or when requested for MTP decode consistency."""
     b_n = x.shape[0]
     na, k = a.weight.shape[0], a.input_dims
     nb = 0 if b is None else b.weight.shape[0]
     assert na % 4 == 0 and nb % 4 == 0
     formats = _pair_formats(a, b)
     affine = _affine(formats)
+    gguf = all(f[0] == "gguf" for f in formats)
     if (
-        (affine or ((DM.use_mma(b_n) if mma is None else mma) and formats == (DM.MXFP8, DM.MXFP8)))
+        (affine
+         or (gguf and (b_n >= 6 if mma is None else mma))
+         or ((DM.use_mma(b_n) if mma is None else mma) and formats == (DM.MXFP8, DM.MXFP8)))
         and na % 8 == 0
         and nb % 8 == 0
     ):
         tiles = (na + nb) // 8
         group = max(f[2] for f in formats)
-        ks = _aff_mma_split(tiles, k // group) if affine else _mma_split(tiles, k // 32)
+        if gguf:
+            # Fixed per projection, including one-row MTP decode. M5 fills the
+            # GPU with more K splits: 8 for the query/KV pair, 16 for wo_b.
+            # Small K may not divide the preferred split (e.g. seventeen Q8 groups).
+            ks = next(
+                s
+                for s in ((8, 4, 2, 1) if b is not None else (16, 8, 4, 2, 1))
+                if k % (32 * s) == 0
+            )
+        else:
+            ks = _aff_mma_split(tiles, k // group) if affine else _mma_split(tiles, k // 32)
         ya, yb = DL.kernel("gemv_fp8_mma", formats)(
             inputs=_pair_inputs(x, a, b),
             template=[("NA", na), ("NB_ROWS", nb), ("K", k), ("NB", b_n), ("KS", ks)],
@@ -471,13 +485,13 @@ def _cos_sin_nb(c, compressed, starts):
     return mx.stack([t[0] for t in trig]), mx.stack([t[1] for t in trig])
 
 
-def attn_mid_nb(att, qa, kv_in, cos, sin, c):
-    """attn_mid for B rows (each row: the single-row kernel)."""
+def attn_mid_nb(att, qa, kv_in, cos, sin, c, quantize_query=True):
+    """attn_mid for B rows; GGUF retains the normalized query without FP8 rounding."""
     b_n = qa.shape[0]
     eps, _ = _scalars(c)
     qr, qrq, packed = DL.kernel("attn_mid_b")(
         inputs=[qa, kv_in, att.q_norm.weight, att.kv_norm.weight, cos, sin, eps],
-        template=[("QR", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim)],
+        template=[("QR", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("QUANTIZE_QUERY", quantize_query)],
         grid=(1024, b_n, 1), threadgroup=(1024, 1, 1),
         output_shapes=[(b_n * c.q_lora_rank,), (b_n * c.q_lora_rank,), (b_n * (c.head_dim + c.head_dim // 32),)],
         output_dtypes=[mx.bfloat16, mx.float32, mx.uint8])
@@ -486,14 +500,17 @@ def attn_mid_nb(att, qa, kv_in, cos, sin, c):
 
 def wqb_rope_nb(att, qrq, cos, sin, c, mma):
     """wqb_rope for B rows: bit for bit per row without matrix tiles (mma=False); affine
-    wq_b always runs on matrix tiles (as gemv_fp8_nb)."""
+    wq_b always runs on matrix tiles (as gemv_fp8_nb). GGUF honors mma without
+    rounding its normalized query to FP8 or changing the packed weight."""
     b_n = qrq.shape[0]
     nq = c.n_heads * c.head_dim
     tmpl = [("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", b_n)]
     fmt = DM.weight_format(att.wq_b)
     affine = _affine((fmt,))
-    if affine or (mma and fmt == DM.MXFP8):
-        ks = (_aff_mma_split if affine else _mma_split)(nq // 8, c.q_lora_rank // fmt[2])
+    if affine or (mma and fmt[0] in ("mxfp8", "gguf")):
+        ks = (next(s for s in (2, 1) if c.q_lora_rank % (32 * s) == 0)
+              if fmt[0] == "gguf"
+              else (_aff_mma_split if affine else _mma_split)(nq // 8, c.q_lora_rank // fmt[2]))
         return DL.kernel("wqb_rope_mma", (fmt,))(
             inputs=[qrq, *_wb(att.wq_b), cos, sin], template=tmpl + [("KS", ks)],
             grid=(nq // 8 * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
@@ -632,6 +649,8 @@ def decode_block_nb(blk, h, pre, caches, shareds, starts, c, together=True):
     """decode_block for B requests at their own positions. h: [B, 1, hc, dim] bf16, pre:
     [B, 1, hc]; caches / shareds / starts: per request. Weight-streaming kernels run once for
     the batch; window, compressor, indexer and attention run per request."""
+    if getattr(blk.attn.wq_a, "mode", None) == "gguf":
+        return _gguf_block(blk, h, pre, caches, shareds, starts, c)
     b_n = h.shape[0]
     hc, dim = c.hc_mult, c.dim
     att = blk.attn
@@ -756,6 +775,8 @@ def decode_block_verify_nb(blk, h, pre, caches, shareds, starts, c):
     matrix tiles whose padded columns never mix), so each request gets the result its own
     decode_block_verify gives. The window, compressor, indexer and attention run per
     request."""
+    if getattr(blk.attn.wq_a, "mode", None) == "gguf":
+        return _gguf_block(blk, h, pre, caches, shareds, starts, c)
     b_n, r_n = h.shape[0], h.shape[1]
     t_n = b_n * r_n
     hc, dim = c.hc_mult, c.dim
@@ -816,9 +837,15 @@ def supported(blk, c):
             and c.dim % 1024 == 0
             and c.head_dim % 256 == 0   # split_attention's layout (V4.1: 512)
             and c.n_heads % 8 == 0
-            and all(_fused_projection(getattr(att, n)) for n in ("wq_a", "wkv", "wq_b", "wo_b"))
             and DM.supported(blk.ffn, _empty((1, 1, c.dim), mx.bfloat16), c)
-            and _woa_mxfp8(att) is not None
+            and (
+                all(getattr(getattr(att, n), "mode", None) == "gguf"
+                    for n in ("wq_a", "wkv", "wq_b", "wo_b"))
+                or (
+                    all(_fused_projection(getattr(att, n)) for n in ("wq_a", "wkv", "wq_b", "wo_b"))
+                    and _woa_mxfp8(att) is not None
+                )
+            )
         )
         object.__setattr__(blk, "_fused_decode_ok", ok)
     return ok
@@ -826,6 +853,8 @@ def supported(blk, c):
 
 def decode_block(blk, h, pre, cache, shared, start, c):
     """Block.__call__ for one token. h: [1, 1, hc, dim] bf16, pre: [1, 1, hc] fp32."""
+    if getattr(blk.attn.wq_a, "mode", None) == "gguf":
+        return _gguf_block(blk, h, pre, [cache], [shared], [start], c)
     hc, dim = c.hc_mult, c.dim
     hf = h.reshape(-1)
     coef_a, x, xq, _ = mix(blk, "attn", c, hf, pre.reshape(-1))
@@ -841,3 +870,61 @@ def decode_block(blk, h, pre, cache, shared, start, c):
     f = blk.sum_ranks(f)
     h3 = hc_post(f, h2, fo, fc, c)
     return h3.reshape(1, 1, hc, dim), fp.reshape(1, 1, hc)
+
+
+def _gguf_block(blk, h, pre, caches, shareds, starts, c):
+    """Fuse HC, GGUF attention and MoE while preserving activation and cache policies."""
+    bn, rn, hc, dim = h.shape
+    hf = h.reshape(bn * rn, hc * dim)
+    coef, x, _, _ = mix_nb(blk, "attn", c, hf, pre.reshape(bn * rn, hc))
+    ap, ao, ac = coef[:, :hc], coef[:, hc : 2 * hc], coef[:, 2 * hc :]
+    att = blk.attn
+    # MTP asks its one-token decode to use the verification projection order.
+    # Otherwise the query/KV pair fills the GPU from four rows while the wider
+    # projections keep row dots below the measured six-row crossover.
+    exact = getattr(blk, "_omlx_verify_exact", False)
+    rows = bn * rn
+    pair_tiles = exact or rows >= 4
+    tiles = exact or rows >= 6
+    if att.wo_a.weight.dtype == mx.bfloat16:
+        qa, kv_in = gemv_fp8_nb(x, att.wq_a, att.wkv, mma=pair_tiles)
+        ratio = c.compress_ratios[att._layer]
+        positions = [start + j for start in starts for j in range(rn)]
+        cos, sin = _cos_sin_nb(c, bool(ratio), positions)
+        qr, qrq, packed = attn_mid_nb(att, qa, kv_in, cos, sin, c, quantize_query=False)
+        q = wqb_rope_nb(att, qrq, cos, sin, c, tiles)
+        outputs = []
+        for b in range(bn):
+            sl = slice(b * rn, (b + 1) * rn)
+            if rn == 1:
+                outputs.append(attention_core(
+                    att, x[sl].reshape(-1), qr[sl].reshape(-1), q[sl].reshape(-1),
+                    packed[sl].reshape(-1), caches[b], shareds[b], starts[b],
+                    cos[sl].reshape(-1), sin[sl].reshape(-1), c,
+                )[None])
+            else:
+                outputs.append(_verify_attention(
+                    att, x[sl], qr[sl], q[sl], packed[sl], cos[sl], sin[sl],
+                    caches[b], shareds[b], starts[b], c,
+                ))
+        # Attention's output quantization is unchanged. GGUF wo_a remains the
+        # original BF16 tensor; the following wo_b input is not FP8-rounded.
+        grouped = mx.concatenate(outputs).astype(mx.bfloat16).reshape(bn, rn, c.o_groups, -1)
+        weight = att.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
+        latent = mx.einsum("bsgd,grd->bsgr", grouped, weight).reshape(bn * rn, -1)
+        attn = gemv_fp8_nb(latent, att.wo_b, mma=tiles)[0]
+    else:
+        x = x.reshape(bn, rn, dim)
+        attn = mx.concatenate(
+            [att(x[b : b + 1], caches[b], shareds[b], starts[b]) for b in range(bn)],
+            axis=0,
+        ).reshape(bn * rn, dim)
+    coef, x2, _, h2 = mix_nb(
+        blk, "ffn", c, hf, ap, sub=blk.sum_ranks(attn), post=ao, comb=ac
+    )
+    fp, fo, fc = coef[:, :hc], coef[:, hc : 2 * hc], coef[:, 2 * hc :]
+    f = DM.fused_decode_moe_nb(
+        blk.ffn, x2, c, reuse_routes=rn >= 6 and getattr(blk, "_omlx_verify_exact", False)
+    )[0]
+    out = hc_post_nb(blk.sum_ranks(f), h2, fo, fc, c)
+    return out.reshape(h.shape), fp.reshape(pre.shape)

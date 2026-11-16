@@ -208,7 +208,7 @@ _ATTN_MID = r"""
         const float qb = float(bfloat16_t(float(qnw[d]) * (float(qa[d]) * rq)));
         qr[d] = bfloat16_t(qb);
         const float s = act_scale(max(simd_max(abs(qb)), 1e-4f));
-        qrq[d] = act_quant_value(qb, s);
+        qrq[d] = QUANTIZE_QUERY ? act_quant_value(qb, s) : qb;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // ---- kv_norm ----

@@ -864,6 +864,30 @@ class TestCheckpointHasMtpWeights:
         # No index, no shards — caller treats as "no MTP weights".
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
 
+    @pytest.mark.parametrize("prefix", ["mtp.", "language_model.mtp.", "layers."])
+    def test_native_gguf_uses_the_dspark_source(self, tmp_path, prefix):
+        from omlx.admin.routes import _mtp_compat_for_model
+
+        source = tmp_path / "original"
+        source.mkdir()
+        self._write_index(source, {prefix + "0.weight": "model.safetensors"})
+        config = {
+            "model_type": "deepseek_v41",
+            "dspark_block_size": 5,
+            "dspark_target_layer_ids": [37, 38, 39],
+            "omlx_deepseek_v41": {
+                "version": 1,
+                "gguf": {"path": str(tmp_path / "GGUF"), "source": str(source)},
+            },
+        }
+        _write_config(tmp_path, json.dumps(config))
+        expected = prefix == "mtp."
+        assert model_loading._checkpoint_has_mtp_weights(tmp_path) == expected
+        assert model_loading.lightning_mtp_supported(tmp_path) == expected
+        assert _mtp_compat_for_model({"model_path": str(tmp_path)})[0] == expected
+        (source / "model.safetensors.index.json").unlink()
+        assert not model_loading._checkpoint_has_mtp_weights(tmp_path)
+
     def test_returns_false_for_nonexistent_path(self, tmp_path):
         assert (
             model_loading._checkpoint_has_mtp_weights(str(tmp_path / "does-not-exist"))

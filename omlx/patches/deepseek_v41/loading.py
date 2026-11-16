@@ -108,14 +108,24 @@ def load(
     if (path / "conversion.inprogress.json").exists():
         raise ValueError("DeepSeek V4.1 checkpoint conversion is still in progress")
     raw = json.loads((path / "config.json").read_text())
-    mapping = json.loads((path / "model.safetensors.index.json").read_text())[
-        "weight_map"
-    ]
     format_spec = raw.get("omlx_deepseek_v41")
     if format_spec is not None and format_spec.get("version") != 1:
         raise ValueError("Unsupported DeepSeek V4.1 converted checkpoint version")
-    source_checkpoint = format_spec is None
-    if source_checkpoint:
+    gguf = format_spec.get("gguf") if format_spec else None
+    source_path = Path(gguf["source"]) if gguf else path
+    mapping = json.loads((source_path / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    source_checkpoint = format_spec is None or gguf is not None
+    if gguf and (
+        stage is not None
+        or tensor is not None
+        or moe_expert_offload_resident_fraction is not None
+    ):
+        raise ValueError(
+            "Packed GGUF V4.1 currently requires resident backbone weights on one device"
+        )
+    if format_spec is None:
         if raw.get("model_type") != "deepseek_v41":
             raise ValueError("Expected a DeepSeek V4.1 checkpoint")
         format_spec = {"engram_tables": source_engram_tables(mapping, raw)}
@@ -279,7 +289,18 @@ def load(
             )
 
         def batches():
-            if source_checkpoint:
+            if gguf:
+                from .gguf import iter_weights
+
+                yield from iter_weights(
+                    gguf["path"],
+                    source_path,
+                    raw,
+                    mapping,
+                    expected_shapes,
+                    config.preserve_mtp,
+                )
+            elif source_checkpoint:
                 yield from iter_source_weights(
                     path,
                     raw,
@@ -341,6 +362,26 @@ def load(
                 all_quantized.update(quantized)
                 for name, spec in quantized.items():
                     if name + ".weight" in values:
+                        if "qtype" in spec:
+                            from .gguf_quant import GGUFProjection, row_bytes
+
+                            logical = expected_shapes[name + ".weight"]
+                            packed = (
+                                *logical[:-1],
+                                row_bytes(logical[-1], spec["qtype"]),
+                            )
+                            if (
+                                spec["input_dims"] != logical[-1]
+                                or values[name + ".weight"].shape != packed
+                            ):
+                                raise ValueError(f"Invalid GGUF projection shape: {name}")
+                            set_module(
+                                model,
+                                name,
+                                GGUFProjection(values[name + ".weight"], **spec),
+                            )
+                            replaced.add(name)
+                            continue
                         if name + ".scales" not in values:
                             raise ValueError(
                                 f"Quantized projection must be stored in one shard: {name}"
