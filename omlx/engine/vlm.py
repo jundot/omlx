@@ -4334,8 +4334,9 @@ class VLMBatchedEngine(BaseEngine):
             # one image per prompt. A single prompt string keeps every page.
             if model_type == "unlimited-ocr" and isinstance(prompt, str):
                 prompts = prompt
+            prefix_tokens = getattr(self, "_prefix_tokens", None)
             if (
-                self._prefix_tokens is not None
+                prefix_tokens is not None
                 and not images
                 and not audio
                 and not videos
@@ -4344,7 +4345,7 @@ class VLMBatchedEngine(BaseEngine):
             ):
                 # mlx-vlm's text-only path is tokenizer(prompts,
                 # add_special_tokens=False); one prompt needs no padding.
-                ids = self._prefix_tokens.encode(prompt)
+                ids = prefix_tokens.encode(prompt)
                 inputs = {
                     "input_ids": mx.array([ids], dtype=mx.int32),
                     "attention_mask": mx.ones((1, len(ids)), dtype=mx.int32),
@@ -6184,7 +6185,7 @@ class VLMBatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
-        return prompt, encode_prompt(self._tokenizer, self._prefix_tokens, prompt)
+        return prompt, encode_prompt(self._tokenizer, getattr(self, "_prefix_tokens", None), prompt)
 
     async def tokenize_chat(
         self,

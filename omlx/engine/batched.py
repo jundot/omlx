@@ -1082,7 +1082,7 @@ class BatchedEngine(BaseEngine):
             add_generation_prompt=add_generation_prompt,
         )
         if add_special_tokens is None:
-            return prompt, encode_prompt(self._tokenizer, self._prefix_tokens, prompt)
+            return prompt, encode_prompt(self._tokenizer, getattr(self, "_prefix_tokens", None), prompt)
         return prompt, list(
             self._tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
         )
