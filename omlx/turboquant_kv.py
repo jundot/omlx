@@ -248,10 +248,20 @@ def _growth_step(tokens: int) -> int:
     return max(_MIN_GROWTH_STEP, (tokens >> 6) // _MIN_GROWTH_STEP * _MIN_GROWTH_STEP)
 
 
+# Spare tokens a built state keeps at least: a decode step, a verify block or
+# a short suffix chunk fits without a growth copy.
+_MIN_SPARE_TOKENS = 64
+
+
 def _spare_capacity(tokens: int) -> int:
-    """Token capacity for a state of ``tokens`` that is about to be appended to."""
+    """Token capacity for a state of ``tokens`` that is about to be appended to.
+
+    The next step boundary past ``tokens + _MIN_SPARE_TOKENS``: between 64 and
+    ``step + 63`` spare tokens, so short and mid contexts carry at most one
+    growth step per row and layer.
+    """
     step = _growth_step(tokens)
-    return (tokens // step + 2) * step
+    return (tokens + _MIN_SPARE_TOKENS + step - 1) // step * step
 
 
 def _state_rows(state) -> int:

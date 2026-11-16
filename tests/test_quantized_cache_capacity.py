@@ -15,7 +15,7 @@ from mlx_vlm.turboquant import _state_length
 
 import omlx.scheduler  # noqa: F401  (applies BatchGenerator cache patches)
 from omlx.affine4 import Affine8KVCache, BatchAffine8KVCache
-from omlx.turboquant_kv import _growth_step, _spare_capacity
+from omlx.turboquant_kv import _MIN_SPARE_TOKENS, _growth_step, _spare_capacity
 
 HEADS, DIM = 2, 64
 
@@ -52,10 +52,10 @@ def test_growth_step_scales_with_long_caches():
     assert _growth_step(16_000) == 256
     assert _growth_step(65_536) == 1024
     assert _growth_step(245_000) == 3584
-    # A built state leaves between one and two steps of room.
+    # A built state leaves at least 64 tokens and at most one step more of room.
     for tokens in (1, 255, 256, 4000, 65_536, 245_000):
         step = _growth_step(tokens)
-        assert step < _spare_capacity(tokens) - tokens <= 2 * step
+        assert _MIN_SPARE_TOKENS <= _spare_capacity(tokens) - tokens < step + _MIN_SPARE_TOKENS
 
 
 def test_merge_writes_rows_end_aligned_with_room_to_grow():
