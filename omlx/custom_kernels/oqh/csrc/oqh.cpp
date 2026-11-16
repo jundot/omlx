@@ -9,6 +9,7 @@
 
 #include <sstream>
 #include <string>
+#include <string_view>
 
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
@@ -77,10 +78,6 @@ array as_dtype(const array& a, Dtype dt, const Stream& s) {
   return a.dtype() == dt ? a : astype(a, dt, s);
 }
 
-// Only add a copy node when the input is not already row-contiguous.
-array row_contiguous(const array& a, const Stream& s) {
-  return a.flags().row_contiguous ? a : contiguous(a, false, s);
-}
 
 // Inputs: x, w, rscale, [indices], [w_b, rscale_b]. A pair writes [.., 2N].
 class OqhQmv : public Primitive {
@@ -233,6 +230,36 @@ class OqhProducer : public Primitive {
   float eps_;
 };
 
+// Whether a is row-contiguous when it is evaluated: evaluated inputs report it,
+// the oQh primitives always write dense outputs, and a reshape or added / removed
+// unit axis of a dense array stays dense.
+bool known_dense(const array& a, int depth = 0) {
+  if (a.is_available()) {
+    return a.flags().row_contiguous;
+  }
+  if (!a.has_primitive() || depth > 4) {
+    return false;
+  }
+  // MLX does not export its primitives' type info, so match them by name.
+  const std::string_view name = a.primitive().name();
+  if (name == "OqhQmv" || name == "OqhProducer") {
+    return true;
+  }
+  const bool view = name == "Reshape" || name == "ExpandDims" || name == "Squeeze";
+  return view && a.inputs().size() == 1 && known_dense(a.inputs()[0], depth + 1);
+}
+
+// The kernels index every input as a dense row-major array; any other input (a
+// slice, a tensor-parallel view) gets a contiguous node, which copies at run
+// time only if it is strided.
+array dense(const array& a, const Stream& s) {
+  return known_dense(a) ? a : contiguous(a, false, s);
+}
+
+array dense(const array& a, Dtype dt, const Stream& s) {
+  return dense(as_dtype(a, dt, s), s);
+}
+
 void check_signs(const array& signs, int width, const char* what) {
   if (signs.size() != static_cast<size_t>(width)) {
     std::ostringstream msg;
@@ -269,13 +296,13 @@ array qmv(
   if (w.ndim() != 2 || x.shape(-1) != K || N % 8 != 0 || K % 16 != 0) {
     throw std::invalid_argument("oqh qmv: expected w [N, K * bits / 32], N % 8 == 0, K % 16 == 0");
   }
-  auto xc = row_contiguous(x, s);
+  auto xc = dense(x, s);
   auto out_shape = xc.shape();
   out_shape.back() = w_b ? 2 * N : N;
-  std::vector<array> inputs = {xc, row_contiguous(w, s), as_dtype(rscale, xc.dtype(), s)};
+  std::vector<array> inputs = {xc, dense(w, s), dense(rscale, xc.dtype(), s)};
   if (w_b) {
-    inputs.push_back(row_contiguous(*w_b, s));
-    inputs.push_back(as_dtype(*rscale_b, xc.dtype(), s));
+    inputs.push_back(dense(*w_b, s));
+    inputs.push_back(dense(*rscale_b, xc.dtype(), s));
   }
   return array(
       out_shape, xc.dtype(), std::make_shared<OqhQmv>(s, bits, false, false, w_b.has_value()),
@@ -296,12 +323,12 @@ array gather_qmv(
   if (w.ndim() != 3 || x.shape(-1) != K || N % 8 != 0 || K % 16 != 0 || (R != 1 && R != P)) {
     throw std::invalid_argument("oqh gather_qmv: expected w [E, N, K * bits / 32] and x with 1 or P rows");
   }
-  auto xc = row_contiguous(x, s);
-  auto idx = row_contiguous(as_dtype(indices, uint32, s), s);
-  std::vector<array> inputs = {xc, row_contiguous(w, s), as_dtype(rscale, xc.dtype(), s), idx};
+  auto xc = dense(x, s);
+  auto idx = dense(indices, uint32, s);
+  std::vector<array> inputs = {xc, dense(w, s), dense(rscale, xc.dtype(), s), idx};
   if (w_b) {
-    inputs.push_back(row_contiguous(*w_b, s));
-    inputs.push_back(as_dtype(*rscale_b, xc.dtype(), s));
+    inputs.push_back(dense(*w_b, s));
+    inputs.push_back(dense(*rscale_b, xc.dtype(), s));
   }
   return array(
       {P, w_b ? 2 * N : N}, xc.dtype(),
@@ -320,11 +347,11 @@ std::vector<array> rmsnorm_had(
     throw std::invalid_argument(msg.str());
   }
   check_signs(signs, D, "rmsnorm_had");
-  auto xc = row_contiguous(x, s);
+  auto xc = dense(x, s);
   return array::make_arrays(
       {xc.shape(), xc.shape()}, {xc.dtype(), xc.dtype()},
       std::make_shared<OqhProducer>(s, Producer::Norm, 256, 0, eps),
-      {xc, as_dtype(weight, xc.dtype(), s), as_dtype(signs, xc.dtype(), s)});
+      {xc, dense(weight, xc.dtype(), s), dense(signs, xc.dtype(), s)});
 }
 
 array rotate(const array& x, const array& signs, int block, StreamOrDevice s_) {
@@ -333,10 +360,10 @@ array rotate(const array& x, const array& signs, int block, StreamOrDevice s_) {
   const int L = static_cast<int>(x.shape(-1));
   check_block(L, block, 128, "rotate");
   check_signs(signs, L, "rotate");
-  auto xc = row_contiguous(x, s);
+  auto xc = dense(x, s);
   return array(
       xc.shape(), xc.dtype(), std::make_shared<OqhProducer>(s, Producer::Rotate, block, 3, 0.0f),
-      {xc, as_dtype(signs, xc.dtype(), s)});
+      {xc, dense(signs, xc.dtype(), s)});
 }
 
 array act_split_had(
@@ -352,14 +379,14 @@ array act_split_had(
     throw std::invalid_argument("oqh act_split_had: last dim must be 2 * signs.size()");
   }
   check_block(L, block, 128, "act_split_had");
-  auto yc = row_contiguous(y, s);
+  auto yc = dense(y, s);
   auto shape = yc.shape();
   shape.back() = L;
   return array(
       std::move(shape), yc.dtype(),
       std::make_shared<OqhProducer>(
           s, Producer::ActSplit, block, limit ? 2 : 0, limit.value_or(0.0f)),
-      {yc, as_dtype(signs, yc.dtype(), s)});
+      {yc, dense(signs, yc.dtype(), s)});
 }
 
 array act_pair_had(
@@ -376,11 +403,11 @@ array act_pair_had(
     throw std::invalid_argument("oqh act_pair_had: a and b must match and end in signs.size()");
   }
   check_block(L, block, 128, "act_pair_had");
-  auto ac = row_contiguous(a, s);
+  auto ac = dense(a, s);
   return array(
       ac.shape(), ac.dtype(),
       std::make_shared<OqhProducer>(s, Producer::Act, block, limit ? 2 : 0, limit.value_or(0.0f)),
-      {ac, row_contiguous(as_dtype(b, ac.dtype(), s), s), as_dtype(signs, ac.dtype(), s)});
+      {ac, dense(b, ac.dtype(), s), dense(signs, ac.dtype(), s)});
 }
 
 std::vector<array> gnorm_had(
@@ -396,12 +423,12 @@ std::vector<array> gnorm_had(
     throw std::invalid_argument("oqh gnorm_had: signs must cover heads x 128");
   }
   check_block(L, block, 128, "gnorm_had");
-  auto xc = row_contiguous(x, s);
-  auto zc = row_contiguous(z, s);
+  auto xc = dense(x, s);
+  auto zc = dense(z, s);
   return array::make_arrays(
       {zc.shape(), zc.shape()}, {zc.dtype(), zc.dtype()},
       std::make_shared<OqhProducer>(s, Producer::GatedNorm, block, 0, eps),
-      {xc, zc, as_dtype(weight, zc.dtype(), s), as_dtype(signs, zc.dtype(), s)});
+      {xc, zc, dense(weight, zc.dtype(), s), dense(signs, zc.dtype(), s)});
 }
 
 } // namespace omlx::oqh

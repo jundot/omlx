@@ -24,7 +24,7 @@ def _signs(key, n):
     return mx.array(fmt.make_signs(key, n)).astype(mx.float32)
 
 
-@pytest.mark.parametrize("bits", [2, 3, 4, 6, 8])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
 def test_matmuls_match_the_dequantized_weight(bits):
     rows, cols, experts = 64, 512, 3
     mx.random.seed(bits)
@@ -55,6 +55,13 @@ def test_matmuls_match_the_dequantized_weight(bits):
         )
         assert _rel(got[i : i + 1], ref_e) < 0.02
 
+    # Tensor-parallel slices hand over strided row scales.
+    strided = mx.stack([rscale, rscale], -1).astype(mx.bfloat16)[:, 0]
+    assert mx.array_equal(
+        fast.qmv(xr, packed, strided, bits),
+        fast.qmv(xr, packed, rscale.astype(mx.bfloat16), bits),
+    )
+
     # A gate | up pair in one call gives both products bit for bit.
     up, up_scale = packed[::-1], rscale[::-1]
     single = [fast.qmv(xr, packed, rscale, bits), fast.qmv(xr, up, up_scale, bits)]
@@ -76,7 +83,8 @@ def _switch(experts, rows, cols, key, seed):
     gram = mx.broadcast_to(mx.eye(cols), (experts, cols, cols))
     packed, rscale, _, _ = quantize.quantize(w, gram, 4, sg, block)
     m = OqhSwitchLinear(cols, rows, experts, 4, block)
-    m.weight, m.rscale = packed, rscale
+    # bf16 row scales, as checkpoints store them.
+    m.weight, m.rscale = packed, rscale.astype(mx.bfloat16)
     m.oqh_signs = sg.reshape(-1, block).astype(mx.bfloat16)
     return m
 
