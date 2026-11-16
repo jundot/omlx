@@ -65,6 +65,40 @@ def test_trim_rows_then_unmasked_decode_stops_at_row_ends(
     )
 
 
+@pytest.mark.parametrize("cache_class", [BatchAffine4KVCache, BatchAffine8KVCache])
+@pytest.mark.parametrize("tokens,native", [(100, True), (700, False)])
+@pytest.mark.parametrize("rows", [1, 4])
+def test_trim_rows_then_attention_without_native_kernel(
+    cache_class, tokens, native, rows, monkeypatch
+):
+    """The routes that run when the native kernels decline (a short cache, or no
+    TensorOps) also stop each row at its own end after trim_rows."""
+    if not native:
+        monkeypatch.setattr(affine4, "_tensor_ops_available", lambda: False)
+    dim, heads, repeats = 256, 4, 6
+    cache = cache_class([0, 0, 0])
+    cache.update_and_fetch(
+        random((3, heads, tokens, dim)), random((3, heads, tokens, dim), seed=1)
+    )
+    cache.update_and_fetch(
+        random((3, heads, 5, dim), seed=2), random((3, heads, 5, dim), seed=3)
+    )
+    cache.trim_rows([0, 4, 2])
+    cache.update_and_fetch(
+        random((3, heads, rows, dim), seed=4), random((3, heads, rows, dim), seed=5)
+    )
+    ends = cache._row_ends
+    assert ends == [tokens + 5 + rows, tokens + 1 + rows, tokens + 3 + rows]
+    q = random((3, heads * repeats, rows, dim), seed=6)
+    out = cache.attention(
+        q, scale=dim**-0.5, mask="causal" if rows > 1 else None
+    )
+    ref = row_reference(cache, q, ends, causal_rows=rows)
+    np.testing.assert_allclose(
+        np.array(out.astype(mx.float32)), np.array(ref), atol=4e-3, rtol=4e-3
+    )
+
+
 @pytest.mark.parametrize("cache_class", [BatchAffine8KVCache])
 def test_trim_rows_then_causal_verify_block(cache_class):
     """A causal multi-row verify after a ragged trim: row b's queries end at its own end."""

@@ -1528,16 +1528,32 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
             raise ValueError(
                 f"Unsupported {self.quantization_scheme} attention mask: {mask}"
             )
+        # Rows of a ragged speculative rollback (trim_rows) end at their own
+        # columns. The native kernels stop each row there; the routes below
+        # need it in the mask, or a shorter row reads its dropped draft tokens.
+        row_ends = getattr(self, "_row_ends", None)
+        ends = None
+        if row_ends is not None and len(row_ends) == self.left_padding.shape[0]:
+            if min(int(e) for e in row_ends) < tokens:
+                ends = mx.array([min(int(e), tokens) for e in row_ends])
         # Without left padding the plain mask is exact; keeping it a string lets the
         # bf16 prefill use the fused kernel instead of a (query x cache) mask array.
-        if (mask is None or causal) and not self._has_left_padding():
+        if (
+            (mask is None or causal)
+            and ends is None
+            and not self._has_left_padding()
+        ):
             return mask
         columns = mx.arange(tokens)
         allowed = columns[None, None, None, :] >= self.left_padding[:, None, None, None]
         if causal:
-            allowed = allowed & (
-                columns[None, :] <= mx.arange(tokens - query_length, tokens)[:, None]
-            )
+            if ends is None:
+                last = mx.arange(tokens - query_length, tokens)[None, :]
+            else:
+                last = ends[:, None] - query_length + mx.arange(query_length)[None, :]
+            allowed = allowed & (columns[None, None, None, :] <= last[:, None, :, None])
+        elif ends is not None:
+            allowed = allowed & (columns[None, None, None, :] < ends[:, None, None, None])
         if mask is None or isinstance(mask, str):
             return allowed
         if mask.dtype == mx.bool_:
