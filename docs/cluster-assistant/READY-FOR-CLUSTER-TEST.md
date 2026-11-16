@@ -201,11 +201,11 @@ long lines, the test-seam rewrite) because the app bundles the web assets.
 
 | Item | Value |
 |---|---|
-| DMG | `build/oMLX-0.8.0rc1.dmg`, 79 MB, SHA256 `b3b9fd102bec00761a078575da2eb66171bf1f5ff79dee176bd720fc6a0ed449` |
-| App binary inside the DMG | `02a1b8417113fa8991208c3f64ca1b91d61c92b76602ba006f6e44111f8f359d` |
+| DMG | `build/oMLX-0.8.0rc1.dmg`, 79 MB, SHA256 `20a716627633ac42a94939cfd53d3c4fdb2e8c42e42d9620901288d977a62b87` |
+| App binary inside the DMG | `1387d42a0c61c6fe82a1c8adc60870cbd4bf17d009091d7a5abceb323dcd894f` |
 | Version string | `0.8.0rc1` (unchanged — the hash is the real gate) |
-| Signed / notarized | Developer-ID signed, notarized (`c70ecf9f-d35a-465a-b91d-f409bb71cc46`, Accepted), stapled and validated; `spctl` → `accepted, source=Notarized Developer ID` |
-| Built from | the tree at `0cfb3183` (code `84ce15e7`); only documentation commits followed |
+| Signed / notarized | Developer-ID signed, notarized (Accepted), stapled and validated; `spctl` → `accepted, source=Notarized Developer ID` |
+| Built from | the tree at `3a39d920` (code `1b8cfa93`, the Welcome model-folder detector) |
 | Contents vs §8 | D1 uninstall, D6 helper capability, distributed inference on by default, the U1–U6 UI, and the inspection clean-up |
 
 **State check measured 2026-11-16 (after the cleanup run):** the three cluster Macs are

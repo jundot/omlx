@@ -22,7 +22,7 @@ Read with: `ROADMAP-ACCEPTANCE-2026-11-16.md` (gate + decisions),
 | Backend suite | `tests/cluster_assistant` **658 passed** |
 | UI suites (focused) | wizard + `test_cluster_ui_integration_ui` + dashboard **289 passed** |
 | Lint | `ruff check omlx/cluster/assistant/` **clean** (8 nitpicks fixed 2026-11-16) |
-| Acceptance DMG | `build/oMLX-0.8.0rc1.dmg` `b3b9fd10…`, app binary `02a1b841…`, `0.8.0rc1`, notarized + stapled (2026-11-16, rebuilt after the inspection clean-up) |
+| Acceptance DMG | `build/oMLX-0.8.0rc1.dmg` `20a71662…`, app binary `1387d42a…`, `0.8.0rc1`, notarized + stapled (2026-11-16, rebuilt after the inspection clean-up) |
 | Installed on `.11` | none — the app was removed by the 2026-11-16 cleanup run |
 | Macs | **`.11` `.12` `.13`** = the validation cluster (`.14` reassigned 2026-11-16, never touched); apps installed + servers on `:8000`, LAN bind `0.0.0.0` |
 | Cluster state | **not wiped** on `.11`: devices, deployments, measurements, `runtime/prompt-cache-ssd` |
@@ -115,12 +115,12 @@ installer). Do not drive these over SSH.
       (backs up to `~/.omlx/backup-cluster-<date>/`, keeps models +
       `cluster/identity.json`, kills processes, frees 8099). Done 2026-11-16 on
       the three cluster Macs; the helper still needs its admin dialog (see §6).
-- [ ] **1.2 Roll out** — copy `build/oMLX-0.8.0rc1.dmg` (`b3b9fd10…`) to the three Macs,
+- [ ] **1.2 Roll out** — copy `build/oMLX-0.8.0rc1.dmg` (`20a71662…`) to the three Macs,
       install, open the app **interactively**, let Local Network, the runtime
       installer and the helper dialog through.
 - [ ] **1.3 Identical-build gate** — `GET /api/cluster/node_id` → same
       `version`; and `shasum -a 256 /Applications/oMLX.app/Contents/MacOS/oMLX`
-      → `02a1b841…` on **all three**. A mixed build is not an acceptance run.
+      → `1387d42a…` on **all three**. A mixed build is not an acceptance run.
 - [ ] **1.4 A1 Manual** — devices → pair → measure → model → plan → apply →
       start → `ready` → one real completion → stop, through the manual flow.
 - [ ] **1.5 A2 Assistant** — the same model through the assistant card; endpoint

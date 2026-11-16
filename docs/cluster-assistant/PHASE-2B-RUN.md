@@ -1968,7 +1968,7 @@ lists it, and it stays *unpaired* although its mDNS advertisement is visible.
 | Origin | `.11` MacBook-Pro-von-Andreas, M5 Max 128 GiB (node `cbc6af36`) |
 | Peer | `.12` Mac-Studio-M2Ultra, M2 Ultra 64 GiB (node `9078f858`) |
 | Peer | `.13` MacStudio-von-Andreas-2, M1 Max 32 GiB, **headless** (node `2dd48599`) |
-| DMG | `b3b9fd10…`, app binary `02a1b841…` on all three, `spctl` accepted (Notarized Developer ID) |
+| DMG | `20a71662…`, app binary `1387d42a…` on all three, `spctl` accepted (Notarized Developer ID) |
 | Version gate | `0.8.0rc1` on all three, distinct node ids |
 | Server | **port 8000**, host `0.0.0.0` (the Welcome default is `127.0.0.1`, which no peer can reach) |
 | Helper | absent on all three at run start → A5 can prove a real first install |
