@@ -162,9 +162,28 @@ class OqhLinear(_Rotating):
         limit = QMV_MAX_ROWS if _EXACT.depth else _GEMV_ROWS
         return x.size // self.input_dims <= limit
 
+    def _affine(self) -> nn.QuantizedLinear:
+        """The codes as an affine linear with unit scales and -center biases.
+
+        It shares the weight and the per-shape unit views, so it holds no new
+        memory, and its decode-batch calls take oMLX's batched affine kernels.
+        """
+        ql = getattr(self, "_oqh_affine", None)
+        w = self["weight"]
+        if ql is None or ql.weight is not w:
+            s1, b1, gs = fast.unit_view(w, self.bits, self["rscale"].dtype)
+            ql = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+            nn.Module.__init__(ql)
+            ql.weight, ql.scales, ql.biases = w, s1, b1
+            ql.group_size, ql.bits, ql.mode = gs, self.bits, "affine"
+            object.__setattr__(self, "_oqh_affine", ql)
+        return ql
+
     def matmul_rotated(self, x: mx.array) -> mx.array:
         if self.gemv_rows(x):
             y = fast.qmv(x, self["weight"], self["rscale"], self.bits)
+        elif x.size // self.input_dims <= QMV_MAX_ROWS:
+            y = self._affine()(x) * self["rscale"]
         else:
             y = fast.qmm(x, self["weight"], self["rscale"], self.bits)
         if "bias" in self:

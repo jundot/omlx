@@ -83,6 +83,25 @@ def test_matmuls_match_the_dequantized_weight(bits):
     assert mx.array_equal(paired, mx.concatenate(single, -1))
 
 
+def test_decode_batches_take_the_batched_affine_kernels():
+    from omlx.oqh.modules import OqhLinear
+    from omlx.patches import batched_decode_qmm
+
+    batched_decode_qmm.apply_batched_decode_qmm_patch()
+    n = k = 1024
+    mx.random.seed(5)
+    m = OqhLinear(k, n, 4, 256)
+    m.weight = mx.random.randint(0, 2**32 - 1, (n, k * 4 // 32)).astype(mx.uint32)
+    m.rscale = (mx.random.uniform(shape=(n,)) * 0.02).astype(mx.bfloat16)
+    m.oqh_signs = _signs("b", k).reshape(-1, 256).astype(mx.bfloat16)
+    x = mx.random.normal((8, 1, k)).astype(mx.bfloat16)
+    got = m.matmul_rotated(x)
+    # Each row agrees with the one-row GEMV up to rounding.
+    for i in range(8):
+        assert _rel(got[i], m.matmul_rotated(x[i : i + 1])[0]) < 0.01
+    assert any(key[1:4] == (8, k, n) for key in batched_decode_qmm._CHECKED)
+
+
 def _switch(experts, rows, cols, key, seed):
     """An OqhSwitchLinear holding quantized random experts."""
     from omlx.oqh.modules import OqhSwitchLinear

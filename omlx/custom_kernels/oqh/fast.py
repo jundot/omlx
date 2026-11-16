@@ -75,7 +75,7 @@ def gather_qmv(
 _UNIT_VIEWS: dict = {}
 
 
-def _unit_view(w: mx.array, bits: int, dtype) -> tuple[mx.array, mx.array, int]:
+def unit_view(w: mx.array, bits: int, dtype) -> tuple[mx.array, mx.array, int]:
     """All-ones scales and -center biases, shared by every weight of one shape and bit width."""
     k = w.shape[-1] * 32 // bits
     gs = next(g for g in (128, 64, 32) if k % g == 0)
@@ -107,20 +107,14 @@ def _row_view(w, rscale, bits: int, dtype):
     return scales, scales * -center, gs
 
 
-# The folded view is built per call. Up to this many rows that costs more than
-# the shared unit view plus an output multiply.
-_UNIT_MAX_ROWS = 16
-
-
 def qmm(x: mx.array, w: mx.array, rscale: mx.array, bits: int, stream=None) -> mx.array:
-    """Rows of x through the stock quantized_matmul."""
-    rows = x.size // (w.shape[-1] * 32 // bits)
-    if bits <= _FOLD_MAX_BITS and rows > _UNIT_MAX_ROWS:
+    """Many rows of x (prefill) through the stock quantized_matmul."""
+    if bits <= _FOLD_MAX_BITS:
         s, b, gs = _row_view(w, rscale, bits, x.dtype)
         return mx.quantized_matmul(
             x, w, s, b, transpose=True, group_size=gs, bits=bits, stream=stream
         )
-    s1, b1, gs = _unit_view(w, bits, x.dtype)
+    s1, b1, gs = unit_view(w, bits, x.dtype)
     y = mx.quantized_matmul(
         x, w, s1, b1, transpose=True, group_size=gs, bits=bits, stream=stream
     )
@@ -151,7 +145,7 @@ def gather_qmm(
             sorted_indices=sorted_indices,
             stream=stream,
         )
-    s1, b1, gs = _unit_view(w, bits, x.dtype)
+    s1, b1, gs = unit_view(w, bits, x.dtype)
     y = mx.gather_qmm(
         x,
         w,
