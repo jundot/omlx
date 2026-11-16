@@ -732,9 +732,25 @@ Not in the scope on purpose: `docs/**` (prose), `i18n/*.json`,
 `static/js/*.min.js`, `static/css/tailwind.css` (generated/vendored) and the
 vendored `mlx_vlm` model trees under `omlx/patches/*_compat/vendor/`.
 
+**Code style is the repository's, not the IDE's default (measured 2026-11-16).**
+`.editorconfig` is the truth: 4-space indentation for everything except
+`json`/`yml`/`css`/`md` (2) and `Makefile` (tabs), `max_line_length = 120`. It
+used to declare 2 spaces for `*.js`/`*.html`/`*.swift` while every file here is
+4-space, and PyCharm accordingly reported 8 188 "incorrect whitespace" findings
+in `cluster_v2.js` alone — a config bug, not 8 188 code defects. If an
+inspection reports a mass of `IncorrectFormatting`, check `.editorconfig` before
+touching code, and never reformat a 3 000-line template to satisfy a setting.
+The remaining, deliberately accepted classes (with counts and reasons) are in
+`docs/cluster-assistant/PLAN-REMAINING-2026-11-16.md` §2.1 — read it before
+"fixing" a finding: `JSUnresolvedReference` on JSON payload properties,
+`JSIgnoredPromiseFromCall` in the sync Alpine lifecycle, `DuplicatedCode` in the
+JSON stores, narrowing false positives, `is True` strictness checks and
+`http://host:port` endpoints are all intentional.
+
 Inspection exports land in the **repo root** as one `<Inspection>.xml` per class
-(PyCharm's "Export" dialog) — 98 files, many MB. Move them out of the working
-tree when done; they are untracked but they pollute the root and `git status`.
+(PyCharm's "Export" dialog) — 67 files, many MB (one is 80 MB). Move them out of
+the working tree when done; they are untracked but they pollute the root and
+`git status`.
 
 Do not install packages globally with pip.
 

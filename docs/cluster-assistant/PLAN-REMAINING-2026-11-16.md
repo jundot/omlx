@@ -70,6 +70,33 @@ code.
 
 ---
 
+## 2.1 PyCharm inspection — where it stands (2026-11-16)
+
+The export in the repository root (67 `<Inspection>.xml` files, 09:31) contained
+**10 593 findings in the `localDev` scope** across 190 files. Two root causes
+explain 94 % of them, and the first is fixed:
+
+| Class | Export | Now | State |
+|---|---|---|---|
+| `IncorrectFormatting` — block indentation | 8 188 in `cluster_v2.js` | **0** | **Fixed by config, not by reformatting**: `.editorconfig` declared 2-space indentation for `*.js`/`*.html`/`*.swift` while every file here is 4-space. JS/HTML/Swift are 4 again, data/CSS/markdown stay 2, `max_line_length = 120`. |
+| `IncorrectFormatting` — continuation/attribute alignment | 249 `cluster_v2.js`, 2 704 template | open | The files align continued expressions/attributes (4-space continuation in JS, attribute alignment in HTML); IntelliJ's default is 8. Either toggle *Align attributes when wrapping* + *continuation indent 4* in the HTML/JS code style, or accept one `Reformat Code` per file (a 3 000-line diff — deliberately **not** done here). |
+| Real defects (unreachable code, dead locals, redundant parens, regex groups, duplicate method, a11y inputs) | ~40 | **0 except 7** | Fixed: `reclaim._inventories`/`routes._calibration_entry` typed `Sequence[Any]`, coordinator replies typed `Any`, five dead initialisers removed, four redundant parenthesis pairs, `diagnostics` credential regex named, `recommendation` layout guard, duplicate `pairingStepOne` removed, 21 pre-increments, 4 regexes (named/non-capturing). Open: 7 `<input>` without an accessible name in `_cluster_v2.html` (needs one i18n key each → 11 locale files). |
+| `LongLine` (> 120) | 596 | 494 measured live (442 template, 28 `cluster_v2.js`, 24 Swift) | Open, and the cheapest remaining real work: wrapping is mechanical. `Uninstall.swift` 2, `AdvancedScreen.swift` 7, `PerformanceScreen.swift` 15 are ours; the rest sits in upstream Swift files we do not restyle. |
+| `JSUnresolvedReference` (71) + `JSUnusedGlobalSymbols` (174) | 245 | open | Property names of JSON payloads (`preset_key`, `placement_signature`, `single_node`, …) and component methods called from Alpine templates. Not typo-able to zero without typing the payloads; a real typo would fail at runtime, and the UI tests cover the flows. |
+| `JSIgnoredPromiseFromCall` (15) + `ES6MissingAwait` (4) | 19 | open | Deliberate fire-and-forget in the sync Alpine lifecycle (`init()`, event handlers). `void` only trades one weak warning for another (`VoidExpressionJS`); awaiting would change load ordering. Documented, not "fixed". |
+| `DuplicatedCode` (116) | 116 | 116 | Structural: JSON-store boilerplate (`state.py`/`operations.py`), two sibling dataclasses (`models.py`), repeated solver blocks (`policy.py`). Refactoring these is a behaviour-risk trade for a weak warning — refused. |
+| Narrowing false positives (`PyUnresolvedReferences` 260, `PyNoneFunctionAssignment`, `PyAttributeOutsideInit`) | 260 | ~240 | `x | None` followed by a guard PyCharm does not follow (mostly tests). AGENTS §8 already says not to "fix" these. |
+| `PySimplifyBooleanCheck` (2), `HttpUrlsUsage` (24) | 26 | 26 | `entry.get("distributed") is True` is the strict JS-boolean check — the simplification would change semantics. `http://host:port` is the LAN endpoint; there is no https. |
+| `XmlUnboundNsPrefix` (3) | 3 | 3 | Alpine `x-transition:enter` read as an XML namespace — false positive of the XML inspection on an Alpine template. |
+
+**Goal for our own code:** errors **0** (reached: the 68 `PyUnresolvedReferences`
+errors are `monkeypatch.setattr(module, "re-exported-name", …)` false positives —
+runtime-verified by 658 green tests — and the one `JSHint` finding is "Node
+interpreter not configured" in the IDE, not code). Warnings: everything with a
+real cause is fixed or listed above with the reason it stays.
+
+---
+
 ## 3. Phase 1 — rollout and the acceptance gate (needs people at the Macs)
 
 > **Rollout bewusst zurückgestellt (2026-11-16):** erst die PyCharm-Inspection
