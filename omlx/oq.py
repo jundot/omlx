@@ -668,6 +668,7 @@ def _is_token_embedding_tensor(path: str) -> bool:
             ".tok_embeddings.weight",
             ".word_embeddings.weight",
             ".wte.weight",
+            "backbone.embeddings.weight",
             f"{inkling2_layout.EMBED_PATH}.weight",
         )
     )
@@ -8415,6 +8416,7 @@ def _find_model_layers(model):
     """
     embed_fn = None
     layers = None
+    text_model = getattr(model, "language_model", model)
 
     if getattr(model, "model_type", None) == "muse_spark":
         # mlx-lm's Muse Spark normalizes its token embeddings.
@@ -8451,9 +8453,10 @@ def _find_model_layers(model):
     elif hasattr(model, "embed_tokens"):
         embed_fn = model.embed_tokens
         layers = model.layers
-    elif hasattr(model, "backbone") and hasattr(model.backbone, "embeddings"):
-        embed_fn = model.backbone.embeddings
-        layers = model.layers
+    elif hasattr(text_model, "backbone") and hasattr(text_model.backbone, "embeddings"):
+        # Nemotron-H exposes the same backbone directly and in Omni wrappers.
+        embed_fn = text_model.backbone.embeddings
+        layers = text_model.layers
 
     return embed_fn, layers
 
@@ -8957,7 +8960,8 @@ def _is_recurrent_layer(layer) -> bool:
         return not bool(layer.is_global)
     if hasattr(layer, "is_attention_layer"):
         return not bool(layer.is_attention_layer)
-    return False
+    # Nemotron-H's Mamba blocks use a padding mask; unpadded prompts need none.
+    return getattr(layer, "block_type", None) == "M"
 
 
 # Layer or attention attributes that mark a sliding-window layer.
@@ -9556,6 +9560,8 @@ class OQImatrixCollector:
 def _collect_untied_lm_head_imatrix(core, hidden, collector, name) -> bool:
     """Capture normalized head inputs without materializing vocabulary logits."""
     norm = getattr(core, "norm", None)
+    if norm is None:
+        norm = getattr(core, "norm_f", None)
     if core is None or norm is None:
         return False
     module = collector._original_modules.get(name)
@@ -9570,6 +9576,11 @@ def _collect_untied_lm_head_imatrix(core, hidden, collector, name) -> bool:
 
 
 def _collect_language_model_lm_head_imatrix(model, hidden, collector) -> bool:
+    text_model = getattr(model, "language_model", model)
+    backbone = getattr(text_model, "backbone", None)
+    if backbone is not None and hasattr(backbone, "embeddings"):
+        name = "language_model.lm_head" if text_model is not model else "lm_head"
+        return _collect_untied_lm_head_imatrix(backbone, hidden, collector, name)
     if str(getattr(model, "model_type", "")) not in ("glm5_next", "flint"):
         return False
     language_model = getattr(model, "language_model", None)

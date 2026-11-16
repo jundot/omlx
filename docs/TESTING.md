@@ -4,6 +4,16 @@ Server tests live in `tests/` and must not depend on `apps/`: after the full run
 
 Run `node --test` from `apps/omlx-web/tests/` to discover the standalone dashboard script tests. `test_admin_network_auth_ui.py` runs `network_auth_ui_runner.cjs` with backend-generated cases on stdin.
 
+# Nemotron-H oQe calibration tests
+
+Run `python -m pytest tests/test_oq.py -k TestNemotronImatrix` to check text
+backbone discovery in Nemotron-H Omni (including Bolt). Tiny real mlx-vlm
+classes cover heterogeneous MoE blocks, Mamba masks, attention, latent/shared
+projections and the normalized LM head, with and without 4-bit weights. The
+tests compare collected statistics with a native forward and exercise a local
+BF16 checkpoint through sanitize, proxy creation, cache reuse, oQ4e and reload.
+No model download is required; this does not validate the real 74B checkpoint.
+
 # Qwen3.5 text-only checkpoint tests
 
 Run `python -m pytest -q tests/test_oq.py -k Qwen35TextCheckpoint` to check
