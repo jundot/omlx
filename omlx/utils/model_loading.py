@@ -564,6 +564,11 @@ def maybe_apply_pre_load_patches(
     Safe to call repeatedly; the patches are idempotent.
     """
     from ..model_settings import validate_moe_expert_offload
+    from ..oqh.loading import install_load_hook, require_native
+
+    # Before any patch captures a model class's load_weights (see the Bonsai
+    # note below). The hook only acts on weights that hold oQh tensors.
+    install_load_hook()
 
     if model_settings is not None:
         validate_moe_expert_offload(
@@ -654,6 +659,7 @@ def maybe_apply_pre_load_patches(
         return
 
     normalize_qwen35_text_config(config)
+    require_native(config)
 
     # Bonsai t5 load patch must run FIRST — before any other patch that wraps
     # load_weights on a model subclass (e.g. mlx_vlm_mtp qwen35_vlm_runtime).

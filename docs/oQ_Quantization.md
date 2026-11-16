@@ -1,6 +1,6 @@
 # oQ: oMLX Quantization
 
-oQ turns a full-precision Hugging Face model into a smaller MLX model. The result is a standard MLX safetensors model, so it runs in oMLX and also loads in mlx-lm, mlx-vlm and other apps that read MLX models. No custom loader is needed.
+oQ turns a full-precision Hugging Face model into a smaller MLX model. The result is a standard MLX safetensors model, so it runs in oMLX and also loads in mlx-lm, mlx-vlm and other apps that read MLX models. No custom loader is needed. The one exception is [oQh](#oqh), which only oMLX can run.
 
 oQ is mixed precision. Before writing anything it measures how much each layer suffers from quantization, then spends extra bits where they help most while keeping the total size close to the level you picked.
 
@@ -47,6 +47,27 @@ Both use the same bit plan and produce models of the same size and speed. The di
 oQe takes longer to make, but the extra work happens only once. On an M3 Ultra, Qwen3.5-9B takes about 7 minutes for the first oQe run and about 5.5 minutes after that, and Qwen3.6-35B-A3B about 10 and 7 minutes. The output-error step reads the original model again for every build, so it is not cached. If the model does not fit in memory, only the model types that oQe can stream one layer at a time get this step. The others, and DeepSeek V4.1, Muse Spark and Inkling 2, skip it and keep the plain oQe values. `oq_imatrix_report.json` in the output records whether it ran.
 
 The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix` inside your model directory. Making another level of the same model, for example oQ3e after oQ4e, reuses it.
+
+## oQh
+
+oQh is a variant of oQe for the Qwen3.5, Qwen3.6 and Qwen3.8 dense and MoE models, Qwen3.8-Flash-Next, GLM-5.3 and DeepSeek V4.1. It gives the same file size as oQe at the same level with lower error. In Qwen3.8-Flash-Next, GLM-5.3 and DeepSeek V4.1 only the routed experts change; the other layers keep their current format and their fast kernels. DeepSeek V4.1 takes oQh below oQ4 only, because oQ4 keeps the original FP4 experts. Turn on **Rotated codes (oQh)** in the oQe section; the output name ends in `h`, for example `Qwen3.5-9B-oQ2.5h`.
+
+oQh is an oMLX format. It needs the oQh kernels, which `make install`, `make dev` and the app build include. mlx-lm, mlx-vlm and other MLX apps cannot load it, and Splash, the Prefill Accelerator, A8 prefill, ANE prefill and MoE expert offload do not run it. In a cluster, GLM-5.3 and DeepSeek V4.1 oQh models run tensor parallel on up to two nodes; other oQh models do not run tensor parallel.
+
+How it differs from oQe:
+
+- Affine quantization stores a scale and an offset for every group of 64 weights, about 0.5 bits per weight. oQh rotates the input of each decoder linear layer with a signed Walsh-Hadamard transform and stores the weights in that rotated basis as integer codes with one scale per output row.
+- At the same bit width, one scale per row rounds less accurately than group scales. The bytes oQh saves buy one more bit, first for the tensors with the fewest bits, until the file is the size of the oQe plan.
+- The rounded values are then re-picked against each layer's output error, as in oQe.
+- The norm and activation kernels write the rotated input next to their normal output, so the rotation adds almost no work at run time.
+
+| Model | Level | Size | oQe KL | oQh KL |
+|---|---|---|---|---|
+| Qwen3.5-4B | oQ3.5 | 2.1 GB | 0.091 | 0.074 (-18%) |
+| Qwen3.5-9B | oQ2.5 | 3.8 GB | 0.251 | 0.118 (-53%) |
+| Qwen3.5-9B | oQ3.5 | 4.5 GB | 0.082 | 0.057 (-30%) |
+
+KL divergence from the original model on general text (FLORES), lower is better. oQe and oQh files of the same level have the same size. The 9B rows compare the decoder layers only, with the embeddings and the LM head kept in BF16.
 
 ## What oQ does
 

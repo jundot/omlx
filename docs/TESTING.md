@@ -13,6 +13,10 @@ cover the Hugging Face `_text` names and the existing mlx-lm name, including
 strict loading of quantized output.
 No model download is required.
 
+# oQh tests
+
+Run `python -m pytest -q tests/test_oqh.py` after `make kernels` to check the oQh format. It compares the GEMV, gather GEMV and stock-path matmuls with the dequantized weight at every width, the norm and activation kernels with their references, the quantizer against plain rounding, the TP-sized blocks of row-parallel linears, and the planner keeping the affine size while it raises the narrowest tensors first. Tiny dense and MoE Qwen3.5 checkpoints check that the load hook builds oQh modules with norm fusion and that prefill, decode and direct submodule calls match a dequantized float twin. Tiny Qwen3.8-Flash-Next, GLM-5.3 and DeepSeek V4.1 checkpoints check the experts-only exports, the GLM fused decode kernels on oQh experts, and the tensor-parallel split of row scales and signs; `test_deepseek_v41_fused_decode.py` runs its fused-decode cases with oQh routed experts too. The kernel cases skip when the oQh extension is not built. Splash and the prefill helper refusals of oQh checkpoints are in `test_splash_engine.py` and `test_prefill_helper.py`. No model download is required.
+
 # LFM3-Omni oQ tests
 
 Run `python -m pytest -q tests/test_oq.py -k 'Lfm3OmniSanitize or lfm3_omni_copies_codec'` to check that oQ writes LFM3-Omni weights under the names mlx-vlm loads (eager sanitize and streaming discovery), keeps the speech modules in floating point, copies the speech codec, and walks the conv layers with the native mask. They use a small config and need no model download.

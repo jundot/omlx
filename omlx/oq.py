@@ -37,6 +37,9 @@ try:
     from mlx_lm.models.base import create_attention_mask
     from mlx_lm.utils import _get_classes
 
+    from omlx.oqh import format as oqh_format
+    from omlx.oqh import targets as oqh_targets
+    from omlx.oqh.writer import OqhWriter
     from omlx.patches import minimax_m3_dspark as minimax_dspark
     from omlx.patches.inkling2 import apply_inkling2_patch
     from omlx.patches.inkling2 import oq_layout as inkling2_layout
@@ -1991,6 +1994,7 @@ def resolve_output_name(
     preserve_mtp: bool = False,
     enhanced: bool = False,
     preserve_ngram_table: bool = False,
+    hadamard: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
@@ -2003,6 +2007,7 @@ def resolve_output_name(
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
         "Qwen3.5-122B-A10B" + 4 + enhanced -> "Qwen3.5-122B-A10B-oQ4e"
+        "Qwen3.5-122B-A10B" + 2.5 + hadamard -> "Qwen3.5-122B-A10B-oQ2.5h"
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
         "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
@@ -2010,7 +2015,7 @@ def resolve_output_name(
             + preserve_mtp -> "DeepSeek-V4.1-Flash-oQ4e-ngram-mtp"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|ngram|mtp)$",
+        r"-(oQ[\d.]+[eh]?|[0-9]+[_-]?bit|fp\d+|bf\d+|ngram|mtp)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -2020,7 +2025,7 @@ def resolve_output_name(
             break
         base = new
     level_str = f"{oq_level:g}"
-    suffix = f"-oQ{level_str}{'e' if enhanced else ''}"
+    suffix = f"-oQ{level_str}{'h' if hadamard else ('e' if enhanced else '')}"
     if dtype == "float16":
         suffix += "-fp16"
     if preserve_ngram_table:
@@ -7184,6 +7189,7 @@ def quantize_oq_streaming(
     sensitivity_map_override: dict[int | str, float] | None = None,
     stream_calibration: bool | None = None,
     preserve_ngram_table: bool = False,
+    hadamard: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -7259,6 +7265,12 @@ def quantize_oq_streaming(
             plain weights. DeepSeek V4.1 keeps its Engram tables in the
             official FP8 storage instead of 4-bit affine. No effect on other
             model types.
+        hadamard: Build oQh: the decoder linears become rotated uniform codes
+            with one scale per row (see omlx/oqh/format.py), quantized against
+            their input Gram. The bytes the affine plan gives them buy the
+            widths (see oqh.targets.reinvest), so the size stays the same.
+            Implies the oQe calibration. It needs the original weights, so a
+            source that only a proxy can calibrate is refused.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -7267,6 +7279,8 @@ def quantize_oq_streaming(
     if dtype not in OQ_DTYPES:
         raise ValueError(f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}")
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
+    if hadamard:
+        enhanced = True
 
     source = Path(model_path)
     output = Path(output_path)
@@ -7308,6 +7322,10 @@ def quantize_oq_streaming(
         and _has_vision_subconfig(config)
         and not text_only
     )
+    if hadamard and not oqh_targets.supports(config):
+        raise ValueError(
+            f"oQh does not support model_type {config.get('model_type')!r}"
+        )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
@@ -7331,6 +7349,7 @@ def quantize_oq_streaming(
             dtype=dtype,
             progress_callback=progress_callback,
             preserve_ngram_table=preserve_ngram_table,
+            hadamard=hadamard,
         )
     if (
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
@@ -7891,6 +7910,14 @@ def quantize_oq_streaming(
     else:
         config["_oq_boost_map"] = {}
 
+    # oQh widths of the decoder linears, from the bytes the affine plan gives them.
+    oqh_plan: dict[str, int] = {}
+    if hadamard:
+        oqh_plan = _plan_oqh_bits(
+            _budgeted_shapes(named_shapes, config), config, oq_level, group_size
+        )
+        logger.info(f"oQ{oq_level:g}: oQh plan covers {len(oqh_plan)} tensors")
+
     cb("loading", 20.0, "Starting tensor quantization")
 
     tensor_names = list(all_weights.keys())
@@ -7947,6 +7974,7 @@ def quantize_oq_streaming(
             src_info = all_weights.source_quant_info(tensor_name)
             if (
                 src_info is not None
+                and tensor_name.removesuffix(".weight") not in oqh_plan
                 and _should_quantize_tensor(
                     tensor_name, all_weights.plan_shape(tensor_name)
                 )
@@ -8012,6 +8040,11 @@ def quantize_oq_streaming(
                     tensor_name, config, oq_level, group_size
                 )
 
+                if tensor_name.removesuffix(".weight") in oqh_plan:
+                    # Written by the oQh pass from the original weights.
+                    del w_mx
+                    processed_bytes += tensor_bytes
+                    continue
                 if bits is not None and len(shape) >= 2 and shape[-1] % gs == 0:
                     # Cast to target dtype before quantize: scales/biases inherit
                     # the input dtype, which drives inference speed on Apple
@@ -8153,6 +8186,30 @@ def quantize_oq_streaming(
         out_shard_idx += 1
         del out_shard_data
 
+    oqh_report = None
+    if hadamard:
+        if out_shard_idx == 1 and (output / "model.safetensors").exists():
+            # A lone main shard took the final name; the oQh shards follow it.
+            single = "model-00001-of-PLACEHOLDER.safetensors"
+            (output / "model.safetensors").rename(output / single)
+            for k in weight_map:
+                weight_map[k] = single
+        oqh_report = _write_oqh_output(
+            source,
+            output,
+            config,
+            weight_map,
+            {**quantization_config, **per_layer_config},
+            oqh_plan,
+            target_dtype,
+            out_shard_idx,
+            streamed=stream_imatrix,
+            requires_proxy=_model_requires_proxy,
+            trust_remote_code=trust_remote_code,
+            progress_callback=cb,
+        )
+        out_shard_idx = oqh_report.pop("shards")
+
     total_shards = out_shard_idx
     if total_shards > 1:
         for i in range(total_shards):
@@ -8166,7 +8223,7 @@ def quantize_oq_streaming(
                     if v == old_name:
                         weight_map[k] = new_name
 
-    if enhanced and upstream_writer is None:
+    if enhanced and upstream_writer is None and not hadamard:
         refine_report = _refine_oqe_output(
             source,
             output,
@@ -8256,6 +8313,13 @@ def quantize_oq_streaming(
         quant_info[key] = val
     output_config["quantization"] = quant_info
     output_config["quantization_config"] = quant_info
+    if oqh_report is not None:
+        output_config[oqh_format.CONFIG_KEY] = {
+            "version": oqh_format.FORMAT_VERSION,
+            "tensors": oqh_report.pop("entries"),
+        }
+        if imatrix_report is not None:
+            imatrix_report["oqh"] = oqh_report
     if minimax_nvfp4_experts:
         output_config["text_config"] = {
             **output_config["text_config"],
@@ -11434,6 +11498,9 @@ class _OQRefineWriter:
         shard = self.weight_map[f"{base}.weight"]
         self.pending.setdefault(shard, {})[f"{base}.weight"] = packed
 
+    def process(self, collector, modules: dict, stats: dict) -> None:
+        _refine_captured(collector, modules, self, stats)
+
     def layer_done(self, layer_idx: int) -> None:
         for shard, last in list(self.last_layer.items()):
             if last <= layer_idx:
@@ -11610,7 +11677,7 @@ def _refine_slots(block, prefix, layer_idx, run_slots, writer, stats) -> None:
     finally:
         collector.restore(block)
     if complete:
-        _refine_captured(collector, modules, writer, stats)
+        writer.process(collector, modules, stats)
     else:
         logger.warning("oQe refine: layer %d forward failed, layer skipped", layer_idx)
         stats["skipped_layers"] += 1
@@ -11861,6 +11928,103 @@ def _refine_oqe_output(
         "skipped_layers": stats["skipped_layers"],
         "hessian_error_reduction": round(gain, 4),
         "seconds": round(seconds, 1),
+    }
+
+
+def _plan_oqh_bits(
+    shapes: dict[str, tuple], config: dict, oq_level, group_size: int
+) -> dict[str, int]:
+    """{path: bits} of the oQh targets within the bytes of their affine plan."""
+    scheme = oqh_targets.scheme_for(config)
+    planned = {}
+    for path, shape in shapes.items():
+        if not scheme.is_target(path, shape):
+            continue
+        bits, gs, mode = _get_predicate_bits(
+            f"{path}.weight", config, oq_level, group_size
+        )
+        if bits is not None and mode == "affine" and shape[-1] % gs == 0:
+            planned[path] = {"bits": bits, "group_size": gs, "mode": mode}
+    return oqh_targets.reinvest(
+        shapes, planned, config.get("_oq_sensitivity_map") or {}
+    )
+
+
+def _write_oqh_output(
+    source: Path,
+    output: Path,
+    config: dict,
+    weight_map: dict[str, str],
+    quantization: dict,
+    target_bits: dict[str, int],
+    dtype,
+    shard_index: int,
+    *,
+    streamed: bool,
+    requires_proxy: bool,
+    trust_remote_code: bool,
+    progress_callback,
+) -> dict:
+    """The oQh tensors of a build, from the original weights and their input Grams.
+
+    Walks the layers like _refine_oqe_output. The affine tensors it visits get the
+    oQe refinement on the way. Returns the report with the shard count and the
+    per-tensor config entries.
+    """
+    if requires_proxy and not streamed:
+        raise ValueError(
+            "oQh needs the original weights during calibration; this source "
+            "only fits in memory through a proxy"
+        )
+    writer = OqhWriter(
+        _OQRefineWriter(output, weight_map, quantization),
+        target_bits,
+        dtype,
+        shard_index,
+        oqh_targets.scheme_for(config),
+    )
+    stats = {"tensors": 0, "kept": 0, "skipped_layers": 0, "before": 0.0, "after": 0.0}
+    started = _time.monotonic()
+
+    def progress(done: int, total: int) -> None:
+        frac = done / max(total, 1)
+        _emit_progress(
+            progress_callback,
+            "oqh",
+            70.0 + 22.0 * frac,
+            f"oQh quantization, layer {done}/{total}",
+        )
+
+    walk = _refine_oqe_streamed if streamed else _refine_oqe_resident
+    walk(
+        str(source),
+        config,
+        writer,
+        stats,
+        trust_remote_code=trust_remote_code,
+        progress=progress,
+    )
+    writer.finish()
+    mx.synchronize()
+    mx.clear_cache()
+    before, after = stats.get("oqh_before", 0.0), stats.get("oqh_after", 0.0)
+    gain = 1.0 - after / before if before > 0 else 0.0
+    seconds = _time.monotonic() - started
+    logger.info(
+        "oQh: %d tensors, Hessian error -%.1f%% against row rounding in %.0fs",
+        stats.get("oqh_tensors", 0),
+        100.0 * gain,
+        seconds,
+    )
+    return {
+        "status": "done",
+        "tensors": stats.get("oqh_tensors", 0),
+        "refined_affine": stats["tensors"],
+        "skipped_layers": stats["skipped_layers"],
+        "hessian_error_reduction": round(gain, 4),
+        "seconds": round(seconds, 1),
+        "entries": writer.entries,
+        "shards": writer.shard_index,
     }
 
 

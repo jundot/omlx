@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..model_discovery import _VISION_WEIGHT_PREFIXES
+from ..oqh import format as oqh_format
 from .node_role import ROLES
 from .performance import ExecutionProfileName, NodePerformanceProfile
 from .staging import DEFAULT_REMOTE_PYTHON, is_local_host, run_remote_python
@@ -682,6 +683,8 @@ def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
     model_type = config.get("model_type")
     if not isinstance(model_type, str):
         return False
+    if oqh_format.is_oqh_config(config):
+        return model_type in oqh_format.TENSOR_PARALLEL_TYPES
     if supports_model_type(model_type):
         return True
     if not model_type.replace("_", "").isalnum():
@@ -737,6 +740,9 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
     heads = _config_int(config, "num_attention_heads", 1)
     kv_heads = _config_int(config, "num_key_value_heads", heads)
     values = [heads, kv_heads]
+    if oqh_format.is_oqh_config(config):
+        # oQh input-split blocks fit this many ranks (see oqh.format.block_for).
+        values.append(oqh_format.TP_BLOCK_RANKS)
     model_type = config.get("model_type")
     if model_type == "deepseek_v41":
         return _deepseek_v41_tensor_divisors(config, heads)
@@ -824,13 +830,14 @@ def _deepseek_v41_tensor_divisors(
     """
 
     groups = _config_int(config, "o_groups", 1)
+    oqh = [oqh_format.TP_BLOCK_RANKS] if oqh_format.is_oqh_config(config) else []
     widths = {
         "attn.wo_b": groups * _config_int(config, "o_lora_rank", 1),
         "experts.w2": _config_int(
             config, "moe_intermediate_size", 1, maximum=1_000_000
         ),
     }
-    values = [heads, groups]
+    values = [heads, groups, *oqh]
     spec = config.get("omlx_deepseek_v41")
     modules = spec.get("quantized_modules") if isinstance(spec, dict) else None
     for name, entry in (modules or {}).items():

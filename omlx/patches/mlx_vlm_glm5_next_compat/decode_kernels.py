@@ -234,6 +234,36 @@ inline void glm_qmv_rows(
   }
 }
 
+// glm_qmv_rows for oQh rows: codes q with one scale per row, w = s * (q - center).
+// The caller multiplies each row's partial sums by its scale.
+template <typename T, int K, int bits, int RPS>
+inline void glm_oqh_rows(
+    const device uint8_t* ws,
+    const device T* x,
+    uint simd_lid,
+    thread float* result) {
+  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int pack_factor = glm_pack_factor<bits>();
+  constexpr int bytes_per_pack = glm_bytes_per_pack<bits>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * 32;
+  constexpr int in_vec_size_w = K * bytes_per_pack / pack_factor;
+  constexpr float center = float((1 << bits) - 1) / 2.0f;
+
+  thread float x_thread[values_per_thread];
+  ws += simd_lid * packs_per_thread * bytes_per_pack;
+  x += simd_lid * values_per_thread;
+  for (int k = 0; k < K; k += block_size) {
+    float sum = glm_load_vector<T, values_per_thread, bits>(x, x_thread);
+    for (int row = 0; row < RPS; row++) {
+      result[row] += glm_qdot<values_per_thread, bits>(
+          ws + row * in_vec_size_w, x_thread, 1.0f, -center, sum);
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    x += block_size;
+  }
+}
+
 // Verbatim copy of MLX quantized.h dequantize (U = float) for 4/5/6/8 bits.
 template <int N, int bits>
 inline void glm_dequantize(const device uint8_t* w, float scale, float bias, thread float* w_local) {
@@ -492,17 +522,28 @@ _GATE_UP_SOURCE = r"""
     const int expert = int(indices[token * TOPK + r]);
 #endif
     constexpr int WB = K * RBITS / 8;   // bytes per weight row
-    constexpr int G = K / RGS;          // groups per row
     // ESTRIDE rows per expert; a fused [gate; up] tensor (ESTRIDE = 2N) is
     // passed as both gate and up with the up rows UP_OFF = N further on.
     const size_t row0 = size_t(expert) * ESTRIDE + out_row;
     const size_t urow0 = row0 + UP_OFF;
+#if ROUTED_OQH
+    // oQh experts read the rotated input; the shared expert keeps x.
+    const device T* xq = x_rot + token * K;
+    glm_oqh_rows<T, K, RBITS, RPS>((const device uint8_t*)gate_w + row0 * WB, xq, simd_lid, g_res);
+    glm_oqh_rows<T, K, RBITS, RPS>((const device uint8_t*)up_w + urow0 * WB, xq, simd_lid, u_res);
+    for (int row = 0; row < RPS; row++) {
+      g_res[row] *= float(gate_rs[row0 + row]);
+      u_res[row] *= float(up_rs[urow0 + row]);
+    }
+#else
+    constexpr int G = K / RGS;          // groups per row
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
         (const device uint8_t*)gate_w + row0 * WB, gate_s + row0 * G,
         gate_b + row0 * G, xr, simd_lid, g_res);
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
         (const device uint8_t*)up_w + urow0 * WB, up_s + urow0 * G,
         up_b + urow0 * G, xr, simd_lid, u_res);
+#endif
   } else {
 #if HAS_SHARED
     constexpr int WB = K * SBITS / 8;
@@ -627,14 +668,24 @@ _DOWN_SOURCE = r"""
 
   float acc[RPS] = {0};
   constexpr int WB = K * RBITS / 8;
-  constexpr int G = K / RGS;
   for (int r = 0; r < TOPK; r++) {
     const int expert = int(indices[token * TOPK + r]);
     const size_t row0 = size_t(expert) * N + out_row;
     float res[RPS] = {0};
+#if ROUTED_OQH
+    // act_rot holds the rotated routed activations, [T, TOPK, K].
+    glm_oqh_rows<T, K, RBITS, RPS>(
+        (const device uint8_t*)down_w + row0 * WB,
+        act_rot + (size_t(token) * TOPK + r) * K, simd_lid, res);
+    for (int row = 0; row < RPS; row++) {
+      res[row] *= float(down_rs[row0 + row]);
+    }
+#else
+    constexpr int G = K / RGS;
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
         (const device uint8_t*)down_w + row0 * WB, down_s + row0 * G,
         down_b + row0 * G, act + (size_t(token) * RT + r) * K, simd_lid, res);
+#endif
     const float score = scores[token * TOPK + r];
     for (int row = 0; row < RPS; row++) {
       float v = simd_sum(res[row]);
@@ -714,14 +765,21 @@ def _gate_up_kernel(
     shared_wide: bool = False,
     slot_major: bool = False,
     select: bool = False,
+    oqh: bool = False,
 ):
     routes = ["sel_sig", "sel_biased", "sel_scaling"] if select else ["indices"]
-    inputs = ["x"] + routes + ["limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
+    if oqh:
+        routed = ["gate_w", "gate_rs", "up_w", "up_rs"]
+        inputs = ["x", "x_rot"] + routes + ["limit"] + routed
+    else:
+        routed = ["gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
+        inputs = ["x"] + routes + ["limit"] + routed
     if has_shared or shared_wide:
         inputs += ["sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"]
     suffix = "_widesh" if shared_wide else ("_shared" if has_shared else "")
     suffix += "_sm" if slot_major else ""
     suffix += "_select" if select else ""
+    suffix += "_oqh" if oqh else ""
     outputs = ["out", "shared_out"] if shared_wide else ["out"]
     if select:
         outputs += ["sel_indices", "sel_scores"]
@@ -736,6 +794,7 @@ def _gate_up_kernel(
             SHARED_WIDE=int(shared_wide),
             SLOT_MAJOR=int(slot_major),
             SELECT=int(select),
+            ROUTED_OQH=int(oqh),
         ),
     )
 
@@ -746,8 +805,12 @@ def _down_kernel(
     add_shared_y: bool,
     slot_major: bool = False,
     shared_wide: bool = False,
+    oqh: bool = False,
 ):
-    inputs = ["act", "indices", "scores", "down_w", "down_s", "down_b"]
+    if oqh:
+        inputs = ["act", "act_rot", "indices", "scores", "down_w", "down_rs"]
+    else:
+        inputs = ["act", "indices", "scores", "down_w", "down_s", "down_b"]
     if has_shared:
         inputs += ["sh_down_w", "sh_down_s", "sh_down_b"]
         if shared_wide:
@@ -758,6 +821,7 @@ def _down_kernel(
         "_shared" if has_shared else ("_add" if add_shared_y else "")
     )
     suffix += "_sm" if slot_major else ""
+    suffix += "_oqh" if oqh else ""
     return mx.fast.metal_kernel(
         name=f"glm5_moe_down_combine{suffix}",
         input_names=inputs,
@@ -769,6 +833,7 @@ def _down_kernel(
             ADD_SHARED_Y=int(add_shared_y and not has_shared),
             SLOT_MAJOR=int(slot_major),
             SHARED_WIDE_DOWN=int(shared_wide),
+            ROUTED_OQH=int(oqh),
         ),
     )
 
@@ -783,6 +848,13 @@ def _qmv_fast_ok(bits: int, group_size: int, n: int, k: int) -> bool:
     if group_size % values_per_thread:
         return False
     return n % 8 == 0 and k % (values_per_thread * 32) == 0
+
+
+def _oqh_parts(layer):
+    """(weight, rscale, bits) of oQh experts: uniform codes with one scale per row."""
+    if "rscale" not in layer or "oqh_signs" not in layer:
+        return None
+    return layer["weight"], layer["rscale"], int(layer.bits)
 
 
 def _affine_parts(layer):
@@ -808,6 +880,7 @@ def moe_gate_up_swiglu(
     nsg: int = 2,
     shared_wide: bool = False,
     select=None,
+    x_rot: Optional[mx.array] = None,
 ):
     """Clamped-SwiGLU activations for every (token, routed expert[, shared]).
 
@@ -824,6 +897,9 @@ def moe_gate_up_swiglu(
     threadgroup replays the router's top-k selection, and the call returns
     ``(act, indices [1, top_k] uint32, scores [1, top_k] fp32)`` like
     ``moe_router`` + this kernel, or None when not covered.
+
+    ``x_rot`` (x in the experts' oQh basis) means the routed experts are oQh:
+    they read it with their row scales, while the shared expert reads ``x``.
     """
     if select is not None:
         if shared_wide or x.ndim != 2 or x.shape[0] != 1:
@@ -835,13 +911,23 @@ def moe_gate_up_swiglu(
         if sig.dtype != mx.float32 or biased.dtype != mx.float32 or E_r > 1024:
             return None
         indices = mx.zeros((1, sel_topk), dtype=mx.uint32)  # shape only
+    oqh = x_rot is not None
     fused_gu = routed_up is None
-    parts = [_affine_parts(m) for m in ((routed_gate,) if fused_gu else (routed_gate, routed_up))]
+    routed = (routed_gate,) if fused_gu else (routed_gate, routed_up)
+    parts = [(_oqh_parts if oqh else _affine_parts)(m) for m in routed]
     if any(p is None for p in parts) or x.ndim != 2 or indices.ndim != 2:
         return None
     if fused_gu:
         parts = parts * 2
-    (gw, gs, gb, rbits, rgs), (uw, us, ub, ubits, ugs) = parts
+    if oqh:
+        if x_rot.shape != x.shape or x_rot.dtype != x.dtype:
+            return None
+        # Any group width that the row layout divides passes the shape check.
+        (gw, gs, rbits), (uw, us, ubits) = parts
+        gb = ub = None
+        rgs = ugs = 128
+    else:
+        (gw, gs, gb, rbits, rgs), (uw, us, ub, ubits, ugs) = parts
     if (rbits, rgs) != (ubits, ugs) or gw.shape != uw.shape or gw.ndim != 3:
         return None
     T, K = x.shape
@@ -864,11 +950,17 @@ def moe_gate_up_swiglu(
         routes = [sig, biased, mx.array([sel_scaling], dtype=mx.float32)]
     else:
         routes = [indices]
-    inputs = [x] + routes + [mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub]
+    limits = [mx.array([limit], dtype=mx.float32)]
+    if oqh:
+        inputs = [x, x_rot] + routes + limits + [gw, gs, uw, us]
+    else:
+        inputs = [x] + routes + limits + [gw, gs, gb, uw, us, ub]
     template = [
         ("T", x.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
-        ("RGS", rgs), ("RPS", rps), ("NSG", nsg), ("ESTRIDE", estride), ("UP_OFF", up_off),
+        ("RPS", rps), ("NSG", nsg), ("ESTRIDE", estride), ("UP_OFF", up_off),
     ]
+    if not oqh:
+        template.append(("RGS", rgs))
     if select is not None:
         template += [("NE", E_r), ("SEL_NORM", int(bool(sel_norm) and sel_topk > 1))]
     if has_shared:
@@ -889,7 +981,7 @@ def moe_gate_up_swiglu(
         inputs += [sgw, sgs, sgb, suw, sus, sub]
         template += [("SBITS", sbits), ("SGS", sgsz)]
     slot_major = _slot_major(T)
-    kernel = _gate_up_kernel(has_shared, shared_wide, slot_major, select is not None)
+    kernel = _gate_up_kernel(has_shared, shared_wide, slot_major, select is not None, oqh)
     STATS["moe_gate_up"] += 1
     tiles = N // (rps * nsg)
     slots = T * topk + 1 if shared_wide else T * (topk + int(has_shared))
@@ -944,6 +1036,7 @@ def moe_down_combine(
     shared_act: Optional[mx.array] = None,
     rps: int = 4,
     nsg: int = 2,
+    act_rot: Optional[mx.array] = None,
 ) -> Optional[mx.array]:
     """Routed down projections combined with the routing weights (+ shared).
 
@@ -952,12 +1045,18 @@ def moe_down_combine(
     last activation slot (``shared_down``), from ``shared_act`` [T, K] (the
     ``shared_wide`` gate/up output, with the multi-row qmv_wide arithmetic)
     or added from a precomputed ``shared_y`` [T, N].  Returns [T, N] in
-    ``act.dtype``.
+    ``act.dtype``. ``act_rot`` [T, TOPK, K] (the routed activations in the
+    experts' oQh basis) means the routed experts are oQh.
     """
-    p = _affine_parts(routed_down)
+    oqh = act_rot is not None
+    p = (_oqh_parts if oqh else _affine_parts)(routed_down)
     if p is None or act.ndim != 3 or scores.dtype != mx.float32:
         return None
-    dw, ds, db, rbits, rgs = p
+    if oqh:
+        dw, ds, rbits = p
+        db, rgs = None, 128
+    else:
+        dw, ds, db, rbits, rgs = p
     T, rt, K = act.shape
     E, N, _ = dw.shape
     topk = indices.shape[1]
@@ -971,11 +1070,18 @@ def moe_down_combine(
         return None
     if not _qmv_fast_ok(rbits, rgs, N, K) or N % (rps * nsg):
         return None
-    inputs = [act, indices, scores, dw, ds, db]
+    if oqh:
+        if act_rot.shape != (T, topk, K) or act_rot.dtype != act.dtype:
+            return None
+        inputs = [act, act_rot, indices, scores, dw, ds]
+    else:
+        inputs = [act, indices, scores, dw, ds, db]
     template = [
         ("T", act.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
-        ("RGS", rgs), ("RPS", rps), ("NSG", nsg),
+        ("RPS", rps), ("NSG", nsg),
     ]
+    if not oqh:
+        template.append(("RGS", rgs))
     if has_shared:
         sp = _affine_parts(shared_down)
         if sp is None:
@@ -997,7 +1103,7 @@ def moe_down_combine(
             return None
         inputs.append(shared_y)
     slot_major = _slot_major(T)
-    kernel = _down_kernel(has_shared, shared_y is not None, slot_major, shared_wide)
+    kernel = _down_kernel(has_shared, shared_y is not None, slot_major, shared_wide, oqh)
     STATS["moe_down"] += 1
     if shared_wide:
         STATS["moe_down_shared_wide"] += 1

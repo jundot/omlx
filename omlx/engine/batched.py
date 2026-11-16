@@ -23,6 +23,7 @@ from ..model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from ..oqh.format import is_oqh_checkpoint
 from ..patches.mlx_lm_mtp import drafter_target
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
@@ -543,7 +544,11 @@ class BatchedEngine(BaseEngine):
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
-        if a8_prefill_on(self._model_settings):
+        # A8 and ANE prefill read affine weights; oQh linears have none.
+        oqh = is_oqh_checkpoint(self._model_name)
+        if oqh and a8_prefill_on(self._model_settings):
+            logger.warning("A8 prefill does not read oQh weights; it stays off")
+        elif a8_prefill_on(self._model_settings):
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -561,6 +566,9 @@ class BatchedEngine(BaseEngine):
 
         ane_backend = ane_prefill_backend(self.model_type)
         ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+        if ane_enabled and oqh:
+            logger.warning("ANE prefill does not read oQh weights; it stays off")
+            ane_enabled = False
         if ane_enabled:
             validate_ane_prefill(self._model_settings.to_dict(), self.model_type)
             ane_fraction = ane_prefill_fraction(
