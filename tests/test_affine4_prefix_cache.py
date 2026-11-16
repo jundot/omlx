@@ -444,6 +444,27 @@ def test_prefix_copy_from_zero_has_no_base(manager_factory):
     manager.close()
 
 
+def test_cut_leaves_recurrent_layers_whole(manager_factory):
+    """A hybrid payload: only the attention layers are cut and carry token_base."""
+    manager, prefix, _, _, payload = _two_layer_store(manager_factory)
+    prefix.fetch_cache("second", list(range(16)))
+    data = payload()
+    recurrent_state = [mx.random.normal((1, 3, 8)), mx.random.normal((1, 2, 4, 4))]
+    recurrent = {
+        "state": recurrent_state,
+        "class_name": "ArraysCache",
+        "meta_state": "",
+    }
+    data.insert(1, recurrent)
+    assert prefix.trim_store_payload("second", data) == 8
+    assert data[1] is recurrent and data[1]["state"] is recurrent_state
+    assert "token_base" not in data[1]
+    assert data[0]["token_base"] == 8 and data[2]["token_base"] == 8
+    assert data[2]["state"][0].shape[2] == 8
+    prefix.release_cache("second")
+    manager.close()
+
+
 def test_cut_payload_is_not_stored_without_its_prefix(manager_factory):
     """If the block table lost the prefix, the cut payload stores nothing."""
     manager, prefix, _, _, payload = _two_layer_store(manager_factory)

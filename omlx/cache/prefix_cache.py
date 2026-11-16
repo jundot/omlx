@@ -3396,7 +3396,9 @@ class BlockAwarePrefixCache(CacheManager):
                     mx.contiguous(keys[:, :, base:, :]),
                     mx.contiguous(values[:, :, base:, :]),
                 )
-        for layer in cache_data:
+        # Only the cut layers start at ``base``; recurrent and windowed layers
+        # are whole and keep no ``token_base``.
+        for layer, _kind, _keys, _values in plan:
             layer["token_base"] = base
         return base
 
