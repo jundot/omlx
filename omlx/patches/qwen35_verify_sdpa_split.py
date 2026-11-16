@@ -591,6 +591,56 @@ def _m1_gqa_chunk(kv_len: int, kv_heads: int, cores: int | None = None) -> int:
     return min(4096, max(512, (many + 63) // 64 * 64))
 
 
+_MID_CORE_MAX_CORES = 40
+_MID_CORE_MIN_GENERATION = 17
+
+
+@functools.cache
+def _mid_core_tensor_gpu_cores() -> int | None:
+    """GPU core count on a tensor-unit GPU with fewer than 40 cores, else None.
+
+    Tensor units start with Apple GPU generation 17 (M5). Chips with 40 or more
+    cores (Ultra class) and chips whose core count can't be read keep the
+    default split sizing.
+    """
+    from omlx.utils.hardware import get_apple_gpu_generation, get_gpu_core_count
+
+    if get_apple_gpu_generation() < _MID_CORE_MIN_GENERATION:
+        return None
+    cores = get_gpu_core_count()
+    if cores and cores < _MID_CORE_MAX_CORES:
+        return cores
+    return None
+
+
+def _mid_core_gqa_chunk(kv_len: int, kv_heads: int, cores: int) -> int:
+    """Keys per split on a mid-core tensor-unit GPU past 16k keys.
+
+    Threadgroups = splits x KV heads. 512-key splits give 64 or more splits per
+    KV head at 32k keys, far more threadgroups than a 20-core GPU has cores,
+    and the combine pass pays for every one. Aim for about 1.6 threadgroups
+    per core (4 to 32 splits per KV head) instead, in blocks of 64 keys:
+    M5 Pro, 4 KV heads, 8 splits at 32k to 128k keys (head_dim 256 verify
+    attention -9..13% at 32k, -16% at 64k).
+    """
+    target_splits = max(4, min(32, -(-8 * cores // (5 * kv_heads))))
+    return max(512, (-(-kv_len // target_splits) + 63) // 64 * 64)
+
+
+def _gqa_chunk(kv_len: int, kv_heads: int) -> int:
+    """Keys per split of the tensor-op verify kernel."""
+    # Short splits beyond 16k keys keep a KV head's blocks in cache between
+    # splits; measured best on M3 Ultra from 2k to 64k keys.
+    if kv_len <= 16384:
+        return max(256, (-(-kv_len // 16) + 63) // 64 * 64)
+    if _m1_gpu():
+        return _m1_gqa_chunk(kv_len, kv_heads)
+    cores = _mid_core_tensor_gpu_cores()
+    if cores:
+        return _mid_core_gqa_chunk(kv_len, kv_heads, cores)
+    return 512
+
+
 def _gqa_causal_sdpa(queries, keys, values, scale):
     """Causal verify attention for up to eight rows, one pass per KV head."""
     _, heads, q_len, dim = queries.shape
@@ -604,14 +654,7 @@ def _gqa_causal_sdpa(queries, keys, values, scale):
     fused = mx.contiguous(
         rows.reshape(kv_heads, group, _WIDE_MAX_ROWS, dim).transpose(0, 2, 1, 3)
     )
-    # Short splits beyond 16k keys keep a KV head's blocks in cache between
-    # splits; measured best on M3 Ultra from 2k to 64k keys.
-    if kv_len > 16384 and _m1_gpu():
-        chunk = _m1_gqa_chunk(kv_len, kv_heads)
-    elif kv_len > 16384:
-        chunk = 512
-    else:
-        chunk = max(256, (-(-kv_len // 16) + 63) // 64 * 64)
+    chunk = _gqa_chunk(kv_len, kv_heads)
     n_splits = -(-kv_len // chunk)
     scale_bits = struct.unpack("<I", struct.pack("<f", float(scale)))[0]
     params = mx.array([kv_len, q_len, chunk, n_splits, scale_bits], dtype=mx.uint32)
