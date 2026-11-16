@@ -19,12 +19,16 @@
 // Matrix-vector product (decode) and its routed-expert form.
 // Same tiling as MLX qmv_fast: 2 simdgroups x 4 output rows per threadgroup.
 // The per-group bias term of affine qmv becomes one -center * sum(x) per row.
+// PAIR reads two matrices of N rows (gate and up) into one [.., 2N] output; a
+// simdgroup's 4 rows never straddle them because N % 8 == 0.
 // ---------------------------------------------------------------------------
 
-template <typename T, int bits, bool gather, bool shared_x>
+template <typename T, int bits, bool gather, bool shared_x, bool pair>
 METAL_FUNC void oqh_qmv_impl(
     const device uint32_t* w,
     const device T* rscale,
+    const device uint32_t* w_b,
+    const device T* rscale_b,
     const device T* x,
     device T* y,
     const device uint32_t* indices,
@@ -43,7 +47,6 @@ METAL_FUNC void oqh_qmv_impl(
   constexpr float center = 0.5f * float((1 << bits) - 1);
   typedef float U;
 
-  const device uint8_t* ws = (const device uint8_t*)w;
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
   U xsum = 0;
@@ -51,6 +54,14 @@ METAL_FUNC void oqh_qmv_impl(
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
+  const int y_cols = pair ? 2 * out_vec_size : out_vec_size;
+  int w_row = out_row;
+  if (pair && out_row >= out_vec_size) {
+    w = w_b;
+    rscale = rscale_b;
+    w_row -= out_vec_size;
+  }
+  const device uint8_t* ws = (const device uint8_t*)w;
   int xrow = tid.x;
   int yrow = tid.x;
   if (gather) {
@@ -60,9 +71,9 @@ METAL_FUNC void oqh_qmv_impl(
     xrow = shared_x ? 0 : int(tid.z);
     yrow = tid.z;
   }
-  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  ws += w_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
   x += size_t(xrow) * in_vec_size + simd_lid * values_per_thread;
-  y += size_t(yrow) * out_vec_size + out_row;
+  y += size_t(yrow) * y_cols + out_row;
 
   const int aligned_end = (in_vec_size / block_size) * block_size;
   for (int k = 0; k < aligned_end; k += block_size) {
@@ -89,12 +100,13 @@ METAL_FUNC void oqh_qmv_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     U r = simd_sum(result[row] - center * xsum);
     if (simd_lid == 0) {
-      y[row] = static_cast<T>(r * U(rscale[out_row + row]));
+      y[row] = static_cast<T>(r * U(rscale[w_row + row]));
     }
   }
 }
 
-template <typename T, int bits>
+// w_b / rscale_b are bound only for pair kernels.
+template <typename T, int bits, bool pair>
 [[kernel]] void oqh_qmv(
     const device uint32_t* w [[buffer(0)]],
     const device T* rscale [[buffer(1)]],
@@ -102,14 +114,17 @@ template <typename T, int bits>
     device T* y [[buffer(3)]],
     const constant int& in_vec_size [[buffer(4)]],
     const constant int& out_vec_size [[buffer(5)]],
+    const device uint32_t* w_b [[buffer(6)]],
+    const device T* rscale_b [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  oqh_qmv_impl<T, bits, false, false>(
-      w, rscale, x, y, nullptr, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+  oqh_qmv_impl<T, bits, false, false, pair>(
+      w, rscale, w_b, rscale_b, x, y, nullptr, in_vec_size, out_vec_size, tid, simd_gid,
+      simd_lid);
 }
 
-template <typename T, int bits, bool shared_x>
+template <typename T, int bits, bool shared_x, bool pair>
 [[kernel]] void oqh_gather_qmv(
     const device uint32_t* w [[buffer(0)]],
     const device T* rscale [[buffer(1)]],
@@ -118,17 +133,24 @@ template <typename T, int bits, bool shared_x>
     const device uint32_t* indices [[buffer(4)]],
     const constant int& in_vec_size [[buffer(5)]],
     const constant int& out_vec_size [[buffer(6)]],
+    const device uint32_t* w_b [[buffer(7)]],
+    const device T* rscale_b [[buffer(8)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  oqh_qmv_impl<T, bits, true, shared_x>(
-      w, rscale, x, y, indices, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+  oqh_qmv_impl<T, bits, true, shared_x, pair>(
+      w, rscale, w_b, rscale_b, x, y, indices, in_vec_size, out_vec_size, tid, simd_gid,
+      simd_lid);
 }
 
-#define oqh_instantiate_qmv(type, bits)                                                  \
-  instantiate_kernel("oqh_qmv_" #type "_b" #bits, oqh_qmv, type, bits)                   \
-  instantiate_kernel("oqh_gather_qmv_" #type "_b" #bits "_s1", oqh_gather_qmv, type, bits, true) \
-  instantiate_kernel("oqh_gather_qmv_" #type "_b" #bits "_s0", oqh_gather_qmv, type, bits, false)
+#define oqh_instantiate_qmv_pair(type, bits, pair, sfx)                                          \
+  instantiate_kernel("oqh_qmv_" #type "_b" #bits sfx, oqh_qmv, type, bits, pair)                 \
+  instantiate_kernel("oqh_gather_qmv_" #type "_b" #bits "_s1" sfx, oqh_gather_qmv, type, bits, true, pair) \
+  instantiate_kernel("oqh_gather_qmv_" #type "_b" #bits "_s0" sfx, oqh_gather_qmv, type, bits, false, pair)
+
+#define oqh_instantiate_qmv(type, bits)                \
+  oqh_instantiate_qmv_pair(type, bits, false, "")      \
+  oqh_instantiate_qmv_pair(type, bits, true, "_pair")
 
 #define oqh_instantiate_qmv_bits(type) \
   oqh_instantiate_qmv(type, 2)         \
@@ -142,9 +164,9 @@ oqh_instantiate_qmv_bits(float16_t)
 oqh_instantiate_qmv_bits(bfloat16_t)
 
 // ---------------------------------------------------------------------------
-// Block producers: one threadgroup rotates one BLK-wide block with BLK / 4
-// threads, 4 values per thread at e = tid * 4 + j. The output is normalized
-// by 1 / sqrt(BLK).
+// Block producers: one threadgroup rotates one BLK-wide block (128 or 256) with
+// BLK / 4 threads, 4 values per thread at e = tid * 4 + j. The output is
+// normalized by 1 / sqrt(BLK).
 // ---------------------------------------------------------------------------
 
 METAL_FUNC void oqh_bfly4(thread float* v) {
@@ -165,9 +187,6 @@ METAL_FUNC void oqh_fwht4(thread float* v, threadgroup float* sh, uint tid, uint
       v[j] = up ? (p - v[j]) : (v[j] + p);
     }
   }
-  if (BLK <= 128) {
-    return;
-  }
   if (BLK == 256) {
     for (int j = 0; j < 4; ++j) {
       sh[tid * 4 + j] = v[j];
@@ -178,42 +197,13 @@ METAL_FUNC void oqh_fwht4(thread float* v, threadgroup float* sh, uint tid, uint
       float p = sh[e ^ 128];
       v[j] = (e & 128) ? (p - v[j]) : (v[j] + p);
     }
-    return;
-  }
-  // Bits 7.. of e: each group g of bits 0-6 holds 2^R values on 2^R / 4 threads.
-  constexpr int R = (BLK == 512) ? 2 : (BLK == 1024) ? 3 : (BLK == 2048) ? 4 : 5;
-  constexpr uint TPG = (1u << R) / 4;
-  for (int j = 0; j < 4; ++j) {
-    sh[tid * 4 + j] = v[j];
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint g = tid / TPG;
-  uint sub = tid % TPG;
-  float w[4];
-  for (int j = 0; j < 4; ++j) {
-    w[j] = sh[g | ((sub * 4 + j) << 7)];
-  }
-  oqh_bfly4(w);
-  for (ushort s = 1; s < TPG; s <<= 1) {
-    bool up = (lane & s) != 0;
-    for (int j = 0; j < 4; ++j) {
-      float p = simd_shuffle_xor(w[j], s);
-      w[j] = up ? (p - w[j]) : (w[j] + p);
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int j = 0; j < 4; ++j) {
-    sh[g | ((sub * 4 + j) << 7)] = w[j];
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int j = 0; j < 4; ++j) {
-    v[j] = sh[tid * 4 + j];
   }
 }
 
-// MODE 0: silu(a) * b, 1: a * sigmoid(b), 2: silu(min(a, lim)) * clamp(b, -lim, lim)
-// (clamped SwiGLU), 3: a (rotation only).
-// SPLIT: a and b are the two halves of one [rows, 2L] input (fused gate / up).
+// MODE 0: silu(a) * b, 2: silu(min(a, lim)) * clamp(b, -lim, lim) (clamped
+// SwiGLU), 3: a (rotation only).
+// SPLIT: a and b are the two halves of one [rows, 2L] input (paired gate | up
+// GEMV); otherwise two [rows, L] inputs (gate and up matmuls).
 template <typename T, int BLK, int MODE, bool SPLIT>
 [[kernel]] void oqh_act(
     const device T* a [[buffer(0)]],
@@ -236,8 +226,6 @@ template <typename T, int BLK, int MODE, bool SPLIT>
     float f;
     if (MODE == 0) {
       f = (av / (1.0f + metal::exp(-av))) * float(b[bbase + j]);
-    } else if (MODE == 1) {
-      f = av / (1.0f + metal::exp(-float(b[bbase + j])));
     } else if (MODE == 2) {
       const float g = metal::min(av, lim);
       f = (g / (1.0f + metal::exp(-g))) * metal::clamp(float(b[bbase + j]), -lim, lim);
@@ -255,8 +243,8 @@ template <typename T, int BLK, int MODE, bool SPLIT>
 
 // Per-head (128) RMSNorm with weight, times silu(z), then the block rotation.
 // Matches the Qwen3-Next gated norm: the normed value is rounded to Tin first.
-// DUAL also writes the gated output before the rotation to plain.
-template <typename Tin, typename T, int BLK, bool DUAL>
+// plain gets the gated output before the rotation.
+template <typename Tin, typename T, int BLK>
 [[kernel]] void oqh_gnorm(
     const device Tin* x [[buffer(0)]],
     const device T* z [[buffer(1)]],
@@ -284,9 +272,7 @@ template <typename Tin, typename T, int BLK, bool DUAL>
     const float zv = float(z[base + j]);
     const float n = static_cast<float>(static_cast<Tin>(v[j] * inv * float(w[(col + j) % 128])));
     const float g = n * (zv / (1.0f + metal::exp(-zv)));
-    if (DUAL) {
-      plain[base + j] = static_cast<T>(g);
-    }
+    plain[base + j] = static_cast<T>(g);
     v[j] = g * float(sg[col + j]);
   }
   oqh_fwht4<BLK>(v, sh, tid, lane);
@@ -296,33 +282,26 @@ template <typename Tin, typename T, int BLK, bool DUAL>
   }
 }
 
-#define oqh_instantiate_block(type, blk)                                                         \
-  instantiate_kernel("oqh_act_" #type "_k" #blk "_m0", oqh_act, type, blk, 0, false)             \
-  instantiate_kernel("oqh_act_" #type "_k" #blk "_m1", oqh_act, type, blk, 1, false)             \
-  instantiate_kernel("oqh_act_" #type "_k" #blk "_m3", oqh_act, type, blk, 3, false)             \
-  instantiate_kernel("oqh_act_" #type "_k" #blk "_m0_s", oqh_act, type, blk, 0, true)            \
-  instantiate_kernel("oqh_act_" #type "_k" #blk "_m2_s", oqh_act, type, blk, 2, true)            \
-  instantiate_kernel("oqh_gnorm_" #type "_" #type "_k" #blk, oqh_gnorm, type, type, blk, false) \
-  instantiate_kernel("oqh_gnorm_" #type "_" #type "_k" #blk "_d1", oqh_gnorm, type, type, blk, true) \
-  instantiate_kernel("oqh_gnorm_float_" #type "_k" #blk, oqh_gnorm, float, type, blk, false)    \
-  instantiate_kernel("oqh_gnorm_float_" #type "_k" #blk "_d1", oqh_gnorm, float, type, blk, true)
+#define oqh_instantiate_block(type, blk)                                                  \
+  instantiate_kernel("oqh_act_" #type "_k" #blk "_m3", oqh_act, type, blk, 3, false)      \
+  instantiate_kernel("oqh_act_" #type "_k" #blk "_m0", oqh_act, type, blk, 0, false)      \
+  instantiate_kernel("oqh_act_" #type "_k" #blk "_m2", oqh_act, type, blk, 2, false)      \
+  instantiate_kernel("oqh_act_" #type "_k" #blk "_m0_s", oqh_act, type, blk, 0, true)     \
+  instantiate_kernel("oqh_act_" #type "_k" #blk "_m2_s", oqh_act, type, blk, 2, true)     \
+  instantiate_kernel("oqh_gnorm_" #type "_" #type "_k" #blk, oqh_gnorm, type, type, blk) \
+  instantiate_kernel("oqh_gnorm_float_" #type "_k" #blk, oqh_gnorm, float, type, blk)
 
 #define oqh_instantiate_blocks(type) \
   oqh_instantiate_block(type, 128)   \
-  oqh_instantiate_block(type, 256)   \
-  oqh_instantiate_block(type, 512)   \
-  oqh_instantiate_block(type, 1024)  \
-  oqh_instantiate_block(type, 2048)  \
-  oqh_instantiate_block(type, 4096)
+  oqh_instantiate_block(type, 256)
 
 oqh_instantiate_blocks(float16_t)
 oqh_instantiate_blocks(bfloat16_t)
 
 // ---------------------------------------------------------------------------
-// Row norms with one threadgroup per row: D / 8 threads, 8 values per thread
-// at e = tid * 8 + i. A 256-wide sub-block is one simdgroup (3 register stages
-// and 5 lane shuffles); the BLK / 256 sub-blocks of a rotation block are
-// combined after one transpose through threadgroup memory.
+// Row norm with one threadgroup per row: D / 8 threads, 8 values per thread at
+// e = tid * 8 + i, so a 256-wide rotation block is one simdgroup (3 register
+// stages and 5 lane shuffles).
 // ---------------------------------------------------------------------------
 
 METAL_FUNC void oqh_fwht256_simd(thread float* v, uint lane) {
@@ -357,146 +336,45 @@ METAL_FUNC float oqh_row_sum(float v, threadgroup float* red, uint lane, uint sg
   return t;
 }
 
-template <int BLK>
-METAL_FUNC void oqh_fwht8(thread float* v, threadgroup float* sh, uint tid, uint lane) {
-  oqh_fwht256_simd(v, lane);
-  constexpr int M = BLK / 256;
-  if (M == 1) {
-    return;
-  }
-  constexpr int TPB = BLK / 8;
-  const uint blk0 = (tid / TPB) * BLK;
-  const uint tb = tid % TPB;
-  for (int i = 0; i < 8; ++i) {
-    sh[tid * 8 + i] = v[i];
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float w[8];
-  if (M <= 8) {
-    // 8 / M groups (bits 0-7) per thread, M values each (bits 8..).
-    constexpr int GPT = 8 / M;
-    for (int gg = 0; gg < GPT; ++gg) {
-      const uint g = tb * GPT + gg;
-      for (int j = 0; j < M; ++j) {
-        w[gg * M + j] = sh[blk0 + g + 256 * j];
-      }
-    }
-    for (int gg = 0; gg < GPT; ++gg) {
-      for (int hh = 1; hh < M; hh <<= 1) {
-        for (int j = 0; j < M; ++j) {
-          if ((j & hh) == 0) {
-            float a = w[gg * M + j];
-            float b = w[gg * M + j + hh];
-            w[gg * M + j] = a + b;
-            w[gg * M + j + hh] = a - b;
-          }
-        }
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int gg = 0; gg < GPT; ++gg) {
-      const uint g = tb * GPT + gg;
-      for (int j = 0; j < M; ++j) {
-        sh[blk0 + g + 256 * j] = w[gg * M + j];
-      }
-    }
-  } else {
-    // M = 16: a thread pair holds one group; bit 3 of j crosses the pair.
-    const uint g = tb / 2;
-    const uint hi = tb % 2;
-    for (int jj = 0; jj < 8; ++jj) {
-      w[jj] = sh[blk0 + g + 256 * (hi * 8 + jj)];
-    }
-    for (int hh = 1; hh < 8; hh <<= 1) {
-      for (int jj = 0; jj < 8; ++jj) {
-        if ((jj & hh) == 0) {
-          float a = w[jj];
-          float b = w[jj + hh];
-          w[jj] = a + b;
-          w[jj + hh] = a - b;
-        }
-      }
-    }
-    for (int jj = 0; jj < 8; ++jj) {
-      float p = simd_shuffle_xor(w[jj], ushort(1));
-      w[jj] = hi ? (p - w[jj]) : (w[jj] + p);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int jj = 0; jj < 8; ++jj) {
-      sh[blk0 + g + 256 * (hi * 8 + jj)] = w[jj];
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int i = 0; i < 8; ++i) {
-    v[i] = sh[tid * 8 + i];
-  }
-}
-
-// ADD: h = x + r first (rounded to T, written out). DUAL: also the unrotated norm.
-template <typename T, int BLK, bool ADD, bool DUAL>
+// plain is MLX rms_norm's output, w * T(x * inv) in T; the rotation reads it, so
+// the rotated output is exactly the rotated plain value.
+template <typename T>
 [[kernel]] void oqh_norm(
     const device T* x [[buffer(0)]],
-    const device T* r [[buffer(1)]],
-    const device T* w [[buffer(2)]],
-    const device T* sg [[buffer(3)]],
-    device T* h [[buffer(4)]],
-    device T* out [[buffer(5)]],
-    device T* plain [[buffer(6)]],
-    const constant int& D [[buffer(7)]],
-    const constant float& eps [[buffer(8)]],
+    const device T* w [[buffer(1)]],
+    const device T* sg [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    device T* plain [[buffer(4)]],
+    const constant int& D [[buffer(5)]],
+    const constant float& eps [[buffer(6)]],
     uint tid [[thread_position_in_threadgroup]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint nsg [[simdgroups_per_threadgroup]]) {
-  // The RMS reduction reuses the first 32 floats; it finishes before the rotation writes.
-  threadgroup float sh[(BLK > 256) ? 8192 : 32];
-  threadgroup float* red = sh;
+  threadgroup float red[32];
   const size_t base = size_t(row) * D + tid * 8;
   float v[8];
   float ss = 0.0f;
   for (int i = 0; i < 8; ++i) {
-    float t;
-    if (ADD) {
-      const T hv = static_cast<T>(float(x[base + i]) + float(r[base + i]));
-      h[base + i] = hv;
-      t = float(hv);
-    } else {
-      t = float(x[base + i]);
-    }
-    v[i] = t;
-    ss += t * t;
+    v[i] = float(x[base + i]);
+    ss += v[i] * v[i];
   }
   const float inv = metal::precise::rsqrt(oqh_row_sum(ss, red, lane, sgid, nsg) / float(D) + eps);
   for (int i = 0; i < 8; ++i) {
     const int e = tid * 8 + i;
-    const float nv = v[i] * inv * float(w[e]);
-    if (DUAL) {
-      plain[base + i] = static_cast<T>(nv);
-    }
-    v[i] = nv * float(sg[e]);
+    const T pv = w[e] * static_cast<T>(v[i] * inv);
+    plain[base + i] = pv;
+    v[i] = float(pv) * float(sg[e]);
   }
-  oqh_fwht8<BLK>(v, sh, tid, lane);
-  const float scale = metal::precise::rsqrt(float(BLK));
+  oqh_fwht256_simd(v, lane);
+  const float scale = metal::precise::rsqrt(256.0f);
   for (int i = 0; i < 8; ++i) {
     out[base + i] = static_cast<T>(v[i] * scale);
   }
 }
 
-#define oqh_instantiate_norm(type, blk)                                                     \
-  instantiate_kernel("oqh_norm_" #type "_k" #blk "_a0_d0", oqh_norm, type, blk, false, false)  \
-  instantiate_kernel("oqh_norm_" #type "_k" #blk "_a0_d1", oqh_norm, type, blk, false, true)   \
-  instantiate_kernel("oqh_norm_" #type "_k" #blk "_a1_d0", oqh_norm, type, blk, true, false)   \
-  instantiate_kernel("oqh_norm_" #type "_k" #blk "_a1_d1", oqh_norm, type, blk, true, true)
-
-#define oqh_instantiate_norms(type) \
-  oqh_instantiate_norm(type, 256)   \
-  oqh_instantiate_norm(type, 512)   \
-  oqh_instantiate_norm(type, 1024)  \
-  oqh_instantiate_norm(type, 2048)  \
-  oqh_instantiate_norm(type, 4096)
-
-oqh_instantiate_norms(float16_t)
-oqh_instantiate_norms(bfloat16_t)
+instantiate_kernel("oqh_norm_float16_t", oqh_norm, float16_t)
+instantiate_kernel("oqh_norm_bfloat16_t", oqh_norm, bfloat16_t)
 
 // clang-format on

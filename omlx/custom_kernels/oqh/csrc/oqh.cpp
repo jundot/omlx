@@ -58,12 +58,13 @@ void check_float(const array& x, const char* what) {
   }
 }
 
+// Rotation blocks are 128 or 256 inputs (oqh.format.MAX_BLOCK).
 void check_block(int width, int block, int min_block, const char* what) {
   const bool pow2 = block > 0 && (block & (block - 1)) == 0;
-  if (!pow2 || block < min_block || block > 4096 || width % block != 0) {
+  if (!pow2 || block < min_block || block > 256 || width % block != 0) {
     std::ostringstream msg;
     msg << "oqh: " << what << " block " << block << " must be a power of two in [" << min_block
-        << ", 4096] dividing width " << width;
+        << ", 256] dividing width " << width;
     throw std::invalid_argument(msg.str());
   }
 }
@@ -81,10 +82,11 @@ array row_contiguous(const array& a, const Stream& s) {
   return a.flags().row_contiguous ? a : contiguous(a, false, s);
 }
 
+// Inputs: x, w, rscale, [indices], [w_b, rscale_b]. A pair writes [.., 2N].
 class OqhQmv : public Primitive {
  public:
-  OqhQmv(Stream s, int bits, bool gather, bool shared_x)
-      : Primitive(s), bits_(bits), gather_(gather), shared_x_(shared_x) {}
+  OqhQmv(Stream s, int bits, bool gather, bool shared_x, bool pair)
+      : Primitive(s), bits_(bits), gather_(gather), shared_x_(shared_x), pair_(pair) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("OqhQmv has no CPU path.");
@@ -104,6 +106,9 @@ class OqhQmv : public Primitive {
     if (gather_) {
       name += shared_x_ ? "_s1" : "_s0";
     }
+    if (pair_) {
+      name += "_pair";
+    }
     auto& enc = metal::get_command_encoder(s);
     enc.set_compute_pipeline_state(get_kernel(d, name));
     int c = 0;
@@ -116,17 +121,23 @@ class OqhQmv : public Primitive {
     }
     enc.set_bytes(K, c++);
     enc.set_bytes(N, c++);
+    // Single kernels never read the second pair of buffers.
+    const size_t b = gather_ ? 4 : 3;
+    enc.set_input_array(pair_ ? inputs[b] : w, c++);
+    enc.set_input_array(pair_ ? inputs[b + 1] : inputs[2], c++);
     const int rows = static_cast<int>(x.size() / K);
+    const int out_rows = pair_ ? 2 * N : N;
     MTL::Size group_dims(32, 2, 1);
     MTL::Size grid_dims = gather_
-        ? MTL::Size(1, N / 8, static_cast<int>(inputs[3].size()))
-        : MTL::Size(rows, N / 8, 1);
+        ? MTL::Size(1, out_rows / 8, static_cast<int>(inputs[3].size()))
+        : MTL::Size(rows, out_rows / 8, 1);
     enc.dispatch_threadgroups(grid_dims, group_dims);
   }
 
   bool is_equivalent(const Primitive& other) const override {
     const auto& o = static_cast<const OqhQmv&>(other);
-    return bits_ == o.bits_ && gather_ == o.gather_ && shared_x_ == o.shared_x_;
+    return bits_ == o.bits_ && gather_ == o.gather_ && shared_x_ == o.shared_x_ &&
+        pair_ == o.pair_;
   }
 
   DEFINE_NAME(OqhQmv)
@@ -135,14 +146,15 @@ class OqhQmv : public Primitive {
   int bits_;
   bool gather_;
   bool shared_x_;
+  bool pair_;
 };
 
-enum class Producer { Norm, AddNorm, Act, ActSplit, GatedNorm };
+enum class Producer { Norm, Rotate, Act, ActSplit, GatedNorm };
 
 class OqhProducer : public Primitive {
  public:
-  OqhProducer(Stream s, Producer kind, int block, int mode, bool dual, float eps)
-      : Primitive(s), kind_(kind), block_(block), mode_(mode), dual_(dual), eps_(eps) {}
+  OqhProducer(Stream s, Producer kind, int block, int mode, float eps)
+      : Primitive(s), kind_(kind), block_(block), mode_(mode), eps_(eps) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("OqhProducer has no CPU path.");
@@ -159,19 +171,15 @@ class OqhProducer : public Primitive {
     const std::string k = "_k" + std::to_string(block_);
     auto& enc = metal::get_command_encoder(s);
     int c = 0;
-    if (kind_ == Producer::Norm || kind_ == Producer::AddNorm) {
-      const bool add = kind_ == Producer::AddNorm;
+    if (kind_ == Producer::Norm) {
+      // Inputs: (x, w, signs). Outputs: (rotated, plain).
       const int D = static_cast<int>(inputs[0].shape(-1));
-      enc.set_compute_pipeline_state(get_kernel(
-          d, "oqh_norm_" + t + k + (add ? "_a1" : "_a0") + (dual_ ? "_d1" : "_d0")));
-      // Inputs: (x, [r], w, signs). Outputs: ([h], rotated, [plain]).
+      enc.set_compute_pipeline_state(get_kernel(d, "oqh_norm_" + t));
       enc.set_input_array(inputs[0], c++);
-      enc.set_input_array(add ? inputs[1] : inputs[0], c++);
-      enc.set_input_array(inputs[add ? 2 : 1], c++);
-      enc.set_input_array(inputs[add ? 3 : 2], c++);
+      enc.set_input_array(inputs[1], c++);
+      enc.set_input_array(inputs[2], c++);
       enc.set_output_array(outputs[0], c++);
-      enc.set_output_array(add ? outputs[1] : outputs[0], c++);
-      enc.set_output_array(dual_ ? outputs.back() : outputs[0], c++);
+      enc.set_output_array(outputs[1], c++);
       enc.set_bytes(D, c++);
       enc.set_bytes(eps_, c++);
       const int rows = static_cast<int>(inputs[0].size() / D);
@@ -179,21 +187,10 @@ class OqhProducer : public Primitive {
       return;
     }
     const int L = static_cast<int>(out.shape(-1));
-    if (kind_ == Producer::Act || kind_ == Producer::ActSplit) {
-      const bool split = kind_ == Producer::ActSplit;
-      enc.set_compute_pipeline_state(
-          get_kernel(d, "oqh_act_" + t + k + "_m" + std::to_string(mode_) + (split ? "_s" : "")));
-      enc.set_input_array(inputs[0], c++);
-      enc.set_input_array(inputs.size() > 2 ? inputs[1] : inputs[0], c++);
-      enc.set_input_array(inputs.back(), c++);
-      enc.set_output_array(out, c++);
-      enc.set_bytes(L, c++);
-      // Clamp limit of mode 2; the other modes ignore it.
-      enc.set_bytes(eps_, c++);
-    } else {
+    if (kind_ == Producer::GatedNorm) {
+      // Inputs: (x, z, w, signs). Outputs: (rotated, plain).
       const std::string tin = type_str(inputs[0].dtype());
-      enc.set_compute_pipeline_state(
-          get_kernel(d, "oqh_gnorm_" + tin + "_" + t + k + (dual_ ? "_d1" : "")));
+      enc.set_compute_pipeline_state(get_kernel(d, "oqh_gnorm_" + tin + "_" + t + k));
       const int Ls = static_cast<int>(inputs[3].size());
       enc.set_input_array(inputs[0], c++);
       enc.set_input_array(inputs[1], c++);
@@ -202,7 +199,21 @@ class OqhProducer : public Primitive {
       enc.set_output_array(out, c++);
       enc.set_bytes(Ls, c++);
       enc.set_bytes(eps_, c++);
-      enc.set_output_array(dual_ ? outputs[1] : out, c++);
+      enc.set_output_array(outputs[1], c++);
+    } else {
+      // Inputs: (y, signs) for Rotate (y alone) and ActSplit (its two halves),
+      // (a, b, signs) for Act.
+      const bool split = kind_ == Producer::ActSplit;
+      const bool two = kind_ == Producer::Act;
+      enc.set_compute_pipeline_state(
+          get_kernel(d, "oqh_act_" + t + k + "_m" + std::to_string(mode_) + (split ? "_s" : "")));
+      enc.set_input_array(inputs[0], c++);
+      enc.set_input_array(inputs[two ? 1 : 0], c++);
+      enc.set_input_array(inputs.back(), c++);
+      enc.set_output_array(out, c++);
+      enc.set_bytes(L, c++);
+      // Clamp limit of mode 2; the other modes ignore it.
+      enc.set_bytes(eps_, c++);
     }
     const int tgs = static_cast<int>(out.size() / block_);
     enc.dispatch_threadgroups(MTL::Size(tgs, 1, 1), MTL::Size(block_ / 4, 1, 1));
@@ -210,8 +221,7 @@ class OqhProducer : public Primitive {
 
   bool is_equivalent(const Primitive& other) const override {
     const auto& o = static_cast<const OqhProducer&>(other);
-    return kind_ == o.kind_ && block_ == o.block_ && mode_ == o.mode_ && dual_ == o.dual_ &&
-        eps_ == o.eps_;
+    return kind_ == o.kind_ && block_ == o.block_ && mode_ == o.mode_ && eps_ == o.eps_;
   }
 
   DEFINE_NAME(OqhProducer)
@@ -220,19 +230,8 @@ class OqhProducer : public Primitive {
   Producer kind_;
   int block_;
   int mode_;
-  bool dual_;
   float eps_;
 };
-
-// The row norm keeps the whole row in one threadgroup: D / 8 threads, D <= 8192.
-void check_norm_width(int D, int block) {
-  if (D % 256 != 0 || D > 8192) {
-    std::ostringstream msg;
-    msg << "oqh: norm width " << D << " must be a multiple of 256 and at most 8192";
-    throw std::invalid_argument(msg.str());
-  }
-  check_block(D, block, 256, "norm");
-}
 
 void check_signs(const array& signs, int width, const char* what) {
   if (signs.size() != static_cast<size_t>(width)) {
@@ -244,10 +243,27 @@ void check_signs(const array& signs, int width, const char* what) {
 
 } // namespace
 
-array qmv(const array& x, const array& w, const array& rscale, int bits, StreamOrDevice s_) {
+namespace {
+
+void check_pair(
+    const array& w, const array& rscale, const std::optional<array>& w_b,
+    const std::optional<array>& rscale_b) {
+  if (w_b.has_value() != rscale_b.has_value() ||
+      (w_b && (w_b->shape() != w.shape() || w_b->dtype() != w.dtype() ||
+               rscale_b->shape() != rscale.shape()))) {
+    throw std::invalid_argument("oqh: w_b and rscale_b must both be given and match w and rscale");
+  }
+}
+
+} // namespace
+
+array qmv(
+    const array& x, const array& w, const array& rscale, int bits,
+    const std::optional<array>& w_b, const std::optional<array>& rscale_b, StreamOrDevice s_) {
   auto s = to_stream(s_);
   check_bits(bits);
   check_float(x, "x");
+  check_pair(w, rscale, w_b, rscale_b);
   const int K = in_width(w, bits);
   const int N = static_cast<int>(w.shape(-2));
   if (w.ndim() != 2 || x.shape(-1) != K || N % 8 != 0 || K % 16 != 0) {
@@ -255,18 +271,24 @@ array qmv(const array& x, const array& w, const array& rscale, int bits, StreamO
   }
   auto xc = row_contiguous(x, s);
   auto out_shape = xc.shape();
-  out_shape.back() = N;
+  out_shape.back() = w_b ? 2 * N : N;
+  std::vector<array> inputs = {xc, row_contiguous(w, s), as_dtype(rscale, xc.dtype(), s)};
+  if (w_b) {
+    inputs.push_back(row_contiguous(*w_b, s));
+    inputs.push_back(as_dtype(*rscale_b, xc.dtype(), s));
+  }
   return array(
-      out_shape, xc.dtype(), std::make_shared<OqhQmv>(s, bits, false, false),
-      {xc, row_contiguous(w, s), as_dtype(rscale, xc.dtype(), s)});
+      out_shape, xc.dtype(), std::make_shared<OqhQmv>(s, bits, false, false, w_b.has_value()),
+      std::move(inputs));
 }
 
 array gather_qmv(
     const array& x, const array& w, const array& rscale, const array& indices, int bits,
-    StreamOrDevice s_) {
+    const std::optional<array>& w_b, const std::optional<array>& rscale_b, StreamOrDevice s_) {
   auto s = to_stream(s_);
   check_bits(bits);
   check_float(x, "x");
+  check_pair(w, rscale, w_b, rscale_b);
   const int K = in_width(w, bits);
   const int N = static_cast<int>(w.shape(-2));
   const int P = static_cast<int>(indices.size());
@@ -276,70 +298,45 @@ array gather_qmv(
   }
   auto xc = row_contiguous(x, s);
   auto idx = row_contiguous(as_dtype(indices, uint32, s), s);
+  std::vector<array> inputs = {xc, row_contiguous(w, s), as_dtype(rscale, xc.dtype(), s), idx};
+  if (w_b) {
+    inputs.push_back(row_contiguous(*w_b, s));
+    inputs.push_back(as_dtype(*rscale_b, xc.dtype(), s));
+  }
   return array(
-      {P, N}, xc.dtype(), std::make_shared<OqhQmv>(s, bits, true, R == 1),
-      {xc, row_contiguous(w, s), as_dtype(rscale, xc.dtype(), s), idx});
+      {P, w_b ? 2 * N : N}, xc.dtype(),
+      std::make_shared<OqhQmv>(s, bits, true, R == 1, w_b.has_value()), std::move(inputs));
 }
 
 std::vector<array> rmsnorm_had(
-    const array& x, const array& weight, const array& signs, float eps, int block, bool dual,
-    StreamOrDevice s_) {
+    const array& x, const array& weight, const array& signs, float eps, StreamOrDevice s_) {
   auto s = to_stream(s_);
   check_float(x, "x");
   const int D = static_cast<int>(x.shape(-1));
-  check_norm_width(D, block);
+  // One threadgroup per row: D / 8 threads, a 256 block per simdgroup.
+  if (D % 256 != 0 || D > 8192) {
+    std::ostringstream msg;
+    msg << "oqh: norm width " << D << " must be a multiple of 256 and at most 8192";
+    throw std::invalid_argument(msg.str());
+  }
   check_signs(signs, D, "rmsnorm_had");
   auto xc = row_contiguous(x, s);
-  const int n = dual ? 2 : 1;
   return array::make_arrays(
-      std::vector<Shape>(n, xc.shape()), std::vector<Dtype>(n, xc.dtype()),
-      std::make_shared<OqhProducer>(s, Producer::Norm, block, 0, dual, eps),
+      {xc.shape(), xc.shape()}, {xc.dtype(), xc.dtype()},
+      std::make_shared<OqhProducer>(s, Producer::Norm, 256, 0, eps),
       {xc, as_dtype(weight, xc.dtype(), s), as_dtype(signs, xc.dtype(), s)});
 }
 
-std::vector<array> add_rmsnorm_had(
-    const array& x, const array& r, const array& weight, const array& signs, float eps, int block,
-    bool dual, StreamOrDevice s_) {
+array rotate(const array& x, const array& signs, int block, StreamOrDevice s_) {
   auto s = to_stream(s_);
   check_float(x, "x");
-  if (x.shape() != r.shape()) {
-    throw std::invalid_argument("oqh add_rmsnorm_had: x and r must have the same shape");
-  }
-  const int D = static_cast<int>(x.shape(-1));
-  check_norm_width(D, block);
-  check_signs(signs, D, "add_rmsnorm_had");
+  const int L = static_cast<int>(x.shape(-1));
+  check_block(L, block, 128, "rotate");
+  check_signs(signs, L, "rotate");
   auto xc = row_contiguous(x, s);
-  auto rc = row_contiguous(as_dtype(r, xc.dtype(), s), s);
-  const int n = dual ? 3 : 2;
-  return array::make_arrays(
-      std::vector<Shape>(n, xc.shape()), std::vector<Dtype>(n, xc.dtype()),
-      std::make_shared<OqhProducer>(s, Producer::AddNorm, block, 0, dual, eps),
-      {xc, rc, as_dtype(weight, xc.dtype(), s), as_dtype(signs, xc.dtype(), s)});
-}
-
-array act_had(
-    const array& a, const std::optional<array>& b, const array& signs, int mode, int block,
-    StreamOrDevice s_) {
-  auto s = to_stream(s_);
-  check_float(a, "a");
-  if ((mode != 0 && mode != 1 && mode != 3) || (mode != 3 && !b.has_value())) {
-    throw std::invalid_argument("oqh act_had: mode must be 0, 1 or 3, and modes 0 and 1 need b");
-  }
-  const int L = static_cast<int>(a.shape(-1));
-  check_block(L, block, 128, "act_had");
-  check_signs(signs, L, "act_had");
-  auto ac = row_contiguous(a, s);
-  std::vector<array> inputs = {ac};
-  if (b.has_value()) {
-    if (b->shape() != a.shape()) {
-      throw std::invalid_argument("oqh act_had: a and b must have the same shape");
-    }
-    inputs.push_back(row_contiguous(as_dtype(*b, ac.dtype(), s), s));
-  }
-  inputs.push_back(as_dtype(signs, ac.dtype(), s));
   return array(
-      ac.shape(), ac.dtype(), std::make_shared<OqhProducer>(s, Producer::Act, block, mode, false, 0.0f),
-      std::move(inputs));
+      xc.shape(), xc.dtype(), std::make_shared<OqhProducer>(s, Producer::Rotate, block, 3, 0.0f),
+      {xc, as_dtype(signs, xc.dtype(), s)});
 }
 
 array act_split_had(
@@ -361,13 +358,34 @@ array act_split_had(
   return array(
       std::move(shape), yc.dtype(),
       std::make_shared<OqhProducer>(
-          s, Producer::ActSplit, block, limit ? 2 : 0, false, limit.value_or(0.0f)),
+          s, Producer::ActSplit, block, limit ? 2 : 0, limit.value_or(0.0f)),
       {yc, as_dtype(signs, yc.dtype(), s)});
+}
+
+array act_pair_had(
+    const array& a,
+    const array& b,
+    const array& signs,
+    int block,
+    std::optional<float> limit,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  check_float(a, "a");
+  const int L = static_cast<int>(signs.size());
+  if (a.shape() != b.shape() || a.shape(-1) != L) {
+    throw std::invalid_argument("oqh act_pair_had: a and b must match and end in signs.size()");
+  }
+  check_block(L, block, 128, "act_pair_had");
+  auto ac = row_contiguous(a, s);
+  return array(
+      ac.shape(), ac.dtype(),
+      std::make_shared<OqhProducer>(s, Producer::Act, block, limit ? 2 : 0, limit.value_or(0.0f)),
+      {ac, row_contiguous(as_dtype(b, ac.dtype(), s), s), as_dtype(signs, ac.dtype(), s)});
 }
 
 std::vector<array> gnorm_had(
     const array& x, const array& z, const array& weight, const array& signs, float eps, int block,
-    bool dual, StreamOrDevice s_) {
+    StreamOrDevice s_) {
   auto s = to_stream(s_);
   check_float(z, "z");
   if (x.shape(-1) != 128 || z.size() != x.size()) {
@@ -380,10 +398,9 @@ std::vector<array> gnorm_had(
   check_block(L, block, 128, "gnorm_had");
   auto xc = row_contiguous(x, s);
   auto zc = row_contiguous(z, s);
-  const int n = dual ? 2 : 1;
   return array::make_arrays(
-      std::vector<Shape>(n, zc.shape()), std::vector<Dtype>(n, zc.dtype()),
-      std::make_shared<OqhProducer>(s, Producer::GatedNorm, block, 0, dual, eps),
+      {zc.shape(), zc.shape()}, {zc.dtype(), zc.dtype()},
+      std::make_shared<OqhProducer>(s, Producer::GatedNorm, block, 0, eps),
       {xc, zc, as_dtype(weight, zc.dtype(), s), as_dtype(signs, zc.dtype(), s)});
 }
 

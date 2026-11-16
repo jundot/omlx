@@ -1,5 +1,6 @@
 """oQh format: kernels, quantizer, planner pricing, load hook and producer fusion."""
 
+import gc
 import json
 
 import pytest
@@ -54,19 +55,29 @@ def test_matmuls_match_the_dequantized_weight(bits):
         )
         assert _rel(got[i : i + 1], ref_e) < 0.02
 
+    # A gate | up pair in one call gives both products bit for bit.
+    up, up_scale = packed[::-1], rscale[::-1]
+    single = [fast.qmv(xr, packed, rscale, bits), fast.qmv(xr, up, up_scale, bits)]
+    paired = fast.qmv(xr, packed, rscale, bits, up, up_scale)
+    assert mx.array_equal(paired, mx.concatenate(single, -1))
+    single = [fast.gather_qmv(xr[:1], pe, re, idx, bits)] * 2
+    paired = fast.gather_qmv(xr[:1], pe, re, idx, bits, pe, re)
+    assert mx.array_equal(paired, mx.concatenate(single, -1))
+
 
 def _switch(experts, rows, cols, key, seed):
     """An OqhSwitchLinear holding quantized random experts."""
     from omlx.oqh.modules import OqhSwitchLinear
 
     mx.random.seed(seed)
+    block = min(cols, fmt.MAX_BLOCK)
     sg = _signs(key, cols)
     w = mx.random.normal((experts, rows, cols)) * 0.05
     gram = mx.broadcast_to(mx.eye(cols), (experts, cols, cols))
-    packed, rscale, _, _ = quantize.quantize(w, gram, 4, sg, cols)
-    m = OqhSwitchLinear(cols, rows, experts, 4, cols)
+    packed, rscale, _, _ = quantize.quantize(w, gram, 4, sg, block)
+    m = OqhSwitchLinear(cols, rows, experts, 4, block)
     m.weight, m.rscale = packed, rscale
-    m.oqh_signs = sg.reshape(1, cols).astype(mx.bfloat16)
+    m.oqh_signs = sg.reshape(-1, block).astype(mx.bfloat16)
     return m
 
 
@@ -99,7 +110,7 @@ def test_fused_switch_glu_serves_mlx_vlm_and_weighted_sum_callers():
     scores = mx.softmax(mx.random.normal((1, 40, 2)), axis=-1)
     shared = mx.random.normal((1, 40, 512)).astype(mx.bfloat16)
     want = glu(x, inds, scores, shared).astype(mx.float32)
-    assert runtime._install_mlp(glu) == [glu._oqh_gate_up]
+    assert runtime._install_mlp(glu) == [glu.gate_proj, glu.up_proj]
     # mlx-vlm passes the router weights and shared experts to SwitchGLU.
     assert _rel(glu(x, inds, scores, shared), want) < 0.03
     kernel = weighted._native_weighted_sum()
@@ -137,7 +148,7 @@ def test_tensor_parallel_split_keeps_blocks_and_row_scales():
         shard_inplace(m.gate_proj, _glm5_rows, group=group)
         shard_inplace(m.up_proj, _glm5_rows, group=group)
         shard_inplace(m.down_proj, _glm5_columns, group=group)
-        assert m._oqh_gate_up.output_dims == 256
+        assert m.gate_proj.output_dims == m.up_proj.output_dims == 128
         assert m.down_proj["rscale"].shape == (8, 512)
         assert m.down_proj["oqh_signs"].shape == (1, 128)
         parts.append(m(x, inds).astype(mx.float32))
@@ -169,7 +180,7 @@ def test_quantize_beats_row_rounding_under_the_gram():
     assert after < 0.95 * before
 
 
-@pytest.mark.parametrize("block", [256, 1024])
+@pytest.mark.parametrize("block", [128, 256])
 def test_producers_match_the_reference(block):
     dim = 1024
     mx.random.seed(block)
@@ -177,50 +188,46 @@ def test_producers_match_the_reference(block):
     r = mx.random.normal((3, dim)).astype(mx.bfloat16)
     w = (1 + 0.2 * mx.random.normal((dim,))).astype(mx.bfloat16)
     sg = _signs("n", dim).astype(mx.bfloat16)
+    # The norm's plain output is what MLX's rms_norm returns; it rotates in 256 blocks.
     base = mx.fast.rms_norm(x, w, 1e-6)
-    rot, plain = fast.rmsnorm_had(x, w, sg, 1e-6, block, dual=True)
-    assert _rel(rot, quantize.rotate(base, sg, block)) < 0.01
-    assert _rel(plain, base) < 0.01
-    h, rot2 = fast.add_rmsnorm_had(x, r, w, sg, 1e-6, block)
-    assert mx.array_equal(h, x + r)
-    assert (
-        _rel(rot2, quantize.rotate(mx.fast.rms_norm(x + r, w, 1e-6), sg, block)) < 0.01
-    )
+    rot, plain = fast.rmsnorm_had(x, w, sg, 1e-6)
+    assert mx.array_equal(plain, base)
+    assert _rel(rot, quantize.rotate(base, sg, 256)) < 0.01
+    assert _rel(fast.rotate(x, sg, block), quantize.rotate(x, sg, block)) < 0.01
 
     a, b = x.astype(mx.float32), r.astype(mx.float32)
-    assert (
-        _rel(
-            fast.act_had(x, r, sg, 0, block), quantize.rotate(nn.silu(a) * b, sg, block)
-        )
-        < 0.01
-    )
-    assert (
-        _rel(
-            fast.act_had(x, r, sg, 1, block),
-            quantize.rotate(a * mx.sigmoid(b), sg, block),
-        )
-        < 0.01
-    )
-    assert mx.array_equal(
-        fast.act_split_had(mx.concatenate([x, r], -1), sg, block),
-        fast.act_had(x, r, sg, 0, block),
-    )
+    got = fast.act_split_had(mx.concatenate([x, r], -1), sg, block)
+    assert _rel(got, quantize.rotate(nn.silu(a) * b, sg, block)) < 0.01
+    # Prefill passes gate and up as two inputs: the same values.
+    assert mx.array_equal(fast.act_pair_had(x, r, sg, block), got)
     # GLM-5.3's clamped SwiGLU: gate capped at the limit, up clipped to it.
     big = mx.concatenate([x, r], -1) * 8
     clamped = nn.silu(mx.minimum(8 * a, 10.0)) * mx.clip(8 * b, -10.0, 10.0)
     got = fast.act_split_had(big, sg, block, limit=10.0)
     assert _rel(got, quantize.rotate(clamped, sg, block)) < 0.01
+    assert mx.array_equal(fast.act_pair_had(8 * x, 8 * r, sg, block, 10.0), got)
     heads = x.reshape(3, dim // 128, 128)
     z = r.reshape(3, dim // 128, 128)
     wg = w[:128]
     ref = nn.silu(z.astype(mx.float32)) * mx.fast.rms_norm(heads, wg, 1e-6).astype(
         mx.float32
     )
-    got = fast.gnorm_had(heads, z, wg, sg, 1e-6, block)
+    got, _ = fast.gnorm_had(heads, z, wg, sg, 1e-6, block)
     assert (
         _rel(got.reshape(3, dim), quantize.rotate(ref.reshape(3, dim), sg, block))
         < 0.01
     )
+
+
+def test_memo_lives_as_long_as_the_plain_array():
+    from omlx.oqh import modules
+
+    plain, rotated = mx.ones((2, 256)), mx.zeros((2, 256))
+    modules.remember(plain, rotated, 7)
+    assert modules._recall(plain, 7) is rotated
+    del plain
+    gc.collect()
+    assert not any(k == 7 for _, _, k in modules._MEMO.entries)
 
 
 def test_targets_and_row_parallel_blocks():
@@ -401,6 +408,16 @@ def test_load_hook_serves_the_checkpoint_with_fusion(tmp_path, moe):
     h = mx.random.normal((1, 3, 256)).astype(mx.bfloat16)
     ref_layer = ref.model.layers[0]
     assert _rel(layer.mlp(h), ref_layer.mlp(h)) < 0.03
+
+    # Row-exact MTP verify feeds every row through the one-token arithmetic.
+    from mlx_vlm.models.qwen3_5.speculative_verifier import (
+        Qwen3_5BatchInvariantForward,
+    )
+
+    mlp = layer.mlp.shared_expert if moe else layer.mlp
+    rows = Qwen3_5BatchInvariantForward._feed_forward(None, mlp, h)
+    for i in range(3):
+        assert mx.array_equal(rows[:, i : i + 1], mlp(h[:, i : i + 1]))
 
 
 def _tiny_qwen4_exp(tmp_path, monkeypatch):

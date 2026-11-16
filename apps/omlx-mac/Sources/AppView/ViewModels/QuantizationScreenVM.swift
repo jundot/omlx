@@ -76,7 +76,10 @@ final class QuantizationScreenVM {
     }
 
     var selectedSupportsOqh: Bool {
-        models.first(where: { $0.path == selectedModelPath })?.oqhSupported ?? false
+        guard let model = models.first(where: { $0.path == selectedModelPath }),
+              model.oqhSupported == true
+        else { return false }
+        return model.oqhMaxLevel.map { oqLevel < $0 } ?? true
     }
 
     /// oQh rides on the oQe calibration, so it applies only with oQe on.

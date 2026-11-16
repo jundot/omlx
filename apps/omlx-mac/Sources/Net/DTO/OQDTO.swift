@@ -25,6 +25,8 @@ struct OQModelInfo: Codable, Equatable, Sendable, Identifiable {
     let isVlm: Bool
     let hasMtpHeads: Bool
     let oqhSupported: Bool?
+    /// oQh levels must stay below this one (DeepSeek V4.1: 4).
+    let oqhMaxLevel: Double?
 
     // Only populated on `source_models` rows.
     let numLayers: Int?

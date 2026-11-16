@@ -10,11 +10,13 @@ memo keyed by array identity), and rotates it itself otherwise.
 from __future__ import annotations
 
 import threading
+import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..custom_kernels.oqh import fast
+from . import format as fmt
 
 # Up to this many rows run the native GEMV once per row: MTP verify batches
 # then use the same arithmetic as one-token decode. Larger batches go through
@@ -25,22 +27,27 @@ _MEMO_SIZE = 8
 
 class _Memo(threading.local):
     def __init__(self):
-        self.entries: list[tuple[mx.array, mx.array, int]] = []
+        self.entries: list[tuple[weakref.ref, mx.array, int]] = []
 
 
 _MEMO = _Memo()
 
 
 def remember(plain: mx.array, rotated: mx.array, key: int) -> None:
+    """Keep rotated for the readers of plain while plain is alive."""
     entries = _MEMO.entries
-    entries.append((plain, rotated, key))
+
+    def drop(ref):
+        entries[:] = [e for e in entries if e[0] is not ref]
+
+    entries.append((weakref.ref(plain, drop), rotated, key))
     if len(entries) > _MEMO_SIZE:
         del entries[0]
 
 
 def _recall(x: mx.array, key: int) -> mx.array | None:
-    for plain, rotated, k in reversed(_MEMO.entries):
-        if plain is x and k == key:
+    for ref, rotated, k in reversed(_MEMO.entries):
+        if k == key and ref() is x:
             return rotated
     return None
 
@@ -92,15 +99,6 @@ class _Rotating(nn.Module):
     def signs(self) -> mx.array:
         return self["oqh_signs"].reshape(-1)
 
-    def update(self, parameters: dict, strict: bool = True) -> nn.Module:
-        shape = self["weight"].shape
-        out = super().update(parameters, strict)
-        # A tensor-parallel split of gate and up fuses the halves again.
-        on_split = getattr(self, "_oqh_on_split", None)
-        if on_split is not None and self["weight"].shape != shape:
-            on_split()
-        return out
-
     def rotate(self, x: mx.array) -> mx.array:
         return fast.rotate(x, self.signs, self.block)
 
@@ -139,14 +137,24 @@ class OqhLinear(_Rotating):
             self.bias = mx.zeros((output_dims,))
         self.freeze()
 
+    def gemv_rows(self, x: mx.array) -> bool:
+        """Whether x runs the native GEMV, one product per row."""
+        return x.size // self.input_dims <= QMV_MAX_ROWS
+
     def matmul_rotated(self, x: mx.array) -> mx.array:
-        if x.size // self.input_dims <= QMV_MAX_ROWS:
+        if self.gemv_rows(x):
             y = fast.qmv(x, self["weight"], self["rscale"], self.bits)
         else:
             y = fast.qmm(x, self["weight"], self["rscale"], self.bits)
         if "bias" in self:
             y = y + self["bias"]
         return y
+
+    def pair_rotated(self, x: mx.array, up: OqhLinear) -> mx.array:
+        """[x @ W.T | x @ up.T] in one GEMV, for gemv_rows inputs (pairs have no bias)."""
+        return fast.qmv(
+            x, self["weight"], self["rscale"], self.bits, up["weight"], up["rscale"]
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         if x.dtype == mx.float32:
@@ -170,28 +178,41 @@ class OqhSwitchLinear(_Rotating):
         self.oqh_signs = mx.zeros((input_dims // block, block))
         self.freeze()
 
+    def gemv_rows(self, x: mx.array, sorted_indices: bool = False) -> bool:
+        """Whether x runs the native gather GEMV; callers sort large route sets."""
+        return not sorted_indices and x.shape[-2] == 1
+
+    def _gemv(self, x: mx.array, indices: mx.array, *pair) -> mx.array:
+        rows = x.size // self.input_dims
+        pairs = indices.size
+        if rows not in (1, pairs):
+            # Batched decode and verify: one row per pair keeps the GEMV.
+            x = mx.broadcast_to(x, (*indices.shape, 1, self.input_dims))
+            rows = pairs
+        y = fast.gather_qmv(
+            x.reshape(rows, self.input_dims),
+            self["weight"],
+            self["rscale"],
+            indices.reshape(-1),
+            self.bits,
+            *pair,
+        )
+        return y.reshape(*indices.shape, 1, -1)
+
     def matmul_rotated(
         self, x: mx.array, indices: mx.array, sorted_indices: bool = False
     ):
-        rows = x.size // self.input_dims
-        pairs = indices.size
-        # Callers sort large route sets; unsorted ones are decode-sized.
-        if not sorted_indices and x.shape[-2] == 1:
-            if rows not in (1, pairs):
-                # Batched decode and verify: one row per pair keeps the GEMV.
-                x = mx.broadcast_to(x, (*indices.shape, 1, self.input_dims))
-                rows = pairs
-            y = fast.gather_qmv(
-                x.reshape(rows, self.input_dims),
-                self["weight"],
-                self["rscale"],
-                indices.reshape(-1),
-                self.bits,
-            )
-            return y.reshape(*indices.shape, 1, self.output_dims)
+        if self.gemv_rows(x, sorted_indices):
+            return self._gemv(x, indices)
         return fast.gather_qmm(
             x, self["weight"], self["rscale"], indices, self.bits, sorted_indices
         )
+
+    def pair_rotated(
+        self, x: mx.array, indices: mx.array, up: OqhSwitchLinear
+    ) -> mx.array:
+        """[gate | up] routed products in one gather GEMV, for gemv_rows inputs."""
+        return self._gemv(x, indices, up["weight"], up["rscale"])
 
     def __call__(
         self,
@@ -216,6 +237,8 @@ def from_tensors(prefix: str, weights: dict[str, mx.array]) -> nn.Module:
     w = weights[f"{prefix}.weight"]
     signs = weights[f"{prefix}.oqh_signs"]
     block = int(signs.shape[-1])
+    if block > fmt.MAX_BLOCK:
+        raise ValueError(f"oQh {prefix}: rotation block {block} > {fmt.MAX_BLOCK}")
     in_dims = int(signs.size)
     bits = int(w.shape[-1]) * 32 // in_dims
     if w.ndim == 3:

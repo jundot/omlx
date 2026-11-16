@@ -74,13 +74,14 @@ def require_native(config: dict) -> None:
         return
     block = config[fmt.CONFIG_KEY]
     version = block.get("version") if isinstance(block, dict) else None
+    # ValueError: engines pass it through as a load refusal.
     if version != fmt.FORMAT_VERSION:
-        raise RuntimeError(
+        raise ValueError(
             f"This checkpoint uses oQh format version {version}; this oMLX reads "
             f"version {fmt.FORMAT_VERSION}"
         )
     if not fast.has_native():
-        raise RuntimeError(
+        raise ValueError(
             "This oQh checkpoint needs the oQh native kernels, which failed to load: "
             f"{fast.import_error()}"
         )

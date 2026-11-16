@@ -23,6 +23,7 @@ import mlx.core as mx
 import numpy as np
 
 from ...oqh import format as oqh_format
+from ...oqh import targets as oqh_targets
 from .convert import iter_source_weights, source_engram_tables, strip_draft_config
 from .oq_inventory import projection_inventory
 from .oqh import plan_widths, planned_bytes, write_experts
@@ -400,7 +401,7 @@ def quantize(
     )
 
     _validate_v41_oq_settings(oq_level, dtype, group_size)
-    if hadamard and oq_level >= 4:
+    if hadamard and oq_level >= oqh_targets.DEEPSEEK_V41.max_level:
         raise ValueError(
             "V4.1 oQh re-rounds the routed experts below oQ4; oQ4 keeps the "
             "source FP4 experts"

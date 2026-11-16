@@ -7568,6 +7568,11 @@ def quantize_oq_streaming(
                 f"oQ{oq_level:g}: oQe imatrix will stream one layer at a "
                 "time from the source checkpoint (no calibration proxy)"
             )
+        elif hadamard and _model_requires_proxy:
+            raise ValueError(
+                "oQh needs the original weights during calibration; this source "
+                "only fits in memory through a proxy"
+            )
         # When the streamed sweep is going to visit every layer anyway and
         # this build still needs a measured sensitivity map, fuse the qdq
         # measurement into that sweep: one weight load serves both passes.
@@ -8204,7 +8209,6 @@ def quantize_oq_streaming(
             target_dtype,
             out_shard_idx,
             streamed=stream_imatrix,
-            requires_proxy=_model_requires_proxy,
             trust_remote_code=trust_remote_code,
             progress_callback=cb,
         )
@@ -11965,7 +11969,6 @@ def _write_oqh_output(
     shard_index: int,
     *,
     streamed: bool,
-    requires_proxy: bool,
     trust_remote_code: bool,
     progress_callback,
 ) -> dict:
@@ -11973,13 +11976,9 @@ def _write_oqh_output(
 
     Walks the layers like _refine_oqe_output. The affine tensors it visits get the
     oQe refinement on the way. Returns the report with the shard count and the
-    per-tensor config entries.
+    per-tensor config entries. Sources that need a calibration proxy are refused
+    before the main pass.
     """
-    if requires_proxy and not streamed:
-        raise ValueError(
-            "oQh needs the original weights during calibration; this source "
-            "only fits in memory through a proxy"
-        )
     writer = OqhWriter(
         _OQRefineWriter(output, weight_map, quantization),
         target_bits,

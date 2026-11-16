@@ -283,6 +283,9 @@ class OQManager:
                                 "is_vlm": _has_vision_subconfig(config),
                                 "has_mtp_heads": has_mtp,
                                 "oqh_supported": oqh_targets.supports(config),
+                                "oqh_max_level": getattr(
+                                    oqh_targets.scheme_for(config), "max_level", None
+                                ),
                                 "hidden_size": tc.get("hidden_size")
                                 or config.get("hidden_size")
                                 or (tc.get("dim") if is_v41 else 0)

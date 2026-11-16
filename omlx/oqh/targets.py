@@ -65,6 +65,8 @@ class Scheme:
 
     roles: dict
     tensor_parallel: bool
+    # oQh levels must stay below this one, if set.
+    max_level: float | None = None
 
     def role(self, path: str) -> str | None:
         m = _split(path)
@@ -98,7 +100,9 @@ class Scheme:
         )
 
 
-# Qwen3.5, Qwen3.6 and Qwen3.8 checkpoints all use qwen3_5 / qwen3_5_moe.
+# Qwen3.5, Qwen3.6 and Qwen3.8 checkpoints all use qwen3_5 / qwen3_5_moe. Their
+# blocks also fit two ranks; at the 256 cap that costs nothing, although the
+# planner does not split Qwen oQh models.
 QWEN = Scheme(_QWEN_ROLES, tensor_parallel=True)
 # Qwen3.8-Flash-Next keeps its trunk affine: its hyper-connection, attention and
 # GDN kernels read affine weights. It does not run tensor parallel.
@@ -106,8 +110,8 @@ QWEN4_EXP = Scheme(_ROUTED_ROLES, tensor_parallel=False)
 # GLM-5.3 keeps its trunk affine for the same reason, and runs tensor parallel.
 GLM5_NEXT = Scheme(_ROUTED_ROLES, tensor_parallel=True)
 # DeepSeek V4.1 likewise: its trunk, Engram tables and shared expert keep
-# their oQ formats.
-DEEPSEEK_V41 = Scheme(_V41_ROUTED_ROLES, tensor_parallel=True)
+# their oQ formats. oQ4 keeps the source FP4 experts, so oQh is for lower levels.
+DEEPSEEK_V41 = Scheme(_V41_ROUTED_ROLES, tensor_parallel=True, max_level=4)
 _SCHEMES = {
     "deepseek_v41": DEEPSEEK_V41,
     "qwen3_5": QWEN,

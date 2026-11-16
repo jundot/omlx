@@ -131,7 +131,7 @@ def _routed_projections(sw, x2):
     """Routed gate / up of a SwitchGLU for the fused kernels, and x in the
     experts' basis when they are oQh (None otherwise)."""
     if getattr(sw, "oqh_experts", None) is not None:
-        return sw.oqh_gate_up, None, sw.oqh_rotated_input(x2)
+        return sw.gate_proj, sw.up_proj, sw.oqh_rotated_input(x2)
     if "gate_up_proj" in sw:
         return sw.gate_up_proj, None, None
     return sw.gate_proj, sw.up_proj, None

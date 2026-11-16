@@ -37,9 +37,22 @@ def _require():
     return _ext
 
 
-def qmv(x: mx.array, w: mx.array, rscale: mx.array, bits: int, stream=None) -> mx.array:
-    """One matrix-vector product per row of x. w: [N, K * bits / 32] uint32, rscale: [N]."""
-    return _require().qmv(x, w, rscale, bits, **native_stream_kwargs(stream))
+def qmv(
+    x: mx.array,
+    w: mx.array,
+    rscale: mx.array,
+    bits: int,
+    w_b: mx.array | None = None,
+    rscale_b: mx.array | None = None,
+    stream=None,
+) -> mx.array:
+    """One matrix-vector product per row of x. w: [N, K * bits / 32] uint32, rscale: [N].
+
+    With ``w_b`` / ``rscale_b`` (e.g. up next to gate) one call returns [..., 2N].
+    """
+    return _require().qmv(
+        x, w, rscale, bits, w_b, rscale_b, **native_stream_kwargs(stream)
+    )
 
 
 def gather_qmv(
@@ -48,11 +61,14 @@ def gather_qmv(
     rscale: mx.array,
     indices: mx.array,
     bits: int,
+    w_b: mx.array | None = None,
+    rscale_b: mx.array | None = None,
     stream=None,
 ) -> mx.array:
-    """Routed experts: x has 1 row (shared) or one row per index. Returns [P, N]."""
+    """Routed experts: x has 1 row (shared) or one row per index. Returns [P, N],
+    or [P, 2N] with ``w_b`` / ``rscale_b`` as in qmv."""
     return _require().gather_qmv(
-        x, w, rscale, indices, bits, **native_stream_kwargs(stream)
+        x, w, rscale, indices, bits, w_b, rscale_b, **native_stream_kwargs(stream)
     )
 
 
@@ -145,33 +161,16 @@ def gather_qmm(
     return y * mx.expand_dims(rscale[indices], -2)
 
 
-def rmsnorm_had(
-    x, weight, signs, eps: float, block: int, dual: bool = False, stream=None
-):
-    """Rotated RMSNorm(x) * weight, or (rotated, plain) when dual."""
-    out = _require().rmsnorm_had(
-        x, weight, signs, eps, block, dual, **native_stream_kwargs(stream)
+def rmsnorm_had(x, weight, signs, eps: float, stream=None):
+    """(rotated, plain): RMSNorm(x) * weight as MLX rounds it, and its 256-block rotation."""
+    rot, plain = _require().rmsnorm_had(
+        x, weight, signs, eps, **native_stream_kwargs(stream)
     )
-    return (out[0], out[1]) if dual else out[0]
-
-
-def add_rmsnorm_had(
-    x, r, weight, signs, eps: float, block: int, dual: bool = False, stream=None
-):
-    """h = x + r, then the rotated norm of h. Returns (h, rotated) or (h, rotated, plain)."""
-    out = _require().add_rmsnorm_had(
-        x, r, weight, signs, eps, block, dual, **native_stream_kwargs(stream)
-    )
-    return tuple(out)
-
-
-def act_had(a, b, signs, mode: int, block: int, stream=None) -> mx.array:
-    """mode 0: silu(a) * b, 1: a * sigmoid(b), 3: a; then the rotation."""
-    return _require().act_had(a, b, signs, mode, block, **native_stream_kwargs(stream))
+    return rot, plain
 
 
 def act_split_had(y, signs, block: int, limit=None, stream=None) -> mx.array:
-    """y holds gate | up halves of a fused projection: rotated silu(gate) * up.
+    """y holds gate | up halves: rotated silu(gate) * up.
 
     With ``limit``, the clamped SwiGLU silu(min(gate, limit)) * clamp(up, -limit, limit).
     """
@@ -180,19 +179,21 @@ def act_split_had(y, signs, block: int, limit=None, stream=None) -> mx.array:
     )
 
 
-def gnorm_had(
-    x, z, weight, signs, eps: float, block: int, dual: bool = False, stream=None
-):
-    """Gated RMSNorm over 128-wide heads, then the rotation of each row.
-
-    Returns the rotated output, or (rotated, plain) when dual.
-    """
-    out = _require().gnorm_had(
-        x, z, weight, signs, eps, block, dual, **native_stream_kwargs(stream)
+def act_pair_had(a, b, signs, block: int, limit=None, stream=None) -> mx.array:
+    """act_split_had for gate and up as two separate inputs."""
+    return _require().act_pair_had(
+        a, b, signs, block, limit, **native_stream_kwargs(stream)
     )
-    return (out[0], out[1]) if dual else out[0]
+
+
+def gnorm_had(x, z, weight, signs, eps: float, block: int, stream=None):
+    """(rotated, plain) of the gated RMSNorm over 128-wide heads."""
+    rot, plain = _require().gnorm_had(
+        x, z, weight, signs, eps, block, **native_stream_kwargs(stream)
+    )
+    return rot, plain
 
 
 def rotate(x, signs, block: int, stream=None) -> mx.array:
     """The input rotation alone, for callers that pass an unrotated activation."""
-    return _require().act_had(x, None, signs, 3, block, **native_stream_kwargs(stream))
+    return _require().rotate(x, signs, block, **native_stream_kwargs(stream))

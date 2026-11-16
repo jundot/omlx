@@ -2,12 +2,14 @@
 """oQh routed experts of a DeepSeek V4.1 export.
 
 The main export leaves out the experts the oQh plan covers. This pass loads the
-source model, runs full forwards over the calibration text a few layers at a
-time while the oQe Gram collector records each routed expert's inputs (w3
-shares w1's), quantizes those experts against their Grams and adds them to the
-export, one module per writer call so each stays in one shard.
+source model, runs forwards over the calibration text a few layers at a time
+(each stops at the next block) while the oQe Gram collector records each routed
+expert's inputs (w3 shares w1's), quantizes those experts against their Grams
+and adds them to the export, one module per writer call so each stays in one
+shard.
 """
 
+import contextlib
 import logging
 
 import mlx.core as mx
@@ -21,6 +23,21 @@ from .quantization import QuantizedProjection
 logger = logging.getLogger(__name__)
 
 _EXPERTS = ("w1", "w3", "w2")
+
+
+class _GroupDoneError(Exception):
+    """Raised by the first block after the layers a pass collects."""
+
+
+def _raise_stop(self, *args, **kwargs):
+    raise _GroupDoneError
+
+
+def _stop_before(block) -> type:
+    """Make block raise _GroupDoneError when called; returns its class to restore."""
+    base = type(block)
+    block.__class__ = type(f"Stop{base.__name__}", (base,), {"__call__": _raise_stop})
+    return base
 
 
 def plan_widths(inventory, allocation, layer_scores) -> dict[str, int]:
@@ -119,6 +136,11 @@ def write_experts(
         for start in range(0, len(layers), layers_per_pass):
             group = layers[start : start + layers_per_pass]
             collectors = {}
+            # The collector evaluates what it records, so the forward can stop
+            # at the block after the group.
+            nxt = group[-1] + 1
+            stop = core.layers[nxt] if nxt < len(core.layers) else None
+            restore = None if stop is None else _stop_before(stop)
             try:
                 for i in group:
                     collector = oq._OQGramCollector()
@@ -129,9 +151,12 @@ def write_experts(
                     for collector in collectors.values():
                         collector.begin_forward()
                     cache = core.make_cache()
-                    mx.eval(core(row[None], cache=cache)[:, -1])
+                    with contextlib.suppress(_GroupDoneError):
+                        mx.eval(core(row[None], cache=cache)[:, -1])
                     del cache
             finally:
+                if restore is not None:
+                    stop.__class__ = restore
                 for i, collector in collectors.items():
                     collector.restore(core.layers[i].ffn.experts)
             for i in group:

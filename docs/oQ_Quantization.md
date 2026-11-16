@@ -63,11 +63,14 @@ How it differs from oQe:
 
 | Model | Level | Size | oQe KL | oQh KL |
 |---|---|---|---|---|
-| Qwen3.5-4B | oQ3.5 | 2.1 GB | 0.091 | 0.074 (-18%) |
-| Qwen3.5-9B | oQ2.5 | 3.8 GB | 0.251 | 0.118 (-53%) |
+| Qwen3.5-4B | oQ3.5 | 2.1 GB | 0.091 | 0.079 (-13%) |
+| Qwen3.5-9B | oQ2.5 | 3.8 GB | 0.251 | 0.115 (-54%) |
 | Qwen3.5-9B | oQ3.5 | 4.5 GB | 0.082 | 0.057 (-30%) |
+| Qwen3.6-35B-A3B | oQ3.5 | 17.5 GB | 0.034 | 0.023 (-32%) |
 
-KL divergence from the original model on general text (FLORES), lower is better. oQe and oQh files of the same level have the same size. The 9B rows compare the decoder layers only, with the embeddings and the LM head kept in BF16.
+KL divergence from the original model on general text (FLORES), lower is better. oQe and oQh files of the same level have the same size. The 9B and 35B rows compare the decoder layers only, with the embeddings and the LM head kept in BF16.
+
+Qwen3.8-Flash-Next oQ3.5 (95 GB, routed experts only) against its FP8 original on English prose: KL 0.167 for oQe and 0.127 for oQh (-24%), with similar gains on code and multilingual text.
 
 ## What oQ does
 

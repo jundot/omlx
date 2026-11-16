@@ -5,7 +5,7 @@ front of them computes the plain and the rotated output in one kernel, returns
 the plain one (routers and every other reader see the usual value) and leaves
 the rotated one in the oQh memo keyed by the returned array, where the linears
 pick it up. MLP and SwitchGLU forwards are replaced on the instance only: gate
-and up run as one fused projection, and the activation writes the rotated
+and up run as one paired projection, and the activation writes the rotated
 input of down. Other models of the same class in the process are untouched.
 """
 
@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import functools
 import itertools
-import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -55,9 +54,7 @@ class _DualNorm:
     """RMSNorm that also writes the rotated input of its oQh readers."""
 
     def __call__(self, x):
-        rot, plain = fast.rmsnorm_had(
-            x, self["weight"], self._oqh_signs, self.eps, self._oqh_block, dual=True
-        )
+        rot, plain = fast.rmsnorm_had(x, self["weight"], self._oqh_signs, self.eps)
         remember(plain, rot, self._oqh_key)
         return plain
 
@@ -75,50 +72,47 @@ class _DualGatedNorm:
         ):
             return super().__call__(x, gate)
         rot, plain = fast.gnorm_had(
-            x,
-            gate,
-            self["weight"],
-            out_proj.signs,
-            self.eps,
-            out_proj.block,
-            dual=True,
+            x, gate, self["weight"], out_proj.signs, self.eps, out_proj.block
         )
         hand_off(self._oqh_handoff, rot)
         return plain
 
 
 class _FusedMLP:
-    """down(silu(gate(x)) * up(x)) with gate | up as one projection."""
+    """down(silu(gate(x)) * up(x)) with gate and up in one paired projection."""
 
     def __call__(self, x):
-        gu = self._oqh_gate_up
-        y = gu.matmul_rotated(gu.rotated_input(x))
-        down = self.down_proj
-        return down.matmul_rotated(fast.act_split_had(y, down.signs, down.block))
+        gate, up, down = self.gate_proj, self.up_proj, self.down_proj
+        x = gate.rotated_input(x)
+        if gate.gemv_rows(x):
+            act = fast.act_split_had(gate.pair_rotated(x, up), down.signs, down.block)
+        else:
+            gu = (gate.matmul_rotated(x), up.matmul_rotated(x))
+            act = fast.act_pair_had(*gu, down.signs, down.block)
+        return down.matmul_rotated(act)
 
 
 class _FusedSwitchGLU:
-    """SwitchGLU with gate | up as one routed projection.
+    """SwitchGLU with gate and up in one paired routed projection.
 
     oqh_rotated_input and oqh_experts also serve MoE blocks that sort and
     combine the routes themselves.
     """
 
-    @property
-    def oqh_gate_up(self):
-        """gate | up as one routed projection, [E, 2N, ...] (gate rows first)."""
-        return self._oqh_gate_up
-
     def oqh_rotated_input(self, x):
-        return self._oqh_gate_up.rotated_input(x)
+        return self.gate_proj.rotated_input(x)
 
     def oqh_experts(self, x, indices, sorted_indices: bool = False):
         """Expert outputs of rotated rows."""
-        y = self._oqh_gate_up.matmul_rotated(x, indices, sorted_indices)
-        down = self.down_proj
+        gate, up, down = self.gate_proj, self.up_proj, self.down_proj
         # GLM-5.3's activation clamps gate and up at its limit.
         limit = getattr(self.activation, "limit", None)
-        act = fast.act_split_had(y, down.signs, down.block, limit)
+        if gate.gemv_rows(x, sorted_indices):
+            y = gate.pair_rotated(x, indices, up)
+            act = fast.act_split_had(y, down.signs, down.block, limit)
+        else:
+            gu = [m.matmul_rotated(x, indices, sorted_indices) for m in (gate, up)]
+            act = fast.act_pair_had(*gu, down.signs, down.block, limit)
         return down.matmul_rotated(act, indices, sorted_indices)
 
     def __call__(
@@ -158,70 +152,30 @@ def _same_rotation(a, b) -> bool:
     return a.block == b.block and bool(mx.array_equal(a.signs, b.signs).item())
 
 
-def _fuse_gate_up(mlp) -> nn.Module | None:
-    """Fuse gate and up rows; the originals become views of the fused buffers."""
-    gate, up = mlp.gate_proj, mlp.up_proj
-    if (
-        type(gate) is not type(up)
-        or gate.bits != up.bits
-        or gate.input_dims != up.input_dims
-        or not _same_rotation(gate, up)
-        or "bias" in gate
-        or "bias" in up
-    ):
-        return None
-    n = gate.output_dims
-    if isinstance(gate, OqhLinear):
-        fused = OqhLinear(gate.input_dims, 2 * n, gate.bits, gate.block)
-        axis = 0
-    else:
-        fused = OqhSwitchLinear(
-            gate.input_dims, 2 * n, gate.num_experts, gate.bits, gate.block
-        )
-        axis = 1
-    fused.weight = mx.concatenate([gate["weight"], up["weight"]], axis=axis)
-    fused.rscale = mx.concatenate([gate["rscale"], up["rscale"]], axis=axis)
-    fused.oqh_signs = gate["oqh_signs"]
-    mx.eval(fused.parameters())
-    lo, hi = slice(0, n), slice(n, 2 * n)
-    for mod, part in ((gate, lo), (up, hi)):
-        index = (part,) if axis == 0 else (slice(None), part)
-        mod.weight = fused["weight"][index]
-        mod.rscale = fused["rscale"][index]
-    mx.eval(gate.parameters(), up.parameters())
-    on_split = _refuse_after_split(weakref.ref(mlp))
-    for mod in (gate, up):
-        _set(mod, "_oqh_on_split", on_split)
-    return fused
-
-
-def _refuse_after_split(ref):
-    """Fuse gate and up again once a tensor-parallel split has cut both."""
-
-    def refuse():
-        mlp = ref()
-        if mlp is None:
-            return
-        gate, up = mlp.gate_proj, mlp.up_proj
-        if gate.output_dims == up.output_dims != mlp._oqh_gate_up.output_dims // 2:
-            _set(mlp, "_oqh_gate_up", _fuse_gate_up(mlp))
-
-    return refuse
+def _pairs(gate, up) -> bool:
+    """Whether gate and up can run as one paired projection."""
+    return (
+        type(gate) is type(up)
+        and gate.bits == up.bits
+        and gate.input_dims == up.input_dims
+        and gate.output_dims == up.output_dims
+        and _same_rotation(gate, up)
+        and "bias" not in gate
+        and "bias" not in up
+    )
 
 
 def _install_mlp(mlp) -> list:
-    """Fuse one MLP or SwitchGLU; returns the oQh modules that read its input."""
+    """Pair gate and up of an MLP or SwitchGLU; returns the oQh readers of its input."""
     names = ("gate_proj", "up_proj", "down_proj")
     mods = [getattr(mlp, n, None) for n in names]
-    if not all(isinstance(m, OQH_MODULES) for m in mods):
-        return [m for m in mods[:2] if isinstance(m, OQH_MODULES)]
-    fused = _fuse_gate_up(mlp)
-    if fused is None:
-        return mods[:2]
-    _set(mlp, "_oqh_gate_up", fused)
+    readers = [m for m in mods[:2] if isinstance(m, OQH_MODULES)]
+    if not all(isinstance(m, OQH_MODULES) for m in mods) or not _pairs(*mods[:2]):
+        return readers
     _set(mlp, "_oqh_installed", True)
-    _rebase(mlp, _FusedSwitchGLU if isinstance(fused, OqhSwitchLinear) else _FusedMLP)
-    return [fused]
+    switch = isinstance(mods[0], OqhSwitchLinear)
+    _rebase(mlp, _FusedSwitchGLU if switch else _FusedMLP)
+    return readers
 
 
 def _is_oqh_glu(module) -> bool:
@@ -255,6 +209,22 @@ def _verify_switch_glu(original):
     return switch_glu
 
 
+def _verify_feed_forward(original):
+    """Run paired oQh MLPs in row-exact MTP verify through the decode arithmetic.
+
+    Up to QMV_MAX_ROWS rows, their forward runs one GEMV per row, as in decode.
+    """
+
+    @functools.wraps(original)
+    def feed_forward(self, module, x):
+        if isinstance(module, _FusedMLP):
+            return module(x)
+        return original(self, module, x)
+
+    feed_forward._omlx_oqh = True
+    return feed_forward
+
+
 def _bind_readers(norm, readers) -> None:
     """Give readers of one input a shared memo key, fused into the norm if possible."""
     groups: list[list] = []
@@ -276,11 +246,10 @@ def _bind_readers(norm, readers) -> None:
         or not isinstance(norm, nn.RMSNorm)
         or width % 256
         or width > 8192
-        or first.block < 256
+        or first.block != 256
     ):
         return
     _set(norm, "_oqh_signs", first.signs.astype(norm["weight"].dtype))
-    _set(norm, "_oqh_block", first.block)
     _set(norm, "_oqh_key", first._oqh_key)
     _rebase(norm, _DualNorm)
 
@@ -373,7 +342,13 @@ def install(model: nn.Module) -> int:
             _bind_readers(None, [module.w1, module.w3])
             _set(module, "_oqh_installed", True)
             count += 1
-    original = Qwen3_5BatchInvariantForward._switch_glu
-    if count and not getattr(original, "_omlx_oqh", False):
-        Qwen3_5BatchInvariantForward._switch_glu = _verify_switch_glu(original)
+    if count:
+        verifier = Qwen3_5BatchInvariantForward
+        for name, wrap in (
+            ("_switch_glu", _verify_switch_glu),
+            ("_feed_forward", _verify_feed_forward),
+        ):
+            original = getattr(verifier, name)
+            if not getattr(original, "_omlx_oqh", False):
+                setattr(verifier, name, wrap(original))
     return count
