@@ -538,6 +538,12 @@ def test_devices_enriches_paired_row_from_discovery_record(_configured_stores):
         "thunderbolt": True,
         "jaccl": True,
         "loopback_only": False,
+        # Identity facts for the device card; a peer that did not report them
+        # stays at "not measured" instead of pretending to have no hardware.
+        "model": "",
+        "cpu_cores": 0,
+        "gpu_cores": 0,
+        "disk_total_gb": 0.0,
     }
     assert row["version"] == "1.2.3"
     assert row["link"] == "tb"

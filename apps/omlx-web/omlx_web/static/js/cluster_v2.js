@@ -1760,6 +1760,62 @@ function clusterV2Wizard() {
             return device?.caps?.chip || window.t('cluster.v2.device.apple_silicon');
         },
 
+        /** A pictogram for the chassis family, from the Mac's own hw.model. */
+        deviceIcon(device) {
+            if (this.deviceHelperOnly(device)) return 'server';
+            const model = String(device?.caps?.model || '');
+            if (model.startsWith('MacBookPro') || model.startsWith('MacBookAir')) {
+                return 'laptop';
+            }
+            if (model.startsWith('iMac')) return 'monitor';
+            if (model.startsWith('Macmini')) return 'box';
+            if (model.startsWith('MacPro')) return 'server';
+            // Mac Studio and anything else unknown: a desktop box.
+            if (model.startsWith('Mac')) return 'box';
+            return 'laptop';
+        },
+
+        /** `C18/G40` — CPU and GPU cores, each only when the peer reported it. */
+        deviceCoresLabel(device) {
+            const cpu = Number(device?.caps?.cpu_cores || 0);
+            const gpu = Number(device?.caps?.gpu_cores || 0);
+            if (!cpu && !gpu) return '';
+            const parts = [];
+            if (cpu) parts.push(`C${cpu}`);
+            if (gpu) parts.push(`G${gpu}`);
+            return parts.join('/');
+        },
+
+        /** `SSD1.8TB` / `SSD926GB`, or '' when the peer did not report a disk. */
+        deviceDiskLabel(device) {
+            const gb = Number(device?.caps?.disk_total_gb || 0);
+            if (!(gb > 0)) return '';
+            return `SSD${this.humanSize(gb * 1024 ** 3)}`;
+        },
+
+        /** The one line under a Mac's name: address, cores, memory, disk. */
+        deviceSpecLine(device) {
+            const parts = [];
+            const addr = this.bestDeviceAddr(device);
+            if (addr?.ip) parts.push(String(addr.ip));
+            const cores = this.deviceCoresLabel(device);
+            if (cores) parts.push(cores);
+            const ram = this.deviceRamGb(device);
+            if (ram) parts.push(`UM${ram}GB`);
+            const disk = this.deviceDiskLabel(device);
+            if (disk) parts.push(disk);
+            return parts.join(' · ');
+        },
+
+        /** `1.8TB` / `926GB` from a byte count; fixed units, no guessing. */
+        humanSize(bytes) {
+            const value = Number(bytes || 0);
+            if (!(value > 0)) return '';
+            const gb = value / 1024 ** 3;
+            if (gb >= 1000) return `${(gb / 1024).toFixed(1)}TB`;
+            return `${Math.round(gb)}GB`;
+        },
+
         deviceLoopbackOnly(device) {
             return !!device?.caps?.loopback_only;
         },

@@ -1233,6 +1233,13 @@ def test_mdns_announce_publishes_spec_txt_record():
         "thunderbolt",
         "jaccl",
         "loopback_only",
+        # The identity facts the device card shows (2026-11-16): the Mac's own
+        # model identifier, core counts and disk, so two Studios that share a
+        # friendly name are still distinguishable.
+        "model",
+        "cpu_cores",
+        "gpu_cores",
+        "disk_total_gb",
     }
     service.stop()
 
@@ -1595,3 +1602,41 @@ def test_a_peer_reachable_over_several_paths_keeps_the_best_one():
     # The new link ranking puts a direct Thunderbolt path ahead of a
     # Tailscale overlay (lower rank = faster path).
     assert _best_link("tb", "tailscale") == "tb"
+
+
+def test_peer_caps_carry_the_hardware_facts_the_device_card_shows():
+    """Address/cores/memory/disk identify a Mac; its name does not.
+
+    Measured 2026-11-16: two Mac Studios shared the base name, and the device card
+    could only show a name and the chip. The caps now travel over the same mDNS
+    TXT record, so a peer of any age keeps working (missing keys read as "not
+    measured", never as zero hardware).
+    """
+
+    caps = PeerCaps(
+        chip="Apple M5 Max",
+        ram_gb=128.0,
+        model="Mac17,6",
+        cpu_cores=18,
+        gpu_cores=40,
+        disk_total_gb=1858.1,
+    )
+    payload = caps.to_dict()
+    assert payload["model"] == "Mac17,6"
+    assert payload["cpu_cores"] == 18
+    assert payload["gpu_cores"] == 40
+    assert payload["disk_total_gb"] == 1858.1
+
+    restored = PeerCaps.from_dict(payload)
+    assert (restored.model, restored.cpu_cores, restored.gpu_cores) == (
+        "Mac17,6",
+        18,
+        40,
+    )
+    assert restored.disk_total_gb == 1858.1
+
+    # A peer that never reported them decodes to "not measured".
+    old = PeerCaps.from_dict({"chip": "Apple M1 Max", "ram_gb": 32.0})
+    assert old.model == ""
+    assert old.cpu_cores == 0 and old.gpu_cores == 0
+    assert old.disk_total_gb == 0.0

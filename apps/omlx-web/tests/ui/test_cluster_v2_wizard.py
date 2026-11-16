@@ -1578,6 +1578,39 @@ def test_expired_join_offers_start_again_not_a_dead_end():
     assert "this.join.coordinator_addr" in javascript
 
 
+def test_a_device_card_identifies_the_mac_by_hardware_not_by_name():
+    """Address + C/G cores + UM + SSD, and a chassis pictogram from hw.model.
+
+    Measured 2026-11-16: two Mac Studios share the base name "MacStudio-von-
+    Andreas", so a card that only shows a friendly name cannot tell them apart.
+    The facts travel in the mDNS caps the peer already publishes.
+    """
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert template.count("data-cluster-v2-device-spec") == 1
+    assert "deviceSpecLine(device)" in template
+    assert ':data-lucide="deviceIcon(device)"' in template
+
+    # The line is built from the address, the caps and the disk — in that order.
+    spec = javascript[javascript.index("deviceSpecLine(device) {"):][:700]
+    assert "bestDeviceAddr(device)" in spec
+    assert "deviceCoresLabel(device)" in spec
+    assert "`UM${ram}GB`" in spec
+    assert "deviceDiskLabel(device)" in spec
+
+    # Chassis families map to distinct pictograms, from hw.model.
+    icon = javascript[javascript.index("deviceIcon(device) {"):][:600]
+    for model, glyph in (
+        ("MacBookPro", "laptop"),
+        ("iMac", "monitor"),
+        ("Macmini", "box"),
+        ("MacPro", "server"),
+    ):
+        assert f"model.startsWith('{model}')" in icon
+        assert f"return '{glyph}'" in icon
+
+
 def test_the_rank0_pin_is_visible_in_the_plan_summary():
     """The pin decides the endpoint host and the decode cadence — not buried.
 

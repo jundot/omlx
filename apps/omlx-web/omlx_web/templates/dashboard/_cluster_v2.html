@@ -1854,13 +1854,20 @@
                         <div class="flex items-start justify-between gap-3">
                             <div class="min-w-0">
                                 <div class="flex items-center gap-2">
-                                    <i :data-lucide="deviceHelperOnly(device) ? 'server' : 'laptop'"
+                                    <i :data-lucide="deviceIcon(device)"
                                        class="w-4 h-4 text-neutral-400 flex-shrink-0"></i>
                                     <span class="text-sm font-semibold text-neutral-900 truncate"
                                           x-text="deviceName(device)"></span>
                                 </div>
                                 <div class="text-xs text-neutral-500 mt-1"
-                                     x-text="deviceChipLabel(device) + ' · ' + deviceRamLabel(device)"></div>
+                                     x-text="deviceChipLabel(device)"></div>
+                                <!-- What identifies the Mac without trusting its
+                                     name: address, cores, unified memory, disk.
+                                     Two Mac Studios shared a base name on
+                                     2026-11-16, so the facts come first. -->
+                                <div class="text-caption text-neutral-400 mt-0.5 font-mono"
+                                     data-cluster-v2-device-spec
+                                     x-text="deviceSpecLine(device)"></div>
                             </div>
                             <span class="badge gap-1 whitespace-nowrap"
                                   :class="deviceStateTone(device)"
