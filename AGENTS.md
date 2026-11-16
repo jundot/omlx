@@ -787,7 +787,12 @@ Do not:
 
 ## 9. Environment reference
 
-The current validation cluster is **`.11` (origin), `.12`, `.13`** — three Macs.
+The current validation cluster is **`.11`, `.12`, `.13`**. As of 2026-11-16 evening
+`.11` is reserved for other project work (GPU), so the live cluster is **`.12`
+(origin) + `.13`**; `.11` may return later. With `.12` (64 GiB) + `.13` (32 GiB)
+the pool admits ~73 GiB, which fits **none** of the large checkpoints (GLM-5.3
+97.7 GiB, Qwen3.8 117 GiB, DeepSeek 366 GiB) — a real 2-Mac start needs `.11`
+or a mid-size model, while small models are single-node recommendations.
 **`.14` was reassigned on 2026-11-16 to its own task and needs its own oMLX
 installation: never clean, install, restart, measure or pair it.** It is not in
 `cleanup-cluster-macs.sh`'s peer list. A 3-Mac plan is the largest the
