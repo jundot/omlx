@@ -104,7 +104,9 @@ private struct SchedulerSection: View {
                               defaultValue: "Chunked Prefill",
                               comment: "Row label for chunked prefill toggle"),
                 sublabel: String(localized: "performance.scheduler.chunked_prefill.sub",
-                                 defaultValue: "Split long prompts across scheduler ticks so other requests can interleave.",
+                                 defaultValue: """
+                                 Split long prompts across scheduler ticks so other requests can interleave.
+                                 """,
                                  comment: "Sublabel for chunked prefill toggle")
             ) {
                 RowSwitch(isOn: $vm.chunkedPrefill)
@@ -114,7 +116,10 @@ private struct SchedulerSection: View {
                               defaultValue: "Concurrent Request Priority",
                               comment: "Row label for the concurrent request priority popup"),
                 sublabel: String(localized: "performance.scheduler.concurrent_priority.sub",
-                                 defaultValue: "What runs first when a new prompt arrives while other responses are generating. Prefill First can pause them during a long prompt.",
+                                 defaultValue: """
+                                 What runs first when a new prompt arrives while other responses are generating. \
+                                 Prefill First can pause them during a long prompt.
+                                 """,
                                  comment: "Sublabel for the concurrent request priority popup")
             ) {
                 Popup(
@@ -128,11 +133,16 @@ private struct SchedulerSection: View {
                         ("balanced",
                          String(localized: "concurrent_priority.option.balanced",
                                 defaultValue: "Balanced",
-                                comment: "Concurrent request priority option that adapts how much GPU time running responses keep")),
+                                comment: """
+                                Concurrent request priority option that adapts how much GPU time \
+                                running responses keep
+                                """)),
                         ("decode",
                          String(localized: "concurrent_priority.option.decode",
                                 defaultValue: "Decode First",
-                                comment: "Concurrent request priority option that keeps running responses decoding first")),
+                                comment: """
+                                Concurrent request priority option that keeps running responses decoding first
+                                """)),
                     ]
                 )
             }
@@ -141,7 +151,10 @@ private struct SchedulerSection: View {
                               defaultValue: "Long Prompt Handling",
                               comment: "Row label for the prefill priority segmented control"),
                 sublabel: String(localized: "performance.scheduler.prefill_priority.sub",
-                                 defaultValue: "Under memory pressure, Max Context accepts longer prompts at a slower prefill speed. Full Speed keeps prefill at full speed and rejects prompts that would not fit.",
+                                 defaultValue: """
+                                 Under memory pressure, Max Context accepts longer prompts at a slower prefill speed. \
+                                 Full Speed keeps prefill at full speed and rejects prompts that would not fit.
+                                 """,
                                  comment: "Sublabel for the prefill priority segmented control"),
                 isLast: true
             ) {
@@ -187,7 +200,10 @@ private struct MemoryLifecycleSection: View {
                               defaultValue: "Prefill Memory Guard",
                               comment: "Row label for prefill memory guard toggle"),
                 sublabel: String(localized: "performance.memory.prefill_guard.sub",
-                                 defaultValue: "Preflight prefill memory before kicking the engine and defer generation scheduling near the ceiling.",
+                                 defaultValue: """
+                                 Preflight prefill memory before kicking the engine and defer generation \
+                                 scheduling near the ceiling.
+                                 """,
                                  comment: "Sublabel for prefill memory guard")
             ) {
                 RowSwitch(isOn: $vm.prefillMemoryGuard)
@@ -228,7 +244,9 @@ private struct MemoryLifecycleSection: View {
                                   defaultValue: "Custom Ceiling",
                                   comment: "Row label for memory guard custom ceiling"),
                     sublabel: String(localized: "performance.memory.custom_ceiling.sub",
-                                     defaultValue: "Fixed process memory ceiling in GB. Used only with the Custom tier.",
+                                     defaultValue: """
+                                     Fixed process memory ceiling in GB. Used only with the Custom tier.
+                                     """,
                                      comment: "Sublabel for memory guard custom ceiling")
                 ) {
                     TextInput(
@@ -250,7 +268,9 @@ private struct MemoryLifecycleSection: View {
                               defaultValue: "Idle Timeout",
                               comment: "Row label for idle timeout field"),
                 sublabel: String(localized: "performance.memory.idle_timeout.sub",
-                                  defaultValue: "Server-wide auto-unload after N seconds idle. Empty or 0 = disabled. Minimum 60.",
+                                  defaultValue: """
+                                  Server-wide auto-unload after N seconds idle. Empty or 0 = disabled. Minimum 60.
+                                  """,
                                   comment: "Sublabel for idle timeout")
             ) {
                 TextInput(
@@ -268,7 +288,9 @@ private struct MemoryLifecycleSection: View {
                               defaultValue: "Model Fallback",
                               comment: "Row label for model fallback toggle"),
                 sublabel: String(localized: "performance.memory.model_fallback.sub",
-                                 defaultValue: "When the requested model isn't loaded, route to any loaded model instead of 404.",
+                                 defaultValue: """
+                                 When the requested model isn't loaded, route to any loaded model instead of 404.
+                                 """,
                                  comment: "Sublabel for model fallback toggle"),
                 isLast: true
             ) {
@@ -304,7 +326,9 @@ private struct MemoryLifecycleSection: View {
                                 CodeChip(value: vm.wiredLimitCommand)
                                 Button(String(localized: "performance.memory.wired_limit_apply",
                                               defaultValue: "Apply with Admin…",
-                                              comment: "Button that raises the Metal wired limit with one system admin dialog")) {
+                                              comment: """
+                                              Button that raises the Metal wired limit with one system admin dialog
+                                              """)) {
                                     Task { await vm.applyWiredLimit(client: services.client) }
                                 }
                                 .buttonStyle(.omlx(.normal))
@@ -344,7 +368,10 @@ private struct SystemHelperSection: View {
                    defaultValue: "System Helper",
                    comment: "Section header for the privileged helper capability"),
             subtitle: String(localized: "performance.section.helper.sub",
-                             defaultValue: "Lets oMLX raise the Metal wired limit with one admin dialog. Install it once; it stays across restarts.",
+                             defaultValue: """
+                             Lets oMLX raise the Metal wired limit with one admin dialog. \
+                             Install it once; it stays across restarts.
+                             """,
                              comment: "Subtitle explaining what the privileged helper is for")
         )
 
@@ -377,7 +404,9 @@ private struct SystemHelperSection: View {
                     if vm.wiredLimitApplyVisible {
                         Button(String(localized: "performance.memory.wired_limit_apply",
                                       defaultValue: "Apply with Admin…",
-                                      comment: "Button that raises the Metal wired limit with one system admin dialog")) {
+                                      comment: """
+                                      Button that raises the Metal wired limit with one system admin dialog
+                                      """)) {
                             Task { await vm.applyWiredLimit(client: services.client) }
                         }
                         .buttonStyle(.omlx(.normal))
@@ -431,7 +460,9 @@ private struct CacheSection: View {
                               defaultValue: "Hot Cache Size",
                               comment: "Row label for the hot cache size field"),
                 sublabel: String(localized: "performance.cache.hot_size.sub",
-                                 defaultValue: "RAM ceiling for hot cache. \"0\" disables, sizes like \"8GB\" are accepted.",
+                                 defaultValue: """
+                                 RAM ceiling for hot cache. \"0\" disables, sizes like \"8GB\" are accepted.
+                                 """,
                                  comment: "Sublabel describing accepted hot cache size values")
             ) {
                 TextInput(
@@ -451,7 +482,9 @@ private struct CacheSection: View {
                                  comment: "Sublabel for the SSD cache directory"),
                 warning: vm.ssdCacheUnavailable
                     ? String(localized: "performance.cache.ssd_dir.unavailable",
-                             defaultValue: "Not available when the server started. SSD cache is off until the server restarts.",
+                             defaultValue: """
+                             Not available when the server started. SSD cache is off until the server restarts.
+                             """,
                              comment: "Warning under the SSD cache directory when it was unavailable at server start")
                     : nil
             ) {
@@ -468,7 +501,10 @@ private struct CacheSection: View {
                               defaultValue: "SSD Cache Size",
                               comment: "Row label for the SSD cache size field"),
                 sublabel: String(localized: "performance.cache.ssd_size.sub",
-                                 defaultValue: "Cold-spillover ceiling. \"auto\" = 50% of the sum of free space and existing SSD cache.",
+                                 defaultValue: """
+                                 Cold-spillover ceiling. \"auto\" = 50% of the sum of free space \
+                                 and existing SSD cache.
+                                 """,
                                  comment: "Sublabel describing accepted SSD cache size values")
             ) {
                 TextInput(

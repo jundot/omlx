@@ -41,7 +41,7 @@ def test_tune_runs_fine_tuning_on_a_ready_winner(api, monkeypatch) -> None:
             chunk_rows=[{"chunk": 4096, "tok_per_s": 50.0}],
         )
 
-    monkeypatch.setattr(tuning_wiring, "fine_tune_constellation", fake_fine_tune)
+    monkeypatch.setitem(tuning_wiring.__dict__, "fine_tune_constellation", fake_fine_tune)
     response = client.post(TUNE_URL, json={"operation_id": op.operation_id})
     assert response.status_code == 200, response.text
     body = response.json()
@@ -79,7 +79,7 @@ def test_tune_skips_mtp_for_a_model_without_an_mtp_head(api, monkeypatch) -> Non
             mtp_applicable=mtp_capable,
         )
 
-    monkeypatch.setattr(tuning_wiring, "fine_tune_constellation", fake)
+    monkeypatch.setitem(tuning_wiring.__dict__, "fine_tune_constellation", fake)
     response = client.post(TUNE_URL, json={"operation_id": op.operation_id})
     assert response.status_code == 200, response.text
     body = response.json()
@@ -102,7 +102,7 @@ def test_tune_marks_chunk_not_applicable_via_a_request_field(api, monkeypatch) -
             sampler={"sampler": "balanced"}, mtp=None, mtp_applicable=mtp_capable,
         )
 
-    monkeypatch.setattr(tuning_wiring, "fine_tune_constellation", fake)
+    monkeypatch.setitem(tuning_wiring.__dict__, "fine_tune_constellation", fake)
     response = client.post(TUNE_URL, json={"operation_id": op.operation_id})
     assert response.status_code == 200, response.text
     body = response.json()
@@ -124,7 +124,7 @@ def test_tune_saves_the_preset_per_model_and_hardware(api, monkeypatch) -> None:
             sampler={"sampler": "balanced"}, mtp=True, mtp_applicable=True,
         )
 
-    monkeypatch.setattr(tuning_wiring, "fine_tune_constellation", fake)
+    monkeypatch.setitem(tuning_wiring.__dict__, "fine_tune_constellation", fake)
     response = client.post(TUNE_URL, json={"operation_id": op.operation_id})
     body = response.json()
     assert body["preset_key"]
@@ -164,7 +164,7 @@ def test_tune_never_erases_an_mtp_depth_a_redeploy_saved(api, monkeypatch) -> No
             sampler={"sampler": "deterministic"}, mtp=True, mtp_applicable=True,
         )
 
-    monkeypatch.setattr(tuning_wiring, "fine_tune_constellation", fake)
+    monkeypatch.setitem(tuning_wiring.__dict__, "fine_tune_constellation", fake)
     response = client.post(TUNE_URL, json={"operation_id": op.operation_id})
     assert response.status_code == 200, response.text
 
@@ -187,7 +187,7 @@ def test_the_saved_preset_is_readable_for_an_operation(api, monkeypatch) -> None
             mtp=True, mtp_applicable=True,
         )
 
-    monkeypatch.setattr(tuning_wiring, "fine_tune_constellation", fake)
+    monkeypatch.setitem(tuning_wiring.__dict__, "fine_tune_constellation", fake)
     tuned = client.post(TUNE_URL, json={"operation_id": op.operation_id})
     assert tuned.status_code == 200, tuned.text
 

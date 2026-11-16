@@ -117,8 +117,8 @@ def test_routed_expert_offload_turns_a_refusal_into_a_plan(monkeypatch) -> None:
     # A fake DeepSeek checkpoint: every layer has 1 GiB of routed experts oMLX
     # can stream from SSD. The arithmetic still comes from the policy module's
     # one helper, which is what the coordinator uses.
-    monkeypatch.setattr(
-        policy_module,
+    monkeypatch.setitem(
+        policy_module.__dict__,
         "moe_offload_layer_bytes",
         lambda model, fraction, mtp=False: (GIB,) * model.layer_count,
     )
@@ -146,8 +146,8 @@ def test_expert_offload_is_priced_into_the_stage_plan(monkeypatch) -> None:
     stage's residency — not just the policy flag — is what this asserts.
     """
 
-    monkeypatch.setattr(
-        policy_module,
+    monkeypatch.setitem(
+        policy_module.__dict__,
         "moe_offload_layer_bytes",
         lambda model, fraction, mtp=False: (GIB,) * model.layer_count,
     )
@@ -375,22 +375,22 @@ def test_the_settings_patch_only_enables_what_the_policy_uses() -> None:
 def test_the_ple_and_engram_switches_are_both_honoured(monkeypatch) -> None:
     from omlx.cluster import routes as cluster_routes
 
-    monkeypatch.setattr(
-        cluster_routes,
+    monkeypatch.setitem(
+        cluster_routes.__dict__,
         "_saved_model_settings",
         lambda path: SimpleNamespace(qwen4_ple_ssd_offload=True),
     )
     assert cluster_routes._saved_engram_ssd_offload("/models/qwen") is True
 
-    monkeypatch.setattr(
-        cluster_routes,
+    monkeypatch.setitem(
+        cluster_routes.__dict__,
         "_saved_model_settings",
         lambda path: SimpleNamespace(deepseek_v41_engram_ssd_offload=True),
     )
     assert cluster_routes._saved_engram_ssd_offload("/models/ds") is True
 
-    monkeypatch.setattr(
-        cluster_routes,
+    monkeypatch.setitem(
+        cluster_routes.__dict__,
         "_saved_model_settings",
         lambda path: SimpleNamespace(),
     )
@@ -576,19 +576,19 @@ def test_the_pruned_solver_decides_exactly_like_the_full_descent(monkeypatch) ->
     original_memo = policy_module._SolverMemo
     for name, nodes, model, overrides in _differential_scenarios():
         optimized = _outcome(nodes, model, **overrides)
-        monkeypatch.setattr(policy_module, "_subset_cannot_fit", _never_prune)
-        monkeypatch.setattr(policy_module, "_SolverMemo", _NoMemo)
+        monkeypatch.setitem(policy_module.__dict__, "_subset_cannot_fit", _never_prune)
+        monkeypatch.setitem(policy_module.__dict__, "_SolverMemo", _NoMemo)
         reference = _outcome(nodes, model, **overrides)
-        monkeypatch.setattr(policy_module, "_subset_cannot_fit", original_prune)
-        monkeypatch.setattr(policy_module, "_SolverMemo", original_memo)
+        monkeypatch.setitem(policy_module.__dict__, "_subset_cannot_fit", original_prune)
+        monkeypatch.setitem(policy_module.__dict__, "_SolverMemo", original_memo)
         assert optimized == reference, f"scenario {name} drifted"
 
 
 def test_the_pruned_solver_matches_the_full_descent_with_moe_offload(monkeypatch) -> None:
     """The same preservation proof with routed-expert offload levers active."""
 
-    monkeypatch.setattr(
-        policy_module,
+    monkeypatch.setitem(
+        policy_module.__dict__,
         "moe_offload_layer_bytes",
         lambda model, fraction, mtp=False: (GIB,) * model.layer_count,
     )
@@ -615,11 +615,11 @@ def test_the_pruned_solver_matches_the_full_descent_with_moe_offload(monkeypatch
     original_memo = policy_module._SolverMemo
     for name, model, overrides in scenarios:
         optimized = _outcome(nodes, model, **overrides)
-        monkeypatch.setattr(policy_module, "_subset_cannot_fit", _never_prune)
-        monkeypatch.setattr(policy_module, "_SolverMemo", _NoMemo)
+        monkeypatch.setitem(policy_module.__dict__, "_subset_cannot_fit", _never_prune)
+        monkeypatch.setitem(policy_module.__dict__, "_SolverMemo", _NoMemo)
         reference = _outcome(nodes, model, **overrides)
-        monkeypatch.setattr(policy_module, "_subset_cannot_fit", original_prune)
-        monkeypatch.setattr(policy_module, "_SolverMemo", original_memo)
+        monkeypatch.setitem(policy_module.__dict__, "_subset_cannot_fit", original_prune)
+        monkeypatch.setitem(policy_module.__dict__, "_SolverMemo", original_memo)
         assert optimized == reference, f"scenario {name} drifted"
 
 
@@ -641,7 +641,7 @@ def test_a_wrong_bound_never_overrides_the_planner(monkeypatch) -> None:
     ]
     for case_nodes, model, overrides in cases:
         reference = _outcome(case_nodes, model, **overrides)
-        monkeypatch.setattr(policy_module, "_subset_cannot_fit", lambda *a, **k: True)
+        monkeypatch.setitem(policy_module.__dict__, "_subset_cannot_fit", lambda *a, **k: True)
         assert _outcome(case_nodes, model, **overrides) == reference
         monkeypatch.undo()
 
@@ -712,14 +712,14 @@ def test_the_prune_skips_the_ladder_for_hopeless_subsets(monkeypatch) -> None:
         calls.append(1)
         return real_plan(plan_model, budgets, **kwargs)
 
-    monkeypatch.setattr(election_module, "plan_hybrid", spy)
+    monkeypatch.setitem(election_module.__dict__, "plan_hybrid", spy)
 
     with pytest.raises(NoFeasiblePlanError) as pruned_error:
         solve(nodes, model, target_context_tokens=32768)
     pruned_calls = len(calls)
 
     calls.clear()
-    monkeypatch.setattr(policy_module, "_subset_cannot_fit", _never_prune)
+    monkeypatch.setitem(policy_module.__dict__, "_subset_cannot_fit", _never_prune)
     with pytest.raises(NoFeasiblePlanError) as full_error:
         solve(nodes, model, target_context_tokens=32768)
     full_calls = len(calls)
@@ -777,7 +777,7 @@ def test_the_memo_never_re_evaluates_an_identical_subproblem(monkeypatch) -> Non
         )
         return real_elect(nodes, model, **kwargs)
 
-    monkeypatch.setattr(policy_module, "elect", spy)
+    monkeypatch.setitem(policy_module.__dict__, "elect", spy)
 
     scenarios = [
         ([facts("a"), facts("b")], layout(), {}),
@@ -797,9 +797,9 @@ def test_the_memo_never_re_evaluates_an_identical_subproblem(monkeypatch) -> Non
         assert len(keys) == len(set(keys)), "a subproblem was evaluated twice"
 
         keys.clear()
-        monkeypatch.setattr(policy_module, "_SolverMemo", _NoMemo)
+        monkeypatch.setitem(policy_module.__dict__, "_SolverMemo", _NoMemo)
         without_memo = _outcome(nodes, model, **overrides)
-        monkeypatch.setattr(policy_module, "_SolverMemo", original_memo)
+        monkeypatch.setitem(policy_module.__dict__, "_SolverMemo", original_memo)
         assert with_memo == without_memo
 
 
@@ -813,7 +813,7 @@ def test_the_memo_does_not_leak_across_solver_calls(monkeypatch) -> None:
         calls.append(1)
         return real_elect(nodes, model, **kwargs)
 
-    monkeypatch.setattr(policy_module, "elect", spy)
+    monkeypatch.setitem(policy_module.__dict__, "elect", spy)
     nodes = [facts("a"), facts("b")]
     model = layout()
 
@@ -834,7 +834,7 @@ def test_the_memo_reads_the_expert_layout_once_per_fraction(monkeypatch) -> None
         reads.append((fraction, mtp))
         return (GIB,) * model.layer_count
 
-    monkeypatch.setattr(policy_module, "moe_offload_layer_bytes", fake)
+    monkeypatch.setitem(policy_module.__dict__, "moe_offload_layer_bytes", fake)
     nodes = [facts("a"), facts("b")]
     model = layout()
 
@@ -844,7 +844,7 @@ def test_the_memo_reads_the_expert_layout_once_per_fraction(monkeypatch) -> None
     assert len(reads) == len(set(reads)), "a (fraction, mtp) layout was read twice"
 
     reads.clear()
-    monkeypatch.setattr(policy_module, "_SolverMemo", _NoMemo)
+    monkeypatch.setitem(policy_module.__dict__, "_SolverMemo", _NoMemo)
     without_memo = solve(
         nodes, model, saved=SavedPolicy(moe_expert_offload_enabled=True)
     )
@@ -944,11 +944,11 @@ def test_quality_is_kept_by_default_over_a_smaller_context(monkeypatch) -> None:
     by default (see the table-default test), which has no speed cost.
     """
 
-    GIB_LOCAL = 1024**3
-    monkeypatch.setattr(
-        policy_module,
+    gib_local = 1024**3
+    monkeypatch.setitem(
+        policy_module.__dict__,
         "moe_offload_layer_bytes",
-        lambda model, fraction, mtp=False: (GIB_LOCAL,) * model.layer_count,
+        lambda model, fraction, mtp=False: (gib_local,) * model.layer_count,
     )
     nodes = [
         facts("a", capacity_gib=20.0, admission_gib=20.0, p50_gib=20.0, p95_gib=20.0),
@@ -970,11 +970,11 @@ def test_quality_is_kept_by_default_over_a_smaller_context(monkeypatch) -> None:
 def test_excluding_expert_offload_yields_the_speed_alternative(monkeypatch) -> None:
     """The speed side of the tradeoff: same Macs, smaller context, experts resident."""
 
-    GIB_LOCAL = 1024**3
-    monkeypatch.setattr(
-        policy_module,
+    gib_local = 1024**3
+    monkeypatch.setitem(
+        policy_module.__dict__,
         "moe_offload_layer_bytes",
-        lambda model, fraction, mtp=False: (GIB_LOCAL,) * model.layer_count,
+        lambda model, fraction, mtp=False: (gib_local,) * model.layer_count,
     )
     nodes = [
         facts("a", capacity_gib=20.0, admission_gib=20.0, p50_gib=20.0, p95_gib=20.0),

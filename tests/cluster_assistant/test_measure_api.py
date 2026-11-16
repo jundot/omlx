@@ -311,8 +311,8 @@ def test_this_mac_resolves_a_dialable_endpoint_without_a_paired_record(
     cluster came up. The address a peer could dial is announced locally.
     """
 
-    monkeypatch.setattr(
-        assistant_routes, "_local_endpoint_addresses", lambda: ["172.16.1.11"]
+    monkeypatch.setitem(
+        assistant_routes.__dict__, "_local_endpoint_addresses", lambda: ["172.16.1.11"]
     )
 
     def budget_override(**kwargs: Any) -> NodeBudgetSuggestion:

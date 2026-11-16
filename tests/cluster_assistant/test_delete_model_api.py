@@ -59,7 +59,7 @@ class Relay:
 @pytest.fixture()
 def relay(monkeypatch) -> Relay:
     fake = Relay()
-    monkeypatch.setattr(assistant_routes, "delete_model_on_mac", fake)
+    monkeypatch.setitem(assistant_routes.__dict__, "delete_model_on_mac", fake)
     return fake
 
 
@@ -199,8 +199,8 @@ def test_the_macs_own_answer_decides_the_one_action(
     with assistant_api(
         tmp_path, monkeypatch, inventory=two_models
     ) as (client, _store, _operations):
-        monkeypatch.setattr(
-            assistant_routes,
+        monkeypatch.setitem(
+            assistant_routes.__dict__,
             "delete_model_on_mac",
             Relay(RemoteAdminError(status, "the delete route answered")),
         )

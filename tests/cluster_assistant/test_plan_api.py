@@ -602,19 +602,19 @@ def test_plan_never_reads_settings_or_runs_a_probe(api, monkeypatch) -> None:
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("plan must not read settings or run a probe")
 
-    monkeypatch.setattr(assistant_routes, "_server_settings", forbidden)
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(assistant_routes.__dict__, "_server_settings", forbidden)
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "_measure_probes",
         forbidden,
     )
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "default_measure_probes",
         forbidden,
     )
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "measurement_timestamp",
         forbidden,
     )
@@ -782,8 +782,8 @@ def test_the_plan_is_built_from_the_layout_the_measurement_recorded(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("plan re-read the checkpoint instead of the record")
 
-    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", forbidden)
-    monkeypatch.setattr(provisioning, "model_layout_for", forbidden)
+    monkeypatch.setitem(provisioning.__dict__, "inspect_safetensors_layout", forbidden)
+    monkeypatch.setitem(provisioning.__dict__, "model_layout_for", forbidden)
 
     response = client.post(PLAN_URL, json=plan_payload(measurement_id))
 

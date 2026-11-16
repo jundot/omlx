@@ -231,7 +231,7 @@ DEFAULT_SETTINGS = SimpleNamespace(port=8099, host="127.0.0.1")
 @pytest.fixture()
 def api(tmp_path, monkeypatch):
     stack = contextlib.ExitStack()
-    monkeypatch.setattr(assistant_routes, "load_model_candidate", fake_loader)
+    monkeypatch.setitem(assistant_routes.__dict__, "load_model_candidate", fake_loader)
 
     def _build(
         *,
@@ -239,8 +239,8 @@ def api(tmp_path, monkeypatch):
         fake_layouts: bool = True,
     ) -> tuple[TestClient, MeasurementStore]:
         if not fake_layouts:
-            monkeypatch.setattr(
-                assistant_routes,
+            monkeypatch.setitem(
+                assistant_routes.__dict__,
                 "load_model_candidate",
                 recommendation_module.load_model_candidate,
             )
@@ -620,10 +620,10 @@ def test_recommend_never_reads_settings_or_runs_a_probe(api, monkeypatch) -> Non
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("recommend must not read settings or run a probe")
 
-    monkeypatch.setattr(assistant_routes, "_server_settings", forbidden)
-    monkeypatch.setattr(assistant_routes, "_measure_probes", forbidden)
-    monkeypatch.setattr(assistant_routes, "default_measure_probes", forbidden)
-    monkeypatch.setattr(assistant_routes, "measurement_timestamp", forbidden)
+    monkeypatch.setitem(assistant_routes.__dict__, "_server_settings", forbidden)
+    monkeypatch.setitem(assistant_routes.__dict__, "_measure_probes", forbidden)
+    monkeypatch.setitem(assistant_routes.__dict__, "default_measure_probes", forbidden)
+    monkeypatch.setitem(assistant_routes.__dict__, "measurement_timestamp", forbidden)
 
     response = client.post(RECOMMEND_URL, json=recommend_payload(measurement_id))
 

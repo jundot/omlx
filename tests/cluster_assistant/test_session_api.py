@@ -91,7 +91,7 @@ def test_a_stopped_session_still_offers_start_again(api, monkeypatch) -> None:
     client, _, _ = api(
         coordinator=_coordinator().factory(), local_addresses=("172.16.1.11",)
     )
-    monkeypatch.setattr(assistant_routes, "_local_admin", _local_admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", _local_admin)
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id)
     ready = _start_ready(client, measurement_id, plan)

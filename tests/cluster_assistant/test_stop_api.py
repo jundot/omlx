@@ -85,7 +85,7 @@ def test_stop_unloads_on_the_local_coordinator_and_marks_the_record(
         calls.append((port, path, method, timeout))
         return {"ok": True, "deployment_id": "dev-1.5b-abc123", "stopped": True}
 
-    monkeypatch.setattr(assistant_routes, "_local_admin", local_admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", local_admin)
 
     response = client.post(STOP_URL, json={"operation_id": record.operation_id})
 
@@ -111,7 +111,7 @@ def test_a_second_stop_does_not_relay_again(api, monkeypatch) -> None:
         calls.append(path)
         return {"ok": True, "stopped": True}
 
-    monkeypatch.setattr(assistant_routes, "_local_admin", local_admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", local_admin)
 
     first = client.post(STOP_URL, json={"operation_id": record.operation_id})
     second = client.post(STOP_URL, json={"operation_id": record.operation_id})
@@ -126,8 +126,8 @@ def test_stop_relays_to_a_remote_coordinator(api, monkeypatch) -> None:
     record = _ready_record(operations, coordinator_local=False)
     calls: list[tuple[Any, ...]] = []
 
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "_paired_device_record",
         lambda node_id: {"node_id": node_id, "ssh_user": "andreaskolb"},
     )
@@ -136,7 +136,7 @@ def test_stop_relays_to_a_remote_coordinator(api, monkeypatch) -> None:
         calls.append((target, port, path, method, timeout))
         return {"ok": True, "stopped": True}
 
-    monkeypatch.setattr(assistant_routes, "remote_admin", remote_admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "remote_admin", remote_admin)
 
     response = client.post(STOP_URL, json={"operation_id": record.operation_id})
 
@@ -162,9 +162,9 @@ def test_stop_relays_to_a_remote_coordinator(api, monkeypatch) -> None:
 def test_stop_without_a_paired_coordinator_asks_to_pair(api, monkeypatch) -> None:
     client, _, operations = api()
     record = _ready_record(operations, coordinator_local=False)
-    monkeypatch.setattr(assistant_routes, "_paired_device_record", lambda node_id: None)
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(assistant_routes.__dict__, "_paired_device_record", lambda node_id: None)
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "remote_admin",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("an unpaired coordinator must not be dialled")
@@ -217,7 +217,7 @@ def test_a_vanished_deployment_counts_as_stopped(api, monkeypatch) -> None:
     def local_admin(port, path, body=None, *, method="GET", timeout=None):
         raise RemoteAdminError(404, "cluster deployment not found")
 
-    monkeypatch.setattr(assistant_routes, "_local_admin", local_admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", local_admin)
 
     response = client.post(STOP_URL, json={"operation_id": record.operation_id})
 
@@ -235,7 +235,7 @@ def test_a_coordinator_that_does_not_answer_keeps_the_record_running(
     def local_admin(port, path, body=None, *, method="GET", timeout=None):
         raise RemoteAdminError(0, "this Mac did not answer")
 
-    monkeypatch.setattr(assistant_routes, "_local_admin", local_admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", local_admin)
 
     response = client.post(STOP_URL, json={"operation_id": record.operation_id})
 

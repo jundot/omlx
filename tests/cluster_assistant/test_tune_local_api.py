@@ -182,15 +182,15 @@ def clean_local_jobs():
 def fast_job(monkeypatch):
     """Keep the load/completion polls short; the real values are minutes."""
 
-    monkeypatch.setattr(assistant_routes, "LOCAL_RUN_POLL_SECONDS", 0.01)
+    monkeypatch.setitem(assistant_routes.__dict__, "LOCAL_RUN_POLL_SECONDS", 0.01)
     # The unload-wait and loaded-poll bound; the real value is minutes. Kept
     # short so the "the pool never drops it" test does not wait a real minute.
-    monkeypatch.setattr(assistant_routes, "LOCAL_RUN_LOAD_TIMEOUT_SECONDS", 0.5)
-    monkeypatch.setattr(assistant_routes, "LOCAL_TUNE_POLL_SECONDS", 0.01)
-    monkeypatch.setattr(assistant_routes, "LOCAL_TUNE_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setitem(assistant_routes.__dict__, "LOCAL_RUN_LOAD_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setitem(assistant_routes.__dict__, "LOCAL_TUNE_POLL_SECONDS", 0.01)
+    monkeypatch.setitem(assistant_routes.__dict__, "LOCAL_TUNE_TIMEOUT_SECONDS", 5.0)
     # Never SSH another Mac for this flow.
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "remote_admin",
         lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("remote admin used by a local flow")
@@ -228,9 +228,9 @@ def _ready_run(
 
     measurement_id = take_measurement(client)
     admin = FakeLocalAdmin(**fake_kwargs)
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
-    monkeypatch.setattr(
-        assistant_routes, "_tune_mtp_capable", lambda model_path: mtp_capable
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
+    monkeypatch.setitem(
+        assistant_routes.__dict__, "_tune_mtp_capable", lambda model_path: mtp_capable
     )
     response = client.post(RUN_LOCAL_URL, json=_run_payload(measurement_id))
     assert response.status_code == 200, response.text
@@ -567,7 +567,7 @@ def test_an_unexpected_tune_failure_is_reported_and_reopens_the_guard(
     # The job imports the sweep from the tuning module, so that is the seam.
     from omlx.cluster.assistant import tuning as assistant_tuning
 
-    monkeypatch.setattr(assistant_tuning, "sweep_samplers", boom)
+    monkeypatch.setitem(assistant_tuning.__dict__, "sweep_samplers", boom)
     body = _tune(client, job_id)
 
     assert body["state"] == "failed"

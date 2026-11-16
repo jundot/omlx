@@ -35,9 +35,9 @@ def test_auto_free_deletes_the_safe_model_and_reports_freed_bytes(monkeypatch) -
         deleted_calls.append((port, model_name, target))
         return {"deleted": True}
 
-    monkeypatch.setattr(assistant_routes, "delete_model_on_mac", fake_delete)
-    monkeypatch.setattr(
-        assistant_routes, "_delete_target", lambda record, node_id: ("", 8099)
+    monkeypatch.setitem(assistant_routes.__dict__, "delete_model_on_mac", fake_delete)
+    monkeypatch.setitem(
+        assistant_routes.__dict__, "_delete_target", lambda record, node_id: ("", 8099)
     )
 
     deleted, freed = asyncio.run(
@@ -54,13 +54,13 @@ def test_auto_free_deletes_the_safe_model_and_reports_freed_bytes(monkeypatch) -
 
 def test_auto_free_does_nothing_when_no_safe_candidate_exists(monkeypatch) -> None:
     record = _record()
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "delete_model_on_mac",
         lambda **kwargs: pytest.fail("must not delete the planned/last copy"),
     )
-    monkeypatch.setattr(
-        assistant_routes, "_delete_target", lambda record, node_id: ("", 8099)
+    monkeypatch.setitem(
+        assistant_routes.__dict__, "_delete_target", lambda record, node_id: ("", 8099)
     )
     # "Planned" is in use and "Old" is not on this Mac, so nothing may be freed.
     deleted, freed = asyncio.run(
@@ -95,8 +95,8 @@ def test_plan_with_auto_free_retries_with_the_freed_bytes(monkeypatch) -> None:
     async def fake_free(record, details):
         return [{"node_id": "n1", "model_id": "Old"}], {"n1": 200}
 
-    monkeypatch.setattr(assistant_routes, "_planned_deployment", fake_plan)
-    monkeypatch.setattr(assistant_routes, "_auto_free_space", fake_free)
+    monkeypatch.setitem(assistant_routes.__dict__, "_planned_deployment", fake_plan)
+    monkeypatch.setitem(assistant_routes.__dict__, "_auto_free_space", fake_free)
 
     plan, warnings = asyncio.run(
         assistant_routes._plan_with_auto_free(record, object())
@@ -125,10 +125,10 @@ def test_plan_with_auto_free_returns_the_refusal_when_nothing_can_be_freed(
     async def fake_free(record, details):
         return [], {}
 
-    monkeypatch.setattr(
-        assistant_routes, "_planned_deployment", lambda *a, **k: refusal
+    monkeypatch.setitem(
+        assistant_routes.__dict__, "_planned_deployment", lambda *a, **k: refusal
     )
-    monkeypatch.setattr(assistant_routes, "_auto_free_space", fake_free)
+    monkeypatch.setitem(assistant_routes.__dict__, "_auto_free_space", fake_free)
 
     plan, warnings = asyncio.run(
         assistant_routes._plan_with_auto_free(record, object())

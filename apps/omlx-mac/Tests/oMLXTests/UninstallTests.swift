@@ -190,7 +190,10 @@ final class UninstallTests: XCTestCase {
         let plan = UninstallPlanner.build(locator: locator, options: .default)
         let report = UninstallRunner.run(plan: plan, actions: recorder.actions(fm))
 
-        XCTAssertEqual(Set(report.removedScopes), ["app", "helper", "runtime", "settings", "clusterState", "diagnostics"])
+        XCTAssertEqual(
+            Set(report.removedScopes),
+            ["app", "helper", "runtime", "settings", "clusterState", "diagnostics"]
+        )
         XCTAssertEqual(report.helperOutcome, .removed)
         XCTAssertFalse(report.helperLeftInPlace)
         XCTAssertTrue(report.errors.isEmpty)

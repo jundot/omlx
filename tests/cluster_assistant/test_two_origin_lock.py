@@ -35,7 +35,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-
 from assistant_harness import (
     APPLY_URL,
     MODEL_PATH,
@@ -205,8 +204,8 @@ def wire_origin(stack, tmp_path, monkeypatch, seam, name):
             coordinator=lambda plan: coordinator_ops(plan, remote=seam),
         )
     )
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "active_operation",
         lambda plan: assistant_start.coordinator_active_operation(plan, remote=seam),
     )
@@ -267,7 +266,7 @@ def test_a_second_origin_is_refused_while_the_first_applies(
     """The B5 scenario: A's running apply must lock the coordinator for B."""
 
     seam = CoordinatorSeam(tmp_path, staging_status="copying")
-    monkeypatch.setattr(assistant_start, "probe_peer", lambda target: True)
+    monkeypatch.setitem(assistant_start.__dict__, "probe_peer", lambda target: True)
     stack = contextlib.ExitStack()
     try:
         client_a, _, operations_a = wire_origin(
@@ -345,7 +344,7 @@ def test_a_second_origin_is_refused_while_the_first_starts(
     seam = CoordinatorSeam(tmp_path)
     gate = threading.Event()
     seam.activation_gate = gate
-    monkeypatch.setattr(assistant_start, "probe_peer", lambda target: True)
+    monkeypatch.setitem(assistant_start.__dict__, "probe_peer", lambda target: True)
     stack = contextlib.ExitStack()
     try:
         client_a, _, operations_a = wire_origin(
@@ -426,7 +425,7 @@ def test_a_refused_mirror_fails_the_origin_operation(tmp_path, monkeypatch) -> N
     seam = CoordinatorSeam(tmp_path)
     seam.store.mirror("op-other-origin", KIND_START, "m5", STATE_LOADING)
     seam.hide_active = True
-    monkeypatch.setattr(assistant_start, "probe_peer", lambda target: True)
+    monkeypatch.setitem(assistant_start.__dict__, "probe_peer", lambda target: True)
     stack = contextlib.ExitStack()
     try:
         client, _, operations = wire_origin(
@@ -456,7 +455,7 @@ def test_a_failed_apply_releases_the_coordinator_lock(tmp_path, monkeypatch) -> 
     """Failure paths release too: a staging failure must not wedge the lock."""
 
     seam = CoordinatorSeam(tmp_path, staging_status="failed")
-    monkeypatch.setattr(assistant_start, "probe_peer", lambda target: True)
+    monkeypatch.setitem(assistant_start.__dict__, "probe_peer", lambda target: True)
     stack = contextlib.ExitStack()
     try:
         client_a, _, operations_a = wire_origin(
@@ -502,7 +501,7 @@ def test_an_unreachable_release_never_fails_the_operation(
 
     seam = CoordinatorSeam(tmp_path)
     seam.release_error = RemoteAdminError(0, "the coordinator did not answer")
-    monkeypatch.setattr(assistant_start, "probe_peer", lambda target: True)
+    monkeypatch.setitem(assistant_start.__dict__, "probe_peer", lambda target: True)
     stack = contextlib.ExitStack()
     try:
         client, _, operations = wire_origin(

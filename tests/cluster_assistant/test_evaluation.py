@@ -9,10 +9,12 @@ measured. No real cluster (AGENTS.md).
 
 from __future__ import annotations
 
+from omlx.cluster.assistant.election import PlanCandidate
 from omlx.cluster.assistant.evaluation import (
     ConstellationResult,
     pareto_front,
     select_best,
+    select_constellations_to_test,
 )
 
 
@@ -105,9 +107,6 @@ def test_pareto_excludes_dominated() -> None:
     assert front == [better]
 
 # --- Candidate selection: rank beforehand, test diverse constellations --------
-
-from omlx.cluster.assistant.election import PlanCandidate
-from omlx.cluster.assistant.evaluation import select_constellations_to_test
 
 
 def _candidate(order: tuple[str, ...], *, feasible: bool = True) -> PlanCandidate:

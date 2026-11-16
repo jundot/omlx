@@ -1126,7 +1126,9 @@ function clusterV2Wizard() {
             if (lastSize > 1) {
                 return {
                     label: window.t('cluster.v2.batch.label_batched').replace('{n}', String(lastSize)),
-                    detail: window.t('cluster.v2.batch.batched_detail').replace('{last}', String(lastSize)).replace('{target}', String(target)),
+                    detail: window.t('cluster.v2.batch.batched_detail')
+                        .replace('{last}', String(lastSize))
+                        .replace('{target}', String(target)),
                     tone: 'bg-green-50 border-green-200 text-green-700',
                     target,
                 };
@@ -1169,9 +1171,16 @@ function clusterV2Wizard() {
                 Number(metrics?.active_request_metrics_truncated || 0),
             );
             if (active > 0) {
-                return `${window.t('cluster.v2.req.active_count').replace('{n}', String(active))}${hidden ? ` · ${window.t('cluster.v2.req.not_shown').replace('{n}', String(hidden))}` : ''}`;
+                const activeLabel = window.t('cluster.v2.req.active_count')
+                    .replace('{n}', String(active));
+                const hiddenLabel = hidden
+                    ? ` · ${window.t('cluster.v2.req.not_shown').replace('{n}', String(hidden))}`
+                    : '';
+                return `${activeLabel}${hiddenLabel}`;
             }
-            return metrics?.last_request ? window.t('cluster.v2.req.last_completed') : window.t('cluster.v2.req.waiting');
+            return metrics?.last_request
+                ? window.t('cluster.v2.req.last_completed')
+                : window.t('cluster.v2.req.waiting');
         },
 
         requestPhaseLabel(request) {
@@ -1255,10 +1264,17 @@ function clusterV2Wizard() {
             if (progress?.active) {
                 const processed = Math.max(0, Number(progress.processed || 0));
                 const total = Math.max(0, Number(progress.total || 0));
-                return window.t('cluster.v2.req.prefill_progress').replace('{processed}', processed.toLocaleString()).replace('{total}', total.toLocaleString());
+                return window.t('cluster.v2.req.prefill_progress')
+                    .replace('{processed}', processed.toLocaleString())
+                    .replace('{total}', total.toLocaleString());
             }
             const uncached = Math.max(0, prompt - cached);
-            return `${window.t('cluster.v2.req.new_tokens').replace('{n}', uncached.toLocaleString())}${cached ? ` · ${window.t('cluster.v2.req.cached_tokens').replace('{n}', cached.toLocaleString())}` : ''}`;
+            const uncachedLabel = window.t('cluster.v2.req.new_tokens')
+                .replace('{n}', uncached.toLocaleString());
+            const cachedLabel = cached
+                ? ` · ${window.t('cluster.v2.req.cached_tokens').replace('{n}', cached.toLocaleString())}`
+                : '';
+            return `${uncachedLabel}${cachedLabel}`;
         },
 
         requestDecodeDetail(request) {
@@ -1403,7 +1419,8 @@ function clusterV2Wizard() {
                     eyebrow: window.t('cluster.v2.deploy.status_configured'),
                     label: window.t('cluster.v2.deploy.status_checking'),
                     detail: this.runtimeError
-                        ? window.t('cluster.v2.deploy.status_runtime_unavailable').replace('{message}', this.runtimeError)
+                        ? window.t('cluster.v2.deploy.status_runtime_unavailable')
+                              .replace('{message}', this.runtimeError)
                         : window.t('cluster.v2.deploy.status_checking_detail'),
                     tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
                     pulse: true,
@@ -1424,10 +1441,12 @@ function clusterV2Wizard() {
                 deployment?.execution?.prompt_cache_ssd ??
                     deployment?.prompt_cache_ssd,
             );
+            const cacheMaxBytes =
+                deployment?.execution?.prompt_cache_ssd_max_bytes || 20 * (1024 ** 3);
             return enabled
                 ? window.t('cluster.v2.deploy.cache_memory_ssd').replace(
                       '{gib}',
-                      String(Math.round(Number(deployment?.execution?.prompt_cache_ssd_max_bytes || 20 * (1024 ** 3)) / (1024 ** 3))),
+                      String(Math.round(Number(cacheMaxBytes) / (1024 ** 3))),
                   )
                 : window.t('cluster.v2.deploy.cache_memory_only');
         },
@@ -1491,11 +1510,27 @@ function clusterV2Wizard() {
             // to mix Plan and Active semantics during activation.
             const wizard = this.wizardState();
             const steps = [
-                { key: 'discover', title: window.t('cluster.v2.steps.discover_title'), hint: window.t('cluster.v2.steps.discover_hint') },
-                { key: 'pair', title: window.t('cluster.v2.steps.pair_title'), hint: window.t('cluster.v2.steps.pair_hint') },
-                { key: 'checks', title: window.t('cluster.v2.steps.checks_title'), hint: window.t('cluster.v2.steps.checks_hint') },
+                {
+                    key: 'discover',
+                    title: window.t('cluster.v2.steps.discover_title'),
+                    hint: window.t('cluster.v2.steps.discover_hint'),
+                },
+                {
+                    key: 'pair',
+                    title: window.t('cluster.v2.steps.pair_title'),
+                    hint: window.t('cluster.v2.steps.pair_hint'),
+                },
+                {
+                    key: 'checks',
+                    title: window.t('cluster.v2.steps.checks_title'),
+                    hint: window.t('cluster.v2.steps.checks_hint'),
+                },
                 { key: 'plan', title: window.t('cluster.v2.steps.plan_title'), hint: this.planStepHint() },
-                { key: 'active', title: window.t('cluster.v2.steps.active_title'), hint: window.t('cluster.v2.steps.active_hint') },
+                {
+                    key: 'active',
+                    title: window.t('cluster.v2.steps.active_title'),
+                    hint: window.t('cluster.v2.steps.active_hint'),
+                },
             ];
             if (wizard === 'accelerator' || wizard === 'helper') {
                 // Prefill Accelerator ends at its checks; nothing is split or activated.
@@ -1660,7 +1695,9 @@ function clusterV2Wizard() {
                 jobs.length,
                 ...jobs.map((job) => Math.max(0, Number(job?.world_size || 0))),
             );
-            return window.t('cluster.v2.progress.ranks_ready').replace('{ready}', String(ready)).replace('{expected}', String(expected));
+            return window.t('cluster.v2.progress.ranks_ready')
+                .replace('{ready}', String(ready))
+                .replace('{expected}', String(expected));
         },
 
         // Step-4 hint is strategy-aware: a tensor split gives every Mac every
@@ -2106,7 +2143,10 @@ function clusterV2Wizard() {
                 await this.refreshDevices();
                 if (result && result.verified) {
                     const name = result.peer?.friendly_name || ip;
-                    this.notify('success', window.t('cluster.v2.toast.found_peer').replace('{name}', name).replace('{ip}', ip));
+                    const foundPeer = window.t('cluster.v2.toast.found_peer')
+                        .replace('{name}', name)
+                        .replace('{ip}', ip);
+                    this.notify('success', foundPeer);
                     if (options.beginJoin !== false) {
                         // First-cluster setup may join in either direction.
                         // An existing coordinator only discovers here: the
@@ -2543,7 +2583,8 @@ function clusterV2Wizard() {
                         .replace('{names}', missing.map((device) => this.deviceName(device)).join(', '));
                     } else {
                         status = 'pass';
-                        detail = window.t('cluster.v2.checks.model_on_every').replace('{model}', this.shortModelName(model));
+                        detail = window.t('cluster.v2.checks.model_on_every')
+                            .replace('{model}', this.shortModelName(model));
                     }
                 }
                 rows.push({
@@ -2564,9 +2605,11 @@ function clusterV2Wizard() {
                     status: mismatches.length ? 'fail' : 'pass',
                     detail: mismatches.length
                         ? mismatches
-                              .map(
-                                  (m) =>
-                                      window.t('cluster.v2.checks.version_mismatch').replace('{name}', m.name).replace('{peer}', String(m.peerVersion)).replace('{self}', String(m.selfVersion)),
+                              .map((m) =>
+                                  window.t('cluster.v2.checks.version_mismatch')
+                                      .replace('{name}', m.name)
+                                      .replace('{peer}', String(m.peerVersion))
+                                      .replace('{self}', String(m.selfVersion)),
                               )
                               .join(' ')
                         : window.t('cluster.v2.checks.version_ok'),
@@ -2775,7 +2818,9 @@ function clusterV2Wizard() {
                 0,
                 capacity - this.reserveBytesFor(role, capacity),
             );
-            return window.t('cluster.v2.role.usable').replace('{gb}', String(Math.round(usable / 1024 ** 3))).replace('{role}', this.roleLabel(role));
+            return window.t('cluster.v2.role.usable')
+                .replace('{gb}', String(Math.round(usable / 1024 ** 3)))
+                .replace('{role}', this.roleLabel(role));
         },
 
         // What flipping every workstation node to headless would free up.
@@ -3479,7 +3524,14 @@ function clusterV2Wizard() {
             const roles = Object.fromEntries(nodes.map((node) => [node.node_id, node.role]));
             const result = await this.apiFetch(CLUSTER_V2_API.nodeBudgets, {
                 method: 'POST',
-                body: JSON.stringify({hosts: hosts.map(({node_id, ssh, python_executable}) => ({node_id, ssh, python_executable})), roles}),
+                body: JSON.stringify({
+                    hosts: hosts.map(({ node_id, ssh, python_executable }) => ({
+                        node_id,
+                        ssh,
+                        python_executable,
+                    })),
+                    roles,
+                }),
             });
             const measured = result?.nodes;
             if (!Array.isArray(measured) || measured.length !== nodes.length ||
@@ -3489,9 +3541,16 @@ function clusterV2Wizard() {
             const resolved = nodes.map((node) => {
                 const budget = measured.find((item) => item.node_id === node.node_id);
                 if (!budget || budget.unusable || !(Number(budget.capacity_bytes) > 0)) {
-                    throw new Error(window.t('cluster.v2.err.memory_budget_unavailable').replace('{node}', node.node_id));
+                    throw new Error(
+                        window.t('cluster.v2.err.memory_budget_unavailable')
+                            .replace('{node}', node.node_id),
+                    );
                 }
-                return {...node, capacity_bytes: Number(budget.capacity_bytes), reserve_bytes: Number(budget.reserve_bytes || 0)};
+                return {
+                    ...node,
+                    capacity_bytes: Number(budget.capacity_bytes),
+                    reserve_bytes: Number(budget.reserve_bytes || 0),
+                };
             });
             this.measuredNodeBudgets = Object.fromEntries(resolved.map((node) => [node.node_id, node]));
             return resolved;
@@ -3595,7 +3654,13 @@ function clusterV2Wizard() {
             } finally {
                 this.stagingPollBusy = false;
             }
-            if (generation !== this.stagingGeneration || jobId !== this.stagingJob?.job_id || this.stagingClaimed) return;
+            if (
+                generation !== this.stagingGeneration ||
+                jobId !== this.stagingJob?.job_id ||
+                this.stagingClaimed
+            ) {
+                return;
+            }
             this.stagingJob = snapshot;
             if (snapshot.status === 'completed') {
                 if (snapshot.ready !== true) {
@@ -4050,15 +4115,26 @@ function clusterV2Wizard() {
             );
             return device
                 ? this.deviceName(device)
-                : assignment?.node_id || window.t('cluster.v2.plan.rank').replace('{n}', String(assignment?.rank ?? '?'));
+                : assignment?.node_id ||
+                      window.t('cluster.v2.plan.rank')
+                          .replace('{n}', String(assignment?.rank ?? '?'));
         },
 
         membershipPlanDetail(assignment) {
             const gib = Number(assignment?.planned_weight_bytes || 0) / (1024 ** 3);
             const tp = Number(assignment?.tensor_parallel_size || 1);
-            return tp > 1
-                ? window.t('cluster.v2.membership.tensor_rank').replace('{rank}', String(Number(assignment?.tensor_parallel_rank || 0) + 1)).replace('{tp}', String(tp)).replace('{gib}', gib.toFixed(1))
-                : window.t('cluster.v2.membership.layers').replace('{start}', String(assignment?.start_layer ?? 0)).replace('{end}', String(assignment?.end_layer ?? 0)).replace('{gib}', gib.toFixed(1));
+            const gibText = gib.toFixed(1);
+            if (tp > 1) {
+                const rank = String(Number(assignment?.tensor_parallel_rank || 0) + 1);
+                return window.t('cluster.v2.membership.tensor_rank')
+                    .replace('{rank}', rank)
+                    .replace('{tp}', String(tp))
+                    .replace('{gib}', gibText);
+            }
+            return window.t('cluster.v2.membership.layers')
+                .replace('{start}', String(assignment?.start_layer ?? 0))
+                .replace('{end}', String(assignment?.end_layer ?? 0))
+                .replace('{gib}', gibText);
         },
 
         async applyMembershipExpansion() {
@@ -4269,7 +4345,10 @@ function clusterV2Wizard() {
                 await this.apiFetch(CLUSTER_V2_API.deployment(id) + (localOnly ? "?local_only=true" : ""), {
                     method: 'DELETE',
                 });
-                this.notify('info', window.t(localOnly ? 'cluster.v2.toast.forgotten_local' : 'cluster.v2.toast.deactivated'));
+                const message = window.t(
+                    localOnly ? 'cluster.v2.toast.forgotten_local' : 'cluster.v2.toast.deactivated',
+                );
+                this.notify('info', message);
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
@@ -5615,12 +5694,24 @@ function clusterV2Wizard() {
                 this.assistantModelLabel() ||
                 String(session?.model_path || '').split('/').pop() ||
                 '-';
+            const contextTokens =
+                plan?.context_tokens ||
+                session?.context_tokens ||
+                this.assistant.selectedContextTokens ||
+                this.targetContextTokens ||
+                '-';
+            const operationId =
+                operation?.operation_id ||
+                this.assistant.operationId ||
+                session?.operation_id ||
+                '-';
+            const operationState = operation?.state || session?.state || '-';
             return [
                 'oMLX Cluster Assistant',
                 `measurement: ${this.assistant.measurementId || session?.measurement_id || '-'}`,
                 `plan: ${plan?.plan_signature || session?.plan_signature || '-'}`,
                 `model: ${model}`,
-                `context: ${plan?.context_tokens || session?.context_tokens || this.assistant.selectedContextTokens || this.targetContextTokens || '-'}`,
+                `context: ${contextTokens}`,
                 `coordinator: ${this.assistantCoordinatorName() || '-'}`,
                 `rank_order: ${(plan?.rank_order || session?.rank_order || []).join(' -> ') || '-'}`,
                 `selected: ${selected.join(', ') || '-'}`,
@@ -5647,7 +5738,7 @@ function clusterV2Wizard() {
                         ? 'yes'
                         : 'no'
                 }`,
-                `operation: ${operation?.operation_id || this.assistant.operationId || session?.operation_id || '-'} ${operation?.state || session?.state || '-'}`,
+                `operation: ${operationId} ${operationState}`,
                 `phase: ${operation?.progress?.phase || this.assistant.progress?.phase || '-'}`,
                 `deployment: ${this.assistant.deploymentId || session?.deployment_id || '-'}`,
                 `endpoint: ${this.assistant.endpoint?.url || session?.endpoint?.url || '-'}`,
@@ -8057,7 +8148,8 @@ function clusterV2Wizard() {
             this.assistant.freeSpaceError = '';
             try {
                 await this.apiFetch(
-                    `${ASSISTANT_API.models(nodeId, model.model_id)}?measurement_id=${encodeURIComponent(measurementId)}`,
+                    ASSISTANT_API.models(nodeId, model.model_id) +
+                        `?measurement_id=${encodeURIComponent(measurementId)}`,
                     { method: 'DELETE' },
                 );
                 this.notify(
@@ -8472,14 +8564,15 @@ function clusterV2Wizard() {
                 return [{ text: 'cluster.v2.cuda_guide.spark_run', command: run }];
             }
             const keyring = '/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg';
+            const toolkitRepo = 'https://nvidia.github.io/libnvidia-container';
             return [
                 {
                     text: 'cluster.v2.cuda_guide.linux_docker',
                     command: [
                         'curl -fsSL https://get.docker.com | sudo sh',
-                        'curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey'
+                        `curl -fsSL ${toolkitRepo}/gpgkey`
                             + ` | sudo gpg --yes --dearmor -o ${keyring}`,
-                        'curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list'
+                        `curl -fsSL ${toolkitRepo}/stable/deb/nvidia-container-toolkit.list`
                             + ` | sed 's#deb https://#deb [signed-by=${keyring}] https://#g'`
                             + ' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list',
                         'sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit',

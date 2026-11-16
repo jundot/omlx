@@ -754,8 +754,8 @@ def test_apply_refuses_while_the_coordinator_runs_another_origins_operation(
 
     fake = FakeCoordinator()
     client, _, operations = api(coordinator=fake.factory())
-    monkeypatch.setattr(
-        assistant_routes, "active_operation", lambda plan: "op-other-origin"
+    monkeypatch.setitem(
+        assistant_routes.__dict__, "active_operation", lambda plan: "op-other-origin"
     )
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id)
@@ -780,7 +780,7 @@ def test_apply_proceeds_when_the_coordinator_cannot_be_asked(api, monkeypatch) -
 
     fake = FakeCoordinator()
     client, _, _ = api(coordinator=fake.factory())
-    monkeypatch.setattr(assistant_routes, "active_operation", unavailable)
+    monkeypatch.setitem(assistant_routes.__dict__, "active_operation", unavailable)
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id)
 

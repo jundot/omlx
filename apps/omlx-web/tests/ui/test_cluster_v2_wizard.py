@@ -2969,7 +2969,12 @@ def test_membership_pairing_waits_for_the_selected_macs_request():
             const missing = {calls: calls.length, error: component.pairing.error};
             component.devicesPayload.discovered = [{node_id: 'other', state: 'awaiting_approval'}];
             await component.submitPairApproval(component.pairing.target);
-            console.log(JSON.stringify({missing, calls, open: component.membershipPanelOpen, target: component.pairing.target.node_id}));
+            console.log(JSON.stringify({
+                missing,
+                calls,
+                open: component.membershipPanelOpen,
+                target: component.pairing.target.node_id,
+            }));
         })();
     """)
     # Only the invite to that Mac; nothing is approved before its request.
@@ -2984,22 +2989,45 @@ def test_membership_pairing_keeps_the_active_model_until_explicit_replan():
     result = _run_wizard("""
         (async () => {
             const calls = [], probes = [];
-            const deployment = {deployment_id: 'existing', model: 'current-model', assignments: [{node_id: 'self'}, {node_id: 'old'}]};
+            const deployment = {
+                deployment_id: 'existing',
+                model: 'current-model',
+                assignments: [{node_id: 'self'}, {node_id: 'old'}],
+            };
             component.configuredDeployment = () => deployment;
-            component.devicesPayload = {paired: [{node_id: 'old', paired: true}], discovered: [{node_id: 'new', state: 'discovered'}]};
+            component.devicesPayload = {
+                paired: [{node_id: 'old', paired: true}],
+                discovered: [{node_id: 'new', state: 'discovered'}],
+            };
             component.executionProfile = 'custom';
             component.selectedModelPath = 'current-model';
             component.beginMembershipPairing({node_id: 'new'});
             component.pairing.code = '123456';
             component.devicesPayload.discovered = [{node_id: 'new', state: 'awaiting_approval'}];
-            component.apiFetch = async (url, options) => { calls.push({url, body: JSON.parse(options.body)}); return {}; };
+            component.apiFetch = async (url, options) => {
+                calls.push({url, body: JSON.parse(options.body)});
+                return {};
+            };
             component.notify = () => {};
-            component.refreshDevices = async () => { component.devicesPayload = {paired: [{node_id: 'old', paired: true}, {node_id: 'new', paired: true}], discovered: []}; };
+            component.refreshDevices = async () => {
+                component.devicesPayload = {
+                    paired: [{node_id: 'old', paired: true}, {node_id: 'new', paired: true}],
+                    discovered: [],
+                };
+            };
             component.probePeer = async (peer) => probes.push(peer.node_id);
             component.startChecks = () => { throw Error('must not leave active cluster'); };
             component.runPlan = async () => { throw Error('must not replan automatically'); };
             await component.submitPairApproval(component.pairing.target);
-            console.log(JSON.stringify({calls, probes, candidates: component.membershipCandidates().map(x => x.node_id), target: component.pairing.target, profile: component.executionProfile, model: component.selectedModelPath, deployment}));
+            console.log(JSON.stringify({
+                calls,
+                probes,
+                candidates: component.membershipCandidates().map(x => x.node_id),
+                target: component.pairing.target,
+                profile: component.executionProfile,
+                model: component.selectedModelPath,
+                deployment,
+            }));
         })();
     """)
     assert result["calls"] == [
@@ -3027,7 +3055,12 @@ def test_membership_pairing_failure_can_be_retried_or_cancelled():
             component.pairing.code = '123456';
             component.apiFetch = async () => { throw Object.assign(Error('Incorrect code'), {status: 403}); };
             await component.submitPairApproval(component.pairing.target);
-            const failed = {target: component.pairing.target.node_id, code: component.pairing.code, error: component.pairing.error, busy: component.pairing.busy};
+            const failed = {
+                target: component.pairing.target.node_id,
+                code: component.pairing.code,
+                error: component.pairing.error,
+                busy: component.pairing.busy,
+            };
             component.cancelPairing();
             console.log(JSON.stringify({failed, target: component.pairing.target}));
         })();
@@ -3060,7 +3093,13 @@ def test_forget_cleanup_requires_confirmation_and_ignores_old_poll():
             await component.forgetJoinCleanup();
             resolvePoll({state: 'approved', cleanup_pending: true});
             await poll;
-            console.log(JSON.stringify({before, calls, pending: component.join.cleanup_pending, state: component.join.state, busy: component.join.busy}));
+            console.log(JSON.stringify({
+                before,
+                calls,
+                pending: component.join.cleanup_pending,
+                state: component.join.state,
+                busy: component.join.busy,
+            }));
         })();
     """)
     assert result["before"] == 0
@@ -3704,7 +3743,6 @@ def test_assistant_search_strings_exist_and_are_mirrored():
 
 
 def test_assistant_search_is_single_flight_generation_guarded_and_measured_only():
-    javascript = _read(JAVASCRIPT)
     block = _assistant_method("runAssistantSearch")
     # Busy guard prevents a double POST of the minutes-long request.
     assert "this.assistant.search.busy" in block

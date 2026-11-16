@@ -48,7 +48,7 @@ def _fake_plan() -> SimpleNamespace:
 def _setup(tmp_path, monkeypatch, *, apply_ok=True, start_ok=True, observed=True):
     store = OperationStore(tmp_path / "store")
     plan = _fake_plan()
-    monkeypatch.setattr(search_wiring, "plan_apply", lambda *a, **k: plan)
+    monkeypatch.setitem(search_wiring.__dict__, "plan_apply", lambda *a, **k: plan)
 
     def fake_apply(store_, op_id, plan_, ops, **kwargs):
         if apply_ok:
@@ -66,9 +66,9 @@ def _setup(tmp_path, monkeypatch, *, apply_ok=True, start_ok=True, observed=True
             )
         return None
 
-    monkeypatch.setattr(search_wiring, "run_apply_job", fake_apply)
-    monkeypatch.setattr(search_wiring, "run_start_job", fake_start)
-    monkeypatch.setattr(search_wiring, "observe_performance", fake_observe)
+    monkeypatch.setitem(search_wiring.__dict__, "run_apply_job", fake_apply)
+    monkeypatch.setitem(search_wiring.__dict__, "run_start_job", fake_start)
+    monkeypatch.setitem(search_wiring.__dict__, "observe_performance", fake_observe)
     return store
 
 
@@ -126,7 +126,7 @@ def test_plan_refusal_is_infeasible(tmp_path, monkeypatch) -> None:
     def refuse(*a, **k):
         raise ProvisioningError("plan_mismatch", "drifted", "plan")
 
-    monkeypatch.setattr(search_wiring, "plan_apply", refuse)
+    monkeypatch.setitem(search_wiring.__dict__, "plan_apply", refuse)
     result = _evaluate(store)
     assert result.feasible is False
 
@@ -157,7 +157,7 @@ def test_a_settings_patch_is_written_before_the_launch(tmp_path, monkeypatch) ->
         calls.append("start")
         await original_start(store_, op_id, request, ops, **kwargs)
 
-    monkeypatch.setattr(search_wiring, "run_start_job", tracking_start)
+    monkeypatch.setitem(search_wiring.__dict__, "run_start_job", tracking_start)
 
     result = asyncio.run(
         search_wiring.evaluate_constellation(

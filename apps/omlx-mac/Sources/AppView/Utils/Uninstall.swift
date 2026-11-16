@@ -59,7 +59,8 @@ struct UninstallLocator: Sendable {
                 library.appendingPathComponent("Saved Application State/omlx.oMLX.savedState"),
                 library.appendingPathComponent("Saved Application State/app.omlx.oMLX.savedState"),
             ],
-            lsregisterPath: "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+            lsregisterPath: "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+                + "LaunchServices.framework/Support/lsregister"
         )
     }
 
@@ -348,7 +349,9 @@ enum UninstallRunner {
                     report.removedScopes.append(item.scope)
                     report.removedURLs.append(item.url)
                 case .cancelled:
-                    report.errors.append("helper: the administrator prompt was cancelled; the helper was left in place.")
+                    report.errors.append(
+                        "helper: the administrator prompt was cancelled; the helper was left in place."
+                    )
                 case .failed(let message):
                     report.errors.append("helper: \(message)")
                 }

@@ -101,7 +101,7 @@ def test_a_model_without_mtp_measures_off_and_saves_the_preset(api, monkeypatch)
             feasible=True,
         )
 
-    monkeypatch.setattr(search_wiring, "evaluate_constellation", fake_evaluate)
+    monkeypatch.setitem(search_wiring.__dict__, "evaluate_constellation", fake_evaluate)
 
     body = _run(client, op.operation_id)
 
@@ -122,7 +122,7 @@ def test_mtp_capable_model_ranks_the_depths_and_saves_the_winner(api, monkeypatc
     measurement_id = take_measurement(client)
     op = _ready_winner(store, measurement_id)
 
-    monkeypatch.setattr(assistant_routes, "_tune_mtp_capable", lambda path: True)
+    monkeypatch.setitem(assistant_routes.__dict__, "_tune_mtp_capable", lambda path: True)
     monkeypatch.setattr(
         assistant_policy, "diverse_candidates", lambda *a, **k: [_candidate()], raising=False
     )
@@ -143,7 +143,7 @@ def test_mtp_capable_model_ranks_the_depths_and_saves_the_winner(api, monkeypatc
             feasible=True,
         )
 
-    monkeypatch.setattr(search_wiring, "evaluate_constellation", fake_evaluate)
+    monkeypatch.setitem(search_wiring.__dict__, "evaluate_constellation", fake_evaluate)
 
     body = _run(client, op.operation_id)
 
@@ -171,7 +171,7 @@ def test_a_config_the_winner_cannot_reproduce_is_an_infeasible_row(api, monkeypa
     measurement_id = take_measurement(client)
     op = _ready_winner(store, measurement_id)
 
-    monkeypatch.setattr(assistant_routes, "_tune_mtp_capable", lambda path: True)
+    monkeypatch.setitem(assistant_routes.__dict__, "_tune_mtp_capable", lambda path: True)
     # The winner's rank order exists for MTP off, not for the MTP-on configs.
     def candidates_for(*a, **k):
         return [_candidate()] if k.get("mtp") is False else []
@@ -188,7 +188,7 @@ def test_a_config_the_winner_cannot_reproduce_is_an_infeasible_row(api, monkeypa
             feasible=True,
         )
 
-    monkeypatch.setattr(search_wiring, "evaluate_constellation", fake_evaluate)
+    monkeypatch.setitem(search_wiring.__dict__, "evaluate_constellation", fake_evaluate)
 
     body = _run(client, op.operation_id)
     by_label = {row["config"]: row for row in body["rows"]}
@@ -214,7 +214,7 @@ def test_redeploy_status_unknown_job_is_a_refusal(api) -> None:
 def _fake_depth_sweep(monkeypatch, rates: dict) -> None:
     """A redeploy sweep whose measured rates are the given depth→rate map."""
 
-    monkeypatch.setattr(assistant_routes, "_tune_mtp_capable", lambda path: True)
+    monkeypatch.setitem(assistant_routes.__dict__, "_tune_mtp_capable", lambda path: True)
     monkeypatch.setattr(
         assistant_policy, "diverse_candidates", lambda *a, **k: [_candidate()], raising=False
     )
@@ -236,7 +236,7 @@ def _fake_depth_sweep(monkeypatch, rates: dict) -> None:
             feasible=True,
         )
 
-    monkeypatch.setattr(search_wiring, "evaluate_constellation", fake_evaluate)
+    monkeypatch.setitem(search_wiring.__dict__, "evaluate_constellation", fake_evaluate)
 
 
 def _fake_tune(monkeypatch, sampler: dict) -> None:
@@ -251,7 +251,7 @@ def _fake_tune(monkeypatch, sampler: dict) -> None:
             mtp_applicable=True,
         )
 
-    monkeypatch.setattr(tuning_wiring, "fine_tune_constellation", fake_fine_tune)
+    monkeypatch.setitem(tuning_wiring.__dict__, "fine_tune_constellation", fake_fine_tune)
 
 
 def test_a_tune_after_a_redeploy_keeps_both_knobs(api, monkeypatch) -> None:

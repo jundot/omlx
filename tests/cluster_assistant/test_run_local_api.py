@@ -109,8 +109,8 @@ class FakeLocalAdmin:
 def fast_job(monkeypatch):
     """Keep the load poll short; the real values are minutes."""
 
-    monkeypatch.setattr(assistant_routes, "LOCAL_RUN_POLL_SECONDS", 0.01)
-    monkeypatch.setattr(assistant_routes, "LOCAL_RUN_LOAD_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setitem(assistant_routes.__dict__, "LOCAL_RUN_POLL_SECONDS", 0.01)
+    monkeypatch.setitem(assistant_routes.__dict__, "LOCAL_RUN_LOAD_TIMEOUT_SECONDS", 1.0)
 
 
 @pytest.fixture(autouse=True)
@@ -142,10 +142,10 @@ def test_run_local_applies_the_preset_loads_and_reports_this_macs_endpoint(
     measurement_id = take_measurement(client)
     _save_preset()
     admin = FakeLocalAdmin(loaded=False)
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
     # Never SSH another Mac for this flow.
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "remote_admin",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("remote admin used")),
     )
@@ -207,7 +207,7 @@ def test_run_local_never_targets_a_mac_the_measurement_does_not_prove_is_local(
     client, _, _ = api(local_addresses=("10.0.0.99",))
     measurement_id = take_measurement(client)
     admin = FakeLocalAdmin()
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
 
     response = client.post(RUN_LOCAL_URL, json=_payload(measurement_id))
     assert response.status_code == 200, response.text
@@ -227,8 +227,8 @@ def test_a_model_that_does_not_fit_this_mac_alone_asks_for_a_smaller_model(
     from omlx.cluster.planner import ModelLayout
 
     client, _, _ = api(local_addresses=(SSH["m5"],))
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "model_layout_for",
         lambda identity: ModelLayout(
             source=MODEL_PATH,
@@ -239,7 +239,7 @@ def test_a_model_that_does_not_fit_this_mac_alone_asks_for_a_smaller_model(
     )
     measurement_id = take_measurement(client)
     admin = FakeLocalAdmin()
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
 
     response = client.post(RUN_LOCAL_URL, json=_payload(measurement_id, layer_count=40))
     assert response.status_code == 200, response.text
@@ -257,8 +257,8 @@ def test_a_context_this_mac_cannot_hold_says_so_with_one_action(
     from omlx.cluster.planner import ModelLayout
 
     client, _, _ = api(local_addresses=(SSH["m5"],))
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "model_layout_for",
         lambda identity: ModelLayout(
             source=MODEL_PATH,
@@ -271,7 +271,7 @@ def test_a_context_this_mac_cannot_hold_says_so_with_one_action(
     )
     measurement_id = take_measurement(client)
     admin = FakeLocalAdmin()
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
 
     response = client.post(RUN_LOCAL_URL, json=_payload(measurement_id))
     assert response.status_code == 200, response.text
@@ -292,7 +292,7 @@ def test_a_load_the_pool_refuses_is_one_action_and_never_ready(
     measurement_id = take_measurement(client)
     admin = FakeLocalAdmin()
     admin.load_error = RemoteAdminError(507, "model exceeds the wired limit")
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
 
     response = client.post(RUN_LOCAL_URL, json=_payload(measurement_id))
     body = _poll(client, response.json()["job_id"])
@@ -329,7 +329,7 @@ def test_an_unexpected_job_failure_is_reported_and_never_left_running(
     def boom(*args, **kwargs):
         raise RuntimeError("a malformed layout")
 
-    monkeypatch.setattr(assistant_routes, "_single_node_fit", boom)
+    monkeypatch.setitem(assistant_routes.__dict__, "_single_node_fit", boom)
     response = client.post(RUN_LOCAL_URL, json=_payload(measurement_id))
     body = _poll(client, response.json()["job_id"])
 
@@ -379,10 +379,10 @@ def test_run_local_asks_for_a_local_only_load_and_writes_the_table_offload(
     api, monkeypatch, fast_job
 ) -> None:
     client, _, _ = api(local_addresses=(SSH["m5"],))
-    monkeypatch.setattr(assistant_routes, "model_layout_for", lambda identity: _table_layout())
+    monkeypatch.setitem(assistant_routes.__dict__, "model_layout_for", lambda identity: _table_layout())
     measurement_id = take_measurement(client)
     admin = FakeLocalAdmin(loaded=False)
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
 
     response = client.post(RUN_LOCAL_URL, json=_payload(measurement_id, layer_count=20))
     body = _poll(client, response.json()["job_id"])
@@ -410,8 +410,8 @@ def test_a_request_past_the_checkpoints_declared_context_is_named_not_clamped(
     from omlx.cluster.planner import ModelLayout
 
     client, _, _ = api(local_addresses=(SSH["m5"],))
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "model_layout_for",
         lambda identity: ModelLayout(
             source=MODEL_PATH,
@@ -423,7 +423,7 @@ def test_a_request_past_the_checkpoints_declared_context_is_named_not_clamped(
     )
     measurement_id = take_measurement(client)
     admin = FakeLocalAdmin()
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
 
     response = client.post(RUN_LOCAL_URL, json=_payload(measurement_id))
     body = _poll(client, response.json()["job_id"])
@@ -440,7 +440,7 @@ def test_a_distributed_engine_is_never_reported_as_a_local_run(
     client, _, _ = api(local_addresses=(SSH["m5"],))
     measurement_id = take_measurement(client)
     admin = FakeLocalAdmin(loaded=False, distributed=True)
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
 
     response = client.post(RUN_LOCAL_URL, json=_payload(measurement_id))
     body = _poll(client, response.json()["job_id"])
@@ -457,7 +457,7 @@ def test_a_model_that_loads_but_does_not_answer_is_not_ready(
     client, _, _ = api(local_addresses=(SSH["m5"],))
     measurement_id = take_measurement(client)
     admin = FakeLocalAdmin(loaded=False, answers=False)
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
 
     response = client.post(RUN_LOCAL_URL, json=_payload(measurement_id))
     body = _poll(client, response.json()["job_id"])
@@ -479,7 +479,7 @@ def test_a_model_that_loads_but_does_not_answer_is_not_ready(
 def _ready_job(client, monkeypatch, **fake_kwargs) -> tuple[FakeLocalAdmin, str]:
     measurement_id = take_measurement(client)
     admin = FakeLocalAdmin(loaded=False, **fake_kwargs)
-    monkeypatch.setattr(assistant_routes, "_local_admin", admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", admin)
     response = client.post(RUN_LOCAL_URL, json=_payload(measurement_id))
     body = _poll(client, response.json()["job_id"])
     assert body["state"] == "ready", body

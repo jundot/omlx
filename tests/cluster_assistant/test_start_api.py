@@ -258,8 +258,8 @@ def test_a_failed_coordinator_start_never_starts_local_rank_zero(
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("the origin must never run the activation itself")
 
-    monkeypatch.setattr(cluster_routes, "activate_cluster_deployment", forbidden)
-    monkeypatch.setattr(cluster_routes, "prepare_cluster_deployment", forbidden)
+    monkeypatch.setitem(cluster_routes.__dict__, "activate_cluster_deployment", forbidden)
+    monkeypatch.setitem(cluster_routes.__dict__, "prepare_cluster_deployment", forbidden)
 
     fake = FakeCoordinator(activate_error=RemoteAdminError(503, "launch failed"))
     client, _, _ = api(coordinator=fake.factory())
@@ -392,7 +392,7 @@ def test_a_remote_coordinator_is_driven_through_the_existing_ssh_seam(
 ) -> None:
     calls: list[tuple[str, int, str, str]] = []
     # The health gate is a real SSH round trip in production; here it answers.
-    monkeypatch.setattr(assistant_start, "probe_peer", lambda target: True)
+    monkeypatch.setitem(assistant_start.__dict__, "probe_peer", lambda target: True)
 
     def remote(
         target: str,
@@ -526,7 +526,7 @@ def test_remote_admin_keeps_the_admin_key_on_the_coordinator(monkeypatch) -> Non
         seen["argument"] = argument
         return {"ok": True, "status": 200, "body": {"ok": True}}
 
-    monkeypatch.setattr(assistant_start, "run_remote_python", fake_run)
+    monkeypatch.setitem(assistant_start.__dict__, "run_remote_python", fake_run)
 
     reply = remote_admin("172.16.1.11", 8099, PLAN_PATH, {"model_path": "/models/qwen"})
 
@@ -570,11 +570,11 @@ def test_the_local_coordinator_uses_the_existing_local_pipeline(
         calls.append("devices")
         return {"paired": [{"node_id": "m5"}, {"node_id": "m1"}]}
 
-    monkeypatch.setattr(cluster_routes, "prepare_cluster_deployment", prepare)
-    monkeypatch.setattr(cluster_routes, "start_cluster_staging", stage)
-    monkeypatch.setattr(cluster_routes, "read_cluster_staging_job", status)
-    monkeypatch.setattr(cluster_routes, "activate_cluster_deployment", activate)
-    monkeypatch.setattr(assistant_start, "check_peers", lambda hosts: ())
+    monkeypatch.setitem(cluster_routes.__dict__, "prepare_cluster_deployment", prepare)
+    monkeypatch.setitem(cluster_routes.__dict__, "start_cluster_staging", stage)
+    monkeypatch.setitem(cluster_routes.__dict__, "read_cluster_staging_job", status)
+    monkeypatch.setitem(cluster_routes.__dict__, "activate_cluster_deployment", activate)
+    monkeypatch.setitem(assistant_start.__dict__, "check_peers", lambda hosts: ())
 
     client, _, _ = api(
         coordinator=lambda plan: replace(

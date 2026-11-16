@@ -22,7 +22,9 @@ struct AdvancedScreen: View {
                        defaultValue: "Advanced",
                        comment: "Section header for the app-level Advanced settings screen"),
                 subtitle: String(localized: "advanced.section.sub",
-                                 defaultValue: "Maintenance for the app itself. These actions affect your whole installation.",
+                                 defaultValue: """
+                                 Maintenance for the app itself. These actions affect your whole installation.
+                                 """,
                                  comment: "Subtitle for the Advanced settings screen")
             )
 
@@ -32,7 +34,10 @@ struct AdvancedScreen: View {
                                   defaultValue: "Uninstall oMLX",
                                   comment: "Row label for the uninstall danger zone"),
                     sublabel: String(localized: "advanced.uninstall.sub",
-                                     defaultValue: "Remove the app, helper, runtime and settings. Models and the node identity are kept unless you choose otherwise.",
+                                     defaultValue: """
+                                     Remove the app, helper, runtime and settings. \
+                                     Models and the node identity are kept unless you choose otherwise.
+                                     """,
                                      comment: "Sublabel explaining what the uninstall removes and keeps"),
                     isLast: true
                 ) {
@@ -175,7 +180,10 @@ private struct UninstallSheet: View {
                 .font(.omlxDisplay(20, weight: .semibold))
                 .foregroundStyle(theme.text)
             Text(String(localized: "advanced.uninstall.sheet_sub",
-                        defaultValue: "Choose what to remove. Models and the node identity are kept by default. The helper needs one admin dialog; the app quits last.",
+                        defaultValue: """
+                        Choose what to remove. Models and the node identity are kept by default. \
+                        The helper needs one admin dialog; the app quits last.
+                        """,
                         comment: "Subtitle of the uninstall sheet"))
                 .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
@@ -202,10 +210,12 @@ private struct UninstallSheet: View {
                          sub: "settings.json, model settings and preferences.", binding: $vm.options.removeSettings)
                 scopeRow(String(localized: "advanced.uninstall.scope_cluster", defaultValue: "Cluster state",
                                 comment: "Uninstall scope: cluster state"),
-                         sub: "Paired devices, deployments, measurements and operations.", binding: $vm.options.removeClusterState)
+                         sub: "Paired devices, deployments, measurements and operations.",
+                         binding: $vm.options.removeClusterState)
                 scopeRow(String(localized: "advanced.uninstall.scope_identity", defaultValue: "Node identity",
                                 comment: "Uninstall scope: the cluster node identity"),
-                         sub: "cluster/identity.json — removing it re-rolls this Mac's node id.", binding: $vm.options.removeIdentity)
+                         sub: "cluster/identity.json — removing it re-rolls this Mac's node id.",
+                         binding: $vm.options.removeIdentity)
                 scopeRow(String(localized: "advanced.uninstall.scope_diagnostics", defaultValue: "Diagnostics",
                                 comment: "Uninstall scope: logs and caches"),
                          sub: "Logs and caches under ~/Library.", binding: $vm.options.removeDiagnostics, isLast: true)
@@ -305,7 +315,10 @@ private struct UninstallSheet: View {
 
             if report.helperLeftInPlace {
                 Text(String(localized: "advanced.uninstall.report_helper_left",
-                            defaultValue: "The system helper was left in place (the admin dialog was cancelled or failed). Everything else was removed.",
+                            defaultValue: """
+                            The system helper was left in place (the admin dialog was cancelled or failed). \
+                            Everything else was removed.
+                            """,
                             comment: "Report line when the helper removal was cancelled or failed"))
                     .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.warningText)
@@ -323,7 +336,9 @@ private struct UninstallSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
             if report.appRemoved {
                 Text(String(localized: "advanced.uninstall.report_quit_hint",
-                            defaultValue: "oMLX was moved to the Trash. Quit now to finish; relaunch from the DMG to restore.",
+                            defaultValue: """
+                            oMLX was moved to the Trash. Quit now to finish; relaunch from the DMG to restore.
+                            """,
                             comment: "Hint that the app was trashed and quitting is the final step"))
                     .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textSecondary)
