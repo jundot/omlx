@@ -106,9 +106,7 @@ class TestQueueFullAfterResponseStarted:
             await asyncio.sleep(0.05)
             raise SchedulerQueueFullError(current_depth=32, max_depth=32)
 
-        resp = await srv._json_response_or_keepalive(
-            self._Request(), _raise_slow()
-        )
+        resp = await srv._json_response_or_keepalive(self._Request(), _raise_slow())
         assert isinstance(resp, srv.StreamingResponse)
         chunks = [chunk async for chunk in resp.body_iterator]
         body = json.loads("".join(chunks))
