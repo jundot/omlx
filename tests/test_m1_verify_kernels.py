@@ -70,6 +70,7 @@ def test_row_and_shape_gating(qmv_only):
     assert m1_verify_qmv.eligible(4, 2048, 1024, 6, 64, f16)
     assert m1_verify_qmv.eligible(4, 2048, 1024, 8, 64, f16)
     assert not m1_verify_qmv.eligible(5, 2048, 1024, 6, 64, f16)
+    assert not m1_verify_qmv.eligible(5, 2048, 1024, 8, 64, f16)
     # unsupported bit width, small N, K off the lane block, fp32 rows
     assert not m1_verify_qmv.eligible(2, 2048, 1024, 3, 64, f16)
     assert not m1_verify_qmv.eligible(2, 2048, 512, 4, 64, f16)
@@ -80,6 +81,20 @@ def test_row_and_shape_gating(qmv_only):
 def test_qmv_disabled_when_the_gate_is_off(qmv_off):
     assert not m1_verify_qmv.eligible(2, 2048, 1024, 4, 64, mx.float16)
     assert qwen35_verify_qmm._verify_route(4, 5120, 17408, 4, 64, mx.float16) == "sg8"
+
+def test_qmv_gate_follows_the_gpu_generation(monkeypatch):
+    # The fixtures stub enabled() itself, so the == 13 check that keeps the
+    # kernel off every other GPU is never run. Drive it through the real
+    # gate: M1 engages, M2 and M5 stay off.
+    import omlx.utils.hardware as hardware
+
+    for generation, engaged in ((13, True), (14, False), (17, False)):
+        monkeypatch.setattr(hardware, "get_apple_gpu_generation", lambda gen=generation: gen)
+        m1_verify_qmv.enabled.cache_clear()
+        try:
+            assert m1_verify_qmv.eligible(2, 2048, 1024, 4, 64, mx.float16) == engaged
+        finally:
+            m1_verify_qmv.enabled.cache_clear()
 
 
 def test_takes_priority_over_sg8_and_split_k(qmv_only):
