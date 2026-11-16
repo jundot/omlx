@@ -1864,7 +1864,12 @@ def test_chat_routes_reuse_final_prepared_prompt(
     assert rendered_kwargs == [{"preserve_thinking": True}]
     engine._tokenizer.encode.assert_called_once_with("canonical prompt")
     engine._tokenizer.apply_chat_template.assert_not_called()
-    context_check.assert_called_once_with(3, "test-model")
+    # /v1/responses has no request max_tokens field yet (minefield 79 covers
+    # the chat-family routes); the others pass the request budget through.
+    expected_context_check = (
+        (3, "test-model") if path == "/v1/responses" else (3, "test-model", 16)
+    )
+    context_check.assert_called_once_with(*expected_context_check)
     prepared = engine.preflight_chat.call_args.kwargs["_prepared_prompt"]
     assert prepared == ("canonical prompt", [11, 12, 13])
     generated = streamed_kwargs[0] if stream else engine.chat.call_args.kwargs

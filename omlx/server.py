@@ -2462,22 +2462,42 @@ class _ContextLengthExceededError(HTTPException):
 
 
 def validate_context_window(
-    num_prompt_tokens: int, model_id: str | None = None
+    num_prompt_tokens: int,
+    model_id: str | None = None,
+    max_tokens: int | None = None,
 ) -> None:
     """
-    Validate that prompt token count does not exceed max context window.
+    Validate that the request fits the max context window.
 
-    Raises HTTPException 400 if the prompt is too long.
+    With ``max_tokens`` set, ``prompt + max_tokens`` must fit: a request
+    whose prompt alone fits but whose completion budget overflows would
+    otherwise return HTTP 200 and silently truncate (minefield 79). When
+    ``max_tokens`` is unset the check stays prompt-only, so engine defaults
+    and engine-side stop still govern generation.
+
+    Raises HTTPException 400 if the request is too long.
     """
     max_ctx = get_max_context_window(model_id)
-    if max_ctx and num_prompt_tokens > max_ctx:
-        raise _ContextLengthExceededError(
-            status_code=400,
-            detail=(
-                f"Prompt is too long: {num_prompt_tokens} tokens > "
-                f"{max_ctx} maximum context length"
-            ),
+    if not max_ctx:
+        return
+    total = num_prompt_tokens + (max_tokens or 0)
+    if total <= max_ctx:
+        return
+    if max_tokens:
+        # OpenAI-style: name the budget and the split so clients can compact.
+        detail = (
+            f"This model's maximum context length is {max_ctx} tokens. "
+            f"However, you requested {total} tokens "
+            f"({num_prompt_tokens} in the messages, {max_tokens} in the "
+            f"completion). Please reduce the length of the messages or "
+            f"completion."
         )
+    else:
+        detail = (
+            f"Prompt is too long: {num_prompt_tokens} tokens > "
+            f"{max_ctx} maximum context length"
+        )
+    raise _ContextLengthExceededError(status_code=400, detail=detail)
 
 
 def init_server(
@@ -4557,7 +4577,11 @@ async def _chat_model_decisions(
                     status_code=400, detail=f"Chat template error: {e}"
                 ) from e
             raise
-        validate_context_window(num_prompt_tokens, request.model)
+        # DecisionRequest carries no max_tokens; getattr keeps this uniform
+        # with the other validate_context_window call sites.
+        validate_context_window(
+            num_prompt_tokens, request.model, getattr(request, "max_tokens", None)
+        )
         return {} if prepared is None else {"_prepared_prompt": prepared}
 
     async def _decide():
@@ -4647,7 +4671,9 @@ async def create_completion(
         for prompt in prompts:
             prompt_token_ids = list(engine.tokenizer.encode(prompt))
             prompt_token_ids_by_prompt.append(prompt_token_ids)
-            validate_context_window(len(prompt_token_ids), request.model)
+            validate_context_window(
+                len(prompt_token_ids), request.model, request.max_tokens
+            )
 
         # Pre-flight prefill memory guard — see create_chat_completion for
         # the reason this must precede any StreamingResponse return.
@@ -5196,7 +5222,7 @@ async def create_chat_completion(
             if _is_chat_template_error(e):
                 raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
             raise
-        validate_context_window(num_prompt_tokens, request.model)
+        validate_context_window(num_prompt_tokens, request.model, request.max_tokens)
 
         # Prepare kwargs
         (
@@ -8130,7 +8156,7 @@ async def create_anthropic_message(
         num_prompt_tokens, prepared_prompt = await _prepare_prompt_off_loop(
             engine, _count_anthropic_prompt, prompt
         )
-        validate_context_window(num_prompt_tokens, request.model)
+        validate_context_window(num_prompt_tokens, request.model, request.max_tokens)
 
         if prepared_prompt is not None:
             chat_kwargs["_prepared_prompt"] = prepared_prompt
