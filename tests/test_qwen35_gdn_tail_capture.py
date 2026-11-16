@@ -14,10 +14,8 @@ from omlx.patches import qwen35_gdn_tail_capture as tail_capture  # noqa: E402
 from omlx.scheduler import Scheduler  # noqa: E402
 
 
-@pytest.fixture(scope="module")
-def layer():
-    assert tail_capture.apply_qwen35_gdn_tail_capture_patch()
-    cfg = types.SimpleNamespace(
+def layer_cfg():
+    return types.SimpleNamespace(
         hidden_size=256,
         linear_num_value_heads=4,
         linear_num_key_heads=2,
@@ -26,6 +24,12 @@ def layer():
         linear_conv_kernel_dim=4,
         rms_norm_eps=1e-6,
     )
+
+
+@pytest.fixture(scope="module")
+def layer():
+    assert tail_capture.apply_qwen35_gdn_tail_capture_patch()
+    cfg = layer_cfg()
     mx.random.seed(0)
     gdn = lang.Qwen3_5GatedDeltaNet(cfg)
     gdn.update(
@@ -105,9 +109,44 @@ def test_snapshot_cache_holds_the_captured_arrays(layer):
     assert tail_capture.captured_snapshot_cache([cache]) is None
 
 
+class _Model(nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = layers
+
+
+def test_capture_layers_are_found_behind_the_vlm_adapter(layer):
+    class Adapter(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self._language_model = inner
+
+    class Adapter2(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self._vlm_model = _Model([inner])
+            self._language_model = inner
+
+    other = lang.Qwen3_5GatedDeltaNet(layer_cfg())
+    assert tail_capture.model_capture_layers(Adapter(_Model([layer, other]))) == 2
+    # The same layer reached twice counts once.
+    assert tail_capture.model_capture_layers(Adapter2(_Model([layer]))) == 1
+
+
+def test_scheduler_keeps_the_stop_for_other_recurrent_layers(layer):
+    sched = Scheduler.__new__(Scheduler)
+    sched.model = _Model([nn.Linear(4, 4)])
+    cache = vcache.ArraysCache(size=2)
+    request = types.SimpleNamespace(request_id="r1")
+    assert sched._plan_tail_capture(
+        request, [cache], cache_tokens=1000, n_tokens=32, tail_at=1026, system_at=None
+    ) is None
+    assert getattr(cache, "_omlx_capture_at", None) is None
+
+
 def test_scheduler_plans_a_capture_only_inside_the_chunk(layer, monkeypatch):
     sched = Scheduler.__new__(Scheduler)
-    sched.model = object()
+    sched.model = _Model([layer])
     request = types.SimpleNamespace(request_id="r1")
     cache = vcache.ArraysCache(size=2)
     kw = dict(cache_tokens=1000, n_tokens=32, system_at=None)

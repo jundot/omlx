@@ -111,6 +111,41 @@ def tail_capture_ready() -> bool:
     return _PATCHED
 
 
+def model_capture_layers(model: Any) -> int:
+    """Patched Gated DeltaNet layers in ``model`` (0 when the patch is off).
+
+    The scheduler only skips a tail stop when every stateful cache belongs to
+    one of these: other recurrent layers would not keep the state.
+    """
+    if not _PATCHED or model is None:
+        return 0
+    cached = getattr(model, "_omlx_tail_capture_layers", None)
+    if cached is not None:
+        return cached
+    try:
+        from mlx_vlm.models.qwen3_5 import language as lang
+
+        cls = lang.Qwen3_5GatedDeltaNet
+        # oMLX's VLMModelAdapter reaches the language model twice (as
+        # _language_model and through the full VLM), so count each layer once.
+        seen: set[int] = set()
+        for root in (
+            model,
+            getattr(model, "_language_model", None),
+            getattr(model, "language_model", None),
+        ):
+            if root is not None and hasattr(root, "modules"):
+                seen.update(id(m) for m in root.modules() if isinstance(m, cls))
+        count = len(seen)
+    except Exception:  # noqa: BLE001
+        count = 0
+    try:
+        model._omlx_tail_capture_layers = count
+    except Exception:  # noqa: BLE001
+        pass
+    return count
+
+
 def request_tail_capture(stateful_caches: list[Any], offset: int) -> bool:
     """Ask every stateful cache to keep its state ``offset`` tokens into the next chunk."""
     if not _PATCHED or offset <= 0 or not stateful_caches:

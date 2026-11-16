@@ -68,6 +68,7 @@ from .exceptions import (
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.qwen35_gdn_tail_capture import (
     captured_snapshot_cache,
+    model_capture_layers,
     request_tail_capture,
     tail_capture_ready,
 )
@@ -4854,6 +4855,12 @@ class Scheduler:
                 captured = captured_snapshot_cache(prompt_cache)
                 if captured is not None:
                     self._emit_prefill_tail_snapshot(request, captured, capture_at)
+                    if not getattr(self, "_tail_capture_logged", False):
+                        self._tail_capture_logged = True
+                        logger.info(
+                            "Prefill tail snapshot taken inside the chunk at token %d",
+                            capture_at,
+                        )
             if boundary_enabled:
                 total_tokens = base_size + processed_tokens
                 if should_emit_prefill_boundary(
@@ -8578,6 +8585,9 @@ class Scheduler:
             for c in prompt_cache
             if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
         ]
+        # Every stateful cache must belong to a patched Gated DeltaNet layer.
+        if not stateful or model_capture_layers(self.model) != len(stateful):
+            return None
         if not request_tail_capture(stateful, tail_at - cache_tokens):
             return None
         return tail_at
