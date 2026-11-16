@@ -1,10 +1,7 @@
 // PR 9 — Integrations.
 //
-// One Applications card holds every tool that talks to oMLX: Claude Code,
-// Codex, DeepSeek Harness, OpenCode, OpenClaw, Hermes Agent, Pi, Mistral Vibe
-// and Copilot CLI. Each is a tile; selecting one opens its panel with the
-// default model and launcher command, and Claude Code's panel adds the mode,
-// tier models, configured command and Claude Desktop aliases. The model
+// One Applications card holds every tool that talks to oMLX. Selecting a tile
+// opens its panel with the default model and launcher command. The model
 // popups read their options from /admin/api/models so the user can only pick
 // something the server actually has on disk.
 //
@@ -452,10 +449,8 @@ private struct WebSearchSection: View {
 
 // MARK: - Applications
 
-/// The integration launcher: one tile per tool, and the selected tool's setup
-/// underneath. Mirrors the Applications card in the web dashboard — the same
-/// nine tools in the same order, with Claude Code's settings inside its own
-/// panel instead of a separate section.
+/// One tile per tool, with the selected tool's panel underneath. Mirrors the
+/// web dashboard's Applications card.
 private struct ApplicationsSection: View {
     @Bindable var vm: IntegrationsScreenVM
     let client: OMLXClient
@@ -682,8 +677,6 @@ private enum IntegrationTool: String, CaseIterable, Identifiable {
     }
 }
 
-/// One tool in the grid: its mark over its name, highlighted while its panel
-/// is open.
 private struct ApplicationTile: View {
     let tool: IntegrationTool
     let isSelected: Bool
@@ -757,7 +750,6 @@ private struct IntegrationIcon: View {
     }
 }
 
-/// A launcher command plus the caption shown above it.
 private struct LauncherCommand {
     let caption: String?
     let command: String
@@ -768,7 +760,6 @@ private struct LauncherCommand {
     }
 }
 
-/// The OpenClaw tools-profile picker that folds into its panel.
 private struct ApplicationProfilePicker {
     let label: String
     let sublabel: String
@@ -776,8 +767,7 @@ private struct ApplicationProfilePicker {
     let options: [(String, String)]
 }
 
-/// Panel shared by every tool except Claude Code: name, default model, the
-/// optional OpenClaw profile, and the launcher command(s).
+/// Panel for every tool except Claude Code.
 private struct ApplicationPanelRows: View {
     let tool: IntegrationTool
     let modelBinding: Binding<String>
@@ -812,9 +802,7 @@ private struct ApplicationPanelRows: View {
     }
 }
 
-/// Claude Code's panel: mode, tier models, the configured command, and the
-/// Claude Desktop aliases — the settings the old section and setup-command
-/// section carried, in one place.
+/// Claude Code's panel: launcher, mode, tier models, env recipe and Desktop aliases.
 private struct ClaudeApplicationPanel: View {
     @Bindable var vm: IntegrationsScreenVM
     let client: OMLXClient
@@ -955,7 +943,6 @@ private struct ClaudeApplicationPanel: View {
     }
 }
 
-/// The selected tool's name, under the grid and above its rows.
 private struct ApplicationPanelHead: View {
     let tool: IntegrationTool
 
@@ -972,9 +959,8 @@ private struct ApplicationPanelHead: View {
     }
 }
 
-/// Shared monospaced command block with a copy button. Used by each tool
-/// panel and by Claude Code's command row. `copyValue` lets a block display a
-/// masked command while the button still copies the real one.
+/// Monospaced command block with a copy button. `copyValue` lets the block
+/// show a masked command while the button copies the real one.
 private struct CommandBlock: View {
     let command: String
     var copyValue: String? = nil

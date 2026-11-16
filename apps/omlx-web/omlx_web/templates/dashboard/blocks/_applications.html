@@ -1,8 +1,3 @@
-{# Applications: an icon launcher. A tool's launch command is one click away,
-   so the card stays a compact grid instead of a nine-row list of commands.
-   Claude Code opens its own settings here rather than in a second card: the
-   mode switch, the command it generates, the tier models and the Claude
-   Desktop aliases all belong to the tool the tile names. #}
 {% macro copy_button(command) %}
 <button type="button" x-data="{ copied: false }"
         @click="copyToClipboard({{ command }}); copied = true; setTimeout(() => copied = false, 2000)"
@@ -15,9 +10,7 @@
 </button>
 {% endmacro %}
 
-{# The bar renders one command and copies another when they differ: Claude's
-   command is shown with its auth token masked, and the button still copies
-   the real one. #}
+{# copy_command lets a bar show a masked command and copy the real one. #}
 {% macro command_bar(command, copy_command=None) %}
 <div class="flex items-start gap-2 rounded-lg border border-neutral-200 bg-white py-1 pl-3 pr-1">
     <code class="min-w-0 flex-1 whitespace-pre-wrap pt-1.5 pb-1 font-mono text-xs leading-relaxed text-neutral-600 [overflow-wrap:anywhere]" x-text="{{ command }}"></code>
@@ -54,8 +47,6 @@
 </div>
 {% endmacro %}
 
-{# One tier row: the model the tier aliases, and the warning when the saved
-   model is no longer served. #}
 {% macro tier_select(tier, label_key, hint_key=None) %}
 <div>
     <label for="claude-{{ tier }}-model" class="mb-1.5 block text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t(label_key) }}</label>
@@ -89,7 +80,6 @@
     </div>
     <div class="px-4 py-4 sm:px-6 sm:py-5">
 
-        <!-- Tools. Each tile opens its own panel below the grid. -->
         <div class="grid grid-cols-[repeat(auto-fit,minmax(5.5rem,1fr))] gap-1.5"
              role="group"
              aria-label="{{ t('status.integrations.section_label') }}">
@@ -104,11 +94,10 @@
             {{ tool_tile('copilot', 'copilot.svg', t('status.integrations.copilot_cli')) }}
         </div>
 
-        <!-- One panel per tool; only the selected one is in the layout. -->
         <div x-show="tool" x-cloak x-transition.opacity.duration.150ms
              class="mt-3 rounded-xl border border-neutral-200 bg-neutral-50 p-3 sm:p-4">
 
-            <!-- Claude Code: the settings the tool needs to talk to oMLX. -->
+            <!-- Claude Code -->
             <div data-tool-panel="claude" id="integration-panel-claude" x-show="tool === 'claude'" class="space-y-3">
                 {{ panel_head('claude.png', t('status.integrations.claude_code')) }}
                 {{ command_bar('claudeCommand') }}

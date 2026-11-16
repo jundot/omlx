@@ -288,44 +288,27 @@ final class IntegrationsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.webSearchTestMessage, "Provider rate limited")
     }
 
-    /// The Claude panel prints the env recipe, so local mode must show the
-    /// server API key masked while the command it copies keeps the real value —
-    /// the same split `claudeCodeCommandDisplay` / `claudeCodeCommand` give the
-    /// web panel.
-    func testClaudeEnvRecipeMasksTheApiKeyInLocalModeOnly() async throws {
+    /// Local mode shows the API key masked and copies the real one.
+    func testClaudeEnvRecipeMasksTheApiKey() async throws {
         let (client, session) = try makeClient()
         defer { session.invalidateAndCancel() }
+        let noKey = IntegrationsScreenVM()
+        await noKey.load(client: client)
+        noKey.claudeMode = "local"
+        XCTAssertEqual(noKey.claudeEnvRecipe, noKey.claudeEnvRecipeDisplay)
+        XCTAssertFalse(noKey.claudeEnvRecipe.contains("ANTHROPIC_AUTH_TOKEN="))
+
         server.setApiKey("sk-live-secret")
         let vm = IntegrationsScreenVM()
         await vm.load(client: client)
-        XCTAssertEqual(vm.serverApiKey, "sk-live-secret")
-
         vm.claudeMode = "local"
         XCTAssertTrue(vm.claudeEnvRecipe.contains("sk-live-secret"))
         XCTAssertFalse(vm.claudeEnvRecipeDisplay.contains("sk-live-secret"))
-        XCTAssertTrue(vm.claudeEnvRecipeDisplay.contains("ANTHROPIC_AUTH_TOKEN='••••••••'"))
-        // Everything except the token is identical, so the panel still shows
-        // the command the copy button hands over.
         XCTAssertEqual(vm.claudeEnvRecipeDisplay.replacingOccurrences(of: "••••••••", with: "sk-live-secret"),
                        vm.claudeEnvRecipe)
 
-        // Cloud mode unsets the token, so there is nothing to mask.
         vm.claudeMode = "cloud"
         XCTAssertEqual(vm.claudeEnvRecipe, vm.claudeEnvRecipeDisplay)
-        XCTAssertFalse(vm.claudeEnvRecipe.contains("sk-live-secret"))
-    }
-
-    /// With no key configured both forms stay identical: no empty `''`
-    /// assignment and no dots.
-    func testClaudeEnvRecipeHasNoTokenWithoutServerKey() async throws {
-        let (client, session) = try makeClient()
-        defer { session.invalidateAndCancel() }
-        let vm = IntegrationsScreenVM()
-        await vm.load(client: client)
-        vm.claudeMode = "local"
-        XCTAssertEqual(vm.claudeEnvRecipe, vm.claudeEnvRecipeDisplay)
-        XCTAssertFalse(vm.claudeEnvRecipe.contains("ANTHROPIC_AUTH_TOKEN="))
-        XCTAssertFalse(vm.claudeEnvRecipe.contains("•"))
     }
 }
 
@@ -340,8 +323,6 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
     private var heldPost: (@Sendable () -> Void)?
     private var recordedSearchRequests: [[String: Any]] = []
     private var searchResponse: [String: Any] = [:]
-    /// Body for `GET /admin/api/stats`. The command builders read `host`,
-    /// `port`, `api_key` and `cli_prefix` from it.
     private var stats: [String: Any] = [:]
 
     var searchRequests: [[String: Any]] { lock.withLock { recordedSearchRequests } }
@@ -366,8 +347,7 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
         }
     }
 
-    /// Minimal `GET /admin/api/stats` payload: the required aggregates plus the
-    /// four fields the command builders read.
+    /// Required stats aggregates plus the fields the command builders read.
     private static func statsBody(apiKey: String) -> [String: Any] {
         [
             "total_tokens_served": 0, "total_cached_tokens": 0, "cache_efficiency": 0.0,

@@ -178,10 +178,8 @@ final class IntegrationsScreenVM {
     /// vars, local form sets them to point at the oMLX server.
     var claudeEnvRecipe: String { claudeEnvRecipe(authToken: serverApiKey) }
 
-    /// The recipe with the server API key replaced by dots, for display only.
-    /// Mirrors `claudeCodeCommandDisplay` in dashboard.js: the panel never
-    /// prints the key, and the block's copy button still copies the real
-    /// command. Local mode is the only form that carries a token.
+    /// `claudeEnvRecipe` with the API key masked, for display only. Mirrors
+    /// `claudeCodeCommandDisplay` in dashboard.js.
     var claudeEnvRecipeDisplay: String {
         claudeEnvRecipe(authToken: serverApiKey.isEmpty ? "" : "••••••••")
     }
