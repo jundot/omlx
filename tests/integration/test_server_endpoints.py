@@ -1542,6 +1542,46 @@ class TestChatCompletionEndpoint:
             assert recorded_count_tools == [None]
             assert "tools" not in recorded_chat_kwargs[0]
 
+    @pytest.mark.parametrize(
+        "max_tokens,expect_ok",
+        [(5, True), (100, False)],
+    )
+    def test_chat_completion_prompt_plus_max_tokens_fits_window(
+        self, client, max_tokens, expect_ok
+    ):
+        """Minefield 79: with the prompt near the window, a large
+        max_tokens must 400 (prompt + budget counted together) instead of
+        returning 200 and silently truncating; a small budget still 200s."""
+        from omlx.server import SamplingDefaults, _server_state
+
+        # "user: one two three" renders ~5 tokens under MockTokenizer.
+        payload = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "one two three"}],
+            "max_tokens": max_tokens,
+        }
+        original_sampling = _server_state.sampling
+        original_settings_manager = _server_state.settings_manager
+        _server_state.sampling = SamplingDefaults(max_context_window=20)
+        _server_state.settings_manager = None
+        try:
+            response = client.post("/v1/chat/completions", json=payload)
+        finally:
+            _server_state.sampling = original_sampling
+            _server_state.settings_manager = original_settings_manager
+
+        if expect_ok:
+            assert response.status_code == 200
+        else:
+            assert response.status_code == 400
+            error = response.json()["error"]
+            assert error["code"] == "context_length_exceeded"
+            detail = error["message"]
+            # OpenAI-style: names the window, the total, and both parts.
+            assert "20 tokens" in detail
+            assert "in the messages" in detail
+            assert f"{max_tokens} in the completion" in detail
+
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize(

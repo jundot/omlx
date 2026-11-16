@@ -251,6 +251,35 @@ class TestValidateContextWindow:
             assert exc_info.value.status_code == 400
             assert "200 tokens > 100" in exc_info.value.detail
 
+    def test_max_tokens_counts_against_window(self):
+        """Minefield 79: a prompt that fits but prompt+max_tokens that
+        overflows must raise the same 400, naming both numbers."""
+        from omlx.server import _ContextLengthExceededError, validate_context_window
+
+        state = self._make_server_state(global_max_ctx=1000)
+        # MagicMock pool would otherwise leak a MagicMock model_context_length.
+        state.engine_pool.get_entry.return_value = None
+        with patch("omlx.server._server_state", state):
+            # 500 prompt + 400 max_tokens <= 1000: fine.
+            validate_context_window(500, max_tokens=400)
+            validate_context_window(500, "test-model", max_tokens=500)
+            with pytest.raises(_ContextLengthExceededError) as exc_info:
+                validate_context_window(500, max_tokens=501)
+            assert exc_info.value.status_code == 400
+            detail = exc_info.value.detail.lower()
+            assert "500" in detail and "501" in detail
+            assert "maximum context length" in detail
+
+    def test_max_tokens_none_unchanged(self):
+        """Minefield 79: unset max_tokens keeps the prompt-only check so
+        engine defaults and engine-side stop still apply."""
+        from omlx.server import validate_context_window
+
+        state = self._make_server_state(global_max_ctx=1000)
+        with patch("omlx.server._server_state", state):
+            validate_context_window(1000, max_tokens=None)
+            validate_context_window(1000)
+
 
 class TestCountChatTokens:
     """Tests for BatchedEngine.count_chat_tokens()."""
