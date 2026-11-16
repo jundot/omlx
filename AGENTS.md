@@ -825,6 +825,11 @@ instead of inventing an answer.
 D6 helper, D4 error placement, D2 steps/back/retry, D3 layout, D5 manual-path proof;
 the acceptance gate A1-A7; the single fold-into-the-series step and the push order).
 The defect package behind it is `PACKAGE-2026-11-15-ACCEPTANCE.md`.
+D1 and D6 are implemented and live-checked (`PHASE-2B-RUN.md` §30); W1/W2 of the
+UI flow (W3/W4/W5 = error placement, steps/back/retry, one flow one page) start
+from **`docs/cluster-assistant/ASSISTANT-UI-SPEC-2026-11-16.md`** — the approved
+mock's code-level contract (screens, markers, semantics, test matrix, packages
+U1–U6).
 
 The gap-closing plan that precedes Chapter 10 is
 [`docs/cluster-assistant/ROADMAP-TO-CHAPTER-10.md`](docs/cluster-assistant/ROADMAP-TO-CHAPTER-10.md).
