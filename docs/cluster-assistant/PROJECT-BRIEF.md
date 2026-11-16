@@ -1999,7 +1999,7 @@ The current validation environment (not production, may be offline):
 |---|---|---|---|
 | `172.16.1.11` | MacBook Pro M5 Max | 128 GiB | fast/large candidate |
 | `172.16.1.13` | Mac Studio M2 Ultra | 64 GiB | medium candidate |
-| `172.16.1.14` | Mac Studio M1 Max | 32 GiB | small candidate |
+| `172.16.1.14` | Mac Studio M1 Max | 32 GiB | **reassigned 2026-11-16 — never touched** (own task, needs its own oMLX) |
 | `172.16.1.12` | MacBook Pro M1 Max | 32 GiB | known 2-node peer, often offline |
 
 The critical asymmetric test is:

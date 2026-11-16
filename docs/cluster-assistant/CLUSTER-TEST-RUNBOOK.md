@@ -172,7 +172,9 @@ the elected coordinator over SSH.
    ```
    A node without those two files has no helper — say so, do not fake it with
    `sudo` or `launchctl` over SSH.
-5. Verify the version on all four Macs (§2.2) before continuing.
+5. Verify the version on the three cluster Macs `.11`/`.12`/`.13` (§2.2) before
+   continuing. `.14` is reassigned (2026-11-16) and is never cleaned, installed or
+   measured again.
 6. Only then pair (§1) and run §3.
 
 The first run of a slim build may want its runtime provisioned. If the app does

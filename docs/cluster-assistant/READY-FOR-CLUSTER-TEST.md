@@ -184,7 +184,8 @@ The notarized `build/oMLX-0.8.0rc1.dmg` is the artefact to install.
    `/Library/LaunchDaemons/app.omlx.helper.plist` exist and
    `launchctl print system/app.omlx.helper` lists the job. This also lifts the
    107.5 GB Metal cap on the 128 GB Mac.
-4. Version gate: `GET /api/cluster/node_id` → same `version` on all four. The
+4. Version gate: `GET /api/cluster/node_id` → same `version` on the three cluster
+   Macs (`.11`/`.12`/`.13`; `.14` is reassigned and never touched). The
    version string stays `0.8.0rc1` for this rebuild, so also compare the **app
    binary hash** on every Mac (`shasum -a 256
    /Applications/oMLX.app/Contents/MacOS/oMLX`) — a missed reinstall is invisible
@@ -207,11 +208,11 @@ long lines, the test-seam rewrite) because the app bundles the web assets.
 | Built from | the tree at `0cfb3183` (code `84ce15e7`); only documentation commits followed |
 | Contents vs §8 | D1 uninstall, D6 helper capability, distributed inference on by default, the U1–U6 UI, and the inspection clean-up |
 
-**State check measured 2026-11-16 (after the cleanup run):** all four Macs are
+**State check measured 2026-11-16 (after the cleanup run):** the three cluster Macs are
 wiped — 0 processes, port 8099 free, `~/.omlx` = `cluster/identity.json` +
 `backup-cluster-2026-11-16/`, 0 app copies, 0 LaunchServices records, runtime venv
 gone. The root-owned helper is the one leftover (needs one admin dialog per Mac).
-So the acceptance run has **not** started: install this DMG on all four Macs,
+So the acceptance run has **not** started: install this DMG on the three Macs,
 verify `02a1b841…` everywhere, then run A1–A7.
 
 The checklist for the whole remaining work is

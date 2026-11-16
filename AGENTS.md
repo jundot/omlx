@@ -787,13 +787,19 @@ Do not:
 
 ## 9. Environment reference
 
-The current validation cluster may be offline. Do not assume it is available.
+The current validation cluster is **`.11` (origin), `.12`, `.13`** — three Macs.
+**`.14` was reassigned on 2026-11-16 to its own task and needs its own oMLX
+installation: never clean, install, restart, measure or pair it.** It is not in
+`cleanup-cluster-macs.sh`'s peer list. A 3-Mac plan is the largest the
+validation cluster can run; the 4-Mac matrix stays Phase-3 work.
+
+The cluster may be offline. Do not assume it is available.
 
 | Node | Hardware | RAM | Test role |
 |---|---|---|---|
 | `172.16.1.11` | MacBook Pro M5 Max | 128 GiB | fast/large candidate |
 | `172.16.1.13` | Mac Studio M2 Ultra | 64 GiB | medium candidate |
-| `172.16.1.14` | Mac Studio M1 Max | 32 GiB | small candidate |
+| `172.16.1.14` | Mac Studio M1 Max | 32 GiB | **reassigned 2026-11-16: never touched** (own task, needs its own oMLX) |
 | `172.16.1.12` | MacBook Pro M1 Max | 32 GiB | known 2-node peer, often offline |
 
 Never copy API keys or model data into this repository.

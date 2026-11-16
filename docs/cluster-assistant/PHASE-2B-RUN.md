@@ -1965,8 +1965,8 @@ measured.
 |---|---|
 | Origin Mac | `.11` (MacBook Pro M5 Max, 128 GiB) |
 | DMG | `build/oMLX-0.8.0rc1.dmg`, SHA256 `b3b9fd102bec00761a078575da2eb66171bf1f5ff79dee176bd720fc6a0ed449` (built 2026-11-16, notarized) |
-| App binary (`shasum -a 256 …/Contents/MacOS/oMLX`) | `02a1b841…` expected; record the four measured hashes |
-| Version gate | `GET /api/cluster/node_id` → same `version` on `.11/.12/.13/.14` |
+| App binary (`shasum -a 256 …/Contents/MacOS/oMLX`) | `02a1b841…` expected; record the three measured hashes (`.11`/`.12`/`.13`; `.14` is reassigned and untouched) |
+| Version gate | `GET /api/cluster/node_id` → same `version` on `.11/.12/.13` |
 | Wipe | `scripts/cleanup-cluster-macs.sh --all --with-helper`, state backup `~/.omlx/backup-cluster-2026-11-__/` |
 | Helper | removed before the run (so A5 proves a real first install) — `__________` |
 | Probe | `assistant_performance_probe` **on** |

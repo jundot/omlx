@@ -24,7 +24,7 @@ Read with: `ROADMAP-ACCEPTANCE-2026-11-16.md` (gate + decisions),
 | Lint | `ruff check omlx/cluster/assistant/` **clean** (8 nitpicks fixed 2026-11-16) |
 | Acceptance DMG | `build/oMLX-0.8.0rc1.dmg` `b3b9fd10…`, app binary `02a1b841…`, `0.8.0rc1`, notarized + stapled (2026-11-16, rebuilt after the inspection clean-up) |
 | Installed on `.11` | none — the app was removed by the 2026-11-16 cleanup run |
-| Macs | `.11` `.12` `.13` `.14` reachable, **no oMLX running** anywhere (app must be opened by a person) |
+| Macs | **`.11` `.12` `.13`** = the validation cluster (`.14` reassigned 2026-11-16, never touched); apps installed + servers on `:8000`, LAN bind `0.0.0.0` |
 | Cluster state | **not wiped** on `.11`: devices, deployments, measurements, `runtime/prompt-cache-ssd` |
 | PR series | `rebase/upstream-main` is **not** an ancestor of `feat/cluster-assistant-run` → fold **not** done (82 commits / 250 files backlog) |
 
@@ -114,13 +114,13 @@ installer). Do not drive these over SSH.
 - [x] **1.1 Wipe** — `scripts/cleanup-cluster-macs.sh --all --with-helper`
       (backs up to `~/.omlx/backup-cluster-<date>/`, keeps models +
       `cluster/identity.json`, kills processes, frees 8099). Done 2026-11-16 on
-      all four Macs; the helper still needs its admin dialog (see §6).
-- [ ] **1.2 Roll out** — copy `build/oMLX-0.8.0rc1.dmg` (`b3b9fd10…`) to all four Macs,
+      the three cluster Macs; the helper still needs its admin dialog (see §6).
+- [ ] **1.2 Roll out** — copy `build/oMLX-0.8.0rc1.dmg` (`b3b9fd10…`) to the three Macs,
       install, open the app **interactively**, let Local Network, the runtime
       installer and the helper dialog through.
 - [ ] **1.3 Identical-build gate** — `GET /api/cluster/node_id` → same
       `version`; and `shasum -a 256 /Applications/oMLX.app/Contents/MacOS/oMLX`
-      → `760a1695…` on **all four**. A mixed build is not an acceptance run.
+      → `02a1b841…` on **all three**. A mixed build is not an acceptance run.
 - [ ] **1.4 A1 Manual** — devices → pair → measure → model → plan → apply →
       start → `ready` → one real completion → stop, through the manual flow.
 - [ ] **1.5 A2 Assistant** — the same model through the assistant card; endpoint
@@ -172,7 +172,7 @@ Each item gets its own `PHASE-2B-RUN.md` section. Evidence from before the
 - [ ] **2.6 3-Mac line start** (minimal subset chooses three when two do not
       fit). A 4-Mac start stays Phase-3 fabric work.
 - [ ] **2.7 `raise_wired_limit` live** — needs a Mac still at the macOS default
-      limit; all four rollout Macs are raised, so either lower one limit
+      limit; the three cluster Macs are raised, so either lower one limit
       deliberately or record the item as still unproven.
 - [ ] **2.8 R16/R17 confirm or drop** — `auto-login` sets no session cookie; the
       card can report `no_model`.
@@ -230,7 +230,7 @@ Only after Phase 1 (the roadmap order: acceptance first, PRs second).
 ## 6. Phase 4 — cleanup and hygiene
 
 **Stand 2026-11-16 (bereits gelaufen):** `scripts/cleanup-cluster-macs.sh --all
---with-helper` über alle vier Macs. Verifiziert auf `.11`, `.12`, `.13`, `.14`:
+--with-helper` über alle vier Macs (damals noch inklusive `.14`). Verifiziert auf `.11`, `.12`, `.13`, `.14`:
 0 Prozesse, Port 8099 frei, `~/.omlx` = `cluster/identity.json` + der State-Backup
 `backup-cluster-2026-11-16/`, 0 App-Kopien, Runtime/Venv entfernt, 0 DerivedData,
 0 Trash-Kopien, 0 LaunchServices-Records. Die Modelle (902 GB) und das notarized
@@ -247,7 +247,7 @@ Wired-Limit-Wert im Kernel stehen (122 880 / 60 293 / 29 696 / 29 696 MB).
       (`DerivedData/oMLX-*`, was 2.0 GB), runtime venv, Trash copies, mounted
       DMG volumes and `/tmp` images removed (2026-11-16).
 - [x] **4.3 Launchpad**: `lsregister -gc -f -r -domain user -domain local` +
-      `killall Dock`; 0 app copies and 0 LS records on all four Macs.
+      `killall Dock`; 0 app copies and 0 LS records on the cluster Macs.
 - [ ] **4.4 Helper**: remove `/Library/PrivilegedHelperTools/app.omlx.helper` +
       `/Library/LaunchDaemons/app.omlx.helper.plist` at each Mac (one admin
       dialog each, no passwordless sudo in the cluster).
@@ -264,7 +264,7 @@ Wired-Limit-Wert im Kernel stehen (122 880 / 60 293 / 29 696 / 29 696 MB).
 
 | # | Question | Needed for |
 |---|---|---|
-| 1 | Is a person available at each of the four Macs for the interactive steps (Local Network, helper admin dialog, runtime installer)? | Phase 1.2–1.9 — without it A5/A6 cannot be proven |
+| 1 | Is a person available at each of the **three** Macs (`.11`/`.12`/`.13`) for the interactive steps (Local Network, helper admin dialog, runtime installer)? | Phase 1.2–1.9 — without it A5/A6 cannot be proven |
 | 2 | Confirm fold **after** acceptance (current roadmap order) — or fold first? | Phase 1 vs Phase 3 order |
 | 3 | R16/R17: confirm or drop | Phase 2.8 |
 | 4 | Do we deliberately lower one Mac's wired limit to prove `raise_wired_limit`? | Phase 2.7 |

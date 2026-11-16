@@ -21,7 +21,8 @@
 #
 # Usage:
 #   scripts/cleanup-cluster-macs.sh              # this Mac
-#   scripts/cleanup-cluster-macs.sh --all        # this Mac + the three peers
+#   scripts/cleanup-cluster-macs.sh --all        # this Mac + .12 and .13 (.14 is
+#                                                # never touched, see PEERS)
 #   scripts/cleanup-cluster-macs.sh --all --with-helper     # also remove the
 #                                                            # root-owned helper
 #                                                            # (one admin dialog
@@ -36,7 +37,10 @@
 # (AGENTS.md §11: back up first, then wipe).
 set -uo pipefail
 
-PEERS=(172.16.1.12 172.16.1.13 172.16.1.14)
+# Validation cluster is .11 + .12 + .13. .14 was REASSIGNED on 2026-11-16 to its
+# own task and needs its own oMLX installation: never clean, install, measure or
+# restart it from here. It is deliberately absent from this list.
+PEERS=(172.16.1.12 172.16.1.13)
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 ALL=0
 KEEP_SETTINGS=0
