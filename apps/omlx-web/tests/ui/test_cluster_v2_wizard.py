@@ -1578,6 +1578,27 @@ def test_expired_join_offers_start_again_not_a_dead_end():
     assert "this.join.coordinator_addr" in javascript
 
 
+def test_the_rank0_pin_is_visible_in_the_plan_summary():
+    """The pin decides the endpoint host and the decode cadence — not buried.
+
+    Measured live 2026-11-16: with a compute profile the election put rank 0 on
+    the M2 Ultra (25.0 tok/s), without one it fell back to headroom and picked
+    the 128 GiB Max (22.6 tok/s). The pin is how that becomes explicit, so it
+    belongs next to Macs/Tier/Context rather than inside the collapsed advanced
+    block.
+    """
+    template = _read(TEMPLATE)
+
+    assert template.count("data-cluster-v2-assistant-coordinator-row") == 1
+    assert "setAssistantCoordinator(" in template
+
+    # Above the advanced block, not inside it: the "Use all Macs" override and
+    # the raw operation JSON stay collapsed, the pin does not.
+    pin = template.index("data-cluster-v2-assistant-coordinator-row")
+    advanced = template.index("data-cluster-v2-assistant-use-all-macs")
+    assert pin < advanced
+
+
 def test_the_memory_tier_is_selectable_in_both_flows():
     """A lever the user may name, and the plan still reports a raise.
 
