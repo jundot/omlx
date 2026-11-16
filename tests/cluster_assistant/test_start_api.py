@@ -926,6 +926,32 @@ def test_start_without_a_saved_preset_writes_no_tuning(api) -> None:
     assert assistant_start.WARNING_TUNING_PRESET_SKIPPED not in codes
 
 
+def test_a_wrapped_memory_refusal_is_still_the_model_or_context_step(api) -> None:
+    """The live card showed start_failed + retry_coordinator for the same refusal.
+
+    2026-11-16: the 503 arrived as a plain exception, so the generic failure path
+    wrote "oMLX … is not reachable" at the user while that Mac was serving.
+    """
+
+    fake = FakeCoordinator(
+        activate_error=RuntimeError(
+            "503: Model does not fit the current per-node memory limits; no ranks "
+            "were started. rank 1 (9078f858) needs 47.8 GiB but can admit 45.2 GiB "
+            "right now."
+        )
+    )
+    client, _, _ = api(coordinator=fake.factory())
+    plan = applied(client, fake)
+
+    response = client.post(START_URL, json=start_payload(plan))
+    operation = wait_for_operation(client, response.json()["operation_id"])
+
+    assert operation["state"] == "failed"
+    assert operation["error"]["action"] == "adjust_model_or_context"
+    assert "No ranks were started" in operation["error"]["message"]
+    assert "not reachable" not in str(operation["error"])
+
+
 def test_a_memory_pressure_start_names_the_cause_and_the_fix(api) -> None:
     """'does not fit ... right now' is memory pressure, not an unreachable
     coordinator; retrying without freeing memory cannot help."""
@@ -945,6 +971,9 @@ def test_a_memory_pressure_start_names_the_cause_and_the_fix(api) -> None:
 
     assert operation["state"] == "failed"
     assert operation["error"]["code"] == "coordinator_start_failed"
-    assert operation["error"]["action"] == "diagnostics"
-    assert "still holding memory" in operation["error"]["message"]
+    # The card's one action opens the model/context step: a memory refusal is
+    # not "oMLX is not reachable" (measured live 2026-11-16).
+    assert operation["error"]["action"] == "adjust_model_or_context"
+    assert "No ranks were started" in operation["error"]["message"]
+    assert "smaller context" in operation["error"]["message"]
     assert "Start again" in operation["error"]["message"]
