@@ -6784,6 +6784,52 @@ class TestNemotronImatrix:
         monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
         return model, config, tokens
 
+    @pytest.mark.parametrize("model_type", ["nemotron_h", "nemotron_h_puzzle"])
+    def test_nested_discovery_accepts_nemotron_h_text_types(self, bolt, model_type):
+        from dataclasses import replace
+
+        outer, _, _ = bolt
+        text = outer.language_model
+        text = type(text)(replace(text.args, model_type=model_type))
+        outer.language_model = text
+
+        assert outer.model_type == "nemotron_h_omni"
+        assert text.model_type == model_type
+        embed, layers = _find_model_layers(outer)
+        assert embed is text.backbone.embeddings
+        assert layers is text.backbone.layers
+
+    @pytest.mark.parametrize("model_type", ["mamba", "mamba2", None])
+    def test_nested_discovery_rejects_unrelated_text_types(self, bolt, model_type):
+        from types import SimpleNamespace
+
+        model, _, _ = bolt
+        unrelated = SimpleNamespace(
+            model_type="unrelated",
+            language_model=SimpleNamespace(
+                model_type=model_type,
+                backbone=model.language_model.backbone,
+                layers=model.layers,
+            ),
+        )
+
+        assert _find_model_layers(unrelated) == (None, None)
+
+    def test_direct_backbone_discovery_keeps_precedence(self, bolt):
+        from types import SimpleNamespace
+
+        model, _, _ = bolt
+        direct = SimpleNamespace(
+            model_type="unrelated",
+            backbone=SimpleNamespace(embeddings=nn.Embedding(128, 128)),
+            layers=[],
+            language_model=model.language_model,
+        )
+
+        embed, layers = _find_model_layers(direct)
+        assert embed is direct.backbone.embeddings
+        assert layers is direct.layers
+
     @pytest.mark.parametrize("wrapped", [False, True])
     @pytest.mark.parametrize("quantized", [False, True])
     def test_layer_walk_matches_native_captures(self, bolt, wrapped, quantized):

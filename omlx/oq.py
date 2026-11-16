@@ -8416,7 +8416,7 @@ def _find_model_layers(model):
     """
     embed_fn = None
     layers = None
-    text_model = getattr(model, "language_model", model)
+    language_model = getattr(model, "language_model", None)
 
     if getattr(model, "model_type", None) == "muse_spark":
         # mlx-lm's Muse Spark normalizes its token embeddings.
@@ -8453,10 +8453,18 @@ def _find_model_layers(model):
     elif hasattr(model, "embed_tokens"):
         embed_fn = model.embed_tokens
         layers = model.layers
-    elif hasattr(text_model, "backbone") and hasattr(text_model.backbone, "embeddings"):
-        # Nemotron-H exposes the same backbone directly and in Omni wrappers.
-        embed_fn = text_model.backbone.embeddings
-        layers = text_model.layers
+    elif hasattr(model, "backbone") and hasattr(model.backbone, "embeddings"):
+        embed_fn = model.backbone.embeddings
+        layers = model.layers
+    elif (
+        getattr(language_model, "model_type", None)
+        in ("nemotron_h", "nemotron_h_puzzle")
+        and hasattr(language_model, "backbone")
+        and hasattr(language_model.backbone, "embeddings")
+    ):
+        # Omni's text wrapper inherits its model_type from the text config.
+        embed_fn = language_model.backbone.embeddings
+        layers = language_model.layers
 
     return embed_fn, layers
 
