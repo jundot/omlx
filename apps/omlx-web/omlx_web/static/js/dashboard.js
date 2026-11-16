@@ -181,6 +181,8 @@
             // Global settings
             globalSettings: {
                 base_path: '',
+                // Read-only: owned by the privileged helper, not user-writable.
+                secure_server: { enabled: false },
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, gpu_keep_warm_idle_window: 300, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
@@ -1311,6 +1313,7 @@
                         this.globalSettings = {
                             ...this.globalSettings,
                             ...data,
+                            secure_server: { ...this.globalSettings.secure_server, ...data.secure_server },
                             server: { ...this.globalSettings.server, ...data.server },
                             model: { ...this.globalSettings.model, ...data.model, model_dirs: modelDirs },
                             memory: { ...this.globalSettings.memory, ...data.memory },
@@ -8126,6 +8129,10 @@
             },
 
             startHFDownload() {
+                if (this.globalSettings.secure_server?.enabled) {
+                    this.hfError = window.t('js.error.secure_server_blocked');
+                    return;
+                }
                 const repoId = this.hfRepoIdFromInput(this.hfRepoId);
                 if (!repoId) return;
                 this.hfRepoId = repoId;
@@ -9517,6 +9524,10 @@
             },
 
             async startMSDownload() {
+                if (this.globalSettings.secure_server?.enabled) {
+                    this.msError = window.t('js.error.secure_server_blocked');
+                    return;
+                }
                 let repoId = this.msRepoId.trim();
                 if (!repoId) return;
 

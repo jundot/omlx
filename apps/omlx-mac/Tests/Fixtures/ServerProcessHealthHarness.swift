@@ -152,6 +152,31 @@ extension ServerProcess {
             try require(state == .running(pid: live.processIdentifier),
                         "recent status did not keep a live child running: \(state)")
 
+        case "reuse_running_sandboxed_server":
+            // The helper already has a live server, so auto-start must reuse it.
+            // Reaching `start` would stop that server first, so `start` is wired to
+            // fail loudly here. At launch the app's own adoption is still awaiting a
+            // measured status, leaving the local pid unset — only the helper can say
+            // what it is already running, which is why the spawn path asks it.
+            let live = try child()
+            let livePID = live.processIdentifier
+            sandboxDirective = ServerSandbox(
+                start: { _ in
+                    throw ServerProcess.StartError.spawnFailed(
+                        "start was called even though the helper had a live pid"
+                    )
+                },
+                stop: { true },
+                runningPID: { livePID }
+            )
+            state = .stopped
+            try doStart()
+            try await waitUntil(seconds: 3) { sandboxedPID != nil }
+            try require(sandboxedPID == livePID,
+                        "helper's running pid was not reused: \(String(describing: sandboxedPID))")
+            try require(state == .running(pid: livePID),
+                        "reuse did not leave the server running: \(state)")
+
         default:
             throw RegressionFailure(description: "unknown scenario: \(scenario)")
         }

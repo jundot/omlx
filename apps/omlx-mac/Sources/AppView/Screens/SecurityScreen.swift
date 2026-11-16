@@ -1,12 +1,17 @@
 // PR 9 — Security.
 //
-// Three sections:
+// Four sections:
 //   • API Key — editable masked field with show/regenerate/copy/save.
 //                Routes through /admin/api/setup-api-key for first-time
 //                setup, and /admin/api/global-settings (`api_key` field)
 //                for updates to an already-configured key.
 //   • Authentication — `skip_api_key_verification` toggle (no-auth mode)
 //                and `allow_unauthenticated_inference` (keyless /v1 only)
+//   • Secure Server — runs the server as a dedicated macOS account that pf
+//                restricts to loopback. The state is a root-owned file written only
+//                by the privileged helper, so every change here is gated by the
+//                administrator dialog, and the change restarts the server so its
+//                sockets belong to the right side of the rules.
 //   • Sub Keys — list + create + delete via /admin/api/sub-keys (POST/DELETE)
 //
 // The main key is rendered as a SecureField with an explicit show toggle
@@ -26,6 +31,7 @@ struct SecurityScreen: View {
         VStack(alignment: .leading, spacing: 0) {
             APIKeySection(vm: vm, client: services.client)
             AuthenticationSection(vm: vm, client: services.client)
+            SecureServerSection()
             SubKeysSection(vm: vm, client: services.client)
 
             FooterBar(error: vm.lastError)
@@ -293,6 +299,178 @@ private struct AuthenticationSection: View {
             Text(String(localized: "security.auth.keyless_inference.confirm_message",
                         defaultValue: "Anyone who can reach this server will be able to use inference APIs, MCP tools, and web search without an API key.\n\nBy turning this on, you acknowledge that the server will be exposed to attacks from the network, that you understand you are removing this security protection, and that you have put appropriate security measures in place.",
                         comment: "Warning shown before enabling keyless inference"))
+        }
+    }
+}
+
+// MARK: - Secure server
+
+/// Sandboxed server mode. The flag, the rules and the sandbox account itself
+/// live under a root-owned directory that only the privileged helper writes, so
+/// this screen can only *ask* for a change: every flip goes through the standard
+/// administrator dialog, and a reboot cannot be used to drop it silently.
+///
+/// The scope is the oMLX server process alone. pf associates a packet with the
+/// uid that owned its socket, so the server is run as its own macOS account and
+/// every rule names that account — which is precisely why the rest of the Mac
+/// keeps working, instead of losing its network along with the server.
+private struct SecureServerSection: View {
+    /// Shared, because the server's spawner has to see the same state as this
+    /// toggle: whether the server may reach the network is decided at spawn.
+    @State private var controller = SecureServerController.shared
+
+    @Environment(\.omlxTheme) private var theme
+
+    private var needsApproval: Bool { controller.helperStatus == .requiresApproval }
+
+    /// The switch records what was asked for; the pill reports what pf is
+    /// actually doing. A lockdown that is not in force must never wear the
+    /// success colour.
+    private var pillColor: Color {
+        if controller.isEnabled, controller.isEnforced { return theme.successText }
+        if controller.isEnabled { return theme.warningText }
+        return theme.textSecondary
+    }
+
+    private var pillLabel: String {
+        if controller.isEnabled, controller.isEnforced {
+            return String(localized: "security.secure_server.status_on",
+                          defaultValue: "ON",
+                          comment: "Secure server status pill when the sandbox is enforcing")
+        }
+        if controller.isEnabled {
+            return String(localized: "security.secure_server.status_not_enforced",
+                          defaultValue: "NOT ENFORCED",
+                          comment: "Secure server status pill when the switch is on but pf is not blocking")
+        }
+        return String(localized: "security.secure_server.status_off",
+                      defaultValue: "OFF",
+                      comment: "Secure server status pill when the sandbox is off")
+    }
+
+    var body: some View {
+        SectionHeader(
+            String(localized: "security.secure_server.section",
+                   defaultValue: "Secure Server",
+                   comment: "Section header for the oMLX server network sandbox"),
+            subtitle: String(localized: "security.secure_server.section.sub",
+                             defaultValue: "While on, the oMLX server runs as its own macOS account with no route off this Mac: only localhost can reach it, and it cannot download models or send telemetry. Everything else on the Mac keeps its network.",
+                             comment: "Subtitle explaining that only the oMLX server is sandboxed")
+        )
+
+        ListGroup {
+            Row(
+                label: String(localized: "security.secure_server.label",
+                              defaultValue: "Sandbox the oMLX server",
+                              comment: "Row label for the secure server toggle"),
+                sublabel: String(localized: "security.secure_server.label.sub",
+                                 defaultValue: "One step: creates the dedicated account and firewall rules, then restarts the server. Every change needs an administrator password and survives reboots.",
+                                 comment: "Sublabel for the secure server toggle"),
+                isLast: !needsApproval
+                    && controller.enforcementWarning == nil
+                    && controller.errorMessage == nil
+            ) {
+                HStack(spacing: 10) {
+                    if controller.isBusy {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    StatusPill(status: .custom(
+                        color: pillColor,
+                        label: pillLabel,
+                        fillBg: true
+                    ))
+                    RowSwitch(isOn: Binding(
+                        get: { controller.isEnabled },
+                        set: { controller.setEnabled($0) }
+                    ))
+                    .disabled(controller.isBusy || needsApproval)
+                }
+            }
+
+            if let warning = controller.enforcementWarning {
+                Row(
+                    label: String(localized: "security.secure_server.warning.label",
+                                  defaultValue: "Not enforcing",
+                                  comment: "Row label when the switch is on but nothing is being blocked"),
+                    sublabel: warning,
+                    isLast: !needsApproval && controller.errorMessage == nil
+                ) {
+                    Button {
+                        controller.refresh()
+                    } label: {
+                        Label(String(localized: "security.secure_server.warning.retry",
+                                     defaultValue: "Re-check",
+                                     comment: "Button that re-reads whether the sandbox is enforcing"),
+                              systemImage: "arrow.clockwise")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                }
+            }
+
+            if needsApproval {
+                Row(
+                    label: String(localized: "security.secure_server.approval.label",
+                                  defaultValue: "Approval required",
+                                  comment: "Row label shown when the helper waits for System Settings approval"),
+                    sublabel: String(localized: "security.secure_server.approval.sub",
+                                     defaultValue: "Allow oMLX background activity in System Settings, then try again.",
+                                     comment: "Sublabel explaining how to approve the privileged helper"),
+                    isLast: controller.errorMessage == nil
+                ) {
+                    Button {
+                        controller.openSystemSettingsLoginItems()
+                    } label: {
+                        Label(String(localized: "security.secure_server.approval.open",
+                                     defaultValue: "Open System Settings",
+                                     comment: "Button that opens the Login Items pane in System Settings"),
+                              systemImage: "gearshape")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                }
+            }
+
+            if let message = controller.errorMessage {
+                Row(
+                    label: String(localized: "security.secure_server.error.label",
+                                  defaultValue: "Secure Server",
+                                  comment: "Row label for a secure server error"),
+                    sublabel: message,
+                    isLast: true
+                ) {
+                    EmptyView()
+                }
+            }
+        }
+
+        // A switch that pulls up an admin dialog and a System Settings hop
+        // invites "what does this actually do?" — answer it inline, in type
+        // clearly subordinate to the rows.
+        VStack(alignment: .leading, spacing: 4) {
+            Text(String(localized: "security.secure_server.explain",
+                        defaultValue: "How it works: a one-time, macOS-approved privileged helper runs the oMLX server under its own dedicated account and loads firewall rules scoped to that account alone. Only the server is restricted — no other app on this Mac is affected. Turning the mode on sets up the account and rules and restarts the server in one step; every change asks for your administrator password.",
+                        comment: "Footnote below the secure server rows explaining that the privileged helper restricts only the oMLX server"))
+            Text(String(localized: "security.secure_server.setup",
+                        defaultValue: "First time: macOS asks you to approve the helper in System Settings, then asks for your administrator password. The switch completes the whole setup — nothing is installed by hand.",
+                        comment: "Footnote below the secure server rows describing the one-time System Settings approval and administrator password"))
+        }
+        .font(.omlxText(11))
+        .foregroundStyle(theme.textSecondary)
+        .multilineTextAlignment(.leading)
+        .padding(.horizontal, 14)
+        .padding(.bottom, 6)
+        // Keep measuring while the section is on screen. `status` is the only thing
+        // the pill reads, and pf can be switched off from a terminal at any moment —
+        // a pill that keeps saying ON until the screen is reopened is exactly the
+        // dishonesty this indicator exists to avoid. Cancelled when the view goes
+        // away, so nothing polls in the background.
+        .task {
+            while !Task.isCancelled {
+                controller.refresh()
+                try? await Task.sleep(for: .seconds(5))
+            }
         }
     }
 }

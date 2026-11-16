@@ -369,6 +369,36 @@
                             </div>
                         </div>
 
+                        <!-- Secure Server Section (read-only: state is owned by
+                             the privileged helper's root-only files) -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="shield-check" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.server.secure_server.title') }}</span>
+                                </div>
+                                <!-- No status pill: the server can read the requested
+                                     state, but it cannot read pf, so any badge here would
+                                     be a claim it cannot verify. The oMLX app shows the
+                                     measured state. -->
+                            </div>
+                            <div class="px-6 py-4">
+                                <p class="text-xs text-neutral-400 mb-2" x-text="window.t('settings.server.secure_server.explain')"></p>
+                                <!-- `explain` is always visible and is phrased
+                                     conditionally ("when enabled") so it stays a
+                                     mechanism note and never claims the mode is on.
+                                     `hint_off` below is shown only while the mode is
+                                     off. The on-state `hint` is deliberately not
+                                     rendered here: it states a protection outcome
+                                     ("no network access of its own") that this surface
+                                     cannot verify — it reads the requested state, not
+                                     pf. Enforcement is shown in the oMLX app, which
+                                     measures it. -->
+                                <p x-show="!globalSettings.secure_server?.enabled" class="text-xs text-neutral-400"
+                                   x-text="window.t('settings.server.secure_server.hint_off')"></p>
+                            </div>
+                        </div>
+
                         <!-- Model Section -->
                         <div id="settings-model" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">

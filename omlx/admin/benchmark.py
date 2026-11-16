@@ -25,6 +25,7 @@ from ..custom_kernels.quant_matmul import fast as quant_fast
 from ..model_discovery import model_display_name
 from ..model_settings import a8_prefill_on, ced_prefill_on, oq_a8_model_supported
 from ..prefill_helper.manager import PrefillHelperManager
+from ..secure_mode import is_enabled as _secure_mode_enabled
 from ..utils.proc_memory import get_lifetime_max_phys_footprint
 from ..utils.system_sampler import SystemSampler
 from .external_api import ExternalAPIClient, ExternalEndpointConfig
@@ -1846,6 +1847,11 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     grouped by submission_group. Upload failures don't affect
     the benchmark run status.
     """
+    if _secure_mode_enabled():
+        # Nothing may leave the box; the caller already records the skip.
+        logger.info("Benchmark upload skipped: Secure Server mode is on")
+        return
+
     import requests
 
     from .._version import __version__
@@ -2588,6 +2594,21 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 },
             },
         )
+
+        # Secure Server mode means nothing leaves the box: skip the upload
+        # outright instead of letting pf drop the packets and logging timeouts.
+        if _secure_mode_enabled():
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "secure_server"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": "secure_server",
+                    "features": run.feature_flags,
+                },
+            )
+            return
 
         # Aligned prompts intentionally use non-standard PP4097/8193/etc.
         # Keep them local rather than mixing them into PP4096 leaderboard

@@ -60284,6 +60284,1140 @@
           }
         }
       }
+    },
+    "security.secure_server.section" : {
+      "comment" : "Section header for the oMLX server network sandbox",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        }
+      }
+    },
+    "security.secure_server.section.sub" : {
+      "comment" : "Subtitle explaining that only the oMLX server is sandboxed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Solange aktiv, läuft der oMLX-Server unter einem eigenen macOS-Benutzerkonto ohne Weg aus diesem Mac heraus: Nur localhost kann ihn erreichen, und er kann keine Modelle laden oder Telemetrie senden. Alles andere auf dem Mac behält seinen Netzwerkzugriff."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "While on, the oMLX server runs as its own macOS account with no route off this Mac: only localhost can reach it, and it cannot download models or send telemetry. Everything else on the Mac keeps its network."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quando è attivo, il server oMLX viene eseguito con un proprio account macOS senza alcuna via d'uscita da questo Mac: solo localhost può raggiungerlo e non può scaricare modelli né inviare telemetria. Tutto il resto sul Mac mantiene la propria rete."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オンの間、oMLX サーバーは専用の macOS アカウントで実行され、この Mac の外へ出る経路を持ちません。到達できるのは localhost だけで、モデルのダウンロードやテレメトリ送信もできません。Mac 上のそれ以外はすべてネットワークを利用できます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "켜져 있는 동안 oMLX 서버는 전용 macOS 계정으로 실행되며 이 Mac 밖으로 나가는 경로가 없습니다. localhost만 접속할 수 있고 모델을 내려받거나 텔레메트리를 보낼 수 없습니다. Mac의 다른 모든 항목은 네트워크를 그대로 사용합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пока режим включён, сервер oMLX работает под отдельной учётной записью macOS без выхода за пределы этого Mac: обратиться к нему может только localhost, и он не может загружать модели или отправлять телеметрию. Всё остальное на Mac сохраняет доступ к сети."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "开启后，oMLX 服务器会以独立的 macOS 账户运行，无法访问本机以外的网络：只有 localhost 能连接它，它也不能下载模型或发送遥测。Mac 上的其他一切照常联网。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "開啟後，oMLX 伺服器會以獨立的 macOS 帳號執行，無法存取本機以外的網路：只有 localhost 能連線到它，它也不能下載模型或傳送遙測。Mac 上的其他一切照常連網。"
+          }
+        }
+      }
+    },
+    "security.secure_server.label" : {
+      "comment" : "Row label for the secure server toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX-Server sandboxen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sandbox the oMLX server"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Isola il server oMLX in una sandbox"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX サーバーをサンドボックス化"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX 서버를 샌드박스화"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Изолировать сервер oMLX в песочнице"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "沙箱化 oMLX 服务器"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "沙箱化 oMLX 伺服器"
+          }
+        }
+      }
+    },
+    "security.secure_server.label.sub" : {
+      "comment" : "Sublabel for the secure server toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein Schritt: legt das eigene Konto und die Firewall-Regeln an und startet den Server neu. Jede Änderung erfordert ein Administratorpasswort und bleibt nach einem Neustart erhalten."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "One step: creates the dedicated account and firewall rules, then restarts the server. Every change needs an administrator password and survives reboots."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Un solo passaggio: crea l'account dedicato e le regole del firewall, poi riavvia il server. Ogni modifica richiede la password di amministratore e sopravvive ai riavvii."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ワンステップで、専用アカウントとファイアウォールルールを作成し、サーバーを再起動します。変更には毎回管理者パスワードが必要で、再起動後も維持されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "한 단계로 전용 계정과 방화벽 규칙을 만든 뒤 서버를 다시 시작합니다. 모든 변경에는 관리자 암호가 필요하며 재시동 후에도 유지됩니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Один шаг: создаёт отдельную учётную запись и правила брандмауэра, затем перезапускает сервер. Каждое изменение требует пароля администратора и сохраняется после перезагрузки."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "一步完成：创建专用账户和防火墙规则，然后重启服务器。每次更改都需要管理员密码，并在重启后依然有效。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "一步完成：建立專用帳號和防火牆規則，然後重新啟動伺服器。每次變更都需要管理員密碼，並在重新開機後依然有效。"
+          }
+        }
+      }
+    },
+    "security.secure_server.explain" : {
+      "comment" : "Footnote below the secure server rows explaining that the privileged helper restricts only the oMLX server",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "So funktioniert es: Ein einmalig von macOS genehmigter privilegierter Helfer führt den oMLX-Server unter einem eigenen, dedizierten Konto aus und lädt Firewall-Regeln, die nur für dieses Konto gelten. Nur der Server wird eingeschränkt — keine andere App auf diesem Mac ist betroffen. Das Einschalten legt Konto und Regeln an und startet den Server in einem Schritt neu; jede Änderung fragt nach deinem Administratorpasswort."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How it works: a one-time, macOS-approved privileged helper runs the oMLX server under its own dedicated account and loads firewall rules scoped to that account alone. Only the server is restricted — no other app on this Mac is affected. Turning the mode on sets up the account and rules and restarts the server in one step; every change asks for your administrator password."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Come funziona: un helper privilegiato, approvato una sola volta da macOS, esegue il server oMLX con un proprio account dedicato e carica regole del firewall valide solo per quell'account. Viene limitato soltanto il server: nessun'altra app su questo Mac è interessata. Attivare la modalità crea l'account e le regole e riavvia il server in un unico passaggio; ogni modifica chiede la password di amministratore."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仕組み: macOS で一度承認された特権ヘルパーが、専用のアカウントで oMLX サーバーを実行し、そのアカウントだけに適用されるファイアウォールルールを読み込みます。制限されるのはサーバーだけで、この Mac の他のアプリには影響しません。モードをオンにすると、アカウントとルールの作成からサーバーの再起動までを一段階で完了します。変更のたびに管理者パスワードを求められます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작동 방식: macOS에서 한 번 승인된 특권 도우미가 전용 계정으로 oMLX 서버를 실행하고 해당 계정에만 적용되는 방화벽 규칙을 불러옵니다. 제한되는 것은 서버뿐이며 이 Mac의 다른 앱에는 영향이 없습니다. 모드를 켜면 계정과 규칙 생성부터 서버 재시작까지 한 단계로 완료됩니다. 변경할 때마다 관리자 암호를 묻습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Как это работает: одноразово одобренный macOS привилегированный помощник запускает сервер oMLX под отдельной учётной записью и загружает правила брандмауэра, действующие только для этой записи. Ограничивается только сервер — другие приложения на этом Mac не затрагиваются. Включение режима создаёт учётную запись и правила и перезапускает сервер за один шаг; каждое изменение запрашивает пароль администратора."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "工作原理：由 macOS 一次性批准的特权助手，以专用账户运行 oMLX 服务器，并加载仅作用于该账户的防火墙规则。只有服务器受到限制，本机上的其他应用都不受影响。开启该模式会一步完成账户与规则的创建并重启服务器；每次更改都会要求输入管理员密码。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "運作原理：由 macOS 一次性核准的特權助手，以專用帳號執行 oMLX 伺服器，並載入僅作用於該帳號的防火牆規則。只有伺服器受到限制，本機上的其他應用程式都不受影響。開啟此模式會一步完成帳號與規則的建立並重新啟動伺服器；每次變更都會要求輸入管理員密碼。"
+          }
+        }
+      }
+    },
+    "security.secure_server.setup" : {
+      "comment" : "Footnote below the secure server rows describing the one-time System Settings approval and administrator password",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beim ersten Mal bittet macOS dich, den Helfer in den Systemeinstellungen zu genehmigen, und fragt danach nach deinem Administratorpasswort. Der Schalter schließt die gesamte Einrichtung ab — nichts wird von Hand installiert."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "First time: macOS asks you to approve the helper in System Settings, then asks for your administrator password. The switch completes the whole setup — nothing is installed by hand."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La prima volta macOS ti chiede di approvare l'helper in Impostazioni di Sistema e poi la password di amministratore. L'interruttore completa l'intera configurazione: nulla viene installato a mano."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "初回は、macOS がシステム設定でヘルパーの承認を求め、続いて管理者パスワードを尋ねます。スイッチ一つでセットアップが完了し、手作業でインストールするものはありません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "처음에는 macOS가 시스템 설정에서 도우미를 승인하라고 요청한 뒤 관리자 암호를 묻습니다. 스위치 하나로 전체 설정이 완료되며 수동으로 설치할 것은 없습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "При первом включении macOS попросит одобрить помощник в системных настройках, а затем ввести пароль администратора. Переключатель завершает всю настройку — ничего не устанавливается вручную."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "首次使用时，macOS 会要求你在系统设置中批准该助手，然后输入管理员密码。开关会完成全部设置，无需手动安装任何组件。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "首次使用時，macOS 會要求你在系統設定中核准該助手，然後輸入管理員密碼。開關會完成全部設定，無需手動安裝任何元件。"
+          }
+        }
+      }
+    },
+    "security.secure_server.status_on" : {
+      "comment" : "Secure server status pill when the sandbox is enforcing",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AN"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ON"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ON"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オン"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "켜짐"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ВКЛ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已开启"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已開啟"
+          }
+        }
+      }
+    },
+    "security.secure_server.status_off" : {
+      "comment" : "Secure server status pill when the sandbox is off",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AUS"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OFF"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OFF"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オフ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "꺼짐"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ВЫКЛ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已关闭"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已關閉"
+          }
+        }
+      }
+    },
+    "security.secure_server.status_not_enforced" : {
+      "comment" : "Secure server status pill when the switch is on but pf is not blocking",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "NICHT ERZWUNGEN"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "NOT ENFORCED"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "NON APPLICATO"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未適用"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "미적용"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "НЕ ПРИМЕНЕНО"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未生效"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未生效"
+          }
+        }
+      }
+    },
+    "security.secure_server.warning.label" : {
+      "comment" : "Row label when the switch is on but nothing is being blocked",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht erzwungen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Not enforcing"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Non applicato"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "適用されていません"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "적용되지 않음"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не применяется"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未生效"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未生效"
+          }
+        }
+      }
+    },
+    "security.secure_server.warning.retry" : {
+      "comment" : "Button that re-reads whether the sandbox is enforcing",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erneut prüfen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Re-check"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ricontrolla"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "再確認"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 확인"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Проверить снова"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新检查"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新檢查"
+          }
+        }
+      }
+    },
+    "security.secure_server.error.not_enforced" : {
+      "comment" : "Shown when the lockdown was requested but pf is not enforcing it",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server ist an, aber es wird nichts blockiert."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server is on but nothing is being blocked."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server è attivo ma non viene bloccato nulla."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server はオンですが、何もブロックされていません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server가 켜져 있지만 아무것도 차단되지 않습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server включён, но ничего не блокируется."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server 已开启，但没有拦截任何流量。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server 已開啟，但沒有攔截任何流量。"
+          }
+        }
+      }
+    },
+    "security.secure_server.error.spawn_without_helper" : {
+      "comment" : "Shown when the server is asked to start while Secure Server is on but no helper is attached",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server ist an, daher kann der Server nur über den privilegierten oMLX-Helfer gestartet werden. Prüfe, ob der Helfer registriert ist, oder schalte Secure Server aus."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server is on, so the server can only be started through the oMLX privileged helper. Check that the helper is registered, or turn Secure Server off."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server è attivo, quindi il server può essere avviato solo tramite l'helper privilegiato di oMLX. Verifica che l'helper sia registrato oppure disattiva Secure Server."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server がオンなので、サーバーは oMLX の特権ヘルパー経由でのみ起動できます。ヘルパーが登録されているか確認するか、Secure Server をオフにしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server가 켜져 있으므로 서버는 oMLX 특권 도우미를 통해서만 시작할 수 있습니다. 도우미가 등록되었는지 확인하거나 Secure Server를 끄세요."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server включён, поэтому сервер можно запустить только через привилегированный помощник oMLX. Убедитесь, что помощник зарегистрирован, или выключите Secure Server."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server 已开启，因此只能通过 oMLX 特权助手启动服务器。请确认助手已注册，或关闭 Secure Server。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server 已開啟，因此只能透過 oMLX 特權助手啟動伺服器。請確認助手已註冊，或關閉 Secure Server。"
+          }
+        }
+      }
+    },
+    "security.secure_server.approval.label" : {
+      "comment" : "Row label shown when the helper waits for System Settings approval",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Genehmigung erforderlich"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Approval required"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Approvazione necessaria"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "承認が必要です"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "승인 필요"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Требуется разрешение"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要批准"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要核准"
+          }
+        }
+      }
+    },
+    "security.secure_server.approval.sub" : {
+      "comment" : "Sublabel explaining how to approve the privileged helper",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erlaube oMLX-Hintergrundaktivität in den Systemeinstellungen und versuche es dann erneut."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow oMLX background activity in System Settings, then try again."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Consenti l'attività in background di oMLX in Impostazioni di Sistema, poi riprova."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "システム設定で oMLX のバックグラウンド実行を許可してから、もう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시스템 설정에서 oMLX의 백그라운드 활동을 허용한 후 다시 시도하세요."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разрешите фоновую активность oMLX в системных настройках, затем повторите попытку."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请在系统设置中允许 oMLX 的后台活动，然后重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "請在系統設定中允許 oMLX 的背景活動，然後重試。"
+          }
+        }
+      }
+    },
+    "security.secure_server.approval.open" : {
+      "comment" : "Button that opens the Login Items pane in System Settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Systemeinstellungen öffnen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open System Settings"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apri Impostazioni di Sistema"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "システム設定を開く"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시스템 설정 열기"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Открыть системные настройки"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开系统设置"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打開系統設定"
+          }
+        }
+      }
+    },
+    "security.secure_server.error.label" : {
+      "comment" : "Row label for a secure server error",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server"
+          }
+        }
+      }
+    },
+    "security.secure_server.error.cancelled" : {
+      "comment" : "Shown when the admin password dialog is dismissed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Administrator-Authentifizierung wurde abgebrochen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Administrator authorization was cancelled."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L'autorizzazione amministratore è stata annullata."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "管理者の認証がキャンセルされました。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "관리자 인증이 취소되었습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Авторизация администратора отменена."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "管理员授权已取消。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "管理員授權已取消。"
+          }
+        }
+      }
+    },
+    "security.secure_server.error.authorization_failed" : {
+      "comment" : "Shown when authorization fails before reaching the helper",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Administrator-Authentifizierung fehlgeschlagen. Die Secure-Server-Einstellung wurde nicht geändert."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Administrator authorization failed. The Secure Server setting was not changed."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Autorizzazione amministratore non riuscita. L'impostazione Secure Server non è stata modificata."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "管理者の認証に失敗しました。Secure Server の設定は変更されていません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "관리자 인증에 실패했습니다. Secure Server 설정은 변경되지 않았습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось получить авторизацию администратора. Настройка Secure Server не изменена."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "管理员授权失败。Secure Server 设置未更改。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "管理員授權失敗。Secure Server 設定未變更。"
+          }
+        }
+      }
+    },
+    "security.secure_server.error.helper_unavailable" : {
+      "comment" : "Shown when the privileged helper cannot be reached",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Secure-Server-Helfer läuft nicht. Genehmige ihn in den Systemeinstellungen und versuche es dann erneut."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Secure Server helper is not running. Approve it in System Settings, then try again."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L'helper Secure Server non è in esecuzione. Approvalo in Impostazioni di Sistema, poi riprova."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server ヘルパーが実行されていません。システム設定で承認してから、もう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server 도우미가 실행 중이 아닙니다. 시스템 설정에서 승인한 후 다시 시도하세요."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Помощник Secure Server не запущен. Разрешите его в системных настройках и повторите попытку."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server 助手未在运行。请在系统设置中批准它，然后重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server 助手未在執行。請在系統設定中核准它，然後重試。"
+          }
+        }
+      }
+    },
+    "security.secure_server.error.rejected" : {
+      "comment" : "Fallback error when the helper rejects a change",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Secure-Server-Helfer hat die Änderung abgelehnt."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Secure Server helper refused the change."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L'helper Secure Server ha rifiutato la modifica."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server ヘルパーが変更を拒否しました。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server 도우미가 변경을 거부했습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Помощник Secure Server отклонил изменение."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server 助手拒绝了此次更改。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Secure Server 助手拒絕了此次變更。"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

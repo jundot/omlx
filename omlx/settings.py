@@ -54,6 +54,18 @@ BASE_PATH_BOOTSTRAP_FILE = (
 )
 
 
+def settings_path(base_path: Path) -> Path:
+    """Path of ``settings.json`` for this process.
+
+    ``OMLX_SETTINGS_FILE`` redirects just that file, for a process that must not
+    write into the data directory it was pointed at: the sandboxed server keeps its
+    own copy, so a save there never turns the file the desktop app reads into one
+    that belongs to another account.
+    """
+    override = os.environ.get("OMLX_SETTINGS_FILE")
+    return Path(override).expanduser() if override else base_path / "settings.json"
+
+
 def resolve_default_base_path() -> Path:
     """
     Resolve the base path to use when none was passed explicitly.
@@ -1192,7 +1204,7 @@ class GlobalSettings:
         settings = cls(base_path=resolved_base)
 
         # Load from file if exists
-        settings_file = resolved_base / "settings.json"
+        settings_file = settings_path(resolved_base)
         if settings_file.exists():
             settings._load_from_file(settings_file)
             logger.debug(f"Loaded settings from {settings_file}")
@@ -1644,7 +1656,7 @@ class GlobalSettings:
 
     def ensure_inference_auth_setting(self) -> None:
         """Add the opt-in default without persisting runtime overrides."""
-        path = self.base_path / "settings.json"
+        path = settings_path(self.base_path)
         data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         auth = data.setdefault("auth", {})
         if "allow_unauthenticated_inference" in auth:
@@ -1654,7 +1666,7 @@ class GlobalSettings:
         self._save_data(data)
 
     def _save_data(self, data: dict[str, Any]) -> None:
-        settings_file = self.base_path / "settings.json"
+        settings_file = settings_path(self.base_path)
         # Write to a temp file and rename so a crash or a concurrent
         # writer can never leave a torn settings.json (same pattern as
         # ModelSettingsManager._save). The rename also carries the temp
@@ -1683,7 +1695,7 @@ class GlobalSettings:
     def save_cli_overrides(self, args: Any) -> list[str]:
         """Persist explicit non-secret CLI configuration without freezing env state."""
         persisted = type(self)(base_path=self.base_path)
-        settings_file = self.base_path / "settings.json"
+        settings_file = settings_path(self.base_path)
         if settings_file.exists():
             persisted._load_from_file(settings_file)
         before = persisted.to_dict()

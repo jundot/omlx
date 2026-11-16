@@ -407,6 +407,8 @@ Set the main API key before changing the server host to a LAN address or `0.0.0.
 
 For keyless inference on a network bind, turn on "Allow inference without API key" in the web admin settings or the Security screen of the macOS app. It sets `auth.allow_unauthenticated_inference`, defaults to `false`, and applies without a restart. This allows anyone who can reach the server to use inference (including stored Responses and audio), MCP tools, and web search. Management endpoints still require the main API key or an admin login.
 
+**Secure Server** (macOS app → Security) runs the oMLX server as its own macOS account with no network access of its own: a `pf` anchor scoped to that account drops everything it sends or receives except loopback, so a model cannot be downloaded from the admin panel and nothing phones home, while the rest of the Mac keeps its network. Turning the mode on or off requires an administrator. See [Secure Server](docs/secure-server.md). It needs a small privileged helper, approved once by macOS, because loading firewall rules, creating the dedicated account and setting the server's uid at launch are root-only operations; the switch performs the whole setup.
+
 <details>
 <summary>Architecture</summary>
 
