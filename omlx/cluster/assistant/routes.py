@@ -1036,6 +1036,17 @@ def _run_probes(
         profile = calibrations.get(str(payload.get("node_id") or ""))
         payload["calibration"] = None if profile is None else profile.to_dict()
 
+    # The calibration just loaded and released a checkpoint on those Macs, and
+    # the freed bytes do not go back to the OS immediately (mlx keeps them in the
+    # process). The launcher charges the *dynamic* ceiling it reads at load time,
+    # so a plan priced from the probe taken before the calibration is refused at
+    # start — measured live 2026-11-16: 47.8 GiB needed against 45.4 GiB
+    # admitted, four minutes later, on a Mac that showed 55.4 GiB idle.
+    # Re-probe now and keep the smaller capacity: the plan must be priced against
+    # what the launch will actually see.
+    if calibrations:
+        _reprice_after_calibration(probes, request, payloads)
+
     measurement = measure_budget_payloads(payloads, measured_at=measurement_timestamp())
     if warnings:
         measurement = replace(
@@ -1174,6 +1185,54 @@ def _stored_performance_profiles(
         if profile.node_id == node_id:
             profiles[node_id] = profile
     return profiles
+
+
+def _reprice_after_calibration(
+    probes: MeasureProbes,
+    request: AssistantMeasureRequest,
+    payloads: list[dict[str, Any]],
+) -> None:
+    """Lower each calibrated Mac's budget to its post-calibration ceiling.
+
+    Never raises the number: a Mac that shows *more* room after the calibration
+    keeps the conservative figure the plan was already built from, so this can
+    only make a plan safer. A failed re-probe leaves the payload untouched.
+    """
+
+    roles = {node.node_id.strip(): node for node in request.nodes}
+    for payload in payloads:
+        node_id = str(payload.get("node_id") or "")
+        node = roles.get(node_id)
+        if node is None:
+            continue
+        if payload.get("calibration") is None:
+            # Only a Mac that actually ran the calibration changed its ceiling.
+            continue
+        ssh = str(payload.get("ssh") or "").strip()
+        local = ssh in _LOCAL_SSH_TARGETS
+        try:
+            fresh = (
+                0
+                if local
+                else int(
+                    probes.admission_ceiling(
+                        ssh, python_executable=node.python_executable
+                    )
+                )
+            )
+            budget = probes.budget(
+                role=str(payload.get("role") or "headless"),
+                ssh_target=ssh,
+                capacity_bytes=fresh,
+                capacity_source=None if local else "admission_ceiling",
+            )
+        except Exception:  # noqa: BLE001 - a failed re-probe keeps the old number
+            continue
+        current = int(payload.get("capacity_bytes") or 0)
+        candidate = int(getattr(budget, "capacity_bytes", 0) or 0)
+        if current > 0 and candidate >= current:
+            continue
+        payload.update(budget.to_dict())
 
 
 def _measure_calibrations(

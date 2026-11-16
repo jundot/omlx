@@ -259,6 +259,70 @@ def facts_by_node(store: MeasurementStore, measurement_id: str) -> dict[str, Any
 # ---------------------------------------------------------------------------
 
 
+def test_a_calibrated_mac_is_repriced_to_its_post_calibration_ceiling() -> None:
+    """The launch charges the dynamic ceiling; the calibration lowers it.
+
+    Measured live 2026-11-16: a plan priced 47.8 GiB for a Mac that then admitted
+    45.4 GiB, four minutes after the measurement had read 55.4 GiB — because the
+    calibration checkpoint had been loaded and released, and the freed bytes stay
+    in the process. The measurement now re-probes after the calibration and keeps
+    the smaller capacity.
+    """
+    from types import SimpleNamespace
+
+    from omlx.cluster.assistant import routes as assistant_routes
+
+    class FakeProbes:
+        def __init__(self, ceiling: int) -> None:
+            self.ceiling = ceiling
+
+        def admission_ceiling(self, ssh, python_executable=None) -> int:
+            return int(self.ceiling)
+
+        def budget(self, *, role, ssh_target, capacity_bytes, capacity_source=None):
+            return NodeBudgetSuggestion(
+                capacity_bytes=capacity_bytes,
+                reserve_bytes=0,
+                role=role,
+                capacity_source=capacity_source or "",
+            )
+
+    request = SimpleNamespace(
+        nodes=[SimpleNamespace(node_id="m1", ssh=SSH["m1"], python_executable="")]
+    )
+
+    def payload(calibration):
+        return {
+            "node_id": "m1",
+            "ssh": SSH["m1"],
+            "role": "headless",
+            "capacity_bytes": 55 * GIB,
+            "reserve_bytes": GIB,
+            "calibration": calibration,
+        }
+
+    # A calibrated Mac whose ceiling dropped is re-priced to the lower number.
+    lowered = [payload({"decode_tok_per_s": 500.0})]
+    assistant_routes._reprice_after_calibration(
+        FakeProbes(46 * GIB), request, lowered
+    )
+    assert lowered[0]["capacity_bytes"] == 46 * GIB
+
+    # No calibration, no re-price.
+    untouched = [payload(None)]
+    assistant_routes._reprice_after_calibration(
+        FakeProbes(46 * GIB), request, untouched
+    )
+    assert untouched[0]["capacity_bytes"] == 55 * GIB
+
+    # A ceiling that came back *higher* never raises the plan's number.
+    higher = [payload({"decode_tok_per_s": 500.0})]
+    assistant_routes._reprice_after_calibration(
+        FakeProbes(60 * GIB), request, higher
+    )
+    assert higher[0]["capacity_bytes"] == 55 * GIB
+
+
 def test_the_measurement_releases_the_calibration_model_it_loaded(
     client, monkeypatch
 ) -> None:
