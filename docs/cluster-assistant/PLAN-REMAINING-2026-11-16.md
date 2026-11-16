@@ -187,14 +187,25 @@ Each item gets its own `PHASE-2B-RUN.md` section. Evidence from before the
 Only after Phase 1 (the roadmap order: acceptance first, PRs second).
 
 - [ ] **3.1 Fold once**
+      Measured 2026-11-16 with a throwaway worktree: the merge reports **76
+      conflicts** — 11 i18n JSON files, `tailwind.css`, `cluster_v2.js`, the
+      template, the three UI test files, `CLUSTER-ASSISTANT.md`/`AGENTS.md`
+      (add/add), `omlx/cluster/assistant/*` (add/add) and the assistant's
+      models/routes. They are all **"this branch is newer"**: `rebase/upstream-main`
+      already contains everything the series has plus the acceptance work, so the
+      resolution rule is one line, not 76 decisions:
       ```sh
       git switch feat/cluster-assistant-run
       git merge --no-ff rebase/upstream-main
-      # conflicts: AGENTS.md, cluster_v2.js, template, models.py, routes.py
-      # → resolve toward this branch (main is newer)
+      git diff --name-only --diff-filter=U | xargs git checkout --theirs --
+      git add -A && git commit --no-edit          # merge commits keep --theirs content
       git switch feat/cluster-assistant-run-local
-      git rebase feat/cluster-assistant-run
+      git rebase feat/cluster-assistant-run       # expect the same, take the newer side
       ```
+      `--theirs` in a merge is `rebase/upstream-main`; verify with
+      `git diff --stat rebase/upstream-main` after the commit (expect empty) and
+      then run §3.2's gates. Clean up the throwaway worktree anyway:
+      `git worktree remove <dir> && git worktree prune`.
 - [ ] **3.2 Re-run gates on the folded branches**: `uv run pytest tests -q`,
       `uv run pytest apps/omlx-web/tests -q`,
       `uv run pytest apps/omlx-mac/Tests/python -q`,
