@@ -20,7 +20,7 @@ EN = json.loads((ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8"))
 
 # The launcher's tools and the command binding each one reveals.
 TOOL_COMMANDS = {
-    "claude": ["claudeCodeCommandDisplay", "claudeDesktopCommand"],
+    "claude": ["claudeCommand", "claudeCodeCommandDisplay", "claudeDesktopCommand"],
     "codex": ["codexCommand", "codexAppCommand"],
     "dsh": ["dshCommand"],
     "opencode": ["opencodeCommand"],

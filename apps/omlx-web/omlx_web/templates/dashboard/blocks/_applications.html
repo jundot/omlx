@@ -6,8 +6,8 @@
 {% macro copy_button(command) %}
 <button type="button" x-data="{ copied: false }"
         @click="copyToClipboard({{ command }}); copied = true; setTimeout(() => copied = false, 2000)"
-        class="shrink-0 rounded-md p-1.5 text-neutral-400 transition-colors hover:bg-neutral-100 hover:text-neutral-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900"
-        :class="copied ? 'text-green-600' : ''"
+        class="shrink-0 rounded-md p-1.5 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900"
+        :class="copied ? 'text-green-600' : 'text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700'"
         :title="window.t('status.integrations.copy_command_tooltip')"
         :aria-label="window.t('status.integrations.copy_command_tooltip')">
     <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
@@ -111,6 +111,7 @@
             <!-- Claude Code: the settings the tool needs to talk to oMLX. -->
             <div data-tool-panel="claude" id="integration-panel-claude" x-show="tool === 'claude'" class="space-y-3">
                 {{ panel_head('claude.png', t('status.integrations.claude_code')) }}
+                {{ command_bar('claudeCommand') }}
 
                 <div class="flex flex-col gap-3 sm:flex-row sm:items-start">
                     <div class="sm:w-44 sm:shrink-0">
@@ -148,8 +149,8 @@
                     </div>
                 </div>
 
-                <!-- Claude Desktop tier aliases. -->
-                <div class="border-t border-neutral-200 pt-3">
+                <!-- Claude Desktop aliases the Local-mode tiers. -->
+                <div x-show="globalSettings.claude_code.mode === 'local'" x-cloak class="border-t border-neutral-200 pt-3">
                     <div class="flex flex-wrap items-center gap-2.5">
                         <button type="button" role="switch"
                                 aria-label="{{ t('status.claude_code.desktop') }}"

@@ -4684,6 +4684,10 @@
                 return `${cli} launch ${tool}`;
             },
 
+            get claudeCommand() {
+                return this._launchCmd('claude');
+            },
+
             get claudeDesktopCommand() {
                 return this._launchCmd('claude_desktop');
             },
