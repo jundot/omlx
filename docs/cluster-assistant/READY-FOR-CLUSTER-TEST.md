@@ -4,6 +4,28 @@ State of the fork after the full-suite pass, the PR review fixes and the local
 end-to-end runs. Everything below is measured, not assumed. Read
 [`CLUSTER-TEST-RUNBOOK.md`](CLUSTER-TEST-RUNBOOK.md) before touching the Macs.
 
+## 0. Update 2026-11-16 — assistant UI (U1–U6) and a new DMG
+
+- `rebase/upstream-main` @ **`0c6e7479`** (`feat(cluster): one assistant flow
+  with a UI render-mode (U1-U6)`), `upstream/main` `624cff0e` still an ancestor.
+- The Cluster tab is now one flow: one `data-assistant-screen` per assistant
+  state, `Assistant / Manual setup` mode split, failure-owns-the-card,
+  choose/stale/back and in-place start retry. No backend route, state, poll or
+  SSE added. Spec `ASSISTANT-UI-SPEC-2026-11-16.md`, log
+  `ASSISTANT-UI-IMPLEMENTATION-PLAN-2026-11-16.md`, PR handoff
+  `PR-READY-2026-11-16.md`.
+- Suites with this change: `apps/omlx-web/tests` **578 passed / 3 deselected**
+  (focused three files 289), `tests/cluster_assistant` **658 passed**;
+  `make web` is a no-op.
+- New artefact: `build/oMLX-0.8.0rc1.dmg`, 79 MB, SHA256
+  `9400d290041ce80aa6a3dc84bd919884ec9f38a7d99ffd76c58e37879942d36c`,
+  Developer-ID signed, notarized and stapled (`hdiutil verify` VALID,
+  `spctl` accepted / Notarized Developer ID), built by
+  `scripts/build-release-dmg.sh` (no staged app copies left behind).
+- Still open before the PRs: fold into `feat/cluster-assistant-run` (+
+  `-run-local` rebase), the live A1–A7 acceptance run, and the screenshot
+  review — all three are listed in `PR-READY-2026-11-16.md` §5.
+
 ## 1. Clean state
 
 - Working tree clean, `rebase/upstream-main` @ `7f9c120f`, `upstream/main`
