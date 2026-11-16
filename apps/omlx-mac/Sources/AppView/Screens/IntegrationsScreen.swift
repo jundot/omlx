@@ -825,6 +825,9 @@ private struct ClaudeApplicationPanel: View {
         FreeRow {
             ApplicationPanelHead(tool: .claude)
         }
+        FreeRow {
+            CommandBlock(command: vm.claudeLaunchCommand)
+        }
         Row(label: modeLabel) {
             Segmented(
                 selection: vm.bind($vm.claudeMode, save: {
@@ -869,7 +872,7 @@ private struct ClaudeApplicationPanel: View {
                 )
             }
         }
-        FreeRow {
+        FreeRow(isLast: vm.claudeMode != "local") {
             VStack(alignment: .leading, spacing: 6) {
                 CommandBlock(command: vm.claudeEnvRecipeDisplay,
                              copyValue: vm.claudeEnvRecipe)
@@ -879,17 +882,20 @@ private struct ClaudeApplicationPanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        Row(label: desktopLabel, sublabel: desktopSublabel, isLast: !vm.desktopEnabled) {
-            Toggle("", isOn: vm.bind($vm.desktopEnabled, save: {
-                Task { await vm.save(.desktopEnabled, client: client) }
-            }))
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .accessibilityLabel(Text(desktopLabel))
-        }
-        if vm.desktopEnabled {
-            FreeRow(isLast: true) {
-                CommandBlock(command: vm.claudeDesktopLaunchCommand, caption: desktopLabel)
+        // Claude Desktop aliases the tier models, which exist only in Local mode.
+        if vm.claudeMode == "local" {
+            Row(label: desktopLabel, sublabel: desktopSublabel, isLast: !vm.desktopEnabled) {
+                Toggle("", isOn: vm.bind($vm.desktopEnabled, save: {
+                    Task { await vm.save(.desktopEnabled, client: client) }
+                }))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .accessibilityLabel(Text(desktopLabel))
+            }
+            if vm.desktopEnabled {
+                FreeRow(isLast: true) {
+                    CommandBlock(command: vm.claudeDesktopLaunchCommand, caption: desktopLabel)
+                }
             }
         }
     }
