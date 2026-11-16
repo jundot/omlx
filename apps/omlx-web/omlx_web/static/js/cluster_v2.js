@@ -454,9 +454,6 @@ function clusterV2Wizard() {
             freeSpaceError: '',
             warnings: [],
             error: null,
-            // The failed screen's raw payload is collapsed by default; the
-            // "diagnostics" action unfolds it without dropping the message.
-            assistantFailureOpen: false,
             // Which tradeoff the user picked on the plan screen (null = the
             // quality-first plan). Declared here so every screen reads the same
             // field; apply resolves it through assistantPlanSource().
@@ -564,6 +561,12 @@ function clusterV2Wizard() {
         // anything is measured or planned. The frozen plan inputs stay untouched
         // until Confirm.
         assistantChooseOpen: false,
+        // The failed screen's raw payload details are collapsed by default.
+        // Top-level on purpose: the template binds it bare (:open=) and the
+        // methods write this.assistantFailureOpen — declaring it only inside
+        // the assistant sub-object left it undefined at first render and the
+        // page threw one ReferenceError on every load (measured 2026-11-16).
+        assistantFailureOpen: false,
         assistantChooseDraft: null,
 
         // ---- plan ------------------------------------------------------------
@@ -660,6 +663,15 @@ function clusterV2Wizard() {
         cudaFabricMemberA: '',
         cudaFabricMemberB: '',
         rdmaLinks: { loading: false, verifying: '', error: '', data: null },
+
+        // CUDA pairing guide (upstream #5163). The rebase merge dropped these
+        // fields while keeping the template's bindings — every Alpine flush
+        // then threw a ReferenceError and poisoned the scheduler queue, so
+        // the manual wizard's x-show sections froze after the first render
+        // (measured live 2026-11-16: stuck on "Looking for other Macs…").
+        cudaGuideOpen: false,
+        cudaGuideOs: 'linux',
+        cudaGuideCopied: '',
 
         // ---- feedback ----------------------------------------------------------
         toasts: [],
