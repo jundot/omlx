@@ -1125,12 +1125,18 @@ inline void gguf_block8(const device uchar* b, uint k, thread float* v,
     }
 }
 
-template <int K, int ROWS, int NB, int QT, int BLOCK, int BYTES, bool MAPPED = false, typename W, typename X>
+template <int K, int ROWS, int NB, int QT, int BLOCK, int BYTES, bool MAPPED = false, int SPLIT = 1, typename W, typename X>
 inline void gguf_rows_nb(W w, uint row0, X x, uint xs, uint lane, thread float* acc,
                          uint2 routes = uint2(0), uint divisor = 1) {
     static_assert(!MAPPED || NB == 2, "mapped routes hold two vectors");
     // Reuse decoded weights while preserving each vector's original dot-product order.
-    for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
+    // Two accumulator chains halve the dependent-FMA latency of the one-vector
+    // routed rows. The per-vector order is unchanged, so every width matches.
+    float acc2[SPLIT == 2 ? ROWS * NB : 1];
+    for (int i = 0; i < ROWS * NB; ++i) {
+        acc[i] = 0.0f;
+        if constexpr (SPLIT == 2) acc2[i] = 0.0f;
+    }
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float xv[NB][8];
         for (int b = 0; b < NB; ++b) {
@@ -1141,11 +1147,18 @@ inline void gguf_rows_nb(W w, uint row0, X x, uint xs, uint lane, thread float* 
             const device uchar* p = reinterpret_cast<const device uchar*>(w) + (size_t(row0 + r) * (K / BLOCK) + k / BLOCK) * BYTES;
             float v[8];
             gguf_decode8<QT>(p, k % BLOCK, v);
-            for (int b = 0; b < NB; ++b)
-                for (int j = 0; j < 8; ++j) acc[r * NB + b] += v[j] * xv[b][j];
+            for (int b = 0; b < NB; ++b) {
+                if constexpr (SPLIT == 2) {
+                    for (int j = 0; j < 4; ++j) acc[r * NB + b] += v[j] * xv[b][j];
+                    for (int j = 4; j < 8; ++j) acc2[r * NB + b] += v[j] * xv[b][j];
+                } else {
+                    for (int j = 0; j < 8; ++j) acc[r * NB + b] += v[j] * xv[b][j];
+                }
+            }
         }
     }
-    for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
+    for (int i = 0; i < ROWS * NB; ++i)
+        acc[i] = simd_sum(SPLIT == 2 ? acc[i] + acc2[i] : acc[i]);
 }
 
 template <int K, int KS, int NB, int QT, int BLOCK, int BYTES, typename W, typename X>

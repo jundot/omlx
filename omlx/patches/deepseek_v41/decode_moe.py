@@ -1044,13 +1044,15 @@ def format_macros(roles):
             block, size, _ = FORMATS[bits]
             wpr, spr = f"((K_) / {block} * {size})", "0"
             args = f"{bits}, {block}, {size}"
-            rows = f"gguf_rows_nb<K_, R_, 1, {args}>(w_, r0_, x_, K_, l_, acc_)"
+            # Routed rows split each vector's sum over two chains; the shared
+            # _ROWS_NB path keeps one so every width stays bitwise consistent.
+            rows = f"gguf_rows_nb<K_, R_, 1, {args}, false, 2>(w_, r0_, x_, K_, l_, acc_)"
             nb = f"gguf_rows_nb<K_, R_, NB_, {args}>(w_, r0_, x_, xs_, l_, acc_)"
             mma = f"gguf_mma8<K_, KS_, NB_, {args}>(w_, r0_, x_, xs_, l_, ks_, red_, tile_)"
             mma16 = f"gguf_mma16<K_, KS_, NB_, {args}>(w_, r0_, x_, xs_, l_, ks_, red_, t0_, t1_)"
             lines.append(
                 f"#define {role}_ROWS_PAIR(K_, R_, w_, s_, b_, r0_, x_, xs_, l_, acc_, routes_, div_) "
-                f"gguf_rows_nb<K_, R_, 2, {args}, true>(w_, r0_, x_, xs_, l_, acc_, routes_, div_)"
+                f"gguf_rows_nb<K_, R_, 2, {args}, true, 2>(w_, r0_, x_, xs_, l_, acc_, routes_, div_)"
             )
         elif mode == "affine":
             # Masked terms for 3 and 5 bits (codes straddle bytes), shifts otherwise.
