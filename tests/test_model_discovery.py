@@ -165,6 +165,25 @@ class TestDetectModelType:
 
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_nemotron_parse_vlm_without_vision_config(self, tmp_path):
+        """Nemotron 3.5 Parse carries encoder/decoder sections, no vision_config.
+
+        mlx-vlm supplies the vision defaults itself, so the model must still go
+        to the VLM engine (#5008).
+        """
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "nemotron_parse_v3_5",
+                    "architectures": ["RadioMBartPrefixForCausalLM"],
+                    "encoder": {"hidden_size": 1152},
+                    "decoder": {"hidden_size": 1024},
+                }
+            )
+        )
+
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_embedding_model_by_type(self, tmp_path):
         """Test detection of embedding model by model_type."""
         config = {
