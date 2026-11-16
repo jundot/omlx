@@ -414,6 +414,36 @@ def test_store_after_a_restore_cuts_only_the_new_tokens(manager_factory, stored)
         assert mx.array_equal(expected, actual).item()
 
 
+def test_prefix_copy_holds_only_the_unstored_head(manager_factory):
+    """The system-prefix store copies only the head past its stored grid."""
+    manager, prefix, affine, dense_state, payload = _two_layer_store(manager_factory)
+    tokens = list(range(10))
+    head = prefix.copy_payload_prefix(payload(), 10, start=8)
+    assert head is not None
+    assert all(layer["token_base"] == 8 for layer in head)
+    assert head[0]["state"][0].norms.shape[2] == 2
+    assert head[1]["state"][0].shape[2] == 2
+    table, _ = prefix.fetch_cache("sys", tokens[:8])
+    assert table is not None and table.num_tokens == 8
+    assert prefix.store_cache("sys", tokens, head) is not None
+    prefix.release_cache("sys")
+    manager.close()
+
+    table, remaining = prefix.fetch_cache("check", tokens + [99])
+    assert table is not None and table.num_tokens == 8 and remaining == [8, 9, 99]
+
+
+def test_prefix_copy_from_zero_has_no_base(manager_factory):
+    manager, prefix, _, dense_state, payload = _two_layer_store(manager_factory)
+    head = prefix.copy_payload_prefix(payload(), 6)
+    assert head is not None and all("token_base" not in layer for layer in head)
+    assert head[1]["state"][0].shape[2] == 6
+    for expected, actual in zip(dense_state, head[1]["state"]):
+        assert mx.array_equal(expected[:, :, :6, :], actual).item()
+    assert prefix.copy_payload_prefix(payload(), 6, start=6) is None
+    manager.close()
+
+
 def test_cut_payload_is_not_stored_without_its_prefix(manager_factory):
     """If the block table lost the prefix, the cut payload stores nothing."""
     manager, prefix, _, _, payload = _two_layer_store(manager_factory)

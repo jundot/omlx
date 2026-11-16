@@ -3267,6 +3267,69 @@ class BlockAwarePrefixCache(CacheManager):
             tokens -= last.token_count
         return max(0, tokens)
 
+    def copy_payload_prefix(
+        self, cache_data: list[Any], end: int, start: int = 0
+    ) -> list[Any] | None:
+        """A copy of tokens ``[start, end)`` of a store payload's attention layers.
+
+        The system-prefix store slices the head of the same payload the main
+        store uses; with its own copy of that head the main payload can be cut
+        to its tail (trim_store_payload). ``start`` is the block-aligned part
+        already stored, recorded as ``token_base`` like trim_store_payload does,
+        so a long shared prefix costs only its last block. Other layers are
+        shared. Returns None for a layout this does not handle.
+        """
+        if (
+            not HAS_MLX
+            or not isinstance(cache_data, list)
+            or end <= 0
+            or not 0 <= start < end
+        ):
+            return None
+        from ..turboquant_kv import _copy_state, _slice_state_range, _state_length
+
+        out = []
+        for layer in cache_data:
+            if not isinstance(layer, dict) or "state" not in layer:
+                return None
+            name = layer.get("class_name") or layer.get("cache_type") or "KVCache"
+            state = layer["state"]
+            if name in _PACKED_CACHE_TYPES:
+                if not isinstance(state, (list, tuple)) or len(state) != 2:
+                    return None
+                ks, vs = (getattr(st, "_state", st) for st in state)
+                if _state_length(ks) < end:
+                    return None
+                copied = dict(layer)
+                copied["state"] = (
+                    _copy_state(_slice_state_range(ks, start, end)),
+                    _copy_state(_slice_state_range(vs, start, end)),
+                )
+                if start:
+                    copied["token_base"] = start
+                out.append(copied)
+                continue
+            handler = CacheTypeRegistry.get_handler_by_class_name(name)
+            if not handler.supports_block_slicing:
+                out.append(layer)
+                continue
+            if (
+                not isinstance(state, (list, tuple))
+                or len(state) != 2
+                or not all(isinstance(st, mx.array) and st.ndim == 4 for st in state)
+                or state[0].shape[2] < end
+            ):
+                return None
+            copied = dict(layer)
+            copied["state"] = (
+                mx.contiguous(state[0][:, :, start:end, :]),
+                mx.contiguous(state[1][:, :, start:end, :]),
+            )
+            if start:
+                copied["token_base"] = start
+            out.append(copied)
+        return out
+
     def trim_store_payload(self, request_id: str, cache_data: list[Any]) -> int:
         """Cut the attention layers of a store payload to the tokens not stored yet.
 
