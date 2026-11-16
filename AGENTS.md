@@ -802,8 +802,13 @@ The cluster may be offline. Do not assume it is available.
 | `172.16.1.13` | Mac Studio M1 Max | 32 GiB | small candidate, **`headless`** (host `MacStudio-von-Andreas-2`) |
 | `172.16.1.14` | Mac Studio M1 Max | 32 GiB | **reassigned 2026-11-16: never cleaned/paired/measured**, its own oMLX app; it also carries the E001 research app by owner request. **Not part of the cluster: verified unpaired on 2026-11-16** (`.11`/`.12`/`.13` know only each other; `.14`'s `~/.omlx/cluster` holds just `identity.json`) |
 
-Measured 2026-11-16 from the pairing records: `.12` is the M2 Ultra (64 GiB), `.13`
-the M1 Max (32 GiB) — the earlier table had the two swapped. A Mac under 64 GiB
+Measured 2026-11-16 from the pairing records and each Mac's own hostname: `.12` is
+the M2 Ultra (64 GiB), `.13` the M1 Max (32 GiB) — the earlier table had the two
+swapped. **`.13` and `.14` share the base name `MacStudio-von-Andreas`; macOS put
+the `-2` on `.13`** (`scutil --get LocalHostName` = `MacStudio-von-Andreas-2` on
+`172.16.1.13`, `MacStudio-von-Andreas` on `172.16.1.14`). A friendly name is
+therefore not an identity in the cluster UI — identify by `node_id` (`.11`
+`cbc6af36`, `.12` `9078f858`, `.13` `2dd48599`, `.14` `8092d5d1`). A Mac under 64 GiB
 installed RAM is **headless** (the workstation reserve would starve it).
 
 Never copy API keys or model data into this repository.
