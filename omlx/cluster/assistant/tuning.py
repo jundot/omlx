@@ -80,7 +80,7 @@ def preset_key(model_signature: str, hardware_key: str) -> str:
     tuning.hardware_key rule), so both parts are hashed into the key.
     """
 
-    raw = f"{model_signature}|{hardware_key}".encode("utf-8")
+    raw = f"{model_signature}|{hardware_key}".encode()
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
