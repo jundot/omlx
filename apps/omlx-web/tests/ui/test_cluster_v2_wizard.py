@@ -1588,7 +1588,8 @@ def test_add_by_ip_validates_then_offers_the_join_flow():
     assert "submitManualPeer" in javascript
     assert "/api/cluster/devices/manual" in javascript
     # Client-side validation before any request leaves: IPv4 + optional port.
-    assert re.search(r"\^\(\\d\{1,3\}\(\?:\\\.\\d\{1,3\}\)\{3\}", javascript)
+    assert re.search(r"\^\(\?<host>\\d\{1,3\}\(\?:\\\.\\d\{1,3\}\)\{3\}", javascript)
+    assert "match.groups.host" in javascript
     assert "port >= 1 && port <= 65535" in javascript
     # A verified address flows straight into the joiner code panel (one click).
     assert "beginJoinAddr(`${ip}:${port}`" in javascript
@@ -1715,7 +1716,8 @@ def test_fit_failure_banner_is_actionable_and_never_silent():
     assert "data-cluster-v2-fit-switch-headless" in template
     assert "cluster.v2.plan.switch_headless" in template
     assert "parseFitFailure" in javascript
-    assert r"at least (\d+) additional bytes" in javascript
+    assert r"at least (?<bytes>\d+) additional bytes" in javascript
+    assert "match.groups.bytes" in javascript
     assert "canFixWithHeadless" in javascript
     # The all-headless flip exists only as the click handler — runPlan parses
     # the failure but never mutates nodeRoles itself.
@@ -3708,7 +3710,8 @@ def test_assistant_search_is_single_flight_generation_guarded_and_measured_only(
     assert "this.assistant.search.busy" in block
     assert "assistantRunning()" in block
     # Generation guard mirrors the polls; a stale answer is dropped.
-    assert "++this.assistant.generation" in block
+    assert "this.assistant.generation += 1;" in block
+    assert "const generation = this.assistant.generation;" in block
     assert "generation !== this.assistant.generation" in block
     # The search is a background job: POST returns a handle, then the UI polls
     # searchStatus(jobId) until the job completes (generation-guarded).

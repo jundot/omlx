@@ -7,9 +7,18 @@ insert_final_newline = true
 trim_trailing_whitespace = true
 indent_style = space
 indent_size = 4
+max_line_length = 120
 
-[*.{js,json,jsonc,yml,yaml,css,html,md}]
+# Data, stylesheet and documentation files use 2 spaces. JavaScript, HTML and
+# Swift are 4-space throughout this repository (dashboard.js, cluster_v2.js, the
+# dashboard templates, the macOS app), so they stay on the [*] default.
+[*.{json,jsonc,yml,yaml,css,md}]
 indent_size = 2
+
+# The Cluster UI's hand-written JS uses a 4-space continuation indent (not the
+# 8-space IntelliJ default), which is what the existing files already follow.
+[*.js]
+ij_continuation_indent_size = 4
 
 [Makefile]
 indent_style = tab

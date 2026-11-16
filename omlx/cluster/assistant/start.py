@@ -292,7 +292,7 @@ def coordinator_active_operation(
         return ""
     admin = remote or remote_admin
     try:
-        reply = admin(
+        reply: Any = admin(
             validate_ssh_target(plan.coordinator.ssh),
             port,
             ACTIVE_OPERATION_PATH,

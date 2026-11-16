@@ -288,7 +288,6 @@ def write_model_settings_on_mac(
             "settings cannot be written; measure again",
             ACTION_CONFIGURE_ENDPOINT,
         )
-    model_id = ""
     try:
         if target.local:
             listing = _local_admin(port, MODELS_PATH)

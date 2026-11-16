@@ -1269,7 +1269,7 @@ def _calibration_for_node(
 
 
 def _calibration_entry(
-    inventory: Sequence[Mapping[str, Any]] | None,
+    inventory: Sequence[Any] | None,
 ) -> Mapping[str, Any] | None:
     """The calibration model in one Mac's catalogue, or ``None``.
 
@@ -1463,7 +1463,7 @@ def _disk_free(
             MeasurementWarning(
                 code=WARNING_DISK_FREE_UNREADABLE,
                 node_id=node.node_id,
-                message=(f"free disk space could not be read: {_redacted(exc)}"),
+                message=f"free disk space could not be read: {_redacted(exc)}",
             )
         )
         return None
@@ -1529,7 +1529,7 @@ def _local_endpoint_addresses() -> list[str]:
     try:
         from ..discovery import local_addr_dicts
 
-        rows = local_addr_dicts()
+        rows: list[Any] = local_addr_dicts()
     except Exception:  # discovery is optional for a measurement
         return []
     addresses: list[str] = []
@@ -2418,7 +2418,7 @@ def _coordinator_active_operation(record: OperationRecord) -> str:
     """
 
     try:
-        reply = _coordinator_admin(
+        reply: Any = _coordinator_admin(
             record, ACTIVE_OPERATION_PATH, method="GET", timeout=30.0
         )
     except Exception:  # noqa: BLE001 - unanswerable is not "busy"
@@ -3996,7 +3996,6 @@ async def _run_local_steps(job_id: str, request: AssistantRunLocalRequest) -> No
     while True:
         if _local_run_cancelled(job_id):
             return
-        listing = None
         try:
             listing = await asyncio.to_thread(_local_admin, port, MODELS_PATH)
         except Exception:  # noqa: BLE001 - an unreadable pool is not "loaded"
@@ -4484,9 +4483,7 @@ async def _local_pool_loaded(port: int, model_path: str) -> tuple[bool, str]:
     """
 
     deadline = time.monotonic() + float(LOCAL_RUN_LOAD_TIMEOUT_SECONDS)
-    problem = ""
     while True:
-        listing = None
         try:
             listing = await asyncio.to_thread(_local_admin, port, MODELS_PATH)
         except Exception:  # noqa: BLE001 - an unreadable pool is not "loaded"
@@ -4674,7 +4671,7 @@ async def _local_tune_steps(
         nonlocal done
         _update_local_tune_job(
             tune_job_id,
-            message=(f"measuring {config.label} ({done + 1} of {len(configs)})"),
+            message=f"measuring {config.label} ({done + 1} of {len(configs)})",
         )
         row = await _measure_local_config(port, model_path, model_id, config)
         done += 1

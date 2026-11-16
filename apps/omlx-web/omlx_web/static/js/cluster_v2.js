@@ -837,7 +837,8 @@ function clusterV2Wizard() {
         },
 
         async refreshRuntime() {
-            const revision = ++this.runtimeRevision;
+            this.runtimeRevision += 1;
+            const revision = this.runtimeRevision;
             try {
                 const payload = await this.apiFetch(CLUSTER_V2_API.runtime);
                 if (revision !== this.runtimeRevision) return;
@@ -1771,16 +1772,6 @@ function clusterV2Wizard() {
             }).catch(() => {});
         },
 
-        pairingStepOne(device = this.pairing.target) {
-            // A helper daemon has no screen; its code is in its log.
-            const key = this.deviceHelperOnly(device)
-                ? 'cluster.v2.pairing.step1_helper'
-                : 'cluster.v2.pairing.step1';
-            return window.t(key)
-                .replaceAll('{name}', this.deviceName(device))
-                .replaceAll('{self}', this.deviceName(this.selfDevice()));
-        },
-
         async refreshInvite() {
             try {
                 this.pairInvite = (await this.apiFetch('/api/cluster/pair/invite'))?.invite || null;
@@ -1961,7 +1952,7 @@ function clusterV2Wizard() {
                     let score = 0;
                     const rank = preferred.indexOf(String(addr.if_type || ''));
                     if (rank >= 0) score += 100 - rank;
-                    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) score += 50;
+                    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) score += 50;
                     if (ip.toLowerCase().startsWith('fe80:')) score -= 1000;
                     return { addr, score };
                 })
@@ -1991,7 +1982,8 @@ function clusterV2Wizard() {
 
         async beginJoinAddr(coordinatorAddr, targetName) {
             if (this.join.busy) return;
-            const revision = ++this.joinRevision;
+            this.joinRevision += 1;
+            const revision = this.joinRevision;
             this.join.busy = true;
             try {
                 const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoin, {
@@ -2026,7 +2018,8 @@ function clusterV2Wizard() {
         },
 
         async cancelJoin(options = {}) {
-            const revision = ++this.joinRevision;
+            this.joinRevision += 1;
+            const revision = this.joinRevision;
             this.join.busy = true;
             try {
                 const snapshot = await this.apiFetch(
@@ -2067,7 +2060,8 @@ function clusterV2Wizard() {
                 return;
             }
             this.confirmForgetCleanup = false;
-            const revision = ++this.joinRevision;
+            this.joinRevision += 1;
+            const revision = this.joinRevision;
             this.join.busy = true;
             try {
                 const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoinCleanup, {
@@ -2090,13 +2084,13 @@ function clusterV2Wizard() {
         async submitManualPeer(options = {}) {
             if (this.manualBusy) return;
             const raw = (this.manualAddr || '').trim();
-            const match = raw.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$/);
+            const match = raw.match(/^(?<host>\d{1,3}(?:\.\d{1,3}){3})(?::(?<port>\d{1,5}))?$/);
             if (!match) {
                 this.manualError = window.t('cluster.v2.manual.invalid_addr');
                 return;
             }
-            const ip = match[1];
-            const port = match[2] ? parseInt(match[2], 10) : 8000;
+            const ip = match.groups.host;
+            const port = match.groups.port ? parseInt(match.groups.port, 10) : 8000;
             const octetsOk = ip.split('.').every((part) => Number(part) <= 255);
             if (!octetsOk || !(port >= 1 && port <= 65535)) {
                 this.manualError = window.t('cluster.v2.manual.out_of_range');
@@ -2803,9 +2797,9 @@ function clusterV2Wizard() {
         // guidance instead of a dead end.
         parseFitFailure(message) {
             if (!/per-node budgets/.test(message || '')) return null;
-            const match = /at least (\d+) additional bytes/.exec(message || '');
+            const match = /at least (?<bytes>\d+) additional bytes/.exec(message || '');
             if (!match) return null;
-            const shortfallBytes = Number(match[1]);
+            const shortfallBytes = Number(match.groups.bytes);
             return {
                 shortfallBytes,
                 canFixWithHeadless:
@@ -2908,8 +2902,8 @@ function clusterV2Wizard() {
             }
             if (segments[segments.length - 1] === 'snapshots') segments.pop();
             let name = segments.pop() || raw || window.t('cluster.v2.model.this_model');
-            const hub = /^models--([^/]+?)--(.+)$/.exec(name);
-            if (hub) name = `${hub[1]}/${hub[2]}`;
+            const hub = /^models--(?<org>[^/]+?)--(?<repo>.+)$/.exec(name);
+            if (hub) name = `${hub.groups.org}/${hub.groups.repo}`;
             return name;
         },
 
@@ -3226,7 +3220,8 @@ function clusterV2Wizard() {
 
         async runPlan() {
             if (!this.selectedModelPath || this.planLoading) return null;
-            const revision = ++this.planRequestRevision;
+            this.planRequestRevision += 1;
+            const revision = this.planRequestRevision;
             const previousActivation = this.planProposal?.activation;
             this.planLoading = true;
             this.planError = '';
@@ -3519,7 +3514,8 @@ function clusterV2Wizard() {
         async stageModelToPeers(activation, purpose = 'plan') {
             this.stagingPurpose = purpose;
             this.stopStagingPoll();
-            const generation = ++this.stagingGeneration;
+            this.stagingGeneration += 1;
+            const generation = this.stagingGeneration;
             this.stagingClaimed = false;
             this.stagingJob = null;
             this.stagingError = '';
@@ -4756,12 +4752,14 @@ function clusterV2Wizard() {
             const step = this.assistantFailureStep();
             this.assistant.error = null;
             if (step === 'start') {
-                const generation = ++this.assistant.generation;
+                this.assistant.generation += 1;
+                const generation = this.assistant.generation;
                 return this.runAssistantStart(generation);
             }
             if (step === 'apply') return this.runAssistantApply();
             if (step === 'plan') {
-                const generation = ++this.assistant.generation;
+                this.assistant.generation += 1;
+                const generation = this.assistant.generation;
                 return this.runAssistantPlan(generation);
             }
             return this.startAssistant();
@@ -4967,7 +4965,8 @@ function clusterV2Wizard() {
                 // until plan replaces them, so the downstream rows visibly read
                 // `stale` while the re-measure runs.
                 this.assistant.plan = null;
-                const generation = ++this.assistant.generation;
+                this.assistant.generation += 1;
+                const generation = this.assistant.generation;
                 return this.runAssistantModelMeasure(generation, draft.model_path);
             }
             if (contextChanged) {
@@ -4975,7 +4974,8 @@ function clusterV2Wizard() {
                     draft.context_tokens,
                 );
                 this.targetContextTokens = this.assistant.selectedContextTokens;
-                const generation = ++this.assistant.generation;
+                this.assistant.generation += 1;
+                const generation = this.assistant.generation;
                 return this.runAssistantPlan(generation);
             }
             return null;
@@ -5908,7 +5908,8 @@ function clusterV2Wizard() {
             // busy; a second must not POST the same minutes-long search again.
             if (this.assistantRunning() || this.assistant.search.busy) return null;
             if (!this.assistantSearchAvailable()) return null;
-            const generation = ++this.assistant.generation;
+            this.assistant.generation += 1;
+            const generation = this.assistant.generation;
             this.assistant.search.busy = true;
             this.assistant.busy = true;
             this.assistant.search.error = '';
@@ -6143,7 +6144,8 @@ function clusterV2Wizard() {
             // One generation per job: a late snapshot from a replaced job is
             // dropped instead of overwriting the newer one (pollStagingJob's
             // rule, kept for this job's own loop).
-            const generation = ++job.generation;
+            job.generation += 1;
+            const generation = job.generation;
             job.busy = true;
             job.jobId = '';
             job.state = 'queued';
@@ -6509,7 +6511,8 @@ function clusterV2Wizard() {
             if (this.assistantRunning() || this.assistant.localRun.busy) return null;
             if (!this.assistantLocalRunAvailable()) return null;
             const job = this.assistant.localRun;
-            const generation = ++job.generation;
+            job.generation += 1;
+            const generation = job.generation;
             const single = this.assistantSingleNode();
             const modelPath =
                 this.assistant.selectedModel || this.selectedModelPath;
@@ -6796,7 +6799,8 @@ function clusterV2Wizard() {
             if (tune.busy) return null;
             if (!this.assistantLocalTunable()) return null;
             const localJobId = this.assistant.localRun.jobId;
-            const generation = ++tune.generation;
+            tune.generation += 1;
+            const generation = tune.generation;
             tune.busy = true;
             this.assistant.busy = true;
             tune.jobId = '';
@@ -7021,7 +7025,8 @@ function clusterV2Wizard() {
 
         async runAssistantMeasure() {
             this.stopAssistantPolls();
-            const generation = ++this.assistant.generation;
+            this.assistant.generation += 1;
+            const generation = this.assistant.generation;
             this.resetAssistant();
             this.assistant.state = 'measuring';
             this.assistant.phase = 'recommend';
@@ -7260,7 +7265,8 @@ function clusterV2Wizard() {
                 this.assistant.nodeSelection === 'all' ? 'minimal' : 'all';
             // A fresh generation retires any in-flight answer from the old
             // selection before the new plan is requested.
-            const generation = ++this.assistant.generation;
+            this.assistant.generation += 1;
+            const generation = this.assistant.generation;
             return this.runAssistantPlan(generation);
         },
 
@@ -7320,7 +7326,8 @@ function clusterV2Wizard() {
             this.assistant.confirmTwoMacFallback = true;
             this.assistant.nodeSelection = 'minimal';
             this.assistant.error = null;
-            const generation = ++this.assistant.generation;
+            this.assistant.generation += 1;
+            const generation = this.assistant.generation;
             return this.runAssistantPlan(generation);
         },
 
@@ -7330,7 +7337,8 @@ function clusterV2Wizard() {
             // Start setup re-plans first and the backend's strict match stays
             // the authority.
             if (this.assistantInputsStale()) {
-                const staleGeneration = ++this.assistant.generation;
+                this.assistant.generation += 1;
+                const staleGeneration = this.assistant.generation;
                 return this.runAssistantPlan(staleGeneration);
             }
             const plan = this.assistant.plan;
@@ -7345,7 +7353,8 @@ function clusterV2Wizard() {
                 return null;
             }
             this.stopAssistantPolls();
-            const generation = ++this.assistant.generation;
+            this.assistant.generation += 1;
+            const generation = this.assistant.generation;
             this.assistant.state = 'applying';
             this.assistant.busy = true;
             this.assistant.error = null;
@@ -7889,7 +7898,8 @@ function clusterV2Wizard() {
         // is applied, otherwise re-run apply for the same frozen plan. It never
         // changes coordinator_node and never names this Mac.
         async retryAssistantCoordinator() {
-            const generation = ++this.assistant.generation;
+            this.assistant.generation += 1;
+            const generation = this.assistant.generation;
             this.assistant.error = null;
             if (this.assistant.applyState === 'applied') {
                 await this.runAssistantStart(generation);
@@ -8495,7 +8505,8 @@ function clusterV2Wizard() {
         },
 
         notify(type, message, timeoutMs = 6000) {
-            const id = ++this.toastSeq;
+            this.toastSeq += 1;
+            const id = this.toastSeq;
             this.toasts.push({ id, type, message });
             setTimeout(() => {
                 this.toasts = this.toasts.filter((toast) => toast.id !== id);

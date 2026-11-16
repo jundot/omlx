@@ -1126,7 +1126,7 @@ def _replaced(
 
 
 def _sort_key(record: OperationRecord) -> tuple[str, str]:
-    return (record.created_at, record.operation_id)
+    return record.created_at, record.operation_id
 
 
 def _optional_int(value: Any) -> int | None:

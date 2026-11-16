@@ -491,11 +491,10 @@ def _single_node_option(
         mtp=mtp,
         rank0_extra_bytes=rank0_extra_bytes,
     )
-    if fit is None or fit[1] < target_tokens:
+    layout = candidate.layout
+    if fit is None or fit[1] < target_tokens or layout is None:
         return None
-    download_bytes = candidate.weight_bytes + (
-        candidate.layout.mtp_weight_bytes if mtp else 0
-    )
+    download_bytes = candidate.weight_bytes + (layout.mtp_weight_bytes if mtp else 0)
     return _single_node_recommendation(
         candidate,
         nodes,
@@ -794,6 +793,7 @@ def _single_node_recommendation(
 
     facts, ctx, headroom, required, budget = fit
     layout = candidate.layout
+    assert layout is not None  # a fit is only computed from a measured layout
     stage = StagePlan(
         rank=0,
         node_id=facts.node_id,
@@ -1029,7 +1029,7 @@ def _ranking_key(item: ModelRecommendation) -> tuple[Any, ...]:
         if item.critical_stage_seconds is None
         else item.critical_stage_seconds
     )
-    return (-item.max_context_tokens, critical, item.weight_bytes, item.model_id)
+    return -item.max_context_tokens, critical, item.weight_bytes, item.model_id
 
 
 def _ordered(

@@ -1107,7 +1107,6 @@ def _plans_for_subset(
         # The planner found a plan the bound called impossible: trust the
         # planner, never the bound, and run the full descent.
 
-    plans: list[tuple[int, int, ElectionResult, ResourcePolicy]] = []
     last_error: NoFeasiblePlanError | None = None
     descending = sorted(ladder, reverse=True)
 
