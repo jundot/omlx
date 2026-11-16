@@ -537,8 +537,8 @@ final class OMLXClient: ObservableObject {
     }
 
     @discardableResult
-    func removeThroughputQueue(index: Int) async throws -> BenchQueueResponse {
-        try await delete(AdminAPI.benchQueueRemove(index))
+    func removeThroughputQueue(queueId: String) async throws -> BenchQueueResponse {
+        try await delete(AdminAPI.benchQueueRemove(queueId))
     }
 
     func getBenchResults(benchId: String) async throws -> BenchResultsResponse {

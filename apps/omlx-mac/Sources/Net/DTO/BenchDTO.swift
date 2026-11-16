@@ -90,7 +90,7 @@ struct BenchQueueItem: Codable, Equatable, Sendable {
     let external: Bool
 }
 
-/// Body of `DELETE /bench/queue/{idx}`; also the queue snapshot every
+/// Body of `DELETE /bench/queue/{queue_id}`; also the queue snapshot every
 /// queue mutation returns.
 struct BenchQueueResponse: Codable, Sendable {
     let queue: [BenchQueueItem]

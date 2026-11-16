@@ -94,7 +94,7 @@ The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The reque
 | Endpoint | Description |
 |---|---|
 | `POST /admin/api/bench/start`, `GET .../{bench_id}/results`, `POST .../{bench_id}/cancel` | Throughput benchmark; a start while one runs is queued (`"status": "queued"`) |
-| `GET /admin/api/bench/active`, `DELETE /admin/api/bench/queue/{idx}` | Active run plus waiting queue; remove one queued request |
+| `GET /admin/api/bench/active`, `DELETE /admin/api/bench/queue/{queue_id}` | Active run plus waiting queue; remove one queued request by its id |
 | `GET /admin/api/bench/{bench_id}/stream` | Server-sent events for the same run |
 | `/admin/api/bench/context/...` | Long-context benchmark, same pattern |
 | `/admin/api/bench/accuracy/...` | Accuracy benchmark queue |

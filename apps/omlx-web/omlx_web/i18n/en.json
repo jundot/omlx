@@ -1756,6 +1756,7 @@
   "bench.config.batch_hint": "Batch tests use PP1024 / TG128",
   "bench.config.run_button": "Run Benchmark",
   "bench.config.add_to_queue": "Add to Queue",
+  "bench.queue.remove": "Remove from queue",
   "bench.completed.section_label": "Completed runs",
   "bench.progress.preparing": "Preparing...",
   "bench.progress.cancel": "Cancel",

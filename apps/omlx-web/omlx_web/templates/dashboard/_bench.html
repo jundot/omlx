@@ -231,7 +231,9 @@
                             <template x-for="(q, idx) in benchQueue" :key="idx">
                                 <div class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-neutral-100 rounded-lg text-sm text-neutral-700">
                                     <span x-text="q.model_id"></span>
-                                    <button @click="removeFromBenchQueue(idx)"
+                                    <button @click="removeFromBenchQueue(q.queue_id)"
+                                            :aria-label="t('bench.queue.remove') + ': ' + q.model_id"
+                                            :title="t('bench.queue.remove')"
                                             class="ml-1 text-neutral-500 hover:text-red-500 transition-colors">
                                         <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                                     </button>

@@ -517,6 +517,10 @@ class TestConcurrentStartQueueing:
         # A failing run is reported on that run, and the next one still runs.
         assert ran == ["model-a", "model-b"]
         assert first.error_message == "engine exploded"
+        assert first.terminal is True
+        assert [e["message"] for e in first.events if e["type"] == "error"] == [
+            "engine exploded"
+        ]
         assert get_queue() == []
 
     @pytest.mark.asyncio
@@ -623,3 +627,43 @@ class TestConcurrentStartQueueing:
             },
         )
         assert r.status_code == 200, r.text
+
+
+class TestQueueDelete:
+    """`DELETE /api/bench/queue/{queue_id}` removes one entry by id.
+
+    Ids stay stable while the queue advances, so a delete cannot hit a
+    different request after the queue moved between the UI poll and the
+    click.
+    """
+
+    def test_remove_by_queue_id(self, bench_client):
+        from omlx.admin import benchmark as bench_module
+
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-x", prompt_lengths=[1024])
+        )
+        queue_id = bench_module.get_queue()[0]["queue_id"]
+
+        r = bench_client.delete(f"/admin/api/bench/queue/{queue_id}")
+        assert r.status_code == 200, r.text
+        assert r.json() == {"queue": []}
+
+        r = bench_client.delete(f"/admin/api/bench/queue/{queue_id}")
+        assert r.status_code == 404
+        assert "not found" in r.json()["detail"]
+
+    def test_remove_keeps_the_other_entries(self, bench_client):
+        from omlx.admin import benchmark as bench_module
+
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-x", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-y", prompt_lengths=[1024])
+        )
+        first, second = bench_module.get_queue()
+
+        r = bench_client.delete(f"/admin/api/bench/queue/{first['queue_id']}")
+        assert r.status_code == 200, r.text
+        assert r.json()["queue"] == [second]

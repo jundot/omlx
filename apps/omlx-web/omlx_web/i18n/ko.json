@@ -1756,6 +1756,7 @@
   "bench.config.batch_hint": "배칭 테스트는 PP1024 / TG128 사용",
   "bench.config.run_button": "벤치마크 실행",
   "bench.config.add_to_queue": "대기열에 추가",
+  "bench.queue.remove": "대기열에서 제거",
   "bench.completed.section_label": "완료된 실행",
   "bench.progress.preparing": "준비 중...",
   "bench.progress.cancel": "취소",

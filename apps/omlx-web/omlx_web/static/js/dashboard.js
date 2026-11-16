@@ -708,6 +708,8 @@
             benchOtherActive: null,
             // Requests waiting behind the running bench (server queue mirror).
             benchQueue: [],
+            // One follow loop at a time; a second would double-poll.
+            benchFollowing: false,
             // Config of the run on screen; the form may already describe a queued one.
             benchRun: null,
             // Text exports of earlier runs, newest first (this session only).
@@ -5556,6 +5558,9 @@
                         this.benchRunning = false;
                         this.benchQueue = data.queue || [];
                         await this.loadBenchState();
+                        // The previous run may still be uploading, so the
+                        // queued run has no SSE stream yet; follow it here.
+                        if (!this.benchRunning) this._benchFollowQueue();
                         return;
                     }
                     this.benchBenchId = data.bench_id;
@@ -5586,30 +5591,39 @@
             // upload can outlast the run by a while, so wait as long as entries
             // are still waiting (two minutes at 500 ms is the safety net).
             async _benchFollowQueue() {
-                for (let i = 0; i < 240; i++) {
-                    await new Promise(r => setTimeout(r, 500));
-                    let data;
-                    try {
-                        const resp = await fetch('/admin/api/bench/active');
-                        if (!resp.ok) return;
-                        data = await resp.json();
-                    } catch (err) {
-                        return;
+                if (this.benchFollowing) return;
+                this.benchFollowing = true;
+                try {
+                    for (let i = 0; i < 240; i++) {
+                        await new Promise(r => setTimeout(r, 500));
+                        let data;
+                        try {
+                            const resp = await fetch('/admin/api/bench/active');
+                            if (!resp.ok) return;
+                            data = await resp.json();
+                        } catch (err) {
+                            return;
+                        }
+                        this.benchQueue = data.queue || [];
+                        if (data.running && data.bench_id && data.bench_id !== this.benchBenchId) {
+                            this.benchOtherActive = data;
+                            // Keep the form: the user may be editing the next request.
+                            this.acceptOtherBench(true);
+                            return;
+                        }
+                        if (!data.running && this.benchQueue.length === 0) return;
                     }
-                    this.benchQueue = data.queue || [];
-                    if (data.running && data.bench_id && data.bench_id !== this.benchBenchId) {
-                        this.benchOtherActive = data;
-                        // Keep the form: the user may be editing the next request.
-                        this.acceptOtherBench(true);
-                        return;
-                    }
-                    if (!data.running && this.benchQueue.length === 0) return;
+                } finally {
+                    this.benchFollowing = false;
                 }
             },
 
-            async removeFromBenchQueue(idx) {
+            async removeFromBenchQueue(queueId) {
                 try {
-                    const resp = await fetch(`/admin/api/bench/queue/${idx}`, { method: 'DELETE' });
+                    const resp = await fetch(
+                        `/admin/api/bench/queue/${encodeURIComponent(queueId)}`,
+                        { method: 'DELETE' }
+                    );
                     if (resp.ok) this.benchQueue = (await resp.json()).queue || [];
                 } catch (err) {
                     this.benchError = err.message;

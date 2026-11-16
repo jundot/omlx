@@ -660,10 +660,12 @@ def add_to_queue(request: BenchmarkRequest) -> str:
     return queue_id
 
 
-def remove_from_queue(idx: int) -> bool:
-    if 0 <= idx < len(_queue):
-        _queue.pop(idx)
-        return True
+def remove_from_queue(queue_id: str) -> bool:
+    """Remove the entry with `queue_id`; ids stay stable while the queue moves."""
+    for idx, (queued_id, _) in enumerate(_queue):
+        if queued_id == queue_id:
+            _queue.pop(idx)
+            return True
     return False
 
 
@@ -708,6 +710,11 @@ async def run_queue(
                 )
                 run.status = "error"
                 run.error_message = str(e)
+                # `run_benchmark` reports its own failures, but an exception
+                # that escapes it would leave subscribers waiting for a
+                # terminal event. Send one unless the run already ended.
+                if not run.terminal:
+                    await _send_event(run, {"type": "error", "message": str(e)})
             if not _queue:
                 return
             cleanup_old_runs()

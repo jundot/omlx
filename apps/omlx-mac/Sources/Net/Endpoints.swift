@@ -111,7 +111,7 @@ enum AdminAPI {
     static let deviceInfo      = "\(prefix)/device-info"
     static let benchStart      = "\(prefix)/bench/start"
     static let benchActive     = "\(prefix)/bench/active"
-    static func benchQueueRemove(_ idx: Int) -> String { "\(prefix)/bench/queue/\(idx)" }
+    static func benchQueueRemove(_ queueId: String) -> String { "\(prefix)/bench/queue/\(queueId)" }
     static func benchResults(_ benchId: String) -> String { "\(prefix)/bench/\(benchId)/results" }
     static func benchCancel(_ benchId: String) -> String  { "\(prefix)/bench/\(benchId)/cancel" }
     static let aneTuneStart = "\(prefix)/bench/ane-tune/start"

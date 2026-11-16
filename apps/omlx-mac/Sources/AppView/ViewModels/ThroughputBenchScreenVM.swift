@@ -295,13 +295,12 @@ final class ThroughputBenchScreenVM {
     }
 
     func cancelBenchmark(client: OMLXClient) {
-        if let ahead = queuedAhead {
-            let index = ahead
+        if let queueId = pendingQueueId {
             queuedAhead = nil
             pendingQueueId = nil
             queuePollTask?.cancel()
             Task { [weak self] in
-                _ = try? await client.removeThroughputQueue(index: index)
+                _ = try? await client.removeThroughputQueue(queueId: queueId)
                 await MainActor.run { self?.running = false }
             }
             return

@@ -9836,16 +9836,18 @@ async def start_benchmark(
     }
 
 
-@router.delete("/api/bench/queue/{idx}")
+@router.delete("/api/bench/queue/{queue_id}")
 async def remove_from_benchmark_queue(
-    idx: int,
+    queue_id: str,
     is_admin: bool = Depends(require_admin),
 ):
-    """Remove a request from the throughput benchmark queue."""
+    """Remove a request from the throughput benchmark queue by its id."""
     from .benchmark import get_queue, remove_from_queue
 
-    if not remove_from_queue(idx):
-        raise HTTPException(status_code=404, detail=f"Queue index {idx} not found")
+    if not remove_from_queue(queue_id):
+        raise HTTPException(
+            status_code=404, detail=f"Queue entry {queue_id} not found"
+        )
     return {"queue": get_queue()}
 
 
