@@ -544,6 +544,57 @@ class TestChatCompletionRequest:
         assert request.enable_thinking is None
         assert request.chat_template_kwargs == {"enable_thinking": False}
 
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("false", False),
+            ("False", False),
+            ("FALSE", False),
+            ("true", True),
+            ("True", True),
+            ("TRUE", True),
+        ],
+    )
+    def test_string_bool_thinking_kwargs_coerced(self, value, expected):
+        """"false" is truthy in Jinja and would silently enable thinking."""
+        req = ChatCompletionRequest(
+            model="test", messages=[], chat_template_kwargs={"enable_thinking": value}
+        )
+        assert req.chat_template_kwargs["enable_thinking"] is expected
+
+    def test_thinking_family_kwargs_coerced_others_untouched(self):
+        """Only known boolean thinking kwargs are coerced."""
+        req = ChatCompletionRequest(
+            model="test",
+            messages=[],
+            chat_template_kwargs={
+                "enable_thinking": "false",
+                "thinking": "true",
+                "preserve_thinking": "False",
+                "reasoning_effort": "low",
+                "custom": "yes",
+                "thinking_budget": 42,
+            },
+        )
+        assert req.chat_template_kwargs == {
+            "enable_thinking": False,
+            "thinking": True,
+            "preserve_thinking": False,
+            "reasoning_effort": "low",
+            "custom": "yes",
+            "thinking_budget": 42,
+        }
+
+    def test_coerced_nested_agrees_with_alias_no_conflict(self):
+        """Coerced "false" must not raise against alias False."""
+        req = ChatCompletionRequest(
+            model="test",
+            messages=[],
+            enable_thinking=False,
+            chat_template_kwargs={"enable_thinking": "false"},
+        )
+        assert req.chat_template_kwargs["enable_thinking"] is False
+
     def test_top_level_enable_thinking_rejects_nested_conflict(self):
         """Conflicting control paths must fail instead of choosing silently."""
         with pytest.raises(ValidationError, match="enable_thinking conflicts"):
