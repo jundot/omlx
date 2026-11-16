@@ -194,7 +194,9 @@ def _one_token(x) -> bool:
 
 def _fused_rows(x) -> bool:
     """Up to ``_MAX_ROWS`` token rows: one token, a speculative verify block, or
-    the decode / verify rows of a small batch (every row routes on its own)."""
+    the decode / verify rows of a small batch (every row routes on its own).
+    The gate is the row count, so the last prefill chunk of a single sequence
+    also takes this path when it has ``_MAX_ROWS`` tokens or fewer (same result)."""
     return x.ndim == 3 and 1 <= x.shape[0] * x.shape[1] <= _MAX_ROWS
 
 
