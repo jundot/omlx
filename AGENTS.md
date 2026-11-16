@@ -367,11 +367,11 @@ Resolved implementation decisions:
   the same admin seam to that Mac's own delete route (worker or coordinator
   alike). Two-step confirm, never automatic, and never the model the cluster is
   about to run. The browser still never deletes anything itself.
-- **Screen 5 preselects in the existing `/chat`.** `/chat?model=<id>&endpoint=<url>`
-  preselects the model and, for a remote endpoint, uses it as the API base. No
-  new page, no second chat. Implemented 2026-11-07 as **model-only**:
-  `Open Chat` builds `/chat?model=<serving id>` when the coordinator is this Mac
-  and `<endpoint.url>/chat?model=<serving id>` when it is another Mac (that
+- **Screen 5 preselects in the existing `/admin/chat`.** The web UI is mounted
+  under `/admin` (`omlx_web.router` prefix), so the chat page is `/admin/chat`;
+  a bare `/chat` is a **404** (measured live 2026-11-16, `115e…`/`5d3…` fix).
+  `Open Chat` builds `/admin/chat?model=<serving id>` when the coordinator is this Mac
+  and `<endpoint.url>/admin/chat?model=<serving id>` when it is another Mac (that
   Mac’s own page; its session and key apply, so the user may sign in there
   once). The serving id is the catalogue’s `modelOptions` id resolved by
   `model_path`; an unresolved id links without the parameter and never guesses.

@@ -5272,7 +5272,11 @@ function clusterV2Wizard() {
                 '',
             );
             if (!url) return '';
-            return this.assistantCoordinatorIsLocal() ? '/chat' : `${url}/chat`;
+            // The web UI is mounted under /admin (omlx_web.router prefix), so
+            // the chat page is /admin/chat — /chat is a 404 (measured 2026-11-16).
+            return this.assistantCoordinatorIsLocal()
+                ? '/admin/chat'
+                : `${url}/admin/chat`;
         },
 
         assistantChatUrl() {
@@ -6581,8 +6585,8 @@ function clusterV2Wizard() {
             if (!this.assistantLocalEndpointUrl()) return '';
             const modelId = String(this.assistant.localRun.modelId || '');
             return modelId
-                ? `/chat?model=${encodeURIComponent(modelId)}`
-                : '/chat';
+                ? `/admin/chat?model=${encodeURIComponent(modelId)}`
+                : '/admin/chat';
         },
 
         openAssistantLocalChat() {

@@ -3828,7 +3828,11 @@ def test_assistant_handoff_links_come_from_the_endpoint_and_the_serving_id():
 
     base = _assistant_method("assistantChatBase")
     assert "endpoint?.url" in base
-    assert "assistantCoordinatorIsLocal() ? '/chat' : `${url}/chat`" in base
+    # The web UI lives under /admin, so the chat page is /admin/chat there
+    # (a bare /chat is a 404 — measured 2026-11-16).
+    assert "assistantCoordinatorIsLocal()" in base
+    assert "? '/admin/chat'" in base
+    assert ": `${url}/admin/chat`" in base
 
     serving = _assistant_method("assistantServingModelId")
     assert "model_path === path" in serving

@@ -1990,6 +1990,20 @@ lists it, and it stays *unpaired* although its mDNS advertisement is visible.
    default), not 8099; `scripts/check_peer_versions.py` also defaults to 8099 and
    needs `--port 8000`.
 
+**Two more live findings (both fixed this session):**
+
+1. **`Open Chat` pointed at a 404.** The assistant built `/chat?model=…`, but the
+   web UI is mounted under `/admin`, so the page is `/admin/chat` — the link the
+   ready card offers answered `{"detail":"Not Found"}`. Both builders
+   (`assistantChatBase`, `assistantLocalChatUrl`) and the four UI assertions were
+   updated; `AGENTS.md` §10 now states `/admin/chat`.
+2. **The chat defaulted to the first model in the list, not the loaded one.**
+   `/v1/models` is alphabetical, so "Chat" preselected `DeepSeek-V4.1-Flash`
+   (384 GB, not loaded) while `GLM-5.3-Flash-oQ2e-mtp` was serving — the first
+   message answered 507 instead of an answer. The chat now records the `loaded`
+   (and `distributed`) flags from `/v1/models/status` and prefers a loaded model,
+   a running cluster model first, before falling back to the first row.
+
 **Gate**
 
 | # | Criterion | Result | Evidence |

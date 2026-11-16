@@ -1324,10 +1324,10 @@ def test_assistant_open_chat_targets_the_coordinator_and_the_serving_model_id():
     # The fixture's coordinator is node-b (http://172.16.1.11:8099) and the
     # wizard's own Mac is node-a, so this is the remote case: that Mac's page.
     assert result["remote"]["local"] is False
-    assert result["remote"]["base"] == "http://172.16.1.11:8099/chat"
+    assert result["remote"]["base"] == "http://172.16.1.11:8099/admin/chat"
     assert (
         result["remote"]["url"]
-        == "http://172.16.1.11:8099/chat?model=qwen3-32b-4bit"
+        == "http://172.16.1.11:8099/admin/chat?model=qwen3-32b-4bit"
     )
     assert result["remote"]["agentBase"] == "http://172.16.1.11:8099/v1"
     assert result["remote"]["agentModel"] == "qwen3-32b-4bit"
@@ -1335,11 +1335,11 @@ def test_assistant_open_chat_targets_the_coordinator_and_the_serving_model_id():
     assert "sign in" in result["remote"]["note"]
 
     assert result["local"]["local"] is True
-    assert result["local"]["base"] == "/chat"
-    assert result["local"]["url"] == "/chat?model=qwen3-32b-4bit"
+    assert result["local"]["base"] == "/admin/chat"
+    assert result["local"]["url"] == "/admin/chat?model=qwen3-32b-4bit"
     assert result["local"]["note"] == ""
 
-    assert result["unresolved"] == "http://172.16.1.11:8099/chat"
+    assert result["unresolved"] == "http://172.16.1.11:8099/admin/chat"
 
 
 def test_assistant_ready_renders_only_the_measured_rate():
@@ -3180,7 +3180,7 @@ def test_assistant_run_on_this_mac_posts_the_job_and_reaches_ready():
     assert result["modelId"] == "qwen"
     assert result["endpoint"] == "http://192.168.1.10:8099"
     # Screen 5, model-only: this Mac serves, so the link is this Mac's own page.
-    assert result["chat"] == "/chat?model=qwen"
+    assert result["chat"] == "/admin/chat?model=qwen"
     # The cluster endpoint/chat stay untouched: run-local is not a cluster ready.
     assert result["clusterChat"] == ""
     assert result["warnings"] == [
@@ -3441,7 +3441,7 @@ def test_assistant_local_run_stop_posts_once_and_retires_the_serving_surface():
     assert result["before"] == {
         "state": "ready",
         "endpoint": "http://127.0.0.1:8099",
-        "chat": "/chat?model=qwen",
+        "chat": "/admin/chat?model=qwen",
         "stoppable": True,
     }
     # Exactly one stop POST, to the job's own route, and exactly one re-read.
@@ -3534,7 +3534,7 @@ def test_assistant_local_run_stop_failure_keeps_serving_and_the_one_action():
     # keeps exactly one action and Stop stays the retry.
     assert result["state"] == "ready"
     assert result["endpoint"] == "http://127.0.0.1:8099"
-    assert result["chat"] == "/chat?model=qwen"
+    assert result["chat"] == "/admin/chat?model=qwen"
     assert result["error"] == "the engine pool did not answer the unload"
     assert result["action"] == "diagnostics"
     assert result["stopping"] is False
@@ -3608,7 +3608,7 @@ def test_assistant_local_run_endpoint_and_chat_need_ready_and_endpoint_ready():
     assert result["ready"] == {
         "busy": False,
         "endpoint": "http://127.0.0.1:8099",
-        "chat": "/chat?model=qwen",
+        "chat": "/admin/chat?model=qwen",
     }
 
 
