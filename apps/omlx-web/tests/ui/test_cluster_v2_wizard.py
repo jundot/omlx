@@ -1588,8 +1588,11 @@ def test_a_device_card_identifies_the_mac_by_hardware_not_by_name():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert template.count("data-cluster-v2-device-spec") == 1
-    assert "deviceSpecLine(device)" in template
+    # The grid, the Find-devices list, the join request and the membership
+    # candidates all print the same facts (2026-11-16: the discovery list still
+    # showed the old "chip · ram" line and looked unchanged).
+    assert template.count("data-cluster-v2-device-spec") >= 4
+    assert template.count("deviceSpecLine(device)") >= 4
     assert ':data-lucide="deviceIcon(device)"' in template
 
     # The line is built from the address, the caps and the disk — in that order.
