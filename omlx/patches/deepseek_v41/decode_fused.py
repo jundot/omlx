@@ -456,9 +456,14 @@ def gemv_fp8_nb(x, a, b=None, mma=None):
         tiles = (na + nb) // 8
         group = max(f[2] for f in formats)
         if gguf:
-            # Fixed per projection, including one-row MTP decode. Small K may
-            # not divide the preferred split (e.g. seventeen Q8 groups).
-            ks = next(s for s in ((4, 2, 1) if b is not None else (2, 1)) if k % (32 * s) == 0)
+            # Fixed per projection, including one-row MTP decode. M5 fills the
+            # GPU with more K splits: 8 for the query/KV pair, 16 for wo_b.
+            # Small K may not divide the preferred split (e.g. seventeen Q8 groups).
+            ks = next(
+                s
+                for s in ((8, 4, 2, 1) if b is not None else (16, 8, 4, 2, 1))
+                if k % (32 * s) == 0
+            )
         else:
             ks = _aff_mma_split(tiles, k // group) if affine else _mma_split(tiles, k // 32)
         ya, yb = DL.kernel("gemv_fp8_mma", formats)(
@@ -875,10 +880,14 @@ def _gguf_block(blk, h, pre, caches, shareds, starts, c):
     ap, ao, ac = coef[:, :hc], coef[:, hc : 2 * hc], coef[:, 2 * hc :]
     att = blk.attn
     # MTP asks its one-token decode to use the verification projection order.
-    # Otherwise keep row dots below the measured six-row crossover.
-    tiles = getattr(blk, "_omlx_verify_exact", False) or bn * rn >= 6
+    # Otherwise the query/KV pair fills the GPU from four rows while the wider
+    # projections keep row dots below the measured six-row crossover.
+    exact = getattr(blk, "_omlx_verify_exact", False)
+    rows = bn * rn
+    pair_tiles = exact or rows >= 4
+    tiles = exact or rows >= 6
     if att.wo_a.weight.dtype == mx.bfloat16:
-        qa, kv_in = gemv_fp8_nb(x, att.wq_a, att.wkv, mma=tiles)
+        qa, kv_in = gemv_fp8_nb(x, att.wq_a, att.wkv, mma=pair_tiles)
         ratio = c.compress_ratios[att._layer]
         positions = [start + j for start in starts for j in range(rn)]
         cos, sin = _cos_sin_nb(c, bool(ratio), positions)

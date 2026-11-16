@@ -1185,7 +1185,11 @@ def fused_decode_moe_nb(moe, x, config, mma=None, *, reuse_routes=False):
     reuse_routes pairs repeated GGUF experts without changing per-token arithmetic."""
     nb = x.shape[0]
     formats = _formats(moe)
-    mma = (use_mma(nb) if mma is None else mma) and all(f[0] in ("mxfp8", "affine", "gguf") for f in formats[3:])
+    # GGUF shared experts prefer row dots through five vectors on M5; from six
+    # the matrix tiles win. Other formats keep the M3-calibrated crossover.
+    if mma is None:
+        mma = nb >= 6 if all(f is not None and f[0] == "gguf" for f in formats) else use_mma(nb)
+    mma = mma and all(f[0] in ("mxfp8", "affine", "gguf") for f in formats[3:])
     reuse_routes = bool(reuse_routes and 4 <= nb <= 16 and config.n_activated_experts <= 8
                         and all(f[0] == "gguf" for f in formats))
     up_k, down_r, down_s = (_gguf_reuse_kernels if reuse_routes else _kernels_nb)(mma, formats)
