@@ -1067,6 +1067,34 @@ class TestPagedCacheManager:
         assert len(tails) == _TAIL_INDEX_PER_PARENT + half
         assert [h for h in tails if manager.is_shared_tail(h)] == shared[-half:]
 
+    def test_get_computed_blocks_root_tails_survive_a_loop_of_twelve_prompts(self):
+        """Twelve short prompts that repeat in turn must all keep hitting.
+
+        With LRU eviction a loop one wider than the per-parent bound is evicted
+        in exactly the order it returns, so none of it ever hits.
+        """
+        from omlx.cache.paged_cache import _TAIL_INDEX_PER_PARENT
+
+        manager = PagedCacheManager(
+            block_size=64, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        prompts = [[i, 7, 7] for i in range(12)]
+        for round_number in range(3):
+            for tokens in prompts:
+                _, num_tokens = manager.get_computed_blocks(tokens)
+                assert num_tokens == (3 if round_number else 0)
+                self._register_tail(manager, None, tokens)
+
+        # Refresh the oldest, then overflow the bound by one: the least
+        # recently registered tail goes, its neighbours stay.
+        self._register_tail(manager, None, prompts[0])
+        for i in range(_TAIL_INDEX_PER_PARENT - len(prompts) + 1):
+            self._register_tail(manager, None, [100 + i, 9, 9])
+        assert manager.get_computed_blocks(prompts[1])[1] == 0
+        assert manager.get_computed_blocks(prompts[0])[1] == 3
+        assert manager.get_computed_blocks(prompts[2])[1] == 3
+        assert manager.get_computed_blocks([100, 9, 9])[1] == 3
+
     def test_get_computed_blocks_tail_cold_registration_and_stale_pruning(self):
         """Indexed tails are verified against the tiers on every lookup."""
         manager = PagedCacheManager(

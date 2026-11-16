@@ -77,7 +77,14 @@ def resolve_block_extra_keys(
 
 
 # Tail index bounds. Entries are advisory and verified on every lookup.
-_TAIL_INDEX_PER_PARENT = 8
+# Every prompt shorter than one block shares the chain root as its parent, so
+# the per-parent bound is the number of distinct short conversations the cache
+# can resume. Eviction is LRU, so a set of repeating prompts one larger than
+# the bound is evicted in exactly the order it comes back and never hits:
+# 8 slots served a loop of 6 prompts and lost every one of them once 4 other
+# short prompts joined it. A miss scans every tail (one hash over the tail
+# tokens each), so the bound also caps that scan.
+_TAIL_INDEX_PER_PARENT = 32
 _TAIL_INDEX_MAX_PARENTS = 4096
 
 
