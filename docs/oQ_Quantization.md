@@ -139,6 +139,11 @@ Models that are already MLX-quantized cannot be used as a source.
 
 Some models have their own rules:
 
+- **Nemotron-H Omni (including Nemotron 3.5 Bolt):** oQe collects text-backbone
+  statistics, including Mamba and MoE projections and the LM head. Large sources
+  use the resident calibration proxy; layer-streamed calibration is not supported
+  for this layout. Text calibration does not exercise the vision projector, so
+  strict imatrix coverage of the full multimodal model can report missing entries.
 - **DeepSeek V4.1:** oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit unless Keep original Engram tables is on.
 - **DeepSeek V4:** float16 output is not supported.
 

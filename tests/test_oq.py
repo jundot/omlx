@@ -6825,6 +6825,242 @@ class TestMeasureSensitivityVlmMtp:
         assert mock_load.call_args.kwargs["trust_remote_code"] is True
 
 
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestNemotronImatrix:
+    @pytest.fixture
+    def bolt(self, monkeypatch):
+        from mlx_vlm.utils import get_model_and_args
+
+        import omlx.oq as oq
+
+        # Bolt's llm_config uses per-block expert counts and intermediate sizes.
+        config = {
+            "model_type": "nemotron_h_omni",
+            "llm_config": {
+                "model_type": "nemotron_h_puzzle",
+                "vocab_size": 128,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "max_position_embeddings": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "attention_bias": False,
+                "mamba_num_heads": 4,
+                "mamba_head_dim": 32,
+                "mamba_proj_bias": False,
+                "ssm_state_size": 32,
+                "conv_kernel": 4,
+                "n_groups": 2,
+                "mlp_bias": False,
+                "layer_norm_epsilon": 1e-5,
+                "use_bias": False,
+                "use_conv_bias": True,
+                "moe_latent_size": 64,
+                "moe_shared_expert_intermediate_size": 64,
+                "n_shared_experts": 1,
+                "n_group": 1,
+                "topk_group": 1,
+                "norm_topk_prob": True,
+                "routed_scaling_factor": 1.0,
+                "block_configs": [
+                    {"block_type": "mamba"},
+                    {
+                        "block_type": "moe",
+                        "n_routed_experts": 2,
+                        "moe_intermediate_size": 64,
+                        "num_experts_per_tok": 2,
+                    },
+                    {"block_type": "attention"},
+                    {
+                        "block_type": "moe",
+                        "n_routed_experts": 3,
+                        "moe_intermediate_size": 128,
+                        "num_experts_per_tok": 3,
+                    },
+                    {"block_type": "mlp"},
+                ],
+            },
+            "vision_config": {
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "intermediate_size": 32,
+                "image_size": 8,
+                "patch_size": 4,
+                "max_resolution": 8,
+            },
+            "vit_hidden_size": 16,
+            "projector_hidden_size": 32,
+        }
+        module, _ = get_model_and_args(config)
+        mx.random.seed(7)
+        model = module.Model(module.ModelConfig.from_dict(config))
+        model.eval()
+        tokens = mx.arange(16, dtype=mx.int32).reshape(2, 8)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        return model, config, tokens
+
+    @pytest.mark.parametrize("wrapped", [False, True])
+    @pytest.mark.parametrize("quantized", [False, True])
+    def test_layer_walk_matches_native_captures(self, bolt, wrapped, quantized):
+        import omlx.oq as oq
+
+        outer, config, tokens = bolt
+        model = outer if wrapped else outer.language_model
+        text = outer.language_model
+        if quantized:
+            nn.quantize(text, group_size=64, bits=4)
+        embed, layers = oq._find_model_layers(model)
+        assert embed is text.backbone.embeddings
+        assert layers is text.backbone.layers
+
+        _, masks, _ = oq._prepare_layer_inputs(model, layers, tokens, embed(tokens))
+        assert masks[0] is None  # Mamba takes a padding mask, not a causal matrix.
+        assert masks[2] is not None
+
+        native = OQImatrixCollector()
+        native.install(model)
+        try:
+            mx.eval(text(tokens).logits)
+        finally:
+            native.restore(model)
+
+        entries, metadata = oq._collect_imatrix_from_model(
+            model,
+            object(),
+            config,
+            calib_dataset=oq._OQE_CALIB_DATASET,
+            num_samples=2,
+            seq_length=8,
+        )
+        prefix = "language_model." if wrapped else ""
+        assert len(entries) == len(native.entries) == 21
+        assert metadata["layer_count"] == 5
+        assert metadata["skipped_layer_forwards"] == 0
+        assert metadata["successful_layer_forwards"] == 5
+        assert metadata["switch_capture_modules"] == 4
+        assert metadata["coverage_sufficient"] is True
+        assert entries.keys() == native.entries.keys()
+        for key, entry in entries.items():
+            np.testing.assert_array_equal(entry.counts, native.entries[key].counts)
+            np.testing.assert_allclose(
+                entry.in_sum2, native.entries[key].in_sum2, rtol=1e-5, atol=1e-5
+            )
+            assert np.isfinite(entry.in_sum2).all()
+            assert (entry.counts > 0).all()
+        for index, experts, intermediate in ((1, 2, 64), (3, 3, 128)):
+            base = f"{prefix}backbone.layers.{index}.mixer.switch_mlp"
+            assert entries[f"{base}.fc1"].in_sum2.shape == (experts, 64)
+            assert entries[f"{base}.fc2"].in_sum2.shape == (experts, intermediate)
+        assert f"{prefix}lm_head" in entries
+        assert not any(
+            "gate" in k or "conv1d" in k or "embeddings" in k for k in entries
+        )
+        assert not any(
+            isinstance(m, oq._ImatrixCaptureWrapper) for _, m in model.named_modules()
+        )
+
+    def test_proxy_cache_and_quantization(self, bolt, tmp_path, monkeypatch):
+        from mlx_vlm.utils import load_model
+
+        import omlx.oq as oq
+
+        model, config, _ = bolt
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.json").write_text(json.dumps(config))
+        weights = {}
+        for key, value in tree_flatten(model.parameters()):
+            value = value.astype(mx.bfloat16)
+            if ".switch_mlp." in key:
+                stem, projection = key.split(".switch_mlp.")
+                projection = {"fc1.weight": "up_proj", "fc2.weight": "down_proj"}[
+                    projection
+                ]
+                for expert in range(value.shape[0]):
+                    weights[f"{stem}.experts.{expert}.{projection}.weight"] = value[
+                        expert
+                    ]
+            else:
+                if key.endswith("conv1d.weight"):
+                    value = value.moveaxis(1, 2)
+                weights[key] = value
+        mx.save_safetensors(str(source / "model.safetensors"), weights)
+        monkeypatch.setattr("mlx_lm.tokenizer_utils.load", lambda *a, **kw: object())
+        proxy = tmp_path / "proxy"
+
+        def build_proxy():
+            oq._build_streaming_proxy_for_sensitivity(
+                str(source), proxy, dtype="bfloat16"
+            )
+            return str(proxy)
+
+        cache_path = str(tmp_path / "imatrix.npz")
+        cache = oq._load_or_collect_imatrix(
+            str(source),
+            config,
+            cache_path=cache_path,
+            reuse_cache=False,
+            num_samples=2,
+            seq_length=8,
+            strict=True,
+            trust_remote_code=False,
+            load_path_factory=build_proxy,
+        )
+        assert len(cache.entries) == 21
+        assert cache.metadata["collection"]["skipped_layer_forwards"] == 0
+        assert cache.metadata["collection"]["coverage_sufficient"] is True
+        loaded = load_model(proxy, strict=True)
+        assert isinstance(
+            loaded.language_model.backbone.layers[0].mixer.in_proj, nn.QuantizedLinear
+        )
+        # Every quantized text projection must resolve under strict coverage.
+        for name, module in model.language_model.named_modules():
+            if OQImatrixCollector._is_capture_module(module):
+                assert (
+                    oq._lookup_imatrix_importance(
+                        cache,
+                        f"language_model.{name}.weight",
+                        module.weight.shape,
+                        config=config,
+                        strict=True,
+                        report=None,
+                    )
+                    is not None
+                )
+        assert (
+            oq._lookup_imatrix_importance(
+                cache,
+                "language_model.backbone.embeddings.weight",
+                (128, 128),
+                config=config,
+                strict=True,
+                report=None,
+            )
+            is None
+        )
+
+        output = tmp_path / "oq4e"
+        oq.quantize_oq_streaming(
+            str(source),
+            str(output),
+            4,
+            enhanced=True,
+            imatrix_cache_path=cache_path,
+            imatrix_num_samples=2,
+            imatrix_seq_length=8,
+        )
+        report = json.loads((output / "oq_imatrix_report.json").read_text())
+        assert report["cache_reused"] is True
+        # Text calibration does not exercise the existing vision projector.
+        assert report["missing"] == ["mlp1.layers.1"]
+        assert report["mismatched"] == []
+        assert set(report["applied"]) == cache.entries.keys()
+        reloaded = load_model(output, strict=True)
+        mx.eval(reloaded.language_model(mx.arange(8)[None]).logits)
+
+
 class TestCollectImatrixTextLoad:
     def test_uses_compat_loader_with_trust_remote_code(self, monkeypatch):
         """oQe calibration forwards the custom-code opt-in to mlx-lm."""
