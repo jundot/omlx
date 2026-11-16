@@ -600,6 +600,12 @@ function clusterV2Wizard() {
         planRequestRevision: 0,
         planLoading: false,
         planError: '',
+        // The memory tier the plan is asked for: '' keeps the saved setting,
+        // otherwise 'safe' | 'balanced' | 'aggressive'. The solver may still
+        // raise it when nothing else fits — the plan then says tier_raised, so
+        // the user always sees the tier that will actually launch.
+        planMemoryTier: '',
+
         // Explicit per-node role picks (node_id → 'workstation' | 'headless').
         // Nodes without an entry keep the long-standing default: this Mac is
         // a workstation, every peer is headless.
@@ -2780,6 +2786,15 @@ function clusterV2Wizard() {
             return this.nodeRoles[nodeId] || (isSelf ? 'workstation' : 'headless');
         },
 
+        /** Pick the memory tier and plan again with it. */
+        setPlanMemoryTier(tier) {
+            const next = String(tier || '');
+            if (this.planMemoryTier === next) return;
+            this.planMemoryTier = next;
+            if (this.selectedModelPath) void this.runPlan();
+            if (this.assistant.measurementId) void this.runAssistantPlan();
+        },
+
         setNodeRole(device, role) {
             if (!device || this.planLoading) return;
             if (this.nodeRole(device.node_id, !!device.is_self) === role) return;
@@ -3241,7 +3256,7 @@ function clusterV2Wizard() {
                     // The Mac whose display is in front of the user keeps a
                     // workstation reserve unless the plan step says otherwise.
                     role: this.nodeRole(self.node_id, true),
-                    memory_guard_tier: 'balanced',
+                    memory_guard_tier: this.planMemoryTier || 'balanced',
                     accelerator: 'metal',
                 });
             }
@@ -3251,7 +3266,7 @@ function clusterV2Wizard() {
                     capacity_bytes:
                         (this.deviceRamGb(peer) || 0) * 1024 ** 3,
                     role: this.nodeRole(peer.node_id, false),
-                    memory_guard_tier: 'balanced',
+                    memory_guard_tier: this.planMemoryTier || 'balanced',
                     accelerator: 'metal',
                 });
             }
@@ -7304,6 +7319,8 @@ function clusterV2Wizard() {
                 // host). Empty means "automatic"; the plan refuses rather than
                 // electing a different Mac when the pin cannot hold the tail.
                 preferred_coordinator: this.assistant.preferredCoordinator || null,
+                // '' keeps the saved tier; the plan shows the tier it used.
+                memory_guard_tier: this.planMemoryTier || null,
                 admission: 'p50',
             };
         },

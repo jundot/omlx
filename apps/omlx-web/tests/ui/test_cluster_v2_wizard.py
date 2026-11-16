@@ -1578,6 +1578,28 @@ def test_expired_join_offers_start_again_not_a_dead_end():
     assert "this.join.coordinator_addr" in javascript
 
 
+def test_the_memory_tier_is_selectable_in_both_flows():
+    """A lever the user may name, and the plan still reports a raise.
+
+    Reported live 2026-11-16: the tier was visible in the plan card but nowhere
+    changeable, and the manual plan hard-coded 'balanced' per node.
+    """
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    # Both surfaces carry the control, bound to the same state.
+    assert template.count("data-cluster-v2-assistant-tier-picker") == 1
+    assert template.count("data-cluster-v2-plan-tier") == 1
+    assert template.count(':data-tier="option"') == 2
+    assert "setPlanMemoryTier(option)" in template
+
+    # The state feeds both plan payloads and re-plans on change.
+    assert "planMemoryTier: ''" in javascript
+    assert "memory_guard_tier: this.planMemoryTier || 'balanced'" in javascript
+    assert "memory_guard_tier: this.planMemoryTier || null" in javascript
+    assert "setPlanMemoryTier(tier) {" in javascript
+
+
 def test_the_selected_model_is_obvious_in_both_pickers():
     """The chosen model must be unmistakable, not a tint nobody notices.
 

@@ -357,6 +357,25 @@
                                           x-text="assistantExpertsLabel()"></span>
                                 </p>
                             </div>
+                            <!-- The tier is a lever the user may name; the
+                                 solver still raises it when nothing else fits
+                                 and the plan then says tier_raised. -->
+                            <div class="mt-2 flex items-center gap-2" data-cluster-v2-assistant-tier-picker>
+                                <span class="text-caption font-semibold text-neutral-600">Memory</span>
+                                <div class="segmented segmented--sm">
+                                    <template x-for="option in ['safe', 'balanced', 'aggressive']" :key="option">
+                                        <button type="button"
+                                                @click="setPlanMemoryTier(option)"
+                                                class="segmented__item"
+                                                :class="planMemoryTier === option ? 'segmented__item--active' : ''"
+                                                :data-selected="planMemoryTier === option ? 'true' : 'false'"
+                                                :data-tier="option"
+                                                x-text="window.t('settings.resource.guard_tier.' + option)"></button>
+                                    </template>
+                                </div>
+                                <span class="text-caption text-neutral-400"
+                                      x-show="!planMemoryTier">saved setting</span>
+                            </div>
                             <!-- One chip per rank, plus the tier and the MTP state
                                  the plan was priced with. Never a rate. -->
                             <div class="mt-2 flex flex-wrap items-center gap-1.5"
@@ -2513,6 +2532,24 @@
                                             data-cluster-v2-role-headless>{{ t('cluster.v2.plan.role_headless') }}</button>
                                 </div>
                             </div>
+                        </template>
+                    </div>
+                </div>
+
+                <!-- Memory tier for the whole split: the plan's own lever. The
+                     solver may raise it when nothing else fits, and the plan
+                     then reports tier_raised instead of hiding it. -->
+                <div class="mt-3 flex items-center justify-between gap-3" data-cluster-v2-plan-tier>
+                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.resource.guard_tier.label') }}</div>
+                    <div class="segmented segmented--sm">
+                        <template x-for="option in ['safe', 'balanced', 'aggressive']" :key="option">
+                            <button type="button"
+                                    @click="setPlanMemoryTier(option)"
+                                    class="segmented__item"
+                                    :class="planMemoryTier === option ? 'segmented__item--active' : ''"
+                                    :data-selected="planMemoryTier === option ? 'true' : 'false'"
+                                    :data-tier="option"
+                                    x-text="window.t('settings.resource.guard_tier.' + option)"></button>
                         </template>
                     </div>
                 </div>
