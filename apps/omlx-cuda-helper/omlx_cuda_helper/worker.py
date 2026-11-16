@@ -313,8 +313,12 @@ class StageServer:
                 item[1].set()
                 continue
             try:
-                wire.send(session.sock, *item)
-            except OSError:
+                if item[0] == "release":
+                    # Replies view MLX buffers until sent; the job's are all out now.
+                    tensors.release_cache()
+                else:
+                    wire.send(session.sock, *item)
+            except (OSError, RuntimeError):
                 with session.changed:
                     session.closed = True
                     session.changed.notify_all()
@@ -391,6 +395,7 @@ class StageServer:
                 with suppress(StageError):
                     self.upstream.cancel(job.job_id)
                 self.upstream.forget(job.job_id)
+            session.outbox.put(("release", None))
 
     def _run_chunks(self, session: _Session, job: _Job) -> None:
         stage, upstream = self.stage, self.upstream

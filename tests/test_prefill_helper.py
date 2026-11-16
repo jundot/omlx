@@ -3,6 +3,7 @@
 import itertools
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -642,6 +643,11 @@ _REMOTE = HelperTarget("node", "M5max", "me@10.0.0.2", "10.0.0.2", "thunderbolt"
 
 
 def _remote(home):
+    shim = home / ".omlx" / "bin" / "omlx-cluster-python"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+    shim.chmod(0o755)
+
     def runner(argv, **kwargs):
         # Run the remote command here, with HOME pointing at the fake Mac.
         command = argv[-1]
@@ -1798,6 +1804,17 @@ def test_qwen4_split_matches_whole_model(layers, k, prefix):
     _split_matches(
         QWEN4, lambda: _qwen4(layers), ids, [9, 6, 7], k, prefix, _qwen4_state
     )
+
+
+def test_qwen4_prefix_of_a_decoded_cache_sends_text_positions():
+    lm = _qwen4(4)
+    cache = lm.make_cache()
+    lm(mx.array(np.random.default_rng(5).integers(3, 58, (1, 9))), cache=cache)
+    text = cache[2].index_position_ids
+    # A decode step leaves the ids in MRoPE form.
+    cache[2].index_position_ids = mx.broadcast_to(text[None], (3, *text.shape))
+    sent = QWEN4.prefix_state(cache, 3)["2.ip"]
+    np.testing.assert_array_equal(np.asarray(sent), np.asarray(text))
 
 
 # ---------------------------------------------------------------------------
