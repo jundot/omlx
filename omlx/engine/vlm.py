@@ -2661,6 +2661,16 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Flint decode patch not applied", exc_info=True)
 
+        # Gemma 4 MoE (26B-A4B): top-k routing and the weighted combine in one
+        # launch each per layer, for decode and speculative verify rows.
+        if self.model_type == "gemma4":
+            try:
+                from ..patches.gemma4_moe_decode import apply_gemma4_moe_decode_patch
+
+                apply_gemma4_moe_decode_patch()
+            except Exception:
+                logger.debug("Gemma 4 MoE decode patch not applied", exc_info=True)
+
         # LFM3 text tower (shared by LFM3, -VL, -Audio and -Omni): one-launch
         # RoPE instead of about fifteen array ops per q/k call.
         if self.model_type in ("lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni"):
