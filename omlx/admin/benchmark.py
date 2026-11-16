@@ -814,6 +814,31 @@ def _restore_speed_priority(engine_pool: Any, previous: bool | None) -> None:
         config.prefill_speed_priority = previous
 
 
+def _pin_prefill_first(engine_pool: Any) -> bool | None:
+    """Turn decode fairness off for the benchmark's duration.
+
+    With fairness on, a batch test's prefills yield to the rows that already
+    decode, so the rows start seconds apart and the batch row no longer
+    measures concurrent decode. Returns the previous value for restoration,
+    or None when the pool exposes no config.
+    """
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if config is None:
+        return None
+    previous = bool(getattr(config, "decode_fairness", True))
+    config.decode_fairness = False
+    return previous
+
+
+def _restore_prefill_first(engine_pool: Any, previous: bool | None) -> None:
+    """Undo _pin_prefill_first (no-op when the pin never landed)."""
+    if previous is None:
+        return
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if config is not None:
+        config.decode_fairness = previous
+
+
 async def _lift_concurrency_for_batch(engine_pool: Any, batch_size: int) -> int | None:
     """Raise the concurrent-request cap to the batch size for the batch tests.
 
@@ -2021,6 +2046,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     # Throughput measurements must not be skewed by the memory-guard
     # throttle shrinking chunks; pin speed priority for the run.
     previous_speed_priority = _pin_speed_priority(engine_pool)
+    previous_decode_fairness = _pin_prefill_first(engine_pool)
     previous_concurrency: int | None = None
     lifted_concurrency: int | None = None
 
@@ -2560,6 +2586,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Benchmark: sampler stop failed: {e}")
         _restore_speed_priority(engine_pool, previous_speed_priority)
+        _restore_prefill_first(engine_pool, previous_decode_fairness)
         # Shielded: a second cancel while restoring must not leave the cap raised.
         await asyncio.shield(
             _restore_concurrency(engine_pool, previous_concurrency, lifted_concurrency)
