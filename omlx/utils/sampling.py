@@ -95,6 +95,29 @@ def top_k_indices(values: mx.array, k: int) -> mx.array:
     return (chunk * _TOP_K_CHUNK + pick % _TOP_K_CHUNK).reshape(*lead, k)
 
 
+_WIDE_TOP_K_CHUNK = 64
+
+
+def top_k_indices_wide(values: mx.array, k: int) -> mx.array:
+    """Indices of the ``k`` largest entries along the last axis, unordered.
+
+    ``top_k_indices`` for a ``k`` up to a few hundred. Chunk maxima are ranked
+    first, so ``argpartition`` sorts ``k * chunk`` values instead of the vocab.
+    Ties at the k-th value may pick either index.
+    """
+    vocab = values.shape[-1]
+    chunk = _WIDE_TOP_K_CHUNK
+    if vocab % chunk or vocab // chunk <= k:
+        return mx.argpartition(-values, kth=k - 1, axis=-1)[..., :k]
+    lead = values.shape[:-1]
+    blocks = values.reshape(-1, vocab // chunk, chunk)
+    best = mx.argpartition(-blocks.max(axis=-1), kth=k - 1, axis=-1)[:, :k]
+    cand = mx.take_along_axis(blocks, best[:, :, None], axis=1)
+    pick = mx.argpartition(-cand.reshape(-1, k * chunk), kth=k - 1, axis=-1)[:, :k]
+    picked = mx.take_along_axis(best, pick // chunk, axis=-1)
+    return (picked * chunk + pick % chunk).reshape(*lead, k)
+
+
 def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
     """Top-k filtering — keep only the ``top_k`` highest-probability tokens."""
     vocab_size = logprobs.shape[-1]
