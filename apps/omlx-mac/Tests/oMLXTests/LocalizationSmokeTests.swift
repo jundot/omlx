@@ -59,6 +59,7 @@ final class LocalizationSmokeTests: XCTestCase {
         // Server-side screens
         "server.section.advanced", "server.row.base_path",
         "security.section.api_key", "security.api_key.row_label",
+        "security.secure_server.section", "security.secure_server.label",
         "integrations.section.applications", "integrations.tool.claude",
         "integrations.section.external_engines", "integrations.panel.model",
         "integrations.section.markitdown", "integrations.markitdown.pdf_processing_missing_model",
@@ -160,6 +161,51 @@ final class LocalizationSmokeTests: XCTestCase {
                                  "catalog suspiciously small (\(strings.count) keys)")
         } catch {
             XCTFail("Localizable.xcstrings is not valid JSON: \(error)")
+        }
+    }
+
+    /// The Secure Server family must be translated into every locale the
+    /// catalog carries, not just English. This is a security surface: a status
+    /// pill or a "not enforcing" warning that falls back to the raw key, or
+    /// silently to English, is a user-visible defect on a non-English Mac.
+    /// Checking the catalog directly (rather than NSLocalizedString) keeps the
+    /// assertion independent of the host language and of which .lproj bundles
+    /// the test host happens to embed.
+    func testSecureServerStringsCoverEveryCatalogLocale() {
+        guard let url = Bundle.main.url(forResource: "Localizable",
+                                        withExtension: "xcstrings") else {
+            // Same non-fatal carve-out as testCatalogIsValidJSON.
+            return
+        }
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let strings = root["strings"] as? [String: Any] else {
+            XCTFail("Couldn't parse Localizable.xcstrings")
+            return
+        }
+
+        func localizations(_ entry: Any?) -> [String: Any] {
+            (entry as? [String: Any])?["localizations"] as? [String: Any] ?? [:]
+        }
+
+        var catalogLocales = Set<String>()
+        for entry in strings.values {
+            catalogLocales.formUnion(localizations(entry).keys)
+        }
+        XCTAssertFalse(catalogLocales.isEmpty, "catalog carries no localizations at all")
+
+        let featureKeys = strings.keys.filter { $0.hasPrefix("security.secure_server.") }
+        XCTAssertFalse(featureKeys.isEmpty, "Secure Server strings vanished from the catalog")
+
+        for key in featureKeys.sorted() {
+            let locs = localizations(strings[key])
+            for locale in catalogLocales.sorted() {
+                let unit = (locs[locale] as? [String: Any])?["stringUnit"] as? [String: Any]
+                let value = unit?["value"] as? String
+                XCTAssertNotNil(value, "\(key) has no \(locale) localization")
+                XCTAssertFalse(value?.isEmpty ?? true, "\(key) has an empty \(locale) value")
+                XCTAssertNotEqual(value, key, "\(key) exposes its own key in \(locale)")
+            }
         }
     }
 }

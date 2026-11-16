@@ -162,6 +162,13 @@
 		FAB000000000000000000013 /* PromptPlaceholders.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000013 /* PromptPlaceholders.swift */; };
 		FAB000000000000000000014 /* AskAIToolRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000014 /* AskAIToolRunner.swift */; };
 		FAB000000000000000000015 /* ScreenCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC000000000000000000015 /* ScreenCapture.swift */; };
+		EA0B0000000000000000A001 /* SecureServerShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA0C0000000000000000B001 /* SecureServerShared.swift */; };
+		EA0B0000000000000000A002 /* SecureServerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA0C0000000000000000B002 /* SecureServerController.swift */; };
+		EA0B0000000000000000A003 /* SecureServerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA0C0000000000000000B003 /* SecureServerTests.swift */; };
+		EA0B0000000000000000A004 /* SecureServerShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA0C0000000000000000B001 /* SecureServerShared.swift */; };
+		EA0B0000000000000000A005 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA0C0000000000000000B004 /* main.swift */; };
+		EA0B0000000000000000A006 /* oMLXSecureServerHelper in CopyFiles */ = {isa = PBXBuildFile; fileRef = EA0C0000000000000000B006 /* oMLXSecureServerHelper */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		EA0B0000000000000000A007 /* com.omlx.secure-server-helper.plist in CopyFiles */ = {isa = PBXBuildFile; fileRef = EA0C0000000000000000B005 /* com.omlx.secure-server-helper.plist */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -172,7 +179,39 @@
 			remoteGlobalIDString = 1AAAAAAAAAAAAAAAAAAAAAA2;
 			remoteInfo = oMLX;
 		};
+		EA0F0000000000000000F005 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1AAAAAAAAAAAAAAAAAAAAAA1 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = EA0F0000000000000000F001;
+			remoteInfo = oMLXSecureServerHelper;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		EA0E0000000000000000D003 /* Embed Secure Server Helper */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 6;
+			files = (
+				EA0B0000000000000000A006 /* oMLXSecureServerHelper in CopyFiles */,
+			);
+			name = "Embed Secure Server Helper";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		EA0E0000000000000000D004 /* Embed Secure Server LaunchDaemon */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "Contents/Library/LaunchDaemons";
+			dstSubfolderSpec = 1;
+			files = (
+				EA0B0000000000000000A007 /* com.omlx.secure-server-helper.plist in CopyFiles */,
+			);
+			name = "Embed Secure Server LaunchDaemon";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
         ABCDEF012345678901234502 /* UsageHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageHistoryView.swift; sourceTree = "<group>"; };
@@ -333,6 +372,12 @@
 		FAC000000000000000000013 /* PromptPlaceholders.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PromptPlaceholders.swift; sourceTree = "<group>"; };
 		FAC000000000000000000014 /* AskAIToolRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskAIToolRunner.swift; sourceTree = "<group>"; };
 		FAC000000000000000000015 /* ScreenCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCapture.swift; sourceTree = "<group>"; };
+		EA0C0000000000000000B001 /* SecureServerShared.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureServerShared.swift; sourceTree = "<group>"; };
+		EA0C0000000000000000B002 /* SecureServerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureServerController.swift; sourceTree = "<group>"; };
+		EA0C0000000000000000B003 /* SecureServerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureServerTests.swift; sourceTree = "<group>"; };
+		EA0C0000000000000000B004 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		EA0C0000000000000000B005 /* com.omlx.secure-server-helper.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "com.omlx.secure-server-helper.plist"; sourceTree = "<group>"; };
+		EA0C0000000000000000B006 /* oMLXSecureServerHelper */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = oMLXSecureServerHelper; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -408,6 +453,7 @@
 				DCC000000000000000000116 /* CountFormatTests.swift */,
 				DCC000000000000000000117 /* IntegrationsScreenVMTests.swift */,
 				FAC00000000000000000000C /* AskAITests.swift */,
+				EA0C0000000000000000B003 /* SecureServerTests.swift */,
 			);
 			path = oMLXTests;
 			sourceTree = "<group>";
@@ -425,6 +471,8 @@
 				6EE000000000000000000001 /* AppView */,
 				AEE000000000000000000001 /* Welcome */,
 				FAE000000000000000000001 /* AskAI */,
+				EA0D0000000000000000C001 /* SecureServer */,
+				EA0D0000000000000000C002 /* SecureServerHelper */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -463,6 +511,7 @@
 				1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX.entitlements */,
 				1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */,
 				BCC000000000000000000002 /* Localizable.xcstrings */,
+				EA0C0000000000000000B005 /* com.omlx.secure-server-helper.plist */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -472,6 +521,7 @@
 			children = (
 				1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */,
 				DCC000000000000000000010 /* oMLXTests.xctest */,
+				EA0C0000000000000000B006 /* oMLXSecureServerHelper */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -678,6 +728,23 @@
 			path = AskAI;
 			sourceTree = "<group>";
 		};
+		EA0D0000000000000000C001 /* SecureServer */ = {
+			isa = PBXGroup;
+			children = (
+				EA0C0000000000000000B001 /* SecureServerShared.swift */,
+				EA0C0000000000000000B002 /* SecureServerController.swift */,
+			);
+			path = SecureServer;
+			sourceTree = "<group>";
+		};
+		EA0D0000000000000000C002 /* SecureServerHelper */ = {
+			isa = PBXGroup;
+			children = (
+				EA0C0000000000000000B004 /* main.swift */,
+			);
+			path = SecureServerHelper;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -688,10 +755,13 @@
 				1EEEEEEEEEEEEEEEEEEEEEE1 /* Sources */,
 				1EEEEEEEEEEEEEEEEEEEEEE2 /* Frameworks */,
 				1EEEEEEEEEEEEEEEEEEEEEE3 /* Resources */,
+				EA0E0000000000000000D003 /* Embed Secure Server Helper */,
+				EA0E0000000000000000D004 /* Embed Secure Server LaunchDaemon */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				EA0F0000000000000000F006 /* PBXTargetDependency */,
 			);
 			name = oMLX;
 			packageProductDependencies = (
@@ -718,6 +788,21 @@
 			productReference = DCC000000000000000000010 /* oMLXTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		EA0F0000000000000000F001 /* oMLXSecureServerHelper */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = EA0F0000000000000000F002 /* Build configuration list for PBXNativeTarget "oMLXSecureServerHelper" */;
+			buildPhases = (
+				EA0E0000000000000000D001 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = oMLXSecureServerHelper;
+			productName = oMLXSecureServerHelper;
+			productReference = EA0C0000000000000000B006 /* oMLXSecureServerHelper */;
+			productType = "com.apple.product-type.tool";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -734,6 +819,9 @@
 					DAA000000000000000000001 = {
 						CreatedOnToolsVersion = 16.4;
 						TestTargetID = 1AAAAAAAAAAAAAAAAAAAAAA2;
+					};
+					EA0F0000000000000000F001 = {
+						CreatedOnToolsVersion = 16.4;
 					};
 				};
 			};
@@ -754,6 +842,7 @@
 			projectRoot = "";
 			targets = (
 				1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX */,
+				EA0F0000000000000000F001 /* oMLXSecureServerHelper */,
 				DAA000000000000000000001 /* oMLXTests */,
 			);
 		};
@@ -895,6 +984,8 @@
 				BBB000000000000000000004 /* AppUpdater.swift in Sources */,
 				BBB000000000000000000005 /* ReleasesChecker.swift in Sources */,
 				BBB000000000000000000006 /* UpdateInstaller.swift in Sources */,
+				EA0B0000000000000000A001 /* SecureServerShared.swift in Sources */,
+				EA0B0000000000000000A002 /* SecureServerController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -935,6 +1026,16 @@
 				DBB000000000000000000116 /* CountFormatTests.swift in Sources */,
 				DBB000000000000000000117 /* IntegrationsScreenVMTests.swift in Sources */,
 				FAB00000000000000000000C /* AskAITests.swift in Sources */,
+				EA0B0000000000000000A003 /* SecureServerTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		EA0E0000000000000000D001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EA0B0000000000000000A004 /* SecureServerShared.swift in Sources */,
+				EA0B0000000000000000A005 /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -945,6 +1046,11 @@
 			isa = PBXTargetDependency;
 			target = 1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX */;
 			targetProxy = DAA000000000000000000008 /* PBXContainerItemProxy */;
+		};
+		EA0F0000000000000000F006 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = EA0F0000000000000000F001 /* oMLXSecureServerHelper */;
+			targetProxy = EA0F0000000000000000F005 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -1154,6 +1260,38 @@
 			};
 			name = Release;
 		};
+		EA0F0000000000000000F003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = app.omlx.secure-server-helper;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		EA0F0000000000000000F004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = app.omlx.secure-server-helper;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -1180,6 +1318,15 @@
 			buildConfigurations = (
 				DAA000000000000000000003 /* Debug */,
 				DAA000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		EA0F0000000000000000F002 /* Build configuration list for PBXNativeTarget "oMLXSecureServerHelper" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				EA0F0000000000000000F003 /* Debug */,
+				EA0F0000000000000000F004 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

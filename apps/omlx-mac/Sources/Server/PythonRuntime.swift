@@ -25,6 +25,7 @@
 //     server after its delayed self-SIGTERM.
 
 import Foundation
+import Security
 
 struct PythonRuntime {
     let executable: URL
@@ -53,7 +54,11 @@ struct PythonRuntime {
         let env = ProcessInfo.processInfo.environment
         var tried: [String] = []
 
-        if let override = env["OMLX_PYTHON_OVERRIDE"], !override.isEmpty {
+        // Only for a development build. This decides what the privileged helper is
+        // asked to execute as the sandbox account, so honouring it in a signed release
+        // would make "run any program you like as the sandbox account" a property of
+        // the shipped app. An ad-hoc build carries no team identifier; a release does.
+        if isDevelopmentBuild, let override = env["OMLX_PYTHON_OVERRIDE"], !override.isEmpty {
             let url = URL(fileURLWithPath: override)
             tried.append(override)
             if FileManager.default.isExecutableFile(atPath: url.path) {
@@ -95,6 +100,25 @@ struct PythonRuntime {
         }
 
         throw ResolutionError.notFound(triedPaths: tried)
+    }
+
+    /// True when this binary is not signed by a team, i.e. a local development build.
+    /// A release is signed with a Team ID, so the development escape hatches above
+    /// cannot be reached in a shipped app.
+    private static var isDevelopmentBuild: Bool {
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return false }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else {
+            return false
+        }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information
+        ) == errSecSuccess,
+              let information = information as? [String: Any]
+        else { return false }
+        return information[kSecCodeInfoTeamIdentifier as String] == nil
     }
 
     /// Build the spawn environment: parent env + supervisor marker +
