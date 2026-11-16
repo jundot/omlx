@@ -1875,3 +1875,79 @@ origin `.11` ran this tree, because only the origin needs the new apply code and
 the rank processes are launched by the coordinator's own interpreter. That is
 not a §1.5-clean cluster: the rebuilt DMG that contains this fix is installed on
 all four Macs before the repeated run.
+
+## 30. W1+W2 live run: the helper as a capability and the in-app uninstall (2026-11-15/16)
+
+W1 (D1 uninstall) and W2 (D6 helper capability) implemented and live-checked on
+`.11`, from a wiped state, with the interactive steps done by a person at the
+Mac. Builds (all four Macs, identical app-binary hash each time):
+
+| DMG | App binary | Content |
+|---|---|---|
+| `19a446d9…` | `01e7898c…` | session start (pre-W1/W2) |
+| `9bb7dc89…` | `aa19aac5…` | W1+W2, first Welcome scroll fix |
+| `6ad5bde7…` | `8b8c63ca…` | compact Welcome panel, runtime row always visible |
+| `6dfaf640…` | `4194baa3…` | quit-after-sheet + real helper removal |
+
+**W2 live (A5).** The Mac was wiped but the kernel limit stayed at 122 880 MB
+and the install ledger still said `1` — exactly the D6 defect state in which the
+old UI showed nothing. The new UI showed **Install** anyway; one admin dialog
+blessed the helper (`/Library/PrivilegedHelperTools/app.omlx.helper` +
+LaunchDaemon plist, Team `YB894QRG4W`); the status seam read the disk truth, not
+the stale ledger. Welcome then showed „installed (v1)"; Performance showed the
+permanent row plus the wired-limit row **122 880 MB of 122 880 MB requested**
+with Apply hidden and Install/Reinstall still visible (state 4, live), and
+Reinstall ran **without a second dialog** (state 2, live). States 3 (other
+version) and 5 (limit below request) are not producible on this Mac right now
+and stay XCTest-covered (five states, injected status, no prompt).
+
+**W1 live (A6).** The first real uninstall (build `8b8c63ca…`) moved the app to
+the Trash, removed runtime/settings/cluster state, stopped the server, and kept
+the 902 GB of models untouched. The identity was removed via the sheet's opt-in
+switch (user-confirmed: the switch was on; the keep-default is unit-proven).
+Two defects surfaced and were fixed (`caa3901a`):
+
+1. **Quit after the sheet.** `NSApp.terminate` is ignored inside a sheet button
+   action and returns without quitting while a sheet is attached; the window's
+   close button is disabled under a sheet, so the only way out was File → Close
+   plus the menubar Quit. `quitAppNow` now ends every attached sheet and
+   terminates deferred (the `UpdateController.performSwap` lesson).
+2. **Helper leftovers.** `SMJobRemove` deregistered the launchd job but left
+   the root-owned tool and plist (mtime unchanged) — the same leftover the
+   cleanup script knows. The uninstall's one admin dialog now runs the
+   lab-proven fixed command (bootout + `rm -f` both files). The leftover files
+   from the pre-fix run are removed by the next uninstall of `4194baa3…` or by
+   Welcome's Reinstall re-blessing them.
+
+**Welcome UX (found live, fixed).** The fixed 680×620 window with a
+non-scrollable card stack overflowed into the footer: rows (including the
+**API key**) slid under it and Start Server's validation pointed at an
+invisible field, with an overlay scrollbar macOS only reveals while scrolling.
+Now: one compact panel with every row visible (Port, Model Directory, API Key,
+Python runtime, System helper), runtime log/errors below the panel, binding
+hint folded into one line, hero shrunk, window resizable (680×660 default,
+620 minimum), ScrollView only as a safety net. The runtime row follows the D6
+capability rule: **always present**, „Installed — Python and MLX are ready." /
+„Not installed — …", install button only while missing (user: no
+system-dependent appearance of buttons).
+
+**Launchpad zombie (diagnosed, not a build defect).** „The bundled runtime
+manifest is missing" + a wired-limit failure appeared after the uninstall: the
+user had launched the **DerivedData Debug test build** registered by the Xcode
+test host (no `runtime-project`, unsigned). The zombie was deregistered and
+deleted; the notarized app carries the manifest (verified in the Trash copy).
+
+**New product decision (recorded in AGENTS §10.7).** *Distributed inference is
+on by default* (`omlx/settings.py`, `exposure.py`): a fresh install must reach
+the Cluster Assistant without hunting for the switch; saved explicit values
+still win; the settings hint was updated in all 11 locales.
+
+**Suites.** `tests/cluster_assistant` 658 passed; macOS python packaging 27
+passed; full Xcode 441 passed / 0 failed (`-scheme oMLX CODE_SIGNING_ALLOWED=NO
+-testLanguage en`); full pytest `tests` + `apps/omlx-web/tests`
+**20 765 passed / 0 failed** (483 skipped; the two wizard-test failures the
+rank-0 pin's Mac picker had tripped were fixed by allowing exactly the one
+coordinator select). `make web` is a no-op. The distributed-inference
+default-on build is the final artefact: DMG `6958fda5…`, app binary
+`09f51c2d…`, notarized + stapled, identical on all four Macs.
+
