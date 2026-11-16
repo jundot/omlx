@@ -315,6 +315,34 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
     overrides make_mask for per-request left_padding support.
     """
 
+    # Host copy of "any row is left-padded", valid for the current
+    # ``left_padding`` array (see ``_has_left_padding``).
+    _left_padded: bool | None = None
+
+    @property
+    def left_padding(self):
+        return self._left_padding
+
+    @left_padding.setter
+    def left_padding(self, value):
+        # Assign (also via ``+=``) rather than mutate in place: the setter is
+        # what invalidates the cached host flag.
+        self._left_padding = value
+        self._left_padded = None
+
+    def _has_left_padding(self) -> bool:
+        """Whether any row is left-padded, read from the device once per assignment.
+
+        ``left_padding`` changes only when the batch is reshaped (prepare,
+        finalize, filter, extend), but mask building asks every decode step
+        and, on the portable attention path, once per attention layer. A
+        device read there waits for all queued GPU work, which stalls the
+        pipelined decode loop.
+        """
+        if self._left_padded is None:
+            self._left_padded = bool(mx.any(self._left_padding).item())
+        return self._left_padded
+
     def __init__(self, left_padding: List[int], bits: float = 4.0, seed: int = 0):
         super().__init__(bits=bits, seed=seed)
         self.group_size = 0
@@ -405,7 +433,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         if (
             isinstance(offset, mx.array)
             and offset.size == 1
-            and int(self.left_padding.max().item()) == 0
+            and not self._has_left_padding()
         ):
             return create_attention_mask(N, offset.item(), return_array, window_size)
         # B>1 (or a left-padded survivor after filter()): delegate to mlx-lm's

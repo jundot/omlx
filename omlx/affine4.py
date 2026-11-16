@@ -1506,7 +1506,7 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
             )
         # Without left padding the plain mask is exact; keeping it a string lets the
         # bf16 prefill use the fused kernel instead of a (query x cache) mask array.
-        if (mask is None or causal) and not mx.any(self.left_padding).item():
+        if (mask is None or causal) and not self._has_left_padding():
             return mask
         columns = mx.arange(tokens)
         allowed = columns[None, None, None, :] >= self.left_padding[:, None, None, None]
