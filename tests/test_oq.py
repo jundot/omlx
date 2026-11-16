@@ -6997,6 +6997,31 @@ class TestNemotronImatrix:
         assert embed is direct.backbone.embeddings
         assert layers is direct.layers
 
+    @pytest.mark.parametrize("model_type", ["mamba", "mamba2"])
+    def test_lm_head_capture_rejects_unrelated_text_types(self, model_type):
+        import omlx.oq as oq
+
+        text = nn.Module()
+        text.model_type = model_type
+        text.backbone = nn.Module()
+        text.backbone.embeddings = nn.Embedding(8, 4)
+        text.backbone.norm_f = nn.RMSNorm(4)
+        text.lm_head = nn.Linear(4, 8, bias=False)
+        model = nn.Module()
+        model.language_model = text
+        collector = OQImatrixCollector()
+        assert collector.install(model) == 1
+        try:
+            assert (
+                oq._collect_language_model_lm_head_imatrix(
+                    model, mx.ones((1, 2, 4)), collector
+                )
+                is False
+            )
+            assert collector.entries == {}
+        finally:
+            collector.restore(model)
+
     @pytest.mark.parametrize("wrapped", [False, True])
     @pytest.mark.parametrize("quantized", [False, True])
     def test_layer_walk_matches_native_captures(self, bolt, wrapped, quantized):
