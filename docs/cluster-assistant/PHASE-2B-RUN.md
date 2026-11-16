@@ -1953,3 +1953,40 @@ coordinator select). `make web` is a no-op. The distributed-inference
 default-on build is the final artefact: DMG `6958fda5…`, app binary
 `09f51c2d…`, notarized + stapled, identical on all four Macs.
 
+## 31. U1–U6 acceptance run (A1–A7) — 2026-11-__ (to be filled in)
+
+The run that closes `ROADMAP-ACCEPTANCE-2026-11-16.md` §2. Shape is fixed here so
+the session only has to fill in the values; nothing is recorded before it is
+measured.
+
+**Build and state**
+
+| Item | Value |
+|---|---|
+| Origin Mac | `.11` (MacBook Pro M5 Max, 128 GiB) |
+| DMG | `build/oMLX-0.8.0rc1.dmg`, SHA256 `__________` |
+| App binary (`shasum -a 256 …/Contents/MacOS/oMLX`) | `__________` on **all four** Macs |
+| Version gate | `GET /api/cluster/node_id` → same `version` on `.11/.12/.13/.14` |
+| Wipe | `scripts/cleanup-cluster-macs.sh --all --with-helper`, state backup `~/.omlx/backup-cluster-2026-11-__/` |
+| Helper | removed before the run (so A5 proves a real first install) — `__________` |
+| Probe | `assistant_performance_probe` **on** |
+
+**Gate** — one row per criterion, `pass` only with the evidence named.
+
+| # | Criterion | Result | Evidence |
+|---|---|---|---|
+| A1 | manual flow: devices → pair → measure → model → plan → apply → start → ready → one completion → stop | | measurement `ms-…`, plan `…`, operation `op-…`, reply text |
+| A2 | the same model through the assistant card; endpoint only at `ready` | | operation `op-…`, endpoint URL, rank order |
+| A3 | a real failure shown at its step, corrected in place, retried successfully (no reload) | | error code + action, second attempt `op-…` |
+| A4 | after a green plan: change model/context, downstream `stale`, finish the flow | | plan signature before/after |
+| A5 | helper installable/reinstallable from Welcome **and** Performance, independent of the wired-limit warning | | five status states observed |
+| A6 | in-app uninstall: app, helper, runtime, settings, cluster state gone; models + `identity.json` kept; 0 LS records | | `ls -d /Applications/oMLX*.app` → 0, `lsregister -dump | grep -c oMLX.app` → 0 |
+| A7 | no error text only in the advanced preview; no warning rendered as an error | | the screens exercised in A3 |
+
+**Observations**
+
+- Plan split (rank order, stages, context, tier, table/MoE offload):
+- `predicted` vs `observed` (probe on): prefill / decode / TTFT, `measured_at`:
+- Stop: operation `stopped`, endpoint hidden, `Start again` offered:
+- Failures found during the run and how they were fixed (each becomes a commit):
+- Suites after any fix (must be re-run before the next attempt):
