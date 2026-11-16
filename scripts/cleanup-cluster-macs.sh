@@ -40,6 +40,13 @@ set -uo pipefail
 # Validation cluster is .11 + .12 + .13. .14 was REASSIGNED on 2026-11-16 to its
 # own task and needs its own oMLX installation: never clean, install, measure or
 # restart it from here. It is deliberately absent from this list.
+# The E001 research build is a SECOND app on .11/.14: `oMLX-E001.app`, bundle id
+# `app.omlx.e001`, its own state in `~/.omlx-e001`, port 8001. It belongs to the
+# parallel research project, not to the cluster, and must survive every cleanup:
+# never remove the app, its LaunchServices record, its state directory or a
+# trashed copy of it. This guard is the reason the app glob below is filtered.
+PROTECTED_APP="oMLX-E001.app"
+PROTECTED_STATE="$HOME/.omlx-e001"
 PEERS=(172.16.1.12 172.16.1.13)
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 ALL=0
@@ -125,6 +132,12 @@ clean_here() {
         "$HOME/omlx-pr" \
         "$HOME/omlx-distributed" ; do
         [ -e "$path" ] || continue
+        case "$(basename "$path")" in
+            "$PROTECTED_APP")
+                echo "  kept $path (E001 research build — never cleaned)"
+                continue
+                ;;
+        esac
         rm -rf "$path" 2>/dev/null && echo "  removed $path"
     done
     find "$HOME/Library/Developer/Xcode/DerivedData" -maxdepth 1 -name 'oMLX-*' \
@@ -136,7 +149,8 @@ clean_here() {
             -exec rm -rf {} + 2>/dev/null
         find "$root/build" -maxdepth 3 -name '*.app' -exec rm -rf {} + 2>/dev/null
     done
-    find "$HOME/.Trash" -maxdepth 1 -name '*oMLX*' -exec rm -rf {} + 2>/dev/null
+    find "$HOME/.Trash" -maxdepth 1 -name '*oMLX*' ! -name "$PROTECTED_APP" \
+        -exec rm -rf {} + 2>/dev/null
     for vol in /Volumes/oMLX*; do
         [ -d "$vol" ] && hdiutil detach "$vol" >/dev/null 2>&1
     done
@@ -181,6 +195,9 @@ clean_here() {
         | grep -o 'path:.*oMLX[^ ]*\.app' | sed 's|path: *||' | sort -u \
         | while read -r bundle; do
             [ -n "$bundle" ] || continue
+            case "$(basename "$bundle")" in
+                "$PROTECTED_APP") continue ;;   # E001 stays registered
+            esac
             "$LSREGISTER" -u "$bundle" >/dev/null 2>&1
         done
     "$LSREGISTER" -gc -f -r -domain user -domain local >/dev/null 2>&1
@@ -189,7 +206,8 @@ clean_here() {
 
     # ---- verify ---------------------------------------------------------
     echo "  apps on disk: $(ls -d /Applications/oMLX*.app 2>/dev/null | wc -l | tr -d ' ')" \
-         "| LS records: $("$LSREGISTER" -dump 2>/dev/null | grep -c 'oMLX\.app')"
+         "| LS records: $("$LSREGISTER" -dump 2>/dev/null | grep -c 'oMLX\.app')" \
+         "| E001 kept: $([ -d "/Applications/$PROTECTED_APP" ] && echo app || echo none), state $([ -d "$PROTECTED_STATE" ] && echo kept || echo none)"
 }
 
 PEER_ARGS=""

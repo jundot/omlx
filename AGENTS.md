@@ -800,7 +800,7 @@ The cluster may be offline. Do not assume it is available.
 | `172.16.1.11` | MacBook Pro M5 Max | 128 GiB | origin, fast/large candidate (host `MacBook-Pro-von-Andreas`) |
 | `172.16.1.12` | Mac Studio M2 Ultra | 64 GiB | medium candidate (host `Mac-Studio-M2Ultra`) |
 | `172.16.1.13` | Mac Studio M1 Max | 32 GiB | small candidate, **`headless`** (host `MacStudio-von-Andreas-2`) |
-| `172.16.1.14` | Mac Studio M1 Max | 32 GiB | **reassigned 2026-11-16: never touched** (own task, needs its own oMLX) |
+| `172.16.1.14` | Mac Studio M1 Max | 32 GiB | **reassigned 2026-11-16: never cleaned/paired/measured**, its own oMLX app; it also carries the E001 research app by owner request |
 
 Measured 2026-11-16 from the pairing records: `.12` is the M2 Ultra (64 GiB), `.13`
 the M1 Max (32 GiB) — the earlier table had the two swapped. A Mac under 64 GiB
@@ -919,7 +919,14 @@ These come back in every cluster session; the answers are decided:
   Back up the JSON state first (`~/.omlx/backup-cluster-<date>/`), then verify: no
   processes, port free, and the cluster directory contains only `identity.json`
   plus backups. This applies to `.11` and to every peer.
-- **A real cleanup also removes every oMLX *copy* and its Launchpad entry.** Delete
+- **A real cleanup also removes every oMLX *copy* and its Launchpad entry — but
+  never the E001 research build.** `oMLX-E001.app` (bundle id `app.omlx.e001`,
+  state `~/.omlx-e001`, port 8001, version `0.8.0rc2`) is the research project's
+  second app; `cleanup-cluster-macs.sh` guards the app, its LaunchServices
+  record, its state directory and any trashed copy, and reports `E001 kept`.
+  It sits on `.11` and `.14`; `.14` is otherwise out of scope. See
+  [`docs/cluster-assistant/E001-RESEARCH-BUILD.md`](docs/cluster-assistant/E001-RESEARCH-BUILD.md).
+  For everything that is *not* E001: Delete
   `/Applications/oMLX*.app`, the **Xcode DerivedData products**
   (`~/Library/Developer/Xcode/DerivedData/oMLX-*`), **Trash copies**, app-support
   and cache dirs, `~/omlx-pr` / `~/omlx-distributed`, mounted DMG volumes and
