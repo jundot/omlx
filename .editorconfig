@@ -15,11 +15,6 @@ max_line_length = 120
 [*.{json,jsonc,yml,yaml,css,md}]
 indent_size = 2
 
-# The Cluster UI's hand-written JS uses a 4-space continuation indent (not the
-# 8-space IntelliJ default), which is what the existing files already follow.
-[*.js]
-ij_continuation_indent_size = 4
-
 [Makefile]
 indent_style = tab
 

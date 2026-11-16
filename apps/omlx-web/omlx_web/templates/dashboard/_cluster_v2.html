@@ -121,11 +121,16 @@
                                     <span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>
                                     <span x-text="mac.name"></span>
                                     <span class="font-normal text-neutral-500" x-text="mac.chip"></span>
-                                    <span class="font-normal text-neutral-500" x-text="mac.ram ? mac.ram + ' GB' : ''"></span>
+                                    <span class="font-normal text-neutral-500"
+                                          x-text="mac.ram ? mac.ram + ' GB' : ''"></span>
                                 </span>
                             </template>
-                            <span class="text-caption text-neutral-500" x-show="assistantCombinedRamLabel()" x-text="assistantCombinedRamLabel()"></span>
-                            <span class="text-caption text-neutral-500" x-show="assistantMeasurementAgeLabel()" x-text="assistantMeasurementAgeLabel()"></span>
+                            <span class="text-caption text-neutral-500"
+                                  x-show="assistantCombinedRamLabel()"
+                                  x-text="assistantCombinedRamLabel()"></span>
+                            <span class="text-caption text-neutral-500"
+                                  x-show="assistantMeasurementAgeLabel()"
+                                  x-text="assistantMeasurementAgeLabel()"></span>
                         </div>
 
                     <!-- Reload resume: the last persisted deployment. It is not a plan; it
@@ -188,7 +193,8 @@
                                     <span class="rounded-[10px] border px-2 py-0.5 text-caption font-semibold"
                                           :class="assistantRowStale(row.key) ? 'border-amber-200 bg-amber-50 text-amber-800' : (row.state === 'failed' ? 'border-red-200 bg-red-50 text-red-700' : (row.state === 'done' ? 'border-green-200 bg-green-50 text-neutral-700' : (row.state === 'current' ? 'border-neutral-900 bg-white text-neutral-900 ring-1 ring-neutral-900' : 'border-neutral-200 bg-neutral-50 text-neutral-400')))"
                                           x-text="assistantStepperLabel(row)"></span>
-                                    <span x-show="index < assistantProgressRows().length - 1" class="text-caption text-neutral-300">›</span>
+                                    <span x-show="index < assistantProgressRows().length - 1"
+                                          class="text-caption text-neutral-300">›</span>
                                 </span>
                             </template>
                         </div>
@@ -209,14 +215,22 @@
                                  :data-assistant-progress-row="row.key"
                                  :data-assistant-progress-state="row.state">
                                 <svg x-show="row.state === 'current'" aria-hidden="true" class="mt-0.5 animate-spin h-3 w-3 text-neutral-500" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                                <i x-show="row.state === 'done'" data-lucide="check" class="mt-0.5 w-3 h-3 text-green-600" x-cloak></i>
-                                <i x-show="row.state === 'failed'" data-lucide="circle-alert" class="mt-0.5 w-3 h-3 text-red-600" x-cloak></i>
+                                <i x-show="row.state === 'done'"
+                                   data-lucide="check"
+                                   class="mt-0.5 w-3 h-3 text-green-600"
+                                   x-cloak></i>
+                                <i x-show="row.state === 'failed'"
+                                   data-lucide="circle-alert"
+                                   class="mt-0.5 w-3 h-3 text-red-600"
+                                   x-cloak></i>
                                 <span x-show="row.state === 'pending'" class="mt-0.5 w-3 h-3 flex items-center justify-center text-caption text-neutral-300">•</span>
                                 <div class="min-w-0">
                                     <div class="text-caption font-semibold"
                                          :class="assistantRowStale(row.key) ? 'text-amber-700' : (row.state === 'pending' ? 'text-neutral-400' : (row.state === 'failed' ? 'text-red-700' : 'text-neutral-900'))"
                                          x-text="row.label"></div>
-                                    <p class="text-caption text-neutral-500" x-show="row.message" x-text="row.message"></p>
+                                    <p class="text-caption text-neutral-500"
+                                       x-show="row.message"
+                                       x-text="row.message"></p>
                                     <p class="text-caption text-neutral-500" x-show="row.count" x-text="row.count"></p>
                                 </div>
                             </div>
@@ -270,8 +284,10 @@
                                 <div class="flex items-start justify-between gap-2">
                                     <div class="min-w-0">
                                         <div class="text-caption font-bold uppercase tracking-wider text-green-700">{{ t('cluster.assistant.screen.plan.recommended') }}</div>
-                                        <div class="text-xs font-semibold text-neutral-900 truncate" x-text="assistantModelLabel()"></div>
-                                        <p class="text-caption text-neutral-600 mt-0.5" x-text="assistantFitHeadline()"></p>
+                                        <div class="text-xs font-semibold text-neutral-900 truncate"
+                                             x-text="assistantModelLabel()"></div>
+                                        <p class="text-caption text-neutral-600 mt-0.5"
+                                           x-text="assistantFitHeadline()"></p>
                                     </div>
                                     <span class="text-caption font-semibold px-2 py-0.5 rounded-full border border-green-200 bg-green-50 text-green-700">{{ t('cluster.assistant.screen.plan.chip') }}</span>
                                 </div>
@@ -360,7 +376,8 @@
                             <div class="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5"
                                  x-show="assistantPlanWarnings().length" x-cloak
                                  data-cluster-v2-assistant-plan-warnings>
-                                <template x-for="warning in assistantPlanWarnings()" :key="warning.code + warning.node_id">
+                                <template x-for="warning in assistantPlanWarnings()"
+                                          :key="warning.code + warning.node_id">
                                     <p class="text-caption text-amber-800" x-text="warning.message"></p>
                                 </template>
                             </div>
@@ -383,7 +400,8 @@
                                             data-cluster-v2-assistant-tradeoff-quality>
                                         Best quality
                                     </button>
-                                    <template x-for="(tradeoff, tradeoffIndex) in assistantTradeoffs()" :key="tradeoffIndex">
+                                    <template x-for="(tradeoff, tradeoffIndex) in assistantTradeoffs()"
+                                              :key="tradeoffIndex">
                                         <button type="button" @click="assistant.selectedTradeoff = tradeoff"
                                                 :class="assistant.selectedTradeoff === tradeoff ? 'bg-neutral-900 text-white border-neutral-900' : 'bg-white border-neutral-200 text-neutral-700'"
                                                 class="px-3 py-1.5 text-caption font-semibold border rounded-full"
@@ -496,7 +514,8 @@
                         <!-- Honest warnings (e.g. the tuning preset outcome). -->
                         <div class="mt-2" x-show="assistant.localRun.warnings.length" x-cloak
                              data-cluster-v2-assistant-local-run-warnings>
-                            <template x-for="(warning, warningIndex) in assistant.localRun.warnings" :key="warningIndex">
+                            <template x-for="(warning, warningIndex) in assistant.localRun.warnings"
+                                      :key="warningIndex">
                                 <p class="text-caption text-neutral-500"
                                    data-cluster-v2-assistant-local-run-warning
                                    x-text="warning.message"></p>
@@ -582,7 +601,8 @@
                                     </thead>
                                     <tbody>
                                         <template x-for="(row, rowIndex) in assistantLocalTuneRows()" :key="rowIndex">
-                                            <tr class="border-t border-neutral-200" data-cluster-v2-assistant-tune-local-row>
+                                            <tr class="border-t border-neutral-200"
+                                                data-cluster-v2-assistant-tune-local-row>
                                                 <td class="py-0.5 pr-2 font-mono" x-text="row.config"></td>
                                                 <td class="py-0.5 pr-2" x-text="assistantLocalTuneRateLabel(row)"></td>
                                                 <td class="py-0.5 text-neutral-500" x-text="row.error || ''"></td>
@@ -708,8 +728,10 @@
                                     </thead>
                                     <tbody>
                                         <template x-for="(row, rowIndex) in assistantSearchResults()" :key="rowIndex">
-                                            <tr class="border-t border-neutral-200" data-cluster-v2-assistant-search-row>
-                                                <td class="py-0.5 pr-2 font-mono" x-text="assistantSearchRankOrder(row)"></td>
+                                            <tr class="border-t border-neutral-200"
+                                                data-cluster-v2-assistant-search-row>
+                                                <td class="py-0.5 pr-2 font-mono"
+                                                    x-text="assistantSearchRankOrder(row)"></td>
                                                 <td class="py-0.5 pr-2 font-mono" x-text="row.node_count"></td>
                                                 <td class="py-0.5 pr-2" x-text="assistantSearchRateLabel(row)"></td>
                                                 <td class="py-0.5" x-text="assistantSearchFeasibleLabel(row)"></td>
@@ -738,11 +760,15 @@
                         <div class="mt-2 space-y-1 text-caption text-neutral-500">
                             <p>
                                 <span class="font-semibold">{{ t('cluster.assistant.details.measurement') }}</span>
-                                <code class="font-mono break-all" data-cluster-v2-assistant-measurement x-text="assistant.measurementId"></code>
+                                <code class="font-mono break-all"
+                                      data-cluster-v2-assistant-measurement
+                                      x-text="assistant.measurementId"></code>
                             </p>
                             <p x-show="assistant.plan">
                                 <span class="font-semibold">{{ t('cluster.assistant.details.signature') }}</span>
-                                <code class="font-mono break-all" data-cluster-v2-assistant-signature x-text="assistant.plan?.plan_signature || ''"></code>
+                                <code class="font-mono break-all"
+                                      data-cluster-v2-assistant-signature
+                                      x-text="assistant.plan?.plan_signature || ''"></code>
                             </p>
                             <div class="mt-1 flex flex-wrap items-center gap-1">
                                 <button type="button" @click="copyAssistantDiagnostics()"
@@ -779,11 +805,15 @@
                             </div>
                             <p x-show="assistant.deploymentId">
                                 <span class="font-semibold">{{ t('cluster.assistant.details.deployment') }}</span>
-                                <code class="font-mono break-all" data-cluster-v2-assistant-deployment x-text="assistant.deploymentId"></code>
+                                <code class="font-mono break-all"
+                                      data-cluster-v2-assistant-deployment
+                                      x-text="assistant.deploymentId"></code>
                             </p>
                             <p x-show="assistant.plan">
                                 <span class="font-semibold">{{ t('cluster.assistant.details.rank_order') }}</span>
-                                <code class="font-mono break-all" data-cluster-v2-assistant-rank-order x-text="assistantRankOrderLabel()"></code>
+                                <code class="font-mono break-all"
+                                      data-cluster-v2-assistant-rank-order
+                                      x-text="assistantRankOrderLabel()"></code>
                             </p>
                             <div x-show="assistantStages().length" data-cluster-v2-assistant-stages>
                                 <span class="font-semibold">{{ t('cluster.assistant.details.stages') }}</span>
@@ -801,8 +831,10 @@
                                             <tr class="border-t border-neutral-200">
                                                 <td class="py-0.5 pr-2 font-mono" x-text="stage.rank"></td>
                                                 <td class="py-0.5 pr-2 font-mono truncate" x-text="stage.node_id"></td>
-                                                <td class="py-0.5 pr-2 font-mono" x-text="stage.first_layer + '–' + stage.last_layer"></td>
-                                                <td class="py-0.5 font-mono" x-text="Math.round(stage.headroom_gib) + ' GiB'"></td>
+                                                <td class="py-0.5 pr-2 font-mono"
+                                                    x-text="stage.first_layer + '–' + stage.last_layer"></td>
+                                                <td class="py-0.5 font-mono"
+                                                    x-text="Math.round(stage.headroom_gib) + ' GiB'"></td>
                                             </tr>
                                         </template>
                                     </tbody>
@@ -811,7 +843,8 @@
                             <div x-show="assistantPlanWarnings().length"
                                  data-cluster-v2-assistant-warnings>
                                 <span class="font-semibold">{{ t('cluster.assistant.details.warnings') }}</span>
-                                <template x-for="warning in assistantPlanWarnings()" :key="warning.code + warning.node_id">
+                                <template x-for="warning in assistantPlanWarnings()"
+                                          :key="warning.code + warning.node_id">
                                     <p class="mt-0.5" x-text="warning.message"></p>
                                 </template>
                             </div>
@@ -862,7 +895,8 @@
                                     <span class="rounded-[10px] border px-2 py-0.5 text-caption font-semibold"
                                           :class="assistantRowStale(row.key) ? 'border-amber-200 bg-amber-50 text-amber-800' : (row.state === 'failed' ? 'border-red-200 bg-red-50 text-red-700' : (row.state === 'done' ? 'border-green-200 bg-green-50 text-neutral-700' : (row.state === 'current' ? 'border-neutral-900 bg-white text-neutral-900 ring-1 ring-neutral-900' : 'border-neutral-200 bg-neutral-50 text-neutral-400')))"
                                           x-text="assistantStepperLabel(row)"></span>
-                                    <span x-show="index < assistantProgressRows().length - 1" class="text-caption text-neutral-300">›</span>
+                                    <span x-show="index < assistantProgressRows().length - 1"
+                                          class="text-caption text-neutral-300">›</span>
                                 </span>
                             </template>
                         </div>
@@ -873,15 +907,25 @@
                                      :data-assistant-progress-row="row.key"
                                      :data-assistant-progress-state="row.state">
                                     <svg x-show="row.state === 'current'" aria-hidden="true" class="mt-0.5 animate-spin h-3 w-3 text-neutral-500" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                                    <i x-show="row.state === 'done'" data-lucide="check" class="mt-0.5 w-3 h-3 text-green-600" x-cloak></i>
-                                    <i x-show="row.state === 'failed'" data-lucide="circle-alert" class="mt-0.5 w-3 h-3 text-red-600" x-cloak></i>
+                                    <i x-show="row.state === 'done'"
+                                       data-lucide="check"
+                                       class="mt-0.5 w-3 h-3 text-green-600"
+                                       x-cloak></i>
+                                    <i x-show="row.state === 'failed'"
+                                       data-lucide="circle-alert"
+                                       class="mt-0.5 w-3 h-3 text-red-600"
+                                       x-cloak></i>
                                     <span x-show="row.state === 'pending'" class="mt-0.5 w-3 h-3 flex items-center justify-center text-caption text-neutral-300">•</span>
                                     <div class="min-w-0">
                                         <div class="text-caption font-semibold"
                                              :class="assistantRowStale(row.key) ? 'text-amber-700' : (row.state === 'pending' ? 'text-neutral-400' : (row.state === 'failed' ? 'text-red-700' : 'text-neutral-900'))"
                                              x-text="row.label"></div>
-                                        <p class="text-caption text-neutral-500" x-show="row.message" x-text="row.message"></p>
-                                        <p class="text-caption text-neutral-500" x-show="row.count" x-text="row.count"></p>
+                                        <p class="text-caption text-neutral-500"
+                                           x-show="row.message"
+                                           x-text="row.message"></p>
+                                        <p class="text-caption text-neutral-500"
+                                           x-show="row.count"
+                                           x-text="row.count"></p>
                                     </div>
                                 </div>
                             </template>
@@ -1181,11 +1225,15 @@
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            <template x-for="(row, rowIndex) in assistantTuneRedeployRows()" :key="rowIndex">
-                                                <tr class="border-t border-neutral-200" data-cluster-v2-assistant-tune-redeploy-row>
+                                            <template x-for="(row, rowIndex) in assistantTuneRedeployRows()"
+                                                      :key="rowIndex">
+                                                <tr class="border-t border-neutral-200"
+                                                    data-cluster-v2-assistant-tune-redeploy-row>
                                                     <td class="py-0.5 pr-2 font-mono" x-text="row.config"></td>
-                                                    <td class="py-0.5 pr-2 font-mono" x-text="assistantTuneRedeployMtpLabel(row)"></td>
-                                                    <td class="py-0.5 pr-2" x-text="assistantTuneRedeployRateLabel(row)"></td>
+                                                    <td class="py-0.5 pr-2 font-mono"
+                                                        x-text="assistantTuneRedeployMtpLabel(row)"></td>
+                                                    <td class="py-0.5 pr-2"
+                                                        x-text="assistantTuneRedeployRateLabel(row)"></td>
                                                     <td class="py-0.5 text-neutral-500" x-text="row.error || ''"></td>
                                                 </tr>
                                             </template>
@@ -1384,8 +1432,10 @@
                                         :class="assistantChooseDraft?.model_path === candidate.model_path ? 'border-neutral-900 bg-white' : 'border-neutral-200 bg-white hover:bg-neutral-50'"
                                         :data-selected="assistantChooseDraft?.model_path === candidate.model_path ? 'true' : 'false'"
                                         data-cluster-v2-assistant-choose-candidate>
-                                    <span class="block text-xs font-semibold text-neutral-900" x-text="candidate.friendly_name"></span>
-                                    <span class="block text-caption text-neutral-500" x-text="assistantChooseCandidateDetail(candidate)"></span>
+                                    <span class="block text-xs font-semibold text-neutral-900"
+                                          x-text="candidate.friendly_name"></span>
+                                    <span class="block text-caption text-neutral-500"
+                                          x-text="assistantChooseCandidateDetail(candidate)"></span>
                                 </button>
                             </template>
                         </div>
@@ -1575,6 +1625,7 @@
                         <input type="text" x-model="manualAddr"
                                @keydown.enter="submitManualPeer()"
                                placeholder="{{ t('cluster.v2.manual.placeholder') }}"
+                               aria-label="{{ t('cluster.v2.manual.placeholder') }}"
                                class="flex-1 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                                data-cluster-v2-manual-input>
                         <button type="button" @click="submitManualPeer()"
@@ -1608,7 +1659,8 @@
                     x-text="selfDevice() ? window.t('cluster.v2.discovering.looking') : window.t('cluster.v2.discovering.waking')"></h3>
                 <p class="text-sm text-neutral-500 mt-2">
                     <span x-show="selfDevice()">{{ t('cluster.v2.discovering.on_network_as') }}
-                        <span class="font-semibold text-neutral-700" x-text="deviceName(selfDevice())"></span>{{ t('cluster.v2.discovering.appears') }}</span>
+                        <span class="font-semibold text-neutral-700"
+                              x-text="deviceName(selfDevice())"></span>{{ t('cluster.v2.discovering.appears') }}</span>
                     <span x-show="!selfDevice()">{{ t('cluster.v2.discovering.still_introducing') }}</span>
                 </p>
                 <p class="text-xs text-neutral-400 mt-4">
@@ -1624,6 +1676,7 @@
                         <input type="text" x-model="manualAddr"
                                @keydown.enter="submitManualPeer()"
                                placeholder="{{ t('cluster.v2.manual.placeholder') }}"
+                               aria-label="{{ t('cluster.v2.manual.placeholder') }}"
                                class="flex-1 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                                data-cluster-v2-manual-input>
                         <button type="button" @click="submitManualPeer()"
@@ -1689,6 +1742,7 @@
                     <input type="text" x-model="manualAddr"
                            @keydown.enter="submitManualPeer({ beginJoin: false })"
                            placeholder="{{ t('cluster.v2.manual.placeholder') }}"
+                           aria-label="{{ t('cluster.v2.manual.placeholder') }}"
                            class="flex-1 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                            data-cluster-v2-plan-add-mac-input>
                     <button type="button" @click="submitManualPeer({ beginJoin: false })"
@@ -1708,7 +1762,8 @@
                         <div class="flex items-start justify-between gap-3">
                             <div class="min-w-0">
                                 <div class="flex items-center gap-2">
-                                    <i :data-lucide="deviceHelperOnly(device) ? 'server' : 'laptop'" class="w-4 h-4 text-neutral-400 flex-shrink-0"></i>
+                                    <i :data-lucide="deviceHelperOnly(device) ? 'server' : 'laptop'"
+                                       class="w-4 h-4 text-neutral-400 flex-shrink-0"></i>
                                     <span class="text-sm font-semibold text-neutral-900 truncate"
                                           x-text="deviceName(device)"></span>
                                 </div>
@@ -1831,7 +1886,8 @@
                                 </p>
                                 <div class="mt-3 flex items-center justify-center gap-1.5 select-all"
                                      data-cluster-v2-join-code>
-                                    <template x-for="(digit, digitIndex) in String(join.code || '').split('')" :key="digitIndex">
+                                    <template x-for="(digit, digitIndex) in String(join.code || '').split('')"
+                                              :key="digitIndex">
                                         <span class="w-10 h-12 inline-flex items-center justify-center rounded-lg border border-neutral-200 bg-neutral-50 text-2xl font-mono font-bold text-neutral-900"
                                               :class="{ 'animate-pulse border-amber-300 bg-amber-50': (join.seconds_remaining || 0) < 60 }"
                                               x-text="digit"></span>
@@ -1902,6 +1958,7 @@
                                            x-model="pairing.code"
                                            @keydown.enter="submitPairApproval(device)"
                                            placeholder="{{ t('cluster.v2.pairing.code_placeholder') }}"
+                                           aria-label="{{ t('cluster.v2.pairing.code_placeholder') }}"
                                            class="w-36 px-3 py-2 text-center text-lg font-mono tracking-[0.3em] border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                                            data-cluster-v2-pair-code>
                                     <button type="button" @click="submitPairApproval(device)"
@@ -1912,7 +1969,9 @@
                                         {{ t('cluster.v2.pairing.approve') }}
                                     </button>
                                 </div>
-                                <div class="text-xs text-red-600 mt-2" x-show="pairing.error" x-text="pairing.error"></div>
+                                <div class="text-xs text-red-600 mt-2"
+                                     x-show="pairing.error"
+                                     x-text="pairing.error"></div>
                             </div>
                         </template>
                     </div>
@@ -1940,6 +1999,7 @@
                                    x-model="pairing.code"
                                    @keydown.enter="submitPairApproval(pairing.target)"
                                    placeholder="{{ t('cluster.v2.pairing.code_placeholder') }}"
+                                   aria-label="{{ t('cluster.v2.pairing.code_placeholder') }}"
                                    class="w-36 px-3 py-2 text-center text-lg font-mono tracking-[0.3em] border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                                    data-cluster-v2-pair-code>
                             <button type="button" @click="submitPairApproval(pairing.target)"
@@ -2051,7 +2111,8 @@
                     </div>
                 </div>
 
-                <p x-show="accelerator.running" class="mt-4 text-xs text-neutral-500">{{ t('cluster.v2.accelerator.running') }}</p>
+                <p x-show="accelerator.running"
+                   class="mt-4 text-xs text-neutral-500">{{ t('cluster.v2.accelerator.running') }}</p>
                 <p x-show="accelerator.error" class="mt-4 text-xs text-red-700" x-text="accelerator.error"></p>
                 <ul x-show="!accelerator.running && acceleratorRows().length"
                     class="mt-4 divide-y divide-neutral-100 border border-neutral-200 rounded-xl overflow-hidden">
@@ -2059,9 +2120,15 @@
                         <li class="px-4 py-3 bg-white" :data-check="row.key">
                             <div class="flex items-start gap-3">
                                 <span class="w-5 h-5 mt-0.5 flex items-center justify-center flex-shrink-0">
-                                    <i x-show="row.status === 'pass'" data-lucide="check-circle-2" class="w-4 h-4 text-green-500"></i>
-                                    <i x-show="row.status === 'warn'" data-lucide="triangle-alert" class="w-4 h-4 text-amber-500"></i>
-                                    <i x-show="row.status === 'fail'" data-lucide="x-circle" class="w-4 h-4 text-red-500"></i>
+                                    <i x-show="row.status === 'pass'"
+                                       data-lucide="check-circle-2"
+                                       class="w-4 h-4 text-green-500"></i>
+                                    <i x-show="row.status === 'warn'"
+                                       data-lucide="triangle-alert"
+                                       class="w-4 h-4 text-amber-500"></i>
+                                    <i x-show="row.status === 'fail'"
+                                       data-lucide="x-circle"
+                                       class="w-4 h-4 text-red-500"></i>
                                 </span>
                                 <div class="min-w-0 flex-1">
                                     <span class="text-xs font-semibold text-neutral-900" x-text="row.label"></span>
@@ -2090,10 +2157,12 @@
                 <div x-show="accelerator.copies" class="mt-4 space-y-2">
                     <p class="text-xs font-semibold text-neutral-700"
                        x-text="window.t('cluster.v2.accelerator.copies_title').replaceAll('{name}', acceleratorName()).replaceAll('{free}', formatSizeBytes(Number(accelerator.copies?.free || 0)))"></p>
-                    <p x-show="!(accelerator.copies?.copies || []).length" class="text-xs text-neutral-500">{{ t('cluster.v2.accelerator.copies_none') }}</p>
+                    <p x-show="!(accelerator.copies?.copies || []).length"
+                       class="text-xs text-neutral-500">{{ t('cluster.v2.accelerator.copies_none') }}</p>
                     <template x-for="copy in (accelerator.copies?.copies || [])" :key="copy.name">
                         <div class="flex items-center justify-between gap-3 rounded-lg border border-neutral-200 px-3 py-2">
-                            <span class="text-xs text-neutral-700 truncate" x-text="copy.name + ' · ' + formatSizeBytes(Number(copy.bytes || 0))"></span>
+                            <span class="text-xs text-neutral-700 truncate"
+                                  x-text="copy.name + ' · ' + formatSizeBytes(Number(copy.bytes || 0))"></span>
                             <button type="button" @click="loadAcceleratorCopies(copy.name)"
                                     :disabled="accelerator.deleting.includes(copy.name)"
                                     class="px-3 py-1 text-xs font-medium rounded-full border border-neutral-300 text-neutral-700 hover:bg-neutral-100 disabled:opacity-50 whitespace-nowrap"
@@ -2131,10 +2200,18 @@
                                 <span class="w-5 h-5 mt-0.5 flex items-center justify-center flex-shrink-0">
                                     <svg x-show="row.status === 'running' || row.status === 'pending'"
                                          class="animate-spin h-4 w-4 text-neutral-400" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                                    <i x-show="row.status === 'pass'" data-lucide="check-circle-2" class="w-4 h-4 text-green-500"></i>
-                                    <i x-show="row.status === 'warn'" data-lucide="triangle-alert" class="w-4 h-4 text-amber-500"></i>
-                                    <i x-show="row.status === 'fail'" data-lucide="x-circle" class="w-4 h-4 text-red-500"></i>
-                                    <i x-show="row.status === 'skipped'" data-lucide="minus-circle" class="w-4 h-4 text-neutral-300"></i>
+                                    <i x-show="row.status === 'pass'"
+                                       data-lucide="check-circle-2"
+                                       class="w-4 h-4 text-green-500"></i>
+                                    <i x-show="row.status === 'warn'"
+                                       data-lucide="triangle-alert"
+                                       class="w-4 h-4 text-amber-500"></i>
+                                    <i x-show="row.status === 'fail'"
+                                       data-lucide="x-circle"
+                                       class="w-4 h-4 text-red-500"></i>
+                                    <i x-show="row.status === 'skipped'"
+                                       data-lucide="minus-circle"
+                                       class="w-4 h-4 text-neutral-300"></i>
                                 </span>
                                 <div class="min-w-0 flex-1">
                                     <div class="flex items-center justify-between gap-3">
@@ -2225,6 +2302,7 @@
                         <i data-lucide="search" class="w-3.5 h-3.5 text-neutral-400 pointer-events-none absolute left-3 top-1/2 -translate-y-1/2"></i>
                         <input type="text" x-model="modelSearch"
                                placeholder="{{ t('cluster.v2.plan.search_placeholder') }}"
+                               aria-label="{{ t('cluster.v2.plan.search_placeholder') }}"
                                class="w-full pl-9 pr-3 py-2 text-xs border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                     </div>
                     <div class="mt-2 max-h-56 overflow-y-auto divide-y divide-neutral-100 border border-neutral-200 rounded-xl">
@@ -2747,7 +2825,8 @@
                                 :disabled="clusterLifecycleBusy || activateBusy"
                                 class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold border border-neutral-200 bg-white text-neutral-700 rounded-full hover:bg-neutral-100 disabled:opacity-40 self-start sm:self-auto"
                                 data-cluster-v2-add-mac>
-                            <i :data-lucide="membershipPanelOpen ? 'x' : 'laptop-minimal-check'" class="w-3.5 h-3.5"></i>
+                            <i :data-lucide="membershipPanelOpen ? 'x' : 'laptop-minimal-check'"
+                               class="w-3.5 h-3.5"></i>
                             <span x-text="membershipPanelOpen ? window.t('cluster.v2.common.close') : window.t('cluster.v2.membership.add_mac')"></span>
                         </button>
                     </div>
@@ -2767,6 +2846,7 @@
                                 <input type="text" x-model="manualAddr"
                                        @keydown.enter="submitManualPeer({ beginJoin: false })"
                                        placeholder="{{ t('cluster.v2.manual.placeholder') }}"
+                                       aria-label="{{ t('cluster.v2.manual.placeholder') }}"
                                        class="flex-1 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                                        data-cluster-v2-membership-manual-input>
                                 <button type="button"
@@ -2798,8 +2878,10 @@
                         <template x-for="device in discoveredDevices()" :key="'membership-found-' + device.node_id">
                             <div class="rounded-lg border border-neutral-200 px-3 py-2.5 flex items-center justify-between gap-3">
                                 <div>
-                                    <div class="text-xs font-semibold text-neutral-900" x-text="deviceName(device)"></div>
-                                    <div class="text-caption text-neutral-600" x-show="!deviceLoopbackOnly(device)">{{ t('cluster.v2.active.found') }}</div>
+                                    <div class="text-xs font-semibold text-neutral-900"
+                                         x-text="deviceName(device)"></div>
+                                    <div class="text-caption text-neutral-600"
+                                         x-show="!deviceLoopbackOnly(device)">{{ t('cluster.v2.active.found') }}</div>
                                     <div class="text-caption text-amber-800" x-show="deviceLoopbackOnly(device)">{{ t('cluster.v2.loopback.peer_notice') }}</div>
                                 </div>
                                 <button type="button" @click="beginMembershipPairing(device)"
@@ -2838,15 +2920,20 @@
                                 <button type="button" @click="cancelPairing()" :disabled="pairing.busy"
                                         class="px-2 py-2 text-xs text-neutral-600">{{ t('cluster.v2.common.cancel') }}</button>
                             </div>
-                            <div x-show="pairing.error" class="text-xs text-red-700 mt-2" role="alert" x-text="pairing.error"></div>
+                            <div x-show="pairing.error"
+                                 class="text-xs text-red-700 mt-2"
+                                 role="alert"
+                                 x-text="pairing.error"></div>
                         </div>
 
                         <template x-if="membershipCandidates().length">
                             <div class="space-y-2" data-cluster-v2-membership-candidates>
-                                <template x-for="device in membershipCandidates()" :key="'membership-candidate-' + device.node_id">
+                                <template x-for="device in membershipCandidates()"
+                                          :key="'membership-candidate-' + device.node_id">
                                     <div class="rounded-lg border border-green-200 bg-green-50 px-3 py-2.5 flex items-center justify-between gap-3">
                                         <div>
-                                            <div class="text-xs font-semibold text-green-900" x-text="deviceName(device)"></div>
+                                            <div class="text-xs font-semibold text-green-900"
+                                                 x-text="deviceName(device)"></div>
                                             <div class="text-caption text-green-800" x-text="deviceChipLabel(device) + ' · ' + deviceRamLabel(device)"></div>
                                         </div>
                                         <span class="text-caption font-semibold text-green-800">{{ t('cluster.v2.active.paired_ready') }}</span>
@@ -2876,10 +2963,13 @@
                                      x-text="(membershipProposal?.backend || 'ring').toUpperCase() + ' · ' + (membershipProposal?.summary || window.t('cluster.v2.membership.automatic_placement'))"></div>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <template x-for="assignment in membershipPlanAssignments()" :key="'membership-plan-' + assignment.node_id">
+                                <template x-for="assignment in membershipPlanAssignments()"
+                                          :key="'membership-plan-' + assignment.node_id">
                                     <div class="px-3 py-2.5 flex items-center justify-between gap-3">
-                                        <span class="text-xs font-semibold text-neutral-900" x-text="membershipPlanNodeName(assignment)"></span>
-                                        <span class="text-caption text-neutral-600 text-right" x-text="membershipPlanDetail(assignment)"></span>
+                                        <span class="text-xs font-semibold text-neutral-900"
+                                              x-text="membershipPlanNodeName(assignment)"></span>
+                                        <span class="text-caption text-neutral-600 text-right"
+                                              x-text="membershipPlanDetail(assignment)"></span>
                                     </div>
                                 </template>
                             </div>
@@ -2900,7 +2990,8 @@
                 <div class="mt-4 divide-y divide-neutral-100 border border-neutral-200 rounded-xl overflow-hidden">
                     <template x-for="device in allDevices()" :key="device.node_id">
                         <div class="px-4 py-3 bg-white flex items-center gap-3" data-cluster-v2-active-device>
-                            <i :data-lucide="deviceHelperOnly(device) ? 'server' : 'laptop'" class="w-4 h-4 text-neutral-400 flex-shrink-0"></i>
+                            <i :data-lucide="deviceHelperOnly(device) ? 'server' : 'laptop'"
+                               class="w-4 h-4 text-neutral-400 flex-shrink-0"></i>
                             <div class="min-w-0 flex-1">
                                 <div class="text-xs font-semibold text-neutral-900 truncate"
                                      x-text="deviceName(device)"></div>
