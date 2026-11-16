@@ -8330,6 +8330,12 @@ function clusterV2Wizard() {
         async runAssistantResume() {
             const session = this.assistant.session;
             if (!session || this.assistantRunning()) return;
+            // Open Chat on the ready card needs modelOptions to resolve the
+            // serving model id for the /admin/chat?model= deep link. On a
+            // fresh page load nothing else loads them in Assistant mode, so a
+            // resumed cluster linked to a chat with the wrong default model
+            // (measured live 2026-11-16: GLM-4bit on .13 while dev-1.5b ran).
+            await this.ensureAssistantModels().catch(() => {});
             const policy = session.resource_policy || {};
             this.assistant.inputs = {
                 measurement_id: session.measurement_id,

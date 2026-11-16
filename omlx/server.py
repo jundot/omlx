@@ -995,7 +995,22 @@ def _register_cluster_routes() -> None:
 
 @app.exception_handler(_RedirectToLogin)
 async def redirect_to_login_handler(request, exc):
-    """Redirect unauthenticated browser requests to the admin login page."""
+    """Redirect unauthenticated browser requests to the admin login page.
+
+    The originally requested page rides along as ``?next=`` so a deep link
+    (the assistant's Open Chat target ``/admin/chat?model=...`` is the one
+    that matters) survives the login round trip instead of stranding the
+    user on the dashboard.
+    """
+    target = request.url.path
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    if target.startswith("/") and not target.startswith("//"):
+        from urllib.parse import quote
+
+        return RedirectResponse(
+            url=f"/admin?next={quote(target, safe='')}", status_code=302
+        )
     return RedirectResponse(url="/admin", status_code=302)
 
 
