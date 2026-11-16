@@ -9,6 +9,7 @@ memo keyed by array identity), and rotates it itself otherwise.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import weakref
 
@@ -18,11 +19,30 @@ import mlx.nn as nn
 from ..custom_kernels.oqh import fast
 from . import format as fmt
 
-# Up to this many rows run the native GEMV once per row: MTP verify batches
-# then use the same arithmetic as one-token decode. Larger batches go through
-# the stock quantized matmul.
+# In row-exact forwards (Lightning MTP decode and verify), up to this many rows
+# run the native GEMV, whose result per row is the one-row result. Elsewhere
+# the GEMV takes up to _GEMV_ROWS rows; from three rows the stock quantized
+# matmul is as fast as for affine weights.
 QMV_MAX_ROWS = 16
+_GEMV_ROWS = 2
 _MEMO_SIZE = 8
+
+
+class _Exact(threading.local):
+    depth = 0
+
+
+_EXACT = _Exact()
+
+
+@contextlib.contextmanager
+def exact_rows():
+    """Give every row of decode-sized inputs the one-row GEMV arithmetic."""
+    _EXACT.depth += 1
+    try:
+        yield
+    finally:
+        _EXACT.depth -= 1
 
 
 class _Memo(threading.local):
@@ -138,8 +158,9 @@ class OqhLinear(_Rotating):
         self.freeze()
 
     def gemv_rows(self, x: mx.array) -> bool:
-        """Whether x runs the native GEMV, one product per row."""
-        return x.size // self.input_dims <= QMV_MAX_ROWS
+        """Whether x runs the native GEMV."""
+        limit = QMV_MAX_ROWS if _EXACT.depth else _GEMV_ROWS
+        return x.size // self.input_dims <= limit
 
     def matmul_rotated(self, x: mx.array) -> mx.array:
         if self.gemv_rows(x):

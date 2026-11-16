@@ -106,6 +106,12 @@ class OqhQmv : public Primitive {
     if (pair_) {
       name += "_pair";
     }
+    const int rows = static_cast<int>(x.size() / K);
+    // x rows per threadgroup: each weight block is read once for all of them.
+    const int R = gather_ || rows == 1 ? 1 : rows <= 4 ? 4 : 8;
+    if (!gather_) {
+      name += "_r" + std::to_string(R);
+    }
     auto& enc = metal::get_command_encoder(s);
     enc.set_compute_pipeline_state(get_kernel(d, name));
     int c = 0;
@@ -122,12 +128,14 @@ class OqhQmv : public Primitive {
     const size_t b = gather_ ? 4 : 3;
     enc.set_input_array(pair_ ? inputs[b] : w, c++);
     enc.set_input_array(pair_ ? inputs[b + 1] : inputs[2], c++);
-    const int rows = static_cast<int>(x.size() / K);
+    if (!gather_) {
+      enc.set_bytes(rows, c++);
+    }
     const int out_rows = pair_ ? 2 * N : N;
     MTL::Size group_dims(32, 2, 1);
     MTL::Size grid_dims = gather_
         ? MTL::Size(1, out_rows / 8, static_cast<int>(inputs[3].size()))
-        : MTL::Size(rows, out_rows / 8, 1);
+        : MTL::Size((rows + R - 1) / R, out_rows / 8, 1);
     enc.dispatch_threadgroups(grid_dims, group_dims);
   }
 

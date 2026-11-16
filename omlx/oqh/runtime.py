@@ -25,6 +25,7 @@ from .modules import (
     QMV_MAX_ROWS,
     OqhLinear,
     OqhSwitchLinear,
+    exact_rows,
     hand_off,
     remember,
 )
@@ -209,6 +210,22 @@ def _verify_switch_glu(original):
     return switch_glu
 
 
+def _exact_forward(original):
+    """Row-exact forward: decode-sized oQh linears keep the one-row arithmetic.
+
+    Lightning MTP runs both decode and verify through it, so verify rows match
+    one-token decode.
+    """
+
+    @functools.wraps(original)
+    def call(self, *args, **kwargs):
+        with exact_rows():
+            return original(self, *args, **kwargs)
+
+    call._omlx_oqh = True
+    return call
+
+
 def _verify_feed_forward(original):
     """Run paired oQh MLPs in row-exact MTP verify through the decode arithmetic.
 
@@ -345,6 +362,7 @@ def install(model: nn.Module) -> int:
     if count:
         verifier = Qwen3_5BatchInvariantForward
         for name, wrap in (
+            ("__call__", _exact_forward),
             ("_switch_glu", _verify_switch_glu),
             ("_feed_forward", _verify_feed_forward),
         ):

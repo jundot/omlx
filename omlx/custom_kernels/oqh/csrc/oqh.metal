@@ -21,9 +21,12 @@
 // The per-group bias term of affine qmv becomes one -center * sum(x) per row.
 // PAIR reads two matrices of N rows (gate and up) into one [.., 2N] output; a
 // simdgroup's 4 rows never straddle them because N % 8 == 0.
+// R x rows share each threadgroup, so a weight block comes from DRAM once for
+// all of them (batched decode, MTP verify). Every x row keeps the one-row
+// arithmetic and order, so its result does not depend on R.
 // ---------------------------------------------------------------------------
 
-template <typename T, int bits, bool gather, bool shared_x, bool pair>
+template <typename T, int bits, bool gather, bool shared_x, bool pair, int R>
 METAL_FUNC void oqh_qmv_impl(
     const device uint32_t* w,
     const device T* rscale,
@@ -34,6 +37,7 @@ METAL_FUNC void oqh_qmv_impl(
     const device uint32_t* indices,
     const int in_vec_size,
     const int out_vec_size,
+    const int n_rows,
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
@@ -48,8 +52,14 @@ METAL_FUNC void oqh_qmv_impl(
   typedef float U;
 
   thread U x_thread[values_per_thread];
-  thread U result[results_per_simdgroup] = {0};
-  U xsum = 0;
+  thread U result[R][results_per_simdgroup];
+  thread U xsum[R];
+  for (int r = 0; r < R; r++) {
+    xsum[r] = 0;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[r][row] = 0;
+    }
+  }
 
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
@@ -62,8 +72,8 @@ METAL_FUNC void oqh_qmv_impl(
     w_row -= out_vec_size;
   }
   const device uint8_t* ws = (const device uint8_t*)w;
-  int xrow = tid.x;
-  int yrow = tid.x;
+  int xrow = tid.x * R;
+  int yrow = tid.x * R;
   if (gather) {
     const size_t e = indices[tid.z];
     ws += e * size_t(out_vec_size) * size_t(in_vec_size_w);
@@ -71,17 +81,21 @@ METAL_FUNC void oqh_qmv_impl(
     xrow = shared_x ? 0 : int(tid.z);
     yrow = tid.z;
   }
+  // The same for the whole threadgroup, so the early exits keep simd_sum uniform.
+  const int nr = gather ? 1 : min(R, n_rows - xrow);
   ws += w_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
   x += size_t(xrow) * in_vec_size + simd_lid * values_per_thread;
   y += size_t(yrow) * y_cols + out_row;
 
   const int aligned_end = (in_vec_size / block_size) * block_size;
   for (int k = 0; k < aligned_end; k += block_size) {
-    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-    xsum += sum;
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, U(1), U(0), sum);
+    for (int r = 0; r < R && r < nr; r++) {
+      U sum = load_vector<T, U, values_per_thread, bits>(x + r * in_vec_size, x_thread);
+      xsum[r] += sum;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        result[r][row] += qdot<U, values_per_thread, bits>(wl, x_thread, U(1), U(0), sum);
+      }
     }
     ws += block_size * bytes_per_pack / pack_factor;
     x += block_size;
@@ -89,24 +103,28 @@ METAL_FUNC void oqh_qmv_impl(
   // Tail for widths that are a multiple of values_per_thread but not of block_size.
   if (aligned_end < in_vec_size &&
       aligned_end + int(simd_lid) * values_per_thread < in_vec_size) {
-    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-    xsum += sum;
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, U(1), U(0), sum);
+    for (int r = 0; r < R && r < nr; r++) {
+      U sum = load_vector<T, U, values_per_thread, bits>(x + r * in_vec_size, x_thread);
+      xsum[r] += sum;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        result[r][row] += qdot<U, values_per_thread, bits>(wl, x_thread, U(1), U(0), sum);
+      }
     }
   }
 
-  for (int row = 0; row < results_per_simdgroup; row++) {
-    U r = simd_sum(result[row] - center * xsum);
-    if (simd_lid == 0) {
-      y[row] = static_cast<T>(r * U(rscale[w_row + row]));
+  for (int r = 0; r < R && r < nr; r++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U v = simd_sum(result[r][row] - center * xsum[r]);
+      if (simd_lid == 0) {
+        y[r * y_cols + row] = static_cast<T>(v * U(rscale[w_row + row]));
+      }
     }
   }
 }
 
-// w_b / rscale_b are bound only for pair kernels.
-template <typename T, int bits, bool pair>
+// w_b / rscale_b are bound only for pair kernels. n_rows: rows of x.
+template <typename T, int bits, bool pair, int R>
 [[kernel]] void oqh_qmv(
     const device uint32_t* w [[buffer(0)]],
     const device T* rscale [[buffer(1)]],
@@ -116,12 +134,13 @@ template <typename T, int bits, bool pair>
     const constant int& out_vec_size [[buffer(5)]],
     const device uint32_t* w_b [[buffer(6)]],
     const device T* rscale_b [[buffer(7)]],
+    const constant int& n_rows [[buffer(8)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  oqh_qmv_impl<T, bits, false, false, pair>(
-      w, rscale, w_b, rscale_b, x, y, nullptr, in_vec_size, out_vec_size, tid, simd_gid,
-      simd_lid);
+  oqh_qmv_impl<T, bits, false, false, pair, R>(
+      w, rscale, w_b, rscale_b, x, y, nullptr, in_vec_size, out_vec_size, n_rows, tid,
+      simd_gid, simd_lid);
 }
 
 template <typename T, int bits, bool shared_x, bool pair>
@@ -138,13 +157,18 @@ template <typename T, int bits, bool shared_x, bool pair>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  oqh_qmv_impl<T, bits, true, shared_x, pair>(
-      w, rscale, w_b, rscale_b, x, y, indices, in_vec_size, out_vec_size, tid, simd_gid,
+  oqh_qmv_impl<T, bits, true, shared_x, pair, 1>(
+      w, rscale, w_b, rscale_b, x, y, indices, in_vec_size, out_vec_size, 1, tid, simd_gid,
       simd_lid);
 }
 
+#define oqh_instantiate_qmv_rows(type, bits, pair, sfx)                                            \
+  instantiate_kernel("oqh_qmv_" #type "_b" #bits sfx "_r1", oqh_qmv, type, bits, pair, 1)          \
+  instantiate_kernel("oqh_qmv_" #type "_b" #bits sfx "_r4", oqh_qmv, type, bits, pair, 4)          \
+  instantiate_kernel("oqh_qmv_" #type "_b" #bits sfx "_r8", oqh_qmv, type, bits, pair, 8)
+
 #define oqh_instantiate_qmv_pair(type, bits, pair, sfx)                                          \
-  instantiate_kernel("oqh_qmv_" #type "_b" #bits sfx, oqh_qmv, type, bits, pair)                 \
+  oqh_instantiate_qmv_rows(type, bits, pair, sfx)                                                \
   instantiate_kernel("oqh_gather_qmv_" #type "_b" #bits "_s1" sfx, oqh_gather_qmv, type, bits, true, pair) \
   instantiate_kernel("oqh_gather_qmv_" #type "_b" #bits "_s0" sfx, oqh_gather_qmv, type, bits, false, pair)
 

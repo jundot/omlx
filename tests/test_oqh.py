@@ -62,6 +62,17 @@ def test_matmuls_match_the_dequantized_weight(bits):
         fast.qmv(xr, packed, rscale.astype(mx.bfloat16), bits),
     )
 
+    # Batched rows share each weight block and keep the one-row result, also in a
+    # partly filled last row group and for gate | up pairs.
+    xs = quantize.rotate(mx.random.normal((11, cols)), sg, 512).astype(mx.bfloat16)
+    for n in (3, 11):
+        got = fast.qmv(xs[:n], packed, rscale, bits)
+        pair = fast.qmv(xs[:n], packed, rscale, bits, packed, rscale)
+        for i in range(n):
+            one = fast.qmv(xs[i : i + 1], packed, rscale, bits)
+            assert mx.array_equal(got[i : i + 1], one)
+            assert mx.array_equal(pair[i : i + 1], mx.concatenate([one, one], -1))
+
     # A gate | up pair in one call gives both products bit for bit.
     up, up_scale = packed[::-1], rscale[::-1]
     single = [fast.qmv(xr, packed, rscale, bits), fast.qmv(xr, up, up_scale, bits)]
@@ -422,10 +433,16 @@ def test_load_hook_serves_the_checkpoint_with_fusion(tmp_path, moe):
         Qwen3_5BatchInvariantForward,
     )
 
+    from omlx.oqh.modules import exact_rows
+
+    assert getattr(Qwen3_5BatchInvariantForward.__call__, "_omlx_oqh", False)
     mlp = layer.mlp.shared_expert if moe else layer.mlp
-    rows = Qwen3_5BatchInvariantForward._feed_forward(None, mlp, h)
+    with exact_rows():
+        rows = Qwen3_5BatchInvariantForward._feed_forward(None, mlp, h)
     for i in range(3):
         assert mx.array_equal(rows[:, i : i + 1], mlp(h[:, i : i + 1]))
+    # Outside it, three rows take the stock matmul: equal up to rounding.
+    assert _rel(mlp(h), rows) < 0.03
 
 
 def _tiny_qwen4_exp(tmp_path, monkeypatch):
