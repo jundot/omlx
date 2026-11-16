@@ -9,6 +9,7 @@ the routes use either through :func:`launcher.for_node`.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -17,6 +18,7 @@ import os
 import secrets
 import socket
 import time
+import urllib.error
 import urllib.request
 import zlib
 from collections.abc import Callable, Iterator
@@ -93,6 +95,11 @@ def _identity(address: str, port: int) -> dict[str, Any] | None:
             url, timeout=3
         ) as response:  # noqa: S310 - a paired LAN address
             reply = json.loads(response.read(65536))
+    except urllib.error.URLError as error:
+        # macOS refuses a process without Local Network access this way.
+        if getattr(error.reason, "errno", None) == errno.EHOSTUNREACH:
+            raise
+        return None
     except (OSError, ValueError):
         return None
     return reply if isinstance(reply, dict) else None
@@ -124,10 +131,15 @@ def resolve_target(node_id: str) -> AgentTarget:
     if device is None or key is None:
         raise LaunchError("This helper is not paired. Pair it in the Cluster tab.")
     port = int(device.get("http_port") or 0)
+    no_route = False
     for address in device.get("last_addrs", []):
         if ":" in address or not port:
             continue
-        found = _identity(address, port)
+        try:
+            found = _identity(address, port)
+        except urllib.error.URLError:
+            no_route = True
+            continue
         if not found or found.get("node_id") != node_id:
             continue
         try:
@@ -147,7 +159,14 @@ def resolve_target(node_id: str) -> AgentTarget:
                 paired_at=float(device.get("paired_at") or 0.0),
             )
         )
-    raise UnreachableError(f"{device['friendly_name']} does not answer.")
+    name = device["friendly_name"]
+    if no_route:
+        raise UnreachableError(
+            f"{name} does not answer: macOS has no route to it. If it is on, allow "
+            "local network access for oMLX (or the terminal that runs omlx serve) "
+            "in System Settings > Privacy & Security > Local Network."
+        )
+    raise UnreachableError(f"{name} does not answer.")
 
 
 def _slower(*speeds: int | None) -> int | None:
