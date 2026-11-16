@@ -1578,6 +1578,29 @@ def test_expired_join_offers_start_again_not_a_dead_end():
     assert "this.join.coordinator_addr" in javascript
 
 
+def test_the_selected_model_is_obvious_in_both_pickers():
+    """The chosen model must be unmistakable, not a tint nobody notices.
+
+    Reported live on 2026-11-16: after "Change model or context" the selected
+    row was a barely visible `bg-neutral-50` with a small check icon, so it was
+    hard to tell which model the plan would use.
+    """
+    template = _read(TEMPLATE)
+
+    # Plan screen picker: left accent + stronger tint + bold label + a11y marker.
+    assert "border-l-2 transition-colors" in template
+    assert "'border-neutral-900 bg-neutral-100'" in template
+    assert "'font-bold text-neutral-900'" in template
+    assert ':aria-current="selectedModelPath === model.model_path' in template
+
+    # Change-model screen: ring + tint + bold, and the same a11y marker.
+    assert "'border-neutral-900 bg-neutral-100 ring-1 ring-neutral-900'" in template
+    assert (
+        ':aria-current="assistantChooseDraft?.model_path === candidate.model_path'
+        in template
+    )
+
+
 def test_add_by_ip_validates_then_offers_the_join_flow():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
