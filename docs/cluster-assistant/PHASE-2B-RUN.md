@@ -2011,6 +2011,41 @@ the two chat bugs above instead of a chat: plan `9bf9c137…`, rank order `.11` 
 `performance_unmeasured`. Both fixes shipped in build `5e2c2738…`, and the run is
 repeated on that build so the whole gate uses one identical binary.
 
+**Live finding (2026-11-16, blocks a fresh plan): the planner and the launcher
+disagree about what a Mac can hold.**
+
+Two start attempts (12:10 and 12:24) were refused with the same numbers:
+
+```
+503: rank 1 (9078f858 = .12) needs 47.8 GiB but can admit 41.6 GiB right now
+```
+
+The plan was built from `ms-…122327Z-0003b7ae`, whose node facts say for `.12`:
+`capacity 54.76 GiB`, `admission_p05 49.28 GiB`, `admission_p50 = null`, tier
+`balanced`. `election.budget_for` therefore priced the stage at 47.8 GiB — inside
+p05. The launcher checks the same node with
+`memory_guard.stage_budget(admission_ceiling, role) =
+node_role.role_for(role).admission_bytes(capacity)` = **41.6 GiB** (capacity ×
+the role's admission fraction), and refuses.
+
+So the two numbers come from different rules — measured p05 vs the role's
+fraction of capacity — and for a 64 GiB workstation they are 7.7 GiB apart.
+`node_role.admission_bytes` even documents "the guard exists to stop a load the
+plan did not anticipate, not to refuse the plan itself", which is exactly what
+happens here. The card's advice ("close other apps") cannot close a formula gap:
+both attempts report identical numbers.
+
+The same model starts fine on the older deployment `…-2da9fbab75c6` (rank 0 `.11`
+holding 69.4 GiB of its 111.4 GiB capacity, headroom 39.5 GiB): its split never
+lands in the gap. Loading it manually through
+`POST /admin/api/cluster/deployments/{id}/load` succeeded, canary 4 tokens, and a
+real completion ran at **22.59 tok/s** — so "Load weights" itself works; the two
+failures were new plans, not the button.
+
+**Fix to schedule:** `election.budget_for` must cap the chosen admission by the
+same `NodeRole.admission_bytes(capacity)` the launcher uses (min of the two), so a
+plan can never be admitted by the planner and refused by the guard.
+
 **Gate**
 
 | # | Criterion | Result | Evidence |
