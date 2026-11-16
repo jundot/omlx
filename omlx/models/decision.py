@@ -70,6 +70,22 @@ def _backbone_files(path: Path) -> Iterator[Path]:
         yield Path(view)
 
 
+_VISION_MODULE_NAMES = ("vision_tower", "vision_model", "vision_encoder", "visual")
+
+
+def has_vision_module(model: Any) -> bool:
+    """True when the loaded model still carries a vision tower.
+
+    mlx-vlm sets a top-level module to ``None`` when the checkpoint has no
+    weights for it (``_drop_modules_without_weights``), so a present image
+    processor alone does not mean the tower is usable: a text-only conversion
+    would silently take the vision path and feed the text model pixels.
+    """
+    if model is None:
+        return False
+    return any(getattr(model, name, None) is not None for name in _VISION_MODULE_NAMES)
+
+
 class DecisionBackbone:
     """Qwen3.5 backbone that returns final normed hidden states."""
 
@@ -85,7 +101,7 @@ class DecisionBackbone:
 
     @property
     def has_vision(self) -> bool:
-        return self.image_processor is not None
+        return self.image_processor is not None and has_vision_module(self.model)
 
     @property
     def max_position_embeddings(self) -> int | None:
