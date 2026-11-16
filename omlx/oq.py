@@ -10361,10 +10361,14 @@ def _iter_streamed_layer_blocks(
             nbytes = sum(len(b) for b in raw.values())
             dp.stage(reads, raw)
             del raw, reads
-            block, is_moe = _load_streamed_block(
-                dp, layer_idx, args, layer_cls, config, skip_key
-            )
-            dp.clear_staged()
+            try:
+                block, is_moe = _load_streamed_block(
+                    dp, layer_idx, args, layer_cls, config, skip_key
+                )
+            finally:
+                # Drop the staged raw bytes even when the block build fails,
+                # so a traceback does not pin a whole layer of source bytes.
+                dp.clear_staged()
             load_s = _time.perf_counter() - started
             if pool is not None and layer_idx + 1 < num_layers:
                 pending = _start_streamed_prefetch(pool, dp, layer_idx + 1, skip_key)
