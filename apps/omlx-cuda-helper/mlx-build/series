@@ -6,3 +6,4 @@
 0005-omlx-cuda-expert-kernel-64bit-strides.patch
 0006-omlx-cuda-cublaslt-float32-reduction.patch
 0007-omlx-cuda-cudnn-sdpa-head-dim-256.patch
+0008-omlx-cuda-qmm-naive-batch-on-grid-x.patch

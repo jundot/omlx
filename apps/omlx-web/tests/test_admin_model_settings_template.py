@@ -764,7 +764,6 @@ DASHBOARD_BLOCK_IDS = (
     "active_models",
     "cache_observability",
     "api_endpoints",
-    "claude_code",
     "applications",
     "engine_versions",
 )
@@ -849,7 +848,7 @@ const plain = value => JSON.parse(JSON.stringify(value));
 assert.equal(lib.COLUMNS, 24);
 assert.equal(lib.MIN_W, 6);
 const def = lib.defaultLayout();
-assert.equal(def.blocks.length, 8);
+assert.equal(def.blocks.length, 7);
 assert.ok(def.blocks.every((b, i) => b.x === 0 && b.y === i && b.w === 24));
 assert.deepEqual(plain(lib.normalizeLayout(null)), plain(def));
 assert.deepEqual(plain(lib.normalizeLayout({ blocks: 'nope' })), plain(def));

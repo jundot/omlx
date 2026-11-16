@@ -12,12 +12,20 @@ import numpy as np
 from . import checkpoint
 from .wire import HostArray
 
+# Cache rows grow every chunk, so a freed buffer never fits again; cap what MLX keeps.
+_CACHE_BYTES = 1 << 30
+
 
 def limit_memory(limit: int) -> None:
     """Hold MLX's buffers, cached ones included, under *limit* bytes: past it
     the allocator frees its cache before it allocates."""
+    mx.set_cache_limit(_CACHE_BYTES)
     if limit:
         mx.set_memory_limit(limit)
+
+
+def release_cache() -> None:
+    mx.clear_cache()
 
 
 def peak_bytes() -> int:

@@ -96,6 +96,7 @@ from ..patches.moe_offload_compat import moe_offload_compatibility
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.routes import helper_status as prefill_helper_status
 from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
+from ..request import live_decode_rate
 from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_KV_FORMATS,
@@ -682,7 +683,6 @@ DASHBOARD_BLOCK_IDS = (
     "active_models",
     "cache_observability",
     "api_endpoints",
-    "claude_code",
     "applications",
     "engine_versions",
 )
@@ -1283,6 +1283,12 @@ def _mtp_compat_for_model(
         if bundled_dspark_path(model_path) is not None:
             return True, ""
         return False, "MiniMax checkpoint has no bundled dspark/ draft"
+    if model_type == "inkling2":
+        from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
+
+        if bundled_inkling2_dspark_path(model_path) is not None:
+            return True, ""
+        return False, "Inkling 2 checkpoint has no bundled mtp.safetensors draft"
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
@@ -7299,8 +7305,13 @@ def _build_active_models_data() -> dict:
             last_activity_age = (
                 max(0.0, now - last_activity_at) if last_activity_at else None
             )
-            tokens_per_second = (
-                generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
+            # Recent speed, so a row shows a speed change within seconds.
+            tokens_per_second = live_decode_rate(
+                getattr(req, "decode_marks", ()),
+                generated_tokens,
+                last_activity_at,
+                started_at,
+                now,
             )
             generating.append(
                 {

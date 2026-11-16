@@ -35,6 +35,7 @@ def register_virtual_tensors(index, config) -> int:
     fatal by design: a checkpoint whose layout we half-understand must not be
     quantized silently.
     """
+    from .inkling2.oq_virtual import register as register_inkling2_experts
     from .mimo_v2.virtual_qkv import register as register_mimo_v2_qkv
     from .mlx_vlm_minimax_m3_compat.virtual_nvfp4 import (
         register as register_minimax_nvfp4,
@@ -51,4 +52,5 @@ def register_virtual_tensors(index, config) -> int:
         register_mimo_v2_qkv(index, config)
         + register_qwen4_exp_ple(index, config)
         + register_minimax_nvfp4(index, config)
+        + register_inkling2_experts(index, config)
     )

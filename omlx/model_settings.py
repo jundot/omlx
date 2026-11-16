@@ -745,9 +745,10 @@ class ModelSettingsManager:
                     document = json.loads(originals[path])
                 else:
                     document = {"version": version, key: {}}
+                # Older versions load unchanged; only a newer build's format is skipped.
                 if (
                     not isinstance(document, dict)
-                    or document.get("version", 1) != version
+                    or document.get("version", 1) > version
                 ):
                     raise ValueError(f"Unsupported profile storage format: {path.name}")
                 records = document.get(key, {})

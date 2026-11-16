@@ -1,6 +1,6 @@
 // Adapted from mlx-serve src/kernels/moe/moe_prefill_cuda_header.cu (MIT,
 // Copyright (c) 2026 David Dalcu). Changed: the expert weights are affine
-// codes (3, 4 or 8 bits, 64 weights a group, bf16 scales and biases), where a
+// codes (2, 3, 4 or 8 bits, 64 weights a group, bf16 scales and biases), where a
 // weight is code * scale + bias in float rounded once, or with MX MLX mxfp4
 // codes (E2M1, one E8M0 scale per 32 weights), whose weights bf16 holds exactly.
 // Each tensor-core step starts from zero and its 16 products are added to
@@ -176,7 +176,19 @@ __device__ __forceinline__ void msv_expert_tile(uint8_t* smem, int mv, ARow arow
           const float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&sbits));
           const float bias = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&bbits));
           uint32_t out[CV / 2];
-          if constexpr (BITS == 4) {
+          if constexpr (BITS == 2) {
+            // The 4 values a code of this group can take; a load is one group.
+            uint32_t tab[4];
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) tab[q] = msv_affine(q, scale, bias);
+            #pragma unroll
+            for (int w4 = 0; w4 < 4; ++w4)
+              #pragma unroll
+              for (int q = 0; q < 8; ++q) {
+                const uint32_t pair = (vw[w4] >> (4 * q)) & 15u;
+                out[8 * w4 + q] = tab[pair & 3] | (tab[pair >> 2] << 16);
+              }
+          } else if constexpr (BITS == 4) {
             if constexpr (MX) {
               const uint32_t e8 = bsc[j][i] & 0xffu;
               // 2**(e8 - 127); e8 = 0 is the subnormal 2**-127.

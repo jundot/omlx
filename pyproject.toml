@@ -194,6 +194,9 @@ bundle = [
     "mistral-common[audio]>=1.10",
     # realtime STT WebSocket endpoint
     "wsproto==1.2.0",
+    # [cluster] mDNS, which finds the NVIDIA prefill helpers; the newest
+    # release before the exclude-newer date in packaging/venvstacks.toml.
+    "zeroconf==0.148.0",
 ]
 
 # PEP 735 development dependencies — installed by uv sync or pip install --group dev.
