@@ -55,6 +55,9 @@
                             <div class="text-caption text-neutral-500 mt-0.5"
                                  x-text="deviceRamLabel(device) + ' · ' + usableGbLabel(device)"
                                  data-cluster-v2-usable-budget></div>
+                            <div class="text-caption text-neutral-400 font-mono"
+                                 data-cluster-v2-device-spec
+                                 x-text="deviceSpecLine(device)"></div>
                         </div>
                         <div class="segmented segmented--sm flex-shrink-0"
                              data-cluster-v2-role-picker>
@@ -3076,13 +3079,16 @@
                 <div class="mt-4 divide-y divide-neutral-100 border border-neutral-200 rounded-xl overflow-hidden">
                     <template x-for="device in allDevices()" :key="device.node_id">
                         <div class="px-4 py-3 bg-white flex items-center gap-3" data-cluster-v2-active-device>
-                            <i :data-lucide="deviceHelperOnly(device) ? 'server' : 'laptop'"
+                            <i :data-lucide="deviceIcon(device)"
                                class="w-4 h-4 text-neutral-400 flex-shrink-0"></i>
                             <div class="min-w-0 flex-1">
                                 <div class="text-xs font-semibold text-neutral-900 truncate"
                                      x-text="deviceName(device)"></div>
                                 <div class="text-caption text-neutral-500"
-                                     x-text="deviceChipLabel(device) + ' · ' + deviceRamLabel(device) + ' · ' + deviceLinkMeta(device).label"></div>
+                                     x-text="deviceChipLabel(device) + ' · ' + deviceLinkMeta(device).label"></div>
+                                <div class="text-caption text-neutral-400 font-mono"
+                                     data-cluster-v2-device-spec
+                                     x-text="deviceSpecLine(device)"></div>
                             </div>
                             <span class="badge gap-1"
                                   :class="deviceStateTone(device)"
