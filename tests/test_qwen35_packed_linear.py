@@ -10,6 +10,8 @@ calls on their kernels.
 
 from __future__ import annotations
 
+import logging
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -127,3 +129,21 @@ def test_skinny_split_follows_the_core_budget(monkeypatch):
             assert split == 1 or (N // 32) * split <= 16 * 40
     finally:
         pl._skinny_split.cache_clear()
+
+
+def test_gpu_cores_fallback_warns_once(monkeypatch, caplog):
+    from omlx.utils import hardware
+
+    pl._gpu_cores.cache_clear()
+    monkeypatch.setattr(hardware, "get_gpu_core_count", lambda: None)
+    try:
+        with caplog.at_level(logging.WARNING, logger=pl.__name__):
+            assert pl._gpu_cores() == pl._FALLBACK_GPU_CORES
+            assert pl._gpu_cores() == pl._FALLBACK_GPU_CORES
+        warnings = [r for r in caplog.records if r.name == pl.__name__]
+        assert len(warnings) == 1 and "core count" in warnings[0].getMessage()
+        pl._gpu_cores.cache_clear()
+        monkeypatch.setattr(hardware, "get_gpu_core_count", lambda: 20)
+        assert pl._gpu_cores() == 20
+    finally:
+        pl._gpu_cores.cache_clear()

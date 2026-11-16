@@ -562,12 +562,24 @@ def _gemm_tile(M: int) -> tuple[int, int, int, int]:
 # row count, never slower than the GEMM.
 _SKINNY_SIMDGROUPS_PER_CORE = 16
 
+# Core count assumed when the GPU's cannot be read: M5 Max, the smallest part the
+# split was tuned on. Assuming more cores than a GPU has over-splits K; results
+# stay correct either way, only the speed changes.
+_FALLBACK_GPU_CORES = 32
+
 
 @functools.cache
 def _gpu_cores() -> int:
     from ..utils.hardware import get_gpu_core_count
 
-    return get_gpu_core_count() or 80
+    cores = get_gpu_core_count()
+    if cores:
+        return cores
+    logger.warning(
+        "GPU core count unavailable; sizing the skinny kernel's K split for %d cores",
+        _FALLBACK_GPU_CORES,
+    )
+    return _FALLBACK_GPU_CORES
 
 
 # Most rows the skinny kernel takes. It beats the GEMM up to here on every
