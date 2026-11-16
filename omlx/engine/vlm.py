@@ -220,7 +220,9 @@ class _VLMPreparedPrompt(tuple):
     """``(prompt, token_ids)`` rendered by the generation path for one request.
 
     ``source`` keeps the request inputs the pair was built from, so that
-    ``_process_chat_messages`` reuses the ids only for the same request.
+    ``_process_chat_messages`` reuses the ids only for the same request. The
+    messages and tools must be the same objects; the template kwargs are kept
+    as a copy and compared by value, since equal kwargs render the same prompt.
     """
 
     source: tuple[Any, ...]
@@ -240,13 +242,10 @@ class _VLMPreparedPrompt(tuple):
         is_partial: bool | None,
     ) -> bool:
         p_messages, p_tools, p_kwargs, p_partial = self.source
-        same_kwargs = p_kwargs is chat_template_kwargs or not (
-            p_kwargs or chat_template_kwargs
-        )
         return (
             p_messages is messages
             and p_tools is tools
-            and same_kwargs
+            and p_kwargs == dict(chat_template_kwargs or {})
             and p_partial == is_partial
         )
 
@@ -6254,7 +6253,7 @@ class VLMBatchedEngine(BaseEngine):
                 return _VLMPreparedPrompt(
                     prompt,
                     token_ids,
-                    (messages, tools, chat_template_kwargs, is_partial),
+                    (messages, tools, dict(chat_template_kwargs or {}), is_partial),
                 )
         prompt = self._apply_chat_template(
             text_messages,

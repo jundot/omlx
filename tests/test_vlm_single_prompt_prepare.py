@@ -175,6 +175,56 @@ def test_prepared_prompt_of_another_request_is_not_reused(change):
     engine._prepare_vision_inputs.assert_called_once()
 
 
+def test_equal_template_kwargs_in_a_new_dict_are_reused():
+    # /v1/decisions prepares with a module constant and chats with a copy of it.
+    engine = _engine("qwen2_5_vl")
+    messages = copy.deepcopy(_TURNS)
+    kwargs = {"enable_thinking": False}
+    prepared = engine.prepare_chat_prompt(messages, None, kwargs, True)
+    engine._prepare_vision_inputs = MagicMock(side_effect=AssertionError("re-encoded"))
+
+    engine._process_chat_messages(
+        messages,
+        None,
+        {
+            "chat_template_kwargs": dict(kwargs),
+            "is_partial": True,
+            "_prepared_prompt": prepared,
+        },
+    )
+
+    engine._prepare_vision_inputs.assert_not_called()
+
+
+def test_template_kwargs_changed_in_place_are_not_reused():
+    engine = _engine("qwen2_5_vl")
+    messages = copy.deepcopy(_TURNS)
+    kwargs = {"enable_thinking": False}
+    prepared = engine.prepare_chat_prompt(messages, None, kwargs)
+    kwargs["enable_thinking"] = True
+    engine._prepare_vision_inputs = MagicMock(
+        return_value=([9], None, None, None, 0, [])
+    )
+
+    engine._process_chat_messages(
+        messages, None, {"chat_template_kwargs": kwargs, "_prepared_prompt": prepared}
+    )
+
+    engine._prepare_vision_inputs.assert_called_once()
+
+
+def test_executor_gets_its_own_copy_of_the_prepared_ids():
+    engine = _engine("qwen2_5_vl")
+    messages = copy.deepcopy(_TURNS)
+    prepared = engine.prepare_chat_prompt(messages)
+    before = list(prepared[1])
+
+    ids = engine._process_chat_messages(messages, None, {"_prepared_prompt": prepared})[0]
+    ids.append(0)
+
+    assert list(prepared[1]) == before
+
+
 def test_untagged_prepared_prompt_is_not_reused():
     engine = _engine("qwen2_5_vl")
     engine._prepare_vision_inputs = MagicMock(
