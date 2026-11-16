@@ -739,13 +739,24 @@ used to declare 2 spaces for `*.js`/`*.html`/`*.swift` while every file here is
 4-space, and PyCharm accordingly reported 8 188 "incorrect whitespace" findings
 in `cluster_v2.js` alone — a config bug, not 8 188 code defects. If an
 inspection reports a mass of `IncorrectFormatting`, check `.editorconfig` before
-touching code, and never reformat a 3 000-line template to satisfy a setting.
-The remaining, deliberately accepted classes (with counts and reasons) are in
-`docs/cluster-assistant/PLAN-REMAINING-2026-11-16.md` §2.1 — read it before
-"fixing" a finding: `JSUnresolvedReference` on JSON payload properties,
-`JSIgnoredPromiseFromCall` in the sync Alpine lifecycle, `DuplicatedCode` in the
-JSON stores, narrowing false positives, `is True` strictness checks and
-`http://host:port` endpoints are all intentional.
+touching code.
+
+The remaining "continuation/attribute alignment" findings (231 in
+`cluster_v2.js`, 2 692 in `_cluster_v2.html`) are a **formatter** mismatch, not a
+code defect, and the fix is the IDE's code style — `.idea/codeStyles/Project.xml`
+(gitignored, loaded at project open) now sets continuation indent 4 for
+JS/HTML/Python/Swift and aligns HTML attributes, i.e. what the files already do.
+It takes effect after a project reload/restart; the `ij_*` keys in
+`.editorconfig` are ignored by this IDE build (measured). **Never "fix" those
+findings with `Reformat Code`**: measured on a copy, the IDE formatter rewrites
+800+ lines of `cluster_v2.js` (object braces `{ key: … }` → `{key: …}`) and
+re-indents 5 200+ lines of the template — an unreviewable diff that also breaks
+the file's own style. The remaining, deliberately accepted classes (with counts
+and reasons) are in `docs/cluster-assistant/PLAN-REMAINING-2026-11-16.md` §2.1 —
+read it before "fixing" a finding: `JSUnresolvedReference` on JSON payload
+properties, `JSIgnoredPromiseFromCall` in the sync Alpine lifecycle,
+`DuplicatedCode` in the JSON stores, narrowing false positives, `is True`
+strictness checks and `http://host:port` endpoints are all intentional.
 
 Inspection exports land in the **repo root** as one `<Inspection>.xml` per class
 (PyCharm's "Export" dialog) — 67 files, many MB (one is 80 MB). Move them out of
