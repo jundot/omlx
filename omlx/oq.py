@@ -9594,7 +9594,11 @@ def _collect_untied_lm_head_imatrix(core, hidden, collector, name) -> bool:
 def _collect_language_model_lm_head_imatrix(model, hidden, collector) -> bool:
     text_model = getattr(model, "language_model", model)
     backbone = getattr(text_model, "backbone", None)
-    if backbone is not None and hasattr(backbone, "embeddings"):
+    if (
+        getattr(text_model, "model_type", None) in ("nemotron_h", "nemotron_h_puzzle")
+        and backbone is not None
+        and hasattr(backbone, "embeddings")
+    ):
         name = "language_model.lm_head" if text_model is not model else "lm_head"
         return _collect_untied_lm_head_imatrix(backbone, hidden, collector, name)
     if str(getattr(model, "model_type", "")) not in ("glm5_next", "flint"):
