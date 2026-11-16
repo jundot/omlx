@@ -61,7 +61,7 @@ def test_unmeasured_never_dominates_measured() -> None:
     front = pareto_front([measured, unmeasured])
     assert measured in front
     # The unmeasured row cannot dominate the measured one on rate.
-    assert not (front == [unmeasured])
+    assert front != [unmeasured]
 
 
 def test_fewer_nodes_breaks_a_speed_tie() -> None:

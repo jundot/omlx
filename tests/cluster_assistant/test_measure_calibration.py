@@ -259,6 +259,45 @@ def facts_by_node(store: MeasurementStore, measurement_id: str) -> dict[str, Any
 # ---------------------------------------------------------------------------
 
 
+def test_the_measurement_releases_the_calibration_model_it_loaded(
+    client, monkeypatch
+) -> None:
+    """The calibration checkpoint must not stay resident after the job.
+
+    A leftover ``dev-1.5b`` lowers the admission ceiling the *launcher* reads,
+    so a plan priced from the measurement is refused at start — measured live
+    2026-11-16 (plan admitted at 49.3 GiB, launch refused at 41.6 GiB).
+    """
+    unloads: list[tuple[str, str]] = []
+
+    def fake_local_admin(port, path, body=None, *, method="GET", timeout=0.0):
+        unloads.append((path, method))
+        return {}
+
+    def fake_remote_admin(target, port, path, body=None, *, method="POST", timeout=0.0):
+        unloads.append((path, method))
+        return {}
+
+    seam = FakeCompletion(usage_reply(), usage_reply(), usage_reply(), usage_reply())
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", fake_local_admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "remote_admin", fake_remote_admin)
+    api, store = client(
+        inventory=calibration_inventory,
+        model_layout=calibration_layout,
+        performance=lambda nodes: [synthetic_profile("m5"), synthetic_profile("m1")],
+    )
+
+    status = run_measurement(api, measure_payload(include_performance_probe=False))
+
+    assert status["state"] == "ready"
+    expected = assistant_routes.MODEL_UNLOAD_PATH.format(model_id="dev-1.5b")
+    released = [call for call in unloads if call == (expected, "POST")]
+    assert released, unloads
+    # One release per Mac that ran the calibration (both hold the checkpoint).
+    assert len(released) == len(status["nodes"]), (released, len(status["nodes"]))
+
+
 def test_the_measure_job_folds_a_real_calibration_into_each_node(
     client, monkeypatch
 ) -> None:

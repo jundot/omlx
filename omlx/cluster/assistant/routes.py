@@ -1256,7 +1256,7 @@ def _calibration_for_node(
 
         # The job runs on a worker thread, so it owns this small event loop;
         # calibrate_node answers None on any failed completion.
-        return asyncio.run(
+        profile = asyncio.run(
             calibrate_node(
                 seam,
                 model_weight_bytes=weight_bytes,
@@ -1264,8 +1264,44 @@ def _calibration_for_node(
                 measured_at=measurement_timestamp(),
             )
         )
+        # The warmup loaded this checkpoint into the Mac's pool and nothing
+        # else would unload it. Left resident it lowers the admission ceiling
+        # the *launcher* sees, so a plan priced from this measurement is then
+        # refused — measured live 2026-11-16: a plan admitted at 49.3 GiB was
+        # rejected at 41.6 GiB because every Mac still held `dev-1.5b`.
+        _release_calibration_model(
+            port=port, ssh="" if local else ssh, model_id=model_id
+        )
+        return profile
     except Exception:  # calibration is evidence, never a gate
         return None
+
+
+def _release_calibration_model(*, port: int, ssh: str, model_id: str) -> None:
+    """Unload the calibration checkpoint this Mac just ran.
+
+    ``calibrate_node`` runs two real completions with the calibration model, so
+    oMLX's pool holds it afterwards. Nothing else unloads it, and a resident
+    calibration model is exactly the difference between the admission the
+    measurement priced and the admission the launcher's guard reports — the
+    plan then fails at start with "needs 47.8 GiB but can admit 41.6 GiB".
+
+    Best effort by design: an unload that fails (busy, already gone, unreadable)
+    only leaves the model where it was, and the measurement itself is complete.
+    ``ssh`` empty means this Mac (in-process seam), otherwise the Mac's own
+    admin route over the existing SSH seam.
+    """
+
+    if not model_id:
+        return
+    path = MODEL_UNLOAD_PATH.format(model_id=model_id)
+    try:
+        if ssh:
+            remote_admin(ssh, port, path, {}, method="POST")
+        else:
+            _local_admin(port, path, {}, method="POST")
+    except Exception:  # noqa: BLE001 - cleanup never fails the measurement
+        logger.debug("calibration release failed for %s", model_id, exc_info=True)
 
 
 def _calibration_entry(
