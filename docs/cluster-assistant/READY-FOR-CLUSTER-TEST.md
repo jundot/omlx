@@ -195,22 +195,24 @@ The notarized `build/oMLX-0.8.0rc1.dmg` is the artefact to install.
 ## 9. Current rollout artefact (2026-11-16, the acceptance build)
 
 This supersedes §8's hashes and is the build the A1–A7 acceptance run must use.
+Rebuilt after the PyCharm clean-up (accessible inputs, wrapped lines, the 28 JS
+long lines, the test-seam rewrite) because the app bundles the web assets.
 
 | Item | Value |
 |---|---|
-| DMG | `build/oMLX-0.8.0rc1.dmg`, 79 MB, SHA256 `9400d290041ce80aa6a3dc84bd919884ec9f38a7d99ffd76c58e37879942d36c` |
-| App binary inside the DMG | `760a1695ad5c17ca7473ffff574b9d251ee3b8aed872194ac4b2d89bf0afdfb3` |
+| DMG | `build/oMLX-0.8.0rc1.dmg`, 79 MB, SHA256 `b3b9fd102bec00761a078575da2eb66171bf1f5ff79dee176bd720fc6a0ed449` |
+| App binary inside the DMG | `02a1b8417113fa8991208c3f64ca1b91d61c92b76602ba006f6e44111f8f359d` |
 | Version string | `0.8.0rc1` (unchanged — the hash is the real gate) |
-| Signed / notarized | Developer-ID signed, notarized (`d3a1b6c9-…`, Accepted), stapled; `spctl` → `accepted, source=Notarized Developer ID` |
-| Built from | `0c6e7479` (U1–U6 one-flow Cluster tab); `691aaa94` and later are docs only |
-| Contents vs §8 | D1 uninstall, D6 helper capability, distributed inference on by default, **and the U1–U6 UI** |
+| Signed / notarized | Developer-ID signed, notarized (`c70ecf9f-d35a-465a-b91d-f409bb71cc46`, Accepted), stapled and validated; `spctl` → `accepted, source=Notarized Developer ID` |
+| Built from | the tree at `0cfb3183` (code `84ce15e7`); only documentation commits followed |
+| Contents vs §8 | D1 uninstall, D6 helper capability, distributed inference on by default, the U1–U6 UI, and the inspection clean-up |
 
-**State check measured 2026-11-16:** this Mac (`.11`) still runs app binary
-`09f51c2d…` (the pre-U1–U6 build), and `~/.omlx/cluster/` is **not wiped**
-(`devices.json`, `deployments.json`, `assistant-measurements.json`,
-`runtime/prompt-cache-ssd` present). So the acceptance run has **not** started:
-reinstall the DMG on all four Macs, verify `760a1695…` everywhere, then wipe per
-`CLUSTER-TEST-RUNBOOK.md` §0.5 and run A1–A7.
+**State check measured 2026-11-16 (after the cleanup run):** all four Macs are
+wiped — 0 processes, port 8099 free, `~/.omlx` = `cluster/identity.json` +
+`backup-cluster-2026-11-16/`, 0 app copies, 0 LaunchServices records, runtime venv
+gone. The root-owned helper is the one leftover (needs one admin dialog per Mac).
+So the acceptance run has **not** started: install this DMG on all four Macs,
+verify `02a1b841…` everywhere, then run A1–A7.
 
 The checklist for the whole remaining work is
 [`PLAN-REMAINING-2026-11-16.md`](PLAN-REMAINING-2026-11-16.md).

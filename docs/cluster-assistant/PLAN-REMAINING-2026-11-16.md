@@ -22,8 +22,8 @@ Read with: `ROADMAP-ACCEPTANCE-2026-11-16.md` (gate + decisions),
 | Backend suite | `tests/cluster_assistant` **658 passed** |
 | UI suites (focused) | wizard + `test_cluster_ui_integration_ui` + dashboard **289 passed** |
 | Lint | `ruff check omlx/cluster/assistant/` **clean** (8 nitpicks fixed 2026-11-16) |
-| Acceptance DMG | `build/oMLX-0.8.0rc1.dmg` `9400d290…`, app binary `760a1695…`, `0.8.0rc1`, notarized + stapled |
-| Installed on `.11` | app binary `09f51c2d…` → **one build behind** (no U1–U6 UI) |
+| Acceptance DMG | `build/oMLX-0.8.0rc1.dmg` `b3b9fd10…`, app binary `02a1b841…`, `0.8.0rc1`, notarized + stapled (2026-11-16, rebuilt after the inspection clean-up) |
+| Installed on `.11` | none — the app was removed by the 2026-11-16 cleanup run |
 | Macs | `.11` `.12` `.13` `.14` reachable, **no oMLX running** anywhere (app must be opened by a person) |
 | Cluster state | **not wiped** on `.11`: devices, deployments, measurements, `runtime/prompt-cache-ssd` |
 | PR series | `rebase/upstream-main` is **not** an ancestor of `feat/cluster-assistant-run` → fold **not** done (82 commits / 250 files backlog) |
@@ -115,7 +115,7 @@ installer). Do not drive these over SSH.
       (backs up to `~/.omlx/backup-cluster-<date>/`, keeps models +
       `cluster/identity.json`, kills processes, frees 8099). Done 2026-11-16 on
       all four Macs; the helper still needs its admin dialog (see §6).
-- [ ] **1.2 Roll out** — copy `build/oMLX-0.8.0rc1.dmg` to all four Macs,
+- [ ] **1.2 Roll out** — copy `build/oMLX-0.8.0rc1.dmg` (`b3b9fd10…`) to all four Macs,
       install, open the app **interactively**, let Local Network, the runtime
       installer and the helper dialog through.
 - [ ] **1.3 Identical-build gate** — `GET /api/cluster/node_id` → same
