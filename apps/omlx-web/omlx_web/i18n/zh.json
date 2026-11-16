@@ -726,7 +726,7 @@
   "settings.advanced.performance": "性能",
   "settings.advanced.distributed_inference": "分布式推理",
   "settings.advanced.distributed_inference_enabled": "启用分布式推理",
-  "settings.advanced.distributed_inference_hint": "重启后启用集群选项卡、集群 API 路由和 Bonjour 广播。功能完善期间默认关闭。",
+  "settings.advanced.distributed_inference_hint": "重启后启用集群选项卡、集群 API 路由和 Bonjour 广播。默认开启，集群助手需要它。",
   "cluster.pairing.shared_secret": "共享配对密钥",
   "cluster.pairing.shared_secret_hint": "在一台 Mac 上生成并复制到另一台，在交换密钥前在两台设备上输入相同的密钥。",
   "cluster.pairing.shared_secret_placeholder": "至少 16 个字符",

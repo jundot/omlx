@@ -810,6 +810,12 @@ request. They govern W1–W6 of the acceptance package:
    independent of the wired-limit warning. One seam
    `PrivilegedHelper.status → {installed, version, wiredLimitCurrentMB,
    wiredLimitRequestedMB}`; idempotent and versioned.
+6. **Distributed inference is on by default (user decision, 2026-11-16):** a
+   fresh install must reach the Cluster Assistant without hunting for the
+   switch — `ServerSettings.distributed_inference_enabled` defaults to True
+   (settings.py, exposure.py), saved explicit values still win, and the
+   settings hint no longer claims "disabled by default". Recorded during the
+   W1/W2 live run: the first real uninstall and first run found it off.
 
 If blocked by an environmental unknown (paths, credentials, hardware), ask once
 instead of inventing an answer.

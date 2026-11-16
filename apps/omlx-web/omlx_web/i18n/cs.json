@@ -726,7 +726,7 @@
   "settings.advanced.performance": "Výkon",
   "settings.advanced.distributed_inference": "Distribuovaná inference",
   "settings.advanced.distributed_inference_enabled": "Povolit distribuovanou inferenci",
-  "settings.advanced.distributed_inference_hint": "Po restartu povolí kartu Cluster, routy cluster API a zjistitelnost přes Bonjour. Ve výchozím stavu vypnuto, dokud funkce nedozraje.",
+  "settings.advanced.distributed_inference_hint": "Po restartu povolí kartu Cluster, routy cluster API a zjistitelnost přes Bonjour. Ve výchozím stavu zapnuto — Cluster Assistant to vyžaduje.",
   "cluster.pairing.shared_secret": "Společné párovací heslo",
   "cluster.pairing.shared_secret_hint": "Vygenerujte jej na jednom Macu, zkopírujte na druhý a před výměnou klíčů zadejte stejné heslo na obou.",
   "cluster.pairing.shared_secret_placeholder": "Nejméně 16 znaků",

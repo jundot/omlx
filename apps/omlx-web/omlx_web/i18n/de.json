@@ -726,7 +726,7 @@
   "settings.advanced.performance": "Leistung",
   "settings.advanced.distributed_inference": "Verteilte Inferenz",
   "settings.advanced.distributed_inference_enabled": "Verteilte Inferenz aktivieren",
-  "settings.advanced.distributed_inference_hint": "Aktiviert nach einem Neustart die Registerkarte „Cluster“, die Cluster-API-Routen und die Bonjour-Ankündigungen. Standardmäßig deaktiviert, solange die Funktion weiterentwickelt wird.",
+  "settings.advanced.distributed_inference_hint": "Aktiviert nach einem Neustart die Registerkarte „Cluster“, die Cluster-API-Routen und die Bonjour-Ankündigungen. Standardmäßig aktiviert — der Cluster Assistant benötigt es.",
   "cluster.pairing.shared_secret": "Gemeinsames Kopplungsgeheimnis",
   "cluster.pairing.shared_secret_hint": "Erzeugen Sie dieses auf einem Mac, kopieren Sie es auf den anderen und geben Sie auf beiden dasselbe Geheimnis ein, bevor Sie Schlüssel austauschen.",
   "cluster.pairing.shared_secret_placeholder": "Mindestens 16 Zeichen",

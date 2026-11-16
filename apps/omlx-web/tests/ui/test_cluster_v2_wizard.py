@@ -3420,9 +3420,13 @@ def test_assistant_strings_exist_in_the_english_catalog():
 def test_assistant_primary_path_has_no_ip_ssh_rank_layer_or_model_path_field():
     card = _assistant_card()
 
-    # The primary path is buttons and rendered values only.
+    # The primary path is buttons and rendered values only. The one exception
+    # is the rank-0 pin (frozen decision, 2026-11-15): a single Mac picker for
+    # preferred_coordinator — never IP/SSH/rank/layer/model-path inputs.
     assert "<input" not in card
-    assert "<select" not in card
+    assert card.count("<select") == 1
+    assert "data-cluster-v2-assistant-coordinator" in card
+    assert "setAssistantCoordinator" in card
     assert "x-model" not in card
     assert "data-cluster-v2-assistant-entry" in card
     assert "data-cluster-v2-assistant-start-setup" in card
@@ -3651,8 +3655,10 @@ def test_assistant_search_affordance_and_api_map_entry_exist():
     assert "data-cluster-v2-assistant-search-results" in card
     assert "data-cluster-v2-assistant-search-errors" in card
     assert "data-cluster-v2-assistant-search-error" in card
-    # The card's primary path stays input-free.
-    assert "<select" not in card
+    # The card's primary path stays input-free; the rank-0 pin's Mac picker
+    # (preferred_coordinator, frozen decision 2026-11-15) is the only select.
+    assert card.count("<select") == 1
+    assert "data-cluster-v2-assistant-coordinator" in card
     assert "<input" not in card
     assert "x-model" not in card
 

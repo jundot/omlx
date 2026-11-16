@@ -52,7 +52,7 @@ class TestServerSettings:
         assert settings.auto_start_on_launch is True
         assert settings.burst_decode_mode == "balanced"
         assert settings.preserve_mid_system_cache is True
-        assert settings.distributed_inference_enabled is False
+        assert settings.distributed_inference_enabled is True
         assert settings.max_audio_upload_size == "100MB"
         assert settings.max_audio_upload_bytes() == 100 * 1024 * 1024
         assert settings.max_image_upload_size == "50MB"
@@ -86,7 +86,7 @@ class TestServerSettings:
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
-            "distributed_inference_enabled": False,
+            "distributed_inference_enabled": True,
             "max_audio_upload_size": "100MB",
             "max_image_upload_size": "50MB",
             "max_request_body_size": "512MB",
@@ -107,13 +107,15 @@ class TestServerSettings:
             is True
         )
 
-    def test_from_dict_distributed_inference_is_opt_in(self):
-        assert ServerSettings.from_dict({}).distributed_inference_enabled is False
+    def test_from_dict_distributed_inference_is_on_by_default(self):
+        # A fresh install must reach the Cluster Assistant without hunting
+        # for this switch (user decision, 2026-11-16).
+        assert ServerSettings.from_dict({}).distributed_inference_enabled is True
         assert (
             ServerSettings.from_dict(
-                {"distributed_inference_enabled": True}
+                {"distributed_inference_enabled": False}
             ).distributed_inference_enabled
-            is True
+            is False
         )
 
     def test_from_dict_sse_keepalive_mode(self):

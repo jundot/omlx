@@ -726,7 +726,7 @@
   "settings.advanced.performance": "Performance",
   "settings.advanced.distributed_inference": "Inferencia distribuida",
   "settings.advanced.distributed_inference_enabled": "Enable Distributed Inference",
-  "settings.advanced.distributed_inference_hint": "Activa la pestaña Clúster, las rutas de la API del clúster y la publicidad Bonjour después de reiniciar. Está desactivado de forma predeterminada mientras la función madura.",
+  "settings.advanced.distributed_inference_hint": "Activa la pestaña Clúster, las rutas de la API del clúster y la publicidad Bonjour después de reiniciar. Activado de forma predeterminada; el asistente de clúster lo necesita.",
   "cluster.pairing.shared_secret": "Secreto de emparejamiento compartido",
   "cluster.pairing.shared_secret_hint": "Genéralo en un Mac, cópialo al otro e introduce el mismo secreto en ambos antes de intercambiar claves.",
   "cluster.pairing.shared_secret_placeholder": "Al menos 16 caracteres",

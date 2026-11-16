@@ -726,7 +726,7 @@
   "settings.advanced.performance": "Performance",
   "settings.advanced.distributed_inference": "분산 추론",
   "settings.advanced.distributed_inference_enabled": "분산 추론 활성화",
-  "settings.advanced.distributed_inference_hint": "재시작 후 클러스터 탭, 클러스터 API 경로 및 Bonjour 광고를 활성화합니다. 기능이 안정화되는 동안 기본적으로 비활성화됩니다.",
+  "settings.advanced.distributed_inference_hint": "재시작 후 클러스터 탭, 클러스터 API 경로 및 Bonjour 광고를 활성화합니다. 기본적으로 활성화되어 있으며 클러스터 어시스턴트에 필요합니다.",
   "cluster.pairing.shared_secret": "공유 페어링 비밀",
   "cluster.pairing.shared_secret_hint": "한 Mac에서 생성해 다른 Mac으로 복사하고, 키를 교환하기 전에 양쪽에 동일한 비밀을 입력하세요.",
   "cluster.pairing.shared_secret_placeholder": "16자 이상",

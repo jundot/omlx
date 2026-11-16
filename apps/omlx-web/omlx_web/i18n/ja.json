@@ -726,7 +726,7 @@
   "settings.advanced.performance": "Performance",
   "settings.advanced.distributed_inference": "分散推論",
   "settings.advanced.distributed_inference_enabled": "Enable Distributed Inference",
-  "settings.advanced.distributed_inference_hint": "再起動後にクラスタタブ、クラスタ API ルート、Bonjour 広告を有効にします。機能の成熟中はデフォルトで無効です。",
+  "settings.advanced.distributed_inference_hint": "再起動後にクラスタタブ、クラスタ API ルート、Bonjour 広告を有効にします。デフォルトで有効です。クラスタアシスタントに必要です。",
   "cluster.pairing.shared_secret": "共有ペアリングシークレット",
   "cluster.pairing.shared_secret_hint": "一方の Mac で生成してもう一方にコピーし、鍵を交換する前に両方へ同じシークレットを入力します。",
   "cluster.pairing.shared_secret_placeholder": "16 文字以上",

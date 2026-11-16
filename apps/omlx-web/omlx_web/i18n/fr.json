@@ -726,7 +726,7 @@
   "settings.advanced.performance": "Performance",
   "settings.advanced.distributed_inference": "Inférence distribuée",
   "settings.advanced.distributed_inference_enabled": "Enable Distributed Inference",
-  "settings.advanced.distributed_inference_hint": "Active l’onglet Cluster, les routes d’API du cluster et l’annonce Bonjour après le redémarrage. Désactivé par défaut pendant la maturation de la fonctionnalité.",
+  "settings.advanced.distributed_inference_hint": "Active l’onglet Cluster, les routes d’API du cluster et l’annonce Bonjour après le redémarrage. Activé par défaut — l’assistant de cluster en a besoin.",
   "cluster.pairing.shared_secret": "Secret d’appairage partagé",
   "cluster.pairing.shared_secret_hint": "Générez-le sur un Mac, copiez-le sur l’autre et saisissez le même secret sur les deux avant d’échanger les clés.",
   "cluster.pairing.shared_secret_placeholder": "Au moins 16 caractères",

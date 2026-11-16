@@ -726,7 +726,7 @@
   "settings.advanced.performance": "Производительность",
   "settings.advanced.distributed_inference": "Распределённый вывод",
   "settings.advanced.distributed_inference_enabled": "Enable Distributed Inference",
-  "settings.advanced.distributed_inference_hint": "После перезапуска включает вкладку кластера, маршруты API кластера и публикацию Bonjour. По умолчанию отключено, пока функция дорабатывается.",
+  "settings.advanced.distributed_inference_hint": "После перезапуска включает вкладку кластера, маршруты API кластера и публикацию Bonjour. Включено по умолчанию — это нужно для Cluster Assistant.",
   "cluster.pairing.shared_secret": "Общий секрет сопряжения",
   "cluster.pairing.shared_secret_hint": "Создайте его на одном Mac, скопируйте на другой и введите одинаковый секрет на обоих перед обменом ключами.",
   "cluster.pairing.shared_secret_placeholder": "Не менее 16 символов",

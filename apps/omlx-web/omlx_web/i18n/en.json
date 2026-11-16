@@ -726,7 +726,7 @@
   "settings.advanced.performance": "Performance",
   "settings.advanced.distributed_inference": "Distributed Inference",
   "settings.advanced.distributed_inference_enabled": "Enable Distributed Inference",
-  "settings.advanced.distributed_inference_hint": "Enable the Cluster tab, cluster API routes, and Bonjour advertising after restart. Disabled by default while the feature matures.",
+  "settings.advanced.distributed_inference_hint": "Enable the Cluster tab, cluster API routes, and Bonjour advertising after restart. On by default — the Cluster Assistant needs it.",
   "cluster.pairing.shared_secret": "Shared pairing secret",
   "cluster.pairing.shared_secret_hint": "Generate this on one Mac, copy it to the other, and enter the same secret on both before exchanging keys.",
   "cluster.pairing.shared_secret_placeholder": "At least 16 characters",

@@ -726,7 +726,7 @@
   "settings.advanced.performance": "效能",
   "settings.advanced.distributed_inference": "分散式推論",
   "settings.advanced.distributed_inference_enabled": "Enable Distributed Inference",
-  "settings.advanced.distributed_inference_hint": "重新啟動後啟用叢集分頁、叢集 API 路由與 Bonjour 廣播。功能成熟前預設為停用。",
+  "settings.advanced.distributed_inference_hint": "重新啟動後啟用叢集分頁、叢集 API 路由與 Bonjour 廣播。預設為啟用，叢集助理需要它。",
   "cluster.pairing.shared_secret": "共用配對密鑰",
   "cluster.pairing.shared_secret_hint": "在一台 Mac 上產生並複製到另一台，在交換金鑰前於兩台裝置輸入相同密鑰。",
   "cluster.pairing.shared_secret_placeholder": "至少 16 個字元",
