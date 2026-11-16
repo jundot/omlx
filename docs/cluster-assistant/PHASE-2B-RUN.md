@@ -1953,40 +1953,82 @@ coordinator select). `make web` is a no-op. The distributed-inference
 default-on build is the final artefact: DMG `6958fda5…`, app binary
 `09f51c2d…`, notarized + stapled, identical on all four Macs.
 
-## 31. U1–U6 acceptance run (A1–A7) — 2026-11-__ (to be filled in)
+## 31. U1–U6 acceptance run (A1–A7) — 2026-11-16
 
-The run that closes `ROADMAP-ACCEPTANCE-2026-11-16.md` §2. Shape is fixed here so
-the session only has to fill in the values; nothing is recorded before it is
-measured.
+The run that closes `ROADMAP-ACCEPTANCE-2026-11-16.md` §2. Backend half proven
+this session; the UI half (A1, A4, A7, screenshots) still needs a person at the
+Cluster tab.
 
-**Build and state**
+**The cluster is now three Macs.** `.14` was reassigned on 2026-11-16 (own task,
+needs its own oMLX) and is never touched; `cleanup-cluster-macs.sh` no longer
+lists it, and it stays *unpaired* although its mDNS advertisement is visible.
 
 | Item | Value |
 |---|---|
-| Origin Mac | `.11` (MacBook Pro M5 Max, 128 GiB) |
-| DMG | `build/oMLX-0.8.0rc1.dmg`, SHA256 `b3b9fd102bec00761a078575da2eb66171bf1f5ff79dee176bd720fc6a0ed449` (built 2026-11-16, notarized) |
-| App binary (`shasum -a 256 …/Contents/MacOS/oMLX`) | `02a1b841…` expected; record the three measured hashes (`.11`/`.12`/`.13`; `.14` is reassigned and untouched) |
-| Version gate | `GET /api/cluster/node_id` → same `version` on `.11/.12/.13` |
-| Wipe | `scripts/cleanup-cluster-macs.sh --all --with-helper`, state backup `~/.omlx/backup-cluster-2026-11-__/` |
-| Helper | removed before the run (so A5 proves a real first install) — `__________` |
-| Probe | `assistant_performance_probe` **on** |
+| Origin | `.11` MacBook-Pro-von-Andreas, M5 Max 128 GiB (node `cbc6af36`) |
+| Peer | `.12` Mac-Studio-M2Ultra, M2 Ultra 64 GiB (node `9078f858`) |
+| Peer | `.13` MacStudio-von-Andreas-2, M1 Max 32 GiB, **headless** (node `2dd48599`) |
+| DMG | `b3b9fd10…`, app binary `02a1b841…` on all three, `spctl` accepted (Notarized Developer ID) |
+| Version gate | `0.8.0rc1` on all three, distinct node ids |
+| Server | **port 8000**, host `0.0.0.0` (the Welcome default is `127.0.0.1`, which no peer can reach) |
+| Helper | absent on all three at run start → A5 can prove a real first install |
 
-**Gate** — one row per criterion, `pass` only with the evidence named.
+**Two operational findings (both fixed during the run, both worth a doc change):**
+
+1. **Welcome leaves the model directory at `~/.omlx/models`.** The 902 GB of
+   models live in `~/Models`, so the first hardware measurement reported
+   `models: []` per Mac and the recommendation had nothing to read. Fixed on all
+   three with `POST /admin/api/global-settings {"model_dirs":["/Users/andreaskolb/Models"]}`
+   (applied immediately, the app rescans). A first-run user with models in place
+   would hit the same wall.
+2. **The runbook's port is stale.** Everything here runs on **8000** (the Welcome
+   default), not 8099; `scripts/check_peer_versions.py` also defaults to 8099 and
+   needs `--port 8000`.
+
+**Gate**
 
 | # | Criterion | Result | Evidence |
 |---|---|---|---|
-| A1 | manual flow: devices → pair → measure → model → plan → apply → start → ready → one completion → stop | | measurement `ms-…`, plan `…`, operation `op-…`, reply text |
-| A2 | the same model through the assistant card; endpoint only at `ready` | | operation `op-…`, endpoint URL, rank order |
-| A3 | a real failure shown at its step, corrected in place, retried successfully (no reload) | | error code + action, second attempt `op-…` |
-| A4 | after a green plan: change model/context, downstream `stale`, finish the flow | | plan signature before/after |
-| A5 | helper installable/reinstallable from Welcome **and** Performance, independent of the wired-limit warning | | five status states observed |
-| A6 | in-app uninstall: app, helper, runtime, settings, cluster state gone; models + `identity.json` kept; 0 LS records | | `ls -d /Applications/oMLX*.app` → 0, `lsregister -dump | grep -c oMLX.app` → 0 |
-| A7 | no error text only in the advanced preview; no warning rendered as an error | | the screens exercised in A3 |
+| A1 | manual flow in the Cluster tab | **open** — needs the browser session | — |
+| A2 | assistant path to `ready` + endpoint | **pass (backend)** | `ms-20261116T095742Z-00027ed1` (hardware) → `ms-20261116T095825Z-00035679` (model-bound, 0 warnings) → `plan c2c97b3c88130155…` → apply `op-20261116T095958Z-apply-00018937` → start `op-20261116T100035Z-start-00022cf2` → **ready**, endpoint `http://172.16.1.12:8000`, deployment `GLM-5.3-Flash-oQ2e-mtp-d59d0b7727b0` |
+| A3 | real failure at its step, corrected, retried | **pass (backend)** | refusal `no_feasible_plan` + action `adjust_model_or_context`, naming the pinned `.13`: “rank 0 is pinned to 2dd48599… but no feasible coordinator … at least 46 064 215 209 additional bytes required”; the correction (unpin, 2 Macs) plans at once (`c2c97b3c…`) |
+| A4 | back/stale after a green plan | **open** — UI only | — |
+| A5 | helper install/reinstall from Welcome **and** Performance | **open** — one admin dialog per Mac | helper absent at start |
+| A6 | in-app uninstall, models + identity kept, 0 LS records | **open** — removes the app; run it last | — |
+| A7 | no error only in the advanced preview, warnings never red | open — UI, exercised with A3's refusal | — |
 
-**Observations**
+**Plan the run approved (A2)**
 
-- Plan split (rank order, stages, context, tier, table/MoE offload):
-- `predicted` vs `observed` (probe on): prefill / decode / TTFT, `measured_at`:
-- Stop: operation `stopped`, endpoint hidden, `Start again` offered:
-- Failures found during the run and how they were fixed (each becomes a commit):
-- Suites after any fix (must be re-run before the next attempt):
+- model `GLM-5.3-Flash-oQ2e-mtp`, 97.66 GiB, **2 Macs** (`.12` rank 0 = tail and
+  endpoint, `.11` rank 1); `.13` **excluded** (`macs_not_needed`) — the
+  fewest-Macs rule held although three Macs were paired
+- context 32768, `mtp: true`, `balanced`; policy: tier **aggressive** (raised,
+  warned as `tier_raised`), no table offload, experts resident, admission `p50`
+- per stage: rank 0 resident 34.95 GiB of 44.12 GiB admission (headroom 9.17),
+  rank 1 68.35 of 102.06 GiB (headroom 33.72); `predicted.critical_stage_seconds`
+  1.065, `measured: true`
+- **rank-0 pin honoured, never moved silently**: pinning `.13` produced a legal
+  **3-Mac** plan (`.13` → `.12` → `.11`, critical stage 0.936 s) instead of
+  silently electing another Mac
+- context ladder sanity: 32768, 131072 and 1048576 (the checkpoint's own max) all
+  plan on 2 Macs — 2 Macs = 146 GiB of p50 admission against 97.66 GiB weights,
+  and the KV for 1M tokens is only ~11.3 GiB on this GQA layout
+
+**Observed**
+
+- One real completion against the elected endpoint: `"hello cluster"`,
+  18 prompt / 30 completion tokens, **8.42 tok/s** generation, model load 16.8 s,
+  wall 20.7 s. `observed` stays `null` (the probe is off by default; the rate above
+  comes from the completion's own `usage`), and the operation carries
+  `performance_unmeasured` — no rate is claimed.
+- 8.42 tok/s vs 18.76 tok/s in §29: this deployment has **no tuning preset** for
+  `(GLM-5.3, {.11,.12})` and no MTP depth sweep, so the launched depth is the
+  default. `/tune` + `/tune-redeploy` is the next step for this config.
+- `chat_profile_applied`: the assistant wrote the documented default profile
+  (temperature 0.6, top_p 0.95, top_k 0, 2048 tokens) because the model had none.
+- Stop: `stopped: true` with `deployment_stopped`; `state` stays `ready` and the
+  endpoint gate is the UI's (`assistantReady()` + `stopped`).
+
+**Still needed for the gate:** A1 (manual path in the Cluster tab), A4 (back and
+`stale`), A5 (one admin dialog per Mac), A6 (uninstall, last), A7 (visual error
+placement) and the eight screenshots (R8).

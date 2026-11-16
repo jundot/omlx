@@ -797,10 +797,14 @@ The cluster may be offline. Do not assume it is available.
 
 | Node | Hardware | RAM | Test role |
 |---|---|---|---|
-| `172.16.1.11` | MacBook Pro M5 Max | 128 GiB | fast/large candidate |
-| `172.16.1.13` | Mac Studio M2 Ultra | 64 GiB | medium candidate |
+| `172.16.1.11` | MacBook Pro M5 Max | 128 GiB | origin, fast/large candidate (host `MacBook-Pro-von-Andreas`) |
+| `172.16.1.12` | Mac Studio M2 Ultra | 64 GiB | medium candidate (host `Mac-Studio-M2Ultra`) |
+| `172.16.1.13` | Mac Studio M1 Max | 32 GiB | small candidate, **`headless`** (host `MacStudio-von-Andreas-2`) |
 | `172.16.1.14` | Mac Studio M1 Max | 32 GiB | **reassigned 2026-11-16: never touched** (own task, needs its own oMLX) |
-| `172.16.1.12` | MacBook Pro M1 Max | 32 GiB | known 2-node peer, often offline |
+
+Measured 2026-11-16 from the pairing records: `.12` is the M2 Ultra (64 GiB), `.13`
+the M1 Max (32 GiB) — the earlier table had the two swapped. A Mac under 64 GiB
+installed RAM is **headless** (the workstation reserve would starve it).
 
 Never copy API keys or model data into this repository.
 
