@@ -59835,7 +59835,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "请在“系统设置 → 屏幕与系统音频录制”中允许 oMLX，然后重新启动 oMLX。"
+            "value" : "请在“系统设置 → 录屏与系统录音”中允许 oMLX，然后重新启动 oMLX。"
           }
         }
       }
