@@ -2008,7 +2008,7 @@ lists it, and it stays *unpaired* although its mDNS advertisement is visible.
 the two chat bugs above instead of a chat: plan `9bf9c137…`, rank order `.11` →
 `.12` (`.13` not needed), context 32768, MTP on, tier aggressive, endpoint
 `http://172.16.1.11:8000`, deployment `GLM-5.3-Flash-oQ2e-mtp-2da9fbab75c6`,
-`performance_unmeasured`. Both fixes shipped in build `a3898cf7…`, and the run is
+`performance_unmeasured`. Both fixes shipped in build `59638c31…`, and the run is
 repeated on that build so the whole gate uses one identical binary.
 
 **Live finding (2026-11-16, blocked a fresh plan): the resident calibration
@@ -2032,6 +2032,17 @@ into oMLX's pool. Nothing unloaded it, so the Mac carried ~7.7 GiB the
 measurement had not counted — the plan was admitted by the planner and refused
 by the launcher, reproducibly, and the card's "close other apps" could never
 close that gap.
+
+**Second half of the cause** (found after the first fix did not change the
+number): releasing the checkpoint does not return its bytes to the OS — mlx keeps
+them in the process — so the *dynamic* ceiling the launcher reads stayed ~8 GiB
+below the probe the measurement had taken four minutes earlier (55.4 GiB reported
+idle on `.12` with nothing loaded, 46.8 GiB charged at load, ×0.97 safety = 45.4).
+The measure job now re-probes each calibrated Mac after the calibration and keeps
+the **smaller** capacity (`35f92ab5`), so a plan is priced against what the launch
+will actually see; a Mac without calibration and a ceiling that came back higher
+are both left alone. Test:
+`test_a_calibrated_mac_is_repriced_to_its_post_calibration_ceiling`.
 
 **Fixed** (`9ce215d4`): the measurement now releases the calibration checkpoint on
 every Mac it ran it on, through the same local/remote admin seam calibration
