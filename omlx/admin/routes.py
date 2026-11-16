@@ -683,7 +683,6 @@ DASHBOARD_BLOCK_IDS = (
     "active_models",
     "cache_observability",
     "api_endpoints",
-    "claude_code",
     "applications",
     "engine_versions",
 )
