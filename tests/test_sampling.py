@@ -662,3 +662,84 @@ def test_nucleus_mixed_rows_in_advance_group_settle_per_row(monkeypatch):
     assert dense1 != fast[1][:-1]  # the fixture makes the redo observable
     assert received[0] == fast[0][:-1]
     assert received[1] == dense1
+
+
+def test_nucleus_fast_path_is_skipped_when_a_predraft_is_queued():
+    """A pre-draft cycle's miss costs the redo plus the discarded pre-draft:
+    the verify must run the dense path there (allow_nucleus=False), whatever
+    the row width."""
+    from omlx.patches.mlx_lm_mtp.batch_generator import (
+        _settled_verify,
+        _stochastic_verify_tokens,
+        _verify_stochastic,
+    )
+
+    depth = 3
+    lp = _nucleus_rows(depth + 1, 65536, mx.float32, scale=0.3, seed=8)  # flat
+    sampler = make_sampler(temp=1.0, top_p=0.95)
+    drafts, qs = _nucleus_inputs(sampler, lp, depth, seed=9)
+    assert _verify_stochastic(sampler, lp, drafts, qs).tolist()[-1] == 0
+    mx.random.seed(1)
+    flagged = _verify_stochastic(sampler, lp, drafts, qs, allow_nucleus=False)
+    mx.random.seed(1)
+    dense = _stochastic_verify_tokens(sampler, lp, drafts, qs).tolist()
+    host, redone = _settled_verify(flagged.tolist(), sampler, lp, drafts, qs)
+    assert not redone and host == dense
+
+
+@pytest.mark.parametrize("has_predraft", [True, False])
+def test_verify_cycle_gates_nucleus_on_a_predraft_capable_drafter(
+    monkeypatch, has_predraft
+):
+    from types import SimpleNamespace
+
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    depth = 3
+    lp = _nucleus_rows(depth + 1, 4096, mx.float32, scale=6.0, seed=3)
+    sampler = make_sampler(temp=1.0, top_p=0.95)
+    drafts, qs = _nucleus_inputs(sampler, lp, depth, seed=4)
+    state = bg._MtpState(
+        uid=1,
+        chain=True,
+        depth=depth,
+        mtp_cache=[],
+        next_main=mx.array([1], dtype=mx.uint32),
+        drafts=drafts,
+        draft_lps=[mx.zeros((4096,)) for _ in range(depth)],
+        draft_accept_lps=qs,
+    )
+    drafter = SimpleNamespace(predraft=lambda *a: False) if has_predraft else SimpleNamespace()
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def spy(*args, allow_nucleus=True):
+        seen["allow_nucleus"] = allow_nucleus
+        raise Stop
+
+    monkeypatch.setattr(bg, "_drafter_for", lambda model: drafter)
+    monkeypatch.setattr(bg, "_drafter_capture_ids", lambda model: None)
+    monkeypatch.setattr(bg, "_clip_block_drafts", lambda state, limit: None)
+    monkeypatch.setattr(bg, "_verify_stochastic", spy)
+    monkeypatch.setattr(
+        bg,
+        "_call_backbone_captured",
+        lambda *a, **k: (lp[None], mx.zeros((1, depth + 1, 4)), None, [mx.zeros((1, depth + 1, 4))]),
+    )
+    batch = SimpleNamespace(
+        model=SimpleNamespace(),
+        prompt_cache=[SimpleNamespace()],
+        tokens=[[4, 5]],
+        samplers=[sampler],
+        fallback_sampler=sampler,
+        logits_processors=[],
+        _token_context=[],
+        max_tokens=[1000],
+        _num_tokens=[0],
+        _matchers=[SimpleNamespace(advance=lambda token: False)],
+    )
+    with pytest.raises(Stop):
+        bg._run_verify_cycle_chain(batch, state)
+    assert seen["allow_nucleus"] is (not has_predraft)

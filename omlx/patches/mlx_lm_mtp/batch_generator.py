@@ -4371,15 +4371,20 @@ def _stochastic_verify_tokens_nucleus(sampler, combined_lp, drafts, draft_accept
     return mx.concatenate([packet, exact.astype(mx.int32).reshape(1)])
 
 
-def _verify_stochastic(sampler, combined_lp, drafts, draft_accept_lps):
+def _verify_stochastic(
+    sampler, combined_lp, drafts, draft_accept_lps, *, allow_nucleus=True
+):
     """``_stochastic_verify_tokens`` packet plus a trailing exactness flag.
 
     Still one host read. A 0 flag is only possible on the top-p fast path; read
-    the packet with ``_settled_verify`` so that case is redone densely.
+    the packet with ``_settled_verify`` so that case is redone densely. A cycle
+    that has queued a block pre-draft passes ``allow_nucleus=False``: a miss
+    there costs the redo behind the pre-draft and the pre-draft itself, which
+    more than eats the saving on the cycles that hit.
     """
     import mlx.core as mx
 
-    if int(drafts.shape[0]) > 0 and _nucleus_verify_eligible(
+    if allow_nucleus and int(drafts.shape[0]) > 0 and _nucleus_verify_eligible(
         sampler, combined_lp.shape[-1]
     ):
         return _stochastic_verify_tokens_nucleus(
@@ -4701,7 +4706,13 @@ def _run_verify_cycle_chain(
         host = stochastic_result
         if host is None:
             result = _verify_stochastic(
-                sampler, combined_lp, state.drafts, state.draft_accept_lps
+                sampler,
+                combined_lp,
+                state.drafts,
+                state.draft_accept_lps,
+                allow_nucleus=not (
+                    can_predraft and callable(getattr(drafter, "predraft", None))
+                ),
             )
             if can_predraft:
                 m_arr = result[:1]
