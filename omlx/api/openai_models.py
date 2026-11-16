@@ -555,6 +555,11 @@ class CompletionRequest(BaseModel):
     # Cap reasoning/thinking tokens (parity with /v1/chat/completions)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
     gpu_power_limit_w: Optional[int] = Field(default=None, ge=2, le=1000)
+    # OpenAI params we accept but do not implement: the route rejects them
+    # with a 400 so clients fail loudly instead of silently getting plain
+    # text.
+    logprobs: Optional[int] = None
+    echo: Optional[bool] = None
 
     @field_validator("stop", mode="before")
     @classmethod

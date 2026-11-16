@@ -1191,6 +1191,39 @@ class TestCompletionEndpoint:
         assert response.status_code == 200
         assert mock_llm_engine.generate.call_args.kwargs["thinking_budget"] == 256
 
+    def test_completion_rejects_echo_and_logprobs(self, client):
+        """Echo and logprobs on /v1/completions must be
+        rejected with 400. CompletionRequest has no such fields, so a
+        client sending them (lm-eval multiple choice does) gets a silent
+        200 with plain text instead of logprob data."""
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Hello",
+                "echo": True,
+                "logprobs": 1,
+            },
+        )
+
+        assert response.status_code == 400
+        body = response.json()
+        message = body["error"]["message"]
+        assert "logprobs" in message
+        assert "echo" in message
+
+        # The guard must run before the streaming branch too.
+        stream_response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Hello",
+                "stream": True,
+                "logprobs": 1,
+            },
+        )
+        assert stream_response.status_code == 400
+
 
 class TestChatCompletionEndpoint:
     """Tests for the /v1/chat/completions endpoint."""

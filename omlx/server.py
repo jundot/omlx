@@ -4624,6 +4624,20 @@ async def create_completion(
 ):
     """Create a text completion."""
     _reject_lone_surrogates(request)
+    # echo/logprobs are parsed but not implemented; without
+    # this guard a client sending them (lm-eval multiple choice) gets a
+    # silent 200 with plain text instead of logprob data.
+    unsupported = [
+        name
+        for name, value in (("logprobs", request.logprobs), ("echo", request.echo))
+        if value
+    ]
+    if unsupported:
+        names = " and ".join(unsupported)
+        raise InvalidRequestError(
+            f"{names} not supported on /v1/completions; use /v1/chat/completions "
+            "for logprobs or drop the flag."
+        )
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
