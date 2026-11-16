@@ -18,7 +18,10 @@ end-to-end runs. Everything below is measured, not assumed. Read
   (focused three files 289), `tests/cluster_assistant` **658 passed**;
   `make web` is a no-op.
 - New artefact: `build/oMLX-0.8.0rc1.dmg`, 79 MB, SHA256
-  `9400d290041ce80aa6a3dc84bd919884ec9f38a7d99ffd76c58e37879942d36c`,
+  `aac490b1fc49c010c218591442f6f954dad41f9ee267d6f087695e130d10c40e`
+  (fit-gap build 2026-11-17: wizard state restored, Open Chat deep link
+  survives reload and login, approved joins retire when their coordinator
+  is unpaired; binary `2fc1698f…` installed on `.12` and `.13`),
   Developer-ID signed, notarized and stapled (`hdiutil verify` VALID,
   `spctl` accepted / Notarized Developer ID), built by
   `scripts/build-release-dmg.sh` (no staged app copies left behind).
