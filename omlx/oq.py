@@ -11681,6 +11681,10 @@ def _refine_slots(block, prefix, layer_idx, run_slots, writer, stats) -> None:
     else:
         logger.warning("oQe refine: layer %d forward failed, layer skipped", layer_idx)
         stats["skipped_layers"] += 1
+    # Inputs of modules the writer left alone (e.g. quantized source experts)
+    # stay in the collector; drop them with the layer.
+    collector.switch_rows.clear()
+    collector.grams.clear()
     del collector
     writer.layer_done(layer_idx)
     mx.synchronize()
