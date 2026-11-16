@@ -1980,7 +1980,12 @@ lists it, and it stays *unpaired* although its mDNS advertisement is visible.
    `models: []` per Mac and the recommendation had nothing to read. Fixed on all
    three with `POST /admin/api/global-settings {"model_dirs":["/Users/andreaskolb/Models"]}`
    (applied immediately, the app rescans). A first-run user with models in place
-   would hit the same wall.
+   would hit the same wall, so the wizard itself now fixes it:
+   `ModelDirectoryDetector` scans the well-known model roots (bounded, one level,
+   HF hub included) and the Model Directory row prefills the largest hit, saying
+   "Found N in ~/Models", with a re-scan button. It only replaces an empty field
+   or the untouched `<base>/models` default — never a folder the user chose
+   (`1b8cfa93`, 7 XCTests).
 2. **The runbook's port is stale.** Everything here runs on **8000** (the Welcome
    default), not 8099; `scripts/check_peer_versions.py` also defaults to 8099 and
    needs `--port 8000`.
