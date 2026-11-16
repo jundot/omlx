@@ -59492,6 +59492,42 @@
           }
         }
       }
+    },
+    "welcome.button.search_models": {
+      "comment": "Tooltip of the re-scan button next to the Model Directory picker",
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erneut nach Modellordnern auf diesem Mac suchen"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Look again for model folders on this Mac"
+          }
+        }
+      }
+    },
+    "welcome.storage.model_dir.found": {
+      "comment": "Model Directory subtitle once existing model folders were detected; the count and the path",
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld in %@ gefunden. Wähle einen anderen Ordner, wenn deine Modelle woanders liegen."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Found %lld in %@. Choose another folder if your models live elsewhere."
+          }
+        }
+      }
     }
   },
   "version": "1.0"

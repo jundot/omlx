@@ -140,6 +140,11 @@ final class WelcomeViewModel: ObservableObject {
     @Published var runtimeLog: String = ""
     @Published var runtimeError: String?
 
+    /// Model folders found on this Mac, most models first. The wizard prefills
+    /// the Model Directory from here so a first run that already has models
+    /// does not end up pointing at an empty folder (2026-11-16).
+    @Published private(set) var detectedModelDirs: [DetectedModelDirectory] = []
+
     // D6: the system helper is part of setting the Mac up, not of an error.
     @Published var helperInstalling: Bool = false
     @Published var helperError: String?
@@ -160,6 +165,34 @@ final class WelcomeViewModel: ObservableObject {
         self.modelDir = cfg.modelDir
         self.portText = String(cfg.port)
         self.apiKey = cfg.apiKey ?? ""
+        detectModelDirectories()
+    }
+
+    /// Scan the well-known model folders and adopt the largest one when the
+    /// field still holds the untouched default. `ModelDirectoryDetector`
+    /// decides what may be replaced: an empty field or the `<base>/models`
+    /// default that has no models — never a folder the user chose.
+    func detectModelDirectories() {
+        let found = ModelDirectoryDetector.detect()
+        detectedModelDirs = found
+        guard let best = found.first,
+              ModelDirectoryDetector.shouldAdopt(current: modelDir, basePath: basePath),
+              modelDir != best.path
+        else { return }
+        modelDir = best.path
+    }
+
+    /// Row subtitle: the ordinary hint, or — once a folder with models was
+    /// found — where they are and how many there are.
+    var modelDirSubtitle: String {
+        guard let best = detectedModelDirs.first else {
+            return String(localized: "welcome.storage.model_dir.sub",
+                          defaultValue: "Where downloaded models are stored.",
+                          comment: "Sublabel explaining the model directory")
+        }
+        return String(localized: "welcome.storage.model_dir.found",
+                      defaultValue: "Found \(best.modelCount) in \(best.displayPath). Choose another folder if your models live elsewhere.",
+                      comment: "Model Directory subtitle once existing model folders were detected; the count and the path")
     }
 
     /// The slim app ships no Python/MLX; the user installs the pinned runtime
@@ -689,9 +722,7 @@ private struct WelcomeSetupBody: View {
                         title: String(localized: "welcome.storage.model_dir.label",
                                       defaultValue: "Model Directory",
                                       comment: "Row label for the Model Directory picker in Welcome wizard"),
-                        subtitle: String(localized: "welcome.storage.model_dir.sub",
-                                         defaultValue: "Where downloaded models are stored.",
-                                         comment: "Sublabel explaining the model directory")
+                        subtitle: vm.modelDirSubtitle
                     ) {
                         HStack(spacing: 8) {
                             Text(vm.modelDir.isEmpty
@@ -713,6 +744,17 @@ private struct WelcomeSetupBody: View {
                             .help(String(localized: "welcome.button.browse",
                                          defaultValue: "Browse...",
                                          comment: "Folder picker trigger button in Welcome wizard"))
+                            Button {
+                                vm.detectModelDirectories()
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 12, weight: .semibold))
+                            }
+                            .buttonStyle(.omlx(.normal, size: .small))
+                            .disabled(vm.isStarting)
+                            .help(String(localized: "welcome.button.search_models",
+                                         defaultValue: "Look again for model folders on this Mac",
+                                         comment: "Tooltip of the re-scan button next to the Model Directory picker"))
                         }
                     }
 
