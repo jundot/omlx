@@ -98,6 +98,10 @@ _NAX_MMA_MAX_ROWS = 16
 # Draft k/v and conv projections (N 1024..1280) also gain from sg8.
 _MIN_SG8_ROUTE_N = 1024
 _SG8_MIN_ROWS = 4
+# A single projection (not the fused swiglu or grouped launches) at 4 and 5
+# rows runs on stock qmv on GPUs with tensor units: stock keeps one pass over
+# the weights through five rows and sg8 only wins from six.
+_SG8_SINGLE_MIN_ROWS_NAX = 6
 
 
 def set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
@@ -1546,6 +1550,8 @@ def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
     if m1:
         return m1
     if sg8_eligible(rows, K, N, bits, group_size, dtype):
+        if rows < _SG8_SINGLE_MIN_ROWS_NAX and is_nax_available():
+            return None
         return "sg8"
     if mma_eligible(rows, K, N, bits, group_size, dtype):
         return "mma"

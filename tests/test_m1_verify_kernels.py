@@ -14,6 +14,7 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 
 @pytest.fixture
 def qmv_only(monkeypatch):
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: False)
     monkeypatch.setattr(m1_verify_qmv, "enabled", lambda: True)
     # Pin the 5-16 row MMA route off so the sg8/qmv boundaries stay visible
     # (the MMA tests below cover it).
@@ -24,6 +25,7 @@ def qmv_only(monkeypatch):
 
 @pytest.fixture
 def qmv_off(monkeypatch):
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: False)
     monkeypatch.setattr(m1_verify_qmv, "enabled", lambda: False)
 
 
@@ -120,6 +122,7 @@ def test_armed_quantized_linear_uses_m1_route(qmv_only):
 
 @pytest.fixture
 def mma_on(monkeypatch):
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: False)
     monkeypatch.setattr(m1_verify_mma, "enabled", lambda: True)
     monkeypatch.setattr(m1_verify_qmv, "enabled", lambda: True)
 
