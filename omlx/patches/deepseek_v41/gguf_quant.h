@@ -1125,13 +1125,18 @@ inline void gguf_block8(const device uchar* b, uint k, thread float* v,
     }
 }
 
-template <int K, int ROWS, int NB, int QT, int BLOCK, int BYTES, typename W, typename X>
-inline void gguf_rows_nb(W w, uint row0, X x, uint xs, uint lane, thread float* acc) {
+template <int K, int ROWS, int NB, int QT, int BLOCK, int BYTES, bool MAPPED = false, typename W, typename X>
+inline void gguf_rows_nb(W w, uint row0, X x, uint xs, uint lane, thread float* acc,
+                         uint2 routes = uint2(0), uint divisor = 1) {
+    static_assert(!MAPPED || NB == 2, "mapped routes hold two vectors");
+    // Reuse decoded weights while preserving each vector's original dot-product order.
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float xv[NB][8];
-        for (int b = 0; b < NB; ++b)
-            for (int j = 0; j < 8; ++j) xv[b][j] = float(x[size_t(b) * xs + k + j]);
+        for (int b = 0; b < NB; ++b) {
+            const size_t row = MAPPED ? routes[b] / divisor : b;
+            for (int j = 0; j < 8; ++j) xv[b][j] = float(x[row * xs + k + j]);
+        }
         for (int r = 0; r < ROWS; ++r) {
             const device uchar* p = reinterpret_cast<const device uchar*>(w) + (size_t(row0 + r) * (K / BLOCK) + k / BLOCK) * BYTES;
             float v[8];

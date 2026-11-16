@@ -914,6 +914,8 @@ def _gguf_block(blk, h, pre, caches, shareds, starts, c):
         blk, "ffn", c, hf, ap, sub=blk.sum_ranks(attn), post=ao, comb=ac
     )
     fp, fo, fc = coef[:, :hc], coef[:, hc : 2 * hc], coef[:, 2 * hc :]
-    f = DM.fused_decode_moe_nb(blk.ffn, x2, c)[0]
+    f = DM.fused_decode_moe_nb(
+        blk.ffn, x2, c, reuse_routes=rn >= 6 and getattr(blk, "_omlx_verify_exact", False)
+    )[0]
     out = hc_post_nb(blk.sum_ranks(f), h2, fo, fc, c)
     return out.reshape(h.shape), fp.reshape(pre.shape)

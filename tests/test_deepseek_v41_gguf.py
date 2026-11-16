@@ -469,7 +469,7 @@ def gguf_module(module, qtype, seed):
 @pytest.mark.parametrize(
     "formats", [(19, 19, 10, 8), (16, 16, 17, 8), (22, 22, 18, 13)]
 )
-@pytest.mark.parametrize("rows", [1, 6])
+@pytest.mark.parametrize("rows", [1, 6, 16])
 def test_gguf_fused_moe_keeps_unquantized_activations(formats, rows):
     from test_deepseek_v41 import tiny
 
@@ -507,6 +507,56 @@ def test_gguf_fused_moe_keeps_unquantized_activations(formats, rows):
     )
     np.testing.assert_allclose(
         actual.astype(mx.float32), exact.astype(mx.float32), atol=2e-4, rtol=0.015
+    )
+    for mma, reference in [(None, actual), (False, exact)]:
+        reused = dm.fused_decode_moe_nb(moe, x, c, mma=mma, reuse_routes=True)
+        for value, wanted in zip(reused, (reference, ids, weights)):
+            np.testing.assert_array_equal(
+                value.astype(mx.float32), wanted.astype(mx.float32)
+            )
+
+
+@pytest.mark.parametrize("rows", [4, 6, 16])
+@pytest.mark.parametrize("pattern", ["distinct", "same", "mixed"])
+def test_gguf_route_pairs_preserve_every_original_slot(rows, pattern):
+    from omlx.patches.deepseek_v41 import decode_moe as dm
+
+    topk, ne = 6, rows * 6
+    wanted_ids = np.array(
+        [
+            np.arange(topk) + topk * (b if pattern == "distinct" else b // 3)
+            if pattern != "same"
+            else np.arange(topk)
+            for b in range(rows)
+        ],
+        dtype=np.int32,
+    )
+    scores = np.full((rows, ne), 0.001, np.float32)
+    ranked = np.arange(topk, 0, -1, dtype=np.float32)
+    scores[np.arange(rows)[:, None], wanted_ids] = ranked
+    groups, ids, weights = dm._gguf_route_plan_kernel()(
+        inputs=[mx.array(scores), mx.zeros(ne), mx.array([1.25])],
+        template=[("NB", rows), ("NE", ne), ("TOPK", topk)],
+        grid=(rows * 32, 1, 1),
+        threadgroup=(rows * 32, 1, 1),
+        output_shapes=[(rows * topk * 3,), (rows * topk,), (rows * topk,)],
+        output_dtypes=[mx.uint32, mx.int32, mx.float32],
+    )
+    flat = wanted_ids.reshape(-1)
+    wanted = np.full((len(flat), 3), np.iinfo(np.uint32).max, np.uint32)
+    wanted[:, 0] = flat
+    for expert in np.unique(flat):
+        slots = np.flatnonzero(flat == expert)
+        for i in range(0, len(slots), 2):
+            wanted[slots[i], 1] = slots[i]
+            if i + 1 < len(slots):
+                wanted[slots[i], 2] = slots[i + 1]
+    np.testing.assert_array_equal(np.asarray(groups).reshape(-1, 3), wanted)
+    np.testing.assert_array_equal(np.asarray(ids).reshape(rows, topk), wanted_ids)
+    np.testing.assert_allclose(
+        np.asarray(weights).reshape(rows, topk),
+        np.broadcast_to(ranked / ranked.sum() * 1.25, (rows, topk)),
+        rtol=1e-7,
     )
 
 

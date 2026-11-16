@@ -723,6 +723,25 @@ _DOWN = r"""
 # dispatch order, so tokens routed to the same expert read the same 32 rows at about the same
 # time and the repeats hit the GPU caches instead of DRAM (real decode at B = 8 routes 48 slots
 # to ~34 distinct experts; row-block-major order: B = 8 +9%, B = 4 +4%).
+_UP_NB_SHARED = r"""
+        float g4[4 * NB], u4[4 * NB];
+        S1_ROWS_NB(DIM, 4, NB, sw1, ss1, sb1, row0, xq, uint(DIM), lane, g4);
+        S3_ROWS_NB(DIM, 4, NB, sw3, ss3, sb3, row0, xq, uint(DIM), lane, u4);
+        if (lane < 4)
+            for (int b = 0; b < NB; ++b) {
+                float gate = float(bfloat16_t(g4[lane * NB + b])), up = float(bfloat16_t(u4[lane * NB + b]));
+                if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
+                hblock[b][sg * 4 + lane] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint v = sg; v < uint(NB); v += 8) {
+            const float y = hblock[v][lane];
+            const float s = act_scale(max(simd_max(abs(y)), 1e-4f));
+            hqs[v * INTER + rb * 32 + lane] = S2_ACT(y, s);
+        }
+    }
+"""
+
 _UP_NB = r"""
     threadgroup int chosen[8];
     threadgroup float hblock[NB][32];
@@ -759,16 +778,28 @@ _UP_NB = r"""
             const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
             hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = R2_ACT(v, s);
         }
-    } else {
-        float g4[4 * NB], u4[4 * NB];
-        S1_ROWS_NB(DIM, 4, NB, sw1, ss1, sb1, row0, xq, uint(DIM), lane, g4);
-        S3_ROWS_NB(DIM, 4, NB, sw3, ss3, sb3, row0, xq, uint(DIM), lane, u4);
-        if (lane < 4)
-            for (int b = 0; b < NB; ++b) {
-                float gate = float(bfloat16_t(g4[lane * NB + b])), up = float(bfloat16_t(u4[lane * NB + b]));
-                if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
-                hblock[b][sg * 4 + lane] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
-            }
+    } else {""" + _UP_NB_SHARED
+# _UP_NB with the shared expert on simdgroup matrices (fp8_mma8); routed path unchanged.
+_UP_NB_MMA_SHARED = r"""
+        // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups,
+        // one column tile per 8 tokens
+        constexpr int CT = (NB + 7) / 8, NB0 = NB < 8 ? NB : 8, NB16 = NB > 8 ? NB : 9;
+        threadgroup float red[4][CT * 2 * 64], tg_g[CT][4][64], tg_u[CT][4][64];
+        const uint t = sg / 2, ks = sg % 2, r0 = rb * 32 + t * 8;
+        if (CT > 1) {
+            S1_MMA16(DIM, 2, NB16, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[0][t], tg_g[CT - 1][t]);
+            S3_MMA16(DIM, 2, NB16, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[0][t], tg_u[CT - 1][t]);
+        } else {
+            S1_MMA8(DIM, 2, NB0, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[0][t]);
+            S3_MMA8(DIM, 2, NB0, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[0][t]);
+        }
+        for (uint i = tid; i < uint(32 * NB); i += 256) {
+            const uint r = i % 32, b = i / 32;
+            const uint e = (r % 8) * 8 + b % 8;
+            float gate = float(bfloat16_t(tg_g[b / 8][r / 8][e])), up = float(bfloat16_t(tg_u[b / 8][r / 8][e]));
+            if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
+            hblock[b][r] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint v = sg; v < uint(NB); v += 8) {
             const float y = hblock[v][lane];
@@ -777,7 +808,7 @@ _UP_NB = r"""
         }
     }
 """
-# _UP_NB with the shared expert on simdgroup matrices (fp8_mma8); routed path unchanged.
+
 _UP_NB_MMA = r"""
     threadgroup int chosen[8];
     threadgroup float hblock[NB][32];
@@ -814,33 +845,85 @@ _UP_NB_MMA = r"""
             const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
             hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = R2_ACT(v, s);
         }
-    } else {
-        // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups,
-        // one column tile per 8 tokens
-        constexpr int CT = (NB + 7) / 8, NB0 = NB < 8 ? NB : 8, NB16 = NB > 8 ? NB : 9;
-        threadgroup float red[4][CT * 2 * 64], tg_g[CT][4][64], tg_u[CT][4][64];
-        const uint t = sg / 2, ks = sg % 2, r0 = rb * 32 + t * 8;
-        if (CT > 1) {
-            S1_MMA16(DIM, 2, NB16, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[0][t], tg_g[CT - 1][t]);
-            S3_MMA16(DIM, 2, NB16, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[0][t], tg_u[CT - 1][t]);
-        } else {
-            S1_MMA8(DIM, 2, NB0, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[0][t]);
-            S3_MMA8(DIM, 2, NB0, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[0][t]);
+    } else {""" + _UP_NB_MMA_SHARED
+
+# Pairing is bounded to 16 rows/top-8 (128 routes). The O(routes²) scan
+# avoids a host count read; compact/sort routes if larger batches need this path.
+_GGUF_ROUTE_PLAN = r"""
+    threadgroup int selected[NB * TOPK];
+    const uint tid=thread_index_in_threadgroup, lane=thread_index_in_simdgroup;
+    const uint b=simdgroup_index_in_threadgroup;
+    topk_select<NE,TOPK>(scores+b*NE,bias,selected+b*TOPK,lane);
+    if(tid>=NB*TOPK) return;
+    const uint token=tid/TOPK, e=uint(selected[tid]);
+    float sum=0.0f;
+    for(uint j=0;j<TOPK;++j) sum+=scores[token*NE+selected[token*TOPK+j]];
+    idx[tid]=int(e);
+    weights[tid]=scores[token*NE+e]/(sum+1e-20f)*route_scale[0];
+    uint previous=0;
+    for(uint j=0;j<tid;++j) previous+=uint(selected[j])==e;
+    groups[3*tid]=e;
+    groups[3*tid+1]=(previous&1) ? 0xffffffffu : tid;
+    uint next=0xffffffffu;
+    if(!(previous&1))
+        for(uint j=tid+1;j<NB*TOPK;++j)
+            if(uint(selected[j])==e) { next=j; break; }
+    groups[3*tid+2]=next;
+"""
+
+_GGUF_REUSE_UP = r"""
+    threadgroup float hblock[NB][32];
+    const uint tid=thread_index_in_threadgroup, lane=thread_index_in_simdgroup;
+    const uint sg=simdgroup_index_in_threadgroup;
+    const uint ys=threadgroup_position_in_grid.x, rb=threadgroup_position_in_grid.y;
+    const uint row0=rb*32+sg*4;
+    if(ys<NB*TOPK) {
+        const uint e=groups[3*ys], r0=groups[3*ys+1], r1=groups[3*ys+2];
+        if(r0==0xffffffffu) return;
+        const uint nv=r1==0xffffffffu ? 1 : 2;
+        if(tid==0 && rb==0) for(uint v=0;v<nv;++v) {
+            const uint r=v ? r1 : r0;
+            out_idx[r]=idx[r]; out_w[r]=weights[r];
         }
-        for (uint i = tid; i < uint(32 * NB); i += 256) {
-            const uint r = i % 32, b = i / 32;
-            const uint e = (r % 8) * 8 + b % 8;
-            float gate = float(bfloat16_t(tg_g[b / 8][r / 8][e])), up = float(bfloat16_t(tg_u[b / 8][r / 8][e]));
-            if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
-            hblock[b][r] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
+        float g[8],u[8];
+        if(nv==1) {
+            R1_ROWS(DIM,4,w1+size_t(e)*INTER*R1_WPR(DIM),s1p,b1p,row0,xq+(r0/TOPK)*DIM,lane,g);
+            R3_ROWS(DIM,4,w3+size_t(e)*INTER*R3_WPR(DIM),s3p,b3p,row0,xq+(r0/TOPK)*DIM,lane,u);
+        } else {
+            R1_ROWS_PAIR(DIM,4,w1+size_t(e)*INTER*R1_WPR(DIM),s1p,b1p,row0,xq,DIM,lane,g,uint2(r0,r1),TOPK);
+            R3_ROWS_PAIR(DIM,4,w3+size_t(e)*INTER*R3_WPR(DIM),s3p,b3p,row0,xq,DIM,lane,u,uint2(r0,r1),TOPK);
+        }
+        if(lane<4) for(uint v=0;v<nv;++v) {
+            float gate=float(bfloat16_t(g[lane*nv+v])),up=float(bfloat16_t(u[lane*nv+v]));
+            if(limit[0]>0.0f) { up=clamp(up,-limit[0],limit[0]); gate=min(gate,limit[0]); }
+            float h=gate/(1.0f+metal::precise::exp(-gate))*up;
+            h=weights[v ? r1 : r0]*h;
+            hblock[v][sg*4+lane]=float(bfloat16_t(h));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint v = sg; v < uint(NB); v += 8) {
-            const float y = hblock[v][lane];
-            const float s = act_scale(max(simd_max(abs(y)), 1e-4f));
-            hqs[v * INTER + rb * 32 + lane] = S2_ACT(y, s);
+        if(sg==0) for(uint v=0;v<nv;++v) {
+            const float y=hblock[v][lane];
+            const float s=act_scale(max(simd_max(abs(y)),1e-4f));
+            hq[(v ? r1 : r0)*INTER+rb*32+lane]=R2_ACT(y,s);
         }
+    } else {
+"""
+
+_GGUF_REUSE_DOWN = r"""
+    const uint group=threadgroup_position_in_grid.x;
+    const uint e=groups[3*group], r0=groups[3*group+1], r1=groups[3*group+2];
+    if(r0==0xffffffffu) return;
+    const uint lane=thread_index_in_simdgroup;
+    const uint row0=threadgroup_position_in_grid.y*32+simdgroup_index_in_threadgroup*4;
+    const uint nv=r1==0xffffffffu ? 1 : 2;
+    float acc[8];
+    if(nv==1) {
+        R2_ROWS(INTER,4,w2+size_t(e)*DIM*R2_WPR(INTER),s2p,b2p,row0,hq+size_t(r0)*INTER,lane,acc);
+    } else {
+        R2_ROWS_PAIR(INTER,4,w2+size_t(e)*DIM*R2_WPR(INTER),s2p,b2p,row0,hq,INTER,lane,acc,uint2(r0,r1),1);
     }
+    if(lane<4) for(uint v=0;v<nv;++v)
+        partial[size_t(v ? r1 : r0)*DIM+row0+lane]=bfloat16_t(acc[lane*nv+v]);
 """
 
 # Down, routed: one threadgroup per (token x, 4 output rows y), simdgroup = routed slot; the
@@ -871,7 +954,15 @@ _DOWN_S_NB = r"""
     S2_ROWS_NB(INTER, 4, NB, sw2, ss2, sb2, row0, hqs, uint(INTER), lane, acc);
     if (lane < 4)
         for (int b = 0; b < NB; ++b)
-            out[b * DIM + row0 + lane] = bfloat16_t(partial[b * DIM + row0 + lane] + float(bfloat16_t(acc[lane * NB + b])));
+        {
+#ifdef GGUF_REUSE_ROUTES
+            float routed = 0.0f;
+            for (uint s = 0; s < TOPK; ++s) routed += float(partial[size_t(b * TOPK + s) * DIM + row0 + lane]);
+#else
+            float routed = partial[b * DIM + row0 + lane];
+#endif
+            out[b * DIM + row0 + lane] = bfloat16_t(routed + float(bfloat16_t(acc[lane * NB + b])));
+        }
 """
 
 # _DOWN_S_NB on simdgroup matrices: one 8-row tile per threadgroup, K split over 2 simdgroups.
@@ -884,7 +975,13 @@ _DOWN_S_NB_MMA = r"""
     else S2_MMA8(INTER, 2, NB0, sw2, ss2, sb2, r0, hqs, uint(INTER), lane, sg, red, tile[0]);
     for (uint i = tid; i < uint(8 * NB); i += 64) {
         const uint r = i % 8, b = i / 8;
-        out[b * DIM + r0 + r] = bfloat16_t(partial[b * DIM + r0 + r] + float(bfloat16_t(tile[b / 8][r * 8 + b % 8])));
+#ifdef GGUF_REUSE_ROUTES
+        float routed = 0.0f;
+        for (uint s = 0; s < TOPK; ++s) routed += float(partial[size_t(b * TOPK + s) * DIM + r0 + r]);
+#else
+        float routed = partial[b * DIM + r0 + r];
+#endif
+        out[b * DIM + r0 + r] = bfloat16_t(routed + float(bfloat16_t(tile[b / 8][r * 8 + b % 8])));
     }
 """
 
@@ -951,6 +1048,10 @@ def format_macros(roles):
             nb = f"gguf_rows_nb<K_, R_, NB_, {args}>(w_, r0_, x_, xs_, l_, acc_)"
             mma = f"gguf_mma8<K_, KS_, NB_, {args}>(w_, r0_, x_, xs_, l_, ks_, red_, tile_)"
             mma16 = f"gguf_mma16<K_, KS_, NB_, {args}>(w_, r0_, x_, xs_, l_, ks_, red_, t0_, t1_)"
+            lines.append(
+                f"#define {role}_ROWS_PAIR(K_, R_, w_, s_, b_, r0_, x_, xs_, l_, acc_, routes_, div_) "
+                f"gguf_rows_nb<K_, R_, 2, {args}, true>(w_, r0_, x_, xs_, l_, acc_, routes_, div_)"
+            )
         elif mode == "affine":
             # Masked terms for 3 and 5 bits (codes straddle bytes), shifts otherwise.
             helper = "aff16" if bits in (3, 5) else "aff8"
@@ -1049,20 +1150,58 @@ def _kernels_nb(mma, formats):
     return up, down_r, down_s
 
 
-def fused_decode_moe_nb(moe, x, config, mma=None):
+@cache
+def _gguf_route_plan_kernel():
+    return mx.fast.metal_kernel(
+        name="v41_gguf_route_pairs", input_names=["scores", "bias", "route_scale"],
+        output_names=["groups", "idx", "weights"], source=_GGUF_ROUTE_PLAN, header=_HEADER)
+
+
+@cache
+def _gguf_reuse_kernels(mma, formats):
+    header = format_macros(zip(_ROLES, formats)) + _HEADER + "\n#define GGUF_REUSE_ROUTES\n"
+    tag = format_tag(formats)
+    up = mx.fast.metal_kernel(
+        name=f"v41_gguf_reuse_up_{int(mma)}_{tag}",
+        input_names=["groups", "idx", "weights", "limit", "xq", "w1", "s1p", "b1p", "w3", "s3p", "b3p",
+                     "sw1", "ss1", "sb1", "sw3", "ss3", "sb3"],
+        output_names=["hq", "hqs", "out_idx", "out_w"],
+        source=_GGUF_REUSE_UP + (_UP_NB_MMA_SHARED if mma else _UP_NB_SHARED), header=header)
+    down = mx.fast.metal_kernel(
+        name=f"v41_gguf_reuse_down_{tag}", input_names=["hq", "groups", "w2", "s2p", "b2p"],
+        output_names=["partial"], source=_GGUF_REUSE_DOWN, header=header)
+    shared = mx.fast.metal_kernel(
+        name=f"v41_gguf_reuse_shared_{int(mma)}_{tag}",
+        input_names=["hqs", "partial", "sw2", "ss2", "sb2"], output_names=["out"],
+        source=_DOWN_S_NB_MMA if mma else _DOWN_S_NB, header=header)
+    return up, down, shared
+
+
+def fused_decode_moe_nb(moe, x, config, mma=None, *, reuse_routes=False):
     """NB tokens at once. x: [NB, dim] bf16 (ffn_norm outputs). Returns [NB, dim] bf16; each
     token's result equals fused_decode_moe on that token alone, bit for bit without matrix
     tiles (mma=False) and within fp32 summation rounding with them (default: use_mma(NB)).
-    Matrix tiles preserve each token's activation policy; FP32 sum order may differ."""
+    Matrix tiles preserve each token's activation policy; FP32 sum order may differ.
+    reuse_routes pairs repeated GGUF experts without changing per-token arithmetic."""
     nb = x.shape[0]
     formats = _formats(moe)
     mma = (use_mma(nb) if mma is None else mma) and all(f[0] in ("mxfp8", "affine", "gguf") for f in formats[3:])
-    up_k, down_r, down_s = _kernels_nb(mma, formats)
+    reuse_routes = bool(reuse_routes and 4 <= nb <= 16 and config.n_activated_experts <= 8
+                        and all(f[0] == "gguf" for f in formats))
+    up_k, down_r, down_s = (_gguf_reuse_kernels if reuse_routes else _kernels_nb)(mma, formats)
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
     scores, xq = _gate(moe, x, config)
     e, s = moe.experts, moe.shared_experts
+    routing = [scores, moe.gate.bias, _const((config.route_scale,))]
+    if reuse_routes:
+        groups, idx, w = _gguf_route_plan_kernel()(
+            inputs=routing, template=[("NB", nb), ("NE", ne), ("TOPK", topk)],
+            grid=(nb * 32, 1, 1), threadgroup=(nb * 32, 1, 1),
+            output_shapes=[(nb * topk * 3,), (nb * topk,), (nb * topk,)],
+            output_dtypes=[mx.uint32, mx.int32, mx.float32])
+        routing = [groups, idx, w]
     hq, hqs, idx, w = up_k(
-        inputs=[scores, moe.gate.bias, _const((config.route_scale,)), _const((config.swiglu_limit,)), xq,
+        inputs=[*routing, _const((config.swiglu_limit,)), xq,
                 e.w1.weight, _scales(e.w1), _biases(e.w1), e.w3.weight, _scales(e.w3), _biases(e.w3),
                 s.w1.weight, _scales(s.w1), _biases(s.w1), s.w3.weight, _scales(s.w3), _biases(s.w3)],
         template=[("NE", ne), ("TOPK", topk), ("DIM", dim), ("INTER", inter), ("NB", nb)],
@@ -1070,13 +1209,15 @@ def fused_decode_moe_nb(moe, x, config, mma=None):
         output_shapes=[(nb * topk * inter,), (nb * inter,), (nb * topk,), (nb * topk,)],
         output_dtypes=[mx.float32, mx.float32, mx.int32, mx.float32])
     partial = down_r(
-        inputs=[hq, idx, e.w2.weight, _scales(e.w2), _biases(e.w2)],
+        inputs=[hq, groups if reuse_routes else idx, e.w2.weight, _scales(e.w2), _biases(e.w2)],
         template=[("TOPK", topk), ("DIM", dim), ("INTER", inter)],
-        grid=(nb * topk * 32, dim // 4, 1), threadgroup=(topk * 32, 1, 1),
-        output_shapes=[(nb * dim,)], output_dtypes=[mx.float32])[0]
+        grid=(nb * topk * 256, dim // 32, 1) if reuse_routes else (nb * topk * 32, dim // 4, 1),
+        threadgroup=(256, 1, 1) if reuse_routes else (topk * 32, 1, 1),
+        output_shapes=[(nb * topk * dim if reuse_routes else nb * dim,)],
+        output_dtypes=[mx.bfloat16 if reuse_routes else mx.float32])[0]
     out = down_s(
         inputs=[hqs, partial, s.w2.weight, _scales(s.w2), _biases(s.w2)],
-        template=[("DIM", dim), ("INTER", inter), ("NB", nb)],
+        template=[("DIM", dim), ("INTER", inter), ("NB", nb)] + ([("TOPK", topk)] if reuse_routes else []),
         grid=(dim // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(nb * dim,)], output_dtypes=[mx.bfloat16])[0]
     return out.reshape(nb, dim), idx.reshape(nb, topk), w.reshape(nb, topk)
