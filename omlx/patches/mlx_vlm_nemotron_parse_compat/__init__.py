@@ -28,9 +28,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# <pad>: the placeholder the processor reserves for the visual prefix.
-IMAGE_PLACEHOLDER_ID = 1
-
 _APPLIED = False
 
 
@@ -52,9 +49,12 @@ def apply_mlx_vlm_nemotron_parse_compat_patch() -> bool:
         logger.debug("mlx-vlm nemotron_parse_v3_5 not importable: %s", exc)
         return False
 
-    np_config.ModelConfig.image_token_id = IMAGE_PLACEHOLDER_ID
+    # <pad> is the family's placeholder token; the checkpoint's tokenizer maps it
+    # to the same id, and the engine reads ``image_token_id`` off this config.
+    placeholder_id = int(np_config.ModelConfig.pad_token_id)
+    np_config.ModelConfig.image_token_id = placeholder_id
     _patch_get_input_embeddings(np_model)
-    _patch_processor_placeholders(np_processing)
+    _patch_processor_placeholders(np_processing, placeholder_id)
 
     _APPLIED = True
     logger.info("Nemotron 3.5 Parse mlx-vlm compatibility patch applied")
@@ -82,7 +82,7 @@ def _patch_get_input_embeddings(np_model: Any) -> None:
             )
         # Drop the leading placeholders the processor reserved for the prefix.
         count = vision.shape[1]
-        placeholder = self.config.image_token_id
+        placeholder = self.config.pad_token_id
         if input_ids.shape[1] > count and bool(
             mx.all(input_ids[:, :count] == placeholder)
         ):
@@ -101,7 +101,7 @@ def _patch_get_input_embeddings(np_model: Any) -> None:
     model_cls.get_input_embeddings = get_input_embeddings
 
 
-def _patch_processor_placeholders(np_processing: Any) -> None:
+def _patch_processor_placeholders(np_processing: Any, placeholder_id: int) -> None:
     processor_cls = np_processing.Processor
     original = processor_cls.__call__
     if getattr(original, "_omlx_np_compat", False):
@@ -126,7 +126,7 @@ def _patch_processor_placeholders(np_processing: Any) -> None:
         ids = np.asarray(data["input_ids"])
         data["input_ids"] = np.concatenate(
             [
-                np.full((ids.shape[0], count), IMAGE_PLACEHOLDER_ID, ids.dtype),
+                np.full((ids.shape[0], count), placeholder_id, ids.dtype),
                 ids,
             ],
             axis=1,
