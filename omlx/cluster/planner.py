@@ -163,6 +163,12 @@ class ModelLayout:
     # ``tensor_parallel_ssd_layer_bytes``; this only names the switch the
     # assistant must write and the plan must show.
     table_offload_kind: str = ""
+    # Zero-based layers whose SSD lookup table (the Qwen4-Exp PLE n-gram
+    # table) streams from disk when the plan offloads it. The stage holding
+    # one of these layers pays a measured per-chunk prefill working set
+    # (``table_prefill_transient_bytes``); every other stage keeps the
+    # generic attention price. Empty means no lookup table.
+    table_layer_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.fixed_weight_bytes < 0:
@@ -250,6 +256,11 @@ class ModelLayout:
             or sum(split_bytes) > sum(self.tensor_parallel_layer_bytes)
         ):
             raise ValueError("tensor-parallel split units and bytes are malformed")
+        table = self.table_layer_ids
+        if list(table) != sorted(set(table)) or any(
+            not 0 <= layer < len(self.layer_weight_bytes) for layer in table
+        ):
+            raise ValueError("table_layer_ids must be increasing existing layers")
 
     @property
     def layer_count(self) -> int:
@@ -278,6 +289,42 @@ class ModelLayout:
             return 0
         scaled = per_token * int(context_tokens) * int(chunk_tokens)
         return -(-scaled // _PREFILL_REFERENCE_CHUNK)
+
+    def table_prefill_transient_bytes(self, chunk_tokens: int) -> int:
+        """Measured prefill working set of the stage holding the SSD table.
+
+        Live measurement on a 128 GiB + 32 GiB Qwen4-Exp split: the stage
+        holding the PLE n-gram layer grew +7.25 GiB above its loaded footprint
+        at a 1024-token chunk and +13.25 GiB at 2048; at 4096 it completed a
+        26k-token prefill inside a 16.25 GiB envelope (the 25 GiB Metal ceiling
+        minus the 8.75 GiB loaded footprint). The chunk sets the size; the
+        context saturates above ~13k tokens, so the reservation scales with
+        the chunk alone. The growth is the table stage's per-chunk working
+        set, not attention and not the table being paged in (one lookup over
+        the prompt reads ~0.8 GB of file data, an order of magnitude below the
+        spike).
+
+        These are the only measured points: below 1024 the envelope scales
+        down linearly, above 4096 it keeps the largest measured value —
+        larger chunks are unmeasured, and the rank guard stays the
+        request-time authority. The measured growth already contains the
+        attention transient at the measured context, so the plan charges
+        ``max(generic, envelope)`` on the table stage, never the sum.
+
+        Zero when the checkpoint has no lookup-table layer: every plan that
+        predates this reservation stays byte-for-byte identical.
+        """
+
+        if not self.table_layer_ids or chunk_tokens <= 0:
+            return 0
+        points = _TABLE_PREFILL_POINTS
+        chunk = int(chunk_tokens)
+        if chunk <= points[0][0]:
+            return points[0][1] * chunk // points[0][0]
+        for (c0, b0), (c1, b1) in zip(points, points[1:]):
+            if chunk <= c1:
+                return b0 + (b1 - b0) * (chunk - c0) // (c1 - c0)
+        return points[-1][1]
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -321,6 +368,8 @@ class ModelLayout:
             payload["max_context_tokens"] = self.max_context_tokens
         if self.table_offload_kind:
             payload["table_offload_kind"] = self.table_offload_kind
+        if self.table_layer_ids:
+            payload["table_layer_ids"] = list(self.table_layer_ids)
         return payload
 
     @classmethod
@@ -386,6 +435,9 @@ class ModelLayout:
                 ),
                 max_context_tokens=int(payload.get("max_context_tokens", 0)),
                 table_offload_kind=str(payload.get("table_offload_kind", "")),
+                table_layer_ids=tuple(
+                    int(value) for value in payload.get("table_layer_ids", ())
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanningError(f"model layout is malformed: {exc}") from exc
@@ -515,6 +567,11 @@ class PipelineAssignment:
     # ``planned_weight_bytes``: a stage that cannot hold its own chunk cannot
     # serve the context the plan promises, however well the weights fit.
     prefill_transient_bytes: int = 0
+    # The measured SSD-table working set considered for this stage (Qwen4-Exp
+    # PLE). ``prefill_transient_bytes`` is the effective reservation — the
+    # larger of the generic attention price and this — so this field records
+    # provenance, not an extra charge. Zero on every stage without the table.
+    table_prefill_transient_bytes: int = 0
     # Bytes of KV this stage adds per token of context, and the largest context
     # this node could hold if the rest of its memory went to cache. The second
     # is the number that decides whether a long prompt works, so it is reported
@@ -561,6 +618,8 @@ class PipelineAssignment:
             )
         if self.prefill_transient_bytes < 0:
             raise ValueError("prefill_transient_bytes must be non-negative")
+        if self.table_prefill_transient_bytes < 0:
+            raise ValueError("table_prefill_transient_bytes must be non-negative")
 
     @property
     def layer_count(self) -> int:
@@ -626,6 +685,8 @@ class PipelineAssignment:
                 self.moe_expert_offload_resident_fraction
             )
             result["moe_offload_weight_bytes"] = self.moe_offload_weight_bytes
+        if self.table_prefill_transient_bytes:
+            result["table_prefill_transient_bytes"] = self.table_prefill_transient_bytes
         if self.predicted_stage_seconds is not None:
             result["predicted_compute_seconds"] = self.predicted_compute_seconds
             result["predicted_send_seconds"] = self.predicted_send_seconds
@@ -1434,6 +1495,41 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
 _PREFILL_REFERENCE_CHUNK = 4096
 _PREFILL_REFERENCE_CONTEXT = 8192
 
+# The measured prefill working set of the stage holding the SSD lookup table:
+# (chunk tokens, bytes above the loaded footprint). Qwen4-Exp PLE, live on a
+# 128 GiB + 32 GiB split; 4096 is the envelope of the largest chunk that
+# completed (25 GiB Metal ceiling - 8.75 GiB loaded). See
+# ``ModelLayout.table_prefill_transient_bytes`` for the scaling rule.
+_TABLE_PREFILL_POINTS: tuple[tuple[int, int], ...] = (
+    (1024, int(7.25 * 1024**3)),
+    (2048, int(13.25 * 1024**3)),
+    (4096, int(16.25 * 1024**3)),
+)
+
+
+def _qwen4_ple_layer_ids(config: dict[str, Any]) -> tuple[int, ...]:
+    """The zero-based layers whose Qwen4-Exp PLE n-gram table can live on SSD.
+
+    The checkpoint declares ``ple_layer_ids`` one-based inside ``text_config``
+    (Qwen4-Exp builds ``ple_layer_ids.index(layer_idx + 1)``). Missing or
+    malformed declarations mean "no PLE table", never an estimate.
+    """
+
+    text = config.get("text_config")
+    source = text if isinstance(text, dict) else config
+    raw = source.get("ple_layer_ids")
+    if not isinstance(raw, list) or not raw:
+        return ()
+    layers: set[int] = set()
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return ()
+        index = value - 1
+        if index < 0:
+            return ()
+        layers.add(index)
+    return tuple(sorted(layers))
+
 
 def _prefill_transient_bytes_per_context_token(config: dict[str, Any]) -> int:
     """Prefill peak one chunk adds on top of weights and KV, per context token.
@@ -1903,6 +1999,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         prefill_transient_bytes_per_context_token=(
             _prefill_transient_bytes_per_context_token(config)
         ),
+        table_layer_ids=_qwen4_ple_layer_ids(config),
         tensor_parallel_ssd_layer_bytes=(
             tuple(ssd_sizes.get(index, 0) for index in expected_indices)
             if ssd_sizes
@@ -2111,6 +2208,8 @@ def _partition_layers(
     microbatch_size: int = 1,
     stage_starts: Sequence[int] = (),
     node_overhead_bytes: int = 0,
+    table_layer_ids: Sequence[int] = (),
+    table_overhead_bytes: int = 0,
 ) -> tuple[tuple[int, int], ...]:
     """Minimize the bottleneck stage while retaining contiguous layers.
 
@@ -2122,6 +2221,10 @@ def _partition_layers(
     ``node_overhead_bytes`` is memory every stage needs but no layer owns — the
     prefill chunk transient — so it is subtracted from each node's budget
     without inflating the weight ceiling or the split target.
+    ``table_overhead_bytes`` is the measured working set of the SSD lookup
+    table: only the stage whose range contains a ``table_layer_ids`` layer
+    pays it, and it replaces the generic overhead there when it is larger
+    (the measurement already includes the attention transient).
     """
 
     layer_count = len(layer_sizes)
@@ -2145,6 +2248,10 @@ def _partition_layers(
             raise ValueError("resident layer size cannot be smaller than its weights")
         weight_prefix.append(weight_prefix[-1] + weight_size)
         resident_prefix.append(resident_prefix[-1] + resident_size)
+    table_set = frozenset(table_layer_ids)
+    table_prefix = [0]
+    for layer_index in range(layer_count):
+        table_prefix.append(table_prefix[-1] + (layer_index in table_set))
 
     allowed_starts = frozenset(stage_starts)
     performance_aware = all(node.performance is not None for node in pipeline_nodes)
@@ -2170,9 +2277,12 @@ def _partition_layers(
                     continue
                 layer_bytes = weight_prefix[end] - weight_prefix[start]
                 resident_layer_bytes = resident_prefix[end] - resident_prefix[start]
+                overhead = node_overhead_bytes
+                if table_overhead_bytes and table_prefix[end] > table_prefix[start]:
+                    overhead = max(overhead, table_overhead_bytes)
                 planned_weight_bytes = fixed_weight_bytes + layer_bytes
                 planned_resident_bytes = (
-                    fixed_weight_bytes + resident_layer_bytes + node_overhead_bytes
+                    fixed_weight_bytes + resident_layer_bytes + overhead
                 )
                 if planned_weight_bytes > node.weight_ceiling_bytes:
                     continue
@@ -2226,6 +2336,11 @@ def _partition_layers(
             max(0, node.usable_bytes - fixed_weight_bytes - node_overhead_bytes)
             for node in pipeline_nodes
         )
+        if table_overhead_bytes:
+            resident_capacity = max(
+                0,
+                resident_capacity - max(0, table_overhead_bytes - node_overhead_bytes),
+            )
         weight_capacity = sum(
             max(0, node.weight_ceiling_bytes - fixed_weight_bytes)
             for node in pipeline_nodes
@@ -2339,6 +2454,11 @@ def plan_unequal_pipeline(
     prefill_bytes = _prefill_transient_bytes(
         model, context_tokens=context_tokens, workload_profile=workload_profile
     )
+    table_bytes = (
+        model.table_prefill_transient_bytes(_prefill_chunk_tokens(workload_profile))
+        if engram_ssd_offload
+        else 0
+    )
     try:
         ranges = _partition_layers(
             held_layer_bytes,
@@ -2352,6 +2472,8 @@ def plan_unequal_pipeline(
             microbatch_size=microbatch_size,
             stage_starts=model.pipeline_stage_starts,
             node_overhead_bytes=prefill_bytes,
+            table_layer_ids=model.table_layer_ids,
+            table_overhead_bytes=table_bytes,
         )
     except PlanningError as exc:
         if kv_bytes_per_layer or prefill_bytes:
@@ -2374,6 +2496,7 @@ def plan_unequal_pipeline(
         moe_offload_layer_bytes=moe_offload_layer_bytes,
         moe_expert_offload_resident_fraction=moe_expert_offload_resident_fraction,
         prefill_transient_bytes=prefill_bytes,
+        table_prefill_transient_bytes=table_bytes,
     )
 
 
@@ -2553,6 +2676,13 @@ def plan_proportional_pipeline(
         prefill_transient_bytes=_prefill_transient_bytes(
             model, context_tokens=context_tokens, workload_profile=workload_profile
         ),
+        table_prefill_transient_bytes=(
+            model.table_prefill_transient_bytes(
+                _prefill_chunk_tokens(workload_profile)
+            )
+            if engram_ssd_offload
+            else 0
+        ),
     )
 
 
@@ -2570,6 +2700,7 @@ def _finish_pipeline_plan(
     moe_offload_layer_bytes: Sequence[int] = (),
     moe_expert_offload_resident_fraction: float = 0.0,
     prefill_transient_bytes: int = 0,
+    table_prefill_transient_bytes: int = 0,
 ) -> ShardPlan:
     """Assignments, per-node fit checks, and the signed hash for a partition."""
 
@@ -2601,16 +2732,27 @@ def _finish_pipeline_plan(
         ssd_bytes = sum(engram_layer_bytes[start:end])
         moe_bytes = sum(moe_offload_layer_bytes[start:end])
         kv_bytes = _kv_bytes_for_stage(model, end - start, context_tokens)
+        stage_table = (
+            table_prefill_transient_bytes
+            if any(start <= layer < end for layer in model.table_layer_ids)
+            else 0
+        )
+        stage_prefill = max(prefill_transient_bytes, stage_table)
         planned = (
-            model.fixed_weight_bytes + held_bytes + kv_bytes + prefill_transient_bytes
+            model.fixed_weight_bytes + held_bytes + kv_bytes + stage_prefill
         )
         if planned > node.usable_bytes:
+            table_note = (
+                ", includes the measured SSD-table working set"
+                if stage_table > prefill_transient_bytes
+                else ""
+            )
             raise PlanningError(
                 f"stage does not fit node {node.node_id} once KV cache for "
                 f"{context_tokens} tokens and the prefill transient are "
                 f"reserved: {planned} > {node.usable_bytes} "
                 f"(weights {held_bytes}, KV {kv_bytes}, "
-                f"prefill {prefill_transient_bytes})"
+                f"prefill {stage_prefill}{table_note})"
             )
         compute_seconds, send_seconds, stage_seconds = _predict_stage_seconds(
             held_bytes,
@@ -2638,7 +2780,8 @@ def _finish_pipeline_plan(
                 ),
                 moe_offload_weight_bytes=moe_bytes,
                 kv_cache_bytes=kv_bytes,
-                prefill_transient_bytes=prefill_transient_bytes,
+                prefill_transient_bytes=stage_prefill,
+                table_prefill_transient_bytes=stage_table,
                 kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, end - start),
                 max_context_tokens=_max_context_for_stage(
                     model,
