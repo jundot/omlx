@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import types
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,7 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_vlm.speculative.drafters.dspark.dspark import VanillaMarkov
 
@@ -351,6 +353,7 @@ def load_spark_dspark_drafter(
     # batch generator can feed the drafter's target-layer hidden states.
     _patch_spark2_5_capture()
     _patch_gate_output_sigmoid()
+    _patch_drafter_batched()
     model = load_spark_dspark_model(path).bind(target_model)
     drafter = wrap_spark_dspark(model, str(path), depth, fixed)
     logger.info(
@@ -537,3 +540,401 @@ def _patch_spark2_5_capture() -> bool:
 def apply_spark_patch() -> bool:
     """Apply the Spark2_5 capture patch (idempotent)."""
     return _patch_spark2_5_capture()
+
+
+def _rope_positions(model, x, start_positions):
+    """Per-position RoPE; mlx.fast.rope accepts only a scalar offset."""
+    ndim = x.ndim
+    head_major = ndim == 4
+    seq = x.shape[2] if head_major else x.shape[1]
+    if not hasattr(start_positions, "ndim") or start_positions.ndim == 0:
+        start = int(start_positions)
+        if seq == 1:
+            return model.rope(x, offset=start)
+        if head_major:
+            parts = []
+            for j in range(seq):
+                parts.append(model.rope(x[:, :, j : j + 1, :], offset=start + j))
+            return mx.concatenate(parts, axis=2)
+        parts = []
+        for j in range(seq):
+            parts.append(model.rope(x[:, j : j + 1], offset=start + j))
+        return mx.concatenate(parts, axis=1)
+    batch = x.shape[0]
+    starts = np.asarray(start_positions).tolist()
+    rows = []
+    for b in range(batch):
+        s = int(starts[b])
+        if seq == 1:
+            rows.append(model.rope(x[b : b + 1], offset=s))
+        else:
+            parts = []
+            for j in range(seq):
+                if head_major:
+                    parts.append(model.rope(x[b : b + 1, :, j : j + 1, :], offset=s + j))
+                else:
+                    parts.append(model.rope(x[b : b + 1, j : j + 1], offset=s + j))
+            rows.append(mx.concatenate(parts, axis=2 if head_major else 1))
+    return mx.concatenate(rows, axis=0)
+
+
+def _copy_params_to_active_stream(self) -> int:
+    """Copy drafter parameters onto the active (draft) stream.
+
+    Weights are created on the loader thread's TLS stream; the draft
+    executor thread cannot read them. ``mx.array(w)`` copies a materialized
+    array onto the calling thread's active stream.
+    """
+    import mlx.core as _mx
+    _count = 0
+
+    def _dup(v):
+        nonlocal _count
+        if isinstance(v, _mx.array):
+            _count += 1
+            return _mx.array(v)
+        if isinstance(v, dict):
+            return {_kk: _dup(_vv) for _kk, _vv in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_dup(_x) for _x in v]
+        return v
+
+    _nested = _dup(self.model.parameters())
+    self.model.update(_nested)
+    return _count
+
+
+def _spark_draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
+        """One draft forward for every row (Spark DSpark enhanced)."""
+        model = self.model
+        uids = [state.uid for state, *_ in rows]
+        slots = self.ring_slots
+        capacity = self.capacity
+        batch = len(rows)
+        block = self.block_size
+        dtype = getattr(model, "context_dtype", None)
+        if dtype is None:
+            fc = model.encoder.fc if hasattr(model, "encoder") else model.fc
+            dtype = fc.weight.dtype if hasattr(fc, "weight") else mx.bfloat16
+            if hasattr(fc, "scales"):
+                dtype = fc.scales.dtype
+
+        # Context segments: keep at most ``slots`` newest tokens per row and
+        # count the rest as skipped so absolute positions stay aligned. A
+        # restored context precedes the captures and is already projected.
+        segments, restored, lengths, bases = [], [], [], []
+        for _state, row, context, _anchor, _sampler in rows:
+            prior = row.restored if commit else None
+            if commit:
+                row.restored = None
+            held = 0 if prior is None else int(prior.shape[1])
+            skip = max(0, held + int(context.shape[1]) - slots)
+            if skip >= held:
+                prior = None
+                context = context[:, skip - held :]
+            elif skip:
+                prior = prior[:, skip:]
+            segments.append(context)
+            restored.append(prior)
+            lengths.append(
+                int(context.shape[1]) + (0 if prior is None else int(prior.shape[1]))
+            )
+            bases.append(row.fed + skip)
+        # Metal projections need a nonempty shape even when the window keeps no context.
+        import mlx.core as _mx
+        for _i, _seg in enumerate(segments):
+            segments[_i] = _mx.contiguous(_mx.array(_seg))
+            _mx.eval(segments[_i])
+        if not getattr(self, '_omlx_weights_copied', False):
+            self._copy_params_to_active_stream()
+            self._omlx_weights_copied = True
+        width = max(1, max(int(seg.shape[1]) for seg in segments))
+        padded = mx.concatenate(
+            [
+                (
+                    seg
+                    if seg.shape[1] == width
+                    else mx.concatenate(
+                        [
+                            seg,
+                            mx.zeros(
+                                (1, width - seg.shape[1], seg.shape[2]), dtype=seg.dtype
+                            ),
+                        ],
+                        axis=1,
+                    )
+                )
+                for seg in segments
+            ],
+            axis=0,
+        )
+        import mlx.core as _mxc
+        padded = _mxc.contiguous(_mxc.array(padded))
+        _mxc.eval(padded)
+        h_ctx = variants.project_context(model, padded)
+        h_ctx = mx.contiguous(mx.array(h_ctx))
+        mx.eval(h_ctx)
+        if any(prior is not None for prior in restored):
+            width = max(lengths)
+            parts = []
+            for index, (prior, seg) in enumerate(zip(restored, segments)):
+                part = h_ctx[index : index + 1, : int(seg.shape[1])]
+                if prior is not None:
+                    part = mx.concatenate([prior.astype(part.dtype), part], axis=1)
+                if int(part.shape[1]) < width:
+                    pad = mx.zeros(
+                        (1, width - int(part.shape[1]), part.shape[2]), dtype=part.dtype
+                    )
+                    part = mx.concatenate([part, pad], axis=1)
+                parts.append(part)
+            h_ctx = mx.concatenate(parts, axis=0)
+
+        anchors = mx.concatenate([anchor for _, _, _, anchor, _ in rows]).astype(
+            mx.int32
+        )
+        # DSpark's anchor row proposes the first token, so its block holds the
+        # anchor plus block - 2 masks and keeps every row.
+        markov = getattr(model, "markov_head", None)
+        anchor_slot = markov is not None and bool(
+            getattr(model.config, "sample_from_anchor", False)
+        )
+        if anchor_slot:
+            block -= 1
+        masks = mx.full(
+            (batch, block - 1), int(model.config.mask_token_id), dtype=mx.int32
+        )
+        inputs = mx.concatenate([anchors[:, None], masks], axis=1)
+        h = model._embed_input_tokens(inputs)
+        # An fp16 drafter keeps its residual stream and its output convolutions
+        # in fp32: on the Qwen3.8 DFlash2 drafter the residual reaches 1.6e5 and
+        # the last MLP convolution 1.5e5, past fp16's 65504, while the
+        # normalized inputs of every projection stay small.
+        wide = dtype == mx.float16
+        if self.mask_embedding is not None:
+            fill = self.mask_embedding.astype(h.dtype)
+            h = mx.concatenate(
+                [h[:, :1], mx.broadcast_to(fill, (batch, block - 1, h.shape[-1]))],
+                axis=1,
+            )
+
+        if wide:
+            h = h.astype(mx.float32)
+        cohort = self._assemble_cohort(uids, dtype)
+        base_arr = mx.array(bases, dtype=mx.int32)
+        if counts is None:
+            totals = mx.array([b + n for b, n in zip(bases, lengths)], dtype=mx.int32)
+        else:
+            totals = base_arr + mx.concatenate(counts).astype(mx.int32)
+        query_offsets = totals
+        write_slots = [
+            mx.array([(b + j) % capacity for j in range(n)], dtype=mx.int32)
+            for b, n in zip(bases, lengths)
+        ]
+        # Fresh wrappers: an index assignment rebinds the wrapped array, and a
+        # predraft must leave the cohort's rings untouched.
+        pos = mx.stop_gradient(cohort.pos)
+        for index, (b, n, slots_b) in enumerate(zip(bases, lengths, write_slots)):
+            if not n:
+                continue
+            pos[index, slots_b] = mx.arange(b, b + n, dtype=mx.int32)
+        # Attend the newest ``slots`` committed positions; block keys always.
+        # Unwritten slots hold position -1 until the ring fills.
+        ring_valid = (
+            (pos >= 0) & (pos >= (totals - slots)[:, None]) & (pos < totals[:, None])
+        )
+        if self.causal:
+            # Each block query sees the context and the block rows up to it.
+            mask = mx.concatenate(
+                [
+                    mx.broadcast_to(ring_valid[:, None, :], (batch, block, capacity)),
+                    mx.broadcast_to(
+                        mx.tril(mx.ones((block, block), dtype=mx.bool_)),
+                        (batch, block, block),
+                    ),
+                ],
+                axis=2,
+            )[:, None]
+        elif self.query_windows:
+            lower = totals[:, None] + mx.arange(block, dtype=mx.int32) - slots
+            windowed = (
+                (pos[:, None, :] >= 0)
+                & (pos[:, None, :] >= lower[:, :, None])
+                & (pos[:, None, :] < totals[:, None, None])
+            )
+            mask = mx.concatenate(
+                [windowed, mx.ones((batch, block, block), dtype=mx.bool_)], axis=2
+            )[:, None]
+        else:
+            mask = mx.concatenate(
+                [ring_valid, mx.ones((batch, block), dtype=mx.bool_)], axis=1
+            )[:, None, None, :]
+
+        new_keys, new_values = [], []
+        for layer_index, layer in enumerate(model.layers):
+            attn = layer.self_attn
+            # DFlash2 layers wrap attention and the MLP in dynamic convs;
+            # DFlash v1 layers are plain pre-norm residual blocks.
+            attention_conv = getattr(layer, "attention_conv", None)
+            mlp_conv = getattr(layer, "mlp_conv", None)
+            residual = h
+            x = layer.input_layernorm(h)
+            if wide:
+                x = x.astype(dtype)
+            if attention_conv is not None:
+                x, kernel = kernels.conv_prepare(attention_conv, x)
+
+            queries, ctx_keys, ctx_values, prop_keys, prop_values = (
+                variants.project_qkv(attn, x, h_ctx)
+            )
+            ctx_k_norm = getattr(attn, "k_norm_ctx", attn.k_norm)
+            ctx_keys = ctx_k_norm(
+                ctx_keys.reshape(batch, width, attn.n_kv_heads, attn.head_dim)
+            ).transpose(0, 2, 1, 3)
+            ctx_values = ctx_values.reshape(
+                batch, width, attn.n_kv_heads, attn.head_dim
+            ).transpose(0, 2, 1, 3)
+            if self.value_scale is not None:
+                ctx_values = ctx_values * self.value_scale
+            ctx_keys = _rope_positions(model, ctx_keys, base_arr)
+
+            ring_keys = mx.stop_gradient(cohort.keys[layer_index])
+            ring_values = mx.stop_gradient(cohort.values[layer_index])
+            for index, (n, slots_b) in enumerate(zip(lengths, write_slots)):
+                if not n:
+                    continue
+                ring_keys[index, :, slots_b, :] = ctx_keys[index, :, :n, :]
+                ring_values[index, :, slots_b, :] = ctx_values[index, :, :n, :]
+            new_keys.append(ring_keys)
+            new_values.append(ring_values)
+
+            queries = attn.q_norm(
+                queries.reshape(batch, block, attn.n_heads, -1)
+            ).transpose(0, 2, 1, 3)
+            prop_keys = attn.k_norm(
+                prop_keys.reshape(batch, block, attn.n_kv_heads, -1)
+            ).transpose(0, 2, 1, 3)
+            prop_values = prop_values.reshape(
+                batch, block, attn.n_kv_heads, -1
+            ).transpose(0, 2, 1, 3)
+            if self.value_scale is not None:
+                prop_values = prop_values * self.value_scale
+            queries = _rope_positions(model, queries, query_offsets)
+            prop_keys = _rope_positions(model, prop_keys, query_offsets)
+            keys = mx.concatenate([ring_keys, prop_keys], axis=2)
+            values = mx.concatenate([ring_values, prop_values], axis=2)
+            attended = mx.fast.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale=attn.scale,
+                mask=mask,
+                sinks=getattr(attn, "attention_sink_bias", None),
+            )
+            attended = attended.transpose(0, 2, 1, 3).reshape(batch, block, -1)
+            attended = attn.o_proj(variants.gate_output(attn, x, attended))
+            if attention_conv is not None:
+                if wide:
+                    attended = attended.astype(mx.float32)
+                attended = kernels.conv_finish(attention_conv, attended, kernel)
+            h = residual + attended
+
+            residual = h
+            x = layer.post_attention_layernorm(h)
+            if wide:
+                x = x.astype(dtype)
+            if mlp_conv is not None:
+                x, kernel = kernels.conv_prepare(mlp_conv, x)
+            x = variants.gated_mlp(layer.mlp, x)
+            if mlp_conv is not None:
+                if wide:
+                    x = x.astype(mx.float32)
+                x = kernels.conv_finish(mlp_conv, x, kernel)
+            h = residual + x
+
+        if commit:
+            cohort.keys = new_keys
+            cohort.values = new_values
+            cohort.pos = pos
+            for index, ((_state, row, *_), b, n) in enumerate(
+                zip(rows, bases, lengths)
+            ):
+                row.fed = b + n
+                self._remember(row, h_ctx[index : index + 1, :n])
+
+        draft_hidden = model.norm(h) if anchor_slot else model.norm(h)[:, 1:]
+        if wide:
+            draft_hidden = draft_hidden.astype(dtype)
+        logits = model._logits(draft_hidden)
+        samplers = [sampler for *_, sampler in rows]
+        selector = getattr(model, "candidate_selector", None)
+        if markov is not None:
+            prepare = getattr(markov, "prepare_block", None)
+            if prepare is not None:
+                # Recurrent Markov heads start each block from the newest
+                # committed context row.
+                prepare(draft_hidden, h_ctx, lengths, uids)
+            proposals = selection.select_markov(markov, logits, anchors, samplers)
+        elif selector is not None and selection.fused_select_eligible(
+            selector, draft_hidden
+        ):
+            proposals = selection.select_fused(
+                selector, draft_hidden, logits, anchors, samplers
+            )
+        elif all(sampler is None for sampler in samplers):
+            if selector is not None:
+                tokens = selector.select(
+                    draft_hidden, logits, anchors, selection.greedy_proposals
+                )
+            else:
+                tokens = selection.greedy_proposals(logits)
+            proposals = [(tokens[i : i + 1], []) for i in range(batch)]
+        elif selector is not None:
+            proposals = selection.select_sampled(
+                selector, draft_hidden, logits, anchors, samplers
+            )
+        else:
+            proposals = selection.sample_positions(logits, samplers)
+        if not commit:
+            self._predraft = _Predraft(
+                uids=tuple(uids),
+                keys=new_keys,
+                values=new_values,
+                pos=pos,
+                bases=bases,
+                unfed=[],
+                proposals=proposals,
+                contexts=[h_ctx[i : i + 1, :n] for i, n in enumerate(lengths)],
+            )
+        return proposals
+
+
+def _patch_drafter_batched() -> bool:
+    """Monkey-patch DFlashDrafter._draft_batched for Spark DSpark.
+
+    Spark's DSpark draft needs per-position RoPE and cross-stream fixes
+    (captures/weights are created on the prefill thread's TLS stream, which
+    the draft executor thread cannot read). Keeping the enhanced method here
+    concentrates the Spark-specific logic in this adapter instead of editing
+    ``omlx/speculative/dflash/drafter.py``.
+    """
+    from omlx.speculative.dflash import drafter as _drafter_mod
+    from omlx.speculative.dflash import DFlashDrafter
+
+    if getattr(DFlashDrafter, "_omlx_spark_batched_patched", False):
+        return True
+    # The patched method references ``_rope_positions``, defined here. Make it
+    # resolvable from the drafter module's globals so the method can find it.
+    _drafter_mod._rope_positions = _rope_positions
+    # Bind the method so its globals resolve in the drafter module (variants,
+    # kernels, selection, _Predraft, ...).
+    fn = types.FunctionType(
+        _spark_draft_batched.__code__,
+        dict(_drafter_mod.__dict__),
+        _spark_draft_batched.__name__,
+    )
+    DFlashDrafter._draft_batched = fn
+    # _copy_params_to_active_stream is referenced by the patched method.
+    if not hasattr(DFlashDrafter, "_copy_params_to_active_stream"):
+        DFlashDrafter._copy_params_to_active_stream = _copy_params_to_active_stream
+    DFlashDrafter._omlx_spark_batched_patched = True
+    return True
