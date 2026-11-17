@@ -7,7 +7,7 @@ injected the way ``tests/test_cluster_routes.py`` injects them. They pin:
 
 * the answer is one model at one context, ranked from the stored hardware facts;
 * the measurement's model identity is *not* compared with the candidates
-  (the design notes) while ``plan`` keeps its strict check;
+  (PROJECT-BRIEF §11.1a) while ``plan`` keeps its strict check;
 * a missing, unknown, stale or mismatched measurement is the same flat
   ``409 stale_measurement`` ``/plan`` returns, with no candidate list;
 * no feasible candidate is ``409 no_feasible_candidate`` with the ranked near
@@ -231,7 +231,7 @@ DEFAULT_SETTINGS = SimpleNamespace(port=8099, host="127.0.0.1")
 @pytest.fixture()
 def api(tmp_path, monkeypatch):
     stack = contextlib.ExitStack()
-    monkeypatch.setattr(assistant_routes, "load_model_candidate", fake_loader)
+    monkeypatch.setitem(assistant_routes.__dict__, "load_model_candidate", fake_loader)
 
     def _build(
         *,
@@ -239,8 +239,8 @@ def api(tmp_path, monkeypatch):
         fake_layouts: bool = True,
     ) -> tuple[TestClient, MeasurementStore]:
         if not fake_layouts:
-            monkeypatch.setattr(
-                assistant_routes,
+            monkeypatch.setitem(
+                assistant_routes.__dict__,
                 "load_model_candidate",
                 recommendation_module.load_model_candidate,
             )
@@ -317,7 +317,7 @@ def test_recommend_names_one_model_at_one_context(api) -> None:
 
 
 def test_recommend_ignores_the_measured_model_identity(api) -> None:
-    """the notes: recommendation may evaluate a model the measurement did not cover."""
+    """§11.1a: recommendation may evaluate a model the measurement did not cover."""
 
     client, _ = api()
     measurement_id = take_measurement(client)
@@ -620,10 +620,10 @@ def test_recommend_never_reads_settings_or_runs_a_probe(api, monkeypatch) -> Non
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("recommend must not read settings or run a probe")
 
-    monkeypatch.setattr(assistant_routes, "_server_settings", forbidden)
-    monkeypatch.setattr(assistant_routes, "_measure_probes", forbidden)
-    monkeypatch.setattr(assistant_routes, "default_measure_probes", forbidden)
-    monkeypatch.setattr(assistant_routes, "measurement_timestamp", forbidden)
+    monkeypatch.setitem(assistant_routes.__dict__, "_server_settings", forbidden)
+    monkeypatch.setitem(assistant_routes.__dict__, "_measure_probes", forbidden)
+    monkeypatch.setitem(assistant_routes.__dict__, "default_measure_probes", forbidden)
+    monkeypatch.setitem(assistant_routes.__dict__, "measurement_timestamp", forbidden)
 
     response = client.post(RECOMMEND_URL, json=recommend_payload(measurement_id))
 
@@ -641,28 +641,31 @@ def test_the_router_exposes_the_assistant_routes(api) -> None:
         (PLAN_URL, ["POST"]),
         (APPLY_URL, ["POST"]),
         (START_URL, ["POST"]),
-        # Screen 6: stop the one deployment a ready start launched, on the
-        # elected coordinator, through the same local/remote seam.
+        # Screen 6: stop the one deployment a ready start launched.
         (STOP_URL, ["POST"]),
-        # The automatic constellation search loop: rank, oMLX plans+starts,
-        # measure, pick the best measured, stop the losers.
+        # The automatic constellation search loop (API-first; UI later).
         (SEARCH_URL, ["POST"]),
         (SEARCH_URL + "/{job_id}", ["GET"]),
-        # Fine-tune the winning constellation (chunk/sampler/MTP) with real
-        # completions on its coordinator. One synchronous answer, no poll.
+        # Fine-tune the winning constellation with real completions.
         (TUNE_URL, ["POST"]),
         # Tune the per-model knobs (MTP on/off + depth) by redeploying each
         # config once; the winner is saved per (model, node config).
         (REDEPLOY_URL, ["POST"]),
         (REDEPLOY_URL + "/{job_id}", ["GET"]),
-        # Read-only: the saved tuning preset for an operation's model + node set,
-        # so a later Start's replay is visible (never a key or SSH target).
+        # Read-only: the saved tuning preset for an operation's model + node set.
         (TUNING_PRESET_URL, ["GET"]),
-        # Read-only: the probe switch, and its one write.
+        # Run the measured model on this Mac alone (single-node inference, no
+        # cluster): an async job, because the engine-pool load blocks.
+        (RUN_LOCAL_URL, ["POST"]),
+        (RUN_LOCAL_URL + "/{job_id}", ["GET"]),
+        (RUN_LOCAL_URL + "/{job_id}/stop", ["POST"]),
+        # Tune the model that ready local run serves: the sampler per request,
+        # then every MTP config by reloading it on this Mac alone.
+        (TUNE_LOCAL_URL, ["POST"]),
+        (TUNE_LOCAL_URL + "/{tune_job_id}", ["GET"]),
+        # Read-only: the last persisted deployment for a reloaded card.
         (PERFORMANCE_PROBE_URL, ["GET"]),
         (PERFORMANCE_PROBE_URL, ["POST"]),
-        # Read-only: the last persisted deployment, so a reloaded card can show
-        # Running/Stopped and offer Start again.
         (SESSION_URL, ["GET"]),
         # Read-only: the redacted support bundle for the last measurement and
         # operation (no key, SSH target, model path, prompt or completion).
@@ -677,7 +680,7 @@ def test_the_router_exposes_the_assistant_routes(api) -> None:
         (OPERATIONS_URL + "/mirror", ["POST"]),
         (OPERATIONS_URL + "/{operation_id}", ["GET"]),
         # The free-space affordance: one model, on one measured Mac, through that
-        # Mac's own delete route (the live-run notes).
+        # Mac's own delete route (PHASE-2B-RUN.md §9).
         (
             "/admin/api/cluster/assistant/models/{node_id}/{model_id:path}",
             ["DELETE"],

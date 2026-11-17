@@ -64,7 +64,7 @@ def test_search_route_runs_the_loop_and_returns_the_best_measured(api, monkeypat
             feasible=True,
         )
 
-    monkeypatch.setattr(search_wiring, "evaluate_constellation", fake_evaluate)
+    monkeypatch.setitem(search_wiring.__dict__, "evaluate_constellation", fake_evaluate)
 
     body = _run_search(client, {"measurement_id": measurement_id})
     assert body["state"] == "completed"
@@ -113,7 +113,7 @@ def test_search_route_with_real_candidate_generation(api, monkeypatch) -> None:
             feasible=True,
         )
 
-    monkeypatch.setattr(search_wiring, "evaluate_constellation", fake_evaluate)
+    monkeypatch.setitem(search_wiring.__dict__, "evaluate_constellation", fake_evaluate)
     body = _run_search(client, {"measurement_id": measurement_id, "max_count": 3})
     assert body["state"] == "completed"
     assert len(body["tested"]) >= 1

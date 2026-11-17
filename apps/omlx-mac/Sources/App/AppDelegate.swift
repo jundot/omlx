@@ -216,8 +216,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // file (`~/.omlx/settings.json` first, Library config.json
             // second) and stamps `config.source` so future saves route to
             // the same file. No re-write needed here.
-            bootstrapServer(config: config)
-            scheduleAccessoryPolicyFlip()
+            //
+            // A returning user whose runtime is gone is not a returning user
+            // in any useful sense: the slim build ships no Python, so the
+            // spawn fails with "Python runtime not found" and the app sits on
+            // an error nobody can act on. That is exactly the state after a
+            // cleanup (the runtime lives in Application Support), and the
+            // first-run wizard is where the runtime is installed — so route
+            // there and keep the saved settings for the wizard to reuse.
+            if PythonRuntime.resolveOrNil() != nil {
+                bootstrapServer(config: config)
+                scheduleAccessoryPolicyFlip()
+            } else {
+                NSApp.activate(ignoringOtherApps: true)
+                presentWelcome()
+            }
         } else {
             // First run: show the wizard only. Do not create the menubar or
             // persist settings until the user clicks Start Server.

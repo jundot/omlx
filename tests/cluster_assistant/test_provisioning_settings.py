@@ -60,7 +60,7 @@ def local_file(tmp_path, monkeypatch):
     """Point the canonical resolver at a tmp settings file (local branch)."""
 
     path = tmp_path / "model_settings.json"
-    monkeypatch.setattr(provisioning, "_local_model_settings_path", lambda: path)
+    monkeypatch.setitem(provisioning.__dict__, "_local_model_settings_path", lambda: path)
     return path
 
 
@@ -74,7 +74,7 @@ def _run_snippet(monkeypatch, tmp_path, payload: dict) -> str:
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("OMLX_BASE_PATH", str(tmp_path / "base"))
-    monkeypatch.setattr(sys, "argv", ["model-settings", json.dumps(payload)])
+    monkeypatch.setitem(sys.__dict__, "argv", ["model-settings", json.dumps(payload)])
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         exec(  # noqa: S102 - the shipped snippet itself, sandboxed above
@@ -165,7 +165,7 @@ def test_local_resolver_honors_a_moved_base_path(tmp_path, monkeypatch) -> None:
 
     # An uninitialized process resolves through GlobalSettings.load(), which
     # reads OMLX_BASE_PATH ahead of the ~/.omlx default.
-    monkeypatch.setattr(settings_module, "_global_settings", None)
+    monkeypatch.setitem(settings_module.__dict__, "_global_settings", None)
     monkeypatch.setenv("OMLX_BASE_PATH", str(tmp_path / "moved"))
 
     path = provisioning._local_model_settings_path()
@@ -236,7 +236,7 @@ def test_snippet_aborts_on_corrupt_json_without_wiping(tmp_path, monkeypatch) ->
     corrupt = b'{"version": 1, "models": {'
     path.write_bytes(corrupt)
 
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017 - any loud failure is the point
         _run_snippet(
             monkeypatch, tmp_path, {"model_id": "qwen", "patch": {"mtp_enabled": True}}
         )
@@ -259,7 +259,7 @@ def test_snippet_aborts_on_permission_denied(tmp_path, monkeypatch) -> None:
             pass
         else:
             pytest.skip("cannot simulate a permission-denied read here")
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017 - any loud failure is the point
             _run_snippet(
                 monkeypatch,
                 tmp_path,
@@ -290,7 +290,7 @@ def test_remote_write_still_goes_through_run_remote_python(monkeypatch) -> None:
         captured.update(ssh=ssh, snippet=snippet, argument=argument)
         return {"ok": True}
 
-    monkeypatch.setattr(staging, "run_remote_python", fake_run)
+    monkeypatch.setitem(staging.__dict__, "run_remote_python", fake_run)
 
     _write_model_settings_file(_remote_target(), "qwen", {"mtp_enabled": True})
 
@@ -320,8 +320,8 @@ def test_the_mac_wide_tier_write_uses_the_global_settings_route(monkeypatch) -> 
         calls.append((ssh, path, body, method))
         return {"status": "success"}
 
-    monkeypatch.setattr(start, "_local_admin", fake_local)
-    monkeypatch.setattr(start, "remote_admin", fake_remote)
+    monkeypatch.setitem(start.__dict__, "_local_admin", fake_local)
+    monkeypatch.setitem(start.__dict__, "remote_admin", fake_remote)
 
     provisioning.write_global_settings_on_mac(
         _local_target(), {"memory_guard_tier": "aggressive"}

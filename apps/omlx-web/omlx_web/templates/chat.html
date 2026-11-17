@@ -2942,6 +2942,12 @@
             micSeconds: 0,
             _micTimerInterval: null,
             realtimeSttMap: {},          // { modelId: bool } from /v1/models/status realtime_stt
+            // Which models are actually loaded, from /v1/models/status. The
+            // first row of /v1/models is often a checkpoint nobody loaded (a
+            // cluster deployment cannot load it at all), and picking it makes
+            // the very first message fail instead of answer (2026-11-16).
+            loadedModelIds: [],
+            loadedDistributedModelIds: [],
             isDragOver: false,           // drag-and-drop state
 
             // Image Modal State
@@ -3406,6 +3412,20 @@
                         return candidate;
                     }
                 }
+                // Prefer what is already loaded — a running distributed model
+                // first, then any loaded one. Only then fall back to the first
+                // row, which may need a load (or, on a cluster, cannot load).
+                const pickLoaded = (ids) => {
+                    for (const id of (ids || [])) {
+                        const gatewayId = this.resolveGatewayModelId(id);
+                        if (this.isModelAvailableOnServer(gatewayId)) return gatewayId;
+                    }
+                    return null;
+                };
+                const loaded =
+                    pickLoaded(this.loadedDistributedModelIds) ||
+                    pickLoaded(this.loadedModelIds);
+                if (loaded) return loaded;
                 return this.availableModels[0].id;
             },
 
@@ -4443,12 +4463,20 @@
             const data = await resp.json();
             const map = {};
             const rtMap = {};
+            const loaded = [];
+            const loadedDistributed = [];
             for (const m of (data.models || [])) {
                 map[m.id] = m.model_type || 'llm';
                 rtMap[m.id] = Boolean(m.realtime_stt);
+                if (m.loaded) {
+                    loaded.push(m.id);
+                    if (m.distributed) loadedDistributed.push(m.id);
+                }
             }
             this.modelTypeMap = map;
             this.realtimeSttMap = rtMap;
+            this.loadedModelIds = loaded;
+            this.loadedDistributedModelIds = loadedDistributed;
             this._mirrorAliasModelTypes();
         } catch (e) {
             // Model status endpoint unavailable

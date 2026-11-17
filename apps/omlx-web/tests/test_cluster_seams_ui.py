@@ -24,9 +24,8 @@ def _registered_routes() -> set[str]:
     from omlx.cluster.assistant import routes as assistant_routes
 
     # The tab now drives both the existing cluster admin router and the
-    # Cluster Assistant router (measure/recommend/plan plus the free-space
-    # relay). A URL is real when either registers it, so keep this seam honest
-    # across both mounts.
+    # Cluster Assistant router (Screen-3 minimal slice). A URL is real when
+    # either registers it, so keep this seam honest across both mounts.
     registered = {
         re.sub(r"\{[^{}]+\}", "{parameter}", route.path)
         for router in (routes.router, assistant_routes.router)
@@ -106,12 +105,19 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
         # Not for the browser: the elected coordinator answers another origin's
         # "are you already running an apply/start?" over the admin seam (the
         # cluster-wide operation lock). The card still calls the eight it owns,
-        # including the free-space relay (the live-run notes).
+        # including the free-space relay (PHASE-2B-RUN.md §9).
         "/admin/api/cluster/assistant/operations/active",
         # Not for the browser either: the origin mirrors its running operation
         # onto the elected coordinator over the same admin seam, so a second
-        # origin sees the cluster-wide lock (the apply/start chapter). Server-to-server.
+        # origin sees the cluster-wide lock (CHAPTER-5.md §2.2). Server-to-server.
         "/admin/api/cluster/assistant/operations/mirror",
+        # The automatic constellation search loop is API-first; the dashboard UI
+        # for it comes later. It only calls the assistant's own apply/start/
+        # observe/stop seams, never a raw cluster route from the browser.
+        "/admin/api/cluster/assistant/search",
+        # Fine-tuning the winner is API-first too; it only runs completions on
+        # the winning coordinator through the assistant's own seam.
+        "/admin/api/cluster/assistant/tune",
         # Read-only: the saved tuning preset for an operation's model + node set.
         # The card shows the preset key the tune/tune-redeploy responses already
         # return; this route serves API clients and a future on-load display, so

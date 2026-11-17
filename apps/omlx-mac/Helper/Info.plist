@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- SMJobBless reads this plist from the binary's __TEXT,__info_plist
+         section and rejects the tool unless CFBundleInfoDictionaryVersion is
+         exactly "6.0" and CFBundleIdentifier equals the tool's file name. -->
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleIdentifier</key>
+    <string>app.omlx.helper</string>
+    <key>CFBundleName</key>
+    <string>oMLX Helper</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>SMAuthorizedClients</key>
+    <array>
+        <!-- Only a Developer ID Application signed oMLX may install and talk to
+             this root helper: the requirement pins the Developer ID CA and the
+             Developer ID Application leaf marker, not just the team (OU). -->
+        <string>anchor apple generic and identifier "app.omlx" and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "YB894QRG4W"</string>
+    </array>
+    <key>CFBundlePackageType</key>
+    <string>TOOL</string>
+</dict>
+</plist>

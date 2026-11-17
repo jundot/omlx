@@ -62,14 +62,19 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             .environment(services)
 
         let hosting = NSHostingController(rootView: root)
-        hosting.view.frame = NSRect(x: 0, y: 0, width: 680, height: 620)
+        hosting.view.frame = NSRect(x: 0, y: 0, width: 680, height: 660)
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 620),
-            styleMask: [.titled, .closable, .fullSizeContentView],
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 660),
+            styleMask: [.titled, .closable, .fullSizeContentView, .resizable],
             backing: .buffered,
             defer: false
         )
+        // The setup rows and the first-run runtime installer must fit without
+        // hiding an input behind the footer, and a person can always enlarge
+        // the window; the content then reflows instead of layering over the
+        // footer. Shrinking below the compact layout stays refused.
+        win.minSize = NSSize(width: 680, height: 620)
         win.title = String(localized: "welcome.window.title",
                            defaultValue: "Welcome to oMLX",
                            comment: "Window title bar text for the Welcome wizard")
@@ -131,6 +136,19 @@ final class WelcomeViewModel: ObservableObject {
     @Published var lastError: String?
     @Published var isStarting: Bool = false
     @Published var startCompleted: Bool = false
+    @Published var runtimeInstalling: Bool = false
+    @Published var runtimeLog: String = ""
+    @Published var runtimeError: String?
+
+    /// Model folders found on this Mac, most models first. The wizard prefills
+    /// the Model Directory from here so a first run that already has models
+    /// does not end up pointing at an empty folder (2026-11-16).
+    @Published private(set) var detectedModelDirs: [DetectedModelDirectory] = []
+
+    // D6: the system helper is part of setting the Mac up, not of an error.
+    @Published var helperInstalling: Bool = false
+    @Published var helperError: String?
+    @Published var helperStatus: HelperStatus = PrivilegedHelper.currentStatus()
 
     var onFinish: ((AppConfig, ServerProcess?) -> Void)?
     var onOpenDashboard: (() -> Void)?
@@ -147,6 +165,119 @@ final class WelcomeViewModel: ObservableObject {
         self.modelDir = cfg.modelDir
         self.portText = String(cfg.port)
         self.apiKey = cfg.apiKey ?? ""
+        detectModelDirectories()
+    }
+
+    /// Scan the well-known model folders and adopt the largest one when the
+    /// field still holds the untouched default. `ModelDirectoryDetector`
+    /// decides what may be replaced: an empty field or the `<base>/models`
+    /// default that has no models — never a folder the user chose.
+    func detectModelDirectories() {
+        let found = ModelDirectoryDetector.detect()
+        detectedModelDirs = found
+        guard let best = found.first,
+              ModelDirectoryDetector.shouldAdopt(current: modelDir, basePath: basePath),
+              modelDir != best.path
+        else { return }
+        modelDir = best.path
+    }
+
+    /// Row subtitle: the ordinary hint, or — once a folder with models was
+    /// found — where they are and how many there are.
+    var modelDirSubtitle: String {
+        guard let best = detectedModelDirs.first else {
+            return String(localized: "welcome.storage.model_dir.sub",
+                          defaultValue: "Where downloaded models are stored.",
+                          comment: "Sublabel explaining the model directory")
+        }
+        return String(localized: "welcome.storage.model_dir.found",
+                      defaultValue: "Found \(best.modelCount) in \(best.displayPath). Choose another folder if your models live elsewhere.",
+                      comment: "Model Directory subtitle once existing model folders were detected; the count and the path")
+    }
+
+    /// The slim app ships no Python/MLX; the user installs the pinned runtime
+    /// once. This is a large download, so it never starts without this click.
+    var runtimeMissing: Bool {
+        !RuntimeInstaller.isInstalled
+    }
+
+    /// The runtime row's subtitle — same "capability, always visible" rule as
+    /// the system helper (D6): the row never disappears, so a Mac that is set
+    /// up shows "Installed" instead of a system that never had the row.
+    var runtimeRowSubtitle: String {
+        if RuntimeInstaller.isInstalled {
+            return String(localized: "welcome.runtime.status_installed",
+                          defaultValue: "Installed — Python and MLX are ready.",
+                          comment: "Status of the pinned Python runtime when it is present")
+        }
+        return String(localized: "welcome.runtime.status_not_installed",
+                      defaultValue: "Not installed — downloads about 1 GB into your Application Support folder.",
+                      comment: "Status of the pinned Python runtime when it is missing")
+    }
+
+    func installRuntime() async {
+        guard !runtimeInstalling else { return }
+        runtimeInstalling = true
+        runtimeLog = ""
+        runtimeError = nil
+        defer { runtimeInstalling = false }
+        do {
+            try await RuntimeInstaller.install { [weak self] text in
+                guard let self else { return }
+                self.runtimeLog += text
+                if self.runtimeLog.count > 6000 {
+                    self.runtimeLog = String(self.runtimeLog.suffix(6000))
+                }
+            }
+        } catch {
+            runtimeError = error.localizedDescription
+        }
+    }
+
+    /// The helper row's subtitle: status plus purpose, one line of truth. No
+    /// server is up yet in Welcome, so the wired-limit pair is nil; the
+    /// installed/version pair is the local truth.
+    var helperRowSubtitle: String {
+        let status: String
+        if helperStatus.installed {
+            let version = helperStatus.version.map { "v\($0)" } ?? "unknown version"
+            status = String(localized: "welcome.helper.status_installed",
+                            defaultValue: "Installed (\(version))",
+                            comment: "Status fragment for the installed system helper")
+        } else {
+            status = String(localized: "welcome.helper.status_not_installed",
+                            defaultValue: "Not installed",
+                            comment: "Status fragment for the absent system helper")
+        }
+        return String(localized: "welcome.helper.row_sub",
+                      defaultValue: "\(status) — raises the GPU memory limit with one admin dialog.",
+                      comment: "Sublabel of the Welcome system helper row")
+    }
+
+    var helperInstallTitle: String {
+        helperStatus.installed
+            ? String(localized: "performance.helper.reinstall",
+                     defaultValue: "Reinstall…",
+                     comment: "Button that re-blesses the privileged helper with one admin dialog")
+            : String(localized: "welcome.helper.install",
+                     defaultValue: "Install with Admin…",
+                     comment: "Welcome button that installs the system helper with one admin dialog")
+    }
+
+    /// One standard admin dialog while the person is already clicking through
+    /// setup. Idempotent: a same-build helper is a no-prompt reuse.
+    func installHelper() async {
+        guard !helperInstalling else { return }
+        helperInstalling = true
+        helperError = nil
+        defer { helperInstalling = false }
+        do {
+            try PrivilegedHelper.ensureInstalled()
+            helperStatus = PrivilegedHelper.currentStatus()
+        } catch {
+            helperError = error.localizedDescription
+            helperStatus = PrivilegedHelper.currentStatus()
+        }
     }
 
     /// Single-page validation gate — runs Storage + API-key checks in
@@ -384,11 +515,25 @@ final class WelcomeViewModel: ObservableObject {
     /// Signs in with the key set in the setup step, like the menubar item.
     @discardableResult
     func openWebDashboard() -> Bool {
+        openDashboard(redirect: "/admin/dashboard")
+    }
+
+    /// Opens the existing dashboard on the Cluster tab. The Welcome screen does
+    /// not grow a second cluster UI; this is the same page and the same
+    /// assistant card the menubar item opens.
+    @discardableResult
+    func openClusterAssistant() -> Bool {
+        openDashboard(redirect: MenubarController.clusterAssistantRedirect)
+    }
+
+    @discardableResult
+    private func openDashboard(redirect: String) -> Bool {
         guard let services else { return false }
         guard let url = MenubarController.webAdminURL(
             host: services.config.host,
             port: services.config.port,
-            apiKey: services.config.apiKey
+            apiKey: services.config.apiKey,
+            redirect: redirect
         ) else {
             return false
         }
@@ -446,7 +591,7 @@ struct WelcomeView: View {
             }
         }
         .omlxThemed()
-        .frame(width: 680, height: 620)
+        .frame(minWidth: 680, minHeight: 620)
     }
 }
 
@@ -524,15 +669,27 @@ private struct WelcomeSetupBody: View {
     @ObservedObject var vm: WelcomeViewModel
     @State private var keyVisible: Bool = false
 
+    // The setup page is one compact panel: every input row (port, model
+    // directory, API key, system helper) stays inside the visible area above
+    // the footer, so a validation error can never point at a hidden field.
+    // The ScrollView is the safety net (runtime-install log), not the plan;
+    // the window is resizable so a person can always make room.
     var body: some View {
-        VStack(spacing: 22) {
-            WelcomeIcon(size: 70)
+        ScrollView {
+            setupContent
+        }
+        .disabled(vm.isStarting)
+    }
+
+    private var setupContent: some View {
+        VStack(spacing: 16) {
+            WelcomeIcon(size: 44)
 
             VStack(spacing: 6) {
                 Text(String(localized: "welcome.setup.title",
                             defaultValue: "Set up your local server",
                             comment: "Heading on the Welcome setup page"))
-                    .font(.omlxDisplay(24, weight: .semibold))
+                    .font(.omlxDisplay(22, weight: .semibold))
                     .foregroundStyle(WelcomeStyle.text)
                 Text(String(localized: "welcome.intro",
                             defaultValue: "Choose where models live, pick a port, and create the API key you'll use from apps and the web dashboard.",
@@ -544,17 +701,7 @@ private struct WelcomeSetupBody: View {
                     .frame(maxWidth: 480)
             }
 
-            VStack(alignment: .leading, spacing: 18) {
-                WelcomeNotice(
-                    icon: "memorychip.fill",
-                    title: String(localized: "welcome.setup.local.title",
-                                  defaultValue: "Local server",
-                                  comment: "Title for the local server setup card"),
-                    text: String(localized: "welcome.setup.local.body",
-                                 defaultValue: "oMLX binds to 127.0.0.1 on first run, so clients on this Mac can use it without exposing the server to your network.",
-                                 comment: "Body for the local server setup card")
-                )
-
+            VStack(alignment: .leading, spacing: 14) {
                 VStack(spacing: 0) {
                     SettingRow(
                         icon: "number",
@@ -575,9 +722,7 @@ private struct WelcomeSetupBody: View {
                         title: String(localized: "welcome.storage.model_dir.label",
                                       defaultValue: "Model Directory",
                                       comment: "Row label for the Model Directory picker in Welcome wizard"),
-                        subtitle: String(localized: "welcome.storage.model_dir.sub",
-                                         defaultValue: "Where downloaded models are stored.",
-                                         comment: "Sublabel explaining the model directory")
+                        subtitle: vm.modelDirSubtitle
                     ) {
                         HStack(spacing: 8) {
                             Text(vm.modelDir.isEmpty
@@ -599,6 +744,17 @@ private struct WelcomeSetupBody: View {
                             .help(String(localized: "welcome.button.browse",
                                          defaultValue: "Browse...",
                                          comment: "Folder picker trigger button in Welcome wizard"))
+                            Button {
+                                vm.detectModelDirectories()
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 12, weight: .semibold))
+                            }
+                            .buttonStyle(.omlx(.normal, size: .small))
+                            .disabled(vm.isStarting)
+                            .help(String(localized: "welcome.button.search_models",
+                                         defaultValue: "Look again for model folders on this Mac",
+                                         comment: "Tooltip of the re-scan button next to the Model Directory picker"))
                         }
                     }
 
@@ -642,6 +798,60 @@ private struct WelcomeSetupBody: View {
                         }
                         .buttonStyle(.omlx(.plain, size: .small))
                     }
+
+                    WelcomeDivider()
+
+                    // The runtime is a capability like the helper (D6): the
+                    // row is always present, installed or not, so every Mac
+                    // shows the same requirement and its state instead of a
+                    // button that appears on one system and never existed on
+                    // another.
+                    SettingRow(
+                        icon: "shippingbox",
+                        title: String(localized: "welcome.runtime.title",
+                                      defaultValue: "Python runtime",
+                                      comment: "Row title for the pinned Python runtime requirement"),
+                        subtitle: vm.runtimeRowSubtitle
+                    ) {
+                        if vm.runtimeMissing {
+                            HStack(spacing: 8) {
+                                if vm.runtimeInstalling {
+                                    ProgressView().controlSize(.small)
+                                }
+                                Button(String(localized: "welcome.runtime.install",
+                                               defaultValue: "Install Runtime…",
+                                               comment: "Button that provisions the external Python runtime")) {
+                                    Task { await vm.installRuntime() }
+                                }
+                                .buttonStyle(.omlx(.primary, size: .small))
+                                .disabled(vm.runtimeInstalling || vm.isStarting)
+                            }
+                        }
+                    }
+
+                    WelcomeDivider()
+
+                    // D6: the helper is part of setting the Mac up — a plain
+                    // row, never hidden behind a wired-limit condition, one
+                    // admin dialog, idempotent.
+                    SettingRow(
+                        icon: "lock.shield",
+                        title: String(localized: "welcome.helper.title",
+                                      defaultValue: "System helper",
+                                      comment: "Row title for the first-run system helper install"),
+                        subtitle: vm.helperRowSubtitle
+                    ) {
+                        HStack(spacing: 8) {
+                            if vm.helperInstalling {
+                                ProgressView().controlSize(.small)
+                            }
+                            Button(vm.helperInstallTitle) {
+                                Task { await vm.installHelper() }
+                            }
+                            .buttonStyle(.omlx(.primary, size: .small))
+                            .disabled(vm.helperInstalling || vm.isStarting)
+                        }
+                    }
                 }
                 .background(WelcomeStyle.panel)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -650,9 +860,32 @@ private struct WelcomeSetupBody: View {
                         .strokeBorder(WelcomeStyle.panelBorder.opacity(0.45), lineWidth: 0.5)
                 )
 
+                if vm.runtimeMissing && !vm.runtimeLog.isEmpty {
+                    ScrollView {
+                        Text(vm.runtimeLog)
+                            .font(.omlxMono(10))
+                            .foregroundStyle(WelcomeStyle.muted)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 72)
+                    .padding(8)
+                    .background(WelcomeStyle.fill)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                if let error = vm.runtimeError {
+                    Text(error)
+                        .font(.omlxText(DesignTokens.FontSize.caption))
+                        .foregroundStyle(Color(nsColor: .systemRed))
+                }
+                if let error = vm.helperError {
+                    Text(error)
+                        .font(.omlxText(DesignTokens.FontSize.caption))
+                        .foregroundStyle(Color(nsColor: .systemRed))
+                }
+
                 Text(String(localized: "welcome.hint.settings_path",
-                            defaultValue: "Settings are stored in ~/.omlx/settings.json.",
-                            comment: "Hint line under the API key section pointing to settings.json"))
+                            defaultValue: "oMLX binds to 127.0.0.1 on this Mac. Settings are stored in ~/.omlx/settings.json.",
+                            comment: "Hint line under the settings panel: local binding and where settings live"))
                     .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(WelcomeStyle.faint)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -662,7 +895,7 @@ private struct WelcomeSetupBody: View {
         .padding(.horizontal, 48)
         .padding(.top, 18)
         .padding(.bottom, 6)
-        .disabled(vm.isStarting)
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -786,14 +1019,25 @@ private struct WelcomeFooter: View {
             .disabled(vm.isStarting)
 
         case .complete:
-            WelcomeCTA(
-                title: String(localized: "welcome.button.open_dashboard",
-                              defaultValue: "Open Web Dashboard",
-                              comment: "Footer button that opens the local web dashboard"),
-                systemImage: "arrow.up.right",
-                width: 210
-            ) {
-                _ = vm.openWebDashboard()
+            HStack(spacing: 10) {
+                WelcomeCTA(
+                    title: String(localized: "welcome.button.cluster_assistant",
+                                  defaultValue: "Cluster Assistant",
+                                  comment: "Footer button that opens the existing Cluster Assistant tab"),
+                    systemImage: "network",
+                    width: 190
+                ) {
+                    _ = vm.openClusterAssistant()
+                }
+                WelcomeCTA(
+                    title: String(localized: "welcome.button.open_dashboard",
+                                  defaultValue: "Open Web Dashboard",
+                                  comment: "Footer button that opens the local web dashboard"),
+                    systemImage: "arrow.up.right",
+                    width: 210
+                ) {
+                    _ = vm.openWebDashboard()
+                }
             }
         }
     }

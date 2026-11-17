@@ -68,7 +68,7 @@ def test_a_table_offload_plan_is_shown_and_written_on_every_selected_mac(
     client, _, _ = api(
         coordinator=FakeCoordinator().factory(), settings_writer=write
     )
-    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", table_layout)
+    monkeypatch.setitem(provisioning.__dict__, "inspect_safetensors_layout", table_layout)
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id, table_offload="engram")
 
@@ -100,7 +100,7 @@ def test_a_worker_policy_write_happens_after_staging_and_fails_apply(
     client, _, _ = api(
         coordinator=FakeCoordinator().factory(), settings_writer=write
     )
-    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", table_layout)
+    monkeypatch.setitem(provisioning.__dict__, "inspect_safetensors_layout", table_layout)
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id, table_offload="engram")
 
@@ -123,7 +123,7 @@ def test_a_failed_policy_write_fails_apply_with_one_action(api, monkeypatch) -> 
     client, _, _ = api(
         coordinator=FakeCoordinator().factory(), settings_writer=refusing
     )
-    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", table_layout)
+    monkeypatch.setitem(provisioning.__dict__, "inspect_safetensors_layout", table_layout)
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id, table_offload="engram")
 
@@ -162,7 +162,7 @@ def test_the_approved_memory_guard_tier_is_written_on_every_selected_mac(
         settings_writer=write_model,
         global_settings_writer=write_tier,
     )
-    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", table_layout)
+    monkeypatch.setitem(provisioning.__dict__, "inspect_safetensors_layout", table_layout)
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id, memory_guard_tier="aggressive")
 
@@ -186,7 +186,7 @@ def test_an_unwritable_tier_fails_apply_before_staging(api, monkeypatch) -> None
     client, _, _ = api(
         coordinator=FakeCoordinator().factory(), global_settings_writer=refuse
     )
-    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", table_layout)
+    monkeypatch.setitem(provisioning.__dict__, "inspect_safetensors_layout", table_layout)
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id, memory_guard_tier="aggressive")
 
@@ -219,8 +219,8 @@ def test_a_reduced_context_survives_plan_apply(tmp_path, monkeypatch) -> None:
     with assistant_api(
         tmp_path, monkeypatch, coordinator=FakeCoordinator().factory()
     ) as (client, _store, _ops):
-        monkeypatch.setattr(
-            provisioning, "inspect_safetensors_layout", context_limited_layout
+        monkeypatch.setitem(
+            provisioning.__dict__, "inspect_safetensors_layout", context_limited_layout
         )
         measurement_id = take_measurement(client)
         plan = take_plan(client, measurement_id, context_tokens=32768)
@@ -252,8 +252,8 @@ def non_pipeline_layout(path: str) -> ModelLayout:
 
 def test_a_non_pipeline_model_is_refused_before_the_coordinator(api, monkeypatch) -> None:
     client, _, _ = api()
-    monkeypatch.setattr(
-        provisioning, "inspect_safetensors_layout", non_pipeline_layout
+    monkeypatch.setitem(
+        provisioning.__dict__, "inspect_safetensors_layout", non_pipeline_layout
     )
     measurement_id = take_measurement(client)
 
@@ -371,7 +371,7 @@ def test_local_worker_is_a_model_source_for_a_remote_coordinator() -> None:
 
 def test_a_drifted_policy_is_a_plan_mismatch(api, monkeypatch) -> None:
     client, _, _ = api(coordinator=FakeCoordinator().factory())
-    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", table_layout)
+    monkeypatch.setitem(provisioning.__dict__, "inspect_safetensors_layout", table_layout)
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id)
 

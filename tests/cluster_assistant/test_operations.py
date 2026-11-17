@@ -373,7 +373,7 @@ def test_the_record_reports_its_own_state_truthfully(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mirrors: the cluster-wide lock on a remote coordinator (B5, the apply/start chapter)
+# Mirrors: the cluster-wide lock on a remote coordinator (B5, CHAPTER-5 §2.2)
 # ---------------------------------------------------------------------------
 
 
@@ -570,7 +570,7 @@ def test_a_terminal_mirror_is_kept_when_the_save_fails(tmp_path, monkeypatch) ->
     def broken_save() -> None:
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(operations, "_save", broken_save)
+    monkeypatch.setitem(operations.__dict__, "_save", broken_save)
     with pytest.raises(OSError):
         operations.mirror("op-origin-a", KIND_APPLY, "m5", STATE_APPLIED, now=NOW)
 

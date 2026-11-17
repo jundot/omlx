@@ -127,6 +127,9 @@ class PlanInputs:
     #: The user's explicit consent to the 2-Mac fallback. It salts the plan
     #: signature, so apply/start must carry it or the signature will not match.
     two_mac_fallback: bool = False
+    #: The rank-0 pin (and with it the endpoint host). Also a plan-time input:
+    #: the election must run with the same pin or the plan cannot be re-proved.
+    preferred_coordinator: str = ""
 
 
 @dataclass(frozen=True)
@@ -285,7 +288,6 @@ def write_model_settings_on_mac(
             "settings cannot be written; measure again",
             ACTION_CONFIGURE_ENDPOINT,
         )
-    model_id = ""
     try:
         if target.local:
             listing = _local_admin(port, MODELS_PATH)
@@ -551,6 +553,7 @@ def elect_for_apply(
         origin_node=inputs.origin_node or None,
         fabric_links=fabric_links,
         two_mac_fallback=inputs.two_mac_fallback,
+        preferred_coordinator=inputs.preferred_coordinator or None,
     )
     return selection.election, selection
 
@@ -944,13 +947,13 @@ def build_deployment_request(
         hosts.append(
             ClusterHostRequest(
                 node_id=node_id,
-                # Rank 0 runs on the coordinator. On macOS Tahoe a local child
-                # cannot join the ring ("[ring] Couldn't connect (error: 60)");
-                # the same hostfile joins when rank 0 is spawned over SSH to the
-                # coordinator's *own* LAN address. This is still the coordinator
-                # spawning its own rank 0, never another Mac — the address is one
-                # this Mac owns, proven by `resolve_targets`.
-                ssh=(target.address if rank == 0 else target.ssh),
+                # Rank 0 runs on the coordinator as its own local child. The
+                # deployment contract requires exactly "127.0.0.1" here
+                # (``ClusterDeployment``), and the validation cluster runs as a
+                # *line* rather than a macOS bridge ring, so the Tahoe ring
+                # workaround (spawn rank 0 over SSH to this Mac's own LAN
+                # address) does not apply and would be rejected.
+                ssh=("127.0.0.1" if rank == 0 else target.ssh),
                 ips=[target.address],
                 # The interpreter that Mac itself reported to the measurement.
                 # Rank 0 is spawned by the MLX launcher over SSH to the

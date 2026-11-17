@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oMLX Cluster Assistant — UI mock</title>
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --panel: #ffffff;
+    --ink: #1d1d1f;
+    --muted: #6e6e73;
+    --faint: #86868b;
+    --line: #e5e5ea;
+    --soft: #f2f2f5;
+    --accent: #0071e3;
+    --accent-soft: #e8f2ff;
+    --green: #248a3d;
+    --green-soft: #e9f7ee;
+    --amber: #9a5b00;
+    --amber-soft: #fff4e5;
+    --red: #c4001d;
+    --red-soft: #fff0f1;
+    --shadow: 0 20px 60px rgba(0,0,0,.08), 0 2px 8px rgba(0,0,0,.04);
+    --radius: 20px;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--ink); }
+  body { padding: 34px 24px 60px; }
+  .mock-shell { max-width: 980px; margin: 0 auto; }
+  .mock-bar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-bottom: 20px; padding: 10px 12px; background: #1d1d1f;
+    color: #f5f5f7; border-radius: 14px; font-size: 12px;
+  }
+  .mock-bar strong { font-weight: 600; letter-spacing: .02em; }
+  .mock-bar span { color: #a1a1a6; margin-right: 4px; }
+  .mock-bar button {
+    appearance: none; border: 1px solid #3a3a3c; background: #2c2c2e;
+    color: #f5f5f7; border-radius: 999px; padding: 5px 11px; font: inherit;
+    font-weight: 600; cursor: pointer;
+  }
+  .mock-bar button.active { background: #f5f5f7; color: #1d1d1f; border-color: #f5f5f7; }
+  .mock-note { margin-left: auto; color: #86868b; font-size: 11px; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+  }
+  .card-head { padding: 22px 24px 18px; border-bottom: 1px solid var(--line); }
+  .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+  .title-row { display: flex; align-items: flex-start; gap: 14px; margin-top: 8px; }
+  .mark {
+    width: 42px; height: 42px; border-radius: 13px; flex: none;
+    background: linear-gradient(145deg, #e8f2ff, #d6e9ff);
+    color: var(--accent); display: grid; place-items: center;
+    font-size: 22px; border: 1px solid #cfe3ff;
+  }
+  h1 { font-size: 23px; line-height: 1.15; margin: 0; letter-spacing: -.02em; }
+  .sub { margin: 5px 0 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+  .state {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 7px;
+    padding: 6px 11px; border-radius: 999px; font-size: 12px; font-weight: 650;
+    white-space: nowrap; border: 1px solid transparent;
+  }
+  .state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .state.ready { color: var(--green); background: var(--green-soft); border-color: #c9ead3; }
+  .state.planning { color: var(--accent); background: var(--accent-soft); border-color: #cfe3ff; }
+  .state.starting { color: var(--amber); background: var(--amber-soft); border-color: #f2d7b0; }
+  .state.failed { color: var(--red); background: var(--red-soft); border-color: #f3c7cc; }
+  .state.stopped { color: var(--muted); background: var(--soft); border-color: var(--line); }
+
+  .summary {
+    display: grid; grid-template-columns: repeat(4, minmax(0,1fr));
+    gap: 1px; background: var(--line); border-bottom: 1px solid var(--line);
+  }
+  .summary > div { background: var(--panel); padding: 14px 16px; min-width: 0; }
+  .label { color: var(--faint); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+  .value { margin-top: 5px; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .value.small { font-weight: 500; color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+  .body { padding: 20px 24px 22px; }
+  .topology {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px;
+    background: #fbfbfd; font-size: 12px; color: var(--muted); margin-bottom: 20px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex: none; }
+  .dot.amber { background: var(--amber); }
+  .dot.red { background: var(--red); }
+  .topology strong { color: var(--ink); font-weight: 650; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px;
+    border-radius: 999px; background: var(--soft); color: var(--muted);
+    font-size: 11px; font-weight: 600; border: 1px solid var(--line);
+  }
+  .pill.green { background: var(--green-soft); color: var(--green); border-color: #c9ead3; }
+
+  .section-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .09em; color: var(--faint); margin: 0 0 10px; }
+  .progress { display: grid; gap: 7px; margin: 0 0 20px; }
+  .step { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); }
+  .step .bubble {
+    width: 20px; height: 20px; border-radius: 50%; border: 1px solid var(--line);
+    background: var(--soft); color: var(--faint); display: grid; place-items: center;
+    font-size: 11px; font-weight: 700; flex: none;
+  }
+  .step.done { color: var(--ink); }
+  .step.done .bubble { background: var(--green-soft); border-color: #c9ead3; color: var(--green); }
+  .step.active { color: var(--ink); font-weight: 600; }
+  .step.active .bubble { background: var(--accent-soft); border-color: #cfe3ff; color: var(--accent); }
+  .step.failed .bubble { background: var(--red-soft); border-color: #f3c7cc; color: var(--red); }
+  .step .detail { margin-left: auto; color: var(--faint); font-size: 11px; font-weight: 500; }
+
+  .actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; padding-top: 4px; }
+  .btn {
+    appearance: none; border: 1px solid var(--line); background: var(--panel);
+    color: var(--ink); border-radius: 999px; padding: 8px 14px;
+    font: inherit; font-size: 12px; font-weight: 650; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 7px;
+  }
+  .btn.primary { background: var(--accent); color: white; border-color: var(--accent); }
+  .btn.ghost { background: transparent; color: var(--muted); }
+  .btn.danger { color: var(--red); border-color: #f3c7cc; background: var(--red-soft); }
+  .btn[disabled] { opacity: .55; cursor: default; }
+  .btn .spark { font-size: 13px; }
+
+  .notice {
+    border: 1px solid var(--line); background: #fbfbfd; border-radius: 12px;
+    padding: 12px 14px; font-size: 12.5px; color: var(--muted); line-height: 1.45;
+    margin: 16px 0 0;
+  }
+  .notice strong { color: var(--ink); }
+  .notice.red { border-color: #f3c7cc; background: var(--red-soft); color: #7a1020; }
+  .notice.red strong { color: var(--red); }
+  .notice.amber { border-color: #f2d7b0; background: var(--amber-soft); color: #6a4300; }
+  .notice.amber strong { color: var(--amber); }
+  .missing { margin-top: 7px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: var(--red); }
+
+  .endpoint {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-top: 16px; padding: 11px 13px; border-radius: 12px;
+    background: var(--green-soft); border: 1px solid #c9ead3;
+    font-size: 12px; color: #1b5e2c;
+  }
+  .endpoint .url { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; color: var(--green); }
+  .endpoint .pill { background: white; border-color: #c9ead3; color: var(--green); }
+
+  details {
+    margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px;
+  }
+  summary {
+    cursor: pointer; list-style: none; font-size: 12px; font-weight: 650;
+    color: var(--muted); display: flex; align-items: center; gap: 7px;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "›"; font-size: 16px; color: var(--faint); transition: transform .15s ease; }
+  details[open] summary::before { transform: rotate(90deg); }
+  .details-grid { margin-top: 14px; display: grid; gap: 16px; }
+  .stage-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .stage-table th { text-align: left; color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: .07em; padding: 0 8px 7px 0; font-weight: 700; }
+  .stage-table td { padding: 7px 8px 7px 0; border-top: 1px solid var(--line); color: var(--muted); }
+  .stage-table td:first-child { color: var(--ink); font-weight: 600; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { padding: 4px 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--muted); font-size: 11px; font-weight: 600; }
+  .chip strong { color: var(--ink); font-weight: 650; }
+  .cmd {
+    margin: 8px 0 0; padding: 10px 12px; border-radius: 10px; background: #1d1d1f;
+    color: #e5e5ea; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .foot { margin-top: 18px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 10.5px; color: var(--faint); }
+  .hidden { display: none !important; }
+
+  @media (max-width: 760px) {
+    .summary { grid-template-columns: repeat(2, minmax(0,1fr)); }
+    .sub { max-width: 90%; }
+    .state { margin-left: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="mock-shell">
+  <div class="mock-bar">
+    <strong>Mock states</strong><span>not product UI</span>
+    <button data-state="plan">Plan</button>
+    <button data-state="starting">Starting</button>
+    <button data-state="ready" class="active">Ready</button>
+    <button data-state="stopped">Stopped</button>
+    <button data-state="failed">Topology error</button>
+    <div class="mock-note">English-only · no terminal · one action per failure</div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div class="eyebrow">Cluster Assistant</div>
+      <div class="title-row">
+        <div class="mark">✦</div>
+        <div>
+          <h1>Run one model across your Macs</h1>
+          <p class="sub">Measured placement, automatic rank 0, and one endpoint. No SSH, no rank or layer questions.</p>
+        </div>
+        <div id="statePill" class="state ready">Ready</div>
+      </div>
+    </div>
+
+    <div class="summary">
+      <div><div class="label">Model</div><div class="value">GLM-5.3-Flash-oQ2e-mtp</div></div>
+      <div><div class="label">Context</div><div class="value">8,192 tokens</div></div>
+      <div><div class="label">Macs</div><div class="value">2 · minimal fit</div></div>
+      <div><div class="label">Coordinator</div><div class="value">MacBook Pro M5 Max</div></div>
+      <div><div class="label">Tier</div><div class="value">Balanced</div></div>
+      <div><div class="label">Table offload</div><div class="value">Engram SSD</div></div>
+      <div><div class="label">Experts</div><div class="value">25% resident</div></div>
+      <div><div class="label">Admission</div><div class="value">p50 · live</div></div>
+    </div>
+
+    <div class="body">
+      <div class="topology">
+        <span class="dot"></span>
+        <span><strong>Measured line</strong> · MacBook Pro M5 Max ↔ Mac Studio M2 Ultra</span>
+        <span class="pill green">Fabric complete</span>
+        <span class="pill">Rank 0 holds the tail</span>
+        <span class="pill">Lightning MTP on</span>
+      </div>
+
+      <p class="section-label">Setup progress</p>
+      <div class="progress" id="progress"></div>
+
+      <div id="actions" class="actions"></div>
+
+      <div id="endpoint" class="endpoint hidden">
+        <span>Endpoint</span>
+        <span class="url">http://172.16.1.11:8099</span>
+        <span class="pill">Ready</span>
+        <span style="color:#3b7a4a">Health and smoke completion passed</span>
+      </div>
+
+      <div id="failureNotice" class="notice red hidden">
+        <strong>The measured fabric has no line for this plan.</strong>
+        <div>Run with two Macs instead? The plan is ready, but the missing cable must be confirmed.</div>
+        <div class="missing">Missing link: Mac Studio M2 Ultra ↔ Mac mini M1</div>
+        <div class="actions" style="margin-top:10px">
+          <button class="btn primary">Run with 2 Macs</button>
+          <button class="btn ghost">Cancel</button>
+        </div>
+      </div>
+
+      <details open>
+        <summary>Details: stages, policy and fabric</summary>
+        <div class="details-grid">
+          <div>
+            <p class="section-label">Pipeline stages</p>
+            <table class="stage-table">
+              <thead><tr><th>Rank</th><th>Mac</th><th>Layers</th><th>Resident</th><th>Headroom</th><th>Predicted</th></tr></thead>
+              <tbody>
+                <tr><td>0</td><td>M5 Max</td><td>66–89</td><td>18.4 GiB</td><td>78.2 GiB</td><td>5.1 s</td></tr>
+                <tr><td>1</td><td>M2 Ultra</td><td>0–65</td><td>42.7 GiB</td><td>11.3 GiB</td><td>6.8 s</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div>
+            <p class="section-label">Resolved policy</p>
+            <div class="chip-row">
+              <span class="chip">Context <strong>8,192</strong></span>
+              <span class="chip">Tier <strong>Balanced</strong></span>
+              <span class="chip">Engram <strong>SSD</strong></span>
+              <span class="chip">MoE <strong>25% resident</strong></span>
+              <span class="chip">Admission <strong>p50</strong></span>
+              <span class="chip">Microbatch <strong>1</strong></span>
+            </div>
+          </div>
+          <div>
+            <p class="section-label">Fabric</p>
+            <div class="chip-row">
+              <span class="chip">Measured <strong>yes</strong></span>
+              <span class="chip">Links <strong>M5 ↔ M2 Ultra</strong></span>
+              <span class="chip">Missing <strong>none</strong></span>
+              <span class="chip">Plan <strong>line</strong></span>
+            </div>
+          </div>
+          <div>
+            <p class="section-label">Network preflight (read-only)</p>
+            <div class="cmd"># bridge0 already exists; do not create a second bridge
+# candidate Thunderbolt ports: en1, en2, en6
+# add only the port connected to the cluster peer, e.g.
+sudo ifconfig bridge0 addm en1
+# review the bridge members and address in System Settings > Network</div>
+            <p style="font-size:11px;color:var(--faint);margin:7px 0 0">Nothing is executed here. A later helper step is the only privileged apply.</p>
+          </div>
+        </div>
+      </details>
+
+      <div class="foot">
+        <span>Mock data · GLM-5.3 · 2 Macs · measured line</span>
+        <span>One tab · one assistant card · existing Cluster tab</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const states = {
+    plan: {
+      pill: ["planning", "Plan ready"],
+      progress: [
+        ["done", "Checking Macs", "2 measured"],
+        ["done", "Planning", "line verified"],
+        ["pending", "Preparing runtime & copying model", ""],
+        ["pending", "Starting coordinator", ""],
+        ["pending", "Loading model & verifying", ""],
+        ["pending", "Ready", ""]
+      ],
+      actions: [
+        ["primary", "Start setup", "setup"],
+        ["ghost", "Use all Macs", "all"]
+      ],
+      endpoint: false
+    },
+    starting: {
+      pill: ["starting", "Starting"],
+      progress: [
+        ["done", "Checking Macs", "2 measured"],
+        ["done", "Planning", "line verified"],
+        ["active", "Preparing runtime & copying model", "copying"],
+        ["active", "Starting coordinator", "queued"],
+        ["pending", "Loading model & verifying", ""],
+        ["pending", "Ready", ""]
+      ],
+      actions: [["primary", "Starting…", "disabled"]],
+      endpoint: false
+    },
+    ready: {
+      pill: ["ready", "Ready"],
+      progress: [
+        ["done", "Checking Macs", "2 measured"],
+        ["done", "Planning", "line verified"],
+        ["done", "Preparing runtime & copying model", "staged"],
+        ["done", "Starting coordinator", "M5 Max"],
+        ["done", "Loading model & verifying", "smoke passed"],
+        ["done", "Ready", "endpoint live"]
+      ],
+      actions: [
+        ["primary", "Open Chat", "chat"],
+        ["", "Connect agent", "agent"],
+        ["danger", "Stop cluster", "stop"],
+        ["ghost", "Refresh", "refresh"]
+      ],
+      endpoint: true
+    },
+    stopped: {
+      pill: ["stopped", "Stopped"],
+      progress: [
+        ["done", "Checking Macs", "2 measured"],
+        ["done", "Planning", "line verified"],
+        ["done", "Preparing runtime & copying model", "staged"],
+        ["done", "Starting coordinator", "M5 Max"],
+        ["done", "Loading model & verifying", "smoke passed"],
+        ["done", "Ready", "stopped"]
+      ],
+      actions: [
+        ["primary", "Start again", "again"],
+        ["", "Copy diagnostics", "diag"],
+        ["ghost", "Network preflight", "network"]
+      ],
+      endpoint: false
+    },
+    failed: {
+      pill: ["failed", "Needs a cable"],
+      progress: [
+        ["done", "Checking Macs", "3 measured"],
+        ["failed", "Planning", "no line"],
+        ["pending", "Preparing runtime & copying model", ""],
+        ["pending", "Starting coordinator", ""],
+        ["pending", "Loading model & verifying", ""],
+        ["pending", "Ready", ""]
+      ],
+      actions: [],
+      endpoint: false
+    }
+  };
+
+  const pill = document.getElementById("statePill");
+  const progress = document.getElementById("progress");
+  const actions = document.getElementById("actions");
+  const endpoint = document.getElementById("endpoint");
+  const failure = document.getElementById("failureNotice");
+
+  function render(name) {
+    const state = states[name];
+    pill.className = "state " + state.pill[0];
+    pill.textContent = state.pill[1];
+    progress.innerHTML = state.progress.map(([kind, label, detail]) => {
+      const mark = kind === "done" ? "✓" : kind === "failed" ? "!" : kind === "active" ? "●" : "";
+      return `<div class="step ${kind}"><span class="bubble">${mark}</span><span>${label}</span><span class="detail">${detail}</span></div>`;
+    }).join("");
+    actions.innerHTML = state.actions.map(([kind, label, key]) =>
+      `<button class="btn ${kind}" ${key === "disabled" ? "disabled" : ""}>${label}</button>`
+    ).join("");
+    endpoint.classList.toggle("hidden", !state.endpoint);
+    failure.classList.toggle("hidden", name !== "failed");
+    document.querySelectorAll(".mock-bar button").forEach((button) => {
+      button.classList.toggle("active", button.dataset.state === name);
+    });
+  }
+
+  document.querySelectorAll(".mock-bar button").forEach((button) => {
+    button.addEventListener("click", () => render(button.dataset.state));
+  });
+  render("ready");
+</script>
+</body>
+</html>

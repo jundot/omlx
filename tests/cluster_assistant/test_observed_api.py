@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """``observed``: the one measured rate block, and who may fill it.
 
-The rules these pin are the ones ``the handoff notes`` records:
+The rules these pin are the ones ``SCREEN-5-HANDOFF.md`` records:
 
 * the block is nullable and ``None`` for a normal start (the probe is off by
   default), and no rate is stored anywhere else;

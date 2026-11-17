@@ -11,6 +11,9 @@ import socket
 import subprocess
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Protocol
 
 _DNS_SD = "/usr/bin/dns-sd"
@@ -321,6 +324,13 @@ class PeerCaps:
     loopback_only: bool = False
     # "agent": a helper daemon driven over its control channel, not SSH.
     control: str = ""
+    # Identity facts the device card shows next to the name: the Mac's own model
+    # identifier (``hw.model``, e.g. Mac14,14), its core counts and its disk.
+    # Empty/0 means "not measured" (an older peer), never "zero".
+    model: str = ""
+    cpu_cores: int = 0
+    gpu_cores: int = 0
+    disk_total_gb: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         caps = {
@@ -330,6 +340,10 @@ class PeerCaps:
             "thunderbolt": self.thunderbolt,
             "jaccl": self.jaccl,
             "loopback_only": self.loopback_only,
+            "model": self.model,
+            "cpu_cores": self.cpu_cores,
+            "gpu_cores": self.gpu_cores,
+            "disk_total_gb": self.disk_total_gb,
         }
         if self.control:
             caps["control"] = self.control
@@ -350,6 +364,10 @@ class PeerCaps:
             jaccl=bool(payload.get("jaccl")),
             loopback_only=bool(payload.get("loopback_only")),
             control="agent" if payload.get("control") == "agent" else "",
+            model=str(payload.get("model") or "")[:32],
+            cpu_cores=max(0, int(payload.get("cpu_cores") or 0)),
+            gpu_cores=max(0, int(payload.get("gpu_cores") or 0)),
+            disk_total_gb=max(0.0, float(payload.get("disk_total_gb") or 0.0)),
         )
 
 
@@ -408,6 +426,67 @@ def _rdma_fabric_caps(
         pass
 
 
+def _sysctl_value(name: str) -> str:
+    """One ``sysctl -n`` value, or "" when it cannot be read."""
+
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed system executable
+            ["/usr/sbin/sysctl", "-n", name],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _hw_model() -> str:
+    """``hw.model`` (e.g. ``Mac14,14``): the identifier the icon is chosen from."""
+
+    return _sysctl_value("hw.model")[:32]
+
+
+def _hw_cpu_cores() -> int:
+    with suppress(ValueError):
+        return max(0, int(_sysctl_value("hw.ncpu")))
+    return 0
+
+
+@lru_cache(maxsize=1)
+def _hw_gpu_cores() -> int:
+    """GPU core count, probed once per process (``sysctl`` does not expose it)."""
+
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed system executable
+            ["/usr/sbin/system_profiler", "SPDisplaysDataType", "-detailLevel", "mini"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    for line in proc.stdout.splitlines():
+        if "Total Number of Cores" in line:
+            with suppress(ValueError):
+                return max(0, int(line.split(":", 1)[1].strip()))
+    return 0
+
+
+@lru_cache(maxsize=1)
+def _disk_total_gb() -> float:
+    """Total size of the volume this Mac boots from, in GiB (0 = not measured)."""
+
+    try:
+        stats = os.statvfs("/")
+    except OSError:
+        return 0.0
+    total = stats.f_blocks * stats.f_frsize
+    return round(total / (1 << 30), 1) if total > 0 else 0.0
+
+
 def local_caps() -> PeerCaps:
     """Best-effort local capability snapshot; never raises."""
 
@@ -432,6 +511,10 @@ def local_caps() -> PeerCaps:
             )
             if mem.returncode == 0:
                 caps.ram_gb = round(int(mem.stdout.strip()) / (1 << 30), 1)
+            caps.model = _hw_model()
+            caps.cpu_cores = _hw_cpu_cores()
+            caps.gpu_cores = _hw_gpu_cores()
+            caps.disk_total_gb = _disk_total_gb()
         else:
             caps.chip = platform.machine()
             with suppress(OSError, ValueError):

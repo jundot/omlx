@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request and response schemas for the Cluster Assistant admin API.
 
-The contract is the one decided in the design notes:
+The contract is the one decided in PROJECT-BRIEF §13.2/§13.3 and §8.5:
 
 * ``measure`` starts a job and returns a ``measurement_id`` immediately;
 * ``status`` reports that job;
@@ -24,7 +24,7 @@ module adds to an ``ElectionResult`` is *derived* and non-scoring: warnings abou
 unmeasured inputs, the predicted-stage block, and the endpoint taken from the
 measurement record.
 
-``predicted`` deliberately contains no tokens/s. The design notes forbids
+``predicted`` deliberately contains no tokens/s. PROJECT-BRIEF §17.2 forbids
 promising absolute throughput before it has been measured, and oMLX's own plan
 objects report predicted stage seconds, not model throughput — so this aligns
 with them and leaves the rate fields to the post-smoke measurement, which will
@@ -33,6 +33,7 @@ fill ``observed``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -71,7 +72,7 @@ WARNING_ENDPOINT_UNRESOLVED = "endpoint_unresolved"
 
 # The one next step when the elected Mac cannot name a dialable endpoint.
 ACTION_CONFIGURE_ENDPOINT = "configure_endpoint"
-# The one next step when no Mac can host rank 0 for these inputs (the notes).
+# The one next step when no Mac can host rank 0 for these inputs (§8.6).
 ACTION_ADJUST_PLAN = "adjust_model_or_context"
 
 
@@ -170,6 +171,29 @@ class AssistantMeasureResponse(BaseModel):
     poll: str
 
 
+class AssistantRunLocalRequest(BaseModel):
+    """Run the measured model on this Mac alone, without a cluster.
+
+    The measured Macs stay what they are; this question is only "does this
+    checkpoint fit on *this* Mac at this context, and may its own engine load
+    it". It is deliberately not a plan request: ``plan`` stays the PP-only
+    cluster contract and a single-Mac plan stays unapplicable
+    (``ClusterDeployment`` needs 2+ hosts).
+
+    ``layer_count`` is optional and only a consistency check against the
+    measured layout — a measurement identity keyed by a path does not carry
+    layers, so the caller may repeat what it saw. ``None`` means "not asserted".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    measurement_id: str = Field(min_length=1, max_length=128)
+    model_path: str = Field(min_length=1, max_length=4096)
+    layer_count: int | None = Field(default=None, gt=0, le=MAX_LAYER_COUNT)
+    context_tokens: int = Field(default=8192, ge=1, le=MAX_CONTEXT_TOKENS)
+    mtp: bool = False
+
+
 class AssistantPlanRequest(BaseModel):
     """One planning question about one already-taken measurement.
 
@@ -218,6 +242,11 @@ class AssistantPlanRequest(BaseModel):
     # Explicit consent to the offered 2-Mac plan when the selected fabric is
     # incomplete. It salts the signature, so apply/start must repeat it.
     confirm_two_mac_fallback: bool = False
+    # Pin rank 0 — and with it the endpoint host, because the MVP keeps rank 0,
+    # coordinator and endpoint on one Mac. Not a hint: the election refuses
+    # rather than electing a different Mac. A plan-time input, so apply/start
+    # carry it too.
+    preferred_coordinator: str | None = Field(default=None, max_length=255)
 
     def model_identity(self) -> ModelIdentity:
         return request_model_identity(
@@ -257,7 +286,7 @@ class PlanPrediction(BaseModel):
     """What the measurements support predicting — and nothing more.
 
     There is no ``decode_tok_per_s`` here: an unmeasured rate is not zero and
-    not a guess (the design notes). ``measured`` false means the whole block
+    not a guess (PROJECT-BRIEF §17.2). ``measured`` false means the whole block
     is worst case, which is exactly how the election scored it.
     """
 
@@ -439,7 +468,7 @@ class AssistantMeasurementStatus(BaseModel):
 
 
 class AssistantPlanResponse(BaseModel):
-    """The plan object from the design notes
+    """The plan object from PROJECT-BRIEF §13.3.
 
     An infeasible answer carries the same shape with ``feasible`` false, an
     empty ``coordinator_node``, no ``endpoint`` and no stages: nothing
@@ -533,7 +562,7 @@ def build_plan_response(
     selection: ClusterPlanSelection | None = None,
     alternatives: Sequence[ClusterPlanSelection] = (),
 ) -> AssistantPlanResponse:
-    """The notes plan object for one election result.
+    """The §13.3 plan object for one election result.
 
     Pure: it reads the election result and the persisted measurement and adds
     only derived, non-scoring fields. The election's own numbers — order, cuts,
@@ -825,7 +854,7 @@ def plan_error_payload(code: str, message: str, action: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# recommendation (the design notes)
+# recommendation (PROJECT-BRIEF §11.1a/§13.3a)
 # ---------------------------------------------------------------------------
 
 # No candidate model fits these Macs. Distinct from ``no_feasible_plan``: this
@@ -853,7 +882,7 @@ class AssistantRecommendCandidate(BaseModel):
 class AssistantRecommendRequest(BaseModel):
     """Which model should these already-measured Macs run?
 
-    Only the hardware half of the measurement is read (the notes), so the candidate
+    Only the hardware half of the measurement is read (§11.1a), so the candidate
     models do not have to include the checkpoint the measurement covered. The
     model the user picks is measured again (model-bound) before ``plan``.
     """
@@ -909,7 +938,7 @@ class RecommendationWarning(BaseModel):
 
 
 class RecommendedModel(BaseModel):
-    """One candidate's verdict, in the shape the notes asks for.
+    """One candidate's verdict, in the shape §13.3a asks for.
 
     There is no token rate anywhere: ``critical_stage_seconds`` is ``None`` when
     no compute was measured, and ``measured_speed`` says which of the two this
@@ -952,7 +981,7 @@ class RecommendedModel(BaseModel):
 
 
 class AssistantRecommendResponse(BaseModel):
-    """The notes recommendation object for one measured cluster.
+    """The §13.3a recommendation object for one measured cluster.
 
     ``selected_model`` names the one model the primary path should offer; the
     ordered ``candidates`` list is what an advanced shelf shows. No feasible
@@ -1100,7 +1129,7 @@ def _warning(item: RecommendationWarningData) -> RecommendationWarning:
 
 
 # ---------------------------------------------------------------------------
-# apply / start / operation status (the design notes, the apply/start chapter)
+# apply / start / operation status (PROJECT-BRIEF §13.2, CHAPTER-5.md §4)
 # ---------------------------------------------------------------------------
 
 OPERATIONS_PATH = "/admin/api/cluster/assistant/operations"
@@ -1153,6 +1182,9 @@ class AssistantApplyRequest(BaseModel):
     #: The user's explicit consent to the 2-Mac fallback; it is part of the
     #: signature that apply re-proves.
     confirm_two_mac_fallback: bool = False
+    #: The rank-0 pin the approved plan was built with. Part of the plan-time
+    #: inputs, so apply re-elects with it and the record keeps it for start.
+    preferred_coordinator: str | None = Field(default=None, max_length=255)
 
     def model_identity(self) -> ModelIdentity:
         return request_model_identity(
@@ -1195,6 +1227,7 @@ class AssistantApplyRequest(BaseModel):
             target_context_tokens=self.target_context_tokens,
             resource_policy=self.resource_policy(),
             two_mac_fallback=self.confirm_two_mac_fallback,
+            preferred_coordinator=self.preferred_coordinator or "",
         )
 
 
@@ -1368,7 +1401,7 @@ class OperationErrorView(BaseModel):
 
 
 class AssistantOperationStatus(BaseModel):
-    """The operation status object (the apply/start chapter).
+    """The operation status object (CHAPTER-5.md §4.3).
 
     Deliberately separate from the measurement status: a measurement job can be
     ready while no deployment exists, and an operation can be ready while its

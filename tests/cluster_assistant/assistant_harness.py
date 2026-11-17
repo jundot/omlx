@@ -469,15 +469,15 @@ def assistant_api(
 ):
     """A ``TestClient`` over the real router, with every Mac-facing seam faked."""
 
-    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", model_layout)
+    monkeypatch.setitem(provisioning.__dict__, "inspect_safetensors_layout", model_layout)
     # The cluster-wide "is the coordinator already running something?" read is
     # a real SSH round trip in production. Tests answer "unanswerable" (not
     # busy) so no test reaches a Mac or waits for an SSH timeout.
-    monkeypatch.setattr(
-        assistant_routes, "active_operation", lambda plan: ""
+    monkeypatch.setitem(
+        assistant_routes.__dict__, "active_operation", lambda plan: ""
     )
     # The staging poll is the only sleep in these jobs; keep the suite quick.
-    monkeypatch.setattr(assistant_start, "POLL_SECONDS", 0.01)
+    monkeypatch.setitem(assistant_start.__dict__, "POLL_SECONDS", 0.01)
     store = MeasurementStore(tmp_path / "store")
     operations = OperationStore(tmp_path / "store")
     assistant_routes.configure_assistant_measurements(

@@ -8,7 +8,7 @@ must never get wrong:
 
 * the Mac running the app is not rank 0 — the elected Mac is the one whose tail
   actually fits, decided from a stored measurement;
-* the notes plan object is complete: measurement id and timestamp, signature,
+* the §13.3 plan object is complete: measurement id and timestamp, signature,
   stages, predicted stage seconds, ``observed: null`` and a real endpoint port
   with ``ready: false``;
 * a missing, unknown, stale or mismatched measurement is a distinct 409 with one
@@ -212,8 +212,45 @@ def take_measurement(client: TestClient, **overrides: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+def test_a_preferred_coordinator_is_rank_zero_and_named_in_the_plan(api) -> None:
+    """The pin decides the endpoint host; the plan says it did."""
+
+    client, _ = api()
+    measurement_id = take_measurement(client)
+
+    response = client.post(
+        PLAN_URL,
+        json=plan_payload(measurement_id, preferred_coordinator="m5"),
+    )
+
+    assert response.status_code == 200, response.text
+    plan = response.json()
+    assert plan["coordinator_node"] == "m5"
+    assert plan["rank_order"][0] == "m5"
+    assert any("pinned" in reason for reason in plan["reasons"])
+
+
+def test_a_pin_that_cannot_hold_rank_zero_is_a_refusal_that_names_it(api) -> None:
+    """Never a silent fallback: the answer says which Mac was pinned."""
+
+    client, _ = api()
+    measurement_id = take_measurement(client)
+
+    response = client.post(
+        PLAN_URL,
+        json=plan_payload(
+            measurement_id,
+            preferred_coordinator="m1",
+            rank0_extra_bytes=70 * GIB,
+        ),
+    )
+
+    assert response.status_code == 409, response.text
+    assert "pinned to m1" in response.text
+
+
 def test_plan_elects_the_remote_mac_when_the_origin_tail_does_not_fit(api) -> None:
-    """the notes at the API boundary, through a stored measurement: M1 cannot hold
+    """§7.6 at the API boundary, through a stored measurement: M1 cannot hold
     tail + head, M5 can, and the app origin does not decide it."""
 
     client, _ = api()
@@ -240,7 +277,7 @@ def test_the_plan_object_matches_the_decided_contract(api) -> None:
 
     plan = client.post(PLAN_URL, json=plan_payload(take_measurement(client))).json()
 
-    # the notes field names, exactly: no ``measurements_timestamp``, no
+    # §13.3/§8.5 field names, exactly: no ``measurements_timestamp``, no
     # ``critical_rank``, no ``endpoint.node_id``.
     assert plan["measurement_id"].startswith("ms-")
     assert plan["measurement_timestamp"]
@@ -280,7 +317,7 @@ def test_the_plan_object_matches_the_decided_contract(api) -> None:
 
 
 def test_the_origin_never_changes_the_elected_coordinator(api) -> None:
-    """the notes: the same measurement elects the same Mac from any origin."""
+    """§7.2: the same measurement elects the same Mac from any origin."""
 
     client, _ = api()
     measurement_id = take_measurement(client)
@@ -469,7 +506,7 @@ def test_an_mtp_mismatch_is_a_stale_409(api) -> None:
 
 
 def test_tensor_parallelism_is_rejected_instead_of_being_planned_as_pp(api) -> None:
-    """the notes: an explicit 4xx, and no PP plan smuggled into the body."""
+    """§8.1: an explicit 4xx, and no PP plan smuggled into the body."""
 
     client, _ = api()
     measurement_id = take_measurement(client)
@@ -488,7 +525,7 @@ def test_tensor_parallelism_is_rejected_instead_of_being_planned_as_pp(api) -> N
 
 
 def test_an_infeasible_cluster_is_409_and_names_no_coordinator(api) -> None:
-    """the notes: no plan is an explicit answer, never the local Mac."""
+    """§7.7/§8.6: no plan is an explicit answer, never the local Mac."""
 
     client, _ = api()
     measurement_id = take_measurement(
@@ -519,7 +556,7 @@ def test_an_infeasible_cluster_is_409_and_names_no_coordinator(api) -> None:
 
 
 def test_an_unmeasured_plan_is_flagged_instead_of_being_called_fast(api) -> None:
-    """the notes: with no probe the plan says "unknown", not a rate."""
+    """§17.2: with no probe the plan says "unknown", not a rate."""
 
     client, _ = api()
     measurement_id = take_measurement(client, include_performance_probe=False)
@@ -540,7 +577,7 @@ def test_an_unmeasured_plan_is_flagged_instead_of_being_called_fast(api) -> None
 
 
 def test_planning_is_idempotent_and_has_no_side_effects(api) -> None:
-    """the notes: ``plan`` is a pure function of the stored measurement."""
+    """§13.2: ``plan`` is a pure function of the stored measurement."""
 
     client, store = api()
     measurement_id = take_measurement(client)
@@ -565,19 +602,19 @@ def test_plan_never_reads_settings_or_runs_a_probe(api, monkeypatch) -> None:
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("plan must not read settings or run a probe")
 
-    monkeypatch.setattr(assistant_routes, "_server_settings", forbidden)
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(assistant_routes.__dict__, "_server_settings", forbidden)
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "_measure_probes",
         forbidden,
     )
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "default_measure_probes",
         forbidden,
     )
-    monkeypatch.setattr(
-        assistant_routes,
+    monkeypatch.setitem(
+        assistant_routes.__dict__,
         "measurement_timestamp",
         forbidden,
     )
@@ -602,11 +639,11 @@ def test_the_router_exposes_the_assistant_routes(api) -> None:
         # elected coordinator, through the same local/remote seam.
         (STOP_URL, ["POST"]),
         # The automatic constellation search loop: rank, oMLX plans+starts,
-        # measure, pick the best measured, stop the losers.
+        # measure, pick the best measured, stop the losers (API-first; UI later).
         (SEARCH_URL, ["POST"]),
         (SEARCH_URL + "/{job_id}", ["GET"]),
         # Fine-tune the winning constellation (chunk/sampler/MTP) with real
-        # completions on its coordinator. One synchronous answer, no poll.
+        # completions on its coordinator.
         (TUNE_URL, ["POST"]),
         # Tune the per-model knobs (MTP on/off + depth) by redeploying each
         # config once; the winner is saved per (model, node config).
@@ -615,11 +652,20 @@ def test_the_router_exposes_the_assistant_routes(api) -> None:
         # Read-only: the saved tuning preset for an operation's model + node set,
         # so a later Start's replay is visible (never a key or SSH target).
         (TUNING_PRESET_URL, ["GET"]),
-        # Read-only: the probe switch, and its one write.
-        (PERFORMANCE_PROBE_URL, ["GET"]),
-        (PERFORMANCE_PROBE_URL, ["POST"]),
+        # Run the measured model on this Mac alone (single-node inference, no
+        # cluster): an async job, because the engine-pool load blocks.
+        (RUN_LOCAL_URL, ["POST"]),
+        (RUN_LOCAL_URL + "/{job_id}", ["GET"]),
+        # Stop a local run and unload its model on this Mac (idempotent).
+        (RUN_LOCAL_URL + "/{job_id}/stop", ["POST"]),
+        # Tune the model that ready local run serves: the sampler per request,
+        # then every MTP config by reloading it on this Mac alone.
+        (TUNE_LOCAL_URL, ["POST"]),
+        (TUNE_LOCAL_URL + "/{tune_job_id}", ["GET"]),
         # Read-only: the last persisted deployment, so a reloaded card can show
         # Running/Stopped and offer Start again.
+        (PERFORMANCE_PROBE_URL, ["GET"]),
+        (PERFORMANCE_PROBE_URL, ["POST"]),
         (SESSION_URL, ["GET"]),
         # Read-only: the redacted support bundle for the last measurement and
         # operation (no key, SSH target, model path, prompt or completion).
@@ -634,7 +680,7 @@ def test_the_router_exposes_the_assistant_routes(api) -> None:
         (OPERATIONS_URL + "/mirror", ["POST"]),
         (OPERATIONS_URL + "/{operation_id}", ["GET"]),
         # The free-space affordance: one model, on one measured Mac, through that
-        # Mac's own delete route (the live-run notes).
+        # Mac's own delete route (PHASE-2B-RUN.md §9).
         (
             "/admin/api/cluster/assistant/models/{node_id}/{model_id:path}",
             ["DELETE"],
@@ -736,8 +782,8 @@ def test_the_plan_is_built_from_the_layout_the_measurement_recorded(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("plan re-read the checkpoint instead of the record")
 
-    monkeypatch.setattr(provisioning, "inspect_safetensors_layout", forbidden)
-    monkeypatch.setattr(provisioning, "model_layout_for", forbidden)
+    monkeypatch.setitem(provisioning.__dict__, "inspect_safetensors_layout", forbidden)
+    monkeypatch.setitem(provisioning.__dict__, "model_layout_for", forbidden)
 
     response = client.post(PLAN_URL, json=plan_payload(measurement_id))
 

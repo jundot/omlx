@@ -3,7 +3,7 @@
 
 The calibration runs dev-1.5b on each Mac and converts its real throughput into
 the planner's ComputeProfile. These tests pin the conversion physics and the
-published-spec ordering (REVIEW-2026-11-13.md B10 / E4=B; the live-run notes):
+published-spec ordering (REVIEW-2026-11-13.md B10 / E4=B; PHASE-2B-RUN.md §17):
 
 * decode tok/s is bandwidth-proportional -> M2 Ultra > M5 Max > M1 Max.
 * prefill tok/s is compute-proportional  -> M5 Max > M2 Ultra > M1 Max.

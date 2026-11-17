@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run apply and start on the *elected* coordinator, never on the origin.
 
-The two jobs this module drives are the ones the design notes describes:
+The two jobs this module drives are the ones PROJECT-BRIEF §9.2 describes:
 
 ``apply``  prepare and stage the model on the elected Mac; start nothing.
 ``start``  health, activation, load, readiness canary, endpoint ready.
@@ -49,6 +49,7 @@ from urllib.parse import quote
 from ..deployment import validate_ssh_target
 from ..liveness import PeerLostError, check_peers, probe_peer, raise_if_peer_lost
 from ..staging import DEFAULT_REMOTE_PYTHON, run_remote_python
+from .models import ACTION_ADJUST_PLAN
 from .operations import (
     ACTION_APPLY,
     ACTION_DIAGNOSTICS,
@@ -131,7 +132,7 @@ CHAT_PROFILE: dict[str, Any] = {
     "force_sampling": True,
 }
 ACTIVE_OPERATION_PATH = "/admin/api/cluster/assistant/operations/active"
-# The cluster-wide lock (the apply/start chapter): the origin mirrors its operation onto
+# The cluster-wide lock (CHAPTER-5 §2.2): the origin mirrors its operation onto
 # the coordinator's own store through the same admin seam, so the coordinator
 # can answer ``operations/active`` while a remote apply/start is working.
 # Server-to-server only; the browser never calls it.
@@ -240,7 +241,7 @@ class CoordinatorOps:
     #: the coordinator's profiles. Optional for tests/older coordinators.
     probe: Callable[[Any], Mapping[str, Any]] | None = None
     #: Mirror one operation lifecycle state onto the coordinator's own store
-    #: (the cluster-wide lock, the apply/start chapter). The body carries the origin's
+    #: (the cluster-wide lock, CHAPTER-5 §2.2). The body carries the origin's
     #: operation ID, kind, coordinator, state and model/context for display.
     #: Remote coordinators only: a local coordinator shares this store, so
     #: ``store.start`` already refuses a second operation and the mirror stays
@@ -292,7 +293,7 @@ def coordinator_active_operation(
         return ""
     admin = remote or remote_admin
     try:
-        reply = admin(
+        reply: Any = admin(
             validate_ssh_target(plan.coordinator.ssh),
             port,
             ACTIVE_OPERATION_PATH,
@@ -1266,23 +1267,24 @@ async def run_start_job(
             # Macs (a previous deployment or an app still holds it), not a
             # coordinator that is down. Retrying without freeing memory just
             # fails again, so name the cause and the fix instead.
-            action = ACTION_DIAGNOSTICS
-            message = (
-                f"{message} Another deployment or app on a selected Mac is still "
-                "holding memory; stop the previous cluster (Screen 6) or close "
-                "apps on that Mac, then Start again."
-            )
+            action = ACTION_ADJUST_PLAN
+            message = _memory_refusal_detail(message)
         _fail(store, operation_id, "coordinator_start_failed", message, action)
     except ProvisioningError as exc:
         _fail(store, operation_id, exc.code, exc.message, exc.action)
     except Exception as exc:  # noqa: BLE001 - a job may never stay starting
-        _fail(
-            store,
-            operation_id,
-            "start_failed",
-            _redacted(exc),
-            ACTION_RETRY_COORDINATOR,
-        )
+        message = _redacted(exc)
+        action = ACTION_RETRY_COORDINATOR
+        if any(hint in message for hint in _MEMORY_PRESSURE_HINTS):
+            # Measured live 2026-11-16: the coordinator answered "503: Model
+            # does not fit the current per-node memory limits ... can admit
+            # 45.2 GiB" and the card then told the user oMLX "is not reachable"
+            # and to open it — on a Mac that was running the whole time.
+            # Nothing was started, and the fix is the plan or the memory, so
+            # the one action is the model/context step.
+            action = ACTION_ADJUST_PLAN
+            message = _memory_refusal_detail(message)
+        _fail(store, operation_id, "start_failed", message, action)
     finally:
         # Every terminal path (ready or failed) releases the coordinator's
         # lock marker; the release is best-effort and never fails the job.
@@ -1338,6 +1340,9 @@ def start_inputs(record: Any, *, model: Any) -> PlanInputs:
         ),
         resource_policy=ResourcePolicy.from_dict(record.policy),
         two_mac_fallback=bool(getattr(record, "two_mac_fallback", False)),
+        preferred_coordinator=str(
+            getattr(record, "preferred_coordinator", "") or ""
+        ),
     )
 
 
@@ -1399,7 +1404,7 @@ def _fail(
 
 
 # ---------------------------------------------------------------------------
-# The cluster-wide lock: mirror the operation onto the coordinator (the notes)
+# The cluster-wide lock: mirror the operation onto the coordinator (§2.2)
 # ---------------------------------------------------------------------------
 
 
@@ -1527,6 +1532,21 @@ _MIRROR_ROUTE_ABSENT = (404, 405)
 #: (a previous deployment/app still holds it), not unreachable. Retrying without
 #: freeing memory cannot help, so the failure names the cause instead.
 _MEMORY_PRESSURE_HINTS = ("does not fit", "per-node memory limits")
+
+
+def _memory_refusal_detail(message: str) -> str:
+    """The cause plus the one step that helps, for a memory refusal.
+
+    Nothing was started, so "retry the coordinator" (its UI text says oMLX "is
+    not reachable") is wrong — measured live 2026-11-16. Freeing memory or a
+    smaller plan is the fix, and that is what the card's single action opens.
+    """
+
+    return (
+        f"{message} No ranks were started. Free memory on the Mac named above "
+        "(stop the previous cluster, close apps) or rebuild the plan with a "
+        "smaller context, then Start again."
+    )
 
 
 def _coordinator_message(exc: RemoteAdminError, plan: ApplyPlan | None) -> str:

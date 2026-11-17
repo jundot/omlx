@@ -5,7 +5,7 @@
 injected seam — the same completion shape ``CoordinatorOps.observe`` uses —
 and converts oMLX's own usage fields into a ``ComputeProfile``. No real
 Mac/model/SSH here (AGENTS.md): the seam is a fake that records bodies and
-replays usage replies. Live evidence belongs in the live-run notes.
+replays usage replies. Live evidence belongs in PHASE-2B-RUN.md.
 """
 
 from __future__ import annotations

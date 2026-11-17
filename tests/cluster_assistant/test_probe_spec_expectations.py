@@ -21,7 +21,7 @@ So the expected ordering is:
 
 These tests are fake-driven (AGENTS.md): they feed spec-derived profiles through
 the real planner timing function. The live measured rates that confirm the
-ordering on the validation cluster are recorded in the live-run notes, not here.
+ordering on the validation cluster are recorded in PHASE-2B-RUN.md, not here.
 """
 
 from __future__ import annotations

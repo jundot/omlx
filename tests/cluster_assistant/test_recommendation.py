@@ -215,7 +215,7 @@ def test_a_model_that_cannot_fit_is_refused_with_exactly_one_action() -> None:
 
 
 def test_a_model_that_would_need_tensor_parallelism_is_refused_not_offered() -> None:
-    """the notes: PP only. A TP-shaped candidate gets a reason and an action."""
+    """§8.1: PP only. A TP-shaped candidate gets a reason and an action."""
 
     tensor_only = candidate(
         "/models/tensor",
@@ -467,7 +467,7 @@ def test_a_mac_without_room_for_the_copy_is_flagged_with_one_action() -> None:
 
 
 def test_without_measured_compute_there_is_no_rate_anywhere() -> None:
-    """the notes: unknown is not fast."""
+    """§17.2: unknown is not fast."""
 
     result = recommend(
         [
@@ -770,7 +770,7 @@ def test_presence_is_unknown_when_the_catalogue_was_not_measured():
 
 
 # ---------------------------------------------------------------------------
-# Single-node option (E6, the live-run notes)
+# Single-node option (E6, PHASE-2B-RUN §22)
 # ---------------------------------------------------------------------------
 
 
