@@ -5253,6 +5253,16 @@ def _holds_chat_template(path: Path) -> bool:
         return True
 
 
+# Sidecars are copied with shutil.copy (contents and mode), not copy2 or
+# copytree: files on SMB shares carry SF_ARCHIVED, which only root may set.
+def _copy_sidecar_tree(src: Path, dst: Path) -> None:
+    for path in src.rglob("*"):
+        if path.is_file():
+            target = dst / path.relative_to(src)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(path, target)
+
+
 def _copy_model_sidecars(
     source: Path, output: Path, *, text_only: bool = False, model_type: str = ""
 ) -> None:
@@ -5266,23 +5276,23 @@ def _copy_model_sidecars(
     """
     for pattern in _SIDECAR_PATTERNS:
         for src_file in source.glob(pattern):
-            shutil.copy2(src_file, output / src_file.name)
+            shutil.copy(src_file, output / src_file.name)
 
     for pattern in _MULTIMODAL_SIDECAR_PATTERNS:
         for src_file in source.glob(pattern):
             if text_only and not _holds_chat_template(src_file):
                 continue
-            shutil.copy2(src_file, output / src_file.name)
+            shutil.copy(src_file, output / src_file.name)
 
     for py_file in source.glob("*.py"):
-        shutil.copy2(py_file, output / py_file.name)
+        shutil.copy(py_file, output / py_file.name)
 
     # LFM3 speech decoding loads its codec separately from the model weights.
     if not text_only and model_type == "lfm3_omni":
         for name in ("audio_tokenizer", "audio_detokenizer"):
             codec = source / name
             if codec.is_dir():
-                shutil.copytree(codec, output / name)
+                _copy_sidecar_tree(codec, output / name)
 
 
 def _copy_bundled_drafts(source: Path, output: Path) -> None:
@@ -5293,7 +5303,7 @@ def _copy_bundled_drafts(source: Path, output: Path) -> None:
     """
     draft = minimax_dspark.bundled_dspark_path(source)
     if draft is not None:
-        shutil.copytree(draft, output / draft.name, dirs_exist_ok=True)
+        _copy_sidecar_tree(draft, output / draft.name)
 
 
 def _build_non_quantizable_set(config: dict) -> set:
@@ -8093,7 +8103,7 @@ def quantize_oq_streaming(
     )
     for name in DECISION_SIDECAR_FILES:
         if (source / name).is_file():
-            shutil.copy2(source / name, output / name)
+            shutil.copy(source / name, output / name)
     if not text_only:
         _copy_bundled_drafts(source, output)
     if inkling2_layout.is_inkling2(config):
@@ -10056,12 +10066,18 @@ def _collect_imatrix_from_model(
 _STREAM_TEXT_LAYER_PREFIX = "language_model.model.layers."
 _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
 
+# Qwen3.5 / 3.6 and their text-only Hugging Face names.
+_QWEN3_5_STREAM_MODEL_TYPES = frozenset(
+    {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
+)
+
 # Only these checkpoint model_types have a streamed sourcer. Every other layout
 # keeps the RAM-safe proxy calibration path: the auto rule never streams them,
 # and an explicit stream_calibration request for one fails fast (see
 # _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
 _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset(
     {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark", "flint"}
+    | _QWEN3_5_STREAM_MODEL_TYPES
 )
 
 
@@ -10077,7 +10093,14 @@ def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
     settings = _calibration_model_settings(
         config, has_mtp_heads=False, has_mtp_weights=False
     )
-    maybe_apply_pre_load_patches(str(model_path), for_vlm=True, model_settings=settings)
+    is_qwen3_5 = _is_qwen3_5_stream(config)
+    maybe_apply_pre_load_patches(
+        str(model_path),
+        for_vlm=_is_vlm_load(config) if is_qwen3_5 else True,
+        model_settings=settings,
+    )
+    if is_qwen3_5:
+        return _qwen3_5_stream_text_args(config)
     if _stream_source_model_type(config) == "flint":
         from mlx_vlm.models.flint.config import ModelConfig
         from mlx_vlm.models.flint.language import DecoderLayer
@@ -10268,6 +10291,28 @@ def _streamed_embed(embed_weight, calib_data, config: dict):
 
 def _stream_source_model_type(config: dict) -> str:
     return str(config.get("model_type", "")).lower()
+
+
+def _is_qwen3_5_stream(config: dict) -> bool:
+    return _stream_source_model_type(config) in _QWEN3_5_STREAM_MODEL_TYPES
+
+
+def _qwen3_5_stream_text_args(config: dict):
+    """Qwen3.5 decoder config and block of the library the resident path loads."""
+    text_config = config.get("text_config") or config
+    if not _is_vlm_load(config):
+        from mlx_lm.models import qwen3_5
+
+        return qwen3_5.TextModelArgs.from_dict(text_config), qwen3_5.DecoderLayer
+    if "moe" in _stream_source_model_type(config):
+        from mlx_vlm.models.qwen3_5_moe.config import TextConfig
+        from mlx_vlm.models.qwen3_5_moe.language import (
+            Qwen3_5MoeDecoderLayer as layer_cls,
+        )
+    else:
+        from mlx_vlm.models.qwen3_5.config import TextConfig
+        from mlx_vlm.models.qwen3_5.language import Qwen3_5DecoderLayer as layer_cls
+    return TextConfig.from_dict(text_config), layer_cls
 
 
 _QWEN4_EXP_PLE_SHARD_KEY_RE = re.compile(
@@ -10534,6 +10579,8 @@ def _streamed_sensitivity_layer(
         layer_mask = None if bool(getattr(block, "is_linear", False)) else state["mask"]
     elif layer_masks is not None:
         layer_mask = layer_masks[layer_idx]
+    elif _is_recurrent_layer(block):
+        layer_mask = None
     else:
         layer_mask = state["mask"]
     out_float, _ = _forward_layer_result(
@@ -10670,6 +10717,57 @@ def _collect_streamed_glm5_next_mtp(
     return installed
 
 
+def _qwen3_5_stream_mtp_head(config: dict):
+    """The MTP head oMLX attaches to the resident Qwen3.5 model, and its args."""
+    if _is_vlm_load(config):
+        from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+
+        apply_mlx_vlm_mtp_runtime_patch(_stream_source_model_type(config))
+    else:
+        from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+
+        apply_mlx_lm_mtp_patch()
+    # Built after the patch, which keeps mtp_num_hidden_layers on the args.
+    args, layer_cls = _qwen3_5_stream_text_args(config)
+    return sys.modules[layer_cls.__module__].MTPModule(args), args
+
+
+def _collect_streamed_qwen3_5_mtp(
+    source, config, collector, calib_data, working, ranges
+) -> int:
+    """Streamed counterpart of the generic branch of _collect_mtp_head_imatrix."""
+    from mlx_lm.models.cache import KVCache
+
+    prefix = "language_model.mtp."
+    plan = _streamed_source_plan(source, config, preserve_mtp=True)
+    head, args = _qwen3_5_stream_mtp_head(config)
+    head.eval()
+    head.load_weights(
+        [
+            (key[len(prefix) :], plan.pop(key))
+            for key in list(plan)
+            if key.startswith(prefix)
+        ],
+        strict=True,
+    )
+    embed_weight = plan.pop(_STREAM_EMBED_KEY)
+    embed = nn.Embedding(*embed_weight.shape)
+    embed.weight = embed_weight
+    norm = nn.RMSNorm(int(embed_weight.shape[1]), eps=float(args.rms_norm_eps))
+    norm.weight = plan.pop("language_model.model.norm.weight")
+    del embed_weight
+    mx.eval(head.parameters(), embed.parameters(), norm.parameters())
+    installed = collector.install(head, name_prefix=prefix)
+    try:
+        for hidden, (lo, hi) in zip(working, ranges):
+            cache = [KVCache() for _ in head.layers]
+            out = head(norm(hidden[:, :-1, :]), calib_data[lo:hi, 1:], embed, cache)
+            mx.eval(out)
+    finally:
+        collector.restore(head)
+    return installed
+
+
 def _collect_imatrix_streaming(
     source,
     tokenizer,
@@ -10730,7 +10828,10 @@ def _collect_imatrix_streaming(
     is_glm5_next = _stream_source_model_type(config) == "glm5_next"
     collect_mtp = (
         require_mtp_entries
-        and _stream_source_model_type(config) in ("qwen4_exp", "glm5_next")
+        and (
+            _stream_source_model_type(config) in ("qwen4_exp", "glm5_next")
+            or _is_qwen3_5_stream(config)
+        )
         and _has_mtp_heads(config)
         and _checkpoint_has_mtp_weights(source)
     )
@@ -10819,12 +10920,12 @@ def _collect_imatrix_streaming(
         mask = None
         position_ids = {"kind": _FLINT_LAYER_STATE_KIND}
     else:
-        # One causal mask and one position-id row serve every layer and every
-        # micro-batch: both depend only on seq_length and the activation dtype.
+        # One causal mask serves every attention layer and micro-batch. Position
+        # ids keep one row per sample, sliced per micro-batch below.
         _, layer_masks, position_ids = _prepare_layer_inputs(
             _StreamingNoModel(),
             [None],
-            calib_data[:1],
+            calib_data,
             embedded[:1],
             noncausal=_noncausal_attention(config),
         )
@@ -10865,14 +10966,15 @@ def _collect_imatrix_streaming(
         round_stop = min(round_start + step_samples, max_samples)
         ranges = _stream_round_micro_ranges(round_start, round_stop, micro_batch_size)
         working = [embedded[lo:hi] for lo, hi in ranges]
-        slot_states = (
-            [
+        if is_qwen4_exp:
+            slot_states = [
                 _streamed_qwen4_exp_slot_state(calib_data, q4_position_ids, lo, hi)
                 for lo, hi in ranges
             ]
-            if is_qwen4_exp
-            else None
-        )
+        elif isinstance(position_ids, mx.array):
+            slot_states = [position_ids[lo:hi] for lo, hi in ranges]
+        else:
+            slot_states = None
 
         first_streamed_layer = round_index == 0
         for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
@@ -10901,6 +11003,9 @@ def _collect_imatrix_streaming(
                 layer_mask = q4_layer_masks[layer_idx]
             elif is_glm5_next:
                 layer_mask = None if bool(getattr(block, "is_linear", False)) else mask
+            elif _is_recurrent_layer(block):
+                # Gated delta nets read a mask as a padding mask.
+                layer_mask = None
             else:
                 layer_mask = mask
             try:
@@ -10990,14 +11095,14 @@ def _collect_imatrix_streaming(
                 installed += head_entries
 
         if collect_mtp:
-            head_installed = (
-                _collect_streamed_glm5_next_mtp(
-                    source, config, collector, calib_data, working, ranges
-                )
-                if is_glm5_next
-                else _collect_streamed_qwen4_mtp(
-                    source, config, collector, calib_data, working, ranges
-                )
+            if is_glm5_next:
+                collect_head = _collect_streamed_glm5_next_mtp
+            elif _is_qwen3_5_stream(config):
+                collect_head = _collect_streamed_qwen3_5_mtp
+            else:
+                collect_head = _collect_streamed_qwen4_mtp
+            head_installed = collect_head(
+                source, config, collector, calib_data, working, ranges
             )
             if round_index == 0:
                 installed += head_installed

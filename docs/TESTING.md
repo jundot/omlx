@@ -233,7 +233,7 @@ For a real-server check, request a small `write(content: string)` call with thin
 
 # Streamed oQ calibration tests
 
-Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. These cases replace the separate streaming test modules and need no external checkpoint.
+Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. Small Qwen3.5 checkpoints (dense and MoE, VLM and text-only) compare streamed and resident statistics and sensitivity, and check that the VLM MTP head keeps each batch row on its own MRoPE positions. These cases replace the separate streaming test modules and need no external checkpoint.
 
 # Fused routed-expert decode tests
 
