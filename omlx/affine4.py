@@ -53,6 +53,47 @@ _FUSED_QUANTIZE_LAUNCHABLE = {}
 _DEQUANTIZE_LAUNCHABLE = {}
 
 
+# Prefill attention straight from the int8 codes (INT8 Q x INT8 K on the
+# tensor ops). OMLX_ATTN_Q8Q=0 turns it off.
+_Q8Q_ATTENTION = __import__("os").environ.get("OMLX_ATTN_Q8Q", "1") == "1"
+_Q8Q_MIN_KEYS = int(__import__("os").environ.get("OMLX_ATTN_Q8Q_MIN_KEYS", "16384"))
+
+
+def _q8q_prefill_attention(cache, queries, keys_state, values_state, scale):
+    """One causal chunk of rows at the end of the history, head dim 256,
+    batch 1, the whole GQA group of a KV head in one tile; None otherwise.
+    See omlx/utils/q8q_attention.py."""
+    ks = getattr(keys_state, "_state", keys_state)
+    vs = getattr(values_state, "_state", values_state)
+    if not (hasattr(ks, "indices") and hasattr(vs, "indices")):
+        return None
+    batch, heads, rows, dim = queries.shape
+    tokens = int(ks.indices.shape[-2])
+    kv_heads = int(ks.indices.shape[1])
+    if (
+        batch != 1
+        or dim != 256
+        or kv_heads <= 0
+        or heads % kv_heads
+        or rows % 8
+        or rows > tokens
+        or tokens < _Q8Q_MIN_KEYS
+        or int(vs.indices.shape[-2]) != tokens
+    ):
+        return None
+    from .utils import q8q_attention as _q8q
+
+    rotated_queries = cache.key_codec.prepare_queries(queries).astype(mx.bfloat16)
+    k = _q8q.prepare_kv(ks.indices, ks.norms)
+    v = _q8q.prepare_kv(vs.indices, vs.norms)
+    rotated_output = _q8q.run(rotated_queries, k, v, scale)
+    output = cache.value_codec._rotate_inverse(rotated_output).astype(queries.dtype)
+    mx.eval(output)
+    output = mx.array(output)
+    mx.eval(output)
+    return output
+
+
 @cache
 def _dequantize_rotated_kernel(bits: int = _BITS):
     if not (hasattr(mx, "metal") and mx.metal.is_available()):
@@ -1408,6 +1449,19 @@ class Affine4KVCache(TurboQuantKVCache):
             and self.key_codec.dim in (64, 72, 80, 96, 128, 256)
             and (effective_mask is None or isinstance(effective_mask, str))
         ):
+            if (
+                _Q8Q_ATTENTION
+                and sinks is None
+                and effective_mask == "causal"
+                and self.key_codec.bits == 8
+                and self.value_codec.bits == 8
+                and _tensor_ops_available()
+            ):
+                output = _q8q_prefill_attention(
+                    self, queries, keys_state, values_state, scale
+                )
+                if output is not None:
+                    return output
             # Attention sinks add one logit per head to the softmax denominator. They
             # do not depend on K/V, so the orthonormal rotation leaves them unchanged.
             fused_sinks = None if sinks is None else sinks.astype(mx.bfloat16)
