@@ -30,6 +30,37 @@ head and the PLE table in the layer named by `ple_layer_ids`.
 - MTP requires a plan with room for the draft head. Set MTP explicitly; do not
   leave one node on a different MTP state.
 
+## Prefill working set of the table stage
+
+Loading a stage is only half of admitting it. Measured live on a 128 GiB +
+32 GiB split (2026-11-12), the stage holding the PLE n-gram layer grows well
+above its loaded footprint during one prefill chunk:
+
+| Chunk | Growth above load | Note |
+|---|---|---|
+| 1024 | +7.25 GiB | measured peak 16 GiB |
+| 2048 | +13.25 GiB | measured peak 22 GiB |
+| 4096 | ≤ 16.25 GiB | completed a 26k-token prefill at the 25 GiB Metal ceiling |
+
+The chunk sets the size; the context saturates above ~13k tokens. The growth
+is the table stage's per-chunk working set — not attention (the stage has one
+full-attention layer and grows 1.8× as much as an 11-attention-layer tail) and
+not the table being paged in (one lookup over the prompt reads ~0.8 GB of file
+data, an order of magnitude below the spike).
+
+The plan reserves this as `ModelLayout.table_prefill_transient_bytes(chunk)`:
+piecewise-linear through the three measured points, scaling down below 1024
+and keeping the largest measured envelope above 4096 (larger chunks are
+unmeasured; the rank guard stays the request-time authority). Only the stage
+whose layers include a `ple_layer_ids` layer pays it, and only when the plan
+offloads the table to SSD; the reservation is `max(generic attention
+transient, envelope)` there — the measured growth already contains the
+attention share, so the two are never summed. Every other stage keeps the
+generic price. A checkpoint without a lookup table plans byte-for-byte as
+before. With this reservation the split that completed live (layers 0–4 on
+the 32 GiB Mac) plans, and the split that ran out of memory (layers 0–8) is
+refused at plan time.
+
 ## Validation
 
 The 2026-11-01 two-node validation (M5 Max 128 GiB + M1 Max 32 GiB, cut 6)
@@ -56,3 +87,5 @@ prefill chunks reached about 864 tok/s prefill and 43.8 tok/s decode. See
 - `omlx/utils/model_loading.py` — pre-load adapter registration.
 - `tests/test_qwen4_cluster_adapter.py`, `tests/test_qwen4_pipeline.py` —
   regression tests.
+- `tests/test_cluster_table_prefill.py` — the measured table-stage working
+  set and the two live split outcomes.
