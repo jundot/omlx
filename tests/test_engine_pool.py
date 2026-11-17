@@ -3931,14 +3931,17 @@ class TestHasActiveRequests:
 
         engine = DummyEngine()
         assert engine.has_active_requests() is False
+        assert engine.active_request_count() == 0
 
         with engine._active_lock:
             engine._active_count += 1
         assert engine.has_active_requests() is True
+        assert engine.active_request_count() == 1
 
         with engine._active_lock:
             engine._active_count -= 1
         assert engine.has_active_requests() is False
+        assert engine.active_request_count() == 0
 
     def test_batched_engine_has_active_requests(self):
         """Test BatchedEngine.has_active_requests() via _output_collectors."""
@@ -3947,6 +3950,7 @@ class TestHasActiveRequests:
         engine = BatchedEngine.__new__(BatchedEngine)
         engine._engine = None
         assert engine.has_active_requests() is False
+        assert engine.active_request_count() == 0
 
         # Simulate engine with active collectors
         mock_engine_core = MagicMock()
@@ -3955,10 +3959,15 @@ class TestHasActiveRequests:
         mock_engine_core.engine = mock_inner
         engine._engine = mock_engine_core
         assert engine.has_active_requests() is True
+        assert engine.active_request_count() == 1
+
+        mock_inner._output_collectors = {"req1": MagicMock(), "req2": MagicMock()}
+        assert engine.active_request_count() == 2
 
         # Empty collectors
         mock_inner._output_collectors = {}
         assert engine.has_active_requests() is False
+        assert engine.active_request_count() == 0
 
     def test_vlm_engine_has_active_requests(self):
         """Test VLMBatchedEngine.has_active_requests() via _output_collectors."""
@@ -3967,6 +3976,7 @@ class TestHasActiveRequests:
         engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
         engine._engine = None
         assert engine.has_active_requests() is False
+        assert engine.active_request_count() == 0
 
         mock_engine_core = MagicMock()
         mock_inner = MagicMock()
@@ -3974,6 +3984,7 @@ class TestHasActiveRequests:
         mock_engine_core.engine = mock_inner
         engine._engine = mock_engine_core
         assert engine.has_active_requests() is True
+        assert engine.active_request_count() == 1
 
 
 class TestResolveModelId:

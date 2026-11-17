@@ -2053,6 +2053,11 @@ raise SystemExit(2)
         await self._require_healthy_cluster()
         return None
 
+    def active_request_count(self) -> int:
+        if self.runtime_failed_reason is not None:
+            return 0
+        return self._active_requests
+
     def has_active_requests(self) -> bool:
         if self.runtime_failed_reason is not None:
             return False
