@@ -142,3 +142,57 @@ def test_registry_file_contains_no_credential_fields(tmp_path):
             and "." not in value
             and "-" not in value
         ), f"value looks like a credential: {value[:16]}…"
+
+
+def test_registry_stamps_and_reports_saved_at(tmp_path):
+    """A saved placement is honest about its age (fit-gap #5, 2026-11-16)."""
+
+    model = tmp_path / "model"
+    model.mkdir()
+    deployment = _deployment(str(model))
+    registry = ClusterRegistry(tmp_path)
+
+    registry.upsert(deployment)
+    stamp = registry.saved_at(deployment.deployment_id)
+    assert stamp is not None and stamp > 0
+
+    payload = registry.to_dict()
+    assert payload["saved_at"] == {deployment.deployment_id: stamp}
+
+    # The stamp survives a restart and rides in the API payload.
+    restored = ClusterRegistry(tmp_path)
+    assert restored.saved_at(deployment.deployment_id) == stamp
+    assert restored.to_dict()["saved_at"] == {
+        deployment.deployment_id: stamp
+    }
+
+    # A re-approval of the same ID keeps the original moment.
+    restored.upsert(_deployment(str(model)))
+    assert restored.saved_at(deployment.deployment_id) == stamp
+
+    # Removing the deployment drops the stamp instead of orphaning it.
+    assert restored.remove(deployment.deployment_id) is True
+    assert restored.saved_at(deployment.deployment_id) is None
+    assert ClusterRegistry(tmp_path).saved_at(deployment.deployment_id) is None
+
+
+def test_registry_loads_files_without_saved_at(tmp_path):
+    """Old envelopes predate saved_at; they must load and report None."""
+
+    model = tmp_path / "model"
+    model.mkdir()
+    deployment = _deployment(str(model))
+    registry = ClusterRegistry(tmp_path)
+    registry.upsert(deployment)
+
+    raw = json.loads((tmp_path / "cluster" / "deployments.json").read_text())
+    del raw["saved_at"]
+    (tmp_path / "cluster" / "deployments.json").write_text(json.dumps(raw))
+
+    restored = ClusterRegistry(tmp_path)
+    assert restored.get_for_model(str(model)) == deployment
+    assert restored.saved_at(deployment.deployment_id) is None
+    # Junk values drop out instead of poisoning the label.
+    raw["saved_at"] = {"gone-id": 12, deployment.deployment_id: "not-a-number"}
+    (tmp_path / "cluster" / "deployments.json").write_text(json.dumps(raw))
+    assert ClusterRegistry(tmp_path).saved_at(deployment.deployment_id) is None

@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,11 @@ class ClusterRegistry:
         self.path = self.base_path / "cluster" / "deployments.json"
         self._lock = threading.RLock()
         self._deployments: dict[str, ClusterDeployment] = {}
+        #: deployment_id → when the setup was first saved (registry
+        #: envelope metadata, not engine input). A stale, unloaded
+        #: placement is honest about its age only if the save time rides
+        #: along (fit-gap #5, 2026-11-16).
+        self._saved_at: dict[str, float] = {}
         self.load_error: str | None = None
         #: Set when an on-disk legacy schema was upgraded on load.
         self.migrated_from: int | None = None
@@ -72,6 +78,18 @@ class ClusterRegistry:
             self._deployments = {
                 _model_key(deployment.model): deployment for deployment in deployments
             }
+            saved_at = payload.get("saved_at")
+            if isinstance(saved_at, dict):
+                # Tolerant decode: unknown ids and non-numeric values drop
+                # out; the age label then simply stays away.
+                self._saved_at = {
+                    str(key): float(value)
+                    for key, value in saved_at.items()
+                    if isinstance(value, (int, float))
+                    and str(key) in {
+                        item.deployment_id for item in self._deployments.values()
+                    }
+                }
             if len(self._deployments) != len(deployments):
                 raise ValueError("cluster deployment registry has duplicate models")
             if payload.get("schema_version") != REGISTRY_SCHEMA_VERSION:
@@ -91,6 +109,7 @@ class ClusterRegistry:
                 deployment.to_dict()
                 for _, deployment in sorted(self._deployments.items())
             ],
+            "saved_at": self._saved_at_payload(),
         }
         descriptor, temporary = tempfile.mkstemp(
             prefix=".deployments.",
@@ -140,12 +159,20 @@ class ClusterRegistry:
                 raise ValueError(
                     f"deployment ID {deployment.deployment_id!r} is already in use"
                 )
+            # First save of a setup stamps its age; a re-approval of the same
+            # ID keeps the original moment (the split did not get younger).
+            stamped = deployment.deployment_id not in self._saved_at
+            self._saved_at.setdefault(
+                deployment.deployment_id, time.time()
+            )
             previous = dict(self._deployments)
             self._deployments[_model_key(deployment.model)] = deployment
             try:
                 self._save()
             except Exception:
                 self._deployments = previous
+                if stamped:
+                    self._saved_at.pop(deployment.deployment_id, None)
                 raise
             self.load_error = None
 
@@ -163,6 +190,7 @@ class ClusterRegistry:
                 return False
             previous = dict(self._deployments)
             del self._deployments[key]
+            self._saved_at.pop(deployment_id, None)
             try:
                 self._save()
             except Exception:
@@ -170,10 +198,31 @@ class ClusterRegistry:
                 raise
             return True
 
+    def _saved_at_payload(self) -> dict[str, float]:
+        """Stamps for deployments that still exist, oldest id order first."""
+
+        present = {
+            deployment.deployment_id
+            for deployment in self._deployments.values()
+        }
+        return {
+            deployment_id: self._saved_at[deployment_id]
+            for deployment_id in sorted(self._saved_at)
+            if deployment_id in present
+        }
+
+    def saved_at(self, deployment_id: str) -> float | None:
+        """When the deployment was first saved, if this registry knows."""
+
+        with self._lock:
+            value = self._saved_at.get(deployment_id)
+            return float(value) if value is not None else None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": REGISTRY_SCHEMA_VERSION,
             "deployments": [deployment.to_dict() for deployment in self.list()],
+            "saved_at": self._saved_at_payload(),
             "load_error": self.load_error,
             "migrated_from": self.migrated_from,
         }
