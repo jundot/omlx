@@ -1209,6 +1209,24 @@ class TestStreaming:
         assert body["stream"] is True and body["return_progress"] is True
         assert engine.has_active_requests() is False
 
+    async def test_active_request_count_follows_streaming_request(self, tmp_path):
+        seen = {}
+
+        def handler(request):
+            seen["active"] = engine.active_request_count()
+            return httpx.Response(
+                200, content=_sse({"choices": [{"delta": {"content": "x"}}]})
+            )
+
+        engine = _engine_with_transport(tmp_path, handler)
+        assert engine.active_request_count() == 0
+
+        async for _ in engine.stream_chat([{"role": "user", "content": "hi"}]):
+            pass
+
+        assert seen["active"] == 1
+        assert engine.active_request_count() == 0
+
     @pytest.mark.parametrize(
         "kwargs, expected",
         [

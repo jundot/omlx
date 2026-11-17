@@ -3462,7 +3462,9 @@ async def server_status(_: bool = Depends(verify_api_key)):
             if entry.is_loading:
                 models_loading += 1
 
-    # Aggregate active/waiting requests across all loaded engines
+    # Aggregate active/waiting requests across all loaded engines. Each
+    # engine owns its count: reading local-engine internals skipped external
+    # engines such as Splash, which reported a permanent zero (#5296).
     active_requests = 0
     waiting_requests = 0
     if pool is not None:
@@ -3470,13 +3472,13 @@ async def server_status(_: bool = Depends(verify_api_key)):
             engine = entry.engine
             if engine is None:
                 continue
+            active_requests += engine.active_request_count()
             async_core = getattr(engine, "_engine", None)
             if async_core is None:
                 continue
             core = getattr(async_core, "engine", None)
             if core is None:
                 continue
-            active_requests += len(getattr(core, "_output_collectors", {}))
             sched = getattr(core, "scheduler", None)
             if sched is not None:
                 waiting_requests += len(getattr(sched, "waiting", []))

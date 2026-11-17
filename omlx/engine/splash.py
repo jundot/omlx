@@ -1274,8 +1274,11 @@ class SplashEngine(BaseEngine):
         value = (self._status or {}).get("maximum_context_tokens")
         return value if isinstance(value, int) and value > 0 else None
 
+    def active_request_count(self) -> int:
+        return self._active
+
     def has_active_requests(self) -> bool:
-        return self._active > 0
+        return self.active_request_count() > 0
 
     @property
     def ssd_cache_dir(self) -> Path | None:
