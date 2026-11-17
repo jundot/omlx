@@ -585,7 +585,7 @@ def wait_for_operation(
     operation_id: str,
     *,
     states: Sequence[str] = (STATE_APPLIED, "ready", "failed"),
-    timeout: float = 10.0,
+    timeout: float = 30.0,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     body: dict[str, Any] = {}

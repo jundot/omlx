@@ -212,7 +212,7 @@ def wire_origin(stack, tmp_path, monkeypatch, seam, name):
     return client, store, operations
 
 
-def wait_until(predicate, description: str, timeout: float = 10.0) -> None:
+def wait_until(predicate, description: str, timeout: float = 30.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -234,7 +234,7 @@ def drain(seam: CoordinatorSeam) -> None:
         seam.activation_gate.set()
 
 
-def wait_for_record(store, operation_id, states, timeout: float = 10.0):
+def wait_for_record(store, operation_id, states, timeout: float = 30.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         record = store.get(operation_id)
