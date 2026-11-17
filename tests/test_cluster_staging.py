@@ -877,12 +877,12 @@ def test_is_local_host_accepts_the_macs_own_lan_address(monkeypatch):
     staging._cached_local_interface_addresses.cache_clear()
     monkeypatch.setattr(
         "omlx.cluster.discovery.local_addr_dicts",
-        lambda: [{"ip": "192.0.2.10", "if_type": "thunderbolt"}],
+        lambda: [{"ip": "172.16.1.13", "if_type": "thunderbolt"}],
     )
 
     assert staging.is_local_host("127.0.0.1") is True
-    assert staging.is_local_host("192.0.2.10") is True
-    assert staging.is_local_host("192.0.2.12") is False
+    assert staging.is_local_host("172.16.1.13") is True
+    assert staging.is_local_host("172.16.1.12") is False
     staging._cached_local_interface_addresses.cache_clear()
 
 
@@ -898,15 +898,15 @@ def test_is_local_host_retries_after_a_failed_discovery_read(monkeypatch):
         reads.append(1)
         if len(reads) == 1:
             raise RuntimeError("discovery is not up yet")
-        return [{"ip": "192.0.2.10", "if_type": "thunderbolt"}]
+        return [{"ip": "172.16.1.13", "if_type": "thunderbolt"}]
 
     monkeypatch.setattr(
         "omlx.cluster.discovery.local_addr_dicts", discovery_not_up_then_up
     )
 
-    assert staging.is_local_host("192.0.2.10") is False, "failed read, not local"
-    assert staging.is_local_host("192.0.2.10") is True, "the next call retries"
-    assert staging.is_local_host("192.0.2.10") is True
+    assert staging.is_local_host("172.16.1.13") is False, "failed read, not local"
+    assert staging.is_local_host("172.16.1.13") is True, "the next call retries"
+    assert staging.is_local_host("172.16.1.13") is True
     assert len(reads) == 2, "the successful answer stays cached"
     staging._cached_local_interface_addresses.cache_clear()
 
