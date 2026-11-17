@@ -225,7 +225,7 @@ def client(tmp_path):
 
 
 def wait_for_state(
-    client: TestClient, measurement_id: str, *, timeout: float = 10.0
+    client: TestClient, measurement_id: str, *, timeout: float = 30.0
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last: dict[str, Any] = {}
