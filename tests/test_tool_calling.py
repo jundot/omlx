@@ -6085,3 +6085,86 @@ def test_think_tags_in_the_answer_survive_for_leading_thinking_models(
     cleaned, calls = parse_tool_calls("Strip ``<think>...</think>`` spans.", tok, None)
     assert calls is None
     assert cleaned == expected
+
+
+# ======================================================================
+# #5336 - a declared array/object parameter that reaches us as a string of
+# one-element JSON arrays (["a"]\n["b"]) must be merged back into a list.
+# ======================================================================
+
+
+class TestContainerParameterStringFragments:
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "submit_report",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "recommendations": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        }
+                    },
+                },
+            },
+        }
+    ]
+
+    def test_native_qwen_parser_string_fragments_become_list(self, monkeypatch):
+        """The qwen3_coder parser returns the fragments as a string; oMLX must
+        merge them even though the declared type never looked like a union."""
+        from types import SimpleNamespace
+
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        tok = SimpleNamespace(
+            has_tool_calling=True,
+            tool_call_start="<tool_call>",
+            tool_call_end="</tool_call>",
+            tool_parser=parse_tool_call,
+        )
+        monkeypatch.setattr(
+            tok.tool_parser, "__module__", "mlx_lm.tool_parsers.qwen3_coder"
+        )
+        value = '["alpha"]\n["beta"]\n["gamma"]'
+        text = (
+            "<tool_call><function=submit_report>"
+            f"<parameter=recommendations>{value}</parameter>"
+            "</function></tool_call>"
+        )
+
+        result = extract_tool_calls_with_thinking(
+            "", text, tok, self.TOOLS, finish_reason="stop"
+        )
+
+        assert not result.parse_errors
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args["recommendations"] == ["alpha", "beta", "gamma"]
+
+    def _props(self):
+        return self.TOOLS[0]["function"]["parameters"]["properties"]
+
+    def test_coerce_double_encoded_fragments(self):
+        """A whole array wrapped in a JSON string is still an array."""
+        val = json.dumps('["alpha"]\n["beta"]')
+        assert _coerce_param_value(
+            val, "recommendations", self._props(), "submit_report"
+        ) == ["alpha", "beta"]
+
+    def test_coerce_repaired_string_fragments(self):
+        """Bracket repair may close a truncated string that holds fragments."""
+        val = '"[\\"alpha\\"]\\n[\\"beta\\"]'
+        assert _coerce_param_value(
+            val, "recommendations", self._props(), "submit_report"
+        ) == ["alpha", "beta"]
+
+    def test_coerce_plain_string_on_array_param_unchanged(self):
+        """A single value that cannot form fragments keeps the legacy string."""
+        assert (
+            _coerce_param_value(
+                '"hello"', "recommendations", self._props(), "submit_report"
+            )
+            == "hello"
+        )

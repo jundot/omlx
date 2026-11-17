@@ -205,6 +205,13 @@ _SCHEMA_CONTAINER_TYPES = {"object", "array", "arr"}
 _SCHEMA_INT_PREFIXES = ("int", "uint", "long", "short", "unsigned")
 
 
+def _is_container_type(ptype: Any) -> bool:
+    """True when a declared parameter type is a container (array/object)."""
+    return isinstance(ptype, str) and (
+        ptype in _SCHEMA_CONTAINER_TYPES or ptype.startswith(("dict", "list"))
+    )
+
+
 def _tool_param_properties(func_name: str, tools: Optional[List]) -> dict:
     """Return the declared parameter properties for a tool, or {}."""
     if not tools:
@@ -408,17 +415,36 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             return int(num) if num == int(num) else num
         except (ValueError, OverflowError):
             pass
+    is_container = _is_container_type(ptype)
     try:
-        return json.loads(val, strict=False)
+        decoded = json.loads(val, strict=False)
     except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
-        pass
+        decoded = None
+    else:
+        if is_container and isinstance(decoded, str):
+            # Some models wrap a whole array in a JSON string, so the per-item
+            # fragments arrive double-encoded ("[\"a\"]\n[\"b\"]").  The wire
+            # type is still an array; merge the inner fragments instead of
+            # handing the caller a string (#5336).
+            merged = _merge_json_fragments(decoded, spec)
+            if merged is not None:
+                logger.warning(
+                    "Merged %d JSON-string-encoded fragments for parameter %r "
+                    "of tool %r (declared type %r)",
+                    len(merged),
+                    key,
+                    func_name,
+                    ptype,
+                )
+                return merged
+        return decoded
     try:
         literal = ast.literal_eval(val)
         if isinstance(literal, (dict, list, tuple)):
             return list(literal) if isinstance(literal, tuple) else literal
     except (ValueError, SyntaxError, TypeError, MemoryError, *_DEEP_NEST_ERRORS):
         pass
-    if ptype in _SCHEMA_CONTAINER_TYPES or ptype.startswith(("dict", "list")):
+    if is_container:
         merged = _merge_json_fragments(val, spec)
         if merged is not None:
             logger.warning(
@@ -432,6 +458,20 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             return merged
         repaired = _repair_json_value(val)
         if repaired is not None:
+            if isinstance(repaired, str):
+                # The repair closed a truncated string that itself holds the
+                # fragments, so the same double-encoding applies (#5336).
+                merged = _merge_json_fragments(repaired, spec)
+                if merged is not None:
+                    logger.warning(
+                        "Merged %d repaired JSON-string-encoded fragments for "
+                        "parameter %r of tool %r (declared type %r)",
+                        len(merged),
+                        key,
+                        func_name,
+                        ptype,
+                    )
+                    return merged
             logger.warning(
                 "Repaired malformed JSON for parameter %r of tool %r "
                 "(declared type %r)",
@@ -2162,7 +2202,17 @@ def _parse_tool_calls_impl(
                                 untyped_string = "type" not in spec and isinstance(
                                     value, str
                                 )
-                                if union_mismatch or untyped_string:
+                                # A declared container that arrives as a string
+                                # needs the same fragment merge the XML parsers
+                                # apply (#5336).
+                                container_mismatch = _is_container_type(
+                                    spec.get("type")
+                                ) and isinstance(value, str)
+                                if (
+                                    union_mismatch
+                                    or untyped_string
+                                    or container_mismatch
+                                ):
                                     arguments[key] = _coerce_param_value(
                                         val, key, props, name
                                     )
