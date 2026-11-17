@@ -7129,17 +7129,31 @@ def _quantize_chunked(w, group_size, bits, mode, importance=None):
 # --- end chunked-quantize helpers ---
 
 
+def _block_fp8_source(config: dict) -> bool:
+    """Whether the checkpoint stores block-FP8 weights that a whole-model load
+    re-quantizes (mlx-vlm converts them to mxfp8)."""
+    quantization = config.get("quantization_config") or {}
+    return (
+        isinstance(quantization, dict)
+        and quantization.get("quant_method") == "fp8"
+        and quantization.get("fmt", "e4m3") == "e4m3"
+        and quantization.get("weight_block_size") == [128, 128]
+    )
+
+
 def _resolve_stream_calibration(
     stream_calibration: bool | None,
     *,
     model_exceeds_ram: bool,
     model_type: str | None,
+    block_fp8: bool = False,
 ) -> bool:
     """Decide whether oQe calibration streams layers from the checkpoint.
 
     Explicit argument first, then the auto rule: stream when the source does
     not fit in RAM, where the resident collector would otherwise calibrate on
-    a lossy quantized proxy of the model.
+    a lossy quantized proxy of the model, or when its block-FP8 weights would
+    be re-quantized by a resident load. The streamed walk decodes them exactly.
 
     Streaming only works for the layouts the sourcer understands
     (_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES). For every other model_type
@@ -7158,7 +7172,7 @@ def _resolve_stream_calibration(
                 "proxy, or extend the streamed sourcer for this layout."
             )
         return bool(stream_calibration)
-    return model_exceeds_ram and supported
+    return (model_exceeds_ram or block_fp8) and supported
 
 
 def quantize_oq_streaming(
@@ -7543,6 +7557,7 @@ def quantize_oq_streaming(
             stream_calibration,
             model_exceeds_ram=_model_requires_proxy,
             model_type=str(config.get("model_type", "")),
+            block_fp8=_block_fp8_source(config),
         )
         if stream_imatrix:
             logger.info(
@@ -11542,6 +11557,7 @@ def _refine_captured(collector, modules: dict, writer, stats: dict) -> None:
         if spec is None or weight is None:
             continue
         if weight.dtype not in (mx.bfloat16, mx.float16, mx.float32):
+            stats["quantized"] += 1
             continue
         packed, scales, biases = writer.read(name)
         if tuple(packed.shape[:-1]) != tuple(weight.shape[:-1]):
@@ -11825,7 +11841,14 @@ def _refine_oqe_output(
         )
         return {"status": "skipped", "reason": "calibrated through a proxy"}
     writer = _OQRefineWriter(output, weight_map, quantization)
-    stats = {"tensors": 0, "kept": 0, "skipped_layers": 0, "before": 0.0, "after": 0.0}
+    stats = {
+        "tensors": 0,
+        "kept": 0,
+        "quantized": 0,
+        "skipped_layers": 0,
+        "before": 0.0,
+        "after": 0.0,
+    }
     started = _time.monotonic()
 
     def progress(done: int, total: int) -> None:
@@ -11858,10 +11881,16 @@ def _refine_oqe_output(
         100.0 * gain,
         seconds,
     )
+    if stats["quantized"]:
+        logger.warning(
+            "oQe refine: %d modules with quantized source weights kept their rounding",
+            stats["quantized"],
+        )
     return {
         "status": "done",
         "tensors": stats["tensors"],
         "kept": stats["kept"],
+        "quantized_sources": stats["quantized"],
         "skipped_layers": stats["skipped_layers"],
         "hessian_error_reduction": round(gain, 4),
         "seconds": round(seconds, 1),
