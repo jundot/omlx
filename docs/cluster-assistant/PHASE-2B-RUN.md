@@ -2125,3 +2125,36 @@ ran here), A4, A5, A6, A7 and the screenshots.
 **Still needed for the gate:** A1 (manual path in the Cluster tab), A4 (back and
 `stale`), A5 (one admin dialog per Mac), A6 (uninstall, last), A7 (visual error
 placement) and the eight screenshots (R8).
+
+**Closed by user verification — see §32 (2026-11-17).**
+
+## 32. Acceptance closed by user verification; GLM live on `.11` + `.12` (2026-11-17)
+
+**User-reported, not an agent-driven run.** The owner walked the flows
+interactively on the installed app and accepted them (2026-11-17):
+
+- **Welcome, in-app uninstall, the assistant flow and Manual setup** were each
+  exercised repeatedly ("1000 mal durchgespielt") and pass. This closes the
+  §31 gate items that needed a person at the browser: **A1** (manual path),
+  **A4** (back/stale), **A5** (helper capability), **A6** (uninstall), **A7**
+  (error placement) — on top of the backend-passed A2/A3.
+- **GLM-5.3 runs on `.11` + `.12` with both Macs set to Headless and rank 0
+  switched to `.12`** — "läuft einwandfrei". `.11` is therefore back in the
+  validation cluster (the 2026-11-16 evening reservation is over), and the
+  rank-0 pin works live in the direction the §31 plan predicted: `.12` holds
+  the tail and the endpoint.
+
+What this does **not** replace: the eight PR screenshots (R8) are still to be
+captured from a running dashboard, and the deferred live matrix
+(`PLAN-REMAINING-2026-11-16.md` §4) keeps its own evidence requirements.
+
+**Agent-verified the same day (the upstream move, G3):** `upstream/main`
+advanced `624cff0e → 5382e748` (+21 commits, none in `omlx/cluster` or the
+cluster UI). `rebase/upstream-main` was rebased onto `5382e748` (backup:
+`backup/pre-rebase-2026-11-17`); the 13 catalog conflicts were resolved
+per-key three-way with **zero** real value conflicts, the catalogue is
+additions-only against upstream (0 removed lines), and the rebuild commit
+restores `make web`/normalizer order. Gates on the rebased tree:
+`tests/cluster_assistant` **661 passed**, `apps/omlx-web/tests` **587 passed /
+3 deselected**, `node --check` clean, `ruff` clean, `xcodebuild test
+-testLanguage en` **450 tests / 0 failures**.

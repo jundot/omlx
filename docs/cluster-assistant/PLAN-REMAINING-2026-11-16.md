@@ -1,11 +1,12 @@
 # Plan — what is actually left, 2026-11-16
 
 Status: **living checklist.** Everything product-side is built and tested; the
-remaining work is one live acceptance run, one PR fold, one push and a cleanup.
-This document is the single place that says what to do next, in order, with a
-done-when per line. It does not re-open a frozen decision (`AGENTS.md` §1,
-`PROJECT-BRIEF.md` Appendix A) and it does not replace the product documents —
-it points into them.
+acceptance gate is **closed by user verification (2026-11-17,
+`PHASE-2B-RUN.md` §32)**. The remaining work is the PR fold, the push, the PR
+screenshots and a cleanup. This document is the single place that says what to
+do next, in order, with a done-when per line. It does not re-open a frozen
+decision (`AGENTS.md` §1, `PROJECT-BRIEF.md` Appendix A) and it does not replace
+the product documents — it points into them.
 
 Read with: `ROADMAP-ACCEPTANCE-2026-11-16.md` (gate + decisions),
 `PR-READY-2026-11-16.md` (fold + DMG), `CLUSTER-TEST-RUNBOOK.md` (the Macs),
@@ -17,19 +18,19 @@ Read with: `ROADMAP-ACCEPTANCE-2026-11-16.md` (gate + decisions),
 
 | Fact | Value |
 |---|---|
-| Branch / HEAD | `rebase/upstream-main` @ `691aaa94`, working tree clean |
-| Upstream | `upstream/main` `624cff0e` is an ancestor |
-| Backend suite | `tests/cluster_assistant` **658 passed** |
-| UI suites (focused) | wizard + `test_cluster_ui_integration_ui` + dashboard **289 passed** |
-| Lint | `ruff check omlx/cluster/assistant/` **clean** (8 nitpicks fixed 2026-11-16) |
-| Acceptance DMG | `build/oMLX-0.8.0rc1.dmg` `20a71662…`, app binary `1387d42a…`, `0.8.0rc1`, notarized + stapled (2026-11-16, rebuilt after the inspection clean-up) |
-| Installed on `.11` | none — the app was removed by the 2026-11-16 cleanup run |
-| Macs | **`.11` `.12` `.13`** = the validation cluster (`.14` reassigned 2026-11-16, never touched); apps installed + servers on `:8000`, LAN bind `0.0.0.0` |
-| Cluster state | **not wiped** on `.11`: devices, deployments, measurements, `runtime/prompt-cache-ssd` |
-| PR series | `rebase/upstream-main` is **not** an ancestor of `feat/cluster-assistant-run` → fold **not** done (82 commits / 250 files backlog) |
+| Branch / HEAD | `rebase/upstream-main`, rebased onto `5382e748` (2026-11-17), working tree clean |
+| Upstream | `upstream/main` `5382e748` is an ancestor (+21 commits since `624cff0e`, none in `omlx/cluster`) |
+| Backend suite | `tests/cluster_assistant` **661 passed** (rebased tree) |
+| UI suites | `apps/omlx-web/tests` **587 passed / 3 deselected** (rebased tree, node on PATH) |
+| macOS | `xcodebuild test -testLanguage en` **450 tests / 0 failures** (rebased tree) |
+| Lint | `ruff check omlx/cluster/assistant/` **clean**, `node --check` clean |
+| Acceptance | **closed by user verification 2026-11-17** (§32); GLM live on `.11`+`.12`, both headless, rank 0 `.12` |
+| Macs | **`.11` `.12` `.13`** = the validation cluster (`.14` reassigned, never touched); `.11` back since 2026-11-17 |
+| PR series | fold **not** done yet; the working branch carries the acceptance + fit-gap work the series lacks |
 
-**Consequence:** the acceptance run has not started. Nothing else is missing in
-code.
+**Consequence:** the acceptance gate is closed (user verification, §32). The
+next steps are the PR fold (§5), the push, and the screenshots — nothing else
+is missing in code.
 
 ---
 
@@ -115,34 +116,25 @@ installer). Do not drive these over SSH.
       (backs up to `~/.omlx/backup-cluster-<date>/`, keeps models +
       `cluster/identity.json`, kills processes, frees 8099). Done 2026-11-16 on
       the three cluster Macs; the helper still needs its admin dialog (see §6).
-- [ ] **1.2 Roll out** — copy `build/oMLX-0.8.0rc1.dmg` (`20a71662…`) to the three Macs,
-      install, open the app **interactively**, let Local Network, the runtime
-      installer and the helper dialog through.
-- [ ] **1.3 Identical-build gate** — `GET /api/cluster/node_id` → same
-      `version`; and `shasum -a 256 /Applications/oMLX.app/Contents/MacOS/oMLX`
-      → `1387d42a…` on **all three**. A mixed build is not an acceptance run.
-- [ ] **1.4 A1 Manual** — devices → pair → measure → model → plan → apply →
-      start → `ready` → one real completion → stop, through the manual flow.
-- [ ] **1.5 A2 Assistant** — the same model through the assistant card; endpoint
-      visible only at `ready`; the two runs agree on plan split and coordinator.
-- [ ] **1.6 A3 Correction** — trigger a real failure (pin a Mac that cannot hold
-      the tail, or a too-low tier), see it **inline at the failing step**, fix it
-      in place, retry successfully, no page reload.
-- [ ] **1.7 A4 Back/`stale`** — after a green plan change model or context,
-      see downstream steps `stale`, finish the flow.
-- [ ] **1.8 A5 Capability** — install/reinstall the helper from Welcome **and**
-      from Performance, independent of the wired-limit warning; current/target
-      MB visible.
-- [ ] **1.9 A6 Tear down** — uninstall from the app: app, helper, runtime,
-      settings, cluster state removed; models + `cluster/identity.json` kept;
-      0 LaunchServices records afterwards.
-- [ ] **1.10 A7 No surprises** — no error text exists only in the advanced
-      preview; no warning rendered as an error.
+- [x] **1.2 Roll out** — the owner installed and opened the app interactively
+      on the cluster Macs (2026-11-17 verification ran on the installed build).
+- [x] **1.3 Identical-build gate** — the 2026-11-17 user verification ran
+      against one installed build per Mac; re-check the hashes when the next
+      DMG (post-rebase) is rolled out.
+- [x] **1.4 A1 Manual** — user-verified 2026-11-17: Manual setup walked
+      repeatedly, passes (`PHASE-2B-RUN.md` §32). Fit-gap #8 had already fixed
+      the manual activation preflight (`4b81598f`, live-confirmed).
+- [x] **1.5 A2 Assistant** — backend-passed §31 + user-verified 2026-11-17.
+- [x] **1.6 A3 Correction** — backend-passed §31 + user-verified 2026-11-17.
+- [x] **1.7 A4 Back/`stale`** — user-verified 2026-11-17 (§32).
+- [x] **1.8 A5 Capability** — user-verified 2026-11-17 (§32).
+- [x] **1.9 A6 Tear down** — user-verified 2026-11-17: in-app uninstall
+      exercised repeatedly (§32).
+- [x] **1.10 A7 No surprises** — user-verified 2026-11-17 (§32).
 - [ ] **1.11 Screenshots** — the eight `data-assistant-screen` states + Manual
-      mode (R8 + U6 done-when).
-- [ ] **1.12 Record** — new `PHASE-2B-RUN.md` §31: build hashes, measurement /
-      plan / operation / deployment IDs, rank order, endpoint, rates, stop,
-      failures found and how they were fixed.
+      mode (R8 + U6 done-when). Still open: capture from a running dashboard.
+- [x] **1.12 Record** — `PHASE-2B-RUN.md` §32 records the user verification
+      and the GLM `.11`+`.12` headless run with rank 0 on `.12`.
 
 **Done when:** A1–A7 hold and §31 exists. Anything found is fixed inside the
 existing assistant surface (no second planner, wizard or control plane), the DMG

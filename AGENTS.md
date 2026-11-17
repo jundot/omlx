@@ -44,11 +44,12 @@ If a task appears to require changing one of these, stop and ask for an explicit
 
 ## 2. Repository baseline
 
-- Upstream base: `upstream/main` `624cff0e` (rebased 2026-11-14; `upstream/main` is
+- Upstream base: `upstream/main` `5382e748` (rebased 2026-11-17; `upstream/main` is
   an ancestor of HEAD).
 - Branch: **`rebase/upstream-main`** — current working branch, the fork replayed
   onto `upstream/main`. Pre-rebase history is kept untouched on
-  `feat/cluster-assistant` (`28245931`) and `backup/pre-rebase-2026-11-14`.
+  `feat/cluster-assistant` (`28245931`), `backup/pre-rebase-2026-11-14` and
+  `backup/pre-rebase-2026-11-17` (the `624cff0e`-based tree).
 - Historical base: oMLX `1e27576af5e10c8f4459e0fdcb05c5cf59245d44` (tag
   `cluster-assistant-base-2026-11-07`). It is no longer the pin; see
   `docs/cluster-assistant/REBASE-2026-11-14.md`.
@@ -787,12 +788,13 @@ Do not:
 
 ## 9. Environment reference
 
-The current validation cluster is **`.11`, `.12`, `.13`**. As of 2026-11-16 evening
-`.11` is reserved for other project work (GPU), so the live cluster is **`.12`
-(origin) + `.13`**; `.11` may return later. With `.12` (64 GiB) + `.13` (32 GiB)
-the pool admits ~73 GiB, which fits **none** of the large checkpoints (GLM-5.3
-97.7 GiB, Qwen3.8 117 GiB, DeepSeek 366 GiB) — a real 2-Mac start needs `.11`
-or a mid-size model, while small models are single-node recommendations.
+The current validation cluster is **`.11`, `.12`, `.13`**. `.11` is back since
+2026-11-17 (the 2026-11-16 evening GPU reservation is over): the owner ran
+GLM-5.3 live on **`.11` + `.12`, both Headless, rank 0 pinned to `.12`** —
+"läuft einwandfrei" (`PHASE-2B-RUN.md` §32). With `.12` (64 GiB) + `.13`
+(32 GiB) alone the pool admits ~73 GiB, which fits **none** of the large
+checkpoints (GLM-5.3 97.7 GiB, Qwen3.8 117 GiB, DeepSeek 366 GiB) — a real
+2-Mac start of a large model needs `.11`.
 **`.14` was reassigned on 2026-11-16 to its own task and needs its own oMLX
 installation: never clean, install, restart, measure or pair it.** It is not in
 `cleanup-cluster-macs.sh`'s peer list. A 3-Mac plan is the largest the
