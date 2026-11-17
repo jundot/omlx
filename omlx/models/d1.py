@@ -7,6 +7,11 @@ state and a group of questions in one forward pass: on full-attention layers
 the state and each question read each other both ways. This wrapper runs that
 pass in layer steps, as Decision 3.0 does, so other models get the GPU between
 steps of a long state.
+
+A question reads at one or more answer slots: a noul at one, a box at five (a
+presence and its four edges), and a boxes question at five per instance. The
+slot positions come from ``suffix_layout``, so no question needs a generated
+token, and only the slot hidden states reach the tied head.
 """
 
 import copy
@@ -19,6 +24,9 @@ import numpy as np
 from mlx_vlm.models.d1_lfm3_vl.d1 import SystemOne, pack_set, set_masks
 from mlx_vlm.models.d1_lfm3_vl.media import media_list, spoken
 from mlx_vlm.models.d1_lfm3_vl.prompt import (
+    Box,
+    Boxes,
+    Read,
     prefix_text,
     question_header,
     state_text,
@@ -38,14 +46,36 @@ from .decision import (
 
 def round_answer(answer: dict) -> dict:
     """Round an answer's probabilities to four places, as the other decision models do."""
-    out = {}
-    for key, value in answer.items():
-        if key == "probabilities":
-            value = {name: round4(p) for name, p in value.items()}
-        elif isinstance(value, float):
-            value = round4(value)
-        out[key] = value
-    return out
+    return {name: _round_value(value) for name, value in answer.items()}
+
+
+def _round_value(value: Any) -> Any:
+    """Round every float of an answer, including a box's edges and the presence
+    of each block of a ``boxes`` answer, which sit inside its value."""
+    if isinstance(value, float):
+        return round4(value)
+    if isinstance(value, dict):
+        return {name: _round_value(leaf) for name, leaf in value.items()}
+    if isinstance(value, list):
+        return [_round_value(leaf) for leaf in value]
+    return value
+
+
+def askable(questions: dict) -> dict:
+    """The questions of a request without the keys the schema fills with null.
+
+    mlx-vlm reads a question by which keys it has, not by their values: a
+    ``null`` ``max`` on a noul is refused as a ``max`` outside boxes, and every
+    unanswered field of :class:`SystemOneQuestion` arrives as one.
+    """
+    return {
+        name: (
+            {key: value for key, value in question.items() if value is not None}
+            if isinstance(question, dict)
+            else question
+        )
+        for name, question in questions.items()
+    }
 
 
 @dataclass
@@ -100,7 +130,7 @@ class D1Model:
             raise DecisionRequestError("videos: d1 models read images only")
         requests = self._requests
         try:
-            items = requests.named(request["questions"])
+            items = requests.named(askable(request["questions"]))
         except ValueError as exc:
             raise DecisionRequestError(str(exc)) from exc
         for name, question in items.items():
@@ -108,7 +138,31 @@ class D1Model:
                 raise DecisionRequestError(
                     f"questions.{name}: instructions must be text, not media"
                 )
+            if isinstance(question, Read):
+                raise DecisionRequestError(
+                    f"questions.{name}: a {question.type} read scores the positions "
+                    "of the state, which oMLX does not compute yet; ask a noul, "
+                    "choice, score, box, boxes, or number with a range"
+                )
+        images = decode_images(request.get("images"))
         state = request["state"]
+        asked_to_locate = any(isinstance(q, (Box, Boxes)) for q in items.values())
+        if asked_to_locate and len(images) != 1:
+            # mlx-vlm checks this in SystemOne._request, which this wrapper
+            # replaces: with no picture, or two of them, the model would read
+            # edges off the text and answer with the confidence of a real box.
+            raise DecisionRequestError(
+                "box and boxes questions read exactly one image; this request "
+                f"has {len(images)}"
+            )
+        if state is None and not images:
+            # d1 accepts a null state because a picture can be the whole state.
+            # With neither, the prompt is the question alone and the answer is
+            # a coin flip dressed as a probability.
+            raise DecisionRequestError(
+                "a d1 request needs a state or an image; with neither there is "
+                "nothing to decide about"
+            )
         state_tokens = len(
             requests.tokenizer.encode(
                 state_text(state, requests.state_style), add_special_tokens=False
@@ -118,9 +172,7 @@ class D1Model:
             raise DecisionContextLengthError(
                 f"the state needs {state_tokens} tokens; the limit is {self.limit}"
             )
-        return D1Plan(
-            request["questions"], state, items, decode_images(request.get("images"))
-        )
+        return D1Plan(request["questions"], state, items, images)
 
     def run(self, plan: D1Plan, chunk_size: ChunkSize) -> Generator[int, None, dict]:
         """Read each group of questions with the state in layer steps, then read out."""
