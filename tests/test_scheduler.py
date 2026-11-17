@@ -4404,6 +4404,54 @@ class TestSchedulerRotatingBlockAlignment:
         ):
             assert scheduler._detect_qwen35_prefill_floor() == expected
 
+    @staticmethod
+    def _windowed_scheduler(mock_tokenizer, window, args):
+        RotatingStub = type("RotatingKVCache", (), {})
+
+        class WindowedModel:
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.num_hidden_layers = 1
+                self.args = args
+
+            def make_cache(self):
+                cache = RotatingStub()
+                cache.max_size = window
+                return [cache]
+
+        scheduler = Scheduler(
+            model=WindowedModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=256),
+        )
+        scheduler.config.paged_ssd_cache_dir = "/tmp/cache"
+        return scheduler
+
+    @pytest.mark.parametrize(
+        "args,expected",
+        [
+            # Flint: 6 of 256 experts, a 513 window -> 4 windows.
+            ({"num_experts": 256, "num_experts_per_tok": 6}, 2052),
+            # The same counts in a nested text config.
+            (
+                {"text_config": {"n_routed_experts": 256, "num_experts_per_tok": 6}},
+                2052,
+            ),
+            # Dense, or MoE with enough rows per expert: one window.
+            ({}, 513),
+            ({"num_experts": 8, "num_experts_per_tok": 2}, 513),
+            ({"num_experts": 64, "num_experts_per_tok": 8}, 513),
+        ],
+    )
+    def test_sparse_moe_gets_blocks_of_2048_tokens(
+        self, mock_tokenizer, args, expected
+    ):
+        """Every chunk stops at a block boundary with the cache on, so a
+        sparse MoE needs wider blocks for its expert GEMMs to fill."""
+        scheduler = self._windowed_scheduler(mock_tokenizer, 513, args)
+        scheduler._align_block_size_with_rotating_window()
+        assert scheduler.config.paged_cache_block_size == expected
+
     def test_multiple_rotating_window_sizes_raise(self, mock_tokenizer):
         RotatingStub = type("RotatingKVCache", (), {})
 
