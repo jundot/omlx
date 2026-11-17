@@ -576,14 +576,7 @@ class BaseEngine(ABC):
         return False
 
     def active_request_count(self) -> int:
-        """Return how many requests the engine is currently serving.
-
-        ``/api/status`` sums this across loaded models. The default answers
-        0/1 from :meth:`has_active_requests` so engines that only track a
-        boolean still report something useful; engines with an exact counter
-        override this (#5296: external engines such as Splash reported a
-        permanent zero because the endpoint read local-engine internals).
-        """
+        """Return the number of in-flight requests (0/1 unless overridden)."""
         return 1 if self.has_active_requests() else 0
 
     @abstractmethod

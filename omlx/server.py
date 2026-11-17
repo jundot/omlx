@@ -3462,9 +3462,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
             if entry.is_loading:
                 models_loading += 1
 
-    # Aggregate active/waiting requests across all loaded engines. Each
-    # engine owns its count: reading local-engine internals skipped external
-    # engines such as Splash, which reported a permanent zero (#5296).
+    # Aggregate active/waiting requests across all loaded engines
     active_requests = 0
     waiting_requests = 0
     if pool is not None:
