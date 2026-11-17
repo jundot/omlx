@@ -118,6 +118,9 @@ ALLOWED_ENDPOINTS = {
     # Tuning: the quick sampler sweep and the minutes-long MTP depth sweep.
     "/admin/api/cluster/assistant/tune",
     "/admin/api/cluster/assistant/tune-redeploy",
+    "/admin/api/cluster/assistant/tune-local",
+    # Run on this Mac: single-node inference on the origin Mac, as an async job.
+    "/admin/api/cluster/assistant/run-local",
 }
 
 
@@ -3439,6 +3442,9 @@ ASSISTANT_ENDPOINTS = {
     # Tuning: the quick sampler sweep and the minutes-long MTP depth sweep.
     "/admin/api/cluster/assistant/tune",
     "/admin/api/cluster/assistant/tune-redeploy",
+    "/admin/api/cluster/assistant/tune-local",
+    # Run on this Mac: single-node inference on the origin Mac, as an async job.
+    "/admin/api/cluster/assistant/run-local",
 }
 
 ASSISTANT_ACTIONS = (
@@ -3713,10 +3719,11 @@ def test_assistant_plans_lightning_mtp_from_the_model_catalogue():
     block = javascript.split("// Assistant — the minimal Screen-3 slice", 1)[1]
 
     assert "mtp: false" not in block
-    # The model-bound measurement and the frozen plan inputs ask the question;
-    # the hardware-only entry measurement has no model to ask about (Phase C3:
-    # measure hardware, recommend, measure the chosen model).
-    assert block.count("mtp: this.assistantMtpFor(modelPath)") == 2
+    # The model-bound measurement, the frozen plan inputs and the single-node
+    # run-local request ask the question; the hardware-only entry measurement has
+    # no model to ask about (Phase C3: measure hardware, recommend, measure the
+    # chosen model).
+    assert block.count("mtp: this.assistantMtpFor(modelPath)") == 3
 
     helper = javascript.split("assistantMtpFor(modelPath) {", 1)[1].split("},", 1)[0]
     assert "mtp_compatible" in helper

@@ -3074,6 +3074,798 @@ def test_the_user_can_pick_the_experts_resident_tradeoff_for_apply():
     assert body["table_offload"] == "ple"
 
 
+# --- Run on this Mac: single-node inference, no cluster ----------------------
+#
+# PHASE-2B-RUN.md §22: a model that fits on one Mac is faster served by that
+# Mac's own engine than by a pipeline. The recommendation names it
+# (`single_node`), and the card offers one action that POSTs an async job. The
+# browser never launches anything, and the endpoint/chat link stay gated on the
+# job's own ready answer.
+
+
+def test_assistant_run_on_this_mac_posts_the_job_and_reaches_ready():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  const calls = [];
+  const polls = [
+    {
+      job_id: 'local-1', state: 'running',
+      message: 'applying the saved tuning preset before the load',
+      model_id: 'qwen', context_tokens: 32768, mtp: false,
+      endpoint: null, warnings: [], error: null,
+    },
+    {
+      job_id: 'local-1', state: 'ready',
+      message: 'qwen is ready on this Mac',
+      model_id: 'qwen', context_tokens: 32768, mtp: false,
+      endpoint: {
+        host: '192.168.1.10', port: 8099,
+        url: 'http://192.168.1.10:8099', ready: true,
+      },
+      warnings: [{
+        code: 'tuning_preset_applied',
+        message: 'the saved tuning preset was applied before the load: mtp_adaptive_max_depth',
+      }],
+      error: null,
+    },
+  ];
+  let progressDuringPoll = '';
+  global.setTimeout = (fn) => {
+    progressDuringPoll = component.assistantLocalRunProgressLabel();
+    if (typeof fn === 'function') fn();
+    return 0;
+  };
+  component.apiFetch = async (url, options = {}) => {
+    calls.push({
+      url,
+      method: (options && options.method) || 'GET',
+      body: options && options.body ? JSON.parse(options.body) : null,
+    });
+    if (url.endsWith('/assistant/run-local')) {
+      return {job_id: 'local-1', state: 'queued', poll: '/admin/api/cluster/assistant/run-local/local-1'};
+    }
+    if (url.endsWith('/assistant/run-local/local-1')) return polls.shift();
+    throw new Error('unexpected URL ' + url);
+  };
+  const available = component.assistantLocalRunAvailable();
+  const returned = await component.runAssistantLocal();
+  process.stdout.write(JSON.stringify({
+    available,
+    calls,
+    progressDuringPoll,
+    returned,
+    state: component.assistant.localRun.state,
+    modelId: component.assistant.localRun.modelId,
+    endpoint: component.assistantLocalEndpointUrl(),
+    chat: component.assistantLocalChatUrl(),
+    clusterChat: component.assistantChatUrl(),
+    warnings: component.assistantLocalRunWarnings(),
+    cardState: component.assistantState(),
+    busy: component.assistant.localRun.busy,
+    assistantBusy: component.assistant.busy,
+  }));
+})();
+"""
+        )
+    )
+
+    assert result["available"] is True
+    posts = [call for call in result["calls"] if call["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["url"] == "/admin/api/cluster/assistant/run-local"
+    # The single-node answer's own context and layer count are what is asserted
+    # to this Mac; the measurement is the model-bound one (m2), never the entry.
+    assert posts[0]["body"] == {
+        "measurement_id": "m2",
+        "model_path": "/models/qwen3-32b-4bit",
+        "layer_count": 80,
+        "context_tokens": 32768,
+        "mtp": False,
+    }
+    gets = [call for call in result["calls"] if call["method"] == "GET"]
+    assert [call["url"] for call in gets] == [
+        "/admin/api/cluster/assistant/run-local/local-1",
+        "/admin/api/cluster/assistant/run-local/local-1",
+    ]
+    # Progress is the backend's sentence, never an invented percentage.
+    assert result["progressDuringPoll"] == (
+        "applying the saved tuning preset before the load"
+    )
+    assert result["state"] == "ready"
+    assert result["returned"]["state"] == "ready"
+    assert result["modelId"] == "qwen"
+    assert result["endpoint"] == "http://192.168.1.10:8099"
+    # Screen 5, model-only: this Mac serves, so the link is this Mac's own page.
+    assert result["chat"] == "/admin/chat?model=qwen"
+    # The cluster endpoint/chat stay untouched: run-local is not a cluster ready.
+    assert result["clusterChat"] == ""
+    assert result["warnings"] == [
+        "the saved tuning preset was applied before the load: mtp_adaptive_max_depth"
+    ]
+    # No new assistant state-machine value: the card rests where it was.
+    assert result["cardState"] == "planning"
+    assert result["busy"] is False
+    assert result["assistantBusy"] is False
+
+
+def test_assistant_run_on_this_mac_is_only_offered_for_this_mac_and_guarded():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+let postedCalls = 0;
+(async () => {
+  await reachPlan();
+  component.apiFetch = async () => { postedCalls += 1; return {}; };
+  const offeredForSelf = component.assistantLocalRunAvailable();
+  // The best single node may be another Mac; this flow is local by contract.
+  component.assistant.recommendation.single_node.rank0_node = 'node-b';
+  const offeredForOther = component.assistantLocalRunAvailable();
+  const postedForOther = await component.runAssistantLocal();
+  component.assistant.recommendation.single_node.rank0_node = 'node-a';
+  // A pipeline answer is not one Mac and is never offered here.
+  component.assistant.recommendation.single_node.nodes_required = 2;
+  const offeredForPipeline = component.assistantLocalRunAvailable();
+  component.assistant.recommendation.single_node.nodes_required = 1;
+  // A second click must not start a second load on this Mac.
+  component.assistant.localRun.busy = true;
+  const postedWhileBusy = await component.runAssistantLocal();
+  component.assistant.localRun.busy = false;
+  process.stdout.write(JSON.stringify({
+    offeredForSelf, offeredForOther, postedForOther,
+    offeredForPipeline, postedWhileBusy, calls: postedCalls,
+  }));
+})();
+"""
+        )
+    )
+
+    assert result == {
+        "offeredForSelf": True,
+        "offeredForOther": False,
+        "postedForOther": None,
+        "offeredForPipeline": False,
+        "postedWhileBusy": None,
+        "calls": 0,
+    }
+
+
+def test_assistant_run_on_this_mac_failure_keeps_the_one_action():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  global.setTimeout = () => 0;
+  component.apiFetch = async (url) => {
+    if (url.endsWith('/assistant/run-local')) {
+      return {job_id: 'local-2', state: 'queued', poll: '/admin/api/cluster/assistant/run-local/local-2'};
+    }
+    return {
+      job_id: 'local-2', state: 'failed',
+      message: 'only 2,048 tokens of context fit on node-a alone, below the requested 32,768; lower the context or choose a smaller model',
+      model_id: 'qwen', context_tokens: 0, mtp: false,
+      endpoint: null, warnings: [],
+      error: {
+        code: 'context_too_large',
+        message: 'only 2,048 tokens of context fit on node-a alone, below the requested 32,768; lower the context or choose a smaller model',
+        action: 'adjust_model_or_context',
+      },
+    };
+  };
+  const returned = await component.runAssistantLocal();
+  process.stdout.write(JSON.stringify({
+    returned,
+    state: component.assistant.localRun.state,
+    error: component.assistant.localRun.error,
+    action: component.assistant.localRun.errorAction,
+    endpoint: component.assistantLocalEndpointUrl(),
+    chat: component.assistantLocalChatUrl(),
+    clusterChat: component.assistantChatUrl(),
+  }));
+})();
+"""
+        )
+    )
+
+    assert result["returned"] is None
+    assert result["state"] == "failed"
+    assert result["action"] == "adjust_model_or_context"
+    assert "below the requested 32,768" in result["error"]
+    # A failed run never shows an endpoint or a chat link.
+    assert result["endpoint"] == ""
+    assert result["chat"] == ""
+    assert result["clusterChat"] == ""
+
+
+def test_assistant_local_run_markup_and_poll_are_declared_and_ready_gated():
+    template = (ROOT / "omlx_web/templates/dashboard/_cluster_v2.html").read_text()
+    javascript = (ROOT / "omlx_web/static/js/cluster_v2.js").read_text()
+
+    start = template.index("<!-- Run on this Mac: single-node inference")
+    block = template[start : template.index("<!-- Search: the automatic", start)]
+    for marker in (
+        "data-cluster-v2-assistant-local-run>",
+        "data-cluster-v2-assistant-local-run-button",
+        "data-cluster-v2-assistant-local-run-busy",
+        "data-cluster-v2-assistant-local-run-progress",
+        "data-cluster-v2-assistant-local-run-error",
+        "data-cluster-v2-assistant-local-run-action",
+        "data-cluster-v2-assistant-local-run-warning",
+        "data-cluster-v2-assistant-local-run-endpoint",
+        "data-cluster-v2-assistant-local-run-endpoint-url",
+        "data-cluster-v2-assistant-local-run-open-chat",
+        "data-cluster-v2-assistant-local-run-model",
+        "data-cluster-v2-assistant-local-run-context",
+    ):
+        assert marker in block, marker
+    # The button is only offered for this Mac's own single-node answer, and the
+    # endpoint + chat link live inside a ready-gated container.
+    assert "assistantLocalRunAvailable()" in block
+    assert "assistantLocalRunVisible()" in block
+    assert 'x-show="assistantLocalEndpointUrl()"' in block
+    assert "openAssistantLocalChat()" in block
+    # No token rate or percentage is rendered by this block.
+    assert "tok/s" not in block
+    assert "%" not in block
+
+    assert "runLocal: '/admin/api/cluster/assistant/run-local'" in javascript
+    assert "/admin/api/cluster/assistant/run-local/${encodeURIComponent(jobId)}" in javascript
+
+    # One job, one loop, generation-guarded; it stops at ready/failed and never
+    # opens a stream.
+    poll = javascript.split("async pollAssistantLocalRun(", 1)[1].split(
+        "applyAssistantLocalRun(snapshot) {", 1
+    )[0]
+    assert "generation !== job.generation" in poll
+    assert "job.state === 'ready'" in poll
+    assert "job.state === 'failed'" in poll
+    assert "await new Promise" in poll
+    assert "EventSource" not in poll
+
+    run = javascript.split("async runAssistantLocal(", 1)[1].split(
+        "async pollAssistantLocalRun(", 1
+    )[0]
+    assert "assistantRunning()" in run
+    assert "assistant.localRun.busy" in run
+    assert "refusal.action" in run
+    # The browser asks only the assistant route: it never deploys, stages,
+    # launches or dials another Mac.
+    assert "/admin/api/cluster/deployments" not in run
+    assert "EventSource" not in javascript
+
+
+# --- Run on this Mac: Stop/Unload + strict readiness -------------------------
+#
+# PHASE-2B-RUN.md §28 recorded that a local run had no stop/unload affordance:
+# the engine kept serving until the model unloaded. Stop is the job's own stop
+# route (idempotent on the backend), posted once, and followed by one re-read so
+# the card never claims "stopped" without the job saying so. The endpoint and
+# Open Chat stay gated on state === 'ready' *and* endpoint.ready === true.
+
+
+def test_assistant_local_run_stop_posts_once_and_retires_the_serving_surface():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  const notifications = [];
+  component.notify = (type, message) => notifications.push({type, message});
+  const calls = [];
+  let stopPosts = 0;
+  const ready = {
+    job_id: 'local-3', state: 'ready',
+    message: 'qwen is ready on this Mac (readiness check passed)',
+    model_id: 'qwen', context_tokens: 32768, mtp: false,
+    endpoint: {
+      host: '127.0.0.1', port: 8099,
+      url: 'http://127.0.0.1:8099', ready: true,
+    },
+    warnings: [], error: null,
+  };
+  const stopped = {
+    job_id: 'local-3', state: 'failed',
+    message: 'the local run was stopped on this Mac',
+    model_id: 'qwen', context_tokens: 0, mtp: false,
+    endpoint: null, warnings: [],
+    error: {
+      code: 'stopped',
+      message: 'the local run was stopped on this Mac',
+      action: '',
+    },
+  };
+  const polls = [
+    {
+      job_id: 'local-3', state: 'running',
+      message: 'applying the saved tuning preset before the load',
+      endpoint: null, warnings: [], error: null,
+    },
+    ready,
+  ];
+  global.setTimeout = (fn) => {
+    if (typeof fn === 'function') fn();
+    return 0;
+  };
+  component.apiFetch = async (url, options = {}) => {
+    calls.push({url, method: (options && options.method) || 'GET'});
+    if (url.endsWith('/assistant/run-local')) {
+      return {job_id: 'local-3', state: 'queued'};
+    }
+    if (url.endsWith('/assistant/run-local/local-3/stop')) {
+      stopPosts += 1;
+      return {job_id: 'local-3', stopped: true};
+    }
+    if (url.endsWith('/assistant/run-local/local-3')) {
+      return polls.length ? polls.shift() : stopped;
+    }
+    throw new Error('unexpected URL ' + url);
+  };
+  const ran = await component.runAssistantLocal();
+  const before = {
+    state: component.assistant.localRun.state,
+    endpoint: component.assistantLocalEndpointUrl(),
+    chat: component.assistantLocalChatUrl(),
+    stoppable: component.assistantLocalRunStoppable(),
+  };
+  const stopResult = await component.stopAssistantLocalRun();
+  const after = {
+    state: component.assistant.localRun.state,
+    stopped: component.assistant.localRun.stopped,
+    stopping: component.assistant.localRun.stopping,
+    endpoint: component.assistantLocalEndpointUrl(),
+    chat: component.assistantLocalChatUrl(),
+    stoppable: component.assistantLocalRunStoppable(),
+    error: component.assistant.localRun.error,
+    busy: component.assistant.localRun.busy,
+    assistantBusy: component.assistant.busy,
+  };
+  // A second click must not post the same stop again.
+  const again = await component.stopAssistantLocalRun();
+  // A snapshot that was already in flight cannot resurrect the stopped job.
+  component.applyAssistantLocalRun(ready);
+  process.stdout.write(JSON.stringify({
+    ran, before, stopResult, after, again, stopPosts,
+    calls, notifications,
+    afterLateSnapshot: component.assistantLocalEndpointUrl(),
+  }));
+})();
+"""
+        )
+    )
+
+    assert result["ran"]["state"] == "ready"
+    assert result["before"] == {
+        "state": "ready",
+        "endpoint": "http://127.0.0.1:8099",
+        "chat": "/admin/chat?model=qwen",
+        "stoppable": True,
+    }
+    # Exactly one stop POST, to the job's own route, and exactly one re-read.
+    posts = [call for call in result["calls"] if call["method"] == "POST"]
+    assert [(call["url"], call["method"]) for call in posts] == [
+        (
+            "/admin/api/cluster/assistant/run-local",
+            "POST",
+        ),
+        (
+            "/admin/api/cluster/assistant/run-local/local-3/stop",
+            "POST",
+        ),
+    ]
+    assert result["stopPosts"] == 1
+    assert result["stopResult"] == {"job_id": "local-3", "stopped": True}
+    # The serving surface is retired: no endpoint, no chat link, no error.
+    assert result["after"] == {
+        "state": "",
+        "stopped": True,
+        "stopping": False,
+        "endpoint": "",
+        "chat": "",
+        "stoppable": False,
+        "error": "",
+        "busy": False,
+        "assistantBusy": False,
+    }
+    assert result["again"] is None
+    assert result["stopPosts"] == 1
+    assert result["afterLateSnapshot"] == ""
+    assert [entry["type"] for entry in result["notifications"]] == ["success"]
+
+
+def test_assistant_local_run_stop_failure_keeps_serving_and_the_one_action():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  const notifications = [];
+  component.notify = (type, message) => notifications.push({type, message});
+  const calls = [];
+  let stopPosts = 0;
+  component.apiFetch = async (url, options = {}) => {
+    calls.push({url, method: (options && options.method) || 'GET'});
+    if (url.endsWith('/assistant/run-local/local-6/stop')) {
+      stopPosts += 1;
+      throw {
+        status: 502,
+        payload: {
+          message: 'the engine pool did not answer the unload',
+          action: 'diagnostics',
+        },
+      };
+    }
+    throw new Error('unexpected URL ' + url);
+  };
+  component.applyAssistantLocalRun({
+    job_id: 'local-6', state: 'ready',
+    message: 'qwen is ready on this Mac',
+    model_id: 'qwen', context_tokens: 32768, mtp: false,
+    endpoint: {
+      host: '127.0.0.1', port: 8099,
+      url: 'http://127.0.0.1:8099', ready: true,
+    },
+    warnings: [], error: null,
+  });
+  const stopResult = await component.stopAssistantLocalRun();
+  process.stdout.write(JSON.stringify({
+    stopResult, stopPosts, calls,
+    state: component.assistant.localRun.state,
+    endpoint: component.assistantLocalEndpointUrl(),
+    chat: component.assistantLocalChatUrl(),
+    error: component.assistant.localRun.error,
+    action: component.assistant.localRun.errorAction,
+    stopping: component.assistant.localRun.stopping,
+    stoppable: component.assistantLocalRunStoppable(),
+    notifications,
+  }));
+})();
+"""
+        )
+    )
+
+    assert result["stopResult"] is None
+    assert result["stopPosts"] == 1
+    assert [call["method"] for call in result["calls"]] == ["POST"]
+    # The engine is still loaded, so the card keeps the endpoint; the failure
+    # keeps exactly one action and Stop stays the retry.
+    assert result["state"] == "ready"
+    assert result["endpoint"] == "http://127.0.0.1:8099"
+    assert result["chat"] == "/admin/chat?model=qwen"
+    assert result["error"] == "the engine pool did not answer the unload"
+    assert result["action"] == "diagnostics"
+    assert result["stopping"] is False
+    assert result["stoppable"] is True
+    assert [entry["type"] for entry in result["notifications"]] == ["error"]
+
+
+def test_assistant_local_run_endpoint_and_chat_need_ready_and_endpoint_ready():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  await reachPlan();
+  component.apiFetch = async () => ({});
+  const endpoint = {
+    host: '127.0.0.1', port: 8099,
+    url: 'http://127.0.0.1:8099', ready: true,
+  };
+  // A load that is still running never shows a URL, even if the endpoint block
+  // already says ready: the readiness canary decides what "ready" means.
+  component.applyAssistantLocalRun({
+    job_id: 'local-7', state: 'running',
+    message: 'checking the endpoint with one tiny completion',
+    model_id: 'qwen', context_tokens: 32768,
+    endpoint, warnings: [], error: null,
+  });
+  const running = {
+    message: component.assistantLocalRunProgressLabel(),
+    busy: component.assistantLocalRunBusy(),
+    endpoint: component.assistantLocalEndpointUrl(),
+    chat: component.assistantLocalChatUrl(),
+  };
+  // state === 'ready' is not enough while the job's own endpoint is unverified.
+  component.applyAssistantLocalRun({
+    job_id: 'local-7', state: 'ready',
+    message: 'qwen loaded',
+    model_id: 'qwen', context_tokens: 32768,
+    endpoint: Object.assign({}, endpoint, {ready: false}),
+    warnings: [], error: null,
+  });
+  const readyButUnverified = {
+    busy: component.assistantLocalRunBusy(),
+    endpoint: component.assistantLocalEndpointUrl(),
+    chat: component.assistantLocalChatUrl(),
+  };
+  component.applyAssistantLocalRun({
+    job_id: 'local-7', state: 'ready',
+    message: 'qwen is ready on this Mac',
+    model_id: 'qwen', context_tokens: 32768,
+    endpoint, warnings: [], error: null,
+  });
+  const ready = {
+    busy: component.assistantLocalRunBusy(),
+    endpoint: component.assistantLocalEndpointUrl(),
+    chat: component.assistantLocalChatUrl(),
+  };
+  process.stdout.write(JSON.stringify({running, readyButUnverified, ready}));
+})();
+"""
+        )
+    )
+
+    # The in-flight message is the backend's canary sentence, never invented.
+    assert result["running"] == {
+        "message": "checking the endpoint with one tiny completion",
+        "busy": True,
+        "endpoint": "",
+        "chat": "",
+    }
+    assert result["readyButUnverified"] == {"busy": False, "endpoint": "", "chat": ""}
+    assert result["ready"] == {
+        "busy": False,
+        "endpoint": "http://127.0.0.1:8099",
+        "chat": "/admin/chat?model=qwen",
+    }
+
+
+def test_assistant_local_run_stop_during_load_retires_the_poll_loop():
+    result = _run_wizard(
+        _assistant_flow(
+            """
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+(async () => {
+  await reachPlan();
+  component.notify = () => {};
+  const calls = [];
+  const timers = [];
+  let resolveGet = null;
+  let openedGets = 0;
+  let stopPosts = 0;
+  // The poll loop waits between snapshots; capture the timer so the test can
+  // decide when the loop wakes up again.
+  global.setTimeout = (fn) => {
+    timers.push(fn);
+    return 0;
+  };
+  component.apiFetch = async (url, options = {}) => {
+    calls.push({url, method: (options && options.method) || 'GET'});
+    if (url.endsWith('/assistant/run-local')) {
+      return {job_id: 'local-4', state: 'queued'};
+    }
+    if (url.endsWith('/assistant/run-local/local-4/stop')) {
+      stopPosts += 1;
+      return {job_id: 'local-4', stopped: true};
+    }
+    if (url.endsWith('/assistant/run-local/local-4')) {
+      openedGets += 1;
+      if (openedGets === 1) {
+        return new Promise((resolve) => { resolveGet = resolve; });
+      }
+      return {
+        job_id: 'local-4', state: 'failed',
+        message: 'the local run was stopped on this Mac',
+        endpoint: null, warnings: [], error: null,
+      };
+    }
+    throw new Error('unexpected URL ' + url);
+  };
+  const running = component.runAssistantLocal();
+  await flush();   // the POST resolved and the first snapshot is in flight
+  resolveGet({
+    job_id: 'local-4', state: 'running',
+    message: 'loading the model on this Mac',
+    model_id: 'qwen', context_tokens: 32768,
+    endpoint: null, warnings: [], error: null,
+  });
+  await flush();   // applied; the loop now waits for the next snapshot
+  const duringLoad = {
+    label: component.assistantLocalRunProgressLabel(),
+    busy: component.assistantLocalRunBusy(),
+    stoppable: component.assistantLocalRunStoppable(),
+  };
+  const stopResult = await component.stopAssistantLocalRun();
+  const timersBeforeRelease = timers.length;
+  if (timers.length) timers[0]();   // let the suspended loop wake up
+  await running;
+  process.stdout.write(JSON.stringify({
+    duringLoad, stopResult, stopPosts, openedGets,
+    timersBeforeRelease,
+    state: component.assistant.localRun.state,
+    stopped: component.assistant.localRun.stopped,
+    endpoint: component.assistantLocalEndpointUrl(),
+    localBusy: component.assistant.localRun.busy,
+    assistantBusy: component.assistant.busy,
+    calls,
+  }));
+})();
+"""
+        )
+    )
+
+    # The load is narrated while it runs, and it is stoppable before it is ready.
+    assert result["duringLoad"] == {
+        "label": "loading the model on this Mac",
+        "busy": True,
+        "stoppable": True,
+    }
+    assert result["stopResult"] == {"job_id": "local-4", "stopped": True}
+    assert result["stopPosts"] == 1
+    assert result["timersBeforeRelease"] >= 1
+    # The loop read one snapshot and the stop's re-read once; the retired job
+    # never issues another snapshot request.
+    assert result["openedGets"] == 2
+    assert [call["url"] for call in result["calls"] if call["method"] == "POST"] == [
+        "/admin/api/cluster/assistant/run-local",
+        "/admin/api/cluster/assistant/run-local/local-4/stop",
+    ]
+    assert result["state"] == ""
+    assert result["stopped"] is True
+    assert result["endpoint"] == ""
+    # A retired load never freezes the card's busy flags.
+    assert result["localBusy"] is False
+    assert result["assistantBusy"] is False
+
+
+def test_assistant_local_run_stop_markup_and_wiring_are_declared():
+    template = (ROOT / "omlx_web/templates/dashboard/_cluster_v2.html").read_text()
+    javascript = (ROOT / "omlx_web/static/js/cluster_v2.js").read_text()
+
+    start = template.index("<!-- Run on this Mac: single-node inference")
+    block = template[start : template.index("<!-- Search: the automatic", start)]
+    for marker in (
+        "data-cluster-v2-assistant-local-run-stop",
+        "data-cluster-v2-assistant-local-run-stopped",
+        "data-cluster-v2-assistant-local-run-busy",
+        "data-cluster-v2-assistant-local-run-progress",
+    ):
+        assert marker in block, marker
+    # One button, disabled while the stop is in flight, and only offered for a
+    # job that holds this Mac's engine.
+    assert 'x-show="assistantLocalRunStoppable()"' in block
+    assert ':disabled="assistant.localRun.stopping"' in block
+    assert "stopAssistantLocalRun()" in block
+    # The load spinner follows the job's own state, not just the promise.
+    assert 'x-show="assistantLocalRunBusy()"' in block
+    # The endpoint + chat link stay inside the ready-gated container.
+    assert 'x-show="assistantLocalEndpointUrl()"' in block
+    # Still no invented progress and still no input in the card block.
+    assert "%" not in block
+    assert "tok/s" not in block
+    assert "<input" not in block
+
+    # The stop route lives in the API map, built from the job id.
+    api_map = javascript.split("const ASSISTANT_API = {", 1)[1].split("};", 1)[0]
+    assert "runLocalStop" in api_map
+    assert "/run-local/${encodeURIComponent(jobId)}/stop" in api_map
+
+    stop = javascript.split("async stopAssistantLocalRun(", 1)[1].split(
+        "retireAssistantLocalRun() {", 1
+    )[0]
+    # Single-flight: one guard, one POST, one re-read, no stream.
+    assert "assistantLocalRunStoppable()" in stop
+    assert stop.count("method: 'POST'") == 1
+    assert stop.count("runLocalStop") == 1
+    assert "runLocalStatus" in stop
+    assert "retireAssistantLocalRun()" in stop
+    assert "refusal.action" in stop
+    assert "EventSource" not in stop
+    # The browser asks only the assistant route; it never unloads a deployment
+    # or dials another Mac itself.
+    assert "/admin/api/cluster/deployments" not in stop
+
+    # Strict ready gating: both the state and the job's own endpoint answer.
+    gating = javascript.split("assistantLocalEndpointUrl() {", 1)[1].split(
+        "},", 1
+    )[0]
+    assert "job.state !== 'ready'" in gating
+    assert "job.endpoint?.ready !== true" in gating
+
+    # The poll loop retires on a stop instead of resurrecting the job.
+    poll = javascript.split("async pollAssistantLocalRun(", 1)[1].split(
+        "applyAssistantLocalRun(snapshot) {", 1
+    )[0]
+    assert "job.stopping || job.stopped" in poll
+    apply = javascript.split("applyAssistantLocalRun(snapshot) {", 1)[1].split(
+        "// Stop/Unload for", 1
+    )[0]
+    assert "if (job.stopped) return;" in apply
+
+
+def test_assistant_local_tune_posts_once_and_tracks_the_winner():
+    """Tune on this Mac: one POST for a ready local run, then poll the winner."""
+
+    result = _run_wizard(
+        _assistant_flow(
+            """
+(async () => {
+  // A ready local run is what tune-local needs; set it directly.
+  component.assistant.localRun.state = 'ready';
+  component.assistant.localRun.jobId = 'local-1';
+  const polls = [
+    { tune_job_id: 'lt-1', state: 'running', total: 3, done: 1,
+      message: 'measuring mtp_off (1 of 3)',
+      rows: [{ config: 'mtp_off', feasible: true, decode_tok_per_s: 22.0 }],
+      best: null, sampler: null, preset_key: '', error: null },
+    { tune_job_id: 'lt-1', state: 'completed', total: 3, done: 3, message: 'done',
+      rows: [
+        { config: 'mtp_off', feasible: true, decode_tok_per_s: 22.0 },
+        { config: 'mtp_on_depth_3', feasible: true, decode_tok_per_s: 31.6 },
+      ],
+      best: { config: 'mtp_on_depth_3', mtp: true, mtp_depth: 3 },
+      sampler: { sampler: 'balanced' }, preset_key: 'abc123',
+      mtp_applicable: true, error: null },
+  ];
+  global.setTimeout = (fn) => { if (typeof fn === 'function') fn(); return 0; };
+  const calls = [];
+  component.apiFetch = async (url, options = {}) => {
+    calls.push({
+      url,
+      method: (options && options.method) || 'GET',
+      body: options && options.body ? JSON.parse(options.body) : null,
+    });
+    if (url.endsWith('/assistant/tune-local')) {
+      return { tune_job_id: 'lt-1', state: 'queued', total: 3, mtp_applicable: true };
+    }
+    if (url.endsWith('/assistant/tune-local/lt-1')) return polls.shift();
+    throw new Error('unexpected URL ' + url);
+  };
+  const tunable = component.assistantLocalTunable();
+  const returned = await component.runAssistantTuneLocal();
+  process.stdout.write(JSON.stringify({
+    tunable, calls, returned,
+    state: component.assistant.localTune.state,
+    rows: component.assistantLocalTuneRows(),
+    best: component.assistantLocalTuneBestLabel(),
+    preset: component.assistant.localTune.presetKey,
+    busy: component.assistant.localTune.busy,
+  }));
+})();
+"""
+        )
+    )
+
+    assert result["tunable"] is True
+    posts = [c for c in result["calls"] if c["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["url"] == "/admin/api/cluster/assistant/tune-local"
+    assert posts[0]["body"] == {"job_id": "local-1"}
+    gets = [c["url"] for c in result["calls"] if c["method"] == "GET"]
+    assert gets == ["/admin/api/cluster/assistant/tune-local/lt-1"] * 2
+    assert result["state"] == "completed"
+    assert [row["config"] for row in result["rows"]] == ["mtp_off", "mtp_on_depth_3"]
+    assert result["best"] == "MTP on, depth 3"
+    assert result["preset"] == "abc123"
+    assert result["busy"] is False
+
+
+def test_assistant_local_tune_markup_and_wiring_are_declared():
+    javascript = (ROOT / "omlx_web/static/js/cluster_v2.js").read_text()
+    template = (ROOT / "omlx_web/templates/dashboard/_cluster_v2.html").read_text()
+
+    assert "tuneLocal: '/admin/api/cluster/assistant/tune-local'" in javascript
+    assert (
+        "/admin/api/cluster/assistant/tune-local/${encodeURIComponent(tuneJobId)}"
+        in javascript
+    )
+    for need in (
+        "runAssistantTuneLocal(",
+        "pollAssistantTuneLocal(",
+        "assistantLocalTunable(",
+        "assistantLocalTuneBestLabel(",
+    ):
+        assert need in javascript, need
+    for marker in (
+        "data-cluster-v2-assistant-tune-local",
+        "data-cluster-v2-assistant-tune-local-button",
+        "data-cluster-v2-assistant-tune-local-rows",
+        "data-cluster-v2-assistant-tune-local-best",
+    ):
+        assert marker in template, marker
+
+
 # --- Assistant UI spec 2026-11-16 (U1-U6) ------------------------------------
 #
 # The screens are a render-mode on the frozen state machine. These tests drive

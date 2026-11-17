@@ -52,6 +52,8 @@ SEARCH_URL = "/admin/api/cluster/assistant/search"
 TUNE_URL = "/admin/api/cluster/assistant/tune"
 REDEPLOY_URL = "/admin/api/cluster/assistant/tune-redeploy"
 TUNING_PRESET_URL = "/admin/api/cluster/assistant/tuning-preset"
+RUN_LOCAL_URL = "/admin/api/cluster/assistant/run-local"
+TUNE_LOCAL_URL = "/admin/api/cluster/assistant/tune-local"
 SESSION_URL = "/admin/api/cluster/assistant/session"
 PERFORMANCE_PROBE_URL = "/admin/api/cluster/assistant/performance-probe"
 OPERATIONS_URL = "/admin/api/cluster/assistant/operations"
@@ -650,6 +652,16 @@ def test_the_router_exposes_the_assistant_routes(api) -> None:
         # Read-only: the saved tuning preset for an operation's model + node set,
         # so a later Start's replay is visible (never a key or SSH target).
         (TUNING_PRESET_URL, ["GET"]),
+        # Run the measured model on this Mac alone (single-node inference, no
+        # cluster): an async job, because the engine-pool load blocks.
+        (RUN_LOCAL_URL, ["POST"]),
+        (RUN_LOCAL_URL + "/{job_id}", ["GET"]),
+        # Stop a local run and unload its model on this Mac (idempotent).
+        (RUN_LOCAL_URL + "/{job_id}/stop", ["POST"]),
+        # Tune the model that ready local run serves: the sampler per request,
+        # then every MTP config by reloading it on this Mac alone.
+        (TUNE_LOCAL_URL, ["POST"]),
+        (TUNE_LOCAL_URL + "/{tune_job_id}", ["GET"]),
         # Read-only: the last persisted deployment, so a reloaded card can show
         # Running/Stopped and offer Start again.
         (PERFORMANCE_PROBE_URL, ["GET"]),
