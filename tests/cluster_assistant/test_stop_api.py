@@ -129,7 +129,7 @@ def test_stop_relays_to_a_remote_coordinator(api, monkeypatch) -> None:
     monkeypatch.setitem(
         assistant_routes.__dict__,
         "_paired_device_record",
-        lambda node_id: {"node_id": node_id, "ssh_user": "andreaskolb"},
+        lambda node_id: {"node_id": node_id, "ssh_user": "operator"},
     )
 
     def remote_admin(target, port, path, body, *, method="POST", timeout=None):
@@ -143,14 +143,14 @@ def test_stop_relays_to_a_remote_coordinator(api, monkeypatch) -> None:
     assert response.status_code == 200, response.text
     assert calls == [
         (
-            "andreaskolb@192.0.2.11",
+            "operator@192.0.2.11",
             8099,
             "/admin/api/cluster/assistant/operations/active",
             "GET",
             30.0,
         ),
         (
-            "andreaskolb@192.0.2.11",
+            "operator@192.0.2.11",
             8099,
             "/admin/api/cluster/deployments/dev-1.5b-abc123/unload",
             "POST",
