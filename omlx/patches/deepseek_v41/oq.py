@@ -468,6 +468,10 @@ def quantize(
         budget["remaining_weights"].update(
             {key: preparation[key] for key in ("tensor_bytes", "effective_bpw")}
         )
+        budget["tensor_bytes"] = (
+            budget["remaining_weights"]["tensor_bytes"]
+            + budget["engram"]["tensor_bytes"]
+        )
     # oQh experts: the bytes their affine plan holds buy the widths.
     widths, oqh_planned = {}, 0
     if hadamard:
@@ -477,10 +481,6 @@ def quantize(
         scores = {str(k): v for k, v in (preparation.get("sensitivity") or {}).items()}
         widths = plan_widths(inventory, allocation, scores)
         oqh_planned = planned_bytes(inventory, allocation, widths)
-        budget["tensor_bytes"] = (
-            budget["remaining_weights"]["tensor_bytes"]
-            + budget["engram"]["tensor_bytes"]
-        )
     destination.parent.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(destination.parent).free < budget["tensor_bytes"] + 1024**3:
         raise OSError("Insufficient space for V4.1 export plus 1 GiB headroom")
