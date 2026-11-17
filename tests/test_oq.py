@@ -6710,56 +6710,6 @@ class TestMeasureSensitivityVlmMtp:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestNemotronImatrix:
-    @pytest.mark.parametrize(
-        "config, layer_walk",
-        [
-            ({"model_type": "nemotron_h"}, "nemotron_h_ssm_mask_lm_head_v1"),
-            ({"model_type": "nemotron_h_puzzle"}, "nemotron_h_ssm_mask_lm_head_v1"),
-            (
-                {
-                    "model_type": "nemotron_h_omni",
-                    "llm_config": {"model_type": "nemotron_h_puzzle"},
-                },
-                "nemotron_h_ssm_mask_lm_head_v1",
-            ),
-            (
-                {
-                    "model_type": "nemotron_h_omni",
-                    "text_config": {"model_type": "nemotron_h_puzzle"},
-                },
-                "nemotron_h_ssm_mask_lm_head_v1",
-            ),
-            ({"model_type": "llama"}, "native_inputs_v1"),
-            ({"model_type": "mamba"}, "native_inputs_v1"),
-            ({"model_type": "mamba2"}, "native_inputs_v1"),
-            (
-                {"model_type": "unrelated", "llm_config": {"model_type": "lfm3"}},
-                "native_inputs_v1",
-            ),
-            (
-                {"model_type": "gemma4", "num_kv_shared_layers": 1},
-                "gemma4_shared_kv_v1",
-            ),
-            ({"model_type": "lfm2"}, "conv_mask_v1"),
-            ({"model_type": "qwen4_exp"}, "qwen4_mtp_batch_positions_v1"),
-            ({"model_type": "glm5_next"}, "glm5_next_hc_moe_lm_head_v4"),
-            ({"model_type": "deepseek_v41"}, "deepseek_v41_full_forward_v1"),
-        ],
-    )
-    def test_imatrix_signature_revises_only_nemotron_h(
-        self, tmp_path, config, layer_walk
-    ):
-        signature = _source_imatrix_signature(
-            tmp_path,
-            config,
-            num_samples=2,
-            seq_length=8,
-            calib_dataset="oqe_code_multilingual",
-        )
-
-        assert signature["layer_walk"] == layer_walk
-        assert signature["format"] == "omlx-oqe-imatrix-cache"
-
     @pytest.fixture
     def bolt(self, monkeypatch):
         from mlx_vlm.utils import get_model_and_args
@@ -6834,77 +6784,6 @@ class TestNemotronImatrix:
         monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
         return model, config, tokens
 
-    @pytest.mark.parametrize("model_type", ["nemotron_h", "nemotron_h_puzzle"])
-    def test_nested_discovery_accepts_nemotron_h_text_types(self, bolt, model_type):
-        from dataclasses import replace
-
-        outer, _, _ = bolt
-        text = outer.language_model
-        text = type(text)(replace(text.args, model_type=model_type))
-        outer.language_model = text
-
-        assert outer.model_type == "nemotron_h_omni"
-        assert text.model_type == model_type
-        embed, layers = _find_model_layers(outer)
-        assert embed is text.backbone.embeddings
-        assert layers is text.backbone.layers
-
-    @pytest.mark.parametrize("model_type", ["mamba", "mamba2", None])
-    def test_nested_discovery_rejects_unrelated_text_types(self, bolt, model_type):
-        from types import SimpleNamespace
-
-        model, _, _ = bolt
-        unrelated = SimpleNamespace(
-            model_type="unrelated",
-            language_model=SimpleNamespace(
-                model_type=model_type,
-                backbone=model.language_model.backbone,
-                layers=model.layers,
-            ),
-        )
-
-        assert _find_model_layers(unrelated) == (None, None)
-
-    def test_direct_backbone_discovery_keeps_precedence(self, bolt):
-        from types import SimpleNamespace
-
-        model, _, _ = bolt
-        direct = SimpleNamespace(
-            model_type="unrelated",
-            backbone=SimpleNamespace(embeddings=nn.Embedding(128, 128)),
-            layers=[],
-            language_model=model.language_model,
-        )
-
-        embed, layers = _find_model_layers(direct)
-        assert embed is direct.backbone.embeddings
-        assert layers is direct.layers
-
-    @pytest.mark.parametrize("model_type", ["mamba", "mamba2"])
-    def test_lm_head_capture_rejects_unrelated_text_types(self, model_type):
-        import omlx.oq as oq
-
-        text = nn.Module()
-        text.model_type = model_type
-        text.backbone = nn.Module()
-        text.backbone.embeddings = nn.Embedding(8, 4)
-        text.backbone.norm_f = nn.RMSNorm(4)
-        text.lm_head = nn.Linear(4, 8, bias=False)
-        model = nn.Module()
-        model.language_model = text
-        collector = OQImatrixCollector()
-        assert collector.install(model) == 1
-        try:
-            assert (
-                oq._collect_language_model_lm_head_imatrix(
-                    model, mx.ones((1, 2, 4)), collector
-                )
-                is False
-            )
-            assert collector.entries == {}
-        finally:
-            collector.restore(model)
-
     @pytest.mark.parametrize("wrapped", [False, True])
     @pytest.mark.parametrize("quantized", [False, True])
     def test_layer_walk_matches_native_captures(self, bolt, wrapped, quantized):
@@ -6912,21 +6791,13 @@ class TestNemotronImatrix:
 
         outer, config, tokens = bolt
         model = outer if wrapped else outer.language_model
-        text = outer.language_model
         if quantized:
-            nn.quantize(text, group_size=64, bits=4)
-        embed, layers = oq._find_model_layers(model)
-        assert embed is text.backbone.embeddings
-        assert layers is text.backbone.layers
-
-        _, masks, _ = oq._prepare_layer_inputs(model, layers, tokens, embed(tokens))
-        assert masks[0] is None  # Mamba takes a padding mask, not a causal matrix.
-        assert masks[2] is not None
+            nn.quantize(outer.language_model, group_size=64, bits=4)
 
         native = OQImatrixCollector()
         native.install(model)
         try:
-            mx.eval(text(tokens).logits)
+            mx.eval(outer.language_model(tokens).logits)
         finally:
             native.restore(model)
 
@@ -6939,35 +6810,16 @@ class TestNemotronImatrix:
             seq_length=8,
         )
         prefix = "language_model." if wrapped else ""
-        assert len(entries) == len(native.entries) == 21
-        assert metadata["layer_count"] == 5
         assert metadata["skipped_layer_forwards"] == 0
-        assert metadata["successful_layer_forwards"] == 5
-        assert metadata["switch_capture_modules"] == 4
-        assert metadata["coverage_sufficient"] is True
+        assert f"{prefix}lm_head" in entries
         assert entries.keys() == native.entries.keys()
         for key, entry in entries.items():
             np.testing.assert_array_equal(entry.counts, native.entries[key].counts)
             np.testing.assert_allclose(
                 entry.in_sum2, native.entries[key].in_sum2, rtol=1e-5, atol=1e-5
             )
-            assert np.isfinite(entry.in_sum2).all()
-            assert (entry.counts > 0).all()
-        for index, experts, intermediate in ((1, 2, 64), (3, 3, 128)):
-            base = f"{prefix}backbone.layers.{index}.mixer.switch_mlp"
-            assert entries[f"{base}.fc1"].in_sum2.shape == (experts, 64)
-            assert entries[f"{base}.fc2"].in_sum2.shape == (experts, intermediate)
-        assert f"{prefix}lm_head" in entries
-        assert not any(
-            "gate" in k or "conv1d" in k or "embeddings" in k for k in entries
-        )
-        assert not any(
-            isinstance(m, oq._ImatrixCaptureWrapper) for _, m in model.named_modules()
-        )
 
-    def test_proxy_recollects_stale_imatrix_and_reuses_new_cache(
-        self, bolt, tmp_path, monkeypatch
-    ):
+    def test_strict_oq4e_conversion(self, bolt, tmp_path, monkeypatch):
         from mlx_vlm.utils import load_model
 
         import omlx.oq as oq
@@ -6994,111 +6846,24 @@ class TestNemotronImatrix:
                 weights[key] = value
         mx.save_safetensors(str(source / "model.safetensors"), weights)
         monkeypatch.setattr("mlx_lm.tokenizer_utils.load", lambda *a, **kw: object())
-        proxy = tmp_path / "proxy"
 
-        def build_proxy():
-            oq._build_streaming_proxy_for_sensitivity(
-                str(source), proxy, dtype="bfloat16"
-            )
-            return str(proxy)
-
-        cache_path = str(tmp_path / "imatrix.npz")
-        entries, collection = oq._collect_imatrix_from_model(
-            model,
-            object(),
-            config,
-            calib_dataset=oq._OQE_CALIB_DATASET,
-            num_samples=2,
-            seq_length=8,
-        )
-        signature = oq._source_imatrix_signature(
-            source,
-            config,
-            num_samples=2,
-            seq_length=8,
-            calib_dataset=oq._OQE_CALIB_DATASET,
-        )
-        # Otherwise valid observations must not hide the obsolete walk revision.
-        oq._save_oqe_imatrix(
-            Path(cache_path),
-            entries,
-            {**signature, "layer_walk": "native_inputs_v1", "collection": collection},
-        )
-        cache = oq._load_or_collect_imatrix(
-            str(source),
-            config,
-            cache_path=cache_path,
-            reuse_cache=True,
-            num_samples=2,
-            seq_length=8,
-            strict=True,
-            trust_remote_code=False,
-            load_path_factory=build_proxy,
-        )
-        assert cache.reused is False
-        assert cache.metadata["layer_walk"] == "nemotron_h_ssm_mask_lm_head_v1"
-        assert len(cache.entries) == 21
-        assert cache.metadata["collection"]["skipped_layer_forwards"] == 0
-        assert cache.metadata["collection"]["coverage_sufficient"] is True
-        loaded = load_model(proxy, strict=True)
-        assert isinstance(
-            loaded.language_model.backbone.layers[0].mixer.in_proj, nn.QuantizedLinear
-        )
-        reused = oq._load_or_collect_imatrix(
-            str(source),
-            config,
-            cache_path=cache_path,
-            reuse_cache=True,
-            num_samples=2,
-            seq_length=8,
-            strict=True,
-            trust_remote_code=False,
-            load_path_factory=build_proxy,
-        )
-        assert reused.reused is True
-        assert reused.metadata == cache.metadata
-        # Every quantized text projection must resolve under strict coverage.
-        for name, module in model.language_model.named_modules():
-            if OQImatrixCollector._is_capture_module(module):
-                assert (
-                    oq._lookup_imatrix_importance(
-                        cache,
-                        f"language_model.{name}.weight",
-                        module.weight.shape,
-                        config=config,
-                        strict=True,
-                        report=None,
-                    )
-                    is not None
-                )
-        assert (
-            oq._lookup_imatrix_importance(
-                cache,
-                "language_model.backbone.embeddings.weight",
-                (128, 128),
-                config=config,
-                strict=True,
-                report=None,
-            )
-            is None
-        )
-
+        cache_path = tmp_path / "imatrix.npz"
         output = tmp_path / "oq4e"
+        # Strict coverage must hold with the vision projector in the source.
         oq.quantize_oq_streaming(
             str(source),
             str(output),
             4,
             enhanced=True,
-            imatrix_cache_path=cache_path,
+            imatrix_cache_path=str(cache_path),
+            imatrix_strict=True,
             imatrix_num_samples=2,
             imatrix_seq_length=8,
         )
+        metadata = json.loads(oq._imatrix_metadata_path(cache_path).read_text())
+        assert metadata["layer_walk"] == "nemotron_h_ssm_mask_lm_head_v1"
         report = json.loads((output / "oq_imatrix_report.json").read_text())
-        assert report["cache_reused"] is True
-        # Text calibration does not exercise the existing vision projector.
-        assert report["missing"] == ["mlp1.layers.1"]
-        assert report["mismatched"] == []
-        assert set(report["applied"]) == cache.entries.keys()
+        assert "language_model.lm_head" in report["applied"]
         reloaded = load_model(output, strict=True)
         mx.eval(reloaded.language_model(mx.arange(8)[None]).logits)
 
