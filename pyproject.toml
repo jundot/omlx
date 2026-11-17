@@ -98,6 +98,12 @@ dependencies = [
     "psutil>=5.9.0",
     # Native process title support (shows as omlx-server instead of python)
     "setproctitle>=1.3.3",
+    # macOS volume capacity that includes purgeable space (APFS snapshots the
+    # system deletes on demand): the HF downloader free-space gate reads
+    # NSURLVolumeAvailableCapacityForImportantUsageKey through Foundation,
+    # the only public API for it (#5349). The marker keeps Linux installs
+    # unchanged; statvfs remains the runtime fallback.
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
     # Server
     "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
