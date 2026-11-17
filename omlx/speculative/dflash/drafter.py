@@ -12,6 +12,7 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from ...patches.mlx_lm_mtp import batch_generator as bg
 from ...patches.qwen35_verify_qmm import set_verify_qmm_armed
@@ -84,6 +85,56 @@ class _Predraft:
     unfed: list[int]
     proposals: list[tuple]
     contexts: list[mx.array] = field(default_factory=list)
+
+
+def _rope_positions(model, x, start_positions):
+    """Per-position RoPE (official llama.cpp uses a per-token position array).
+
+    ``x`` is ``(batch, heads, seq, head_dim)`` after the q/k/v transpose
+    (Spark draft attention) or ``(batch, seq, ...)`` in general. The sequence
+    axis is axis=2 for a 4D head-major tensor and axis=1 otherwise.
+    ``start_positions`` is ``(batch,)``; position ``j`` of each row is
+    ``start_positions[row] + j``.
+
+    ``mlx.fast.rope`` only accepts a scalar or 1-element offset, so a batch
+    vector must be applied one row at a time.
+    """
+    ndim = x.ndim
+    head_major = ndim == 4
+    seq = x.shape[2] if head_major else x.shape[1]
+    if not hasattr(start_positions, "ndim") or start_positions.ndim == 0:
+        # Scalar offset: same position for every row.
+        start = int(start_positions)
+        if seq == 1:
+            return model.rope(x, offset=start)
+        if head_major:
+            parts = []
+            for j in range(seq):
+                parts.append(model.rope(x[:, :, j : j + 1, :], offset=start + j))
+            return mx.concatenate(parts, axis=2)
+        parts = []
+        for j in range(seq):
+            parts.append(model.rope(x[:, j : j + 1], offset=start + j))
+        return mx.concatenate(parts, axis=1)
+    # Batch vector: one start position per row; loop rows and positions.
+    batch = x.shape[0]
+    starts = np.asarray(start_positions).tolist()
+    rows = []
+    for b in range(batch):
+        s = int(starts[b])
+        if seq == 1:
+            rows.append(model.rope(x[b : b + 1], offset=s))
+        else:
+            parts = []
+            for j in range(seq):
+                if head_major:
+                    parts.append(model.rope(x[b : b + 1, :, j : j + 1, :], offset=s + j))
+                else:
+                    parts.append(model.rope(x[b : b + 1, j : j + 1], offset=s + j))
+            rows.append(mx.concatenate(parts, axis=2 if head_major else 1))
+    return mx.concatenate(rows, axis=0)
+
+
 
 
 def _concat_captured(captured: Sequence[mx.array]) -> mx.array:
@@ -593,6 +644,35 @@ class DFlashDrafter:
         self._cohort = _Cohort(uids=uids, keys=keys, values=values, pos=pos)
         return self._cohort
 
+    def _copy_params_to_active_stream(self) -> int:
+        """Copy every drafter parameter onto the current (active) stream.
+
+        Weights are created on the model-loader thread and bound to that
+        thread's TLS stream. The draft executor thread cannot read them
+        ("There is no Stream(gpu, N) in current thread"). ``mx.array(w)``
+        copies a materialized array onto the calling thread's active stream,
+        so this makes downstream projections inherit a stream this thread
+        owns. Returns the number of parameters copied.
+        """
+        import mlx.core as _mx
+        _count = 0
+
+        def _dup(v):
+            nonlocal _count
+            if isinstance(v, _mx.array):
+                _count += 1
+                return _mx.array(v)
+            if isinstance(v, dict):
+                return {_kk: _dup(_vv) for _kk, _vv in v.items()}
+            if isinstance(v, (list, tuple)):
+                return [_dup(_x) for _x in v]
+            return v
+
+        _nested = _dup(self.model.parameters())
+        self.model.update(_nested)
+        return _count
+
+
     def _draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
         """One draft forward for every row; mirrors DFlashAttention rowwise math.
 
@@ -635,6 +715,26 @@ class DFlashDrafter:
             )
             bases.append(row.fed + skip)
         # Metal projections need a nonempty shape even when the window keeps no context.
+        # Cross-stream fix: captures may be bound to a different per-thread TLS
+        # stream (prefill) than the draft executor's active stream. Force each
+        # segment onto the active stream so downstream kernels inherit it.
+        import mlx.core as _mx
+        for _i, _seg in enumerate(segments):
+            # Always materialize onto the active (draft executor) stream so
+            # downstream projections inherit a stream this thread owns. A
+            # capture bound to another per-thread TLS stream would otherwise
+            # make every op below bind that foreign stream and fail eval.
+            segments[_i] = _mx.contiguous(_mx.array(_seg))
+            _mx.eval(segments[_i])
+        # Cross-stream fix for model weights: weights are created on the model
+        # loader thread and bound to that thread's TLS stream. The draft
+        # executor thread cannot read them ("no Stream(gpu, N) in current
+        # thread"). Copy every drafter parameter onto the active (draft)
+        # stream once so downstream projections inherit a stream this thread
+        # owns. Mirrors the Qwen35 prefill-helper wire path, but in-process.
+        if not getattr(self, '_omlx_weights_copied', False):
+            self._copy_params_to_active_stream()
+            self._omlx_weights_copied = True
         width = max(1, max(int(seg.shape[1]) for seg in segments))
         padded = mx.concatenate(
             [
@@ -655,7 +755,22 @@ class DFlashDrafter:
             ],
             axis=0,
         )
+        import mlx.core as _mxc
+        # Cross-stream: ``padded`` inherits the capture segments' stream.
+        # Captures are created on the prefill thread's TLS stream (gpu,1) and
+        # the draft executor thread (gpu,5) cannot read them. Materialize and
+        # copy ``padded`` onto the active stream so ``fc`` and every downstream
+        # projection reads arrays this thread owns.
+        padded = _mxc.contiguous(_mxc.array(padded))
+        _mxc.eval(padded)
         h_ctx = variants.project_context(model, padded)
+        # Cross-stream: project_context consumes capture segments bound to the
+        # prefill stream. Materialize the result onto the active (draft) stream
+        # so attention projections inherit a stream this thread owns. A foreign
+        # stream binding makes QuantizedLinear kernels fail with
+        # "There is no Stream(gpu, X) in current thread".
+        h_ctx = mx.contiguous(mx.array(h_ctx))
+        mx.eval(h_ctx)
         if any(prior is not None for prior in restored):
             width = max(lengths)
             parts = []
@@ -778,7 +893,7 @@ class DFlashDrafter:
             ).transpose(0, 2, 1, 3)
             if self.value_scale is not None:
                 ctx_values = ctx_values * self.value_scale
-            ctx_keys = model.rope(ctx_keys, offset=base_arr)
+            ctx_keys = _rope_positions(model, ctx_keys, base_arr)
 
             ring_keys = mx.stop_gradient(cohort.keys[layer_index])
             ring_values = mx.stop_gradient(cohort.values[layer_index])
@@ -801,8 +916,8 @@ class DFlashDrafter:
             ).transpose(0, 2, 1, 3)
             if self.value_scale is not None:
                 prop_values = prop_values * self.value_scale
-            queries = model.rope(queries, offset=query_offsets)
-            prop_keys = model.rope(prop_keys, offset=query_offsets)
+            queries = _rope_positions(model, queries, query_offsets)
+            prop_keys = _rope_positions(model, prop_keys, query_offsets)
             keys = mx.concatenate([ring_keys, prop_keys], axis=2)
             values = mx.concatenate([ring_values, prop_values], axis=2)
             attended = mx.fast.scaled_dot_product_attention(
