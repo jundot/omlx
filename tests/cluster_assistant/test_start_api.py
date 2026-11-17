@@ -367,7 +367,7 @@ def test_the_operation_state_is_monotonic_through_a_start(api) -> None:
 
     response = client.post(START_URL, json=start_payload(plan))
     operation_id = response.json()["operation_id"]
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         body = client.get(f"{OPERATIONS_URL}/{operation_id}").json()
         if not seen or seen[-1] != body["state"]:

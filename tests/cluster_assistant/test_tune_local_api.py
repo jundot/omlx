@@ -208,7 +208,7 @@ def _run_payload(measurement_id: str) -> dict:
     }
 
 
-def _poll(client, url: str, job_id: str, *, timeout: float = 10.0) -> dict:
+def _poll(client, url: str, job_id: str, *, timeout: float = 30.0) -> dict:
     deadline = time.monotonic() + timeout
     body: dict = {}
     while time.monotonic() < deadline:

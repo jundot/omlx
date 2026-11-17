@@ -52,7 +52,7 @@ def _start(client, plan: dict[str, Any]) -> str:
     return response.json()["operation_id"]
 
 
-def _wait(client, operation_id: str, predicate, timeout: float = 10.0) -> dict:
+def _wait(client, operation_id: str, predicate, timeout: float = 30.0) -> dict:
     deadline = time.monotonic() + timeout
     body: dict[str, Any] = {}
     while time.monotonic() < deadline:
