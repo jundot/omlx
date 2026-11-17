@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Coordinator-election tests.
 
-These are the tests the first milestone is defined by (PROJECT-BRIEF §7,
+These are the tests the first milestone is defined by (the project design notes,
 Appendix A.8). They run off-cluster: no Mac, model, GPU or SSH is involved,
 only measured numbers, because the election is a pure function and the thing
 that must be provable is the *decision*.
@@ -137,7 +137,7 @@ def m5(**kwargs) -> NodeFacts:
         admission_gib=100,
         decode_gib_per_s=2.0,
         prefill_gib_per_s=4.0,
-        host="172.16.1.11",
+        host="192.0.2.11",
         **kwargs,
     )
 
@@ -149,7 +149,7 @@ def m1(**kwargs) -> NodeFacts:
         admission_gib=40,
         decode_gib_per_s=0.8,
         prefill_gib_per_s=1.6,
-        host="172.16.1.14",
+        host="192.0.2.14",
         **kwargs,
     )
 
@@ -383,7 +383,7 @@ def test_three_node_rank_orders_are_valid() -> None:
             admission_gib=52,
             decode_gib_per_s=1.6,
             prefill_gib_per_s=3.2,
-            host="172.16.1.13",
+            host="192.0.2.13",
         ),
         m1(),
     ]
@@ -409,7 +409,7 @@ def test_four_node_rank_orders_are_valid() -> None:
             admission_gib=52,
             decode_gib_per_s=1.6,
             prefill_gib_per_s=3.2,
-            host="172.16.1.13",
+            host="192.0.2.13",
         ),
         m1(),
         facts(
@@ -418,7 +418,7 @@ def test_four_node_rank_orders_are_valid() -> None:
             admission_gib=44,
             decode_gib_per_s=0.9,
             prefill_gib_per_s=1.8,
-            host="172.16.1.12",
+            host="192.0.2.12",
         ),
     ]
     model = layout(layers=32, layer_gib=0.6)  # 20 GiB
@@ -595,7 +595,7 @@ def test_election_is_serializable_and_keeps_the_planner_plan() -> None:
     assert payload["plan_signature"] == result.selected.plan_hash
     assert len(payload["plan_signature"]) == 64
     assert payload["endpoint"]["node_id"] == "m5"
-    assert payload["endpoint"]["url"] == "http://172.16.1.11"
+    assert payload["endpoint"]["url"] == "http://192.0.2.11"
     assert payload["policy"]["name"] == "feasibility_first"
     assert payload["reasons"]
 

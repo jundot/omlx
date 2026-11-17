@@ -29,7 +29,7 @@ RUN_LOCAL_URL = "/admin/api/cluster/assistant/run-local"
 TUNE_LOCAL_URL = "/admin/api/cluster/assistant/tune-local"
 
 # Measured MTP rates this Mac "produces": depth 3 wins, exactly the live shape
-# of PHASE-2B-RUN.md §27 (MTP on with a fixed depth beats off and adaptive).
+# of the live-run notes (MTP on with a fixed depth beats off and adaptive).
 RATES = {
     (False, None): 20.0,
     (True, None): 29.0,
@@ -320,7 +320,7 @@ def test_tune_local_measures_the_sampler_and_every_mtp_config(
         "top_k": 20,
     }
     # MTP is a model setting here, never a per-request field (a per-request
-    # sweep of it would measure noise — PHASE-2B-RUN §25).
+    # sweep of it would measure noise — the live-run notes).
     rate_bodies = [
         payload
         for _, path, payload in admin.calls

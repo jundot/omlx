@@ -61,7 +61,7 @@ MAX_OPERATION_RECORDS = 8
 # Generous on purpose: staging copies tens of gigabytes and a weight load takes
 # minutes, so the bound sits well above any normal apply/start. It exists only
 # so an origin that crashed mid-operation cannot wedge the coordinator's lock
-# forever (CHAPTER-5 §2.2); a live origin mirrors the terminal state long
+# forever (the apply/start design notes); a live origin mirrors the terminal state long
 # before this expires.
 MIRROR_TTL_SECONDS = 2 * 3600.0
 
@@ -96,7 +96,7 @@ RUNNING_STATES = frozenset(
     {STATE_QUEUED, STATE_APPLYING, STATE_STARTING, STATE_LOADING}
 )
 
-# The next step for each failure. One action per failure (PROJECT-BRIEF §8.6,
+# The next step for each failure. One action per failure (the project design notes,
 # §12.4); the route never invents a second one.
 ACTION_APPLY = "apply"
 ACTION_START = "start"
@@ -356,7 +356,7 @@ class OperationRecord:
     #: did become ready, and no state machine value reports a stop.
     stopped: bool = False
     #: True when another origin mirrored this record onto this Mac through the
-    #: admin seam (the cluster-wide lock, CHAPTER-5 §2.2). A mirror is a lock
+    #: admin seam (the cluster-wide lock, the apply/start design notes). A mirror is a lock
     #: marker, not this Mac's own assistant session: ``latest_session`` and
     #: ``applied`` skip it, while ``active`` reports a running one.
     mirrored: bool = False
@@ -838,7 +838,7 @@ class OperationStore:
     ) -> OperationRecord:
         """Register or release another origin's operation on this coordinator.
 
-        The cluster-wide lock (CHAPTER-5 §2.2): a remote apply/start drives
+        The cluster-wide lock (the apply/start design notes): a remote apply/start drives
         this Mac's raw cluster routes, so the origin's record lives only in
         the origin's store. The origin mirrors its operation here through the
         admin seam — a running mirror takes the lock (``active`` reports it

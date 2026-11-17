@@ -188,7 +188,7 @@ def test_start_launches_on_the_elected_coordinator(api) -> None:
     assert operation["rank_order"] == ["m5", "m1"]
     assert operation["endpoint"]["node"] == "m5"
     assert operation["endpoint"]["ready"] is True
-    assert operation["endpoint"]["url"] == "http://172.16.1.11:8099"
+    assert operation["endpoint"]["url"] == "http://192.0.2.11:8099"
     assert operation["error"] is None
     assert fake.health_checks == 1
     # The coordinator received the signed request. Rank 0 is spawned as the
@@ -282,7 +282,7 @@ def test_a_remote_coordinator_without_an_admin_key_is_one_action() -> None:
 
     with pytest.raises(RemoteAdminError) as excinfo:
         assistant_start.remote_admin(
-            "172.16.1.11",
+            "192.0.2.11",
             0,
             ACTIVATION_PATH,
             {},
@@ -433,7 +433,7 @@ def test_a_remote_coordinator_is_driven_through_the_existing_ssh_seam(
     assert operation["state"] == STATE_READY
     # Every call went to the elected coordinator's own address and port, never
     # to loopback on the origin.
-    assert {target for target, _, _, _ in calls} == {"172.16.1.11"}
+    assert {target for target, _, _, _ in calls} == {"192.0.2.11"}
     assert {port for _, port, _, _ in calls} == {8099}
     assert [path for _, _, path, _ in calls] == [
         # Apply: mirror running, do the work, mirror terminal (applied).
@@ -528,10 +528,10 @@ def test_remote_admin_keeps_the_admin_key_on_the_coordinator(monkeypatch) -> Non
 
     monkeypatch.setitem(assistant_start.__dict__, "run_remote_python", fake_run)
 
-    reply = remote_admin("172.16.1.11", 8099, PLAN_PATH, {"model_path": "/models/qwen"})
+    reply = remote_admin("192.0.2.11", 8099, PLAN_PATH, {"model_path": "/models/qwen"})
 
     assert reply == {"ok": True}
-    assert seen["ssh_target"] == "172.16.1.11"
+    assert seen["ssh_target"] == "192.0.2.11"
     # The key is read and used on the coordinator; it is never in the payload.
     assert "get_settings().auth" in seen["snippet"]
     assert "api_key" in seen["snippet"]
@@ -583,7 +583,7 @@ def test_the_local_coordinator_uses_the_existing_local_pipeline(
             devices=devices,
             reload=lambda: calls.append("reload"),
         ),
-        local_addresses=("172.16.1.11",),
+        local_addresses=("192.0.2.11",),
     )
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id, rank0_extra_bytes=70 * GIB)

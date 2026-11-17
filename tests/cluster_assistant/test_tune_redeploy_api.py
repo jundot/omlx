@@ -256,7 +256,7 @@ def _fake_tune(monkeypatch, sampler: dict) -> None:
 
 def test_a_tune_after_a_redeploy_keeps_both_knobs(api, monkeypatch) -> None:
     # One combined preset: the redeploy measures mtp+depth, /tune measures the
-    # sampler; whichever runs second must not erase the other (PHASE-2B-RUN.md
+    # sampler; whichever runs second must not erase the other (the live-run notes
     # §26). This is the live regression (depth 3 was erased by a later /tune).
     client, _, store = api()
     measurement_id = take_measurement(client)

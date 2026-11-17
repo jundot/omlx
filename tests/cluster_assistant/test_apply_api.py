@@ -217,7 +217,7 @@ def test_an_unpaired_coordinator_asks_for_the_pairing(api) -> None:
     """An unpaired Mac has no address *because* it is unpaired.
 
     Telling the user to bind an interface would send them to the wrong control;
-    the one next step is the pairing flow (PROJECT-BRIEF §13.2).
+    the one next step is the pairing flow (the project design notes).
     """
 
     client, _, _ = api(device=lambda node_id: None)
@@ -285,7 +285,7 @@ def test_apply_stages_and_never_starts_inference(api) -> None:
     # it — not an assumption about the app origin.
     assert source_host == "127.0.0.1"
     # The endpoint is known but not ready: nothing has been started or proven.
-    assert operation["endpoint"]["host"] == "172.16.1.11"
+    assert operation["endpoint"]["host"] == "192.0.2.11"
     assert operation["endpoint"]["port"] == 8099
     assert operation["endpoint"]["ready"] is False
     # No throughput is claimed anywhere: the field is null until a real
@@ -350,7 +350,7 @@ def test_apply_uses_a_peer_as_the_model_source_when_the_coordinator_lacks_it(
     assert operation["state"] == STATE_APPLIED
     _, source_host, _ = fake.staged[0]
     # The coordinator reaches the M1 through its paired SSH target.
-    assert source_host == "omlx@172.16.1.14"
+    assert source_host == "omlx@192.0.2.14"
 
 
 def test_apply_does_not_reload_a_coordinator_that_already_lists_the_model(api) -> None:
@@ -618,8 +618,8 @@ def test_an_unpaired_discovered_mac_is_never_a_launch_target(monkeypatch) -> Non
 
 def test_a_link_local_address_never_wins_over_ipv4() -> None:
     assert (
-        provisioning._first_address("fe80::18b2:3e41:95e1:b30b", "172.16.1.13")
-        == "172.16.1.13"
+        provisioning._first_address("fe80::18b2:3e41:95e1:b30b", "192.0.2.13")
+        == "192.0.2.13"
     )
     assert provisioning._first_address("fe80::1") == "fe80::1"
 

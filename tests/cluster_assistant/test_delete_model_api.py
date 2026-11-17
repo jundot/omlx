@@ -2,7 +2,7 @@
 """The free-space affordance: one model, one measured Mac, one relay.
 
 A copy that cannot fit is refused with ``insufficient_disk`` and the single
-action ``free_disk_space`` (PHASE-2B-RUN.md §8.2). Freeing space is a delete on
+action ``free_disk_space`` (the live-run notes). Freeing space is a delete on
 the Mac that is short of it, and this route is the only place the assistant
 deletes anything:
 

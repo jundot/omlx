@@ -3,7 +3,7 @@
 
 These tests are fake-driven on purpose. The decision is a pure function of
 measured facts and a checkpoint shape, so a Mac, a model and SSH would only add
-noise. The live evidence for the same levers belongs in ``PHASE-2B-RUN.md``.
+noise. The live evidence for the same levers belongs in ``the live-run notes``.
 """
 
 from __future__ import annotations

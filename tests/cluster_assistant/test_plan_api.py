@@ -61,7 +61,7 @@ MEASURED_AT = "2026-11-03T12:00:00+00:00"
 
 CAPACITY_GIB = {"m5": 107.5, "m1": 60.0}
 USABLE_GIB = {"m5": 96.75, "m1": 54.0}
-SSH = {"m5": "172.16.1.11", "m1": "172.16.1.14"}
+SSH = {"m5": "192.0.2.11", "m1": "192.0.2.14"}
 UNITS = [
     {"node_id": "m5", "ssh": SSH["m5"]},
     {"node_id": "m1", "ssh": SSH["m1"]},
@@ -302,9 +302,9 @@ def test_the_plan_object_matches_the_decided_contract(api) -> None:
     endpoint = plan["endpoint"]
     assert set(endpoint) == {"node", "host", "port", "url", "ready"}
     assert endpoint["node"] == "m5"
-    assert endpoint["host"] == "172.16.1.11"
+    assert endpoint["host"] == "192.0.2.11"
     assert endpoint["port"] == 8099
-    assert endpoint["url"] == "http://172.16.1.11:8099"
+    assert endpoint["url"] == "http://192.0.2.11:8099"
     assert endpoint["ready"] is False
 
     assert plan["model"].startswith("synthetic model")
@@ -680,7 +680,7 @@ def test_the_router_exposes_the_assistant_routes(api) -> None:
         (OPERATIONS_URL + "/mirror", ["POST"]),
         (OPERATIONS_URL + "/{operation_id}", ["GET"]),
         # The free-space affordance: one model, on one measured Mac, through that
-        # Mac's own delete route (PHASE-2B-RUN.md §9).
+        # Mac's own delete route (the live-run notes).
         (
             "/admin/api/cluster/assistant/models/{node_id}/{model_id:path}",
             ["DELETE"],

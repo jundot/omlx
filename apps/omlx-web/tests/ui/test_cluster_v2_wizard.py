@@ -87,7 +87,7 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/cuda-fabric/verify",
     "/admin/api/cluster/rdma-links",
     "/admin/api/cluster/rdma-links/verify",
-    # Cluster Assistant (SCREEN-3-MINIMAL.md §2): the entire browser surface
+    # Cluster Assistant (the minimal-card contract): the entire browser surface
     # for Screen 3. Nothing else in the tab may reach these.
     "/admin/api/cluster/assistant/measure",
     "/admin/api/cluster/assistant/status",
@@ -108,7 +108,7 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/assistant/network-preflight",
     # The in-app switch for the post-ready measurement.
     "/admin/api/cluster/assistant/performance-probe",
-    # The free-space relay (PHASE-2B-RUN.md §9): the only assistant route that
+    # The free-space relay (the live-run notes): the only assistant route that
     # changes another Mac's disk.
     "/admin/api/cluster/assistant/models",
     # Tuning: the quick sampler sweep and the minutes-long MTP depth sweep.
@@ -3454,7 +3454,7 @@ ASSISTANT_ENDPOINTS = {
     "/admin/api/cluster/assistant/network-preflight",
     # The in-app switch for the post-ready measurement.
     "/admin/api/cluster/assistant/performance-probe",
-    # The free-space relay (PHASE-2B-RUN.md §9): the only assistant route that
+    # The free-space relay (the live-run notes): the only assistant route that
     # changes another Mac's disk.
     "/admin/api/cluster/assistant/models",
     # Tuning: the quick sampler sweep and the minutes-long MTP depth sweep.
@@ -3878,7 +3878,7 @@ def test_assistant_search_is_single_flight_generation_guarded_and_measured_only(
     assert "assistant.state =" not in block
 
 
-# --- Screen 5: the handoff (SCREEN-5-HANDOFF.md) ------------------------------
+# --- Screen 5: the handoff (the handoff notes) ------------------------------
 #
 # The ready surface opens the *existing* /chat with the cluster's model, and
 # Connect agent shows the base URL, the serving model ID and where the key is.
@@ -4171,7 +4171,7 @@ def test_a_small_mac_is_forced_to_headless_and_says_so():
 
 # --- Cluster Assistant: Screen 4 (the progress surface) -----------------------
 #
-# SCREEN-4-PROGRESS.md §2 maps eight labels onto six observable rows. These tests
+# the progress-row contract maps eight labels onto six observable rows. These tests
 # pin that mapping, the two combined pairs, the unknown-phase fallback, the
 # failure row and the absence of any invented progress. The behaviour of the
 # rows under a running flow is covered under Node in
@@ -4356,7 +4356,7 @@ def test_screen_4_never_renders_a_rate_a_percentage_or_an_eta():
 
 # --- Cluster Assistant: the free-space affordance ----------------------------
 #
-# PHASE-2B-RUN.md §9 (decision A): an insufficient_disk refusal keeps the one
+# the live-run notes (decision A): an insufficient_disk refusal keeps the one
 # action free_disk_space, and the card may then delete an unused model on the Mac
 # that is short — two-step confirm, never automatic, never the model the cluster
 # is about to run, and only a Mac the user picked.
@@ -4584,7 +4584,7 @@ def test_assistant_session_endpoint_is_hidden_when_stopped():
     result = _run_wizard(
         """
 component.assistant.session = {
-  state: 'ready', stopped: false, endpoint: {ready: true, url: 'http://172.16.1.11:8099'},
+  state: 'ready', stopped: false, endpoint: {ready: true, url: 'http://192.0.2.11:8099'},
 };
 const running = component.assistantSessionEndpoint();
 component.assistant.session.endpoint.ready = false;
@@ -4593,14 +4593,14 @@ component.assistant.session.endpoint.ready = true;
 component.assistant.session.stopped = true;
 const stopped = component.assistantSessionEndpoint();
 component.assistant.session = {
-  state: 'applied', stopped: false, endpoint: {ready: true, url: 'http://172.16.1.11:8099'},
+  state: 'applied', stopped: false, endpoint: {ready: true, url: 'http://192.0.2.11:8099'},
 };
 const applied = component.assistantSessionEndpoint();
 process.stdout.write(JSON.stringify({running, notReady, stopped, applied}));
 """
     )
     assert result == {
-        "running": "http://172.16.1.11:8099",
+        "running": "http://192.0.2.11:8099",
         "notReady": "",
         "stopped": "",
         "applied": "",

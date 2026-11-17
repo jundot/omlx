@@ -1,19 +1,12 @@
-"""Bootstrap checks for the Cluster Assistant workspace.
+"""Bootstrap checks for the Cluster Assistant package.
 
-These do not test product behavior. They prove that the project skeleton and
-the assistant package are wired correctly before the election implementation
-starts.
+These do not test product behavior; they prove the assistant package is
+importable and documented before the election implementation starts.
 """
 
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-
-
-def test_project_handoff_files_exist() -> None:
-    assert (ROOT / "AGENTS.md").is_file()
-    assert (ROOT / "docs" / "cluster-assistant" / "PROJECT-BRIEF.md").is_file()
-    assert (ROOT / "docs" / "cluster-assistant" / "README.md").is_file()
 
 
 def test_assistant_package_imports() -> None:

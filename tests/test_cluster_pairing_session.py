@@ -574,7 +574,7 @@ def test_legacy_approved_join_retires_by_coordinator_address(tmp_path):
     # A pre-reconcile record: no node id, the coordinator long unpaired.
     with joiner.ui_session.lock:
         joiner.ui_session.attempt.pop("coordinator_node_id", None)
-        joiner.ui_session.attempt["coordinator_addr"] = "172.16.1.11:8000"
+        joiner.ui_session.attempt["coordinator_addr"] = "192.0.2.11:8000"
     joiner.unpair(coordinator.node_id)
 
     assert joiner.ui_session.snapshot()["state"] == "idle"

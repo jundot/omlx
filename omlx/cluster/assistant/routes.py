@@ -3451,7 +3451,7 @@ async def cluster_assistant_tuning_preset(
 # "Run on this Mac" is deliberately not a plan: ``plan`` is the PP-only cluster
 # contract and a single-Mac plan stays unapplicable (ClusterDeployment needs 2+
 # hosts). A model that fits on one Mac is measurably faster served by that Mac's
-# own engine than by a pipeline (PHASE-2B-RUN.md §22: 254 tok/s single-node vs
+# own engine than by a pipeline (the live-run notes: 254 tok/s single-node vs
 # 53 tok/s on the 4-Mac cluster), so the assistant offers this as its own flow.
 #
 # The job only ever talks to *this* Mac: its own admin port through the same
@@ -4980,7 +4980,7 @@ class AssistantOperationMirrorRequest(BaseModel):
 
     The browser never calls this: the origin mirrors its apply/start onto the
     elected coordinator through the admin seam so the coordinator's own store
-    can answer ``operations/active`` — the cluster-wide lock (CHAPTER-5 §2.2).
+    can answer ``operations/active`` — the cluster-wide lock (the apply/start design notes).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -5046,7 +5046,7 @@ async def cluster_assistant_operation_status(
 
 
 # ---------------------------------------------------------------------------
-# free space (PHASE-2B-RUN.md §9: the delete affordance is a relay)
+# free space (the live-run notes: the delete affordance is a relay)
 # ---------------------------------------------------------------------------
 
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request and response schemas for the Cluster Assistant admin API.
 
-The contract is the one decided in PROJECT-BRIEF §13.2/§13.3 and §8.5:
+The contract is the one decided in the project design notes/§13.3 and §8.5:
 
 * ``measure`` starts a job and returns a ``measurement_id`` immediately;
 * ``status`` reports that job;
@@ -24,7 +24,7 @@ module adds to an ``ElectionResult`` is *derived* and non-scoring: warnings abou
 unmeasured inputs, the predicted-stage block, and the endpoint taken from the
 measurement record.
 
-``predicted`` deliberately contains no tokens/s. PROJECT-BRIEF §17.2 forbids
+``predicted`` deliberately contains no tokens/s. the project design notes forbids
 promising absolute throughput before it has been measured, and oMLX's own plan
 objects report predicted stage seconds, not model throughput — so this aligns
 with them and leaves the rate fields to the post-smoke measurement, which will
@@ -286,7 +286,7 @@ class PlanPrediction(BaseModel):
     """What the measurements support predicting — and nothing more.
 
     There is no ``decode_tok_per_s`` here: an unmeasured rate is not zero and
-    not a guess (PROJECT-BRIEF §17.2). ``measured`` false means the whole block
+    not a guess (the project design notes). ``measured`` false means the whole block
     is worst case, which is exactly how the election scored it.
     """
 
@@ -468,7 +468,7 @@ class AssistantMeasurementStatus(BaseModel):
 
 
 class AssistantPlanResponse(BaseModel):
-    """The plan object from PROJECT-BRIEF §13.3.
+    """The plan object from the project design notes
 
     An infeasible answer carries the same shape with ``feasible`` false, an
     empty ``coordinator_node``, no ``endpoint`` and no stages: nothing
@@ -854,7 +854,7 @@ def plan_error_payload(code: str, message: str, action: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# recommendation (PROJECT-BRIEF §11.1a/§13.3a)
+# recommendation (the project design notesa/§13.3a)
 # ---------------------------------------------------------------------------
 
 # No candidate model fits these Macs. Distinct from ``no_feasible_plan``: this
@@ -1129,7 +1129,7 @@ def _warning(item: RecommendationWarningData) -> RecommendationWarning:
 
 
 # ---------------------------------------------------------------------------
-# apply / start / operation status (PROJECT-BRIEF §13.2, CHAPTER-5.md §4)
+# apply / start / operation status (the project design notes, the apply/start design notes)
 # ---------------------------------------------------------------------------
 
 OPERATIONS_PATH = "/admin/api/cluster/assistant/operations"
@@ -1401,7 +1401,7 @@ class OperationErrorView(BaseModel):
 
 
 class AssistantOperationStatus(BaseModel):
-    """The operation status object (CHAPTER-5.md §4.3).
+    """The operation status object (the apply/start design notes).
 
     Deliberately separate from the measurement status: a measurement job can be
     ready while no deployment exists, and an operation can be ready while its
