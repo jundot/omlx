@@ -9863,22 +9863,29 @@ async def check_update(
         # Use the releases list (not /releases/latest) and filter by the
         # user's update channel. GitHub's prerelease flag has historically
         # been unreliable for rc/dev tags, so release_check validates tags too.
-        resp = await asyncio.to_thread(
-            requests.get,
-            "https://api.github.com/repos/jundot/omlx/releases",
-            params={"per_page": 20},
-            timeout=5,
-        )
-        if resp.status_code != 200:
-            _update_cache[channel] = no_update
-            _update_cache_time[channel] = now
-            return _update_cache[channel]
+        page_size = 20
+        page = 1
+        while True:
+            resp = await asyncio.to_thread(
+                requests.get,
+                "https://api.github.com/repos/jundot/omlx/releases",
+                params={"per_page": page_size, "page": page},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                _update_cache[channel] = no_update
+                _update_cache_time[channel] = now
+                return _update_cache[channel]
 
-        data = select_latest_release(resp.json(), channel=channel)
-        if data is None:
-            _update_cache[channel] = no_update
-            _update_cache_time[channel] = now
-            return _update_cache[channel]
+            releases = resp.json()
+            data = select_latest_release(releases, channel=channel)
+            if data is not None:
+                break
+            if len(releases) < page_size:
+                _update_cache[channel] = no_update
+                _update_cache_time[channel] = now
+                return _update_cache[channel]
+            page += 1
 
         latest = data["tag_name"].lstrip("v")
 
