@@ -1515,14 +1515,26 @@ def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
     if not snapshots_dir.is_dir():
         return None
 
+    ref_files = []
     for ref_name in ("main", "master"):
+        ref_file = path / "refs" / ref_name
+        if not ref_file.exists():
+            continue
+        ref_files.append(ref_file)
         try:
-            commit_hash = (path / "refs" / ref_name).read_text().strip()
-        except OSError:
+            commit_hash = ref_file.read_text().strip()
+        except (OSError, ValueError):
+            # ValueError covers UnicodeDecodeError: a stray byte in the ref file
             continue
         snapshot = snapshots_dir / commit_hash
         if snapshot.is_dir():
             return HfCacheEntry(snapshot, model_id, source_repo_id)
+
+    if ref_files:
+        logger.warning(
+            "Could not resolve pinned revision from %s — falling back to newest snapshot",
+            ", ".join(str(f) for f in ref_files),
+        )
 
     snapshots = [
         p
