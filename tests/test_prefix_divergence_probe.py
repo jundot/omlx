@@ -234,3 +234,79 @@ class TestJunctionEnd:
             self._plan(stored, prompt, cached, gen_start=gen_start, stateful=stateful)
             == 0
         ), name
+
+
+class TestParagraphEnd:
+    """A long prompt with no branch point keeps a tail at its last paragraph break."""
+
+    BREAK = 271  # "\n\n" in the stub tokenizer
+
+    @classmethod
+    def _plan(cls, prompt, cached, *, gen_start, stateful=True, junction=0):
+        sched = _make_scheduler()
+        sched._boundary_snapshot_required = stateful
+        sched.tokenizer = MagicMock()
+        sched.tokenizer.encode.side_effect = lambda text, add_special_tokens=False: (
+            [cls.BREAK]
+            if text == "\n\n"
+            else (
+                [7, cls.BREAK]
+                if text.endswith("\n\n") and text.count("\n") == 2
+                else [8, 9]
+            )
+        )
+        sched.tokenizer.decode.side_effect = lambda ids: (
+            "\n\n" if ids == [cls.BREAK] else "x"
+        )
+        request = _request(prompt, cached_tokens=cached)
+        request.generation_prompt_start = gen_start
+        if junction:
+            request.junction_end = junction
+        sched._resolve_paragraph_end(request)
+        return getattr(request, "junction_end", 0)
+
+    def _prompt(self, doc_tokens, question_tokens=30, gen=5):
+        return (
+            list(range(1000, 1000 + doc_tokens))
+            + [self.BREAK]
+            + [5] * question_tokens
+            + [6] * gen
+        )
+
+    def test_plans_a_tail_after_the_last_break_before_the_question(self):
+        prompt = self._prompt(9000)
+        assert self._plan(prompt, 0, gen_start=len(prompt) - 5) == 9001
+
+    @pytest.mark.parametrize(
+        "name,prompt_doc,question,cached,stateful,junction",
+        [
+            # The break is far from the question: not an appended question.
+            ("break too far", 9000, 5000, 0, True, 0),
+            # Too little to save over what the lookup restores.
+            ("small gain", 9000, 30, 8800, True, 0),
+            # Attention-only models resume at any block boundary.
+            ("stateless model", 9000, 30, 0, False, 0),
+            # A branch point is already planned.
+            ("branch point set", 9000, 30, 0, True, 4321),
+        ],
+    )
+    def test_plans_nothing(
+        self, name, prompt_doc, question, cached, stateful, junction
+    ):
+        prompt = self._prompt(prompt_doc, question)
+        got = self._plan(
+            prompt,
+            cached,
+            gen_start=len(prompt) - 5,
+            stateful=stateful,
+            junction=junction,
+        )
+        assert got == (junction or 0), name
+
+    def test_on_the_grid_plans_nothing(self):
+        # A break that ends on a block boundary: the boundary snapshot covers it.
+        block = 2048  # _make_scheduler's block size
+        prompt = (
+            list(range(1000, 1000 + block * 4 - 1)) + [self.BREAK] + [5] * 30 + [6] * 5
+        )
+        assert self._plan(prompt, 0, gen_start=len(prompt) - 5) == 0
