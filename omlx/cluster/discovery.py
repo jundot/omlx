@@ -586,19 +586,49 @@ def decode_hello(data: bytes) -> tuple[int, int] | None:
 
 
 def encode_wassup(
-    nonce: int, node_id: str, http_port: int, loopback_only: bool = False
+    nonce: int,
+    node_id: str,
+    http_port: int,
+    loopback_only: bool = False,
+    *,
+    friendly_name: str = "",
+    caps: dict[str, Any] | None = None,
+    addrs: object = None,
 ) -> bytes:
-    # Older decoders ignore keys they do not know.
-    payload = json.dumps(
-        {
-            "nonce": nonce,
-            "node_id": node_id,
-            "http_port": int(http_port),
-            "loopback_only": bool(loopback_only),
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return _WASSUP_MAGIC + payload
+    # Older decoders ignore keys they do not know. The name, the capability
+    # snapshot and the IPv4 addresses travel with the reply because mDNS — the
+    # transport that carries them as TXT and A records — is not always
+    # available: without them a discovered peer could only be rendered as a
+    # machine ID with "Memory unknown" on an address nobody can dial.
+    payload: dict[str, Any] = {
+        "nonce": nonce,
+        "node_id": node_id,
+        "http_port": int(http_port),
+        "loopback_only": bool(loopback_only),
+    }
+    name = (friendly_name or "").strip()[:255]
+    if name:
+        payload["friendly_name"] = name
+    if isinstance(caps, dict) and caps:
+        payload["caps"] = {
+            key: value
+            for key, value in caps.items()
+            if isinstance(key, str) and isinstance(value, (str, int, float, bool, list))
+        }
+    announced: list[dict[str, str]] = []
+    for item in addrs if isinstance(addrs, (list, tuple)) else ():
+        if isinstance(item, dict):
+            ip = str(item.get("ip") or "").strip()
+            kind = str(item.get("if_type") or "unknown").strip()[:32]
+        else:
+            ip = str(item or "").strip()
+            kind = "unknown"
+        if ip:
+            announced.append({"ip": ip, "if_type": kind or "unknown"})
+    announced = announced[:8]
+    if announced:
+        payload["addrs"] = announced
+    return _WASSUP_MAGIC + json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 def decode_wassup(data: bytes) -> dict[str, Any] | None:
@@ -621,11 +651,29 @@ def decode_wassup(data: bytes) -> dict[str, Any] | None:
         return None
     if not isinstance(http_port, int) or not 1 <= http_port <= 65535:
         return None
+    name = payload.get("friendly_name")
+    caps = payload.get("caps")
+    raw_addrs = payload.get("addrs")
+    addrs: list[dict[str, str]] = []
+    for item in raw_addrs if isinstance(raw_addrs, list) else ():
+        if isinstance(item, dict):
+            ip = str(item.get("ip") or "").strip()
+            kind = str(item.get("if_type") or "unknown").strip()[:32]
+        elif isinstance(item, str):
+            ip, kind = item.strip(), "unknown"
+        else:
+            continue
+        if ip:
+            addrs.append({"ip": ip, "if_type": kind or "unknown"})
+    addrs = addrs[:8]
     return {
         "nonce": nonce,
         "node_id": node_id,
         "http_port": http_port,
         "loopback_only": payload.get("loopback_only") is True,
+        "friendly_name": name.strip()[:255] if isinstance(name, str) else "",
+        "caps": caps if isinstance(caps, dict) else {},
+        "addrs": addrs,
     }
 
 
@@ -924,7 +972,15 @@ def local_addr_dicts() -> list[dict[str, str]]:
                 if match is None:
                     continue
                 ip = match.group(1)
-                if_type = "vpn" if current.startswith("utun") else "lan"
+                # macOS names the Thunderbolt Bridge ``bridge0``. Calling that
+                # address plain "lan" is why a cable-connected Mac rendered as
+                # "Network": the card's link kind comes from the address type.
+                if current.startswith("bridge"):
+                    if_type = "thunderbolt"
+                elif current.startswith("utun"):
+                    if_type = "vpn"
+                else:
+                    if_type = "lan"
                 if ip.startswith("100."):
                     if_type = "tailscale"
                 addrs.append({"ip": ip, "if_type": if_type})
@@ -1033,13 +1089,17 @@ def _system_proxy_probe_node_id(
 def _classify_link(ip: str, if_type: str, rtt: float | None) -> PeerLink:
     """Best-effort link classification.
 
-    Tailscale is certain (100.64.0.0/10); Thunderbolt vs ethernet vs wifi is
+    Tailscale is certain (100.64.0.0/10) and so is an address the peer published
+    as a Thunderbolt-bridge address. Otherwise Thunderbolt vs ethernet vs wifi is
     an RTT heuristic over the verified address until interface metadata says
-    otherwise.
+    otherwise — and that heuristic labelled a cable-connected Mac "wifi" as soon
+    as one probe answered slowly.
     """
 
     if if_type == "tailscale":
         return "tailscale"
+    if if_type in {"thunderbolt", "tb"}:
+        return "tb"
     with suppress(ValueError):
         if ipaddress.ip_address(ip) in ipaddress.ip_network("100.64.0.0/10"):
             return "tailscale"
@@ -1054,6 +1114,14 @@ def _classify_link(ip: str, if_type: str, rtt: float | None) -> PeerLink:
 
 # Fastest first; a Mac shows the best link among its verified addresses.
 _LINK_RANK = {"tb": 0, "ethernet": 1, "wifi": 2, "tailscale": 3, "unknown": 4}
+
+def _best_link(current: str, candidate: str) -> str:
+    """Keep the best path a peer answered on, using the same ranking."""
+
+    if current == candidate:
+        return current
+    return candidate if _LINK_RANK.get(candidate, 4) < _LINK_RANK.get(current, 4) else current
+
 _LINK_CACHE_S = 60.0
 _link_cache: dict[str, tuple[float, PeerLink | None]] = {}
 _port_cache: list[Any] = [0.0, None]
@@ -1212,6 +1280,7 @@ class DiscoveryService:
         self._joined: dict[str, int] = {}  # ifname -> ifindex
         self._tx_fail_logged_at: dict[int, float] = {}  # ifindex -> monotonic
         self._reply_fail_logged_at: dict[str, float] = {}  # peer_ip -> monotonic
+        self._announced_addrs_cache: tuple[float, list[dict[str, str]]] | None = None
         self._consecutive_tx_fail_rounds = 0
         self._last_tx_ok_wall: float | None = None
         self._last_tx_error: str | None = None
@@ -1712,6 +1781,40 @@ class DiscoveryService:
         if wassup is not None:
             self._handle_wassup(wassup, addr)
 
+    def _announced_ipv4_addrs(self) -> list[dict[str, str]]:
+        """This Mac's own IPv4 addresses and their kind, refreshed every 30 s.
+
+        The fallback announcement has to carry them: without an IPv4 the peer
+        records only the IPv6 link-local source address of the datagram, cannot
+        probe this Mac over HTTP and renders it "Unreachable" on an address
+        nobody can dial. Cached because the lookup shells out to ``ifconfig``
+        and this runs for every HELLO reply.
+        """
+
+        now = self._clock()
+        with self._lock:
+            cached = self._announced_addrs_cache
+            if cached is not None and now - cached[0] < 30.0:
+                return list(cached[1])
+        try:
+            rows = local_addr_dicts()
+        except Exception:  # pragma: no cover - address discovery is best effort
+            rows = []
+        ipv4 = [
+            {
+                "ip": str(row.get("ip")),
+                "if_type": str(row.get("if_type") or "unknown"),
+            }
+            for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("ip"), str)
+            and row.get("ip")
+            and ":" not in str(row.get("ip"))
+        ][:8]
+        with self._lock:
+            self._announced_addrs_cache = (now, ipv4)
+        return ipv4
+
     def _handle_hello(
         self, nonce: int, cluster_hash: int, addr: Any, sock: Any = None
     ) -> None:
@@ -1748,6 +1851,9 @@ class DiscoveryService:
             self.identity.node_id,
             self.config.http_port,
             self.config.caps.loopback_only,
+            friendly_name=self.identity.friendly_name,
+            caps=self.config.caps.to_dict(),
+            addrs=self._announced_ipv4_addrs(),
         )
         target_sock = sock if sock is not None else self._socket
         if target_sock is not None:
@@ -1784,16 +1890,69 @@ class DiscoveryService:
                 self._peers[node_id] = peer
             peer.http_port = payload["http_port"]
             peer.caps.loopback_only = payload.get("loopback_only") is True
+            # The fallback transport also carries the display identity, so a
+            # peer discovered without mDNS has a name and a chip instead of a
+            # bare machine ID and "Memory unknown". Absent keys (an older peer)
+            # never erase what mDNS, an HTTP probe or pairing already learned.
+            announced_name = str(payload.get("friendly_name") or "").strip()
+            if announced_name:
+                peer.friendly_name = announced_name[:255]
+            announced_caps = payload.get("caps")
+            if isinstance(announced_caps, dict) and announced_caps:
+                try:
+                    merged = PeerCaps.from_dict(announced_caps).to_dict()
+                except Exception:  # pragma: no cover - defensive
+                    merged = {}
+                if merged.get("chip"):
+                    peer.caps.chip = str(merged["chip"])
+                if float(merged.get("ram_gb") or 0.0) > 0:
+                    peer.caps.ram_gb = float(merged["ram_gb"])
+                if merged.get("backends"):
+                    peer.caps.backends = [
+                        str(item) for item in merged["backends"] if isinstance(item, str)
+                    ]
+                peer.caps.thunderbolt = bool(
+                    merged.get("thunderbolt") or peer.caps.thunderbolt
+                )
+                peer.caps.jaccl = bool(merged.get("jaccl") or peer.caps.jaccl)
             peer.last_seen = now
             if peer.state == "dead":
                 peer.state = "discovered"
             if not any(a["ip"] == peer_ip for a in peer.addrs):
                 peer.addrs.append({"ip": peer_ip, "if_type": "unknown"})
-                peer.addrs = peer.addrs[-8:]
+            # The reply also lists this Mac's IPv4 addresses. Recording them is
+            # what makes the peer reachable over HTTP when mDNS — which would
+            # have supplied A records — is unavailable.
+            for item in payload.get("addrs") or []:
+                ip = str((item or {}).get("ip") or "") if isinstance(item, dict) else ""
+                kind = str((item or {}).get("if_type") or "unknown")
+                if not ip or ":" in ip:
+                    continue
+                existing = next((a for a in peer.addrs if a["ip"] == ip), None)
+                if existing is None:
+                    peer.addrs.append({"ip": ip, "if_type": kind or "unknown"})
+                elif kind not in ("", "unknown"):
+                    existing["if_type"] = kind
+            peer.addrs = peer.addrs[-8:]
+            # The card's link kind ("Network" / "Thunderbolt") comes from here.
+            # Without it a cable-connected Mac rendered as plain "Network".
+            if peer.link in ("", "unknown"):
+                kinds = {a.get("if_type") for a in peer.addrs}
+                if "thunderbolt" in kinds:
+                    peer.link = "tb"
+                elif "lan" in kinds:
+                    peer.link = "ethernet"
         self._merge_registry(peer)
         self._add_candidate(
             peer_ip, payload["http_port"], node_id=node_id, if_type="unknown"
         )
+        for item in payload.get("addrs") or []:
+            ip = str((item or {}).get("ip") or "") if isinstance(item, dict) else ""
+            kind = str((item or {}).get("if_type") or "unknown")
+            if ip and ":" not in ip:
+                self._add_candidate(
+                    ip, payload["http_port"], node_id=node_id, if_type=kind or "unknown"
+                )
         if is_new:
             self._fire_change(peer)
         # Higher node_id (string compare) initiates contact: the higher node
@@ -1929,9 +2088,12 @@ class DiscoveryService:
                 peer.caps = PeerCaps.from_dict(result["caps"])
             peer.http_port = port
             peer.last_seen = now
-            if not any(a["ip"] == ip for a in peer.addrs):
+            existing = next((a for a in peer.addrs if a["ip"] == ip), None)
+            if existing is None:
                 peer.addrs.append({"ip": ip, "if_type": if_type})
                 peer.addrs = peer.addrs[-8:]
+            elif if_type not in ("", "unknown"):
+                existing["if_type"] = if_type
             fresh = [
                 value.get("link") or "unknown"
                 for value in self._candidates.values()
@@ -1939,7 +2101,10 @@ class DiscoveryService:
                 and value.get("verified")
                 and now - (value.get("last_success") or 0.0) < self.config.dead_after
             ]
-            peer.link = min(fresh or [link], key=lambda kind: _LINK_RANK.get(kind, 4))
+            best = link
+            for candidate in fresh:
+                best = _best_link(best, candidate)
+            peer.link = best
         self._merge_registry(peer)
         if is_new:
             self._fire_change(peer)
