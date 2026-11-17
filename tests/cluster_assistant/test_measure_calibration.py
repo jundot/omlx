@@ -54,7 +54,7 @@ STATUS_URL = "/admin/api/cluster/assistant/status"
 
 CAPACITY_GIB = {"m5": 107.5, "m1": 60.0}
 USABLE_GIB = {"m5": 96.75, "m1": 54.0}
-SSH = {"m5": "172.16.1.11", "m1": "172.16.1.14"}
+SSH = {"m5": "192.0.2.11", "m1": "192.0.2.14"}
 
 # dev-1.5b is ~1 GB of weights; a round number keeps rates readable as GB/s.
 WEIGHT_BYTES = 1_000_000_000
@@ -625,9 +625,9 @@ def test_stream_completion_routes_local_in_process_and_remote_over_ssh(
 
     assert assistant_start.stream_completion(port=8099, body=body) == {"usage": {}}
     assert assistant_start.stream_completion(
-        port=9123, body=body, target="172.16.1.11"
+        port=9123, body=body, target="192.0.2.11"
     ) == {"usage": {}}
-    assert calls == [("local", 8099, body), ("172.16.1.11", 9123, body)]
+    assert calls == [("local", 8099, body), ("192.0.2.11", 9123, body)]
 
 
 def test_remote_stream_observe_sends_an_explicit_body_through_the_ssh_seam(
@@ -644,11 +644,11 @@ def test_remote_stream_observe_sends_an_explicit_body_through_the_ssh_seam(
     body = calibration_body("dev-1.5b", prompt="hi", max_tokens=8)
 
     reply = assistant_start.remote_stream_observe(
-        "172.16.1.11", 8099, "", body=body
+        "192.0.2.11", 8099, "", body=body
     )
 
     assert reply == {"usage": {"generation_tokens_per_second": 500.0}}
-    assert seen["ssh_target"] == "172.16.1.11"
+    assert seen["ssh_target"] == "192.0.2.11"
     assert seen["argument"]["body"] == body
     assert seen["argument"]["port"] == 8099
     # The key is still read on the Mac itself, never carried in the payload.
@@ -666,7 +666,7 @@ def test_remote_stream_observe_without_a_body_keeps_the_observe_request(
 
     monkeypatch.setattr(assistant_start, "run_remote_python", fake_run)
 
-    assistant_start.remote_stream_observe("172.16.1.11", 8099, "qwen")
+    assistant_start.remote_stream_observe("192.0.2.11", 8099, "qwen")
 
     assert "body" not in seen["argument"]
     assert seen["argument"]["model"] == "qwen"

@@ -70,9 +70,9 @@
   "observed": null,
   "endpoint": {
     "node": "node-b",
-    "host": "172.16.1.11",
+    "host": "192.0.2.11",
     "port": 8099,
-    "url": "http://172.16.1.11:8099",
+    "url": "http://192.0.2.11:8099",
     "ready": false
   }
 }

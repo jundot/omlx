@@ -96,7 +96,7 @@ def m5(**kwargs) -> NodeFacts:
         capacity_gib=128,
         admission_gib=96.75,
         decode_gib_per_s=2.0,
-        host="172.16.1.11",
+        host="192.0.2.11",
         **kwargs,
     )
 
@@ -109,7 +109,7 @@ def m1(**kwargs) -> NodeFacts:
         capacity_gib=60,
         admission_gib=54.0,
         decode_gib_per_s=0.8,
-        host="172.16.1.14",
+        host="192.0.2.14",
         **kwargs,
     )
 

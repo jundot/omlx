@@ -43,7 +43,7 @@ MEASURED_AT = "2026-11-03T12:00:00+00:00"
 
 CAPACITY_GIB = {"m5": 107.5, "m1": 60.0}
 USABLE_GIB = {"m5": 96.75, "m1": 54.0}
-SSH = {"m5": "172.16.1.11", "m1": "172.16.1.14"}
+SSH = {"m5": "192.0.2.11", "m1": "192.0.2.14"}
 
 
 def measure_payload(**overrides: Any) -> dict[str, Any]:
@@ -232,7 +232,7 @@ def test_a_finished_measurement_is_ready_with_its_facts(client) -> None:
     assert status["error"] is None
     assert [node["node_id"] for node in status["nodes"]] == ["m5", "m1"]
     assert status["nodes"][0]["admission_p05_gib"] == pytest.approx(96.75)
-    assert status["nodes"][0]["endpoint_host"] == "172.16.1.11"
+    assert status["nodes"][0]["endpoint_host"] == "192.0.2.11"
     assert status["nodes"][0]["endpoint_port"] == 8099
     # Measured without a performance probe: no rate was invented.
     codes = {warning["code"] for warning in status["warnings"]}
@@ -312,7 +312,7 @@ def test_this_mac_resolves_a_dialable_endpoint_without_a_paired_record(
     """
 
     monkeypatch.setattr(
-        assistant_routes, "_local_endpoint_addresses", lambda: ["172.16.1.11"]
+        assistant_routes, "_local_endpoint_addresses", lambda: ["192.0.2.11"]
     )
 
     def budget_override(**kwargs: Any) -> NodeBudgetSuggestion:
@@ -334,7 +334,7 @@ def test_this_mac_resolves_a_dialable_endpoint_without_a_paired_record(
     status = wait_for_state(api, measurement_id)
 
     assert status["state"] == "ready"
-    assert status["nodes"][0]["endpoint_host"] == "172.16.1.11"
+    assert status["nodes"][0]["endpoint_host"] == "192.0.2.11"
     assert status["nodes"][0]["endpoint_port"] == 8099
 
 

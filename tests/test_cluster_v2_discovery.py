@@ -251,7 +251,7 @@ def test_hello_from_same_cluster_sets_multicast_ok_and_replies_wassup(monkeypatc
     monkeypatch.setattr(
         "omlx.cluster.discovery.local_addr_dicts",
         lambda: [
-            {"ip": "172.16.1.14", "if_type": "lan"},
+            {"ip": "192.0.2.14", "if_type": "lan"},
             {"ip": "fe80::99", "if_type": "lan"},
         ],
     )
@@ -283,7 +283,7 @@ def test_hello_from_same_cluster_sets_multicast_ok_and_replies_wassup(monkeypatc
     # and the card reads "Unreachable" on an IPv6 link-local address.
     # Announced addresses carry their kind now, so the receiver can say
     # "Thunderbolt" instead of "Network".
-    assert reply["addrs"] == [{"ip": "172.16.1.14", "if_type": "lan"}]
+    assert reply["addrs"] == [{"ip": "192.0.2.14", "if_type": "lan"}]
     assert sock.sent[0][1] == ("fe80::99", 53413)
 
 
@@ -383,15 +383,15 @@ def test_wassup_records_the_announced_ipv4_and_probes_it():
                 42,
                 "bbbb-node",
                 8000,
-                addrs=[{"ip": "172.16.1.14", "if_type": "thunderbolt"}],
+                addrs=[{"ip": "192.0.2.14", "if_type": "thunderbolt"}],
             )
         ),
         ("fe80::99", 53413),
     )
 
     peer = service.peers()[0]
-    assert {"ip": "172.16.1.14", "if_type": "thunderbolt"} in peer.addrs
-    assert ("172.16.1.14", 8000) in service._candidates
+    assert {"ip": "192.0.2.14", "if_type": "thunderbolt"} in peer.addrs
+    assert ("192.0.2.14", 8000) in service._candidates
     # The card's link kind comes from the address kind.
     assert peer.link == "tb"
 
@@ -404,13 +404,13 @@ def test_wassup_accepts_plain_string_addrs_from_an_older_peer():
         b"OMLXW"
         + json.dumps(
             {"nonce": 42, "node_id": "bbbb-node", "http_port": 8000,
-             "addrs": ["172.16.1.14"]}
+             "addrs": ["192.0.2.14"]}
         ).encode()
     )
     service._handle_wassup(decoded, ("fe80::99", 53413))
 
     peer = service.peers()[0]
-    assert {"ip": "172.16.1.14", "if_type": "unknown"} in peer.addrs
+    assert {"ip": "192.0.2.14", "if_type": "unknown"} in peer.addrs
     assert peer.link == "unknown"
 
 
@@ -1576,11 +1576,11 @@ def test_a_thunderbolt_address_is_classified_from_metadata_not_latency():
 
     from omlx.cluster.discovery import _classify_link
 
-    assert _classify_link("172.16.1.14", "thunderbolt", 0.042) == "tb"
-    assert _classify_link("172.16.1.14", "tb", None) == "tb"
+    assert _classify_link("192.0.2.14", "thunderbolt", 0.042) == "tb"
+    assert _classify_link("192.0.2.14", "tb", None) == "tb"
     # Without that metadata the heuristic still applies.
-    assert _classify_link("172.16.1.14", "lan", 0.042) == "wifi"
-    assert _classify_link("172.16.1.14", "lan", 0.0005) == "tb"
+    assert _classify_link("192.0.2.14", "lan", 0.042) == "wifi"
+    assert _classify_link("192.0.2.14", "lan", 0.0005) == "tb"
 
 
 def test_a_peer_reachable_over_several_paths_keeps_the_best_one():

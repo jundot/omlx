@@ -12,13 +12,13 @@
     {
       "node_id": "node-a",
       "admission_p05_gib": 61.4,
-      "endpoint_host": "172.16.1.13",
+      "endpoint_host": "192.0.2.13",
       "endpoint_port": 8099
     },
     {
       "node_id": "node-b",
       "admission_p05_gib": 118.7,
-      "endpoint_host": "172.16.1.11",
+      "endpoint_host": "192.0.2.11",
       "endpoint_port": 8099
     }
   ],
