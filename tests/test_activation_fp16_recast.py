@@ -107,6 +107,11 @@ def test_cast_keeps_bf16_when_a_value_exceeds_the_float16_range():
     assert numerics_revision_for_model(model) is None
 
 
+def _header(payload):
+    """A safetensors file whose header bytes are ``payload``."""
+    return struct.pack("<Q", len(payload)) + payload
+
+
 def test_checkpoint_has_bf16_leaves_reads_safetensors_headers(tmp_path):
     def _write(path, dtype):
         header = json.dumps(
@@ -127,3 +132,46 @@ def test_checkpoint_has_bf16_leaves_reads_safetensors_headers(tmp_path):
 
     assert checkpoint_has_bf16_leaves("") is False
     assert checkpoint_has_bf16_leaves(str(tmp_path / "missing")) is False
+
+
+@pytest.mark.parametrize(
+    ("label", "blob"),
+    [
+        ("a truncated download", b"0" * 1024),
+        ("a file shorter than the length field", b"1234567"),
+        ("a length that names a terabyte", struct.pack("<Q", 1024**4) + b"{}"),
+        ("a header that is a JSON list", _header(b"[1, 2, 3]")),
+        ("a header that is a JSON string", _header(b'"nope"')),
+        ("a header that is JSON null", _header(b"null")),
+        ("a file that is not safetensors at all", _header(b"not json")),
+    ],
+)
+def test_checkpoint_has_bf16_leaves_ignores_a_bad_header(tmp_path, label, blob):
+    """One unreadable shard must not break the admin model list.
+
+    ``list_models`` calls this for every served model, so a raise here loses
+    the whole list. Each of these shapes used to raise MemoryError or
+    AttributeError.
+    """
+    shard_dir = tmp_path / "bad"
+    shard_dir.mkdir()
+    (shard_dir / "model.safetensors").write_bytes(blob)
+
+    assert checkpoint_has_bf16_leaves(str(shard_dir)) is False, label
+
+
+def test_checkpoint_has_bf16_leaves_still_reads_a_good_shard_after_a_bad_one(
+    tmp_path,
+):
+    """A bad shard is skipped, not treated as an answer for the whole model."""
+    shard_dir = tmp_path / "mixed"
+    shard_dir.mkdir()
+    (shard_dir / "model-00001.safetensors").write_bytes(b"0" * 1024)
+    header = json.dumps(
+        {"w": {"dtype": "BF16", "shape": [2], "data_offsets": [0, 4]}}
+    ).encode()
+    (shard_dir / "model-00002.safetensors").write_bytes(
+        struct.pack("<Q", len(header)) + header + b"\x00" * 4
+    )
+
+    assert checkpoint_has_bf16_leaves(str(shard_dir)) is True
