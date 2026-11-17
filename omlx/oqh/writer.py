@@ -80,7 +80,8 @@ class OqhWriter:
         signs, block = self._signs_for(name, in_dim)
         packed, rscale = [], []
         before = after = 0.0
-        for first, stop in collector.expert_ranges(owner, n_exp, in_dim):
+        out_dim = int(weight.shape[-2])
+        for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
             gram = oq._shrunk_gram(collector.switch_gram(owner, first, stop))
             p, r, b0, b1 = quantize.quantize(
                 weight[first:stop], gram, bits, signs, block

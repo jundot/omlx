@@ -11362,6 +11362,10 @@ def _collect_imatrix_streaming(
 
 _OQE_REFINE_SEQ_LENGTH = 512
 _OQE_REFINE_EXPERT_BYTES = 4 << 30
+# Quantizing an expert range keeps about this many float32 copies of its weights
+# alive (input, rotation, error, error @ H, ...); down projections have few
+# inputs and many outputs, so their ranges must count the weights too.
+_OQE_REFINE_WEIGHT_COPIES = 10
 # Model types whose calibration walk runs outside the generic layer path.
 _OQE_REFINE_UNSUPPORTED_TYPES = frozenset({"deepseek_v41", "muse_spark"})
 
@@ -11448,12 +11452,13 @@ class _OQGramCollector(OQImatrixCollector):
             parts = self.switch_rows[name] = [merged]
         return parts[0]
 
-    def expert_ranges(self, name: str, n_experts: int, in_dim: int):
-        """Expert ranges whose Grams and gathered float32 rows fit the budget."""
+    def expert_ranges(self, name: str, n_experts: int, in_dim: int, out_dim: int):
+        """Expert ranges whose Grams, gathered rows and weight copies fit the budget."""
         counts = np.bincount(self._merged_rows(name)[2], minlength=n_experts)
         first, used = 0, 0
         for e in range(n_experts):
-            cost = (in_dim + int(counts[e])) * in_dim * 4
+            rows = in_dim + int(counts[e]) + _OQE_REFINE_WEIGHT_COPIES * out_dim
+            cost = rows * in_dim * 4
             if e > first and used + cost > _OQE_REFINE_EXPERT_BYTES:
                 yield first, e
                 first, used = e, 0
@@ -11591,9 +11596,10 @@ def _token_rows(tokenizer, texts, seq_length: int):
 
 def _refine_switch_codes(collector, owner, targets):
     n_exp, in_dim = int(targets[0][1].shape[0]), int(targets[0][1].shape[-1])
+    out_dim = int(targets[0][1].shape[-2])
     parts = [[] for _ in targets]
     sums = [[0.0, 0.0, False] for _ in targets]
-    for first, stop in collector.expert_ranges(owner, n_exp, in_dim):
+    for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
         hessian = _shrunk_gram(collector.switch_gram(owner, first, stop))
         for i, (_, weight, packed, scales, biases, bits, gs) in enumerate(targets):
             result = _refine_affine_codes(

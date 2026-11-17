@@ -3188,7 +3188,7 @@ class TestQuantizeChunked:
         collector.collect_switch("experts", module, shared, routes)
         collector.collect_switch("experts", module, per_route, routes + 0)
 
-        ranges = list(collector.expert_ranges("experts", 6, 16))
+        ranges = list(collector.expert_ranges("experts", 6, 16, 0))
         grams = [collector.switch_gram("experts", a, b) for a, b in ranges]
 
         def bf16_rows(x):
@@ -3204,6 +3204,8 @@ class TestQuantizeChunked:
         np.testing.assert_allclose(
             np.array(mx.concatenate(grams)), ref, rtol=1e-4, atol=1e-4
         )
+        # Weight copies of wide outputs count too: down projections split finer.
+        assert len(list(collector.expert_ranges("experts", 6, 16, 8))) > len(ranges)
 
     def test_refine_writer_rewrites_a_shard_after_its_last_layer(self, tmp_path):
         w = mx.random.normal((8, 64))

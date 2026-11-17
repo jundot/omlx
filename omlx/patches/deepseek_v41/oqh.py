@@ -82,7 +82,8 @@ def _quantize_module(collector, owner, name, module, bits):
     signs = mx.array(fmt.make_signs(key, in_dim)).astype(mx.float32)
     packed, rscale = [], []
     before = after = 0.0
-    for first, stop in collector.expert_ranges(owner, n_exp, in_dim):
+    out_dim = int(module.weight.shape[-2])
+    for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
         gram = oq._shrunk_gram(collector.switch_gram(owner, first, stop))
         weight = _float_experts(module, first, stop)
         p, r, b0, b1 = quantize.quantize(weight, gram, bits, signs, block)
