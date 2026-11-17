@@ -8974,22 +8974,29 @@ class TestStreamedCalibration:
         assert mx.isfinite(loaded(tokens).logits).all().item()
 
     @pytest.mark.parametrize(
-        "explicit,kind,over_budget,expected",
+        "explicit,kind,over_budget,block_fp8,expected",
         [
-            (None, "llama", True, False),
-            (None, "minimax_m3_vl", True, True),
-            (None, "glm5_next", True, True),
-            (None, "qwen4_exp", False, False),
-            (False, "qwen4_exp", True, False),
-            (True, "qwen4_exp", False, True),
+            (None, "llama", True, False, False),
+            (None, "minimax_m3_vl", True, False, True),
+            (None, "glm5_next", True, False, True),
+            (None, "qwen4_exp", False, False, False),
+            (None, "qwen4_exp", False, True, True),
+            (None, "llama", False, True, False),
+            (False, "qwen4_exp", True, True, False),
+            (True, "qwen4_exp", False, False, True),
         ],
     )
-    def test_selection(self, explicit, kind, over_budget, expected):
+    def test_selection(self, explicit, kind, over_budget, block_fp8, expected):
         import omlx.oq as oq
 
+        fp8 = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+        config = {"quantization_config": fp8 if block_fp8 else {}}
         assert (
             oq._resolve_stream_calibration(
-                explicit, model_exceeds_ram=over_budget, model_type=kind
+                explicit,
+                model_exceeds_ram=over_budget,
+                model_type=kind,
+                block_fp8=oq._block_fp8_source(config),
             )
             is expected
         )
