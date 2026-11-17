@@ -5253,38 +5253,14 @@ def _holds_chat_template(path: Path) -> bool:
         return True
 
 
-def _copy_sidecar_file(src, dst, *, follow_symlinks: bool = True):
-    """Copy a sidecar file with its contents, mode and timestamps.
-
-    Like :func:`shutil.copy2`, except that metadata the destination
-    refuses is skipped instead of failing the copy. Files on SMB shares
-    carry the ``SF_ARCHIVED`` flag, which only root may set, so
-    ``copy2`` raises ``EPERM`` from ``chflags`` after the contents are
-    already written. These copies run after the whole model has been
-    quantized, and a failed job removes its output directory.
-    """
-    shutil.copyfile(src, dst, follow_symlinks=follow_symlinks)
-    try:
-        shutil.copystat(src, dst, follow_symlinks=follow_symlinks)
-    except OSError as e:
-        logger.debug("oQ: kept %s without its source metadata (%s)", dst, e)
-    return dst
-
-
-def _copy_sidecar_tree(src, dst, **kwargs) -> None:
-    """``shutil.copytree`` with :func:`_copy_sidecar_file` semantics.
-
-    ``copytree`` applies each directory's metadata after its contents and
-    collects a refused ``chflags`` as an error. Those are dropped; any
-    error on a file is still raised.
-    """
-    try:
-        shutil.copytree(src, dst, copy_function=_copy_sidecar_file, **kwargs)
-    except shutil.Error as e:
-        remaining = [err for err in e.args[0] if not Path(err[0]).is_dir()]
-        if remaining:
-            raise shutil.Error(remaining) from e
-        logger.debug("oQ: copied %s without its directory metadata", dst)
+# Sidecars are copied with shutil.copy (contents and mode), not copy2 or
+# copytree: files on SMB shares carry SF_ARCHIVED, which only root may set.
+def _copy_sidecar_tree(src: Path, dst: Path) -> None:
+    for path in src.rglob("*"):
+        if path.is_file():
+            target = dst / path.relative_to(src)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(path, target)
 
 
 def _copy_model_sidecars(
@@ -5300,16 +5276,16 @@ def _copy_model_sidecars(
     """
     for pattern in _SIDECAR_PATTERNS:
         for src_file in source.glob(pattern):
-            _copy_sidecar_file(src_file, output / src_file.name)
+            shutil.copy(src_file, output / src_file.name)
 
     for pattern in _MULTIMODAL_SIDECAR_PATTERNS:
         for src_file in source.glob(pattern):
             if text_only and not _holds_chat_template(src_file):
                 continue
-            _copy_sidecar_file(src_file, output / src_file.name)
+            shutil.copy(src_file, output / src_file.name)
 
     for py_file in source.glob("*.py"):
-        _copy_sidecar_file(py_file, output / py_file.name)
+        shutil.copy(py_file, output / py_file.name)
 
     # LFM3 speech decoding loads its codec separately from the model weights.
     if not text_only and model_type == "lfm3_omni":
@@ -5327,7 +5303,7 @@ def _copy_bundled_drafts(source: Path, output: Path) -> None:
     """
     draft = minimax_dspark.bundled_dspark_path(source)
     if draft is not None:
-        _copy_sidecar_tree(draft, output / draft.name, dirs_exist_ok=True)
+        _copy_sidecar_tree(draft, output / draft.name)
 
 
 def _build_non_quantizable_set(config: dict) -> set:
@@ -8127,7 +8103,7 @@ def quantize_oq_streaming(
     )
     for name in DECISION_SIDECAR_FILES:
         if (source / name).is_file():
-            _copy_sidecar_file(source / name, output / name)
+            shutil.copy(source / name, output / name)
     if not text_only:
         _copy_bundled_drafts(source, output)
     if inkling2_layout.is_inkling2(config):
@@ -10090,9 +10066,7 @@ def _collect_imatrix_from_model(
 _STREAM_TEXT_LAYER_PREFIX = "language_model.model.layers."
 _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
 
-# Qwen3.5 / 3.6 and their text-only Hugging Face names. VLM checkpoints stream
-# mlx-vlm's decoder blocks and text-only ones mlx-lm's, the classes the
-# resident collector loads for each (_is_vlm_load).
+# Qwen3.5 / 3.6 and their text-only Hugging Face names.
 _QWEN3_5_STREAM_MODEL_TYPES = frozenset(
     {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
 )
@@ -10744,41 +10718,24 @@ def _collect_streamed_glm5_next_mtp(
 
 
 def _qwen3_5_stream_mtp_head(config: dict):
-    """The MTP head class oMLX attaches to the resident Qwen3.5 model."""
-    text_config = config.get("text_config") or config
-    if not _is_vlm_load(config):
-        from mlx_lm.models import qwen3_5
+    """The MTP head oMLX attaches to the resident Qwen3.5 model, and its args."""
+    if _is_vlm_load(config):
+        from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
 
+        apply_mlx_vlm_mtp_runtime_patch(_stream_source_model_type(config))
+    else:
         from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
 
         apply_mlx_lm_mtp_patch()
-        args = qwen3_5.TextModelArgs.from_dict(text_config)
-        return qwen3_5.MTPModule(args), args
-    from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
-
-    model_type = _stream_source_model_type(config)
-    apply_mlx_vlm_mtp_runtime_patch(model_type)
-    if "moe" in model_type:
-        from mlx_vlm.models.qwen3_5_moe import language
-        from mlx_vlm.models.qwen3_5_moe.config import TextConfig
-    else:
-        from mlx_vlm.models.qwen3_5 import language
-        from mlx_vlm.models.qwen3_5.config import TextConfig
-    # The runtime patch keeps mtp_num_hidden_layers on TextConfig.from_dict.
-    args = TextConfig.from_dict(text_config)
-    return language.MTPModule(args), args
+    # Built after the patch, which keeps mtp_num_hidden_layers on the args.
+    args, layer_cls = _qwen3_5_stream_text_args(config)
+    return sys.modules[layer_cls.__module__].MTPModule(args), args
 
 
 def _collect_streamed_qwen3_5_mtp(
     source, config, collector, calib_data, working, ranges
 ) -> int:
-    """Streamed counterpart of the generic branch of _collect_mtp_head_imatrix.
-
-    Qwen3.5 heads take the final-normed trunk hidden (they do not set
-    _omlx_mtp_head_prenorm), the shifted tokens and a fresh KV cache per
-    micro-batch. Both loaders place the head under language_model.mtp, so
-    the entries carry the names the quantizer looks up.
-    """
+    """Streamed counterpart of the generic branch of _collect_mtp_head_imatrix."""
     from mlx_lm.models.cache import KVCache
 
     prefix = "language_model.mtp."
@@ -10800,24 +10757,12 @@ def _collect_streamed_qwen3_5_mtp(
     norm.weight = plan.pop("language_model.model.norm.weight")
     del embed_weight
     mx.eval(head.parameters(), embed.parameters(), norm.parameters())
-    # mlx-vlm's head derives its MRoPE positions from the cache offset as a
-    # single row, and the fused kernel indexes them per batch row: rows past
-    # the first would read positions out of range. One row per call keeps
-    # every row on its own positions. mlx-lm's head uses plain RoPE.
-    rows = 1 if _is_vlm_load(config) else None
     installed = collector.install(head, name_prefix=prefix)
     try:
         for hidden, (lo, hi) in zip(working, ranges):
-            step = rows or (hi - lo)
-            for start in range(0, hi - lo, step):
-                cache = [KVCache() for _ in head.layers]
-                out = head(
-                    norm(hidden[start : start + step, :-1, :]),
-                    calib_data[lo + start : lo + start + step, 1:],
-                    embed,
-                    cache,
-                )
-                mx.eval(out)
+            cache = [KVCache() for _ in head.layers]
+            out = head(norm(hidden[:, :-1, :]), calib_data[lo:hi, 1:], embed, cache)
+            mx.eval(out)
     finally:
         collector.restore(head)
     return installed
@@ -10954,7 +10899,6 @@ def _collect_imatrix_streaming(
     del embed_weight
     mx.clear_cache()
 
-    generic_position_rows = None
     if is_qwen4_exp:
         # hc-tile once at stage 0 (slicing commutes with the tile, so the
         # per-slot rows stay bitwise-equal to the resident per-batch tiling)
@@ -10976,12 +10920,9 @@ def _collect_imatrix_streaming(
         mask = None
         position_ids = {"kind": _FLINT_LAYER_STATE_KIND}
     else:
-        # One causal mask serves every attention layer and micro-batch; it
-        # depends only on seq_length and the activation dtype. Position ids
-        # keep one row per sample, sliced per micro-batch below: the fused
-        # MRoPE kernel reads position_ids[b * S + t], so a shared row would
-        # run past its end, and the resident walk passes one row per row.
-        _, layer_masks, generic_position_rows = _prepare_layer_inputs(
+        # One causal mask serves every attention layer and micro-batch. Position
+        # ids keep one row per sample, sliced per micro-batch below.
+        _, layer_masks, position_ids = _prepare_layer_inputs(
             _StreamingNoModel(),
             [None],
             calib_data,
@@ -10989,7 +10930,6 @@ def _collect_imatrix_streaming(
             noncausal=_noncausal_attention(config),
         )
         mask = layer_masks[0]
-        position_ids = None
 
     text_config = config.get("text_config") or {}
     total_layers = int(
@@ -11031,8 +10971,8 @@ def _collect_imatrix_streaming(
                 _streamed_qwen4_exp_slot_state(calib_data, q4_position_ids, lo, hi)
                 for lo, hi in ranges
             ]
-        elif generic_position_rows is not None:
-            slot_states = [generic_position_rows[lo:hi] for lo, hi in ranges]
+        elif isinstance(position_ids, mx.array):
+            slot_states = [position_ids[lo:hi] for lo, hi in ranges]
         else:
             slot_states = None
 
@@ -11064,9 +11004,7 @@ def _collect_imatrix_streaming(
             elif is_glm5_next:
                 layer_mask = None if bool(getattr(block, "is_linear", False)) else mask
             elif _is_recurrent_layer(block):
-                # Linear-attention / SSM layers take no causal mask, exactly
-                # as _layer_masks_for_model schedules them for the resident
-                # walk (gated delta nets read a mask as a padding mask).
+                # Gated delta nets read a mask as a padding mask.
                 layer_mask = None
             else:
                 layer_mask = mask

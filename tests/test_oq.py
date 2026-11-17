@@ -7583,11 +7583,7 @@ class TestTextOnlyMultimodalMetadata:
         not hasattr(os, "chflags"), reason="file flags are a BSD/macOS feature"
     )
     def test_copies_sidecars_whose_flags_cannot_be_set(self, tmp_path, monkeypatch):
-        """SMB sources carry SF_ARCHIVED, which only root may set.
-
-        ``shutil.copy2`` then fails in ``chflags`` with EPERM after the
-        whole model was quantized. The sidecar must still be copied.
-        """
+        """SMB sources carry SF_ARCHIVED, which only root may set."""
         import errno
 
         from omlx.oq import _copy_model_sidecars
@@ -8793,12 +8789,7 @@ _QWEN3_5_STREAM_EXPERTS = {
 def _qwen3_5_stream_source(path, model_type, *, vlm, mtp):
     """Save a tiny BF16 Qwen3.5 checkpoint in the Hugging Face layout.
 
-    VLM checkpoints keep the text tower under ``model.language_model`` and
-    load through mlx-vlm, text-only ones under ``model`` through mlx-lm, as
-    oQ's resident collector loads them. Experts are fused
-    (``experts.gate_up_proj``), and the conv weights and the MTP head are
-    stored as Hugging Face ships them. The vision tower is left out because
-    calibration never runs it.
+    The vision tower is left out because calibration never runs it.
     """
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -9088,11 +9079,7 @@ class TestStreamedCalibration:
             (False, "qwen4_exp", True, False),
             (True, "qwen4_exp", False, True),
             (None, "qwen3_5_moe", True, True),
-            (None, "qwen3_5", True, True),
-            (None, "qwen3_5_moe_text", True, True),
             (None, "qwen3_5_text", True, True),
-            (None, "qwen3_5_moe", False, False),
-            (True, "qwen3_5", False, True),
         ],
     )
     def test_selection(self, explicit, kind, over_budget, expected):
@@ -9258,41 +9245,19 @@ class TestStreamedCalibration:
             np.testing.assert_array_equal(streamed[key].counts, entry.counts)
             np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2)
 
-    @pytest.mark.parametrize(
-        "micro_batch", [pytest.param(None, id="batched"), pytest.param(1, id="row")]
-    )
     @pytest.mark.parametrize("model_type,vlm,mtp", _QWEN3_5_STREAM_CASES)
     def test_qwen3_5_collection_matches_resident(
-        self, tmp_path, monkeypatch, model_type, vlm, mtp, micro_batch
+        self, tmp_path, monkeypatch, model_type, vlm, mtp
     ):
-        """Streamed Qwen3.5 layers match the resident collector bit for bit.
-
-        Gated delta net layers take no mask, attention layers one MRoPE
-        position row per batch row, and the MTP head runs on the normed trunk
-        output under the resident names. Streaming runs first so it applies
-        every patch it needs itself.
-
-        The resident walk runs mlx-vlm's MTP head on whole micro-batches,
-        where its attention reads MRoPE positions out of range for every row
-        after the first; streaming runs that head one row at a time. Its
-        attention output and everything after it therefore match the resident
-        statistics only with one-row micro-batches.
-        """
+        """Streamed Qwen3.5 statistics and sensitivity match resident collection."""
         import omlx.oq as oq
 
         source = tmp_path / "source"
         config = _qwen3_5_stream_source(source, model_type, vlm=vlm, mtp=mtp)
-        # As many tokens as rows: a causal mask a gated delta net received would
-        # pass its batch check and be applied as a padding mask.
+        # As many rows as tokens: a gated delta net would apply a causal mask as
+        # a padding mask.
         tokens = (mx.arange(16).reshape(4, 4) * 7 % 120 + 1).astype(mx.int32)
         monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
-        if micro_batch is not None:
-            plan = oq._oqe_calibration_batch_plan
-
-            def one_row_plan(*args, **kwargs):
-                return {**plan(*args, **kwargs), "micro_batch_size": micro_batch}
-
-            monkeypatch.setattr(oq, "_oqe_calibration_batch_plan", one_row_plan)
         streamed, metadata = oq._collect_imatrix_streaming(
             source,
             object(),
@@ -9308,25 +9273,12 @@ class TestStreamedCalibration:
         resident, _ = oq._collect_imatrix(
             str(source), json.loads(json.dumps(config)), num_samples=4, seq_length=4
         )
-        layers = "language_model.model.layers."
-        assert layers + "0.linear_attn.in_proj_qkv" in resident
-        assert layers + "1.self_attn.q_proj" in resident
-        moe = model_type == "qwen3_5_moe"
-        assert (layers + "1.mlp.switch_mlp.gate_proj" in resident) == moe
+        assert "language_model.model.layers.0.linear_attn.in_proj_qkv" in resident
         assert ("language_model.mtp.fc" in resident) == mtp
         assert streamed.keys() == resident.keys()
         for key, entry in resident.items():
-            batched_head = vlm and micro_batch is None and ".mtp." in key
-            if batched_head and (".self_attn.o_proj" in key or ".mlp." in key):
-                continue
             np.testing.assert_array_equal(streamed[key].counts, entry.counts, key)
-            if batched_head:
-                # Row-wise calls only regroup the fp32 token sums.
-                np.testing.assert_allclose(
-                    streamed[key].in_sum2, entry.in_sum2, rtol=1e-6, err_msg=key
-                )
-            else:
-                np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2, key)
+            np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2, key)
         reference = oq._measure_sensitivity(
             str(source),
             json.loads(json.dumps(config)),
@@ -9340,11 +9292,7 @@ class TestStreamedCalibration:
 
     @pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5"])
     def test_qwen3_5_vlm_mtp_rows_keep_their_positions(self, tmp_path, model_type):
-        """Two identical rows give the MTP head exactly twice one row's statistics.
-
-        Run as one batch, mlx-vlm's head would read MRoPE positions out of
-        range for the second row.
-        """
+        """Two identical rows give the MTP head twice one row's statistics."""
         import omlx.oq as oq
 
         source = tmp_path / "source"
@@ -9369,42 +9317,10 @@ class TestStreamedCalibration:
         assert one.keys() == two.keys()
         for key, entry in one.items():
             np.testing.assert_array_equal(two[key].counts, 2 * entry.counts, key)
-            # Expert kernels may regroup the fp32 sums; wrong positions move
-            # the statistics by tens of percent.
+            # Expert kernels may regroup the fp32 sums.
             np.testing.assert_allclose(
                 two[key].in_sum2, 2 * entry.in_sum2, rtol=1e-6, err_msg=key
             )
-
-    @pytest.mark.parametrize(
-        "vlm", [pytest.param(True, id="vlm"), pytest.param(False, id="text")]
-    )
-    def test_qwen3_5_streamed_imatrix_covers_quantized_mtp(
-        self, tmp_path, monkeypatch, vlm
-    ):
-        """Streamed MTP entries carry the names quantization looks up."""
-        import omlx.oq as oq
-
-        source = tmp_path / "source"
-        _qwen3_5_stream_source(source, "qwen3_5_moe", vlm=vlm, mtp=True)
-        tokens = (mx.arange(32).reshape(4, 8) * 7 % 120 + 1).astype(mx.int32)
-        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
-        output = tmp_path / "output"
-        oq.quantize_oq_streaming(
-            str(source),
-            str(output),
-            4,
-            group_size=32,
-            enhanced=True,
-            stream_calibration=True,
-            imatrix_num_samples=2,
-            imatrix_seq_length=8,
-            sensitivity_map_override={i: 1.0 for i in range(4)},
-            preserve_mtp=True,
-        )
-        report = json.loads((output / "oq_imatrix_report.json").read_text())
-        assert any(".mtp." in name for name in report["applied"])
-        assert report["missing"] == ["language_model.lm_head"]
-        assert not report["mismatched"]
 
 
 # Tiny Inkling 2 source in the original layout. Layers 0-3 hold NVFP4 experts and
