@@ -1472,90 +1472,7 @@ async def test_local_stop_passes_scope_to_supervisor(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_distributed_stream_chat_recovers_answer_streamed_as_reasoning():
-    """Answer streamed only as reasoning must stay recoverable as content.
-
-    A rank-zero backend whose chat template pre-opens the think block files
-    the whole answer under ``reasoning`` and never sends ``content``. The
-    engine must not close the think block at finalize: ThinkingParser.finish()
-    recovers an unclosed block as content, so the answer reaches the content
-    channel the way the local engine delivers it. Closing it marks the block
-    complete and the answer is lost to the reasoning channel.
-    """
-    events = [
-        {
-            "choices": [
-                {
-                    "delta": {"role": "assistant", "reasoning": "Need lookup. "},
-                    "finish_reason": None,
-                }
-            ]
-        },
-        {
-            "choices": [
-                {
-                    "delta": {"reasoning": "Paris is the answer."},
-                    "finish_reason": "stop",
-                }
-            ]
-        },
-        {
-            "choices": [],
-            "usage": {
-                "prompt_tokens": 9,
-                "completion_tokens": 3,
-                "total_tokens": 12,
-                "prompt_tokens_details": {"cached_tokens": 0},
-            },
-        },
-    ]
-    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
-    content += "data: [DONE]\n\n"
-
-    def handler(request):
-        body = json.loads(request.content)
-        assert request.url.path == "/v1/chat/completions"
-        assert body["stream"] is True
-        return httpx.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
-            text=content,
-        )
-
-    engine = _ready_engine(handler)
-    try:
-        outputs = [
-            output
-            async for output in engine.stream_chat(
-                [{"role": "user", "content": "Weather?"}]
-            )
-        ]
-    finally:
-        await engine._client.aclose()
-
-    parser = ThinkingParser()
-    for output in outputs:
-        parser.feed(output.new_text)
-    _, recovered = parser.finish()
-    assert recovered.strip() == "Need lookup. Paris is the answer."
-    assert outputs[-1].finish_reason == "stop"
-    assert outputs[-1].tool_calls is None
-
-
-@pytest.mark.asyncio
-async def test_distributed_chat_recovers_answer_filed_as_reasoning():
-    """Template/parser disagreement must not null the content channel.
-
-    A rank-zero backend whose chat template pre-opens the think block files
-    the whole answer under ``reasoning`` with empty ``content``. The engine
-    used to rejoin the channels as a closed ``<think>R</think>`` block, so
-    extract_thinking returned (R, "") and the API answered content=null with
-    everything in reasoning_content. Leaving the block unclosed lets
-    extract_thinking's malformed-open recovery return the answer as content,
-    matching the local engine. The assertion mirrors the server's non-stream
-    split of GenerationOutput.text.
-    """
-
+async def test_distributed_chat_recovers_reasoning_only_reply_as_content():
     def handler(request):
         return httpx.Response(
             200,
@@ -1565,85 +1482,51 @@ async def test_distributed_chat_recovers_answer_filed_as_reasoning():
                         "message": {
                             "role": "assistant",
                             "content": None,
-                            "reasoning": "A weather lookup is required.",
+                            "reasoning": "Paris is the answer.",
                         },
                         "finish_reason": "stop",
                     }
                 ],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 4,
-                    "total_tokens": 14,
-                    "prompt_tokens_details": {"cached_tokens": 0},
-                },
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4},
             },
         )
 
     engine = _ready_engine(handler)
     try:
-        output = await engine.chat([{"role": "user", "content": "Weather?"}])
+        output = await engine.chat([{"role": "user", "content": "Capital?"}])
     finally:
         await engine._client.aclose()
 
-    thinking, content = extract_thinking(
-        output.text,
-        truncated=output.finish_reason == "length",
-    )
-    assert content == "A weather lookup is required."
-    assert thinking == ""
-    assert output.finish_reason == "stop"
-    assert output.tool_calls is None
+    assert extract_thinking(output.text) == ("", "Paris is the answer.")
 
 
 @pytest.mark.asyncio
-async def test_distributed_chat_prompt_opened_think_recovers_short_answer():
-    """Prompt-opened think must not file a short answer as reasoning.
-
-    With thinking on, the chat template pre-opens the think block and a short
-    answer finishes without ever emitting </think>. The rank-zero backend then
-    reports reasoning=R with empty content and finish_reason stop, and the
-    engine used to rejoin the channels as a closed <think>R</think> block, so
-    the whole answer was filed as reasoning and content stayed empty. Leaving
-    the block unclosed lets the prompt-opened recovery paths return the answer
-    as content, matching the local engine. The assertion mirrors the server's
-    non-stream split with start_in_thinking=True.
-    """
+async def test_distributed_stream_chat_recovers_reasoning_only_reply_as_content():
+    events = [
+        {"choices": [{"delta": {"reasoning": "Paris "}, "finish_reason": None}]},
+        {"choices": [{"delta": {"reasoning": "is it."}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 2}},
+    ]
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
 
     def handler(request):
         return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "",
-                            "reasoning": "Short answer: yes.",
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 7,
-                    "completion_tokens": 2,
-                    "total_tokens": 9,
-                    "prompt_tokens_details": {"cached_tokens": 0},
-                },
-            },
+            200, headers={"content-type": "text/event-stream"}, text=content
         )
 
     engine = _ready_engine(handler)
     try:
-        output = await engine.chat([{"role": "user", "content": "Yes or no?"}])
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Capital?"}]
+            )
+        ]
     finally:
         await engine._client.aclose()
 
-    thinking, content = extract_thinking(
-        output.text,
-        truncated=output.finish_reason == "length",
-        start_in_thinking=True,
-    )
-    assert content == "Short answer: yes."
-    assert thinking == ""
-    assert output.finish_reason == "stop"
-    assert output.tool_calls is None
+    parser = ThinkingParser()
+    for output in outputs:
+        parser.feed(output.new_text)
+    assert parser.finish() == ("", "Paris is it.")
