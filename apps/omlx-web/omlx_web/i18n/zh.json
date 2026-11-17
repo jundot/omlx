@@ -528,6 +528,8 @@
   "settings.integrations.splash.cancel": "取消",
   "settings.integrations.splash.kv_format": "KV 缓存精度",
   "settings.integrations.splash.kv_format_hint": "同样的内存下，int8 能容纳的上下文约为 bf16 的两倍。",
+  "settings.integrations.splash.activations": "激活精度",
+  "settings.integrations.splash.activations_hint": "bf16 在 M5 及之后的芯片上让注意力保持 bf16；auto 交由 Splash 在更快时选择 int8。仅 Splash 1.6.1 及以上生效。",
   "settings.integrations.splash.max_memory": "内存上限",
   "settings.integrations.splash.max_memory_hint": "留空时，Splash 会获得足以容纳模型完整上下文窗口的内存。上限越大，前缀缓存的空间越多；在内存较小的 Mac 上，Splash 会按剩余内存缩短上下文。oMLX 会把 Splash 计划使用的内存计入自身的上限。",
   "settings.integrations.splash.ssd_cache": "SSD 缓存",

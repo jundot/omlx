@@ -14735,6 +14735,54 @@
         }
       }
     },
+    "integrations.splash.activations" : {
+      "comment" : "Row label for the Splash attention activation precision",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktivierungspräzision"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Activation Precision"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Precisione delle attivazioni"
+          }
+        }
+      }
+    },
+    "integrations.splash.activations.sub" : {
+      "comment" : "Sublabel for the Splash attention activation precision",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf M5 und neuer hält bf16 die Attention in bf16; auto lässt Splash int8 wählen, wo es schneller ist. Gilt ab Splash 1.6.1."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "bf16 keeps attention in bf16 on M5 and later; auto lets Splash use int8 where it is faster. Applies to Splash 1.6.1 and later."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Su M5 e successivi bf16 mantiene l'attenzione in bf16; auto lascia che Splash usi int8 dove è più veloce. Vale da Splash 1.6.1."
+          }
+        }
+      }
+    },
     "integrations.splash.limits.apply" : {
       "comment" : "Apply button for the Splash memory and SSD cache sizes",
       "extractionState" : "manual",

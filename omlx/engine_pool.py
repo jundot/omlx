@@ -2397,6 +2397,7 @@ class EnginePool:
                 max_context=requested_context,
                 max_memory_bytes=budget,
                 kv_format=integrations.splash_kv_format,
+                activations=integrations.splash_activations,
                 ane_prefill=integrations.splash_ane_prefill,
                 cache_disk_bytes=cache_disk_bytes,
                 cache_dir=cache_dir,
