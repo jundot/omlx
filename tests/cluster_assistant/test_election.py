@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Coordinator-election tests.
 
-These are the tests the first milestone is defined by (PROJECT-BRIEF §7,
+These are the tests the first milestone is defined by (the project design notes,
 Appendix A.8). They run off-cluster: no Mac, model, GPU or SSH is involved,
 only measured numbers, because the election is a pure function and the thing
 that must be provable is the *decision*.

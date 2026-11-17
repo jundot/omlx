@@ -770,7 +770,7 @@ def test_presence_is_unknown_when_the_catalogue_was_not_measured():
 
 
 # ---------------------------------------------------------------------------
-# Single-node option (E6, PHASE-2B-RUN §22)
+# Single-node option (E6, the live-run notes)
 # ---------------------------------------------------------------------------
 
 

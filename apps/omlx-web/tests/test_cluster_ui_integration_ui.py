@@ -141,7 +141,7 @@ def test_assistant_surface_stays_visible_with_a_configured_deployment():
 component.deploymentsPayload = [{deployment_id:'A',model:'/a'}];
 component.runtimePayload = {jobs:[],launchers:[]};
 component.assistant.state = 'ready';
-component.assistant.endpoint = {ready:true, url:'http://172.16.1.11:8099'};
+component.assistant.endpoint = {ready:true, url:'http://192.0.2.11:8099'};
 process.stdout.write(JSON.stringify({
   wizard: component.wizardState(),
   surface: component.assistantSurfaceVisible(),
@@ -352,7 +352,7 @@ def test_assistant_recommendation_binds_selected_model_and_context():
         for candidate in result["recommendBody"]["candidates"]
     ] == ["/models/qwen3-32b"]
     assert result["recommendBody"]["context_tokens"] == 32768
-    # Phase C3 (ROADMAP-TO-CHAPTER-10.md §6, recorded in SCREEN-3-MINIMAL.md
+    # Phase C3 (the roadmap notes, recorded in the minimal-card contract
     # §4.2): the entry measurement is hardware-only (no model_path), and the
     # recommended model is measured model-bound before plan; plan then uses
     # that measurement and exactly that model.
@@ -504,7 +504,7 @@ def test_assistant_operation_poll_stops_at_ready_and_drops_a_stale_generation():
         "state": "ready",
         "timer": None,
         "ready": True,
-        "url": "http://172.16.1.11:8099",
+        "url": "http://192.0.2.11:8099",
     }
     # The second call was single-flight, and the late old-generation response
     # could not flip the newer state back to ready.
@@ -552,7 +552,7 @@ def test_assistant_endpoint_is_hidden_until_the_operation_is_ready():
     assert result["ready"]["state"] == "ready"
     assert result["ready"]["endpointReady"] is True
     assert result["ready"]["exposed"] is True
-    assert result["ready"]["url"] == "http://172.16.1.11:8099"
+    assert result["ready"]["url"] == "http://192.0.2.11:8099"
 
 
 def test_assistant_retry_coordinator_retries_the_elected_coordinator_only():
@@ -691,7 +691,7 @@ def test_assistant_flow_never_calls_stage_deploy_replan_or_autoconfigure():
 
 # --- Screen 4: the progress surface ------------------------------------------
 #
-# SCREEN-4-PROGRESS.md §2 pins which backend value makes which row current. These
+# the progress-row contract pins which backend value makes which row current. These
 # tests walk a real apply/start against the recorded operation payloads and read
 # the rows the card would render.
 
@@ -790,7 +790,7 @@ const rowOf = (key) => component.assistantProgressRows()
     assert result["preparing"]["message"] == "the operation is running on node-b"
     assert result["preparing"]["count"] == "1 of 2 Macs ready"
     assert result["loading"]["message"] == "loading weights on node-b"
-    assert result["endpoint"] == "http://172.16.1.11:8099"
+    assert result["endpoint"] == "http://192.0.2.11:8099"
 
 
 def test_assistant_ready_row_is_not_reached_without_a_ready_endpoint():
@@ -1003,7 +1003,7 @@ def test_assistant_resumes_the_running_operation_the_backend_names():
     A reloaded page has no plan-time inputs, so the honest resume point is the
     answer to the next request: ``409 operation_in_progress`` carries the running
     ``operation_id`` and the one action ``status``. The card then renders the
-    phase that stored record reports (SCREEN-4-PROGRESS.md §5).
+    phase that stored record reports (the progress-row contract).
     """
 
     result = _run_wizard(
@@ -1320,15 +1320,15 @@ def test_assistant_open_chat_targets_the_coordinator_and_the_serving_model_id():
         )
     )
 
-    # The fixture's coordinator is node-b (http://172.16.1.11:8099) and the
+    # The fixture's coordinator is node-b (http://192.0.2.11:8099) and the
     # wizard's own Mac is node-a, so this is the remote case: that Mac's page.
     assert result["remote"]["local"] is False
-    assert result["remote"]["base"] == "http://172.16.1.11:8099/admin/chat"
+    assert result["remote"]["base"] == "http://192.0.2.11:8099/admin/chat"
     assert (
         result["remote"]["url"]
-        == "http://172.16.1.11:8099/admin/chat?model=qwen3-32b-4bit"
+        == "http://192.0.2.11:8099/admin/chat?model=qwen3-32b-4bit"
     )
-    assert result["remote"]["agentBase"] == "http://172.16.1.11:8099/v1"
+    assert result["remote"]["agentBase"] == "http://192.0.2.11:8099/v1"
     assert result["remote"]["agentModel"] == "qwen3-32b-4bit"
     assert "Node B" in result["remote"]["note"]
     assert "sign in" in result["remote"]["note"]
@@ -1338,7 +1338,7 @@ def test_assistant_open_chat_targets_the_coordinator_and_the_serving_model_id():
     assert result["local"]["url"] == "/admin/chat?model=qwen3-32b-4bit"
     assert result["local"]["note"] == ""
 
-    assert result["unresolved"] == "http://172.16.1.11:8099/admin/chat"
+    assert result["unresolved"] == "http://192.0.2.11:8099/admin/chat"
 
 
 def test_assistant_ready_renders_only_the_measured_rate():
@@ -1506,7 +1506,7 @@ def test_assistant_stop_closes_the_endpoint_and_offers_start_again():
     )
 
     assert result["before"]["ready"] is True
-    assert result["before"]["url"] == "http://172.16.1.11:8099"
+    assert result["before"]["url"] == "http://192.0.2.11:8099"
     assert result["before"]["deployment"] == "dev-1.5b-abc123"
     assert result["stopped"] is True
     assert result["ready"] is False
@@ -1622,7 +1622,7 @@ const setNavigator = (value) => Object.defineProperty(
 );
 (async () => {
   setNavigator({clipboard: {writeText: async () => {}}});
-  component.copyAssistantValue('http://172.16.1.11:8099');
+  component.copyAssistantValue('http://192.0.2.11:8099');
   await flush();
   const ok = {toasts: toasts.slice(), copied: component.assistant.copied};
   toasts.length = 0;
@@ -1630,12 +1630,12 @@ const setNavigator = (value) => Object.defineProperty(
   setNavigator({
     clipboard: {writeText: () => Promise.reject(new Error('denied'))},
   });
-  component.copyAssistantValue('http://172.16.1.11:8099');
+  component.copyAssistantValue('http://192.0.2.11:8099');
   await flush();
   const rejected = {toasts: toasts.slice(), copied: component.assistant.copied};
   toasts.length = 0;
   setNavigator({});
-  component.copyAssistantValue('http://172.16.1.11:8099');
+  component.copyAssistantValue('http://192.0.2.11:8099');
   await flush();
   const unavailable = {toasts: toasts.slice(), copied: component.assistant.copied};
   process.stdout.write(JSON.stringify({ok, rejected, unavailable}));
@@ -1644,7 +1644,7 @@ const setNavigator = (value) => Object.defineProperty(
     )
 
     # A real copy marks the value and notifies success.
-    assert result["ok"]["copied"] == "http://172.16.1.11:8099"
+    assert result["ok"]["copied"] == "http://192.0.2.11:8099"
     assert [toast["type"] for toast in result["ok"]["toasts"]] == ["success"]
     # A rejected write notifies an error and never marks the value copied.
     assert [toast["type"] for toast in result["rejected"]["toasts"]] == ["error"]
@@ -1673,7 +1673,7 @@ def test_assistant_details_json_after_stop_has_no_ready_endpoint():
     state: component.assistantState(),
     snapStopped: parsed.stopped,
     snapEndpoint: parsed.endpoint,
-    hasUrl: json.includes('http://172.16.1.11:8099'),
+    hasUrl: json.includes('http://192.0.2.11:8099'),
   }));
 })();
 """
@@ -1721,7 +1721,7 @@ def test_assistant_refresh_syncs_state_and_progress():
     assert result["state"] == "ready"
     assert result["phase"] == "ready"
     assert result["ready"] is True
-    assert result["url"] == "http://172.16.1.11:8099"
+    assert result["url"] == "http://192.0.2.11:8099"
     assert result["busy"] is False
 
 
@@ -1793,19 +1793,19 @@ def test_assistant_operation_json_redacts_the_endpoint_until_ready():
   // A port-0 URL is never rendered, even on an otherwise ready snapshot.
   component.assistant.stopped = false;
   component.assistant.state = 'ready';
-  component.assistant.endpoint = {ready: true, port: 0, url: 'http://172.16.1.11:0'};
+  component.assistant.endpoint = {ready: true, port: 0, url: 'http://192.0.2.11:0'};
   component.assistant.operation = Object.assign({}, readyFixture, {
-    endpoint: {ready: true, port: 0, url: 'http://172.16.1.11:0'},
+    endpoint: {ready: true, port: 0, url: 'http://192.0.2.11:0'},
   });
   const portZeroJson = component.assistantOperationJson();
   process.stdout.write(JSON.stringify({
     loadingEndpoint: JSON.parse(loadingJson).endpoint,
-    loadingHasUrl: loadingJson.includes('http://172.16.1.11:8099'),
+    loadingHasUrl: loadingJson.includes('http://192.0.2.11:8099'),
     readyUrl: JSON.parse(readyJson).endpoint.url,
     stoppedEndpoint: JSON.parse(stoppedJson).endpoint,
-    stoppedHasUrl: stoppedJson.includes('http://172.16.1.11:8099'),
+    stoppedHasUrl: stoppedJson.includes('http://192.0.2.11:8099'),
     portZeroEndpoint: JSON.parse(portZeroJson).endpoint,
-    portZeroHasUrl: portZeroJson.includes('http://172.16.1.11:0'),
+    portZeroHasUrl: portZeroJson.includes('http://192.0.2.11:0'),
   }));
 })();
 """
@@ -1816,7 +1816,7 @@ def test_assistant_operation_json_redacts_the_endpoint_until_ready():
     assert result["loadingEndpoint"] is None
     assert result["loadingHasUrl"] is False
     # When the card would show it, the pane shows it too.
-    assert result["readyUrl"] == "http://172.16.1.11:8099"
+    assert result["readyUrl"] == "http://192.0.2.11:8099"
     # After stop it is redacted again.
     assert result["stoppedEndpoint"] is None
     assert result["stoppedHasUrl"] is False
@@ -1827,7 +1827,7 @@ def test_assistant_operation_json_redacts_the_endpoint_until_ready():
 
 # --- Review slice 11: session-card runtime coverage (Phase C1 reload resume) --
 #
-# SCREEN-6-MANAGE.md §1: after a reload the idle card shows the persisted
+# the manage-card contract: after a reload the idle card shows the persisted
 # session (Running / Stopped / Applied) and offers Start again / Stop. These
 # tests execute the shipped session methods under Node with the fake apiFetch;
 # no real cluster, no SSH. The session payload mirrors the backend's
@@ -1876,7 +1876,7 @@ def test_assistant_session_endpoint_only_when_ready_and_not_stopped():
     result = _run_wizard(
         _WIZARD_TWO_MACS
         + """
-const url = 'http://172.16.1.11:8099';
+const url = 'http://192.0.2.11:8099';
 const base = {endpoint: {ready: true, url}};
 component.assistant.session = Object.assign({}, base, {state: 'ready', stopped: false});
 const running = component.assistantSessionEndpoint();
@@ -1893,7 +1893,7 @@ const noSession = component.assistantSessionEndpoint();
 process.stdout.write(JSON.stringify({running, notReady, stopped, applied, noEndpoint, noSession}));
 """
     )
-    assert result["running"] == "http://172.16.1.11:8099"
+    assert result["running"] == "http://192.0.2.11:8099"
     assert result["notReady"] == ""
     assert result["stopped"] == ""
     assert result["applied"] == ""
@@ -2056,7 +2056,7 @@ def test_assistant_stop_session_posts_operation_id_and_is_busy_guarded():
     assert result["emptyPosts"] == 0
     # After a successful stop the handler reloads the session (busy cleared
     # first), so the strip shows the stopped deployment with "Start again"
-    # rather than vanishing (SCREEN-6-MANAGE.md §1).
+    # rather than vanishing (the manage-card contract).
     assert result["sessionReads"] == 1
     assert result["sessionAfter"]["operation_id"] == "op-start"
     assert result["sessionAfter"]["stopped"] is True
@@ -2544,10 +2544,10 @@ _TUNE_SETUP = """
 component.assistant.state = 'ready';
 component.assistant.operationId = 'op-start';
 component.assistant.applyOperationId = 'op-apply';
-component.assistant.endpoint = {ready:true, url:'http://172.16.1.11:8099', port:8099, node:'node-a'};
+component.assistant.endpoint = {ready:true, url:'http://192.0.2.11:8099', port:8099, node:'node-a'};
 component.assistant.operation = {
   operation_id: 'op-start', kind: 'start', state: 'ready',
-  endpoint: {ready:true, url:'http://172.16.1.11:8099', port:8099, node:'node-a'},
+  endpoint: {ready:true, url:'http://192.0.2.11:8099', port:8099, node:'node-a'},
 };
 component.assistant.selectedModel = '/models/qwen3-32b';
 component.assistant.selectedContextTokens = 32768;
@@ -3079,7 +3079,7 @@ def test_the_user_can_pick_the_experts_resident_tradeoff_for_apply():
 # The screens are a render-mode on the frozen state machine. These tests drive
 # the shipped methods with the same fake seams as the rest of this file: no
 # real Mac, model or endpoint appears here (AGENTS: live evidence lives in
-# PHASE-2B-RUN.md).
+# the live-run notes).
 
 
 def test_assistant_screen_is_exactly_one_per_backend_state():

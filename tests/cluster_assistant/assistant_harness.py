@@ -420,7 +420,7 @@ class FakeCoordinator:
 
         return CoordinatorOps(
             local=False,
-            target="172.16.1.11",
+            target="192.0.2.11",
             prepare=prepare,
             stage=stage,
             staging_status=staging_status,

@@ -62,7 +62,7 @@ NOW = datetime(2026, 11, 3, 12, 0, tzinfo=UTC)
 MEASURED_AT = NOW.isoformat()
 MODEL = ModelIdentity(model_size_bytes=40 * GIB, layer_count=20)
 STATUS_URL = "/admin/api/cluster/assistant/status"
-SSH = {"m5": "172.16.1.11", "m1": "172.16.1.14"}
+SSH = {"m5": "192.0.2.11", "m1": "192.0.2.14"}
 CAPACITY_GIB = {"m5": 107.5, "m1": 60.0}
 USABLE_GIB = {"m5": 96.75, "m1": 54.0}
 

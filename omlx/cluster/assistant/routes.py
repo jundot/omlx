@@ -3541,7 +3541,7 @@ class AssistantOperationMirrorRequest(BaseModel):
 
     The browser never calls this: the origin mirrors its apply/start onto the
     elected coordinator through the admin seam so the coordinator's own store
-    can answer ``operations/active`` — the cluster-wide lock (CHAPTER-5 §2.2).
+    can answer ``operations/active`` — the cluster-wide lock (the apply/start design notes).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -3607,7 +3607,7 @@ async def cluster_assistant_operation_status(
 
 
 # ---------------------------------------------------------------------------
-# free space (PHASE-2B-RUN.md §9: the delete affordance is a relay)
+# free space (the live-run notes: the delete affordance is a relay)
 # ---------------------------------------------------------------------------
 
 

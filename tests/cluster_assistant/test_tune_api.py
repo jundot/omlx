@@ -141,7 +141,7 @@ def test_tune_saves_the_preset_per_model_and_hardware(api, monkeypatch) -> None:
 
 def test_tune_never_erases_an_mtp_depth_a_redeploy_saved(api, monkeypatch) -> None:
     # One combined preset: the sampler sweep must merge into the depth the
-    # redeploy sweep measured, not overwrite it with None (PHASE-2B-RUN.md §26).
+    # redeploy sweep measured, not overwrite it with None (the live-run notes).
     client, _, store = api()
     op = _ready_winner(store)
 

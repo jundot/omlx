@@ -668,7 +668,7 @@ def test_the_router_exposes_the_assistant_routes(api) -> None:
         (OPERATIONS_URL + "/mirror", ["POST"]),
         (OPERATIONS_URL + "/{operation_id}", ["GET"]),
         # The free-space affordance: one model, on one measured Mac, through that
-        # Mac's own delete route (PHASE-2B-RUN.md §9).
+        # Mac's own delete route (the live-run notes).
         (
             "/admin/api/cluster/assistant/models/{node_id}/{model_id:path}",
             ["DELETE"],

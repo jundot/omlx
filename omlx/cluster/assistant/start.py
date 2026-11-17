@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run apply and start on the *elected* coordinator, never on the origin.
 
-The two jobs this module drives are the ones PROJECT-BRIEF §9.2 describes:
+The two jobs this module drives are the ones the project design notes describes:
 
 ``apply``  prepare and stage the model on the elected Mac; start nothing.
 ``start``  health, activation, load, readiness canary, endpoint ready.
@@ -132,7 +132,7 @@ CHAT_PROFILE: dict[str, Any] = {
     "force_sampling": True,
 }
 ACTIVE_OPERATION_PATH = "/admin/api/cluster/assistant/operations/active"
-# The cluster-wide lock (CHAPTER-5 §2.2): the origin mirrors its operation onto
+# The cluster-wide lock (the apply/start design notes): the origin mirrors its operation onto
 # the coordinator's own store through the same admin seam, so the coordinator
 # can answer ``operations/active`` while a remote apply/start is working.
 # Server-to-server only; the browser never calls it.
@@ -241,7 +241,7 @@ class CoordinatorOps:
     #: the coordinator's profiles. Optional for tests/older coordinators.
     probe: Callable[[Any], Mapping[str, Any]] | None = None
     #: Mirror one operation lifecycle state onto the coordinator's own store
-    #: (the cluster-wide lock, CHAPTER-5 §2.2). The body carries the origin's
+    #: (the cluster-wide lock, the apply/start design notes). The body carries the origin's
     #: operation ID, kind, coordinator, state and model/context for display.
     #: Remote coordinators only: a local coordinator shares this store, so
     #: ``store.start`` already refuses a second operation and the mirror stays

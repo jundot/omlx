@@ -40,7 +40,7 @@ def _ready_record(
     deployment_id: str = "dev-1.5b-abc123",
 ) -> Any:
     endpoint = OperationEndpoint(
-        node="m5", host="172.16.1.11", port=8099
+        node="m5", host="192.0.2.11", port=8099
     )
     record = operations.start(
         kind=KIND_START,
@@ -67,7 +67,7 @@ def _ready_record(
         STATE_READY,
         progress=OperationProgress(phase="ready", message="ready"),
         endpoint=OperationEndpoint(
-            node="m5", host="172.16.1.11", port=8099, ready=True
+            node="m5", host="192.0.2.11", port=8099, ready=True
         ),
         deployment_id=deployment_id,
     )
@@ -143,14 +143,14 @@ def test_stop_relays_to_a_remote_coordinator(api, monkeypatch) -> None:
     assert response.status_code == 200, response.text
     assert calls == [
         (
-            "andreaskolb@172.16.1.11",
+            "andreaskolb@192.0.2.11",
             8099,
             "/admin/api/cluster/assistant/operations/active",
             "GET",
             30.0,
         ),
         (
-            "andreaskolb@172.16.1.11",
+            "andreaskolb@192.0.2.11",
             8099,
             "/admin/api/cluster/deployments/dev-1.5b-abc123/unload",
             "POST",
@@ -185,7 +185,7 @@ def test_stop_refuses_an_operation_that_is_not_ready(api) -> None:
         kind=KIND_APPLY,
         measurement_id="ms-stop",
         coordinator_node="m5",
-        endpoint=OperationEndpoint(node="m5", host="172.16.1.11", port=8099),
+        endpoint=OperationEndpoint(node="m5", host="192.0.2.11", port=8099),
     )
     operations.advance(
         record.operation_id,

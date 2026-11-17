@@ -45,7 +45,7 @@ NOW = datetime(2026, 11, 3, 12, 0, tzinfo=UTC)
 
 
 def endpoint() -> OperationEndpoint:
-    return OperationEndpoint(node="m5", host="172.16.1.11", port=8099)
+    return OperationEndpoint(node="m5", host="192.0.2.11", port=8099)
 
 
 def store(tmp_path) -> OperationStore:
@@ -100,7 +100,7 @@ def test_an_applied_operation_survives_a_restart_intact(tmp_path) -> None:
     assert loaded.coordinator_node == "m5"
     assert loaded.rank_order == ("m5", "m1")
     assert loaded.context_tokens == 8192
-    assert loaded.endpoint == OperationEndpoint("m5", "172.16.1.11", 8099)
+    assert loaded.endpoint == OperationEndpoint("m5", "192.0.2.11", 8099)
     assert loaded.error is None
     # An applied record is finished, so it may not become "interrupted".
     assert reopened.recovered == 0
@@ -192,7 +192,7 @@ def test_states_move_forward_only(tmp_path) -> None:
         start_record.operation_id,
         STATE_READY,
         progress=OperationProgress(phase="ready", message="done"),
-        endpoint=OperationEndpoint("m5", "172.16.1.11", 8099, ready=True),
+        endpoint=OperationEndpoint("m5", "192.0.2.11", 8099, ready=True),
         now=NOW,
     )
     assert ready.state == STATE_READY
@@ -332,7 +332,7 @@ def test_nothing_secret_is_persisted(tmp_path) -> None:
     # One endpoint host and port are identifiers a client must dial, not
     # credentials — and the record stores exactly one of them. The checkpoint
     # path is likewise an identifier the reloaded card needs, never a key.
-    assert "172.16.1.11" in raw
+    assert "192.0.2.11" in raw
     assert raw.count('"host"') == 1
     assert "model_path" in raw
 
@@ -373,7 +373,7 @@ def test_the_record_reports_its_own_state_truthfully(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mirrors: the cluster-wide lock on a remote coordinator (B5, CHAPTER-5 §2.2)
+# Mirrors: the cluster-wide lock on a remote coordinator (B5, the apply/start design notes)
 # ---------------------------------------------------------------------------
 
 

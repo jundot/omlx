@@ -48,8 +48,8 @@ def _local_target() -> NodeTarget:
 def _remote_target() -> NodeTarget:
     return NodeTarget(
         node_id="m1",
-        address="172.16.1.14",
-        ssh="user@172.16.1.14",
+        address="192.0.2.14",
+        ssh="user@192.0.2.14",
         local=False,
         port=8099,
     )
@@ -294,7 +294,7 @@ def test_remote_write_still_goes_through_run_remote_python(monkeypatch) -> None:
 
     _write_model_settings_file(_remote_target(), "qwen", {"mtp_enabled": True})
 
-    assert captured["ssh"] == "user@172.16.1.14"
+    assert captured["ssh"] == "user@192.0.2.14"
     assert captured["snippet"] is provisioning._SETTINGS_FILE_SNIPPET
     payload = json.loads(captured["argument"])
     assert payload["model_id"] == "qwen"
@@ -333,7 +333,7 @@ def test_the_mac_wide_tier_write_uses_the_global_settings_route(monkeypatch) -> 
     assert calls == [
         ("local", start.GLOBAL_SETTINGS_PATH, {"memory_guard_tier": "aggressive"}, "POST"),
         (
-            "user@172.16.1.14",
+            "user@192.0.2.14",
             start.GLOBAL_SETTINGS_PATH,
             {"memory_guard_tier": "aggressive"},
             "POST",
@@ -342,7 +342,7 @@ def test_the_mac_wide_tier_write_uses_the_global_settings_route(monkeypatch) -> 
 
 
 def test_a_mac_wide_write_without_a_port_is_one_action() -> None:
-    target = NodeTarget(node_id="m1", address="172.16.1.14", ssh="u@h", local=False, port=0)
+    target = NodeTarget(node_id="m1", address="192.0.2.14", ssh="u@h", local=False, port=0)
 
     with pytest.raises(ProvisioningError) as raised:
         provisioning.write_global_settings_on_mac(target, {"memory_guard_tier": "safe"})

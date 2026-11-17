@@ -7,7 +7,7 @@ injected the way ``tests/test_cluster_routes.py`` injects them. They pin:
 
 * the answer is one model at one context, ranked from the stored hardware facts;
 * the measurement's model identity is *not* compared with the candidates
-  (PROJECT-BRIEF §11.1a) while ``plan`` keeps its strict check;
+  (the project design notesa) while ``plan`` keeps its strict check;
 * a missing, unknown, stale or mismatched measurement is the same flat
   ``409 stale_measurement`` ``/plan`` returns, with no candidate list;
 * no feasible candidate is ``409 no_feasible_candidate`` with the ranked near
@@ -669,7 +669,7 @@ def test_the_router_exposes_the_assistant_routes(api) -> None:
         (OPERATIONS_URL + "/mirror", ["POST"]),
         (OPERATIONS_URL + "/{operation_id}", ["GET"]),
         # The free-space affordance: one model, on one measured Mac, through that
-        # Mac's own delete route (PHASE-2B-RUN.md §9).
+        # Mac's own delete route (the live-run notes).
         (
             "/admin/api/cluster/assistant/models/{node_id}/{model_id:path}",
             ["DELETE"],

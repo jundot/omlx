@@ -61,7 +61,7 @@ def test_the_session_is_empty_before_any_operation(api) -> None:
 
 def test_a_ready_deployment_is_resumable_after_a_reload(api) -> None:
     client, _, _ = api(
-        coordinator=_coordinator().factory(), local_addresses=("172.16.1.11",)
+        coordinator=_coordinator().factory(), local_addresses=("192.0.2.11",)
     )
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id)
@@ -89,7 +89,7 @@ def test_a_ready_deployment_is_resumable_after_a_reload(api) -> None:
 
 def test_a_stopped_session_still_offers_start_again(api, monkeypatch) -> None:
     client, _, _ = api(
-        coordinator=_coordinator().factory(), local_addresses=("172.16.1.11",)
+        coordinator=_coordinator().factory(), local_addresses=("192.0.2.11",)
     )
     monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", _local_admin)
     measurement_id = take_measurement(client)
@@ -112,7 +112,7 @@ def test_a_stopped_session_still_offers_start_again(api, monkeypatch) -> None:
 
 def test_stop_is_refused_while_another_operation_runs(api) -> None:
     client, _, operations = api(
-        coordinator=_coordinator().factory(), local_addresses=("172.16.1.11",)
+        coordinator=_coordinator().factory(), local_addresses=("192.0.2.11",)
     )
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id)

@@ -2,7 +2,7 @@
 """Which model should this measured cluster run?
 
 ``plan`` answers "given this model, how do we split it?". This module answers the
-question that comes first (PROJECT-BRIEF §11.1/§13.3a), and the two are
+question that comes first (the project design notes/§13.3a), and the two are
 deliberately different contracts:
 
 * recommendation reads only the **hardware** half of a stored measurement —
@@ -236,7 +236,7 @@ class ModelRecommendation:
     excluded_nodes: tuple[str, ...] = ()
     #: "single" (the local engine on one Mac, no pipeline) or "cluster" (a
     #: pipeline across 2+ Macs). Single-node is preferred when the model fits on
-    #: one Mac at the target context (E6, PHASE-2B-RUN §22): no pipeline overhead.
+    #: one Mac at the target context (E6, the live-run notes): no pipeline overhead.
     mode: str = "cluster"
 
     @property
@@ -303,7 +303,7 @@ class RecommendationResult:
     reasons: tuple[str, ...]
     #: The single-node option for the selected model (E6): when the recommended
     #: model also fits on one Mac at the target context, the local engine is
-    #: faster than a pipeline (PHASE-2B-RUN §22). ``None`` when it does not fit
+    #: faster than a pipeline (the live-run notes). ``None`` when it does not fit
     #: on one Mac. The cluster recommendation above stays the compatible answer;
     #: this is the preferred faster option the caller may choose instead.
     single_node: ModelRecommendation | None = None
@@ -468,7 +468,7 @@ def _single_node_option(
 
     Additive to the cluster recommendation (E6): the recommended model may also
     run on a single Mac at the target context, which is faster than a pipeline
-    (PHASE-2B-RUN §22). Returns ``None`` when no model is recommended or the
+    (the live-run notes). Returns ``None`` when no model is recommended or the
     selected model does not fit on one Mac at the target context.
     """
 

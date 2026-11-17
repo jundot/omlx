@@ -60,7 +60,7 @@ def profile_ops(
 
     return CoordinatorOps(
         local=False,
-        target="172.16.1.11",
+        target="192.0.2.11",
         prepare=forbidden,
         stage=forbidden,
         staging_status=forbidden,

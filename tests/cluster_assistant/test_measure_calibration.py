@@ -14,7 +14,7 @@ result into the node ahead of the synthetic probe. These tests pin the wiring:
   the Mac's own admin seam over SSH for any other.
 
 No real Mac, model or SSH here (AGENTS.md): the probes, the layout read and
-the completion transport are fakes. Live evidence belongs in PHASE-2B-RUN.md.
+the completion transport are fakes. Live evidence belongs in the live-run notes.
 """
 
 from __future__ import annotations
