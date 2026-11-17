@@ -136,7 +136,7 @@ def test_free_text_warnings_are_scrubbed(tmp_path, monkeypatch) -> None:
             node_id="m1",
             message=(
                 f"could not read {MODEL_PATH} on "
-                f"andreaskolb@{SSH['m1']} with api_key=sk-secret123"
+                f"operator@{SSH['m1']} with api_key=sk-secret123"
             ),
         )
         store.finish(
@@ -156,7 +156,7 @@ def test_free_text_warnings_are_scrubbed(tmp_path, monkeypatch) -> None:
     assert response.status_code == 200
     text = response.text
     assert MODEL_PATH not in text
-    assert "andreaskolb@" not in text
+    assert "operator@" not in text
     assert "sk-secret123" not in text
     assert "[ssh-target]" in text
     assert "[redacted-key]" in text or "api_key=[redacted]" in text
