@@ -9,6 +9,7 @@ gate even when ``_prefill_memory_guard`` was flipped on by the enforcer.
 These tests pin the wiring so a future refactor cannot silently revert it.
 """
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1383,3 +1384,148 @@ def test_post_prefill_guard_uses_stable_physical_cap(
     else:
         check()
     assert scheduler._reclaim_prefill_headroom.call_count == reclaims
+
+
+def _preflight_admits(scheduler: Scheduler, num_prompt_tokens: int) -> bool:
+    try:
+        scheduler.preflight_or_raise(num_prompt_tokens=num_prompt_tokens)
+    except PrefillMemoryExceededError:
+        return False
+    return True
+
+
+def _cold_estimate(scheduler: Scheduler, num_prompt_tokens: int) -> int:
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=num_prompt_tokens, cached_tokens=0, current=0
+    )
+    assert est is not None
+    return est.estimated
+
+
+def test_max_admitted_prompt_tokens_is_the_admission_boundary():
+    """The post-load fit is the length where preflight starts to 400 (#5147)."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18  # keep safety cap out
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        scheduler._memory_hard_limit_bytes = _cold_estimate(scheduler, 40_000)
+        fit = scheduler.max_admitted_prompt_tokens(1 << 21)
+
+        assert fit == 40_000
+        assert _preflight_admits(scheduler, fit)
+        assert not _preflight_admits(scheduler, fit + 1)
+
+
+def test_max_admitted_prompt_tokens_is_the_safety_cap_boundary():
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+    scheduler._prefill_abort_margin = 1.0
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        scheduler._memory_abort_limit_bytes = _cold_estimate(scheduler, 20_000)
+        fit = scheduler.max_admitted_prompt_tokens(1 << 21)
+
+        assert fit == 20_000
+        assert _preflight_admits(scheduler, fit)
+        assert not _preflight_admits(scheduler, fit + 1)
+
+
+def test_max_admitted_prompt_tokens_returns_limit_when_it_fits():
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+    scheduler._memory_abort_limit_bytes = 10**18
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        assert scheduler.max_admitted_prompt_tokens(65_536) == 65_536
+
+
+def test_max_admitted_prompt_tokens_is_none_when_guard_does_not_price():
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = False
+    scheduler._memory_hard_limit_bytes = 10**9
+    assert scheduler.max_admitted_prompt_tokens(65_536) is None
+
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 0
+    assert scheduler.max_admitted_prompt_tokens(65_536) is None
+
+
+@pytest.mark.parametrize(
+    ("speed_priority", "phys_bytes", "hot_cache_bytes"),
+    [
+        (False, 0, 0),
+        (False, 3 * 1024**3, 0),
+        (False, 3 * 1024**3, 2 * 1024**3),
+        (True, 3 * 1024**3, 0),
+    ],
+)
+def test_max_admitted_prompt_tokens_is_where_preflight_starts_to_reject(
+    speed_priority, phys_bytes, hot_cache_bytes
+):
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18
+    scheduler._prefill_speed_priority = speed_priority
+    scheduler._memory_hot_cache_reserved_bytes = hot_cache_bytes
+    scheduler._hot_cache_cpu_bytes = lambda: hot_cache_bytes
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=phys_bytes),
+    ):
+        scheduler._memory_hard_limit_bytes = phys_bytes + _cold_estimate(
+            scheduler, 4_000
+        )
+        fit = scheduler.max_admitted_prompt_tokens(1 << 21)
+
+        assert fit is not None and 1 < fit < 1 << 21
+        assert _preflight_admits(scheduler, fit)
+        assert not _preflight_admits(scheduler, fit + 1)
+
+
+def test_max_admitted_prompt_tokens_counts_evictable_bytes_as_free():
+    gib = 1024**3
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=6 * gib),
+    ):
+        scheduler._memory_hard_limit_bytes = 6 * gib + _cold_estimate(scheduler, 20_000)
+        crowded = scheduler.max_admitted_prompt_tokens(1 << 21)
+        freed = scheduler.max_admitted_prompt_tokens(1 << 21, evictable_bytes=4 * gib)
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=2 * gib),
+    ):
+        alone = scheduler.max_admitted_prompt_tokens(1 << 21)
+
+    assert crowded == 20_000
+    assert freed == alone > crowded
+
+
+def test_max_admitted_prompt_tokens_search_does_not_log(caplog):
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+        caplog.at_level(logging.WARNING, logger="omlx.scheduler"),
+    ):
+        scheduler._memory_hard_limit_bytes = _cold_estimate(scheduler, 4_096)
+        caplog.clear()
+        scheduler.max_admitted_prompt_tokens(1 << 21)
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+        assert not _preflight_admits(scheduler, 1 << 21)
+        assert "Preflight rejected" in caplog.text

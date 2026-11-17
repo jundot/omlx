@@ -1059,3 +1059,22 @@ def test_reranker_context_window_i18n_key_exists_in_every_locale():
     for path in sorted(i18n_dir.glob("*.json")):
         catalog = json.loads(path.read_text())
         assert key in catalog, f"{path.name} is missing {key}"
+
+
+def test_memory_fit_warning_i18n_key_exists_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx_web/i18n"
+    key = "modal.model_settings.max_context_window_memory_warning"
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        assert "{tokens}" in catalog.get(key, ""), f"{path.name} is missing {key}"
+
+
+def test_context_window_row_shows_the_memory_fit_warning():
+    row = _section(
+        _model_settings_template(),
+        "modal.model_settings.max_context_window_hint",
+        "</label>",
+    )
+    assert 'x-show="contextWindowMemoryWarning"' in row
+    assert 'x-text="contextWindowMemoryWarning"' in row

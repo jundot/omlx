@@ -447,6 +447,7 @@
                                 <span class="min-w-0">
                                     <span class="block {{ ms_row_label }}">{{ t('modal.model_settings.max_context_window') }}</span>
                                     <span class="{{ ms_row_hint }}">{{ t('modal.model_settings.max_context_window_hint') }}</span>
+                                    <span class="block text-xs text-amber-700 mt-1" x-show="contextWindowMemoryWarning" x-text="contextWindowMemoryWarning"></span>
                                 </span>
                                 <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
                                        class="{{ ms_field_short }}">
