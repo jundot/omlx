@@ -332,6 +332,12 @@ final class ServerProcess: @unchecked Sendable {
         consecutiveFailures = 0
         lastAuxiliaryHealthyAt = nil
 
+        // A fresh install has no logs directory yet. Create it before the
+        // FileHandle below; otherwise server start fails silently with no log.
+        try FileManager.default.createDirectory(
+            at: logURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         if !FileManager.default.fileExists(atPath: logURL.path) {
             FileManager.default.createFile(atPath: logURL.path, contents: nil)
         }

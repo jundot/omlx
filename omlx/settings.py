@@ -200,7 +200,10 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
-    distributed_inference_enabled: bool = False
+    # On by default (user decision, 2026-11-16): a fresh install must reach
+    # the Cluster Assistant without hunting for this switch. The Cluster tab,
+    # the cluster API routes and Bonjour advertising exist on first start.
+    distributed_inference_enabled: bool = True
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
     # Maximum raw image payload size accepted ("50MB", "100MB").
@@ -268,7 +271,7 @@ class ServerSettings:
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
             distributed_inference_enabled=data.get(
                 "distributed_inference_enabled",
-                False,
+                True,
             ),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
             max_image_upload_size=data.get("max_image_upload_size", "50MB"),

@@ -4,7 +4,7 @@
 The one rule these tests exist to pin down is the negative one: **a measurement
 that did not happen must not become a number**. A zero, a nominal rate or a
 synthesised p50 would all make the election answer a question nobody measured —
-and make an unmeasured plan look fast, which is what the design notes forbids.
+and make an unmeasured plan look fast, which is what PROJECT-BRIEF §17.2 forbids.
 """
 
 from __future__ import annotations

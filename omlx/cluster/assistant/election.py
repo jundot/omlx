@@ -4,7 +4,7 @@
 Rank 0 is not the Mac the user opened the app on. In the MVP rank 0 is also the
 coordinator, the endpoint owner and the supervisor host, so choosing it decides
 where the cluster *is*. The rule this module implements is the one frozen in
-``the design notes`` section 7:
+``docs/cluster-assistant/PROJECT-BRIEF.md`` section 7:
 
 1. every healthy Mac is tried as rank 0, with every order of the other Macs;
 2. a candidate is kept only if a legal PP split exists for it — every stage
@@ -46,9 +46,53 @@ from ..planner import (
     normalize_memory_guard_tier,
     plan_hybrid,
 )
+from .operations import ACTION_RAISE_WIRED_LIMIT
 from .topology import missing_line_links
 
 GIB = 1024**3
+
+#: A Mac's admitted ceiling is never above its ``iogpu.wired_limit_mb``:
+#: ``capacity_bytes`` is the minimum of the static, the live and the GPU
+#: ceiling. Being within this much of the GPU cap therefore means the cap — not
+#: RAM and not live pressure — is what a bigger stage would have to beat, and
+#: that Mac is the one to send to Performance → "Apply with Admin…".
+WIRED_LIMIT_HEADROOM_BYTES = 1 * GIB
+
+
+def wired_limit_binds(facts: NodeFacts) -> bool:
+    """Whether raising this Mac's GPU wired limit could admit more.
+
+    ``None`` is "not measured" and never reads as "too low": nobody sends a Mac
+    to an admin dialog on a guess. A measured ``0`` is the macOS default, i.e.
+    the limit was never raised, which is exactly the case the preflight exists
+    for.
+    """
+
+    if facts.wired_limit_mb is None:
+        return False
+    wired = int(facts.wired_limit_mb) * 1024**2
+    if wired <= 0:
+        return True
+    return facts.capacity_bytes >= wired - WIRED_LIMIT_HEADROOM_BYTES
+
+
+def wired_limit_hint(nodes: Sequence[NodeFacts]) -> str:
+    """One sentence naming the Macs whose GPU cap is the constraint."""
+
+    binding = [facts for facts in nodes if wired_limit_binds(facts)]
+    if not binding:
+        return ""
+    named = ", ".join(
+        f"{facts.node_id} ({int(facts.wired_limit_mb or 0):,} MB)"
+        for facts in binding
+    )
+    return (
+        "the GPU wired limit is what caps "
+        + named
+        + ": raise it in the app (Performance → Apply with Admin…, one admin "
+        "dialog) and measure again; if it still does not fit, choose a smaller "
+        "model or context"
+    )
 
 # Leave a little admission for the supervisor/HTTP and for the difference
 # between the measurement's p50 and the live ceiling at Start. A live GLM 32k
@@ -548,7 +592,7 @@ class RejectedCandidate:
 class ElectionPolicy:
     """The rule set that was applied, recorded with the result.
 
-    the notes' hard order is fixed in code; this only records which preferences
+    §7.5's hard order is fixed in code; this only records which preferences
     were on, so a persisted election can explain itself later.
     """
 
@@ -569,7 +613,7 @@ class EndpointPlaceholder:
     """Who will own the endpoint. The address itself is not an election input.
 
     The MVP puts the endpoint on the elected Mac, but the port and binding are
-    runtime decisions (the design notes), so this only names the owner and carries the
+    runtime decisions (brief §9.4), so this only names the owner and carries the
     measured address when one exists. ``port`` 0 means "the coordinator's
     configured port".
     """
@@ -651,6 +695,7 @@ def elect(
     moe_expert_offload_resident_fraction: float = 0.0,
     fabric_links: Sequence[Sequence[str]] | None = None,
     two_mac_fallback: bool = False,
+    preferred_coordinator: str | None = None,
 ) -> ElectionResult:
     """Elect the coordinator/rank 0 and return the plan that justifies it.
 
@@ -675,6 +720,14 @@ def elect(
     means the fabric was not measured and keeps the nominal-ring behaviour.
     ``two_mac_fallback`` is the user's explicit acceptance of the offered 2-Mac
     plan; it salts the signature so apply/start must repeat that consent.
+
+    ``preferred_coordinator`` is the user's explicit *pin* of rank 0 (and with
+    it the endpoint host, because the MVP keeps rank 0, coordinator and endpoint
+    on one Mac). It is not a hint: candidate generation is restricted to that
+    Mac, and if no legal split exists with it in front the election refuses with
+    a message naming it instead of quietly electing a different Mac. The pin is
+    a plan-time input, so apply/start must carry it; the plan signature then
+    pins the placement that launch will use.
     """
 
     _reject_tensor_parallel(tensor_parallel_size)
@@ -710,10 +763,16 @@ def elect(
     facts_by_id = {facts.node_id: facts for facts in nodes}
     extra = rank0_extra_bytes + (model.mtp_weight_bytes if mtp else 0)
 
+    pin = (preferred_coordinator or "").strip()
+    if pin and pin not in facts_by_id:
+        raise ValueError(
+            f"preferred_coordinator {pin!r} is not one of the measured Macs"
+        )
+
     considered: list[PlanCandidate] = []
     rejected: list[RejectedCandidate] = []
 
-    for candidate in nodes:
+    for candidate in ([facts_by_id[pin]] if pin else nodes):
         refusal = _ineligible_reason(candidate, model)
         if refusal:
             rejected.append(
@@ -802,10 +861,21 @@ def elect(
             ),
             tensor_parallel_size=1,
         )
+        hint = wired_limit_hint(nodes)
+        # A pin is never silently dropped: the refusal names the Mac the user
+        # chose and why it cannot hold rank 0, so the next step is visible.
+        pin_note = (
+            f"rank 0 is pinned to {pin} on request, but "
+            if pin
+            else ""
+        )
         raise NoFeasiblePlanError(
-            "no feasible coordinator: "
-            + _summarize_failures([item.reason for item in rejected]),
+            pin_note
+            + "no feasible coordinator: "
+            + _summarize_failures([item.reason for item in rejected])
+            + (f". {hint}" if hint else ""),
             result,
+            action=(ACTION_RAISE_WIRED_LIMIT if hint else "adjust_model_or_context"),
         )
 
     selected = ordered[0]
@@ -832,7 +902,15 @@ def elect(
         policy=resolved_policy,
         origin_node=origin_node or "",
         plan_signature=signature,
-        reasons=_reasons(selected, runner_up, facts_by_id, rejected, resolved_policy),
+        reasons=(
+            (
+                f"rank 0 is pinned to {pin} on request; the plan is feasible "
+                "there",
+            )
+            if pin
+            else ()
+        )
+        + _reasons(selected, runner_up, facts_by_id, rejected, resolved_policy),
         tensor_parallel_size=1,
     )
     return result
@@ -843,7 +921,7 @@ def _reject_tensor_parallel(tensor_parallel_size: int) -> None:
         return
     if tensor_parallel_size < 1:
         raise ValueError("tensor_parallel_size must be at least 1")
-    # the notes: the assistant API rejects TP with a clear message instead of
+    # §8.1: the assistant API rejects TP with a clear message instead of
     # silently planning PP behind the caller's back.
     raise UnsupportedParallelismError(
         f"tensor parallelism ({tensor_parallel_size}-way) is not supported by "
@@ -1101,7 +1179,7 @@ def _score(
 ) -> tuple[Any, ...]:
     """Ascending sort key: first element decides, later ones break ties.
 
-    Order is the notes', with one deliberate reading: a plan with no measurement
+    Order is §7.5's, with one deliberate reading: a plan with no measurement
     cannot outrank a measured one, because "unknown" is not "fast".
     """
 
@@ -1122,7 +1200,7 @@ def _score(
 
 
 def _coordinator_preference(facts: NodeFacts) -> tuple[int, int, int]:
-    """the notes step 4: a stable host with the model already on it starts sooner."""
+    """§7.5 step 4: a stable host with the model already on it starts sooner."""
 
     return (
         0 if facts.model_present else 1,

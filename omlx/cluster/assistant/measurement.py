@@ -71,7 +71,7 @@ DEFAULT_ENDPOINT_PORT = 8099
 
 # Addresses that identify this process, not this Mac on the network. An
 # endpoint other Macs dial is never loopback: binding there is exactly the
-# mistake the design notes names.
+# mistake brief §9.4 names.
 LOOPBACK_ENDPOINT_HOSTS = frozenset(
     {"", "127.0.0.1", "localhost", "::1", "0.0.0.0", "::"}
 )

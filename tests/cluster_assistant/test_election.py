@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Coordinator-election tests.
 
-These are the tests the first milestone is defined by (the design notes,
+These are the tests the first milestone is defined by (PROJECT-BRIEF §7,
 Appendix A.8). They run off-cluster: no Mac, model, GPU or SSH is involved,
 only measured numbers, because the election is a pure function and the thing
 that must be provable is the *decision*.
@@ -16,7 +16,7 @@ Mac          RAM                 role
 ``m1``       32-64 GiB, less     small candidate
 ===========  ==================  ==========
 
-Every test states which the notes rule it pins down, because the scoring order is
+Every test states which §7.5 rule it pins down, because the scoring order is
 the part of this module most likely to be "improved" into a free-memory sort.
 """
 
@@ -39,6 +39,7 @@ from omlx.cluster.assistant.election import (
     budget_for,
     elect,
     rank_candidates,
+    wired_limit_binds,
 )
 from omlx.cluster.planner import ModelLayout, ShardPlan
 
@@ -179,7 +180,7 @@ def assert_valid_rank_order(result: ElectionResult, node_ids: set[str]) -> None:
 
 
 def test_app_origin_does_not_decide_rank0() -> None:
-    """the notes/exit criterion: the Mac running the app has no vote.
+    """§7.2/exit criterion: the Mac running the app has no vote.
 
     The origin is recorded for support, and must produce a bit-identical
     election whether the user opened the app on the small Mac, the large one,
@@ -206,7 +207,7 @@ def test_app_origin_does_not_decide_rank0() -> None:
 
 
 def test_infeasible_local_rank0_is_replaced_by_a_remote_one() -> None:
-    """the notes: the M1 tail does not fit, the M5 tail does.
+    """§7.6: the M1 tail does not fit, the M5 tail does.
 
     The local Mac is the app origin *and* the only Mac that cannot hold the
     tail layer plus head. Election must pick the remote M5, not fall back.
@@ -229,7 +230,7 @@ def test_infeasible_local_rank0_is_replaced_by_a_remote_one() -> None:
 
 
 def test_best_feasible_plan_wins_over_the_most_free_admission() -> None:
-    """the notes steps 1-2 and the notes: feasibility and speed outrank free memory.
+    """§7.5 steps 1-2 and §7.6: feasibility and speed outrank free memory.
 
     A KV/owner boundary pins the single legal cut, so the Mac in the tail
     position holds 16 of 24 layers. Putting the fast Mac there is ~2x faster;
@@ -266,14 +267,14 @@ def test_best_feasible_plan_wins_over_the_most_free_admission() -> None:
     roomy_plan = by_coordinator["roomy"]
     assert roomy_plan.rank0_admission_bytes > result.selected.rank0_admission_bytes
     # ...and it also has more rank-0 headroom, so the decision was made on the
-    # predicted critical stage alone, as the notes requires.
+    # predicted critical stage alone, as §7.5 requires.
     assert roomy_plan.rank0_headroom_bytes > result.selected.rank0_headroom_bytes
     assert roomy_plan.critical_stage_seconds > result.selected.critical_stage_seconds
     assert result.rejected == ()
 
 
 def test_no_feasible_candidate_is_an_error_and_never_a_local_fallback() -> None:
-    """the notes: no split for any Mac is an explicit failure, not the origin Mac."""
+    """§7.7: no split for any Mac is an explicit failure, not the origin Mac."""
 
     model = layout(layers=32, layer_gib=6.0)  # 192 GiB across 140 GiB of admission
     with pytest.raises(NoFeasiblePlanError) as caught:
@@ -297,7 +298,7 @@ def test_no_feasible_candidate_is_an_error_and_never_a_local_fallback() -> None:
 
 
 def test_rank0_extra_bytes_change_feasibility() -> None:
-    """the notes step 1: tail + LM head + MTP + coordinator memory is a hard limit.
+    """§7.5 step 1: tail + LM head + MTP + coordinator memory is a hard limit.
 
     The same checkpoint and the same two Macs elect a plan with no extra
     rank-0 bytes, and lose the fast candidate once rank 0 must also hold
@@ -372,7 +373,7 @@ def test_mtp_head_only_counts_when_the_plan_enables_it() -> None:
 
 
 def test_three_node_rank_orders_are_valid() -> None:
-    """the notes: every permutation is tried; the result is a legal 3-stage split."""
+    """§7.4: every permutation is tried; the result is a legal 3-stage split."""
 
     nodes = [
         m5(),
@@ -398,7 +399,7 @@ def test_three_node_rank_orders_are_valid() -> None:
 
 
 def test_four_node_rank_orders_are_valid() -> None:
-    """the notes: the 4-Mac ring is supported, and every Mac can be rank 0."""
+    """§4.1: the 4-Mac ring is supported, and every Mac can be rank 0."""
 
     nodes = [
         m5(),
@@ -436,7 +437,7 @@ def test_four_node_rank_orders_are_valid() -> None:
 
 
 def test_tensor_parallel_request_is_rejected() -> None:
-    """the notes: TP is out of scope and must be refused, not silently PP'd."""
+    """§8.1/§4.2: TP is out of scope and must be refused, not silently PP'd."""
 
     for degree in (2, 3, 4):
         with pytest.raises(UnsupportedParallelismError) as caught:
@@ -451,7 +452,7 @@ def test_tensor_parallel_request_is_rejected() -> None:
 
 
 def test_free_admission_breaks_an_otherwise_exact_tie() -> None:
-    """the notes step 5: admission is the last preference, never the first.
+    """§7.5 step 5: admission is the last preference, never the first.
 
     Built as candidates rather than as a model because a real Mac pair almost
     always differs in headroom as well; this pins the ordering itself. The
@@ -513,7 +514,7 @@ def test_free_admission_breaks_an_otherwise_exact_tie() -> None:
 
 
 def test_an_unmeasured_plan_never_outranks_a_measured_one() -> None:
-    """the notes: no throughput promises — "unknown" is not "fast"."""
+    """§17.2: no throughput promises — "unknown" is not "fast"."""
 
     nodes = [
         facts("measured", capacity_gib=128, admission_gib=100),
@@ -540,7 +541,7 @@ def test_an_unmeasured_plan_never_outranks_a_measured_one() -> None:
 
 
 def test_measured_admission_is_the_budget_not_installed_ram() -> None:
-    """the notes: a plan is built against measured admission (p05), not capacity."""
+    """§7.3: a plan is built against measured admission (p05), not capacity."""
 
     node = facts("hot", capacity_gib=128, admission_gib=60)  # 68 GiB still in use
     model = layout(layers=16, layer_gib=2.0)  # 33 GiB
@@ -554,7 +555,7 @@ def test_measured_admission_is_the_budget_not_installed_ram() -> None:
 
 
 def test_unhealthy_and_unstageable_macs_are_rejected_with_a_reason() -> None:
-    """the notes candidates: paired, healthy, model present or stageable."""
+    """§7.4 candidates: paired, healthy, model present or stageable."""
 
     sick = facts("sick", capacity_gib=128, admission_gib=100, healthy=False)
     no_disk = facts(
@@ -583,7 +584,7 @@ def test_unhealthy_and_unstageable_macs_are_rejected_with_a_reason() -> None:
 
 
 def test_election_is_serializable_and_keeps_the_planner_plan() -> None:
-    """the notes: the result must survive an API round trip, and keep its plan."""
+    """§13.3: the result must survive an API round trip, and keep its plan."""
 
     result = elect([m1(), m5()], layout(), context_tokens=8192, origin_node="m1")
     payload = json.loads(json.dumps(result.to_dict()))
@@ -662,3 +663,104 @@ def test_implausible_compute_is_treated_as_unmeasured() -> None:
     assert budget_for(implausible, rank=1, admission="p50").performance is None
     plausible = facts("m2", capacity_gib=128, admission_gib=100, decode_gib_per_s=2.0)
     assert budget_for(plausible, rank=1, admission="p50").performance is not None
+
+
+def test_the_wired_limit_only_counts_when_it_is_what_caps_the_mac() -> None:
+    """R5: a Mac whose ceiling sits at its GPU cap can be helped by raising it.
+
+    ``capacity_bytes`` is the minimum of the static, live and GPU ceilings, so
+    being *at* the cap is the one case where more limit means more plan. A Mac
+    capped by RAM or by live pressure is not sent to an admin dialog.
+    """
+
+    at_cap = facts("cap", capacity_gib=48, admission_gib=44, wired_limit_mb=48 * 1024)
+    below_cap = facts(
+        "ram", capacity_gib=40, admission_gib=36, wired_limit_mb=48 * 1024
+    )
+    unmeasured = facts("unknown", capacity_gib=48, admission_gib=44)
+    never_raised = facts("default", capacity_gib=48, admission_gib=44, wired_limit_mb=0)
+
+    assert wired_limit_binds(at_cap) is True
+    assert wired_limit_binds(below_cap) is False
+    assert wired_limit_binds(unmeasured) is False
+    # 0 is the macOS default (nobody raised it) — the case the preflight exists
+    # for. "Not measured" is None and never reads as too low.
+    assert wired_limit_binds(never_raised) is True
+
+def test_a_pinned_coordinator_is_rank_zero_and_says_so() -> None:
+    """Pin: the endpoint host is the user's choice, not the ranking's."""
+
+    model = layout(layers=24, layer_gib=1.0)
+    big = facts("big", capacity_gib=128, admission_gib=100, decode_gib_per_s=2.0)
+    small = facts("small", capacity_gib=64, admission_gib=48, decode_gib_per_s=1.0)
+
+    automatic = elect([big, small], model, context_tokens=8192)
+    pinned = elect(
+        [big, small], model, context_tokens=8192, preferred_coordinator="small"
+    )
+
+    assert pinned.coordinator_node == "small"
+    assert pinned.rank_order[0] == "small"
+    assert pinned.endpoint is not None and pinned.endpoint.node_id == "small"
+    assert any("pinned" in reason for reason in pinned.reasons)
+    assert automatic.coordinator_node  # the ranking still answers on its own
+
+
+def test_an_unknown_pin_is_a_refusal_not_a_silent_election() -> None:
+    with pytest.raises(ValueError, match="preferred_coordinator"):
+        elect(
+            [m1(), m5()],
+            layout(layers=8, layer_gib=1.0),
+            context_tokens=1024,
+            preferred_coordinator="not-a-measured-mac",
+        )
+
+
+def test_a_pin_that_cannot_hold_rank_zero_is_named_in_the_refusal() -> None:
+    """The frozen rule: never silently elect a different Mac than the pin."""
+
+    model = layout(layers=8, layer_gib=4.0)
+    tiny = facts("tiny", capacity_gib=16, admission_gib=8)
+    big = facts("big", capacity_gib=128, admission_gib=100)
+
+    with pytest.raises(NoFeasiblePlanError) as caught:
+        elect(
+            [tiny, big],
+            model,
+            context_tokens=8192,
+            rank0_extra_bytes=10 * GIB,
+            preferred_coordinator="tiny",
+        )
+
+    assert "pinned to tiny" in str(caught.value)
+
+
+
+def test_a_refusal_names_the_wired_limit_and_offers_to_raise_it() -> None:
+    """A too-small Mac gets the click that helps, not only "choose a model"."""
+
+    model = layout(layers=32, layer_gib=6.0)  # needs far more than 48 GiB
+    capped = facts("capped", capacity_gib=48, admission_gib=44, wired_limit_mb=48_000)
+    other = facts("other", capacity_gib=48, admission_gib=44, wired_limit_mb=48_000)
+
+    with pytest.raises(NoFeasiblePlanError) as caught:
+        elect([capped, other], model, context_tokens=8192)
+
+    error = caught.value
+    assert error.action == "raise_wired_limit"
+    assert "Performance" in str(error)
+    assert "48,000 MB" in str(error)
+
+
+def test_a_refusal_stays_adjust_model_when_the_cap_is_not_the_constraint() -> None:
+    model = layout(layers=32, layer_gib=6.0)
+    pressured = facts(
+        "pressure", capacity_gib=40, admission_gib=36, wired_limit_mb=96 * 1024
+    )
+    other = facts("other", capacity_gib=40, admission_gib=36, wired_limit_mb=96 * 1024)
+
+    with pytest.raises(NoFeasiblePlanError) as caught:
+        elect([pressured, other], model, context_tokens=8192)
+
+    assert caught.value.action == "adjust_model_or_context"
+    assert "Performance" not in str(caught.value)

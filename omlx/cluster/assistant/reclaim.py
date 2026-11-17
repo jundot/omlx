@@ -59,7 +59,7 @@ def _planned_path(record: Any) -> str:
     return str(getattr(model, "model_path", "") or "")
 
 
-def _inventories(record: Any) -> Mapping[str, Sequence[Mapping[str, Any]]]:
+def _inventories(record: Any) -> Mapping[str, Sequence[Any]]:
     inventories = getattr(record, "inventories", None)
     return inventories if isinstance(inventories, Mapping) else {}
 

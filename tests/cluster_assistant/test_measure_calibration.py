@@ -14,7 +14,7 @@ result into the node ahead of the synthetic probe. These tests pin the wiring:
   the Mac's own admin seam over SSH for any other.
 
 No real Mac, model or SSH here (AGENTS.md): the probes, the layout read and
-the completion transport are fakes. Live evidence belongs in the live-run notes.
+the completion transport are fakes. Live evidence belongs in PHASE-2B-RUN.md.
 """
 
 from __future__ import annotations
@@ -259,11 +259,114 @@ def facts_by_node(store: MeasurementStore, measurement_id: str) -> dict[str, Any
 # ---------------------------------------------------------------------------
 
 
+def test_a_calibrated_mac_is_repriced_to_its_post_calibration_ceiling() -> None:
+    """The launch charges the dynamic ceiling; the calibration lowers it.
+
+    Measured live 2026-11-16: a plan priced 47.8 GiB for a Mac that then admitted
+    45.4 GiB, four minutes after the measurement had read 55.4 GiB — because the
+    calibration checkpoint had been loaded and released, and the freed bytes stay
+    in the process. The measurement now re-probes after the calibration and keeps
+    the smaller capacity.
+    """
+    from types import SimpleNamespace
+
+    from omlx.cluster.assistant import routes as assistant_routes
+
+    class FakeProbes:
+        def __init__(self, ceiling: int) -> None:
+            self.ceiling = ceiling
+
+        def admission_ceiling(self, ssh, python_executable=None) -> int:
+            return int(self.ceiling)
+
+        def budget(self, *, role, ssh_target, capacity_bytes, capacity_source=None):
+            return NodeBudgetSuggestion(
+                capacity_bytes=capacity_bytes,
+                reserve_bytes=0,
+                role=role,
+                capacity_source=capacity_source or "",
+            )
+
+    request = SimpleNamespace(
+        nodes=[SimpleNamespace(node_id="m1", ssh=SSH["m1"], python_executable="")]
+    )
+
+    def payload(calibration):
+        return {
+            "node_id": "m1",
+            "ssh": SSH["m1"],
+            "role": "headless",
+            "capacity_bytes": 55 * GIB,
+            "reserve_bytes": GIB,
+            "calibration": calibration,
+        }
+
+    # A calibrated Mac whose ceiling dropped is re-priced to the lower number.
+    lowered = [payload({"decode_tok_per_s": 500.0})]
+    assistant_routes._reprice_after_calibration(
+        FakeProbes(46 * GIB), request, lowered
+    )
+    assert lowered[0]["capacity_bytes"] == 46 * GIB
+
+    # No calibration, no re-price.
+    untouched = [payload(None)]
+    assistant_routes._reprice_after_calibration(
+        FakeProbes(46 * GIB), request, untouched
+    )
+    assert untouched[0]["capacity_bytes"] == 55 * GIB
+
+    # A ceiling that came back *higher* never raises the plan's number.
+    higher = [payload({"decode_tok_per_s": 500.0})]
+    assistant_routes._reprice_after_calibration(
+        FakeProbes(60 * GIB), request, higher
+    )
+    assert higher[0]["capacity_bytes"] == 55 * GIB
+
+
+def test_the_measurement_releases_the_calibration_model_it_loaded(
+    client, monkeypatch
+) -> None:
+    """The calibration checkpoint must not stay resident after the job.
+
+    A leftover ``dev-1.5b`` lowers the admission ceiling the *launcher* reads,
+    so a plan priced from the measurement is refused at start — measured live
+    2026-11-16 (plan admitted at 49.3 GiB, launch refused at 41.6 GiB).
+    """
+    unloads: list[tuple[str, str]] = []
+
+    def fake_local_admin(port, path, body=None, *, method="GET", timeout=0.0):
+        unloads.append((path, method))
+        return {}
+
+    def fake_remote_admin(target, port, path, body=None, *, method="POST", timeout=0.0):
+        unloads.append((path, method))
+        return {}
+
+    seam = FakeCompletion(usage_reply(), usage_reply(), usage_reply(), usage_reply())
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "_local_admin", fake_local_admin)
+    monkeypatch.setitem(assistant_routes.__dict__, "remote_admin", fake_remote_admin)
+    api, store = client(
+        inventory=calibration_inventory,
+        model_layout=calibration_layout,
+        performance=lambda nodes: [synthetic_profile("m5"), synthetic_profile("m1")],
+    )
+
+    status = run_measurement(api, measure_payload(include_performance_probe=False))
+
+    assert status["state"] == "ready"
+    expected = assistant_routes.MODEL_UNLOAD_PATH.format(model_id="dev-1.5b")
+    released = [call for call in unloads if call == (expected, "POST")]
+    assert released, unloads
+    # One release per Mac that ran the calibration (both hold the checkpoint).
+    assert len(released) == len(status["nodes"]), (released, len(status["nodes"]))
+
+
 def test_the_measure_job_folds_a_real_calibration_into_each_node(
     client, monkeypatch
 ) -> None:
     seam = FakeCompletion(usage_reply(), usage_reply(), usage_reply(), usage_reply())
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(
         inventory=calibration_inventory,
         model_layout=calibration_layout,
@@ -310,7 +413,7 @@ def test_calibration_alone_measures_compute_without_a_synthetic_probe(
     client, monkeypatch
 ) -> None:
     seam = FakeCompletion(usage_reply(), usage_reply(), usage_reply(), usage_reply())
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(
         inventory=calibration_inventory, model_layout=calibration_layout
     )
@@ -337,7 +440,7 @@ def test_a_mac_without_the_calibration_model_keeps_the_synthetic_probe(
     client, monkeypatch
 ) -> None:
     seam = FakeCompletion()
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(
         performance=lambda nodes: [synthetic_profile("m5"), synthetic_profile("m1")],
     )
@@ -365,7 +468,7 @@ def test_a_failed_calibration_falls_back_to_the_synthetic_probe(
         RuntimeError("the node did not answer"),
         RuntimeError("the node did not answer"),
     )
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(
         inventory=calibration_inventory,
         model_layout=calibration_layout,
@@ -391,7 +494,7 @@ def test_a_reply_without_timing_falls_back_to_the_synthetic_probe(
     client, monkeypatch
 ) -> None:
     seam = FakeCompletion(usage_reply(), {}, usage_reply(), {})
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(
         inventory=calibration_inventory,
         model_layout=calibration_layout,
@@ -414,7 +517,7 @@ def test_a_failed_calibration_without_a_probe_is_unknown_not_a_failure(
     client, monkeypatch
 ) -> None:
     seam = FakeCompletion(RuntimeError("model not loaded"))
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(
         inventory=calibration_inventory, model_layout=calibration_layout
     )
@@ -437,7 +540,7 @@ def test_an_unreadable_calibration_layout_falls_back(client, monkeypatch) -> Non
         raise RuntimeError("the checkpoint headers could not be read")
 
     seam = FakeCompletion()
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(
         inventory=calibration_inventory,
         model_layout=broken_layout,
@@ -465,7 +568,7 @@ def test_an_unreadable_calibration_layout_falls_back(client, monkeypatch) -> Non
 
 def test_calibration_does_not_change_admission_or_memory(client, monkeypatch) -> None:
     seam = FakeCompletion(usage_reply(), usage_reply(), usage_reply(), usage_reply())
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(
         inventory=calibration_inventory, model_layout=calibration_layout
     )
@@ -509,7 +612,7 @@ def test_a_hardware_only_measurement_still_calibrates(client, monkeypatch) -> No
         return calibration_inventory(ssh)
 
     seam = FakeCompletion(usage_reply(), usage_reply(), usage_reply(), usage_reply())
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(inventory=inventory, model_layout=calibration_layout)
 
     status = run_measurement(
@@ -539,11 +642,11 @@ def test_a_local_mac_calibrates_in_process(client, monkeypatch) -> None:
         fixed_weight_bytes=CALIBRATION_LAYOUT["fixed_weight_bytes"],
         layer_weight_bytes=tuple(CALIBRATION_LAYOUT["layer_weight_bytes"]),
     )
-    monkeypatch.setattr(
-        assistant_routes, "inspect_safetensors_layout", lambda path: layout
+    monkeypatch.setitem(
+        assistant_routes.__dict__, "inspect_safetensors_layout", lambda path: layout
     )
     seam = FakeCompletion(usage_reply(), usage_reply())
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(
         inventory=calibration_inventory,
         device=lambda node_id: None,
@@ -585,7 +688,7 @@ def test_the_calibration_model_is_matched_by_folder_name_on_another_home(
         return dict(CALIBRATION_LAYOUT)
 
     seam = FakeCompletion(usage_reply(), usage_reply(), usage_reply(), usage_reply())
-    monkeypatch.setattr(assistant_routes, "stream_completion", seam)
+    monkeypatch.setitem(assistant_routes.__dict__, "stream_completion", seam)
     api, store = client(inventory=inventory, model_layout=layout)
 
     status = run_measurement(api)
@@ -619,8 +722,8 @@ def test_stream_completion_routes_local_in_process_and_remote_over_ssh(
         calls.append((target, port, dict(body)))
         return {"usage": {}}
 
-    monkeypatch.setattr(assistant_start, "_local_stream_observe", local)
-    monkeypatch.setattr(assistant_start, "remote_stream_observe", remote)
+    monkeypatch.setitem(assistant_start.__dict__, "_local_stream_observe", local)
+    monkeypatch.setitem(assistant_start.__dict__, "remote_stream_observe", remote)
     body = calibration_body("dev-1.5b", prompt="hi", max_tokens=8)
 
     assert assistant_start.stream_completion(port=8099, body=body) == {"usage": {}}
@@ -640,7 +743,7 @@ def test_remote_stream_observe_sends_an_explicit_body_through_the_ssh_seam(
         seen["argument"] = json.loads(argument)
         return {"ok": True, "usage": {"generation_tokens_per_second": 500.0}}
 
-    monkeypatch.setattr(assistant_start, "run_remote_python", fake_run)
+    monkeypatch.setitem(assistant_start.__dict__, "run_remote_python", fake_run)
     body = calibration_body("dev-1.5b", prompt="hi", max_tokens=8)
 
     reply = assistant_start.remote_stream_observe(
@@ -664,7 +767,7 @@ def test_remote_stream_observe_without_a_body_keeps_the_observe_request(
         seen["argument"] = json.loads(argument)
         return {"ok": True, "usage": {}}
 
-    monkeypatch.setattr(assistant_start, "run_remote_python", fake_run)
+    monkeypatch.setitem(assistant_start.__dict__, "run_remote_python", fake_run)
 
     assistant_start.remote_stream_observe("172.16.1.11", 8099, "qwen")
 
@@ -694,7 +797,7 @@ def test_local_stream_observe_sends_an_explicit_body(monkeypatch) -> None:
         seen["timeout"] = timeout
         return FakeReply()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setitem(urllib.request.__dict__, "urlopen", fake_urlopen)
     monkeypatch.setattr(
         "omlx.settings.get_settings",
         lambda: SimpleNamespace(auth=SimpleNamespace(api_key="")),

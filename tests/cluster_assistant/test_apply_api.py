@@ -217,7 +217,7 @@ def test_an_unpaired_coordinator_asks_for_the_pairing(api) -> None:
     """An unpaired Mac has no address *because* it is unpaired.
 
     Telling the user to bind an interface would send them to the wrong control;
-    the one next step is the pairing flow (the design notes).
+    the one next step is the pairing flow (PROJECT-BRIEF §13.2).
     """
 
     client, _, _ = api(device=lambda node_id: None)
@@ -329,7 +329,7 @@ def test_apply_fails_with_one_action_when_staging_fails(api) -> None:
 def test_apply_uses_a_peer_as_the_model_source_when_the_coordinator_lacks_it(
     api,
 ) -> None:
-    """the notes: the coordinator is not assumed to hold the model."""
+    """§9.6: the coordinator is not assumed to hold the model."""
 
     def device(node_id: str) -> dict[str, Any] | None:
         return {"last_addrs": [SSH[node_id]], "ssh_user": "omlx", "http_port": 8099}
@@ -519,7 +519,7 @@ def test_the_origin_mac_is_dialable_when_another_mac_is_rank_zero(tmp_path) -> N
 
     A Mac has no paired record of itself, so its own target used to stay empty
     and apply refused with ``node_not_paired`` — the brief's "the origin can be
-    the smallest Mac" case (the notes). Its measured address is the evidence.
+    the smallest Mac" case (§9.5). Its measured address is the evidence.
     """
 
     store = MeasurementStore(tmp_path / "store")
@@ -754,8 +754,8 @@ def test_apply_refuses_while_the_coordinator_runs_another_origins_operation(
 
     fake = FakeCoordinator()
     client, _, operations = api(coordinator=fake.factory())
-    monkeypatch.setattr(
-        assistant_routes, "active_operation", lambda plan: "op-other-origin"
+    monkeypatch.setitem(
+        assistant_routes.__dict__, "active_operation", lambda plan: "op-other-origin"
     )
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id)
@@ -780,7 +780,7 @@ def test_apply_proceeds_when_the_coordinator_cannot_be_asked(api, monkeypatch) -
 
     fake = FakeCoordinator()
     client, _, _ = api(coordinator=fake.factory())
-    monkeypatch.setattr(assistant_routes, "active_operation", unavailable)
+    monkeypatch.setitem(assistant_routes.__dict__, "active_operation", unavailable)
     measurement_id = take_measurement(client)
     plan = take_plan(client, measurement_id)
 

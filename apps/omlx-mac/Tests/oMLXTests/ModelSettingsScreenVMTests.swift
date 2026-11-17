@@ -5,6 +5,17 @@ import SwiftUI
 @MainActor
 final class ModelSettingsScreenVMTests: XCTestCase {
 
+    /// Percent labels are localized: macOS may render "42 %" with a narrow
+    /// no-break space (U+202F) or a no-break space (U+00A0) before "%". The
+    /// product contract is the numeric value, not the separator, so normalize
+    /// the whitespace before comparing.
+    private func normalizedPercent(_ label: String) -> String {
+        label
+            .replacingOccurrences(of: "\u{202F}", with: "")
+            .replacingOccurrences(of: "\u{00A0}", with: "")
+            .replacingOccurrences(of: " ", with: "")
+    }
+
     func testSnapshotResultHelpersFormatSkippedStatsAndAppliedJSON() {
         let skipped = [
             SkippedFeatureDTO(feature: "dflash", reason: "draft model 'x' is not installed"),
@@ -325,7 +336,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         vm.qwen35AnePrefillEnabled = true
         let presets = ModelSettingsScreenVM.aneFractionOptions(current: "0.42", presets: [1.0 / 3.0, 0.5])
         XCTAssertEqual(presets.map(\.0), ["0.42", String(1.0 / 3.0), "0.5"])
-        XCTAssertEqual(presets.map(\.1), ["42%", "33%", "50%"])
+        XCTAssertEqual(presets.map { normalizedPercent($0.1) }, ["42%", "33%", "50%"])
         vm.qwen35AnePrefillFraction = presets[0].0
         XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.qwen35AnePrefillFraction]?.value as? Double, 0.42)
         vm.qwen35AnePrefillFraction = presets[1].0
@@ -336,7 +347,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     func testK2SharedPresetsKeepLoadedStringSelection() {
         for current in ["0", "0.0", "1", "1.0", String(1.0 / 3.0)] {
             let options = ModelSettingsScreenVM.aneFractionOptions(current: current, presets: [0, 1.0 / 3.0, 1])
-            XCTAssertEqual(options.map(\.1), ["0%", "33%", "100%"])
+            XCTAssertEqual(options.map { normalizedPercent($0.1) }, ["0%", "33%", "100%"])
             XCTAssertEqual(options.filter { $0.0 == current }.count, 1)
         }
     }

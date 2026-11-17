@@ -191,14 +191,16 @@ def test_start_launches_on_the_elected_coordinator(api) -> None:
     assert operation["endpoint"]["url"] == "http://172.16.1.11:8099"
     assert operation["error"] is None
     assert fake.health_checks == 1
-    # The coordinator received the signed request. Rank 0 is spawned on the
-    # coordinator through its own LAN address (the macOS Tahoe ring workaround),
-    # never on another Mac.
+    # The coordinator received the signed request. Rank 0 is spawned as the
+    # coordinator's own local child: `ClusterDeployment` requires
+    # `hosts[0].ssh == "127.0.0.1"`, and the validation cluster runs as a line,
+    # so the macOS Tahoe ring workaround (rank 0 over SSH to the coordinator's
+    # own LAN address) is neither allowed by the contract nor needed.
     assert len(fake.activated) == 1
     activated = fake.activated[0]
     assert activated.approved_placement == fake.placement
     assert activated.hosts[0].node_id == "m5"
-    assert activated.hosts[0].ssh == "172.16.1.11"
+    assert activated.hosts[0].ssh == "127.0.0.1"
     assert [host.node_id for host in activated.hosts] == ["m5", "m1"]
     assert [node.capacity_bytes for node in activated.nodes] == [
         int(107.5 * GIB),
@@ -256,8 +258,8 @@ def test_a_failed_coordinator_start_never_starts_local_rank_zero(
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("the origin must never run the activation itself")
 
-    monkeypatch.setattr(cluster_routes, "activate_cluster_deployment", forbidden)
-    monkeypatch.setattr(cluster_routes, "prepare_cluster_deployment", forbidden)
+    monkeypatch.setitem(cluster_routes.__dict__, "activate_cluster_deployment", forbidden)
+    monkeypatch.setitem(cluster_routes.__dict__, "prepare_cluster_deployment", forbidden)
 
     fake = FakeCoordinator(activate_error=RemoteAdminError(503, "launch failed"))
     client, _, _ = api(coordinator=fake.factory())
@@ -390,7 +392,7 @@ def test_a_remote_coordinator_is_driven_through_the_existing_ssh_seam(
 ) -> None:
     calls: list[tuple[str, int, str, str]] = []
     # The health gate is a real SSH round trip in production; here it answers.
-    monkeypatch.setattr(assistant_start, "probe_peer", lambda target: True)
+    monkeypatch.setitem(assistant_start.__dict__, "probe_peer", lambda target: True)
 
     def remote(
         target: str,
@@ -524,7 +526,7 @@ def test_remote_admin_keeps_the_admin_key_on_the_coordinator(monkeypatch) -> Non
         seen["argument"] = argument
         return {"ok": True, "status": 200, "body": {"ok": True}}
 
-    monkeypatch.setattr(assistant_start, "run_remote_python", fake_run)
+    monkeypatch.setitem(assistant_start.__dict__, "run_remote_python", fake_run)
 
     reply = remote_admin("172.16.1.11", 8099, PLAN_PATH, {"model_path": "/models/qwen"})
 
@@ -568,11 +570,11 @@ def test_the_local_coordinator_uses_the_existing_local_pipeline(
         calls.append("devices")
         return {"paired": [{"node_id": "m5"}, {"node_id": "m1"}]}
 
-    monkeypatch.setattr(cluster_routes, "prepare_cluster_deployment", prepare)
-    monkeypatch.setattr(cluster_routes, "start_cluster_staging", stage)
-    monkeypatch.setattr(cluster_routes, "read_cluster_staging_job", status)
-    monkeypatch.setattr(cluster_routes, "activate_cluster_deployment", activate)
-    monkeypatch.setattr(assistant_start, "check_peers", lambda hosts: ())
+    monkeypatch.setitem(cluster_routes.__dict__, "prepare_cluster_deployment", prepare)
+    monkeypatch.setitem(cluster_routes.__dict__, "start_cluster_staging", stage)
+    monkeypatch.setitem(cluster_routes.__dict__, "read_cluster_staging_job", status)
+    monkeypatch.setitem(cluster_routes.__dict__, "activate_cluster_deployment", activate)
+    monkeypatch.setitem(assistant_start.__dict__, "check_peers", lambda hosts: ())
 
     client, _, _ = api(
         coordinator=lambda plan: replace(
@@ -924,6 +926,32 @@ def test_start_without_a_saved_preset_writes_no_tuning(api) -> None:
     assert assistant_start.WARNING_TUNING_PRESET_SKIPPED not in codes
 
 
+def test_a_wrapped_memory_refusal_is_still_the_model_or_context_step(api) -> None:
+    """The live card showed start_failed + retry_coordinator for the same refusal.
+
+    2026-11-16: the 503 arrived as a plain exception, so the generic failure path
+    wrote "oMLX … is not reachable" at the user while that Mac was serving.
+    """
+
+    fake = FakeCoordinator(
+        activate_error=RuntimeError(
+            "503: Model does not fit the current per-node memory limits; no ranks "
+            "were started. rank 1 (9078f858) needs 47.8 GiB but can admit 45.2 GiB "
+            "right now."
+        )
+    )
+    client, _, _ = api(coordinator=fake.factory())
+    plan = applied(client, fake)
+
+    response = client.post(START_URL, json=start_payload(plan))
+    operation = wait_for_operation(client, response.json()["operation_id"])
+
+    assert operation["state"] == "failed"
+    assert operation["error"]["action"] == "adjust_model_or_context"
+    assert "No ranks were started" in operation["error"]["message"]
+    assert "not reachable" not in str(operation["error"])
+
+
 def test_a_memory_pressure_start_names_the_cause_and_the_fix(api) -> None:
     """'does not fit ... right now' is memory pressure, not an unreachable
     coordinator; retrying without freeing memory cannot help."""
@@ -943,6 +971,9 @@ def test_a_memory_pressure_start_names_the_cause_and_the_fix(api) -> None:
 
     assert operation["state"] == "failed"
     assert operation["error"]["code"] == "coordinator_start_failed"
-    assert operation["error"]["action"] == "diagnostics"
-    assert "still holding memory" in operation["error"]["message"]
+    # The card's one action opens the model/context step: a memory refusal is
+    # not "oMLX is not reachable" (measured live 2026-11-16).
+    assert operation["error"]["action"] == "adjust_model_or_context"
+    assert "No ranks were started" in operation["error"]["message"]
+    assert "smaller context" in operation["error"]["message"]
     assert "Start again" in operation["error"]["message"]

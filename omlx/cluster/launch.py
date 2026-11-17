@@ -43,7 +43,11 @@ from .models import CLUSTER_PROTOCOL_VERSION
 from .performance import performance_profiles_from_records
 from .runtime import read_runtime_markers
 from .ssh_policy import cluster_ssh_options
-from .staging import home_relative_model_path, validate_staged_model
+from .staging import (
+    DEFAULT_REMOTE_PYTHON,
+    home_relative_model_path,
+    validate_staged_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1154,9 +1158,19 @@ def _interpreter_parity(local: str, remote: Any) -> tuple[str | None, str | None
 
 
 def _validate_python_executable(value: str) -> str:
+    # ``~``-prefixed paths are the portable remote form: the peer's shell
+    # expands them under its own account (same contract as the worker
+    # shim). Absolute paths stay valid for locally probed interpreters.
     path = Path(value)
-    if not path.is_absolute() or "\x00" in value or len(value.encode()) > 4096:
-        raise ValueError("distributed Python executable must be an absolute path")
+    home_relative = value.startswith("~/")
+    if (
+        (not path.is_absolute() and not home_relative)
+        or "\x00" in value
+        or len(value.encode()) > 4096
+    ):
+        raise ValueError(
+            "distributed Python executable must be an absolute or ~/ path"
+        )
     return str(path)
 
 
@@ -1274,7 +1288,13 @@ def build_mlx_launch_argv(
         [
             "--",
             *_rank_python_module_argv(
-                [host.python_executable for host in deployment.hosts],
+                # Same contract as the preflight: a rank without a recorded
+                # interpreter runs the worker shim (the peer's own shell
+                # expands ~), never this Mac's sys.executable.
+                [
+                    host.python_executable or DEFAULT_REMOTE_PYTHON
+                    for host in deployment.hosts
+                ],
                 fallback=python_executable,
                 module="omlx.cluster.inference_worker",
             ),
@@ -2408,7 +2428,10 @@ def preflight_remote_hosts(
 ) -> list[dict[str, Any]]:
     """Require non-interactive, host-key-verified SSH and matching runtimes."""
 
-    python_executable = _validate_python_executable(python_executable)
+    # Validate the caller's interpreter choice (the local launcher still
+    # runs under it); remote ranks no longer fall back to it — see the
+    # DEFAULT_REMOTE_PYTHON note in the rank loop below.
+    _validate_python_executable(python_executable)
     if timeout <= 0:
         raise ValueError("SSH preflight timeout must be positive")
     expected = _local_runtime_versions()
@@ -2470,7 +2493,12 @@ def preflight_remote_hosts(
                 }
             )
             continue
-        remote_python = host.python_executable or python_executable
+        # A host without a recorded interpreter falls back to the worker
+        # shim, never to this coordinator's sys.executable: that path exists
+        # on a peer only by accident (the shared runtime venv location), and
+        # the plain venv cannot import oMLX without the PYTHONPATH only the
+        # shim sets. Measured live 2026-11-17 on .13: ModuleNotFoundError.
+        remote_python = host.python_executable or DEFAULT_REMOTE_PYTHON
         # A path_map entry is already absolute on this peer. Without one, send
         # the portable ~-form so peers with different macOS accounts resolve
         # the model under their own home directory.

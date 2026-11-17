@@ -9,10 +9,12 @@ measured. No real cluster (AGENTS.md).
 
 from __future__ import annotations
 
+from omlx.cluster.assistant.election import PlanCandidate
 from omlx.cluster.assistant.evaluation import (
     ConstellationResult,
     pareto_front,
     select_best,
+    select_constellations_to_test,
 )
 
 
@@ -59,7 +61,7 @@ def test_unmeasured_never_dominates_measured() -> None:
     front = pareto_front([measured, unmeasured])
     assert measured in front
     # The unmeasured row cannot dominate the measured one on rate.
-    assert not (front == [unmeasured])
+    assert front != [unmeasured]
 
 
 def test_fewer_nodes_breaks_a_speed_tie() -> None:
@@ -105,9 +107,6 @@ def test_pareto_excludes_dominated() -> None:
     assert front == [better]
 
 # --- Candidate selection: rank beforehand, test diverse constellations --------
-
-from omlx.cluster.assistant.election import PlanCandidate
-from omlx.cluster.assistant.evaluation import select_constellations_to_test
 
 
 def _candidate(order: tuple[str, ...], *, feasible: bool = True) -> PlanCandidate:

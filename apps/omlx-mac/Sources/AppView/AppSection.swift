@@ -12,7 +12,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
     case server, status, appearance, network, performance, askAI, logs
     case models, downloads, integrations, quantization
     case throughputBench, accuracyBench, contextBench
-    case security, about
+    case security, advanced, about
 
     var id: String { rawValue }
 
@@ -78,6 +78,10 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
             return String(localized: "sidebar.security",
                           defaultValue: "Security",
                           comment: "Sidebar row label / navigation title for the Security section")
+        case .advanced:
+            return String(localized: "sidebar.advanced",
+                          defaultValue: "Advanced",
+                          comment: "Sidebar row label / navigation title for the Advanced section")
         case .about:
             return String(localized: "sidebar.about",
                           defaultValue: "About oMLX",
@@ -102,6 +106,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         case .accuracyBench:   return "target"
         case .contextBench:    return "ruler"
         case .security:        return "lock"
+        case .advanced:        return "gearshape.2"
         case .about:           return "info.circle"
         }
     }

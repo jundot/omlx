@@ -111,8 +111,8 @@ def _redact_text(text: Any, paths: dict[str, str]) -> str:
     value = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "[address]", value)
     value = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[redacted-key]", value)
     value = re.sub(
-        r"(?i)\b(api[_-]?key|token|password|authorization)\b\s*[:=]\s*\S+",
-        r"\1=[redacted]",
+        r"(?i)\b(?P<key>api[_-]?key|token|password|authorization)\b\s*[:=]\s*\S+",
+        r"\g<key>=[redacted]",
         value,
     )
     value = re.sub(r"(?<![\w.])/(?:[\w.@+-]+/)+[\w.@+-]+", "[path]", value)

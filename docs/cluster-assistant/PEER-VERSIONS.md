@@ -10,7 +10,7 @@ exists on the origin. Live, that showed up as:
 > {"detail":"Method Not Allowed"}`
 
 measured 2026-11-14 when `.12` (M2 Ultra) was elected coordinator while running a
-build without the new assistant routes.
+build without the new assistant routes (see `PHASE-2B-RUN.md` §27).
 
 ## What the code does now
 
@@ -45,7 +45,7 @@ The peers run the app's runtime, not this checkout, so aligning means putting th
 **same build** on every Mac:
 
 1. Build/notarize the slim app from this branch (`apps/omlx-mac/Scripts/build.sh`
-   + `package_dmg.sh`, signed with your Developer ID).
+   + `package_dmg.sh`; see `SIGNING.md`, `DISTRIBUTION.md`, `SLIM-RUNTIME.md`).
 2. Install it on `.12`, `.13`, `.14` (and `.11`, this Mac) and let the app's
    first-run runtime installer provision the same oMLX build on each.
 3. Re-run `scripts/check_peer_versions.py` — every reachable Mac must print

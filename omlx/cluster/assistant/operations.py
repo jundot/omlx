@@ -61,7 +61,7 @@ MAX_OPERATION_RECORDS = 8
 # Generous on purpose: staging copies tens of gigabytes and a weight load takes
 # minutes, so the bound sits well above any normal apply/start. It exists only
 # so an origin that crashed mid-operation cannot wedge the coordinator's lock
-# forever (the apply/start chapter); a live origin mirrors the terminal state long
+# forever (CHAPTER-5 §2.2); a live origin mirrors the terminal state long
 # before this expires.
 MIRROR_TTL_SECONDS = 2 * 3600.0
 
@@ -96,8 +96,8 @@ RUNNING_STATES = frozenset(
     {STATE_QUEUED, STATE_APPLYING, STATE_STARTING, STATE_LOADING}
 )
 
-# The next step for each failure. One action per failure (the design notes,
-# the notes); the route never invents a second one.
+# The next step for each failure. One action per failure (PROJECT-BRIEF §8.6,
+# §12.4); the route never invents a second one.
 ACTION_APPLY = "apply"
 ACTION_START = "start"
 ACTION_PLAN = "plan"
@@ -111,6 +111,11 @@ ACTION_FREE_DISK_SPACE = "free_disk_space"
 ACTION_CONFIGURE_ENDPOINT = "configure_endpoint"
 ACTION_RETRY_COORDINATOR = "retry_coordinator"
 ACTION_DIAGNOSTICS = "diagnostics"
+#: The one next step when ``iogpu.wired_limit_mb`` — not RAM and not live
+#: pressure — is what caps a Mac's admitted ceiling. The app applies the
+#: recommended limit from Performance → "Apply with Admin…"; the web page can
+#: only show the command, so this remains an app-side click.
+ACTION_RAISE_WIRED_LIMIT = "raise_wired_limit"
 
 OPERATION_IN_PROGRESS_CODE = "operation_in_progress"
 OPERATION_NOT_FOUND_CODE = "operation_not_found"
@@ -335,6 +340,10 @@ class OperationRecord:
     #: The user's explicit consent to the 2-Mac fallback. It is part of the
     #: plan signature, so start must carry it when it re-proves the plan.
     two_mac_fallback: bool = False
+    #: The rank-0 pin the plan was approved with (and with it the endpoint
+    #: host). Stored so ``start`` re-elects the same plan without trusting the
+    #: request body; empty means "automatic".
+    preferred_coordinator: str = ""
     #: The resource policy the approved plan used (engram/ple, MoE offload,
     #: tier, context, admission). Persisted so ``start`` re-elects the same plan
     #: after a reload without trusting the request body.
@@ -347,7 +356,7 @@ class OperationRecord:
     #: did become ready, and no state machine value reports a stop.
     stopped: bool = False
     #: True when another origin mirrored this record onto this Mac through the
-    #: admin seam (the cluster-wide lock, the apply/start chapter). A mirror is a lock
+    #: admin seam (the cluster-wide lock, CHAPTER-5 §2.2). A mirror is a lock
     #: marker, not this Mac's own assistant session: ``latest_session`` and
     #: ``applied`` skip it, while ``active`` reports a running one.
     mirrored: bool = False
@@ -385,6 +394,7 @@ class OperationRecord:
             "mtp": self.mtp,
             "execution_profile": self.execution_profile,
             "two_mac_fallback": self.two_mac_fallback,
+            "preferred_coordinator": self.preferred_coordinator,
             "policy": dict(self.policy),
             "progress": self.progress.to_dict(),
             "endpoint": None if self.endpoint is None else self.endpoint.to_dict(),
@@ -438,6 +448,7 @@ class OperationRecord:
             mtp=bool(payload.get("mtp", False)),
             execution_profile=str(payload.get("execution_profile") or "balanced"),
             two_mac_fallback=bool(payload.get("two_mac_fallback", False)),
+            preferred_coordinator=str(payload.get("preferred_coordinator") or ""),
             policy=_policy_from_dict(payload.get("policy")),
             progress=OperationProgress.from_dict(payload.get("progress") or {}),
             endpoint=(
@@ -615,6 +626,7 @@ class OperationStore:
         mtp: bool = False,
         execution_profile: str = "balanced",
         two_mac_fallback: bool = False,
+        preferred_coordinator: str = "",
         policy: Mapping[str, Any] | None = None,
         endpoint: OperationEndpoint | None = None,
         now: datetime | None = None,
@@ -654,6 +666,7 @@ class OperationStore:
                 mtp=mtp,
                 execution_profile=execution_profile,
                 two_mac_fallback=two_mac_fallback,
+                preferred_coordinator=preferred_coordinator,
                 policy=dict(policy or {}),
                 progress=OperationProgress(
                     phase=STATE_QUEUED,
@@ -825,7 +838,7 @@ class OperationStore:
     ) -> OperationRecord:
         """Register or release another origin's operation on this coordinator.
 
-        The cluster-wide lock (the apply/start chapter): a remote apply/start drives
+        The cluster-wide lock (CHAPTER-5 §2.2): a remote apply/start drives
         this Mac's raw cluster routes, so the origin's record lives only in
         the origin's store. The origin mirrors its operation here through the
         admin seam — a running mirror takes the lock (``active`` reports it
@@ -1113,7 +1126,7 @@ def _replaced(
 
 
 def _sort_key(record: OperationRecord) -> tuple[str, str]:
-    return (record.created_at, record.operation_id)
+    return record.created_at, record.operation_id
 
 
 def _optional_int(value: Any) -> int | None:

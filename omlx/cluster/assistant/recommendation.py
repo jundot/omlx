@@ -2,7 +2,7 @@
 """Which model should this measured cluster run?
 
 ``plan`` answers "given this model, how do we split it?". This module answers the
-question that comes first (the design notes), and the two are
+question that comes first (PROJECT-BRIEF §11.1/§13.3a), and the two are
 deliberately different contracts:
 
 * recommendation reads only the **hardware** half of a stored measurement —
@@ -19,12 +19,12 @@ Three rules are deliberate.
    tail/head, admission and the no-fallback rule. What this module adds is only
    the question — one model, one context — and the ranking of the answers.
 2. **PP only.** A model mlx-lm cannot split into pipeline stages is refused
-   with one action, never offered as tensor parallelism (the notes). ``elect`` alone
+   with one action, never offered as tensor parallelism (§8.1). ``elect`` alone
    would happily split its weights, which is how a plan gets approved for a
    model that then fails at load, so the architecture's own capability flag is
    checked before the election is asked.
 3. **Unknown is not fast and not zero.** Without measured compute the result
-   says "unknown" — no stage seconds, no token rate, no "fast" (the notes).
+   says "unknown" — no stage seconds, no token rate, no "fast" (§17.2).
    Likewise unknown disk free space stays ``None``; a Mac that cannot be proven
    short of room is not called full.
 
@@ -73,14 +73,14 @@ GIB = 1024**3
 # an advanced surface; this keeps one request bounded and the answer readable.
 MAX_RECOMMENDATION_CANDIDATES = 32
 
-# The one next step a caller can act on, per refusal kind (the notes). Exactly one is
+# The one next step a caller can act on, per refusal kind (§8.6). Exactly one is
 # ever attached to a candidate, and exactly one to a result with no winner.
 ACTION_CHOOSE_SMALLER_MODEL = "choose_smaller_model"
 ACTION_CHOOSE_PIPELINE_MODEL = "choose_pipeline_model"
 ACTION_CHECK_MODEL_PATH = "check_model_path"
 ACTION_FREE_DISK_SPACE = "free_disk_space"
 
-# Why a candidate was not recommended, machine-readable (the notes). ``memory`` is
+# Why a candidate was not recommended, machine-readable (§13.3a). ``memory`` is
 # the ordinary "does not fit"; the other two need a different fix, and the
 # dashboard must not render all three as "too large".
 FAILURE_MEMORY = "memory"
@@ -236,7 +236,7 @@ class ModelRecommendation:
     excluded_nodes: tuple[str, ...] = ()
     #: "single" (the local engine on one Mac, no pipeline) or "cluster" (a
     #: pipeline across 2+ Macs). Single-node is preferred when the model fits on
-    #: one Mac at the target context (E6, the live-run notes): no pipeline overhead.
+    #: one Mac at the target context (E6, PHASE-2B-RUN §22): no pipeline overhead.
     mode: str = "cluster"
 
     @property
@@ -303,7 +303,7 @@ class RecommendationResult:
     reasons: tuple[str, ...]
     #: The single-node option for the selected model (E6): when the recommended
     #: model also fits on one Mac at the target context, the local engine is
-    #: faster than a pipeline (the live-run notes). ``None`` when it does not fit
+    #: faster than a pipeline (PHASE-2B-RUN §22). ``None`` when it does not fit
     #: on one Mac. The cluster recommendation above stays the compatible answer;
     #: this is the preferred faster option the caller may choose instead.
     single_node: ModelRecommendation | None = None
@@ -468,7 +468,7 @@ def _single_node_option(
 
     Additive to the cluster recommendation (E6): the recommended model may also
     run on a single Mac at the target context, which is faster than a pipeline
-    (the live-run notes). Returns ``None`` when no model is recommended or the
+    (PHASE-2B-RUN §22). Returns ``None`` when no model is recommended or the
     selected model does not fit on one Mac at the target context.
     """
 
@@ -491,11 +491,10 @@ def _single_node_option(
         mtp=mtp,
         rank0_extra_bytes=rank0_extra_bytes,
     )
-    if fit is None or fit[1] < target_tokens:
+    layout = candidate.layout
+    if fit is None or fit[1] < target_tokens or layout is None:
         return None
-    download_bytes = candidate.weight_bytes + (
-        candidate.layout.mtp_weight_bytes if mtp else 0
-    )
+    download_bytes = candidate.weight_bytes + (layout.mtp_weight_bytes if mtp else 0)
     return _single_node_recommendation(
         candidate,
         nodes,
@@ -567,7 +566,7 @@ def _recommend_one(
 
     if len(nodes) > 1 and not layout.supports_pipeline:
         # mlx-lm cannot split this architecture into stages, so a multi-Mac
-        # plan would stage the weights and then fail at load (the notes).
+        # plan would stage the weights and then fail at load (§8.1).
         if layout.supports_tensor_parallel:
             reason = (
                 f"{candidate.label} cannot be split into pipeline stages; it "
@@ -794,6 +793,7 @@ def _single_node_recommendation(
 
     facts, ctx, headroom, required, budget = fit
     layout = candidate.layout
+    assert layout is not None  # a fit is only computed from a measured layout
     stage = StagePlan(
         rank=0,
         node_id=facts.node_id,
@@ -1020,7 +1020,7 @@ def _ranking_key(item: ModelRecommendation) -> tuple[Any, ...]:
     first — a heavier checkpoint capped at a tiny context is the worse answer
     (B11). Equal contexts are broken by the measured critical stage, the same
     predicted seconds the election scores; ``None`` is worst-case, because
-    unknown is not fast (the notes) and no rate is ever estimated. Smaller size is
+    unknown is not fast (§17.2) and no rate is ever estimated. Smaller size is
     the last resort, and the model ID keeps the answer stable for one input.
     """
 
@@ -1029,7 +1029,7 @@ def _ranking_key(item: ModelRecommendation) -> tuple[Any, ...]:
         if item.critical_stage_seconds is None
         else item.critical_stage_seconds
     )
-    return (-item.max_context_tokens, critical, item.weight_bytes, item.model_id)
+    return -item.max_context_tokens, critical, item.weight_bytes, item.model_id
 
 
 def _ordered(

@@ -11,7 +11,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_project_handoff_files_exist() -> None:
-    assert (ROOT / "CLUSTER-ASSISTANT.md").is_file()
+    assert (ROOT / "AGENTS.md").is_file()
+    assert (ROOT / "docs" / "cluster-assistant" / "PROJECT-BRIEF.md").is_file()
+    assert (ROOT / "docs" / "cluster-assistant" / "README.md").is_file()
 
 
 def test_assistant_package_imports() -> None:

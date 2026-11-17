@@ -268,7 +268,14 @@
                     const data = await response.json();
 
                     if (response.ok && data.success) {
-                        window.location.href = '/admin/dashboard';
+                        // A login page reached through a deep link (for example
+                        // the assistant's Open Chat link to /admin/chat?model=)
+                        // carries ?next=; go back there, not to the dashboard.
+                        const params = new URLSearchParams(window.location.search);
+                        const next = (params.get('next') || '').trim();
+                        window.location.href = next.startsWith('/') && !next.startsWith('//')
+                            ? next
+                            : '/admin/dashboard';
                     } else {
                         this.error = data.detail || data.message || window.t('login.error.invalid_api_key');
                     }

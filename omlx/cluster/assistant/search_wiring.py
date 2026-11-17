@@ -32,8 +32,7 @@ from .operations import (
     OperationStore,
 )
 from .provisioning import PlanInputs, ProvisioningError, plan_apply
-from .start import observe_performance, run_apply_job, run_start_job
-from .start import _serving_model_id
+from .start import _serving_model_id, observe_performance, run_apply_job, run_start_job
 
 
 async def evaluate_constellation(

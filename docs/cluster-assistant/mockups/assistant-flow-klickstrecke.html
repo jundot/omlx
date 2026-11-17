@@ -1,0 +1,1111 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oMLX Cluster Assistant — Klickstrecke UX-Redesign (2026-11-15)</title>
+<style>
+  /* ============================================================
+     Design tokens — mirrors the oMLX web UI (Tailwind palette,
+     Inter, rounded-2xl cards, neutral-900 pill buttons).
+     ============================================================ */
+  :root {
+    --n50:#f9fafb; --n100:#f3f4f6; --n200:#e5e7eb; --n300:#d1d5db;
+    --n400:#9ca3af; --n500:#6b7280; --n700:#374151; --n800:#1f2937; --n900:#111827;
+    --red50:#fef2f2; --red200:#fecaca; --red300:#fca5a5; --red700:#b91c1c; --red800:#991b1b;
+    --amber50:#fffbeb; --amber200:#fde68a; --amber700:#b45309; --amber800:#92400e;
+    --green50:#f0fdf4; --green200:#bbf7d0; --green600:#16a34a; --green700:#15803d;
+    --blue50:#eff6ff; --blue200:#bfdbfe; --blue600:#2563eb; --blue700:#1d4ed8;
+    --font: Inter, -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { font-family: var(--font); background: var(--n100); color: var(--n900); -webkit-font-smoothing: antialiased; }
+
+  svg.ic { width: 1em; height: 1em; flex: none; }
+
+  /* ---------- control bar (mock chrome, not product UI) ---------- */
+  .ctrl { position: sticky; top: 0; z-index: 50; background: var(--n900); color: #f5f5f7;
+          padding: 10px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .ctrl h1 { font-size: 13px; font-weight: 700; margin: 0; letter-spacing: .01em; }
+  .ctrl .sub { font-size: 11px; color: #9ca3af; }
+  .ctrl .spacer { flex: 1; }
+  .ctrl button { appearance: none; font: inherit; font-size: 11px; font-weight: 600;
+          border: 1px solid #3a3a3c; background: #2c2c2e; color: #f5f5f7;
+          border-radius: 999px; padding: 5px 11px; cursor: pointer; }
+  .ctrl button:hover { background: #3a3a3c; }
+  .ctrl button.active { background: #f5f5f7; color: var(--n900); border-color: #f5f5f7; }
+  .ctrl .grp { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .ctrl .grp-label { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: .08em; margin-right: 2px; }
+  #screen-counter { font-size: 11px; color: #9ca3af; min-width: 110px; text-align: right; }
+
+  /* ---------- layout ---------- */
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 22px 20px 70px; display: flex; gap: 22px; align-items: flex-start; }
+  .stage { flex: 1; min-width: 0; }
+  .notes { width: 350px; position: sticky; top: 64px; }
+  body.nonotes .notes { display: none; }
+  @media (max-width: 1080px) { .wrap { flex-direction: column; } .notes { width: 100%; position: static; } }
+
+  /* ---------- browser window mock ---------- */
+  .chrome { background: #fff; border: 1px solid var(--n200); border-bottom: 0;
+            border-radius: 16px 16px 0 0; overflow: hidden; }
+  .navbar { padding: 18px 28px; border-bottom: 1px solid var(--n100); display: flex; align-items: center; }
+  .logo { display: flex; align-items: center; gap: 8px; }
+  .logo .mark { width: 34px; height: 34px; border-radius: 9px; background: var(--n900); color: #fff;
+                display: grid; place-items: center; font-weight: 800; font-size: 13px; }
+  .logo .name { font-weight: 700; font-size: 18px; letter-spacing: -.02em; line-height: 1; }
+  .logo .ver { font-size: 10px; color: var(--n500); line-height: 1.2; }
+  .tabs { position: absolute; left: 50%; transform: translateX(-50%); }
+  .navbar { position: relative; }
+  .tabs { display: flex; gap: 4px; background: var(--n100); border-radius: 999px; padding: 4px; }
+  .tabs span { font-size: 13px; font-weight: 500; color: var(--n500); padding: 6px 14px; border-radius: 999px; }
+  .tabs span.on { background: #fff; color: var(--n900); box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  @media (max-width: 900px) { .tabs { display: none; } }
+
+  .page { background: var(--n50); border: 1px solid var(--n200); border-top: 0;
+          border-radius: 0 0 16px 16px; padding: 24px; min-height: 640px; }
+  .page-head h2 { font-size: 24px; font-weight: 700; letter-spacing: -.025em; margin: 0; }
+  .page-head p { font-size: 14px; color: var(--n500); margin: 8px 0 0; max-width: 720px; }
+
+  /* ---------- product building blocks ---------- */
+  .card { background: #fff; border: 1px solid var(--n200); border-radius: 16px; padding: 22px 24px; margin-bottom: 18px; }
+  .panel { border: 1px solid var(--n200); background: var(--n50); border-radius: 12px; padding: 14px 16px; }
+  .eyebrow { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--n400); }
+  .eyebrow.green { color: var(--green700); }
+  .eyebrow.red { color: var(--red700); }
+  .ttl { font-size: 17px; font-weight: 700; margin: 6px 0 0; }
+  .sub { font-size: 13px; color: var(--n500); line-height: 1.5; margin: 6px 0 0; }
+  .cap { font-size: 10px; }
+  .xs { font-size: 12px; }
+  .mono { font-family: var(--mono); font-size: 11px; }
+
+  .btn { appearance: none; font: inherit; cursor: pointer; border-radius: 999px;
+         display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
+  .btn-primary { background: var(--n900); color: #fff; font-size: 12px; font-weight: 600;
+                 padding: 9px 16px; border: 1px solid var(--n900); }
+  .btn-primary:hover { background: var(--n800); }
+  .btn-secondary { background: #fff; color: var(--n700); font-size: 12px; font-weight: 600;
+                 padding: 7px 12px; border: 1px solid var(--n200); }
+  .btn-secondary:hover { background: var(--n100); }
+  .btn-danger { background: #fff; color: var(--red700); font-size: 12px; font-weight: 600;
+                 padding: 7px 12px; border: 1px solid var(--red200); }
+  .btn-danger:hover { background: var(--red50); }
+  .btn-action { background: #fff; color: var(--red800); font-size: 11px; font-weight: 600;
+                 padding: 7px 12px; border: 1px solid var(--red300); }
+  .btn-action:hover { background: #fce8e8; }
+  .btn-quiet { background: transparent; border: 0; color: var(--n500); font-size: 11px; font-weight: 600;
+               padding: 4px 2px; text-decoration: underline; text-underline-offset: 2px; }
+  .btn-quiet:hover { color: var(--n700); }
+
+  .seg { display: inline-flex; gap: 4px; background: var(--n100); border-radius: 999px; padding: 4px; }
+  .seg button { appearance: none; font: inherit; font-size: 12px; font-weight: 600; border: 0; cursor: pointer;
+                background: transparent; color: var(--n500); padding: 6px 14px; border-radius: 999px; }
+  .seg button.on { background: #fff; color: var(--n900); box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+
+  .chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--n200);
+          background: #fff; border-radius: 999px; padding: 5px 10px; font-size: 11px; font-weight: 600;
+          color: var(--n700); }
+  .chip .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green600); }
+  .chip .cap { color: var(--n500); font-weight: 500; }
+
+  /* stepper — the six observable Screen-4 phases */
+  .stepper { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+  .step { display: flex; align-items: center; gap: 7px; padding: 5px 10px; border-radius: 10px; border: 1px solid var(--n200); background: var(--n50); }
+  .step .bubble { width: 18px; height: 18px; border-radius: 50%; background: var(--n200); color: var(--n500);
+                  display: grid; place-items: center; font-size: 10px; font-weight: 700; }
+  .step .lbl { font-size: 11px; font-weight: 600; color: var(--n400); }
+  .step.done { border-color: var(--green200); background: var(--green50); }
+  .step.done .bubble { background: var(--green50); color: var(--green700); border: 1px solid var(--green200); }
+  .step.done .lbl { color: var(--n700); }
+  .step.active { border-color: var(--n900); background: #fff; box-shadow: 0 0 0 1px var(--n900); transform: scale(1.02); }
+  .step.active .bubble { background: var(--n900); color: #fff; }
+  .step.active .lbl { color: var(--n900); }
+  .step.failed { border-color: var(--red200); background: var(--red50); }
+  .step.failed .bubble { background: var(--red50); color: var(--red700); border: 1px solid var(--red200); }
+  .step.failed .lbl { color: var(--red700); }
+  .step-sep { color: var(--n300); font-size: 10px; }
+
+  /* progress rows (Screen 4) */
+  .rows { display: grid; gap: 6px; margin-top: 14px; }
+  .row { display: flex; align-items: flex-start; gap: 9px; }
+  .row .mark { width: 14px; height: 14px; margin-top: 1px; display: grid; place-items: center; flex: none; }
+  .row .mark.pending { color: var(--n300); font-size: 11px; }
+  .row .mark.done { color: var(--green600); }
+  .row .mark.failed { color: var(--red700); }
+  .row .lbl { font-size: 12px; font-weight: 600; color: var(--n400); }
+  .row.active .lbl { color: var(--n900); }
+  .row.done .lbl { color: var(--n700); }
+  .row.failed .lbl { color: var(--red700); }
+  .row .msg { font-size: 12px; color: var(--n500); margin: 1px 0 0; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(1turn); } }
+
+  /* banners */
+  .berr { border: 1px solid var(--red200); background: var(--red50); border-radius: 12px; padding: 14px 16px; }
+  .berr .t { font-size: 13px; font-weight: 700; color: var(--red800); display: flex; gap: 8px; align-items: center; }
+  .berr .b { font-size: 12px; color: var(--red700); margin: 6px 0 0; line-height: 1.5; }
+  .bwarn { border: 1px solid var(--amber200); background: var(--amber50); border-radius: 12px; padding: 10px 12px; font-size: 12px; color: var(--amber800); }
+  .bok { border: 1px solid var(--green200); background: var(--green50); border-radius: 12px; padding: 10px 12px; font-size: 12px; color: var(--green700); }
+  .link { color: var(--blue700); text-decoration: none; }
+  .link:hover { text-decoration: underline; }
+
+  .kv { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin-top: 12px; }
+  .kv > div { min-width: 0; }
+  .kv .k { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--n400); }
+  .kv .v { font-size: 12px; font-weight: 600; color: var(--n900); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  details.disc { margin-top: 12px; }
+  details.disc summary { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em;
+                 color: var(--n400); cursor: pointer; }
+  details.disc[open] summary { color: var(--n700); }
+
+  /* demo-only controls — clearly not product UI */
+  .demo { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 11px; font-weight: 600;
+          color: var(--n500); background: transparent; border: 1px dashed var(--n300); border-radius: 999px;
+          padding: 5px 11px; cursor: pointer; }
+  .demo:hover { color: var(--n700); border-color: var(--n400); }
+
+  /* ---------- today schematic ---------- */
+  .sketch { display: grid; gap: 6px; }
+  .sketch .b { border: 1px solid var(--n200); background: #fff; border-radius: 10px;
+               padding: 8px 12px; font-size: 11px; color: var(--n500); display: flex; align-items: center; gap: 8px; }
+  .sketch .b .h { width: 46px; height: 10px; border-radius: 5px; background: var(--n100); flex: none; }
+  .sketch .b.wide .h { background: var(--n200); }
+  .sketch .b.assist { border-color: var(--n900); background: var(--n50); color: var(--n900); font-weight: 600; }
+  .sketch .b.assist .h { background: var(--n300); }
+  .sketch .b.err { border-color: var(--red200); background: var(--red50); color: var(--red700); }
+  .scrollpath { display: flex; align-items: center; gap: 10px; margin: 10px 0; color: var(--red700); font-size: 11px; font-weight: 700; }
+  .scrollpath .line { flex: 1; border-left: 2px dashed var(--red300); height: 46px; margin-left: 8px; position: relative; }
+  .scrollpath .line::after { content: "▾"; position: absolute; bottom: -4px; left: -6px; }
+
+  /* ---------- notes column ---------- */
+  .note { background: #fff; border: 1px solid var(--blue200); border-radius: 14px; padding: 16px 18px; }
+  .note .nh { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 700;
+              text-transform: uppercase; letter-spacing: .09em; color: var(--blue600); }
+  .note .nt { font-size: 15px; font-weight: 700; margin: 8px 0 2px; }
+  .note .np { font-size: 11px; color: var(--n500); margin: 0 0 10px; }
+  .note ul { margin: 0; padding-left: 16px; display: grid; gap: 7px; }
+  .note li { font-size: 12px; color: var(--n700); line-height: 1.55; }
+  .note li b { color: var(--n900); }
+  .note .tag { display: inline-block; font-size: 10px; font-weight: 700; background: var(--blue50);
+               color: var(--blue700); border: 1px solid var(--blue200); border-radius: 999px; padding: 2px 8px; }
+  .legend { font-size: 11px; color: var(--n500); background: var(--n50); border: 1px solid var(--n200);
+            border-radius: 10px; padding: 8px 12px; margin-bottom: 10px; line-height: 1.5; }
+
+  /* option cards (model list) */
+  .opt { border: 1px solid var(--n200); border-radius: 12px; background: #fff; padding: 12px 14px;
+         display: flex; align-items: flex-start; gap: 12px; cursor: pointer; margin-top: 8px; }
+  .opt:hover { border-color: var(--n300); }
+  .opt.on { border-color: var(--n900); box-shadow: 0 0 0 1px var(--n900); }
+  .opt .radio { width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid var(--n300); margin-top: 2px; flex: none; }
+  .opt.on .radio { border-color: var(--n900); background: radial-gradient(circle, var(--n900) 0 4.5px, #fff 5px); }
+  .opt .nm { font-size: 13px; font-weight: 700; }
+  .opt .ds { font-size: 11px; color: var(--n500); margin-top: 2px; }
+
+  .flowline { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 16px;
+              padding-top: 14px; border-top: 1px solid var(--n100); }
+  .flowline .spacer { flex: 1; }
+
+  .hidden { display: none !important; }
+  @media (max-width: 760px) { .today-grid { grid-template-columns: 1fr !important; } .kv { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+  section.scr { animation: fadeUp .35s ease-out; }
+  @keyframes fadeUp { 0% { opacity: 0; transform: translateY(8px);} 100% { opacity: 1; transform: none; } }
+</style>
+</head>
+<body>
+
+<!-- ======================= control bar (mock chrome) ======================= -->
+<header class="ctrl">
+  <div>
+    <h1>oMLX Cluster Assistant — Klickstrecke</h1>
+    <div class="sub">UX-Redesign 15.11.2026 · aktuelles Design · <span class="mono">docs/cluster-assistant/mockups/assistant-flow-klickstrecke.html</span></div>
+  </div>
+  <div class="spacer"></div>
+  <div class="grp">
+    <span class="grp-label">Fluss</span>
+    <button data-nav="today">S0 Problem</button>
+    <button data-nav="idle">S1 Start</button>
+    <button data-nav="checking">S2 Check</button>
+    <button data-nav="plan" data-plan="default">S3 Plan</button>
+    <button data-nav="launching">S4 Launch</button>
+    <button data-nav="ready">S5 Ready</button>
+  </div>
+  <div class="grp">
+    <span class="grp-label">Verzweigungen</span>
+    <button data-nav="err-coordinator">B1 Coordinator</button>
+    <button data-nav="err-topology">B2 Topologie</button>
+    <button data-nav="wired">B3 Wired-Limit</button>
+    <button data-nav="choose" data-plan="default">B4 Modell ändern</button>
+    <button data-nav="stopped">B5 Stop/Resume</button>
+  </div>
+  <div class="grp">
+    <button id="notes-toggle" class="active">Notizen an</button>
+    <button data-nav="today" id="reset">Reset</button>
+  </div>
+  <span id="screen-counter"></span>
+</header>
+
+<div class="wrap">
+  <!-- ======================= stage: browser mock ======================= -->
+  <div class="stage">
+    <div class="chrome">
+      <div class="navbar">
+        <div class="logo">
+          <div class="mark">o</div>
+          <div>
+            <div class="name">oMLX</div>
+            <div class="ver">v1.9.2</div>
+          </div>
+        </div>
+        <div class="tabs">
+          <span>Status</span>
+          <span class="on">Cluster</span>
+          <span>Models</span>
+          <span>Chat</span>
+          <span>Performance</span>
+          <span>Settings</span>
+        </div>
+      </div>
+    </div>
+    <div class="page">
+      <div class="page-head" style="margin-bottom:18px;">
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;">
+          <div>
+            <h2>Cluster</h2>
+            <p>Run one model across your Apple Silicon Macs — or let the assistant set everything up for you.</p>
+          </div>
+          <div class="seg" role="tablist" aria-label="Cluster mode">
+            <button class="on" id="mode-assistant">Assistant</button>
+            <button id="mode-manual">Manual setup</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ S0 · today (schematic, not product UI) ============ -->
+      <section class="scr" id="scr-today">
+        <div class="card">
+          <div class="eyebrow">S0 · Ist-Zustand — schematisch</div>
+          <div class="ttl">Cluster-Tab heute: ein Stapel, kein Weg</div>
+          <p class="sub">Reihenfolge der Panels im heutigen <span class="mono">_cluster_v2.html</span> (2731 Zeilen). Der Einstieg des Assistenten liegt unter ca. 4–6 Bildschirmhöhen Wizard-Chrome; innerhalb der Karte wächst der Fluss nach unten.</p>
+          <div style="display:grid; grid-template-columns: 1fr 300px; gap:18px; margin-top:14px;" class="today-grid">
+            <div class="sketch">
+              <div class="b"><span class="h"></span>1 · Cluster-Header</div>
+              <div class="b"><span class="h"></span>2 · Lifecycle-Banner (Cleanup, Loopback, Version-Mismatch, Wizard-Fehler)</div>
+              <div class="b"><span class="h"></span>3 · 5-Schritt-Wizard-Kacheln (Find → Pair → Check → Split → Activate)</div>
+              <div class="b"><span class="h"></span>4 · Activation-Progress-Banner</div>
+              <div class="b wide"><span class="h"></span>5 · Zustands-Sektionen (empty / discovering / pairing / checks …)</div>
+              <div class="b wide"><span class="h"></span>6 · Device-Karten-Grid (N Karten) + „Add Mac“ + CUDA-Guide</div>
+              <div class="scrollpath"><span>Scroll ≈ 4–6 Viewports</span><span class="line"></span></div>
+              <div class="b assist"><span class="h"></span>7 · ASSISTANT-Karte — Einstiegs-Button „Find and start a setup“</div>
+              <div class="b assist wide"><span class="h"></span>7a · …und während des Flusses: Progress-Zeilen, Plan, Local-Run, Search, Tuning, Tune-Redeploy …</div>
+              <div class="b err"><span class="h"></span>7b · 5 verschiedene Fehlerboxen (assistant / localRun / search / tune / tuneRedeploy) an unvorhersehbarer Position</div>
+              <div class="b wide"><span class="h"></span>8 · Manuelles Plan-Formular (Modell-Picker, Context, Layers)</div>
+              <div class="b"><span class="h"></span>9 · Active-Deployment-Sektion</div>
+            </div>
+            <div>
+              <div class="bwarn" style="margin-bottom:10px;">
+                <b>Befund P1–P7</b><br><br>
+                <b>P1</b> Assistant-Einstieg unten begraben<br>
+                <b>P2</b> zwei konkurrierende Fortschritts-Systeme<br>
+                <b>P3</b> eine endlose Karte, ~10 Panels gleichzeitig<br>
+                <b>P4</b> Fehler als Inline-Boxen an wechselnder Stelle<br>
+                <b>P5</b> kein Rückwärts im Fluss<br>
+                <b>P6</b> gleichgewichtige CTAs auf dem Entscheidungsbild<br>
+                <b>P7</b> „Fortschritt“ = Scrollen nach unten
+              </div>
+              <button class="btn-primary" data-go="idle" style="margin-top:12px;">Weiter zum Vorschlag
+                <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ S1 · start (idle + resume + mac chips) ============ -->
+      <section class="scr hidden" id="scr-idle">
+        <!-- resume strip: first thing after a reload (Phase C1) -->
+        <div class="card" style="padding:14px 16px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <span class="chip"><span class="dot"></span>Running</span>
+          <span class="xs" style="color:var(--n700);"><b>Last deployment</b> — GLM-4.5-AirB-oQ4 on MacBook Pro (.12) + MacBook Pro (.11) · 32,768 tokens</span>
+          <a class="link mono" href="javascript:void(0)">http://172.16.1.12:8099/v1</a>
+          <span style="flex:1"></span>
+          <button class="btn-danger" data-go="stopped" data-ic="square" style="font-size:11px; padding:6px 11px;">Stop</button>
+        </div>
+
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; gap:14px; align-items:flex-start; flex-wrap:wrap;">
+            <div>
+              <div class="eyebrow">Assistant</div>
+              <div class="ttl">Set up this cluster</div>
+              <p class="sub" style="max-width:560px;">oMLX measures these Macs, recommends a model and its context, and starts the endpoint on the elected Mac. You only press the next step.</p>
+            </div>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:16px;" aria-label="Paired Macs">
+            <span class="chip" data-ic="laptop"><span class="dot"></span>MacBook Pro (.12) <span class="cap">M1 Max · 32 GiB</span></span>
+            <span class="chip" data-ic="laptop"><span class="dot"></span>MacBook Pro (.11) <span class="cap">M5 Max · 128 GiB</span></span>
+            <span class="chip" data-ic="cpu"><span class="cap">192 GiB combined</span></span>
+            <span class="chip" data-ic="gauge"><span class="cap">measured 3 min ago</span></span>
+          </div>
+          <div class="flowline">
+            <button class="btn-primary" data-go="checking" data-ic="zap" id="entry-btn">Find and start a setup
+              <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+            </button>
+            <button class="btn-quiet" id="mode-manual-link">Manual setup — full wizard, device cards and plan form</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ S2 · check (async phases own the card) ============ -->
+      <section class="scr hidden" id="scr-checking">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div class="eyebrow">Assistant</div>
+            <span class="cap" style="font-weight:600; color:var(--n500);">Checking Macs</span>
+          </div>
+          <div class="stepper" data-stepper="0"></div>
+          <div class="rows">
+            <div class="row active">
+              <span class="mark"><svg class="spin ic" viewBox="0 0 24 24" style="width:14px;height:14px;"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" opacity=".25"/><path fill="currentColor" opacity=".85" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg></span>
+              <div>
+                <div class="lbl">Checking Macs</div>
+                <p class="msg">Measuring memory, admission and links on 2 Macs — then recommending a model…</p>
+              </div>
+            </div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Planning</div></div></div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Preparing the runtime and copying the model</div></div></div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Starting the coordinator</div></div></div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Loading the model and verifying the endpoint</div></div></div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Ready</div></div></div>
+          </div>
+          <div class="flowline">
+            <span class="cap" style="color:var(--n400);">Nothing to decide while oMLX measures — this screen stays until a plan exists.</span>
+            <span class="spacer"></span>
+            <button class="demo" data-go="plan" data-plan="default">▸ Demo: Messung fertig</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ S2b · check (model-bound re-measure) ============ -->
+      <section class="scr hidden" id="scr-checking-model">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div class="eyebrow">Assistant</div>
+            <span class="cap" style="font-weight:600; color:var(--n500);">Measuring model</span>
+          </div>
+          <div class="stepper" data-stepper="0"></div>
+          <div class="rows">
+            <div class="row active">
+              <span class="mark"><svg class="spin ic" viewBox="0 0 24 24" style="width:14px;height:14px;"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" opacity=".25"/><path fill="currentColor" opacity=".85" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg></span>
+              <div>
+                <div class="lbl">Checking Macs</div>
+                <p class="msg" id="measuring-model-msg">Measuring Qwen3.8-Flash-Next-oQ5e-mtp (model-bound): layout, memory and MTP head…</p>
+              </div>
+            </div>
+            <div class="row done"><span class="mark done" data-ic="check"></span><div><div class="lbl">Checking Macs</div><p class="msg">Hardware measurement reused — still fresh (measured 3 min ago).</p></div></div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Planning</div></div></div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Preparing the runtime and copying the model</div></div></div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Starting the coordinator</div></div></div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Ready</div></div></div>
+          </div>
+          <div class="flowline">
+            <button class="btn-quiet" data-go="choose" data-plan="default">← Back to model choice</button>
+            <span class="spacer"></span>
+            <button class="demo" data-go="plan" data-plan="qwen">▸ Demo: Messung fertig</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ B4 · choose (change model or context) ============ -->
+      <section class="scr hidden" id="scr-choose">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:10px;">
+            <div>
+              <div class="eyebrow">Assistant</div>
+              <div class="ttl">Change model or context</div>
+              <p class="sub">The hardware measurement stays fresh — only a different model is measured again before planning.</p>
+            </div>
+            <button class="btn-secondary" data-go="plan" data-plan="default">← Back to plan</button>
+          </div>
+          <div class="panel" style="margin-top:12px;">
+            <div class="eyebrow">Candidates from your Macs</div>
+            <div class="opt on" data-model="default" data-label="Continue with GLM-4.5-AirB-oQ4">
+              <span class="radio"></span>
+              <div>
+                <div class="nm">GLM-4.5-AirB-oQ4 <span class="cap" style="color:var(--green700); font-weight:600;">· recommended</span></div>
+                <div class="ds">117 layers · fits 2 Macs at 32,768 tokens · MTP head · present on .11</div>
+              </div>
+            </div>
+            <div class="opt" data-model="qwen" data-label="Continue with Qwen3.8-Flash-Next">
+              <span class="radio"></span>
+              <div>
+                <div class="nm">Qwen3.8-Flash-Next-oQ5e-mtp</div>
+                <div class="ds">PP-capable · PLE table on SSD · 2 Macs at 16,384 tokens · present on .11</div>
+              </div>
+            </div>
+            <div class="opt" data-model="staging" data-label="Continue with DeepSeek-V4.1">
+              <span class="radio"></span>
+              <div>
+                <div class="nm">DeepSeek-V4.1-oQ4</div>
+                <div class="ds">214 GiB · must be staged to a second Mac during setup</div>
+              </div>
+            </div>
+          </div>
+          <div class="flowline">
+            <span class="cap" style="color:var(--n400);">A different model is measured model-bound again — the strict plan match stays intact.</span>
+            <span class="spacer"></span>
+            <button class="btn-primary" id="choose-continue" data-go="checking-model">Continue with GLM-4.5-AirB-oQ4
+              <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ S3 · plan review (one decision, one CTA) ============ -->
+      <section class="scr hidden" id="scr-plan">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div>
+              <div class="eyebrow">Assistant</div>
+              <div class="ttl" id="plan-headline">Your setup, ready to start</div>
+            </div>
+            <span class="cap" style="font-weight:600; color:var(--n500);">Plan</span>
+          </div>
+          <div class="stepper" data-stepper="1"></div>
+
+          <!-- recommendation + plan summary -->
+          <div class="panel">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
+              <div>
+                <div class="eyebrow green">Recommended</div>
+                <div class="ttl" id="plan-model">GLM-4.5-AirB-oQ4</div>
+                <p class="sub" id="plan-fit">Fits with 21 GiB headroom — no quality tradeoff needed.</p>
+              </div>
+              <span class="chip" data-ic="check" style="border-color:var(--green200); color:var(--green700);">Fits</span>
+            </div>
+            <div class="kv">
+              <div><div class="k">Macs</div><div class="v" id="plan-macs">2 of 2 paired</div></div>
+              <div><div class="k">Context</div><div class="v" id="plan-context">32,768 tokens</div></div>
+              <div><div class="k">Coordinator</div><div class="v" id="plan-coordinator">MacBook Pro (.12)</div></div>
+              <div><div class="k">Offload</div><div class="v" id="plan-offload">Engram table on SSD</div></div>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;">
+              <span class="chip" data-ic="cpu"><span class="cap">rank 0 · MacBook Pro (.12) — tail + sampler</span></span>
+              <span class="chip" data-ic="cpu"><span class="cap" id="plan-rank1">rank 1 · MacBook Pro (.11) — head</span></span>
+              <span class="chip" data-ic="gauge"><span class="cap">Tier balanced · p50 admission</span></span>
+              <span class="chip" data-ic="zap"><span class="cap" id="plan-mtp">Lightning MTP on</span></span>
+            </div>
+            <p class="cap" style="color:var(--n500); margin:10px 0 0;">Speed stays unknown until the running cluster has been measured. No rate is promised here.</p>
+          </div>
+
+          <!-- tradeoff: plan-time user choice (frozen 2026-11-14) -->
+          <div class="panel" id="plan-tradeoff" style="margin-top:10px;">
+            <div class="eyebrow">Context vs speed — your call</div>
+            <p class="sub" style="margin-top:4px;">Keeping the context offloads routed experts (slower). Keeping experts resident costs context.</p>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+              <button class="btn-primary" style="font-size:11px; padding:7px 12px;">Best quality — 32,768 tokens, experts offloaded 75 %</button>
+              <button class="btn-secondary">Faster — 24,576 tokens, experts resident</button>
+            </div>
+          </div>
+
+          <!-- notes from the plan (amber), variant-driven -->
+          <div id="plan-note" class="hidden" style="margin-top:10px;"></div>
+
+          <!-- advanced evidence stays collapsed -->
+          <details class="disc">
+            <summary>Details — stages, rank order, plan signature, warnings</summary>
+            <div style="margin-top:10px;" class="mono" id="plan-details">
+              rank_order: n12 → n11 · plan_signature: 7f3c…a21 · measurement: msr_2b91 (fresh)<br>
+              stages: rank 0 = layers 62–116 + LM head + MTP 3 · rank 1 = layers 0–61<br>
+              warnings: —
+              <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+                <button class="btn-secondary" style="font-size:11px;" data-ic="copy">Copy diagnostics</button>
+                <button class="btn-secondary" style="font-size:11px;" data-ic="network">Network preflight</button>
+                <button class="btn-quiet">Use all Macs</button>
+                <button class="btn-quiet">Pin rank 0…</button>
+              </div>
+            </div>
+          </details>
+
+          <div class="flowline">
+            <button class="btn-secondary" data-go="choose" data-plan="default" data-ic="arrowl2">Change model or context</button>
+            <button class="btn-quiet" id="run-local-quiet">This model also fits this Mac alone — run single-node instead</button>
+            <span class="spacer"></span>
+            <button class="btn-primary" data-go="launching" data-ic="play">Start setup</button>
+          </div>
+          <div class="flowline" style="border-top:0; padding-top:4px;">
+            <button class="demo" data-go="err-topology">▸ Demo: Topologie unvollständig</button>
+            <button class="demo" data-go="wired">▸ Demo: Wired-Limit verweigert</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ S4 · launch (async phases own the card) ============ -->
+      <section class="scr hidden" id="scr-launching">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div class="eyebrow">Assistant</div>
+            <span class="cap" style="font-weight:600; color:var(--n500);" id="launch-state">Preparing</span>
+          </div>
+          <div class="stepper" data-stepper="2"></div>
+          <div class="rows" id="launch-rows"></div>
+          <div class="flowline">
+            <button class="demo" id="launch-next">▸ Demo: weiter</button>
+            <button class="demo" data-go="err-coordinator">▸ Demo: Coordinator offline</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ B1 · error: coordinator offline ============ -->
+      <section class="scr hidden" id="scr-err-coordinator">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div class="eyebrow red">Assistant — needs attention</div>
+            <span class="cap" style="font-weight:600; color:var(--red700);">Start failed</span>
+          </div>
+          <div class="stepper" data-stepper="3" data-fail="3"></div>
+          <div class="berr">
+            <div class="t"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>MacBook Pro (.12) did not answer</div>
+            <p class="b">The elected coordinator's oMLX app is closed or its admin key is missing. The setup stays on the elected Mac — nothing fell back to this Mac.</p>
+          </div>
+          <div class="panel" style="margin-top:10px; border-color:var(--red200); background:#fff;">
+            <div class="eyebrow">Before retrying</div>
+            <ol style="margin:8px 0 0; padding-left:18px; display:grid; gap:5px; font-size:12px; color:var(--n700);">
+              <li>Open oMLX on <b>MacBook Pro (.12)</b> — Spotlight or Dock, started by a person.</li>
+              <li>Check <b>Settings → API key</b> on that Mac.</li>
+              <li>The applied deployment is kept — the retry starts it in place, no re-apply.</li>
+            </ol>
+          </div>
+          <div class="flowline">
+            <button class="btn-secondary" data-go="choose" data-plan="default">Change model or context</button>
+            <button class="btn-quiet">Show details</button>
+            <span class="spacer"></span>
+            <button class="btn-action" data-go="coordinator-hint" data-ic="retry">Retry on MacBook Pro (.12)</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ B1 · interstitial: coordinator reached ============ -->
+      <section class="scr hidden" id="scr-coordinator-hint">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div class="eyebrow">Assistant</div>
+            <span class="cap" style="font-weight:600; color:var(--n500);">Waiting for coordinator</span>
+          </div>
+          <div class="stepper" data-stepper="3"></div>
+          <div class="bok">
+            <b>MacBook Pro (.12) is back.</b> The applied deployment is still valid — retrying the start in place.
+          </div>
+          <div class="rows" style="margin-top:12px;">
+            <div class="row done"><span class="mark done" data-ic="check"></span><div><div class="lbl">Checking Macs</div></div></div>
+            <div class="row done"><span class="mark done" data-ic="check"></span><div><div class="lbl">Planning</div></div></div>
+            <div class="row done"><span class="mark done" data-ic="check"></span><div><div class="lbl">Preparing the runtime and copying the model</div></div></div>
+            <div class="row active">
+              <span class="mark"><svg class="spin ic" viewBox="0 0 24 24" style="width:14px;height:14px;"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" opacity=".25"/><path fill="currentColor" opacity=".85" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg></span>
+              <div><div class="lbl">Starting the coordinator</div><p class="msg">Re-validating the placement, then starting on MacBook Pro (.12)…</p></div>
+            </div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Loading the model and verifying the endpoint</div></div></div>
+            <div class="row"><span class="mark pending">•</span><div><div class="lbl">Ready</div></div></div>
+          </div>
+          <div class="flowline">
+            <span class="spacer"></span>
+            <button class="btn-primary" data-go="launching" data-phase="1" data-ic="retry" id="hint-retry">Retry start</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ B2 · error: topology incomplete ============ -->
+      <section class="scr hidden" id="scr-err-topology">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div class="eyebrow red">Assistant — needs attention</div>
+            <span class="cap" style="font-weight:600; color:var(--red700);">Plan refused</span>
+          </div>
+          <div class="stepper" data-stepper="1" data-fail="1"></div>
+          <div class="berr">
+            <div class="t"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>The measured fabric has no line for this plan</div>
+            <p class="b">The plan needs <span class="mono">Mac Studio (.13) ↔ Mac Studio (.14)</span>, but the measured links have no cable there. Nothing degrades silently.</p>
+          </div>
+          <div class="panel" style="margin-top:10px; border-color:var(--red200); background:#fff;">
+            <div class="eyebrow">Explicit fallback — your confirmation</div>
+            <p class="sub" style="margin-top:4px;">Two Macs fit: <b>MacBook Pro (.12) ↔ MacBook Pro (.11)</b> at <b>32,768 tokens</b>. This confirmation is recorded in the plan signature.</p>
+            <div class="flowline" style="border-top:0; padding-top:10px;">
+              <button class="btn-secondary" data-go="choose" data-plan="default">Choose a smaller model</button>
+              <span class="spacer"></span>
+              <button class="btn-action" data-go="plan" data-plan="consent">Run with 2 Macs</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ B3 · error: wired limit (settings changed) ============ -->
+      <section class="scr hidden" id="scr-wired">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div class="eyebrow red">Assistant — needs attention</div>
+            <span class="cap" style="font-weight:600; color:var(--red700);">Plan refused</span>
+          </div>
+          <div class="stepper" data-stepper="1" data-fail="1"></div>
+          <div class="berr">
+            <div class="t"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>No plan fits with the current memory settings</div>
+            <p class="b"><b>Mac Studio (.13)</b> sits at its GPU wired limit (<span class="mono">36,864 MB</span>) — macOS admits no more of its memory. Raising the limit is the one fix that costs neither context nor quality.</p>
+          </div>
+          <div class="panel" style="margin-top:10px;">
+            <div class="eyebrow">One admin dialog, in the app</div>
+            <p class="sub" style="margin-top:4px;">Performance → <b>Apply with Admin…</b> raises <span class="mono">iogpu.wired_limit_mb</span>. The browser never runs a privileged command — it only names the step.</p>
+          </div>
+          <div class="flowline">
+            <button class="btn-secondary" data-go="choose" data-plan="default">Change model or context</button>
+            <span class="spacer"></span>
+            <button class="btn-action" data-go="wired-applied" data-ic="gauge">Raise the GPU limit in Performance</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ B3 · interstitial: limit raised, re-enter at plan ============ -->
+      <section class="scr hidden" id="scr-wired-applied">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div class="eyebrow">Assistant</div>
+            <span class="cap" style="font-weight:600; color:var(--n500);">Settings changed</span>
+          </div>
+          <div class="stepper" data-stepper="1"></div>
+          <div class="bok">
+            <b>Wired limit raised on Mac Studio (.13)</b> — now 49,152 MB. The measurement is still fresh, so only the plan runs again; the flow re-enters at the failed step, not at the beginning.
+          </div>
+          <div class="flowline">
+            <button class="btn-quiet" data-go="choose" data-plan="default">Change model or context instead</button>
+            <span class="spacer"></span>
+            <button class="btn-primary" data-go="plan" data-plan="wired" data-ic="retry">Plan again</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ S5 · ready ============ -->
+      <section class="scr hidden" id="scr-ready">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div>
+              <div class="eyebrow green">Assistant</div>
+              <div class="ttl">Your endpoint is ready</div>
+            </div>
+            <span class="chip" style="border-color:var(--green200); color:var(--green700);"><span class="dot"></span>Ready</span>
+          </div>
+          <div class="stepper" data-stepper="5"></div>
+          <div class="kv" style="margin-top:0;">
+            <div><div class="k">Model</div><div class="v">GLM-4.5-AirB-oQ4</div></div>
+            <div><div class="k">Context</div><div class="v">32,768 tokens</div></div>
+            <div><div class="k">Coordinator</div><div class="v">MacBook Pro (.12)</div></div>
+            <div><div class="k">Macs</div><div class="v">2</div></div>
+          </div>
+          <div class="panel" style="margin-top:12px;">
+            <div class="eyebrow">Endpoint</div>
+            <a class="link mono" href="javascript:void(0)" style="font-size:12px; font-weight:600;">http://172.16.1.12:8099/v1</a>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; align-items:center;">
+              <button class="btn-secondary" data-ic="copy" style="font-size:11px;">Copy URL</button>
+              <button class="btn-primary" data-ic="chat" style="font-size:11px;">Open Chat
+                <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+              </button>
+              <button class="btn-secondary" data-ic="link" style="font-size:11px;">Connect agent</button>
+              <button class="btn-secondary" data-ic="retry" style="font-size:11px;">Refresh</button>
+              <span style="flex:1"></span>
+              <button class="btn-danger" data-go="stopped" data-ic="square" style="font-size:11px;">Stop cluster</button>
+            </div>
+            <p class="cap" style="color:var(--n500); margin:10px 0 0;">Serving <span class="mono">glm-4.5-airb-oq4</span>. Chat opens on MacBook Pro (.12) — that Mac's own session and API key apply.</p>
+            <p class="cap" style="color:var(--n700); margin:8px 0 0;"><b>Measured</b> (probe on): 31.6 tok/s decode · 89 tok/s prefill · TTFT 0.42 s — 2 min ago.</p>
+          </div>
+          <details class="disc">
+            <summary>Performance — tuning, MTP depth, constellation search</summary>
+            <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+              <button class="btn-secondary" style="font-size:11px;" data-ic="sliders">Fine-tune (keeps serving)</button>
+              <button class="btn-secondary" style="font-size:11px;" data-ic="retry">Tune MTP depth (redeploys — stops the cluster)</button>
+              <button class="btn-secondary" style="font-size:11px;" data-ic="search">Search constellations</button>
+              <span class="chip"><span class="cap">Performance probe: On</span></span>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <!-- ============ B5 · stopped ============ -->
+      <section class="scr hidden" id="scr-stopped">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+            <div>
+              <div class="eyebrow">Assistant</div>
+              <div class="ttl">Your cluster is stopped</div>
+            </div>
+            <span class="chip"><span class="cap">Stopped</span></span>
+          </div>
+          <div class="stepper" data-stepper="5"></div>
+          <div class="panel">
+            <p class="sub" style="margin-top:0;">Your cluster is stopped. The endpoint is closed until you start it again.</p>
+            <p class="cap" style="color:var(--n500); margin-top:8px;">GLM-4.5-AirB-oQ4 · 32,768 tokens · MacBook Pro (.12) + MacBook Pro (.11) · frozen plan inputs and saved tuning are kept.</p>
+            <div class="flowline" style="border-top:0; padding-top:10px;">
+              <button class="btn-quiet" data-go="ready">Show what ran</button>
+              <span class="spacer"></span>
+              <button class="btn-primary" data-go="launching" data-ic="play">Start again
+                <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </div><!-- /page -->
+  </div><!-- /stage -->
+
+  <!-- ======================= notes column ======================= -->
+  <aside class="notes">
+    <div class="legend">
+      <b>Klickstrecke</b> — klicke die Produkt-Buttons im Mock (dunkle Pillen) oder die Verzweigungen oben.
+      <b>Gestrichelte „Demo“-Knöpfe</b> sind Mock-Steuerung, kein Produkt-UI. Produkt-Texte Englisch (frozen), Notizen Deutsch.
+    </div>
+    <div class="note" id="note">
+      <div class="nh"><span id="note-tag"></span><span id="note-id"></span></div>
+      <div class="nt" id="note-title"></div>
+      <p class="np" id="note-sub"></p>
+      <ul id="note-list"></ul>
+    </div>
+  </aside>
+</div>
+
+<script>
+/* ============================ icons ============================ */
+const ICONS = {
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  arrowr: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
+  arrowl2: '<path d="M19 12H5"/><path d="m12 19-7-7 7-7"/>',
+  play: '<path d="M6 3l14 9-14 9V3z"/>',
+  copy: '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+  square: '<rect width="18" height="18" x="3" y="3" rx="2"/>',
+  laptop: '<path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.742a1 1 0 0 1-.9 1.258h-13.76a1 1 0 0 1-.9-1.258L4 16"/>',
+  network: '<rect width="6" height="6" x="16" y="16" rx="1"/><rect width="6" height="6" x="2" y="16" rx="1"/><rect width="6" height="6" x="9" y="2" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/>',
+  retry: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
+  sliders: '<path d="M21 4h-7"/><path d="M10 4H3"/><path d="M21 12h-9"/><path d="M8 12H3"/><path d="M21 20h-5"/><path d="M12 20H3"/><path d="M14 2v2"/><path d="M14 10v2"/><path d="M8 10v2"/><path d="M16 18v2"/>',
+  chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  zap: '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  gauge: '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
+  cpu: '<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/>'
+};
+function icSVG(name) {
+  return '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + (ICONS[name] || '') + '</svg>';
+}
+document.querySelectorAll('[data-ic]').forEach(function (el) { el.insertAdjacentHTML('afterbegin', icSVG(el.dataset.ic)); });
+
+/* ============================ notes ============================ */
+const NOTES = {
+  today: { tag: 'S0', title: 'Ist-Zustand: der Stapel', sub: 'Cluster-Tab heute, schematisch nach _cluster_v2.html.',
+    bullets: [
+      '<b>P1 — Einstieg begraben:</b> „Find and start a setup“ liegt unter Wizard-Kacheln, Bannern, Device-Karten und CUDA-Guide — ca. 4–6 Viewports Scrollen.',
+      '<b>P2 — zwei Wahrheiten:</b> der 5-Schritt-Wizard-Header sagt „Split the model“, während der Assistant „measuring“ meldet.',
+      '<b>P3/P7 — eine Karte wächst:</b> Entry, Progress, Plan, Local-Run, Search, Tuning und Details mounten gleichzeitig; der Nutzer folgt dem Fluss per Scrollen.',
+      '<b>P4 — Fehler ohne Ort:</b> 5 verschiedene rote Boxen (assistant, localRun, search, tune, tuneRedeploy) erscheinen inline an der Position ihres Panels.',
+      '<b>P5 — kein Zurück:</b> Modell/Kontext ändern heißt: Flow von vorn.'
+    ]},
+  idle: { tag: 'S1', title: 'Start — der Einstieg liegt oben', sub: 'idle + Resume-Strip + Mac-Chips.',
+    bullets: [
+      '<b>Lösung P1:</b> der Assistant ist das Erste im Tab. Das komplette Wizard-Chrome (Kacheln, Pairing, Checks, Device-Karten, Plan-Formular) rutscht hinter „Manual setup“ — <b>genau die Akzeptanz-Entscheidung D3</b> (2026-11-15): Wizard hinter eingeklappter Disclosure, Assistant ist der primäre Top-to-Bottom-Fluss.',
+      '<b>Resume-Strip (P1/C1):</b> nach einem Reload ist „läuft / läuft nicht + Stop/Start again“ sofort sichtbar — ohne Scrollen zur alten Ready-Karte.',
+      '<b>Device-Karten → Chips:</b> Name, Chip, RAM, grüner Punkt. Die vollen Karten bleiben im manuellen Modus; „Add Mac“ wird ein Chip-Plus.',
+      '<b>Ein primärer CTA:</b> „Find and start a setup“ bleibt der einzige dunkle Button. „Manual setup“ ist ein ruhiger Textlink, kein zweiter equal-weight Button (P6).'
+    ]},
+  checking: { tag: 'S2', title: 'Check — asynchrone Phasen besitzen die Karte', sub: 'measuring / recommending / measuring_model / planning (ohne Plan).',
+    bullets: [
+      '<b>Lösung P3/P7:</b> während Messung/Empfehlung steht <b>nichts anderes</b> im Bild: kein Plan-Panel, kein Tuning, keine Fehlerbox. Die Karte kann nicht „nach unten wachsen“.',
+      '<b>Lösung P2 — ein Fortschrittssystem:</b> der 6er-Stepper oben sind exakt die sechs beobachtbaren Screen-4-Phasen; der Wizard-Header ist im Assistant-Modus ausgeblendet. Keine Phase, die das Backend nicht melden kann.',
+      '<b>Ehrlich:</b> keine Prozente, keine Byte-Zähler, keine Token-Rate (frozen). Die Zeile darunter ist der eigene State-Satz des Backends.',
+      'Der Assistenz-State-Status („Checking Macs“) wandert als schlichtes Label nach oben rechts — kein zweiter konkurrierender Indikator.'
+    ]},
+  'checking-model': { tag: 'B4a', title: 'Modell-gebundene Nachmessung', sub: 'nach Modellwechsel aus der Modellauswahl.',
+    bullets: [
+      '<b>Was erhalten bleibt:</b> die Hardware-Messung ist noch frisch (TTL 15 min) — kein erneutes Messen der Macs (grüne Zeile).',
+      '<b>Was neu läuft:</b> nur die modell-gebundene Messung des gewählten Modells — der strikte Plan-Match (Node-Set/Modell/MTP) bleibt intakt (frozen).',
+      '„← Back“ kehrt zur Modellauswahl zurück, ohne die Messung zu verlieren (P5).'
+    ]},
+  choose: { tag: 'B4', title: 'Change model or context — rückwärts ohne Neustart', sub: 'von der Plan-Ansicht zurück mit erhaltenem Zustand.',
+    bullets: [
+      '<b>Lösung P5:</b> „Change model or context“ ersetzt den Neustart des Flusses. Auswahl per Optionskarten, ein „Continue“ pro Auswahl.',
+      '<b>D2 (Back scope):</b> zurückgehen bis zum grünen <i>applied</i>; alles dahinter wird <i>stale</i>, nie still behalten. Ein laufender Cluster bleibt frozen (Screen-6-Regeln) — hier im Mock: Vor-apply.',
+      'Staging-Hinweis (DeepSeek „muss gestaged werden“) ist eine ehrliche Amber-Note, kein versteckter Kopiervorgang.',
+      'String ist neu: „Change model or context“ / „Continue with …“ — braucht neue i18n-Keys (en).'
+    ]},
+  plan: { tag: 'S3', title: 'Plan review — eine Entscheidung, ein CTA', sub: 'planning mit plan gesetzt; Trade-offs bleiben Plan-zeitlich.',
+    bullets: [
+      '<b>Lösung P6:</b> genau ein dunkler Button („Start setup“). „Change model or context“ sekundär, „Run on this Mac“ als ruhiger Link (nur wenn single_node diese Mac nennt — Entscheidung E6).',
+      '<b>Empfehlung + Plan in einem Bild:</b> Modell, Fit, Macs/Context/Coordinator/Offload, Rank-Chips, Tier, MTP — die heutigen summary/policy-Zeilen, nur gebündelt statt gestapelt.',
+      '<b>Trade-off bleibt Plan-Entscheidung</b> (frozen 2026-11-14): „Best quality“ vs. „Faster“ als zwei Pills statt verstreuter Buttons.',
+      '<b>Progressive Disclosure:</b> Stages, Signatur, Warnungen, „Use all Macs“, Pin, Network-Preflight bleiben hinter „Details“.',
+      '„Speed stays unknown …“ bleibt der ehrliche Satz aus dem heutigen UI.'
+    ]},
+  launching: { tag: 'S4', title: 'Launch — dieselbe Fläche wie Check', sub: 'applying / starting / loading.',
+    bullets: [
+      'Identisches Layout wie S2: die asynchronen Phasen besitzen die Karte — kein Plan, kein Tuning, nichts anderes gemountet (P3/P7).',
+      'Die Zeilen-Details sind die Backend-eigenen Messages (progress.message, „1 of 2 Macs ready“) — nie eine Phase, die das Backend nicht gemeldet hat.',
+      'apply → start Reihenfolge bleibt wie heute: „Start setup“ postet apply, wartet auf applied, dann start.',
+      'Demo-Knöpfe (gestrichelt) simulieren Phasen-Fortschritt bzw. den Coordinator-Ausfall → B1.'
+    ]},
+  'err-coordinator': { tag: 'B1', title: 'Fehler sind Bildschirme, keine Boxen', sub: 'failed bei start — retry_coordinator.',
+    bullets: [
+      '<b>Lösung P4:</b> der Fehlschlag übernimmt die ganze Karte — an derselben Stelle, an der der Nutzer gerade schaut. Klartext-Titel, Ursache, genau <b>eine</b> Aktion (frozen: error.action).',
+      'Der Stepper zeigt rot am fehlschlagenden Schritt — der Nutzer weiß, <b>wo</b> es hakte, nicht nur dass es hakte.',
+      '<b>Kein lokaler Fallback</b> (frozen): „The setup stays on the elected Mac — nothing fell back to this Mac.“ Der Satz steht explizit im UI.',
+      'Die Anweisungen (oMLX auf .12 öffnen, per Person — nie SSH) sind Teil des Fehlerbildschirms, nicht ein Toast, der verschwindet.',
+      '<b>D2 (Retry scope):</b> Retry startet in-place gegen das bestehende applied Deployment — kein erzwungenes re-apply.'
+    ]},
+  'coordinator-hint': { tag: 'B1b', title: 'Retry — am fehlschlagenden Schritt', sub: 'Interstitium nach dem Fix.',
+    bullets: [
+      'Nach dem Fix (Nutzer hat oMLX auf .12 geöffnet) re-entryt der Fluss am <b>fehlgeschlagenen Schritt</b>: Re-Validierung des Placements, dann start.',
+      'Kein Neustart: Messung bleibt gültig, apply bleibt applied — nur die fehlgeschlagene Anfrage läuft erneut (D2).',
+      'Der Fortschritt zeigt ehrlich: Zeilen 1–3 done (aus dem apply), Zeile 4 aktiv — der Nutzer verliert nichts.'
+    ]},
+  'err-topology': { tag: 'B2', title: 'Topologie-Verweigerung mit explizitem Consent', sub: 'topology_incomplete bei plan.',
+    bullets: [
+      'Das fehlende Kabel wird namentlich genannt (<span class="mono">.13 ↔ .14</span>) — nichts degradiert still (frozen §10.3).',
+      '<b>„Run with 2 Macs“ nur per Klick:</b> die Bestätigung salzt die Plan-Signatur — apply/start müssen sie wiederholen (frozen).',
+      'Sekundär: „Choose a smaller model“ — der Rückweg ist Teil des Fehlerbildschirms, nicht unten im Karton.',
+      'Consent-Karte liegt direkt unter der Ursache, nicht unter laufenden Fremd-Panels (P4).'
+    ]},
+  wired: { tag: 'B3', title: 'Retry nach Settings-Änderung — Teil 1', sub: 'raise_wired_limit (R5) bei plan.',
+    bullets: [
+      'Der Fall, den du genannt hast: <b>Fehlermeldung, Nutzer ändert etwas an den Settings, dann Retry.</b>',
+      'R5 (frozen): „at the cap“ ist der einzige Fall, in dem Anheben mehr admitted — `None` nie „zu niedrig“, 0 = Default. Das UI nennt Mac + MB-Wert.',
+      'Die Aktion führt in die <b>App</b> (Performance → Apply with Admin…, ein Admin-Dialog) — der Browser hat keinen privilegierten Pfad und sagt nur den Schritt (frozen).',
+      'Genau eine primäre Aktion; „Change model or context“ bleibt der sekundäre Rückweg.'
+    ]},
+  'wired-applied': { tag: 'B3b', title: 'Retry nach Settings-Änderung — Teil 2', sub: 'Re-Entry am fehlschlagenden Schritt.',
+    bullets: [
+      '<b>Re-Entry-Regel:</b> nach der Änderung läuft nur <b>plan</b> erneut — die Hardware-Messung ist noch frisch (TTL 15 min), die modell-gebundene Messung unberührt. Kein Neustart des Flusses (P5).',
+      'Der Bildschirm sagt explizit, was erhalten bleibt — der Nutzer versteht, warum es schnell geht.',
+      '„Plan again“ führt auf die Plan-Ansicht mit den neuen Fakten (3 Macs / größerer Kontext); „Change model or context“ bleibt der Ausstieg.'
+    ]},
+  ready: { tag: 'S5', title: 'Ready — der Abschluss ist das Ziel des Flusses', sub: 'ready + endpoint.ready.',
+    bullets: [
+      '<b>Endpoint-Gating bleibt</b> (frozen): URL, Copy, Open Chat, Connect agent nur bei ready — hier erfüllt.',
+      'Stop cluster rot umrandet rechts — vorhanden, aber nicht dominant. Screen 6 bleibt „state + stop/restart, nothing more“.',
+      '<b>Progressive Disclosure:</b> Fine-tune, Tune MTP depth, Constellation-Search und Probe-Toggle wandern hinter „Performance“ — Post-Ready-Optimierung, nicht Teil des Start-Flusses (P3).',
+      'Die gemessene Zeile („Measured … 2 min ago“) erscheint nur, wenn observed gefüllt ist — sonst sagt das UI nichts über Geschwindigkeit (frozen).',
+      '„Refresh“ bleibt der bounded Re-Read der Operation.'
+    ]},
+  stopped: { tag: 'B5', title: 'Stopped — Zustand statt Ende', sub: 'ready + stopped (Screen 6 / Phase C1).',
+    bullets: [
+      '„Start again“ re-applied die gespeicherten Plan-Inputs (Signatur wird neu geprüft — drifted placement = plan_mismatch) und lässt den bestehenden Poll starten (frozen).',
+      'Keine Endpunkt-Anzeige, kein Chat/Agent-Link solange gestoppt (frozen) — „Show what ran“ zeigt die Fakten ohne URL.',
+      'Nach einem Reload erscheint derselbe Zustand als Resume-Strip auf S1 (C1) — konsistent, ohne erneutes Suchen.'
+    ]}
+};
+
+/* ============================ stepper ============================ */
+const STEPS = [
+  { key: 'check',  lbl: 'Check' },
+  { key: 'plan',   lbl: 'Plan' },
+  { key: 'prepare',lbl: 'Prepare' },
+  { key: 'start',  lbl: 'Start' },
+  { key: 'load',   lbl: 'Load' },
+  { key: 'ready',  lbl: 'Ready' }
+];
+function renderStepper(el, activeIdx, failIdx) {
+  if (!el) return;
+  el.innerHTML = STEPS.map(function (s, i) {
+    var st = i < activeIdx ? 'done' : (i === activeIdx ? (failIdx === i ? 'failed' : 'active') : '');
+    if (failIdx != null && i > activeIdx) st = '';
+    var bubble = st === 'done' ? icSVG('check') : (st === 'failed' ? '!' : (i + 1));
+    return '<div class="step ' + st + '"><span class="bubble">' + bubble + '</span><span class="lbl">' + s.lbl + '</span></div>' +
+           (i < STEPS.length - 1 ? '<span class="step-sep">›</span>' : '');
+  }).join('');
+}
+
+/* ============================ plan variants ============================ */
+const PLANS = {
+  default: {
+    model: 'GLM-4.5-AirB-oQ4',
+    headline: 'Your setup, ready to start',
+    fit: 'Fits with 21 GiB headroom — no quality tradeoff needed.',
+    macs: '2 of 2 paired',
+    context: '32,768 tokens',
+    coordinator: 'MacBook Pro (.12)',
+    offload: 'Engram table on SSD',
+    rank1: 'rank 1 · MacBook Pro (.11) — head',
+    mtp: 'Lightning MTP on',
+    tradeoff: true,
+    note: null,
+    details: 'rank_order: n12 → n11 · plan_signature: 7f3c…a21 · measurement: msr_2b91 (fresh)<br>stages: rank 0 = layers 62–116 + LM head + MTP 3 · rank 1 = layers 0–61<br>warnings: —'
+  },
+  qwen: {
+    model: 'Qwen3.8-Flash-Next-oQ5e-mtp',
+    headline: 'Your setup, ready to start',
+    fit: 'Fits at 16,384 tokens — PLE table offloaded to SSD.',
+    macs: '2 of 2 paired',
+    context: '16,384 tokens',
+    coordinator: 'MacBook Pro (.11)',
+    offload: 'PLE table on SSD',
+    rank1: 'rank 1 · Mac Studio (.13) — head',
+    mtp: 'Lightning MTP on',
+    tradeoff: false,
+    note: null,
+    details: 'rank_order: n11 → n13 · plan_signature: 91bd…e04 · measurement: msr_2c47 (fresh)<br>stages: rank 0 = layers 58–116 + LM head + MTP 2 · rank 1 = layers 0–57<br>warnings: unmeasured_compute on .13 — headroom preferred, no rate invented'
+  },
+  consent: {
+    model: 'DeepSeek-V4.1-oQ4',
+    headline: 'Running with 2 Macs — as confirmed',
+    fit: 'Two Macs fit after your explicit confirmation.',
+    macs: '2 of 3 paired',
+    context: '32,768 tokens',
+    coordinator: 'MacBook Pro (.12)',
+    offload: 'Engram table on SSD',
+    rank1: 'rank 1 · MacBook Pro (.11) — head',
+    mtp: 'MTP off',
+    tradeoff: true,
+    note: { cls: 'bwarn', html: '<b>2-Mac consent recorded in the plan signature.</b> The third Mac (Mac Studio .13) stays excluded — reason: missing fabric link. Apply and start must repeat this confirmation.' },
+    details: 'rank_order: n12 → n11 · plan_signature: 44aa…7c2 (consent salted) · measurement: msr_2b91 (fresh)<br>excluded_nodes: n13 (topology) · stages: rank 0 = layers 74–142 + LM head · rank 1 = layers 0–73'
+  },
+  wired: {
+    model: 'DeepSeek-V4.1-oQ4',
+    headline: 'Now it fits — with the raised limit',
+    fit: 'Mac Studio (.13) now admits 48 GiB — 32,768 tokens fit on 2 Macs.',
+    macs: '2 of 2 paired',
+    context: '32,768 tokens',
+    coordinator: 'MacBook Pro (.11)',
+    offload: 'Engram table on SSD',
+    rank1: 'rank 1 · Mac Studio (.13) — head',
+    mtp: 'MTP off',
+    tradeoff: false,
+    note: { cls: 'bok', html: '<b>Plan re-entered at the failed step.</b> Measurement reused (still fresh) — only solve_cluster_plan ran again with the new ceiling.' },
+    details: 'rank_order: n11 → n13 · plan_signature: 08cf…d19 · measurement: msr_2b91 (fresh, reused)<br>stages: rank 0 = layers 74–142 + LM head · rank 1 = layers 0–73<br>warnings: —'
+  }
+};
+function setPlan(variant) {
+  var p = PLANS[variant] || PLANS.default;
+  document.getElementById('plan-model').textContent = p.model;
+  document.getElementById('plan-headline').textContent = p.headline;
+  document.getElementById('plan-fit').textContent = p.fit;
+  document.getElementById('plan-macs').textContent = p.macs;
+  document.getElementById('plan-context').textContent = p.context;
+  document.getElementById('plan-coordinator').textContent = p.coordinator;
+  document.getElementById('plan-offload').textContent = p.offload;
+  document.getElementById('plan-rank1').textContent = p.rank1;
+  document.getElementById('plan-mtp').textContent = p.mtp;
+  document.getElementById('plan-tradeoff').classList.toggle('hidden', !p.tradeoff);
+  var noteEl = document.getElementById('plan-note');
+  if (p.note) { noteEl.className = p.note.cls; noteEl.innerHTML = p.note.html; }
+  else { noteEl.className = 'hidden'; noteEl.innerHTML = ''; }
+  document.getElementById('plan-details').innerHTML = p.details +
+    '<div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">' +
+    '<button class="btn-secondary" style="font-size:11px;" data-ic="copy">Copy diagnostics</button>' +
+    '<button class="btn-secondary" style="font-size:11px;" data-ic="network">Network preflight</button>' +
+    '<button class="btn-quiet">Use all Macs</button><button class="btn-quiet">Pin rank 0…</button></div>';
+  document.querySelectorAll('#plan-details [data-ic]').forEach(function (el) { el.insertAdjacentHTML('afterbegin', icSVG(el.dataset.ic)); });
+}
+
+/* ============================ launch phases ============================ */
+const LAUNCH_PHASES = [
+  { state: 'Preparing', active: 2, rows: [
+    { s: 'done' }, { s: 'done' },
+    { s: 'active', msg: 'Staging GLM-4.5-AirB-oQ4 to MacBook Pro (.11) — 1 of 2 Macs ready' },
+    { s: 'pending' }, { s: 'pending' }, { s: 'pending' } ] },
+  { state: 'Starting', active: 3, rows: [
+    { s: 'done' }, { s: 'done' }, { s: 'done' },
+    { s: 'active', msg: 'Starting the coordinator on MacBook Pro (.12)…' },
+    { s: 'pending' }, { s: 'pending' } ] },
+  { state: 'Loading', active: 4, rows: [
+    { s: 'done' }, { s: 'done' }, { s: 'done' }, { s: 'done' },
+    { s: 'active', msg: 'Loading the model and verifying the endpoint (readiness canary)…' },
+    { s: 'pending' } ] }
+];
+var launchIdx = 0;
+function renderLaunch() {
+  var ph = LAUNCH_PHASES[launchIdx];
+  document.getElementById('launch-state').textContent = ph.state;
+  renderStepper(document.querySelector('#scr-launching .stepper'), ph.active);
+  var labels = ['Checking Macs', 'Planning', 'Preparing the runtime and copying the model', 'Starting the coordinator', 'Loading the model and verifying the endpoint', 'Ready'];
+  document.getElementById('launch-rows').innerHTML = ph.rows.map(function (r) {
+    var mark = r.s === 'active'
+      ? '<svg class="spin ic" viewBox="0 0 24 24" style="width:14px;height:14px;"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" opacity=".25"/><path fill="currentColor" opacity=".85" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>'
+      : (r.s === 'done' ? icSVG('check') : '•');
+    return '<div class="row ' + r.s + '"><span class="mark ' + (r.s === 'pending' ? 'pending' : r.s) + '">' + mark + '</span>' +
+           '<div><div class="lbl">' + labels[ph.rows.indexOf(r)] + '</div>' + (r.msg ? '<p class="msg">' + r.msg + '</p>' : '') + '</div></div>';
+  }).join('');
+}
+document.getElementById('launch-next').addEventListener('click', function () {
+  if (launchIdx < LAUNCH_PHASES.length - 1) { launchIdx++; renderLaunch(); }
+  else go('ready');
+});
+
+/* ============================ navigation ============================ */
+var current = null;
+function go(id, planVariant) {
+  var scr = document.getElementById('scr-' + id);
+  if (!scr) return;
+  if (id === 'plan' && planVariant) setPlan(planVariant);
+  if (id === 'launching') { launchIdx = (window.__launchIdx != null) ? window.__launchIdx : 0; window.__launchIdx = null; renderLaunch(); }
+  document.querySelectorAll('section.scr').forEach(function (s) { s.classList.add('hidden'); });
+  scr.classList.remove('hidden');
+  current = id;
+  // stepper rendering per screen
+  var st = scr.querySelector('.stepper');
+  if (st) {
+    var idx = parseInt(st.dataset.stepper, 10);
+    var fail = st.dataset.fail != null ? parseInt(st.dataset.fail, 10) : null;
+    renderStepper(st, idx, fail);
+  }
+  if (id === 'launching') renderLaunch();
+  // notes
+  var n = NOTES[id] || { tag: '—', title: id, sub: '', bullets: [] };
+  document.getElementById('note-tag').textContent = n.tag;
+  document.getElementById('note-id').textContent = '· Screen ' + id;
+  document.getElementById('note-title').textContent = n.title;
+  document.getElementById('note-sub').textContent = n.sub;
+  document.getElementById('note-list').innerHTML = n.bullets.map(function (b) { return '<li>' + b + '</li>'; }).join('');
+  // control bar state
+  document.querySelectorAll('.ctrl [data-nav]').forEach(function (b) {
+    b.classList.toggle('active', b.dataset.nav === id);
+  });
+  document.getElementById('screen-counter').textContent = 'Screen ' + n.tag + ' / ' + id;
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+document.addEventListener('click', function (e) {
+  var t = e.target.closest('[data-go], [data-nav]');
+  if (!t) return;
+  if (t.dataset.phase != null) window.__launchIdx = parseInt(t.dataset.phase, 10);
+  if (t.dataset.nav) { go(t.dataset.nav, t.dataset.plan); return; }
+  go(t.dataset.go, t.dataset.plan);
+});
+
+/* mode toggle (demo only — mirrors the segmented control) */
+document.getElementById('mode-manual').addEventListener('click', function () {
+  alert('Demo: „Manual setup“ öffnet den bestehenden exo-Wizard (Kacheln, Device-Karten, Checks, Plan-Formular) — unverändert, nur eingeklappt. Entscheidung D3.');
+});
+document.getElementById('mode-assistant').addEventListener('click', function () { /* already active */ });
+document.getElementById('mode-manual-link').addEventListener('click', function () {
+  alert('Demo: gleiche Disclosure wie der Segmented-Button oben rechts — der Wizard bleibt derselbe Code.');
+});
+document.getElementById('run-local-quiet').addEventListener('click', function () {
+  alert('Demo: „Run on this Mac“ öffnet den bestehenden Local-Run-Flow (run-local, tune-local) als fokussierten Bildschirm — nie ein stiller Fallback für einen verweigerten Plan (Entscheidung E6).');
+});
+
+/* notes toggle */
+document.getElementById('notes-toggle').addEventListener('click', function () {
+  var off = document.body.classList.toggle('nonotes');
+  this.textContent = off ? 'Notizen aus' : 'Notizen an';
+  this.classList.toggle('active', !off);
+});
+
+/* model option cards */
+document.querySelectorAll('#scr-choose .opt').forEach(function (opt) {
+  opt.addEventListener('click', function () {
+    document.querySelectorAll('#scr-choose .opt').forEach(function (o) { o.classList.remove('on'); });
+    opt.classList.add('on');
+    var btn = document.getElementById('choose-continue');
+    btn.firstChild.textContent = opt.dataset.label + ' ';
+    document.getElementById('measuring-model-msg').textContent =
+      'Measuring ' + opt.querySelector('.nm').textContent + ' (model-bound): layout, memory and MTP head…';
+  });
+});
+
+/* entry: start */
+go('today');
+</script>
+</body>
+</html>

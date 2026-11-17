@@ -133,3 +133,6 @@ tq_batch_memory.md
 .claude/
 issues.md
 clusterPlan.md
+# Private live-run drivers and logs (machine-specific, may name internal IPs)
+.live_prefill_driver*.py
+.local-*.md

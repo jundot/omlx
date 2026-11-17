@@ -2,7 +2,7 @@
 """The free-space affordance: one model, one measured Mac, one relay.
 
 A copy that cannot fit is refused with ``insufficient_disk`` and the single
-action ``free_disk_space`` (the live-run notes). Freeing space is a delete on
+action ``free_disk_space`` (PHASE-2B-RUN.md §8.2). Freeing space is a delete on
 the Mac that is short of it, and this route is the only place the assistant
 deletes anything:
 
@@ -59,7 +59,7 @@ class Relay:
 @pytest.fixture()
 def relay(monkeypatch) -> Relay:
     fake = Relay()
-    monkeypatch.setattr(assistant_routes, "delete_model_on_mac", fake)
+    monkeypatch.setitem(assistant_routes.__dict__, "delete_model_on_mac", fake)
     return fake
 
 
@@ -199,8 +199,8 @@ def test_the_macs_own_answer_decides_the_one_action(
     with assistant_api(
         tmp_path, monkeypatch, inventory=two_models
     ) as (client, _store, _operations):
-        monkeypatch.setattr(
-            assistant_routes,
+        monkeypatch.setitem(
+            assistant_routes.__dict__,
             "delete_model_on_mac",
             Relay(RemoteAdminError(status, "the delete route answered")),
         )
