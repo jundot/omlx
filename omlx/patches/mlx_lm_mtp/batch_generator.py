@@ -200,13 +200,22 @@ def apply() -> bool:
                     )
                 _drop_mtp_batch_state(self, "batch-ineligible")
 
-            if _is_mtp_eligible(self):
+            emitted = getattr(self, "_omlx_first_token_emitted", None)
+            if emitted is not None and tuple(self.uids) != (emitted[0],):
+                # The row finished or left between the two calls.
+                delattr(self, "_omlx_first_token_emitted")
+                emitted = None
+            if emitted is not None or _is_mtp_eligible(self):
                 handed_off = False
                 if _singleton_mtp_handoff_ready(self):
                     # A prefill is waiting on this batch generator; hand the
                     # singleton back to the standard step at the drained-queue
                     # boundary so the late join merges this very call (#2515).
                     handed_off = _handoff_mtp_for_late_join(self, self._omlx_mtp_state)
+                if not handed_off and emitted is None:
+                    early = _early_first_emit(self)
+                    if early is not None:
+                        return early
                 if not handed_off:
                     try:
                         state = _prepare_mtp_state_for_next(self)
@@ -600,6 +609,7 @@ def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
     return (
         getattr(gen_batch, "_omlx_mtp_state", None) is not None
         or getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None
+        or getattr(gen_batch, "_omlx_first_token_emitted", None) is not None
     )
 
 
@@ -1546,6 +1556,50 @@ def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:
         return False
 
 
+def _early_first_emit(gen_batch: Any) -> Optional[List[Any]]:
+    """Stream the token sampled from the prompt before the drafter starts.
+
+    ``_post_init_mtp`` runs one more backbone forward and the first draft
+    before it emits that token, which adds both to the time to the first
+    token. Emit it now; the next call runs the init and drops the token
+    from the init queue. While the token is pending the batch counts as
+    MTP-active, so no prompt merges between the two calls.
+    """
+    if getattr(gen_batch, "_omlx_mtp_state", None) is not None:
+        return None
+    if gen_batch._next_tokens is None or len(gen_batch.uids) != 1:
+        return None
+    if gen_batch._num_tokens[0] != 0:
+        return None
+    if _mtp_park_state_for_batch(gen_batch) is not None:
+        return None
+    if (
+        _cluster_mtp(gen_batch.model) is not None
+        or _drafter_for(gen_batch.model) is None
+    ):
+        return None
+    main_tok = _ensure_uint32(gen_batch._next_tokens)
+    token_id = int(main_tok.tolist()[0])
+    result = _emit_response(gen_batch, token_id, gen_batch._next_logprobs[0])
+    if result[0].finish_reason is None:
+        gen_batch._omlx_first_token_emitted = (gen_batch.uids[0], token_id)
+    return result
+
+
+def _take_early_first_token(gen_batch: Any, state: Optional[_MtpState]) -> None:
+    """Drop the init queue entry of a token ``_early_first_emit`` streamed."""
+    emitted = getattr(gen_batch, "_omlx_first_token_emitted", None)
+    if emitted is None:
+        return
+    delattr(gen_batch, "_omlx_first_token_emitted")
+    if state is None or not state.queue:
+        return
+    token_id, _lp, source = state.queue[0]
+    if emitted == (state.uid, token_id) and source == "init":
+        state.queue.popleft()
+        _bump_emit_stat(state, "init")
+
+
 def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
     """Return a valid singleton MTP state, lazily initializing if needed."""
     state = getattr(gen_batch, "_omlx_mtp_state", None)
@@ -1561,6 +1615,7 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
     if not _mtp_state_valid_for_batch(gen_batch, state):
         _drop_mtp_state(gen_batch, "post-init-invalid")
         return None
+    _take_early_first_token(gen_batch, state)
 
     # Eligibility already admitted this parked singleton. Mark the fresh
     # state unconditionally so a prefill arriving between the two checks
