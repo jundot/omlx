@@ -15,200 +15,229 @@ IPv6 egress every ``/admin/api/hf/*`` call returned 504 after exactly
 the 10 s HF API timeout, while browsers on the same machine loaded
 huggingface.co in ~150 ms because they race the families.
 
-``install()`` wraps ``socket.create_connection`` with a two-family race:
-the first IPv6 candidate gets a 300 ms head start, then the first IPv4
-candidate joins in parallel; the first success wins and the loser is
-closed.  Single-family names, explicit ``source_address`` bindings and
-non-(host, port) addresses delegate to the original implementation
-unchanged, so behaviour on healthy or IPv4-only networks is identical.
+``install()`` wraps ``socket.create_connection`` with a race on
+non-blocking sockets.  Addresses are tried in interleaved family order
+(the resolver's first family first), a new attempt starts every
+:data:`HAPPY_EYEBALLS_DELAY` seconds or at once when the previous one
+fails, the first connection to complete wins, and every other attempt is
+closed at once.  All attempts run in the calling thread on one
+``selectors`` loop, so no thread or socket outlives the call.  Each
+attempt keeps the per-address timeout of the stdlib, so a call never
+waits longer than plain ``socket.create_connection`` would.
+
+Single-family names, explicit ``source_address`` bindings and
+non-(host, port) addresses go to the original implementation unchanged,
+so behaviour on healthy or IPv4-only networks is identical.
 """
 
 from __future__ import annotations
 
+import errno
+import itertools
+import os
+import selectors
 import socket
-import threading
-from typing import Any, Optional
+import time
+from typing import Any
 
-#: How long to let the resolver-preferred family (IPv6 on dual-stack
-#: hosts) connect alone before starting the other family in parallel.
-#: Same value browsers use (RFC 8305 recommends ~300 ms).
+#: Time a pending attempt gets before the next address starts in
+#: parallel.  RFC 8305 section 5 recommends 250 ms; 300 ms is the value
+#: Chrome uses for its IPv6 fallback.
 HAPPY_EYEBALLS_DELAY = 0.3
 
-#: Sentinel for "caller did not pass a timeout", mirroring the semantics
-#: of ``socket._GLOBAL_DEFAULT_TIMEOUT``: leave the socket timeout alone.
-_UNSET = object()
-
-# The stdlib sentinel, if it exists; comparing against it keeps callers
-# that pass it explicitly working unchanged.
-_STDLIB_DEFAULT_TIMEOUT = getattr(socket, "_GLOBAL_DEFAULT_TIMEOUT", _UNSET)
+#: The stdlib's "caller did not pass a timeout" sentinel.
+_DEFAULT_TIMEOUT: Any = getattr(socket, "_GLOBAL_DEFAULT_TIMEOUT", object())
 
 _ORIGINAL_CREATE_CONNECTION = socket.create_connection
 
 _INSTALLED_ATTR = "_omlx_happy_eyeballs"
 
-_AddrInfo = tuple  # (family, type, proto, canonname, sockaddr) as returned by getaddrinfo()
+# connect_ex() results that mean "non-blocking connect is under way".
+_IN_PROGRESS = frozenset({errno.EINPROGRESS, errno.EWOULDBLOCK})
+
+_AddrInfo = tuple  # (family, type, proto, canonname, sockaddr) from getaddrinfo()
 
 
-def _normalize_timeout(timeout: Any) -> Any:
-    if timeout is _STDLIB_DEFAULT_TIMEOUT:
-        return _UNSET
-    return timeout
+def _raise_errors(exceptions: list[BaseException], all_errors: bool) -> None:
+    """Raise like the stdlib: the last error, or all of them as a group."""
+    if not exceptions:
+        raise OSError("getaddrinfo returns an empty list")
+    try:
+        if all_errors:
+            raise ExceptionGroup("create_connection failed", exceptions)
+        raise exceptions[-1]
+    finally:
+        exceptions.clear()  # break the reference cycle, as the stdlib does
 
 
-def _connect_one(info: _AddrInfo, timeout: Any) -> tuple[Optional[socket.socket], Optional[BaseException]]:
-    """Connect a single addrinfo tuple.
+def _connect_sequential(
+    addrinfos: list[_AddrInfo], timeout: Any, all_errors: bool
+) -> socket.socket:
+    """The stdlib loop: try every address in resolver order."""
+    exceptions: list[BaseException] = []
+    for family, socktype, proto, _canonname, sockaddr in addrinfos:
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            if timeout is not _DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            if not all_errors:
+                exceptions.clear()
+            exceptions.append(exc)
+            if sock is not None:
+                sock.close()
+    _raise_errors(exceptions, all_errors)
+    raise AssertionError("unreachable")  # pragma: no cover
 
-    Returns ``(socket, None)`` on success or ``(None, error)`` on
-    failure; never raises.
+
+def _interleave(addrinfos: list[_AddrInfo]) -> list[_AddrInfo]:
+    """RFC 8305 section 4: alternate families, the resolver's first first."""
+    first = addrinfos[0][0]
+    preferred = [info for info in addrinfos if info[0] == first]
+    other = [info for info in addrinfos if info[0] != first]
+    pairs = itertools.zip_longest(preferred, other)
+    return [info for pair in pairs for info in pair if info is not None]
+
+
+def _start_attempt(
+    info: _AddrInfo, exceptions: list[BaseException]
+) -> tuple[socket.socket | None, bool]:
+    """Start a non-blocking connect.
+
+    Returns ``(sock, True)`` when it connected at once, ``(sock, False)``
+    when it is under way, and ``(None, False)`` when it failed at once
+    (the error is appended to ``exceptions``).
     """
     family, socktype, proto, _canonname, sockaddr = info
-    sock: Optional[socket.socket] = None
+    sock = None
     try:
         sock = socket.socket(family, socktype, proto)
-        if timeout is not _UNSET:
-            sock.settimeout(timeout)
-        sock.connect(sockaddr)
-        return sock, None
+        sock.setblocking(False)
+        err = sock.connect_ex(sockaddr)
     except OSError as exc:
         if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
-        return None, exc
+            sock.close()
+        exceptions.append(exc)
+        return None, False
+    if err == 0:
+        return sock, True
+    if err in _IN_PROGRESS:
+        return sock, False
+    sock.close()
+    exceptions.append(OSError(err, os.strerror(err)))
+    return None, False
 
 
-def _connect_sequential(addrinfos: list[_AddrInfo], timeout: Any) -> socket.socket:
-    """Original stdlib semantics: try every address in resolver order,
-    raise the last error."""
-    last_exc: Optional[BaseException] = None
-    for info in addrinfos:
-        sock, exc = _connect_one(info, timeout)
-        if sock is not None:
-            return sock
-        last_exc = exc
-    if last_exc is not None:
-        raise last_exc
-    raise OSError("getaddrinfo returns an empty list")
+def _won(sock: socket.socket, timeout: Any) -> socket.socket:
+    """Give the winner the timeout mode the stdlib would have left on it."""
+    if timeout is _DEFAULT_TIMEOUT:
+        timeout = socket.getdefaulttimeout()
+    sock.settimeout(timeout)
+    return sock
 
 
-def connect_addrinfos(addrinfos: list[_AddrInfo], timeout: Any = _UNSET) -> socket.socket:
-    """Connect to the first reachable address using Happy Eyeballs.
+def _connect_race(
+    addrinfos: list[_AddrInfo], timeout: Any, all_errors: bool
+) -> socket.socket:
+    limit = socket.getdefaulttimeout() if timeout is _DEFAULT_TIMEOUT else timeout
+    if limit is not None and limit <= 0:
+        # A non-blocking connect request has no time to race in.
+        return _connect_sequential(addrinfos, timeout, all_errors)
 
-    ``addrinfos`` is a list of tuples as returned by
-    ``socket.getaddrinfo``.  When both families are represented, the
-    first IPv6 candidate gets :data:`HAPPY_EYEBALLS_DELAY` seconds alone
-    before the first IPv4 candidate is attempted in parallel; the first
-    success wins and the loser's socket is closed.  If both racing
-    candidates fail, the remaining addresses are tried sequentially
-    (original semantics) before the last error is raised.
-    """
-    timeout = _normalize_timeout(timeout)
-    if not addrinfos:
-        raise OSError("getaddrinfo returns an empty list")
+    queue = _interleave(addrinfos)
+    exceptions: list[BaseException] = []
+    pending: dict[socket.socket, float | None] = {}  # socket -> deadline
+    next_start = 0.0
+    selector = selectors.DefaultSelector()
+    try:
+        while queue or pending:
+            now = time.monotonic()
+            if queue and (not pending or now >= next_start):
+                sock, connected = _start_attempt(queue.pop(0), exceptions)
+                if connected:
+                    return _won(sock, timeout)
+                if sock is not None:
+                    selector.register(sock, selectors.EVENT_WRITE)
+                    pending[sock] = None if limit is None else now + limit
+                    next_start = now + HAPPY_EYEBALLS_DELAY
+                continue
 
-    v6 = [i for i in addrinfos if i[0] == socket.AF_INET6]
-    v4 = [i for i in addrinfos if i[0] == socket.AF_INET]
-    if not v6 or not v4:
-        # Single family: nothing to race, keep stdlib order and errors.
-        return _connect_sequential(addrinfos, timeout)
-
-    lock = threading.Lock()
-    winner: Optional[socket.socket] = None
-    errors: dict[str, BaseException] = {}
-    done = {"v6": False, "v4": False}
-    v4_started = False
-    first_done = threading.Event()  # first racing attempt produced a result
-    settled = threading.Event()  # success, or both racing attempts failed
-
-    def attempt(key: str, info: _AddrInfo, signal_first: bool) -> None:
-        nonlocal winner
-        try:
-            sock, exc = _connect_one(info, timeout)
-        except BaseException as unexpected:  # defensive: never strand the waiter
-            sock, exc = None, unexpected
-        with lock:
-            if sock is not None:
-                if winner is None:
-                    winner = sock
+            wakeups = [d for d in pending.values() if d is not None]
+            if queue:
+                wakeups.append(next_start)
+            wait = max(0.0, min(wakeups) - now) if wakeups else None
+            # With no timeout the kernel still ends every attempt (SYN
+            # retries run out), so this wait is bounded like connect().
+            for key, _events in selector.select(wait):
+                sock = key.fileobj
+                selector.unregister(sock)
+                del pending[sock]
+                try:
+                    err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                except OSError as exc:
+                    err, failure = -1, exc
                 else:
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
-            elif exc is not None:
-                errors[key] = exc
-            done[key] = True
-            if winner is not None or (done["v6"] and done["v4"]):
-                settled.set()
-        if signal_first:
-            first_done.set()
+                    failure = OSError(err, os.strerror(err))
+                if err == 0:
+                    return _won(sock, timeout)
+                sock.close()
+                exceptions.append(failure)
+                next_start = 0.0  # a failure starts the next address at once
 
-    t6 = threading.Thread(
-        target=attempt, args=("v6", v6[0], True), daemon=True, name="omlx-happy-eyeballs-v6"
-    )
-    t6.start()
+            now = time.monotonic()
+            for sock, deadline in list(pending.items()):
+                if deadline is not None and now >= deadline:
+                    selector.unregister(sock)
+                    del pending[sock]
+                    sock.close()
+                    exceptions.append(TimeoutError("timed out"))
+                    next_start = 0.0
+    finally:
+        selector.close()
+        for sock in pending:  # every attempt that did not win
+            sock.close()
+    _raise_errors(exceptions, all_errors)
+    raise AssertionError("unreachable")  # pragma: no cover
 
-    # Give the resolver-preferred family a head start, but join the race
-    # early if it fails fast.
-    first_done.wait(HAPPY_EYEBALLS_DELAY)
-    with lock:
-        sock = winner
-        if sock is None and not v4_started:
-            v4_started = True
-            t4 = threading.Thread(
-                target=attempt,
-                args=("v4", v4[0], False),
-                daemon=True,
-                name="omlx-happy-eyeballs-v4",
-            )
-            t4.start()
-    if sock is not None:
-        return sock
 
-    settled.wait()
-    with lock:
-        sock = winner
-        last_exc = errors.get("v4") or errors.get("v6")
-    if sock is not None:
-        return sock
+def connect_addrinfos(
+    addrinfos: list[_AddrInfo],
+    timeout: Any = _DEFAULT_TIMEOUT,
+    *,
+    all_errors: bool = False,
+) -> socket.socket:
+    """Connect to the first reachable address of ``getaddrinfo()`` results.
 
-    # Both racing candidates failed: sweep the remaining addresses with
-    # the original sequential logic so we do not try fewer addresses than
-    # the stdlib would have.
-    rest = [i for i in addrinfos if i is not v6[0] and i is not v4[0]]
-    if rest:
-        try:
-            return _connect_sequential(rest, timeout)
-        except BaseException as exc:
-            last_exc = exc
-    if last_exc is not None:
-        raise last_exc
-    raise OSError("all connection attempts failed")
+    Races the families when both IPv4 and IPv6 are present, otherwise
+    keeps the stdlib's sequential order and errors.
+    """
+    families = {info[0] for info in addrinfos}
+    if {socket.AF_INET, socket.AF_INET6} <= families:
+        return _connect_race(addrinfos, timeout, all_errors)
+    return _connect_sequential(addrinfos, timeout, all_errors)
 
 
 def create_connection(
-    address: Any, timeout: Any = _UNSET, source_address: Any = None
+    address: Any,
+    timeout: Any = _DEFAULT_TIMEOUT,
+    source_address: Any = None,
+    *,
+    all_errors: bool = False,
 ) -> socket.socket:
     """``socket.create_connection`` replacement with Happy Eyeballs."""
-    if source_address is not None:
-        if timeout is _UNSET:
-            return _ORIGINAL_CREATE_CONNECTION(address, source_address=source_address)
-        return _ORIGINAL_CREATE_CONNECTION(address, timeout, source_address=source_address)
     try:
         host, port = address
     except (TypeError, ValueError):
-        # Let the original raise its exact error for malformed addresses.
-        if timeout is _UNSET:
-            return _ORIGINAL_CREATE_CONNECTION(address)
-        return _ORIGINAL_CREATE_CONNECTION(address, timeout)
-    if not isinstance(host, str):
-        if timeout is _UNSET:
-            return _ORIGINAL_CREATE_CONNECTION(address)
-        return _ORIGINAL_CREATE_CONNECTION(address, timeout)
-    timeout = _normalize_timeout(timeout)
+        host = port = None
+    if source_address is not None or not isinstance(host, str):
+        return _ORIGINAL_CREATE_CONNECTION(
+            address, timeout, source_address, all_errors=all_errors
+        )
     addrinfos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-    return connect_addrinfos(addrinfos, timeout)
+    return connect_addrinfos(addrinfos, timeout, all_errors=all_errors)
 
 
 def install() -> bool:
