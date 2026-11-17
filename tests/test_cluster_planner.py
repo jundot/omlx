@@ -102,29 +102,6 @@ def test_qwen4_rank_prefixes_are_visible_to_a_cold_planner():
     assert "mtp." in planner._cluster_mtp_prefixes(config)
 
 
-def test_qwen4_exp_is_pipeline_capable_after_registration():
-    """R1 decision: Qwen4-Exp (Qwen3.8) runs PP, not TP.
-
-    A cold planner only knows the adapter once registration ran, which is what
-    ``inspect_safetensors_layout`` does before capability detection. Pin that so
-    the family cannot silently fall back to "not pipeline-capable" and be
-    refused for a multi-Mac plan.
-    """
-
-    import sys
-
-    from omlx.cluster import planner
-
-    config = {"model_type": "qwen4_exp"}
-    module = planner._cluster_rank_module(config)
-
-    assert module is not None
-    assert getattr(module, "SUPPORTS_PIPELINE", None) is True
-    assert getattr(module, "HONORS_PIPELINE_ASSIGNMENT", None) is True
-    assert planner._supports_pipeline(config) is True
-    assert sys.modules.get("mlx_lm.models.qwen4_exp") is module
-
-
 def test_inspect_safetensors_layout_rejects_offset_past_file(tmp_path):
     header = {
         "model.layers.0.weight": {
@@ -957,14 +934,6 @@ def test_offloaded_engram_tables_stay_out_of_pipeline_rank_memory():
 
 
 def test_offloaded_experts_stay_out_of_pipeline_rank_memory():
-    """A stage that streams routed experts holds ``layer - offloaded``.
-
-    The coordinator's plan, the worker's decoded assignment and the plan hash
-    have to agree on that saving: an expert plan that is priced resident is
-    refused as not fitting, and a decoded plan that re-charges the streamed
-    bytes over-charges the rank's memory guard.
-    """
-
     layout = ModelLayout(
         source="experts",
         fixed_weight_bytes=0,

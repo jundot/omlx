@@ -1703,30 +1703,6 @@ def _engram_tables(config: dict[str, Any]) -> tuple[frozenset[str], tuple[str, .
     return frozenset(names), tuple(sorted(files))
 
 
-def _qwen4_ple_layer_ids(config: dict[str, Any]) -> tuple[int, ...]:
-    """The zero-based layers whose Qwen4-Exp PLE n-gram table can live on SSD.
-
-    The checkpoint declares ``ple_layer_ids`` one-based inside ``text_config``
-    (Qwen4-Exp builds ``ple_layer_ids.index(layer_idx + 1)``). Missing or
-    malformed declarations mean "no PLE table", never an estimate.
-    """
-
-    text = config.get("text_config")
-    source = text if isinstance(text, dict) else config
-    raw = source.get("ple_layer_ids")
-    if not isinstance(raw, list) or not raw:
-        return ()
-    layers: set[int] = set()
-    for value in raw:
-        if isinstance(value, bool) or not isinstance(value, int):
-            return ()
-        index = value - 1
-        if index < 0:
-            return ()
-        layers.add(index)
-    return tuple(sorted(layers))
-
-
 def _is_qwen4_ple_tensor(name: str, layers: tuple[int, ...]) -> bool:
     if not layers:
         return False
