@@ -449,9 +449,16 @@ def test_cluster_plan_follows_the_saved_engram_ssd_offload_setting(monkeypatch):
     assert offloaded["placement_signature"] != resident["placement_signature"]
 
 
-def test_cluster_plan_follows_the_saved_moe_expert_offload_setting(
+def test_cluster_plan_prices_the_saved_moe_expert_offload_setting(
     tmp_path, monkeypatch
 ):
+    """The coordinator's own plan must not re-charge streamed experts.
+
+    The assistant elects from the same saved setting, so a coordinator plan
+    that priced every expert resident would refuse a placement the election
+    approved (or vice versa).
+    """
+
     from omlx.cluster.planner import ModelLayout
 
     gib = 1024**3
@@ -470,14 +477,28 @@ def test_cluster_plan_follows_the_saved_moe_expert_offload_setting(
         "omlx.patches.moe_offload_compat.moe_offload_compatibility",
         lambda _path: (True, ""),
     )
+    calls = []
+
+    def fake_plan(path, fraction, mtp_resident=False):
+        calls.append((str(path), fraction, mtp_resident))
+        # Half of each layer's experts stay resident, so half stream (2 GiB).
+        return SimpleNamespace(
+            count=8,
+            capacity=4,
+            layer_bytes={
+                f"language_model.layers.{index}.ffn.experts": gib
+                for index in range(4)
+            },
+        )
+
     monkeypatch.setattr(
-        "omlx.patches.deepseek_v41.moe_offload.offload_layer_bytes",
-        lambda _path, _fraction, **_kwargs: (0, 2 * gib, 0, 0),
+        "omlx.patches.deepseek_v41.moe_offload._plan",
+        fake_plan,
     )
     saved = {
         "v41": SimpleNamespace(
             moe_expert_offload_enabled=True,
-            moe_expert_offload_resident_fraction=0.125,
+            moe_expert_offload_resident_fraction=0.5,
             deepseek_v41_engram_ssd_offload=False,
             mtp_enabled=False,
         )
@@ -502,36 +523,48 @@ def test_cluster_plan_follows_the_saved_moe_expert_offload_setting(
         ],
     }
 
-    response = _client().post("/admin/api/cluster/plan", json=body)
+    offloaded = _client().post("/admin/api/cluster/plan", json=body)
+    saved["v41"].moe_expert_offload_enabled = False
+    resident = _client().post("/admin/api/cluster/plan", json=body)
 
-    assert response.status_code == 200
-    assignment = response.json()["assignments"][0]
-    assert assignment["moe_expert_offload_resident_fraction"] == 0.125
+    assert offloaded.status_code == resident.status_code == 200
+    assignment = offloaded.json()["assignments"][0]
+    assert assignment["moe_expert_offload_resident_fraction"] == 0.5
     assert assignment["moe_offload_weight_bytes"] == 2 * gib
-    assert assignment["planned_weight_bytes"] == (
-        gib + 4 * 4 * gib - 2 * gib
-    )
+    assert assignment["layer_weight_bytes"] == 16 * gib
+    assert assignment["planned_weight_bytes"] == gib + 16 * gib - 2 * gib
+    assert calls == [(str(tmp_path), 0.5, False)]
 
+    untouched = resident.json()["assignments"][0]
+    assert untouched["layer_weight_bytes"] == 16 * gib
+    assert untouched["planned_weight_bytes"] == gib + 16 * gib
+    assert "moe_offload_weight_bytes" not in untouched
 
 def test_moe_offload_allows_deepseek_v41_with_mtp(tmp_path, monkeypatch):
     from omlx.cluster.planner import ModelLayout
 
+    gib = 1024**3
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
-    monkeypatch.setattr(
-        routes, "_saved_moe_offload", lambda _path: (True, 0.5)
-    )
+    monkeypatch.setattr(routes, "_saved_moe_offload", lambda _path: (True, 0.5))
     monkeypatch.setattr(
         "omlx.patches.moe_offload_compat.moe_offload_compatibility",
         lambda _path: (True, ""),
     )
-    monkeypatch.setattr(
-        "omlx.patches.deepseek_v41.moe_offload.offload_layer_bytes",
-        lambda _path, _fraction, **_kwargs: (0,),
-    )
+    calls = []
+
+    def fake_plan(path, fraction, mtp_resident=False):
+        calls.append((str(path), fraction, mtp_resident))
+        return SimpleNamespace(
+            count=8,
+            capacity=4,
+            layer_bytes={"language_model.layers.0.ffn.experts": 2 * gib},
+        )
+
+    monkeypatch.setattr("omlx.patches.deepseek_v41.moe_offload._plan", fake_plan)
     layout = ModelLayout(
         source=str(tmp_path),
         fixed_weight_bytes=1,
-        layer_weight_bytes=(1,),
+        layer_weight_bytes=(2 * gib,),
         mtp_weight_bytes=1,
     )
 
@@ -543,8 +576,10 @@ def test_moe_offload_allows_deepseek_v41_with_mtp(tmp_path, monkeypatch):
     )
 
     assert fraction == 0.5
-    assert layer_bytes == (0,)
-
+    # Half of the experts stay resident; the MTP head is not a routed expert,
+    # and the loader is told to keep it resident while experts stream.
+    assert layer_bytes == (gib,)
+    assert calls == [(str(tmp_path), 0.5, True)]
 
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
     from omlx.cluster.planner import ModelLayout
@@ -1535,6 +1570,7 @@ def test_forget_member_preserves_other_pairings_or_leaves_cluster(monkeypatch, n
 @pytest.mark.parametrize("status", [409, 503])
 def test_forget_member_does_not_unpair_when_local_teardown_fails(monkeypatch, status):
     from fastapi import HTTPException
+
     from omlx.cluster import pairing_routes
 
     removed = []
