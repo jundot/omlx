@@ -521,6 +521,28 @@ def test_systemone_noul_reads_out_the_predicate_prompt():
     assert "A. Yes: Down.\n" in engine.calls[2]["messages"][0]["content"]
 
 
+def test_systemone_refuses_what_a_chat_model_cannot_read_out():
+    """A box has a readout of its own; a letter readout would answer "yes"."""
+    box = _systemone(cat={"type": "box", "instructions": "Where is the cat?"})
+    with pytest.raises(decisions.DecisionsRequestError, match="decision model"):
+        decisions.decisions_request(box)
+
+    multiple = _systemone(
+        q={"type": "choice", "multiple": True, "criteria": {"a": "A", "b": "B"}}
+    )
+    with pytest.raises(decisions.DecisionsRequestError, match="one option"):
+        decisions.decisions_request(multiple)
+
+    no_state = SystemOneRequest.model_validate(
+        {
+            "model": "m",
+            "questions": {"q": {"type": "noul", "instructions": "Urgent?"}},
+        }
+    )
+    with pytest.raises(decisions.DecisionsRequestError, match="state"):
+        decisions.decisions_request(no_state)
+
+
 def test_systemone_answers_skip_the_refusal_check():
     # Letters without the next-token mass are a refusal in /v1/decisions.
     engine = _FakeChatEngine(

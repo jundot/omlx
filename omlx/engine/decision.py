@@ -23,6 +23,7 @@ from ..model_discovery import decision_kind
 from ..models.clef import ClefModel
 from ..models.d1 import D1Model
 from ..models.d3 import D3Model
+from ..models.decision import check_question_types, check_state
 from ..models.openjev import OpenJevModel
 from ..scheduler import _CONTENDED_CHUNK_FLOOR, SchedulerConfig
 from .base import BaseNonStreamingEngine
@@ -119,6 +120,8 @@ class DecisionEngine(BaseNonStreamingEngine):
         Raises the model's request errors before any GPU work starts.
         """
         model = self._require_model()
+        check_question_types(self._kind, request.get("questions"))
+        check_state(self._kind, request.get("state"))
         return await asyncio.to_thread(model.encode, request, truncate)
 
     async def systemone(self, plan: Any) -> dict:

@@ -312,6 +312,33 @@ The response includes text, the audio duration, and one segment per speaker turn
 
 Streaming is not supported, and `chunking_strategy` must be `auto` or omitted; the whole file goes to the model. Models without timed speaker labels, including Nemotron checkpoints without the CTC alignment files, return HTTP 400.
 
+#### Bounding boxes
+
+A LiquidAI d1 model locates things as well as classifying them. A `box` question answers one object and a `boxes` question every instance of something, as fractions of the picture, each with the probability it was found and a confidence. The request carries exactly one image and needs no `state` at all: a `box` or `boxes` question reads the picture, so the key can be left out.
+
+```json
+{
+  "model": "d1-2B",
+  "images": ["data:image/jpeg;base64,..."],
+  "questions": {
+    "remote": {"type": "box", "instructions": "Where is the remote control?"},
+    "cats": {"type": "boxes", "instructions": "Every cat.", "max": 4}
+  }
+}
+```
+
+```json
+{"answers": {
+  "remote": {"type": "box", "box": {"top": 0.153, "bottom": 0.241, "left": 0.058, "right": 0.273}, "found": 1.0, "confidence": 0.9369},
+  "cats": {"type": "boxes", "count": 2, "at_least": false, "boxes": [
+    {"box": {"top": 0.115, "bottom": 0.984, "left": 0.016, "right": 0.495}, "found": 1.0, "confidence": 0.9402},
+    {"box": {"top": 0.054, "bottom": 0.774, "left": 0.531, "right": 0.999}, "found": 0.9972, "confidence": 0.9402}
+  ]}
+}}
+```
+
+Edges are fractions of the picture with the origin at the top left. A `number` question with a `range` estimates a count the same way. The `text` and `date` reads, which point at spans of the state instead of a picture, need a readout oMLX does not run yet.
+
 ### Tool Calling & Structured Output
 
 Supports all function calling formats available in mlx-lm, JSON schema validation, and MCP tool integration. Tool calling requires the model's chat template to support the `tools` parameter. The following model families are auto-detected:
@@ -354,7 +381,7 @@ Models are auto-detected by type. You can also download models directly from the
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
-| Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
+| Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge), LiquidAI d1 (d1-2B) |
 
 ## CLI Configuration
 

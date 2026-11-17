@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,73 @@ class DecisionRequestError(ValueError):
 
 class DecisionContextLengthError(ValueError):
     """The prompt does not fit the model's context limit."""
+
+
+# The question types each decision family has a readout for. ``box`` and
+# ``boxes`` are d1's picture readout, a presence and four edges scored at the
+# answer slots of one picture; the pointer reads (``text``, ``date``, and a
+# ``number`` without a ``range``) score positions in the state, which no oMLX
+# forward computes yet, so d1 refuses those itself, where the forward lives.
+QUESTION_TYPES: dict[str, tuple[str, ...]] = {
+    "clef": ("noul", "choice", "score"),
+    "openjev": ("noul", "choice", "score"),
+    "d3": ("noul", "choice", "score"),
+    "d1": ("noul", "choice", "score", "number", "box", "boxes", "text", "date"),
+}
+
+
+# A ``multiple: true`` choice scores every option with its own yes/no, which
+# only d1's slots do: the other families answer a choice with one pick.
+MULTIPLE_CHOICE = ("d1",)
+
+
+def check_question_types(
+    kind: str | None, questions: Any, where: str = "questions"
+) -> None:
+    """Refuse a question the served family has no readout for.
+
+    Runs before any GPU work, because a family that does not know a type does
+    not always say so: Clef reads an unknown one as a score and OpenJev as a
+    noul, so a ``box`` question would come back as a confident yes or no.
+    """
+    served = QUESTION_TYPES.get(kind or "")
+    if served is None or not isinstance(questions, Mapping):
+        return
+    for name, question in questions.items():
+        if not isinstance(question, Mapping):
+            continue
+        asked = question.get("type")
+        if asked not in served:
+            needs_d1 = (
+                " A box needs a d1 model such as LiquidAI/d1-2B."
+                if asked in ("box", "boxes")
+                else ""
+            )
+            raise DecisionRequestError(
+                f"{where}.{name}: {kind} models answer {' or '.join(served)} "
+                f"questions, not {asked!r}.{needs_d1}"
+            )
+        if question.get("multiple") and kind not in MULTIPLE_CHOICE:
+            raise DecisionRequestError(
+                f"{where}.{name}: a {kind} model picks one option, so it cannot "
+                "answer a choice with multiple; a d1 model scores each option "
+                "on its own"
+            )
+
+
+# The families whose prompt reads its questions after a state, so a request has
+# to carry one. d1 answers from a picture alone, where the state is null and
+# its prompt carries neither a state block nor a QUESTION: header.
+STATE_REQUIRED = ("clef", "openjev", "d3")
+
+
+def check_state(kind: str | None, state: Any) -> None:
+    """Refuse a request with no state on a family whose prompt has one."""
+    if state is None and kind in STATE_REQUIRED:
+        raise DecisionRequestError(
+            f"state: a {kind} model reads its questions after a state, so it "
+            "cannot be null; pass a string or an object"
+        )
 
 
 def round4(value: float) -> float:
