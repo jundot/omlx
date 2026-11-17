@@ -3766,6 +3766,56 @@ def test_block_drafter_matches_standard_and_feeds_committed_context(
     assert sorted(drafter.released) == sorted(terminal)
 
 
+@pytest.mark.parametrize("join_step", [None, 1, 2, 3])
+def test_block_drafter_streams_first_token_before_drafting(join_step):
+    """The prompt's token comes out before the drafter's init forward and
+    first draft; a request joining around that call keeps standard output."""
+    prompts = [[1, 2], [10, 11, 12]]
+    limits = [10, 6]
+    standard = CapturingCountingModel()
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, prompts, limits)
+
+    model = _drafted_counting_model(4)
+    drafter = model._omlx_drafter
+    bg.apply()
+    cache_rollback.apply()
+    gen = BatchGenerator(
+        model,
+        sampler=lambda lp: mx.argmax(lp, -1),
+        prefill_batch_size=len(prompts),
+        max_tokens=max(limits),
+    )
+    output, terminal = {}, {}
+    jobs_at_first_token = None
+    try:
+        (first_uid,) = gen.insert(prompts[:1], max_tokens=limits[:1])
+        output[first_uid] = []
+        uids = [first_uid]
+        for step in range(100):
+            if step == join_step:
+                (late_uid,) = gen.insert(prompts[1:], max_tokens=limits[1:])
+                output[late_uid] = []
+                uids.append(late_uid)
+            _, responses = gen.next()
+            for response in responses:
+                assert response.uid not in terminal
+                if response.uid == first_uid and not output[first_uid]:
+                    jobs_at_first_token = drafter.jobs
+                output[response.uid].append(response.token)
+                if response.finish_reason:
+                    terminal[response.uid] = response
+            if len(terminal) == len(uids) and (join_step is None or step >= join_step):
+                break
+    finally:
+        gen.close()
+    assert jobs_at_first_token == 0
+    assert drafter.jobs > 0
+    assert output[first_uid] == expected[0]
+    if join_step is not None:
+        assert output[uids[1]] == expected[1]
+
+
 @pytest.mark.parametrize("wrong", [None, 0, 3])
 def test_block_drafter_copies_keep_output_and_context(monkeypatch, wrong):
     from omlx.patches.mlx_lm_mtp import context_copy
