@@ -208,6 +208,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         /// Splash launcher path; nil means the server detects it.
         let splashPath: String?
         let splashKvFormat: String?
+        let splashActivations: String?
         let splashMaxMemoryGb: Double?
         let splashSsdCacheGb: Double?
         let splashAnePrefill: Bool?
@@ -332,6 +333,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     // detection; `.null` sizes return to automatic sizing.
     var splashPath: String? = nil
     var splashKvFormat: String? = nil
+    var splashActivations: String? = nil
     var splashMaxMemoryGb: PatchOptionalInt? = nil
     var splashSsdCacheGb: PatchOptionalInt? = nil
     var splashAnePrefill: Bool? = nil

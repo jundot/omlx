@@ -528,6 +528,8 @@
   "settings.integrations.splash.cancel": "Cancel",
   "settings.integrations.splash.kv_format": "KV cache precision",
   "settings.integrations.splash.kv_format_hint": "int8 holds about twice the context of bf16 in the same memory.",
+  "settings.integrations.splash.activations": "Précision des activations",
+  "settings.integrations.splash.activations_hint": "Sur M5 et plus récent, bf16 garde l'attention en bf16 ; auto laisse Splash choisir int8 quand c'est plus rapide. S'applique à Splash 1.6.1 et ultérieur.",
   "settings.integrations.splash.max_memory": "Memory limit",
   "settings.integrations.splash.max_memory_hint": "Empty gives Splash enough for the model's full context window. A larger limit gives its prefix cache more room; on a smaller Mac Splash fits a shorter context to the memory left. oMLX counts the memory Splash plans against its own limit.",
   "settings.integrations.splash.ssd_cache": "SSD cache",

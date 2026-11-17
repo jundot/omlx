@@ -9,7 +9,8 @@ final class IntegrationsScreenVM {
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
         case hermesModel, copilotModel, dshModel, vibeModel
         case mcpConfig
-        case splashPath, splashLimits, splashKvFormat, splashAnePrefill
+        case splashPath, splashLimits, splashKvFormat, splashActivations
+        case splashAnePrefill
         case markitdownEnabled, markitdownExposeModel, markitdownMaxFileSize
         case markitdownMaxFiles, markitdownPdfProcessingEngine
     }
@@ -39,6 +40,7 @@ final class IntegrationsScreenVM {
     var splashPathDraft: String = ""
     var editingSplashPath = false
     var splashKvFormat: String = "int8"
+    var splashActivations: String = "bf16"
     var splashAnePrefill = true
     /// Whole GB as text; empty means automatic.
     var splashMaxMemoryGb: String = ""
@@ -299,6 +301,7 @@ final class IntegrationsScreenVM {
                 self.dshModel             = it.dshModel ?? ""
                 self.splashPathSetting    = it.splashPath ?? ""
                 self.splashKvFormat       = it.splashKvFormat ?? "int8"
+                self.splashActivations    = it.splashActivations ?? "bf16"
                 self.splashAnePrefill     = it.splashAnePrefill ?? true
                 self.splashMaxMemoryGb    = Self.gigabytesText(it.splashMaxMemoryGb)
                 self.splashSsdCacheGb     = Self.gigabytesText(it.splashSsdCacheGb)
@@ -374,6 +377,7 @@ final class IntegrationsScreenVM {
         case .splashPath:
             patch.splashPath = Self.trimmed(splashPathDraft)
         case .splashKvFormat:       patch.splashKvFormat = splashKvFormat
+        case .splashActivations:    patch.splashActivations = splashActivations
         case .splashAnePrefill:     patch.splashAnePrefill = splashAnePrefill
         case .splashLimits:
             guard let memory = Self.gigabytesPatch(splashMaxMemoryGb, minimum: 1),
