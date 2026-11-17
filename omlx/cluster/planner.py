@@ -388,9 +388,12 @@ class PipelineAssignment:
     # Part of ``layer_weight_bytes`` this rank reads via mmap (offloaded Engram
     # tables). Nonzero also tells the rank to load its tables that way.
     ssd_weight_bytes: int = 0
-    # Routed experts this rank reads from the checkpoint instead of holding.
+    # Routed experts this rank streams from the checkpoint instead of holding.
     # The fraction is the loader setting; the bytes are the planner's share of
     # the stage, so the rank's guard and the plan agree on what stays resident.
+    # Deliberately separate from ``ssd_weight_bytes``: the worker uses that one
+    # to decide whether to mmap Engram tables, and expert offload must not
+    # trigger it.
     moe_expert_offload_resident_fraction: float = 0.0
     moe_offload_weight_bytes: int = 0
     # KV cache this node must hold at the planned context length. Counted as
@@ -485,14 +488,16 @@ class PipelineAssignment:
             "tensor_parallel_size": self.tensor_parallel_size,
             "sharded_weight_bytes": self.sharded_weight_bytes,
             "ssd_weight_bytes": self.ssd_weight_bytes,
-            "moe_expert_offload_resident_fraction": (
-                self.moe_expert_offload_resident_fraction
-            ),
-            "moe_offload_weight_bytes": self.moe_offload_weight_bytes,
             "kv_cache_bytes": self.kv_cache_bytes,
             "kv_bytes_per_token": self.kv_bytes_per_token,
             "max_context_tokens": self.max_context_tokens,
         }
+        # Omitted when 0 so a resident plan's payload is unchanged.
+        if self.moe_offload_weight_bytes:
+            result["moe_expert_offload_resident_fraction"] = (
+                self.moe_expert_offload_resident_fraction
+            )
+            result["moe_offload_weight_bytes"] = self.moe_offload_weight_bytes
         if self.predicted_stage_seconds is not None:
             result["predicted_compute_seconds"] = self.predicted_compute_seconds
             result["predicted_send_seconds"] = self.predicted_send_seconds
@@ -1783,7 +1788,7 @@ def plan_unequal_pipeline(
     microbatch_size: int = 1,
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
     engram_ssd_offload: bool = False,
-    moe_offload_layer_bytes: tuple[int, ...] = (),
+    moe_offload_layer_bytes: Sequence[int] = (),
     moe_expert_offload_resident_fraction: float = 0.0,
 ) -> ShardPlan:
     """Assign contiguous layers in MLX pipeline order across unequal nodes."""
@@ -1839,9 +1844,16 @@ def _held_layer_bytes(
     model: ModelLayout,
     engram_ssd_offload: bool,
     *,
-    moe_offload_layer_bytes: tuple[int, ...] = (),
+    moe_offload_layer_bytes: Sequence[int] = (),
 ) -> tuple[int, ...]:
-    """Per-layer bytes a pipeline stage holds in memory."""
+    """Per-layer bytes a pipeline stage holds in memory.
+
+    Offloaded Engram/PLE tables and offloaded routed experts are both read from
+    the checkpoint at load instead of being held, so neither is chargeable to
+    the stage. The two are kept apart on the assignment (``ssd_weight_bytes``
+    is the table share only) because the worker uses that field to decide
+    whether to mmap tables.
+    """
 
     held = (
         model.tensor_parallel_layer_bytes
@@ -1851,11 +1863,9 @@ def _held_layer_bytes(
     if not moe_offload_layer_bytes:
         return held
     if len(moe_offload_layer_bytes) != model.layer_count:
-        raise PlanningError(
-            "MoE offload layer bytes must cover every model layer"
-        )
+        raise PlanningError("MoE offload layer bytes must cover every model layer")
     return tuple(
-        max(0, weight - offloaded)
+        max(0, weight - int(offloaded))
         for weight, offloaded in zip(held, moe_offload_layer_bytes)
     )
 
@@ -1913,7 +1923,7 @@ def plan_proportional_pipeline(
     microbatch_size: int = 1,
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
     engram_ssd_offload: bool = False,
-    moe_offload_layer_bytes: tuple[int, ...] = (),
+    moe_offload_layer_bytes: Sequence[int] = (),
     moe_expert_offload_resident_fraction: float = 0.0,
 ) -> ShardPlan:
     """RAM-proportional N-node pipeline plan (largest-remainder, exo-style).
@@ -1990,16 +2000,14 @@ def _finish_pipeline_plan(
     context_tokens: int,
     optimization: str,
     engram_ssd_offload: bool = False,
-    moe_offload_layer_bytes: tuple[int, ...] = (),
+    moe_offload_layer_bytes: Sequence[int] = (),
     moe_expert_offload_resident_fraction: float = 0.0,
 ) -> ShardPlan:
     """Assignments, per-node fit checks, and the signed hash for a partition."""
 
     performance_aware = all(node.performance is not None for node in pipeline_nodes)
     if moe_offload_layer_bytes and len(moe_offload_layer_bytes) != model.layer_count:
-        raise PlanningError(
-            "MoE offload layer bytes must cover every model layer"
-        )
+        raise PlanningError("MoE offload layer bytes must cover every model layer")
     held_layer_bytes = _held_layer_bytes(
         model,
         engram_ssd_offload,
@@ -2112,6 +2120,8 @@ def _finish_pipeline_plan(
                     if item.ssd_weight_bytes
                     else {}
                 ),
+                # Also omitted when 0: a resident plan's hash must not change
+                # just because the planner learned to price expert offload.
                 **(
                     {
                         "moe_expert_offload_resident_fraction": (
@@ -2373,7 +2383,7 @@ def plan_hybrid(
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
     head_rank_extra_bytes: int = 0,
     engram_ssd_offload: bool = False,
-    moe_offload_layer_bytes: tuple[int, ...] = (),
+    moe_offload_layer_bytes: Sequence[int] = (),
     moe_expert_offload_resident_fraction: float = 0.0,
 ) -> ShardPlan:
     """Plan hybrid pipeline + tensor parallelism across nodes.
@@ -2381,6 +2391,9 @@ def plan_hybrid(
     ``head_rank_extra_bytes`` are weights only rank zero holds (an unsharded
     Lightning MTP head). ``engram_ssd_offload`` matters only without tensor
     parallelism, because tensor-parallel ranks always read Engram from SSD.
+    ``moe_offload_layer_bytes`` are per-layer routed-expert bytes the rank
+    streams from the checkpoint instead of holding; ``()`` means the whole
+    checkpoint stays resident and reproduces the resident plan exactly.
 
     Combines contiguous pipeline stages with tensor-parallel weight sharding.
     The world is 2D: pipeline_stages * tensor_parallel_size == len(nodes).
