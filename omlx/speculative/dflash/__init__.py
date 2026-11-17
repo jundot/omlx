@@ -177,14 +177,8 @@ def load_dflash_drafter(
     checkpoint's context window.
     """
     adaptive = resolve_verify_mode(verify_mode)
-    # Spark X2.5/X2.6 ships its DSpark draft as a ``SparkDSparkDraftModel``
-    # checkpoint. The stock mlx-vlm ``load_drafter`` cannot load it (the
-    # architecture is not registered), so route it through the bundled Spark
-    # adapter, which patches the target capture hooks, promotes the draft to
-    # FP32 (the official llama.cpp dflash graph computes in FP32) and honors
-    # the sigmoid per-head gate. ``quant_bits`` is applied by the adapter's
-    # caller via ``quantize_drafter`` below for the generic path; the Spark
-    # adapter quantizes its own linear layers here.
+    # Spark DSpark drafts are a ``SparkDSparkDraftModel`` that stock
+    # mlx-vlm cannot load; route them through the bundled adapter.
     from omlx.patches.spark_dspark import (
         load_spark_dspark_drafter,
     )
@@ -203,9 +197,7 @@ def load_dflash_drafter(
             depth=block_size - 1 if block_size else None,
             fixed=not adaptive,
         )
-        # Override the trained block size with the configured depth.
-        # ``dflash_block_size`` is draft+verify tokens per cycle (anchor +
-        # proposals); the drafter's ``depth`` is the proposal count.
+        # ``dflash_block_size`` is anchor+proposals; depth is proposals.
         target_block = resolve_block_size(
             drafter.model, block_size, getattr(target_model, "_omlx_mtp_max_verify_rows", None)
         )
