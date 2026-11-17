@@ -9,10 +9,13 @@ import omlx.affine4 as a4
 from tests.test_affine4 import require_tensor_ops
 
 
+@pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("keys,rows", [(4096, 1024), (6144, 2048)])
-def test_q8q_matches_the_dequantize_route(monkeypatch, keys, rows):
+def test_q8q_matches_the_dequantize_route(monkeypatch, keys, rows, split):
     require_tensor_ops()
     monkeypatch.setattr(a4, "_Q8Q_MIN_KEYS", 1024)
+    monkeypatch.setattr(a4, "_Q8Q_SPLIT", split)
+    monkeypatch.setattr(a4, "_Q8Q_SPLIT_MIN_KEYS", 1024)
     cache = a4.Affine8KVCache()
     for start in range(0, keys, 2048):
         n = min(2048, keys - start)

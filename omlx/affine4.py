@@ -57,6 +57,8 @@ _DEQUANTIZE_LAUNCHABLE = {}
 # tensor ops). OMLX_ATTN_Q8Q=0 turns it off.
 _Q8Q_ATTENTION = __import__("os").environ.get("OMLX_ATTN_Q8Q", "1") == "1"
 _Q8Q_MIN_KEYS = int(__import__("os").environ.get("OMLX_ATTN_Q8Q_MIN_KEYS", "16384"))
+_Q8Q_SPLIT = int(__import__("os").environ.get("OMLX_ATTN_Q8Q_SPLIT", "8"))
+_Q8Q_SPLIT_MIN_KEYS = 65536
 
 
 def _q8q_prefill_attention(cache, queries, keys_state, values_state, scale):
@@ -86,7 +88,10 @@ def _q8q_prefill_attention(cache, queries, keys_state, values_state, scale):
     rotated_queries = cache.key_codec.prepare_queries(queries).astype(mx.bfloat16)
     k = _q8q.prepare_kv(ks.indices, ks.norms)
     v = _q8q.prepare_kv(vs.indices, vs.norms)
-    rotated_output = _q8q.run(rotated_queries, k, v, scale)
+    # Long histories run several threadgroups per tile (shorter threadgroups
+    # keep the GPU busier); short ones gain nothing from the extra combine.
+    split = _Q8Q_SPLIT if tokens >= _Q8Q_SPLIT_MIN_KEYS else 1
+    rotated_output = _q8q.run(rotated_queries, k, v, scale, split=split)
     output = cache.value_codec._rotate_inverse(rotated_output).astype(queries.dtype)
     mx.eval(output)
     output = mx.array(output)

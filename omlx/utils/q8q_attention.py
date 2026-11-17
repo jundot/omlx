@@ -28,7 +28,7 @@ using namespace mpp::tensor_ops;
 
 namespace q8q {
 
-template <int G, int ROWS, int D, int N, bool QK8, bool PVT, bool SKIP>
+template <int G, int ROWS, int D, int N, bool QK8, bool PVT, bool SKIP, int LPR>
 METAL_FUNC void tile(
     const device int8_t* qc, const device bfloat* qb, const device float* qs,
     const device int8_t* kc, const device float* ks,
@@ -36,11 +36,11 @@ METAL_FUNC void tile(
     device float* out, int qL, int T, int Tpad, float sm_scale,
     threadgroup float* scores_raw, threadgroup bfloat* probs,
     threadgroup float* row_max, threadgroup float* row_sum, threadgroup float* prev,
-    threadgroup atomic_uint* rescale, uint kvh, uint tidx, uint tid) {
+    threadgroup atomic_uint* rescale, uint kvh, uint tidx, uint tid,
+    int page_lo, int page_hi, device float* stats_m, device float* stats_l) {
   constexpr int M = ROWS * G;
-  constexpr int LPR = 4;   // lanes per fused row
-  constexpr int TPL = 8;   // tokens per lane
-  static_assert(N == LPR * TPL, "four lanes of eight tokens span a page");
+  constexpr int TPL = N / LPR;   // tokens per lane
+  static_assert(N == LPR * TPL && TPL % 4 == 0, "lanes span a page");
   static_assert(LPR * M <= 256, "softmax lanes fit the threadgroup");
   using Score = metal::conditional_t<QK8, int, float>;
   using QE = metal::conditional_t<QK8, int8_t, bfloat>;
@@ -97,7 +97,8 @@ METAL_FUNC void tile(
 
   const device float* ksp = ks + ulong(kvh) * ulong(Tpad);
   const device float* vsp = vs + ulong(kvh) * ulong(Tpad);
-  for (int page = 0; page < pages; ++page) {
+  const int page_end = min(pages, page_hi);
+  for (int page = page_lo; page < page_end; ++page) {
     const int t0 = page * N;
     auto kp = kt.template slice<D, N>(0, t0);
     auto sc = qk.template get_destination_cooperative_tensor<decltype(q0), decltype(k0), Score>();
@@ -108,21 +109,20 @@ METAL_FUNC void tile(
     if (lane) {
       const int token = t0 + int(column);
       threadgroup const vec<Score, 4>* s4 = reinterpret_cast<threadgroup const vec<Score, 4>*>(scores + fr * N + column);
-      float4 lo = float4(s4[0]), hi = float4(s4[1]);
       const device float4* k4 = reinterpret_cast<const device float4*>(ksp + token);
-      lo *= k4[0]; hi *= k4[1];
-      lo *= score_scale; hi *= score_scale;
-      float s[TPL] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+      float s[TPL];
+      for (int q = 0; q < TPL / 4; ++q) {
+        float4 x = float4(s4[q]) * k4[q] * score_scale;
+        s[4 * q] = x.x; s[4 * q + 1] = x.y; s[4 * q + 2] = x.z; s[4 * q + 3] = x.w;
+      }
       float lmax = -INFINITY;
       for (int j = 0; j < TPL; ++j) { s[j] = token + j < limit ? s[j] : -INFINITY; lmax = max(lmax, s[j]); }
-      lmax = max(lmax, simd_shuffle_xor(lmax, 1));
-      lmax = max(lmax, simd_shuffle_xor(lmax, 2));
+      for (int o = 1; o < LPR; o <<= 1) lmax = max(lmax, simd_shuffle_xor(lmax, ushort(o)));
       const float pmax = row_max[fr];
       const float nmax = max(pmax, lmax);
       float p[TPL]; float lsum = 0.0f;
       for (int j = 0; j < TPL; ++j) { p[j] = token + j < limit ? fast::exp(s[j] - nmax) : 0.0f; lsum += p[j]; }
-      lsum += simd_shuffle_xor(lsum, 1);
-      lsum += simd_shuffle_xor(lsum, 2);
+      for (int o = 1; o < LPR; o <<= 1) lsum += simd_shuffle_xor(lsum, ushort(o));
       if (column == 0) {
         const float scale = (nmax == -INFINITY || nmax == pmax) ? 1.0f : fast::exp(pmax - nmax);
         prev[fr] = scale;
@@ -131,13 +131,13 @@ METAL_FUNC void tile(
         if (scale != 1.0f) atomic_store_explicit(rescale, 1u, memory_order_relaxed);
       }
       const device float4* v4 = reinterpret_cast<const device float4*>(vsp + token);
-      const float4 vl = v4[0], vh = v4[1];
-      const float4 a(token + 0 < limit ? p[0] * vl.x : 0.0f, token + 1 < limit ? p[1] * vl.y : 0.0f,
-                     token + 2 < limit ? p[2] * vl.z : 0.0f, token + 3 < limit ? p[3] * vl.w : 0.0f);
-      const float4 b(token + 4 < limit ? p[4] * vh.x : 0.0f, token + 5 < limit ? p[5] * vh.y : 0.0f,
-                     token + 6 < limit ? p[6] * vh.z : 0.0f, token + 7 < limit ? p[7] * vh.w : 0.0f);
       threadgroup bfloat4* p4 = reinterpret_cast<threadgroup bfloat4*>(probs + fr * N + column);
-      p4[0] = bfloat4(a); p4[1] = bfloat4(b);
+      for (int q = 0; q < TPL / 4; ++q) {
+        const float4 vv = v4[q];
+        const int b = 4 * q;
+        p4[q] = bfloat4(float4(token + b < limit ? p[b] * vv.x : 0.0f, token + b + 1 < limit ? p[b + 1] * vv.y : 0.0f,
+                               token + b + 2 < limit ? p[b + 2] * vv.z : 0.0f, token + b + 3 < limit ? p[b + 3] * vv.w : 0.0f));
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!SKIP || atomic_load_explicit(rescale, memory_order_relaxed)) {
@@ -158,6 +158,7 @@ METAL_FUNC void tile(
   }
   OT ot(out + qoff * D, dextents<int, 2>{D, M}, array<int, 2>{1, D});
   running.store(ot.template slice<D, M>(0, 0));
+  if (stats_m != nullptr && tid < uint(M)) { stats_m[qoff + tid] = row_max[tid]; stats_l[qoff + tid] = row_sum[tid]; }
 }
 }  // namespace q8q
 """
@@ -170,13 +171,23 @@ SOURCE = r"""
   threadgroup float row_sum[M];
   threadgroup float prev[M];
   threadgroup atomic_uint rescale;
-  q8q::tile<{G}, {ROWS}, 256, 32, {QK8}, {PVT}, {SKIP}>(
-      qc, reinterpret_cast<const device bfloat*>(qb), qs, kc, ks, vc, vs, out,
+  const uint kvh_i = {ORDER} ? threadgroup_position_in_grid.y : threadgroup_position_in_grid.x;
+  const uint tile_i = {ORDER} ? threadgroup_position_in_grid.x : threadgroup_position_in_grid.y;
+  const int split = int(threadgroup_position_in_grid.z);
+  const int hist_pages = (prm[1] - prm[0]) / 32;          // pages wholly before the chunk
+  const int cut = {SPLIT} > 1 ? (hist_pages / {SPLIT}) * split : 0;
+  const int cut_hi = ({SPLIT} > 1 && split + 1 < {SPLIT}) ? (hist_pages / {SPLIT}) * (split + 1) : (1 << 30);
+  const ulong part = ulong(prm[3]);                           // elements per split of the output
+  const ulong spart = ulong(prm[4]);                          // elements per split of the stats
+  q8q::tile<{G}, {ROWS}, 256, 32, {QK8}, {PVT}, {SKIP}, {LPR}>(
+      qc, reinterpret_cast<const device bfloat*>(qb), qs, kc, ks, vc, vs, out + part * split,
       prm[0], prm[1], prm[2], scl[0], scores, probs, row_max, row_sum, prev, &rescale,
-      threadgroup_position_in_grid.x, threadgroup_position_in_grid.y, thread_index_in_threadgroup);
+      kvh_i, tile_i, thread_index_in_threadgroup, cut, cut_hi,
+      {SPLIT} > 1 ? sm + spart * split : nullptr, {SPLIT} > 1 ? sl + spart * split : nullptr);
 """
 
 INPUTS = ["qc", "qb", "qs", "kc", "ks", "vc", "vs", "prm", "scl"]
+OUTPUTS = ["out", "sm", "sl"]
 
 
 def _b(x):
@@ -184,21 +195,34 @@ def _b(x):
 
 
 @cache
-def kernel(g=6, rows=8, qk8=True, pvt=False, skip=True):
+def kernel(g=6, rows=8, qk8=True, pvt=False, skip=True, split=1):
     """The JIT kernel for ``g`` query heads per KV head and ``rows`` rows per tile.
 
     ``qk8``: INT8 queries (else bf16 queries x int8 keys); ``pvt``: dim-major V;
-    ``skip``: rescale the running output only when a row max grew. The engine
-    uses the defaults.
+    ``skip``: rescale the running output only when a row max grew; ``split``:
+    threadgroups per tile, each over its share of the history pages. The
+    engine uses the defaults apart from ``split``.
     """
     src = SOURCE
-    for k, v in dict(G=g, ROWS=rows, QK8=_b(qk8), PVT=_b(pvt), SKIP=_b(skip)).items():
+    params = dict(
+        G=g,
+        ROWS=rows,
+        QK8=_b(qk8),
+        PVT=_b(pvt),
+        SKIP=_b(skip),
+        ORDER=0,
+        LPR=4,
+        SPLIT=int(split),
+    )
+    for k, v in params.items():
         src = src.replace("{" + k + "}", str(v))
-    name = f"q8q_v1_g{g}_r{rows}_qk8{int(qk8)}_pvt{int(pvt)}_skip{int(skip)}"
+    name = (
+        f"q8q_v2_g{g}_r{rows}_qk8{int(qk8)}_pvt{int(pvt)}_skip{int(skip)}_s{int(split)}"
+    )
     return mx.fast.metal_kernel(
         name=name,
         input_names=INPUTS,
-        output_names=["out"],
+        output_names=["out", "sm", "sl"],
         header=HEADER,
         source=src,
         ensure_row_contiguous=True,
@@ -240,9 +264,13 @@ def quant_queries(rq, kv_heads):
     return c, s
 
 
-def run(rq, k, v, scale, *, rows=8):
+def run(rq, k, v, scale, *, rows=8, split=1):
     """Causal attention of rotated bf16 queries [1, H, n, 256] (the last n keys)
-    over ``prepare_kv`` operands; fp32 output [1, H, n, 256] in the rotated space."""
+    over ``prepare_kv`` operands; fp32 output [1, H, n, 256] in the rotated space.
+
+    ``split`` > 1 runs that many threadgroups per tile over equal shares of the
+    history and combines their normalized partials by their softmax weights.
+    """
     _, heads, n, dim = rq.shape
     kc, ks, tokens = k
     vc, vs, _ = v
@@ -251,13 +279,27 @@ def run(rq, k, v, scale, *, rows=8):
     group = heads // kv_heads
     assert dim == 256 and n % rows == 0 and n <= tokens
     qc, qs = quant_queries(rq, kv_heads)
-    prm = mx.array([n, tokens, padded, 0, 0, 0, 0, 0], dtype=mx.int32)
+    part = kv_heads * n * group * dim
+    spart = kv_heads * n * group
+    prm = mx.array([n, tokens, padded, part, spart, 0, 0, 0], dtype=mx.int32)
     scl = mx.array([scale] * 8, dtype=mx.float32)
-    (out,) = kernel(group, rows)(
+    out, row_max, row_sum = kernel(group, rows, split=split)(
         inputs=[qc, _placeholder(mx.bfloat16), qs, kc, ks, vc, vs, prm, scl],
-        grid=(256 * kv_heads, n // rows, 1),
+        grid=(256 * kv_heads, n // rows, split),
         threadgroup=(256, 1, 1),
-        output_shapes=[(kv_heads, n, group, dim)],
-        output_dtypes=[mx.float32],
+        output_shapes=[
+            (split, kv_heads, n, group, dim),
+            (split, kv_heads, n, group),
+            (split, kv_heads, n, group),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
+    if split > 1:
+        top = mx.max(row_max, axis=0, keepdims=True)
+        weight = mx.exp(row_max - top) * row_sum
+        out = (
+            mx.sum(out * weight[..., None], axis=0) / mx.sum(weight, axis=0)[..., None]
+        )
+    else:
+        out = out[0]
     return out.transpose(0, 2, 1, 3).reshape(1, heads, n, dim)
