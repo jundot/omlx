@@ -902,6 +902,8 @@ def _patch_drafter_batched() -> bool:
         _spark_draft_batched.__code__,
         dict(_drafter_mod.__dict__),
         _spark_draft_batched.__name__,
+        _spark_draft_batched.__defaults__,
+        _spark_draft_batched.__kwdefaults__,
     )
     DFlashDrafter._draft_batched = fn
     DFlashDrafter._omlx_spark_batched_patched = True
