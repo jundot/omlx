@@ -10,6 +10,7 @@ from omlx.request import (
     SamplingParams,
     Request,
     RequestOutput,
+    live_decode_rate,
 )
 
 
@@ -376,6 +377,51 @@ class TestRequest:
         )
         assert request.images == ["image_data_1", "image_data_2"]
         assert request.videos == ["video_data_1"]
+
+
+class TestLiveDecodeRate:
+    @staticmethod
+    def _decode(request, start, seconds, tokens_per_step):
+        """Run 50 ms decode steps and return the time of the last one."""
+        now = start
+        for step in range(1, round(seconds * 20) + 1):
+            now = start + step * 0.05
+            request.mark_decode_progress(now)
+            request.last_activity_at = now
+            request.output_token_ids.extend([0] * tokens_per_step)
+        return now
+
+    def test_rate_follows_recent_seconds_not_the_whole_run(self):
+        request = Request("r", prompt="p", sampling_params=SamplingParams())
+        request.generation_started_at = 99.0
+
+        def rate(now):
+            return live_decode_rate(
+                request.decode_marks,
+                request.num_output_tokens,
+                request.last_activity_at,
+                request.generation_started_at,
+                now,
+            )
+
+        now = self._decode(request, 100.0, 1.0, 1)
+        # Younger than the window: 20 tokens in the 2 s since the start.
+        assert rate(now) == pytest.approx(10.0)
+
+        now = self._decode(request, now, 59.0, 1)
+        assert rate(now) == pytest.approx(20.0, abs=0.1)
+
+        now = self._decode(request, now, 4.0, 2)
+        # The average since the start is still about 21 tok/s here.
+        assert rate(now) == pytest.approx(40.0, abs=0.1)
+        assert len(request.decode_marks) <= 10
+
+        # Idle: half the window still holds tokens, then none.
+        assert rate(now + 1.5) == pytest.approx(20.0, abs=1.0)
+        assert rate(now + 3.5) == 0.0
+
+        resumed = self._decode(request, now + 10.0, 4.0, 1)
+        assert rate(resumed) == pytest.approx(20.0, abs=0.1)
 
 
 class TestRequestOutput:

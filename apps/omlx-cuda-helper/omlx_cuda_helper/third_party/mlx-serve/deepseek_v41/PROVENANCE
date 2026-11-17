@@ -12,8 +12,10 @@ The header and the down projection are the GLM-5.3 versions of this helper
 scales and biases, 64 weights a group, each weight rounded once to bf16 from
 float, and each mma.m16n8k16 step added to the running sum with a correctly
 rounded float add. The launch geometry and the tensor-core main loop are
-unchanged. Added here: 3-bit codes (MLX's little-endian bit stream), which a
-thread loads as the 24 bytes of one group and unpacks to the same bf16 tile;
+unchanged. Added here: 2-bit codes, one 16-byte load a group of 64 decoded
+through the group's 4 values (Inkling 2 uses them); 3-bit codes (MLX's
+little-endian bit stream), which a thread loads as the 24 bytes of one group
+and unpacks to the same bf16 tile;
 MLX mxfp4 codes (E2M1, one E8M0 scale per 32 weights, MX template value),
 each decoded from the bits of its fp4 value times the power-of-two scale,
 which float and bf16 hold exactly. The down projection takes the same

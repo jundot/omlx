@@ -765,6 +765,12 @@ def maybe_apply_pre_load_patches(
         if apply_hy_v3_patch():
             logger.info("Hy3 pre-load patch applied for %s", model_name)
 
+    if model_type == "inkling2":
+        from ..patches.inkling2 import apply_inkling2_patch
+
+        if apply_inkling2_patch():
+            logger.info("Inkling 2 pre-load patch applied for %s", model_name)
+
     text_config = config.get("text_config")
     text_model_type = (
         text_config.get("model_type") if isinstance(text_config, dict) else None
@@ -945,6 +951,11 @@ def maybe_apply_pre_load_patches(
         from ..patches.minimax_m3_dspark import bundled_dspark_path
 
         minimax_dspark = bundled_dspark_path(model_name)
+    if model_type == "inkling2":
+        from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
+
+        # Inkling 2 bundles its DSpark draft as mtp.safetensors.
+        minimax_dspark = bundled_inkling2_dspark_path(model_name)
     if _is_mtp_compatible(config, model_type) or dflash_batched or minimax_dspark:
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
@@ -1448,6 +1459,10 @@ def lightning_mtp_supported(model_path: str | Path) -> bool:
     if str(quantization.get("quant_method") or "").lower() == "paroquant":
         return False
     model_type = config.get("model_type")
+    if model_type == "inkling2":
+        from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
+
+        return bundled_inkling2_dspark_path(model_path) is not None
     if model_type == "qwen4_exp":
         if not _has_mtp_heads(config):
             return False

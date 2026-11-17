@@ -3363,6 +3363,9 @@ _PLE_IO_POOL = ThreadPoolExecutor(
     max_workers=_PLE_IO_WORKERS, thread_name_prefix="ple-io"
 )
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+# Gathers of more rows read their missing pages on the I/O pool first; smaller
+# ones (a decode token's rows in each shard) are advised to the kernel instead.
+_PLE_POOL_PREFETCH_ROWS = 8
 # Slow gathers may indicate page eviction. Allow normal gather overhead and
 # rate-limit retries; elapsed time is a heuristic, not a residency check.
 _PLE_REARM_FLOOR_SECONDS = 0.0005
@@ -3442,7 +3445,7 @@ class _SafeTensorMMap:
         if row_indices.size == 0:
             return np.empty((0, shape[1]), dtype=np_dtype), dtype
         gather_start = None
-        if row_indices.size > 8:
+        if row_indices.size > _PLE_POOL_PREFETCH_ROWS:
             fully_seen = self._prefetch_missing_pages(
                 row_indices,
                 self._data_start + start,
@@ -3472,6 +3475,25 @@ class _SafeTensorMMap:
 
     def rows(self, key: str, rows: list[int]) -> mx.array:
         return self.to_mx(*self.rows_np(key, rows))
+
+    def advise_rows(self, key: str, rows: np.ndarray) -> None:
+        """Ask the kernel to start reading these rows' pages now.
+
+        Copying the rows faults their missing pages in one at a time. Advised
+        first, the kernel reads all of them concurrently; resident pages cost
+        one system call.
+        """
+        self._require_owner()
+        with self._resource_lock:
+            if self._mapping is None or self._file is None:
+                raise RuntimeError("SSD-backed Qwen4 PLE reader is closed")
+            entry = self._header[key]
+            start, end = entry["data_offsets"]
+            row_bytes = (end - start) // entry["shape"][0]
+            offsets = self._data_start + start + np.asarray(rows, np.int64) * row_bytes
+            pages = offsets // _PLE_PAGE_SIZE * _PLE_PAGE_SIZE
+            for page, row_end in zip(pages.tolist(), (offsets + row_bytes).tolist()):
+                self._mapping.madvise(mmap.MADV_WILLNEED, page, row_end - page)
 
     def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
         """Prefetch unmarked pages; return whether all were already marked."""
@@ -3747,10 +3769,20 @@ class DiskBackedShardedEmbedding(nn.Module):
     def _assemble(self, host: np.ndarray, plan) -> dict[int, np.ndarray]:
         """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
         shard, local, touched, specs, families, _, _, _ = plan
-        buffers: dict[int, np.ndarray] = {}
+        slices = []
         for shard_index, spec in zip(touched, specs):
             positions = np.flatnonzero(shard == shard_index)
-            rows = local[positions]
+            slices.append((positions, local[positions], spec))
+        # Advise every small slice before copying any: a decode token's missing
+        # pages are then read together, and the copies wait for one drive
+        # latency instead of one per row.
+        for _, rows, spec in slices:
+            if rows.size <= _PLE_POOL_PREFETCH_ROWS:
+                for family in families:
+                    key = spec[family]
+                    self._tensor_readers[key].advise_rows(key, rows)
+        buffers: dict[int, np.ndarray] = {}
+        for positions, rows, spec in slices:
             for family in families:
                 key = spec[family]
                 copied, _ = self._tensor_readers[key].rows_np(key, rows)

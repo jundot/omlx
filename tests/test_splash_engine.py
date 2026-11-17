@@ -1061,6 +1061,27 @@ class TestRequestTranslation:
         assert value("--max-cache-disk") == str(5 * GIB)
         assert value("--cache-dir") == str(tmp_path / "ssd")
 
+    def test_serve_command_sends_activations_when_supported(self, tmp_path):
+        engine = _engine(tmp_path, version="1.6.1", activations="bf16")
+
+        command = engine._serve_command(9000)
+
+        assert command[command.index("--activations") + 1] == "bf16"
+
+    def test_serve_command_skips_activations_for_older_launchers(self, tmp_path):
+        # Splash < 1.6.1 rejects --activations, so it must not be passed there.
+        engine = _engine(tmp_path, version="1.6.0", activations="bf16")
+
+        assert "--activations" not in engine._serve_command(9000)
+
+    def test_serve_command_leaves_auto_activations_to_splash(self, tmp_path):
+        engine = _engine(tmp_path, version="1.6.1", activations="auto")
+
+        assert "--activations" not in engine._serve_command(9000)
+
+    def test_default_activation_precision_keeps_bf16(self):
+        assert SplashOptions().activations == "bf16"
+
     def test_serve_command_leaves_unset_limits_to_splash(self, tmp_path):
         command = _engine(tmp_path)._serve_command(9000)
 
@@ -1208,6 +1229,24 @@ class TestStreaming:
         assert body["reasoning_effort"] == "high"
         assert body["stream"] is True and body["return_progress"] is True
         assert engine.has_active_requests() is False
+
+    async def test_active_request_count_follows_streaming_request(self, tmp_path):
+        seen = {}
+
+        def handler(request):
+            seen["active"] = engine.active_request_count()
+            return httpx.Response(
+                200, content=_sse({"choices": [{"delta": {"content": "x"}}]})
+            )
+
+        engine = _engine_with_transport(tmp_path, handler)
+        assert engine.active_request_count() == 0
+
+        async for _ in engine.stream_chat([{"role": "user", "content": "hi"}]):
+            pass
+
+        assert seen["active"] == 1
+        assert engine.active_request_count() == 0
 
     @pytest.mark.parametrize(
         "kwargs, expected",
@@ -1860,6 +1899,7 @@ class TestAdminAPI:
             splash_max_memory_gb=24,
             splash_ssd_cache_gb=0,
             splash_ane_prefill=False,
+            splash_activations="auto",
         )
 
         assert "integrations" in result["runtime_applied"]
@@ -1869,8 +1909,10 @@ class TestAdminAPI:
             24,
         )
         assert (restored.splash_ssd_cache_gb, restored.splash_ane_prefill) == (0, False)
+        assert restored.splash_activations == "auto"
         for fields in (
             {"splash_kv_format": "fp8"},
+            {"splash_activations": "fp8"},
             {"splash_max_memory_gb": 0},
             {"splash_ssd_cache_gb": -1},
         ):
@@ -1893,6 +1935,7 @@ class TestAdminAPI:
         assert status["path"] == str(launcher)
         assert (status["version"], status["auto_detected"]) == ("1.3.1", True)
         assert response["integrations"]["splash_kv_format"] == "int8"
+        assert response["integrations"]["splash_activations"] == "bf16"
 
     async def test_model_external_engine_is_validated(
         self, tmp_path, launchers, global_settings

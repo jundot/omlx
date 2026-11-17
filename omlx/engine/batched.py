@@ -1645,15 +1645,18 @@ class BatchedEngine(BaseEngine):
         ):
             yield output
 
-    def has_active_requests(self) -> bool:
-        """Check if the engine has active in-flight requests."""
+    def active_request_count(self) -> int:
+        """Number of requests holding a live output collector."""
         engine_core = getattr(self, "_engine", None)
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
             if inner is not None:
-                collectors = getattr(inner, "_output_collectors", {})
-                return len(collectors) > 0
-        return False
+                return len(getattr(inner, "_output_collectors", {}))
+        return 0
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        return self.active_request_count() > 0
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

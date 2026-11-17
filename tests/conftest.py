@@ -110,6 +110,7 @@ _GPU_SERIAL_TESTS = {
     "test_qwen35_moe_verify_window.py": {
         "test_batched_decode_rows_equal_one_token_decode",
         "test_kernel_failure_falls_back_to_the_composed_verifier",
+        "test_quantized_router_window_rows_equal_one_token_decode",
         "test_router_ties_and_high_experts",
         "test_top8_window_and_batched_rows_equal_one_token_decode",
         "test_window_rows_equal_one_token_decode",

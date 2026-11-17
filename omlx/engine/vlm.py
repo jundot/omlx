@@ -59,6 +59,7 @@ from ..model_settings import (
 from ..models.vlm import VLMModelAdapter
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
+from ..patches.inkling2 import vlm as inkling2_vlm
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
@@ -2079,6 +2080,8 @@ class VLMBatchedEngine(BaseEngine):
                             getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                         ),
                     )
+                if model_type == "inkling2":
+                    return inkling2_vlm.load(self._model_name)
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
                         self._model_name,
@@ -6201,19 +6204,22 @@ class VLMBatchedEngine(BaseEngine):
         )
         return list(token_ids)
 
-    def has_active_requests(self) -> bool:
-        """Check if the engine has active in-flight requests."""
+    def active_request_count(self) -> int:
+        """Number of in-flight requests across speech, diffusion and text."""
         if getattr(self, "_speech_active", 0):
-            return True
+            return int(self._speech_active)
         if self.is_diffusion_model:
-            return getattr(self, "_diffusion_active_requests", 0) > 0
+            return int(getattr(self, "_diffusion_active_requests", 0))
         engine_core = getattr(self, "_engine", None)
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
             if inner is not None:
-                collectors = getattr(inner, "_output_collectors", {})
-                return len(collectors) > 0
-        return False
+                return len(getattr(inner, "_output_collectors", {}))
+        return 0
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        return self.active_request_count() > 0
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
