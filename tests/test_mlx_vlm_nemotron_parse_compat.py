@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -61,7 +62,7 @@ def test_nemotron_parse_embeddings_drop_the_placeholders():
         return mx.zeros((1, ids.shape[1], 4), dtype=mx.bfloat16)
 
     stub = SimpleNamespace(
-        config=SimpleNamespace(image_token_id=1),
+        config=SimpleNamespace(pad_token_id=1),
         vision_tower=vision_tower,
         language_model=SimpleNamespace(
             embed=embed,
@@ -77,3 +78,31 @@ def test_nemotron_parse_embeddings_drop_the_placeholders():
 
     # Three vision rows plus the two text rows the placeholders stood for.
     assert out.inputs_embeds.shape == (1, 5, 4)
+
+    # A prompt that does not start with the placeholders keeps all its tokens.
+    plain = np_model.Model.get_input_embeddings(
+        stub,
+        mx.array([[7, 8, 9, 10, 11]]),
+        mx.zeros((2, 768), dtype=mx.bfloat16),
+    )
+
+    assert plain.inputs_embeds.shape == (1, 8, 4)
+
+
+def test_nemotron_parse_compat_layer_is_wired_into_vlm_loads(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "nemotron_parse_v3_5"})
+    )
+    from omlx.patches import mlx_vlm_nemotron_parse_compat as compat
+    from omlx.utils import model_loading
+
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        compat,
+        "apply_mlx_vlm_nemotron_parse_compat_patch",
+        lambda: calls.append(True) or False,
+    )
+
+    model_loading.maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
+
+    assert calls
