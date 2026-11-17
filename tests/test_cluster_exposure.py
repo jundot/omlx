@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The distributed surface remains dark until explicitly enabled."""
+"""The distributed surface is on by default; settings can still switch it off."""
 
 from __future__ import annotations
 
@@ -21,7 +21,15 @@ def test_distributed_inference_is_disabled_without_settings():
     assert distributed_inference_enabled(None) is False
 
 
-def test_distributed_inference_requires_explicit_opt_in():
+def test_distributed_inference_is_on_by_default():
+    # A fresh install must reach the Cluster Assistant without hunting for
+    # the switch (user decision, 2026-11-16): a settings object that does not
+    # carry the attribute at all still exposes the distributed surface.
+    missing = SimpleNamespace(server=SimpleNamespace())
+    assert distributed_inference_enabled(missing) is True
+
+
+def test_distributed_inference_can_be_switched_off():
     assert distributed_inference_enabled(_settings(False)) is False
     assert distributed_inference_enabled(_settings(True)) is True
 

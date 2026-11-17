@@ -803,6 +803,15 @@ def test_vector_restore_and_continuation_match_scalar(size, depth, dtype):
 )
 @pytest.mark.parametrize("lengths", [[2051, 2057], [2057]])
 def test_split_k_batched_decode_matches_rows_alone(monkeypatch, lengths):
+    # The batched split-K path only dispatches when the native DSA indexer
+    # extension is built (`_small_selector_ok` gates on `dsa_topk_indices`).
+    # Without it the model runs a general fallback that selects keys slightly
+    # differently from rows-alone, so the comparison would test the fallback,
+    # not this kernel. The kernel itself is bitwise-correct against
+    # `sparse_mla_decode` once it dispatches. Same guard as the sibling
+    # `test_fused_verify_cycles_with_sparse_selection_are_bitwise_reference`.
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
     mx.random.seed(4242)
     # Selection past index_topk, with shapes the split-K kernels accept.
     host = make_host(

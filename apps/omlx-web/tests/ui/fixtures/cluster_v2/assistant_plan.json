@@ -1,0 +1,78 @@
+{
+  "_state": "assistant_planning",
+  "_source": "omlx/cluster/assistant/models.py::AssistantPlanResponse",
+  "measurement_id": "msr-a1b2c3d4",
+  "measurement_timestamp": "2026-11-03T10:16:20Z",
+  "plan_signature": "3f9a1c7d20b45e68",
+  "feasible": true,
+  "coordinator_node": "node-b",
+  "rank_order": ["node-b", "node-a"],
+  "groups": [0, 0],
+  "stages": [
+    {
+      "rank": 0,
+      "node_id": "node-b",
+      "first_layer": 0,
+      "last_layer": 39,
+      "layer_count": 40,
+      "resident_bytes": 9663676416,
+      "resident_gib": 9.0,
+      "admission_bytes": 127560237056,
+      "headroom_bytes": 4294967296,
+      "headroom_gib": 4.0,
+      "predicted_seconds": null,
+      "critical": true
+    },
+    {
+      "rank": 1,
+      "node_id": "node-a",
+      "first_layer": 40,
+      "last_layer": 79,
+      "layer_count": 40,
+      "resident_bytes": 8589934592,
+      "resident_gib": 8.0,
+      "admission_bytes": 65927716864,
+      "headroom_bytes": 2147483648,
+      "headroom_gib": 2.0,
+      "predicted_seconds": null,
+      "critical": false
+    }
+  ],
+  "reasons": [],
+  "warnings": [
+    {
+      "code": "unmeasured_plan",
+      "node_id": "node-b",
+      "message": "no stage was measured, so no speed is predicted for this plan",
+      "action": ""
+    }
+  ],
+  "policy": {
+    "name": "free-admission-preference",
+    "free_admission_preference": true,
+    "stop_on_infeasible": true
+  },
+  "origin_node": "node-a",
+  "tensor_parallel_size": 1,
+  "rejected": [],
+  "model": "/models/qwen3-32b-4bit",
+  "context_tokens": 32768,
+  "mtp": false,
+  "predicted": {
+    "measured": false,
+    "critical_stage_rank": null,
+    "critical_stage_seconds": null,
+    "stages": [
+      { "rank": 0, "node_id": "node-b", "seconds": null },
+      { "rank": 1, "node_id": "node-a", "seconds": null }
+    ]
+  },
+  "observed": null,
+  "endpoint": {
+    "node": "node-b",
+    "host": "192.0.2.11",
+    "port": 8099,
+    "url": "http://192.0.2.11:8099",
+    "ready": false
+  }
+}

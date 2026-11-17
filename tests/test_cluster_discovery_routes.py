@@ -227,6 +227,9 @@ def test_devices_merges_pending_pairing_requests(_configured_stores, monkeypatch
     assert len(pending) == 1
     assert pending[0]["state"] == "awaiting_approval"
     assert pending[0]["friendly_name"] == "studio-2"
+    assert pending[0]["addrs"] == [
+        {"ip": "192.168.1.11", "if_type": "unknown"}
+    ]
 
 
 def test_devices_paired_rows_carry_enrolled_ssh_target(_configured_stores, monkeypatch):
@@ -475,6 +478,9 @@ def test_devices_pending_request_wins_over_stale_discovered_record(
     assert len(pending) == 1
     assert pending[0]["state"] == "awaiting_approval"
     assert pending[0]["friendly_name"] == "studio-2"
+    assert pending[0]["addrs"] == [
+        {"ip": "192.168.1.11", "if_type": "unknown"}
+    ]
     configure_discovery_service(None)
 
 
@@ -532,6 +538,12 @@ def test_devices_enriches_paired_row_from_discovery_record(_configured_stores):
         "thunderbolt": True,
         "jaccl": True,
         "loopback_only": False,
+        # Identity facts for the device card; a peer that did not report them
+        # stays at "not measured" instead of pretending to have no hardware.
+        "model": "",
+        "cpu_cores": 0,
+        "gpu_cores": 0,
+        "disk_total_gb": 0.0,
     }
     assert row["version"] == "1.2.3"
     assert row["link"] == "tb"

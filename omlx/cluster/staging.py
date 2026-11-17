@@ -24,7 +24,7 @@ import struct
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 
@@ -42,9 +42,52 @@ DEFAULT_REMOTE_PYTHON = CLUSTER_PYTHON_SHIM
 
 
 def is_local_host(host: str) -> bool:
-    """Whether this address names this machine, so ssh would be a detour."""
+    """Whether this address names this machine, so ssh would be a detour.
 
-    return host.strip() in _LOCAL_HOSTS
+    Loopback covers the ordinary local path.  A coordinator also reaches its
+    *own* rank 0 over its LAN address (the Tahoe ring workaround), so the
+    machine's real interface addresses count as local too.  Otherwise staging
+    SSHes to itself, which turns a stale self ``known_hosts`` entry into
+    ``REMOTE HOST IDENTIFICATION HAS CHANGED`` and fails a 3/4-Mac apply.
+    """
+
+    text = host.strip().rsplit("@", 1)[-1]
+    if text in _LOCAL_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        # A hostname is not an interface address; do not ask discovery (and do
+        # not turn a test or an SSH target into an unnecessary subprocess).
+        return False
+    return text.split("%", 1)[0] in _local_interface_addresses()
+
+
+def _local_interface_addresses() -> frozenset[str]:
+    """This Mac's announced IPv4/IPv6 addresses, cached once discovery answers.
+
+    A failed read (discovery not up yet) returns empty *without* caching, so
+    the next call retries; caching the empty fallback would disable own-LAN
+    local detection for the whole process.
+    """
+
+    try:
+        return _cached_local_interface_addresses()
+    except Exception:  # discovery is optional for a pure staging unit
+        return frozenset()
+
+
+@lru_cache(maxsize=1)
+def _cached_local_interface_addresses() -> frozenset[str]:
+    """The successful discovery read; lru_cache never stores an exception."""
+
+    from .discovery import local_addr_dicts
+
+    return frozenset(
+        str(row.get("ip") or "").strip().split("%", 1)[0]
+        for row in local_addr_dicts()
+        if isinstance(row, dict) and str(row.get("ip") or "").strip()
+    )
 
 
 @dataclass(frozen=True)
@@ -1181,7 +1224,11 @@ def run_remote_python(
     result = subprocess.run(
         [
             "ssh",
-            *cluster_ssh_options(connect_timeout=10),
+            # Keepalive so a coordinator that dies mid-call is detected in
+            # ~60 s (ServerAliveInterval=15 x CountMax=4) instead of hanging
+            # until the full subprocess timeout (B13). Harmless for short
+            # snippets: the probes only fire after 15 s of silence.
+            *cluster_ssh_options(connect_timeout=10, keepalive=True),
             ssh_target,
             f"{executable_word} -c {shlex.quote(snippet)} {shlex.quote(argument)}",
         ],
@@ -1403,14 +1450,31 @@ def free_disk_bytes(path: str | Path, *, ssh_target: str | None = None) -> int:
     """Free bytes on the filesystem holding ``path``, locally or on a peer."""
 
     if ssh_target and not is_local_host(ssh_target):
+        value = str(path)
+        if value == "~":
+            path_expr = '"$HOME"'
+        elif value.startswith("~/"):
+            path_expr = '"$HOME"/' + shlex.quote(value[2:])
+        else:
+            path_expr = shlex.quote(value)
+        # The checkpoint itself may not exist on this Mac yet; df must still
+        # answer for the nearest existing parent (usually ~/Models or ~).
+        # Without this walk, every not-yet-staged model reported free space 0,
+        # which the caller turned into "unknown" and the election treated as
+        # stageable.
+        command = (
+            f'p={path_expr}; '
+            'while [ ! -e "$p" ] && [ "$p" != "/" ]; do p=$(dirname "$p"); done; '
+            'df -k "$p" | tail -1'
+        )
         result = subprocess.run(
-            # Unquoted so the remote shell expands ~; the path comes from a
-            # validated model directory, not user text.
+            # One quoted shell word; the path comes from a validated model
+            # directory, not from arbitrary user text.
             [
                 "ssh",
                 *cluster_ssh_options(connect_timeout=10),
                 ssh_target,
-                f"df -k {path} | tail -1",
+                command,
             ],
             capture_output=True,
             text=True,
