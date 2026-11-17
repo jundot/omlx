@@ -4,7 +4,7 @@
 A remote start drives the coordinator's *raw* cluster routes, so the origin's
 operation record lives only in the origin's store: the coordinator answered
 ``operations/active`` with ``null`` while it was working, and a second origin
-could activate concurrently. CHAPTER-5 §2.2 (E3, Option A) closes the hole by
+could activate concurrently. the apply/start design notes (E3, Option A) closes the hole by
 mirroring the operation onto the coordinator through the same admin seam.
 
 These tests pin that contract end to end, fake-driven per AGENTS.md:
@@ -630,7 +630,7 @@ def test_remote_ops_wire_the_mirror_through_the_admin_seam() -> None:
         calls.append((target, port, path, body))
         return {"operation_id": body["operation_id"], "running": True}
 
-    ops = assistant_start._remote_ops("172.16.1.11", 8099, admin)
+    ops = assistant_start._remote_ops("192.0.2.11", 8099, admin)
     assert ops.mirror is not None
     body = {
         "operation_id": "op-origin-a",
@@ -643,7 +643,7 @@ def test_remote_ops_wire_the_mirror_through_the_admin_seam() -> None:
     reply = ops.mirror(body)
 
     assert reply == {"operation_id": "op-origin-a", "running": True}
-    assert calls == [("172.16.1.11", 8099, MIRROR_URL, body)]
+    assert calls == [("192.0.2.11", 8099, MIRROR_URL, body)]
 
 
 def test_the_local_ops_leave_the_mirror_unset() -> None:
@@ -662,7 +662,7 @@ def test_the_local_ops_leave_the_mirror_unset() -> None:
 
 def _ops_with_mirror(exc: Exception):
     class _Ops:
-        target = "172.16.1.12"
+        target = "192.0.2.12"
 
         def mirror(self, body):
             raise exc

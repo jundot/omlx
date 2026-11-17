@@ -4,7 +4,7 @@
 The one rule these tests exist to pin down is the negative one: **a measurement
 that did not happen must not become a number**. A zero, a nominal rate or a
 synthesised p50 would all make the election answer a question nobody measured —
-and make an unmeasured plan look fast, which is what PROJECT-BRIEF §17.2 forbids.
+and make an unmeasured plan look fast, which is what the project design notes forbids.
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ def small_budget_payload(**overrides) -> dict:
 
     payload = {
         "node_id": "m1",
-        "ssh": "172.16.1.14",
+        "ssh": "192.0.2.14",
         "capacity_bytes": int(60 * GIB),
         "reserve_bytes": int(6 * GIB),
         "usable_bytes": int(54 * GIB),
@@ -110,7 +110,7 @@ def test_node_budget_payload_becomes_node_facts() -> None:
     """The measured ceiling and the role's reserve, not installed RAM."""
 
     payload = budget_payload(
-        endpoint_host="172.16.1.11",
+        endpoint_host="192.0.2.11",
         disk_free_bytes=300 * GIB,
         performance=profile().to_dict(),
     )
@@ -129,7 +129,7 @@ def test_node_budget_payload_becomes_node_facts() -> None:
     # One admission number existed, so there is no spread to report.
     assert node.admission_p50_gib is None
     assert node.admission_p95_gib is None
-    assert node.endpoint_host == "172.16.1.11"
+    assert node.endpoint_host == "192.0.2.11"
     assert node.disk_free_gib == 300
     assert result.measured_at == MEASURED_AT
     # Everything that matters was measured: nothing to warn about.
@@ -375,13 +375,13 @@ def test_endpoint_host_and_port_are_carried_from_the_budget_payload() -> None:
     """The plan must not have to guess where the elected Mac is reachable."""
 
     measured = measured_node_from_budget(
-        budget_payload(endpoint_host="172.16.1.11", endpoint_port=9123)
+        budget_payload(endpoint_host="192.0.2.11", endpoint_port=9123)
     )
     facts = measure_nodes([measured], measured_at=MEASURED_AT).nodes[0]
 
-    assert measured.endpoint_host == "172.16.1.11"
+    assert measured.endpoint_host == "192.0.2.11"
     assert measured.endpoint_port == 9123
-    assert facts.endpoint_host == "172.16.1.11"
+    assert facts.endpoint_host == "192.0.2.11"
 
 
 def test_an_unmeasured_port_stays_missing() -> None:
@@ -417,7 +417,7 @@ def test_the_port_is_the_macs_own_and_8099_only_when_settings_are_unreadable() -
 
 
 def test_loopback_is_not_an_endpoint_another_mac_can_dial() -> None:
-    assert reachable_endpoint_host("127.0.0.1", "172.16.1.11") == "172.16.1.11"
+    assert reachable_endpoint_host("127.0.0.1", "192.0.2.11") == "192.0.2.11"
     assert reachable_endpoint_host("localhost", "::1") == ""
     assert reachable_endpoint_host(None, "") == ""
     assert reachable_endpoint_host("10.0.0.5") == "10.0.0.5"
@@ -432,11 +432,11 @@ def test_measured_facts_are_accepted_by_the_election() -> None:
     """Measured oMLX payloads elect the M5, exactly like hand-built facts do."""
 
     m5 = measured_node_from_budget(
-        budget_payload(endpoint_host="172.16.1.11", performance=profile("m5").to_dict())
+        budget_payload(endpoint_host="192.0.2.11", performance=profile("m5").to_dict())
     )
     m1 = measured_node_from_budget(
         small_budget_payload(
-            endpoint_host="172.16.1.14",
+            endpoint_host="192.0.2.14",
             performance=profile("m1", decode_gib_per_s=0.8, backend="ring").to_dict(),
         )
     )
@@ -457,7 +457,7 @@ def test_measured_facts_are_accepted_by_the_election() -> None:
     assert result.rank_order == ("m5", "m1")
     assert [item.node_id for item in result.rejected] == ["m1"]
     assert result.endpoint is not None
-    assert result.endpoint.host == "172.16.1.11"
+    assert result.endpoint.host == "192.0.2.11"
 
 
 # ---------------------------------------------------------------------------

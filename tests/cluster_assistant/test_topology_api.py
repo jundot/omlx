@@ -31,7 +31,7 @@ from omlx.cluster.transport import TransportMatrix
 
 PLAN_URL = "/admin/api/cluster/assistant/plan"
 MODEL_PATH = "/models/qwen"
-THIRD = "172.16.1.13"
+THIRD = "192.0.2.13"
 
 
 def seed_three_node_measurement(

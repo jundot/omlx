@@ -284,12 +284,12 @@ def test_the_worker_uses_the_interpreter_it_reported(api) -> None:
     nodes = [
         {
             "node_id": "m5",
-            "ssh": "172.16.1.11",
+            "ssh": "192.0.2.11",
             "python_executable": "/opt/m5/python",
         },
         {
             "node_id": "m1",
-            "ssh": "172.16.1.14",
+            "ssh": "192.0.2.14",
             "python_executable": "/opt/m1/python",
         },
     ]
@@ -319,8 +319,8 @@ def test_a_worker_without_a_reported_interpreter_uses_the_published_shim(api) ->
     fake = FakeCoordinator()
     client, _, _ = api(coordinator=fake.factory())
     nodes = [
-        {"node_id": "m5", "ssh": "172.16.1.11"},
-        {"node_id": "m1", "ssh": "172.16.1.14"},
+        {"node_id": "m5", "ssh": "192.0.2.11"},
+        {"node_id": "m1", "ssh": "192.0.2.14"},
     ]
     measurement_id = take_measurement(client, nodes=nodes)
     plan = take_plan(client, measurement_id)
@@ -353,8 +353,8 @@ def test_local_worker_is_a_model_source_for_a_remote_coordinator() -> None:
     )
     result = SimpleNamespace(rank_order=("m12", "m11"))
     targets = {
-        "m12": SimpleNamespace(node_id="m12", ssh="172.16.1.12", local=False),
-        "m11": SimpleNamespace(node_id="m11", ssh="172.16.1.11", local=True),
+        "m12": SimpleNamespace(node_id="m12", ssh="192.0.2.12", local=False),
+        "m11": SimpleNamespace(node_id="m11", ssh="192.0.2.11", local=True),
     }
 
     assert (
@@ -365,7 +365,7 @@ def test_local_worker_is_a_model_source_for_a_remote_coordinator() -> None:
             coordinator=targets["m12"],
             inputs=None,
         )
-        == "172.16.1.11"
+        == "192.0.2.11"
     )
 
 

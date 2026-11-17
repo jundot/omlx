@@ -88,7 +88,7 @@ function clusterV2Wizard() {
     };
 
     // The Cluster Assistant surface: seven admin routes, and nothing else.
-    // SCREEN-3-MINIMAL.md §2: the browser never launches, stages, deploys or
+    // the minimal-card contract: the browser never launches, stages, deploys or
     // starts inference itself — it calls these and renders the answer.
     // A 32 GB Mac cannot spare the 32 GiB workstation reserve and still hold a
     // pipeline stage; the assistant treats it as Headless (see assistantRoles).
@@ -143,14 +143,14 @@ function clusterV2Wizard() {
         stop: '/admin/api/cluster/assistant/stop',
         operation: (id) =>
             `/admin/api/cluster/assistant/operations/${encodeURIComponent(id)}`,
-        // The free-space relay (PHASE-2B-RUN.md §9): one model, on one measured
+        // The free-space relay (the live-run notes): one model, on one measured
         // Mac, deleted by that Mac's own route. The browser asks; it never
         // reaches a disk or an SSH target itself.
         models: (nodeId, modelId) =>
             `/admin/api/cluster/assistant/models/${encodeURIComponent(nodeId)}/${encodeURIComponent(modelId)}`,
     };
 
-    // Screen 4 (docs/cluster-assistant/SCREEN-4-PROGRESS.md §2): the six steps
+    // Screen 4 (the progress-row contract): the six steps
     // the backend can actually distinguish, in its corrected order — planning
     // precedes staging. The two pairs it cannot split are one row each
     // (runtime prepare + model copy, load + readiness canary).
@@ -189,7 +189,7 @@ function clusterV2Wizard() {
     const CLUSTER_MODE_KEY = 'clusterV2.mode';
     const CLUSTER_MODES = ['assistant', 'manual'];
 
-    // The render-mode screens (ASSISTANT-UI-SPEC-2026-11-16.md §2). A screen is
+    // The render-mode screens (the UI spec). A screen is
     // a coarser gate on top of assistantState(); exactly one is mounted because
     // each is gated by equality on assistantScreen().
     const ASSISTANT_SCREENS = [
@@ -425,7 +425,7 @@ function clusterV2Wizard() {
             probeEnabled: false,
             // Screen 4: the last row the backend actually reported. A failure
             // keeps it so the user can see where it stopped; nothing advances
-            // it without a value from SCREEN-4-PROGRESS.md §2.
+            // it without a value from the progress-row contract.
             failedRow: '',
             // The measured Macs from the last status poll, with each Mac's own
             // model list. Only the Mac the user picks is ever listed for delete.
@@ -4695,7 +4695,7 @@ function clusterV2Wizard() {
 
         // =====================================================================
         // Assistant — the minimal Screen-3 slice
-        // (docs/cluster-assistant/SCREEN-3-MINIMAL.md)
+        // (the minimal-card contract)
         //
         // One card inside the plan step drives whichever flow the recorded
         // entry decision allows: measure the selected model (model-bound),
@@ -7572,7 +7572,7 @@ function clusterV2Wizard() {
 
         // -----------------------------------------------------------------
         // Free space: the UI of the one action `free_disk_space`
-        // (PHASE-2B-RUN.md §9). Nothing here deletes by itself: the user picks
+        // (the live-run notes). Nothing here deletes by itself: the user picks
         // the Mac, then one model on it, then confirms.
         // -----------------------------------------------------------------
         assistantNodeLabel(nodeId) {

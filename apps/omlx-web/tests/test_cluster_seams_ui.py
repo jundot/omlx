@@ -105,11 +105,11 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
         # Not for the browser: the elected coordinator answers another origin's
         # "are you already running an apply/start?" over the admin seam (the
         # cluster-wide operation lock). The card still calls the eight it owns,
-        # including the free-space relay (PHASE-2B-RUN.md §9).
+        # including the free-space relay (the live-run notes).
         "/admin/api/cluster/assistant/operations/active",
         # Not for the browser either: the origin mirrors its running operation
         # onto the elected coordinator over the same admin seam, so a second
-        # origin sees the cluster-wide lock (CHAPTER-5.md §2.2). Server-to-server.
+        # origin sees the cluster-wide lock (the apply/start design notes). Server-to-server.
         "/admin/api/cluster/assistant/operations/mirror",
         # The automatic constellation search loop is API-first; the dashboard UI
         # for it comes later. It only calls the assistant's own apply/start/

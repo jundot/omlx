@@ -4,7 +4,7 @@
 Rank 0 is not the Mac the user opened the app on. In the MVP rank 0 is also the
 coordinator, the endpoint owner and the supervisor host, so choosing it decides
 where the cluster *is*. The rule this module implements is the one frozen in
-``docs/cluster-assistant/PROJECT-BRIEF.md`` section 7:
+``the project design notes`` section 7:
 
 1. every healthy Mac is tried as rank 0, with every order of the other Macs;
 2. a candidate is kept only if a legal PP split exists for it — every stage

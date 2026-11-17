@@ -80,8 +80,8 @@ def payload(node_id: str, *, capacity_gib: float, usable_gib: float, host: str) 
 def measurement(*, measured_at: str = MEASURED_AT):
     return measure_budget_payloads(
         [
-            payload("m5", capacity_gib=107.5, usable_gib=96.75, host="172.16.1.11"),
-            payload("m1", capacity_gib=60, usable_gib=54, host="172.16.1.14"),
+            payload("m5", capacity_gib=107.5, usable_gib=96.75, host="192.0.2.11"),
+            payload("m1", capacity_gib=60, usable_gib=54, host="192.0.2.14"),
         ],
         measured_at=measured_at,
     )
@@ -94,8 +94,8 @@ def finished_store(tmp_path, *args, **kwargs):
         record.measurement_id,
         measurement=measurement(*args, **kwargs),
         endpoints={
-            "m5": MeasurementEndpoint(host="172.16.1.11", port=8099),
-            "m1": MeasurementEndpoint(host="172.16.1.14", port=8099),
+            "m5": MeasurementEndpoint(host="192.0.2.11", port=8099),
+            "m1": MeasurementEndpoint(host="192.0.2.14", port=8099),
         },
         now=NOW,
     )
@@ -121,14 +121,14 @@ def test_a_finished_measurement_survives_a_restart(tmp_path) -> None:
     assert loaded.model == MODEL
     assert loaded.node_ids == ("m5", "m1")
     assert loaded.node_count == 2
-    assert loaded.endpoint_for("m5") == MeasurementEndpoint("172.16.1.11", 8099)
+    assert loaded.endpoint_for("m5") == MeasurementEndpoint("192.0.2.11", 8099)
     assert loaded.warnings == ()
 
     facts = loaded.measurement_set().nodes
     assert [node.node_id for node in facts] == ["m5", "m1"]
     assert facts[0].admission_p05_gib == pytest.approx(96.75)
     assert facts[0].compute is not None
-    assert facts[0].endpoint_host == "172.16.1.11"
+    assert facts[0].endpoint_host == "192.0.2.11"
 
 
 def test_a_running_job_does_not_survive_a_restart_as_running(tmp_path) -> None:
@@ -377,7 +377,7 @@ def test_a_plan_for_another_path_is_refused(tmp_path) -> None:
     store.finish(
         record.measurement_id,
         measurement=measurement(),
-        endpoints={"m5": MeasurementEndpoint("172.16.1.11", 8099)},
+        endpoints={"m5": MeasurementEndpoint("192.0.2.11", 8099)},
         now=NOW,
     )
 
@@ -425,7 +425,7 @@ def test_a_record_with_warnings_keeps_them(tmp_path) -> None:
     store = MeasurementStore(tmp_path)
     record = store.start(model=MODEL, node_ids=["m5"], now=NOW)
     measured = measure_budget_payloads(
-        [payload("m5", capacity_gib=107.5, usable_gib=96.75, host="172.16.1.11")],
+        [payload("m5", capacity_gib=107.5, usable_gib=96.75, host="192.0.2.11")],
         measured_at=MEASURED_AT,
     )
     from dataclasses import replace
@@ -442,7 +442,7 @@ def test_a_record_with_warnings_keeps_them(tmp_path) -> None:
     store.finish(
         record.measurement_id,
         measurement=measured,
-        endpoints={"m5": MeasurementEndpoint("172.16.1.11", 8099)},
+        endpoints={"m5": MeasurementEndpoint("192.0.2.11", 8099)},
         now=NOW,
     )
 
