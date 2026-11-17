@@ -81,10 +81,25 @@ def _block(
     inter=INTER,
     top_k=10,
     dtype=mx.bfloat16,
+    shared_bits=8,
+    shared_group=128,
+    router_bits=None,
 ):
-    """A real-shape oQ block: quantized routed experts, 8-bit gs128 shared
-    expert, 8-bit gs64 shared-expert gate, ``dtype`` router."""
-    key = (seed, bits, experts, hidden, inter, top_k, dtype)
+    """A real-shape oQ block: quantized routed experts, ``shared_bits``
+    shared expert, 8-bit gs64 shared-expert gate, ``dtype`` router (8-bit
+    gs64 quantized with ``router_bits``)."""
+    key = (
+        seed,
+        bits,
+        experts,
+        hidden,
+        inter,
+        top_k,
+        dtype,
+        shared_bits,
+        shared_group,
+        router_bits,
+    )
     if key in _BLOCKS:
         return _BLOCKS[key]
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
@@ -111,8 +126,16 @@ def _block(
         setattr(sm, name, layer)
     shared = block.shared_expert
     for name in ("gate_proj", "up_proj", "down_proj"):
-        setattr(shared, name, nn.QuantizedLinear.from_linear(getattr(shared, name), 128, 8))
+        setattr(
+            shared,
+            name,
+            nn.QuantizedLinear.from_linear(
+                getattr(shared, name), shared_group, shared_bits
+            ),
+        )
     block.shared_expert_gate = nn.QuantizedLinear.from_linear(block.shared_expert_gate, 64, 8)
+    if router_bits:
+        block.gate = nn.QuantizedLinear.from_linear(block.gate, 64, router_bits)
     block.eval()
     model = _FakeQwen4Model()
     model.named_modules = lambda: [("mlp.switch_mlp", sm)]
@@ -134,13 +157,13 @@ def _serial(block, x):
     return mx.concatenate([block(row) for row in rows]).reshape(x.shape)
 
 
-def _verify(block, x, window):
+def _verify(block, x, window, row_exact=True):
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 
     fused = routed.routed_verify_window
     if not window:
         routed.routed_verify_window = lambda block, x: None
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=row_exact)
     try:
         out = Qwen3_5BatchInvariantForward()._feed_forward(block, x)
     finally:
@@ -149,19 +172,18 @@ def _verify(block, x, window):
     mx.eval(out)
     return out
 
-def _check(block, x, engaged):
-    """Window rows == one-token rows == the composed verifier's rows (the
-    latter only up to the shared router cap: past it the composed verifier
-    runs stock argpartition routing, not the one-token arithmetic)."""
+def _check(block, x, engaged, row_exact=True):
+    """Window rows == one-token rows == the row-exact composed verifier's
+    rows (the latter only up to the shared router cap: past it the composed
+    verifier runs stock argpartition routing, not the one-token arithmetic)."""
     count = len(engaged)
-    new = _verify(block, x, window=True)
+    new = _verify(block, x, window=True, row_exact=row_exact)
     ref = _serial(block, x)
-    old = _verify(block, x, window=False)
-    mx.eval(ref, old)
+    mx.eval(ref)
     assert engaged[count:] == [True]
     assert _same_bits(new, ref)
-    if x.size // x.shape[-1] <= router._MAX_ROWS:
-        assert _same_bits(new, old)
+    if row_exact and x.size // x.shape[-1] <= router._MAX_ROWS:
+        assert _same_bits(new, _verify(block, x, window=False))
 
 
 @pytest.fixture
@@ -289,6 +311,34 @@ def test_top8_window_and_batched_rows_equal_one_token_decode(dtype, engaged):
         for step in range(3):
             _check(block, _inputs(rows, step, hidden=hidden, dtype=dtype), engaged)
     x = _inputs(5, 0, hidden=hidden, dtype=dtype).reshape(5, 1, hidden)
+    count = len(engaged)
+    got = block(x)
+    assert engaged[count:] == [True]
+    assert _same_bits(got, _serial(block, x).reshape(got.shape))
+
+
+@pytest.mark.parametrize("row_exact", [True, False], ids=["row_exact", "verify"])
+def test_quantized_router_window_rows_equal_one_token_decode(row_exact, engaged):
+    """Qwen3.6-35B-A3B 4-bit layout (4-bit gs64 experts and shared expert,
+    8-bit gs64 router and shared-expert gate): row-exact and ordinary verify
+    windows and batched decode rows equal the fused one-token decode of each
+    row."""
+    hidden = 2048
+    block = _block(
+        6,
+        bits=4,
+        hidden=hidden,
+        inter=512,
+        top_k=8,
+        shared_bits=4,
+        shared_group=64,
+        router_bits=8,
+    )
+    for rows in (1, 2, 5, 8, 16):
+        for step in range(3):
+            x = _inputs(rows, step, hidden=hidden)
+            _check(block, x, engaged, row_exact=row_exact)
+    x = _inputs(5, 0, hidden=hidden).reshape(5, 1, hidden)
     count = len(engaged)
     got = block(x)
     assert engaged[count:] == [True]
