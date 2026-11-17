@@ -2,18 +2,16 @@
 # package_dmg.sh — wrap the staged oMLX.app in a direct-download DMG.
 #
 # The staged app is produced by `apps/omlx-mac/Scripts/build.sh release --slim`;
-# this script does not rebuild the Python/runtime layers. Build that stage with
-# OMLX_TEAM_ID set to the Apple team id that owns your Developer ID identity:
-# the helper's and the app's SMJobBless requirements are generated from it.
-# Signing and notarization happen only when their credentials are supplied;
-# without them it produces an unsigned DMG for local inspection and says so.
-# When an identity is given, the helper is signed first, then the app, then the
-# .dmg image itself (an unsigned container cannot be assessed by Gatekeeper
-# even after the app inside has been notarized).
+# this script does not rebuild the Python/runtime layers. Signing and
+# notarization happen only when their credentials are supplied; without them it
+# produces an unsigned DMG for local inspection and says so. When an identity is
+# given, the helper is signed first, then the app, then the .dmg image itself
+# (an unsigned container cannot be assessed by Gatekeeper even after the app
+# inside has been notarized).
 #
 # Usage:
 #   apps/omlx-mac/Scripts/package_dmg.sh
-#   SIGN_IDENTITY="Developer ID Application: Example Corp (ABCDE12345)" \
+#   SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
 #   NOTARY_PROFILE=omlx-notary apps/omlx-mac/Scripts/package_dmg.sh
 #
 # Env:
@@ -59,21 +57,21 @@ if [ -n "$SIGN_IDENTITY" ]; then
             --sign "$SIGN_IDENTITY" "$HELPER"
         codesign --verify --strict --verbose=2 "$HELPER"
     fi
-    # Sign nested Mach-O binaries inside-out first. `codesign --deep` does not
-    # reliably seal arbitrary Mach-O files under Contents/Resources (the compiled
-    # custom kernels are exactly that), and one unsigned nested binary makes
-    # notarization fail with "not signed with a valid Developer ID certificate"
-    # plus "signature does not include a secure timestamp".
-    echo "signing nested Mach-O binaries"
+    # Sign nested Mach-O binaries inside-out first. `codesign --deep` on the
+    # bundle does not reliably seal arbitrary Mach-O files under
+    # Contents/Resources (the compiled custom kernels are exactly that), and an
+    # unsigned nested binary makes notarization fail with "not signed with a
+    # valid Developer ID certificate" + "signature does not include a secure
+    # timestamp".
     # `Contents/MacOS` may hold our own launcher scripts (the slim runtime
     # wrappers `omlx-cli` and `omlx-cluster-python`). A bundle cannot be sealed
     # while a subcomponent there is unsigned: codesign reports "code object is
-    # not signed at all" and names the script — exactly what blocked the slim
-    # DMG after the inside-out signing change. A non-Mach-O executable takes a
-    # Developer ID signature in its extended attributes, which the bundle seal
-    # and the ditto copy into the DMG both keep. They are signed *before* the
-    # nested pass, because signing the bundle's main executable first validates
-    # the siblings and fails on an unsigned one.
+    # not signed at all" and names the script — which is exactly what blocked
+    # the first slim DMG after the inside-out signing change. A non-Mach-O
+    # executable takes a Developer ID signature in its extended attributes,
+    # which the bundle seal and the ditto copy into the DMG both keep. They are
+    # signed *before* the nested Mach-O pass, because signing the bundle's main
+    # executable first validates the siblings and fails on an unsigned one.
     LAUNCHER_COUNT=0
     for launcher in "$APP_PATH/Contents/MacOS/"*; do
         [ -f "$launcher" ] || continue
@@ -87,10 +85,13 @@ if [ -n "$SIGN_IDENTITY" ]; then
     done
     echo "  signed $LAUNCHER_COUNT MacOS launchers"
 
+    echo "signing nested Mach-O binaries"
     NESTED_LIST="$(mktemp "${TMPDIR:-/tmp}/omlx-nested.XXXXXX")"
     find "$APP_PATH" -type f \
         \( -name "*.so" -o -name "*.dylib" -o -name "*.node" -o -perm -111 \) \
-        -print0 | tr '\0' '\n' > "$NESTED_LIST"
+        -print0 > "$NESTED_LIST.0"
+    tr '\0' '\n' < "$NESTED_LIST.0" > "$NESTED_LIST"
+    rm -f "$NESTED_LIST.0"
     # The bundle's own main executable is sealed by the bundle signature below;
     # signing it here would validate the still-unsigned siblings first.
     MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)"

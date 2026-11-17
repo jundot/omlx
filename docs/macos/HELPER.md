@@ -38,6 +38,36 @@ cannot be installed (no signed app, or a cancelled install that is then retried
 explicitly); a cancelled admin dialog stops there instead of opening a second
 prompt.
 
+## The helper as a capability
+
+Installing the helper is not hidden behind the low-limit warning. One seam is
+the single source of truth:
+
+```
+PrivilegedHelper.status → { installed, version,
+                            wiredLimitCurrentMB, wiredLimitRequestedMB }
+```
+
+- **Welcome** has a *System helper* step: one admin prompt while the person is
+  already clicking through first run.
+- **Performance** has a permanent *System Helper* row with **Install /
+  Reinstall**, independent of any warning, and a separate wired-limit row with
+  **Apply** whenever the current limit differs from the requested one. A raised
+  limit therefore never hides the capability.
+- `ensureInstalled` is idempotent and versioned: it blesses, reuses, or replaces
+  the tool (see the version ledger below), and the five status states are
+  covered by `PerformanceScreenVMTests` without opening a prompt.
+
+## Uninstall
+
+The app uninstalls itself from **Settings → Advanced → Uninstall…**: one sheet
+with a keep switch per scope (app, helper, runtime, settings, cluster state) and
+a byte summary before anything is removed. Models and the cluster identity are
+kept by default; model deletion is opt-in per directory. Removing the helper is
+the one admin dialog; cancelling it leaves the rest done and is reported.
+`Uninstall.swift` separates locator, plan and runner so the tests drive temporary
+directories and delete nothing real.
+
 ## Persistent helper
 
 `apps/omlx-mac/Helper/` contains the helper sources, its embedded Info.plist and
