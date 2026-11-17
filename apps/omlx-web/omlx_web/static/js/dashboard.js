@@ -697,7 +697,7 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
-            benchUploadSkipped: null,  // { reason } — only external-endpoint runs skip now
+            benchUploadSkipped: null,  // { reason, features } from the upload_skipped event
             benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
@@ -6062,6 +6062,16 @@
                     novel_ja: 'bench.config.context.novel_ja',
                 };
                 return window.t(keys[profile] || keys.code_python);
+            },
+
+            benchUploadSkippedLabel(reason) {
+                const keys = {
+                    external_endpoint: 'bench.upload_skipped.reason_external',
+                    splash: 'bench.upload_skipped.reason_splash',
+                    ane_aligned_prompt: 'bench.upload_skipped.reason_ane_aligned_prompt',
+                    custom_generation_length: 'bench.upload_skipped.reason_custom_generation_length',
+                };
+                return window.t(keys[reason] || 'bench.upload_skipped.reason_default');
             },
 
             // User clicked "View live" on the banner — clear the stale

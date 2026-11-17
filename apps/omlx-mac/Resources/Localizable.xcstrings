@@ -9892,6 +9892,78 @@
         }
       }
     },
+    "bench.throughput.upload.skipped.ane_aligned_prompt" : {
+      "comment" : "Skipped-upload reason when the benchmark used ANE-aligned prompt lengths",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse mit ANE-angepassten Prompts werden nicht gesendet, weil ihre Prompt-Längen nicht den Standard-PP-Stufen entsprechen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE-aligned prompt results are not submitted because their prompt lengths do not match the standard PP buckets."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I risultati con prompt allineati ad ANE non vengono inviati perché le lunghezze dei prompt non corrispondono ai livelli PP standard."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Результаты с промптами, выровненными под ANE, не отправляются, потому что длины промптов не совпадают со стандартными группами PP."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 对齐提示词的结果不会提交，因为其提示词长度与标准 PP 档位不一致。"
+          }
+        }
+      }
+    },
+    "bench.throughput.upload.skipped.custom_generation_length" : {
+      "comment" : "Skipped-upload reason when the benchmark used a generation length other than 128 tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse mit einer anderen Generierungslänge als 128 Tokens werden nicht gesendet, damit sie mit anderen Einsendungen vergleichbar bleiben."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Results with a generation length other than 128 tokens are not submitted so they stay comparable with other submissions."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I risultati con una lunghezza di generazione diversa da 128 token non vengono inviati, così restano confrontabili con gli altri invii."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Результаты с длиной генерации, отличной от 128 токенов, не отправляются, чтобы оставаться сопоставимыми с другими результатами."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "生成长度不是 128 tokens 的结果不会提交，以便与其他提交结果保持可比。"
+          }
+        }
+      }
+    },
     "bench.throughput.upload.skipped.default" : {
       "comment" : "Fallback skipped-upload reason when the server didn't provide one",
       "extractionState" : "manual",
@@ -9924,6 +9996,42 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "服务器跳过了上传这些结果。"
+          }
+        }
+      }
+    },
+    "bench.throughput.upload.skipped.splash" : {
+      "comment" : "Skipped-upload reason when the benchmark ran on the Splash engine",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash-Ergebnisse werden nicht gesendet, weil sie die Splash-Engine statt oMLX messen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash results are not submitted because they measure the Splash engine, not oMLX."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I risultati di Splash non vengono inviati perché misurano il motore Splash, non oMLX."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Результаты Splash не отправляются, потому что они измеряют движок Splash, а не oMLX."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash 结果不会提交，因为它们测量的是 Splash 引擎，而不是 oMLX。"
           }
         }
       }
