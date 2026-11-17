@@ -5001,3 +5001,90 @@ def test_assistant_screen_copy_exists_in_the_english_catalog():
         "cluster.assistant.show_details",
     ):
         assert catalog.get(key), key
+
+
+def test_saved_setup_card_names_its_state_and_age():
+    """Fit-gap #5 (2026-11-16): an unloaded placement is a saved setup.
+
+    The eyebrow no longer claims "Cluster configured" while nothing runs,
+    and the age line appears only when the registry knows the moment —
+    never invented.
+    """
+
+    fixtures = _fixtures()
+    deployment = fixtures["deployments_active.json"]["deployments"][0]
+    result = _run_wizard(
+        f"""
+component.deploymentsPayload = {json.dumps([deployment])};
+component.runtimePayload = {json.dumps(fixtures['runtime_detached.json'])};
+component.runtimeLoaded = true;
+const dep = component.deploymentsPayload[0];
+const withoutStamp = component.deploymentStatus(dep);
+component.deploymentsSavedAt = {{ [dep.deployment_id]: 1794900000 }};
+const stamped = component.deploymentStatus(dep);
+process.stdout.write(JSON.stringify({{
+  without: {{ eyebrow: withoutStamp.eyebrow, label: withoutStamp.label, detail: withoutStamp.detail }},
+  stamped: {{ eyebrow: stamped.eyebrow, label: stamped.label, detail: stamped.detail }},
+}}));
+"""
+    )
+
+    assert result["without"]["eyebrow"] == "Saved setup"
+    assert result["without"]["label"] == "Not loaded"
+    assert "no model weights are resident" in result["without"]["detail"]
+    assert "Saved" not in result["without"]["detail"].replace("saved,", "")
+
+    assert result["stamped"]["eyebrow"] == "Saved setup"
+    assert result["stamped"]["label"] == "Not loaded"
+    # The age line carries the formatted moment, not a promise about activity.
+    assert result["stamped"]["detail"].startswith(
+        result["without"]["detail"].rstrip(".") + "."
+    ) or "no model weights are resident" in result["stamped"]["detail"]
+    assert "Saved" in result["stamped"]["detail"]
+
+
+def test_assistant_card_headline_is_the_session_after_reload():
+    """Fit-gap #6 (2026-11-16): a persisted session owns the headline.
+
+    After a reload with a running (or stopped) cluster the card must not
+    say "Set up this cluster / Not started" above a live deployment.
+    """
+
+    result = _run_wizard(
+        """
+component.assistant.state = 'idle';
+component.assistant.session = {
+  state: 'ready', stopped: false, model_path: '/models/dev-1.5b',
+  context_tokens: 32768, coordinator_node: 'node-a',
+};
+const running = {
+  title: component.assistantScreenTitle(),
+  subtitle: component.assistantScreenSubtitle(),
+  stateLabel: component.assistantStateLabel(),
+};
+component.assistant.session.stopped = true;
+const stopped = {
+  title: component.assistantScreenTitle(),
+  stateLabel: component.assistantStateLabel(),
+};
+component.assistant.session = null;
+const fresh = {
+  title: component.assistantScreenTitle(),
+  subtitle: component.assistantScreenSubtitle(),
+  stateLabel: component.assistantStateLabel(),
+};
+process.stdout.write(JSON.stringify({ running, stopped, fresh }));
+"""
+    )
+
+    assert result["running"]["title"] == "Cluster running"
+    assert "dev-1.5b" in result["running"]["subtitle"]
+    assert "32,768" in result["running"]["subtitle"]
+    assert result["running"]["stateLabel"] == ""
+
+    assert result["stopped"]["title"] == "Cluster stopped"
+    assert result["stopped"]["stateLabel"] == ""
+
+    assert result["fresh"]["title"] == "Set up this cluster"
+    assert "measures these Macs" in result["fresh"]["subtitle"]
+    assert result["fresh"]["stateLabel"] == "Not started"

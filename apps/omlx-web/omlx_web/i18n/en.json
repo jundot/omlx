@@ -2717,5 +2717,10 @@
   "cluster.assistant.failure.generic": "The step did not finish",
   "cluster.assistant.show_details": "Show details",
   "cluster.v2.levers.title": "Your Macs",
-  "cluster.v2.levers.hint": "roles apply at the next measurement"
+  "cluster.v2.levers.hint": "roles apply at the next measurement",
+  "cluster.assistant.session.title.running": "Cluster running",
+  "cluster.assistant.session.title.stopped": "Cluster stopped",
+  "cluster.assistant.session.title.applied": "Setup applied",
+  "cluster.v2.deploy.status_saved_setup": "Saved setup",
+  "cluster.v2.deploy.saved_at": "Saved {when}."
 }

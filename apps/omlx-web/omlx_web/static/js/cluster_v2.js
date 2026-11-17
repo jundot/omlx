@@ -320,6 +320,10 @@ function clusterV2Wizard() {
         devicesFailureCount: 0,
         devicesUnreachable: false,
         deploymentsPayload: [],
+        // deployment_id → epoch seconds, from the registry envelope's
+        // saved_at map. An unloaded, saved placement is honest about its
+        // age only with this (fit-gap #5, 2026-11-16).
+        deploymentsSavedAt: {},
         deploymentsLoaded: false,
         // Deployments are durable configuration. Runtime is the separate,
         // observed proof that their rank processes are loading or resident.
@@ -840,6 +844,7 @@ function clusterV2Wizard() {
             try {
                 const payload = await this.apiFetch(CLUSTER_V2_API.deployments);
                 this.deploymentsPayload = payload?.deployments || [];
+                this.deploymentsSavedAt = payload?.saved_at || {};
                 this.deploymentsLoaded = true;
                 this.ensureColdModelSelection();
             } catch (error) {
@@ -1446,12 +1451,30 @@ function clusterV2Wizard() {
             }
             return {
                 state: 'configured',
-                eyebrow: window.t('cluster.v2.deploy.status_configured'),
+                eyebrow: window.t('cluster.v2.deploy.status_saved_setup'),
                 label: window.t('cluster.v2.deploy.status_not_loaded'),
-                detail: window.t('cluster.v2.deploy.status_not_loaded_detail'),
+                detail: this.deploymentSavedAtDetail(deployment),
                 tone: 'bg-amber-50 border-amber-200 text-amber-700',
                 pulse: false,
             };
+        },
+
+        // Fit-gap #5 (2026-11-16): a saved placement without resident
+        // weights is yesterday's leftover as often as it is a fresh
+        // pre-load setup. The headline names the state, and the age line
+        // is only present when the registry knows the save moment — never
+        // invented.
+        deploymentSavedAtDetail(deployment = this.configuredDeployment()) {
+            const detail = window.t('cluster.v2.deploy.status_not_loaded_detail');
+            const stamp = Number(
+                this.deploymentsSavedAt?.[deployment?.deployment_id] || 0,
+            );
+            if (!Number.isFinite(stamp) || stamp <= 0) return detail;
+            const when = new Date(stamp * 1000).toLocaleString(undefined, {
+                dateStyle: 'medium',
+                timeStyle: 'short',
+            });
+            return `${detail} ${window.t('cluster.v2.deploy.saved_at').replace('{when}', when)}`;
         },
 
         deploymentCacheLabel(deployment = this.configuredDeployment()) {
@@ -4783,6 +4806,11 @@ function clusterV2Wizard() {
         },
 
         assistantStateLabel() {
+            // A visible session owns the card's headline (fit-gap #6,
+            // 2026-11-16): the flow chip would say "Not started" while the
+            // cluster runs below it. Empty hides the chip instead of
+            // contradicting the strip.
+            if (this.assistantSessionVisible()) return '';
             const labels = {
                 idle: window.t('cluster.assistant.state.idle'),
                 measuring: window.t('cluster.assistant.state.measuring'),
@@ -4823,6 +4851,19 @@ function clusterV2Wizard() {
         },
 
         assistantScreenTitle() {
+            // The resume case is the card's real state (fit-gap #6,
+            // 2026-11-16): "Set up this cluster" above a running cluster
+            // read as a contradiction. The session names what is there.
+            if (this.assistantScreen() === 'start' && this.assistantSessionVisible()) {
+                const session = this.assistant.session;
+                if (session?.stopped) {
+                    return t('cluster.assistant.session.title.stopped');
+                }
+                if (session?.state === 'ready') {
+                    return t('cluster.assistant.session.title.running');
+                }
+                return t('cluster.assistant.session.title.applied');
+            }
             const titles = {
                 start: 'cluster.assistant.title',
                 check: 'cluster.assistant.screen.check.title',
@@ -4837,7 +4878,14 @@ function clusterV2Wizard() {
         },
 
         assistantScreenSubtitle() {
-            if (this.assistantScreen() === 'start') return t('cluster.assistant.blurb');
+            if (this.assistantScreen() === 'start') {
+                // With a persisted session the model/context/coordinator line
+                // replaces the sales pitch: the DAU sees what runs, not what
+                // the feature could do.
+                return this.assistantSessionVisible()
+                    ? this.assistantSessionLabel()
+                    : t('cluster.assistant.blurb');
+            }
             if (this.assistantScreen() === 'choose') {
                 return t('cluster.assistant.screen.choose.sub');
             }
