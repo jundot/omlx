@@ -58,10 +58,9 @@
 #   OMLX_WITH_CUSTOM_KERNEL=1           # same as --with-custom-kernel
 #   OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET=15.0
 #                                       # macOS min version for custom kernels
+
 #   OMLX_TEAM_ID=ABCDE12345             # Apple Developer team id for the
 #                                       # helper's SMJobBless requirements.
-#                                       # Unset = empty team: the helper is
-#                                       # built but cannot be blessed.
 
 set -euo pipefail
 
@@ -651,7 +650,7 @@ if [ "$SLIM" -eq 1 ]; then
     cp "$RENDERED_HELPER_PLISTS/app.omlx.helper.plist" \
         "$HELPER_DAEMONS/app.omlx.helper.plist"
     chmod 755 "$HELPER_TOOLS/app.omlx.helper"
-    ok "  + privileged helper (SMJobBless, team ${OMLX_TEAM_ID:-none})"
+    ok "  + privileged helper (SMJobBless)"
 
     # The slim app starts the server from the external runtime venv; no
     # PYTHONHOME and no embedded framework path.
@@ -683,11 +682,11 @@ WRAPPER
 exec "$PYTHON" "$@"
 WRAPPER
     chmod 755 "$STAGED_APP/Contents/MacOS/omlx-cli"         "$STAGED_APP/Contents/MacOS/omlx-cluster-python"
-    # `omlx-cli` and `omlx-cluster-python` are shell scripts, so the later
-    # "Re-sign ad-hoc" block (which only runs on the embedded-Python path)
-    # never reaches them. A file in `Contents/MacOS` must carry a signature or
-    # the bundle cannot be sealed at release time, so sign them ad-hoc here;
-    # `package_dmg.sh` re-signs them with the Developer ID identity first.
+    # These two are shell scripts, so the later "Re-sign ad-hoc" block below
+    # (which only runs on the embedded-Python path) never reaches them. A file
+    # in `Contents/MacOS` must carry a signature or the bundle cannot be
+    # sealed at release time, so sign them ad-hoc here; `package_dmg.sh`
+    # re-signs them with the Developer ID identity before it seals the app.
     codesign --force --sign - "$STAGED_APP/Contents/MacOS/omlx-cli" \
         "$STAGED_APP/Contents/MacOS/omlx-cluster-python" >/dev/null 2>&1 || true
     ok "  + slim runtime wrappers"

@@ -19,9 +19,7 @@
     <array>
         <!-- Only a Developer ID Application signed oMLX may install and talk to
              this root helper: the requirement pins the Developer ID CA and the
-             Developer ID Application leaf marker, not just the team (OU).
-             This plist is embedded with -sectcreate, so Xcode does not process
-             it: build.sh substitutes $(OMLX_TEAM_ID) when it stages the helper. -->
+             Developer ID Application leaf marker, not just the team (OU). -->
         <string>anchor apple generic and identifier "app.omlx" and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "$(OMLX_TEAM_ID)"</string>
     </array>
     <key>CFBundlePackageType</key>

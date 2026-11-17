@@ -2,7 +2,7 @@
 // offline-testable surface: the exact `uv` command plan, the pinned
 // interpreter, the installation check, and the fail-closed order that keeps a
 // missing bundled installer from creating a half-built venv. The download
-// itself needs a network and is exercised by hand (docs/macos/SLIM-RUNTIME.md).
+// itself needs a network and is exercised by hand (SLIM-RUNTIME.md).
 
 import XCTest
 @testable import oMLX
