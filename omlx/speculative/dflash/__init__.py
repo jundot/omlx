@@ -109,6 +109,15 @@ def quantize_drafter(model: nn.Module, *, bits: int, group_size: int) -> int:
         return True
 
     nn.quantize(model, group_size=group_size, bits=bits, class_predicate=predicate)
+    # ``nn.quantize`` replaces each Linear with a QuantizedLinear whose packed
+    # weights (uint32) are lazy until evaluated. If we do not materialize them
+    # here, every weight stays bound to the loader thread's TLS stream as an
+    # unevaluated graph node, and the draft executor thread cannot trigger
+    # their execution ("no Stream(gpu, N) in current thread") when it copies
+    # them via ``mx.array(w)``. Eval the whole parameter tree on the loader
+    # thread so the draft thread can copy the materialized arrays.
+    import mlx.core as _mxq
+    _mxq.eval(model.parameters())
     return quantized
 
 
@@ -177,6 +186,59 @@ def load_dflash_drafter(
     checkpoint's context window.
     """
     adaptive = resolve_verify_mode(verify_mode)
+    # Spark X2.5/X2.6 ships its DSpark draft as a ``SparkDSparkDraftModel``
+    # checkpoint. The stock mlx-vlm ``load_drafter`` cannot load it (the
+    # architecture is not registered), so route it through the bundled Spark
+    # adapter, which patches the target capture hooks, promotes the draft to
+    # FP32 (the official llama.cpp dflash graph computes in FP32) and honors
+    # the sigmoid per-head gate. ``quant_bits`` is applied by the adapter's
+    # caller via ``quantize_drafter`` below for the generic path; the Spark
+    # adapter quantizes its own linear layers here.
+    from omlx.patches.spark_dspark import (
+        load_spark_dspark_drafter,
+    )
+    local = get_model_path(path)
+    try:
+        _spark_cfg = json.loads((local / "config.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        _spark_cfg = {}
+    _spark_arch = set(_spark_cfg.get("architectures") or ()) | set(
+        (_spark_cfg.get("text_config") or {}).get("architectures") or ()
+    )
+    if "SparkDSparkDraftModel" in _spark_arch:
+        drafter = load_spark_dspark_drafter(
+            local,
+            target_model,
+            depth=block_size - 1 if block_size else None,
+            fixed=not adaptive,
+        )
+        # Override the trained block size with the configured depth.
+        # ``dflash_block_size`` is draft+verify tokens per cycle (anchor +
+        # proposals); the drafter's ``depth`` is the proposal count.
+        target_block = resolve_block_size(
+            drafter.model, block_size, getattr(target_model, "_omlx_mtp_max_verify_rows", None)
+        )
+        if target_block != drafter.block_size:
+            drafter.block_size = target_block
+            drafter.depth = target_block - 1
+            logger.info(
+                "Spark DFlash block overridden: block=%d depth=%d",
+                target_block,
+                drafter.depth,
+            )
+        if quant_enabled and not getattr(drafter.model.config, "quantization", None):
+            count = quantize_drafter(
+                drafter.model, bits=quant_bits, group_size=quant_group_size
+            )
+            logger.info(
+                "Spark DFlash drafter quantized: %d linear layers at %d bits "
+                "(group %d)",
+                count,
+                quant_bits,
+                quant_group_size,
+            )
+        return drafter
+
     model, kind = load_drafter(path, kind="dflash")
     if kind != "dflash":
         raise ValueError(f"{path} resolved to drafter kind {kind!r}, expected 'dflash'")
