@@ -62,6 +62,7 @@ from .discovery import (
 )
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
 from .guidance import explain
+from .identity import get_node_identity
 from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
@@ -107,7 +108,6 @@ from .planner import (
 from .probe import collect_cluster_status
 from .rdma.link_routes import cluster_rdma_link_verify, cluster_rdma_links
 from .registry import get_cluster_registry, get_device_registry
-from .identity import get_node_identity
 from .replan import (
     hosts_from_deployment,
     nodes_from_deployment,
@@ -337,23 +337,72 @@ def _saved_moe_offload(model_path: str | None) -> tuple[bool, float]:
     return enabled, fraction
 
 
+def _moe_offload_layer_bytes(
+    model: ModelLayout, fraction: float, *, mtp: bool
+) -> tuple[int, ...]:
+    """Per-layer routed-expert bytes this rank streams instead of holding.
+
+    Upstream's ``moe_offload`` module no longer exports a per-layer byte table:
+    ``ExpertOffloadPlan`` (via ``_plan``) owns it. A layer streams everything it
+    does not keep resident — ``layer_bytes - layer_bytes * capacity // count`` —
+    which is the same saving the assistant's ``policy.moe_offload_layer_bytes``
+    derives, so the coordinator's plan and the election cannot disagree about
+    it. The bytes come from the checkpoint's own headers, never an estimate.
+    """
+
+    if not 0 < fraction <= 1:
+        raise PlanningError("MoE resident fraction must be in (0, 1]")
+    source = (model.source or "").strip()
+    if not source or source == "synthetic":
+        return ()
+    from ..patches.deepseek_v41.moe_offload import _plan
+
+    try:
+        plan = _plan(source, float(fraction), mtp_resident=mtp)
+        count = int(plan.count) or 0
+        capacity = int(plan.capacity)
+        per_layer = [0] * model.layer_count
+        for prefix, full in plan.layer_bytes.items():
+            parts = prefix.split(".")
+            try:
+                index = int(parts[2])
+            except (IndexError, ValueError):
+                continue
+            if not 0 <= index < model.layer_count:
+                raise PlanningError(
+                    "expert-offload layout does not match the model's layers"
+                )
+            resident = int(full) * capacity // count if count else 0
+            per_layer[index] += int(full) - resident
+    except PlanningError:
+        raise
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        raise PlanningError(
+            f"could not size the expert-offload layout: {exc}"
+        ) from exc
+    return tuple(per_layer)
+
+
 def _moe_offload_for_plan(
     model_path: str | None,
-    model: Any,
+    model: ModelLayout,
     *,
     mtp: bool,
     tensor_parallel_size: int,
 ) -> tuple[float, tuple[int, ...]]:
-    """Validate the saved expert-offload setting against this plan shape."""
+    """The expert offload ``(fraction, per-layer bytes)`` this plan may price.
+
+    Only a DeepSeek-V4.1 MoE has a routed-expert layout the planner can size
+    today. Any other checkpoint — no setting, another MoE family, a synthetic
+    layout — gets no bytes and therefore upstream's resident plan unchanged: a
+    saving is never invented. A DeepSeek-V4.1 checkpoint whose saved setting is
+    on always gets a price, or an explicit error, because the loader is about to
+    stream those experts.
+    """
 
     enabled, fraction = _saved_moe_offload(model_path)
     if not enabled:
         return 0.0, ()
-    if tensor_parallel_size > 1:
-        raise PlanningError(
-            "MoE expert offload is supported for pipeline stages only; "
-            "tensor-parallel ranks read every expert"
-        )
     if not model_path:
         raise PlanningError(
             "MoE expert offload needs a model path to measure the expert layout"
@@ -370,24 +419,17 @@ def _moe_offload_for_plan(
         raise PlanningError(
             f"could not read the model config for expert offload: {exc}"
         ) from exc
-    model_type = str(config.get("model_type", "")).lower()
-    if model_type != "deepseek_v41":
+    if str(config.get("model_type", "")).lower() != "deepseek_v41":
+        # Other families keep upstream's plan. Their loader may still offload,
+        # but the planner has no per-layer expert map for them, and charging
+        # resident experts is the conservative direction.
+        return 0.0, ()
+    if tensor_parallel_size > 1:
         raise PlanningError(
-            "cluster MoE expert offload currently supports DeepSeek V4.1 "
-            "checkpoints only"
+            "MoE expert offload is supported for pipeline stages only; "
+            "tensor-parallel ranks read every expert"
         )
-    from ..patches.deepseek_v41.moe_offload import offload_layer_bytes
-
-    try:
-        layer_bytes = offload_layer_bytes(
-            model_path,
-            fraction,
-            mtp_resident=mtp,
-        )
-    except (OSError, TypeError, ValueError, KeyError) as exc:
-        raise PlanningError(
-            f"could not size the expert-offload layout: {exc}"
-        ) from exc
+    layer_bytes = _moe_offload_layer_bytes(model, fraction, mtp=mtp)
     if len(layer_bytes) != model.layer_count:
         raise PlanningError(
             "expert-offload layer count does not match the model layout"
@@ -843,8 +885,6 @@ _PLACEMENT_FIELDS = (
     "start_layer",
     "end_layer",
     "planned_weight_bytes",
-    "moe_expert_offload_resident_fraction",
-    "moe_offload_weight_bytes",
     "kv_cache_bytes",
     "max_context_tokens",
     "reserve_bytes",
@@ -986,6 +1026,10 @@ def _create_cluster_plan(request: ClusterPlanRequest):
     pipeline_model = with_mtp_head(model) if request.mtp else model
     head_bytes = model.mtp_weight_bytes if request.mtp else 0
     engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
+    # The saved routed-expert offload setting is priced here too: the assistant
+    # elects from it, so the coordinator's own plan must not re-charge experts
+    # the loader streams. A tensor-parallel request is refused, because every
+    # TP rank reads every expert.
     moe_fraction, moe_offload_layer_bytes = _moe_offload_for_plan(
         request.model_path,
         model,
@@ -1322,12 +1366,23 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
-    moe_fraction, moe_offload_layer_bytes = _moe_offload_for_plan(
-        request.model_path,
-        model,
-        mtp=mtp,
-        tensor_parallel_size=1,
-    )
+    # Same saved-setting derivation the assistant elects from: a DeepSeek-V4.1
+    # MoE with expert offload on is priced by pipeline stage, so the coordinator
+    # cannot re-charge streamed experts when it re-plans the approved split.
+    try:
+        moe_fraction, moe_offload_layer_bytes = _moe_offload_for_plan(
+            request.model_path,
+            model,
+            mtp=mtp,
+            tensor_parallel_size=1,
+        )
+    except PlanningError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Every tensor-parallel rank reads every expert, so an offloaded plan is a
+    # pipeline plan. Automatic takes that split instead of silently pricing the
+    # experts resident; an explicit tensor request is refused below.
+    moe_forced_pipeline = bool(moe_offload_layer_bytes) and request.strategy == "auto"
+    plan_strategy = "pipeline" if moe_forced_pipeline else request.strategy
 
     transports: tuple[Any, ...] = ()
     transport_error: str | None = None
@@ -1389,15 +1444,49 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             nodes,
             transports=strategy_transports,
             prefer=request.prefer,
-            strategy=request.strategy,
+            strategy=plan_strategy,
             measurements=measurements,
             workload_profile=request.execution_profile,
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
             engram_ssd_offload=engram_ssd_offload,
-            moe_offload_layer_bytes=moe_offload_layer_bytes,
-            moe_expert_offload_resident_fraction=moe_fraction,
         )
+        if moe_offload_layer_bytes:
+            if choice.tensor_parallel_size > 1:
+                raise PlanningError(
+                    "MoE expert offload is supported for pipeline stages only; "
+                    "tensor-parallel ranks read every expert"
+                )
+            # ``choose_parallelism`` has no expert-offload seam, so rebuild the
+            # pipeline plan with it: the stage then holds ``layer - offloaded``,
+            # exactly the split the assistant's election approved.
+            reason = choice.reason
+            choice_warnings = choice.warnings
+            if moe_forced_pipeline:
+                reason = (
+                    f"{reason}. Routed experts are offloaded per pipeline "
+                    "stage, so tensor parallelism was not considered."
+                )
+                choice_warnings += (
+                    "MoE expert offload streams routed experts per pipeline "
+                    "stage, so tensor parallelism was not considered.",
+                )
+            choice = replace(
+                choice,
+                plan=plan_hybrid(
+                    model,
+                    nodes,
+                    tensor_parallel_size=1,
+                    workload_profile=request.execution_profile,
+                    context_tokens=request.target_context_tokens,
+                    head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
+                    engram_ssd_offload=engram_ssd_offload,
+                    moe_offload_layer_bytes=moe_offload_layer_bytes,
+                    moe_expert_offload_resident_fraction=moe_fraction,
+                ),
+                reason=reason,
+                warnings=choice_warnings,
+            )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1506,6 +1595,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
             engram_ssd_offload=engram_ssd_offload,
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=moe_fraction,
         )
         choice = replace(choice, plan=ordered_plan)
     for group in tp_groups_spanning_slow_links(
@@ -3130,9 +3221,7 @@ def _build_performance_plan(
         context_tokens=context_tokens,
         engram_ssd_offload=engram_ssd_offload,
         moe_offload_layer_bytes=moe_offload_layer_bytes,
-        moe_expert_offload_resident_fraction=(
-            moe_expert_offload_resident_fraction
-        ),
+        moe_expert_offload_resident_fraction=moe_expert_offload_resident_fraction,
     )
 
 
@@ -3167,6 +3256,9 @@ def _performance_optimized_deployment(
     nodes = _node_budgets(request.nodes, profiles=profiles)
     # Keep the approved plan's Engram decision instead of rereading settings.
     engram_ssd_offload = any(item.ssd_weight_bytes for item in deployment.assignments)
+    # Likewise the approved expert-offload decision: re-reading the saved
+    # setting could price a different fraction than the plan that was approved,
+    # and an un-applied offload has no bytes to charge.
     moe_fraction = next(
         (
             item.moe_expert_offload_resident_fraction
@@ -3177,13 +3269,13 @@ def _performance_optimized_deployment(
     )
     moe_offload_layer_bytes: tuple[int, ...] = ()
     if moe_fraction:
-        from ..patches.deepseek_v41.moe_offload import offload_layer_bytes
-
-        moe_offload_layer_bytes = offload_layer_bytes(
-            deployment.model,
-            moe_fraction,
-            mtp_resident=False,
+        moe_offload_layer_bytes = _moe_offload_layer_bytes(
+            model, moe_fraction, mtp=False
         )
+        if not moe_offload_layer_bytes:
+            # The approved plan claimed a streamed share this layout cannot be
+            # sized for; charge the experts resident rather than a made-up split.
+            moe_fraction = 0.0
     plan = _build_performance_plan(
         model,
         nodes,
