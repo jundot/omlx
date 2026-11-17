@@ -886,8 +886,10 @@ def _extract_tool_result_content(
 
 # Anthropic server-side tools (executed on Anthropic's infrastructure) carry a
 # versioned ``type`` like ``web_search_20250305`` and have no ``input_schema``.
-# oMLX cannot fulfill these locally, so we drop them before forwarding to the
-# model. See https://docs.anthropic.com for the canonical tool families.
+# web_search_20250305 is handled earlier by anthropic_web_search.py; any
+# remaining server-side tool cannot be fulfilled locally and is dropped before
+# forwarding to the model. See https://docs.anthropic.com for the canonical
+# tool families.
 SERVER_SIDE_TOOL_TYPE_PREFIXES = (
     "web_search_",
     "code_execution_",
