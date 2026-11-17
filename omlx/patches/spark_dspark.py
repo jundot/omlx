@@ -578,32 +578,6 @@ def _rope_positions(model, x, start_positions):
     return mx.concatenate(rows, axis=0)
 
 
-def _copy_params_to_active_stream(self) -> int:
-    """Copy drafter parameters onto the active (draft) stream.
-
-    Weights are created on the loader thread's TLS stream; the draft
-    executor thread cannot read them. ``mx.array(w)`` copies a materialized
-    array onto the calling thread's active stream.
-    """
-    import mlx.core as _mx
-    _count = 0
-
-    def _dup(v):
-        nonlocal _count
-        if isinstance(v, _mx.array):
-            _count += 1
-            return _mx.array(v)
-        if isinstance(v, dict):
-            return {_kk: _dup(_vv) for _kk, _vv in v.items()}
-        if isinstance(v, (list, tuple)):
-            return [_dup(_x) for _x in v]
-        return v
-
-    _nested = _dup(self.model.parameters())
-    self.model.update(_nested)
-    return _count
-
-
 def _spark_draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
         """One draft forward for every row (Spark DSpark enhanced)."""
         model = self.model
@@ -645,9 +619,6 @@ def _spark_draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
         for _i, _seg in enumerate(segments):
             segments[_i] = _mx.contiguous(_mx.array(_seg))
             _mx.eval(segments[_i])
-        if not getattr(self, '_omlx_weights_copied', False):
-            self._copy_params_to_active_stream()
-            self._omlx_weights_copied = True
         width = max(1, max(int(seg.shape[1]) for seg in segments))
         padded = mx.concatenate(
             [
@@ -933,8 +904,5 @@ def _patch_drafter_batched() -> bool:
         _spark_draft_batched.__name__,
     )
     DFlashDrafter._draft_batched = fn
-    # _copy_params_to_active_stream is referenced by the patched method.
-    if not hasattr(DFlashDrafter, "_copy_params_to_active_stream"):
-        DFlashDrafter._copy_params_to_active_stream = _copy_params_to_active_stream
     DFlashDrafter._omlx_spark_batched_patched = True
     return True
