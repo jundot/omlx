@@ -94,6 +94,7 @@ from .api.anthropic_utils import (
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
+from .api.anthropic_web_search import maybe_handle_anthropic_web_search
 from .api.body_limit import RequestBodySizeLimitMiddleware
 from .api.embedding_models import (
     EmbeddingData,
@@ -8044,6 +8045,16 @@ async def create_anthropic_message(
             status_code=503,
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
+
+    # Claude Code's built-in WebSearch uses Anthropic's server-side
+    # web_search_20250305 tool. Fulfil that nested request with the search
+    # provider configured in Settings -> Integrations -> Web Search instead
+    # of dropping the tool in the conversion layer.
+    web_search_response = await maybe_handle_anthropic_web_search(
+        request, _server_state.global_settings
+    )
+    if web_search_response is not None:
+        return web_search_response
 
     lease = _LLMEngineLease()
     try:

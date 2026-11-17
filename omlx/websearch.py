@@ -3,9 +3,10 @@
 Built-in web search and page fetch for the admin chat UI.
 
 The chat page advertises two client-side tools (web_search / fetch_url)
-and executes them through the /v1/web endpoints, which land here. These
-tools are never merged into /v1/chat/completions requests, so external
-API clients are unaffected.
+and executes them through the /v1/web endpoints, which land here. The
+Anthropic /v1/messages server-tool handler also reuses run_web_search for
+Claude Code's built-in WebSearch tool; none of these tools are merged into
+/v1/chat/completions requests.
 
 Providers:
 - duckduckgo (default): ddgs library, no credentials required. Note that
