@@ -327,15 +327,21 @@ def test_stdlib_default_timeout_gives_default_on_winner(monkeypatch):
     assert sock.timeout == 7.0
 
 
+def _uninstalled(monkeypatch):
+    # Server-start tests (cli.serve_command, server.main) install the
+    # wrapper for real; start from the stdlib function either way.
+    monkeypatch.setattr(socket, "create_connection", he._ORIGINAL_CREATE_CONNECTION)
+
+
 def test_install_is_idempotent(monkeypatch):
-    monkeypatch.setattr(socket, "create_connection", socket.create_connection)
+    _uninstalled(monkeypatch)
     assert he.install() is True
     assert he.install() is False
     assert socket.create_connection is he.create_connection
 
 
 def test_installed_wrapper_races(monkeypatch):
-    monkeypatch.setattr(socket, "create_connection", socket.create_connection)
+    _uninstalled(monkeypatch)
     he.install()
     NetStub(monkeypatch, [ai6(), ai4()], v6="hang", v4="ok")
     sock, elapsed = _timed(socket.create_connection, ("example.com", 443), 5.0)
