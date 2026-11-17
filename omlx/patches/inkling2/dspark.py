@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bundled DSpark drafter for Inkling 2 (``mtp.safetensors``).
 
-A five-layer block drafter. Each layer mixes the target's context taps (the
-partial block sums entering ``target_layer_ids[:-1]`` and the final-norm
-output) with its own softmax weights and projects them to context K/V. The
+A small block drafter. Each layer mixes the target's context taps (the
+partial block sums entering the layer visits ``target_layer_ids[:-1]`` and the
+final-norm output) with its own softmax weights and projects them to context
+K/V. Looped targets count every pass through a core layer as a visit. The
 block attends to that context and to itself in both directions, and the mask
 positions propose through the target LM head plus an RNN Markov head.
 
