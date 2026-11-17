@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Admin API for the Cluster Assistant: measure, plan, then apply and start.
 
-Twenty-two routes: the browser's assistant surface, plus the two read/write routes
+Fifteen routes: the browser's assistant surface, plus the two read/write routes
 a second origin and the origin itself exchange with the elected coordinator —
 the cluster-wide "one apply/start at a time" lock — and the redacted support
 bundle::
@@ -14,6 +14,11 @@ bundle::
     POST   /admin/api/cluster/assistant/start               start it on the elected Mac
     GET    /admin/api/cluster/assistant/session             last deployment after reload
     POST   /admin/api/cluster/assistant/stop                stop the ready deployment
+    POST   /admin/api/cluster/assistant/run-local           load the model on this Mac alone
+    GET    /admin/api/cluster/assistant/run-local/{job_id}  poll that local run
+    POST   /admin/api/cluster/assistant/run-local/{job_id}/stop  stop it, unload locally
+    POST   /admin/api/cluster/assistant/tune-local          tune the model that local run serves
+    GET    /admin/api/cluster/assistant/tune-local/{id}     poll that local tune
     GET    /admin/api/cluster/assistant/performance-probe   read the probe switch
     POST   /admin/api/cluster/assistant/performance-probe   write the probe switch
     GET    /admin/api/cluster/assistant/operations/active   is the coordinator busy?
@@ -74,6 +79,7 @@ import ipaddress
 import json
 import logging
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -103,12 +109,14 @@ from .diagnostics import build_diagnostics
 from .election import (
     ComputeProfile,
     ElectionError,
+    NodeFacts,
     NoFeasiblePlanError,
     UnsupportedParallelismError,
     _reject_tensor_parallel,
 )
 from .measurement import (
     DEFAULT_ENDPOINT_PORT,
+    LOOPBACK_ENDPOINT_HOSTS,
     MeasurementSet,
     MeasurementWarning,
     measure_budget_payloads,
@@ -134,6 +142,7 @@ from .models import (
     AssistantPlanResponse,
     AssistantRecommendRequest,
     AssistantRecommendResponse,
+    AssistantRunLocalRequest,
     AssistantStartRequest,
     AssistantStopRequest,
     AssistantStopResponse,
@@ -154,6 +163,7 @@ from .operations import (
     ACTION_PAIR_MAC,
     ACTION_PLAN,
     ACTION_RETRY_COORDINATOR,
+    ACTION_START,
     ACTION_STATUS,
     KIND_APPLY,
     KIND_START,
@@ -171,6 +181,9 @@ from .operations import (
 )
 from .performance_store import AssistantPerformanceStore
 from .policy import (
+    TABLE_OFFLOAD_ENGRAM,
+    TABLE_OFFLOAD_PLE,
+    WARNING_TABLE_OFFLOAD_ENABLED,
     SavedPolicy,
     solve_cluster_plan,
 )
@@ -183,18 +196,28 @@ from .provisioning import (
     plan_apply,
 )
 from .recommendation import (
+    ACTION_CHECK_MODEL_PATH,
+    ACTION_CHOOSE_SMALLER_MODEL,
     ModelCandidate,
     RecommendationResult,
+    _single_node_fit,
     load_model_candidate,
     recommend,
 )
 from .start import (
     ACTIVE_OPERATION_PATH,
+    CHAT_COMPLETIONS_PATH,
     COORDINATOR_REFUSALS,
+    MODEL_LOAD_PATH,
+    MODEL_SETTINGS_PATH,
     MODEL_UNLOAD_PATH,
+    MODELS_PATH,
+    WARNING_TUNING_PRESET_APPLIED,
+    WARNING_TUNING_PRESET_SKIPPED,
     CoordinatorOps,
     RemoteAdminError,
     _local_admin,
+    _model_entry,
     coordinator_ops,
     delete_model_on_mac,
     remote_admin,
@@ -208,6 +231,7 @@ from .start import (
 )
 from .state import (
     ACTION_MEASURE,
+    REFUSAL_NOT_READY,
     STALE_MEASUREMENT_CODE,
     MeasurementEndpoint,
     MeasurementRecord,
@@ -3039,7 +3063,7 @@ def _merge_and_save_preset_for(
 
     The key is ``preset_key(model_path, hardware_key(node_ids))`` — the same one
     ``_tuning_preset_patch`` reads back — so a preset saved by a local tune is
-    the preset a single-node replay reads back, and a cluster Start keys its own on
+    the preset this Mac's run-local replays, and a cluster Start keys its own on
     its elected node set. Returns "" when nothing could be saved (no model path,
     no nodes, or an unwritable store): tuning never fails on a preset write.
     """
@@ -3088,7 +3112,7 @@ def _saved_preset_patch(record: Any) -> dict[str, Any] | None:
 def _tuning_preset_patch(
     model_path: str, node_ids: Sequence[str]
 ) -> dict[str, Any] | None:
-    """The same patch for any (model, node set) — one lookup for Start and any single-node replay.
+    """The same patch for any (model, node set) — one lookup for Start and run-local.
 
     Start replays the preset for the elected rank order; a single-node run
     replays it for this one Mac (``hardware_key([this_mac])``). Both must read
@@ -3420,8 +3444,1423 @@ async def cluster_assistant_tuning_preset(
     return preset.to_dict()
 
 
+# ---------------------------------------------------------------------------
+# run-local (single-node inference on this Mac, no cluster)
+# ---------------------------------------------------------------------------
+#
+# "Run on this Mac" is deliberately not a plan: ``plan`` is the PP-only cluster
+# contract and a single-Mac plan stays unapplicable (ClusterDeployment needs 2+
+# hosts). A model that fits on one Mac is measurably faster served by that Mac's
+# own engine than by a pipeline (PHASE-2B-RUN.md §22: 254 tok/s single-node vs
+# 53 tok/s on the 4-Mac cluster), so the assistant offers this as its own flow.
+#
+# The job only ever talks to *this* Mac: its own admin port through the same
+# loopback seam Start uses, with the key this Mac already stores. It never SSHes
+# another Mac, never stages, and never launches a process. The load carries
+# ``local_only=true``, so a registered cluster deployment for the same checkpoint
+# is ignored and a model that does not fit here is refused here. Every branch
+# keeps one action, and no rate or percentage is invented — the job reports what
+# the engine pool says, then proves it serves with one minimal completion.
+#
+# Job states are forward-only: ``queued → running → ready | failed``. A stop
+# aborts a queued/running job and unloads this Mac; a stopped ready job keeps
+# ``ready`` and gains ``stopped: true`` (the frozen machine has no stopped value).
+
+LOCAL_RUN_QUEUED = "queued"
+LOCAL_RUN_RUNNING = "running"
+LOCAL_RUN_READY = "ready"
+LOCAL_RUN_FAILED = "failed"
+LOCAL_RUN_PATH = "/admin/api/cluster/assistant/run-local"
+
+# The load itself blocks on the engine pool (minutes for a large checkpoint), so
+# the job is a background job like /search and /redeploy. After the load route
+# answers, the pool is asked a bounded number of times whether the model is in
+# memory; a pool that never says "loaded" fails the job instead of claiming ready.
+LOCAL_RUN_POLL_SECONDS = 2.0
+LOCAL_RUN_LOAD_TIMEOUT_SECONDS = 900.0
+# One minimal completion after the pool reports "loaded": ready must mean
+# "serves", not merely "allocated". Two tokens cannot measure a rate, so this
+# is a success/failure check and never a speed claim.
+LOCAL_RUN_CANARY_MAX_TOKENS = 2
+LOCAL_RUN_CANARY_TIMEOUT_SECONDS = 120.0
+
+# Jobs are ephemeral, exactly like the search/redeploy jobs: a server restart
+# loses a running job, and the caller starts it again.
+_local_run_jobs: dict[str, dict[str, Any]] = {}
+_local_run_jobs_lock = threading.Lock()
 
 
+def _create_local_run_job() -> str:
+    job_id = f"local-{uuid.uuid4().hex[:12]}"
+    with _local_run_jobs_lock:
+        _local_run_jobs[job_id] = {
+            "job_id": job_id,
+            "state": LOCAL_RUN_QUEUED,
+            "message": "queued",
+            "model_id": "",
+            # The checkpoint, this Mac's node id and the measurement it came
+            # from: tune-local keys the tuning preset by exactly these, so the
+            # ready run carries them (no second lookup, no guess).
+            "model_path": "",
+            "node_id": "",
+            "measurement_id": "",
+            "context_tokens": 0,
+            "mtp": False,
+            "endpoint": None,
+            "port": 0,
+            "stopped": False,
+            "cancel_requested": False,
+            "working": True,
+            "warnings": [],
+            "error": None,
+        }
+    return job_id
+
+
+def _local_run_cancelled(job_id: str) -> bool:
+    """Whether a stop was requested: a cancelled job never turns ready."""
+
+    with _local_run_jobs_lock:
+        job = _local_run_jobs.get(job_id)
+        return bool(job and job.get("cancel_requested"))
+
+
+def _update_local_run_job(job_id: str, **fields: Any) -> None:
+    with _local_run_jobs_lock:
+        job = _local_run_jobs.get(job_id)
+        if job is None:
+            return
+        if (
+            job.get("cancel_requested")
+            and "state" in fields
+            and fields["state"] != LOCAL_RUN_FAILED
+        ):
+            # A stop won the race with a late step: keep its terminal record.
+            return
+        job.update(fields)
+
+
+def _active_local_run_job() -> str:
+    """The run-local job still working, or "" — one load on this Mac at a time.
+
+    ``working`` stays true until the job's own task exits, so stopping a job
+    whose uninterruptible engine load is still draining cannot let a second load
+    start on top of it.
+    """
+
+    with _local_run_jobs_lock:
+        for job in _local_run_jobs.values():
+            if job.get("working"):
+                return str(job["job_id"])
+    return ""
+
+
+def _local_measured_node(record: MeasurementRecord) -> NodeFacts | None:
+    """Which measured Mac is this one, proven from addresses this Mac owns.
+
+    The same evidence ``resolve_targets``/``_delete_target`` use: a Mac is local
+    only when one of its measured addresses is an address this Mac owns. Never
+    assumed from node order and never the fallback for an unproven Mac.
+    """
+
+    seams = _provisioning_seams()
+    try:
+        local = {str(address) for address in seams.local_addresses() if str(address)}
+    except Exception:  # noqa: BLE001 - unreadable addresses prove nothing
+        return None
+    if not local:
+        return None
+    for facts in record.measurement_set().nodes:
+        endpoint = record.endpoint_for(facts.node_id)
+        device = seams.device_record(facts.node_id) or {}
+        paired = [
+            str(item).strip()
+            for item in (device.get("last_addrs") or ())
+            if isinstance(item, str) and str(item).strip()
+        ]
+        candidates = [
+            facts.endpoint_host,
+            "" if endpoint is None else endpoint.host,
+            *paired,
+        ]
+        if any(item in local for item in candidates if item):
+            return facts
+    return None
+
+
+def _local_run_endpoint(
+    record: MeasurementRecord, facts: NodeFacts
+) -> tuple[str, int] | None:
+    """This Mac's dialable host and port, or ``None`` when it cannot be named.
+
+    The measurement owns both values (its port was resolved from this Mac's own
+    settings). A loopback host is not a URL a chat page can use, so it is not
+    upgraded to one; an unknown port is not guessed as 8099.
+    """
+
+    endpoint = record.endpoint_for(facts.node_id)
+    host = str(
+        facts.endpoint_host or ("" if endpoint is None else endpoint.host) or ""
+    ).strip()
+    port = int(endpoint.port) if endpoint is not None and endpoint.port else 0
+    if not port:
+        settings = _server_settings()
+        port = int(getattr(settings, "port", 0) or 0)
+    if not host or host in LOOPBACK_ENDPOINT_HOSTS:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return host, port
+
+
+def _local_model_id(port: int, model_path: str) -> str:
+    """This Mac's own catalogue id for the checkpoint, folder name as fallback.
+
+    The settings, load and listing routes are all keyed by the pool's own id.
+    A catalogue that cannot be read is not a failure here — the folder name is
+    the documented fallback the policy writer uses too.
+    """
+
+    try:
+        listing = _local_admin(port, MODELS_PATH)
+    except Exception:  # noqa: BLE001 - the id fallback still names the model
+        listing = None
+    entry = _model_entry(listing, model_path)
+    model_id = "" if entry is None else str(entry.get("id") or "").strip()
+    return model_id or Path(model_path).name
+
+
+def _local_run_warning(
+    code: str, message: str, *, node_id: str = ""
+) -> dict[str, Any]:
+    return OperationWarning(code=code, message=message, node_id=node_id).to_dict()
+
+
+def _fail_local_run(job_id: str, code: str, message: str, action: str) -> None:
+    with _local_run_jobs_lock:
+        job = _local_run_jobs.get(job_id)
+        if job is not None and job.get("cancel_requested"):
+            # A stopped job keeps its own terminal record.
+            return
+    _update_local_run_job(
+        job_id,
+        state=LOCAL_RUN_FAILED,
+        message=message,
+        error={"code": code, "message": message, "action": action},
+    )
+
+
+def _table_offload_patch(layout: ModelLayout) -> dict[str, Any]:
+    """The settings write that keeps this checkpoint's lookup table on SSD.
+
+    The plan treats an Engram/PLE table as a free lever and writes this switch on
+    Start; the engine prices exactly the same resident bytes. A local run must do
+    it too, or its fit (which subtracts the table) and the engine's local
+    admission (which does not) would disagree. An empty patch means the
+    checkpoint has no such table, so nothing is written.
+    """
+
+    if layout.table_offload_kind == TABLE_OFFLOAD_PLE:
+        return {"qwen4_ple_ssd_offload": True}
+    if layout.table_offload_kind == TABLE_OFFLOAD_ENGRAM:
+        return {"deepseek_v41_engram_ssd_offload": True}
+    return {}
+
+
+@router.post("/run-local")
+async def cluster_assistant_run_local(request: AssistantRunLocalRequest) -> Any:
+    """Load the measured model on this Mac alone and serve it locally.
+
+    Returns a job handle immediately: the engine pool load blocks for minutes on
+    a large checkpoint, so progress is polled. Only this Mac is ever a target; an
+    unproven Mac, a model that does not fit here alone, or a context this Mac
+    cannot hold all fail the job with exactly one action — never a silent
+    fallback to a smaller context or another Mac.
+    """
+
+    running = _active_local_run_job()
+    if running:
+        return _refusal_response(
+            "local_run_in_progress",
+            f"run-local job {running} is still working on this Mac; poll it "
+            "instead of loading a second model",
+            ACTION_STATUS,
+        )
+    tuning = _active_local_tune_job()
+    if tuning:
+        # A tune unloads and loads this Mac's model per config; a second load on
+        # top of that would fight it for the same engine pool.
+        return _refusal_response(
+            "local_tune_in_progress",
+            f"local tune job {tuning} is still unloading and loading this Mac's "
+            "model; poll it before starting a local run",
+            ACTION_STATUS,
+        )
+    job_id = _create_local_run_job()
+    _schedule(asyncio.create_task(_run_local_job(job_id, request)))
+    return {
+        "job_id": job_id,
+        "state": LOCAL_RUN_QUEUED,
+        "poll": f"{LOCAL_RUN_PATH}/{job_id}",
+    }
+
+
+@router.get("/run-local/{job_id}")
+async def cluster_assistant_run_local_status(
+    job_id: str = PathParam(min_length=1, max_length=128),
+) -> Any:
+    """Poll a local run: state, message, serving id, endpoint and one action."""
+
+    with _local_run_jobs_lock:
+        job = _local_run_jobs.get(job_id)
+        snapshot = None if job is None else dict(job)
+    if snapshot is None:
+        return _refusal_response(
+            "local_run_not_found",
+            f"no local run {job_id}; start one with POST {LOCAL_RUN_PATH}",
+            ACTION_STATUS,
+        )
+    return snapshot
+
+
+@router.post("/run-local/{job_id}/stop")
+async def cluster_assistant_run_local_stop(
+    job_id: str = PathParam(min_length=1, max_length=128),
+) -> Any:
+    """Stop a local run and unload its model on this Mac. Idempotent.
+
+    ``stopped`` is true when nothing is left working or serving after the call.
+    A queued/running job is aborted (it never turns ``ready`` after this); a ready
+    job keeps its ``ready`` state, loses its endpoint and gains ``stopped: true``
+    — the frozen state machine has no "stopped" value, exactly like Screen 6.
+    Unloading happens on this Mac only, through its own unload route.
+    """
+
+    with _local_run_jobs_lock:
+        job = _local_run_jobs.get(job_id)
+        snapshot = None if job is None else dict(job)
+        active = bool(
+            job and job.get("state") in (LOCAL_RUN_QUEUED, LOCAL_RUN_RUNNING)
+        )
+        if job is not None:
+            job["cancel_requested"] = True
+            job["stopped"] = True
+            if job.get("state") == LOCAL_RUN_QUEUED:
+                # No step has started yet, so nothing is holding this Mac.
+                job["working"] = False
+            if active:
+                message = "the local run was stopped"
+                job.update(
+                    state=LOCAL_RUN_FAILED,
+                    message=message,
+                    endpoint=None,
+                    error={
+                        "code": "local_run_stopped",
+                        "message": message,
+                        "action": ACTION_START,
+                    },
+                )
+            elif job.get("state") == LOCAL_RUN_READY:
+                job.update(
+                    message="stopped on this Mac",
+                    endpoint=None,
+                )
+    if snapshot is None:
+        return _refusal_response(
+            "local_run_not_found",
+            f"no local run {job_id}; nothing to stop",
+            ACTION_STATUS,
+        )
+    model_id = str(snapshot.get("model_id") or "").strip()
+    port = int(snapshot.get("port") or 0)
+    if not model_id or not 1 <= port <= 65535:
+        # Nothing was ever loaded (queued, or failed before the load).
+        return {"job_id": job_id, "stopped": True}
+    try:
+        await asyncio.to_thread(
+            _local_admin,
+            port,
+            MODEL_UNLOAD_PATH.format(model_id=model_id),
+            {},
+            method="POST",
+        )
+    except RemoteAdminError as exc:
+        if exc.status in (400, 404):
+            # Already unloaded: the stop is still complete.
+            return {"job_id": job_id, "stopped": True}
+        if exc.status == 409:
+            return {
+                "job_id": job_id,
+                "stopped": False,
+                "message": (
+                    f"this Mac is still unloading {model_id}; the local run is "
+                    "stopped but its memory is not freed yet — call stop again"
+                ),
+            }
+        return _refusal_response(
+            "local_unload_failed",
+            f"this Mac could not unload {model_id}: "
+            f"{_redacted(exc.detail or exc)}",
+            ACTION_DIAGNOSTICS,
+            status_code=502,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unanswered unload is not a stop
+        return _refusal_response(
+            "local_unload_failed",
+            f"this Mac's engine pool did not answer the unload: {_redacted(exc)}",
+            ACTION_DIAGNOSTICS,
+            status_code=502,
+        )
+    return {"job_id": job_id, "stopped": True}
+
+
+async def _run_local_job(job_id: str, request: AssistantRunLocalRequest) -> None:
+    """The job shell: a failure can never leave the job "running" forever.
+
+    The steps below report their own one-action failures; this wrapper exists
+    for the unexpected ones (a malformed layout, a seam that raises), because a
+    stuck ``running`` job would keep the one-load-at-a-time guard closed.
+    """
+
+    try:
+        await _run_local_steps(job_id, request)
+    except Exception as exc:  # noqa: BLE001 - a failed run is a failed job
+        with _local_run_jobs_lock:
+            job = _local_run_jobs.get(job_id)
+            finished = job is not None and job["state"] in (
+                LOCAL_RUN_READY,
+                LOCAL_RUN_FAILED,
+            )
+        if not finished:
+            _fail_local_run(
+                job_id,
+                "local_run_failed",
+                f"the local run failed: {_redacted(exc)}",
+                ACTION_DIAGNOSTICS,
+            )
+    finally:
+        # Only now is this Mac free for another local run.
+        _update_local_run_job(job_id, working=False)
+
+
+async def _run_local_steps(job_id: str, request: AssistantRunLocalRequest) -> None:
+    """Verify this Mac, replay the tuning preset, load the model, then verify it.
+
+    Every step is this Mac's own: the admin seam is loopback with the key this
+    Mac stores, and nothing here names another Mac or a second launch path.
+    """
+
+    warnings: list[dict[str, Any]] = []
+
+    def note(code: str, message: str, *, node_id: str = "") -> None:
+        warnings.append(_local_run_warning(code, message, node_id=node_id))
+        _update_local_run_job(job_id, warnings=list(warnings))
+
+    _update_local_run_job(job_id, state=LOCAL_RUN_RUNNING, message="checking this Mac")
+
+    if _local_run_cancelled(job_id):
+        return
+
+    # (1) The measurement must be usable, model-bound, and cover this Mac.
+    record = _measurement_store().get(request.measurement_id)
+    if record is None:
+        _fail_local_run(
+            job_id,
+            STALE_MEASUREMENT_CODE,
+            f"no measurement {request.measurement_id} is stored; measure again",
+            ACTION_MEASURE,
+        )
+        return
+    try:
+        identity = ModelIdentity(model_path=request.model_path, mtp=request.mtp)
+    except ValueError as exc:
+        _fail_local_run(job_id, "invalid_model", str(exc), ACTION_CHECK_MODEL_PATH)
+        return
+    refusal = measurement_refusal(record, model=identity)
+    if refusal is not None:
+        _fail_local_run(
+            job_id,
+            refusal.reason,
+            refusal.message,
+            ACTION_STATUS if refusal.reason == REFUSAL_NOT_READY else ACTION_MEASURE,
+        )
+        return
+    layout = record.model_layout()
+    if layout is None:
+        _fail_local_run(
+            job_id,
+            "no_model_layout",
+            "the measurement has no model layout; measure the chosen model first",
+            ACTION_MEASURE,
+        )
+        return
+    facts = _local_measured_node(record)
+    if facts is None:
+        _fail_local_run(
+            job_id,
+            "origin_not_measured",
+            "this Mac could not be identified in the measurement, so it cannot "
+            "be the one that runs the model; measure this Mac again",
+            ACTION_MEASURE,
+        )
+        return
+    if request.layer_count is not None and layout.layer_count != request.layer_count:
+        _fail_local_run(
+            job_id,
+            "model_mismatch",
+            f"the request names {request.layer_count} layers but the measured "
+            f"checkpoint has {layout.layer_count}; measure the model again",
+            ACTION_MEASURE,
+        )
+        return
+
+    # The one fit authority: the recommendation's own single-node rule
+    # (budget_for on this Mac, resident weights with the table on SSD + MTP head
+    # + KV for the context). The checkpoint's declared context caps the ladder,
+    # so a request past it is named instead of silently clamped.
+    fit = _single_node_fit(
+        [facts],
+        layout,
+        target=request.context_tokens,
+        declared=layout.max_context_tokens or None,
+        mtp=request.mtp,
+        rank0_extra_bytes=0,
+    )
+    if fit is None:
+        _fail_local_run(
+            job_id,
+            "insufficient_memory",
+            f"{Path(request.model_path).name} does not fit on {facts.node_id} "
+            "alone at any context; choose a smaller model",
+            ACTION_CHOOSE_SMALLER_MODEL,
+        )
+        return
+    context_tokens = int(fit[1])
+    if context_tokens < request.context_tokens:
+        _fail_local_run(
+            job_id,
+            "context_too_large",
+            f"only {context_tokens:,} tokens of context fit on {facts.node_id} "
+            f"alone, below the requested {request.context_tokens:,}; lower the "
+            "context or choose a smaller model",
+            ACTION_ADJUST_PLAN,
+        )
+        return
+
+    endpoint = _local_run_endpoint(record, facts)
+    if endpoint is None:
+        _fail_local_run(
+            job_id,
+            "endpoint_unresolved",
+            "this Mac has no dialable endpoint in the measurement; bind oMLX to "
+            "the local network and measure again",
+            ACTION_CONFIGURE_ENDPOINT,
+        )
+        return
+    host, port = endpoint
+    model_id = await asyncio.to_thread(_local_model_id, port, request.model_path)
+    _update_local_run_job(
+        job_id,
+        model_id=model_id,
+        context_tokens=context_tokens,
+        port=port,
+        model_path=request.model_path,
+        node_id=facts.node_id,
+        measurement_id=request.measurement_id,
+    )
+
+    # (2) Write the settings the fit assumed, then replay the saved tuning
+    # preset for this model on this one-Mac node set. The table switch is part of
+    # the fit (the plan treats it as a free lever); the preset is a preference.
+    # A preset write that fails is reported, never fatal.
+    table_patch = _table_offload_patch(layout)
+    preset_patch = _tuning_preset_patch(request.model_path, [facts.node_id]) or {}
+    patch = {**table_patch, **preset_patch}
+    if not preset_patch:
+        note(
+            WARNING_TUNING_PRESET_SKIPPED,
+            "no saved tuning preset for this model on this Mac; the model's own "
+            "settings are used",
+            node_id=facts.node_id,
+        )
+    if patch:
+        _update_local_run_job(
+            job_id, message="applying the saved tuning preset before the load"
+        )
+        try:
+            await asyncio.to_thread(
+                _local_admin,
+                port,
+                MODEL_SETTINGS_PATH.format(model_id=model_id),
+                dict(patch),
+                method="PUT",
+            )
+        except Exception as exc:  # the preset never fails a run
+            note(
+                WARNING_TUNING_PRESET_SKIPPED,
+                "the settings write ("
+                + ", ".join(sorted(patch))
+                + f") failed: {_redacted(exc)}; the engine pool will decide the "
+                "table's residency from memory pressure",
+                node_id=facts.node_id,
+            )
+        else:
+            if table_patch:
+                note(
+                    WARNING_TABLE_OFFLOAD_ENABLED,
+                    "the "
+                    + (
+                        "PLE"
+                        if layout.table_offload_kind == TABLE_OFFLOAD_PLE
+                        else "Engram"
+                    )
+                    + " table is kept on SSD so the model fits this Mac; written "
+                    "before the load",
+                    node_id=facts.node_id,
+                )
+            if preset_patch:
+                note(
+                    WARNING_TUNING_PRESET_APPLIED,
+                    "the saved tuning preset was applied before the load: "
+                    + ", ".join(sorted(preset_patch)),
+                    node_id=facts.node_id,
+                )
+
+    if _local_run_cancelled(job_id):
+        return
+
+    # (3) Ask this Mac's own engine pool to load the model, on this Mac alone.
+    # ``local_only`` is the contract that makes this a single-node run: a
+    # registered cluster deployment for the same checkpoint is ignored, so a
+    # model that does not fit here is refused here instead of launching ranks.
+    _update_local_run_job(
+        job_id, message=f"loading {model_id} on this Mac"
+    )
+    try:
+        await asyncio.to_thread(
+            _local_admin,
+            port,
+            MODEL_LOAD_PATH.format(model_id=model_id) + "?local_only=true",
+            {},
+            method="POST",
+            timeout=float(LOCAL_RUN_LOAD_TIMEOUT_SECONDS),
+        )
+    except RemoteAdminError as exc:
+        detail = str(exc.detail or "").strip()[-300:] or f"HTTP {exc.status}"
+        if exc.status == 507:
+            _fail_local_run(
+                job_id,
+                "insufficient_memory",
+                f"{model_id} did not fit this Mac's memory when the engine pool "
+                f"tried to load it: {detail}",
+                ACTION_ADJUST_PLAN,
+            )
+            return
+        if exc.status == 404:
+            _fail_local_run(
+                job_id,
+                "model_not_available",
+                f"this Mac's catalogue does not list {model_id}: {detail}",
+                ACTION_CHECK_MODEL_PATH,
+            )
+            return
+        if exc.status != 409:
+            # 409 is "already loading" / "busy", which the poll below settles.
+            _fail_local_run(
+                job_id,
+                "local_load_failed",
+                f"this Mac could not load {model_id}: {detail}",
+                ACTION_DIAGNOSTICS,
+            )
+            return
+    except Exception as exc:  # noqa: BLE001 - a load that never answered failed
+        _fail_local_run(
+            job_id,
+            "local_load_failed",
+            f"this Mac's engine pool did not answer the load: {_redacted(exc)}",
+            ACTION_DIAGNOSTICS,
+        )
+        return
+
+    # (4) The pool is the authority on "loaded", not the load call's return.
+    # A load that reports ``distributed`` is never this Mac's own run: fail
+    # instead of claiming a cluster launch as a local endpoint.
+    _update_local_run_job(job_id, message=f"verifying {model_id} is loaded")
+    deadline = time.monotonic() + float(LOCAL_RUN_LOAD_TIMEOUT_SECONDS)
+    loaded = False
+    while True:
+        if _local_run_cancelled(job_id):
+            return
+        try:
+            listing = await asyncio.to_thread(_local_admin, port, MODELS_PATH)
+        except Exception:  # noqa: BLE001 - an unreadable pool is not "loaded"
+            listing = None
+        entry = _model_entry(listing, request.model_path)
+        if entry is not None and entry.get("loaded") is True:
+            if entry.get("distributed") is True:
+                _fail_local_run(
+                    job_id,
+                    "local_engine_required",
+                    f"{model_id} is loaded as a distributed deployment, not on "
+                    "this Mac alone; stop that cluster and run it locally",
+                    ACTION_STATUS,
+                )
+                return
+            loaded = True
+            break
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(float(LOCAL_RUN_POLL_SECONDS))
+    if not loaded:
+        _fail_local_run(
+            job_id,
+            "local_load_timeout",
+            f"{model_id} did not appear loaded on this Mac in time; check its "
+            "engine pool and the model's settings",
+            ACTION_DIAGNOSTICS,
+        )
+        return
+
+    if _local_run_cancelled(job_id):
+        return
+
+    # (5) One minimal completion. "Loaded" is an allocation; "serves" is what
+    # the user is promised. Two tokens cannot measure a rate, so nothing here is
+    # reported as one — only success or one action.
+    _update_local_run_job(job_id, message=f"checking {model_id} answers")
+    canary_problem = ""
+    try:
+        answer = await asyncio.to_thread(
+            _local_admin,
+            port,
+            CHAT_COMPLETIONS_PATH,
+            {
+                "model": model_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": LOCAL_RUN_CANARY_MAX_TOKENS,
+                "temperature": 0.0,
+                "stream": False,
+            },
+            method="POST",
+            timeout=float(LOCAL_RUN_CANARY_TIMEOUT_SECONDS),
+        )
+        choices = answer.get("choices") if isinstance(answer, Mapping) else None
+        if not isinstance(choices, list) or not choices:
+            canary_problem = "the completion had no choices"
+    except RemoteAdminError as exc:
+        canary_problem = (
+            str(exc.detail or "").strip()[-300:] or f"HTTP {exc.status}"
+        )
+    except Exception as exc:  # noqa: BLE001 - an unanswered canary failed
+        canary_problem = _redacted(exc)
+    if canary_problem:
+        _fail_local_run(
+            job_id,
+            "local_canary_failed",
+            f"{model_id} loaded on this Mac but did not answer a minimal "
+            f"completion: {canary_problem}",
+            ACTION_DIAGNOSTICS,
+        )
+        return
+
+    # (6) Ready: this Mac's endpoint, the serving id, and the measured context.
+    _update_local_run_job(
+        job_id,
+        state=LOCAL_RUN_READY,
+        message=f"{model_id} is ready on this Mac",
+        model_id=model_id,
+        context_tokens=context_tokens,
+        mtp=request.mtp,
+        port=port,
+        endpoint={
+            "host": host,
+            "port": port,
+            "url": f"http://{host}:{port}",
+            "ready": True,
+        },
+        warnings=list(warnings),
+        error=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# tune-local (tune the single-node run this Mac is serving)
+# ---------------------------------------------------------------------------
+#
+# Tuning was cluster-only: ``/tune`` and ``/tune-redeploy`` both need a ready
+# *start operation*, so a local run had no preset and said so
+# (``tuning_preset_skipped``). This is the same tuning for the one Mac that is
+# actually serving it, and it never talks to another Mac:
+#
+# * the SAMPLER is a per-request knob, so it is swept on the loaded model with
+#   the golden prompts (``tuning.sweep_samplers`` / ``best_sampler``, the same
+#   scoring ``/tune`` uses);
+# * the MTP switch and its adaptive depth are PER-MODEL settings, so every
+#   config (``redeploy_tuning.plan_configs``) is written, this Mac's model is
+#   unloaded and loaded again with ``local_only=true``, and ONE real completion's
+#   ``usage.generation_tokens_per_second`` is its rate (``choose_best`` ranks).
+#
+# The seams are the run-local ones: the settings/load/unload/completion calls go
+# through ``_local_admin`` (this Mac's own loopback admin API with the key it
+# stores). A config that does not load or reports no rate is an infeasible row
+# with its reason — never a number. The winning settings are written back and the
+# pool must report the model loaded before the job completes, so tuning leaves
+# the user with a serving model or fails with one action.
+
+LOCAL_TUNE_QUEUED = "queued"
+LOCAL_TUNE_RUNNING = "running"
+LOCAL_TUNE_COMPLETED = "completed"
+LOCAL_TUNE_FAILED = "failed"
+LOCAL_TUNE_PATH = "/admin/api/cluster/assistant/tune-local"
+
+# One config is one unload + load, so the job is a background job like
+# /tune-redeploy. The completion is a single real decode measurement (oMLX's own
+# usage field), not a rate the route invents.
+LOCAL_TUNE_PROMPT = "Write four short sentences about the ocean."
+LOCAL_TUNE_MAX_TOKENS = 96
+LOCAL_TUNE_TIMEOUT_SECONDS = 300.0
+LOCAL_TUNE_POLL_SECONDS = 2.0
+
+_local_tune_jobs: dict[str, dict[str, Any]] = {}
+_local_tune_jobs_lock = threading.Lock()
+
+
+def _create_local_tune_job(local_run_id: str, *, total: int) -> str:
+    tune_job_id = f"local-tune-{uuid.uuid4().hex[:12]}"
+    with _local_tune_jobs_lock:
+        _local_tune_jobs[tune_job_id] = {
+            "tune_job_id": tune_job_id,
+            "local_run_id": local_run_id,
+            "state": LOCAL_TUNE_QUEUED,
+            "message": "queued",
+            "total": total,
+            "done": 0,
+            "rows": [],
+            "best": None,
+            "sampler": None,
+            "sampler_rows": [],
+            "preset_key": "",
+            "error": None,
+            "working": True,
+        }
+    return tune_job_id
+
+
+def _update_local_tune_job(tune_job_id: str, **fields: Any) -> None:
+    with _local_tune_jobs_lock:
+        job = _local_tune_jobs.get(tune_job_id)
+        if job is not None:
+            job.update(fields)
+
+
+def _active_local_tune_job() -> str:
+    """The tune-local job still measuring, or "" — one tune on this Mac at a time.
+
+    ``working`` stays true until the job's own task exits, so a second tune (or
+    a second local run, which would fight it for the same engine pool) is
+    refused instead of interleaving loads.
+    """
+
+    with _local_tune_jobs_lock:
+        for job in _local_tune_jobs.values():
+            if job.get("working"):
+                return str(job["tune_job_id"])
+    return ""
+
+
+def _fail_local_tune(tune_job_id: str, code: str, message: str, action: str) -> None:
+    _update_local_tune_job(
+        tune_job_id,
+        state=LOCAL_TUNE_FAILED,
+        message=message,
+        error={"code": code, "message": message, "action": action},
+    )
+
+
+class AssistantTuneLocalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1, max_length=128)
+
+
+@router.post("/tune-local")
+async def cluster_assistant_tune_local(request: AssistantTuneLocalRequest) -> Any:
+    """Tune the model a ready local run is serving, on this Mac alone.
+
+    Returns a job handle immediately: every MTP config is an unload + load of a
+    possibly huge checkpoint, so progress is polled. One tune at a time, and only
+    a *ready* run is tunable — there is nothing loaded to measure otherwise.
+    """
+
+    from .redeploy_tuning import plan_configs
+
+    running = _active_local_tune_job()
+    if running:
+        return _refusal_response(
+            "local_tune_in_progress",
+            f"local tune job {running} is still unloading and loading this "
+            "Mac's model; poll it instead of tuning twice",
+            ACTION_STATUS,
+        )
+    with _local_run_jobs_lock:
+        run = _local_run_jobs.get(request.job_id)
+        snapshot = None if run is None else dict(run)
+    if snapshot is None:
+        return _refusal_response(
+            "local_run_not_found",
+            f"no local run {request.job_id}; start one with POST "
+            f"{LOCAL_RUN_PATH} and tune it once it is ready",
+            ACTION_STATUS,
+        )
+    model_id = str(snapshot.get("model_id") or "").strip()
+    model_path = str(snapshot.get("model_path") or "").strip()
+    node_id = str(snapshot.get("node_id") or "").strip()
+    port = int(snapshot.get("port") or 0)
+    run_mtp = bool(snapshot.get("mtp"))
+    if (
+        snapshot.get("state") != LOCAL_RUN_READY
+        or snapshot.get("stopped")
+        or not model_id
+        or not model_path
+        or not node_id
+        or not 1 <= port <= 65535
+    ):
+        stopped_or_failed = (
+            bool(snapshot.get("stopped")) or snapshot.get("state") == LOCAL_RUN_FAILED
+        )
+        return _refusal_response(
+            "local_run_not_ready",
+            f"local run {request.job_id} is "
+            f"{snapshot.get('state')}"
+            + (" and stopped" if snapshot.get("stopped") else "")
+            + "; tuning needs a ready run serving on this Mac",
+            ACTION_START if stopped_or_failed else ACTION_STATUS,
+        )
+
+    mtp_capable = _tune_mtp_capable(model_path)
+    configs = plan_configs(mtp_capable=mtp_capable)
+    tune_job_id = _create_local_tune_job(request.job_id, total=len(configs))
+    _schedule(
+        asyncio.create_task(
+            _run_local_tune_job(
+                tune_job_id,
+                model_path=model_path,
+                node_id=node_id,
+                model_id=model_id,
+                port=port,
+                configs=configs,
+                mtp_capable=mtp_capable,
+                run_mtp=run_mtp,
+            )
+        )
+    )
+    return {
+        "tune_job_id": tune_job_id,
+        "state": LOCAL_TUNE_QUEUED,
+        "total": len(configs),
+        "mtp_applicable": mtp_capable,
+        "poll": f"{LOCAL_TUNE_PATH}/{tune_job_id}",
+    }
+
+
+@router.get("/tune-local/{tune_job_id}")
+async def cluster_assistant_tune_local_status(
+    tune_job_id: str = PathParam(min_length=1, max_length=128),
+) -> Any:
+    """Poll a local tune: state, progress rows, the winner and the preset key."""
+
+    with _local_tune_jobs_lock:
+        job = _local_tune_jobs.get(tune_job_id)
+        snapshot = dict(job) if job is not None else None
+    if snapshot is None:
+        return _refusal_response(
+            "local_tune_not_found",
+            f"no local tune job {tune_job_id}; start one with POST {LOCAL_TUNE_PATH}",
+            ACTION_STATUS,
+        )
+    return snapshot
+
+
+def _local_mtp_settings(config: Any) -> dict[str, Any]:
+    """The model settings one MTP config needs before its load.
+
+    ``mtp_enabled`` is written explicitly because this is a *local* model setting
+    (the cluster passes MTP as a launch input instead). For an MTP-on config the
+    adaptive depth is written too — ``None`` is the measured answer "adaptive".
+    """
+
+    patch: dict[str, Any] = {"mtp_enabled": bool(config.mtp)}
+    if config.mtp:
+        patch["mtp_adaptive_max_depth"] = config.mtp_depth
+    return patch
+
+
+def _local_winning_settings(
+    *, mtp: bool, mtp_depth: int | None, sampler: Any
+) -> dict[str, Any]:
+    """The settings a measured winner needs, in the shape run-local replays.
+
+    ``mtp_enabled`` is written explicitly because this is a *local* model setting
+    (the cluster passes MTP as a launch input instead), and the sampler is a
+    per-request knob that is still written on the model so the serving process
+    matches what was measured and ``_tuning_preset_patch`` reads one shape.
+    """
+
+    patch: dict[str, Any] = {"mtp_enabled": bool(mtp)}
+    if mtp:
+        # ``None`` is the measured answer "adaptive", not a missing value, so it
+        # is written too: a depth a sweep left behind must not outlive it.
+        patch["mtp_adaptive_max_depth"] = mtp_depth
+    if isinstance(sampler, Mapping):
+        for key in ("temperature", "top_p", "top_k"):
+            value = sampler.get(key)
+            if value is not None:
+                patch[key] = value
+    return patch
+
+
+async def _read_local_model_settings(
+    port: int, model_path: str
+) -> dict[str, Any] | None:
+    """This Mac's current settings for the knobs a sweep writes, if readable.
+
+    Read before the first config so a sweep in which nothing could be measured
+    can put the model back the way it found it instead of guessing a value.
+    """
+
+    try:
+        listing = await asyncio.to_thread(_local_admin, port, MODELS_PATH)
+    except Exception:  # noqa: BLE001 - an unreadable catalogue proves nothing
+        return None
+    entry = _model_entry(listing, model_path)
+    settings = entry.get("settings") if isinstance(entry, Mapping) else None
+    if not isinstance(settings, Mapping):
+        return None
+    keep = ("mtp_enabled", "mtp_adaptive_max_depth", "temperature", "top_p", "top_k")
+    return {key: settings[key] for key in keep if key in settings}
+
+
+async def _write_local_model_settings(
+    port: int, model_id: str, patch: Mapping[str, Any]
+) -> str:
+    """Write one settings patch on this Mac's own model; "" on success."""
+
+    try:
+        await asyncio.to_thread(
+            _local_admin,
+            port,
+            MODEL_SETTINGS_PATH.format(model_id=model_id),
+            dict(patch),
+            method="PUT",
+        )
+    except Exception as exc:  # noqa: BLE001 - one problem, carried as a row
+        return (
+            "the settings write ("
+            + ", ".join(sorted(patch))
+            + f") failed: {_redacted(exc)}"
+        )
+    return ""
+
+
+async def _local_model_entry(
+    port: int, model_id: str
+) -> Mapping[str, Any] | None:
+    """This Mac's catalogue entry for a serving id, or ``None`` if unreadable."""
+
+    try:
+        listing = await asyncio.to_thread(_local_admin, port, MODELS_PATH)
+    except Exception:  # noqa: BLE001 - an unreadable catalogue proves nothing
+        return None
+    entry = _model_entry(listing, model_id)
+    return entry if isinstance(entry, Mapping) else None
+
+
+async def _wait_local_unloaded(port: int, model_id: str) -> bool:
+    """Wait until the pool no longer holds the model.
+
+    An unload that answers ``unloading`` (202) only aborts and drops the engine
+    asynchronously. Loading again before it has gone would hand back the engine
+    loaded with the PREVIOUS settings, and the config would then be measured —
+    and labelled — with a setting it never ran. So the next load waits for it;
+    a model that never goes away is a failed config, never a guessed row.
+    """
+
+    deadline = time.monotonic() + float(LOCAL_RUN_LOAD_TIMEOUT_SECONDS)
+    while True:
+        entry = await _local_model_entry(port, model_id)
+        if entry is None or entry.get("loaded") is not True:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(float(LOCAL_TUNE_POLL_SECONDS))
+
+
+async def _reload_local_model(port: int, model_id: str) -> tuple[str, str]:
+    """Unload then load this Mac's model with the settings just written.
+
+    Returns ``("", "")`` when the load route accepted the request, else one
+    problem and its code. An unload of an already-unloaded model (400/404) is not
+    a failure — the point is that the next load uses the new settings. A load
+    that answers "busy" (409) is settled by the loaded poll, exactly like
+    run-local.
+    """
+
+    unload_reply: Any = None
+    try:
+        unload_reply = await asyncio.to_thread(
+            _local_admin,
+            port,
+            MODEL_UNLOAD_PATH.format(model_id=model_id),
+            {},
+            method="POST",
+            timeout=float(LOCAL_TUNE_TIMEOUT_SECONDS),
+        )
+    except RemoteAdminError as exc:
+        if exc.status not in (400, 404):
+            return (
+                f"this Mac could not unload {model_id}: {_redacted(exc)}",
+                "local_unload_failed",
+            )
+    except Exception as exc:  # noqa: BLE001 - an unanswered unload failed
+        return (
+            f"this Mac's engine pool did not answer the unload: {_redacted(exc)}",
+            "local_unload_failed",
+        )
+    if (
+        isinstance(unload_reply, Mapping)
+        and unload_reply.get("status") == "unloading"
+        and not await _wait_local_unloaded(port, model_id)
+    ):
+        return (
+            f"this Mac is still unloading {model_id}, so the config's "
+            "settings were not applied; tune again once it is idle",
+            "local_unload_failed",
+        )
+    try:
+        await asyncio.to_thread(
+            _local_admin,
+            port,
+            MODEL_LOAD_PATH.format(model_id=model_id) + "?local_only=true",
+            {},
+            method="POST",
+            timeout=float(LOCAL_RUN_LOAD_TIMEOUT_SECONDS),
+        )
+    except RemoteAdminError as exc:
+        detail = str(exc.detail or "").strip()[-300:] or f"HTTP {exc.status}"
+        if exc.status == 507:
+            return (
+                f"{model_id} did not fit this Mac's memory: {detail}",
+                "insufficient_memory",
+            )
+        if exc.status == 404:
+            return (
+                f"this Mac's catalogue does not list {model_id}: {detail}",
+                "model_not_available",
+            )
+        if exc.status != 409:
+            return (
+                f"this Mac could not load {model_id}: {detail}",
+                "local_load_failed",
+            )
+    except Exception as exc:  # noqa: BLE001 - a load that never answered failed
+        return (
+            f"this Mac's engine pool did not answer the load: {_redacted(exc)}",
+            "local_load_failed",
+        )
+    return "", ""
+
+
+async def _local_pool_loaded(port: int, model_path: str) -> tuple[bool, str]:
+    """Poll this Mac's own catalogue until the pool reports the model loaded.
+
+    ``(loaded, problem)``: "loaded" is the pool's answer, never the load call's
+    return, and a distributed engine is a problem — this flow runs one Mac.
+    """
+
+    deadline = time.monotonic() + float(LOCAL_RUN_LOAD_TIMEOUT_SECONDS)
+    while True:
+        try:
+            listing = await asyncio.to_thread(_local_admin, port, MODELS_PATH)
+        except Exception:  # noqa: BLE001 - an unreadable pool is not "loaded"
+            listing = None
+        entry = _model_entry(listing, model_path)
+        if entry is not None and entry.get("loaded") is True:
+            if entry.get("distributed") is True:
+                return False, (
+                    f"{Path(model_path).name} is loaded as a distributed "
+                    "deployment, not on this Mac alone; stop that cluster and "
+                    "tune again"
+                )
+            return True, ""
+        problem = f"{Path(model_path).name} did not appear loaded on this Mac in time"
+        if time.monotonic() >= deadline:
+            return False, problem
+        await asyncio.sleep(float(LOCAL_TUNE_POLL_SECONDS))
+
+
+async def _measure_local_config(
+    port: int, model_path: str, model_id: str, config: Any
+) -> Any:
+    """Write one MTP config, reload this Mac's model with it, and measure it.
+
+    A failure of any step is an infeasible row carrying its reason — never a
+    rate. The measurement is one real completion on this Mac and the rate is
+    oMLX's own ``usage.generation_tokens_per_second``; a reply without it is
+    "no rate", not a zero.
+    """
+
+    from .redeploy_tuning import RedeployRow
+    from .tuning_wiring import tune_sample_from_reply
+
+    problem = await _write_local_model_settings(
+        port, model_id, _local_mtp_settings(config)
+    )
+    if problem:
+        return RedeployRow(config=config, feasible=False, error=problem)
+    problem, _ = await _reload_local_model(port, model_id)
+    if problem:
+        return RedeployRow(config=config, feasible=False, error=problem)
+    loaded, problem = await _local_pool_loaded(port, model_path)
+    if not loaded:
+        return RedeployRow(config=config, feasible=False, error=problem)
+    try:
+        reply = await asyncio.to_thread(
+            _local_admin,
+            port,
+            CHAT_COMPLETIONS_PATH,
+            {
+                "model": model_id,
+                "messages": [{"role": "user", "content": LOCAL_TUNE_PROMPT}],
+                "max_tokens": LOCAL_TUNE_MAX_TOKENS,
+                "temperature": 0.0,
+                "stream": False,
+            },
+            method="POST",
+            timeout=float(LOCAL_TUNE_TIMEOUT_SECONDS),
+        )
+    except RemoteAdminError as exc:
+        detail = str(exc.detail or "").strip()[-300:] or f"HTTP {exc.status}"
+        return RedeployRow(
+            config=config,
+            feasible=False,
+            error=f"the measurement completion failed: {detail}",
+        )
+    except Exception as exc:  # noqa: BLE001 - an unanswered probe measured nothing
+        return RedeployRow(
+            config=config,
+            feasible=False,
+            error=f"the measurement completion failed: {_redacted(exc)}",
+        )
+    sample = tune_sample_from_reply(reply)
+    if not sample.ok or sample.tok_per_s <= 0:
+        return RedeployRow(
+            config=config,
+            feasible=False,
+            error="the completion reported no decode rate",
+        )
+    return RedeployRow(config=config, feasible=True, decode_tok_per_s=sample.tok_per_s)
+
+
+async def _run_local_tune_job(
+    tune_job_id: str,
+    *,
+    model_path: str,
+    node_id: str,
+    model_id: str,
+    port: int,
+    configs: list,
+    mtp_capable: bool,
+    run_mtp: bool = False,
+) -> None:
+    """The job shell: an unexpected failure is a failed job, never "running".
+
+    A job stuck in ``running`` would keep the one-tune-at-a-time guard (and this
+    Mac's single engine pool) closed forever, so every unexpected exception ends
+    the job with one action.
+    """
+
+    try:
+        await _local_tune_steps(
+            tune_job_id,
+            model_path=model_path,
+            node_id=node_id,
+            model_id=model_id,
+            port=port,
+            configs=configs,
+            mtp_capable=mtp_capable,
+            run_mtp=run_mtp,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed tune is a failed job
+        with _local_tune_jobs_lock:
+            job = _local_tune_jobs.get(tune_job_id)
+            finished = job is not None and job["state"] in (
+                LOCAL_TUNE_COMPLETED,
+                LOCAL_TUNE_FAILED,
+            )
+        if not finished:
+            _fail_local_tune(
+                tune_job_id,
+                "local_tune_failed",
+                f"the local tune failed: {_redacted(exc)}",
+                ACTION_DIAGNOSTICS,
+            )
+    finally:
+        # Only now is this Mac free for another tune or local run.
+        _update_local_tune_job(tune_job_id, working=False)
+
+
+async def _local_tune_steps(
+    tune_job_id: str,
+    *,
+    model_path: str,
+    node_id: str,
+    model_id: str,
+    port: int,
+    configs: list,
+    mtp_capable: bool,
+    run_mtp: bool = False,
+) -> None:
+    """Sweep the sampler, then every MTP config, then leave the winner serving."""
+
+    from .redeploy_tuning import sweep
+    from .tuning import best_sampler, sweep_samplers
+    from .tuning_wiring import completion_seam
+
+    _update_local_tune_job(
+        tune_job_id, state=LOCAL_TUNE_RUNNING, message="measuring the sampler"
+    )
+
+    async def complete(body: dict) -> Any:
+        # The same loopback completion seam /tune uses through the coordinator:
+        # oMLX's own usage fields are the measurement, nothing is estimated.
+        return await asyncio.to_thread(
+            _local_admin,
+            port,
+            CHAT_COMPLETIONS_PATH,
+            dict(body),
+            method="POST",
+            timeout=float(LOCAL_TUNE_TIMEOUT_SECONDS),
+        )
+
+    # The settings as they are now, so a sweep that measures nothing can put the
+    # model back instead of leaving it on the last failed config's leftovers.
+    before = await _read_local_model_settings(port, model_path)
+
+    # (1) The sampler is a per-request knob, so it is swept on the model that is
+    # already loaded — no reload, and its rows are the golden-prompt scoring.
+    sampler_rows = await sweep_samplers(completion_seam(complete), model_id=model_id)
+    sampler = best_sampler(sampler_rows)
+    _update_local_tune_job(
+        tune_job_id,
+        sampler=sampler,
+        sampler_rows=sampler_rows,
+        message="measuring the MTP configs",
+    )
+
+    # (2) MTP on/off and its adaptive depth are per-model settings: one real
+    # reload and one real completion per config, ranked by measured decode rate.
+    done = 0
+    rows: list[Any] = []
+
+    async def measure(config: Any) -> Any:
+        nonlocal done
+        _update_local_tune_job(
+            tune_job_id,
+            message=f"measuring {config.label} ({done + 1} of {len(configs)})",
+        )
+        row = await _measure_local_config(port, model_path, model_id, config)
+        done += 1
+        rows.append(row)
+        _update_local_tune_job(
+            tune_job_id, done=done, rows=[item.to_dict() for item in rows]
+        )
+        return row
+
+    outcome = await sweep(measure, configs, mtp_capable=mtp_capable)
+    best = outcome.best
+    if best is None:
+        # Nothing could be measured: the rows carry every reason and no rate is
+        # invented. Put this Mac back the way the sweep found it (the settings it
+        # read, or the run's own MTP switch when they were unreadable) and fail
+        # with one action instead of leaving an unmeasured config serving.
+        _update_local_tune_job(
+            tune_job_id, message="restoring this Mac's model after the sweep"
+        )
+        restore = (
+            dict(before)
+            if before
+            else _local_winning_settings(mtp=run_mtp, mtp_depth=None, sampler=sampler)
+        )
+        if not await _write_local_model_settings(port, model_id, restore):
+            await _reload_local_model(port, model_id)
+        _fail_local_tune(
+            tune_job_id,
+            "local_tune_infeasible",
+            "no MTP config could be measured on this Mac: "
+            + "; ".join(f"{row.config.label}: {row.error}" for row in outcome.rows)[
+                :600
+            ],
+            ACTION_DIAGNOSTICS,
+        )
+        return
+
+    # (3) Leave the winner serving: write its settings, reload this Mac's model
+    # with them, and require the pool to report it loaded.
+    _update_local_tune_job(
+        tune_job_id, message=f"writing the winner ({best.label}) and loading it"
+    )
+    problem = await _write_local_model_settings(
+        port,
+        model_id,
+        _local_winning_settings(
+            mtp=best.mtp, mtp_depth=best.mtp_depth, sampler=sampler
+        ),
+    )
+    code = "local_tune_failed"
+    if not problem:
+        problem, code = await _reload_local_model(port, model_id)
+    if not problem:
+        loaded, problem = await _local_pool_loaded(port, model_path)
+        if not loaded:
+            code = "local_load_timeout"
+    if problem:
+        action = ACTION_DIAGNOSTICS
+        if code == "insufficient_memory":
+            action = ACTION_ADJUST_PLAN
+        elif code == "model_not_available":
+            action = ACTION_CHECK_MODEL_PATH
+        _fail_local_tune(
+            tune_job_id,
+            code,
+            f"the winning config {best.label} could not be left loaded on this "
+            f"Mac: {problem}",
+            action,
+        )
+        return
+
+    # (4) One preset per (model, this Mac), merged so a sampler from /tune (or a
+    # depth from a cluster sweep) is not erased by this save, and vice versa.
+    preset_key = _merge_and_save_preset_for(
+        model_path,
+        [node_id],
+        mtp=best.mtp,
+        mtp_depth=best.mtp_depth,
+        sampler=_measured(sampler),
+    )
+    _update_local_tune_job(
+        tune_job_id,
+        state=LOCAL_TUNE_COMPLETED,
+        message="done",
+        rows=[item.to_dict() for item in outcome.rows],
+        best={
+            "config": best.label,
+            "mtp": best.mtp,
+            "mtp_depth": best.mtp_depth,
+        },
+        mtp_applicable=outcome.mtp_applicable,
+        preset_key=preset_key,
+        error=None,
+    )
 
 
 @router.get("/performance-probe")

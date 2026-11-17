@@ -171,6 +171,29 @@ class AssistantMeasureResponse(BaseModel):
     poll: str
 
 
+class AssistantRunLocalRequest(BaseModel):
+    """Run the measured model on this Mac alone, without a cluster.
+
+    The measured Macs stay what they are; this question is only "does this
+    checkpoint fit on *this* Mac at this context, and may its own engine load
+    it". It is deliberately not a plan request: ``plan`` stays the PP-only
+    cluster contract and a single-Mac plan stays unapplicable
+    (``ClusterDeployment`` needs 2+ hosts).
+
+    ``layer_count`` is optional and only a consistency check against the
+    measured layout — a measurement identity keyed by a path does not carry
+    layers, so the caller may repeat what it saw. ``None`` means "not asserted".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    measurement_id: str = Field(min_length=1, max_length=128)
+    model_path: str = Field(min_length=1, max_length=4096)
+    layer_count: int | None = Field(default=None, gt=0, le=MAX_LAYER_COUNT)
+    context_tokens: int = Field(default=8192, ge=1, le=MAX_CONTEXT_TOKENS)
+    mtp: bool = False
+
+
 class AssistantPlanRequest(BaseModel):
     """One planning question about one already-taken measurement.
 
