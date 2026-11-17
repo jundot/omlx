@@ -37,7 +37,15 @@ def _float_weight(module) -> mx.array:
 class OqhWriter:
     """Writes oQh targets; the other refinable tensors go to the oQe refine writer."""
 
-    def __init__(self, refine, target_bits: dict, dtype, shard_index: int, scheme):
+    def __init__(
+        self,
+        refine,
+        target_bits: dict,
+        dtype,
+        shard_index: int,
+        scheme,
+        group_size: int | None = None,
+    ):
         self.refine = refine
         self.scheme = scheme
         self.output = refine.output
@@ -45,6 +53,8 @@ class OqhWriter:
         self.target_bits = dict(target_bits)
         self.dtype = dtype
         self.shard_index = shard_index
+        # None: one scale per row; else group scales and biases of this size.
+        self.group_size = group_size
         self.entries: dict[str, dict] = {}
         self._out: dict[str, mx.array] = {}
         self._signs: dict[str, mx.array] = {}
@@ -57,19 +67,32 @@ class OqhWriter:
             self._signs[key] = signs
         return signs, block
 
-    def _emit(self, name, packed, rscale, signs, block, bits) -> None:
-        self._out[f"{name}.weight"] = packed
-        self._out[f"{name}.rscale"] = rscale.astype(self.dtype)
+    def _quantize(self, weight, gram, bits, signs, block):
+        """({suffix: tensor}, before, after) for one weight or expert range."""
+        if self.group_size is None:
+            packed, rscale, before, after = quantize.quantize(
+                weight, gram, bits, signs, block
+            )
+            return {"weight": packed, "rscale": rscale}, before, after
+        packed, scales, biases, before, after = quantize.quantize_affine(
+            weight, gram, bits, signs, block, self.group_size
+        )
+        parts = {"weight": packed, "oqh_scales": scales, "oqh_biases": biases}
+        return parts, before, after
+
+    def _emit(self, name, parts, signs, block, bits) -> None:
+        for suffix, value in parts.items():
+            if suffix != "weight":
+                value = value.astype(self.dtype)
+            self._out[f"{name}.{suffix}"] = value
         self._out[f"{name}.oqh_signs"] = signs.reshape(-1, block).astype(self.dtype)
-        self.entries[name] = fmt.config_entry(bits, block)
+        self.entries[name] = fmt.config_entry(bits, block, self.group_size)
 
     def _quantize_dense(self, name, weight, gram, stats) -> None:
         bits = self.target_bits[name]
         signs, block = self._signs_for(name, int(weight.shape[-1]))
-        packed, rscale, before, after = quantize.quantize(
-            weight, gram, bits, signs, block
-        )
-        self._emit(name, packed, rscale, signs, block, bits)
+        parts, before, after = self._quantize(weight, gram, bits, signs, block)
+        self._emit(name, parts, signs, block, bits)
         stats["oqh_tensors"] = stats.get("oqh_tensors", 0) + 1
         stats["oqh_before"] = stats.get("oqh_before", 0.0) + before
         stats["oqh_after"] = stats.get("oqh_after", 0.0) + after
@@ -78,28 +101,19 @@ class OqhWriter:
         bits = self.target_bits[name]
         n_exp, in_dim = int(weight.shape[0]), int(weight.shape[-1])
         signs, block = self._signs_for(name, in_dim)
-        packed, rscale = [], []
+        ranges: list[dict] = []
         before = after = 0.0
         out_dim = int(weight.shape[-2])
         for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
             gram = oq._shrunk_gram(collector.switch_gram(owner, first, stop))
-            p, r, b0, b1 = quantize.quantize(
-                weight[first:stop], gram, bits, signs, block
-            )
-            packed.append(p)
-            rscale.append(r)
+            parts, b0, b1 = self._quantize(weight[first:stop], gram, bits, signs, block)
+            ranges.append(parts)
             before += b0
             after += b1
             del gram
             mx.clear_cache()
-        self._emit(
-            name,
-            mx.concatenate(packed, 0),
-            mx.concatenate(rscale, 0),
-            signs,
-            block,
-            bits,
-        )
+        parts = {k: mx.concatenate([r[k] for r in ranges], 0) for k in ranges[0]}
+        self._emit(name, parts, signs, block, bits)
         stats["oqh_tensors"] = stats.get("oqh_tensors", 0) + 1
         stats["oqh_before"] = stats.get("oqh_before", 0.0) + before
         stats["oqh_after"] = stats.get("oqh_after", 0.0) + after

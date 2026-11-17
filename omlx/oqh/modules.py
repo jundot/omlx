@@ -15,6 +15,7 @@ import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_vlm.speculative.ops.linear import _target_verify_linear
 
 from ..custom_kernels.oqh import fast
 from . import format as fmt
@@ -103,6 +104,12 @@ class _Rotating(nn.Module):
     Dimensions come from the tensors, so they follow tensor-parallel splits.
     """
 
+    # Set per instance by the runtime. The class defaults keep the per-call
+    # lookups off nn.Module.__getattr__, which raises for missing names.
+    _oqh_key = None
+    _oqh_handoff = None
+    _oqh_affine = None
+
     @property
     def input_dims(self) -> int:
         return self["oqh_signs"].size
@@ -117,19 +124,20 @@ class _Rotating(nn.Module):
 
     @property
     def signs(self) -> mx.array:
-        return self["oqh_signs"].reshape(-1)
+        """The signs as stored, [inputs / block, block]; the kernels read them flat."""
+        return self["oqh_signs"]
 
     def rotate(self, x: mx.array) -> mx.array:
         return fast.rotate(x, self.signs, self.block)
 
     def rotated_input(self, x: mx.array) -> mx.array:
         """x rotated for this module; reuses the copy of a producer or sibling."""
-        handoff = getattr(self, "_oqh_handoff", None)
+        handoff = self._oqh_handoff
         if handoff is not None:
             rot = _take(handoff, x.size)
             if rot is not None:
                 return rot.reshape(x.shape)
-        key = getattr(self, "_oqh_key", None)
+        key = self._oqh_key
         if key is None:
             return self.rotate(x)
         rot = _recall(x, key)
@@ -168,9 +176,9 @@ class OqhLinear(_Rotating):
         It shares the weight and the per-shape unit views, so it holds no new
         memory, and its decode-batch calls take oMLX's batched affine kernels.
         """
-        ql = getattr(self, "_oqh_affine", None)
+        ql = self._oqh_affine
         w = self["weight"]
-        if ql is None or ql.weight is not w:
+        if ql is None or ql["weight"] is not w:
             s1, b1, gs = fast.unit_view(w, self.bits, self["rscale"].dtype)
             ql = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
             nn.Module.__init__(ql)
@@ -269,7 +277,122 @@ class OqhSwitchLinear(_Rotating):
         return self.matmul_rotated(self.rotated_input(x), indices, sorted_indices)
 
 
-OQH_MODULES = (OqhLinear, OqhSwitchLinear)
+class OqhAffineLinear(_Rotating):
+    """Rotated codes with group scales and biases, served by the stock affine kernels."""
+
+    def __init__(
+        self,
+        input_dims: int,
+        output_dims: int,
+        bits: int,
+        group_size: int,
+        block: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.bits = bits
+        self.group_size = group_size
+        groups = input_dims // group_size
+        self.weight = mx.zeros((output_dims, input_dims * bits // 32), dtype=mx.uint32)
+        self.oqh_scales = mx.zeros((output_dims, groups))
+        self.oqh_biases = mx.zeros((output_dims, groups))
+        self.oqh_signs = mx.zeros((input_dims // block, block))
+        if bias:
+            self.bias = mx.zeros((output_dims,))
+        self.freeze()
+
+    def gemv_rows(self, x: mx.array) -> bool:
+        return False
+
+    def _affine(self) -> nn.QuantizedLinear:
+        """A stock affine linear sharing the codes, scales and biases.
+
+        Its calls take oMLX's batched affine kernels and verify paths as oQe does.
+        """
+        ql = self._oqh_affine
+        w, s, b = self["weight"], self["oqh_scales"], self["oqh_biases"]
+        if ql is None or ql["weight"] is not w or ql["scales"] is not s:
+            ql = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+            nn.Module.__init__(ql)
+            ql.weight, ql.scales, ql.biases = w, s, b
+            ql.group_size, ql.bits, ql.mode = self.group_size, self.bits, "affine"
+            object.__setattr__(self, "_oqh_affine", ql)
+        return ql
+
+    def matmul_rotated(self, x: mx.array) -> mx.array:
+        ql = self._affine()
+        # Row-exact forwards give verify rows the one-row affine arithmetic.
+        y = _target_verify_linear(ql, x) if _EXACT.depth else ql(x)
+        if "bias" in self:
+            y = y + self["bias"]
+        return y
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if x.dtype == mx.float32:
+            return self(x.astype(self["oqh_scales"].dtype)).astype(mx.float32)
+        return self.matmul_rotated(self.rotated_input(x))
+
+
+class OqhAffineSwitchLinear(_Rotating):
+    """Routed experts with group scales: weight [E, N, K * bits / 32]."""
+
+    def __init__(
+        self,
+        input_dims: int,
+        output_dims: int,
+        num_experts: int,
+        bits: int,
+        group_size: int,
+        block: int,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.bits = bits
+        self.group_size = group_size
+        groups = input_dims // group_size
+        self.weight = mx.zeros(
+            (num_experts, output_dims, input_dims * bits // 32), dtype=mx.uint32
+        )
+        self.oqh_scales = mx.zeros((num_experts, output_dims, groups))
+        self.oqh_biases = mx.zeros((num_experts, output_dims, groups))
+        self.oqh_signs = mx.zeros((input_dims // block, block))
+        self.freeze()
+
+    def gemv_rows(self, x: mx.array, sorted_indices: bool = False) -> bool:
+        return False
+
+    def matmul_rotated(
+        self, x: mx.array, indices: mx.array, sorted_indices: bool = False
+    ):
+        return mx.gather_qmm(
+            x,
+            self["weight"],
+            self["oqh_scales"],
+            self["oqh_biases"],
+            rhs_indices=indices,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode="affine",
+            sorted_indices=sorted_indices,
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        sorted_indices: bool = False,
+        block_plan=None,
+    ):
+        if x.dtype == mx.float32:
+            y = self(x.astype(self["oqh_scales"].dtype), indices, sorted_indices)
+            return y.astype(mx.float32)
+        return self.matmul_rotated(self.rotated_input(x), indices, sorted_indices)
+
+
+OQH_DENSE = (OqhLinear, OqhAffineLinear)
+OQH_SWITCH = (OqhSwitchLinear, OqhAffineSwitchLinear)
+OQH_MODULES = OQH_DENSE + OQH_SWITCH
 
 
 def from_tensors(prefix: str, weights: dict[str, mx.array]) -> nn.Module:
@@ -281,8 +404,15 @@ def from_tensors(prefix: str, weights: dict[str, mx.array]) -> nn.Module:
         raise ValueError(f"oQh {prefix}: rotation block {block} > {fmt.MAX_BLOCK}")
     in_dims = int(signs.size)
     bits = int(w.shape[-1]) * 32 // in_dims
+    scales = weights.get(f"{prefix}.oqh_scales")
+    bias = f"{prefix}.bias" in weights
+    if scales is not None:
+        group_size = in_dims // int(scales.shape[-1])
+        if w.ndim == 3:
+            return OqhAffineSwitchLinear(
+                in_dims, int(w.shape[1]), int(w.shape[0]), bits, group_size, block
+            )
+        return OqhAffineLinear(in_dims, int(w.shape[0]), bits, group_size, block, bias)
     if w.ndim == 3:
         return OqhSwitchLinear(in_dims, int(w.shape[1]), int(w.shape[0]), bits, block)
-    return OqhLinear(
-        in_dims, int(w.shape[0]), bits, block, bias=f"{prefix}.bias" in weights
-    )
+    return OqhLinear(in_dims, int(w.shape[0]), bits, block, bias=bias)

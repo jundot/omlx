@@ -13,10 +13,16 @@ Walsh-Hadamard transform applied to each block of ``b`` input channels. Every
 linear that reads the same producer output shares its signs and block, so the
 producer can write the rotated activation once.
 
-The tensors describe themselves: bits come from the packed width and the block
-from the signs. ``config["omlx_oqh"]`` records the format version and each
-source path with its bits and block. The ``quantization`` entries stay those of
-the affine tensors, so the stock loaders build every other module as usual.
+From AFFINE_LEVEL up, families that allow it keep group scales instead of the
+row scale: ``<path>.oqh_scales`` and ``<path>.oqh_biases`` hold MLX affine
+scales and biases of AFFINE_GROUP_SIZE inputs in the rotated basis. The names
+differ from ``.scales`` so loaders without oQh refuse the tensors.
+
+The tensors describe themselves: bits come from the packed width, the block
+from the signs and the group from the scales. ``config["omlx_oqh"]`` records
+the format version and each source path with its bits, block and, for group
+scales, group size. The ``quantization`` entries stay those of the affine
+tensors, so the stock loaders build every other module as usual.
 
 This module needs no MLX: the cluster planner reads it.
 """
@@ -38,6 +44,10 @@ MAX_BLOCK = 256
 # must fit in one rank's share at this size.
 TP_BLOCK_RANKS = 2
 SUPPORTED_BITS = (2, 3, 4, 5, 6, 8)
+# At 4 bits and up, group scales and biases on the rotated weights measured
+# 8-10% lower KL than a row scale at the same size; below, the row scale wins.
+AFFINE_LEVEL = 4
+AFFINE_GROUP_SIZE = 128
 # Families whose tensor-parallel strategy splits oQh tensors in place. The
 # others replace linears with MLX's sharded layer types, which oQh has none of.
 TENSOR_PARALLEL_TYPES = frozenset({"glm5_next", "deepseek_v41"})
@@ -57,12 +67,15 @@ def make_signs(key: str, n: int) -> np.ndarray:
     return rng.choice(np.array([-1, 1], dtype=np.int8), size=n)
 
 
-def config_entry(bits: int, block: int) -> dict:
-    return {"bits": int(bits), "block": int(block)}
+def config_entry(bits: int, block: int, group_size: int | None = None) -> dict:
+    entry = {"bits": int(bits), "block": int(block)}
+    if group_size:
+        entry["group_size"] = int(group_size)
+    return entry
 
 
 def oqh_paths(config: dict) -> dict[str, dict]:
-    """{path: {"bits", "block"}} of the oQh tensors a config declares, or {}."""
+    """{path: {"bits", "block"[, "group_size"]}} of the oQh tensors, or {}."""
     block = config.get(CONFIG_KEY) or {}
     if int(block.get("version", 0)) != FORMAT_VERSION:
         return {}

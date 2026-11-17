@@ -239,8 +239,9 @@ class OqhProducer : public Primitive {
 };
 
 // Whether a is row-contiguous when it is evaluated: evaluated inputs report it,
-// the oQh primitives always write dense outputs, and a reshape or added / removed
-// unit axis of a dense array stays dense.
+// the oQh primitives, MLX's quantized matmuls and custom Metal kernels always
+// write fresh dense outputs, and a reshape or added / removed unit axis of a
+// dense array stays dense.
 bool known_dense(const array& a, int depth = 0) {
   if (a.is_available()) {
     return a.flags().row_contiguous;
@@ -250,7 +251,8 @@ bool known_dense(const array& a, int depth = 0) {
   }
   // MLX does not export its primitives' type info, so match them by name.
   const std::string_view name = a.primitive().name();
-  if (name == "OqhQmv" || name == "OqhProducer") {
+  if (name == "OqhQmv" || name == "OqhProducer" || name == "QuantizedMatmul" ||
+      name == "GatherQMM" || name == "CustomKernel") {
     return true;
   }
   const bool view = name == "Reshape" || name == "ExpandDims" || name == "Squeeze";

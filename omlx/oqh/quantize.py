@@ -2,7 +2,9 @@
 
 The weight is rotated into the oQh basis, rounded to uniform levels with one
 scale per row, its codes re-picked by the oQe Hessian refinement, and the row
-scale refit by least squares under the same Hessian.
+scale refit by least squares under the same Hessian. quantize_affine keeps
+group scales and biases instead: the oQe quantizer runs on the rotated weight,
+weighted by the rotated Gram's diagonal, before the same refinement.
 """
 
 from __future__ import annotations
@@ -150,6 +152,67 @@ def quantize(weight: mx.array, gram: mx.array, bits: int, signs: mx.array, block
     rscale = scale.reshape(*lead).astype(mx.bfloat16)
     mx.eval(packed, rscale)
     return packed, rscale, before, after
+
+
+def quantize_affine(
+    weight: mx.array,
+    gram: mx.array,
+    bits: int,
+    signs: mx.array,
+    block: int,
+    group_size: int,
+):
+    """Rotated codes with group scales and biases of one weight, as quantize().
+
+    Returns (packed uint32, scales, biases, objective before, objective after).
+    """
+    if bits not in fmt.SUPPORTED_BITS:
+        raise ValueError(f"oQh bits must be one of {fmt.SUPPORTED_BITS}, got {bits}")
+    lead = weight.shape[:-1]
+    w3 = weight.reshape(-1, *weight.shape[-2:]) if weight.ndim == 3 else weight[None]
+    wr = rotate(w3, signs, block)
+    hr = rotate_gram(gram, signs, block)
+    mx.eval(wr, hr)
+    importance = mx.diagonal(hr, axis1=-2, axis2=-1)
+    if w3.shape[0] == 1:
+        wr, importance = wr[0], importance[0]
+    packed, scales, biases = oq._quantize_chunked(
+        wr, group_size, bits, "affine", importance=importance
+    )
+    refined = oq._refine_affine_codes(wr, packed, scales, biases, hr, bits, group_size)
+    if refined is None:
+        deq = mx.dequantize(packed, scales, biases, group_size=group_size, bits=bits)
+        err = deq - wr
+        err = err.astype(mx.float32).reshape(-1, *w3.shape[-2:])
+        before = after = mx.sum((err @ hr) * err).item()
+    else:
+        packed, before, after = refined
+    mx.eval(packed)
+    return (
+        packed.reshape(*lead, -1),
+        scales.reshape(*lead, -1),
+        biases.reshape(*lead, -1),
+        before,
+        after,
+    )
+
+
+def dequantize_affine(
+    packed: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    bits: int,
+    signs: mx.array,
+    block: int,
+):
+    """The float32 weight a group-scale oQh tensor stands for, in the plain basis."""
+    n_in = int(packed.shape[-1]) * 32 // bits
+    group_size = n_in // int(scales.shape[-1])
+    wr = mx.dequantize(packed, scales, biases, group_size=group_size, bits=bits)
+    wr = wr.astype(mx.float32)
+    shape = wr.shape
+    w = mx.hadamard_transform(wr.reshape(*shape[:-1], n_in // block, block))
+    return w.reshape(shape) * signs.astype(mx.float32)
 
 
 def dequantize(

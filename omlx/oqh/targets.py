@@ -67,6 +67,15 @@ class Scheme:
     tensor_parallel: bool
     # oQh levels must stay below this one, if set.
     max_level: float | None = None
+    # Whether levels from fmt.AFFINE_LEVEL keep group scales; the fused MoE
+    # kernels of the other families read row scales only.
+    group_scales: bool = False
+
+    def group_size(self, oq_level) -> int | None:
+        """Group size of the rotated weights at this level, None for row scales."""
+        if self.group_scales and float(oq_level) >= fmt.AFFINE_LEVEL:
+            return fmt.AFFINE_GROUP_SIZE
+        return None
 
     def role(self, path: str) -> str | None:
         m = _split(path)
@@ -103,10 +112,10 @@ class Scheme:
 # Qwen3.5, Qwen3.6 and Qwen3.8 checkpoints all use qwen3_5 / qwen3_5_moe. Their
 # blocks also fit two ranks; at the 256 cap that costs nothing, although the
 # planner does not split Qwen oQh models.
-QWEN = Scheme(_QWEN_ROLES, tensor_parallel=True)
+QWEN = Scheme(_QWEN_ROLES, tensor_parallel=True, group_scales=True)
 # Qwen3.8-Flash-Next keeps its trunk affine: its hyper-connection, attention and
 # GDN kernels read affine weights. It does not run tensor parallel.
-QWEN4_EXP = Scheme(_ROUTED_ROLES, tensor_parallel=False)
+QWEN4_EXP = Scheme(_ROUTED_ROLES, tensor_parallel=False, group_scales=True)
 # GLM-5.3 keeps its trunk affine for the same reason, and runs tensor parallel.
 GLM5_NEXT = Scheme(_ROUTED_ROLES, tensor_parallel=True)
 # DeepSeek V4.1 likewise: its trunk, Engram tables and shared expert keep
@@ -173,20 +182,29 @@ def _partner(path: str, bits: dict) -> str | None:
     return None
 
 
-def reinvest(named_shapes: dict, planned: dict, layer_scores: dict) -> dict[str, int]:
+def reinvest(
+    named_shapes: dict,
+    planned: dict,
+    layer_scores: dict,
+    group_size: int | None = None,
+) -> dict[str, int]:
     """{path: bits} of the oQh targets within the bytes of their affine plan.
 
     planned: {path: {"bits", "group_size"}} the main pass would write.
-    At equal width a row scale rounds coarser than affine group scales, so the
-    bytes the group scales free must buy bits where the error is largest: the
-    narrowest target gets one more bit first (water-filling), ties broken by
-    _REINVEST_RANK, then the most sensitive layer. Gate and up of one MLP at
+    group_size: the rotated weights' group size, None for row scales.
+    At equal width rotated weights round coarser than the affine plan, so the
+    bytes their smaller scales free must buy bits where the error is largest:
+    the narrowest target gets one more bit first (water-filling), ties broken
+    by _REINVEST_RANK, then the most sensitive layer. Gate and up of one MLP at
     the same width rise together, so they still fuse into one projection.
     """
     bits = {p: int(v["bits"]) for p, v in planned.items()}
+
+    def cost(path: str, width: int) -> int:
+        return price(named_shapes[path], width, group_size)
+
     slack = sum(
-        _affine_bytes(named_shapes[p], v) - price(named_shapes[p], bits[p])
-        for p, v in planned.items()
+        _affine_bytes(named_shapes[p], v) - cost(p, bits[p]) for p, v in planned.items()
     )
 
     def key(path: str) -> tuple:
@@ -206,10 +224,7 @@ def reinvest(named_shapes: dict, planned: dict, layer_scores: dict) -> dict[str,
             continue
         partner = _partner(p, bits)
         group = (p, partner) if partner and bits[partner] == bits[p] else (p,)
-        delta = sum(
-            price(named_shapes[q], wider) - price(named_shapes[q], bits[q])
-            for q in group
-        )
+        delta = sum(cost(q, wider) - cost(q, bits[q]) for q in group)
         if delta > slack:
             continue
         slack -= delta
@@ -219,10 +234,14 @@ def reinvest(named_shapes: dict, planned: dict, layer_scores: dict) -> dict[str,
     return bits
 
 
-def price(shape: tuple, bits: int) -> int:
-    """Serialized bytes of a target at ``bits``: codes, row scales and signs."""
+def price(shape: tuple, bits: int, group_size: int | None = None) -> int:
+    """Serialized bytes of a target at ``bits``: codes, scales and signs.
+
+    Row scales take one bf16 per row; group scales a bf16 scale and bias per group.
+    """
     n = 1
     for d in shape:
         n *= d
     rows = n // shape[-1]
-    return (n * bits + 7) // 8 + 2 * rows + 2 * shape[-1]
+    scales = 2 * rows if group_size is None else 4 * rows * (shape[-1] // group_size)
+    return (n * bits + 7) // 8 + scales + 2 * shape[-1]

@@ -7936,7 +7936,11 @@ def quantize_oq_streaming(
         oqh_plan = _plan_oqh_bits(
             _budgeted_shapes(named_shapes, config), config, oq_level, group_size
         )
-        logger.info(f"oQ{oq_level:g}: oQh plan covers {len(oqh_plan)} tensors")
+        oqh_group = oqh_targets.scheme_for(config).group_size(oq_level)
+        logger.info(
+            f"oQ{oq_level:g}: oQh plan covers {len(oqh_plan)} tensors, "
+            + (f"group scales of {oqh_group}" if oqh_group else "row scales")
+        )
 
     cb("loading", 20.0, "Starting tensor quantization")
 
@@ -8223,6 +8227,7 @@ def quantize_oq_streaming(
             oqh_plan,
             target_dtype,
             out_shard_idx,
+            group_size=oqh_group,
             streamed=stream_imatrix,
             trust_remote_code=trust_remote_code,
             progress_callback=cb,
@@ -11989,7 +11994,10 @@ def _plan_oqh_bits(
         if bits is not None and mode == "affine" and shape[-1] % gs == 0:
             planned[path] = {"bits": bits, "group_size": gs, "mode": mode}
     return oqh_targets.reinvest(
-        shapes, planned, config.get("_oq_sensitivity_map") or {}
+        shapes,
+        planned,
+        config.get("_oq_sensitivity_map") or {},
+        scheme.group_size(oq_level),
     )
 
 
@@ -12003,6 +12011,7 @@ def _write_oqh_output(
     dtype,
     shard_index: int,
     *,
+    group_size: int | None = None,
     streamed: bool,
     trust_remote_code: bool,
     progress_callback,
@@ -12020,6 +12029,7 @@ def _write_oqh_output(
         dtype,
         shard_index,
         oqh_targets.scheme_for(config),
+        group_size,
     )
     stats = {
         "tensors": 0,
@@ -12056,7 +12066,7 @@ def _write_oqh_output(
     gain = 1.0 - after / before if before > 0 else 0.0
     seconds = _time.monotonic() - started
     logger.info(
-        "oQh: %d tensors, Hessian error -%.1f%% against row rounding in %.0fs",
+        "oQh: %d tensors, Hessian error -%.1f%% against plain rounding in %.0fs",
         stats.get("oqh_tensors", 0),
         100.0 * gain,
         seconds,

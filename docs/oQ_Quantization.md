@@ -58,6 +58,7 @@ How it differs from oQe:
 
 - Affine quantization stores a scale and an offset for every group of 64 weights, about 0.5 bits per weight. oQh rotates the input of each decoder linear layer with a signed Walsh-Hadamard transform and stores the weights in that rotated basis as integer codes with one scale per output row.
 - At the same bit width, one scale per row rounds less accurately than group scales. The bytes oQh saves buy one more bit, first for the tensors with the fewest bits, until the file is the size of the oQe plan.
+- From oQ4 up, the Qwen models keep a scale and an offset for every 128 rotated weights instead of the row scale, and run on the regular affine kernels. At 4 bits that measured about 9% lower KL than the row scale at the same size; at 2 and 3 bits the row scale is better. GLM-5.3 and DeepSeek V4.1 keep the row scale at every level, because their fused MoE kernels read row scales.
 - The rounded values are then re-picked against each layer's output error, as in oQe.
 - The norm and activation kernels write the rotated input next to their normal output, so the rotation adds almost no work at run time.
 

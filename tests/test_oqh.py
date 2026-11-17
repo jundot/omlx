@@ -328,6 +328,14 @@ def test_reinvest_keeps_the_affine_size_and_widths():
     assert [plan[f"model.layers.{i}.mlp.down_proj"] for i in (0, 1)] == [4, 4]
     assert plan["model.layers.0.self_attn.q_proj"] == 5
     assert plan["model.layers.0.mlp.gate_proj"] == 3
+    # From oQ4, Qwen keeps group scales: their bytes leave less to reinvest.
+    assert targets.QWEN.group_size(4) == fmt.AFFINE_GROUP_SIZE
+    assert targets.QWEN.group_size(3.5) is None
+    assert targets.GLM5_NEXT.group_size(4) is None
+    gs = targets.QWEN.group_size(4)
+    grouped = targets.reinvest(shapes, planned, {"0": 1.0, "1": 2.0}, gs)
+    assert sum(targets.price(shapes[p], grouped[p], gs) for p in plan) <= affine
+    assert sum(grouped.values()) < sum(plan.values())
 
 
 def test_reinvest_raises_gate_and_up_together():
@@ -346,7 +354,7 @@ def test_reinvest_raises_gate_and_up_together():
     assert plan["model.layers.0.mlp.down_proj"] == 6
 
 
-def _tiny_qwen(tmp_path, moe: bool):
+def _tiny_qwen(tmp_path, moe: bool, group_size=None):
     """A tiny Qwen3.5 checkpoint whose decoder linears are oQh, and its float twin."""
     from mlx.utils import tree_flatten
     from mlx_lm.models import qwen3_5, qwen3_5_moe
@@ -394,14 +402,22 @@ def _tiny_qwen(tmp_path, moe: bool):
         gram = mx.broadcast_to(
             mx.eye(w.shape[-1]), (w.shape[0] if w.ndim == 3 else 1, *w.shape[-1:] * 2)
         )
-        packed, rscale, _, _ = quantize.quantize(w, gram, 4, sg, block)
+        if group_size:
+            packed, scales, biases, _, _ = quantize.quantize_affine(
+                w, gram, 4, sg, block, group_size
+            )
+            scales, biases = scales.astype(mx.bfloat16), biases.astype(mx.bfloat16)
+            weights[f"{base}.oqh_scales"] = scales
+            weights[f"{base}.oqh_biases"] = biases
+            deq = quantize.dequantize_affine(packed, scales, biases, 4, sg, block)
+        else:
+            packed, rscale, _, _ = quantize.quantize(w, gram, 4, sg, block)
+            weights[f"{base}.rscale"] = rscale
+            deq = quantize.dequantize(packed, rscale, 4, sg, block)
         weights[key] = packed
-        weights[f"{base}.rscale"] = rscale
         weights[f"{base}.oqh_signs"] = sg.reshape(-1, block).astype(mx.bfloat16)
-        twin[key] = quantize.dequantize(packed, rscale, 4, sg, block).astype(
-            mx.bfloat16
-        )
-        entries[base] = fmt.config_entry(4, block)
+        twin[key] = deq.astype(mx.bfloat16)
+        entries[base] = fmt.config_entry(4, block, group_size)
     path = tmp_path / ("moe" if moe else "dense")
     path.mkdir()
     mx.save_safetensors(str(path / "model.safetensors"), weights)
@@ -412,15 +428,16 @@ def _tiny_qwen(tmp_path, moe: bool):
     return path, ref, len(entries)
 
 
+@pytest.mark.parametrize("group_size", [None, 128], ids=["row", "group"])
 @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
-def test_load_hook_serves_the_checkpoint_with_fusion(tmp_path, moe):
+def test_load_hook_serves_the_checkpoint_with_fusion(tmp_path, moe, group_size):
     from mlx_lm.models.cache import make_prompt_cache
     from mlx_lm.utils import load_model
 
     from omlx.oqh.loading import install_load_hook
     from omlx.oqh.modules import OQH_MODULES
 
-    path, ref, count = _tiny_qwen(tmp_path, moe)
+    path, ref, count = _tiny_qwen(tmp_path, moe, group_size)
     install_load_hook()
     model, _ = load_model(path)
     loaded = [m for _, m in model.named_modules() if isinstance(m, OQH_MODULES)]
@@ -433,14 +450,17 @@ def test_load_hook_serves_the_checkpoint_with_fusion(tmp_path, moe):
     ids = mx.array([[1, 5, 9, 2, 7, 3, 11, 4]])
     want = ref(ids).astype(mx.float32)
     got = model(ids).astype(mx.float32)
-    assert _rel(got, want) < 0.03
+    # Stock affine matmuls drift from a float twin by 0.025-0.04 on this model
+    # even without rotation; each group-scale linear alone matches within 0.6%.
+    tol = 0.03 if group_size is None else 0.06
+    assert _rel(got, want) < tol
 
     cache = make_prompt_cache(model)
     model(ids[:, :6], cache=cache)
     step = mx.concatenate(
         [model(ids[:, i : i + 1], cache=cache) for i in (6, 7)], axis=1
     )
-    assert _rel(step.astype(mx.float32), want[:, 6:]) < 0.03
+    assert _rel(step.astype(mx.float32), want[:, 6:]) < tol
 
     # A caller that bypasses the decoder layer still gets plain-basis results.
     layer = model.model.layers[0]
@@ -508,7 +528,8 @@ def _tiny_qwen4_exp(tmp_path, monkeypatch):
     return source, tokens
 
 
-def test_qwen4_exp_experts_round_trip(tmp_path, monkeypatch):
+@pytest.mark.parametrize("level", [3.5, 4])
+def test_qwen4_exp_experts_round_trip(tmp_path, monkeypatch, level):
     from mlx.utils import tree_flatten
     from mlx_vlm.models.qwen3_5.speculative_verifier import (
         Qwen3_5BatchInvariantForward,
@@ -524,7 +545,7 @@ def test_qwen4_exp_experts_round_trip(tmp_path, monkeypatch):
     oq.quantize_oq_streaming(
         str(source),
         str(out),
-        3.5,
+        level,
         hadamard=True,
         stream_calibration=True,
         imatrix_num_samples=2,
@@ -540,6 +561,9 @@ def test_qwen4_exp_experts_round_trip(tmp_path, monkeypatch):
         "switch_mlp.down_proj",
     }
     assert {e["block"] for p, e in entries.items() if p.endswith("down_proj")} == {128}
+    # oQ4 keeps group scales on the rotated experts.
+    want_group = fmt.AFFINE_GROUP_SIZE if level >= 4 else None
+    assert {e.get("group_size") for e in entries.values()} == {want_group}
 
     # Twin: the same checkpoint with the experts stored as dequantized BF16.
     twin = tmp_path / "twin"
@@ -549,13 +573,16 @@ def test_qwen4_exp_experts_round_trip(tmp_path, monkeypatch):
         weights.update(mx.load(str(f)))
     for path, e in entries.items():
         signs = weights.pop(f"{path}.oqh_signs").reshape(-1).astype(mx.float32)
-        w = quantize.dequantize(
-            weights[f"{path}.weight"],
-            weights.pop(f"{path}.rscale"),
-            e["bits"],
-            signs,
-            e["block"],
-        )
+        packed = weights[f"{path}.weight"]
+        if "group_size" in e:
+            scales = weights.pop(f"{path}.oqh_scales")
+            biases = weights.pop(f"{path}.oqh_biases")
+            w = quantize.dequantize_affine(
+                packed, scales, biases, e["bits"], signs, e["block"]
+            )
+        else:
+            rscale = weights.pop(f"{path}.rscale")
+            w = quantize.dequantize(packed, rscale, e["bits"], signs, e["block"])
         weights[f"{path}.weight"] = w.astype(mx.bfloat16)
     mx.save_safetensors(str(twin / "model.safetensors"), weights)
     del config[fmt.CONFIG_KEY]

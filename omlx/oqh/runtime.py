@@ -21,10 +21,10 @@ from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantFor
 
 from ..custom_kernels.oqh import fast
 from .modules import (
+    OQH_DENSE,
     OQH_MODULES,
+    OQH_SWITCH,
     QMV_MAX_ROWS,
-    OqhLinear,
-    OqhSwitchLinear,
     exact_rows,
     hand_off,
     remember,
@@ -100,14 +100,16 @@ class _FusedSwitchGLU:
     combine the routes themselves.
     """
 
+    # GLM-5.3's activation clamps gate and up at this limit.
+    _oqh_limit = None
+
     def oqh_rotated_input(self, x):
         return self.gate_proj.rotated_input(x)
 
     def oqh_experts(self, x, indices, sorted_indices: bool = False):
         """Expert outputs of rotated rows."""
         gate, up, down = self.gate_proj, self.up_proj, self.down_proj
-        # GLM-5.3's activation clamps gate and up at its limit.
-        limit = getattr(self.activation, "limit", None)
+        limit = self._oqh_limit
         if gate.gemv_rows(x, sorted_indices):
             y = gate.pair_rotated(x, indices, up)
             act = fast.act_split_had(y, down.signs, down.block, limit)
@@ -132,7 +134,8 @@ class _FusedSwitchGLU:
         unsummed [..., top_k, D] result themselves.
         """
         x = mx.expand_dims(self.oqh_rotated_input(x), (-2, -3))
-        indices = mx.stop_gradient(indices)
+        if self.training:
+            indices = mx.stop_gradient(indices)
         # Decode and MTP verify keep the per-route GEMV of one-token decode.
         tokens = indices.size // indices.shape[-1]
         do_sort = indices.size >= 64 and tokens > QMV_MAX_ROWS
@@ -174,8 +177,11 @@ def _install_mlp(mlp) -> list:
     if not all(isinstance(m, OQH_MODULES) for m in mods) or not _pairs(*mods[:2]):
         return readers
     _set(mlp, "_oqh_installed", True)
-    switch = isinstance(mods[0], OqhSwitchLinear)
+    switch = isinstance(mods[0], OQH_SWITCH)
     _rebase(mlp, _FusedSwitchGLU if switch else _FusedMLP)
+    limit = getattr(getattr(mlp, "activation", None), "limit", None)
+    if switch and limit is not None:
+        _set(mlp, "_oqh_limit", limit)
     return readers
 
 
@@ -296,7 +302,7 @@ def _bind_gated_norm(norm, out_proj) -> None:
     Its callers reshape the heads before out_proj, so the rotated copy goes
     through the module handoff, not the memo.
     """
-    if not isinstance(out_proj, OqhLinear) or not isinstance(norm, nn.Module):
+    if not isinstance(out_proj, OQH_DENSE) or not isinstance(norm, nn.Module):
         return
     weight = norm.get("weight")
     if weight is None or weight.size != 128 or out_proj.input_dims % 128:
