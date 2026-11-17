@@ -144,8 +144,9 @@ def test_fused_switch_glu_serves_mlx_vlm_and_weighted_sum_callers():
     glu.up_proj = _switch(8, 256, 512, "in", 2)
     glu.down_proj = _switch(8, 512, 256, "down", 3)
     x = mx.random.normal((1, 40, 512)).astype(mx.bfloat16)
-    inds = mx.random.randint(0, 8, (1, 40, 2))
-    scores = mx.softmax(mx.random.normal((1, 40, 2)), axis=-1)
+    # Four routes: the native weighted sum supports top-k 4, 6, 8 and 10.
+    inds = mx.random.randint(0, 8, (1, 40, 4))
+    scores = mx.softmax(mx.random.normal((1, 40, 4)), axis=-1)
     shared = mx.random.normal((1, 40, 512)).astype(mx.bfloat16)
     want = glu(x, inds, scores, shared).astype(mx.float32)
     assert runtime._install_mlp(glu) == [glu.gate_proj, glu.up_proj]
