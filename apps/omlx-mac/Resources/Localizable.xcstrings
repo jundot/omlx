@@ -15199,6 +15199,12 @@
             "state" : "translated",
             "value" : "Precisione delle attivazioni"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "激活精度"
+          }
         }
       }
     },
@@ -15222,6 +15228,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Su M5 e successivi bf16 mantiene l'attenzione in bf16; auto lascia che Splash usi int8 dove è più veloce. Vale da Splash 1.6.1."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "bf16 在 M5 及之后的芯片上让注意力保持 bf16；auto 交由 Splash 在更快时选择 int8。仅 Splash 1.6.1 及以上生效。"
           }
         }
       }
