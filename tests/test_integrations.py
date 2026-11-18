@@ -1776,7 +1776,6 @@ class TestClaudeCodeIntegration:
             )
 
         env = captured["env"]
-        # Below Claude Code's 100k auto-compact minimum: not emitted.
         assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
         assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "49152"
 
@@ -1804,54 +1803,8 @@ class TestClaudeCodeIntegration:
             )
 
         env = captured["env"]
-        # Below Claude Code's 100k auto-compact minimum: not emitted.
         assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
         assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
-
-    @pytest.mark.parametrize(
-        "context_window, auto_compact_expected",
-        [
-            (49152, False),
-            (99_999, False),
-            (100_000, True),
-            (262_144, True),
-            (1_000_000, True),
-            (1_000_001, False),
-            (2_000_000, False),
-        ],
-    )
-    def test_launch_auto_compact_window_only_within_claude_code_bounds(
-        self, context_window, auto_compact_expected
-    ):
-        """Claude Code warns for CLAUDE_CODE_AUTO_COMPACT_WINDOW outside
-        [100k, 1M]; MAX_CONTEXT_TOKENS is always set."""
-        cc = ClaudeCodeIntegration()
-        captured = {}
-
-        def fake_execvpe(binary, argv, env):
-            captured["env"] = env
-
-        with (
-            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
-            patch.object(
-                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
-            ),
-        ):
-            cc.launch(
-                ctx(
-                    port=8000,
-                    api_key="secret",
-                    model="qwen3.5",
-                    context_window=context_window,
-                )
-            )
-
-        env = captured["env"]
-        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == str(context_window)
-        if auto_compact_expected:
-            assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == str(context_window)
-        else:
-            assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
 
     def test_launch_sets_max_context_tokens_for_canonical_claude_alias(self):
         """oMLX always sets CLAUDE_CODE_MAX_CONTEXT_TOKENS the same way

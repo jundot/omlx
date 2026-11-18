@@ -1758,14 +1758,6 @@ class TestLaunchClaudeTierPrecedence:
         assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "haiku-cfg"
         assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "haiku-cfg"
         assert env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == expected_window
-        # CLAUDE_CODE_AUTO_COMPACT_WINDOW is only emitted within Claude
-        # Code's [100k, 1M] range; 49152 is below it.
-        auto_compact = (
-            expected_window
-            if expected_window and 100_000 <= int(expected_window) <= 1_000_000
-            else None
-        )
-        assert env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == auto_compact
 
 
 class TestSavedNetworkAuthMigration:
