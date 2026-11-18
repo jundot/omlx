@@ -1398,6 +1398,8 @@ def dflash_draft_for(
     if model_settings is None or not getattr(model_settings, "dflash_enabled", False):
         return None
     configured = getattr(model_settings, "dflash_draft_model", None)
+    if configured and configured.startswith("~"):
+        configured = str(Path(configured).expanduser())
     return configured or bundled_dflash_draft(model_path)
 
 

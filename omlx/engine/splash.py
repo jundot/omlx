@@ -583,7 +583,7 @@ def _is_splash_draft(draft: dict, text: dict) -> bool:
 def find_splash_draft(text_config: dict, candidates: Iterable[str]) -> Path | None:
     """The first DFlash2 draft among ``candidates`` that fits ``text_config``."""
     for candidate in candidates:
-        path = Path(candidate)
+        path = Path(candidate).expanduser()
         draft = _read_config(path)
         if draft is not None and _is_splash_draft(draft, text_config):
             return path
