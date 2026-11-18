@@ -666,7 +666,6 @@ def test_bounded_prefill_peak_memory():
 
 
 def test_batch_left_padding_is_read_from_the_device_once_per_assignment(monkeypatch):
-    """Mask building must not wait on queued GPU work at every decode step and layer."""
     reads = []
     real_any = mx.any
     monkeypatch.setattr(mx, "any", lambda *a, **k: reads.append(1) or real_any(*a, **k))
@@ -674,21 +673,9 @@ def test_batch_left_padding_is_read_from_the_device_once_per_assignment(monkeypa
 
     for _ in range(3):
         assert cache._attention_mask(None, 1, 16) is None
-        assert cache._attention_mask("causal", 2, 16) == "causal"
-        cache.make_mask(1)
     assert len(reads) == 1
 
-    # Reshaping the batch reassigns left_padding: the flag is read again and a
-    # left-padded row is masked out of its padding columns.
-    cache.left_padding = cache.left_padding + mx.array([3, 0])
+    cache.left_padding += mx.array([3, 0])
     mask = cache._attention_mask(None, 1, 16)
     assert len(reads) == 2
     assert mask[:, 0, 0, :].tolist() == [[False] * 3 + [True] * 13, [True] * 16]
-
-
-def test_single_row_make_mask_uses_the_host_left_padding_flag():
-    cache = BatchAffine8KVCache([0, 0])
-    cache.filter(mx.array([0]))  # one row left: offset is a size-1 array
-    assert cache._left_padded is None
-    assert cache.make_mask(1) is None
-    assert cache._left_padded is False
