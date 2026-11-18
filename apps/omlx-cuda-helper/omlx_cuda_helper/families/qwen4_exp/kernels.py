@@ -26,19 +26,17 @@ def available() -> bool:
     return mx.cuda.is_available()
 
 
-def close(got: mx.array, want: mx.array, what: str, spread: bool = False) -> bool:
+def close(got: mx.array, want: mx.array, what: str) -> bool:
     """Whether a kernel result equals its reference up to float32 rounding.
 
     A 16-bit output may round the other way in a few places when the float32
-    sums take another order; anything more is a wrong kernel. With ``spread``
-    a rotation spreads each such rounding over its block, so only the error
-    counts.
+    sums take another order; anything more is a wrong kernel.
     """
     a, b = got.astype(mx.float32), want.astype(mx.float32)
     error = (mx.linalg.norm(a - b) / mx.maximum(mx.linalg.norm(b), 1e-30)).item()
     differ = (got != want).astype(mx.float32).mean().item()
     limit = 1e-5 if want.dtype == mx.float32 else 1e-3
-    if error <= limit and (want.dtype == mx.float32 or spread or differ <= 0.02):
+    if error <= limit and (want.dtype == mx.float32 or differ <= 0.02):
         return True
     logger.warning(
         "%s kernel differs from its reference (relative error %.2e, %.1f%% of "

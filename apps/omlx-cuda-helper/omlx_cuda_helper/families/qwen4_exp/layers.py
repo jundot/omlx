@@ -30,6 +30,9 @@ from .ops import (
     unit_scale,
 )
 
+# Relative error the oQh expert kernel may have against the experts rebuilt dense.
+_OQH_EXPERT_ERROR = 3e-3
+
 
 def checked_conv(taps: mx.array, dilation: int, dtype: mx.Dtype):
     """The conv kernel if it equals ``depthwise_conv`` on these taps, else None."""
@@ -494,19 +497,28 @@ class MoE:
         than a launch block holds at once.
         """
         tokens, count = 256, self.gate_up[0].shape[0]
-        x = mx.random.normal((1, tokens, self.router.weight.shape[1])).astype(dtype)
+        keys = mx.random.split(mx.random.key(11), 2)
+        width = self.router.weight.shape[1]
+        x = mx.random.normal((1, tokens, width), key=keys[0]).astype(dtype)
         # The oQh reference rebuilds the experts in use dense: keep them few.
         spread = min(count, 4 * self.top_k) if self.oqh else count
-        others = mx.random.randint(1, spread, (1, tokens, self.top_k - 1))
+        others = mx.random.randint(1, spread, (1, tokens, self.top_k - 1), key=keys[1])
         chosen = mx.concatenate([mx.zeros((1, tokens, 1), mx.int32), others], -1)
         self.expert_kernel = False
         want = self.experts(x, chosen)[0]
         self.expert_kernel = True
         got = self.experts(x, chosen)[0]
         if self.oqh:
-            # The reference rebuilds the experts dense and sums in another order.
-            if kernels.close(got, want, "oQh expert", spread=True):
+            # The reference rebuilds the experts dense and sums in another
+            # order, and the rotations spread each rounding over a block: only
+            # the error counts, bounded as for the other families' experts.
+            a, b = got.astype(mx.float32), want.astype(mx.float32)
+            error = (mx.linalg.norm(a - b) / mx.linalg.norm(b)).item()
+            if error <= _OQH_EXPERT_ERROR:
                 return True
+            kernels.logger.warning(
+                "oQh expert kernel differs from its reference by %.2e; using it", error
+            )
             self.expert_kernel = False
             return False
         if mx.array_equal(got, want).item():
