@@ -4960,19 +4960,15 @@ class Scheduler:
     # naturally exhausted, and a pass with nothing left to give costs one
     # ~100ms pause before the guard falls back to throttling as before.
     _MAX_PREFILL_EVICTION_RETRIES = 2
-    # A sized offload slot release gives up a quarter of the slots above the
-    # floor per pause (see release_moe_offload_slots), so reaching the floor
-    # takes up to four pauses where a release to the floor took one.
+    # A sized offload slot release reaches the floor in at most four steps.
     _MAX_OFFLOAD_SLOT_PAUSES = 4
 
     def _offload_slot_pause(self, request_id: str, request: Any) -> bool:
         """True when this pause's ladder will release MoE offload slots.
 
-        Such a pause does not count toward ``_MAX_PREFILL_EVICTION_RETRIES``:
-        the request reaches the floor with the same pauses left that a
-        single release to the floor would leave it, for the hot cache, idle
-        models and ANE banks. The release is skipped while another request
-        runs (``release_moe_offload_slots``), so then the pause counts."""
+        Such pauses keep the two counted pauses for the hot cache and idle
+        models. The release is skipped while another request runs, so then
+        the pause counts."""
         releasable = getattr(self, "moe_offload_releasable", None)
         if releasable is None:
             return False

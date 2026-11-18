@@ -3398,9 +3398,7 @@ class TestEnginePoolPrefillEviction:
     async def test_offload_slot_release_repeats_until_the_prefill_step_fits(
         self, steps_left
     ):
-        """Each pass releases a step sized from the shortfall left. The rung
-        repeats while a pass frees bytes; once the slots are at their floor,
-        the hot cache is next."""
+        """The slot rung repeats on the shortfall left, then the hot cache is next."""
         gb = 1024**3
         phys = [52 * gb]
         needs = []

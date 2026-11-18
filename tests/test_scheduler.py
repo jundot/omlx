@@ -2326,8 +2326,7 @@ class TestSchedulerStatistics:
     ):
         """Slots are released only while no other request runs on the engine,
         and the next decode step restores them once, whatever its batch width.
-        The release gets the prefill's shortfall, and both get a per-cache
-        reclaim that clears the Metal pool on the scheduler's stream."""
+        Both get a reclaim on the scheduler's stream."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         release = MagicMock(return_value=3 * 1024**3)
         scheduler.moe_offload_release = release

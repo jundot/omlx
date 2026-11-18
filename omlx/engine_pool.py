@@ -3282,9 +3282,7 @@ class EnginePool:
                 if not slots_exhausted:
                     # The requesting model's MoE offload slots return at its next
                     # decode step, so they go before cached prefixes and models.
-                    # Each pass releases the shortfall in coarse steps, and the
-                    # rung repeats until the prefill step fits or the slots are
-                    # at their floor.
+                    # Sized passes repeat until the step fits or the floor.
                     released = await self._release_offload_slots_for_headroom(
                         exclude_model_id, request_id, current + predicted - target
                     )

@@ -416,12 +416,10 @@ class ExpertCache:
         self.warm = False
 
     def _resize(self, capacity: int) -> None:
-        """Change the slot count, keeping as many resident experts as fit.
+        """Change the slot count, keeping the hottest resident experts that fit.
 
-        When not all fit, the ones with the highest routing counts stay. The
-        kept experts move to the first slots in slot order, so growing a full
-        cache keeps every expert in its slot. The new slots are evaluated
-        here, so the old ones are unreferenced once this returns.
+        Kept experts move to the first slots in slot order, so growing a full
+        cache keeps every expert in its slot. A failed eval leaves the old state.
         """
         slots = np.flatnonzero(self.slot_expert >= 0)
         if len(slots) > capacity:
@@ -440,17 +438,19 @@ class ExpertCache:
                 out[:n] = a[:n] if in_place else mx.take(a, index, axis=0)
             return out
 
-        self.resident = {
+        resident = {
             name: [None if a is None else rows(a) for a in triple]
             for name, triple in self.resident.items()
         }
         slot_map = np.full(self.n_experts, -1, dtype=np.int32)
         slot_map[experts] = np.arange(n, dtype=np.int32)
-        self.map = mx.array(slot_map)
+        expert_map = mx.array(slot_map)
         mx.eval(
-            self.map,
-            *(a for triple in self.resident.values() for a in triple if a is not None),
+            expert_map,
+            *(a for triple in resident.values() for a in triple if a is not None),
         )
+        self.resident = resident
+        self.map = expert_map
         self.capacity = capacity
         self.slot_of = {int(e): s for s, e in enumerate(experts.tolist())}
         self.slot_expert = np.full(capacity, -1, dtype=np.int64)
@@ -1388,11 +1388,9 @@ def release_moe_offload_slots(caches, need_bytes=None, reclaim=None) -> int:
     """Shrink the caches for a prefill; return the bytes given up.
 
     Without ``need_bytes`` every cache shrinks to its floor. With it, every
-    cache shrinks to the smallest :data:`_RELEASE_STEPS` share that frees at
-    least ``need_bytes`` in all, counting from the capacity each cache has
-    now, or to its floor if no share does. ``reclaim`` runs after each cache
-    that shrank, to return its old slots to the OS before the next cache
-    allocates. Decode restores the slots."""
+    cache shrinks to the smallest :data:`_RELEASE_STEPS` share that frees
+    ``need_bytes`` more in all, or to its floor. ``reclaim`` runs after each
+    cache that shrank, so its old slots go back before the next one allocates."""
     caches = [c for c in caches if hasattr(c, "release_slots")]
     if need_bytes is None:
         targets = [c.floor for c in caches]
