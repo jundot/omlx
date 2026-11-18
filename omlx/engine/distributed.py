@@ -39,6 +39,7 @@ from ..patches.deepseek_v41.processing import (
     install_tokenizer_protocol as install_deepseek_v41_tokenizer_protocol,
 )
 from ..reasoning_effort import _fallback_candidate, _normalized_input
+from ..utils.dry import warn_dry_unsupported
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
@@ -741,6 +742,10 @@ raise SystemExit(2)
             "xtc_threshold": kwargs.get("xtc_threshold", 0.1),
             "stream": stream,
         }
+        if kwargs.get("dry") is not None:
+            # Ranks build processors from the forwarded request body, which
+            # carries no DRY fields.
+            warn_dry_unsupported("distributed")
         repetition_context_size = kwargs.get("repetition_context_size")
         if repetition_context_size is not None:
             # Widens mlx-lm's look-back window for the repetition penalty
@@ -814,6 +819,10 @@ raise SystemExit(2)
             "xtc_threshold": kwargs.get("xtc_threshold", 0.1),
             "stream": stream,
         }
+        if kwargs.get("dry") is not None:
+            # Ranks build processors from the forwarded request body, which
+            # carries no DRY fields.
+            warn_dry_unsupported("distributed")
         repetition_context_size = kwargs.get("repetition_context_size")
         if repetition_context_size is not None:
             # See _completion_payload: widens the penalty look-back window.
