@@ -89,6 +89,7 @@ from ..model_settings import (
     oq_a8_model_supported,
     validate_kv_compression_settings,
 )
+from ..oqh.format import is_oqh_checkpoint
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
@@ -99,6 +100,7 @@ from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
 from ..request import live_decode_rate
 from ..settings import (
     BURST_DECODE_MODES,
+    SPLASH_ACTIVATIONS,
     SPLASH_KV_FORMATS,
     ConcurrentPriority,
     SubKeyEntry,
@@ -683,7 +685,6 @@ DASHBOARD_BLOCK_IDS = (
     "active_models",
     "cache_observability",
     "api_endpoints",
-    "claude_code",
     "applications",
     "engine_versions",
 )
@@ -873,6 +874,7 @@ class GlobalSettingsRequest(BaseModel):
     # External engines: Splash. An empty path means automatic detection.
     splash_path: str | None = None
     splash_kv_format: str | None = None
+    splash_activations: str | None = None
     splash_max_memory_gb: float | None = None
     splash_ssd_cache_gb: float | None = None
     splash_ane_prefill: bool | None = None
@@ -955,6 +957,7 @@ class OQStartRequest(BaseModel):
     imatrix_seq_length: int = 512
     mtp_assistant_model_path: str = ""
     preserve_ngram_table: bool = False
+    hadamard: bool = False
 
 
 class HFUploadRequest(BaseModel):
@@ -1014,6 +1017,9 @@ def _parse_hot_cache_max_size(value: str) -> int:
 
 
 _PAROQUANT_REASON = "Not supported on paroquant models yet (compatibility not verified)"
+
+
+_OQH_PREFILL_REASON = "A8 and ANE prefill do not read oQh weights."
 
 
 def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
@@ -2420,8 +2426,9 @@ def _model_options(model_info: dict, settings) -> dict:
     thinking_modes = ["auto", "on_limit"] if is_k2 else [
         "auto", "on_unlimit", "on_limit", "off"
     ]
+    oqh = is_oqh_checkpoint(model_info.get("model_path") or "")
     ane_backend = (
-        None if model_info.get("is_helper") else ane_prefill_backend(model_type)
+        None if model_info.get("is_helper") or oqh else ane_prefill_backend(model_type)
     )
     return {
         "thinking_forced": is_k2,
@@ -2439,7 +2446,9 @@ def _model_options(model_info: dict, settings) -> dict:
         "embedding_audio_supported": model_type == "embedding_gemma2",
         # Lets the settings UIs hide the toggle the save would reject.
         "a8_prefill_supported": (
-            _oq_a8_model_supported(model_type) and _oq_a8_kernels_available()
+            not oqh
+            and _oq_a8_model_supported(model_type)
+            and _oq_a8_kernels_available()
         ),
         "gpu_power_limit_supported": gpu_power.gpu_power_cap_supported(),
     }
@@ -3822,6 +3831,10 @@ def _validate_model_settings(entry, settings):
             raise HTTPException(
                 status_code=400, detail="A8 prefill min tokens must be at least 1."
             )
+    if (
+        settings.get("a8_prefill_enabled") or settings.get("qwen35_ane_prefill_enabled")
+    ) and is_oqh_checkpoint(getattr(entry, "model_path", "") or ""):
+        raise HTTPException(status_code=400, detail=_OQH_PREFILL_REASON)
     if settings.get("a8_prefill_enabled"):
         if not _oq_a8_model_supported(getattr(entry, "config_model_type", "")):
             raise HTTPException(
@@ -4185,6 +4198,8 @@ def _feature_problem(
     if name in ("turboquant", "index_cache"):
         is_paro, reason = _paroquant_compat_for_model(info)
         return reason if is_paro else None
+    if name in ("ane_prefill", "a8_prefill") and is_oqh_checkpoint(entry.model_path):
+        return _OQH_PREFILL_REASON
     if name == "ane_prefill":
         try:
             validate_ane_prefill(snapshot, entry.config_model_type)
@@ -4978,6 +4993,7 @@ def _global_settings_response(global_settings):
             "web_search_content_max_chars": global_settings.integrations.web_search_content_max_chars,
             "splash_path": global_settings.integrations.splash_path,
             "splash_kv_format": global_settings.integrations.splash_kv_format,
+            "splash_activations": global_settings.integrations.splash_activations,
             "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
             "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
             "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
@@ -5909,6 +5925,14 @@ async def update_global_settings(
                 detail=f"splash_kv_format must be one of {sorted(SPLASH_KV_FORMATS)}",
             )
         global_settings.integrations.splash_kv_format = request.splash_kv_format
+        integrations_changed = True
+    if "splash_activations" in request.model_fields_set:
+        if request.splash_activations not in SPLASH_ACTIVATIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"splash_activations must be one of {sorted(SPLASH_ACTIVATIONS)}",
+            )
+        global_settings.integrations.splash_activations = request.splash_activations
         integrations_changed = True
     if "splash_max_memory_gb" in request.model_fields_set:
         memory = request.splash_max_memory_gb
@@ -9853,22 +9877,29 @@ async def check_update(
         # Use the releases list (not /releases/latest) and filter by the
         # user's update channel. GitHub's prerelease flag has historically
         # been unreliable for rc/dev tags, so release_check validates tags too.
-        resp = await asyncio.to_thread(
-            requests.get,
-            "https://api.github.com/repos/jundot/omlx/releases",
-            params={"per_page": 20},
-            timeout=5,
-        )
-        if resp.status_code != 200:
-            _update_cache[channel] = no_update
-            _update_cache_time[channel] = now
-            return _update_cache[channel]
+        page_size = 20
+        page = 1
+        while True:
+            resp = await asyncio.to_thread(
+                requests.get,
+                "https://api.github.com/repos/jundot/omlx/releases",
+                params={"per_page": page_size, "page": page},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                _update_cache[channel] = no_update
+                _update_cache_time[channel] = now
+                return _update_cache[channel]
 
-        data = select_latest_release(resp.json(), channel=channel)
-        if data is None:
-            _update_cache[channel] = no_update
-            _update_cache_time[channel] = now
-            return _update_cache[channel]
+            releases = resp.json()
+            data = select_latest_release(releases, channel=channel)
+            if data is not None:
+                break
+            if len(releases) < page_size:
+                _update_cache[channel] = no_update
+                _update_cache_time[channel] = now
+                return _update_cache[channel]
+            page += 1
 
         latest = data["tag_name"].lstrip("v")
 
@@ -9994,6 +10025,7 @@ async def start_oq_quantization(
             imatrix_seq_length=request.imatrix_seq_length,
             mtp_assistant_model_path=request.mtp_assistant_model_path,
             preserve_ngram_table=request.preserve_ngram_table,
+            hadamard=request.hadamard,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

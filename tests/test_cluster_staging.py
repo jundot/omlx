@@ -2,6 +2,7 @@
 """Staging must send each Mac its layers' shards and nothing else."""
 
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -869,6 +870,26 @@ def test_free_space_is_readable_for_a_path_that_does_not_exist_yet(tmp_path):
     from omlx.cluster.staging import free_disk_bytes
 
     assert free_disk_bytes(tmp_path / "not" / "created" / "yet") > 0
+
+
+def test_remote_free_space_reads_a_destination_that_does_not_exist_yet(
+    tmp_path, monkeypatch
+):
+    from omlx.cluster.staging import free_disk_bytes
+
+    real_run = subprocess.run
+
+    def run_on_this_mac(argv, **kwargs):
+        # The peer's shell, with tmp_path as its home directory.
+        return real_run(
+            ["/bin/sh", "-c", argv[-1]],
+            env={**os.environ, "HOME": str(tmp_path)},
+            **kwargs,
+        )
+
+    monkeypatch.setattr(subprocess, "run", run_on_this_mac)
+
+    assert free_disk_bytes("~/Models/not staged yet", ssh_target="studio") > 0
 
 
 def test_remote_default_uses_published_worker_shim(monkeypatch):

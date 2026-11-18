@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -56,8 +57,18 @@ def plan(model_dir: str | Path) -> tuple[int, list[int]]:
     for name, weight in index.items():
         base = name.removesuffix(".weight")
         layer = checkpoint.layer_of(name)
+        if base == name or layer is None or not resident(name):
+            continue
+        signs = index.get(f"{base}.{checkpoint.OQH_SIGNS}")
+        if signs is not None:
+            # oQh: dense weight [N, K]; only the signs stay next to it.
+            parts = ("rscale", "oqh_scales", "oqh_biases")
+            packed = [t for p in parts if (t := index.get(f"{base}.{p}")) is not None]
+            dense = weight.shape[0] * math.prod(signs.shape) * 2
+            layers[layer] += dense - weight.nbytes - sum(t.nbytes for t in packed)
+            continue
         packed = [index.get(f"{base}.{part}") for part in ("scales", "biases")]
-        if base == name or layer is None or None in packed or not resident(name):
+        if None in packed:
             continue
         bits = checkpoint.quantization(config, base)["bits"]
         dense = weight.shape[0] * (weight.shape[1] * 32 // bits) * 2

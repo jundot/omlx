@@ -2,6 +2,7 @@
 """Unit tests for accuracy evaluation modules."""
 
 import asyncio
+import subprocess
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,6 +17,7 @@ from omlx.eval.jmmlu import JMMLUBenchmark
 from omlx.eval.kmmlu import KMMLUBenchmark
 from omlx.eval.livecodebench import LiveCodeBenchBenchmark, _extract_code
 from omlx.eval.mmlu import MMLUBenchmark, _parse_choices
+from omlx.eval.sandbox import limited_python_command
 from omlx.eval.truthfulqa import TruthfulQABenchmark
 
 
@@ -309,6 +311,22 @@ class TestLiveCodeBench:
         )
         assert bench.check_answer(gold, item) is True
         assert bench.check_answer(signature + "        return []\n", item) is False
+
+    def test_generated_code_sets_its_own_limits(self, tmp_path):
+        script = tmp_path / "solution.py"
+        script.write_text(
+            "import resource, sys\n"
+            "if __name__ == '__main__':\n"
+            "    print(resource.getrlimit(resource.RLIMIT_CPU)[0], sys.stdin.read())\n"
+        )
+        result = subprocess.run(
+            limited_python_command(str(script), 1 << 30, 7),
+            input="x",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.stdout.split() == ["7", "x"], result.stderr
 
 
 # --- HumanEval Tests ---

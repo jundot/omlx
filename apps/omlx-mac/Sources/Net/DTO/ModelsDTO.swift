@@ -220,8 +220,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
 /// keys (Encoder converts via `.convertToSnakeCase`). `nil` fields are
 /// omitted by `encodeIfPresent` so the server merges instead of resetting.
 struct ModelSettingsPatch: Encodable, Equatable, Sendable {
-    var modelAlias: String? = nil
-    var modelTypeOverride: String? = nil
+    var modelAlias: String?? = nil
+    var modelTypeOverride: String?? = nil
     var maxContextWindow: Int? = nil
     var maxTokens: Int? = nil
     var temperature: Double? = nil

@@ -641,6 +641,10 @@ def test_official_oq3_streams_affine_weights_and_unified_engram(
         assert not (output / "engram").exists()
         report = json.loads((output / "quantization_report.json").read_text())
         assert report["imatrix_applied_modules"] == ([name] if enhanced else [])
+        assert report["tensor_bytes"] == (
+            report["remaining_weights"]["tensor_bytes"]
+            + report["engram"]["tensor_bytes"]
+        )
         loaded, _ = load(output, engram_ssd_offload=True)
         try:
             projection = loaded.language_model.layers[0].attn.wq_a

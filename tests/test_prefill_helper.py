@@ -3,6 +3,7 @@
 import itertools
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -642,6 +643,11 @@ _REMOTE = HelperTarget("node", "M5max", "me@10.0.0.2", "10.0.0.2", "thunderbolt"
 
 
 def _remote(home):
+    shim = home / ".omlx" / "bin" / "omlx-cluster-python"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+    shim.chmod(0o755)
+
     def runner(argv, **kwargs):
         # Run the remote command here, with HOME pointing at the fake Mac.
         command = argv[-1]
@@ -1522,6 +1528,11 @@ def test_agent_transport_drives_a_helper_daemon(tmp_path, monkeypatch):
     assert "does not support" in agent.incompatible(info, GLM, "nvidia1")
     older = {**info, "contracts": {"deepseek_v41": DSV41.contract - 1}}
     assert "update the helper" in agent.incompatible(older, DSV41, "nvidia1")
+    # oQh weights need a helper whose family reads that format version.
+    assert "oQh" in agent.incompatible(info, DSV41, "nvidia1", oqh=1)
+    reads = {**info, "oqh": {"deepseek_v41": 1}}
+    assert agent.incompatible(reads, DSV41, "nvidia1", oqh=1) is None
+    assert "oQh" in agent.incompatible(reads, DSV41, "nvidia1", oqh=2)
 
     # A copy stopped halfway resumes from the bytes the helper kept.
     model = tmp_path / "Model"
@@ -1800,6 +1811,17 @@ def test_qwen4_split_matches_whole_model(layers, k, prefix):
     )
 
 
+def test_qwen4_prefix_of_a_decoded_cache_sends_text_positions():
+    lm = _qwen4(4)
+    cache = lm.make_cache()
+    lm(mx.array(np.random.default_rng(5).integers(3, 58, (1, 9))), cache=cache)
+    text = cache[2].index_position_ids
+    # A decode step leaves the ids in MRoPE form.
+    cache[2].index_position_ids = mx.broadcast_to(text[None], (3, *text.shape))
+    sent = QWEN4.prefix_state(cache, 3)["2.ip"]
+    np.testing.assert_array_equal(np.asarray(sent), np.asarray(text))
+
+
 # ---------------------------------------------------------------------------
 # Qwen3.5: Gated DeltaNet and full-attention layers on either side of the cut.
 # ---------------------------------------------------------------------------
@@ -1924,6 +1946,10 @@ def test_only_a_model_that_gets_a_helper_has_an_adapter(tmp_path):
     config["quantization_config"]["quant_method"] = "paroquant"
     (tmp_path / "config.json").write_text(json.dumps(config))
     assert adapter_for_model("qwen3_5", "vlm", path) is None
+    # A Mac helper loads oQh as the server does; a CUDA helper says what it reads.
+    config = {"model_type": "qwen3_5", "omlx_oqh": {"version": 1, "tensors": {}}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert adapter_for_model("qwen3_5", "vlm", path) is QWEN35
     # The other families keep their adapter on every engine.
     assert adapter_for_model("qwen4-exp", "batched", path) is QWEN4
 

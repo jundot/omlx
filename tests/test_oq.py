@@ -2,6 +2,7 @@
 """Tests for oQ (oMLX Universal Dynamic Quantization)."""
 
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -79,6 +80,10 @@ from omlx.oq import (
     _TrackedTensor,
     _validate_oq_dtype_for_model,
     _uses_minimax_mxfp8_scale_inv_source,
+    _OQGramCollector,
+    _OQRefineWriter,
+    _refine_affine_codes,
+    _shrunk_gram,
     _weighted_lsq_refit,
     _weighted_lsq_refit_metal,
     estimate_bpw_and_size,
@@ -3144,6 +3149,92 @@ class TestQuantizeChunked:
         same = (out[0] == ref[0]) & (out[1] == ref[1])
         assert mx.mean(same.astype(mx.float32)).item() > 0.98
         assert abs(mx.sum(out_err).item() / mx.sum(ref_err).item() - 1) < 1e-4
+
+    @pytest.mark.skipif(
+        not HAS_MLX or not mx.metal.is_available(), reason="Metal not available"
+    )
+    @pytest.mark.parametrize("shape", [(48, 256), (3, 16, 128)])
+    def test_code_refinement_lowers_hessian_error(self, shape):
+        mx.random.seed(2)
+        w = mx.random.normal(shape).astype(mx.bfloat16)
+        mixing = mx.random.normal((shape[-1], shape[-1]))
+        x = mx.random.normal((512, shape[-1])) @ mixing
+        gram = mx.broadcast_to(x.T @ x, (*shape[:-2], shape[-1], shape[-1]))
+        hessian = _shrunk_gram(gram)
+        packed, scales, biases = mx.quantize(w, group_size=64, bits=3)
+
+        out = _refine_affine_codes(w, packed, scales, biases, hessian, 3, 64)
+
+        def hessian_error(p):
+            err = mx.dequantize(p, scales, biases, group_size=64, bits=3) - w
+            err = err.astype(mx.float32).reshape(-1, *shape[-2:])
+            return mx.sum((err @ hessian) * err).item()
+
+        assert out is not None
+        new_packed, before, after = out
+        assert after < before
+        assert hessian_error(new_packed) < hessian_error(packed)
+
+    @pytest.mark.skipif(
+        not HAS_MLX or not mx.metal.is_available(), reason="Metal not available"
+    )
+    def test_gram_collector_builds_per_expert_grams_in_chunks(self, monkeypatch):
+        monkeypatch.setattr("omlx.oq._OQE_REFINE_EXPERT_BYTES", 3 * 20 * 16 * 4)
+        module = nn.Module()
+        module.weight = mx.zeros((6, 8, 16))
+        routes = mx.random.randint(0, 6, (2, 10, 2))
+        shared = mx.random.normal((2, 10, 1, 1, 16))
+        per_route = mx.random.normal((2, 10, 2, 1, 16))
+        collector = _OQGramCollector()
+        collector.collect_switch("experts", module, shared, routes)
+        collector.collect_switch("experts", module, per_route, routes + 0)
+
+        ranges = list(collector.expert_ranges("experts", 6, 16, 0))
+        grams = [collector.switch_gram("experts", a, b) for a, b in ranges]
+
+        def bf16_rows(x):
+            return np.array(x.astype(mx.bfloat16).astype(mx.float32)).reshape(-1, 16)
+
+        rows = np.concatenate(
+            [np.repeat(bf16_rows(shared), 2, axis=0), bf16_rows(per_route)]
+        )
+        experts = np.tile(np.array(routes).reshape(-1), 2)
+        ref = np.stack([rows[experts == e].T @ rows[experts == e] for e in range(6)])
+        assert len(ranges) > 1
+        assert ranges[0][0] == 0 and ranges[-1][1] == 6
+        np.testing.assert_allclose(
+            np.array(mx.concatenate(grams)), ref, rtol=1e-4, atol=1e-4
+        )
+        # Weight copies of wide outputs count too: down projections split finer.
+        assert len(list(collector.expert_ranges("experts", 6, 16, 8))) > len(ranges)
+
+    def test_refine_writer_rewrites_a_shard_after_its_last_layer(self, tmp_path):
+        w = mx.random.normal((8, 64))
+        packed, scales, biases = mx.quantize(w, group_size=64, bits=4)
+        tensors = {"model.norm.weight": mx.ones((64,))}
+        parts = {"weight": packed, "scales": scales, "biases": biases}
+        for layer in (0, 1):
+            for part, value in parts.items():
+                tensors[f"model.layers.{layer}.mlp.down_proj.{part}"] = value
+        path = tmp_path / "model.safetensors"
+        mx.save_safetensors(str(path), tensors)
+        quantization = {"bits": 4, "group_size": 64, "mode": "affine"}
+        writer = _OQRefineWriter(
+            tmp_path, {k: path.name for k in tensors}, quantization
+        )
+        refined = mx.zeros_like(packed)
+
+        writer.write("model.layers.0.mlp.down_proj", refined)
+        writer.layer_done(0)
+        early = mx.load(str(path))["model.layers.0.mlp.down_proj.weight"]
+        writer.layer_done(1)
+        out = mx.load(str(path))
+
+        assert mx.array_equal(early, packed)
+        assert mx.array_equal(out["model.layers.0.mlp.down_proj.weight"], refined)
+        assert mx.array_equal(out["model.layers.0.mlp.down_proj.scales"], scales)
+        assert mx.array_equal(out["model.layers.1.mlp.down_proj.weight"], packed)
+        assert mx.array_equal(out["model.norm.weight"], tensors["model.norm.weight"])
 
     def test_weighted_3d_expert_importance_chunked(self, monkeypatch):
         monkeypatch.setattr("omlx.oq._QUANTIZE_CHUNK_BYTES", 128)
@@ -7578,6 +7669,30 @@ class TestTextOnlyMultimodalMetadata:
         assert (out / "preprocessor_config.json").exists()
         assert (out / "processor_config.json").exists()
 
+    @pytest.mark.skipif(
+        not hasattr(os, "chflags"), reason="file flags are a BSD/macOS feature"
+    )
+    def test_copies_sidecars_whose_flags_cannot_be_set(self, tmp_path, monkeypatch):
+        """SMB sources carry SF_ARCHIVED, which only root may set."""
+        import errno
+
+        from omlx.oq import _copy_model_sidecars
+
+        def refuse_flags(*args, **kwargs):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+
+        src = self._make_source(tmp_path)
+        (src / "audio_tokenizer").mkdir()
+        (src / "audio_tokenizer" / "config.json").write_text("{}")
+        out = tmp_path / "out"
+        out.mkdir()
+        monkeypatch.setattr(os, "chflags", refuse_flags)
+
+        _copy_model_sidecars(src, out, model_type="lfm3_omni")
+
+        assert (out / "tokenizer.json").read_text() == "{}"
+        assert (out / "audio_tokenizer" / "config.json").is_file()
+
     def test_text_only_keeps_processor_config_holding_a_chat_template(
         self, tmp_path
     ):
@@ -8727,6 +8842,165 @@ class TestEstimateBpwPostSanitizeNames:
         assert est["effective_bpw"] < 8.0, est
 
 
+_QWEN3_5_STREAM_TEXT = {
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 8,
+    "linear_num_value_heads": 4,
+    "linear_num_key_heads": 2,
+    # The gated-delta Metal kernel needs a key head dim of 32.
+    "linear_key_head_dim": 32,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
+    # Layers 0 and 2 are gated delta nets, 1 and 3 full attention.
+    "full_attention_interval": 2,
+    "rms_norm_eps": 1e-6,
+    "vocab_size": 128,
+    "max_position_embeddings": 256,
+    "tie_word_embeddings": False,
+    "rope_parameters": {
+        "rope_type": "default",
+        "mrope_section": [2, 1, 1],
+        "rope_theta": 10000,
+        "partial_rotary_factor": 1.0,
+    },
+}
+_QWEN3_5_STREAM_EXPERTS = {
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 32,
+}
+
+
+def _qwen3_5_stream_source(path, model_type, *, vlm, mtp):
+    """Save a tiny BF16 Qwen3.5 checkpoint in the Hugging Face layout.
+
+    The vision tower is left out because calibration never runs it.
+    """
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from omlx.patches.mlx_lm_mtp import (
+        apply_mlx_lm_mtp_patch,
+        is_mtp_active,
+        set_mtp_active,
+    )
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    moe = model_type == "qwen3_5_moe"
+    text = {
+        **_QWEN3_5_STREAM_TEXT,
+        **(_QWEN3_5_STREAM_EXPERTS if moe else {}),
+        "model_type": f"{model_type}_text",
+        "mtp_num_hidden_layers": int(mtp),
+    }
+    prefix = "Qwen3_5Moe" if moe else "Qwen3_5"
+    if vlm:
+        vision = {
+            "model_type": model_type,
+            "depth": 1,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "out_hidden_size": 32,
+            "num_heads": 4,
+            "patch_size": 14,
+            "in_channels": 3,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "num_position_embeddings": 16,
+            "deepstack_visual_indexes": [],
+        }
+        config = {
+            "model_type": model_type,
+            "architectures": [f"{prefix}ForConditionalGeneration"],
+            "text_config": text,
+            "vision_config": vision,
+        }
+    else:
+        config = {**text, "architectures": [f"{prefix}ForCausalLM"]}
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(config))
+    mx.random.seed(5)
+    was_active = is_mtp_active()
+    try:
+        if vlm:
+            from mlx_vlm.utils import get_model_and_args, update_module_configs
+
+            from omlx.patches.mlx_vlm_mtp import (
+                apply_mlx_vlm_mtp_runtime_patch,
+                set_mtp_attach_enabled,
+            )
+
+            maybe_apply_pre_load_patches(str(path), for_vlm=True)
+            apply_mlx_vlm_mtp_runtime_patch(model_type)
+            set_mtp_attach_enabled(True)
+            cfg = json.loads(json.dumps(config))
+            model_class, _ = get_model_and_args(config=cfg, model_path=path)
+            model_config = update_module_configs(
+                model_class.ModelConfig.from_dict(cfg),
+                model_class,
+                cfg,
+                ["text", "vision", "perceiver", "projector", "audio"],
+            )
+            model = model_class.Model(model_config)
+            root = "model.language_model."
+        else:
+            from mlx_lm.models import qwen3_5, qwen3_5_moe
+
+            apply_mlx_lm_mtp_patch()
+            set_mtp_active(mtp)
+            module = qwen3_5_moe if moe else qwen3_5
+            model = module.Model(module.ModelArgs.from_dict(config))
+            root = "model."
+    finally:
+        set_mtp_active(was_active)
+    model.set_dtype(mx.bfloat16)
+    params = dict(tree_flatten(model.parameters()))
+    assert any(".mtp." in key for key in params) == mtp
+    weights = {}
+    for key, value in params.items():
+        if key.startswith("vision_tower.") or ".switch_mlp.up_proj." in key:
+            continue
+        if key.endswith(".conv1d.weight"):
+            value = mx.moveaxis(value, 2, 1)
+        if ".switch_mlp." in key:
+            layer, projection = key.split(".switch_mlp.")
+            if projection.startswith("gate_proj"):
+                up = params[f"{layer}.switch_mlp.up_proj.weight"]
+                key = f"{layer}.experts.gate_up_proj"
+                value = mx.concatenate([value, up], axis=-2)
+            else:
+                key = f"{layer}.experts.down_proj"
+        for old, new in (
+            ("language_model.model.", root),
+            ("language_model.mtp.", "mtp."),
+            ("language_model.lm_head.", "lm_head."),
+        ):
+            if key.startswith(old):
+                key = new + key[len(old) :]
+        weights[key] = value
+    mx.save_safetensors(str(path / "model.safetensors"), weights)
+    vocab = {f"t{i}": i for i in range(text["vocab_size"])}
+    tokenizer = Tokenizer(WordLevel(vocab, unk_token="t0"))
+    PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="t0").save_pretrained(
+        path
+    )
+    return config
+
+
+_QWEN3_5_STREAM_CASES = [
+    pytest.param("qwen3_5_moe", True, True, id="moe-vlm-mtp"),
+    pytest.param("qwen3_5", True, True, id="dense-vlm-mtp"),
+    pytest.param("qwen3_5_moe", False, True, id="moe-text-mtp"),
+    pytest.param("qwen3_5", False, False, id="dense-text"),
+]
+
+
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestStreamedCalibration:
     @pytest.fixture
@@ -8886,22 +9160,31 @@ class TestStreamedCalibration:
         assert mx.isfinite(loaded(tokens).logits).all().item()
 
     @pytest.mark.parametrize(
-        "explicit,kind,over_budget,expected",
+        "explicit,kind,over_budget,block_fp8,expected",
         [
-            (None, "llama", True, False),
-            (None, "minimax_m3_vl", True, True),
-            (None, "glm5_next", True, True),
-            (None, "qwen4_exp", False, False),
-            (False, "qwen4_exp", True, False),
-            (True, "qwen4_exp", False, True),
+            (None, "llama", True, False, False),
+            (None, "minimax_m3_vl", True, False, True),
+            (None, "glm5_next", True, False, True),
+            (None, "qwen4_exp", False, False, False),
+            (None, "qwen4_exp", False, True, True),
+            (None, "llama", False, True, False),
+            (False, "qwen4_exp", True, True, False),
+            (True, "qwen4_exp", False, False, True),
+            (None, "qwen3_5_moe", True, False, True),
+            (None, "qwen3_5_text", True, False, True),
         ],
     )
-    def test_selection(self, explicit, kind, over_budget, expected):
+    def test_selection(self, explicit, kind, over_budget, block_fp8, expected):
         import omlx.oq as oq
 
+        fp8 = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+        config = {"quantization_config": fp8 if block_fp8 else {}}
         assert (
             oq._resolve_stream_calibration(
-                explicit, model_exceeds_ram=over_budget, model_type=kind
+                explicit,
+                model_exceeds_ram=over_budget,
+                model_type=kind,
+                block_fp8=oq._block_fp8_source(config),
             )
             is expected
         )
@@ -9058,6 +9341,83 @@ class TestStreamedCalibration:
         for key, entry in resident.items():
             np.testing.assert_array_equal(streamed[key].counts, entry.counts)
             np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2)
+
+    @pytest.mark.parametrize("model_type,vlm,mtp", _QWEN3_5_STREAM_CASES)
+    def test_qwen3_5_collection_matches_resident(
+        self, tmp_path, monkeypatch, model_type, vlm, mtp
+    ):
+        """Streamed Qwen3.5 statistics and sensitivity match resident collection."""
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        config = _qwen3_5_stream_source(source, model_type, vlm=vlm, mtp=mtp)
+        # As many rows as tokens: a gated delta net would apply a causal mask as
+        # a padding mask.
+        tokens = (mx.arange(16).reshape(4, 4) * 7 % 120 + 1).astype(mx.int32)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        streamed, metadata = oq._collect_imatrix_streaming(
+            source,
+            object(),
+            json.loads(json.dumps(config)),
+            num_samples=4,
+            seq_length=4,
+            calib_data=tokens,
+            measure_sensitivity=True,
+            sensitivity_oq_level=4,
+            sensitivity_num_samples=4,
+            sensitivity_seq_length=4,
+        )
+        resident, _ = oq._collect_imatrix(
+            str(source), json.loads(json.dumps(config)), num_samples=4, seq_length=4
+        )
+        assert "language_model.model.layers.0.linear_attn.in_proj_qkv" in resident
+        assert ("language_model.mtp.fc" in resident) == mtp
+        assert streamed.keys() == resident.keys()
+        for key, entry in resident.items():
+            np.testing.assert_array_equal(streamed[key].counts, entry.counts, key)
+            np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2, key)
+        reference = oq._measure_sensitivity(
+            str(source),
+            json.loads(json.dumps(config)),
+            4,
+            num_samples=4,
+            seq_length=4,
+        )
+        assert reference and metadata["sensitivity_map"].keys() == reference.keys()
+        for key, value in reference.items():
+            assert metadata["sensitivity_map"][key] == pytest.approx(value, rel=1e-3)
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5"])
+    def test_qwen3_5_vlm_mtp_rows_keep_their_positions(self, tmp_path, model_type):
+        """Two identical rows give the MTP head twice one row's statistics."""
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        config = _qwen3_5_stream_source(source, model_type, vlm=True, mtp=True)
+        mx.random.seed(3)
+        hidden = mx.random.normal((1, 6, 32)).astype(mx.bfloat16)
+        tokens = mx.array([[5, 9, 2, 7, 11, 4]], dtype=mx.int32)
+        entries = []
+        for rows in (1, 2):
+            collector = OQImatrixCollector()
+            oq._collect_streamed_qwen3_5_mtp(
+                source,
+                json.loads(json.dumps(config)),
+                collector,
+                mx.repeat(tokens, rows, axis=0),
+                [mx.repeat(hidden, rows, axis=0)],
+                [(0, rows)],
+            )
+            entries.append(collector.entries)
+        one, two = entries
+        assert "language_model.mtp.layers.0.self_attn.o_proj" in one
+        assert one.keys() == two.keys()
+        for key, entry in one.items():
+            np.testing.assert_array_equal(two[key].counts, 2 * entry.counts, key)
+            # Expert kernels may regroup the fp32 sums.
+            np.testing.assert_allclose(
+                two[key].in_sum2, 2 * entry.in_sum2, rtol=1e-6, err_msg=key
+            )
 
 
 # Tiny Inkling 2 source in the original layout. Layers 0-3 hold NVFP4 experts and

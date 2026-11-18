@@ -15,6 +15,8 @@ from transformers import PreTrainedTokenizerFast
 
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
+from ...oqh import format as oqh_format
+from ...oqh.modules import from_tensors as oqh_module
 from ..mlx_lm_mtp import get_mtp_depth
 from .a8 import MIN_TOKENS_FLOOR, tag_dense_a8
 from .config import ModelConfig
@@ -56,14 +58,22 @@ _TENSOR_COLUMNS = ("attn.wo_b", "experts.w2")
 
 
 def tensor_slice(key, value, rank, size):
-    """This rank's part of checkpoint tensor ``key``."""
-    module = key.rpartition(".")[0]
+    """This rank's part of checkpoint tensor ``key``.
+
+    oQh experts split their row scales with the rows of w1 / w3; w2 keeps
+    every row scale, and each rank takes whole rotation blocks of its signs.
+    """
+    module, _, name = key.rpartition(".")
     if key.endswith("attn.attn_sink"):
         axis = 0
     elif module.endswith(_TENSOR_ROWS):
-        axis = -2
+        if name == "oqh_signs":
+            return value
+        axis = -1 if name == "rscale" else -2
     elif module.endswith(_TENSOR_COLUMNS):
-        axis = -1
+        if name == "rscale":
+            return value
+        axis = 0 if name == "oqh_signs" else -1
     else:
         return value
     return mx.contiguous(mx.split(value, size, axis=axis)[rank])
@@ -187,11 +197,13 @@ def load(
 
     def in_scope(key):
         module, _, name = key.rpartition(".")
-        # A packed projection stores scales and biases beside its weight.
+        # A packed projection stores scales and biases (oQh: row scales and
+        # signs) beside its weight.
+        siblings = ("scales", "biases", "rscale", "oqh_signs")
         return (
             held is None
             or key in held
-            or (name in ("scales", "biases") and f"{module}.weight" in held)
+            or (name in siblings and f"{module}.weight" in held)
         )
 
     if config.engram_layer_ids:
@@ -332,6 +344,7 @@ def load(
                         if name + ".weight" in values
                     }
 
+        oqh = oqh_format.oqh_paths(raw)
         seen, replaced, all_quantized = set(), set(), {}
         loaded_bytes = 0
         with closing(batches()) as stream:
@@ -376,8 +389,13 @@ def load(
                             ),
                         )
                         replaced.add(name)
+                for name in oqh:
+                    if name + ".oqh_signs" in values:
+                        set_module(model, name, oqh_module(name, values))
                 for key, value in values.items():
                     module_name = key.rsplit(".", 1)[0]
+                    if module_name in oqh:
+                        continue
                     if module_name not in quantized and (
                         key not in expected_shapes
                         or value.shape != expected_shapes[key]

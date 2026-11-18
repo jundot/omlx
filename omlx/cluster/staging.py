@@ -1403,15 +1403,22 @@ def free_disk_bytes(path: str | Path, *, ssh_target: str | None = None) -> int:
     """Free bytes on the filesystem holding ``path``, locally or on a peer."""
 
     if ssh_target and not is_local_host(ssh_target):
+        value = str(path)
+        if value == "~":
+            path_word = '"$HOME"'
+        elif value.startswith("~/"):
+            path_word = '"$HOME"/' + shlex.quote(value[2:])
+        else:
+            path_word = shlex.quote(value)
+        # Staging creates the destination, so df its nearest existing parent
+        # like the local branch does. A failed df reads as "unknown" space.
+        command = (
+            f"p={path_word}; "
+            'while [ ! -e "$p" ] && [ "$p" != "/" ]; do p=$(dirname "$p"); done; '
+            'df -k "$p" | tail -1'
+        )
         result = subprocess.run(
-            # Unquoted so the remote shell expands ~; the path comes from a
-            # validated model directory, not user text.
-            [
-                "ssh",
-                *cluster_ssh_options(connect_timeout=10),
-                ssh_target,
-                f"df -k {path} | tail -1",
-            ],
+            ["ssh", *cluster_ssh_options(connect_timeout=10), ssh_target, command],
             capture_output=True,
             text=True,
             check=False,

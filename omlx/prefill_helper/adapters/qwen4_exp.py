@@ -235,11 +235,13 @@ def _cache_state(i: int, item: Any, since: int | None) -> Arrays:
     if not _is_qsa(item):
         return {f"{i}.{s}": v for s, v in enumerate(item.cache) if v is not None}
     start = since or 0
+    positions = item.index_position_ids[..., start:]
     return {
         f"{i}.k": item.keys[..., start : item.offset, :],
         f"{i}.v": item.values[..., start : item.offset, :],
         f"{i}.ik": item.index_keys[:, start:],
-        f"{i}.ip": item.index_position_ids[..., start:],
+        # Decoding promotes the ids to MRoPE [3, 1, n]; text planes are equal.
+        f"{i}.ip": positions[0] if positions.ndim == 3 else positions,
     }
 
 

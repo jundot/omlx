@@ -925,9 +925,8 @@ private struct OwnerHashRow: View {
     }
 }
 
-/// Kept for the external-endpoint case, which still skips. Not reachable from
-/// this screen today (BenchStartRequest has no `external` field), but the
-/// server state exists and a silent EmptyView would be worse.
+/// Shown when the server skips the community upload. Unknown reasons fall
+/// back to a generic message.
 private struct SkippedBanner: View {
     let reason: String?
 
@@ -965,6 +964,18 @@ private struct SkippedBanner: View {
             return String(localized: "bench.throughput.upload.skipped.external",
                           defaultValue: "External endpoint results are not submitted because they measure remote hardware.",
                           comment: "Skipped-upload reason when the benchmark ran against an external endpoint")
+        case "splash":
+            return String(localized: "bench.throughput.upload.skipped.splash",
+                          defaultValue: "Splash results are not submitted because they measure the Splash engine, not oMLX.",
+                          comment: "Skipped-upload reason when the benchmark ran on the Splash engine")
+        case "ane_aligned_prompt":
+            return String(localized: "bench.throughput.upload.skipped.ane_aligned_prompt",
+                          defaultValue: "ANE-aligned prompt results are not submitted because their prompt lengths do not match the standard PP buckets.",
+                          comment: "Skipped-upload reason when the benchmark used ANE-aligned prompt lengths")
+        case "custom_generation_length":
+            return String(localized: "bench.throughput.upload.skipped.custom_generation_length",
+                          defaultValue: "Results with a generation length other than 128 tokens are not submitted so they stay comparable with other submissions.",
+                          comment: "Skipped-upload reason when the benchmark used a generation length other than 128 tokens")
         default:
             return String(localized: "bench.throughput.upload.skipped.default",
                           defaultValue: "The server skipped uploading these results.",
