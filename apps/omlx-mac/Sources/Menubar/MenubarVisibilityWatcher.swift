@@ -80,9 +80,8 @@ final class MenubarVisibilityWatcher {
         return !(api && visible && occlusion)
     }
 
-    /// True when the item sits behind the camera notch of its screen. macOS
-    /// reports such an item as occluded and shows it nowhere else, so the
-    /// StatusKit repair can't bring it back: the menu bar is simply full.
+    /// A full menu bar parks new items behind the notch, where StatusKit
+    /// repair can't help.
     private func isUnderNotch() -> Bool {
         guard let window = statusItem?.button?.window, let screen = window.screen else {
             return false
@@ -192,9 +191,7 @@ final class MenubarVisibilityWatcher {
         }
     }
 
-    /// The menu bar ran out of room beside the notch. Nothing is wrong with
-    /// the app's approval, so this alert offers no Auto-Fix and asks for no
-    /// Full Disk Access: it tells the user how to make room instead.
+    /// No Auto-Fix here: the approval is fine, the menu bar is just full.
     private func showNotchAlert() {
         let alert = NSAlert()
         alert.messageText = "oMLX Menubar Icon Hidden"
@@ -239,15 +236,9 @@ final class MenubarVisibilityWatcher {
     }
 }
 
-/// Camera notch geometry for the visibility probe. A full menu bar parks
-/// new status items behind the notch, where macOS reports them occluded.
 enum MenubarNotch {
-    /// True when `itemFrame` overlaps the notch of the screen described by
-    /// `screenFrame`. The notch is the gap between the screen's unobscured
-    /// top-left and top-right areas; only their widths are used, measured
-    /// from the screen's own edges, so the answer doesn't depend on where
-    /// the screen sits in the global layout. Screens without a notch report
-    /// no auxiliary areas and never cover anything.
+    /// The notch is the gap between the unobscured top-left and top-right
+    /// areas, measured from the screen's own edges.
     static func covers(
         itemFrame: CGRect,
         screenFrame: CGRect,
