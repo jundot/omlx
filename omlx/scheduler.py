@@ -5114,6 +5114,13 @@ class Scheduler:
             # gathered sample.
             ewma = tracker.bytes_per_token_for(gathered_core)
             recent_reclaim = tracker.recent_reclaim_bytes
+            # The released pool held the last measured chunk's buffers. A
+            # narrower chunk can only take back its share: charging all of a
+            # 4096-token chunk's pool to a 32-token floor chunk rejected a
+            # 100K prompt at 8K tokens with 5.1GB of a 27.3GB cap unused.
+            pool_width = tracker.last_n_tokens_for(gathered_core)
+            if pool_width > n_tokens:
+                recent_reclaim = recent_reclaim * n_tokens // pool_width
             if ewma > 0:
                 per_token = max(per_token, ewma)
             last_n_tokens = tracker.last_n_tokens_for(gathered_core)
@@ -5359,7 +5366,7 @@ class Scheduler:
             min_chunk = n_tokens
         else:
             min_chunk = max(1, self._prefill_min_chunk_tokens, minimum_tokens)
-        current = self._current_usage_bytes()
+        current = self._current_usage_bytes(include_pool=False)
         if (
             current
             + self._admission_transient_bound(
@@ -5498,9 +5505,10 @@ class Scheduler:
     ) -> int:
         """Size against the candidate's prediction, including fixed costs.
 
-        Generic models also include size-independent reclaimed pool bytes.
-        Scaling a larger chunk's prediction proportionally discounts that
-        charge and can return a chunk whose predicted peak exceeds headroom.
+        Generic models also charge reclaimed pool bytes, scaled to the
+        candidate's width, and flat-overhead profiles a size-independent
+        overhead. Scaling a larger chunk's prediction proportionally would
+        misprice both, so each candidate is predicted on its own.
         The floor remains the caller's fallback when no candidate fits; the
         pre-chunk guard must reject that case before submitting work.
         """
@@ -5613,7 +5621,7 @@ class Scheduler:
         if soft_base <= 0 or hard_cap <= 0 or requested <= 0:
             return requested
 
-        current = self._current_usage_bytes()
+        current = self._current_usage_bytes(include_pool=False)
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
@@ -5952,12 +5960,20 @@ class Scheduler:
         )
         return len(plans)
 
-    def _current_usage_bytes(self, *, refresh_mlx_active: bool = True) -> int:
+    def _current_usage_bytes(
+        self, *, refresh_mlx_active: bool = True, include_pool: bool = True
+    ) -> int:
         """Current memory usage for scheduler-side guard checks.
 
         Scheduler steps run on the MLX executor thread, so they can refresh
         mx.get_active_memory() safely. Event-loop callers such as early
         preflight use the cached executor sample and phys_footprint instead.
+
+        ``include_pool=False`` leaves out MLX's buffer pool. Prefill chunk
+        sizing uses it: a chunk runs under ``_chunk_backpressure``'s MLX
+        memory limit, and MLX trims the pool before it grows past that
+        limit, so pooled buffers are room the chunk can take rather than
+        usage on top of its transient.
         """
         active = self._last_mlx_active_memory_bytes
         cache = getattr(self, "_last_mlx_cache_memory_bytes", 0)
@@ -5976,6 +5992,7 @@ class Scheduler:
             int(get_phys_footprint())
             - unreleased_graphics_bytes(active + cache, fresh=refresh_mlx_active)
             - hot_cache_bytes
+            - (0 if include_pool else cache)
         )
         return max(active, phys, 0)
 
@@ -6327,7 +6344,7 @@ class Scheduler:
         if target <= 0:
             yield
             return
-        current = self._current_usage_bytes()
+        current = self._current_usage_bytes(include_pool=False)
         headroom = max(target - current, Scheduler._CHUNK_BACKPRESSURE_FLOOR_BYTES)
         set_chunk_memory_limit(id(self), self._last_mlx_active_memory_bytes + headroom)
         try:

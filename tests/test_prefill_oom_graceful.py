@@ -195,6 +195,7 @@ def _throttle_ctx(
 def _call(ns, requested, kv_len=0, *, gathered_core=False, probe=False):
     with (
         patch.object(sched_mod.mx, "get_active_memory", return_value=0),
+        patch.object(sched_mod.mx, "get_cache_memory", return_value=0),
         patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
     ):
         return Scheduler._adaptive_chunk_size(
@@ -266,6 +267,7 @@ def test_adaptive_throttle_requests_eviction_before_shrinking():
 def _guard_call(ns, n, kv_len=0, *, gathered_core=False):
     with (
         patch.object(sched_mod.mx, "get_active_memory", return_value=0),
+        patch.object(sched_mod.mx, "get_cache_memory", return_value=0),
         patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
     ):
         return Scheduler._guard_prefill_chunk(
@@ -927,6 +929,74 @@ def test_generic_reclaim_that_cannot_fit_still_aborts(gathered_core):
         _guard_call(ns, chosen, kv_len=90000, gathered_core=gathered_core)
 
 
+@pytest.mark.parametrize("gathered_core", [False, True])
+def test_floor_chunk_takes_its_share_of_a_wide_chunk_reclaim(gathered_core):
+    """A 4096-token chunk's released pool must not be charged in full to a
+    32-token floor chunk. oQ8e at a 28.7GB ceiling was rejected 8K into a
+    100K prompt: 22.78GB used, 5.13GB predicted for the floor chunk, all but
+    76MB of it the previous wide chunk's reclaim."""
+    mib = 1024**2
+    hard = 20 * _GB
+    cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+    current = cap - 1000 * mib
+    ns = _throttle_ctx(current=current, hard=hard, min_chunk=32)
+    ns._fake_current = current
+    tracker = ns._prefill_transient_tracker
+    tracker.update(4096, 4096 * 2 * mib, gathered_core=gathered_core)
+    tracker.record_reclaim(5 * _GB)
+
+    floor_charge = ns._predicted_chunk_transient(32, 90000, gathered_core=gathered_core)
+    assert 5 * _GB * 32 // 4096 <= floor_charge < 128 * mib, floor_charge
+    assert (
+        ns._predicted_chunk_transient(4096, 90000, gathered_core=gathered_core)
+        >= 5 * _GB
+    )
+    assert _guard_call(ns, 32, kv_len=90000, gathered_core=gathered_core) == 32
+
+
+def test_chunk_sizing_usage_leaves_out_the_mlx_pool():
+    """Pooled buffers are trimmed by MLX before a chunk grows past the
+    backpressure limit, so chunk sizing must not count them as used; other
+    guards still see the full footprint."""
+    active, pool, phys = 12 * _GB, 9 * _GB, 23 * _GB
+    ns = _throttle_ctx(current=phys, hard=30 * _GB)
+    ns._hot_cache_cpu_bytes = lambda: 0
+    with (
+        patch.object(sched_mod.mx, "get_active_memory", return_value=active),
+        patch.object(sched_mod.mx, "get_cache_memory", return_value=pool),
+        patch.object(sched_mod, "get_phys_footprint", return_value=phys),
+        patch.object(sched_mod, "unreleased_graphics_bytes", return_value=0),
+    ):
+        full = Scheduler._current_usage_bytes(ns)
+        sizing = Scheduler._current_usage_bytes(ns, include_pool=False)
+    assert full == phys, full
+    assert sizing == phys - pool, sizing
+
+
+def test_pool_bytes_do_not_reject_a_chunk_that_fits_beside_live_memory():
+    """A pool that fills the headroom must not abort a prefill whose live
+    memory plus chunk transient fits under the cap."""
+    hard = 30 * _GB
+    cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+    pool = 10 * _GB
+    live = cap - 4 * _GB
+    ns = _throttle_ctx(current=live + pool, hard=hard, samples_bpt=1024**2)
+    ns._hot_cache_cpu_bytes = lambda: 0
+    ns._reclaim_prefill_headroom = lambda: Scheduler._current_usage_bytes(
+        ns, include_pool=False
+    )
+    with (
+        patch.object(sched_mod.mx, "get_active_memory", return_value=live),
+        patch.object(sched_mod.mx, "get_cache_memory", return_value=pool),
+        patch.object(sched_mod, "get_phys_footprint", return_value=live + pool),
+        patch.object(sched_mod, "unreleased_graphics_bytes", return_value=0),
+    ):
+        chosen = Scheduler._guard_prefill_chunk(
+            ns, 2048, kv_len=0, progress=0, loop_label="test"
+        )
+    assert chosen == 2048, chosen
+
+
 @pytest.mark.parametrize("path", ["adaptive", "guard"])
 @pytest.mark.parametrize("budget_tokens", [32, 63, 64, 511, 512, 513])
 def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(path, budget_tokens):
@@ -1261,7 +1331,7 @@ def test_chunk_backpressure_holds_mlx_at_the_peak_target(monkeypatch):
     ns = _throttle_ctx(current=30 * _GB, hard=50 * _GB)
     ns._prefill_memory_guard = True
     ns._last_mlx_active_memory_bytes = 20 * _GB
-    ns._current_usage_bytes = lambda: 30 * _GB
+    ns._current_usage_bytes = lambda **_: 30 * _GB
     target = Scheduler._prefill_peak_target(ns)
 
     with Scheduler._chunk_backpressure(ns):
@@ -1270,7 +1340,7 @@ def test_chunk_backpressure_holds_mlx_at_the_peak_target(monkeypatch):
 
     # Past the target, the chunk still gets the floor instead of a stall.
     calls.clear()
-    ns._current_usage_bytes = lambda: target + _GB
+    ns._current_usage_bytes = lambda **_: target + _GB
     with Scheduler._chunk_backpressure(ns):
         pass
     assert calls == [20 * _GB + Scheduler._CHUNK_BACKPRESSURE_FLOOR_BYTES, None]
