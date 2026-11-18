@@ -14,13 +14,13 @@ import json
 import logging
 import os
 import re
-import resource
 import subprocess
 import tempfile
 from pathlib import Path
 
 from .base import BaseBenchmark
 from .datasets import deterministic_sample, load_jsonl
+from .sandbox import limited_python_command
 
 logger = logging.getLogger(__name__)
 
@@ -99,18 +99,6 @@ def _extract_code(response: str, prompt: str) -> str:
     return prompt + response
 
 
-def _set_resource_limits():
-    """Set resource limits for subprocess."""
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (EXEC_MEMORY_LIMIT_BYTES, EXEC_MEMORY_LIMIT_BYTES))
-    except (ValueError, resource.error):
-        pass
-    try:
-        resource.setrlimit(resource.RLIMIT_CPU, (EXEC_TIMEOUT_SECONDS + 5, EXEC_TIMEOUT_SECONDS + 5))
-    except (ValueError, resource.error):
-        pass
-
-
 def _execute_with_tests(code: str, test_code: str, entry_point: str) -> tuple[bool, str]:
     """Execute generated code with test cases.
 
@@ -132,11 +120,12 @@ check({entry_point})
 
     try:
         result = subprocess.run(
-            ["python3", tmp_path],
+            limited_python_command(
+                tmp_path, EXEC_MEMORY_LIMIT_BYTES, EXEC_TIMEOUT_SECONDS + 5
+            ),
             capture_output=True,
             text=True,
             timeout=EXEC_TIMEOUT_SECONDS,
-            preexec_fn=_set_resource_limits,
             env={
                 "PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"),
                 "HOME": os.environ.get("HOME", "/tmp"),

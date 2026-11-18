@@ -11,6 +11,7 @@ final class QuantizationScreenVM {
     var preserveMtp: Bool = false
     var dtype: String = "bfloat16"
     var enhanced: Bool = false
+    var hadamard: Bool = false
     var imatrixReuseCache: Bool = true
     var imatrixCachePath: String = ""
     var imatrixStrict: Bool = false
@@ -72,6 +73,23 @@ final class QuantizationScreenVM {
 
     var selectedIsVLM: Bool {
         models.first(where: { $0.path == selectedModelPath })?.isVlm ?? false
+    }
+
+    var selectedSupportsOqh: Bool {
+        guard let model = models.first(where: { $0.path == selectedModelPath }),
+              model.oqhSupported == true
+        else { return false }
+        return model.oqhMaxLevel.map { oqLevel < $0 } ?? true
+    }
+
+    /// oQh rides on the oQe calibration, so it applies only with oQe on.
+    var hadamardActive: Bool {
+        enhanced && hadamard && selectedSupportsOqh
+    }
+
+    /// Output-name suffix of the selected variant, as `resolve_output_name` adds it.
+    var variantSuffix: String {
+        hadamardActive ? "h" : (enhanced ? "e" : "")
     }
 
     var selectedHasMTP: Bool {
@@ -268,6 +286,7 @@ final class QuantizationScreenVM {
             dtype: dtype,
             preserveMtp: selectedHasMTP && preserveMtp,
             enhanced: enhanced,
+            hadamard: hadamardActive,
             imatrixCachePath: imatrixCachePath.trimmingCharacters(in: .whitespacesAndNewlines),
             imatrixReuseCache: imatrixReuseCache,
             imatrixStrict: imatrixStrict
@@ -276,7 +295,7 @@ final class QuantizationScreenVM {
             ?? selectedModelPath
         let levelLabel = ((oqLevel.rounded() == oqLevel)
             ? "oQ\(Int(oqLevel))" : "oQ\(oqLevel)")
-            + (enhanced ? "e" : "")
+            + variantSuffix
         Task { [weak self] in
             defer { Task { @MainActor [weak self] in self?.isStarting = false } }
             do {

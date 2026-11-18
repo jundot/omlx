@@ -5,6 +5,14 @@ import SwiftUI
 @MainActor
 final class ModelSettingsScreenVMTests: XCTestCase {
 
+    /// Some locales put a (narrow) no-break space before "%", e.g. "42 %".
+    private func normalizedPercent(_ label: String) -> String {
+        label
+            .replacingOccurrences(of: "\u{202F}", with: "")
+            .replacingOccurrences(of: "\u{00A0}", with: "")
+            .replacingOccurrences(of: " ", with: "")
+    }
+
     func testSnapshotResultHelpersFormatSkippedStatsAndAppliedJSON() {
         let skipped = [
             SkippedFeatureDTO(feature: "dflash", reason: "draft model 'x' is not installed"),
@@ -325,7 +333,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         vm.qwen35AnePrefillEnabled = true
         let presets = ModelSettingsScreenVM.aneFractionOptions(current: "0.42", presets: [1.0 / 3.0, 0.5])
         XCTAssertEqual(presets.map(\.0), ["0.42", String(1.0 / 3.0), "0.5"])
-        XCTAssertEqual(presets.map(\.1), ["42%", "33%", "50%"])
+        XCTAssertEqual(presets.map { normalizedPercent($0.1) }, ["42%", "33%", "50%"])
         vm.qwen35AnePrefillFraction = presets[0].0
         XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.qwen35AnePrefillFraction]?.value as? Double, 0.42)
         vm.qwen35AnePrefillFraction = presets[1].0
@@ -336,7 +344,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     func testK2SharedPresetsKeepLoadedStringSelection() {
         for current in ["0", "0.0", "1", "1.0", String(1.0 / 3.0)] {
             let options = ModelSettingsScreenVM.aneFractionOptions(current: current, presets: [0, 1.0 / 3.0, 1])
-            XCTAssertEqual(options.map(\.1), ["0%", "33%", "100%"])
+            XCTAssertEqual(options.map { normalizedPercent($0.1) }, ["0%", "33%", "100%"])
             XCTAssertEqual(options.filter { $0.0 == current }.count, 1)
         }
     }
@@ -654,6 +662,21 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNotEqual(vm.summary(for: .acceleration), summary)
     }
 
+    func testSavingEmptyAliasAndModelTypeSendsExplicitClears() async {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RejectingSettingsURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = OMLXClient(host: "127.0.0.1", port: 18160, session: session)
+        let vm = ModelSettingsScreenVM()
+        vm.modelID = "clear"
+
+        await vm.save(.alias, client: client)
+        await vm.save(.modelType, client: client)
+
+        XCTAssertNil(vm.lastError)
+    }
+
     func testRejectedAutoSaveRestoresTheStoredValues() async {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [RejectingSettingsURLProtocol.self]
@@ -932,8 +955,9 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     }
 }
 
-/// Serves one model with Lightning MTP on and rejects every settings write
-/// the way the server rejects an MTP + DFlash pair.
+/// Serves one model with Lightning MTP on and rejects its settings writes
+/// the way the server rejects an MTP + DFlash pair. Writes to "clear" must
+/// send JSON null.
 private final class RejectingSettingsURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
 
@@ -955,6 +979,13 @@ private final class RejectingSettingsURLProtocol: URLProtocol, @unchecked Sendab
                 body = try Data(contentsOf: URL(fileURLWithPath: #filePath)
                     .deletingLastPathComponent()
                     .appendingPathComponent("Fixtures/global-settings.json"))
+            case "/admin/api/models/clear/settings":
+                let stream = try XCTUnwrap(request.httpBodyStream)
+                stream.open()
+                defer { stream.close() }
+                let settings = try XCTUnwrap(JSONSerialization.jsonObject(with: stream) as? [String: Any])
+                XCTAssertTrue(!settings.isEmpty && settings.values.allSatisfy { $0 is NSNull })
+                body = Data(#"{"status":"ok"}"#.utf8)
             case "/admin/api/models/m/settings":
                 status = 400
                 body = Data(#"{"detail":"MTP and DFlash cannot both be enabled; choose one speculative-decoding path."}"#.utf8)

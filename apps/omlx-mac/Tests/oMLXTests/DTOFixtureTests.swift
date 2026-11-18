@@ -85,6 +85,7 @@ final class DTOFixtureTests: XCTestCase {
             dtype: "bfloat16",
             preserveMtp: false,
             enhanced: true,
+            hadamard: false,
             imatrixCachePath: "/Users/test/cache/imatrix.npz",
             imatrixReuseCache: true,
             imatrixStrict: true

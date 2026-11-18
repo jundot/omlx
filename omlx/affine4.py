@@ -39,9 +39,12 @@ __all__ = [
 
 _BITS = 4
 _MIN_NATIVE_TOKENS = 256
-# 32-row launches ran slower than two 16-row launches on M3 Ultra and M5 Max.
-_MAX_PADDED_ROWS = 24
-_MAX_THREADGROUP_BYTES = 32 * 1024
+# Query rows per threadgroup; a KV head with more rows runs as chunks in one launch.
+# 16-row chunks were faster than 32 rows on M3 Ultra and M5 Max and 24 rows on M5 Pro.
+# 16 rows at dim 512 use 23 KiB of the 32 KiB threadgroup memory.
+_MAX_PADDED_ROWS = 16
+# Longer query blocks (prefill) keep the dequantized fused-SDPA route.
+_MAX_NATIVE_QUERY_LENGTH = 24
 # Bound each unfused float32 score matrix to 64 MiB, or one query row.
 _MAX_SCORE_ELEMENTS = 16 * 1024 * 1024
 _NATIVE_LAUNCHABLE = {}
@@ -338,9 +341,9 @@ _MPP_HEADER = r"""
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-template <int Dim, int Repeats, int QueryLength, int PaddedRows, int Warps,
-          int NumKvHeads, int Bits, int ValuesPerWord, typename Accumulator,
-          bool HasMask, typename ScalePtr>
+template <int Dim, int Repeats, int QueryLength, int ChunkRows, int Chunks,
+          int PaddedRows, int Warps, int NumKvHeads, int Bits, int ValuesPerWord,
+          typename Accumulator, bool HasMask, typename ScalePtr>
 METAL_FUNC void affine_attention_impl(
     device uchar* keys,
     ScalePtr key_scales,
@@ -374,9 +377,13 @@ METAL_FUNC void affine_attention_impl(
     threadgroup float* row_factor,
     threadgroup float* value_scale_max,
     threadgroup float* query_scales) {
-    constexpr int ActiveRows = Repeats * QueryLength;
+    // A threadgroup scores ChunkRows consecutive rows of its KV head's
+    // (repeat, position) rows; the last chunk may be partly padding.
+    constexpr int ActiveRows = ChunkRows;
+    constexpr int TotalRows = Repeats * QueryLength;
     constexpr int BK = 64;
     constexpr int OutDim = Dim / Warps;
+    int row_base = (int(group.x) % Chunks) * ChunkRows;
 
     int bh = int(group.y) * NumKvHeads + int(group.x);
     int block = int(group.z);
@@ -442,6 +449,8 @@ METAL_FUNC void affine_attention_impl(
     for (int w = 0; w < Warps; ++w)
         block_scale = max(block_scale, value_scale_max[w]);
     block_scale = block_scale > 0.0f ? block_scale : 1.0f;
+    threadgroup float* tile_key_scales = value_scale_max + 8;
+    threadgroup float* tile_value_scales = value_scale_max + 8 + BK;
 
     for (int tile_idx = tile_begin; tile_idx < tile_end; ++tile_idx) {
         int token = tile_idx * BK;
@@ -449,6 +458,16 @@ METAL_FUNC void affine_attention_impl(
         int tile_valid_end = min(min(token + BK, tokens), valid_end);
         if (tile_valid_start >= tile_valid_end)
             continue;
+        // Stage the tile's scales once per token instead of once per element.
+        for (int c = int(tid); c < BK; c += 32 * Warps) {
+            int t = token + c;
+            bool in_range = t < tokens;
+            tile_key_scales[c] = in_range
+                ? float(key_scales[t * key_scale_stride]) : 0.0f;
+            tile_value_scales[c] = in_range
+                ? float(value_scales[t * value_scale_stride]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Simdgroups score BK / QKWarps columns each; QKWarps is the largest of
         // Warps, 2, 1 that divides the tile (3 warps for dim 96 -> 2 score).
@@ -470,18 +489,20 @@ METAL_FUNC void affine_attention_impl(
                     int column = int(sg) * QKCols + coord[0];
                     int row = coord[1];
                     int absolute_token = token + column;
-                    int position = row % QueryLength;
+                    int global_row = row_base + row;
+                    int position = global_row % QueryLength;
                     int row_valid_end = causal
                         ? valid_end - QueryLength + position + 1 : valid_end;
                     scores[row * BK + column] = row < ActiveRows &&
+                            global_row < TotalRows &&
                             absolute_token >= tile_valid_start &&
                             absolute_token < tile_valid_end &&
                             absolute_token < row_valid_end &&
-                            (!HasMask || mask[(row / QueryLength) * mask_head_stride +
+                            (!HasMask || mask[(global_row / QueryLength) * mask_head_stride +
                                  position * mask_query_stride +
                                  absolute_token * mask_token_stride])
                         ? score_tile[i] * query_scales[row] * attention_scale *
-                              float(key_scales[absolute_token * key_scale_stride])
+                              tile_key_scales[column]
                         : -INFINITY;
                 }
             }
@@ -520,13 +541,12 @@ METAL_FUNC void affine_attention_impl(
                     float part = 0.0f;
                     for (int c = 0; c < ColsPerLane; ++c) {
                         int column = first_column + c;
-                        int absolute_token = token + column;
                         float score = scores[row * BK + column];
                         bool active = !isinf(score);
                         float weight = active ? fast::exp(score - new_m) : 0.0f;
                         part += weight;
                         probabilities[row * BK + column] = half(
-                            weight * (active ? float(value_scales[absolute_token * value_scale_stride]) / block_scale : 0.0f));
+                            weight * (active ? tile_value_scales[column] / block_scale : 0.0f));
                     }
                     for (ushort offset = SoftmaxLanes / 2; offset > 0; offset >>= 1)
                         part += simd_shuffle_xor(part, offset);
@@ -571,28 +591,27 @@ METAL_FUNC void affine_attention_impl(
 _MPP_ATTENTION_SOURCE = r"""
     uint tid = thread_index_in_threadgroup;
     uint3 group = threadgroup_position_in_grid;
-    constexpr int ActiveRows = Repeats * QueryLength;
+    constexpr int ActiveRows = ChunkRows;
+    constexpr int TotalRows = Repeats * QueryLength;
     threadgroup half q_tile[PaddedRows * Dim];
     threadgroup float scores[PaddedRows * 64];
     threadgroup half probabilities[PaddedRows * 64];
     threadgroup float row_m[PaddedRows];
     threadgroup float row_l[PaddedRows];
     threadgroup float row_factor[PaddedRows];
-    threadgroup float value_scale_max[Warps];
+    // Per-warp scale maxima, then the tile's key and value scales.
+    threadgroup float value_scale_max[8 + 2 * 64];
     threadgroup float query_scales[PaddedRows];
 
     int batch = int(group.y);
-    // A KV head's query heads that do not fit one threadgroup split into
-    // Chunks threadgroups next to each other in x, so they stream the same
-    // K/V tiles together.
     int kv_head = int(group.x) / Chunks;
-    int chunk = int(group.x) % Chunks;
+    int row_base = (int(group.x) % Chunks) * ChunkRows;
     if (int(tid) < PaddedRows) {
         int row = int(tid);
         float maximum = 0.0f;
-        if (row < ActiveRows) {
-            int head = kv_head * RepeatsTotal + chunk * Repeats + row / QueryLength;
-            int position = row % QueryLength;
+        if (row < ActiveRows && row_base + row < TotalRows) {
+            int head = kv_head * Repeats + (row_base + row) / QueryLength;
+            int position = (row_base + row) % QueryLength;
             for (int d = 0; d < Dim; ++d)
                 maximum = max(maximum, abs(float(queries[
                     batch * queries_strides[0] + head * queries_strides[1] +
@@ -603,9 +622,9 @@ _MPP_ATTENTION_SOURCE = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int i = int(tid); i < PaddedRows * Dim; i += 32 * Warps) {
         int row = i / Dim;
-        if (row < ActiveRows) {
-            int head = kv_head * RepeatsTotal + chunk * Repeats + row / QueryLength;
-            int position = row % QueryLength;
+        if (row < ActiveRows && row_base + row < TotalRows) {
+            int head = kv_head * Repeats + (row_base + row) / QueryLength;
+            int position = (row_base + row) % QueryLength;
             q_tile[i] = half(queries[
                 batch * queries_strides[0] + head * queries_strides[1] +
                 position * queries_strides[2] + i % Dim] / query_scales[row]);
@@ -627,8 +646,8 @@ _MPP_ATTENTION_SOURCE = r"""
     int value_scale_offset = batch * int(value_scales_strides[0]) +
         kv_head * int(value_scales_strides[1]);
     affine_attention_impl<
-        Dim, Repeats, QueryLength, PaddedRows, Warps, NumKvHeads, Bits,
-        ValuesPerWord, Accumulator, HasMask>(
+        Dim, Repeats, QueryLength, ChunkRows, Chunks, PaddedRows, Warps,
+        NumKvHeads, Bits, ValuesPerWord, Accumulator, HasMask>(
         (device uchar*)(keys + key_word_offset),
         key_scales + key_scale_offset,
         (device uchar*)(values + value_word_offset),
@@ -644,8 +663,7 @@ _MPP_ATTENTION_SOURCE = r"""
         int(values_strides[2]),
         int(key_scales_strides[2]),
         int(value_scales_strides[2]),
-        mask + batch * mask_strides[0] +
-            (kv_head * RepeatsTotal + chunk * Repeats) * mask_strides[1],
+        mask + batch * mask_strides[0] + kv_head * Repeats * mask_strides[1],
         int(mask_strides[1]),
         int(mask_strides[2]),
         int(mask_strides[3]),
@@ -707,16 +725,17 @@ def _mpp_attention_kernel(
     dim: int,
     repeats: int,
     query_length: int,
+    chunk_rows: int,
+    chunks: int,
     padded_rows: int,
     warps: int,
     kv_heads: int,
     bits: int = _BITS,
-    chunks: int = 1,
 ):
     return mx.fast.metal_kernel(
         name=(
             f"affine{bits}_mpp_d{dim}_r{repeats}_l{query_length}_"
-            f"m{padded_rows}_w{warps}_h{kv_heads}_c{chunks}"
+            f"c{chunk_rows}x{chunks}_m{padded_rows}_w{warps}_h{kv_heads}"
         ),
         input_names=[
             "queries",
@@ -768,21 +787,6 @@ def _attention_blocks(tokens: int, kv_heads: int, dim: int) -> int:
     token_tiles = (tokens + 63) // 64
     target_groups = 256 if dim <= 64 else 168
     return min(token_tiles, max(1, (target_groups + kv_heads - 1) // kv_heads))
-
-
-def _repeats_per_launch(dim: int, repeats: int, query_length: int, warps: int) -> int:
-    """Largest divisor of ``repeats`` whose query rows fit one threadgroup."""
-    for group in range(repeats, 0, -1):
-        rows = _padded_rows(group * query_length)
-        # q_tile, scores, probabilities, four per-row floats, per-warp scales.
-        tile_bytes = rows * (2 * dim + 64 * 4 + 64 * 2 + 4 * 4) + 4 * warps
-        if (
-            not repeats % group
-            and rows <= _MAX_PADDED_ROWS
-            and tile_bytes <= _MAX_THREADGROUP_BYTES
-        ):
-            return group
-    return 0
 
 
 def _attention_warps(dim: int) -> int:
@@ -847,10 +851,12 @@ def _native_attention(
         return None
     repeats = query_heads // kv_heads
     warps = _attention_warps(dim)
-    group = _repeats_per_launch(dim, repeats, query_length, warps)
-    if not group or dim % warps:
+    total_rows = repeats * query_length
+    group = min(total_rows, _MAX_PADDED_ROWS)
+    if not group or dim % warps or query_length > _MAX_NATIVE_QUERY_LENGTH:
         return None
-    padded_rows = _padded_rows(group * query_length)
+    chunks = (total_rows + group - 1) // group
+    padded_rows = _padded_rows(group)
     tokens = _state_length(keys_state)
     if (
         tokens < _MIN_NATIVE_TOKENS
@@ -898,8 +904,10 @@ def _native_attention(
         if has_sinks
         else mx.zeros((1,), dtype=mx.float32)
     )
-    rows = batch * kv_heads * group * query_length
-    geometry = (dim, group, query_length, padded_rows, warps, kv_heads)
+    # Output rows per KV head: every chunk's rows, padding included.
+    head_rows = chunks * group
+    rows = batch * kv_heads * head_rows
+    geometry = (dim, repeats, query_length, group, chunks, padded_rows, warps, kv_heads)
     signature = (
         *geometry,
         cache.key_codec.bits,
@@ -912,14 +920,9 @@ def _native_attention(
         return None
 
     try:
-        # Query heads that do not fit one threadgroup (a multi-row verify)
-        # run as several threadgroups per KV head in one launch rather than
-        # one launch per chunk: each launch streams the whole cache, while
-        # neighbouring threadgroups share its tiles. Rows come out in
-        # (batch, kv_head, repeat, position) order either way.
-        chunks = repeats // group
-        pass1 = _mpp_attention_kernel(*geometry, cache.key_codec.bits, chunks)
-        all_rows = rows * chunks
+        pass1 = _mpp_attention_kernel(*geometry, cache.key_codec.bits)
+        # One launch: threadgroup x = kv_head * chunks + chunk, chunk fastest,
+        # so the chunks of a KV head stream the same K/V tiles together.
         partials, sums, maxs = pass1(
             inputs=[
                 rotated.reshape(batch, query_heads, query_length, dim),
@@ -934,10 +937,10 @@ def _native_attention(
             ],
             template=[
                 ("Dim", dim),
-                ("Repeats", group),
-                ("RepeatsTotal", repeats),
-                ("Chunks", chunks),
+                ("Repeats", repeats),
                 ("QueryLength", query_length),
+                ("ChunkRows", group),
+                ("Chunks", chunks),
                 ("PaddedRows", padded_rows),
                 ("Warps", warps),
                 ("NumKvHeads", kv_heads * chunks),
@@ -947,28 +950,39 @@ def _native_attention(
                 ("HasMask", has_mask),
             ],
             output_shapes=[
-                (all_rows, blocks, dim),
-                (all_rows, blocks),
-                (all_rows, blocks),
+                (rows, blocks, dim),
+                (rows, blocks),
+                (rows, blocks),
             ],
             output_dtypes=[mx.float32, mx.float32, mx.float32],
             grid=(kv_heads * chunks * 32, batch * warps, blocks),
             threadgroup=(32, warps, 1),
         )
+        if has_sinks:
+            if head_rows > total_rows:
+                row_sinks = mx.concatenate(
+                    [
+                        row_sinks.reshape(batch, kv_heads, total_rows),
+                        mx.zeros(
+                            (batch, kv_heads, head_rows - total_rows), dtype=mx.float32
+                        ),
+                    ],
+                    axis=-1,
+                )
+            row_sinks = mx.contiguous(row_sinks).reshape(-1)
         rotated_output = _mpp_reduce_kernel(dim)(
-            inputs=[
-                partials,
-                sums,
-                maxs,
-                mx.contiguous(row_sinks).reshape(-1) if has_sinks else row_sinks,
-                params,
-            ],
+            inputs=[partials, sums, maxs, row_sinks, params],
             template=[("Dim", dim), ("HasSinks", has_sinks)],
-            output_shapes=[(batch, kv_heads, repeats, query_length, dim)],
+            output_shapes=[(batch, kv_heads, head_rows, dim)],
             output_dtypes=[mx.float32],
-            grid=(all_rows * dim, 1, 1),
+            grid=(rows * dim, 1, 1),
             threadgroup=(dim, 1, 1),
         )[0]
+        if head_rows > total_rows:
+            rotated_output = rotated_output[:, :, :total_rows]
+        rotated_output = rotated_output.reshape(
+            batch, kv_heads, repeats, query_length, dim
+        )
         output = cache.value_codec._rotate_inverse(rotated_output)
         output = output.reshape(batch, query_heads, query_length, dim).astype(
             queries.dtype
@@ -980,7 +994,7 @@ def _native_attention(
                 "Affine%d TensorOps attention active (d=%d, repeats=%d, rows=%d)",
                 cache.key_codec.bits,
                 dim,
-                group,
+                repeats,
                 query_length,
             )
         return output
@@ -993,7 +1007,7 @@ def _native_attention(
             "using portable attention",
             cache.key_codec.bits,
             dim,
-            group,
+            repeats,
             query_length,
         )
         logger.debug("TensorOps launch failure", exc_info=True)
@@ -1506,7 +1520,7 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
             )
         # Without left padding the plain mask is exact; keeping it a string lets the
         # bf16 prefill use the fused kernel instead of a (query x cache) mask array.
-        if (mask is None or causal) and not mx.any(self.left_padding).item():
+        if (mask is None or causal) and not self._has_left_padding():
             return mask
         columns = mx.arange(tokens)
         allowed = columns[None, None, None, :] >= self.left_padding[:, None, None, None]

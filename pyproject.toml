@@ -202,8 +202,10 @@ bundle = [
 # PEP 735 development dependencies — installed by uv sync or pip install --group dev.
 [dependency-groups]
 dev = [
-    "pytest>=7.0.0",
+    # pytest 9.2 ignores xdist 3.8's loadgroup node id suffix (see ci.yml).
+    "pytest>=7.0.0,<9.2",
     "pytest-asyncio>=0.21.0",
+    "pytest-xdist>=3.8",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
@@ -234,13 +236,18 @@ where = [".", "apps/omlx-web"]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
-"omlx" = ["oq_calibration_data.json", "oqe_calibration_data.json"]
+"omlx" = [
+    "oq_calibration_data.json",
+    "oqe_calibration_data.json",
+    "oqe_refine_calibration_data.json",
+]
 "omlx.admin" = ["bench_corpora/*"]
 "omlx_web" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.patches.deepseek_v41" = ["LICENSE"]
 "omlx.custom_kernels.attention" = ["*.metallib", "*.so"]
 "omlx.custom_kernels.lowbit" = ["*.metallib", "*.so"]
+"omlx.custom_kernels.oqh" = ["*.metallib", "*.so"]
 "omlx.custom_kernels.quant_matmul" = ["*.metallib", "*.so"]
 "omlx.custom_kernels.sparse_index" = ["*.metallib", "*.so"]
 
@@ -269,8 +276,3 @@ python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-asyncio_mode = "auto"

@@ -142,6 +142,17 @@ private struct ExternalEnginesSection: View {
                 }), width: .controlCompact, options: [("int8", "int8"), ("bf16", "bf16")])
             }
 
+            Row(label: String(localized: "integrations.splash.activations",
+                              defaultValue: "Activation Precision",
+                              comment: "Row label for the Splash attention activation precision"),
+                sublabel: String(localized: "integrations.splash.activations.sub",
+                                 defaultValue: "bf16 keeps attention in bf16 on M5 and later; auto lets Splash use int8 where it is faster. Applies to Splash 1.6.1 and later.",
+                                 comment: "Sublabel for the Splash attention activation precision")) {
+                Popup(selection: vm.bind($vm.splashActivations, save: {
+                    Task { await vm.save(.splashActivations, client: client) }
+                }), width: .controlCompact, options: [("bf16", "bf16"), ("auto", "auto")])
+            }
+
             Row(label: String(localized: "integrations.splash.max_memory",
                               defaultValue: "Memory Limit",
                               comment: "Row label for the Splash memory limit"),

@@ -3277,9 +3277,7 @@ async def cluster_models(request: ClusterModelInventoryRequest) -> dict[str, Any
             models = await asyncio.to_thread(
                 remote_model_inventory,
                 validated,
-                python_executable=(
-                    host.python_executable or "~/omlx-distributed/.venv/bin/python"
-                ),
+                python_executable=host.python_executable or DEFAULT_REMOTE_PYTHON,
             )
             source_python = host.python_executable or DEFAULT_REMOTE_PYTHON
             models = [

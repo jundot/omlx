@@ -45,6 +45,7 @@ from transformers import AutoTokenizer
 from ..api.utils import _consolidate_system_messages
 from ..exceptions import InvalidRequestError
 from ..gguf import SPLIT_VARIANT
+from ..oqh.format import is_oqh_config
 from ..request import DecodeMarks, add_decode_mark, live_decode_rate
 from ..utils.hardware import get_chip_name, parse_chip_info
 from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
@@ -147,6 +148,10 @@ FLASH_NEXT_VERSION = (1, 4, 0)
 SPLIT_GGUF_VERSION = (1, 4, 0)
 # Splash 1.4.1 serves MoE GGUFs pruned to a multiple of 8 routed experts.
 PRUNED_EXPERTS_VERSION = (1, 4, 1)
+# Splash 1.6.1 adds --activations; older launchers reject the flag. From that
+# release on M5+ `auto` quantizes attention queries to int8, so oMLX pins bf16
+# by default and only sends the flag where it is understood.
+ACTIVATIONS_VERSION = (1, 6, 1)
 _PRUNED_EXPERTS_MULTIPLE = 8
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
 _COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
@@ -292,6 +297,10 @@ class SplashBinary:
     @property
     def loads_nvidia_quantization(self) -> bool:
         return self.version_tuple >= NVIDIA_QUANTIZATION_VERSION
+
+    @property
+    def accepts_activations(self) -> bool:
+        return self.version_tuple >= ACTIVATIONS_VERSION
 
 
 def _version_tuple(version: str) -> tuple[int, int, int] | None:
@@ -537,6 +546,8 @@ def _is_nvfp4_or_fp8(quant_config: dict) -> bool:
 
 
 def _quantization_problem(config: dict, binary: SplashBinary) -> str:
+    if is_oqh_config(config):
+        return "Splash does not read oQh weights"
     quant = config.get("quantization")
     if not isinstance(quant, dict):
         quant_config = config.get("quantization_config") or {}
@@ -575,7 +586,7 @@ def _is_splash_draft(draft: dict, text: dict) -> bool:
 def find_splash_draft(text_config: dict, candidates: Iterable[str]) -> Path | None:
     """The first DFlash2 draft among ``candidates`` that fits ``text_config``."""
     for candidate in candidates:
-        path = Path(candidate)
+        path = Path(candidate).expanduser()
         draft = _read_config(path)
         if draft is not None and _is_splash_draft(draft, text_config):
             return path
@@ -1197,6 +1208,7 @@ class SplashOptions:
     max_context: int | None = None
     max_memory_bytes: int = 0
     kv_format: str = "int8"
+    activations: str = "bf16"
     ane_prefill: bool = True
     cache_disk_bytes: int = 0
     cache_dir: Path | None = None
@@ -1274,8 +1286,11 @@ class SplashEngine(BaseEngine):
         value = (self._status or {}).get("maximum_context_tokens")
         return value if isinstance(value, int) and value > 0 else None
 
+    def active_request_count(self) -> int:
+        return self._active
+
     def has_active_requests(self) -> bool:
-        return self._active > 0
+        return self.active_request_count() > 0
 
     @property
     def ssd_cache_dir(self) -> Path | None:
@@ -1343,6 +1358,10 @@ class SplashEngine(BaseEngine):
             "--kv-format",
             options.kv_format,
         ]
+        # Splash defaults to auto; only an explicit bf16 needs the flag, and
+        # launchers before 1.6.1 would refuse to start on it.
+        if options.activations != "auto" and self._target.binary.accepts_activations:
+            command += ["--activations", options.activations]
         if model != self._repo_id:
             command += ["--served-model-name", self._repo_id]
         if not self._vision:

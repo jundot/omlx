@@ -43,6 +43,10 @@ _benchmark_runs: dict[str, "BenchmarkRun"] = {}
 # Valid prompt lengths for single request tests
 VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
 
+# Default token generation length for any request. Runs at a different
+# length stay out of the community leaderboard (see run_benchmark).
+DEFAULT_GENERATION_LENGTH = 128
+
 # Valid batch sizes for continuous batching tests
 VALID_BATCH_SIZES = [2, 4, 8]
 
@@ -114,7 +118,7 @@ class BenchmarkRequest(BaseModel):
 
     model_id: str
     prompt_lengths: list[int]
-    generation_length: int = 128
+    generation_length: int = DEFAULT_GENERATION_LENGTH
     batch_sizes: list[int] = []
     context_profile: BenchmarkContextProfile = BenchmarkContextProfile.CODE_PYTHON
     warmup_mode: BenchmarkWarmupMode = BenchmarkWarmupMode.QUICK
@@ -136,6 +140,15 @@ class BenchmarkRequest(BaseModel):
                     f"Invalid prompt length {pl}. Must be one of {VALID_PROMPT_LENGTHS}"
                 )
         return sorted(v)
+
+    @field_validator("generation_length")
+    @classmethod
+    def validate_generation_length(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(
+                f"Generation length ({v}) must be higher than 0"
+            )
+        return v
 
     @field_validator("batch_sizes")
     @classmethod
@@ -2503,6 +2516,21 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 {
                     "type": "upload_skipped",
                     "reason": "ane_aligned_prompt",
+                    "features": run.feature_flags,
+                },
+            )
+            return
+
+        if request.generation_length != DEFAULT_GENERATION_LENGTH:
+            # Non-default generation lengths are used to test different
+            # scenarios; keep them out of the omlx.ai community leaderboard.
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "custom_generation_length"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": "custom_generation_length",
                     "features": run.feature_flags,
                 },
             )

@@ -14,7 +14,7 @@ import threading
 from contextlib import suppress
 from typing import Any
 
-from . import CONTROL_VERSION, DATA_PROTOCOL, __version__, gpus, wire
+from . import CONTROL_VERSION, DATA_PROTOCOL, __version__, checkpoint, gpus, wire
 from .files import FileError, ModelStore
 from .state import State
 
@@ -41,12 +41,14 @@ class ControlServer:
         supervisor: Any,
         contracts: dict[str, int],
         *,
+        oqh: dict[str, int] | None = None,
         gpu_indices: list[int] | None = None,
         bind: str = "",
         port: int = 0,
     ):
         self.state, self.store, self.supervisor = state, store, supervisor
         self.contracts, self.gpu_indices = contracts, gpu_indices
+        self.oqh = oqh or {}
         self._listeners = [socket.create_server((bind, port), reuse_port=False)]
         self.port: int = self._listeners[0].getsockname()[1]
         if not bind and socket.has_ipv6:
@@ -159,6 +161,7 @@ class ControlServer:
                 "version": __version__,
                 "data_protocol": DATA_PROTOCOL,
                 "contracts": self.contracts,
+                "oqh": self.oqh,
                 "gpus": gpus.gpus(self.gpu_indices),
                 "ram": total,
                 "ram_available": available,
@@ -195,9 +198,20 @@ class ControlServer:
                     f"this helper has contract {self.contracts.get(model_type)} for "
                     f"{model_type}, the host asked for {meta.get('contract')}"
                 )
+            folder = store.folder(str(meta["model"]))
+            # A folder without its config fails later, in the stage load.
+            config = folder / "config.json"
+            found = checkpoint.oqh_version(
+                checkpoint.load_config(folder) if config.exists() else {}
+            )
+            if found is not None and self.oqh.get(model_type) != found:
+                raise RuntimeError(
+                    f"this helper does not read oQh weights (version {found}) "
+                    f"of {model_type}"
+                )
             ready = self.supervisor.start(
                 owner,
-                model_dir=str(store.folder(str(meta["model"]))),
+                model_dir=str(folder),
                 model_type=model_type,
                 layers=int(meta["layers"]),
                 warm_tokens=int(meta.get("warm_tokens") or 8192),

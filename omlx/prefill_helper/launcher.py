@@ -242,7 +242,9 @@ def remote_info(
         raise LaunchError(f"oMLX is not installed on {target.name}.") from None
 
 
-def incompatible(info: dict, adapter: StageAdapter | None, name: str) -> str | None:
+def incompatible(
+    info: dict, adapter: StageAdapter | None, name: str, oqh: int | None = None
+) -> str | None:
     """Why this Mac cannot help, or None: it runs the helper from its own
     oMLX, so the versions must be equal."""
     if info.get("version") != __version__:
