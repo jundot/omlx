@@ -6610,7 +6610,6 @@ def test_spec_command_buffers_overlapping_engines_restore_mlx_caps(monkeypatch):
 def test_plain_moe_decode_steps_run_under_the_raised_caps(
     monkeypatch, model_type, raised
 ):
-    """A Qwen MoE target's ordinary decode step raises the caps; dense keeps MLX's."""
     import omlx.scheduler as scheduler
 
     caps = [(50, 50)]

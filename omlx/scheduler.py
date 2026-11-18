@@ -911,9 +911,8 @@ def _omlx_advance_grammar_rows(self) -> None:
 
 _original_generation_batch_step = GenerationBatch._step
 
-# Plain decode of these small-active MoE models is bound by the host cost of
-# MLX's command-buffer commits, so it takes the speculative cycles' raised
-# caps. Dense decode stays on MLX's caps; larger buffers slow it on M5.
+# Decode of small-active MoE models is bound by command-buffer commits. Dense
+# decode keeps MLX's caps because larger buffers slow it on M5.
 _DECODE_CAPS_TYPES = frozenset({"qwen3_5_moe", "qwen3_6_moe"})
 
 
