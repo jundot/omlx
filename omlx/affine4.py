@@ -39,17 +39,12 @@ __all__ = [
 
 _BITS = 4
 _MIN_NATIVE_TOKENS = 256
-# Query rows per threadgroup. A KV head's rows (query heads x positions) run
-# as chunks of up to this many rows, side by side in one launch so they share
-# each K/V tile through the GPU cache. 32-row threadgroups ran slower than two
-# 16-row launches on M3 Ultra and M5 Max; on M5 Pro (flint, 8 query heads per
-# KV head, 245K tokens) 24 rows took 2.70 ms against 2.17 ms for two 16-row
-# chunks, and 40 rows 4.3 ms as 2 x 24 against 2.9 ms as 3 x 16.
+# Query rows per threadgroup; a KV head with more rows runs as chunks in one launch.
+# 16-row chunks were faster than 32 rows on M3 Ultra and M5 Max and 24 rows on M5 Pro.
+# 16 rows at dim 512 use 23 KiB of the 32 KiB threadgroup memory.
 _MAX_PADDED_ROWS = 16
-# Longer query blocks (prefill chunks) keep the dequantized fused-SDPA route,
-# as when a whole query head's positions had to fit one 24-row threadgroup.
+# Longer query blocks (prefill) keep the dequantized fused-SDPA route.
 _MAX_NATIVE_QUERY_LENGTH = 24
-_MAX_THREADGROUP_BYTES = 32 * 1024
 # Bound each unfused float32 score matrix to 64 MiB, or one query row.
 _MAX_SCORE_ELEMENTS = 16 * 1024 * 1024
 _NATIVE_LAUNCHABLE = {}
@@ -463,16 +458,14 @@ METAL_FUNC void affine_attention_impl(
         int tile_valid_end = min(min(token + BK, tokens), valid_end);
         if (tile_valid_start >= tile_valid_end)
             continue;
-        // The tile's key scales (times the softmax scale) and value scales
-        // (over the block maximum): one device load per token, not one per
-        // score and probability element.
+        // Stage the tile's scales once per token instead of once per element.
         for (int c = int(tid); c < BK; c += 32 * Warps) {
             int t = token + c;
             bool in_range = t < tokens;
             tile_key_scales[c] = in_range
-                ? float(key_scales[t * key_scale_stride]) * attention_scale : 0.0f;
+                ? float(key_scales[t * key_scale_stride]) : 0.0f;
             tile_value_scales[c] = in_range
-                ? float(value_scales[t * value_scale_stride]) / block_scale : 0.0f;
+                ? float(value_scales[t * value_scale_stride]) : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -508,7 +501,8 @@ METAL_FUNC void affine_attention_impl(
                             (!HasMask || mask[(global_row / QueryLength) * mask_head_stride +
                                  position * mask_query_stride +
                                  absolute_token * mask_token_stride])
-                        ? score_tile[i] * query_scales[row] * tile_key_scales[column]
+                        ? score_tile[i] * query_scales[row] * attention_scale *
+                              tile_key_scales[column]
                         : -INFINITY;
                 }
             }
@@ -552,7 +546,7 @@ METAL_FUNC void affine_attention_impl(
                         float weight = active ? fast::exp(score - new_m) : 0.0f;
                         part += weight;
                         probabilities[row * BK + column] = half(
-                            weight * (active ? tile_value_scales[column] : 0.0f));
+                            weight * (active ? tile_value_scales[column] / block_scale : 0.0f));
                     }
                     for (ushort offset = SoftmaxLanes / 2; offset > 0; offset >>= 1)
                         part += simd_shuffle_xor(part, offset);
@@ -795,21 +789,6 @@ def _attention_blocks(tokens: int, kv_heads: int, dim: int) -> int:
     return min(token_tiles, max(1, (target_groups + kv_heads - 1) // kv_heads))
 
 
-def _rows_per_chunk(dim: int, repeats: int, query_length: int, warps: int) -> int:
-    """Query rows one threadgroup scores: all of a KV head's rows when they
-    fit, else the largest multiple of 8 that does (0 when none fits)."""
-    total = repeats * query_length
-    candidates = [total] if total <= _MAX_PADDED_ROWS else []
-    candidates += range((min(total, _MAX_PADDED_ROWS) // 8) * 8, 0, -8)
-    for rows in candidates:
-        padded = _padded_rows(rows)
-        # q_tile, scores, probabilities, four per-row floats, warp and tile scales.
-        tile_bytes = padded * (2 * dim + 64 * 4 + 64 * 2 + 4 * 4) + 4 * (8 + 2 * 64)
-        if padded <= _MAX_PADDED_ROWS and tile_bytes <= _MAX_THREADGROUP_BYTES:
-            return rows
-    return 0
-
-
 def _attention_warps(dim: int) -> int:
     if dim <= 64:
         return 1
@@ -872,10 +851,10 @@ def _native_attention(
         return None
     repeats = query_heads // kv_heads
     warps = _attention_warps(dim)
-    group = _rows_per_chunk(dim, repeats, query_length, warps)
+    total_rows = repeats * query_length
+    group = min(total_rows, _MAX_PADDED_ROWS)
     if not group or dim % warps or query_length > _MAX_NATIVE_QUERY_LENGTH:
         return None
-    total_rows = repeats * query_length
     chunks = (total_rows + group - 1) // group
     padded_rows = _padded_rows(group)
     tokens = _state_length(keys_state)
@@ -1015,7 +994,7 @@ def _native_attention(
                 "Affine%d TensorOps attention active (d=%d, repeats=%d, rows=%d)",
                 cache.key_codec.bits,
                 dim,
-                group,
+                repeats,
                 query_length,
             )
         return output
@@ -1028,7 +1007,7 @@ def _native_attention(
             "using portable attention",
             cache.key_codec.bits,
             dim,
-            group,
+            repeats,
             query_length,
         )
         logger.debug("TensorOps launch failure", exc_info=True)

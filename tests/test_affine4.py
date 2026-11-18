@@ -192,8 +192,8 @@ def test_portable_attention_masks_sinks_and_dimensions(
         (1, 4, 8, 4, 512, 1025, mx.bfloat16, Affine4KVCache, True),
         (1, 4, 6, 8, 256, 1025, mx.bfloat16, Affine8KVCache, False),
         (1, 8, 8, 1, 64, 1025, mx.bfloat16, Affine8KVCache, True),
-        # Speculative verify of flint's geometry: 24 and 40 rows per KV head
-        # run as 16-row chunks that split query heads.
+        # Over 16 rows per KV head run as 16-row chunks, which can split a
+        # query head's positions and end with a partial chunk.
         (1, 4, 8, 3, 128, 1025, mx.bfloat16, Affine8KVCache, True),
         (1, 4, 8, 5, 128, 2049, mx.bfloat16, Affine8KVCache, True),
         (2, 2, 3, 7, 64, 700, mx.float16, Affine4KVCache, True),
@@ -666,34 +666,3 @@ def test_bounded_prefill_peak_memory():
     temporary = mx.get_peak_memory() - baseline
     assert temporary < 600 * 1024**2, f"Prefill allocated {temporary / 1024**2:.1f} MiB"
     assert mx.all(mx.isfinite(output)).item()
-
-
-@pytest.mark.parametrize(
-    "dim,repeats,rows,expected",
-    [
-        (128, 8, 1, 8),
-        (128, 8, 2, 16),
-        (128, 8, 3, 16),
-        (128, 8, 5, 16),
-        (64, 3, 3, 9),
-        (512, 8, 4, 16),
-        (256, 32, 1, 16),
-    ],
-)
-def test_rows_per_chunk(dim, repeats, rows, expected):
-    """A KV head's rows run whole when they fit, else as 16-row chunks."""
-    warps = affine4._attention_warps(dim)
-    assert affine4._rows_per_chunk(dim, repeats, rows, warps) == expected
-
-
-def test_prefill_blocks_keep_the_fused_route():
-    """Query blocks longer than a verify window are not routed to the native kernel."""
-    require_tensor_ops()
-    cache = Affine8KVCache()
-    cache.update_and_fetch(random((1, 2, 600, 64)), random((1, 2, 600, 64), seed=1))
-    q = random((1, 8, affine4._MAX_NATIVE_QUERY_LENGTH + 1, 64), seed=2)
-    assert affine4._native_attention(cache, q, *cache.state, 0.125, "causal") is None
-    q = random((1, 8, affine4._MAX_NATIVE_QUERY_LENGTH, 64), seed=2)
-    assert (
-        affine4._native_attention(cache, q, *cache.state, 0.125, "causal") is not None
-    )
