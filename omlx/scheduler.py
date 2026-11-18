@@ -2775,8 +2775,9 @@ class Scheduler:
         self.total_completion_tokens = 0
         # Set by the engine when MoE expert offload wrapped the model.
         self.moe_offload_stats: Callable[[], dict] | None = None
-        self.moe_offload_release: Callable[[], int] | None = None
-        self.moe_offload_restore: Callable[[], None] | None = None
+        self.moe_offload_release: Callable[..., int] | None = None
+        self.moe_offload_restore: Callable[..., None] | None = None
+        self.moe_offload_releasable: Callable[[], int] | None = None
         self._moe_offload_slots_released = False
 
         # Step counter for periodic cleanup
@@ -5197,6 +5198,25 @@ class Scheduler:
     # naturally exhausted, and a pass with nothing left to give costs one
     # ~100ms pause before the guard falls back to throttling as before.
     _MAX_PREFILL_EVICTION_RETRIES = 2
+    # A sized offload slot release reaches the floor in at most four steps.
+    _MAX_OFFLOAD_SLOT_PAUSES = 4
+
+    def _offload_slot_pause(self, request_id: str, request: Any) -> bool:
+        """True when this pause's ladder will release MoE offload slots.
+
+        Such pauses keep the two counted pauses for the hot cache and idle
+        models. The release is skipped while another request runs, so then
+        the pause counts."""
+        releasable = getattr(self, "moe_offload_releasable", None)
+        if releasable is None:
+            return False
+        if getattr(request, "prefill_offload_pauses", 0) >= getattr(
+            self, "_MAX_OFFLOAD_SLOT_PAUSES", Scheduler._MAX_OFFLOAD_SLOT_PAUSES
+        ):
+            return False
+        if any(rid != request_id for rid in getattr(self, "running", {})):
+            return False
+        return releasable() > 0
 
     def _raise_prefill_eviction_if_available(
         self,
@@ -5217,12 +5237,16 @@ class Scheduler:
             "_MAX_PREFILL_EVICTION_RETRIES",
             Scheduler._MAX_PREFILL_EVICTION_RETRIES,
         )
-        if request.prefill_eviction_retries >= max_retries:
-            return
         if target_cap <= 0 or predicted_transient <= 0:
             return
-
-        request.prefill_eviction_retries += 1
+        if Scheduler._offload_slot_pause(self, request_id, request):
+            request.prefill_offload_pauses = (
+                getattr(request, "prefill_offload_pauses", 0) + 1
+            )
+        elif request.prefill_eviction_retries >= max_retries:
+            return
+        else:
+            request.prefill_eviction_retries += 1
         config = getattr(self, "config", None)
         eviction_request = PrefillEvictionRequest(
             request_id=request_id,
@@ -6429,15 +6453,21 @@ class Scheduler:
                 total / 1024**2,
             )
 
-    def release_moe_offload_slots(self, request_id: str) -> int:
+    def release_moe_offload_slots(
+        self, request_id: str, need_bytes: int | None = None
+    ) -> int:
         """Release the offload slots for ``request_id``'s prefill; return the bytes.
 
-        Skipped while another request runs; the next decode step restores them."""
+        ``need_bytes`` is the prefill's shortfall: the release covers it in
+        coarse steps instead of shrinking every cache to its floor. Skipped
+        while another request runs; the next decode step restores them."""
         if self.moe_offload_release is None or any(
             rid != request_id for rid in self.running
         ):
             return 0
-        released = self.moe_offload_release()
+        released = self.moe_offload_release(
+            need_bytes, lambda: Scheduler._clear_cache(self)
+        )
         if released:
             self._moe_offload_slots_released = True
             self._reclaim_prefill_headroom()
@@ -15973,7 +16003,7 @@ class Scheduler:
             ) and self.running:
                 if self._moe_offload_slots_released:
                     self._moe_offload_slots_released = False
-                    self.moe_offload_restore()
+                    self.moe_offload_restore(lambda: Scheduler._clear_cache(self))
                 _t_decode_start = time.perf_counter()
                 if self.batch_generator is not None:
                     responses = list(self.batch_generator.next_generated())
