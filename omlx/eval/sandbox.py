@@ -1,15 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run generated benchmark code in a resource-limited Python subprocess.
 
-The limits are applied by the child itself through a small launcher instead of
-``subprocess``'s ``preexec_fn``. ``preexec_fn`` runs Python code between fork
-and exec, which is unsafe in a multi-threaded process like the server: the
-forked child can deadlock on a lock held by another thread at fork time. Such a
-child never execs, ignores SIGTERM, leaves ``subprocess.run`` blocked forever
-(its timeout never starts), and still holds every inherited file descriptor,
-including the server's listening socket, because ``close_fds`` only runs after
-``preexec_fn``. Once the server exits, the orphan keeps the port bound and
-every restart fails with "Address already in use".
+The child sets its own limits. A ``preexec_fn`` child forked from the threaded
+server can hang before exec while it holds the listening socket.
 """
 
 from __future__ import annotations
