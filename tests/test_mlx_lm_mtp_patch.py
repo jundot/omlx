@@ -6605,6 +6605,41 @@ def test_spec_command_buffers_overlapping_engines_restore_mlx_caps(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "model_type,raised", [("qwen3_5_moe", True), ("qwen3_5", False)]
+)
+def test_plain_moe_decode_steps_run_under_the_raised_caps(
+    monkeypatch, model_type, raised
+):
+    import omlx.scheduler as scheduler
+
+    caps = [(50, 50)]
+
+    def fake_set(ops, mb):
+        previous = caps[-1]
+        caps.append((ops, mb))
+        return previous
+
+    seen = []
+    monkeypatch.setattr(quant_fast, "set_command_buffer_caps", fake_set)
+    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: True)
+    monkeypatch.setattr(bg, "_spec_caps_holders", 0)
+    monkeypatch.setattr(bg, "_spec_caps_previous", None)
+    monkeypatch.setattr(
+        scheduler, "_original_generation_batch_step", lambda b: seen.append(caps[-1])
+    )
+    batch = SimpleNamespace(
+        model=SimpleNamespace(model_type=model_type),
+        uids=[7],
+        logits_processors=[[]],
+        samplers=[None],
+        _next_tokens=None,
+    )
+    scheduler._patched_generation_batch_step(batch)
+    assert seen == [bg._SPEC_BUFFER_CAPS if raised else (50, 50)]
+    assert caps[-1] == (50, 50)
+
+
+@pytest.mark.parametrize(
     "model_type,gpu,enabled,detected",
     [
         ("qwen3_5_moe", True, True, True),

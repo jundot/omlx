@@ -67,6 +67,9 @@ from .exceptions import (
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
+from .patches.mlx_lm_mtp.batch_generator import (
+    _spec_command_buffers as _decode_command_buffers,
+)
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.vlm_batch_kv_capacity import (
     allow_early_kv_growth,
@@ -908,6 +911,10 @@ def _omlx_advance_grammar_rows(self) -> None:
 
 _original_generation_batch_step = GenerationBatch._step
 
+# Decode of small-active MoE models is bound by command-buffer commits. Dense
+# decode keeps MLX's caps because larger buffers slow it on M5.
+_DECODE_CAPS_TYPES = frozenset({"qwen3_5_moe", "qwen3_6_moe"})
+
 
 def _patched_generation_batch_step(self):
     # Build per-batch mRoPE deltas from UID mapping before each step.
@@ -930,6 +937,9 @@ def _patched_generation_batch_step(self):
     # is there to guarantee.
     _omlx_advance_grammar_rows(self)
 
+    if getattr(model, "model_type", None) in _DECODE_CAPS_TYPES:
+        with _decode_command_buffers(model):
+            return _original_generation_batch_step(self)
     return _original_generation_batch_step(self)
 
 
