@@ -10,9 +10,8 @@ is the runtime gate for the *generic* text-model patch.
 Both admin gates reused that whitelist, so the Lightning MTP toggle reported
 "model_type='qwen4_exp' is not on the MTP whitelist" and saving the setting
 returned 400 even though the runtime supports the head as shipped by the
-#3174 converter. The admin gates must instead accept qwen4_exp and fall
-through to the embedded ``mtp.*`` weight check — the same condition the
-runtime path applies.
+#3174 converter. The admin gates must instead accept qwen4_exp and check for
+embedded ``mtp.*`` weights or a matching standalone head, as the runtime does.
 """
 
 import json
@@ -39,6 +38,9 @@ def _make_checkpoint(
     name="Qwen3.8-Flash-Next",
     nextn_weights=False,
 ):
+    import numpy as np
+    from safetensors.numpy import save_file
+
     model_dir = tmp_path / name
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps(config))
@@ -49,6 +51,10 @@ def _make_checkpoint(
         weight_map["model.layers.48.self_attn.q_proj.weight"] = "model.safetensors"
     (model_dir / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {}, "weight_map": weight_map})
+    )
+    save_file(
+        {key: np.zeros((1,), dtype=np.float32) for key in weight_map},
+        str(model_dir / "model.safetensors"),
     )
     return model_dir
 

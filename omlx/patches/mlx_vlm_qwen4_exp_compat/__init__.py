@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 _VENDOR_MLX_VLM = Path(__file__).resolve().parent / "vendor" / "mlx_vlm"
 _APPLIED = False
+_MODEL_BEING_LOADED: ContextVar[Path | None] = ContextVar(
+    "omlx_qwen4_model_being_loaded", default=None
+)
 
 
 def _append_package_path(package: Any, path: Path) -> None:
@@ -51,6 +55,7 @@ def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
         _patch_prompt_utils()
         _patch_prompt_loop()
         _patch_model_file_bypass()
+        _patch_indexed_sidecar_loading()
     except Exception as exc:  # noqa: BLE001
         logger.debug("Qwen4-Exp mlx-vlm registration failed: %s", exc)
         return False
@@ -58,6 +63,39 @@ def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
     _APPLIED = True
     logger.info("Qwen4-Exp mlx-vlm compatibility patch applied")
     return True
+
+
+def _patch_indexed_sidecar_loading() -> None:
+    """Keep independently configured heads out of mlx-vlm's shard merge."""
+    import mlx_vlm.utils as utils
+    from mlx_vlm.models.qwen4_exp.language import get_mtp_runtime
+
+    if getattr(utils.load_model, "_omlx_qwen4_sidecar", False):
+        return
+
+    original_load_model = utils.load_model
+    original_load_safetensors = utils._load_safetensors
+
+    def load_model(model_path, *args, **kwargs):
+        token = _MODEL_BEING_LOADED.set(Path(model_path).resolve())
+        try:
+            return original_load_model(model_path, *args, **kwargs)
+        finally:
+            _MODEL_BEING_LOADED.reset(token)
+
+    def load_safetensors(path, *args, **kwargs):
+        sidecar = get_mtp_runtime().sidecar_path
+        if (
+            sidecar is not None
+            and _MODEL_BEING_LOADED.get() == sidecar.parent.parent.resolve()
+            and Path(path).resolve() == sidecar.resolve()
+        ):
+            return {}
+        return original_load_safetensors(path, *args, **kwargs)
+
+    load_model._omlx_qwen4_sidecar = True
+    utils.load_model = load_model
+    utils._load_safetensors = load_safetensors
 
 
 def _patch_model_file_bypass() -> None:
@@ -183,7 +221,7 @@ def configure_qwen4_exp_runtime(
     logger.info("Qwen4-Exp PLE mode for %s: %s", model_path, resolved)
     if mtp_enabled and not mtp_runtime.enabled:
         logger.warning(
-            "Qwen4-Exp Lightning MTP was requested for %s, but no embedded "
+            "Qwen4-Exp Lightning MTP was requested for %s, but no compatible "
             "MTP tensors were found",
             model_path,
         )
@@ -191,6 +229,6 @@ def configure_qwen4_exp_runtime(
         logger.info(
             "Qwen4-Exp Lightning MTP enabled for %s (checkpoint layout: %s)",
             model_path,
-            mtp_runtime.checkpoint_prefix,
+            mtp_runtime.sidecar_path or mtp_runtime.checkpoint_prefix,
         )
     return resolved

@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 
@@ -47,7 +48,32 @@ _RMSNORM_ZERO_CENTERED_MEDIAN_MIN = -0.5
 _RMSNORM_ZERO_CENTERED_MEDIAN_MAX = 0.25
 
 
-def _normalize_ones_centered_rmsnorm_weights(model, weights):
+def _recenter_rmsnorm_weights(model, weights, *, mtp_only=None):
+    """Recenter selected direct-gamma norms without losing BF16 precision."""
+    target_keys = {
+        f"{path}.weight"
+        for path, module in model.named_modules()
+        if isinstance(module, Qwen4ExpRMSNorm)
+        and (mtp_only is None or path.startswith("mtp.") == mtp_only)
+    }
+    normalized = 0
+    for key in target_keys:
+        value = weights.get(key)
+        if not isinstance(value, mx.array) or not mx.issubdtype(
+            value.dtype, mx.floating
+        ):
+            continue
+        # BF16 can lose information below 0.5. Keep it only when exact, so
+        # fused BF16 kernels remain available and 1 + weight stays unchanged.
+        residual = value.astype(mx.float32) - 1.0
+        narrow = residual.astype(value.dtype)
+        exact = mx.array_equal(narrow.astype(mx.float32), residual).item()
+        weights[key] = narrow if exact else residual
+        normalized += 1
+    return normalized
+
+
+def _normalize_ones_centered_rmsnorm_weights(model, weights, *, separate_mtp=False):
     """Canonicalize legacy direct-gamma Qwen4 RMSNorm checkpoints.
 
     Qwen4 stores most RMSNorm parameters as a residual around zero and applies
@@ -56,9 +82,8 @@ def _normalize_ones_centered_rmsnorm_weights(model, weights):
     hyper-connection norms to identify that checkpoint-wide conversion, then
     recenter only modules backed by :class:`Qwen4ExpRMSNorm`.
 
-    The MTP head is normalized using the base-model decision. Its trained norm
-    means are not independently centered near zero, so sampling the MTP head
-    alone would be ambiguous.
+    An embedded MTP head shares that decision. A standalone head does not:
+    its trained norm means cannot reliably identify its own convention.
     """
     named_modules = getattr(model, "named_modules", None)
     if named_modules is None:
@@ -105,28 +130,9 @@ def _normalize_ones_centered_rmsnorm_weights(model, weights):
             )
         return
 
-    target_keys = {
-        f"{path}.weight"
-        for path, module in named_modules()
-        if isinstance(module, Qwen4ExpRMSNorm)
-    }
-    normalized = 0
-    for key in target_keys:
-        value = weights.get(key)
-        if not isinstance(value, mx.array) or not mx.issubdtype(
-            value.dtype, mx.floating
-        ):
-            continue
-        # Subtract in FP32: in BF16 it can lose information for direct gamma
-        # values below 0.5, which occur in the trained MTP head. Keep the
-        # checkpoint dtype when it holds the residual exactly (gammas in
-        # [0.5, 2] always do), so 1 + weight is unchanged and BF16-only kernels
-        # such as the fused hyper-connection norm still apply.
-        residual = value.astype(mx.float32) - 1.0
-        narrow = residual.astype(value.dtype)
-        exact = mx.array_equal(narrow.astype(mx.float32), residual).item()
-        weights[key] = narrow if exact else residual
-        normalized += 1
+    normalized = _recenter_rmsnorm_weights(
+        model, weights, mtp_only=False if separate_mtp else None
+    )
 
     logger.info(
         "Canonicalized %d ones-centered Qwen4-Exp RMSNorm tensors "
@@ -143,11 +149,67 @@ class Model(Qwen3_5Model):
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
-        if get_mtp_runtime().enabled:
+        mtp_runtime = get_mtp_runtime()
+        self._mtp_sidecar_path = mtp_runtime.sidecar_path
+        if mtp_runtime.enabled:
             self.mtp = Qwen4ExpMTPModule(config.text_config)
             self.language_model.bind_mtp_owner(self)
 
     def sanitize(self, weights):
+        mtp_runtime = get_mtp_runtime()
+        sidecar_path = getattr(self, "_mtp_sidecar_path", None)
+        loaded_sidecar = False
+        sidecar_norm_format = "zero_centered"
+        if (
+            mtp_runtime.enabled
+            and not mtp_runtime.checkpoint_prefix
+            and sidecar_path is not None
+        ):
+            # Native qwen4_exp_mtp checkpoints use zero-centered RMSNorm
+            # weights. A legacy direct-gamma conversion must declare its format.
+            sidecar_config = json.loads(
+                (sidecar_path.parent / "config.json").read_text()
+            )
+            sidecar_norm_format = sidecar_config.get(
+                "rms_norm_weight_format", "zero_centered"
+            )
+            if sidecar_norm_format not in ("zero_centered", "ones_centered"):
+                raise ValueError(
+                    f"Unknown Qwen4 MTP RMSNorm format {sidecar_norm_format!r}"
+                )
+            logger.info(
+                "Loading Qwen4 MTP sidecar with %s RMSNorm weights%s",
+                sidecar_norm_format,
+                " (native default)"
+                if "rms_norm_weight_format" not in sidecar_config
+                else "",
+            )
+            raw_sidecar = mx.load(str(sidecar_path))
+            external_quant = sidecar_config.get("quantization_config")
+            if not sidecar_config.get("quantization") and isinstance(
+                external_quant, dict
+            ):
+                method = external_quant.get("quant_method")
+                if method and (
+                    method != "fp8"
+                    or any(key.endswith(".scales") for key in raw_sidecar)
+                ):
+                    raise ValueError(
+                        f"Qwen4 MTP sidecar quantization {method!r} is not a native "
+                        "MLX recipe; convert the head to MLX format first"
+                    )
+            sidecar_weights = {}
+            for key, value in raw_sidecar.items():
+                prefix = next(
+                    (prefix for prefix in _MTP_PREFIXES if key.startswith(prefix)),
+                    "",
+                )
+                key = "mtp." + key[len(prefix) :]
+                if key in sidecar_weights:
+                    raise ValueError(f"Qwen4 MTP sidecar has duplicate tensor {key!r}")
+                sidecar_weights[key] = value
+            weights.update(sidecar_weights)
+            loaded_sidecar = True
         if get_ple_runtime_mode() == "mmap" and not getattr(
             self, "_omlx_preserve_qwen4_ple_for_quantization", False
         ):
@@ -172,7 +234,7 @@ class Model(Qwen3_5Model):
                 and runtime_scale_key not in weights
             ):
                 weights[source_scale_key] = mx.ones((1,), dtype=mx.bfloat16)
-        mtp_enabled = get_mtp_runtime().enabled
+        mtp_enabled = mtp_runtime.enabled
 
         normalized = {}
         for key, value in weights.items():
@@ -208,18 +270,31 @@ class Model(Qwen3_5Model):
                 None,
             )
             if gate_up_key is not None:
+                up_key = f"{prefix}.switch_mlp.up_proj.weight"
+                down_key = next(
+                    (
+                        key
+                        for key in (
+                            f"{prefix}.experts.down_proj",
+                            f"{prefix}.experts.down_proj.weight",
+                        )
+                        if key in weights
+                    ),
+                    None,
+                )
+                if loaded_sidecar and prefix.startswith("mtp."):
+                    for key in (up_key, f"{prefix}.switch_mlp.down_proj.weight"):
+                        if key in weights and (key == up_key or down_key is not None):
+                            raise ValueError(
+                                f"Qwen4 MTP sidecar has duplicate tensor {key!r}"
+                            )
                 gate, up = mx.split(weights.pop(gate_up_key), 2, axis=-2)
                 weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = up
-                for down_key in (
-                    f"{prefix}.experts.down_proj",
-                    f"{prefix}.experts.down_proj.weight",
-                ):
-                    if down_key in weights:
-                        weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                            down_key
-                        )
-                        break
+                weights[up_key] = up
+                if down_key is not None:
+                    weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                        down_key
+                    )
                 return
 
             if f"{prefix}.experts.0.gate_proj.weight" not in weights:
@@ -264,7 +339,82 @@ class Model(Qwen3_5Model):
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
             sanitized[key] = value
-        _normalize_ones_centered_rmsnorm_weights(self, sanitized)
+        if loaded_sidecar:
+            # mlx-vlm prioritizes a per-module override over the presence of
+            # scales. Dense head tensors must not inherit stale target
+            # overrides; quantized head tensors use their own recipe when given.
+            sidecar_quant = sidecar_config.get("quantization") or sidecar_config.get(
+                "quantization_config"
+            )
+            standalone_recipes = {}
+            for key in sanitized:
+                if not key.startswith("mtp.") or not key.endswith(".weight"):
+                    continue
+                path = key.removesuffix(".weight")
+                recipe = None
+                if path + ".scales" in sanitized and isinstance(sidecar_quant, dict):
+                    head_path = path.removeprefix("mtp.")
+                    names = (
+                        head_path,
+                        *(prefix + head_path for prefix in _MTP_PREFIXES),
+                    )
+                    layer_quant = next(
+                        (
+                            sidecar_quant[name]
+                            for name in names
+                            if name in sidecar_quant
+                        ),
+                        None,
+                    )
+                    if layer_quant is False:
+                        raise ValueError(
+                            f"Qwen4 MTP sidecar has scales for disabled module {path!r}"
+                        )
+                    if isinstance(layer_quant, dict):
+                        recipe = layer_quant
+                    else:
+                        recipe = {
+                            name: sidecar_quant[name]
+                            for name in ("group_size", "bits", "mode", "quantize_input")
+                            if name in sidecar_quant
+                        }
+                if path + ".scales" in sanitized and not isinstance(
+                    getattr(self.config, "quantization", None), dict
+                ):
+                    if not recipe:
+                        raise ValueError(
+                            "A quantized Qwen4 MTP sidecar on a dense target requires "
+                            "its own MLX quantization recipe"
+                        )
+                    standalone_recipes[path.removeprefix("mtp.")] = dict(recipe)
+                for attr in ("quantization", "quantization_config"):
+                    quantization = getattr(self.config, attr, None)
+                    if not isinstance(quantization, dict):
+                        continue
+                    if recipe:
+                        quantization[path] = dict(recipe)
+                    elif (
+                        path + ".scales" in sanitized
+                        and quantization.get(path) is False
+                    ):
+                        # A disabled target-head override cannot describe the
+                        # separate packed head; use the target's global recipe.
+                        quantization.pop(path)
+                    elif path + ".scales" not in sanitized and path in quantization:
+                        quantization[path] = False
+            if standalone_recipes:
+                nn.quantize(
+                    self.mtp,
+                    class_predicate=lambda path, _: standalone_recipes.get(path, False),
+                )
+        _normalize_ones_centered_rmsnorm_weights(
+            self, sanitized, separate_mtp=loaded_sidecar
+        )
+        if loaded_sidecar and sidecar_norm_format == "ones_centered":
+            normalized = _recenter_rmsnorm_weights(self, sanitized, mtp_only=True)
+            logger.info(
+                "Canonicalized %d ones-centered Qwen4 MTP RMSNorm tensors", normalized
+            )
         return sanitized
 
     def load_weights(self, weights, strict=True):
