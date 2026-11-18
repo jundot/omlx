@@ -102,19 +102,28 @@ def test_decode_batches_take_the_batched_affine_kernels():
     assert any(key[1:4] == (8, k, n) for key in batched_decode_qmm._CHECKED)
 
 
-def _switch(experts, rows, cols, key, seed):
-    """An OqhSwitchLinear holding quantized random experts."""
-    from omlx.oqh.modules import OqhSwitchLinear
+def _switch(experts, rows, cols, key, seed, group_size=None):
+    """oQh switch linear holding quantized random experts, row or group scales."""
+    from omlx.oqh.modules import OqhAffineSwitchLinear, OqhSwitchLinear
 
     mx.random.seed(seed)
     block = min(cols, fmt.MAX_BLOCK)
     sg = _signs(key, cols)
     w = mx.random.normal((experts, rows, cols)) * 0.05
     gram = mx.broadcast_to(mx.eye(cols), (experts, cols, cols))
-    packed, rscale, _, _ = quantize.quantize(w, gram, 4, sg, block)
-    m = OqhSwitchLinear(cols, rows, experts, 4, block)
-    # bf16 row scales, as checkpoints store them.
-    m.weight, m.rscale = packed, rscale.astype(mx.bfloat16)
+    # bf16 scales, as checkpoints store them.
+    if group_size:
+        packed, scales, biases, _, _ = quantize.quantize_affine(
+            w, gram, 4, sg, block, group_size
+        )
+        m = OqhAffineSwitchLinear(cols, rows, experts, 4, group_size, block)
+        m.weight = packed
+        m.oqh_scales = scales.astype(mx.bfloat16)
+        m.oqh_biases = biases.astype(mx.bfloat16)
+    else:
+        packed, rscale, _, _ = quantize.quantize(w, gram, 4, sg, block)
+        m = OqhSwitchLinear(cols, rows, experts, 4, block)
+        m.weight, m.rscale = packed, rscale.astype(mx.bfloat16)
     m.oqh_signs = sg.reshape(-1, block).astype(mx.bfloat16)
     return m
 
@@ -158,7 +167,8 @@ def test_fused_switch_glu_serves_mlx_vlm_and_weighted_sum_callers():
         assert _rel(got + shared, want) < 0.03
 
 
-def test_tensor_parallel_split_keeps_blocks_and_row_scales():
+@pytest.mark.parametrize("group_size", [None, 128], ids=["row", "group"])
+def test_tensor_parallel_split_keeps_blocks_and_row_scales(group_size):
     from types import SimpleNamespace
 
     from mlx.nn.layers.distributed import shard_inplace
@@ -169,10 +179,10 @@ def test_tensor_parallel_split_keeps_blocks_and_row_scales():
 
     def glu():
         m = SwitchGLU(512, 256, 8)
-        m.gate_proj = _switch(8, 256, 512, "in", 1)
-        m.up_proj = _switch(8, 256, 512, "in", 2)
+        m.gate_proj = _switch(8, 256, 512, "in", 1, group_size)
+        m.up_proj = _switch(8, 256, 512, "in", 2, group_size)
         # 256 inputs split over two ranks: 128-wide blocks.
-        m.down_proj = _switch(8, 512, 256, "down", 3)
+        m.down_proj = _switch(8, 512, 256, "down", 3, group_size)
         m.down_proj.oqh_signs = m.down_proj["oqh_signs"].reshape(2, 128)
         runtime._install_mlp(m)
         return m
@@ -188,7 +198,12 @@ def test_tensor_parallel_split_keeps_blocks_and_row_scales():
         shard_inplace(m.up_proj, _glm5_rows, group=group)
         shard_inplace(m.down_proj, _glm5_columns, group=group)
         assert m.gate_proj.output_dims == m.up_proj.output_dims == 128
-        assert m.down_proj["rscale"].shape == (8, 512)
+        if group_size:
+            # Group scales split with the rows of gate / up and the inputs of down.
+            assert m.gate_proj["oqh_scales"].shape == (8, 128, 4)
+            assert m.down_proj["oqh_biases"].shape == (8, 512, 1)
+        else:
+            assert m.down_proj["rscale"].shape == (8, 512)
         assert m.down_proj["oqh_signs"].shape == (1, 128)
         parts.append(m(x, inds).astype(mx.float32))
     assert _rel(parts[0] + parts[1], want) < 0.02
@@ -328,10 +343,10 @@ def test_reinvest_keeps_the_affine_size_and_widths():
     assert [plan[f"model.layers.{i}.mlp.down_proj"] for i in (0, 1)] == [4, 4]
     assert plan["model.layers.0.self_attn.q_proj"] == 5
     assert plan["model.layers.0.mlp.gate_proj"] == 3
-    # From oQ4, Qwen keeps group scales: their bytes leave less to reinvest.
+    # From oQ4, Qwen and GLM keep group scales: their bytes leave less to reinvest.
     assert targets.QWEN.group_size(4) == fmt.AFFINE_GROUP_SIZE
     assert targets.QWEN.group_size(3.5) is None
-    assert targets.GLM5_NEXT.group_size(4) is None
+    assert targets.GLM5_NEXT.group_size(4) == fmt.AFFINE_GROUP_SIZE
     gs = targets.QWEN.group_size(4)
     grouped = targets.reinvest(shapes, planned, {"0": 1.0, "1": 2.0}, gs)
     assert sum(targets.price(shapes[p], grouped[p], gs) for p in plan) <= affine
@@ -659,7 +674,8 @@ def _tiny_glm5_next(tmp_path, monkeypatch):
     return source, tokens
 
 
-def test_glm5_next_experts_round_trip(tmp_path, monkeypatch):
+@pytest.mark.parametrize("level", [3.5, 4], ids=["row", "group"])
+def test_glm5_next_experts_round_trip(tmp_path, monkeypatch, level):
     from mlx.utils import tree_flatten
     from mlx_vlm.utils import load_model
 
@@ -671,7 +687,7 @@ def test_glm5_next_experts_round_trip(tmp_path, monkeypatch):
     oq.quantize_oq_streaming(
         str(source),
         str(out),
-        3.5,
+        level,
         hadamard=True,
         imatrix_num_samples=2,
         imatrix_seq_length=6,
@@ -686,6 +702,8 @@ def test_glm5_next_experts_round_trip(tmp_path, monkeypatch):
     }
     # TP2 splits the down projection's 256 inputs: 128-wide blocks.
     assert {e["block"] for p, e in entries.items() if p.endswith("down_proj")} == {128}
+    want_group = fmt.AFFINE_GROUP_SIZE if level >= fmt.AFFINE_LEVEL else None
+    assert {e.get("group_size") for e in entries.values()} == {want_group}
 
     twin = tmp_path / "twin"
     twin.mkdir()
@@ -694,13 +712,23 @@ def test_glm5_next_experts_round_trip(tmp_path, monkeypatch):
         weights.update(mx.load(str(f)))
     for path, e in entries.items():
         signs = weights.pop(f"{path}.oqh_signs").reshape(-1).astype(mx.float32)
-        w = quantize.dequantize(
-            weights[f"{path}.weight"],
-            weights.pop(f"{path}.rscale"),
-            e["bits"],
-            signs,
-            e["block"],
-        )
+        if "group_size" in e:
+            w = quantize.dequantize_affine(
+                weights[f"{path}.weight"],
+                weights.pop(f"{path}.oqh_scales"),
+                weights.pop(f"{path}.oqh_biases"),
+                e["bits"],
+                signs,
+                e["block"],
+            )
+        else:
+            w = quantize.dequantize(
+                weights[f"{path}.weight"],
+                weights.pop(f"{path}.rscale"),
+                e["bits"],
+                signs,
+                e["block"],
+            )
         weights[f"{path}.weight"] = w.astype(mx.bfloat16)
     mx.save_safetensors(str(twin / "model.safetensors"), weights)
     del config[fmt.CONFIG_KEY]
@@ -726,7 +754,8 @@ def test_glm5_next_experts_round_trip(tmp_path, monkeypatch):
         assert mx.array_equal(rows[:, i : i + 1], one)
 
 
-def test_glm5_next_fused_decode_kernels_read_oqh_experts():
+@pytest.mark.parametrize("group_size", [None, 128], ids=["row", "group"])
+def test_glm5_next_fused_decode_kernels_read_oqh_experts(group_size):
     from omlx.oqh import runtime
     from omlx.patches import mlx_vlm_glm5_next_compat
     from tests.test_mlx_vlm_glm5_next_compat import _tiny_config
@@ -744,9 +773,9 @@ def test_glm5_next_fused_decode_kernels_read_oqh_experts():
     text.num_experts_per_tok = 2
     text.swiglu_limit = 10.0
     moe = language.Glm5NextMoE(text)
-    moe.switch_mlp.gate_proj = _switch(64, 512, 512, "in", 1)
-    moe.switch_mlp.up_proj = _switch(64, 512, 512, "in", 2)
-    moe.switch_mlp.down_proj = _switch(64, 512, 512, "down", 3)
+    moe.switch_mlp.gate_proj = _switch(64, 512, 512, "in", 1, group_size)
+    moe.switch_mlp.up_proj = _switch(64, 512, 512, "in", 2, group_size)
+    moe.switch_mlp.down_proj = _switch(64, 512, 512, "down", 3, group_size)
     moe.shared_experts.set_dtype(mx.bfloat16)
     nn.quantize(moe.shared_experts, group_size=64, bits=4)
     moe.gate.weight = mx.random.normal(moe.gate.weight.shape)

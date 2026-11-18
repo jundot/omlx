@@ -117,7 +117,8 @@ QWEN = Scheme(_QWEN_ROLES, tensor_parallel=True, group_scales=True)
 # GDN kernels read affine weights. It does not run tensor parallel.
 QWEN4_EXP = Scheme(_ROUTED_ROLES, tensor_parallel=False, group_scales=True)
 # GLM-5.3 keeps its trunk affine for the same reason, and runs tensor parallel.
-GLM5_NEXT = Scheme(_ROUTED_ROLES, tensor_parallel=True)
+# Its fused decode kernels read both row and group scales.
+GLM5_NEXT = Scheme(_ROUTED_ROLES, tensor_parallel=True, group_scales=True)
 # DeepSeek V4.1 likewise: its trunk, Engram tables and shared expert keep
 # their oQ formats. oQ4 keeps the source FP4 experts, so oQh is for lower levels.
 DEEPSEEK_V41 = Scheme(_V41_ROUTED_ROLES, tensor_parallel=True, max_level=4)

@@ -537,12 +537,18 @@ _GATE_UP_SOURCE = r"""
     }
 #else
     constexpr int G = K / RGS;          // groups per row
+#if ROUTED_ROT
+    // Group-scale oQh experts: affine codes on the rotated input.
+    const device T* xa = x_rot + token * K;
+#else
+    const device T* xa = xr;
+#endif
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
         (const device uint8_t*)gate_w + row0 * WB, gate_s + row0 * G,
-        gate_b + row0 * G, xr, simd_lid, g_res);
+        gate_b + row0 * G, xa, simd_lid, g_res);
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
         (const device uint8_t*)up_w + urow0 * WB, up_s + urow0 * G,
-        up_b + urow0 * G, xr, simd_lid, u_res);
+        up_b + urow0 * G, xa, simd_lid, u_res);
 #endif
   } else {
 #if HAS_SHARED
@@ -682,9 +688,15 @@ _DOWN_SOURCE = r"""
     }
 #else
     constexpr int G = K / RGS;
+#if ROUTED_ROT
+    // Group-scale oQh experts read act_rot like the row-scale ones.
+    const device T* xa = act_rot + (size_t(token) * TOPK + r) * K;
+#else
+    const device T* xa = act + (size_t(token) * RT + r) * K;
+#endif
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
         (const device uint8_t*)down_w + row0 * WB, down_s + row0 * G,
-        down_b + row0 * G, act + (size_t(token) * RT + r) * K, simd_lid, res);
+        down_b + row0 * G, xa, simd_lid, res);
 #endif
     const float score = scores[token * TOPK + r];
     for (int row = 0; row < RPS; row++) {
@@ -765,21 +777,21 @@ def _gate_up_kernel(
     shared_wide: bool = False,
     slot_major: bool = False,
     select: bool = False,
-    oqh: bool = False,
+    oqh: Optional[str] = None,
 ):
+    """``oqh``: None for affine experts, "rows" or "groups" for oQh experts."""
     routes = ["sel_sig", "sel_biased", "sel_scaling"] if select else ["indices"]
-    if oqh:
+    if oqh == "rows":
         routed = ["gate_w", "gate_rs", "up_w", "up_rs"]
-        inputs = ["x", "x_rot"] + routes + ["limit"] + routed
     else:
         routed = ["gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
-        inputs = ["x"] + routes + ["limit"] + routed
+    inputs = ["x"] + (["x_rot"] if oqh else []) + routes + ["limit"] + routed
     if has_shared or shared_wide:
         inputs += ["sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"]
     suffix = "_widesh" if shared_wide else ("_shared" if has_shared else "")
     suffix += "_sm" if slot_major else ""
     suffix += "_select" if select else ""
-    suffix += "_oqh" if oqh else ""
+    suffix += f"_oqh_{oqh}" if oqh else ""
     outputs = ["out", "shared_out"] if shared_wide else ["out"]
     if select:
         outputs += ["sel_indices", "sel_scores"]
@@ -794,7 +806,8 @@ def _gate_up_kernel(
             SHARED_WIDE=int(shared_wide),
             SLOT_MAJOR=int(slot_major),
             SELECT=int(select),
-            ROUTED_OQH=int(oqh),
+            ROUTED_OQH=int(oqh == "rows"),
+            ROUTED_ROT=int(oqh == "groups"),
         ),
     )
 
@@ -805,12 +818,11 @@ def _down_kernel(
     add_shared_y: bool,
     slot_major: bool = False,
     shared_wide: bool = False,
-    oqh: bool = False,
+    oqh: Optional[str] = None,
 ):
-    if oqh:
-        inputs = ["act", "act_rot", "indices", "scores", "down_w", "down_rs"]
-    else:
-        inputs = ["act", "indices", "scores", "down_w", "down_s", "down_b"]
+    """``oqh``: None for affine experts, "rows" or "groups" for oQh experts."""
+    routed = ["down_w", "down_rs"] if oqh == "rows" else ["down_w", "down_s", "down_b"]
+    inputs = ["act"] + (["act_rot"] if oqh else []) + ["indices", "scores"] + routed
     if has_shared:
         inputs += ["sh_down_w", "sh_down_s", "sh_down_b"]
         if shared_wide:
@@ -821,7 +833,7 @@ def _down_kernel(
         "_shared" if has_shared else ("_add" if add_shared_y else "")
     )
     suffix += "_sm" if slot_major else ""
-    suffix += "_oqh" if oqh else ""
+    suffix += f"_oqh_{oqh}" if oqh else ""
     return mx.fast.metal_kernel(
         name=f"glm5_moe_down_combine{suffix}",
         input_names=inputs,
@@ -833,7 +845,8 @@ def _down_kernel(
             ADD_SHARED_Y=int(add_shared_y and not has_shared),
             SLOT_MAJOR=int(slot_major),
             SHARED_WIDE_DOWN=int(shared_wide),
-            ROUTED_OQH=int(oqh),
+            ROUTED_OQH=int(oqh == "rows"),
+            ROUTED_ROT=int(oqh == "groups"),
         ),
     )
 
@@ -865,6 +878,29 @@ def _affine_parts(layer):
     if biases is None or "bias" in layer:
         return None
     return layer["weight"], layer["scales"], biases, int(layer.bits), int(layer.group_size)
+
+
+def _oqh_group_parts(layer):
+    """(weight, scales, biases, bits, group_size) of oQh experts with group scales."""
+    if "oqh_scales" not in layer or "oqh_signs" not in layer:
+        return None
+    return (
+        layer["weight"],
+        layer["oqh_scales"],
+        layer["oqh_biases"],
+        int(layer.bits),
+        int(layer.group_size),
+    )
+
+
+_ROUTED_PARTS = {None: _affine_parts, "rows": _oqh_parts, "groups": _oqh_group_parts}
+
+
+def _oqh_mode(layer, rotated) -> Optional[str]:
+    """None for affine experts; for oQh ones (a rotated input) "rows" or "groups"."""
+    if rotated is None:
+        return None
+    return "rows" if "rscale" in layer else "groups"
 
 
 def moe_gate_up_swiglu(
@@ -899,7 +935,8 @@ def moe_gate_up_swiglu(
     ``moe_router`` + this kernel, or None when not covered.
 
     ``x_rot`` (x in the experts' oQh basis) means the routed experts are oQh:
-    they read it with their row scales, while the shared expert reads ``x``.
+    they read it with their row or group scales, while the shared expert
+    reads ``x``.
     """
     if select is not None:
         if shared_wide or x.ndim != 2 or x.shape[0] != 1:
@@ -911,17 +948,17 @@ def moe_gate_up_swiglu(
         if sig.dtype != mx.float32 or biased.dtype != mx.float32 or E_r > 1024:
             return None
         indices = mx.zeros((1, sel_topk), dtype=mx.uint32)  # shape only
-    oqh = x_rot is not None
+    oqh = _oqh_mode(routed_gate, x_rot)
     fused_gu = routed_up is None
     routed = (routed_gate,) if fused_gu else (routed_gate, routed_up)
-    parts = [(_oqh_parts if oqh else _affine_parts)(m) for m in routed]
+    parts = [_ROUTED_PARTS[oqh](m) for m in routed]
     if any(p is None for p in parts) or x.ndim != 2 or indices.ndim != 2:
         return None
     if fused_gu:
         parts = parts * 2
-    if oqh:
-        if x_rot.shape != x.shape or x_rot.dtype != x.dtype:
-            return None
+    if oqh and (x_rot.shape != x.shape or x_rot.dtype != x.dtype):
+        return None
+    if oqh == "rows":
         # Any group width that the row layout divides passes the shape check.
         (gw, gs, rbits), (uw, us, ubits) = parts
         gb = ub = None
@@ -951,15 +988,13 @@ def moe_gate_up_swiglu(
     else:
         routes = [indices]
     limits = [mx.array([limit], dtype=mx.float32)]
-    if oqh:
-        inputs = [x, x_rot] + routes + limits + [gw, gs, uw, us]
-    else:
-        inputs = [x] + routes + limits + [gw, gs, gb, uw, us, ub]
+    rows = [gw, gs, uw, us] if oqh == "rows" else [gw, gs, gb, uw, us, ub]
+    inputs = [x] + ([x_rot] if oqh else []) + routes + limits + rows
     template = [
         ("T", x.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
         ("RPS", rps), ("NSG", nsg), ("ESTRIDE", estride), ("UP_OFF", up_off),
     ]
-    if not oqh:
+    if oqh != "rows":
         template.append(("RGS", rgs))
     if select is not None:
         template += [("NE", E_r), ("SEL_NORM", int(bool(sel_norm) and sel_topk > 1))]
@@ -1048,11 +1083,11 @@ def moe_down_combine(
     ``act.dtype``. ``act_rot`` [T, TOPK, K] (the routed activations in the
     experts' oQh basis) means the routed experts are oQh.
     """
-    oqh = act_rot is not None
-    p = (_oqh_parts if oqh else _affine_parts)(routed_down)
+    oqh = _oqh_mode(routed_down, act_rot)
+    p = _ROUTED_PARTS[oqh](routed_down)
     if p is None or act.ndim != 3 or scores.dtype != mx.float32:
         return None
-    if oqh:
+    if oqh == "rows":
         dw, ds, rbits = p
         db, rgs = None, 128
     else:
@@ -1070,17 +1105,15 @@ def moe_down_combine(
         return None
     if not _qmv_fast_ok(rbits, rgs, N, K) or N % (rps * nsg):
         return None
-    if oqh:
-        if act_rot.shape != (T, topk, K) or act_rot.dtype != act.dtype:
-            return None
-        inputs = [act, act_rot, indices, scores, dw, ds]
-    else:
-        inputs = [act, indices, scores, dw, ds, db]
+    if oqh and (act_rot.shape != (T, topk, K) or act_rot.dtype != act.dtype):
+        return None
+    rows = [dw, ds] if oqh == "rows" else [dw, ds, db]
+    inputs = [act] + ([act_rot] if oqh else []) + [indices, scores] + rows
     template = [
         ("T", act.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
         ("RPS", rps), ("NSG", nsg),
     ]
-    if not oqh:
+    if oqh != "rows":
         template.append(("RGS", rgs))
     if has_shared:
         sp = _affine_parts(shared_down)
