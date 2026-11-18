@@ -1,27 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Defer the KV-bank realignment of a ragged MTP rollback.
 
-When the rows of a batch accept different draft counts, mlx-vlm's speculative
-rollback trims to the longest row and ``finalize()`` rolls every lagging row
-over the whole logical width so all rows end at ``_idx`` again. At long
-context that roll costs about 3.6 ms per full-attention layer and cycle
-(24.7K + 100.7K on an M5 Max), which a lone request never pays.
+When batch rows accept different draft counts, the stock rollback rolls every
+lagging row over the whole logical width so all rows end at ``_idx`` again.
+Here a rollback on a marked cache records a per-row *tail* instead: row ``r``
+keeps its keys in ``[left_padding[r], _idx - tail[r])`` and writes its next
+block at ``_idx - tail[r]``. Only the padded-row attention reads tails, so it
+marks the full-attention caches it serves.
 
-Here a ragged rollback inside an MTP transaction records a per-row *tail*
-instead: row ``r`` keeps its keys in ``[left_padding[r], _idx - tail[r])``
-and the next block of row ``r`` is written at ``_idx - tail[r]``, so each row
-stays contiguous and ``_idx`` still advances by exactly the block size (the
-transaction checks that). The bank is realigned (the same roll as before, all
-tails at once) only when a tail exceeds ``_MAX_TAIL`` or right before anything
-else touches the cache: ``filter``, ``extend``, ``merge``, ``extract``,
-``state`` and external reads of ``keys`` / ``values``. Everything outside the
-steady MTP loop therefore sees the stock layout.
-
-Only caches a Qwen3.5 forward has marked (full-attention caches seen by the
-padded-row attention hook) defer, because only that attention knows tails:
-while a cache has tails, every attention call on it goes per row over
-``[pad, _idx - tail)``. Installed by the padded-row attention patch, with
-no switch of its own.
+The bank is realigned (the stock roll, all tails at once) when a tail exceeds
+``_MAX_TAIL`` or before anything else touches the cache: ``filter``,
+``extend``, ``extract`` and outside reads of ``keys`` / ``values``.
 """
 
 from __future__ import annotations
@@ -31,14 +20,25 @@ import logging
 import threading
 
 import mlx.core as mx
+from mlx_lm.models.cache import BatchKVCache as LMBatchKVCache
+from mlx_vlm.models.cache import BatchKVCache
+from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+from mlx_vlm.speculative import cache_state
+
+from .vlm_batch_kv_capacity import (
+    _early_growth,
+    _roll_logical_prefix,
+    apply_batch_kv_capacity_patch,
+)
 
 logger = logging.getLogger(__name__)
 
 TAIL = "_omlx_tail"  # list[int] per live row
-MARK = "_omlx_tail_ok"  # set on full-attention caches of a Qwen3.5 forward
+MARK = "_omlx_tail_ok"
+REALIGN_ALL = "_omlx_realign_all"
 _PENDING = "_omlx_pending_tail"
-# Realign before any tail exceeds this, so every realignment shift stays
-# within the native in-place roll (16 columns) after one more verify block.
+# Realign once a tail exceeds this, so the realignment shift stays within the
+# native in-place roll (16 columns) after one more verify block.
 _MAX_TAIL = 8
 _state = threading.local()
 _PATCHED = False
@@ -51,46 +51,28 @@ def tails(cache):
 
 
 def realign(cache) -> None:
-    """Roll every row right by its tail (the stock realignment), clear tails.
-
-    The new banks and padding are built first and committed together; the
-    tail record is cleared only after that, so a failure leaves the cache
-    still described by its tails (fail closed).
-    """
-    t = cache.__dict__.get(TAIL)
+    """Roll every row right by its tail, as the stock finalize would have."""
+    t = cache.__dict__.pop(TAIL, None)
     if not t or not any(t):
-        cache.__dict__.pop(TAIL, None)
         return
-    from .vlm_batch_kv_capacity import _roll_logical_prefix
-
-    _state.internal = True
-    try:
-        cache._settle_extracts()
-        width = cache._logical_width()
-        spare = int(cache._keys.shape[0]) - len(t)
-        shifts = mx.array(list(t) + [0] * spare, dtype=cache.left_padding.dtype)
-        keys = _roll_logical_prefix(
-            cache._keys, shifts[:, None], width, axis=2, max_shift=max(t)
-        )
-        values = _roll_logical_prefix(
-            cache._values, shifts[:, None], width, axis=2, max_shift=max(t)
-        )
-        left = cache.left_padding + mx.array(list(t), dtype=cache.left_padding.dtype)
-        # Evaluate before committing, so a failing roll raises here with the
-        # tails still recorded. Realignment is rare (a tail above _MAX_TAIL or
-        # a foreign read), so the sync is cheap. Limit: a native in-place roll
-        # that fails midway on the GPU leaves the bank unrecoverable in any
-        # layout.
-        mx.eval(keys, values, left)
-        cache._keys, cache._values, cache.left_padding = keys, values, left
-        cache.__dict__.pop(TAIL, None)
-    finally:
-        _state.internal = False
+    cache._settle_extracts()
+    width = cache._logical_width()
+    spare = int(cache._keys.shape[0]) - len(t)
+    dtype = cache.left_padding.dtype
+    shifts = mx.array(t + [0] * spare, dtype=dtype)[:, None]
+    cache._keys = _roll_logical_prefix(
+        cache._keys, shifts, width, axis=2, max_shift=max(t)
+    )
+    cache._values = _roll_logical_prefix(
+        cache._values, shifts, width, axis=2, max_shift=max(t)
+    )
+    cache.left_padding = cache.left_padding + mx.array(t, dtype=dtype)
 
 
-def request_realign_all(cache) -> None:
-    """Ask the next ``_set_qwen3_5_decode_left_padding`` to realign every layer."""
-    cache.__dict__["_omlx_realign_all"] = True
+def realign_all(cache) -> None:
+    """Realign ``cache`` now and the other layers in the next ``set_pads``."""
+    realign(cache)
+    cache.__dict__[REALIGN_ALL] = True
 
 
 def _internal() -> bool:
@@ -99,13 +81,10 @@ def _internal() -> bool:
 
 @contextlib.contextmanager
 def verifying():
-    """Mark a speculative verify forward on this thread.
+    """Mark the batch-invariant verifier forward on this thread.
 
-    Only mlx-vlm's batch-invariant verifier routes every multi-token block
-    through the tail-aware attention seam; an ordinary model forward runs the
-    stock masked SDPA over the whole bank for any non-decode mask. So tails
-    may serve a multi-token forward only inside this context: an ordinary
-    2-9 token forward would read a lagging row's stale columns.
+    Only that verifier sends every multi-token block through the tail-aware
+    attention seam; an ordinary forward runs masked SDPA over the whole bank.
     """
     prev = getattr(_state, "verify", False)
     _state.verify = True
@@ -120,37 +99,16 @@ def in_verify() -> bool:
 
 
 def _mark_verifier() -> None:
-    """Run the Qwen3.5 batch-invariant verifier forward inside ``verifying``.
-
-    If the class is missing, nothing is marked and every multi-token forward
-    realigns first: correct, just without the deferral.
-    """
-    try:
-        from mlx_vlm.models.qwen3_5.speculative_verifier import (
-            Qwen3_5BatchInvariantForward as verifier,
-        )
-    except ImportError:
-        logger.warning(
-            "deferred realignment: verifier not found, verify forwards realign"
-        )
-        return
-    original = verifier._model
-    if getattr(original, "_omlx_verify_marked", False):
-        return
+    original = Qwen3_5BatchInvariantForward._model
 
     def _model(self, *args, **kwargs):
         with verifying():
             return original(self, *args, **kwargs)
 
-    _model._omlx_verify_marked = True
-    verifier._model = _model
+    Qwen3_5BatchInvariantForward._model = _model
 
 
 def _wrap_class(cls) -> None:
-    if getattr(cls, "_omlx_deferred_realign", False):
-        return
-    from . import vlm_batch_kv_capacity as cap
-
     keys_prop, values_prop = cls.keys, cls.values
     orig_prepare, orig_finalize = cls.prepare, cls.finalize
     orig_update = cls.update_and_fetch
@@ -191,8 +149,7 @@ def _wrap_class(cls) -> None:
         pending = self.__dict__.pop(_PENDING, None)
         if pending is None or self._right_padding is None or self._keys is None:
             return orig_finalize(self)
-        # The stock finalize: offset -= padding; roll; left_padding += padding.
-        # Keep the offsets (RoPE positions), record the tail, skip the roll.
+        # The stock finalize minus the roll: offsets (RoPE positions) still drop.
         self.offset = self.offset - self._right_padding
         self._right_padding = None
         prior = self.__dict__.get(TAIL) or [0] * len(pending)
@@ -214,7 +171,7 @@ def _wrap_class(cls) -> None:
             if self.__dict__.get("_extracts"):
                 self._settle_extracts()
             length = int(keys.shape[2])
-            if cap._early_growth["allowed"] and length < self.step:
+            if _early_growth["allowed"] and length < self.step:
                 self._grow_early(length)
             prev = self._idx
             width = self._logical_width()
@@ -258,29 +215,12 @@ def _wrap_class(cls) -> None:
 
         setattr(cls, name, foreign)
 
-    orig_merge = cls.__dict__["merge"].__func__
-
-    def merge(klass, caches):
-        for c in caches:
-            realign(c)
-        return orig_merge(klass, caches)
-
-    cls.merge = classmethod(merge)
-    cls._omlx_deferred_realign = True
-
 
 def apply_qwen35_deferred_realign_patch() -> bool:
     global _PATCHED
     if _PATCHED:
         return False
-    try:
-        from mlx_lm.models.cache import BatchKVCache as LMBatchKVCache
-        from mlx_vlm.models.cache import BatchKVCache
-        from mlx_vlm.speculative import cache_state
-
-        from .vlm_batch_kv_capacity import apply_batch_kv_capacity_patch
-    except ImportError:
-        return False
+    # Install the capacity methods first; installing them later replaces the wraps.
     apply_batch_kv_capacity_patch()
     for cls in (BatchKVCache, LMBatchKVCache):
         _wrap_class(cls)

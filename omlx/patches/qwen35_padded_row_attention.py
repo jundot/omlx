@@ -157,7 +157,7 @@ def _padded_causal_mask_shape(mask, batch: int, length: int, k_size: int) -> boo
 
 
 def _loop_causal(q, k, v, scale):
-    """Exact causal attention of a query block over one row, row by row."""
+    """Causal attention one query at a time, like the verifier's own fallback."""
     prefix = k.shape[2] - q.shape[2]
     return mx.concatenate(
         [
@@ -182,7 +182,6 @@ def _per_row(original, queries, keys, values, pads, scale, tails=None):
     """
     outputs = []
     for row, pad in enumerate(pads):
-        # A deferred-realignment tail ends the row before _idx.
         end = keys.shape[2] - (tails[row] if tails else 0)
         q = queries[row : row + 1]
         k = keys[row : row + 1, :, pad:end, :]
@@ -192,6 +191,7 @@ def _per_row(original, queries, keys, values, pads, scale, tails=None):
         else:
             out = original(q, k, v, cache=None, scale=scale, mask="causal")
             if out is None:
+                # Rows with tails have no batched fallback.
                 if not tails:
                     return None
                 out = _loop_causal(q, k, v, scale)
@@ -216,26 +216,22 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
         return False
 
     def attention_mask(h, cache):
-        t = dr.tails(cache) if cache is not None else None
+        t = dr.tails(cache)
         if t and (
             h.shape[1] > _MAX_VERIFY_WIDTH
             or h.shape[0] != len(t)
             or (h.shape[1] > 1 and not dr.in_verify())
         ):
-            # Not a block the per-row tail path serves (too wide, a different
-            # batch, or a multi-token forward outside the speculative verifier,
-            # which would take the stock masked SDPA): realign this cache now
-            # (the mask is built from its padding) and every other layer in
-            # set_pads, not just the layer the mask is built from.
-            dr.realign(cache)
-            dr.request_realign_all(cache)
+            # Only decode and verifier blocks of this batch know tails. An
+            # ordinary multi-token forward takes masked SDPA over the whole bank.
+            dr.realign_all(cache)
             t = None
         mask = original_mask(h, cache)
         if cache is not None and hasattr(cache, _ROWS_ATTR):
             delattr(cache, _ROWS_ATTR)
         length = h.shape[1]
         if t and length == 1:
-            # Rows end before _idx: every layer must take the per-row seam.
+            # Rows end before _idx, so every layer must take the per-row seam.
             cache._qwen3_5_decode_left_padding = [
                 int(p) for p in cache.left_padding.tolist()
             ]
@@ -257,16 +253,10 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
             pads = tuple(int(p) for p in cache.left_padding.tolist())
             if same.item() and len(pads) == h.shape[0] and (t or max(pads) > 0):
                 setattr(cache, _ROWS_ATTR, (pads, cache._idx, length, mask.shape))
-            elif t:
-                # The tail path drops the mask, which is only valid for the
-                # padded causal mask: otherwise realign everything and serve
-                # this forward through the stock masked path.
-                dr.realign(cache)
-                dr.request_realign_all(cache)
-                return original_mask(h, cache)
-        elif t and length > 1:
-            dr.realign(cache)
-            dr.request_realign_all(cache)
+                return mask
+        if t and length > 1:
+            # Any other mask or cache needs the stock layout.
+            dr.realign_all(cache)
             return original_mask(h, cache)
         return mask
 
@@ -275,12 +265,12 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
         if caches is None:
             return
         if any(
-            entry is not None and entry.__dict__.pop("_omlx_realign_all", False)
+            entry.__dict__.pop(dr.REALIGN_ALL, False)
             for entry in caches
             if hasattr(entry, "__dict__")
         ):
-            for layer, entry in zip(layers, caches):
-                if not layer.is_linear and entry is not None and dr.tails(entry):
+            for entry in caches:
+                if dr.tails(entry):
                     dr.realign(entry)
         rows = None
         for layer, entry in zip(layers, caches):
@@ -291,8 +281,7 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
             if layer.is_linear or entry is None:
                 continue
             if _plain_padded_cache(entry):
-                # Only caches this attention serves may defer realignment.
-                entry.__dict__["_omlx_tail_ok"] = True
+                entry.__dict__[dr.MARK] = True
             if rows is None:
                 if hasattr(entry, _ROWS_ATTR):
                     delattr(entry, _ROWS_ATTR)
@@ -300,11 +289,9 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
                 setattr(entry, _ROWS_ATTR, rows)
 
     def attention(queries, keys, values, *, cache, scale, mask):
-        t = dr.tails(cache) if cache is not None else None
+        t = dr.tails(cache)
         if t is not None:
-            # Rows end at _idx - tail: no batched path knows that, so always
-            # per row (decode pads from the hook, verify pads from the stash
-            # or the cache).
+            # No batched path knows that rows end at _idx - tail.
             rows = getattr(cache, _ROWS_ATTR, None)
             if queries.shape[2] == 1:
                 pads = getattr(cache, "_qwen3_5_decode_left_padding", None)
@@ -341,9 +328,7 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
     q35._set_qwen3_5_decode_left_padding = set_pads
     _PATCHED = True
     logger.info("qwen3_5 padded-row attention patch applied")
-    # Ragged MTP rollbacks on the caches this attention serves keep per-row
-    # tails instead of rolling. Without it the attention above still works:
-    # no cache ever gets a tail.
+    # Without the deferral no cache gets a tail, and the attention above still works.
     try:
         dr.apply_qwen35_deferred_realign_patch()
     except Exception:
