@@ -13,7 +13,7 @@ import inspect
 import io
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -70,6 +70,33 @@ class EmbeddingOutput:
 
     dimensions: int = 0
     """Dimension of each embedding vector."""
+
+
+@dataclass
+class TokenEmbeddingOutput:
+    """Per-token (late-interaction / MaxSim) output for explicit token ids.
+
+    One entry per input sequence: the final hidden state of every token, with
+    padding positions already dropped, so ``len(token_embeddings[i])`` equals
+    ``len(ids_batch[i])`` exactly.
+
+    ``non_finite_items`` holds the request-level indices (in ``ids_batch``
+    order) of sequences with a NaN/Inf token vector. When it is not empty no
+    vectors are returned (``token_embeddings == []``) and the caller must
+    reject the whole request rather than serialize corrupt data.
+    """
+
+    token_embeddings: List[List[List[float]]]
+    """Per input sequence, one vector per token id."""
+
+    total_tokens: int
+    """Total number of tokens returned (sum of the sequence lengths)."""
+
+    dimensions: int = 0
+    """Dimension of each token vector."""
+
+    non_finite_items: List[int] = field(default_factory=list)
+    """Request-level indices of sequences holding a NaN/Inf token vector."""
 
 
 class _ChatTemplateEmbeddingInputs:
@@ -763,6 +790,39 @@ class MLXEmbeddingModel:
 
         return _DEFAULT_EMBEDDING_MAX_LENGTH
 
+    def _resolve_vocab_size(self) -> Optional[int]:
+        """Resolve model vocabulary size from model config or its tokenizer."""
+        from ..utils.tokenizer import resolve_vocab_size
+
+        vs = resolve_vocab_size(self.model)
+        if vs is not None:
+            return vs
+
+        # Composite/VLM wrappers keep the text tokenizer behind the processor;
+        # fall back to its declared size or its length.
+        for obj in (
+            getattr(self, "processor", None),
+            getattr(getattr(self, "processor", None), "tokenizer", None),
+            getattr(getattr(self, "processor", None), "_tokenizer", None),
+        ):
+            if obj is None:
+                continue
+            vocab_size = getattr(obj, "vocab_size", None)
+            if (
+                isinstance(vocab_size, int)
+                and not isinstance(vocab_size, bool)
+                and vocab_size > 0
+            ):
+                return vocab_size
+            try:
+                length = len(obj)
+            except Exception:
+                continue
+            if isinstance(length, int) and length > 0:
+                return length
+
+        return None
+
     def _prepare_embedding_inputs(
         self,
         processor,
@@ -1197,6 +1257,156 @@ class MLXEmbeddingModel:
                 embeddings_array = self._extract_embeddings_array(outputs, eager_mask)
 
         return embeddings_array, total_tokens
+
+    def embed_token_ids(
+        self,
+        ids_batch: List[List[int]],
+        max_length: int | None = None,
+    ) -> TokenEmbeddingOutput:
+        """Per-token vectors for EXACT token ids (late interaction / MaxSim).
+
+        Unlike :meth:`embed`, the caller owns the token window: the ids are used
+        verbatim, so the returned rows line up one-to-one with the text window
+        the pooled ``sentence_embedding`` was computed over (head truncation and
+        any appended special token are the caller's). This is the tensor the
+        pinned ONNX export exposes as ``token_embeddings`` — the final hidden
+        state, before pooling and before L2 normalization — so a caller that
+        needs the ColBERT/MaxSim convention normalizes the rows itself.
+
+        The batch is split on ``ENCODER_BATCH_TOKEN_BUDGET`` like the pooled
+        path, right-padded to the longest sequence in each sub-batch, and each
+        row is sliced back to its own length with the attention mask, so
+        padding never reaches a returned vector (a causal model's real tokens
+        all precede the pads). Non-finite rows are reported through
+        ``non_finite_items`` instead of being returned as vectors.
+        ``mx.compile`` is deliberately not used here: a compiled primitive
+        returns the pooled array only.
+
+        Args:
+            ids_batch: one list of token ids per input sequence.
+            max_length: Maximum token length for each sequence. A longer
+                sequence is rejected, never truncated. The effective limit is
+                the smaller of this value and the model's own context bound.
+
+        Returns:
+            TokenEmbeddingOutput with ragged per-token vectors.
+        """
+        if not self._loaded:
+            self.load()
+
+        sequences = [list(ids) for ids in ids_batch]
+        if not sequences or any(not ids for ids in sequences):
+            raise ValueError(
+                "token-id embeddings require at least one non-empty sequence"
+            )
+
+        resolved_max_length = self._resolve_max_length(max_length)
+        # An explicit max_length must never lift the model's own position
+        # bound: absolute position tables read out of range without an error
+        # and silently return zero rows, so clamp to the declared context.
+        model_bound = self._resolve_max_length(None)
+        position_limit = getattr(self.model, "max_input_length", None)
+        if isinstance(position_limit, int) and not isinstance(position_limit, bool):
+            model_bound = min(model_bound, position_limit)
+        resolved_max_length = min(resolved_max_length, model_bound)
+        vocab_size = self._resolve_vocab_size()
+
+        lengths: List[int] = []
+        for ids in sequences:
+            if len(ids) > resolved_max_length:
+                raise ValueError(
+                    f"Input sequence of length {len(ids)} exceeds maximum "
+                    f"context length of {resolved_max_length}"
+                )
+            lengths.append(len(ids))
+            for token_id in ids:
+                if token_id < 0:
+                    raise ValueError(
+                        f"token ids must be non-negative integers; got {token_id}"
+                    )
+                if token_id >= 2**31:
+                    raise ValueError(
+                        f"token id {token_id} exceeds 32-bit integer range"
+                    )
+                if vocab_size is not None and token_id >= vocab_size:
+                    raise ValueError(
+                        f"token id {token_id} exceeds model vocabulary size of {vocab_size}"
+                    )
+
+        # A forward's memory grows with padded tokens (batch x longest), so split
+        # on the encoder token budget like the pooled path instead of padding
+        # everything into one batch. Groups are by length; results are placed
+        # back by original index so caller order is preserved.
+        batches = [list(range(len(sequences)))]
+        if len(sequences) * max(lengths) > ENCODER_BATCH_TOKEN_BUDGET:
+            batches = token_budget_batches(lengths, ENCODER_BATCH_TOKEN_BUDGET)
+
+        token_embeddings: List[Optional[List[List[float]]]] = [None] * len(sequences)
+        non_finite_items: List[int] = []
+        total_tokens = 0
+        dimensions = 0
+        for batch in batches:
+            batch_ids = [sequences[i] for i in batch]
+            width = max(len(ids) for ids in batch_ids)
+            # The pad id is irrelevant: real tokens precede the pads, so a causal
+            # forward pass never lets a pad influence their hidden state, and pad
+            # positions are dropped before returning.
+            padded = [ids + [0] * (width - len(ids)) for ids in batch_ids]
+            masks = [[1] * len(ids) + [0] * (width - len(ids)) for ids in batch_ids]
+            attention_mask = mx.array(masks, dtype=mx.int32)
+            inputs = self._adapt_model_inputs_for_call(
+                {
+                    "input_ids": mx.array(padded, dtype=mx.int32),
+                    "attention_mask": attention_mask,
+                }
+            )
+
+            outputs = self.model(**inputs)
+            last_hidden = getattr(outputs, "last_hidden_state", None)
+            if last_hidden is None or last_hidden.ndim != 3:
+                raise ValueError(
+                    "Model output does not expose per-token features "
+                    "(last_hidden_state with shape (batch, seq_len, hidden)); "
+                    f"got {type(last_hidden).__name__}"
+                )
+
+            last_hidden = last_hidden.astype(mx.float32)
+            mx.eval(last_hidden)
+            dimensions = int(last_hidden.shape[-1])
+
+            # Row-level finiteness on the device, over the real token prefix
+            # only: padding is dropped before returning and a fully-masked row
+            # may legitimately be non-finite.
+            finite = mx.all(mx.isfinite(last_hidden), axis=-1)
+            real_tokens = mx.logical_or(finite, mx.equal(attention_mask, 0))
+            bad_rows = mx.any(mx.logical_not(real_tokens), axis=-1).tolist()
+            non_finite_items.extend(
+                batch[row] for row, is_bad in enumerate(bad_rows) if is_bad
+            )
+
+            for row, original in enumerate(batch):
+                token_embeddings[original] = last_hidden[
+                    row, : lengths[original], :
+                ].tolist()
+            total_tokens += sum(lengths[i] for i in batch)
+
+        if non_finite_items:
+            # Failure path: return no vectors and let the caller reject the
+            # request with the offending request-level indices.
+            return TokenEmbeddingOutput(
+                token_embeddings=[],
+                total_tokens=total_tokens,
+                dimensions=dimensions,
+                non_finite_items=sorted(non_finite_items),
+            )
+
+        return TokenEmbeddingOutput(
+            token_embeddings=[
+                vectors for vectors in token_embeddings if vectors is not None
+            ],
+            total_tokens=total_tokens,
+            dimensions=dimensions,
+        )
 
     def _count_tokens(
         self,
