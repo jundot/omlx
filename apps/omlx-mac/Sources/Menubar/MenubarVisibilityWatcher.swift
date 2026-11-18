@@ -36,6 +36,8 @@ final class MenubarVisibilityWatcher {
     /// timer in `_doFinishLaunching` — gives ControlCenter time to settle
     /// before we conclude the icon is hidden.
     func scheduleInitialCheck(after delay: TimeInterval = 3.0) {
+        // A probe in the XCTest host reads the item as hidden and opens the alert.
+        guard !MenubarController.isRunningUnitTests else { return }
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             self?.checkOnce()
