@@ -561,21 +561,6 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         }
     }
 
-    func testAliasPatchCanSetClearOrOmitAlias() throws {
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        let cases: [(String??, String)] = [
-            (nil, "{}"),
-            (.some(nil), #"{"model_alias":null}"#),
-            (.some("coding"), #"{"model_alias":"coding"}"#),
-        ]
-        for (value, expected) in cases {
-            var patch = ModelSettingsPatch()
-            patch.modelAlias = value
-            XCTAssertEqual(String(decoding: try encoder.encode(patch), as: UTF8.self), expected)
-        }
-    }
-
     func testSharedAneSettingsPreserveSplitAndExcludeOtherBackendOptions() {
         let vm = ModelSettingsScreenVM()
         vm.qwen35AnePrefillEnabled = true
@@ -669,24 +654,24 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNotEqual(vm.summary(for: .acceleration), summary)
     }
 
-    func testSavingEmptyAliasSendsAnExplicitClear() async {
+    func testSavingEmptyAliasAndModelTypeSendsExplicitClears() async {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [ModelSettingsURLProtocol.self]
+        configuration.protocolClasses = [RejectingSettingsURLProtocol.self]
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
         let client = OMLXClient(host: "127.0.0.1", port: 18160, session: session)
         let vm = ModelSettingsScreenVM()
-        vm.modelID = "clear-alias"
-        vm.alias = ""
+        vm.modelID = "clear"
 
         await vm.save(.alias, client: client)
+        await vm.save(.modelType, client: client)
 
         XCTAssertNil(vm.lastError)
     }
 
     func testRejectedAutoSaveRestoresTheStoredValues() async {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [ModelSettingsURLProtocol.self]
+        configuration.protocolClasses = [RejectingSettingsURLProtocol.self]
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
         let client = OMLXClient(host: "127.0.0.1", port: 18160, session: session)
@@ -962,8 +947,10 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     }
 }
 
-/// Checks alias clearing and rejects conflicting MTP + DFlash settings.
-private final class ModelSettingsURLProtocol: URLProtocol, @unchecked Sendable {
+/// Serves one model with Lightning MTP on and rejects its settings writes
+/// the way the server rejects an MTP + DFlash pair. Writes to "clear" must
+/// send JSON null.
+private final class RejectingSettingsURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -984,13 +971,12 @@ private final class ModelSettingsURLProtocol: URLProtocol, @unchecked Sendable {
                 body = try Data(contentsOf: URL(fileURLWithPath: #filePath)
                     .deletingLastPathComponent()
                     .appendingPathComponent("Fixtures/global-settings.json"))
-            case "/admin/api/models/clear-alias/settings":
-                let stream = try XCTUnwrap(request.httpBodyStream
-                    ?? request.httpBody.map { InputStream(data: $0) })
+            case "/admin/api/models/clear/settings":
+                let stream = try XCTUnwrap(request.httpBodyStream)
                 stream.open()
                 defer { stream.close() }
-                let settings = try JSONSerialization.jsonObject(with: stream) as? [String: Any]
-                XCTAssertTrue(settings?["model_alias"] is NSNull)
+                let settings = try XCTUnwrap(JSONSerialization.jsonObject(with: stream) as? [String: Any])
+                XCTAssertTrue(!settings.isEmpty && settings.values.allSatisfy { $0 is NSNull })
                 body = Data(#"{"status":"ok"}"#.utf8)
             case "/admin/api/models/m/settings":
                 status = 400
