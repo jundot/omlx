@@ -876,6 +876,47 @@ def test_deepseek_v41_oqh_experts_export_and_load(tmp_path, monkeypatch):
         reference.close()
 
 
+def test_deepseek_v41_oqh_stages_match_one_forward(tmp_path, monkeypatch):
+    """Rows carried across stages give the experts of one forward over all layers."""
+    from omlx import oq
+    from omlx.patches.deepseek_v41.oqh import write_experts
+    from tests.test_deepseek_v41 import write_checkpoint
+
+    source, _ = write_checkpoint(tmp_path, vision=False, dim=256, moe_inter_dim=256)
+    tokens = mx.array([[3, 4, 5, 6, 7, 8, 9, 10], [9, 8, 7, 6, 5, 4, 3, 11]])
+    monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+    widths = {
+        f"language_model.layers.{i}.ffn.experts.{part}": 3
+        for i in range(5)
+        for part in ("w1", "w3", "w2")
+    }
+
+    class Writer:
+        def __init__(self):
+            self.values = {}
+
+        def add(self, values):
+            self.values.update(values)
+
+    outputs = []
+    # One layer per stage carries every row's stream four times; five per stage
+    # is a single forward.
+    for per_pass in (1, 5):
+        writer = Writer()
+        write_experts(
+            source,
+            writer,
+            widths,
+            num_samples=2,
+            seq_length=8,
+            layers_per_pass=per_pass,
+        )
+        outputs.append(writer.values)
+    assert outputs[0].keys() == outputs[1].keys()
+    for key, value in outputs[0].items():
+        assert mx.array_equal(value, outputs[1][key]), key
+
+
 def test_deepseek_v41_tensor_split_keeps_oqh_blocks():
     from omlx.patches.deepseek_v41.loading import tensor_slice
 

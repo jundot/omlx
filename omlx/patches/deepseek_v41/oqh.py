@@ -2,14 +2,14 @@
 """oQh routed experts of a DeepSeek V4.1 export.
 
 The main export leaves out the experts the oQh plan covers. This pass loads the
-source model, runs forwards over the calibration text a few layers at a time
-(each stops at the next block) while the oQe Gram collector records each routed
-expert's inputs (w3 shares w1's), quantizes those experts against their Grams
-and adds them to the export, one module per writer call so each stays in one
-shard.
+source model and runs the calibration text through it a few layers at a time,
+as pipeline stages: each row's stream (h, pre and the shared cross-layer state)
+carries over to the next group, so no layer runs twice. The oQe Gram collector
+records each routed expert's inputs (w3 shares w1's) while its group runs; the
+pass quantizes those experts against their Grams and adds them to the export,
+one module per writer call so each stays in one shard.
 """
 
-import contextlib
 import logging
 
 import mlx.core as mx
@@ -23,21 +23,6 @@ from .quantization import QuantizedProjection
 logger = logging.getLogger(__name__)
 
 _EXPERTS = ("w1", "w3", "w2")
-
-
-class _GroupDoneError(Exception):
-    """Raised by the first block after the layers a pass collects."""
-
-
-def _raise_stop(self, *args, **kwargs):
-    raise _GroupDoneError
-
-
-def _stop_before(block) -> type:
-    """Make block raise _GroupDoneError when called; returns its class to restore."""
-    base = type(block)
-    block.__class__ = type(f"Stop{base.__name__}", (base,), {"__call__": _raise_stop})
-    return base
 
 
 def plan_widths(inventory, allocation, layer_scores) -> dict[str, int]:
@@ -134,32 +119,40 @@ def write_experts(
         if tokens is None or len(tokens) == 0:
             raise ValueError("V4.1 oQh requires nonempty calibration data")
         core = model.language_model
+        stages = (core.start_idx, core.end_idx)
+        # Each row's stream after the layers run so far, the next stage's input.
+        streams = [None] * len(tokens)
+        stage_start = 0
         for start in range(0, len(layers), layers_per_pass):
             group = layers[start : start + layers_per_pass]
             collectors = {}
-            # The collector evaluates what it records, so the forward can stop
-            # at the block after the group.
-            nxt = group[-1] + 1
-            stop = core.layers[nxt] if nxt < len(core.layers) else None
-            restore = None if stop is None else _stop_before(stop)
+            core.start_idx, core.end_idx = stage_start, group[-1] + 1
             try:
                 for i in group:
                     collector = oq._OQGramCollector()
                     prefix = f"language_model.layers.{i}.ffn.experts."
                     collector.install(core.layers[i].ffn.experts, name_prefix=prefix)
                     collectors[i] = collector
-                for row in tokens:
+                for k, row in enumerate(tokens):
                     for collector in collectors.values():
                         collector.begin_forward()
-                    cache = core.make_cache()
-                    with contextlib.suppress(_GroupDoneError):
-                        mx.eval(core(row[None], cache=cache)[:, -1])
-                    del cache
+                    capture = {}
+                    kwargs = {"skip_logits": True, "_stage_capture": capture}
+                    if streams[k] is not None:
+                        kwargs["_stage_input"] = streams[k]
+                    mx.eval(core(row[None], cache=core.make_cache(), **kwargs))
+                    shared = capture["shared"].values()
+                    mx.eval(
+                        capture["h"],
+                        capture["pre"],
+                        [v for v in shared if isinstance(v, mx.array)],
+                    )
+                    streams[k] = capture
             finally:
-                if restore is not None:
-                    stop.__class__ = restore
+                core.start_idx, core.end_idx = stages
                 for i, collector in collectors.items():
                     collector.restore(core.layers[i].ffn.experts)
+            stage_start = group[-1] + 1
             for i in group:
                 collector = collectors[i]
                 experts = core.layers[i].ffn.experts
