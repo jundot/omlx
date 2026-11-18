@@ -419,24 +419,11 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     try:
         decoded = json.loads(val, strict=False)
     except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
-        decoded = None
+        pass
     else:
+        # Some models wrap the whole fragment list in a JSON string (#5336).
         if is_container and isinstance(decoded, str):
-            # Some models wrap a whole array in a JSON string, so the per-item
-            # fragments arrive double-encoded ("[\"a\"]\n[\"b\"]").  The wire
-            # type is still an array; merge the inner fragments instead of
-            # handing the caller a string (#5336).
-            merged = _merge_json_fragments(decoded, spec)
-            if merged is not None:
-                logger.warning(
-                    "Merged %d JSON-string-encoded fragments for parameter %r "
-                    "of tool %r (declared type %r)",
-                    len(merged),
-                    key,
-                    func_name,
-                    ptype,
-                )
-                return merged
+            decoded = _merge_json_fragments(decoded, spec) or decoded
         return decoded
     try:
         literal = ast.literal_eval(val)
@@ -457,21 +444,9 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             )
             return merged
         repaired = _repair_json_value(val)
+        if isinstance(repaired, str):
+            repaired = _merge_json_fragments(repaired, spec) or repaired
         if repaired is not None:
-            if isinstance(repaired, str):
-                # The repair closed a truncated string that itself holds the
-                # fragments, so the same double-encoding applies (#5336).
-                merged = _merge_json_fragments(repaired, spec)
-                if merged is not None:
-                    logger.warning(
-                        "Merged %d repaired JSON-string-encoded fragments for "
-                        "parameter %r of tool %r (declared type %r)",
-                        len(merged),
-                        key,
-                        func_name,
-                        ptype,
-                    )
-                    return merged
             logger.warning(
                 "Repaired malformed JSON for parameter %r of tool %r "
                 "(declared type %r)",
@@ -2202,9 +2177,6 @@ def _parse_tool_calls_impl(
                                 untyped_string = "type" not in spec and isinstance(
                                     value, str
                                 )
-                                # A declared container that arrives as a string
-                                # needs the same fragment merge the XML parsers
-                                # apply (#5336).
                                 container_mismatch = _is_container_type(
                                     spec.get("type")
                                 ) and isinstance(value, str)
