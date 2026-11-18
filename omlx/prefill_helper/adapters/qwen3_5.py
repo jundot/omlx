@@ -27,7 +27,6 @@ import numpy as np
 from mlx.utils import tree_flatten
 from mlx_vlm.models.cache import ArraysCache
 
-from ...oqh.format import is_oqh_config
 from ...patches import qwen38_modelopt_mixed
 from ...patches.mlx_lm_mtp import prompt_priming
 from ...patches.qwen35_fa256_attention import apply_qwen35_fa256_attention_patch
@@ -65,20 +64,16 @@ def _yarn(lm: Any) -> bool:
 
 def _custom_loader(path: str | Path | None) -> bool:
     """Whether the server loads this checkpoint with a loader of its own
-    (ParoQuant, ModelOpt mixed) or modules of its own (oQh) instead of mlx-vlm's."""
+    (ParoQuant, ModelOpt mixed) instead of mlx-vlm's."""
     try:
         config = json.loads((Path(path).expanduser() / "config.json").read_text())
     except (OSError, TypeError, ValueError):
         return False
     quant = config.get("quantization_config")
     method = str(quant.get("quant_method") or "") if isinstance(quant, dict) else ""
-    return (
-        method.lower() == "paroquant"
-        or (
-            method.lower() == "compressed-tensors"
-            and qwen38_modelopt_mixed.is_supported_config(config)
-        )
-        or is_oqh_config(config)
+    return method.lower() == "paroquant" or (
+        method.lower() == "compressed-tensors"
+        and qwen38_modelopt_mixed.is_supported_config(config)
     )
 
 
@@ -200,8 +195,8 @@ class Qwen35Adapter(StageAdapter):
     def load_first(self, path: str, k: int, a8_min_tokens: int | None = None) -> Any:
         if _custom_loader(path):
             raise ValueError(
-                "this checkpoint needs the server's own loader (ParoQuant, "
-                "ModelOpt mixed or oQh), which a prefill helper does not have"
+                "this checkpoint needs the server's own loader (ParoQuant or "
+                "ModelOpt mixed), which a prefill helper does not have"
             )
         maybe_apply_pre_load_patches(path, None, for_vlm=True)
         load_config = vlm_utils.load_config

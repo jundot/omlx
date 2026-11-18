@@ -87,6 +87,18 @@ def is_oqh_config(config: dict) -> bool:
     return CONFIG_KEY in config
 
 
+def checkpoint_version(model_path) -> int | None:
+    """The oQh format version of a checkpoint folder, None without oQh tensors."""
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(config, dict) or not is_oqh_config(config):
+        return None
+    block = config[CONFIG_KEY]
+    return int(block.get("version", 0)) if isinstance(block, dict) else 0
+
+
 def is_oqh_checkpoint(model_path) -> bool:
     try:
         config = json.loads((Path(model_path) / "config.json").read_text())

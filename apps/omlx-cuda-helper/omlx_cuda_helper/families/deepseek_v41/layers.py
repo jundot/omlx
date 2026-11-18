@@ -12,8 +12,9 @@ import logging
 
 import mlx.core as mx
 
-from ... import mx_linear
+from ... import mx_linear, oqh
 from ...tensors import unpack
+from ..qwen4_exp import kernels as expert_kernels
 from . import kernels, ops, quant
 from .config import Config, expert_bits
 
@@ -157,6 +158,13 @@ class ExpertBank:
         self.weight = weights[f"{name}.weight"]
         self.spec = config.quantized.get(name)
         self.quantize_input = False
+        # oQh: rotated codes; the rows it reads are rotated, never FP8.
+        self.rotation = None
+        found = oqh.load_bank(weights, name)
+        if found is not None:
+            self.weight, self.scales, self.biases, self.quant, self.rotation = found
+            self.bits = self.quant["bits"]
+            return
         if self.spec is None:
             return
         self.quantize_input = bool(self.spec.get("quantize_input", True))
@@ -187,8 +195,14 @@ class ExpertBank:
                 "needs 64-bit expert offsets"
             )
 
+    def bank(self) -> tuple:
+        """(weight, scales, biases, quantization) of an oQh bank."""
+        return self.weight, self.scales, self.biases, self.quant
+
     def __call__(self, x: mx.array, experts: mx.array) -> mx.array:
         """x [R, 1, in] through the expert of each row; ``experts`` ascends."""
+        if self.rotation is not None:
+            return oqh.bank_gather(x, self.bank(), experts)
         if self.spec is None:
             return x @ self.weight[experts].swapaxes(-1, -2)
         out = mx.gather_qmm(
@@ -334,6 +348,22 @@ class Block:
         self.experts = [
             ExpertBank(weights, f"{base}ffn.experts.{n}", c) for n in ("w1", "w3", "w2")
         ]
+        # oQh: w1 | w3 as one bank for the expert kernel; w1 and w3 view it.
+        self.oqh_pair = None
+        self.oqh_kernel = False
+        w1, w3, _ = self.experts
+        if w1.rotation is not None:
+            oqh.check_shared(w1, w3)
+            weight = mx.concatenate([w1.weight, w3.weight], axis=1)
+            scales = mx.concatenate([w1.scales, w3.scales], axis=1)
+            biases = None
+            if w1.biases is not None:
+                biases = mx.concatenate([w1.biases, w3.biases], axis=1)
+            self.oqh_pair = (weight, scales, biases, w1.quant)
+            inner = w1.weight.shape[1]
+            for bank, part in ((w1, slice(0, inner)), (w3, slice(inner, None))):
+                bank.weight, bank.scales = weight[:, part], scales[:, part]
+                bank.biases = None if biases is None else biases[:, part]
         # Set by check_kernels once the expert tile kernels reproduce gather_qmm;
         # "mx" for the block-scaled tiles.
         self.tiles: bool | str = False
@@ -512,6 +542,10 @@ class Block:
         order = mx.argsort(experts)
         experts, token = experts[order], order // k
         route_weights = weights.reshape(-1)[order]
+        if w1.rotation is not None:
+            return self._oqh_routed(flat, experts, token, route_weights), mx.argsort(
+                order
+            )
         if tiles == "mx":
             codes, scales = kernels.expert_gate_up_mx(
                 *(codes or kernels.fp8_codes(flat)),
@@ -543,11 +577,78 @@ class Block:
             routed = w2(y, experts)
         return routed, mx.argsort(order)
 
+    def _oqh_routed(self, flat, experts, token, route_weights):
+        """Routed rows [R, 1, D] of oQh banks, as the host computes them: rows
+        rotated, the activation times its route weight rounded to the
+        activation dtype, then rotated for w2."""
+        c = self.config
+        w1, w3, w2 = self.experts
+        rows = oqh.rotate(flat.astype(mx.bfloat16), *w1.rotation)
+        if self.oqh_kernel:
+            offsets = expert_kernels.expert_offsets(experts, w2.weight.shape[0])
+            act = expert_kernels.expert_gemm(
+                rows,
+                self.oqh_pair,
+                offsets,
+                token.astype(mx.uint32),
+                act=2 if c.swiglu_limit is None else 3,
+                limit=c.swiglu_limit,
+            )
+            hidden = oqh.scale_rotate(act, route_weights, *w2.rotation, mx.bfloat16)
+            return expert_kernels.expert_gemm(hidden, w2.bank(), offsets)[:, None]
+        routed_rows = rows[token][:, None]
+        y = _swiglu(
+            w1(routed_rows, experts),
+            w3(routed_rows, experts),
+            route_weights,
+            c.swiglu_limit,
+            False,
+        )
+        return w2(oqh.rotate(y.astype(mx.bfloat16), *w2.rotation), experts)
+
+    def _check_oqh(self) -> None:
+        """Take the expert kernel for oQh banks when it reproduces the banks
+        rebuilt dense on a sample of routes."""
+        c = self.config
+        _, _, w2 = self.experts
+        if not (
+            kernels.available()
+            and expert_kernels.expert_gemm_fits(self.oqh_pair, c.dim, True)
+            and expert_kernels.expert_gemm_fits(w2.bank(), c.moe_inter_dim, True)
+        ):
+            return
+        keys = mx.random.split(mx.random.key(5), 3)
+        flat = mx.random.normal((96, c.dim), key=keys[0]).astype(self.attn_norm.dtype)
+        shape = (96, c.n_activated_experts)
+        # The reference rebuilds the experts in use dense: keep them few.
+        count = min(c.n_routed_experts, 2 * c.n_activated_experts)
+        chosen = mx.random.randint(0, count, shape, key=keys[1])
+        weights = mx.random.uniform(0.1, 1.0, shape, key=keys[2])
+        want = self._routed(flat, flat, chosen, weights, False)[0]
+        self.oqh_kernel = True
+        try:
+            error = kernels.relative_error(
+                self._routed(flat, flat, chosen, weights, False)[0], want
+            )
+        except RuntimeError as failure:
+            error, self.oqh_kernel = float("inf"), False
+            logger.warning("DeepSeek V4.1 oQh expert kernel is off: %r", failure)
+        if not error <= _TILE_ERROR:
+            self.oqh_kernel = False
+            logger.warning(
+                "DeepSeek V4.1 oQh expert kernel is off: layer %d differs by %.2e",
+                self.layer,
+                error,
+            )
+
     def check_kernels(self) -> None:
         """Turn the expert tile kernels on when they reproduce gather_qmm on a
         sample of routes through this layer's banks; unpack an MXFP8 weight
         whose block-scaled matmul does not reproduce the unpacked product."""
         self._check_linears()
+        if self.oqh_pair is not None:
+            self._check_oqh()
+            return
         w1, w3, _ = self.experts
         if not (
             kernels.available()
