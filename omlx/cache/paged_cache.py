@@ -77,7 +77,6 @@ def resolve_block_extra_keys(
 
 
 # Tail index bounds. Entries are advisory and verified on every lookup.
-# Many conversations share one parent (the root or a common system prefix).
 _TAIL_INDEX_PER_PARENT = 32
 _TAIL_INDEX_MAX_PARENTS = 4096
 
