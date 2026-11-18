@@ -663,3 +663,19 @@ def test_bounded_prefill_peak_memory():
     temporary = mx.get_peak_memory() - baseline
     assert temporary < 600 * 1024**2, f"Prefill allocated {temporary / 1024**2:.1f} MiB"
     assert mx.all(mx.isfinite(output)).item()
+
+
+def test_batch_left_padding_is_read_from_the_device_once_per_assignment(monkeypatch):
+    reads = []
+    real_any = mx.any
+    monkeypatch.setattr(mx, "any", lambda *a, **k: reads.append(1) or real_any(*a, **k))
+    cache = BatchAffine8KVCache([0, 0])
+
+    for _ in range(3):
+        assert cache._attention_mask(None, 1, 16) is None
+    assert len(reads) == 1
+
+    cache.left_padding += mx.array([3, 0])
+    mask = cache._attention_mask(None, 1, 16)
+    assert len(reads) == 2
+    assert mask[:, 0, 0, :].tolist() == [[False] * 3 + [True] * 13, [True] * 16]
