@@ -158,8 +158,8 @@ def _throttle_ctx(
         _prefill_abort_margin=abort_margin,
         _prefill_headroom_safety=Scheduler._PREFILL_HEADROOM_SAFETY,
         _prefill_speed_priority=False,
-        # Dedupes the once-per-request INFO throttle notice.
-        _throttle_notified_requests=set(),
+        # Last throttled chunk size logged per request.
+        _throttled_chunk_sizes={},
         _prefill_transient_tracker=tracker,
         memory_monitor=monitor,
         _PREFILL_STEP_TIERS=Scheduler._PREFILL_STEP_TIERS,
@@ -224,7 +224,7 @@ def test_adaptive_throttle_probe_neither_pauses_nor_notifies():
     # A packed forward only asks whether its rows fit.
     assert _call(ns, 2048, probe=True) < 2048
     assert request.prefill_eviction_retries == 0
-    assert ns._throttle_notified_requests == set()
+    assert ns._throttled_chunk_sizes == {}
 
 
 def test_adaptive_throttle_requests_eviction_before_shrinking():
@@ -330,7 +330,7 @@ def test_throttle_emits_one_info_notice_per_request(caplog):
     The per-chunk shrink line is DEBUG, so a request running an order of
     magnitude slower used to leave no trace in a normal server log — the
     gap that made a measured 2.6x slowdown undiagnosable. One INFO line
-    per request, not per chunk: a 6k-token prompt floored at 32 tokens
+    per size, not per chunk: a 6k-token prompt floored at 32 tokens
     submits ~190 chunks.
     """
     hard = 40 * _GB
@@ -354,6 +354,34 @@ def test_throttle_emits_one_info_notice_per_request(caplog):
     assert "floor=32" in message
 
 
+def test_throttle_logs_each_chunk_size_change(caplog):
+    """After the first notice, every change of the throttled size and the
+    return to the requested size get their own INFO line, so the prefill
+    speed of a long request can be followed from the server log."""
+    hard = 40 * _GB
+    ns = _throttle_ctx(
+        current=hard + _GB, hard=hard, samples_bpt=1_000_000, min_chunk=32
+    )
+    sizes = []
+    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+        for current in (hard + _GB, hard + _GB, 35 * _GB, 35 * _GB, 10 * _GB):
+            ns._fake_current = current
+            sizes.append(_call(ns, 2048, kv_len=5000))
+
+    assert sizes[0] == sizes[1] == 32, sizes
+    assert 32 < sizes[2] == sizes[3] < 2048, sizes
+    assert sizes[4] == 2048, sizes
+    lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert [line.split(" for ")[0] for line in lines] == [
+        "Prefill throttled",
+        "Prefill chunk",
+        "Prefill unthrottled",
+    ], lines
+    assert f": 32 -> {sizes[2]} of 2048 requested" in lines[1], lines[1]
+    assert "chunk back to 2048" in lines[2], lines[2]
+    assert ns._throttled_chunk_sizes == {}
+
+
 def test_throttle_notice_repeats_for_a_new_request():
     """The dedupe is per request id, not process-wide."""
     hard = 40 * _GB
@@ -369,7 +397,7 @@ def test_throttle_notice_repeats_for_a_new_request():
             Scheduler._adaptive_chunk_size(
                 ns, 2048, request_id=rid, loop_label="test", kv_len=5000
             )
-    assert ns._throttle_notified_requests == {"r1", "r2"}
+    assert set(ns._throttled_chunk_sizes) == {"r1", "r2"}
 
 
 def test_throttle_predictor_anchors_on_recent_measurement():

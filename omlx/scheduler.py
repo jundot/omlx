@@ -1829,6 +1829,20 @@ _DECODE_ACTIVITY_TTL_S = 2.5
 _PACKED_PREFILL_MAX_ROWS = 4
 
 
+def _log_prefill_unthrottled(
+    request_id: str, chunk: int, current: int, target: int, kv_len: int
+) -> None:
+    logger.info(
+        "Prefill unthrottled for %s: chunk back to %d "
+        "(usage %.2fGB vs sizing target %.2fGB, kv_len=%d).",
+        request_id,
+        chunk,
+        current / 1024**3,
+        target / 1024**3,
+        kv_len,
+    )
+
+
 def _decode_share_for_floor(row_decode_tps: float | None) -> float:
     """Debt ratio that holds each running row at the rate floor.
 
@@ -2494,11 +2508,12 @@ class Scheduler:
         if config is not None and config.model_name:
             _model_label = config.model_name
         self._decode_activity_key: str = f"{_model_label}:{id(self):x}"
-        # Requests that already emitted the INFO throttle notice. The per-chunk
-        # shrink log is DEBUG, so a throttled prefill used to be silent at the
-        # default level even while it ran an order of magnitude slower; one
-        # line per request keeps that visible without a line per chunk.
-        self._throttle_notified_requests: set[str] = set()
+        # Last throttled chunk size logged per request. The per-chunk shrink
+        # log is DEBUG, so a throttled prefill used to be silent at the
+        # default level even while it ran an order of magnitude slower. An
+        # INFO line on each size change keeps the prefill speed traceable
+        # without a line per chunk while the size holds.
+        self._throttled_chunk_sizes: dict[str, int] = {}
         self._pending_prefill_eviction_request: PrefillEvictionRequest | None = None
         self._memory_admission_blocked_request_id: str | None = None
         self._memory_admission_blocked_since: float = 0.0
@@ -5588,6 +5603,10 @@ class Scheduler:
             # baseline (MoE prefill at tens of MB/token), the failure this
             # prevents.
             if current + per_token * requested <= target:
+                if not probe and self._throttled_chunk_sizes.pop(request_id, None):
+                    _log_prefill_unthrottled(
+                        request_id, requested, current, target, kv_len
+                    )
                 return requested
             maybe_raise_eviction = getattr(
                 self, "_raise_prefill_eviction_if_available", None
@@ -5652,12 +5671,27 @@ class Scheduler:
 
         n = self._snap_chunk_size(n, requested)
 
-        if (
-            n < requested
-            and not probe
-            and request_id not in self._throttle_notified_requests
-        ):
-            self._throttle_notified_requests.add(request_id)
+        previous = self._throttled_chunk_sizes.get(request_id)
+        if n < requested and not probe and previous is not None and n != previous:
+            self._throttled_chunk_sizes[request_id] = n
+            logger.info(
+                "Prefill chunk for %s: %d -> %d of %d requested "
+                "(usage %.2fGB vs sizing target %.2fGB, per_token=%.1fKB, "
+                "kv_len=%d).",
+                request_id,
+                previous,
+                n,
+                requested,
+                current / 1024**3,
+                target / 1024**3,
+                per_token / 1024,
+                kv_len,
+            )
+        elif n >= requested and not probe and previous is not None:
+            del self._throttled_chunk_sizes[request_id]
+            _log_prefill_unthrottled(request_id, requested, current, target, kv_len)
+        elif n < requested and not probe and previous is None:
+            self._throttled_chunk_sizes[request_id] = n
             binding_str, advice = describe_ceiling_binding(
                 static=self._memory_static_ceiling_bytes,
                 dynamic=self._memory_dynamic_ceiling_bytes,
@@ -6016,7 +6050,7 @@ class Scheduler:
             drafter.release_request(request_id)
         self._cache_freshness_waits.pop(request_id, None)
         self._prefix_cache_prepared.discard(request_id)
-        self._throttle_notified_requests.discard(request_id)
+        self._throttled_chunk_sizes.pop(request_id, None)
         self._clear_memory_admission_blocker(request_id)
         self._clear_store_cache_admission_blocker(request_id)
 
@@ -14711,7 +14745,7 @@ class Scheduler:
             # _clear_request_admission_bookkeeping only runs on abort/failure
             # paths, so a request that was throttled and then completed
             # normally would keep its id here forever.
-            self._throttle_notified_requests.discard(rid)
+            self._throttled_chunk_sizes.pop(rid, None)
 
         for request_id in finished_ids:
             _mtp_priming.release_request(self.model, request_id)
