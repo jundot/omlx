@@ -339,6 +339,9 @@ def wrap_spark_dspark(
         drafter.depth = max(1, min(drafter.depth, int(depth)))
     drafter.query_windows = False
     drafter.context_copy = True
+    # Instance flag: only this drafter routes through ``_spark_draft_batched``;
+    # every other DFlashDrafter keeps the stock ``_draft_batched``.
+    drafter._omlx_spark_drafter = True
     return drafter
 
 
@@ -542,42 +545,6 @@ def apply_spark_patch() -> bool:
     return _patch_spark2_5_capture()
 
 
-def _rope_positions(model, x, start_positions):
-    """Per-position RoPE; mlx.fast.rope accepts only a scalar offset."""
-    ndim = x.ndim
-    head_major = ndim == 4
-    seq = x.shape[2] if head_major else x.shape[1]
-    if not hasattr(start_positions, "ndim") or start_positions.ndim == 0:
-        start = int(start_positions)
-        if seq == 1:
-            return model.rope(x, offset=start)
-        if head_major:
-            parts = []
-            for j in range(seq):
-                parts.append(model.rope(x[:, :, j : j + 1, :], offset=start + j))
-            return mx.concatenate(parts, axis=2)
-        parts = []
-        for j in range(seq):
-            parts.append(model.rope(x[:, j : j + 1], offset=start + j))
-        return mx.concatenate(parts, axis=1)
-    batch = x.shape[0]
-    starts = np.asarray(start_positions).tolist()
-    rows = []
-    for b in range(batch):
-        s = int(starts[b])
-        if seq == 1:
-            rows.append(model.rope(x[b : b + 1], offset=s))
-        else:
-            parts = []
-            for j in range(seq):
-                if head_major:
-                    parts.append(model.rope(x[b : b + 1, :, j : j + 1, :], offset=s + j))
-                else:
-                    parts.append(model.rope(x[b : b + 1, j : j + 1], offset=s + j))
-            rows.append(mx.concatenate(parts, axis=2 if head_major else 1))
-    return mx.concatenate(rows, axis=0)
-
-
 def _spark_draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
         """One draft forward for every row (Spark DSpark enhanced)."""
         model = self.model
@@ -766,7 +733,7 @@ def _spark_draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
             ).transpose(0, 2, 1, 3)
             if self.value_scale is not None:
                 ctx_values = ctx_values * self.value_scale
-            ctx_keys = _rope_positions(model, ctx_keys, base_arr)
+            ctx_keys = model.rope(ctx_keys, offset=base_arr)
 
             ring_keys = mx.stop_gradient(cohort.keys[layer_index])
             ring_values = mx.stop_gradient(cohort.values[layer_index])
@@ -789,8 +756,8 @@ def _spark_draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
             ).transpose(0, 2, 1, 3)
             if self.value_scale is not None:
                 prop_values = prop_values * self.value_scale
-            queries = _rope_positions(model, queries, query_offsets)
-            prop_keys = _rope_positions(model, prop_keys, query_offsets)
+            queries = model.rope(queries, offset=query_offsets)
+            prop_keys = model.rope(prop_keys, offset=query_offsets)
             keys = mx.concatenate([ring_keys, prop_keys], axis=2)
             values = mx.concatenate([ring_values, prop_values], axis=2)
             attended = mx.fast.scaled_dot_product_attention(
@@ -880,24 +847,31 @@ def _spark_draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
 
 
 def _patch_drafter_batched() -> bool:
-    """Monkey-patch DFlashDrafter._draft_batched for Spark DSpark.
+    """Route Spark drafter instances to the enhanced ``_spark_draft_batched``.
 
-    Spark's DSpark draft needs per-position RoPE and cross-stream fixes
-    (captures/weights are created on the prefill thread's TLS stream, which
-    the draft executor thread cannot read). Keeping the enhanced method here
-    concentrates the Spark-specific logic in this adapter instead of editing
-    ``omlx/speculative/dflash/drafter.py``.
+    Spark's DSpark draft needs cross-stream fixes (captures/weights are
+    created on the prefill thread's TLS stream, which the draft executor
+    thread cannot read) and the stock RoPE helper is not per-position aware.
+    Keeping the enhanced method here concentrates the Spark-specific logic in
+    this adapter instead of editing ``omlx/speculative/dflash/drafter.py``.
+
+    The replacement is **instance-scoped**, not a global class override: the
+    stock ``DFlashDrafter._draft_batched`` stays intact for every other
+    drafter (MiniCPM5, GSQ, future DFlash adapters), and only a drafter
+    instance flagged ``_omlx_spark_drafter`` (set by
+    :func:`wrap_spark_dspark`) routes through the Spark method.  This avoids
+    the implicit cross-model coupling that a blanket class replacement would
+    impose on future DFlash adapters.
     """
     from omlx.speculative.dflash import drafter as _drafter_mod
     from omlx.speculative.dflash import DFlashDrafter
 
     if getattr(DFlashDrafter, "_omlx_spark_batched_patched", False):
         return True
-    # The patched method references ``_rope_positions``, defined here. Make it
-    # resolvable from the drafter module's globals so the method can find it.
-    _drafter_mod._rope_positions = _rope_positions
-    # Bind the method so its globals resolve in the drafter module (variants,
-    # kernels, selection, _Predraft, ...).
+    # Keep the stock method for every non-Spark drafter instance.
+    _orig = DFlashDrafter._draft_batched
+    # Bind the enhanced method so its globals resolve in the drafter module
+    # (variants, kernels, selection, _Predraft, ...).
     fn = types.FunctionType(
         _spark_draft_batched.__code__,
         dict(_drafter_mod.__dict__),
@@ -905,6 +879,12 @@ def _patch_drafter_batched() -> bool:
         _spark_draft_batched.__defaults__,
         _spark_draft_batched.__kwdefaults__,
     )
-    DFlashDrafter._draft_batched = fn
+
+    def _routed(self, *args, **kwargs):
+        if getattr(self, "_omlx_spark_drafter", False):
+            return fn(self, *args, **kwargs)
+        return _orig(self, *args, **kwargs)
+
+    DFlashDrafter._draft_batched = _routed
     DFlashDrafter._omlx_spark_batched_patched = True
     return True
