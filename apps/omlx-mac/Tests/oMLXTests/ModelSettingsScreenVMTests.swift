@@ -654,6 +654,21 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNotEqual(vm.summary(for: .acceleration), summary)
     }
 
+    func testSavingEmptyAliasAndModelTypeSendsExplicitClears() async {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RejectingSettingsURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = OMLXClient(host: "127.0.0.1", port: 18160, session: session)
+        let vm = ModelSettingsScreenVM()
+        vm.modelID = "clear"
+
+        await vm.save(.alias, client: client)
+        await vm.save(.modelType, client: client)
+
+        XCTAssertNil(vm.lastError)
+    }
+
     func testRejectedAutoSaveRestoresTheStoredValues() async {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [RejectingSettingsURLProtocol.self]
@@ -932,8 +947,9 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     }
 }
 
-/// Serves one model with Lightning MTP on and rejects every settings write
-/// the way the server rejects an MTP + DFlash pair.
+/// Serves one model with Lightning MTP on and rejects its settings writes
+/// the way the server rejects an MTP + DFlash pair. Writes to "clear" must
+/// send JSON null.
 private final class RejectingSettingsURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
 
@@ -955,6 +971,13 @@ private final class RejectingSettingsURLProtocol: URLProtocol, @unchecked Sendab
                 body = try Data(contentsOf: URL(fileURLWithPath: #filePath)
                     .deletingLastPathComponent()
                     .appendingPathComponent("Fixtures/global-settings.json"))
+            case "/admin/api/models/clear/settings":
+                let stream = try XCTUnwrap(request.httpBodyStream)
+                stream.open()
+                defer { stream.close() }
+                let settings = try XCTUnwrap(JSONSerialization.jsonObject(with: stream) as? [String: Any])
+                XCTAssertTrue(!settings.isEmpty && settings.values.allSatisfy { $0 is NSNull })
+                body = Data(#"{"status":"ok"}"#.utf8)
             case "/admin/api/models/m/settings":
                 status = 400
                 body = Data(#"{"detail":"MTP and DFlash cannot both be enabled; choose one speculative-decoding path."}"#.utf8)
