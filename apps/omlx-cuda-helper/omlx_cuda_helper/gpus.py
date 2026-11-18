@@ -67,8 +67,7 @@ def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
 def memory_limit(gpu: dict[str, Any]) -> int:
     """Bytes a stage on *gpu* may hold before it hands a prompt back.
 
-    On an integrated GPU that is the free memory its layers were planned
-    with: what the OS and the apps left of the RAM, less 16 GiB.
+    On an integrated GPU that is the free RAM its layers were planned with.
     """
     if gpu.get("integrated"):
         return gpu["free"]
