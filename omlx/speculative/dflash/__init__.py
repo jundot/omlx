@@ -109,6 +109,15 @@ def quantize_drafter(model: nn.Module, *, bits: int, group_size: int) -> int:
         return True
 
     nn.quantize(model, group_size=group_size, bits=bits, class_predicate=predicate)
+    # ``nn.quantize`` replaces each Linear with a QuantizedLinear whose packed
+    # weights (uint32) are lazy until evaluated. If we do not materialize them
+    # here, every weight stays bound to the loader thread's TLS stream as an
+    # unevaluated graph node, and the draft executor thread cannot trigger
+    # their execution ("no Stream(gpu, N) in current thread") when it copies
+    # them via ``mx.array(w)``. Eval the whole parameter tree on the loader
+    # thread so the draft thread can copy the materialized arrays.
+    import mlx.core as _mxq
+    _mxq.eval(model.parameters())
     return quantized
 
 

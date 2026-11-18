@@ -50,12 +50,10 @@ contract.
 
 from __future__ import annotations
 
-import importlib
 import logging
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
-import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
 
@@ -654,6 +652,68 @@ def _patch_attach_drafter() -> bool:
     return True
 
 
+def _omlx_force_engine_vlm(model_path: Any) -> bool:
+    """True when ``config.json`` declares ``omlx_force_engine: "vlm"``.
+
+    This is the single source of truth for text-only models (e.g. the
+    MiniCPM5 llama) that must run on the VLM engine so the block-drafter
+    (DFlash/DSpark) path is available even though the model_type is not a
+    native VLM type.  Keeping the *code* here (and the *value* in the
+    checkpoint's config.json) means ``model_discovery.py`` stays byte
+    identical to upstream.
+    """
+    try:
+        from pathlib import Path as _P
+        import json as _json
+        cfg_path = _P(model_path) / "config.json"
+        if not cfg_path.is_file():
+            return False
+        cfg = _json.loads(cfg_path.read_text())
+        return cfg.get("omlx_force_engine") == "vlm"
+    except Exception:
+        return False
+
+
+_ENGINE_FORCE_HOOK_INSTALLED = "_omlx_engine_force_hook_installed"
+
+
+def install_engine_force_hook() -> None:
+    """Monkey-patch ``detect_model_type`` to honor ``omlx_force_engine``.
+
+    Called once at module-load time from ``utils/model_loading.py`` so the
+    wrapper is in place before any model-discovery/engine decision runs.
+    Wraps the name in both ``model_discovery`` (internal + admin local
+    imports) and ``engine_pool`` (module-level bound import) if present.
+    Idempotent.
+    """
+    import importlib
+
+    md = importlib.import_module("omlx.model_discovery")
+    if getattr(md, _ENGINE_FORCE_HOOK_INSTALLED, False):
+        return
+    orig = md.detect_model_type
+
+    def _wrapped(model_path):
+        if _omlx_force_engine_vlm(model_path):
+            logger.info(
+                "%s forced to VLM engine (omlx_force_engine=vlm)",
+                model_path,
+            )
+            return "vlm"
+        return orig(model_path)
+
+    md.detect_model_type = _wrapped
+    setattr(md, _ENGINE_FORCE_HOOK_INSTALLED, True)
+    # engine_pool binds detect_model_type at import time; patch that name too
+    try:
+        ep = importlib.import_module("omlx.engine_pool")
+        if "detect_model_type" in ep.__dict__:
+            ep.detect_model_type = _wrapped
+    except Exception:
+        pass
+    logger.debug("install_engine_force_hook: detect_model_type wrapped")
+
+
 def apply() -> bool:
     """Install every MiniCPM5 DSpark hook.  Idempotent.  Returns active."""
     _resolve_attention_mask_fn()
@@ -670,6 +730,7 @@ __all__ = [
     "bundled_dspark_path",
     "dspark_initial_depth",
     "dspark_next_block_size",
+    "install_engine_force_hook",
     "is_dspark_drafter",
     "make_dspark_depth_controller",
 ]

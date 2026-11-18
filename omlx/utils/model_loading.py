@@ -17,6 +17,14 @@ from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 from ..patches.raon1_mini import normalize_raon1_mini_model_file
 
+# MiniCPM5 / text-only llama needs the VLM engine for the DFlash block-drafter
+# path.  Honor ``omlx_force_engine: "vlm"`` from the checkpoint config.json by
+# wrapping ``detect_model_type`` before any engine decision runs.  Keeps
+# ``model_discovery.py`` byte-identical to upstream.
+from ..patches.minicpm5_dspark import install_engine_force_hook as _install_engine_force_hook
+
+_install_engine_force_hook()
+
 logger = logging.getLogger(__name__)
 
 _VLM_TEXT_PREFIX = "language_model."
@@ -180,36 +188,6 @@ def _add_mla_split_quant_keys(quant: dict) -> None:
             if target not in quant and target not in extras:
                 extras[target] = val
     quant.update(extras)
-
-
-def _merge_qc_per_path_into_quantization(cfg: dict) -> None:
-    """Merge ``quantization_config`` per-path entries into ``quantization``.
-
-    Pre-quantized checkpoints (MiniCPM5-2B, mixed bit-width) put the
-    per-layer quantization spec in ``quantization_config`` while
-    ``quantization`` holds only the global default. mlx-vlm's
-    ``nn.quantize`` class_predicate reads only ``config["quantization"]``,
-    so merge the per-path entries so it can build each layer at the correct
-    bit-width.
-    """
-    quant = cfg.get("quantization")
-    qc = cfg.get("quantization_config")
-    if not isinstance(quant, dict) or not isinstance(qc, dict):
-        return
-    # Only merge when quantization is a bare global default (no per-path).
-    if any(isinstance(v, dict) or v is False for v in quant.values()):
-        return
-    per_path = {
-        k: v for k, v in qc.items()
-        if isinstance(v, dict) or v is False
-    }
-    if not per_path:
-        return
-    # Preserve the global defaults as the top-level recipe.
-    merged = dict(quant)
-    for k, v in per_path.items():
-        merged.setdefault(k, v)
-    cfg["quantization"] = merged
 
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
@@ -475,6 +453,36 @@ def normalize_mimo_mxfp4_quant(cfg: dict) -> dict:
     return cfg
 
 
+def _merge_qc_per_path_into_quantization(cfg: dict) -> None:
+    """Merge ``quantization_config`` per-path entries into ``quantization``.
+
+    Pre-quantized checkpoints (MiniCPM5-2B, mixed bit-width) put the
+    per-layer quantization spec in ``quantization_config`` while
+    ``quantization`` holds only the global default. mlx-vlm's
+    ``nn.quantize`` class_predicate reads only ``config["quantization"]``,
+    so merge the per-path entries so it can build each layer at the correct
+    bit-width.
+    """
+    quant = cfg.get("quantization")
+    qc = cfg.get("quantization_config")
+    if not isinstance(quant, dict) or not isinstance(qc, dict):
+        return
+    # Only merge when quantization is a bare global default (no per-path).
+    if any(isinstance(v, dict) or v is False for v in quant.values()):
+        return
+    per_path = {
+        k: v for k, v in qc.items()
+        if isinstance(v, dict) or v is False
+    }
+    if not per_path:
+        return
+    # Preserve the global defaults as the top-level recipe.
+    merged = dict(quant)
+    for k, v in per_path.items():
+        merged.setdefault(k, v)
+    cfg["quantization"] = merged
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -494,12 +502,12 @@ def _patch_mlx_lm_load_config() -> None:
         normalize_hy_v3_rope_config(cfg)
         # Cluster ranks load MiniMax through mlx-lm, not the patched mlx-vlm.
         adopt_expert_global_scales(cfg)
-        _merge_qc_per_path_into_quantization(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
         normalize_mimo_mxfp4_quant(cfg)
+        _merge_qc_per_path_into_quantization(cfg)
         normalize_raon1_mini_model_file(cfg)
         return cfg
 
