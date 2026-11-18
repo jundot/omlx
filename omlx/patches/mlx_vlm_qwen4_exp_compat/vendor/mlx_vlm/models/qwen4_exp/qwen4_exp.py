@@ -208,18 +208,30 @@ class Model(Qwen3_5Model):
                 None,
             )
             if gate_up_key is not None:
-                gate, up = mx.split(weights.pop(gate_up_key), 2, axis=-2)
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = up
-                for down_key in (
-                    f"{prefix}.experts.down_proj",
-                    f"{prefix}.experts.down_proj.weight",
+                # A quantized fused checkpoint keeps affine scales/biases beside
+                # each packed weight. They split along the same output axis as
+                # gate_up_proj's weight and move with down_proj's.
+                gate_up = f"{prefix}.experts.gate_up_proj"
+                for suffix, key in (
+                    ("weight", gate_up_key),
+                    ("scales", f"{gate_up}.scales"),
+                    ("biases", f"{gate_up}.biases"),
                 ):
-                    if down_key in weights:
-                        weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                            down_key
+                    if key in weights:
+                        gate, up = mx.split(weights.pop(key), 2, axis=-2)
+                        weights[f"{prefix}.switch_mlp.gate_proj.{suffix}"] = gate
+                        weights[f"{prefix}.switch_mlp.up_proj.{suffix}"] = up
+                down = f"{prefix}.experts.down_proj"
+                for suffix, keys in (
+                    ("weight", (down, f"{down}.weight")),
+                    ("scales", (f"{down}.scales",)),
+                    ("biases", (f"{down}.biases",)),
+                ):
+                    key = next((key for key in keys if key in weights), None)
+                    if key is not None:
+                        weights[f"{prefix}.switch_mlp.down_proj.{suffix}"] = (
+                            weights.pop(key)
                         )
-                        break
                 return
 
             if f"{prefix}.experts.0.gate_proj.weight" not in weights:

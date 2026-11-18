@@ -680,6 +680,92 @@ def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_bf16_checkpoint():
     ).item()
 
 
+@pytest.mark.parametrize(
+    "mode, bits, group_size",
+    [("affine", 4, 64), ("affine", 8, 64), ("mxfp4", 4, 32)],
+)
+@pytest.mark.parametrize("weight_suffix", ["", ".weight"])
+def test_qwen4_exp_sanitize_splits_quantized_fused_experts(
+    tmp_path, weight_suffix, mode, bits, group_size
+):
+    """Quantized fused experts keep their scales/biases with the split weights.
+
+    Quantized MLX conversions with fused experts (rapid-mlx
+    Qwen3.8-Flash-Next-4bit) store gate_up_proj/down_proj as packed weights
+    plus scales (and affine biases), in the backbone and in the MTP layer.
+    Leaving them under ``experts.*`` failed the load with "parameters not in
+    model".
+    """
+    from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    def quantize(value):
+        packed, scales, *biases = mx.quantize(
+            value, group_size=group_size, bits=bits, mode=mode
+        )
+        return packed, scales, (biases[0] if biases else None)
+
+    def dequantize(weight, scales, biases):
+        return mx.dequantize(
+            weight, scales, biases, group_size=group_size, bits=bits, mode=mode
+        )
+
+    experts, intermediate, hidden = 2, 64, 64
+    gate_up = quantize(mx.random.normal((experts, 2 * intermediate, hidden)))
+    down = quantize(mx.random.normal((experts, hidden, intermediate)))
+    prefixes = {
+        "model.language_model.layers.0.mlp": "language_model.model.layers.0.mlp",
+        "mtp.layers.0.mlp": "mtp.layers.0.mlp",
+    }
+    weights = {}
+    for prefix in prefixes:
+        for name, (packed, scales, biases) in (
+            ("gate_up_proj", gate_up),
+            ("down_proj", down),
+        ):
+            weights[f"{prefix}.experts.{name}{weight_suffix}"] = packed
+            weights[f"{prefix}.experts.{name}.scales"] = scales
+            if biases is not None:
+                weights[f"{prefix}.experts.{name}.biases"] = biases
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=1,
+                num_experts=experts,
+                ple_layer_ids=(),
+            )
+        )
+    )
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
+        encoding="utf-8",
+    )
+    configure_mtp_runtime(tmp_path, enabled=True)
+    try:
+        result = Model.sanitize(model, dict(weights))
+    finally:
+        configure_mtp_runtime(tmp_path, enabled=False)
+
+    assert [key for key in result if ".experts." in key] == []
+    expected_gate, expected_up = mx.split(dequantize(*gate_up), 2, axis=-2)
+    for out in prefixes.values():
+        for name, expected in (
+            ("gate_proj", expected_gate),
+            ("up_proj", expected_up),
+            ("down_proj", dequantize(*down)),
+        ):
+            base = f"{out}.switch_mlp.{name}"
+            assert (f"{base}.biases" in result) == (mode == "affine"), base
+            actual = dequantize(
+                result[f"{base}.weight"],
+                result[f"{base}.scales"],
+                result.get(f"{base}.biases"),
+            )
+            assert mx.array_equal(actual, expected).item(), base
+
+
 
 def test_qwen4_resident_ple_looks_up_shard_windows_on_device():
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
