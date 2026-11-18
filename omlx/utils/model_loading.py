@@ -1587,8 +1587,14 @@ def checkpoint_has_bf16_leaves(model_path: str) -> bool:
         try:
             with open(shard, "rb") as handle:
                 header_len = int.from_bytes(handle.read(8), "little")
+                # A non-safetensors file, such as a git-lfs pointer, reads as a
+                # huge length.
+                if header_len > shard.stat().st_size:
+                    continue
                 header = json.loads(handle.read(header_len))
         except (OSError, ValueError):
+            continue
+        if not isinstance(header, dict):
             continue
         for name, spec in header.items():
             if (
