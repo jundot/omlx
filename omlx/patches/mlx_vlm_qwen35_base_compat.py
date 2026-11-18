@@ -45,7 +45,18 @@ def needs_base_compat(config: dict) -> bool:
     text_config = config.get("text_config") or {}
     layer_types = text_config.get("layer_types")
     interval = text_config.get("full_attention_interval", 4)
-    if not layer_types or not interval:
+    if not layer_types:
+        # 122B source (no layer_types in config): the stock periodic
+        # schedule marks the LAST layer linear, but the checkpoint has
+        # full-attn there. Install the override only when the schedule
+        # actually mislabels the last layer (safe no-op otherwise).
+        n = config.get("num_hidden_layers")
+        if n is None:
+            n = text_config.get("num_hidden_layers")
+        if interval and n and (int(n) % interval) != 0:
+            return True
+        return False
+    if not interval:
         return False
     periodic = [
         "linear_attention" if (i + 1) % interval else "full_attention"
@@ -124,6 +135,14 @@ def _patch_layers(language: Any) -> None:
         layer_init(self, args, layer_idx)
         layer_types = getattr(args, "layer_types", None)
         if not layer_types:
+            # 122B source (no layer_types in config): the stock periodic
+            # schedule marks the LAST layer linear, but the checkpoint has
+            # full-attn there. Force it full so its q/k/v/norms load, then stop.
+            n = getattr(args, "num_hidden_layers", None)
+            if n is not None and layer_idx == n - 1 and self.is_linear:
+                del self.linear_attn
+                self.self_attn = language.Qwen3_5Attention(args)
+                self.is_linear = False
             return
         is_linear = layer_types[layer_idx] == "linear_attention"
         # 11-15 fix (0.8.0 port): the source 122B has full-attn through
