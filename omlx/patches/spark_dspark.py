@@ -30,14 +30,11 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_vlm.speculative.drafters.dspark.dspark import VanillaMarkov
 
 logger = logging.getLogger(__name__)
 
-DSPARK_DIRNAME = "dspark"
-_ARCHITECTURE = "SparkDSparkDraftModel"
 _WEIGHT_PREFIX = "language_model.model.dspark."
 _MXFP8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 
@@ -54,27 +51,6 @@ class _IdentityNorm:
 
     def __call__(self, x):
         return x
-
-
-def bundled_spark_dspark_path(model_path: str | Path) -> Path | None:
-    """``<model>/dspark`` when it holds a Spark DSpark draft checkpoint."""
-    path = Path(model_path) / DSPARK_DIRNAME
-    config_path = path / "config.json"
-    if not config_path.is_file():
-        return None
-    try:
-        config = json.loads(config_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    text_config = config.get("text_config") or config
-    architectures = set(config.get("architectures") or ()) | set(
-        text_config.get("architectures") or ()
-    )
-    if _ARCHITECTURE not in architectures:
-        return None
-    if not any(path.glob("*.safetensors")):
-        return None
-    return path
 
 
 @dataclass
@@ -342,6 +318,21 @@ def wrap_spark_dspark(
     # Instance flag: only this drafter routes through ``_spark_draft_batched``;
     # every other DFlashDrafter keeps the stock ``_draft_batched``.
     drafter._omlx_spark_drafter = True
+    # The VLM engine's prefill path returns ``[captures..., last]`` = n_cap+1
+    # layers in ``hidden_states``, but the drafter's ``project_context`` fc is
+    # ``Linear(2560*n_targets, 2560)`` and needs exactly ``len(target_layer_ids)``
+    # layers. Strip the trailing ``last`` layer here (instance-scoped) instead of
+    # editing the scheduler's ``_dflash_seed_prefill``. The helper-prefill path
+    # already passes exactly n_cap layers, so the guard below is a no-op there.
+    _orig_seed = drafter.seed_request
+    _n_cap = len(drafter.target_layer_ids)
+
+    def _spark_seed(request_id, captured, position=None):
+        if len(captured) == _n_cap + 1:
+            captured = captured[:-1]
+        return _orig_seed(request_id, captured, position)
+
+    drafter.seed_request = _spark_seed
     return drafter
 
 
@@ -358,6 +349,15 @@ def load_spark_dspark_drafter(
     _patch_gate_output_sigmoid()
     _patch_drafter_batched()
     model = load_spark_dspark_model(path).bind(target_model)
+    # The drafter is loaded on the mlx-executor thread, so its weights bind
+    # that thread's ThreadLocalStream (gpu,3). The batched decode path runs
+    # on the mlx-engine thread whose current stream is DIFFERENT. The weights
+    # are NOT copied across streams: MLX matmul auto-synchronizes its operands
+    # across per-thread streams, so the packed weights stay where they are and
+    # ``_spark_draft_batched`` only materializes the intermediate activations
+    # (segments / h_ctx / padded) on the current stream via ``mx.array`` +
+    # ``mx.contiguous`` + ``mx.eval``; see the comment there for the full
+    # cross-stream rationale.
     drafter = wrap_spark_dspark(model, str(path), depth, fixed)
     logger.info(
         "Spark DSpark drafter loaded: path=%s block=%d depth=%d adaptive=%s "
@@ -540,14 +540,21 @@ def _patch_spark2_5_capture() -> bool:
     return True
 
 
-def apply_spark_patch() -> bool:
-    """Apply the Spark2_5 capture patch (idempotent)."""
-    return _patch_spark2_5_capture()
-
-
 def _spark_draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
         """One draft forward for every row (Spark DSpark enhanced)."""
         model = self.model
+        # The Spark drafter is loaded on the mlx executor thread (upstream
+        # engine_pool runs _load_dflash_sync via run_in_executor), so its
+        # weights are bound to that thread's ThreadLocalStream. The batched
+        # decode path runs on the mlx-engine thread inside
+        # ``with mx.stream(self._stream)``, which resolves to a DIFFERENT
+        # concrete stream. The weights are NOT re-bound here: MLX matmul
+        # auto-synchronizes operands across per-thread streams, so the packed
+        # weights can stay on the executor stream and still be read. Only the
+        # intermediate activations (segments / h_ctx / padded) built on the
+        # executor thread need to be materialized on the current stream via
+        # ``mx.array`` + ``mx.contiguous`` + ``mx.eval`` before use.
+
         uids = [state.uid for state, *_ in rows]
         slots = self.ring_slots
         capacity = self.capacity
@@ -849,9 +856,14 @@ def _spark_draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
 def _patch_drafter_batched() -> bool:
     """Route Spark drafter instances to the enhanced ``_spark_draft_batched``.
 
-    Spark's DSpark draft needs cross-stream fixes (captures/weights are
+    Spark's DSpark draft needs cross-stream handling: the captures are
     created on the prefill thread's TLS stream, which the draft executor
-    thread cannot read) and the stock RoPE helper is not per-position aware.
+    thread cannot read directly, so ``_spark_draft_batched`` materializes the
+    intermediate activations (segments / h_ctx / padded) on the current
+    stream via ``mx.array`` + ``mx.contiguous`` + ``mx.eval``.  The drafter
+    weights are NOT copied across streams (MLX matmul auto-synchronizes its
+    operands); the stock per-position RoPE helper is replaced with
+    ``model.rope(x, offset=...)`` (array offset) for the direct offsets.
     Keeping the enhanced method here concentrates the Spark-specific logic in
     this adapter instead of editing ``omlx/speculative/dflash/drafter.py``.
 
