@@ -223,6 +223,42 @@ def _register_mtp_classes(q35: Any) -> None:
     q35.MTPDecoderLayer = MTPDecoderLayer
     q35.MTPModule = MTPModule
 
+    class GlmMtpHead(nn.Module):
+        """GLM-style MTP head (enorm/hnorm + eh_proj + shared_head_norm).
+
+        The stock MTPModule is Qwen3.5-style. GLM-MTP checkpoints
+        (mtp_head_style == 'glm') ship a different head; build it so the
+        mtp.* weights map 1:1 instead of being stripped by sanitize.
+        """
+
+        def __init__(self, args):
+            super().__init__()
+            self.enorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            self.hnorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            self.eh_proj = nn.Linear(
+                args.hidden_size * 2, args.hidden_size, bias=False
+            )
+            self.shared_head_norm = nn.RMSNorm(
+                args.hidden_size, eps=args.rms_norm_eps
+            )
+            self.layers = [
+                MTPDecoderLayer(args)
+                for _ in range(args.mtp_num_hidden_layers)
+            ]
+
+        def __call__(
+            self, hidden_states, next_token_ids, embed_tokens, cache=None
+        ):
+            h = self.enorm(hidden_states)
+            e = self.hnorm(embed_tokens(next_token_ids))
+            fused = self.eh_proj(mx.concatenate([h, e], axis=-1))
+            if cache is None:
+                cache = [None] * len(self.layers)
+            mask = create_attention_mask(fused, cache[0] if cache else None)
+            for layer, c in zip(self.layers, cache):
+                fused = layer(fused, mask, c)
+            return self.shared_head_norm(fused)
+
 
 # ---------------------------------------------------------------------------
 # GatedDeltaNet — _process_chunk helper + __call__ replacement.
@@ -516,7 +552,10 @@ def _patch_text_model(q35: Any) -> None:
         mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
         self._omlx_mtp_decode_enabled = mtp_decode_enabled
         if mtp_decode_enabled:
-            self.mtp = q35.MTPModule(args)
+            if getattr(args, "mtp_head_style", None) == "glm":
+                self.mtp = GlmMtpHead(args)
+            else:
+                self.mtp = q35.MTPModule(args)
             # Depth-k chained drafting is available on this model: the qwen
             # patch supports return_hidden mtp_forward + partial rollback.
             from . import get_mtp_depth, is_mtp_depth_fixed

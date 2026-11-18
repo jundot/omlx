@@ -10350,7 +10350,7 @@ _QWEN3_5_STREAM_MODEL_TYPES = frozenset(
 # and an explicit stream_calibration request for one fails fast (see
 # _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
 _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset(
-    {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark", "flint"}
+    {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark", "flint", "step3p7", "jamba"}
     | _QWEN3_5_STREAM_MODEL_TYPES
 )
 
@@ -10380,6 +10380,18 @@ def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
         from mlx_vlm.models.flint.language import DecoderLayer
 
         return ModelConfig.from_dict(config), DecoderLayer
+    if _stream_source_model_type(config) == "step3p7":
+        # Step3p7 is a VLM with a text_config sub-struct and a DecoderLayer
+        # in mlx_vlm.models.step3p7.language — same shape as glm5_next.
+        from mlx_vlm.models.step3p7.config import TextConfig
+        from mlx_vlm.models.step3p7.language import DecoderLayer
+        return TextConfig.from_dict(config["text_config"]), DecoderLayer
+    if _stream_source_model_type(config) == "jamba":
+        # Jamba has a flat ModelConfig (no text_config sub-struct) and a
+        # JambaDecoderLayer — same flint-shape return.
+        from mlx_vlm.models.jamba.config import ModelConfig
+        from mlx_vlm.models.jamba.language import JambaDecoderLayer
+        return ModelConfig.from_dict(config), JambaDecoderLayer
     if _stream_source_model_type(config) == "qwen4_exp":
         from mlx_vlm.models.qwen4_exp.config import TextConfig
         from mlx_vlm.models.qwen4_exp.language import Qwen4ExpDecoderLayer
