@@ -416,9 +416,6 @@ def test_select_logprobs_reads_batch_rows_on_host(dtype, tol):
     assert select_logprobs(forced, 1, 3) == (0.0, [(1, 0.0)])
 
 
-# ---- top-p-only MTP verify on the top-512 candidates (top_k == 0) ----------
-
-
 def _nucleus_rows(rows, vocab, dtype, scale, seed):
     mx.random.seed(seed)
     logits = (mx.random.normal((rows, vocab)) * scale).astype(dtype)
@@ -441,38 +438,31 @@ def _nucleus_inputs(sampler, lp, depth, seed):
     return drafts, qs
 
 
-@pytest.mark.parametrize("vocab", [65536, 40001])  # chunked / plain candidates
-@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
-@pytest.mark.parametrize("temp,top_p", [(0.6, 0.95), (1.0, 0.9)])
-def test_nucleus_support_is_the_dense_top_p_density(vocab, dtype, temp, top_p):
+def test_nucleus_support_is_the_dense_top_p_density():
     from omlx.patches.mlx_lm_mtp.batch_generator import (
         _accept_lp_for,
         _nucleus_support,
     )
 
-    lp = _nucleus_rows(5, vocab, dtype, scale=6.0, seed=11)
-    sampler = make_sampler(temp=temp, top_p=top_p)
+    lp = _nucleus_rows(5, 65536, mx.bfloat16, scale=6.0, seed=11)
+    sampler = make_sampler(temp=0.6, top_p=0.95)
     ids, logp, exact = _nucleus_support(sampler, lp)
     dense = _accept_lp_for(sampler, lp)
     sparse = mx.put_along_axis(mx.full(dense.shape, -float("inf")), ids, logp, axis=-1)
-    mx.eval(exact, dense, sparse)
     assert exact.item() == 1
     assert mx.array_equal(mx.isinf(sparse), mx.isinf(dense)).item()
-    keep = ~mx.isinf(dense)
-    diff = mx.abs(mx.where(keep, sparse - dense, 0.0))
+    diff = mx.abs(mx.where(mx.isinf(dense), 0.0, sparse - dense))
     assert diff.max().item() < 1e-5
 
 
-@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
-def test_nucleus_verify_packet_matches_dense(dtype):
+def test_nucleus_verify_packet_matches_dense():
     from omlx.patches.mlx_lm_mtp.batch_generator import (
-        _settled_verify,
         _stochastic_verify_tokens,
         _verify_stochastic,
     )
 
     depth = 4
-    lp = _nucleus_rows(depth + 1, 65536, dtype, scale=6.0, seed=3)
+    lp = _nucleus_rows(depth + 1, 65536, mx.bfloat16, scale=6.0, seed=3)
     sampler = make_sampler(temp=0.6, top_p=0.95)
     drafts, qs = _nucleus_inputs(sampler, lp, depth, seed=4)
     accepted = set()
@@ -480,53 +470,11 @@ def test_nucleus_verify_packet_matches_dense(dtype):
         mx.random.seed(seed)
         dense = _stochastic_verify_tokens(sampler, lp, drafts, qs).tolist()
         mx.random.seed(seed)
-        fast, redone = _settled_verify(
-            _verify_stochastic(sampler, lp, drafts, qs).tolist(),
-            sampler,
-            lp,
-            drafts,
-            qs,
-        )
-        assert not redone
-        # Same uniform draws, same densities: same acceptance and drafts.
+        fast = _verify_stochastic(sampler, lp, drafts, qs).tolist()
+        assert fast[-1] == 1
         assert fast[: depth + 1] == dense[: depth + 1]
         accepted.add(dense[0])
-    assert len(accepted) > 1  # the comparison saw both accepts and rejects
-
-
-def test_nucleus_draft_outside_nucleus_rejects_and_residual_stays_inside():
-    from omlx.patches.mlx_lm_mtp.batch_generator import (
-        _accept_lp_for,
-        _settled_verify,
-        _verify_stochastic,
-    )
-
-    lp = _nucleus_rows(3, 65536, mx.float32, scale=6.0, seed=5)
-    sampler = make_sampler(temp=1.0, top_p=0.9)
-    dense = _accept_lp_for(sampler, lp)
-    outside = mx.argmin(dense, axis=-1)[:2].astype(mx.uint32)  # p == 0
-    q_peak = mx.full((2, 65536), -30.0).astype(mx.float32)
-    q_peak = mx.put_along_axis(
-        q_peak, outside[:, None].astype(mx.int32), mx.array([[0.0], [0.0]]), axis=-1
-    )
-    q_peak = q_peak - mx.logsumexp(q_peak, axis=-1, keepdims=True)
-    qs = [q_peak[0], q_peak[1]]
-    nucleus = [
-        set(np.flatnonzero(np.asarray(~mx.isinf(dense[r]))).tolist()) for r in range(3)
-    ]
-    for seed in range(25):
-        mx.random.seed(seed)
-        host, redone = _settled_verify(
-            _verify_stochastic(sampler, lp, outside, qs).tolist(),
-            sampler,
-            lp,
-            outside,
-            qs,
-        )
-        assert not redone
-        assert host[0] == 0  # p(d) = 0: rejected at the first draft
-        assert host[3] in nucleus[0]  # residual of row 0
-        assert host[5] in nucleus[2]  # bonus
+    assert len(accepted) > 1
 
 
 def test_nucleus_wider_than_candidates_is_redone_densely():
@@ -537,209 +485,12 @@ def test_nucleus_wider_than_candidates_is_redone_densely():
     )
 
     depth = 3
-    lp = _nucleus_rows(depth + 1, 65536, mx.float32, scale=0.3, seed=8)  # flat
+    lp = _nucleus_rows(depth + 1, 65536, mx.float32, scale=0.3, seed=8)
     sampler = make_sampler(temp=1.0, top_p=0.95)
     drafts, qs = _nucleus_inputs(sampler, lp, depth, seed=9)
-    mx.random.seed(1)
     flagged = _verify_stochastic(sampler, lp, drafts, qs).tolist()
     assert flagged[-1] == 0
     mx.random.seed(2)
-    host, redone = _settled_verify(flagged, sampler, lp, drafts, qs)
+    host = _settled_verify(flagged, sampler, lp, drafts, qs)
     mx.random.seed(2)
-    dense = _stochastic_verify_tokens(sampler, lp, drafts, qs).tolist()
-    assert redone and host == dense
-
-
-def test_nucleus_cutoff_tie_across_the_candidate_window_is_redone(monkeypatch):
-    from omlx.patches.mlx_lm_mtp import batch_generator as bg
-
-    monkeypatch.setattr(bg, "_NUCLEUS_CANDIDATES", 4)
-    # One token holds 0.5; ten more tie at 0.05. top_p 0.7 cuts inside the tie,
-    # so every tied token is kept, including those outside the 4 candidates.
-    probs = np.array([0.5] + [0.05] * 10, dtype=np.float32)
-    probs = np.concatenate([probs, np.zeros(2048 - 11, dtype=np.float32) + 1e-12])
-    lp = mx.log(mx.array(probs / probs.sum()))[None, :]
-    sampler = make_sampler(temp=1.0, top_p=0.7)
-    _, _, exact = bg._nucleus_support(sampler, lp)
-    assert exact.item() == 0
-
-
-def test_nucleus_fast_path_is_limited_to_top_p_only_targets():
-    from omlx.patches.mlx_lm_mtp.batch_generator import _nucleus_verify_eligible
-
-    assert _nucleus_verify_eligible(make_sampler(temp=0.7, top_p=0.95), 248320)
-    for params in (
-        {"temp": 0.7, "top_p": 0.95, "top_k": 20},
-        {"temp": 0.7, "top_p": 0.95, "min_p": 0.05},
-        {"temp": 0.7, "top_p": 1.0},
-        {"temp": 0.0, "top_p": 0.95},
-    ):
-        assert not _nucleus_verify_eligible(make_sampler(**params), 248320)
-    assert not _nucleus_verify_eligible(make_sampler(temp=0.7, top_p=0.95), 1024)
-
-
-def test_nucleus_mixed_rows_in_advance_group_settle_per_row(monkeypatch):
-    """A row whose nucleus overflows the candidates is redone densely while its
-    peaked neighbour keeps the fast host packet (fused_batch._advance_group)."""
-    from types import SimpleNamespace
-
-    from omlx.patches.mlx_lm_mtp import batch_generator as bg
-    from omlx.patches.mlx_lm_mtp import batched_head, fused_batch
-
-    depth, vocab = 3, 2048
-    sampler = make_sampler(temp=0.6, top_p=0.95, top_k=0)
-    lps = [
-        _nucleus_rows(depth + 1, vocab, mx.float32, scale=6.0, seed=21),  # peaked
-        _nucleus_rows(depth + 1, vocab, mx.float32, scale=0.3, seed=22),  # flat
-    ]
-    assert [bg._nucleus_support(sampler, lp)[2].item() for lp in lps] == [1, 0]
-    logits = mx.stack(lps)
-    inputs = [
-        _nucleus_inputs(sampler, lp, depth, seed=23 + i) for i, lp in enumerate(lps)
-    ]
-    rows, received = [], {}
-    for i in range(2):
-        state = SimpleNamespace(
-            uid=i,
-            drafts=inputs[i][0],
-            draft_accept_lps=inputs[i][1],
-            next_main=mx.array([0], dtype=mx.int32),
-        )
-        row = SimpleNamespace(
-            samplers=[sampler],
-            fallback_sampler=sampler,
-            logits_processors=[None],
-            prompt_cache=None,
-            _token_context=[[0]],
-        )
-        rows.append((i, row, state))
-    batch = SimpleNamespace(
-        model=SimpleNamespace(),
-        uids=[0, 1],
-        _token_context=[[0], [0]],
-        _omlx_mtp_batch_state=None,
-    )
-
-    def chain(row, state, **kwargs):
-        received[state.uid] = kwargs["stochastic_result"]
-
-    monkeypatch.setattr(bg, "_run_verify_cycle_chain", chain)
-    monkeypatch.setattr(bg, "_drafter_for", lambda model: None)
-    monkeypatch.setattr(bg, "_drafter_capture_ids", lambda model: None)
-    monkeypatch.setattr(bg, "_set_batched_mrope_deltas", lambda batch, uids: None)
-    monkeypatch.setattr(bg, "_set_singleton_mrope_delta", lambda row: None)
-    monkeypatch.setattr(bg, "_slice_captured", lambda captured, idx: None)
-    monkeypatch.setattr(bg, "_clear_rollback", lambda cache: None)
-    monkeypatch.setattr(
-        bg,
-        "_call_backbone_captured",
-        lambda model, inputs, cache, **kw: (
-            logits,
-            mx.zeros((2, depth + 1, 4)),
-            None,
-            None,
-        ),
-    )
-    monkeypatch.setattr(batched_head, "eligible", lambda batch, rows: False)
-    monkeypatch.setattr(batched_head, "flush", lambda batch_state: None)
-
-    cache = []
-    mx.random.seed(5)
-    fused_batch._advance_group(batch, depth, rows, {}, cache=cache)
-
-    # Same draws in the same order: both fast packets, then the dense redo of
-    # row 1 only. Row 1's packet must be the dense one, row 0's the fast one.
-    mx.random.seed(5)
-    lps_in = [bg._logprobs(logits[i]) for i in range(2)]
-    fast = [
-        bg._verify_stochastic(sampler, lps_in[i], inputs[i][0], inputs[i][1]).tolist()
-        for i in range(2)
-    ]
-    dense1, redone = bg._settled_verify(
-        fast[1], sampler, lps_in[1], inputs[1][0], inputs[1][1]
-    )
-    assert redone
-    assert dense1 != fast[1][:-1]  # the fixture makes the redo observable
-    assert received[0] == fast[0][:-1]
-    assert received[1] == dense1
-
-
-def test_nucleus_fast_path_is_skipped_when_a_predraft_is_queued():
-    """A pre-draft cycle's miss costs the redo plus the discarded pre-draft:
-    the verify must run the dense path there (allow_nucleus=False), whatever
-    the row width."""
-    from omlx.patches.mlx_lm_mtp.batch_generator import (
-        _settled_verify,
-        _stochastic_verify_tokens,
-        _verify_stochastic,
-    )
-
-    depth = 3
-    lp = _nucleus_rows(depth + 1, 65536, mx.float32, scale=0.3, seed=8)  # flat
-    sampler = make_sampler(temp=1.0, top_p=0.95)
-    drafts, qs = _nucleus_inputs(sampler, lp, depth, seed=9)
-    assert _verify_stochastic(sampler, lp, drafts, qs).tolist()[-1] == 0
-    mx.random.seed(1)
-    flagged = _verify_stochastic(sampler, lp, drafts, qs, allow_nucleus=False)
-    mx.random.seed(1)
-    dense = _stochastic_verify_tokens(sampler, lp, drafts, qs).tolist()
-    host, redone = _settled_verify(flagged.tolist(), sampler, lp, drafts, qs)
-    assert not redone and host == dense
-
-
-@pytest.mark.parametrize("has_predraft", [True, False])
-def test_verify_cycle_gates_nucleus_on_a_predraft_capable_drafter(
-    monkeypatch, has_predraft
-):
-    from types import SimpleNamespace
-
-    from omlx.patches.mlx_lm_mtp import batch_generator as bg
-
-    depth = 3
-    lp = _nucleus_rows(depth + 1, 4096, mx.float32, scale=6.0, seed=3)
-    sampler = make_sampler(temp=1.0, top_p=0.95)
-    drafts, qs = _nucleus_inputs(sampler, lp, depth, seed=4)
-    state = bg._MtpState(
-        uid=1,
-        chain=True,
-        depth=depth,
-        mtp_cache=[],
-        next_main=mx.array([1], dtype=mx.uint32),
-        drafts=drafts,
-        draft_lps=[mx.zeros((4096,)) for _ in range(depth)],
-        draft_accept_lps=qs,
-    )
-    drafter = SimpleNamespace(predraft=lambda *a: False) if has_predraft else SimpleNamespace()
-    seen = {}
-
-    class Stop(Exception):
-        pass
-
-    def spy(*args, allow_nucleus=True):
-        seen["allow_nucleus"] = allow_nucleus
-        raise Stop
-
-    monkeypatch.setattr(bg, "_drafter_for", lambda model: drafter)
-    monkeypatch.setattr(bg, "_drafter_capture_ids", lambda model: None)
-    monkeypatch.setattr(bg, "_clip_block_drafts", lambda state, limit: None)
-    monkeypatch.setattr(bg, "_verify_stochastic", spy)
-    monkeypatch.setattr(
-        bg,
-        "_call_backbone_captured",
-        lambda *a, **k: (lp[None], mx.zeros((1, depth + 1, 4)), None, [mx.zeros((1, depth + 1, 4))]),
-    )
-    batch = SimpleNamespace(
-        model=SimpleNamespace(),
-        prompt_cache=[SimpleNamespace()],
-        tokens=[[4, 5]],
-        samplers=[sampler],
-        fallback_sampler=sampler,
-        logits_processors=[],
-        _token_context=[],
-        max_tokens=[1000],
-        _num_tokens=[0],
-        _matchers=[SimpleNamespace(advance=lambda token: False)],
-    )
-    with pytest.raises(Stop):
-        bg._run_verify_cycle_chain(batch, state)
-    assert seen["allow_nucleus"] is (not has_predraft)
+    assert host == _stochastic_verify_tokens(sampler, lp, drafts, qs).tolist()

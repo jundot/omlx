@@ -4223,7 +4223,6 @@ def _stochastic_verify_tokens_sparse(
 
     from omlx.utils.sampling import top_k_indices
 
-    k = int(drafts.shape[0])
     top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
     temp = float(sampler.temp)
     ids = top_k_indices(combined_lp, top_k)
@@ -4240,8 +4239,7 @@ def _stochastic_verify_tokens_sparse(
 
 
 def _verify_on_support(ids, logp, drafts, draft_accept_lps):
-    """Leviathan/Chen verification when the target density is ``exp(logp)`` on
-    ``ids`` (``(k+1, n)``, distinct per row) and zero everywhere else."""
+    """Verify drafts against a target density that is zero outside ``ids``."""
     import mlx.core as mx
 
     k = int(drafts.shape[0])
@@ -4293,16 +4291,14 @@ def _verify_on_support(ids, logp, drafts, draft_accept_lps):
     )
 
 
-# Candidates the top-p fast path ranks per row (see _stochastic_verify_tokens_nucleus).
 _NUCLEUS_CANDIDATES = 512
-_NUCLEUS_MIN_VOCAB = 1024
 
 
 def _nucleus_verify_eligible(sampler, vocab: int) -> bool:
     """Target filter is exactly top-p (no top-k, min-p or XTC) on a wide vocab."""
     top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
     return (
-        vocab > _NUCLEUS_MIN_VOCAB
+        vocab > 2 * _NUCLEUS_CANDIDATES
         and float(getattr(sampler, "temp", 0.0) or 0.0) > 0.0
         and 0.0 < top_p < 1.0
         and int(getattr(sampler, "top_k", 0) or 0) == 0
@@ -4313,15 +4309,9 @@ def _nucleus_verify_eligible(sampler, vocab: int) -> bool:
 
 
 def _nucleus_support(sampler, combined_lp):
-    """Top-p target density on the row's ``_NUCLEUS_CANDIDATES`` likeliest tokens.
+    """Top-p density on the ``_NUCLEUS_CANDIDATES`` likeliest tokens of each row.
 
-    Returns ``(ids, logp, exact)``: candidate ids sorted by descending
-    log-probability, the log of ``apply_top_p`` -> temperature -> renormalize
-    on them (``-inf`` outside the nucleus), and a scalar that is 1 only when
-    every row's nucleus lies inside its candidates, i.e. the last candidate is
-    strictly below the cutoff and so is every token outside. Then the density
-    is zero off ``ids`` and equals the dense one on it. ``combined_lp`` must be
-    normalized over the vocabulary.
+    ``exact`` is 1 only when every row's nucleus fits inside its candidates.
     """
     import mlx.core as mx
 
@@ -4334,8 +4324,7 @@ def _nucleus_support(sampler, combined_lp):
     order = mx.argsort(-vals.astype(mx.float32), axis=-1)
     vals = mx.take_along_axis(vals, order, axis=-1)
     ids = mx.take_along_axis(ids, order, axis=-1)
-    # apply_top_p, rank by rank: a token is dropped once the mass above it
-    # reaches top_p of the vocabulary's total mass.
+    # Same rule as apply_top_p: drop a token once the mass above it reaches top_p.
     probs = mx.exp(vals.astype(mx.float32))
     total = mx.exp(combined_lp.astype(mx.float32)).sum(axis=-1, keepdims=True)
     mass_above = mx.cumsum(probs, axis=-1, inclusive=False)
@@ -4351,61 +4340,33 @@ def _nucleus_support(sampler, combined_lp):
     return ids, logp, exact
 
 
-def _stochastic_verify_tokens_nucleus(sampler, combined_lp, drafts, draft_accept_lps):
-    """``_stochastic_verify_tokens`` for a top-p-only target, minus the vocab sort.
-
-    The top-p target density p is zero outside its nucleus, and so are the
-    residual max(p - q, 0) and the bonus draw; a draft outside the nucleus has
-    p = 0 and is rejected whatever q is. So when the nucleus lies inside the
-    row's top ``_NUCLEUS_CANDIDATES`` tokens, ranking those gives the same
-    p, residual and bonus distributions, and only the draft densities q are
-    read (at the candidate ids and the drafts). Returns the packet
-    ``_stochastic_verify_tokens`` does plus a final 1 when that holds, 0 when
-    some row's nucleus is wider: the packet is then not valid, and the caller
-    redoes it with the dense path after its one host read.
-    """
-    import mlx.core as mx
-
-    ids, logp, exact = _nucleus_support(sampler, combined_lp)
-    packet = _verify_on_support(ids, logp, drafts, draft_accept_lps)
-    return mx.concatenate([packet, exact.astype(mx.int32).reshape(1)])
-
-
 def _verify_stochastic(
     sampler, combined_lp, drafts, draft_accept_lps, *, allow_nucleus=True
 ):
-    """``_stochastic_verify_tokens`` packet plus a trailing exactness flag.
-
-    Still one host read. A 0 flag is only possible on the top-p fast path; read
-    the packet with ``_settled_verify`` so that case is redone densely. A cycle
-    that has queued a block pre-draft passes ``allow_nucleus=False``: a miss
-    there costs the redo behind the pre-draft and the pre-draft itself, which
-    more than eats the saving on the cycles that hit.
-    """
+    """``_stochastic_verify_tokens`` packet plus a trailing 1 when it is valid."""
     import mlx.core as mx
 
     if allow_nucleus and int(drafts.shape[0]) > 0 and _nucleus_verify_eligible(
         sampler, combined_lp.shape[-1]
     ):
-        return _stochastic_verify_tokens_nucleus(
-            sampler, combined_lp, drafts, draft_accept_lps
-        )
+        ids, logp, exact = _nucleus_support(sampler, combined_lp)
+        packet = _verify_on_support(ids, logp, drafts, draft_accept_lps)
+        return mx.concatenate([packet, exact.astype(mx.int32).reshape(1)])
     packet = _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps)
     return mx.concatenate([packet, mx.ones((1,), dtype=mx.int32)])
 
 
 def _settled_verify(host, sampler, combined_lp, drafts, draft_accept_lps):
-    """Packet of a ``_verify_stochastic`` host read, and whether it was redone.
+    """Host packet of ``_verify_stochastic``, redrawn densely when not valid.
 
-    The fast path's validity depends on the target logits alone, never on its
-    random draws, so discarding an invalid packet and drawing a fresh one with
-    the dense path leaves the sampled distribution unchanged.
+    Validity depends only on the logits, so the redraw keeps the distribution.
     """
     *packet, exact = host
     if exact:
-        return packet, False
-    dense = _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps)
-    return dense.tolist(), True
+        return packet
+    return _stochastic_verify_tokens(
+        sampler, combined_lp, drafts, draft_accept_lps
+    ).tolist()
 
 
 def _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps):
@@ -4654,7 +4615,6 @@ def _run_verify_cycle_chain(
         and not defer_commit
     )
     predrafted = False
-    nucleus_redone = False
 
     if k == 0:
         # Depth-0 cycle (controller escape hatch): the forward above was a
@@ -4710,6 +4670,7 @@ def _run_verify_cycle_chain(
                 combined_lp,
                 state.drafts,
                 state.draft_accept_lps,
+                # A fast-path miss would also discard the queued pre-draft.
                 allow_nucleus=not (
                     can_predraft and callable(getattr(drafter, "predraft", None))
                 ),
@@ -4724,7 +4685,7 @@ def _run_verify_cycle_chain(
                 predrafted = _predraft(
                     gen_batch, state, drafter, captured, result, m_arr, anchor
                 )
-            host, nucleus_redone = _settled_verify(
+            host = _settled_verify(
                 result.tolist(),
                 sampler,
                 combined_lp,
@@ -4749,8 +4710,7 @@ def _run_verify_cycle_chain(
     # bounded). Emitting fewer verified drafts is always correct; position
     # ``m`` was itself accepted when the clamp lowers it, so its draft
     # token is a fair emit for the correction slot.
-    # A redone packet is not the one a pre-drafted block was conditioned on.
-    m_gpu = -1 if nucleus_redone else m
+    m_gpu = m
     clamp = getattr(gen_batch.model, "mtp_clamp_accept", None)
     if m < k:
         if callable(clamp):

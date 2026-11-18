@@ -263,12 +263,10 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
                 for index, (_, _, state) in enumerate(rows)
             ]
         ).tolist()
-        # A row whose top-p nucleus was wider than its fast-path candidates is
-        # redone densely (rare); every other row keeps this one host read.
         stochastic_results = [
             bg._settled_verify(
                 host, samplers[index], lps[index], state.drafts, state.draft_accept_lps
-            )[0]
+            )
             for index, (host, (_, _, state)) in enumerate(zip(stochastic_results, rows))
         ]
     else:
