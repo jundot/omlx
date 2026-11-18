@@ -319,6 +319,8 @@ def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
     ),
     [
         (64, True, True, True),
+        (64, True, False, False),
+        (64, False, False, True),
         (128, False, False, True),
         (128, False, True, True),
         (128, True, False, False),

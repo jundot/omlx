@@ -55,6 +55,25 @@ class TestCheckUpdate:
         assert "releases/tag" in result["release_url"]
 
     @pytest.mark.asyncio
+    async def test_stable_update_after_full_prerelease_page(self):
+        prereleases = [{"tag_name": f"v99.1.0.dev{i}"} for i in range(20)]
+        first_page = _FakeResponse(200, prereleases)
+        second_page = _FakeResponse(200, [{"tag_name": "v99.0.0"}])
+
+        with (
+            patch.object(admin_routes, "_read_update_channel", return_value="stable"),
+            patch.object(
+                admin_routes.requests, "get", side_effect=[first_page, second_page]
+            ) as get,
+        ):
+            result = await admin_routes.check_update(is_admin=True)
+
+        assert result["update_available"] is True
+        assert result["latest_version"] == "99.0.0"
+        assert get.call_args.kwargs["params"]["page"] == 2
+        assert get.call_count == 2
+
+    @pytest.mark.asyncio
     async def test_no_update(self):
         """Should return update_available=False when current version is latest."""
         fake_resp = _FakeResponse(200, [{

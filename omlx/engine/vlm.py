@@ -70,10 +70,10 @@ from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
-    compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
     extract_media_from_messages,
+    image_hash_prefixes,
 )
 from ..utils.video import (
     NATIVE_VIDEO_MODEL_TYPES,
@@ -2163,12 +2163,14 @@ class VLMBatchedEngine(BaseEngine):
         # BEFORE materialize so non-resident experts never load.
         moe_offload_wrapped = 0
         offload_stats = offload_release = offload_restore = None
+        offload_releasable = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
                 moe_offload_caches,
                 moe_offload_stats,
+                releasable_moe_offload_bytes,
                 release_moe_offload_slots,
                 restore_moe_offload_slots,
             )
@@ -2212,6 +2214,9 @@ class VLMBatchedEngine(BaseEngine):
                 offload_stats = functools.partial(moe_offload_stats, caches=caches)
                 offload_release = functools.partial(release_moe_offload_slots, caches)
                 offload_restore = functools.partial(restore_moe_offload_slots, caches)
+                offload_releasable = functools.partial(
+                    releasable_moe_offload_bytes, caches
+                )
         self._moe_offload_wrapped = moe_offload_wrapped
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
@@ -2527,6 +2532,7 @@ class VLMBatchedEngine(BaseEngine):
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
+        scheduler.moe_offload_releasable = offload_releasable
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled and self.model_type == "glm5_next":
@@ -4156,6 +4162,8 @@ class VLMBatchedEngine(BaseEngine):
                 field="messages",
             )
 
+        cumulative_hashes = image_hash_prefixes(images)
+
         # Normalize audio to numpy float32 arrays expected by processor.
         # Request-facing string paths are rejected before this point; remaining
         # sources are inline buffers, arrays, or (array, sample_rate) tuples.
@@ -4435,7 +4443,7 @@ class VLMBatchedEngine(BaseEngine):
                             boundary_tokens += 1
 
                     images_consumed += msg_num_images
-                    cumulative_hash = compute_image_hash(images[:images_consumed])
+                    cumulative_hash = cumulative_hashes[images_consumed - 1]
                     image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
 
                 # A later image's prefix can diverge earlier. Its cumulative
@@ -4490,7 +4498,7 @@ class VLMBatchedEngine(BaseEngine):
             image_hash = None
             image_token_count = None
             if num_images > 0:
-                image_hash = compute_image_hash(images)
+                image_hash = cumulative_hashes[-1]
                 image_token_count = self._image_token_count(input_ids)
             elif has_video:
                 image_cache_key_ranges = self._video_cache_key_ranges(
@@ -6210,19 +6218,22 @@ class VLMBatchedEngine(BaseEngine):
         )
         return list(token_ids)
 
-    def has_active_requests(self) -> bool:
-        """Check if the engine has active in-flight requests."""
+    def active_request_count(self) -> int:
+        """Number of in-flight requests across speech, diffusion and text."""
         if getattr(self, "_speech_active", 0):
-            return True
+            return int(self._speech_active)
         if self.is_diffusion_model:
-            return getattr(self, "_diffusion_active_requests", 0) > 0
+            return int(getattr(self, "_diffusion_active_requests", 0))
         engine_core = getattr(self, "_engine", None)
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
             if inner is not None:
-                collectors = getattr(inner, "_output_collectors", {})
-                return len(collectors) > 0
-        return False
+                return len(getattr(inner, "_output_collectors", {}))
+        return 0
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        return self.active_request_count() > 0
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

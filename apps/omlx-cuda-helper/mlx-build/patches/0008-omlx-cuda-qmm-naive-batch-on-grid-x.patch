@@ -1,0 +1,46 @@
+qmm_naive put the batch on grid z, which allows 65,535 blocks.
+A gather_qmm over sorted routes has one batch per (row, expert) pair, so a 3-bit or other non-4/8-bit expert bank (no qmm_sm80 path) failed to launch at 8192 prefill rows x top-10 experts.
+The batch and the M tiles now share grid x, and the A and C batch strides are 64-bit like the stock kernels.
+
+diff --git a/mlx/backend/cuda/device/qmm_naive.cuh b/mlx/backend/cuda/device/qmm_naive.cuh
+index 5eea030c5..b16b03430 100644
+--- a/mlx/backend/cuda/device/qmm_naive.cuh
++++ b/mlx/backend/cuda/device/qmm_naive.cuh
+@@ -243,14 +243,17 @@ void qmm_naive_kernel(
+     int m, int n, int k, int l,
+     bool broadcast_b) {
+   int thread_idx = int(threadIdx.x);
+-  int m_coord = int(blockIdx.x);
++  // Batches share grid x with the M tiles: a gather has one batch per route.
++  int m_tiles = int(ceil_div(m, size<0>(CtaTiler{})));
++  int m_coord = int(blockIdx.x) % m_tiles;
+   int n_coord = int(blockIdx.y);
+-  int l_coord = int(blockIdx.z);
++  int l_coord = int(blockIdx.x) / m_tiles;
+ 
+   // Define layouts (mixed).
+-  auto dA = make_stride(k, Int<1>{}, m * k);  // (dM,dK,dL)
++  // 64-bit batch strides: a gather can write more than 2^31 elements.
++  auto dA = make_stride(k, Int<1>{}, int64_t(m) * k);  // (dM,dK,dL)
+   auto dB = make_matrix_stride<KMajor>(n, k); // (dN,dK,dL)
+-  auto dC = make_stride(n, Int<1>{}, m * n);  // (dM,dN,dL)
++  auto dC = make_stride(n, Int<1>{}, int64_t(m) * n);  // (dM,dN,dL)
+   auto S_layout = make_scales_layout<GroupSize, KMajor>(n, k, l);
+ 
+   // Handle broadcasting.
+diff --git a/mlx/backend/cuda/quantized/qmm/qmm_naive.cu b/mlx/backend/cuda/quantized/qmm/qmm_naive.cu
+index c7c5c6049..13f84569f 100644
+--- a/mlx/backend/cuda/quantized/qmm/qmm_naive.cu
++++ b/mlx/backend/cuda/quantized/qmm/qmm_naive.cu
+@@ -88,9 +88,9 @@ void qmm_naive(
+   encoder.set_output_array(out);
+ 
+   dim3 num_blocks{
+-      uint32_t(cute::ceil_div(m, cute::size<0>(cta_tiler))),
++      uint32_t(cute::ceil_div(m, cute::size<0>(cta_tiler)) * l),
+       uint32_t(cute::ceil_div(n, cute::size<1>(cta_tiler))),
+-      uint32_t(l)};
++      1};
+   dim3 block_dims{uint32_t(cute::size(cu::make_tiled_mma(cta_tiler)))};
+ 
+   auto [sA_layout, sB_layout] = cu::make_smem_layouts(cta_tiler);

@@ -12,6 +12,7 @@ import pytest
 
 from omlx.utils import model_loading
 from omlx.utils.model_loading import (
+    dflash_draft_for,
     ensure_model_code_trusted,
     maybe_apply_pre_load_patches,
     maybe_load_custom_quantization,
@@ -1446,3 +1447,11 @@ class TestMoondreamCompatibility:
             token="test-token",
         )
         assert processor.tokenizer.convert_tokens_to_ids("<|md_reserved_2|>") == 3
+
+
+def test_dflash_draft_for_expands_a_home_relative_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings = types.SimpleNamespace(dflash_enabled=True, dflash_draft_model="~/d")
+    assert dflash_draft_for(settings, None) == str(tmp_path / "d")
+    settings.dflash_draft_model = "z-lab/d"
+    assert dflash_draft_for(settings, None) == "z-lab/d"
