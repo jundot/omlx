@@ -1569,36 +1569,6 @@ def materialize_lazy_state(model: Any) -> None:
             mx.eval(arrays[start : start + _MATERIALIZE_EVAL_CHUNK])
 
 
-# The safetensors spec puts no bound on the header, but a real one holds a few
-# KB. A larger value means the first 8 bytes are not a length, so the read is
-# refused instead of allocated.
-_MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024 * 1024
-
-
-def _safetensors_header(path: Path) -> dict[str, Any] | None:
-    """Read one safetensors header, or None when the file is not one.
-
-    A truncated download gives a garbage length, and a file from another tool
-    can hold any JSON. Both must read as "no header" here, because the caller
-    runs this on every model for the admin list.
-    """
-    try:
-        file_size = path.stat().st_size
-        with open(path, "rb") as handle:
-            encoded_size = handle.read(8)
-            if len(encoded_size) != 8:
-                return None
-            header_size = int.from_bytes(encoded_size, "little")
-            if not 2 <= header_size <= _MAX_SAFETENSORS_HEADER_BYTES:
-                return None
-            if 8 + header_size > file_size:
-                return None
-            header = json.loads(handle.read(header_size))
-    except (OSError, ValueError, MemoryError):
-        return None
-    return header if isinstance(header, dict) else None
-
-
 def checkpoint_has_bf16_leaves(model_path: str) -> bool:
     """Whether the checkpoint on disk still carries bfloat16 tensors.
 
@@ -1614,8 +1584,17 @@ def checkpoint_has_bf16_leaves(model_path: str) -> bool:
     except OSError:
         return False
     for shard in shards:
-        header = _safetensors_header(shard)
-        if header is None:
+        try:
+            with open(shard, "rb") as handle:
+                header_len = int.from_bytes(handle.read(8), "little")
+                # A non-safetensors file, such as a git-lfs pointer, reads as a
+                # huge length.
+                if header_len > shard.stat().st_size:
+                    continue
+                header = json.loads(handle.read(header_len))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(header, dict):
             continue
         for name, spec in header.items():
             if (
