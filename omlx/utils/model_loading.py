@@ -1398,6 +1398,8 @@ def dflash_draft_for(
     if model_settings is None or not getattr(model_settings, "dflash_enabled", False):
         return None
     configured = getattr(model_settings, "dflash_draft_model", None)
+    if configured and configured.startswith("~"):
+        configured = str(Path(configured).expanduser())
     return configured or bundled_dflash_draft(model_path)
 
 
@@ -1587,8 +1589,14 @@ def checkpoint_has_bf16_leaves(model_path: str) -> bool:
         try:
             with open(shard, "rb") as handle:
                 header_len = int.from_bytes(handle.read(8), "little")
+                # A non-safetensors file, such as a git-lfs pointer, reads as a
+                # huge length.
+                if header_len > shard.stat().st_size:
+                    continue
                 header = json.loads(handle.read(header_len))
         except (OSError, ValueError):
+            continue
+        if not isinstance(header, dict):
             continue
         for name, spec in header.items():
             if (

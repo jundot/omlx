@@ -217,6 +217,7 @@
                     web_search_content_max_chars: 20000,
                     splash_path: null,
                     splash_kv_format: 'int8',
+                    splash_activations: 'bf16',
                     splash_max_memory_gb: null,
                     splash_ssd_cache_gb: null,
                     splash_ane_prefill: true,
@@ -696,7 +697,7 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
-            benchUploadSkipped: null,  // { reason } — only external-endpoint runs skip now
+            benchUploadSkipped: null,  // { reason, features } from the upload_skipped event
             benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
@@ -4773,6 +4774,7 @@
                             web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
                             splash_path: this.globalSettings.integrations.splash_path,
                             splash_kv_format: this.globalSettings.integrations.splash_kv_format,
+                            splash_activations: this.globalSettings.integrations.splash_activations,
                             splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
                             splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
                             splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
@@ -6060,6 +6062,16 @@
                     novel_ja: 'bench.config.context.novel_ja',
                 };
                 return window.t(keys[profile] || keys.code_python);
+            },
+
+            benchUploadSkippedLabel(reason) {
+                const keys = {
+                    external_endpoint: 'bench.upload_skipped.reason_external',
+                    splash: 'bench.upload_skipped.reason_splash',
+                    ane_aligned_prompt: 'bench.upload_skipped.reason_ane_aligned_prompt',
+                    custom_generation_length: 'bench.upload_skipped.reason_custom_generation_length',
+                };
+                return window.t(keys[reason] || 'bench.upload_skipped.reason_default');
             },
 
             // User clicked "View live" on the banner — clear the stale
