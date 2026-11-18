@@ -4147,8 +4147,6 @@ class VLMBatchedEngine(BaseEngine):
                 field="messages",
             )
 
-        # One pass over the pixels: every prefix digest below snapshots these
-        # prefixes instead of re-hashing all preceding images.
         cumulative_hashes = image_hash_prefixes(images)
 
         # Normalize audio to numpy float32 arrays expected by processor.
@@ -4430,11 +4428,7 @@ class VLMBatchedEngine(BaseEngine):
                             boundary_tokens += 1
 
                     images_consumed += msg_num_images
-                    cumulative_hash = (
-                        cumulative_hashes[images_consumed - 1]
-                        if images_consumed > 0
-                        else None
-                    )
+                    cumulative_hash = cumulative_hashes[images_consumed - 1]
                     image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
 
                 # A later image's prefix can diverge earlier. Its cumulative
@@ -4489,7 +4483,7 @@ class VLMBatchedEngine(BaseEngine):
             image_hash = None
             image_token_count = None
             if num_images > 0:
-                image_hash = cumulative_hashes[-1] if cumulative_hashes else None
+                image_hash = cumulative_hashes[-1]
                 image_token_count = self._image_token_count(input_ids)
             elif has_video:
                 image_cache_key_ranges = self._video_cache_key_ranges(
