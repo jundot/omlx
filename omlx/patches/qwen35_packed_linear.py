@@ -19,12 +19,10 @@ Projections that read the same input (GDN qkv/z, attention q/k/v, MLP
 gate/up) share one buffer, so a verify forward serves them in one dispatch.
 Every row count runs on packed kernels: one row on a SIMD matvec, 2..8 rows
 on a tensor-unit kernel, 9..48 rows on a skinny tensor-unit kernel that reads
-each weight once for all rows (its K split comes from the shape alone, so a
-row gets the same bits at every row count in that range), more rows on a
-tensor-unit GEMM that dequantizes each group tile into threadgroup memory.
-``PackedLinear`` does not subclass
-``nn.QuantizedLinear``, so code that reads stock quantized weights directly
-skips it and calls the module instead.
+each weight once for all rows, more rows on a tensor-unit GEMM that
+dequantizes each group tile into threadgroup memory. ``PackedLinear`` does not
+subclass ``nn.QuantizedLinear``, so code that reads stock quantized weights
+directly skips it and calls the module instead.
 """
 
 from __future__ import annotations
@@ -38,6 +36,8 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from ..utils.hardware import get_gpu_core_count
 
 logger = logging.getLogger(__name__)
 
@@ -555,23 +555,16 @@ def _gemm_tile(M: int) -> tuple[int, int, int, int]:
     return 128, 64, 2, 2
 
 
-# Skinny threadgroups in flight per GPU core: the K split is the largest power of
-# two up to 8 that keeps 32-column threadgroups x split under this budget. Tuned
-# on M5 Ultra (80 cores) and M5 Max (32 cores) over the Qwen3.5-family 4B and
-# 27B projection shapes: within 2% (Ultra) and 6% (Max) of the best split per
-# row count, never slower than the GEMM.
+# The skinny K split is the largest power of two up to 8 that keeps 32-column
+# threadgroups x split within this many simdgroups per GPU core (tuned on M5).
 _SKINNY_SIMDGROUPS_PER_CORE = 16
 
-# Core count assumed when the GPU's cannot be read: M5 Max, the smallest part the
-# split was tuned on. Assuming more cores than a GPU has over-splits K; results
-# stay correct either way, only the speed changes.
+# Core count assumed when it cannot be read (M5 Max). It changes speed, not results.
 _FALLBACK_GPU_CORES = 32
 
 
 @functools.cache
 def _gpu_cores() -> int:
-    from ..utils.hardware import get_gpu_core_count
-
     cores = get_gpu_core_count()
     if cores:
         return cores
@@ -582,9 +575,8 @@ def _gpu_cores() -> int:
     return _FALLBACK_GPU_CORES
 
 
-# Most rows the skinny kernel takes. It beats the GEMM up to here on every
-# Qwen3.5-family 4B and 27B shape on M5 Ultra and M5 Max; at 64 rows the GEMM
-# wins on some wide outputs.
+# Up to 8 rows the small kernel stays: it applies scale and bias after the code
+# dot product, so it rounds less. From 64 rows the GEMM can be faster.
 _SKINNY_MAX_ROWS = 48
 
 
@@ -950,8 +942,7 @@ def pack_model(model: Any) -> int:
 
 
 # Row counts that select distinct pipelines: matvec, the tensor-unit kernel
-# with each K-split reduce, and the three GEMM tiles.
-# One per kernel variant: matvec, small kernel, skinny 1/2/3 row fragments, GEMM tiles.
+# with each K-split reduce, the skinny 1..3 row fragments, and the GEMM tiles.
 _WARM_ROWS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 33, 49, 65, 513)
 
 

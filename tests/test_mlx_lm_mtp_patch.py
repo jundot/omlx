@@ -6189,7 +6189,7 @@ def test_packed_linear_replaces_4bit_projections(monkeypatch):
 
     assert packed.pack_model(language) == len(originals)
     assert (gdn.in_proj_b, gdn.in_proj_a, mlp.down_proj) == kept
-    # The tensor-unit matvec (<= 8 rows) and GEMM paths, aligned or not.
+    # The matvec, small (<= 8 rows), skinny (9..48) and GEMM paths, aligned or not.
     for rows in (1, 3, 8, 9, 70):
         x = (mx.random.normal((1, rows, 512)) * 0.5).astype(mx.bfloat16)
         for parent, name, original in originals:
