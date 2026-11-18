@@ -630,7 +630,7 @@ class OQManager:
                     if task_id in self._cancelled:
                         raise _QuantCancelled(f"Task {task_id} cancelled")
                     base_phase = phase.split("|", 1)[0]
-                    if base_phase.startswith("quantizing"):
+                    if base_phase.startswith("quantizing") or base_phase == "refine":
                         task.status = QuantStatus.QUANTIZING
                     elif base_phase == "saving":
                         task.status = QuantStatus.SAVING
@@ -788,6 +788,7 @@ class OQManager:
             "loading": "Loading model...",
             "imatrix": "Collecting oQe imatrix...",
             "quantizing": f"Quantizing to {oq_label}...",
+            "refine": "Refining oQe codes...",
             "saving": "Saving quantized model...",
         }
         # Handle progress: "quantizing_eta|792|879|0:02"

@@ -45,6 +45,7 @@ def test_oqe_corpus_declared_in_package_data():
         "oqe_calibration_data.json must be in [tool.setuptools.package-data] "
         "so it ships in the wheel; otherwise oQe silently mis-calibrates."
     )
+    assert "oqe_refine_calibration_data.json" in package_data
 
 
 def test_oqe_corpus_shipped_and_loadable():
