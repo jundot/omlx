@@ -450,6 +450,8 @@
   "models.oq.combine_mtp_donor_help": "Graft the MTP head from a same-architecture donor checkpoint (e.g. the base model of a fine-tune) into the quantized output. Tokenizer and geometry must match exactly; the output name gets a -mtp suffix.",
   "models.oq.enhanced_label": "Enhanced quantization (oQe)",
   "models.oq.enhanced_help": "Use imatrix calibration to weight affine quantization by activation importance.",
+  "models.oq.hadamard_label": "Codes pivotés (oQh)",
+  "models.oq.hadamard_help": "Même taille que oQe avec une erreur plus faible : les poids sont stockés dans une base pivotée de Hadamard avec une échelle par ligne. L'exécution nécessite les noyaux oQh.",
   "models.oq.imatrix_reuse_cache": "Reuse imatrix cache",
   "models.oq.imatrix_reuse_cache_help": "Use a compatible cached imatrix when available; otherwise collect a new one.",
   "models.oq.imatrix_cache_path": "Imatrix cache path",

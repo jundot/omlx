@@ -450,6 +450,8 @@
   "models.oq.combine_mtp_donor_help": "Přenese hlavu MTP z jiného checkpointu se stejnou architekturou (např. základní model laděné verze) do kvantizovaného výstupu. Tokenizer a geometrie se musí přesně shodovat; výsledek dostane příponu -mtp.",
   "models.oq.enhanced_label": "Vylepšená kvantizace (oQe)",
   "models.oq.enhanced_help": "Použije kalibraci imatrix k vážení afinní kvantizace podle důležitosti aktivací.",
+  "models.oq.hadamard_label": "Rotované kódy (oQh)",
+  "models.oq.hadamard_help": "Stejná velikost jako oQe s menší chybou: váhy jsou uloženy v Hadamardově rotované bázi s jedním měřítkem na řádek. Ke spuštění jsou potřeba jádra oQh.",
   "models.oq.imatrix_reuse_cache": "Znovu použít cache imatrix",
   "models.oq.imatrix_reuse_cache_help": "Použije kompatibilní uloženou imatrix, je-li k dispozici; jinak sesbírá novou.",
   "models.oq.imatrix_cache_path": "Cesta k cache imatrix",

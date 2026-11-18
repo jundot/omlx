@@ -479,6 +479,12 @@ class TestCompatibility:
         assert resolve_splash_target(model, None, [str(draft)])[0] is None
         launchers("splash", version="1.3.1")
         assert resolve_splash_target(model, None, [str(draft)])[0] is not None
+        # The oQh variant of the same level keeps its rotated tensors out of Splash.
+        config = json.loads((model / "config.json").read_text())
+        config["omlx_oqh"] = {"version": 1, "tensors": {}}
+        (model / "config.json").write_text(json.dumps(config))
+        target, reason = resolve_splash_target(model, None, [str(draft)])
+        assert target is None and "oQh" in reason
 
     @pytest.mark.parametrize(
         "quantization_config",

@@ -1941,7 +1941,13 @@ def test_only_a_model_that_gets_a_helper_has_an_adapter(tmp_path):
     config["quantization_config"]["quant_method"] = "paroquant"
     (tmp_path / "config.json").write_text(json.dumps(config))
     assert adapter_for_model("qwen3_5", "vlm", path) is None
+    # oQh replaces linears with modules no helper builds, in every family.
+    config = {"model_type": "qwen3_5", "omlx_oqh": {"version": 1, "tensors": {}}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert adapter_for_model("qwen3_5", "vlm", path) is None
+    assert adapter_for_model("qwen4-exp", "batched", path) is None
     # The other families keep their adapter on every engine.
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
     assert adapter_for_model("qwen4-exp", "batched", path) is QWEN4
 
 

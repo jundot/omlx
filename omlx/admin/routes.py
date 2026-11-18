@@ -89,6 +89,7 @@ from ..model_settings import (
     oq_a8_model_supported,
     validate_kv_compression_settings,
 )
+from ..oqh.format import is_oqh_checkpoint
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
@@ -956,6 +957,7 @@ class OQStartRequest(BaseModel):
     imatrix_seq_length: int = 512
     mtp_assistant_model_path: str = ""
     preserve_ngram_table: bool = False
+    hadamard: bool = False
 
 
 class HFUploadRequest(BaseModel):
@@ -1015,6 +1017,9 @@ def _parse_hot_cache_max_size(value: str) -> int:
 
 
 _PAROQUANT_REASON = "Not supported on paroquant models yet (compatibility not verified)"
+
+
+_OQH_PREFILL_REASON = "A8 and ANE prefill do not read oQh weights."
 
 
 def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
@@ -2421,8 +2426,9 @@ def _model_options(model_info: dict, settings) -> dict:
     thinking_modes = ["auto", "on_limit"] if is_k2 else [
         "auto", "on_unlimit", "on_limit", "off"
     ]
+    oqh = is_oqh_checkpoint(model_info.get("model_path") or "")
     ane_backend = (
-        None if model_info.get("is_helper") else ane_prefill_backend(model_type)
+        None if model_info.get("is_helper") or oqh else ane_prefill_backend(model_type)
     )
     return {
         "thinking_forced": is_k2,
@@ -2440,7 +2446,9 @@ def _model_options(model_info: dict, settings) -> dict:
         "embedding_audio_supported": model_type == "embedding_gemma2",
         # Lets the settings UIs hide the toggle the save would reject.
         "a8_prefill_supported": (
-            _oq_a8_model_supported(model_type) and _oq_a8_kernels_available()
+            not oqh
+            and _oq_a8_model_supported(model_type)
+            and _oq_a8_kernels_available()
         ),
         "gpu_power_limit_supported": gpu_power.gpu_power_cap_supported(),
     }
@@ -3823,6 +3831,10 @@ def _validate_model_settings(entry, settings):
             raise HTTPException(
                 status_code=400, detail="A8 prefill min tokens must be at least 1."
             )
+    if (
+        settings.get("a8_prefill_enabled") or settings.get("qwen35_ane_prefill_enabled")
+    ) and is_oqh_checkpoint(getattr(entry, "model_path", "") or ""):
+        raise HTTPException(status_code=400, detail=_OQH_PREFILL_REASON)
     if settings.get("a8_prefill_enabled"):
         if not _oq_a8_model_supported(getattr(entry, "config_model_type", "")):
             raise HTTPException(
@@ -4186,6 +4198,8 @@ def _feature_problem(
     if name in ("turboquant", "index_cache"):
         is_paro, reason = _paroquant_compat_for_model(info)
         return reason if is_paro else None
+    if name in ("ane_prefill", "a8_prefill") and is_oqh_checkpoint(entry.model_path):
+        return _OQH_PREFILL_REASON
     if name == "ane_prefill":
         try:
             validate_ane_prefill(snapshot, entry.config_model_type)
@@ -10011,6 +10025,7 @@ async def start_oq_quantization(
             imatrix_seq_length=request.imatrix_seq_length,
             mtp_assistant_model_path=request.mtp_assistant_model_path,
             preserve_ngram_table=request.preserve_ngram_table,
+            hadamard=request.hadamard,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

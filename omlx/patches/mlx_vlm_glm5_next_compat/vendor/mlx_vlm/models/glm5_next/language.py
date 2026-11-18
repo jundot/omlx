@@ -127,6 +127,23 @@ def _decode_hc_pre(connection, norm, x: mx.array):
     return exact_hc_norm(connection, norm, x, mixes)
 
 
+def _routed_projections(sw, x2):
+    """Routed gate / up of a SwitchGLU for the fused kernels, and x in the
+    experts' basis when they are oQh (None otherwise)."""
+    if getattr(sw, "oqh_experts", None) is not None:
+        return sw.gate_proj, sw.up_proj, sw.oqh_rotated_input(x2)
+    if "gate_up_proj" in sw:
+        return sw.gate_up_proj, None, None
+    return sw.gate_proj, sw.up_proj, None
+
+
+def _routed_act(sw, act, top_k):
+    """oQh experts read the routed activations in their down projection's basis."""
+    if getattr(sw, "oqh_experts", None) is None:
+        return None
+    return sw.down_proj.rotate(act[:, :top_k])
+
+
 def _switch_projections(sw):
     """A SwitchGLU's expert projections in the order its forward passes them
     to _sort_threshold (fused gate_up_proj or separate gate/up, then down)."""
@@ -2264,18 +2281,19 @@ class Glm5NextMoE(nn.Module):
         )
         if logits is None:
             return None
-        if "gate_up_proj" in sw:
-            routed_gate, routed_up = sw.gate_up_proj, None
-        else:
-            routed_gate, routed_up = sw.gate_proj, sw.up_proj
+        routed_gate, routed_up, x_rot = _routed_projections(sw, x2)
         fused = dk.moe_gate_up_swiglu(
             x2, None, limit, routed_gate, routed_up, shared.gate_proj, shared.up_proj,
             select=(*logits, gate.top_k, gate.routed_scaling_factor, gate.norm_topk_prob),
+            x_rot=x_rot,
         )
         if fused is None:
             return None
         act, routes, weights = fused
-        y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
+        y = dk.moe_down_combine(
+            act, routes, weights, sw.down_proj, shared.down_proj,
+            act_rot=_routed_act(sw, act, gate.top_k),
+        )
         return None if y is None else y.reshape(x.shape)
 
     def _decode_experts(self, x, indices, scores):
@@ -2303,12 +2321,6 @@ class Glm5NextMoE(nn.Module):
             )
         ):
             return None
-        # Separate gate/up projections, or one fused [gate; up] gate_up_proj
-        # (MoE gate/up fusion); the kernels read either layout in place.
-        if "gate_up_proj" in sw:
-            routed_gate, routed_up = sw.gate_up_proj, None
-        else:
-            routed_gate, routed_up = sw.gate_proj, sw.up_proj
         limit = getattr(sw.activation, "limit", None)
         if limit is None or (shared is not None and shared.limit != limit):
             return None
@@ -2316,15 +2328,22 @@ class Glm5NextMoE(nn.Module):
         x2 = x.reshape(T, D)
         routes = indices.reshape(T, -1).astype(mx.uint32)
         weights = scores.reshape(T, -1)
+        top_k = routes.shape[1]
         dk = _decode_kernels
+        # Separate gate/up projections, or one fused [gate; up] gate_up_proj
+        # (MoE gate/up fusion); the kernels read either layout in place.
+        routed_gate, routed_up, x_rot = _routed_projections(sw, x2)
         if shared is not None and T == 1:
             act = dk.moe_gate_up_swiglu(
                 x2, routes, limit, routed_gate, routed_up,
-                shared.gate_proj, shared.up_proj,
+                shared.gate_proj, shared.up_proj, x_rot=x_rot,
             )
             if act is None:
                 return None
-            y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
+            y = dk.moe_down_combine(
+                act, routes, weights, sw.down_proj, shared.down_proj,
+                act_rot=_routed_act(sw, act, top_k),
+            )
         else:
             fused = None
             # A shared projection on an armed verify route leaves the
@@ -2337,15 +2356,16 @@ class Glm5NextMoE(nn.Module):
                 # the multi-row qmv_wide arithmetic its own T > 1 call uses.
                 fused = dk.moe_gate_up_swiglu(
                     x2, routes, limit, routed_gate, routed_up,
-                    shared.gate_proj, shared.up_proj, shared_wide=True,
+                    shared.gate_proj, shared.up_proj, shared_wide=True, x_rot=x_rot,
                 )
             if fused is not None:
                 act, shared_act = fused
+                act_rot = _routed_act(sw, act, top_k)
                 # The shared expert's down projection (qmv_wide rows) folds
                 # into the combine kernel when covered.
                 y = dk.moe_down_combine(
                     act, routes, weights, sw.down_proj, shared.down_proj,
-                    shared_act=shared_act,
+                    shared_act=shared_act, act_rot=act_rot,
                 )
                 if y is not None:
                     return y.reshape(x.shape)
@@ -2353,11 +2373,16 @@ class Glm5NextMoE(nn.Module):
                     shared.down_proj, shared_act.reshape(1, T, -1)
                 ).reshape(T, D)
             else:
-                act = dk.moe_gate_up_swiglu(x2, routes, limit, routed_gate, routed_up)
+                act = dk.moe_gate_up_swiglu(
+                    x2, routes, limit, routed_gate, routed_up, x_rot=x_rot
+                )
                 if act is None:
                     return None
+                act_rot = _routed_act(sw, act, top_k)
                 shared_y = None if shared is None else shared(x).reshape(T, D)
-            y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared_y=shared_y)
+            y = dk.moe_down_combine(
+                act, routes, weights, sw.down_proj, shared_y=shared_y, act_rot=act_rot
+            )
         return None if y is None else y.reshape(x.shape)
 
 
