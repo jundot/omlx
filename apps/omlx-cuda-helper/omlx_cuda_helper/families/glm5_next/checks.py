@@ -24,6 +24,9 @@ def _joined(parts) -> mx.array | None:
 def _experts(moe: model.Moe) -> None:
     """The expert kernels against the MLX gather over the same routes."""
     count = moe.gate.weight.shape[0]
+    if moe.oqh_pair is not None:
+        # The oQh reference rebuilds the experts in use dense: keep them few.
+        count = min(count, 2 * moe.top_k)
     x = mx.random.normal((1, 96, moe.router_t.shape[0])).astype(mx.bfloat16)
     experts = mx.random.randint(0, count, (1, 96, moe.top_k))
     weights = mx.random.uniform(shape=experts.shape)
@@ -33,7 +36,9 @@ def _experts(moe: model.Moe) -> None:
     def run():
         return kernels.moe_routed(moe, x, experts, weights)
 
-    kernels.verify("moe", run, want, _EXPERTS)
+    kernels.verify(
+        "moe oqh" if moe.oqh_pair is not None else "moe", run, want, _EXPERTS
+    )
 
 
 def _hyper_connection(connection: model.HyperConnection) -> None:

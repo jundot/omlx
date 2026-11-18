@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Family adapters by model type."""
 
-from ...oqh.format import is_oqh_checkpoint
 from ..adapter import StageAdapter
 from .deepseek_v41 import DeepseekV41Adapter
 from .glm5_next import Glm5NextAdapter
@@ -35,8 +34,5 @@ def adapter_for_model(
     no helper. ``model_type`` is the raw model type of its config.json."""
     adapter = adapter_for((model_type or "").replace("-", "_").lower())
     if adapter is None or not adapter.serves(engine_type, model_path):
-        return None
-    # Helpers build the stock modules; oQh linears exist only in the server.
-    if model_path and is_oqh_checkpoint(model_path):
         return None
     return adapter

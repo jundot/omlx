@@ -60,6 +60,7 @@ def serve(args: argparse.Namespace) -> int:
         ModelStore(models),
         supervisor,
         families.contracts(),
+        oqh=families.oqh_formats(),
         gpu_indices=only,
         bind=args.bind,
         port=args.control_port,

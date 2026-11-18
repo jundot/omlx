@@ -344,8 +344,13 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
     }
 
 
-def incompatible(info: dict, adapter: StageAdapter | None, name: str) -> str | None:
-    """Why this helper cannot serve the family, or None when it can."""
+def incompatible(
+    info: dict, adapter: StageAdapter | None, name: str, oqh: int | None = None
+) -> str | None:
+    """Why this helper cannot serve the family, or None when it can.
+
+    ``oqh`` is the model's oQh format version, None for other checkpoints.
+    """
     if info.get("data_protocol") != wire.PROTOCOL:
         return (
             f"{name} speaks another prefill protocol; update the older of "
@@ -360,6 +365,10 @@ def incompatible(info: dict, adapter: StageAdapter | None, name: str) -> str | N
     if theirs != adapter.contract:
         older = "the helper" if theirs < adapter.contract else "oMLX on this Mac"
         return f"{name} and this Mac disagree on this model family; update {older}."
+    if oqh is not None:
+        reads = info.get("oqh") or {}
+        if not any(reads.get(t) == oqh for t in adapter.model_types):
+            return f"{name} does not read oQh weights of this model family yet."
     return None
 
 
