@@ -14,10 +14,8 @@ final class ThemeTests: XCTestCase {
 
         assertClose(actual, expected)
         XCTAssertGreaterThan(actual.red, 0.95)
-        // macOS 27 (Tahoe) resolves .underPageBackgroundColor almost like
-        // .windowBackgroundColor, so the "> 0.25 apart" contrast no longer holds
-        // there. Keep the strict contract on older systems and assert the real
-        // one (a bright light background) only where the OS converged.
+        // On macOS 27 the light underPage color is almost white (0.965), so
+        // the 0.25 contrast check only holds on older systems.
         if #available(macOS 27, *) {
             XCTAssertGreaterThan(underPage.red, 0.9)
         } else {

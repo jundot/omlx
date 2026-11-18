@@ -5,10 +5,7 @@ import SwiftUI
 @MainActor
 final class ModelSettingsScreenVMTests: XCTestCase {
 
-    /// Percent labels are localized: macOS may render "42 %" with a narrow
-    /// no-break space (U+202F) or a no-break space (U+00A0) before "%". The
-    /// product contract is the numeric value, not the separator, so normalize
-    /// the whitespace before comparing.
+    /// Some locales put a (narrow) no-break space before "%", e.g. "42 %".
     private func normalizedPercent(_ label: String) -> String {
         label
             .replacingOccurrences(of: "\u{202F}", with: "")
