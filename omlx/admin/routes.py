@@ -100,6 +100,7 @@ from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
 from ..request import live_decode_rate
 from ..settings import (
     BURST_DECODE_MODES,
+    SPLASH_ACTIVATIONS,
     SPLASH_KV_FORMATS,
     ConcurrentPriority,
     SubKeyEntry,
@@ -684,7 +685,6 @@ DASHBOARD_BLOCK_IDS = (
     "active_models",
     "cache_observability",
     "api_endpoints",
-    "claude_code",
     "applications",
     "engine_versions",
 )
@@ -874,6 +874,7 @@ class GlobalSettingsRequest(BaseModel):
     # External engines: Splash. An empty path means automatic detection.
     splash_path: str | None = None
     splash_kv_format: str | None = None
+    splash_activations: str | None = None
     splash_max_memory_gb: float | None = None
     splash_ssd_cache_gb: float | None = None
     splash_ane_prefill: bool | None = None
@@ -4992,6 +4993,7 @@ def _global_settings_response(global_settings):
             "web_search_content_max_chars": global_settings.integrations.web_search_content_max_chars,
             "splash_path": global_settings.integrations.splash_path,
             "splash_kv_format": global_settings.integrations.splash_kv_format,
+            "splash_activations": global_settings.integrations.splash_activations,
             "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
             "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
             "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
@@ -5923,6 +5925,14 @@ async def update_global_settings(
                 detail=f"splash_kv_format must be one of {sorted(SPLASH_KV_FORMATS)}",
             )
         global_settings.integrations.splash_kv_format = request.splash_kv_format
+        integrations_changed = True
+    if "splash_activations" in request.model_fields_set:
+        if request.splash_activations not in SPLASH_ACTIVATIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"splash_activations must be one of {sorted(SPLASH_ACTIVATIONS)}",
+            )
+        global_settings.integrations.splash_activations = request.splash_activations
         integrations_changed = True
     if "splash_max_memory_gb" in request.model_fields_set:
         memory = request.splash_max_memory_gb
@@ -9867,22 +9877,29 @@ async def check_update(
         # Use the releases list (not /releases/latest) and filter by the
         # user's update channel. GitHub's prerelease flag has historically
         # been unreliable for rc/dev tags, so release_check validates tags too.
-        resp = await asyncio.to_thread(
-            requests.get,
-            "https://api.github.com/repos/jundot/omlx/releases",
-            params={"per_page": 20},
-            timeout=5,
-        )
-        if resp.status_code != 200:
-            _update_cache[channel] = no_update
-            _update_cache_time[channel] = now
-            return _update_cache[channel]
+        page_size = 20
+        page = 1
+        while True:
+            resp = await asyncio.to_thread(
+                requests.get,
+                "https://api.github.com/repos/jundot/omlx/releases",
+                params={"per_page": page_size, "page": page},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                _update_cache[channel] = no_update
+                _update_cache_time[channel] = now
+                return _update_cache[channel]
 
-        data = select_latest_release(resp.json(), channel=channel)
-        if data is None:
-            _update_cache[channel] = no_update
-            _update_cache_time[channel] = now
-            return _update_cache[channel]
+            releases = resp.json()
+            data = select_latest_release(releases, channel=channel)
+            if data is not None:
+                break
+            if len(releases) < page_size:
+                _update_cache[channel] = no_update
+                _update_cache_time[channel] = now
+                return _update_cache[channel]
+            page += 1
 
         latest = data["tag_name"].lstrip("v")
 

@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from transformers.utils.chat_template_utils import render_jinja_template
+
 from . import gguf
 
 logger = logging.getLogger(__name__)
@@ -945,18 +947,13 @@ def detect_thinking_default(
 ) -> bool | None:
     """Detect a model's effective thinking default from local metadata.
 
-    Inspects the Jinja chat template for ``enable_thinking`` references and
-    determines the default behaviour, including narrow model-family serving
-    recommendations when the raw template deliberately defaults to opt-in:
+    Renders the chat template without ``enable_thinking`` and compares the
+    prompt with explicit True and False renders:
 
-    * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
-      thinking when ``enable_thinking is false``; Laguna: Poolside recommends
-      servers pass ``enable_thinking=true`` by default).
-    * **False** — model suppresses thinking by default (e.g. Gemma 4: only
-      enables thinking when ``enable_thinking`` is truthy,
-      ``default(false)``).
-    * **None** — template does not reference ``enable_thinking`` (model has
-      no thinking toggle).
+    * **True** - model thinks by default (e.g. Qwen 3.x, GLM-4.6V; Laguna:
+      Poolside recommends servers pass ``enable_thinking=true`` by default).
+    * **False** - model suppresses thinking by default (e.g. Gemma 4).
+    * **None** - template has no thinking toggle, or the probe cannot decide.
     """
     if template_text is None:
         template_text = _read_chat_template_text(model_path)
@@ -975,23 +972,30 @@ def detect_thinking_default(
     if model_config.get("model_type") == "laguna":
         return True
 
-    # Heuristic: if the template only disables thinking when explicitly
-    # ``enable_thinking is false``, then thinking is ON by default.
-    # If the template requires ``enable_thinking`` to be truthy or uses
-    # ``default(false)``, then thinking is OFF by default.
-    if "enable_thinking is false" in template_text:
-        return True  # ON by default (Qwen pattern)
-    # An explicit ``enable_thinking | default(true)`` filter states the ON
-    # default directly. It must be anchored and checked before the broad
-    # ``default(false)`` scan: a template may default *other* flags to false
-    # (e.g. ``preserve_thinking | default(false)``, Laguna S-2.1) without
-    # changing its thinking default.
-    if re.search(r"enable_thinking\s*\|\s*default\(true\)", template_text):
+    try:
+        silent = _render_generation_prompt(template_text)
+        enabled = _render_generation_prompt(template_text, enable_thinking=True)
+        disabled = _render_generation_prompt(template_text, enable_thinking=False)
+    except Exception as e:
+        logger.debug("Thinking default probe failed for %s: %s", model_path, e)
+        return None
+    if enabled == disabled:
+        return None
+    if silent == enabled:
         return True
-    if "default(false)" in template_text or "enable_thinking)" in template_text:
-        return False  # OFF by default (Gemma pattern)
-
+    if silent == disabled:
+        return False
     return None
+
+
+def _render_generation_prompt(template_text: str, **kwargs) -> str:
+    rendered, _ = render_jinja_template(
+        conversations=[[{"role": "user", "content": "Hello"}]],
+        chat_template=template_text,
+        add_generation_prompt=True,
+        **kwargs,
+    )
+    return rendered[0]
 
 
 # Context-length keys, in priority order. Order mirrors HuggingFace
@@ -1515,14 +1519,26 @@ def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
     if not snapshots_dir.is_dir():
         return None
 
+    ref_files = []
     for ref_name in ("main", "master"):
+        ref_file = path / "refs" / ref_name
+        if not ref_file.exists():
+            continue
+        ref_files.append(ref_file)
         try:
-            commit_hash = (path / "refs" / ref_name).read_text().strip()
-        except OSError:
+            commit_hash = ref_file.read_text().strip()
+        except (OSError, ValueError):
+            # ValueError covers UnicodeDecodeError: a stray byte in the ref file
             continue
         snapshot = snapshots_dir / commit_hash
         if snapshot.is_dir():
             return HfCacheEntry(snapshot, model_id, source_repo_id)
+
+    if ref_files:
+        logger.warning(
+            "Could not resolve pinned revision from %s — falling back to newest snapshot",
+            ", ".join(str(f) for f in ref_files),
+        )
 
     snapshots = [
         p

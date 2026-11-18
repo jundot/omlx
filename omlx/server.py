@@ -3470,13 +3470,13 @@ async def server_status(_: bool = Depends(verify_api_key)):
             engine = entry.engine
             if engine is None:
                 continue
+            active_requests += engine.active_request_count()
             async_core = getattr(engine, "_engine", None)
             if async_core is None:
                 continue
             core = getattr(async_core, "engine", None)
             if core is None:
                 continue
-            active_requests += len(getattr(core, "_output_collectors", {}))
             sched = getattr(core, "scheduler", None)
             if sched is not None:
                 waiting_requests += len(getattr(sched, "waiting", []))

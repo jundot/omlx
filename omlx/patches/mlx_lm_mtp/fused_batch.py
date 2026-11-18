@@ -253,17 +253,22 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     elif depth > 0 and all(
         not bg._is_greedy(row) and bg._proc_list(row) is None for _, row, _ in rows
     ):
+        samplers = [bg._resolve_sampler(row) for _, row, _ in rows]
+        lps = [bg._logprobs(logits[index]) for index in range(len(rows))]
         stochastic_results = mx.stack(
             [
-                bg._stochastic_verify_tokens(
-                    bg._resolve_sampler(row),
-                    bg._logprobs(logits[index]),
-                    state.drafts,
-                    state.draft_accept_lps,
+                bg._verify_stochastic(
+                    samplers[index], lps[index], state.drafts, state.draft_accept_lps
                 )
-                for index, (_, row, state) in enumerate(rows)
+                for index, (_, _, state) in enumerate(rows)
             ]
         ).tolist()
+        stochastic_results = [
+            bg._settled_verify(
+                host, samplers[index], lps[index], state.drafts, state.draft_accept_lps
+            )
+            for index, (host, (_, _, state)) in enumerate(zip(stochastic_results, rows))
+        ]
     else:
         mx.eval(logits, hidden)
     verify_ms = (time.perf_counter() - started) * 1000 / len(rows)
