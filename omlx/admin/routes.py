@@ -95,6 +95,7 @@ from ..model_settings import (
 from ..oqh.format import is_oqh_checkpoint
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
+from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
@@ -1319,7 +1320,7 @@ def _mtp_compat_for_model(
         if bundled_dspark_path(model_path) is not None:
             return True, ""
         return False, "MiniMax checkpoint has no bundled dspark/ draft"
-    if model_type == "inkling2":
+    if model_type in INKLING2_MODEL_TYPES:
         from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
 
         if bundled_inkling2_dspark_path(model_path) is not None:

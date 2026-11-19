@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -583,6 +585,28 @@ def test_inkling2_loop_controller_ignores_prefill_chunking():
         full = _mix_messages(x, msg, down, gates)
         part = _mix_messages(x[:, :, :1000], msg[:, :, :1000], down, gates)
         assert mx.array_equal(part, full[:, :, :1000])
+
+
+def test_inkling2_loop_model_type_uses_inkling2(tmp_path):
+    from mlx_lm.utils import _get_classes
+
+    from omlx.patches.inkling2 import apply_inkling2_patch
+    from omlx.patches.inkling2 import model as inkling2
+    from omlx.patches.inkling2.dspark import bundled_inkling2_dspark_path
+    from omlx.utils.model_loading import normalize_inkling2_modelopt_quant
+
+    assert apply_inkling2_patch()
+    assert _get_classes({"model_type": "inkling2_loop"})[0] is inkling2.Model
+    release = {
+        "model_type": "inkling2_loop",
+        "quantization_config": {"quant_method": "modelopt"},
+    }
+    assert "quantization_config" not in normalize_inkling2_modelopt_quant(release)
+    mtp = {"markov_head_type": "rnn_hidden"}
+    config = {"model_type": "inkling2_loop", "mtp_config": mtp}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "mtp.safetensors").touch()
+    assert bundled_inkling2_dspark_path(tmp_path) is not None
 
 
 @pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])

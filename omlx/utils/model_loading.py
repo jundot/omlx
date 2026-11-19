@@ -13,6 +13,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
+from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 from ..patches.raon1_mini import normalize_raon1_mini_model_file
@@ -452,7 +453,7 @@ def normalize_inkling2_modelopt_quant(cfg: dict) -> dict:
     The Inkling 2 loader builds the expert carriers itself, and mlx-lm's ModelOpt
     branch would otherwise infer a format for them and fail.
     """
-    if cfg.get("model_type") != "inkling2" or isinstance(
+    if cfg.get("model_type") not in INKLING2_MODEL_TYPES or isinstance(
         cfg.get("quantization"), dict
     ):
         return cfg
@@ -795,7 +796,10 @@ def maybe_apply_pre_load_patches(
         if apply_hy_v4_patch():
             logger.info("Hy4 pre-load patch applied for %s", model_name)
 
-    if model_type == "inkling2":
+    # Cluster autoconfigure reads these guards from the source, so the types
+    # are a literal here and not INKLING2_MODEL_TYPES.
+    inkling2_types = {"inkling2", "inkling2_loop"}
+    if model_type in inkling2_types:
         from ..patches.inkling2 import apply_inkling2_patch
 
         if apply_inkling2_patch():
@@ -981,7 +985,7 @@ def maybe_apply_pre_load_patches(
         from ..patches.minimax_m3_dspark import bundled_dspark_path
 
         minimax_dspark = bundled_dspark_path(model_name)
-    if model_type == "inkling2":
+    if model_type in inkling2_types:
         from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
 
         # Inkling 2 bundles its DSpark draft as mtp.safetensors.
@@ -1497,7 +1501,7 @@ def lightning_mtp_supported(model_path: str | Path) -> bool:
     if str(quantization.get("quant_method") or "").lower() == "paroquant":
         return False
     model_type = config.get("model_type")
-    if model_type == "inkling2":
+    if model_type in INKLING2_MODEL_TYPES:
         from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
 
         return bundled_inkling2_dspark_path(model_path) is not None
