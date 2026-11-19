@@ -179,7 +179,7 @@ Un Mac abbinato può anche accelerare il prefill senza suddividere il modello: i
 [Prefill Accelerator](docs/experimental/prefill-accelerator.md) esegue i primi
 livelli dei prompt lunghi sull'altro Mac, mentre il modello, la sua cache e la
 decodifica restano su questo (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next,
-Qwen3.8 27B e MiniMax M3). L'helper può essere anche una macchina Linux con
+Qwen3.8 27B, MiniMax M3 e Inkling 2). L'helper può essere anche una macchina Linux con
 GPU NVIDIA che esegue [omlx-cuda-helper](apps/omlx-cuda-helper/README.md).
 
 ### Modelli visione-linguaggio
@@ -292,9 +292,27 @@ Sostituisce le API di OpenAI e Anthropic senza modifiche lato client. Supporta l
 | `POST /v1/rerank` | Reranking di documenti |
 | `POST /v1/systemone` | Decisioni tipizzate con modelli decisionali o modelli di chat (TypeSafe System One) |
 | `GET /v1/models` | Elenco dei modelli disponibili |
-| `POST /tokenize`, `POST /detokenize` | API del tokenizer compatibile con vLLM (anche sotto `/v1`) |
+| `POST /v1/audio/transcriptions` | Trascrizione del parlato, con le etichette dei parlanti quando il modello le supporta |
+| `POST /tokenize`, `POST /detokenize` | API del tokenizer compatibile con vLLM (anche sotto `/v1`); i modelli di embedding accettano solo `prompt` |
 
 L'API di amministrazione per impostazioni, modelli, download, quantizzazione e benchmark accetta la chiave API principale come token Bearer e funziona anche in modalità headless. Vedi [Admin API](docs/admin-api.md).
+
+#### Trascrizione con etichette dei parlanti
+
+Seleziona un modello vocale installato che supporti l'attribuzione dei parlanti con i tempi, come VibeVoice-ASR o Nemotron 3.5 Transcribe. Invia una richiesta multipart con l'ID del modello restituito da `GET /v1/models`:
+
+```sh
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer $OMLX_API_KEY" \
+  -F "file=@meeting.wav" \
+  -F "model=$MODEL_ID" \
+  -F "response_format=diarized_json" \
+  -F "chunking_strategy=auto"
+```
+
+La risposta contiene il testo, la durata dell'audio e un segmento per ogni turno di parola con `speaker`, `start`, `end` e `text`. Le etichette dei parlanti valgono solo all'interno della registrazione.
+
+Lo streaming non è supportato e `chunking_strategy` deve essere `auto` oppure omesso: l'intero file viene inviato al modello. I modelli senza etichette dei parlanti con i tempi, compresi i checkpoint Nemotron privi dei file di allineamento CTC, restituiscono HTTP 400.
 
 ### Tool calling e output strutturato
 
