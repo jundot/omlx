@@ -6460,27 +6460,15 @@ class Scheduler:
 
         ``need_bytes`` is the prefill's shortfall: the release covers it in
         coarse steps instead of shrinking every cache to its floor. Skipped
-        while another request runs; the next decode step restores them.
-
-        The bytes come from the caches' own releasable total rather than the
-        release's return value: a release that fails partway still shrank the
-        caches it reached, and those have to be restored too."""
+        while another request runs; the next decode step restores them."""
         if self.moe_offload_release is None or any(
             rid != request_id for rid in self.running
         ):
             return 0
-        releasable = self.moe_offload_releasable
-        before = releasable() if releasable is not None else 0
-        released = 0
-        try:
-            released = self.moe_offload_release(
-                need_bytes, lambda: Scheduler._clear_cache(self)
-            )
-        finally:
-            if releasable is not None:
-                released = max(0, before - releasable())
-            if released:
-                self._moe_offload_slots_released = True
+        self._moe_offload_slots_released = True
+        released = self.moe_offload_release(
+            need_bytes, lambda: Scheduler._clear_cache(self)
+        )
         if released:
             self._reclaim_prefill_headroom()
         return released
