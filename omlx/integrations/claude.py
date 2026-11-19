@@ -99,6 +99,8 @@ class ClaudeCodeIntegration(Integration):
         env["ANTHROPIC_AUTH_TOKEN"] = ctx.auth_token
         env["ANTHROPIC_API_KEY"] = ""
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
+        # Allows automode to work without generating Claude server message.
+        env["CLAUDE_CODE_AUTO_MODE_SERVER"] = "0"
         # Large timeout for local model inference (model loading + generation).
         env["API_TIMEOUT_MS"] = "3000000"
         if ctx.model:
