@@ -253,7 +253,7 @@ class GatedDeltaNet:
         # L2 norm with the epsilon after the sum; the query takes 1/sqrt(dim).
         q = q * mx.rsqrt(row_sum(mx.square(q)) + 1e-6)
         k = k * mx.rsqrt(row_sum(mx.square(k)) + 1e-6)
-        return q * self.key_dim**-0.5, k, v, conv_in[:, rows:]
+        return q * self.key_dim**-0.5, k, v, mx.contiguous(conv_in[:, rows:])
 
     def gates(self, a: mx.array, b: mx.array) -> tuple[mx.array, mx.array]:
         """(decay in float32, update rate) of each step and value head."""

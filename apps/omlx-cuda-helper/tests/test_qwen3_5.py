@@ -222,3 +222,16 @@ def test_the_oqh_rotation_keeps_the_host_butterfly_order():
             got = oqh.rotate(x, signs, block, dtype=mx.bfloat16)
             want = oqh.reference_rotate(x, signs, block, mx.bfloat16)
             assert mx.array_equal(got, want).item()
+
+
+def test_the_next_conv_window_does_not_hold_the_chunk():
+    mixer = load_stage(FIXTURE / "model", 0, 1).layers[0].mixer
+    qkv = mx.random.normal((1, 8192, mixer.taps.shape[0])).astype(mx.bfloat16)
+    mx.eval(qkv)
+    mx.synchronize()
+    before = mx.get_active_memory()
+    *outputs, window = mixer.prework(qkv, None)
+    mx.eval(*outputs, window)
+    del outputs
+    mx.synchronize()
+    assert mx.get_active_memory() - before < qkv.nbytes // 16
