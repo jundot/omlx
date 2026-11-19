@@ -191,11 +191,7 @@ def _is_dspark_model(config: Any) -> bool:
 def _materialize_cache_arrays(cache: Optional[Any]) -> None:
     """Detach DeepSeek-V4 cache update graphs from prior decode steps.
 
-    ``mx.async_eval`` detaches the graphs as ``mx.eval`` does, which is what
-    bounds Metal residency on long decodes (ml-explore/mlx-lm#1332), but it
-    returns without waiting for the GPU. A blocking eval here sits inside the
-    forward, so the caller could not build the next decode step's graph while
-    this one ran.
+    ``mx.async_eval`` cuts the graphs like ``mx.eval`` without blocking the forward.
     """
     if cache is None:
         return
