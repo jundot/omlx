@@ -124,7 +124,6 @@ from .utils.hardware import format_bytes
 from .utils.metal_sync import (
     _default_generation_stream,
     _mx_buffer_access_lock,
-    background_store_holds_lock,
     _sync_and_clear_cache,
     clear_thread_streams,
     set_chunk_memory_limit,
@@ -1389,6 +1388,11 @@ PromptProcessingBatch.prompt = _patched_ppb_prompt
 # new ones are done, so the finish store only adds the tail and a new question
 # on the same prompt finds the blocks without waiting for it.
 _INCREMENTAL_STORE_MIN_BLOCKS = 4
+# Chunk sizing leaves an in-flight incremental copy out, so the chunks match a
+# prefill without it. The copy must then fit in a slice of the room between
+# the sizing target and the hard cap; a bigger one is left to the finish store.
+_INCREMENTAL_COPY_MARGIN_SHARE = 0.25
+_INCREMENTAL_COPY_MIN_CAP_BYTES = 256 * 1024 * 1024
 
 _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
     {
@@ -2670,6 +2674,9 @@ class Scheduler:
         self._incremental_futures: dict[str, concurrent.futures.Future] = {}
         self._incremental_released: set[str] = set()
         self._incremental_lock = threading.Lock()
+        # Bytes of each queued or running store's block copy, which chunk
+        # sizing leaves out (_incremental_copy_bytes_in_flight).
+        self._incremental_copy_bytes: dict[str, int] = {}
         self._inflight_store_info: dict[str, _InflightStoreInfo] = {}
         # Admission-only cache freshness waits. A waiting request can pause at
         # the front of the queue for a relevant in-flight store without
@@ -5018,7 +5025,7 @@ class Scheduler:
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
-            Scheduler._clear_cache(self, defer_to_background_store=True)
+            Scheduler._clear_cache(self)
             if vlm_embeds is None:
                 self._accrue_decode_debt(time.perf_counter() - _trace_chunk_start)
             if getattr(request, "benchmark_trace", False):
@@ -5664,7 +5671,7 @@ class Scheduler:
         if soft_base <= 0 or hard_cap <= 0 or requested <= 0:
             return requested
 
-        current = self._current_usage_bytes()
+        current = Scheduler._prefill_sizing_usage_bytes(self)
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
@@ -6284,13 +6291,8 @@ class Scheduler:
             return False
         return current >= self._memory_limit_bytes
 
-    def _clear_cache(self, defer_to_background_store: bool = False) -> None:
-        """Clear the Metal pool and account for flat-overhead buffers that may return.
-
-        ``defer_to_background_store``: a routine clear between prefill chunks
-        is skipped, not waited for, while an incremental prefill store holds
-        the buffer lock; the next chunk clears.
-        """
+    def _clear_cache(self) -> None:
+        """Clear the Metal pool and account for flat-overhead buffers that may return."""
         tracker = getattr(self, "_prefill_transient_tracker", None)
         track = (
             tracker is not None
@@ -6300,11 +6302,7 @@ class Scheduler:
         # release, so a footprint delta read here can miss the whole pool.
         pooled = int(mx.get_cache_memory())
         residual = _graphics_residual() if pooled > 0 else None
-        if defer_to_background_store:
-            if _sync_and_clear_cache(self._stream, defer_to_background_store=True) is False:
-                return
-        else:
-            _sync_and_clear_cache(self._stream)
+        _sync_and_clear_cache(self._stream)
         if residual is not None:
             Scheduler._note_pool_release(self, residual)
         self._prefill_chunk_pool = None
@@ -7591,7 +7589,7 @@ class Scheduler:
         )
 
         if self._should_clear_after_chunk():
-            Scheduler._clear_cache(self, defer_to_background_store=True)
+            Scheduler._clear_cache(self)
         chunk_dt = time.perf_counter() - head.started
         for plan, before in zip(plans, processed_before):
             state = plan.state
@@ -8739,7 +8737,11 @@ class Scheduler:
                 in_memory_snapshots=in_memory,
                 paged_ssd_manager=self.paged_ssd_cache_manager,
             )
-        arrays = self._collect_arrays_from_extracted_cache(payload)
+        copy_arrays = self._collect_arrays_from_extracted_cache(payload)
+        copy_bytes = sum(int(getattr(a, "nbytes", 0) or 0) for a in copy_arrays)
+        if copy_bytes > self._incremental_copy_cap_bytes():
+            return
+        arrays = list(copy_arrays)
         for snap in in_memory.values():
             arrays.extend(self._collect_arrays_from_extracted_cache(snap))
         if arrays:
@@ -8756,8 +8758,51 @@ class Scheduler:
         except Exception as e:  # noqa: BLE001 - the finish store stores it all
             logger.debug("Incremental store not submitted for %s: %s", rid, e)
             return
+        with self._incremental_lock:
+            if not future.done():
+                self._incremental_copy_bytes[rid] = copy_bytes
         self._incremental_futures[rid] = future
         self._incremental_stored[rid] = end_tokens
+
+    def _incremental_copy_cap_bytes(self) -> int:
+        """Largest block copy an incremental store may hold in flight."""
+        hard_cap = int(getattr(self, "_memory_hard_limit_bytes", 0) or 0)
+        margin = 0
+        if hard_cap > 0:
+            margin = hard_cap - int(Scheduler._prefill_peak_target(self))
+        return max(
+            _INCREMENTAL_COPY_MIN_CAP_BYTES,
+            int(max(0, margin) * _INCREMENTAL_COPY_MARGIN_SHARE),
+        )
+
+    def _prefill_sizing_usage_bytes(self) -> int:
+        """Current usage for prefill chunk sizing.
+
+        An in-flight incremental store's block copy is left out (see
+        _incremental_copy_bytes_in_flight), so the chunks match a prefill
+        without it.
+        """
+        copy_in_flight = getattr(self, "_incremental_copy_bytes_in_flight", None)
+        in_flight = copy_in_flight() if callable(copy_in_flight) else 0
+        return max(0, int(self._current_usage_bytes()) - int(in_flight))
+
+    def _incremental_copy_bytes_in_flight(self) -> int:
+        """Bytes of the block copies of queued or running incremental stores.
+
+        A copy lives from the end of the chunk that made it until its store
+        has written it, usually during the next chunk. Chunk sizing leaves it
+        out, so a prefill picks the same chunk sizes with or without these
+        stores; the copy is capped (_incremental_copy_cap_bytes) to fit in the
+        room between the sizing target and the hard cap.
+        """
+        with self._incremental_lock:
+            items = list(self._incremental_copy_bytes.items())
+        total = 0
+        for rid, nbytes in items:
+            future = self._incremental_futures.get(rid)
+            if future is not None and not future.done():
+                total += nbytes
+        return total
 
     def _incremental_converts_to_turboquant(self, prompt_cache: list[Any]) -> bool:
         """TurboQuant prefills dense and converts the full-attention layers at
@@ -8836,23 +8881,23 @@ class Scheduler:
         """
         with self._incremental_lock:
             if request_id in self._incremental_released:
+                self._incremental_copy_bytes.pop(request_id, None)
                 return
         try:
             with _mx_buffer_access_lock:
-                background_store_holds_lock.set()
-                try:
-                    _safe_sync_stream(self._stream)
-                    self.block_aware_cache.store_cache(
-                        request_id,
-                        tokens,
-                        payload,
-                        model_cache_config=model_cache_config,
-                        boundary_snapshots=snapshots,
-                    )
-                finally:
-                    background_store_holds_lock.clear()
+                _safe_sync_stream(self._stream)
+                self.block_aware_cache.store_cache(
+                    request_id,
+                    tokens,
+                    payload,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots=snapshots,
+                )
         except Exception as e:  # noqa: BLE001 - the finish store stores what is left
             logger.warning("Incremental store_cache failed for %s: %s", request_id, e)
+        finally:
+            with self._incremental_lock:
+                self._incremental_copy_bytes.pop(request_id, None)
 
     # A released request waits this long for its incremental store to land in
     # its block table, so the release returns those references too.
@@ -8868,6 +8913,8 @@ class Scheduler:
         """
         self._incremental_stored.pop(request_id, None)
         future = self._incremental_futures.pop(request_id, None)
+        with self._incremental_lock:
+            self._incremental_copy_bytes.pop(request_id, None)
         if future is None or future.done():
             return
         with self._incremental_lock:

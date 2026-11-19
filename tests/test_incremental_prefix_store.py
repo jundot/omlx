@@ -16,7 +16,11 @@ import omlx.scheduler as sch
 from omlx.cache.paged_cache import PagedCacheManager
 from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
 from omlx.cache.prefix_cache import BlockAwarePrefixCache
-from omlx.utils.metal_sync import _mx_buffer_access_lock, mx_buffer_lock_released
+from omlx.utils.metal_sync import (
+    _mx_buffer_access_lock,
+    _sync_and_clear_cache,
+    mx_buffer_lock_released,
+)
 
 BLOCK = 4
 
@@ -113,6 +117,7 @@ def _scheduler(prefix, executor=None, **overrides):
         _incremental_futures={},
         _incremental_released=set(),
         _incremental_lock=threading.Lock(),
+        _incremental_copy_bytes={},
         _INCREMENTAL_RELEASE_WAIT_S=5.0,
         _boundary_cache_snapshots={},
         _boundary_snapshot_store=None,
@@ -141,6 +146,8 @@ def _scheduler(prefix, executor=None, **overrides):
         "_note_incremental_release",
         "_incremental_converts_to_turboquant",
         "_incremental_turboquant_payload",
+        "_incremental_copy_cap_bytes",
+        "_incremental_copy_bytes_in_flight",
     ):
         setattr(sched, name, types.MethodType(getattr(s, name), sched))
     return sched
@@ -428,3 +435,56 @@ def test_turboquant_blocks_match_the_converted_cache(tmp_path):
     finally:
         ssd_a.close()
         ssd_b.close()
+
+
+def test_chunk_sizing_leaves_out_a_copy_in_flight(prefix_factory):
+    """The guard sizes the next chunk from the same usage as without the
+    store: the queued store's block copy is left out until it has run."""
+    prefix, _ = prefix_factory()
+    executor = _Executor(run=False)
+    sched = _scheduler(prefix, executor)
+    live = _live(8)
+    sched._maybe_incremental_store(_request(12), [live], 8, False)
+    copy = sum(part.nbytes for part in _data(live)["state"]) * 8 // live.offset
+    assert sched._incremental_copy_bytes_in_flight() == copy
+    sched._current_usage_bytes = lambda: 10 * copy
+    assert sch.Scheduler._prefill_sizing_usage_bytes(sched) == 9 * copy
+    executor.drain()
+    assert sched._incremental_copy_bytes_in_flight() == 0
+    assert sched._incremental_copy_bytes == {}
+    assert sch.Scheduler._prefill_sizing_usage_bytes(sched) == 10 * copy
+
+
+def test_a_copy_too_big_for_the_margin_is_left_to_the_finish_store(prefix_factory):
+    prefix, paged = prefix_factory()
+    sched = _scheduler(prefix)
+    sched._incremental_copy_cap_bytes = lambda: 1
+    sched._maybe_incremental_store(_request(12), [_live(8)], 8, False)
+    assert sched._incremental_stored == {} and sched._incremental_futures == {}
+    assert (
+        paged.get_block_table("r") is None or not paged.get_block_table("r").block_ids
+    )
+
+
+def test_a_released_queued_store_drops_its_copy_bytes(prefix_factory):
+    prefix, _ = prefix_factory()
+    executor = _Executor(run=False)
+    sched = _scheduler(prefix, executor)
+    sched._maybe_incremental_store(_request(12), [_live(8)], 8, False)
+    assert sched._incremental_copy_bytes
+    sched._note_incremental_release("r")
+    executor.drain()
+    assert sched._incremental_copy_bytes == {}
+    assert sched._incremental_copy_bytes_in_flight() == 0
+
+
+def test_the_routine_clear_waits_for_a_store_holding_the_lock():
+    """The clear between prefill chunks is not skipped while a store holds
+    the buffer lock: it waits (one block, see mx_buffer_lock_released)."""
+    done = threading.Event()
+    with _mx_buffer_access_lock:
+        worker = threading.Thread(target=lambda: (_sync_and_clear_cache(), done.set()))
+        worker.start()
+        assert not done.wait(0.2)
+    worker.join(5)
+    assert done.is_set()

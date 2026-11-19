@@ -39,11 +39,6 @@ _default_generation_stream = generation_stream
 _mx_buffer_access_lock = threading.RLock()
 
 
-# Set while an incremental prefill store holds _mx_buffer_access_lock: a
-# prefill chunk's routine pool clear skips that chunk instead of waiting.
-background_store_holds_lock = threading.Event()
-
-
 @contextmanager
 def mx_buffer_lock_released():
     """Let go of ``_mx_buffer_access_lock`` while this thread waits on I/O.
@@ -83,7 +78,7 @@ def clear_thread_streams() -> None:
     mx.clear_streams()
 
 
-def _sync_and_clear_cache(stream=None, *, defer_to_background_store=False):
+def _sync_and_clear_cache(stream=None):
     """Synchronize in-flight GPU work before clearing the Metal buffer cache.
 
     Without synchronization, mx.clear_cache() can release Metal buffers that
@@ -98,19 +93,8 @@ def _sync_and_clear_cache(stream=None, *, defer_to_background_store=False):
 
     See: https://github.com/jundot/omlx/issues/300, #888, #1106
     """
-    if defer_to_background_store and background_store_holds_lock.is_set():
-        # A routine clear between prefill chunks can wait for the next chunk;
-        # an incremental store is copying blocks out under the lock.
-        if not _mx_buffer_access_lock.acquire(blocking=False):
-            return False
-        try:
-            _sync_and_clear_locked(stream)
-        finally:
-            _mx_buffer_access_lock.release()
-        return True
     with _mx_buffer_access_lock:
         _sync_and_clear_locked(stream)
-    return True
 
 
 def _sync_and_clear_locked(stream=None):
