@@ -59,9 +59,10 @@ final class LocalizationSmokeTests: XCTestCase {
         // Server-side screens
         "server.section.advanced", "server.row.base_path",
         "security.section.api_key", "security.api_key.row_label",
-        "integrations.section.claude_code", "integrations.tool.codex",
-        "integrations.section.external_engines",
+        "integrations.section.applications", "integrations.tool.claude",
+        "integrations.section.external_engines", "integrations.panel.model",
         "integrations.section.markitdown", "integrations.markitdown.pdf_processing_missing_model",
+        "integrations.websearch.section_label", "integrations.websearch.test_success",
         "performance.section.cache", "performance.cache.enabled",
         "askai.row.enabled", "askai.section.presets",
         "settings.search.prompt", "settings.search.empty",

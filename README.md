@@ -176,7 +176,7 @@ A paired Mac can also speed up prefill without splitting the model: the
 [Prefill Accelerator](docs/experimental/prefill-accelerator.md) runs the first
 layers of long prompts on the other Mac while the model, its cache and
 decoding stay on this one (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next,
-Qwen3.8 27B and MiniMax M3). The helper can also be a Linux machine with
+Qwen3.8 27B, MiniMax M3 and Inkling 2). The helper can also be a Linux machine with
 NVIDIA GPUs running [omlx-cuda-helper](apps/omlx-cuda-helper/README.md).
 
 ### Vision-Language Models
@@ -289,9 +289,27 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/rerank` | Document reranking |
 | `POST /v1/systemone` | Typed decisions with decision models or chat models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
-| `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
+| `POST /v1/audio/transcriptions` | Speech-to-text, including speaker labels when supported |
+| `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`); embedding models take `prompt` only |
 
 The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
+
+#### Transcription with speaker labels
+
+Select an installed speech model that supports timed speaker attribution, such as VibeVoice-ASR or Nemotron 3.5 Transcribe. Send a multipart request with the model ID from `GET /v1/models`:
+
+```sh
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer $OMLX_API_KEY" \
+  -F "file=@meeting.wav" \
+  -F "model=$MODEL_ID" \
+  -F "response_format=diarized_json" \
+  -F "chunking_strategy=auto"
+```
+
+The response includes text, the audio duration, and one segment per speaker turn with `speaker`, `start`, `end`, and `text`. Speaker labels are local to the recording.
+
+Streaming is not supported, and `chunking_strategy` must be `auto` or omitted; the whole file goes to the model. Models without timed speaker labels, including Nemotron checkpoints without the CTC alignment files, return HTTP 400.
 
 ### Tool Calling & Structured Output
 

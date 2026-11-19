@@ -12,6 +12,7 @@ from typing import Any
 
 import mlx.core as mx
 
+from ... import checkpoint, oqh
 from ...tensors import unpack
 from . import kernels
 
@@ -232,28 +233,57 @@ class Mlp:
 
 
 class ExpertBank:
-    """One projection of every routed expert, [experts, out, in]."""
+    """One projection of every routed expert, [experts, out, in].
 
-    def __init__(self, weight, scales=None, biases=None, quant=None):
+    An oQh bank has ``rotation`` (signs, block) and reads rotated rows.
+    """
+
+    def __init__(self, weight, scales=None, biases=None, quant=None, rotation=None):
         self.weight, self.scales, self.biases, self.quant = (
             weight,
             scales,
             biases,
             quant,
         )
+        self.rotation = rotation
         if scales is None:
             self.weight = mx.contiguous(weight.swapaxes(-1, -2))
 
     @classmethod
     def load(cls, weights: dict[str, mx.array], prefix: str, quant) -> ExpertBank:
+        signs = weights.get(f"{prefix}.{checkpoint.OQH_SIGNS}")
+        if signs is not None:
+            weight = weights[f"{prefix}.weight"]
+            scales = weights.get(f"{prefix}.oqh_scales")
+            group = scales is not None
+            bits = weight.shape[-1] * 32 // signs.size
+            packing = {
+                "bits": bits,
+                "group_size": signs.size // scales.shape[-1] if group else 0,
+                "mode": "affine",
+                "oqh": True,
+            }
+            return cls(
+                weight,
+                scales if group else weights[f"{prefix}.rscale"],
+                weights[f"{prefix}.oqh_biases"] if group else None,
+                packing,
+                (signs, int(signs.shape[-1])),
+            )
         packed = (weights.get(f"{prefix}.{leaf}") for leaf in ("scales", "biases"))
         return cls(weights[f"{prefix}.weight"], *packed, quant(prefix))
+
+    def bank(self) -> tuple:
+        """(weight, scales, biases, quantization) as the expert kernel reads it."""
+        return self.weight, self.scales, self.biases, self.quant
 
     def parameters(self) -> list[mx.array]:
         return [a for a in (self.weight, self.scales, self.biases) if a is not None]
 
     def __call__(self, x: mx.array, experts: mx.array) -> mx.array:
         """Rows ``x`` [routes, 1, in] through their expert; sorted by expert."""
+        if self.rotation is not None:
+            return oqh.bank_gather(x, self.bank(), experts)
         if self.scales is None:
             return mx.gather_mm(
                 x, self.weight, rhs_indices=experts, sorted_indices=True
@@ -280,7 +310,15 @@ def routed(banks, x, experts, weights, limit) -> mx.array:
     order = mx.argsort(flat)
     rows = x.reshape(batch * length, 1, -1)[order // k]
     chosen = flat[order]
-    y = down(_clamped_swiglu(up(rows, chosen), gate(rows, chosen), limit), chosen)
+    if gate.rotation is not None:
+        # oQh: rows and the float32 activation are rotated, as on the host.
+        rows = oqh.rotate(rows, *gate.rotation)
+        act = oqh.act_rotate(
+            gate(rows, chosen), up(rows, chosen), *down.rotation, limit
+        )
+        y = down(act, chosen)
+    else:
+        y = down(_clamped_swiglu(up(rows, chosen), gate(rows, chosen), limit), chosen)
     y = y[mx.argsort(order)].reshape(batch, length, k, -1)
     return (y * weights[..., None]).sum(axis=-2).astype(x.dtype)
 
@@ -297,6 +335,22 @@ class Moe:
             ExpertBank.load(weights, f"{prefix}.switch_mlp.{name}", quant)
             for name in ("gate_proj", "up_proj", "down_proj")
         )
+        # oQh: gate | up as one bank for the expert kernel; gate and up view it.
+        self.oqh_pair = None
+        if self.gate.rotation is not None:
+            oqh.check_shared(self.gate, self.up)
+            pair = [
+                mx.concatenate([a, b], axis=1) if a is not None else None
+                for a, b in zip(self.gate.bank()[:3], self.up.bank()[:3])
+            ]
+            self.oqh_pair = (*pair, self.gate.quant)
+            inner = self.gate.weight.shape[1]
+            for bank, part in (
+                (self.gate, slice(0, inner)),
+                (self.up, slice(inner, None)),
+            ):
+                bank.weight, bank.scales = pair[0][:, part], pair[1][:, part]
+                bank.biases = None if pair[2] is None else pair[2][:, part]
         self.shared = None
         if f"{prefix}.shared_experts.gate_proj.weight" in weights:
             shared = f"{prefix}.shared_experts"
@@ -308,7 +362,11 @@ class Moe:
 
     def parameters(self) -> list[mx.array]:
         out = [self.router_t, self.bias]
-        for bank in (self.gate, self.up, self.down):
+        banks = (self.gate, self.up, self.down)
+        if self.oqh_pair is not None:
+            out += [a for a in self.oqh_pair[:3] if a is not None]
+            banks = (self.down,)
+        for bank in banks:
             out += bank.parameters()
         return out + (self.shared.parameters() if self.shared else [])
 

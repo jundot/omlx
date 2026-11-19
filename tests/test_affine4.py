@@ -192,8 +192,11 @@ def test_portable_attention_masks_sinks_and_dimensions(
         (1, 4, 8, 4, 512, 1025, mx.bfloat16, Affine4KVCache, True),
         (1, 4, 6, 8, 256, 1025, mx.bfloat16, Affine8KVCache, False),
         (1, 8, 8, 1, 64, 1025, mx.bfloat16, Affine8KVCache, True),
-        # Flint verify: 8 query heads per KV head over 6 rows run as two
-        # threadgroup chunks per KV head in one launch.
+        # Over 16 rows per KV head run as 16-row chunks, which can split a
+        # query head's positions and end with a partial chunk.
+        (1, 4, 8, 3, 128, 1025, mx.bfloat16, Affine8KVCache, True),
+        (1, 4, 8, 5, 128, 2049, mx.bfloat16, Affine8KVCache, True),
+        (2, 2, 3, 7, 64, 700, mx.float16, Affine4KVCache, True),
         (1, 4, 8, 6, 128, 2049, mx.bfloat16, Affine8KVCache, True),
         (2, 4, 8, 8, 128, 1025, mx.float16, Affine4KVCache, True),
     ],
@@ -303,6 +306,59 @@ def test_bf16_prefill_forces_fused_sdpa_only_where_supported(
     close(output, dense(cache, queries, mask), atol=8e-3, rtol=8e-3)
 
 
+@pytest.mark.parametrize(
+    "dim,repeats,rows,mask,force_fused,cache_class",
+    [
+        (128, 8, 33, "causal", True, Affine8KVCache),
+        (64, 4, 33, None, True, Affine4KVCache),
+        (80, 4, 8, "causal", None, Affine8KVCache),
+    ],
+)
+def test_bf16_prefill_with_sinks_keeps_sinks(
+    monkeypatch, dim, repeats, rows, mask, force_fused, cache_class
+):
+    # Models with attention sinks used to skip this branch and dequantize the whole
+    # cache to fp32 per chunk; the portable fallback inside it also dropped the sinks.
+    if not mx.metal.is_available():
+        pytest.skip("Fused prefill requires Metal")
+    cache = cache_class()
+    cache.update_and_fetch(
+        random((1, 2, 513, dim), mx.bfloat16),
+        random((1, 2, 513, dim), mx.bfloat16, 1),
+    )
+    queries = random((1, 2 * repeats, rows, dim), mx.bfloat16, 2)
+    # Large sinks take most of the softmax mass, so a dropped sink fails.
+    sinks = mx.linspace(4, 9, 2 * repeats)
+    monkeypatch.setattr(affine4, "_tensor_ops_available", lambda: False)
+    original = mx.fast.scaled_dot_product_attention
+    calls = []
+
+    def capture(q, k, v, **kwargs):
+        calls.append(
+            (
+                q.dtype,
+                k.dtype,
+                kwargs.get("force_fused"),
+                kwargs.get("sinks") is not None,
+            )
+        )
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", capture)
+    output = cache.attention(queries, scale=dim**-0.5, mask=mask, sinks=sinks)
+    assert calls == [(mx.bfloat16, mx.bfloat16, force_fused, True)]
+    close(output, dense(cache, queries, mask, sinks), atol=8e-3, rtol=8e-3)
+
+
+@pytest.mark.parametrize("cache_class", [BatchAffine4KVCache, BatchAffine8KVCache])
+def test_unpadded_batch_keeps_string_mask(cache_class):
+    cache = cache_class([0, 0])
+    assert cache._attention_mask("causal", 5, 40) == "causal"
+    assert cache._attention_mask(None, 5, 40) is None
+    padded = cache_class([3, 0])
+    assert isinstance(padded._attention_mask("causal", 5, 40), mx.array)
+
+
 @pytest.mark.parametrize("magnitude", [60000, 1e6])
 @pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
 def test_native_large_queries(magnitude, cache_class):
@@ -352,7 +408,7 @@ def test_from_cache_trim_and_batch_lifecycle():
     assert batch.extract(2).offset == 5
 
 
-@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("rows", [1, 3, 7])
 def test_batch_native_standard_mask_and_padding(monkeypatch, rows):
     require_tensor_ops()
     cache = BatchAffine4KVCache([37, 0])
@@ -610,3 +666,19 @@ def test_bounded_prefill_peak_memory():
     temporary = mx.get_peak_memory() - baseline
     assert temporary < 600 * 1024**2, f"Prefill allocated {temporary / 1024**2:.1f} MiB"
     assert mx.all(mx.isfinite(output)).item()
+
+
+def test_batch_left_padding_is_read_from_the_device_once_per_assignment(monkeypatch):
+    reads = []
+    real_any = mx.any
+    monkeypatch.setattr(mx, "any", lambda *a, **k: reads.append(1) or real_any(*a, **k))
+    cache = BatchAffine8KVCache([0, 0])
+
+    for _ in range(3):
+        assert cache._attention_mask(None, 1, 16) is None
+    assert len(reads) == 1
+
+    cache.left_padding += mx.array([3, 0])
+    mask = cache._attention_mask(None, 1, 16)
+    assert len(reads) == 2
+    assert mask[:, 0, 0, :].tolist() == [[False] * 3 + [True] * 13, [True] * 16]

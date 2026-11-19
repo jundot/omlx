@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from omlx.api.grammar import GRAMMAR_CACHE_LIMIT_BYTES
 from omlx.engine.base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
 
 
@@ -1533,3 +1534,19 @@ class TestGrammarCompilerLazyInit:
         assert len(results) == 8
         assert all(result is sentinel for result in results), results
         assert len(calls) == 1
+
+    @pytest.mark.parametrize(
+        ("model_type", "limit"),
+        [("qwen3", GRAMMAR_CACHE_LIMIT_BYTES), ("k2_horizon", 64 * 1024**2)],
+    )
+    def test_compiler_cache_is_bounded(self, model_type, limit):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._model = SimpleNamespace(config={"model_type": model_type})
+        engine._tokenizer = object()
+
+        with patch("omlx.api.grammar.create_grammar_compiler") as create:
+            assert engine.grammar_compiler is create.return_value
+
+        assert create.call_args.kwargs == {"cache_limit_bytes": limit}

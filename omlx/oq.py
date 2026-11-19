@@ -37,7 +37,12 @@ try:
     from mlx_lm.models.base import create_attention_mask
     from mlx_lm.utils import _get_classes
 
+    from omlx.oqh import format as oqh_format
+    from omlx.oqh import targets as oqh_targets
+    from omlx.oqh.writer import OqhWriter
     from omlx.patches import minimax_m3_dspark as minimax_dspark
+    from omlx.patches.inkling2 import apply_inkling2_patch
+    from omlx.patches.inkling2 import oq_layout as inkling2_layout
     from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
 
     HAS_MLX = True
@@ -129,6 +134,32 @@ def _muse_spark_passthrough_capture_skip(
     return frozenset(names)
 
 
+def _inkling2_passthrough_capture_skip(
+    all_weights, config: dict, oq_level: float, group_size: int
+) -> frozenset:
+    """Expert modules whose packed source tensors this level passes through.
+
+    Same role as the Muse Spark helper above: their imatrix is never used.
+    Calibration names them as the runtime model does, ``ExpertProj`` paths.
+    """
+    floor_config = {**config, "_oq_boost_map": {}}
+    names = set()
+    layers = int(inkling2_layout.text_config(config)["num_hidden_layers"])
+    for layer in range(layers):
+        for proj in ("w13", "w2"):
+            name = f"model.layers.{layer}.mlp.experts.{proj}"
+            source_key = f"{inkling2_layout.SOURCE_PREFIX}{name[len('model.') :]}"
+            info = all_weights.source_quant_info(f"{source_key}.weight")
+            if info is None:
+                continue
+            bits, _, _ = _get_predicate_bits(
+                f"{name}.weight", floor_config, oq_level, group_size
+            )
+            if bits is not None and bits >= info["bits"]:
+                names.add(name)
+    return frozenset(names)
+
+
 def _muse_spark_folded_scales(
     all_weights, config: dict, oq_level: float, group_size: int
 ) -> frozenset:
@@ -137,9 +168,12 @@ def _muse_spark_folded_scales(
     Those experts are written dequantized or requantized, so their weights take
     the per-expert tensor scale and no ``global_scale`` is written. The output
     then holds plain affine experts that mlx-lm loads as well. Experts passed
-    through as NVFP4 keep their ``global_scale``.
+    through as NVFP4 keep their ``global_scale``. Inkling 2 follows the same
+    rule for its NVFP4 layers.
     """
-    if not _is_muse_spark_modelopt_nvfp4(config):
+    if not (
+        _is_muse_spark_modelopt_nvfp4(config) or inkling2_layout.is_inkling2(config)
+    ):
         return frozenset()
     names = set()
     for name in all_weights.keys():
@@ -375,6 +409,9 @@ def _is_vlm_load(config: dict) -> bool:
     ``mlx_vlm.speculative.drafters.<type>`` lookup and fails.
     """
     model_type = str(config.get("model_type", "")).lower().replace("-", "_")
+    if inkling2_layout.is_inkling2(config):
+        # mlx-lm's Inkling 2 module holds the vision tower too.
+        return False
     return model_type in VLM_NATIVE_TEXT_MODEL_TYPES or (
         _has_vision_subconfig(config)
         and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
@@ -634,6 +671,7 @@ def _is_token_embedding_tensor(path: str) -> bool:
             ".tok_embeddings.weight",
             ".word_embeddings.weight",
             ".wte.weight",
+            f"{inkling2_layout.EMBED_PATH}.weight",
         )
     )
 
@@ -691,6 +729,7 @@ def universal_quant_predicate(
         or tc.get("num_local_experts")
         or config.get("num_experts")
         or tc.get("num_experts", 0)
+        or inkling2_layout.n_routed_experts(config)
         or 0
     )
     hidden_size = config.get("hidden_size") or tc.get("hidden_size", 0)
@@ -857,6 +896,12 @@ def universal_quant_predicate(
     if config.get("model_type") in ("inkling", "inkling_mm_model") and (
         "qkvr_proj" in path
     ):
+        return bits(8)
+
+    # Inkling 2 fuses q, k, v, the relative-bias rows, the output gate and the
+    # attention sink logits into each projection, and the sink rows drive every
+    # softmax. The projections are under 1% of the weights, so keep them at Q8.
+    if inkling2_layout.is_attention_projection(config, path):
         return bits(8)
 
     if any(p in path for p in ("v_proj", "v_a_proj", "v_b_proj")):
@@ -1114,6 +1159,14 @@ def _routed_expert_projection(path: str) -> str | None:
 # other boost.
 _MANDATORY_BOOST_PATTERNS = ("lm_head", "embeddings", "embed_tokens", "wte")
 
+
+def _mandatory_boost_patterns(config: dict) -> tuple[str, ...]:
+    """Head and embedding names; Inkling 2's table is the bare ``model.embed``."""
+    if inkling2_layout.is_inkling2(config):
+        return (*_MANDATORY_BOOST_PATTERNS, inkling2_layout.EMBED_PATH)
+    return _MANDATORY_BOOST_PATTERNS
+
+
 # Dense models below 3-bit lift every decoder tensor to this floor first;
 # wider groups keep it inside the low-level budgets. Widths that 128 does not
 # divide use the default group, which would otherwise leave them unquantized.
@@ -1138,11 +1191,11 @@ def _global_attention_layers(config: dict) -> set[int]:
     return {i for i, kind in enumerate(layer_types) if kind == "full_attention"}
 
 
-def _is_always_on_tensor(path: str) -> bool:
+def _is_always_on_tensor(path: str, config: dict) -> bool:
     """Decoder weights every token runs through: all but routed experts and heads."""
     if _is_routed_expert(path) or _is_vision_tensor(path) or _is_audio_tensor(path):
         return False
-    return not any(p in path for p in _MANDATORY_BOOST_PATTERNS)
+    return not any(p in path for p in _mandatory_boost_patterns(config))
 
 
 def _always_on_candidates(
@@ -1156,7 +1209,7 @@ def _always_on_candidates(
     pred_config = {**config, "_oq_boost_map": {}}
     found = []
     for path, shape in named_shapes.items():
-        if path in fixed_overrides or not _is_always_on_tensor(path):
+        if path in fixed_overrides or not _is_always_on_tensor(path, config):
             continue
         if universal_quant_predicate(path, None, pred_config, oq_level) is False:
             continue
@@ -1419,7 +1472,7 @@ def _build_quant_plan(
         )
         if pred is False:
             continue
-        for pattern in _MANDATORY_BOOST_PATTERNS:
+        for pattern in _mandatory_boost_patterns(config):
             if pattern in path:
                 numel = 1
                 for dim in shape:
@@ -1701,7 +1754,7 @@ def _build_quant_plan(
         for path, shape in named_shapes.items():
             if _is_routed_expert(path) or path in fixed_overrides:
                 continue
-            if any(p in path for p in _MANDATORY_BOOST_PATTERNS):
+            if any(p in path for p in _mandatory_boost_patterns(config)):
                 continue
             cur = boost_map.get(path)
             if cur is None:
@@ -1751,7 +1804,9 @@ def _build_quant_plan(
     # before it reaches routed experts.
     for path in sorted(boost_map, key=lambda p: "lm_head" not in p):
         cur = boost_map[path]
-        if cur["bits"] >= 8 or not any(p in path for p in _MANDATORY_BOOST_PATTERNS):
+        if cur["bits"] >= 8 or not any(
+            p in path for p in _mandatory_boost_patterns(config)
+        ):
             continue
         shape = named_shapes[path]
         full_gs = _gs_for_mode(8, _OQ_DEFAULT_GROUP_SIZE)
@@ -1939,6 +1994,7 @@ def resolve_output_name(
     preserve_mtp: bool = False,
     enhanced: bool = False,
     preserve_ngram_table: bool = False,
+    hadamard: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
@@ -1951,6 +2007,7 @@ def resolve_output_name(
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
         "Qwen3.5-122B-A10B" + 4 + enhanced -> "Qwen3.5-122B-A10B-oQ4e"
+        "Qwen3.5-122B-A10B" + 2.5 + hadamard -> "Qwen3.5-122B-A10B-oQ2.5h"
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
         "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
@@ -1958,7 +2015,7 @@ def resolve_output_name(
             + preserve_mtp -> "DeepSeek-V4.1-Flash-oQ4e-ngram-mtp"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|ngram|mtp)$",
+        r"-(oQ[\d.]+[eh]?|[0-9]+[_-]?bit|fp\d+|bf\d+|ngram|mtp)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -1968,7 +2025,7 @@ def resolve_output_name(
             break
         base = new
     level_str = f"{oq_level:g}"
-    suffix = f"-oQ{level_str}{'e' if enhanced else ''}"
+    suffix = f"-oQ{level_str}{'h' if hadamard else ('e' if enhanced else '')}"
     if dtype == "float16":
         suffix += "-fp16"
     if preserve_ngram_table:
@@ -4327,6 +4384,14 @@ def _metal_available_memory_bytes() -> int:
     return max(0, max_working_set - active)
 
 
+def _is_inkling2_dir(path: str | Path) -> bool:
+    try:
+        config = json.loads((Path(path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return inkling2_layout.is_inkling2(config)
+
+
 def _source_weight_files(model_path: str | Path) -> list[Path]:
     source = Path(model_path)
     files = sorted(
@@ -4334,6 +4399,8 @@ def _source_weight_files(model_path: str | Path) -> list[Path]:
         for f in source.glob("*.safetensors")
         if f.name not in DECISION_SIDECAR_WEIGHTS
     )
+    if inkling2_layout.has_bundled_draft(source) and _is_inkling2_dir(source):
+        files = [f for f in files if not inkling2_layout.is_draft_file(f)]
     sidecar = source / "mtp" / "model_mtp.safetensors"
     if sidecar.is_file():
         config = json.loads((source / "config.json").read_text())
@@ -4408,6 +4475,7 @@ def _calibration_memory_budget(
     checkpoint_bytes: int = 0,
     *,
     fallback_system_bytes: int = 0,
+    model_fraction: float = _MAX_MODEL_RAM_FRACTION,
 ) -> dict[str, int | bool]:
     """Return the live memory budget for full-model calibration forwards.
 
@@ -4421,7 +4489,7 @@ def _calibration_memory_budget(
     metal_available = _metal_available_memory_bytes()
     candidates = [value for value in (system_available, metal_available) if value > 0]
     capacity = min(candidates) if candidates else max(0, int(fallback_system_bytes))
-    model_limit = int(capacity * _MAX_MODEL_RAM_FRACTION)
+    model_limit = int(capacity * model_fraction)
     checkpoint_bytes = max(0, int(checkpoint_bytes))
     return {
         "system_available_bytes": int(system_available),
@@ -4749,6 +4817,8 @@ def _build_model_sanitizer(
     normalize_qwen35_text_config(config)
     if _is_muse_spark(config):
         return muse_spark_layout.sanitizer(config, text_only=text_only)
+    if inkling2_layout.is_inkling2(config):
+        return inkling2_layout.sanitizer(config, text_only=text_only)
     if config.get("model_type") == "flint":
         from mlx_vlm.models.flint import Model, ModelConfig
 
@@ -5188,6 +5258,16 @@ def _holds_chat_template(path: Path) -> bool:
         return True
 
 
+# Sidecars are copied with shutil.copy (contents and mode), not copy2 or
+# copytree: files on SMB shares carry SF_ARCHIVED, which only root may set.
+def _copy_sidecar_tree(src: Path, dst: Path) -> None:
+    for path in src.rglob("*"):
+        if path.is_file():
+            target = dst / path.relative_to(src)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(path, target)
+
+
 def _copy_model_sidecars(
     source: Path, output: Path, *, text_only: bool = False, model_type: str = ""
 ) -> None:
@@ -5201,23 +5281,23 @@ def _copy_model_sidecars(
     """
     for pattern in _SIDECAR_PATTERNS:
         for src_file in source.glob(pattern):
-            shutil.copy2(src_file, output / src_file.name)
+            shutil.copy(src_file, output / src_file.name)
 
     for pattern in _MULTIMODAL_SIDECAR_PATTERNS:
         for src_file in source.glob(pattern):
             if text_only and not _holds_chat_template(src_file):
                 continue
-            shutil.copy2(src_file, output / src_file.name)
+            shutil.copy(src_file, output / src_file.name)
 
     for py_file in source.glob("*.py"):
-        shutil.copy2(py_file, output / py_file.name)
+        shutil.copy(py_file, output / py_file.name)
 
     # LFM3 speech decoding loads its codec separately from the model weights.
     if not text_only and model_type == "lfm3_omni":
         for name in ("audio_tokenizer", "audio_detokenizer"):
             codec = source / name
             if codec.is_dir():
-                shutil.copytree(codec, output / name)
+                _copy_sidecar_tree(codec, output / name)
 
 
 def _copy_bundled_drafts(source: Path, output: Path) -> None:
@@ -5228,7 +5308,7 @@ def _copy_bundled_drafts(source: Path, output: Path) -> None:
     """
     draft = minimax_dspark.bundled_dspark_path(source)
     if draft is not None:
-        shutil.copytree(draft, output / draft.name, dirs_exist_ok=True)
+        _copy_sidecar_tree(draft, output / draft.name)
 
 
 def _build_non_quantizable_set(config: dict) -> set:
@@ -5249,6 +5329,8 @@ def _build_non_quantizable_set(config: dict) -> set:
             model.leaf_modules(), is_leaf=nn.Module.is_module
         ):
             if hasattr(module, "weight") and not hasattr(module, "to_quantized"):
+                if inkling2_layout.is_expert_carrier(module):
+                    continue
                 if getattr(module.weight, "ndim", 0) >= 2:
                     result.add(_normalize_quant_path(path))
 
@@ -6076,9 +6158,12 @@ def _calibration_footprint_bytes(index, storage_bytes: int, config: dict) -> int
     logical BF16 view determines admission. MiniMax MXFP8 and DeepSeek V4 FP4
     sources take the quantized-source sensitivity path and remain packed in
     quantized modules; pricing those as BF16 would force an unnecessary proxy.
+    Inkling 2 calibrates on its packed source model, which is what it stores.
     """
     storage_bytes = max(0, int(storage_bytes))
-    if _uses_quantized_source_sensitivity(config):
+    if _uses_quantized_source_sensitivity(config) or inkling2_layout.is_inkling2(
+        config
+    ):
         return storage_bytes
     return max(storage_bytes, _logical_footprint_bytes(index))
 
@@ -6781,6 +6866,173 @@ def _weighted_affine_quantize(w, group_size: int, bits: int, importance):
     return packed, scales, biases
 
 
+# H + 3 diag(H) keeps the code refinement from overfitting the calibration data.
+_OQE_REFINE_SAMPLES = 176
+_OQE_REFINE_EXTRA_SAMPLES = 16
+_OQE_REFINE_SHRINK = 3.0
+_OQE_REFINE_SWEEPS = 4
+_OQE_REFINE_PASSES = 2
+_OQE_REFINE_CHUNK_ELEMS = 1 << 26
+
+# One thread per (row, group); r is the group's slice of (W_hat - W) @ H.
+_CODE_REFINE_SOURCE = """
+    uint t = thread_position_in_grid.x;
+    if (t >= T) return;
+    const device float* h = hbb + (t / ROWS) * GS * GS;
+    const float s = scales[t];
+    const float qmax = float(QMAX);
+    float r[GS];
+    float q[GS];
+    for (int k = 0; k < GS; ++k) {
+        r[k] = res[t * GS + k];
+        q[k] = codes[t * GS + k];
+    }
+    if (s != 0.0f) {
+        for (int p = 0; p < PASSES; ++p) {
+            bool moved = false;
+            for (int j = 0; j < GS; ++j) {
+                float den = s * h[j * GS + j];
+                float target = q[j] - r[j] / den;
+                if (den == 0.0f || !isfinite(target)) continue;
+                float qn = clamp(rint(target), 0.0f, qmax);
+                float dq = qn - q[j];
+                if (dq != 0.0f) {
+                    for (int k = 0; k < GS; ++k) r[k] += s * dq * h[j * GS + k];
+                    q[j] = qn;
+                    moved = true;
+                }
+            }
+            if (!moved) break;
+        }
+    }
+    for (int k = 0; k < GS; ++k) {
+        out_delta[t * GS + k] = s * (q[k] - codes[t * GS + k]);
+        out_codes[t * GS + k] = q[k];
+    }
+"""
+
+_CODE_REFINE_KERNEL = None
+
+
+def _code_refine_kernel():
+    global _CODE_REFINE_KERNEL
+    if _CODE_REFINE_KERNEL is None:
+        _CODE_REFINE_KERNEL = mx.fast.metal_kernel(
+            name="oqe_code_refine",
+            input_names=["codes", "scales", "res", "hbb"],
+            output_names=["out_codes", "out_delta"],
+            source=_CODE_REFINE_SOURCE,
+        )
+    return _CODE_REFINE_KERNEL
+
+
+def _unpack_affine_codes(packed, bits: int, group_size: int, in_dim: int):
+    flat = packed.reshape(-1, packed.shape[-1])
+    ones = mx.ones((flat.shape[0], in_dim // group_size), mx.float32)
+    codes = mx.dequantize(
+        flat, ones, mx.zeros_like(ones), group_size=group_size, bits=bits
+    )
+    return codes.reshape(*packed.shape[:-1], in_dim)
+
+
+def _refine_code_block(w, codes, scales, biases, h, bits, group_size):
+    """Refine (experts, rows, in) codes against h (experts, in, in)."""
+    n_exp, n_rows, n_in = w.shape
+    kernel = _code_refine_kernel()
+    s_full = mx.repeat(scales, group_size, axis=-1)
+    b_full = mx.repeat(biases, group_size, axis=-1)
+    err = s_full * codes + b_full - w
+    r = err @ h
+    before = mx.sum(err * r).item()
+    last = before
+    for _ in range(_OQE_REFINE_SWEEPS):
+        blocks = []
+        for g in range(n_in // group_size):
+            c0, c1 = g * group_size, (g + 1) * group_size
+            new_codes, delta = kernel(
+                inputs=[
+                    codes[..., c0:c1].reshape(n_exp * n_rows, group_size),
+                    scales[..., g].reshape(n_exp * n_rows),
+                    r[..., c0:c1].reshape(n_exp * n_rows, group_size),
+                    h[:, c0:c1, c0:c1],
+                ],
+                template=[
+                    ("T", n_exp * n_rows),
+                    ("GS", group_size),
+                    ("ROWS", n_rows),
+                    ("QMAX", (1 << bits) - 1),
+                    ("PASSES", _OQE_REFINE_PASSES),
+                ],
+                grid=(n_exp * n_rows, 1, 1),
+                threadgroup=(min(256, n_exp * n_rows), 1, 1),
+                output_shapes=[(n_exp * n_rows, group_size)] * 2,
+                output_dtypes=[mx.float32, mx.float32],
+            )
+            r = r + delta.reshape(n_exp, n_rows, group_size) @ h[:, c0:c1, :]
+            blocks.append(new_codes.reshape(n_exp, n_rows, group_size))
+            if g % 8 == 7:
+                mx.eval(r, blocks)
+        codes = mx.concatenate(blocks, axis=-1)
+        objective = mx.sum((s_full * codes + b_full - w) * r).item()
+        done = last - objective <= 1e-4 * abs(before)
+        last = objective
+        if done:
+            break
+    return codes, before, last
+
+
+def _shrunk_gram(gram):
+    in_dim = int(gram.shape[-1])
+    gram = gram.reshape(-1, in_dim, in_dim).astype(mx.float32)
+    idx = mx.arange(in_dim)
+    gram = gram.at[:, idx, idx].add(_OQE_REFINE_SHRINK * gram[:, idx, idx])
+    mx.eval(gram)
+    return gram
+
+
+def _refine_affine_codes(weight, packed, scales, biases, hessian, bits, group_size):
+    """Re-pick the codes of one affine tensor, keeping its scales and biases.
+
+    weight: the original (rows, in) or (experts, rows, in) tensor.
+    hessian: the matching (experts or 1, in, in) _shrunk_gram output.
+    Returns (packed, before, after), or None if the objective is not finite or lower.
+    """
+    lead = weight.shape[:-1]
+    in_dim = int(weight.shape[-1])
+    w3 = weight.reshape(-1, *weight.shape[-2:]) if weight.ndim == 3 else weight[None]
+    n_exp, n_rows = int(w3.shape[0]), int(w3.shape[1])
+    codes = _unpack_affine_codes(packed, bits, group_size, in_dim)
+    codes = codes.reshape(n_exp, n_rows, in_dim)
+    s_all = scales.astype(mx.float32).reshape(n_exp, n_rows, -1)
+    b_all = biases.astype(mx.float32).reshape(n_exp, n_rows, -1)
+    rows = max(1, _OQE_REFINE_CHUNK_ELEMS // (n_exp * in_dim))
+    out = []
+    before = after = 0.0
+    for r0 in range(0, n_rows, rows):
+        r1 = min(n_rows, r0 + rows)
+        q, b0, b1 = _refine_code_block(
+            w3[:, r0:r1].astype(mx.float32),
+            codes[:, r0:r1],
+            s_all[:, r0:r1],
+            b_all[:, r0:r1],
+            hessian,
+            bits,
+            group_size,
+        )
+        mx.eval(q)
+        out.append(q)
+        before += b0
+        after += b1
+    if not (math.isfinite(after) and after <= before):
+        return None
+    codes = mx.concatenate(out, axis=1).reshape(-1, in_dim)
+    one = mx.ones((1, 1, 1), mx.float32)
+    new_packed = _pack_affine_codes(codes, one, mx.zeros_like(one), group_size, bits)
+    new_packed = new_packed.reshape(*lead, -1)
+    mx.eval(new_packed)
+    return new_packed, before, after
+
+
 def _importance_is_uniform(importance) -> bool:
     try:
         imp = importance if isinstance(importance, mx.array) else mx.array(importance)
@@ -6892,17 +7144,31 @@ def _quantize_chunked(w, group_size, bits, mode, importance=None):
 # --- end chunked-quantize helpers ---
 
 
+def _block_fp8_source(config: dict) -> bool:
+    """Whether the checkpoint stores block-FP8 weights that a whole-model load
+    re-quantizes (mlx-vlm converts them to mxfp8)."""
+    quantization = config.get("quantization_config") or {}
+    return (
+        isinstance(quantization, dict)
+        and quantization.get("quant_method") == "fp8"
+        and quantization.get("fmt", "e4m3") == "e4m3"
+        and quantization.get("weight_block_size") == [128, 128]
+    )
+
+
 def _resolve_stream_calibration(
     stream_calibration: bool | None,
     *,
     model_exceeds_ram: bool,
     model_type: str | None,
+    block_fp8: bool = False,
 ) -> bool:
     """Decide whether oQe calibration streams layers from the checkpoint.
 
     Explicit argument first, then the auto rule: stream when the source does
     not fit in RAM, where the resident collector would otherwise calibrate on
-    a lossy quantized proxy of the model.
+    a lossy quantized proxy of the model, or when its block-FP8 weights would
+    be re-quantized by a resident load. The streamed walk decodes them exactly.
 
     Streaming only works for the layouts the sourcer understands
     (_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES). For every other model_type
@@ -6921,7 +7187,7 @@ def _resolve_stream_calibration(
                 "proxy, or extend the streamed sourcer for this layout."
             )
         return bool(stream_calibration)
-    return model_exceeds_ram and supported
+    return (model_exceeds_ram or block_fp8) and supported
 
 
 def quantize_oq_streaming(
@@ -6947,6 +7213,7 @@ def quantize_oq_streaming(
     sensitivity_map_override: dict[int | str, float] | None = None,
     stream_calibration: bool | None = None,
     preserve_ngram_table: bool = False,
+    hadamard: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -7010,6 +7277,9 @@ def quantize_oq_streaming(
             model_type, and an explicit stream_calibration=True on an
             unsupported layout raises a ValueError up front instead of
             failing deep in the sourcer. Only consulted when enhanced is True.
+            Inkling 2 never builds a proxy: its packed source is calibrated
+            resident and needs that much live memory, and the DSpark draft
+            is copied with the config's mtp_config whatever preserve_mtp says.
         preserve_ngram_table: Write the qwen4_exp N-gram PLE table
             (``ple_embedding.ngram_embedding`` shard tensors) unquantized, in
             the checkpoint dtype, instead of at the selected oQ level. The
@@ -7019,6 +7289,12 @@ def quantize_oq_streaming(
             plain weights. DeepSeek V4.1 keeps its Engram tables in the
             official FP8 storage instead of 4-bit affine. No effect on other
             model types.
+        hadamard: Build oQh: the decoder linears become rotated uniform codes
+            with one scale per row (see omlx/oqh/format.py), quantized against
+            their input Gram. The bytes the affine plan gives them buy the
+            widths (see oqh.targets.reinvest), so the size stays the same.
+            Implies the oQe calibration. It needs the original weights, so a
+            source that only a proxy can calibrate is refused.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -7027,6 +7303,8 @@ def quantize_oq_streaming(
     if dtype not in OQ_DTYPES:
         raise ValueError(f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}")
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
+    if hadamard:
+        enhanced = True
 
     source = Path(model_path)
     output = Path(output_path)
@@ -7060,11 +7338,18 @@ def quantize_oq_streaming(
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
+    if inkling2_layout.is_inkling2(config):
+        # The model class is needed before any calibration load registers it.
+        apply_inkling2_patch()
     mimo_multimodal = (
         normalized_model_type in {"mimo_v2", "mimo_v2_flash"}
         and _has_vision_subconfig(config)
         and not text_only
     )
+    if hadamard and not oqh_targets.supports(config):
+        raise ValueError(
+            f"oQh does not support model_type {config.get('model_type')!r}"
+        )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
@@ -7088,6 +7373,7 @@ def quantize_oq_streaming(
             dtype=dtype,
             progress_callback=progress_callback,
             preserve_ngram_table=preserve_ngram_table,
+            hadamard=hadamard,
         )
     if (
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
@@ -7141,6 +7427,12 @@ def quantize_oq_streaming(
         ),
         config=config,
     )
+    if inkling2_layout.is_inkling2(config):
+        capture_skip = _inkling2_passthrough_capture_skip(
+            all_weights, config, oq_level, group_size
+        )
+        if capture_skip:
+            config["_oq_imatrix_capture_skip"] = capture_skip
     if (
         preserve_mtp
         and not any(_is_mtp_tensor(k) for k in all_weights.keys())
@@ -7173,6 +7465,11 @@ def quantize_oq_streaming(
     _calibration_budget = _calibration_memory_budget(
         _calibration_bytes,
         fallback_system_bytes=_system_ram,
+        # A proxy of Inkling 2 would be as large as its packed source, so only
+        # the live capacity limits calibration.
+        model_fraction=(
+            1.0 if inkling2_layout.is_inkling2(config) else _MAX_MODEL_RAM_FRACTION
+        ),
     )
     _model_requires_proxy = bool(_calibration_budget["requires_proxy"])
     if _model_requires_proxy and static_sensitivity_map is None:
@@ -7203,6 +7500,15 @@ def quantize_oq_streaming(
 
     def _ensure_ram_safe_proxy() -> Path:
         nonlocal _ram_safe_proxy_dir
+        if _ram_safe_proxy_dir is None and inkling2_layout.is_inkling2(config):
+            raise RuntimeError(
+                "Inkling 2 calibrates on its packed source model, which needs "
+                f"{_format_size(_calibration_bytes)} of live memory but only "
+                f"{_format_size(int(_calibration_budget['capacity_bytes']))} is "
+                "available, and no smaller proxy exists. Stop other model "
+                "servers, or pass sensitivity_map_override and an existing "
+                "imatrix cache."
+            )
         if _ram_safe_proxy_dir is None:
             logger.warning(
                 f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
@@ -7280,11 +7586,17 @@ def quantize_oq_streaming(
             stream_calibration,
             model_exceeds_ram=_model_requires_proxy,
             model_type=str(config.get("model_type", "")),
+            block_fp8=_block_fp8_source(config),
         )
         if stream_imatrix:
             logger.info(
                 f"oQ{oq_level:g}: oQe imatrix will stream one layer at a "
                 "time from the source checkpoint (no calibration proxy)"
+            )
+        elif hadamard and _model_requires_proxy:
+            raise ValueError(
+                "oQh needs the original weights during calibration; this source "
+                "only fits in memory through a proxy"
             )
         # When the streamed sweep is going to visit every layer anyway and
         # this build still needs a measured sensitivity map, fuse the qdq
@@ -7534,6 +7846,12 @@ def quantize_oq_streaming(
                 f"{len(all_weights)} output tensors"
             )
         except Exception as e:
+            if inkling2_layout.is_inkling2(config):
+                raise RuntimeError(
+                    f"oQ{oq_level:g}: Inkling 2 sanitize-plan discovery failed "
+                    f"({e}); the eager fallback would materialize the whole "
+                    "model in BF16"
+                ) from e
             if _model_requires_proxy:
                 raise RuntimeError(
                     f"oQ{oq_level:g}: streaming sanitize-plan discovery "
@@ -7622,6 +7940,18 @@ def quantize_oq_streaming(
     else:
         config["_oq_boost_map"] = {}
 
+    # oQh widths of the decoder linears, from the bytes the affine plan gives them.
+    oqh_plan: dict[str, int] = {}
+    if hadamard:
+        oqh_plan = _plan_oqh_bits(
+            _budgeted_shapes(named_shapes, config), config, oq_level, group_size
+        )
+        oqh_group = oqh_targets.scheme_for(config).group_size(oq_level)
+        logger.info(
+            f"oQ{oq_level:g}: oQh plan covers {len(oqh_plan)} tensors, "
+            + (f"group scales of {oqh_group}" if oqh_group else "row scales")
+        )
+
     cb("loading", 20.0, "Starting tensor quantization")
 
     tensor_names = list(all_weights.keys())
@@ -7678,6 +8008,7 @@ def quantize_oq_streaming(
             src_info = all_weights.source_quant_info(tensor_name)
             if (
                 src_info is not None
+                and tensor_name.removesuffix(".weight") not in oqh_plan
                 and _should_quantize_tensor(
                     tensor_name, all_weights.plan_shape(tensor_name)
                 )
@@ -7743,6 +8074,11 @@ def quantize_oq_streaming(
                     tensor_name, config, oq_level, group_size
                 )
 
+                if tensor_name.removesuffix(".weight") in oqh_plan:
+                    # Written by the oQh pass from the original weights.
+                    del w_mx
+                    processed_bytes += tensor_bytes
+                    continue
                 if bits is not None and len(shape) >= 2 and shape[-1] % gs == 0:
                     # Cast to target dtype before quantize: scales/biases inherit
                     # the input dtype, which drives inference speed on Apple
@@ -7884,6 +8220,30 @@ def quantize_oq_streaming(
         out_shard_idx += 1
         del out_shard_data
 
+    oqh_report = None
+    if hadamard:
+        if out_shard_idx == 1 and (output / "model.safetensors").exists():
+            # A lone main shard took the final name; the oQh shards follow it.
+            single = "model-00001-of-PLACEHOLDER.safetensors"
+            (output / "model.safetensors").rename(output / single)
+            for k in weight_map:
+                weight_map[k] = single
+        oqh_report = _write_oqh_output(
+            source,
+            output,
+            config,
+            weight_map,
+            {**quantization_config, **per_layer_config},
+            oqh_plan,
+            target_dtype,
+            out_shard_idx,
+            group_size=oqh_group,
+            streamed=stream_imatrix,
+            trust_remote_code=trust_remote_code,
+            progress_callback=cb,
+        )
+        out_shard_idx = oqh_report.pop("shards")
+
     total_shards = out_shard_idx
     if total_shards > 1:
         for i in range(total_shards):
@@ -7896,6 +8256,21 @@ def quantize_oq_streaming(
                 for k, v in weight_map.items():
                     if v == old_name:
                         weight_map[k] = new_name
+
+    if enhanced and upstream_writer is None and not hadamard:
+        refine_report = _refine_oqe_output(
+            source,
+            output,
+            config,
+            weight_map,
+            {**quantization_config, **per_layer_config},
+            streamed=stream_imatrix,
+            requires_proxy=_model_requires_proxy,
+            trust_remote_code=trust_remote_code,
+            progress_callback=cb,
+        )
+        if imatrix_report is not None:
+            imatrix_report["refine"] = refine_report
 
     cb("saving", 92.0, "Writing model metadata")
 
@@ -7925,7 +8300,11 @@ def quantize_oq_streaming(
         output_config.pop(temp_key, None)
     if text_only:
         _normalize_text_only_in_config(output_config)
-    if not preserve_mtp:
+    # The DSpark draft is copied unchanged, so the config keeps declaring it.
+    bundled_draft = inkling2_layout.is_inkling2(config) and (
+        inkling2_layout.has_bundled_draft(source)
+    )
+    if not preserve_mtp and not bundled_draft:
         # Default path: zero out MTP layer counts so the quantized model
         # doesn't claim to have an MTP head while its weights have been
         # stripped. This keeps the output self-consistent — mtp_enabled
@@ -7968,6 +8347,13 @@ def quantize_oq_streaming(
         quant_info[key] = val
     output_config["quantization"] = quant_info
     output_config["quantization_config"] = quant_info
+    if oqh_report is not None:
+        output_config[oqh_format.CONFIG_KEY] = {
+            "version": oqh_format.FORMAT_VERSION,
+            "tensors": oqh_report.pop("entries"),
+        }
+        if imatrix_report is not None:
+            imatrix_report["oqh"] = oqh_report
     if minimax_nvfp4_experts:
         output_config["text_config"] = {
             **output_config["text_config"],
@@ -7987,9 +8373,11 @@ def quantize_oq_streaming(
     )
     for name in DECISION_SIDECAR_FILES:
         if (source / name).is_file():
-            shutil.copy2(source / name, output / name)
+            shutil.copy(source / name, output / name)
     if not text_only:
         _copy_bundled_drafts(source, output)
+    if inkling2_layout.is_inkling2(config):
+        inkling2_layout.copy_bundled_draft(source, output)
 
     if mimo_multimodal:
         from .patches.mimo_v2.omnimodal import export_sidecars
@@ -8009,12 +8397,13 @@ _SENS_SEQ_LENGTH = 256
 # stream untouched.
 _CALIB_SAMPLE_SEED = 0
 _OQE_CALIB_DATASET = "oqe_code_multilingual"
+_OQE_REFINE_CALIB_DATASET = "oqe_refine"
 _OQE_IMATRIX_FORMAT = "omlx-oqe-imatrix-cache"
 _OQE_MAX_SAMPLE_MULTIPLIER = 8
 _OQE_MAX_ADAPTIVE_SAMPLES = 1024
 _OQE_MIN_EXPERT_COUNT = 16
 _OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
-_OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
+_OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear", "ExpertProj"}
 
 
 def _is_oqe_switch_module(module) -> bool:
@@ -8080,6 +8469,8 @@ def _load_calibration_data(
     Returns:
         MLX array of shape (num_samples, seq_length) or None on failure.
     """
+    if dataset == _OQE_REFINE_CALIB_DATASET:
+        return _load_oqe_refine_calibration(tokenizer, num_samples, seq_length)
     if dataset == _OQE_CALIB_DATASET:
         # oQe (enhanced=True) requests this built-in corpus by name. If the data
         # file is not present in the installed package, the generic handler below
@@ -8130,6 +8521,15 @@ def _load_calibration_data(
         return None
 
 
+def _encoded_ids(tokenizer, text: str) -> list[int]:
+    ids = tokenizer.encode(text)
+    if hasattr(ids, "input_ids"):
+        ids = ids.input_ids
+    if isinstance(ids, list):
+        return ids
+    return ids.tolist() if hasattr(ids, "tolist") else list(ids)
+
+
 def _load_builtin_calibration(
     tokenizer, dataset: str, num_samples: int, seq_length: int
 ):
@@ -8173,15 +8573,7 @@ def _load_builtin_calibration(
     total_kb = sum(len(t) for t in texts) // 1024
     logger.info(f"Built-in calibration: {len(texts)} texts, {total_kb} KB ({dataset})")
 
-    all_ids = []
-    for text in texts:
-        ids = tokenizer.encode(text)
-        if hasattr(ids, "input_ids"):
-            ids = ids.input_ids
-        if isinstance(ids, list):
-            all_ids.extend(ids)
-        else:
-            all_ids.extend(ids.tolist() if hasattr(ids, "tolist") else list(ids))
+    all_ids = [i for text in texts for i in _encoded_ids(tokenizer, text)]
     tokens = mx.array(all_ids)
 
     usable = (tokens.size // seq_length) * seq_length
@@ -8311,6 +8703,8 @@ def _find_model_layers(model):
     if getattr(model, "model_type", None) == "muse_spark":
         # mlx-lm's Muse Spark normalizes its token embeddings.
         return model.model.language_model.embed, model.layers
+    if getattr(model, "model_type", None) == inkling2_layout.MODEL_TYPE:
+        return inkling2_layout.embed_fn(model), model.layers
     if getattr(model, "model_type", None) == "spark2_5":
         # afm7 also uses ``embedding`` but keeps kv-reuse blocks outside model.layers.
         return model.model.embedding, model.model.layers
@@ -8356,6 +8750,7 @@ _FLINT_LAYER_STATE_KIND = "flint"
 _DEEPSEEK_V4_LAYER_STATE_KIND = "deepseek_v4"
 _KIMI_K3_LAYER_STATE_KIND = "kimi_k3"
 _LLAMA4_SCALED_LAYER_STATE_KIND = "llama4_attn_scale"
+_INKLING2_LAYER_STATE_KIND = "inkling2"
 
 
 def _find_layer_model(model, layers):
@@ -8627,7 +9022,7 @@ def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None
             state["intermediates"][layer_idx] = aux
     elif state.get("kind") == "glm_moe_dsa":
         state["prev_topk_indices"] = aux if aux is not None else fallback
-    elif state.get("kind") == _KIMI_K3_LAYER_STATE_KIND:
+    elif state.get("kind") in (_KIMI_K3_LAYER_STATE_KIND, _INKLING2_LAYER_STATE_KIND):
         state["blocks"] = aux
 
 
@@ -8716,6 +9111,19 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
                 f"Kimi K3 calibration forward failed at layer {layer_idx}: {e}"
             ) from e
         return result[0], result[1]
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _INKLING2_LAYER_STATE_KIND
+    ):
+        # A copy per call: a layer appends its completed block in place, and the
+        # sensitivity walk runs each block twice on the same inputs.
+        blocks = list(position_ids["blocks"])
+        try:
+            return block(inputs, blocks, cache=None), blocks
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            raise RuntimeError(
+                f"Inkling 2 calibration forward failed at layer {layer_idx}: {e}"
+            ) from e
     if (
         isinstance(position_ids, dict)
         and position_ids.get("kind") == _LLAMA4_SCALED_LAYER_STATE_KIND
@@ -8968,6 +9376,8 @@ def _temporary_quantize_block(
             continue
         if getattr(module.weight, "ndim", 0) < 2:
             continue
+        if inkling2_layout.is_expert_carrier(module):
+            continue
         norm_path = _normalize_quant_path(path)
         if _is_muse_spark(config):
             # The fused qkvg_proj takes the one format oQ gives its parts.
@@ -9028,6 +9438,11 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
     )
     if model_type == "flint":
         return inputs, [None] * len(layers), {"kind": _FLINT_LAYER_STATE_KIND}
+    if model_type == inkling2_layout.MODEL_TYPE:
+        # Layers mix the completed attention-residual blocks of earlier layers,
+        # build their own masks and take no cache.
+        state = {"kind": _INKLING2_LAYER_STATE_KIND, "blocks": []}
+        return inputs, [None] * len(layers), state
     gemma4_inputs = _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs)
     if gemma4_inputs is not None:
         return gemma4_inputs
@@ -9375,7 +9790,11 @@ class OQImatrixCollector:
         try:
             weight_shape = getattr(module.weight, "shape", ())
             n_experts = int(getattr(module, "num_experts", weight_shape[0]))
-            in_dim = int(getattr(module, "input_dims", weight_shape[-1]))
+            if inkling2_layout.is_expert_carrier(module):
+                # Packed carriers store the input width in 32-bit words.
+                in_dim = self._module_in_dim(module)
+            else:
+                in_dim = int(getattr(module, "input_dims", weight_shape[-1]))
             if getattr(x, "shape", ()) and int(x.shape[-1]) != in_dim:
                 return
             mx.eval(x, indices)
@@ -9442,6 +9861,18 @@ def _collect_language_model_lm_head_imatrix(model, hidden, collector) -> bool:
     return _collect_untied_lm_head_imatrix(
         core, hidden, collector, "language_model.lm_head"
     )
+
+
+def _collect_inkling2_lm_head_imatrix(model, hidden, state, collector) -> bool:
+    """Capture the head input: the last layer's mixture of all blocks, normed."""
+    if str(getattr(model, "model_type", "")) != inkling2_layout.MODEL_TYPE:
+        return False
+    module = collector._original_modules.get("lm_head")
+    if module is None or not isinstance(state, dict):
+        return False
+    x = inkling2_layout.head_input(model, hidden, state["blocks"])
+    collector.collect_dense("lm_head", module, x)
+    return "lm_head" in collector.entries
 
 
 def _run_glm5_next_mtp_blocks(blocks, hidden, embed, input_ids) -> None:
@@ -9745,6 +10176,9 @@ def _collect_imatrix_from_model(
 
                 _collect_language_model_lm_head_imatrix(model, inputs, collector)
                 _collect_k2_horizon_lm_head_imatrix(model, inputs, collector)
+                _collect_inkling2_lm_head_imatrix(
+                    model, inputs, position_ids, collector
+                )
 
                 # Match the head's decode-time hidden-state normalization.
                 if _collect_mtp_head_imatrix(
@@ -9906,12 +10340,18 @@ def _collect_imatrix_from_model(
 _STREAM_TEXT_LAYER_PREFIX = "language_model.model.layers."
 _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
 
+# Qwen3.5 / 3.6 and their text-only Hugging Face names.
+_QWEN3_5_STREAM_MODEL_TYPES = frozenset(
+    {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
+)
+
 # Only these checkpoint model_types have a streamed sourcer. Every other layout
 # keeps the RAM-safe proxy calibration path: the auto rule never streams them,
 # and an explicit stream_calibration request for one fails fast (see
 # _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
 _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset(
     {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark", "flint"}
+    | _QWEN3_5_STREAM_MODEL_TYPES
 )
 
 
@@ -9927,7 +10367,14 @@ def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
     settings = _calibration_model_settings(
         config, has_mtp_heads=False, has_mtp_weights=False
     )
-    maybe_apply_pre_load_patches(str(model_path), for_vlm=True, model_settings=settings)
+    is_qwen3_5 = _is_qwen3_5_stream(config)
+    maybe_apply_pre_load_patches(
+        str(model_path),
+        for_vlm=_is_vlm_load(config) if is_qwen3_5 else True,
+        model_settings=settings,
+    )
+    if is_qwen3_5:
+        return _qwen3_5_stream_text_args(config)
     if _stream_source_model_type(config) == "flint":
         from mlx_vlm.models.flint.config import ModelConfig
         from mlx_vlm.models.flint.language import DecoderLayer
@@ -10118,6 +10565,28 @@ def _streamed_embed(embed_weight, calib_data, config: dict):
 
 def _stream_source_model_type(config: dict) -> str:
     return str(config.get("model_type", "")).lower()
+
+
+def _is_qwen3_5_stream(config: dict) -> bool:
+    return _stream_source_model_type(config) in _QWEN3_5_STREAM_MODEL_TYPES
+
+
+def _qwen3_5_stream_text_args(config: dict):
+    """Qwen3.5 decoder config and block of the library the resident path loads."""
+    text_config = config.get("text_config") or config
+    if not _is_vlm_load(config):
+        from mlx_lm.models import qwen3_5
+
+        return qwen3_5.TextModelArgs.from_dict(text_config), qwen3_5.DecoderLayer
+    if "moe" in _stream_source_model_type(config):
+        from mlx_vlm.models.qwen3_5_moe.config import TextConfig
+        from mlx_vlm.models.qwen3_5_moe.language import (
+            Qwen3_5MoeDecoderLayer as layer_cls,
+        )
+    else:
+        from mlx_vlm.models.qwen3_5.config import TextConfig
+        from mlx_vlm.models.qwen3_5.language import Qwen3_5DecoderLayer as layer_cls
+    return TextConfig.from_dict(text_config), layer_cls
 
 
 _QWEN4_EXP_PLE_SHARD_KEY_RE = re.compile(
@@ -10384,6 +10853,8 @@ def _streamed_sensitivity_layer(
         layer_mask = None if bool(getattr(block, "is_linear", False)) else state["mask"]
     elif layer_masks is not None:
         layer_mask = layer_masks[layer_idx]
+    elif _is_recurrent_layer(block):
+        layer_mask = None
     else:
         layer_mask = state["mask"]
     out_float, _ = _forward_layer_result(
@@ -10520,6 +10991,57 @@ def _collect_streamed_glm5_next_mtp(
     return installed
 
 
+def _qwen3_5_stream_mtp_head(config: dict):
+    """The MTP head oMLX attaches to the resident Qwen3.5 model, and its args."""
+    if _is_vlm_load(config):
+        from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+
+        apply_mlx_vlm_mtp_runtime_patch(_stream_source_model_type(config))
+    else:
+        from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+
+        apply_mlx_lm_mtp_patch()
+    # Built after the patch, which keeps mtp_num_hidden_layers on the args.
+    args, layer_cls = _qwen3_5_stream_text_args(config)
+    return sys.modules[layer_cls.__module__].MTPModule(args), args
+
+
+def _collect_streamed_qwen3_5_mtp(
+    source, config, collector, calib_data, working, ranges
+) -> int:
+    """Streamed counterpart of the generic branch of _collect_mtp_head_imatrix."""
+    from mlx_lm.models.cache import KVCache
+
+    prefix = "language_model.mtp."
+    plan = _streamed_source_plan(source, config, preserve_mtp=True)
+    head, args = _qwen3_5_stream_mtp_head(config)
+    head.eval()
+    head.load_weights(
+        [
+            (key[len(prefix) :], plan.pop(key))
+            for key in list(plan)
+            if key.startswith(prefix)
+        ],
+        strict=True,
+    )
+    embed_weight = plan.pop(_STREAM_EMBED_KEY)
+    embed = nn.Embedding(*embed_weight.shape)
+    embed.weight = embed_weight
+    norm = nn.RMSNorm(int(embed_weight.shape[1]), eps=float(args.rms_norm_eps))
+    norm.weight = plan.pop("language_model.model.norm.weight")
+    del embed_weight
+    mx.eval(head.parameters(), embed.parameters(), norm.parameters())
+    installed = collector.install(head, name_prefix=prefix)
+    try:
+        for hidden, (lo, hi) in zip(working, ranges):
+            cache = [KVCache() for _ in head.layers]
+            out = head(norm(hidden[:, :-1, :]), calib_data[lo:hi, 1:], embed, cache)
+            mx.eval(out)
+    finally:
+        collector.restore(head)
+    return installed
+
+
 def _collect_imatrix_streaming(
     source,
     tokenizer,
@@ -10580,7 +11102,10 @@ def _collect_imatrix_streaming(
     is_glm5_next = _stream_source_model_type(config) == "glm5_next"
     collect_mtp = (
         require_mtp_entries
-        and _stream_source_model_type(config) in ("qwen4_exp", "glm5_next")
+        and (
+            _stream_source_model_type(config) in ("qwen4_exp", "glm5_next")
+            or _is_qwen3_5_stream(config)
+        )
         and _has_mtp_heads(config)
         and _checkpoint_has_mtp_weights(source)
     )
@@ -10669,12 +11194,12 @@ def _collect_imatrix_streaming(
         mask = None
         position_ids = {"kind": _FLINT_LAYER_STATE_KIND}
     else:
-        # One causal mask and one position-id row serve every layer and every
-        # micro-batch: both depend only on seq_length and the activation dtype.
+        # One causal mask serves every attention layer and micro-batch. Position
+        # ids keep one row per sample, sliced per micro-batch below.
         _, layer_masks, position_ids = _prepare_layer_inputs(
             _StreamingNoModel(),
             [None],
-            calib_data[:1],
+            calib_data,
             embedded[:1],
             noncausal=_noncausal_attention(config),
         )
@@ -10715,14 +11240,15 @@ def _collect_imatrix_streaming(
         round_stop = min(round_start + step_samples, max_samples)
         ranges = _stream_round_micro_ranges(round_start, round_stop, micro_batch_size)
         working = [embedded[lo:hi] for lo, hi in ranges]
-        slot_states = (
-            [
+        if is_qwen4_exp:
+            slot_states = [
                 _streamed_qwen4_exp_slot_state(calib_data, q4_position_ids, lo, hi)
                 for lo, hi in ranges
             ]
-            if is_qwen4_exp
-            else None
-        )
+        elif isinstance(position_ids, mx.array):
+            slot_states = [position_ids[lo:hi] for lo, hi in ranges]
+        else:
+            slot_states = None
 
         first_streamed_layer = round_index == 0
         for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
@@ -10751,6 +11277,9 @@ def _collect_imatrix_streaming(
                 layer_mask = q4_layer_masks[layer_idx]
             elif is_glm5_next:
                 layer_mask = None if bool(getattr(block, "is_linear", False)) else mask
+            elif _is_recurrent_layer(block):
+                # Gated delta nets read a mask as a padding mask.
+                layer_mask = None
             else:
                 layer_mask = mask
             try:
@@ -10840,14 +11369,14 @@ def _collect_imatrix_streaming(
                 installed += head_entries
 
         if collect_mtp:
-            head_installed = (
-                _collect_streamed_glm5_next_mtp(
-                    source, config, collector, calib_data, working, ranges
-                )
-                if is_glm5_next
-                else _collect_streamed_qwen4_mtp(
-                    source, config, collector, calib_data, working, ranges
-                )
+            if is_glm5_next:
+                collect_head = _collect_streamed_glm5_next_mtp
+            elif _is_qwen3_5_stream(config):
+                collect_head = _collect_streamed_qwen3_5_mtp
+            else:
+                collect_head = _collect_streamed_qwen4_mtp
+            head_installed = collect_head(
+                source, config, collector, calib_data, working, ranges
             )
             if round_index == 0:
                 installed += head_installed
@@ -10941,31 +11470,734 @@ def _collect_imatrix_streaming(
     return _oq_imatrix_entries(collector.entries, config), metadata
 
 
-def _collect_imatrix(
-    model_path: str,
-    config: dict,
-    *,
-    calib_dataset: str = _OQE_CALIB_DATASET,
-    num_samples: int = 128,
-    seq_length: int = 512,
-    trust_remote_code: bool = False,
-    progress_callback=None,
-    progress_start: float = 13.0,
-    progress_end: float = 18.0,
-) -> tuple[dict[str, OQImatrixEntry], dict[str, Any]]:
-    if str(config.get("model_type", "")).replace("-", "_") == "deepseek_v41":
-        from .patches.deepseek_v41.calibration import collect_checkpoint_imatrix
+_OQE_REFINE_SEQ_LENGTH = 512
+_OQE_REFINE_EXPERT_BYTES = 4 << 30
+# Quantizing an expert range keeps about this many float32 copies of its weights
+# alive (input, rotation, error, error @ H, ...); down projections have few
+# inputs and many outputs, so their ranges must count the weights too.
+_OQE_REFINE_WEIGHT_COPIES = 10
+# Model types whose calibration walk runs outside the generic layer path.
+_OQE_REFINE_UNSUPPORTED_TYPES = frozenset({"deepseek_v41", "muse_spark"})
 
-        return collect_checkpoint_imatrix(
-            model_path,
-            calib_dataset=calib_dataset,
-            num_samples=num_samples,
-            seq_length=seq_length,
-            progress_callback=progress_callback,
-            progress_start=progress_start,
-            progress_end=progress_end,
+
+class _OQGramCollector(OQImatrixCollector):
+    """Collect input Gram matrices X^T X for oQe code refinement.
+
+    Routed expert inputs keep their rows; per-expert Grams are built in chunks.
+    Modules called on the same input array (q/k/v, gate/up) share one entry.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.grams: dict[str, mx.array] = {}
+        self.switch_rows: dict[str, list[tuple[mx.array, np.ndarray, np.ndarray]]] = {}
+        self.aliases: dict[str, str] = {}
+        self._readers: dict[tuple[int, ...], tuple[tuple, str]] = {}
+
+    def begin_forward(self) -> None:
+        self._readers = {}
+
+    def _first_reader(self, name: str, *arrays) -> bool:
+        key = tuple(id(a) for a in arrays)
+        seen = self._readers.get(key)
+        if seen is None:
+            # Holding the arrays keeps their ids from being reused this forward.
+            self._readers[key] = (arrays, name)
+            return True
+        if seen[1] != name:
+            self.aliases[name] = seen[1]
+        return False
+
+    def collect_dense(self, name: str, module, x) -> None:
+        try:
+            in_dim = self._module_in_dim(module)
+            if int(x.shape[-1]) != in_dim or not self._first_reader(name, x):
+                return
+            rows = x.reshape(-1, in_dim).astype(mx.float32)
+            gram = rows.T @ rows
+            if name in self.grams:
+                gram = gram + self.grams[name]
+            mx.eval(gram)
+            self.grams[name] = gram
+        except Exception as e:
+            logger.debug("oQe refine dense capture skipped for %s: %s", name, e)
+
+    def collect_multi(self, name: str, module, x, *, transpose: bool = True) -> None:
+        return None
+
+    def collect_switch(self, name: str, module, x, indices) -> None:
+        try:
+            in_dim = int(getattr(module, "input_dims", module.weight.shape[-1]))
+            if int(x.shape[-1]) != in_dim or not self._first_reader(name, x, indices):
+                return
+            mx.eval(x, indices)
+            rows = x.reshape(-1, in_dim).astype(mx.bfloat16)
+            idx = np.asarray(indices).astype(np.int64)
+            idx_2d = (
+                idx.reshape(-1, idx.shape[-1]) if idx.ndim > 1 else idx.reshape(-1, 1)
+            )
+            if rows.shape[0] == idx_2d.shape[0]:
+                row_ids = np.repeat(np.arange(idx_2d.shape[0]), idx_2d.shape[1])
+            elif rows.shape[0] == idx_2d.size:
+                row_ids = np.arange(idx_2d.size)
+            else:
+                return
+            mx.eval(rows)
+            self.switch_rows.setdefault(name, []).append(
+                (rows, row_ids, idx_2d.reshape(-1))
+            )
+        except Exception as e:
+            logger.debug("oQe refine switch capture skipped for %s: %s", name, e)
+
+    def _merged_rows(self, name: str):
+        parts = self.switch_rows[name]
+        if len(parts) > 1:
+            offsets = np.cumsum([0] + [int(p[0].shape[0]) for p in parts])
+            merged = (
+                mx.concatenate([p[0] for p in parts], axis=0),
+                np.concatenate([p[1] + off for p, off in zip(parts, offsets)]),
+                np.concatenate([p[2] for p in parts]),
+            )
+            mx.eval(merged[0])
+            parts = self.switch_rows[name] = [merged]
+        return parts[0]
+
+    def expert_ranges(self, name: str, n_experts: int, in_dim: int, out_dim: int):
+        """Expert ranges whose Grams, gathered rows and weight copies fit the budget."""
+        counts = np.bincount(self._merged_rows(name)[2], minlength=n_experts)
+        first, used = 0, 0
+        for e in range(n_experts):
+            rows = in_dim + int(counts[e]) + _OQE_REFINE_WEIGHT_COPIES * out_dim
+            cost = rows * in_dim * 4
+            if e > first and used + cost > _OQE_REFINE_EXPERT_BYTES:
+                yield first, e
+                first, used = e, 0
+            used += cost
+        yield first, n_experts
+
+    def switch_gram(self, name: str, first: int, stop: int):
+        rows, row_ids, experts = self._merged_rows(name)
+        keep = (experts >= first) & (experts < stop)
+        row_ids, experts = row_ids[keep], experts[keep] - first
+        order = np.argsort(experts, kind="stable")
+        counts = np.bincount(experts, minlength=stop - first)
+        ends = np.cumsum(counts)
+        segments = mx.array(np.stack([ends - counts, ends], axis=1).astype(np.uint32))
+        picked = rows[mx.array(row_ids[order].astype(np.int32))].astype(mx.float32)
+        gram = mx.segmented_mm(picked.T, picked, segments)
+        mx.eval(gram)
+        return gram
+
+
+class _OQRefineWriter:
+    """Read affine tensors from the output shards and write refined ones back.
+
+    A shard is rewritten after the last layer that owns a refinable tensor in it.
+    """
+
+    def __init__(self, output: Path, weight_map: dict[str, str], quantization: dict):
+        self.output = output
+        self.weight_map = weight_map
+        self.quantization = quantization
+        self.pending: dict[str, dict[str, mx.array]] = {}
+        self.last_layer: dict[str, int] = {}
+        self._read_name: str | None = None
+        self._read_tensors: dict[str, mx.array] = {}
+        for key, shard in weight_map.items():
+            if not key.endswith(".scales") or self.spec(key[:-7]) is None:
+                continue
+            layer = _extract_layer_index(key[:-7])
+            layer = layer if layer >= 0 else sys.maxsize
+            self.last_layer[shard] = max(self.last_layer.get(shard, -1), layer)
+
+    def spec(self, base: str) -> tuple[int, int] | None:
+        for part in ("weight", "biases"):
+            if f"{base}.{part}" not in self.weight_map:
+                return None
+        entry = self.quantization.get(base)
+        cfg = entry if isinstance(entry, dict) else self.quantization
+        if cfg.get("mode", "affine") != "affine":
+            return None
+        return int(cfg["bits"]), int(cfg["group_size"])
+
+    def read(self, base: str):
+        shard = self.weight_map[f"{base}.weight"]
+        if self._read_name != shard:
+            self._read_tensors = mx.load(str(self.output / shard))
+            self._read_name = shard
+        parts = ("weight", "scales", "biases")
+        return tuple(self._read_tensors[f"{base}.{part}"] for part in parts)
+
+    def write(self, base: str, packed) -> None:
+        shard = self.weight_map[f"{base}.weight"]
+        self.pending.setdefault(shard, {})[f"{base}.weight"] = packed
+
+    def process(self, collector, modules: dict, stats: dict) -> None:
+        _refine_captured(collector, modules, self, stats)
+
+    def layer_done(self, layer_idx: int) -> None:
+        for shard, last in list(self.last_layer.items()):
+            if last <= layer_idx:
+                self._flush(shard)
+
+    def finish(self) -> None:
+        for shard in list(self.last_layer):
+            self._flush(shard)
+
+    def _flush(self, shard: str) -> None:
+        self.last_layer.pop(shard, None)
+        pending = self.pending.pop(shard, None)
+        if not pending:
+            return
+        if self._read_name == shard:
+            self._read_name, self._read_tensors = None, {}
+        path = self.output / shard
+        tensors = mx.load(str(path))
+        tensors.update(pending)
+        # Read every tensor before the file is replaced under the lazy loads.
+        mx.eval(list(tensors.values()))
+        tmp = path.with_name(f".refine-{shard}")
+        mx.save_safetensors(str(tmp), tensors, metadata={"format": "mlx"})
+        os.replace(tmp, path)
+        del tensors, pending
+        mx.clear_cache()
+
+
+def _load_oqe_refine_calibration(tokenizer, num_samples: int, seq_length: int):
+    """The oQe base draw plus German, French, Spanish and extra code samples.
+
+    Without European text, the learned channel correlations fail on those languages.
+    """
+    calib = _load_calibration_data(
+        tokenizer,
+        dataset=_OQE_CALIB_DATASET,
+        num_samples=num_samples,
+        seq_length=seq_length,
+    )
+    path = Path(__file__).parent / "oqe_refine_calibration_data.json"
+    if not path.exists():
+        raise FileNotFoundError(f"oQe refinement calibration data not found: {path}")
+    if calib is None:
+        return None
+    extra = json.loads(path.read_text(encoding="utf-8"))
+    base_data = json.loads(
+        (Path(__file__).parent / "oqe_calibration_data.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    n = _OQE_REFINE_EXTRA_SAMPLES
+    rows = [calib]
+    for lang in ("de", "fr", "es"):
+        rows.append(_token_rows(tokenizer, extra[lang], seq_length)[:n])
+    chunks = _token_rows(tokenizer, base_data["code"], seq_length)
+    if chunks.shape[0] > 0:
+        pick = mx.random.permutation(chunks.shape[0], key=mx.random.key(1))[:n]
+        rows.append(chunks[pick])
+    out = mx.concatenate([r.astype(calib.dtype) for r in rows], axis=0)
+    logger.info(f"oQe refine calibration: {out.shape[0]} samples x {seq_length} tokens")
+    return out
+
+
+def _token_rows(tokenizer, texts, seq_length: int):
+    ids = [i for text in texts for i in _encoded_ids(tokenizer, text)]
+    usable = (len(ids) // seq_length) * seq_length
+    return mx.array(ids[:usable], dtype=mx.int32).reshape(-1, seq_length)
+
+
+def _refine_switch_codes(collector, owner, targets):
+    n_exp, in_dim = int(targets[0][1].shape[0]), int(targets[0][1].shape[-1])
+    out_dim = int(targets[0][1].shape[-2])
+    parts = [[] for _ in targets]
+    sums = [[0.0, 0.0, False] for _ in targets]
+    for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
+        hessian = _shrunk_gram(collector.switch_gram(owner, first, stop))
+        for i, (_, weight, packed, scales, biases, bits, gs) in enumerate(targets):
+            result = _refine_affine_codes(
+                weight[first:stop],
+                packed[first:stop],
+                scales[first:stop],
+                biases[first:stop],
+                hessian,
+                bits,
+                gs,
+            )
+            if result is None:
+                parts[i].append(packed[first:stop])
+                continue
+            parts[i].append(result[0])
+            sums[i][0] += result[1]
+            sums[i][1] += result[2]
+            sums[i][2] = True
+        del hessian
+        mx.clear_cache()
+    return [
+        (mx.concatenate(p, axis=0), before, after) if changed else None
+        for p, (before, after, changed) in zip(parts, sums)
+    ]
+
+
+def _refine_captured(collector, modules: dict, writer, stats: dict) -> None:
+    groups: dict[str, list] = {}
+    for name, module in modules.items():
+        spec = writer.spec(name)
+        weight = getattr(module, "weight", None)
+        if spec is None or weight is None:
+            continue
+        if weight.dtype not in (mx.bfloat16, mx.float16, mx.float32):
+            stats["quantized"] += 1
+            continue
+        packed, scales, biases = writer.read(name)
+        if tuple(packed.shape[:-1]) != tuple(weight.shape[:-1]):
+            continue
+        if int(packed.shape[-1]) * 32 // spec[0] != int(weight.shape[-1]):
+            continue
+        owner = collector.aliases.get(name, name)
+        groups.setdefault(owner, []).append(
+            (name, weight, packed, scales, biases, *spec)
+        )
+    for owner in list(groups):
+        targets = groups.pop(owner)
+        if owner in collector.grams:
+            hessian = _shrunk_gram(collector.grams.pop(owner))
+            results = [
+                _refine_affine_codes(w, p, s, b, hessian, bits, gs)
+                for _, w, p, s, b, bits, gs in targets
+            ]
+            del hessian
+        elif owner in collector.switch_rows:
+            results = _refine_switch_codes(collector, owner, targets)
+            collector.switch_rows.pop(owner)
+        else:
+            continue
+        for target, result in zip(targets, results):
+            if result is None:
+                stats["kept"] += 1
+                continue
+            writer.write(target[0], result[0])
+            stats["tensors"] += 1
+            stats["before"] += result[1]
+            stats["after"] += result[2]
+        del targets, results
+        mx.clear_cache()
+
+
+def _refine_head(model, layers, hidden_states, writer, stats) -> None:
+    """Refine an untied lm_head applied right after the text model's final norm."""
+    norm = getattr(_find_layer_model(model, layers), "norm", None)
+    heads = [
+        (path, module)
+        for path, module in model.named_modules()
+        if path.split(".")[-1] == "lm_head"
+        and "mtp" not in path
+        and writer.spec(path) is not None
+    ]
+    if norm is None or len(heads) != 1:
+        return
+    name, module = heads[0]
+    weight = getattr(module, "weight", None)
+    if weight is None or weight.ndim != 2:
+        return
+    collector = _OQGramCollector()
+    for hidden in hidden_states:
+        collector.begin_forward()
+        collector.collect_dense(name, module, norm(hidden))
+    _refine_captured(collector, {name: module}, writer, stats)
+
+
+def _refine_slots(block, prefix, layer_idx, run_slots, writer, stats) -> None:
+    collector = _OQGramCollector()
+    collector.install(block, name_prefix=prefix)
+    modules = dict(collector._prefixed_modules)
+    try:
+        complete = run_slots(collector)
+    finally:
+        collector.restore(block)
+    if complete:
+        writer.process(collector, modules, stats)
+    else:
+        logger.warning("oQe refine: layer %d forward failed, layer skipped", layer_idx)
+        stats["skipped_layers"] += 1
+    # Inputs of modules the writer left alone (e.g. quantized source experts)
+    # stay in the collector; drop them with the layer.
+    collector.switch_rows.clear()
+    collector.grams.clear()
+    del collector
+    writer.layer_done(layer_idx)
+    mx.synchronize()
+    mx.clear_cache()
+
+
+def _refine_oqe_resident(
+    model_path, config, writer, stats, *, trust_remote_code, progress
+):
+    model, tokenizer = _load_calibration_model(
+        model_path, config, trust_remote_code=trust_remote_code
+    )
+    calib = _load_calibration_data(
+        tokenizer,
+        dataset=_OQE_REFINE_CALIB_DATASET,
+        num_samples=_OQE_REFINE_SAMPLES,
+        seq_length=_OQE_REFINE_SEQ_LENGTH,
+    )
+    embed_fn, layers = _find_model_layers(model)
+    if calib is None or embed_fn is None or layers is None:
+        logger.warning("oQe refine: no calibration data or decoder layers, skipped")
+        return
+    paths = {id(module): path for path, module in model.named_modules()}
+    plan = _oqe_calibration_batch_plan(
+        config,
+        requested_samples=int(calib.shape[0]),
+        seq_length=int(calib.shape[1]),
+        model_bytes=_calibration_resident_checkpoint_bytes(model_path, config),
+    )
+    micro = max(1, int(plan["micro_batch_size"]))
+    noncausal = _noncausal_attention(config)
+    slots = []
+    for lo in range(0, int(calib.shape[0]), micro):
+        batch = calib[lo : lo + micro]
+        hidden, masks, state = _prepare_layer_inputs(
+            model, layers, batch, embed_fn(batch), noncausal=noncausal
+        )
+        mx.eval(hidden)
+        slots.append([hidden, masks, state])
+
+    for layer_idx, block in enumerate(layers):
+
+        def run_slots(collector, layer_idx=layer_idx, block=block):
+            complete = True
+            for slot in slots:
+                collector.begin_forward()
+                state = slot[2]
+                prev = (
+                    state.get("prev_topk_indices")
+                    if isinstance(state, dict) and state.get("kind") == "glm_moe_dsa"
+                    else None
+                )
+                mask = slot[1][layer_idx] if layer_idx < len(slot[1]) else None
+                out, aux = _forward_layer_result(
+                    block, slot[0], mask, state, layer_idx=layer_idx
+                )
+                # Same as the imatrix walk: a failed forward keeps its input.
+                if out is None:
+                    complete = False
+                    continue
+                _commit_layer_forward_aux(state, layer_idx, aux, fallback=prev)
+                mx.eval(out)
+                slot[0] = out
+            return complete
+
+        _refine_slots(
+            block, f"{paths[id(block)]}.", layer_idx, run_slots, writer, stats
+        )
+        progress(layer_idx + 1, len(layers))
+
+    # Dict states and hyper-connection streams build the head input differently.
+    plain = not any(isinstance(s[2], dict) or s[0].ndim != 3 for s in slots)
+    if plain and stats["skipped_layers"] == 0:
+        _refine_head(model, layers, [s[0] for s in slots], writer, stats)
+    del model, tokenizer
+
+
+def _refine_oqe_streamed(source, config, writer, stats, *, trust_remote_code, progress):
+    tokenizer = load_mlx_lm_tokenizer(Path(source))
+    calib = _load_calibration_data(
+        tokenizer,
+        dataset=_OQE_REFINE_CALIB_DATASET,
+        num_samples=_OQE_REFINE_SAMPLES,
+        seq_length=_OQE_REFINE_SEQ_LENGTH,
+    )
+    if calib is None:
+        logger.warning("oQe refine: no calibration data, skipped")
+        return
+    model_type = _stream_source_model_type(config)
+    is_qwen4_exp = model_type == "qwen4_exp"
+    is_glm5_next = model_type == "glm5_next"
+    if is_qwen4_exp:
+        _qwen4_exp_apply_compat_patch()
+    embed_weight = _streamed_embed_weight(source, config)
+    embedded = _streamed_embed(embed_weight, calib, config)
+    del embed_weight
+    mx.eval(embedded)
+    q4_masks = q4_position_ids = None
+    if is_qwen4_exp:
+        embedded, q4_masks, q4_position_ids = _streamed_qwen4_exp_state(
+            config, calib, embedded
+        )
+        mask = position_ids = None
+    elif is_glm5_next:
+        embedded, mask = _streamed_glm5_next_state(config, embedded)
+        position_ids = {"kind": _GLM5_NEXT_LAYER_STATE_KIND}
+    elif model_type == "flint":
+        mask = None
+        position_ids = {"kind": _FLINT_LAYER_STATE_KIND}
+    else:
+        _, masks, position_ids = _prepare_layer_inputs(
+            _StreamingNoModel(),
+            [None],
+            calib[:1],
+            embedded[:1],
+            noncausal=_noncausal_attention(config),
+        )
+        mask = masks[0]
+    mx.eval(embedded)
+    plan = _oqe_calibration_batch_plan(
+        config, requested_samples=int(calib.shape[0]), seq_length=int(calib.shape[1])
+    )
+    ranges = _stream_round_micro_ranges(
+        0, int(calib.shape[0]), max(1, int(plan["micro_batch_size"]))
+    )
+    working = [embedded[lo:hi] for lo, hi in ranges]
+    slot_states = (
+        [
+            _streamed_qwen4_exp_slot_state(calib, q4_position_ids, lo, hi)
+            for lo, hi in ranges
+        ]
+        if is_qwen4_exp
+        else None
+    )
+    text_config = config.get("text_config") or config
+    total_layers = int(text_config.get("num_hidden_layers") or 0)
+    for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
+        source, config, trust_remote_code=trust_remote_code
+    ):
+        if is_qwen4_exp:
+            layer_mask = q4_masks[layer_idx]
+        elif is_glm5_next:
+            layer_mask = None if bool(getattr(block, "is_linear", False)) else mask
+        else:
+            layer_mask = mask
+
+        def run_slots(
+            collector, layer_idx=layer_idx, block=block, layer_mask=layer_mask
+        ):
+            complete = True
+            for slot in range(len(working)):
+                collector.begin_forward()
+                out, _ = _forward_layer_result(
+                    block,
+                    working[slot],
+                    layer_mask,
+                    slot_states[slot] if slot_states is not None else position_ids,
+                    layer_idx=layer_idx,
+                )
+                if out is None:
+                    complete = False
+                    continue
+                mx.eval(out)
+                working[slot] = out
+            return complete
+
+        _refine_slots(
+            block,
+            f"{_STREAM_TEXT_LAYER_PREFIX}{layer_idx}.",
+            layer_idx,
+            run_slots,
+            writer,
+            stats,
+        )
+        del block
+        progress(layer_idx + 1, total_layers)
+
+
+def _refine_oqe_output(
+    source: Path,
+    output: Path,
+    config: dict,
+    weight_map: dict[str, str],
+    quantization: dict,
+    *,
+    streamed: bool,
+    requires_proxy: bool,
+    trust_remote_code: bool,
+    progress_callback,
+) -> dict | None:
+    """Hessian code refinement of a finished oQe build, written in place.
+
+    It needs the original weights: the resident model, or the streamed layer walk.
+    Builds calibrated through a proxy have neither and keep the plain oQe codes.
+    """
+    model_type = str(config.get("model_type", "")).replace("-", "_")
+    unsupported = model_type in _OQE_REFINE_UNSUPPORTED_TYPES
+    if unsupported or inkling2_layout.is_inkling2(config):
+        logger.info("oQe refine: not available for model_type=%s, skipped", model_type)
+        return {"status": "skipped", "reason": f"model_type {model_type}"}
+    if requires_proxy and not streamed:
+        logger.info(
+            "oQe refine: the source does not fit in memory and this model type "
+            "has no streamed calibration walk, skipped"
+        )
+        return {"status": "skipped", "reason": "calibrated through a proxy"}
+    writer = _OQRefineWriter(output, weight_map, quantization)
+    stats = {
+        "tensors": 0,
+        "kept": 0,
+        "quantized": 0,
+        "skipped_layers": 0,
+        "before": 0.0,
+        "after": 0.0,
+    }
+    started = _time.monotonic()
+
+    def progress(done: int, total: int) -> None:
+        frac = done / max(total, 1)
+        _emit_progress(
+            progress_callback,
+            "refine",
+            90.0 + 2.0 * frac,
+            f"oQe code refinement, layer {done}/{total}",
         )
 
+    walk = _refine_oqe_streamed if streamed else _refine_oqe_resident
+    walk(
+        str(source),
+        config,
+        writer,
+        stats,
+        trust_remote_code=trust_remote_code,
+        progress=progress,
+    )
+    writer.finish()
+    mx.synchronize()
+    mx.clear_cache()
+    gain = 1.0 - stats["after"] / stats["before"] if stats["before"] > 0 else 0.0
+    seconds = _time.monotonic() - started
+    logger.info(
+        "oQe refine: %d tensors refined (%d kept), Hessian error -%.1f%% in %.0fs",
+        stats["tensors"],
+        stats["kept"],
+        100.0 * gain,
+        seconds,
+    )
+    if stats["quantized"]:
+        logger.warning(
+            "oQe refine: %d modules with quantized source weights kept their rounding",
+            stats["quantized"],
+        )
+    return {
+        "status": "done",
+        "tensors": stats["tensors"],
+        "kept": stats["kept"],
+        "quantized_sources": stats["quantized"],
+        "skipped_layers": stats["skipped_layers"],
+        "hessian_error_reduction": round(gain, 4),
+        "seconds": round(seconds, 1),
+    }
+
+
+def _plan_oqh_bits(
+    shapes: dict[str, tuple], config: dict, oq_level, group_size: int
+) -> dict[str, int]:
+    """{path: bits} of the oQh targets within the bytes of their affine plan."""
+    scheme = oqh_targets.scheme_for(config)
+    planned = {}
+    for path, shape in shapes.items():
+        if not scheme.is_target(path, shape):
+            continue
+        bits, gs, mode = _get_predicate_bits(
+            f"{path}.weight", config, oq_level, group_size
+        )
+        if bits is not None and mode == "affine" and shape[-1] % gs == 0:
+            planned[path] = {"bits": bits, "group_size": gs, "mode": mode}
+    return oqh_targets.reinvest(
+        shapes,
+        planned,
+        config.get("_oq_sensitivity_map") or {},
+        scheme.group_size(oq_level),
+    )
+
+
+def _write_oqh_output(
+    source: Path,
+    output: Path,
+    config: dict,
+    weight_map: dict[str, str],
+    quantization: dict,
+    target_bits: dict[str, int],
+    dtype,
+    shard_index: int,
+    *,
+    group_size: int | None = None,
+    streamed: bool,
+    trust_remote_code: bool,
+    progress_callback,
+) -> dict:
+    """The oQh tensors of a build, from the original weights and their input Grams.
+
+    Walks the layers like _refine_oqe_output. The affine tensors it visits get the
+    oQe refinement on the way. Returns the report with the shard count and the
+    per-tensor config entries. Sources that need a calibration proxy are refused
+    before the main pass.
+    """
+    writer = OqhWriter(
+        _OQRefineWriter(output, weight_map, quantization),
+        target_bits,
+        dtype,
+        shard_index,
+        oqh_targets.scheme_for(config),
+        group_size,
+    )
+    stats = {
+        "tensors": 0,
+        "kept": 0,
+        "quantized": 0,
+        "skipped_layers": 0,
+        "before": 0.0,
+        "after": 0.0,
+    }
+    started = _time.monotonic()
+
+    def progress(done: int, total: int) -> None:
+        frac = done / max(total, 1)
+        _emit_progress(
+            progress_callback,
+            "oqh",
+            70.0 + 22.0 * frac,
+            f"oQh quantization, layer {done}/{total}",
+        )
+
+    walk = _refine_oqe_streamed if streamed else _refine_oqe_resident
+    walk(
+        str(source),
+        config,
+        writer,
+        stats,
+        trust_remote_code=trust_remote_code,
+        progress=progress,
+    )
+    writer.finish()
+    mx.synchronize()
+    mx.clear_cache()
+    before, after = stats.get("oqh_before", 0.0), stats.get("oqh_after", 0.0)
+    gain = 1.0 - after / before if before > 0 else 0.0
+    seconds = _time.monotonic() - started
+    logger.info(
+        "oQh: %d tensors, Hessian error -%.1f%% against plain rounding in %.0fs",
+        stats.get("oqh_tensors", 0),
+        100.0 * gain,
+        seconds,
+    )
+    if stats["quantized"]:
+        logger.warning(
+            "oQe refine: %d modules with quantized source weights kept their rounding",
+            stats["quantized"],
+        )
+    return {
+        "status": "done",
+        "tensors": stats.get("oqh_tensors", 0),
+        "refined_affine": stats["tensors"],
+        "skipped_layers": stats["skipped_layers"],
+        "hessian_error_reduction": round(gain, 4),
+        "seconds": round(seconds, 1),
+        "entries": writer.entries,
+        "shards": writer.shard_index,
+    }
+
+
+def _load_calibration_model(model_path: str, config: dict, *, trust_remote_code=False):
+    """Load the source model lazily for oQe calibration passes.
+
+    It applies the pre-load patches and attaches the MTP head, as the imatrix needs.
+    """
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
@@ -11041,11 +12273,43 @@ def _collect_imatrix(
                 model_config=_sensitivity_lm_config_override(config, model_path),
             )
     except Exception as e:
-        logger.error("oQe imatrix: model load failed (%s)", e)
-        raise RuntimeError(f"oQe imatrix model load failed: {e}") from e
+        logger.error("oQe calibration: model load failed (%s)", e)
+        raise RuntimeError(f"oQe calibration model load failed: {e}") from e
     finally:
         if restore_mtp_active is not None:
             restore_mtp_active()
+
+    return model, tokenizer
+
+
+def _collect_imatrix(
+    model_path: str,
+    config: dict,
+    *,
+    calib_dataset: str = _OQE_CALIB_DATASET,
+    num_samples: int = 128,
+    seq_length: int = 512,
+    trust_remote_code: bool = False,
+    progress_callback=None,
+    progress_start: float = 13.0,
+    progress_end: float = 18.0,
+) -> tuple[dict[str, OQImatrixEntry], dict[str, Any]]:
+    if str(config.get("model_type", "")).replace("-", "_") == "deepseek_v41":
+        from .patches.deepseek_v41.calibration import collect_checkpoint_imatrix
+
+        return collect_checkpoint_imatrix(
+            model_path,
+            calib_dataset=calib_dataset,
+            num_samples=num_samples,
+            seq_length=seq_length,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=progress_end,
+        )
+
+    model, tokenizer = _load_calibration_model(
+        model_path, config, trust_remote_code=trust_remote_code
+    )
 
     try:
         model_bytes = _calibration_resident_checkpoint_bytes(model_path, config)

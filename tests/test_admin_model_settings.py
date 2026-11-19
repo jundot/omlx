@@ -533,6 +533,33 @@ def test_model_options_report_oq_a8_support(config_type, kernels, expected):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["a8_prefill_enabled", "qwen35_ane_prefill_enabled"])
+async def test_oqh_checkpoint_refuses_a8_and_ane_prefill(tmp_path, field):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "omlx_oqh": {"version": 1}})
+    )
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    entry.model_path = str(tmp_path)
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        options = admin_routes._model_options(
+            {"config_model_type": "qwen3_5", "model_path": str(tmp_path)}, None
+        )
+        with pytest.raises(admin_routes.HTTPException) as excinfo:
+            await _update_settings(
+                pool, settings, admin_routes.ModelSettingsRequest(**{field: True})
+            )
+
+    assert options["a8_prefill_supported"] is False
+    assert options["ane_prefill_backend"] is None
+    assert excinfo.value.status_code == 400
+    assert "oQh" in excinfo.value.detail
+    assert getattr(settings, field) in (None, False)
+
+
+@pytest.mark.asyncio
 async def test_oq_a8_choice_is_kept_without_native_int8_kernels():
     """Without the kernels, A8 reaches only a Prefill Accelerator Mac's
     layers. The saved choice is kept, and changing the helper does not write

@@ -6189,7 +6189,7 @@ def test_packed_linear_replaces_4bit_projections(monkeypatch):
 
     assert packed.pack_model(language) == len(originals)
     assert (gdn.in_proj_b, gdn.in_proj_a, mlp.down_proj) == kept
-    # The tensor-unit matvec (<= 8 rows) and GEMM paths, aligned or not.
+    # The matvec, small (<= 8 rows), skinny (9..48) and GEMM paths, aligned or not.
     for rows in (1, 3, 8, 9, 70):
         x = (mx.random.normal((1, rows, 512)) * 0.5).astype(mx.bfloat16)
         for parent, name, original in originals:
@@ -6272,7 +6272,7 @@ def _stock_quantized_linear_call(self, x):
     )
 
 
-def _batched_decode_spy(monkeypatch, nax=False, bits=4):
+def _batched_decode_spy(monkeypatch, nax=False, bits=4, out=288):
     """Enable batched decode routing on small layers and record each route.
 
     The patch wraps a stock call, so verify wrappers installed by other tests
@@ -6295,7 +6295,7 @@ def _batched_decode_spy(monkeypatch, nax=False, bits=4):
     monkeypatch.setattr(qwen35_verify_qmm, "run_route", spy)
     assert batched_decode_qmm.apply_batched_decode_qmm_patch()
     mx.random.seed(5)
-    layer = nn.QuantizedLinear(512, 288, bias=False, bits=bits, group_size=64)
+    layer = nn.QuantizedLinear(512, out, bias=False, bits=bits, group_size=64)
     layer.scales = layer.scales.astype(mx.bfloat16)
     layer.biases = layer.biases.astype(mx.bfloat16)
     return layer, calls
@@ -6337,10 +6337,12 @@ def test_batched_decode_routes_one_token_rows(monkeypatch, shape, bits, routed):
     assert calls == ([routed] if routed else [])
 
 
-@pytest.mark.parametrize("rows,routed", [(16, "mma"), (24, None)])
-def test_batched_decode_stops_at_sixteen_rows_on_nax(monkeypatch, rows, routed):
+@pytest.mark.parametrize(
+    "rows,out,routed", [(16, 288, "mma"), (16, 1024, "mma"), (24, 288, None)]
+)
+def test_batched_decode_stops_at_sixteen_rows_on_nax(monkeypatch, rows, out, routed):
     """NAX GPUs keep stock MLX past 16 rows, where its tensor-unit qmm wins."""
-    layer, calls = _batched_decode_spy(monkeypatch, nax=True)
+    layer, calls = _batched_decode_spy(monkeypatch, nax=True, out=out)
     layer((mx.random.normal((rows, 1, 512)) * 0.5).astype(mx.bfloat16))
     assert calls == ([routed] if routed else [])
 
@@ -6601,6 +6603,41 @@ def test_spec_command_buffers_overlapping_engines_restore_mlx_caps(monkeypatch):
         with bg._spec_command_buffers(target):
             second_cycle.enter_context(bg._spec_command_buffers(target))
         assert caps[-1] == bg._SPEC_BUFFER_CAPS
+    assert caps[-1] == (50, 50)
+
+
+@pytest.mark.parametrize(
+    "model_type,raised", [("qwen3_5_moe", True), ("qwen3_5", False)]
+)
+def test_plain_moe_decode_steps_run_under_the_raised_caps(
+    monkeypatch, model_type, raised
+):
+    import omlx.scheduler as scheduler
+
+    caps = [(50, 50)]
+
+    def fake_set(ops, mb):
+        previous = caps[-1]
+        caps.append((ops, mb))
+        return previous
+
+    seen = []
+    monkeypatch.setattr(quant_fast, "set_command_buffer_caps", fake_set)
+    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: True)
+    monkeypatch.setattr(bg, "_spec_caps_holders", 0)
+    monkeypatch.setattr(bg, "_spec_caps_previous", None)
+    monkeypatch.setattr(
+        scheduler, "_original_generation_batch_step", lambda b: seen.append(caps[-1])
+    )
+    batch = SimpleNamespace(
+        model=SimpleNamespace(model_type=model_type),
+        uids=[7],
+        logits_processors=[[]],
+        samplers=[None],
+        _next_tokens=None,
+    )
+    scheduler._patched_generation_batch_step(batch)
+    assert seen == [bg._SPEC_BUFFER_CAPS if raised else (50, 50)]
     assert caps[-1] == (50, 50)
 
 

@@ -79,9 +79,19 @@ def _native_switch_weighted_sum(
     scores: mx.array,
     weighted_sum: Callable[..., mx.array],
 ) -> mx.array:
+    # oQh experts read the rotated token rows, with gate | up fused.
+    oqh_experts = getattr(switch_mlp, "oqh_experts", None)
+    if oqh_experts is not None:
+        x = switch_mlp.oqh_rotated_input(x)
     # mlx-lm's _gather_sort; the replicated rows stay lazy and are never
     # computed when the gate/up kernel reads the token rows in place.
     x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), inds)
+    if oqh_experts is not None:
+        return weighted_sum(
+            mx.contiguous(oqh_experts(x_tok[row_map], idx, sorted_indices=True)),
+            mx.contiguous(inv_order.astype(mx.uint32)),
+            mx.contiguous(scores.astype(mx.float32)),
+        )
     if not switch_mlp.training:
         # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up on
         # INT8 operands and the A16 Down; None keeps the A16 path below.

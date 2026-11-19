@@ -180,7 +180,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, gpu_keep_warm_idle_window: 300, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', concurrent_priority: 'balanced' },
@@ -217,6 +217,7 @@
                     web_search_content_max_chars: 20000,
                     splash_path: null,
                     splash_kv_format: 'int8',
+                    splash_activations: 'bf16',
                     splash_max_memory_gb: null,
                     splash_ssd_cache_gb: null,
                     splash_ane_prefill: true,
@@ -636,6 +637,7 @@
             oqPreserveNgram: false,
             oqMtpAssistantPath: '',
             oqEnhanced: false,
+            oqHadamard: false,
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
             oqeStrictImatrix: false,
@@ -696,7 +698,7 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
-            benchUploadSkipped: null,  // { reason } — only external-endpoint runs skip now
+            benchUploadSkipped: null,  // { reason, features } from the upload_skipped event
             benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
@@ -1467,6 +1469,7 @@
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
+                            gpu_keep_warm_idle_window: this.globalSettings.server.gpu_keep_warm_idle_window,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
@@ -1531,7 +1534,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.saveError = Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
+                        this.saveError = this.formatApiError(data.detail) || window.t('js.error.save_settings_failed');
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
                     }
@@ -1580,7 +1583,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.subKeyError = data.detail || window.t('js.error.save_settings_failed');
+                        this.subKeyError = this.formatApiError(data.detail) || window.t('js.error.save_settings_failed');
                     }
                 } catch (err) {
                     this.subKeyError = window.t('js.error.save_settings_failed');
@@ -1675,7 +1678,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.update_model_setting_failed'));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.update_model_setting_failed'));
                         await this.loadModels();
                     }
                 } catch (err) {
@@ -2140,6 +2143,31 @@
                 return v;
             },
 
+            // The admin API answers a pydantic validation error with an array
+            // of {loc, msg} objects. alert() on that array prints
+            // "[object Object]" and hides which field the server refused, so
+            // the settings endpoints that can return one render it here.
+            formatApiError(detail) {
+                if (!detail) return '';
+                if (Array.isArray(detail)) {
+                    return detail.map(item => {
+                        if (!item || typeof item !== 'object') return String(item);
+                        const loc = Array.isArray(item.loc) ? item.loc : [];
+                        const fields = ['body', 'query', 'path', 'header'].includes(loc[0])
+                            ? loc.slice(1) : loc;
+                        const path = fields.join('.');
+                        const message = String(item.msg || item.message || '')
+                            .replace(/^Value error, /, '');
+                        const text = message || JSON.stringify(item);
+                        return path ? `${path}: ${text}` : text;
+                    }).filter(Boolean).join('; ');
+                }
+                if (typeof detail === 'object') {
+                    return String(detail.message || detail.msg || JSON.stringify(detail));
+                }
+                return String(detail);
+            },
+
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
                 const ctk = chatTemplateKwargs || {};
                 const forced = new Set(forcedCtKwargs || []);
@@ -2511,7 +2539,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.save_profile_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2638,7 +2666,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.update_profile_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.update_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2679,7 +2707,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.save_template_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.save_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2705,7 +2733,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.update_template_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.update_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -3004,7 +3032,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || window.t('js.error.apply_ane_tuning_result_failed'));
+                        throw new Error(this.formatApiError(data.detail) || window.t('js.error.apply_ane_tuning_result_failed'));
                     }
                     Object.assign(this.modelSettings, patch);
                     const model = this.models.find(item => item.id === this.selectedModel.id);
@@ -3812,8 +3840,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        // Request validation errors (422) carry a list of objects.
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_model_settings_failed')));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.save_model_settings_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
@@ -3862,7 +3889,7 @@
                     }
                     const data = await response.json().catch(() => ({}));
                     if (!response.ok) {
-                        this.settingsApply.error = data.detail || window.t('js.error.settings_apply_failed');
+                        this.settingsApply.error = this.formatApiError(data.detail) || window.t('js.error.settings_apply_failed');
                         this.settingsApply.phase = 'error';
                         return null;
                     }
@@ -4748,6 +4775,7 @@
                             web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
                             splash_path: this.globalSettings.integrations.splash_path,
                             splash_kv_format: this.globalSettings.integrations.splash_kv_format,
+                            splash_activations: this.globalSettings.integrations.splash_activations,
                             splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
                             splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
                             splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
@@ -6035,6 +6063,16 @@
                     novel_ja: 'bench.config.context.novel_ja',
                 };
                 return window.t(keys[profile] || keys.code_python);
+            },
+
+            benchUploadSkippedLabel(reason) {
+                const keys = {
+                    external_endpoint: 'bench.upload_skipped.reason_external',
+                    splash: 'bench.upload_skipped.reason_splash',
+                    ane_aligned_prompt: 'bench.upload_skipped.reason_ane_aligned_prompt',
+                    custom_generation_length: 'bench.upload_skipped.reason_custom_generation_length',
+                };
+                return window.t(keys[reason] || 'bench.upload_skipped.reason_default');
             },
 
             // User clicked "View live" on the banner — clear the stale
@@ -7841,7 +7879,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_failed')));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.save_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
@@ -8187,6 +8225,7 @@
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
+                        payload.hadamard = this.oqHadamardActive();
                         payload.imatrix_reuse_cache = this.oqeReuseImatrixCache;
                         payload.imatrix_cache_path = this.oqeImatrixCachePath.trim();
                         payload.imatrix_strict = this.oqeStrictImatrix;
@@ -8200,7 +8239,7 @@
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', 'oQ' + this.oqLevel + (this.oqEnhanced ? 'e' : ''));
+                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', this.oqLevelLabel(this.oqLevel));
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
@@ -8349,7 +8388,18 @@
             },
 
             oqLevelLabel(level) {
-                return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
+                return `oQ${level}${this.oqHadamardActive() ? 'h' : (this.oqEnhanced ? 'e' : '')}`;
+            },
+
+            oqSelectedModelSupportsOqh() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!model?.oqh_supported) return false;
+                // DeepSeek V4.1 takes oQh below oQ4 only.
+                return model.oqh_max_level == null || this.oqLevel < model.oqh_max_level;
+            },
+
+            oqHadamardActive() {
+                return this.oqEnhanced && this.oqHadamard && this.oqSelectedModelSupportsOqh();
             },
 
             oqSelectedModelIsVLM() {

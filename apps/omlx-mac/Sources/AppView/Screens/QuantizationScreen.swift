@@ -68,7 +68,7 @@ struct QuantizationScreen: View {
                 selectedModelPath: $vm.selectedModelPath,
                 sensitivityModelPath: $vm.sensitivityModelPath,
                 oqLevel: $vm.oqLevel,
-                enhanced: vm.enhanced,
+                variantSuffix: vm.variantSuffix,
                 isStarting: vm.isStarting,
                 modelsLoaded: vm.modelsLoaded,
                 onStart: { vm.startQuantization(client: services.client) }
@@ -84,6 +84,8 @@ struct QuantizationScreen: View {
 
             EnhancedQuantizationSection(
                 enabled: $vm.enhanced,
+                hadamard: $vm.hadamard,
+                supportsOqh: vm.selectedSupportsOqh,
                 reuseCache: $vm.imatrixReuseCache,
                 cachePath: $vm.imatrixCachePath,
                 strictCoverage: $vm.imatrixStrict
@@ -153,7 +155,7 @@ private struct SourceModelSection: View {
     @Binding var selectedModelPath: String
     @Binding var sensitivityModelPath: String
     @Binding var oqLevel: Double
-    let enhanced: Bool
+    let variantSuffix: String
     let isStarting: Bool
     let modelsLoaded: Bool
     let onStart: () -> Void
@@ -268,12 +270,12 @@ private struct SourceModelSection: View {
         return opts
     }
 
-    // Mirrors the HTML <option>s. oQe keeps the same bit levels, but makes
-    // the output variant explicit in the picker, as the web UI does.
+    // Mirrors the HTML <option>s. oQe and oQh keep the same bit levels, but
+    // make the output variant explicit in the picker, as the web UI does.
     private var levelOptions: [PopupOption<Double>] {
         Self.levelValues.map { level in
             let number = level.rounded() == level ? String(Int(level)) : String(level)
-            return PopupOption(value: level, label: "oQ\(number)\(enhanced ? "e" : "")")
+            return PopupOption(value: level, label: "oQ\(number)\(variantSuffix)")
         }
     }
 
@@ -424,6 +426,8 @@ private struct AdvancedSection: View {
 /// intentionally sent rather than replaced with a client-specific path.
 private struct EnhancedQuantizationSection: View {
     @Binding var enabled: Bool
+    @Binding var hadamard: Bool
+    let supportsOqh: Bool
     @Binding var reuseCache: Bool
     @Binding var cachePath: String
     @Binding var strictCoverage: Bool
@@ -452,6 +456,19 @@ private struct EnhancedQuantizationSection: View {
             }
 
             if enabled {
+                if supportsOqh {
+                    Row(
+                        label: String(localized: "quant.enhanced.hadamard.label",
+                                      defaultValue: "Rotated codes (oQh)",
+                                      comment: "Toggle label that builds the oQh variant of an oQe model"),
+                        sublabel: String(localized: "quant.enhanced.hadamard.sub",
+                                         defaultValue: "Same size as oQe with lower error: weights are stored in a Hadamard-rotated basis with one scale per row. Needs the oQh kernels to run.",
+                                         comment: "Toggle sublabel explaining the oQh variant")
+                    ) {
+                        RowSwitch(isOn: $hadamard)
+                    }
+                }
+
                 Row(
                     label: String(localized: "quant.enhanced.reuse.label",
                                   defaultValue: "Reuse imatrix cache",

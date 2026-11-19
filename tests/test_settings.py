@@ -92,6 +92,7 @@ class TestServerSettings:
             "max_request_body_size": "512MB",
             "max_image_side_length": 2048,
             "gpu_keep_warm_interval": 0.5,
+            "gpu_keep_warm_idle_window": 300.0,
         }
 
     def test_from_dict_distributed_inference_is_opt_in(self):

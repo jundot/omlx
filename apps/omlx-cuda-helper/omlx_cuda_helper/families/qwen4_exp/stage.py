@@ -130,7 +130,11 @@ class Stage:
             name = f"{self.first + j}."
             if isinstance(cache, QSACache):
                 if name + "k" in state:
-                    cache.append(*(from_host(state[name + s]) for s in _QSA_SLOTS))
+                    *rows, positions = (from_host(state[name + s]) for s in _QSA_SLOTS)
+                    # Older hosts send a decoded cache's MRoPE ids [3, 1, n]; take the text plane.
+                    if positions.ndim == 3:
+                        positions = positions[0]
+                    cache.append(*rows, positions)
             else:
                 for slot in range(len(cache)):
                     if f"{name}{slot}" in state:

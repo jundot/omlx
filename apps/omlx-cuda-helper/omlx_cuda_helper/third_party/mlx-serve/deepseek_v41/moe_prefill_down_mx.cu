@@ -1,5 +1,5 @@
 // moe_prefill_down.cu on the MX tile: E4M3 activation codes and scales from
-// moe_prefill_gate_up_mx.cu, an mxfp4 bank.
+// moe_prefill_gate_up_mx.cu, an mxfp4 bank. A pass covers MT tiles of 64 routes.
 extern __shared__ __align__(128) uint8_t smem[];
 __shared__ int range[2];
 const uint32_t e = blockIdx.y;
@@ -9,24 +9,26 @@ const long n0 = (long)e * N + blockIdx.x * 128;
 const uint8_t* codes = reinterpret_cast<const uint8_t*>(w) + n0 * (K / 2);
 const uint8_t* scales = s + n0 * (K / 32);
 const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wm = warp >> 2, wn = warp & 3;
-for (int r0 = begin + (int)blockIdx.z * 64; r0 < end; r0 += (int)gridDim.z * 64) {
-  const int mv = end - r0 < 64 ? end - r0 : 64;
-  float acc[2][4][4];
-  msv_expert_tile_mx<K, BDEP, STG>(smem, mv,
+for (int r0 = begin + (int)blockIdx.z * 64 * MT; r0 < end; r0 += (int)gridDim.z * 64 * MT) {
+  const int mv = end - r0 < 64 * MT ? end - r0 : 64 * MT;
+  float acc[MT][2][4][4];
+  msv_expert_tile_mx<K, BDEP, STG, MT>(smem, mv,
       [&](int row) { return xc + (long)(r0 + row) * K; },
       [&](int row) { return xs + (long)(r0 + row) * (K / 32); },
       [&](int r) { return codes + (long)r * (K / 2); },
       [&](int r) { return scales + (long)r * (K / 32); }, acc);
   #pragma unroll
-  for (int a = 0; a < 2; ++a)
+  for (int m = 0; m < MT; ++m)
     #pragma unroll
-    for (int j = 0; j < 4; ++j)
+    for (int a = 0; a < 2; ++a)
       #pragma unroll
-      for (int hlf = 0; hlf < 2; ++hlf) {
-        const int row = wm * 32 + a * 16 + hlf * 8 + (lane >> 2);
-        if (row < mv) {
-          const int col = blockIdx.x * 128 + wn * 32 + j * 8 + (lane & 3) * 2;
-          *reinterpret_cast<__nv_bfloat162*>(y + (long)(r0 + row) * N + col) = __floats2bfloat162_rn(acc[a][j][2 * hlf], acc[a][j][2 * hlf + 1]);
+      for (int j = 0; j < 4; ++j)
+        #pragma unroll
+        for (int hlf = 0; hlf < 2; ++hlf) {
+          const int row = m * 64 + wm * 32 + a * 16 + hlf * 8 + (lane >> 2);
+          if (row < mv) {
+            const int col = blockIdx.x * 128 + wn * 32 + j * 8 + (lane & 3) * 2;
+            *reinterpret_cast<__nv_bfloat162*>(y + (long)(r0 + row) * N + col) = __floats2bfloat162_rn(acc[m][a][j][2 * hlf], acc[m][a][j][2 * hlf + 1]);
+          }
         }
-      }
 }

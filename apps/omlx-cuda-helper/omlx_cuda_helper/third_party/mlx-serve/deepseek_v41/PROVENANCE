@@ -12,8 +12,10 @@ The header and the down projection are the GLM-5.3 versions of this helper
 scales and biases, 64 weights a group, each weight rounded once to bf16 from
 float, and each mma.m16n8k16 step added to the running sum with a correctly
 rounded float add. The launch geometry and the tensor-core main loop are
-unchanged. Added here: 3-bit codes (MLX's little-endian bit stream), which a
-thread loads as the 24 bytes of one group and unpacks to the same bf16 tile;
+unchanged. Added here: 2-bit codes, one 16-byte load a group of 64 decoded
+through the group's 4 values (Inkling 2 uses them); 3-bit codes (MLX's
+little-endian bit stream), which a thread loads as the 24 bytes of one group
+and unpacks to the same bf16 tile;
 MLX mxfp4 codes (E2M1, one E8M0 scale per 32 weights, MX template value),
 each decoded from the bits of its fp4 value times the power-of-two scale,
 which float and bf16 hold exactly. The down projection takes the same
@@ -33,4 +35,7 @@ step runs mma.sync.kind::mxf8f6f4.block_scale (E4M3 x E2M1, UE8M0 scales)
 from zero and is added with a correctly rounded float add. The products are
 the bf16 tile's exact products. The gate/up epilogue is unchanged up to the
 FP8 round trip, which it writes as codes and scales for the MX down projection.
+One MX pass covers MT tiles of 64 routes of an expert (template value MT), so
+each staged weight tile serves all of them and the weight slab is read once a
+pass instead of once a 64-route tile. Each output keeps its k32 order.
 

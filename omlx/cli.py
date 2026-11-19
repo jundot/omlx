@@ -939,6 +939,10 @@ def diagnose_menubar() -> int:
     print()
     print("Note: Restore edits ControlCenter's own StatusKit approval, which")
     print("needs Full Disk Access. Without it, use the System Settings toggle.")
+    print()
+    print("If the log shows notch=true, the icon is behind the camera notch:")
+    print("  the menu bar is full. Quit or turn off a few other menu bar icons,")
+    print("  or use a menubar manager like Ice or Bartender.")
     return 0
 
 

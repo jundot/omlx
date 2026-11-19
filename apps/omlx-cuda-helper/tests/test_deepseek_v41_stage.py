@@ -170,16 +170,17 @@ def test_expert_tiles_read_banks_as_gather_qmm(spec):
     )
     assert kernels.experts_fit([gate, up, down])
     keys = mx.random.split(mx.random.key(4), 3)
-    x = quant.quantize(mx.random.normal((40, 256), key=keys[0]).astype(mx.bfloat16))
-    experts = mx.sort(mx.random.randint(0, 2, (40,), key=keys[1])).astype(mx.uint32)
-    weights = mx.random.uniform(0.1, 1.0, (40,), key=keys[2])
+    # 200 routes on two experts: passes of two 64-route tiles and a partial one.
+    x = quant.quantize(mx.random.normal((200, 256), key=keys[0]).astype(mx.bfloat16))
+    experts = mx.sort(mx.random.randint(0, 2, (200,), key=keys[1])).astype(mx.uint32)
+    weights = mx.random.uniform(0.1, 1.0, (200,), key=keys[2])
     rows = x[:, None]
     want = layers._swiglu(gate(rows, experts), up(rows, experts), weights, 10.0, True)
     got = kernels.expert_gate_up(
-        x, mx.arange(40, dtype=mx.uint32), experts, gate, up, weights, 10.0, True
+        x, mx.arange(200, dtype=mx.uint32), experts, gate, up, weights, 10.0, True
     )
     assert kernels.relative_error(got, want.reshape(got.shape)) < layers._TILE_ERROR
-    got = kernels.expert_down(want.reshape(40, -1), experts, down)
+    got = kernels.expert_down(want.reshape(200, -1), experts, down)
     want_down = down(want, experts)
     assert (
         kernels.relative_error(got, want_down.reshape(got.shape)) < layers._TILE_ERROR
@@ -192,11 +193,11 @@ def test_expert_tiles_read_banks_as_gather_qmm(spec):
         scale = mx.repeat(mx.power(2.0, scales.astype(mx.float32) - 127), 32, -1)
         return quant.from_fp8(codes) * scale
 
-    raw = mx.random.normal((40, 256), key=keys[0]).astype(mx.bfloat16)
+    raw = mx.random.normal((200, 256), key=keys[0]).astype(mx.bfloat16)
     codes, scales = kernels.fp8_codes(raw)
     assert mx.array_equal(values(codes, scales).astype(mx.bfloat16), x).item()
     codes, scales = kernels.expert_gate_up_mx(
-        codes, scales, mx.arange(40, dtype=mx.uint32), experts, gate, up, weights, 10.0
+        codes, scales, mx.arange(200, dtype=mx.uint32), experts, gate, up, weights, 10.0
     )
     got = values(codes, scales)
     assert kernels.relative_error(got, want.reshape(got.shape)) < layers._TILE_ERROR
@@ -204,6 +205,15 @@ def test_expert_tiles_read_banks_as_gather_qmm(spec):
     assert (
         kernels.relative_error(got, want_down.reshape(got.shape)) < layers._TILE_ERROR
     )
+
+
+@pytest.mark.skipif(not kernels.available(), reason="the FP8 kernel runs on CUDA")
+def test_fp8_pack_matches_quant_pack_for_each_input_dtype():
+    """The FP8 kernel compiled for one input dtype must not serve another."""
+    x = mx.random.normal((2, 4, 64), key=mx.random.key(5)) * 3
+    for dtype in (mx.float32, mx.bfloat16):
+        rows = x.astype(dtype)
+        assert mx.array_equal(kernels.pack_fp8(rows), quant.pack(rows)).item()
 
 
 @pytest.mark.skipif(not mx_linear.available(), reason="needs the block-scaled mma")

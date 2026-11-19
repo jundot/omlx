@@ -1,4 +1,4 @@
-"""Tests for the enable_thinking toggle and detect_thinking_default heuristic."""
+"""Tests for the enable_thinking toggle and detect_thinking_default probe."""
 
 import json
 
@@ -17,40 +17,46 @@ from omlx.model_settings import ModelSettings
 
 
 class TestDetectThinkingDefault:
-    """Test chat template heuristic for thinking default detection."""
+    """Test the rendered chat template probe for the thinking default."""
 
-    def test_qwen_pattern_returns_true(self, tmp_path):
-        """Qwen3 pattern: thinking is ON by default, only suppressed when
-        enable_thinking is explicitly false."""
-        template = (
-            "{%- if enable_thinking is false -%}\n"
-            "  ... suppress thinking ...\n"
-            "{%- endif -%}"
-        )
+    @pytest.mark.parametrize(
+        ("template", "expected"),
+        [
+            # Qwen 3.x: thinking is suppressed only when explicitly false.
+            (
+                "{%- if enable_thinking is false -%}<think></think>{%- endif -%}",
+                True,
+            ),
+            # Gemma 4: thinking requires an explicit opt-in.
+            (
+                "{%- if enable_thinking | default(false) -%}<think>{%- endif -%}",
+                False,
+            ),
+            # Another flag defaulting to false must not decide the result.
+            (
+                "{%- set enable_thinking = enable_thinking | default(true) -%}\n"
+                "{%- set preserve_thinking = preserve_thinking | default(false) -%}"
+                "{%- if enable_thinking -%}<think>{%- endif -%}",
+                True,
+            ),
+            # GLM-4.6V: the closing paren in the guard does not mean opt-in.
+            (
+                "{{- '<think></think>' if (enable_thinking is defined "
+                "and not enable_thinking) else '' -}}",
+                True,
+            ),
+            # Nemotron Cascade: default assigned with an inline if/else.
+            (
+                "{%- set enable_thinking = enable_thinking "
+                "if enable_thinking is defined else True -%}"
+                "{%- if enable_thinking -%}<think>{%- endif -%}",
+                True,
+            ),
+        ],
+    )
+    def test_rendered_default(self, tmp_path, template, expected):
         (tmp_path / "chat_template.jinja").write_text(template)
-        assert detect_thinking_default(tmp_path) is True
-
-    def test_gemma_default_false_pattern_returns_false(self, tmp_path):
-        """Gemma4 pattern: thinking is OFF by default, requires explicit enable."""
-        template = "{%- set thinking = enable_thinking | default(false) -%}"
-        (tmp_path / "chat_template.jinja").write_text(template)
-        assert detect_thinking_default(tmp_path) is False
-
-    def test_explicit_default_true_pattern_returns_true(self, tmp_path):
-        """Laguna S-2.1 pattern: enable_thinking | default(true) means ON even
-        when another flag in the same template defaults to false."""
-        template = (
-            "{%- set enable_thinking = enable_thinking | default(true) -%}\n"
-            "{%- set preserve_thinking = preserve_thinking | default(false) -%}"
-        )
-        (tmp_path / "chat_template.jinja").write_text(template)
-        assert detect_thinking_default(tmp_path) is True
-
-    def test_enable_thinking_paren_pattern_returns_false(self, tmp_path):
-        """Template that references enable_thinking) returns False."""
-        template = "{%- if default(enable_thinking) -%}think{%- endif -%}"
-        (tmp_path / "chat_template.jinja").write_text(template)
-        assert detect_thinking_default(tmp_path) is False
+        assert detect_thinking_default(tmp_path) is expected
 
     def test_no_enable_thinking_returns_none(self, tmp_path):
         """Template without enable_thinking reference returns None."""
@@ -91,7 +97,11 @@ class TestDetectThinkingDefault:
             "{%- if enable_thinking is false -%}suppress{%- endif -%}"
         )
         # tokenizer_config says Gemma pattern (False)
-        tc = {"chat_template": "{%- set t = enable_thinking | default(false) -%}"}
+        tc = {
+            "chat_template": (
+                "{%- if enable_thinking | default(false) -%}<think>{%- endif -%}"
+            )
+        }
         (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
 
         assert detect_thinking_default(tmp_path) is True
@@ -107,9 +117,18 @@ class TestDetectThinkingDefault:
         (tmp_path / "tokenizer_config.json").write_text(json.dumps({"model_type": "llama"}))
         assert detect_thinking_default(tmp_path) is None
 
-    def test_unrecognized_pattern_returns_none(self, tmp_path):
-        """Template with enable_thinking but no recognized pattern returns None."""
+    def test_toggle_without_prompt_effect_returns_none(self, tmp_path):
+        """A template whose prompt does not change with the flag returns None."""
         template = "{%- if enable_thinking == 'maybe' -%}hmm{%- endif -%}"
+        (tmp_path / "chat_template.jinja").write_text(template)
+        assert detect_thinking_default(tmp_path) is None
+
+    def test_template_render_error_returns_none(self, tmp_path):
+        """A template that fails to render must not break discovery."""
+        template = (
+            "{%- if enable_thinking is false -%}{{ raise_exception('no') }}"
+            "{%- endif -%}"
+        )
         (tmp_path / "chat_template.jinja").write_text(template)
         assert detect_thinking_default(tmp_path) is None
 

@@ -11,6 +11,7 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
+from omlx_cuda_helper import oqh  # noqa: E402
 from omlx_cuda_helper.families import qwen4_exp  # noqa: E402
 from omlx_cuda_helper.families.qwen4_exp import kernels  # noqa: E402
 from omlx_cuda_helper.families.qwen4_exp.attention import Attention  # noqa: E402
@@ -42,12 +43,17 @@ def _group(arrays, tag):
 
 @needs_fixture
 @pytest.mark.parametrize(
-    "bounds",
-    [(0, 3), (0, 2, 3), (0, 4)],
-    ids=["one-stage", "two-stages", "fewer-layers-than-held"],
+    ("bounds", "mrope_prefix"),
+    [((0, 3), False), ((0, 2, 3), False), ((0, 4), False), ((0, 3), True)],
+    ids=["one-stage", "two-stages", "fewer-layers-than-held", "mrope-prefix"],
 )
-def test_stages_reproduce_the_contract_fixture(bounds):
+def test_stages_reproduce_the_contract_fixture(bounds, mrope_prefix):
     meta, arrays = _case()
+    if mrope_prefix:
+        # A host cache that decoded sends its QSA positions as MRoPE [3, 1, n].
+        for name, (data, dtype) in list(arrays.items()):
+            if name.startswith("p:") and name.endswith(".ip"):
+                arrays[name] = (np.broadcast_to(data, (3, *data.shape)).copy(), dtype)
     k, sizes, skip = meta["layers"], meta["sizes"], meta["prefix_chunks"]
     assert meta["contract"] == qwen4_exp.CONTRACT
     assert all(a >= qwen4_exp.FIRST_STAGE_MIN for a in bounds[1:-1])
@@ -204,3 +210,47 @@ def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry():
     assert connection.fused and connection.write is kernels.hc_write
     assert linear.fused and linear.recurrence is kernels.gated_delta
     assert moe.expert_kernel
+
+
+@pytest.mark.skipif(not kernels.available(), reason="CUDA kernels")
+@pytest.mark.parametrize(
+    "bits, group, limit", [(2, 0, None), (3, 0, 2.0), (5, 128, None)]
+)
+def test_the_oqh_expert_kernel_matches_the_rebuilt_experts(bits, group, limit):
+    experts, k, inner, tokens, top = 8, 512, 128, 256, 4
+    key = mx.random.key(bits)
+
+    def bank(n, width):
+        w = mx.random.randint(0, 2**31, (experts, n, width * bits // 32), key=key)
+        w = w.astype(mx.uint32)
+        if not group:
+            s = mx.random.uniform(0.01, 0.02, (experts, n), key=key)
+            return w, s.astype(mx.bfloat16), None, {"bits": bits, "group_size": 0}
+        groups = (experts, n, width // group)
+        s = mx.random.uniform(0.01, 0.02, groups, key=key).astype(mx.bfloat16)
+        b = (mx.random.normal(groups, key=key) * 0.05).astype(mx.bfloat16)
+        return w, s, b, {"bits": bits, "group_size": group}
+
+    gate_up, down = bank(2 * inner, k), bank(k, inner)
+    assert kernels.expert_gemm_fits(gate_up, k, True)
+    assert kernels.expert_gemm_fits(down, inner, True)
+    x = mx.random.normal((tokens, k), key=key).astype(mx.bfloat16)
+    ids = mx.sort(mx.random.randint(0, experts, (tokens * top,), key=key))
+    ids = ids.astype(mx.uint32)
+    src = mx.random.randint(0, tokens, (tokens * top,), key=key).astype(mx.uint32)
+    offsets = kernels.expert_offsets(ids, experts)
+    act = kernels.expert_gemm(
+        x, gate_up, offsets, src, 2 if limit is None else 3, limit
+    )
+    both = oqh.bank_gather(x[src][:, None], gate_up, ids)[:, 0].astype(mx.float32)
+    gate, up = both[:, :inner], both[:, inner:]
+    if limit is not None:
+        gate, up = mx.minimum(gate, limit), mx.clip(up, -limit, limit)
+    want = (gate / (1 + mx.exp(-gate))) * up
+    hidden = act.astype(mx.bfloat16)
+    y = kernels.expert_gemm(hidden, down, offsets)
+    want_y = oqh.bank_gather(hidden[:, None], down, ids)[:, 0]
+    # Only the order of the float32 sums differs from the rebuilt experts.
+    for got, ref in ((act, want), (y, want_y)):
+        got, ref = got.astype(mx.float32), ref.astype(mx.float32)
+        assert (mx.linalg.norm(got - ref) / mx.linalg.norm(ref)).item() < 1e-3

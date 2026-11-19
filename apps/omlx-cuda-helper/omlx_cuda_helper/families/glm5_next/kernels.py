@@ -12,6 +12,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from ... import oqh
+from ..qwen4_exp import kernels as expert_kernels
 from . import sources
 
 logger = logging.getLogger("omlx_cuda_helper.glm5_next")
@@ -238,8 +240,41 @@ def moe_sum(down: mx.array, inverse: mx.array, weights: mx.array) -> mx.array:
     ]
 
 
+def _oqh_routed(moe, x: mx.array, experts: mx.array, weights: mx.array):
+    """``moe_routed`` of oQh banks on the expert kernel of 2 to 5 bit codes.
+
+    The activation stays float32 until it is rotated for down, as on the host.
+    """
+    down = moe.down.bank()
+    width, inner = x.shape[-1], moe.down.weight.shape[-1] * 32 // down[3]["bits"]
+    if (
+        not _on("moe oqh")
+        or x.dtype != mx.bfloat16
+        or x.shape[0] != 1
+        or not expert_kernels.expert_gemm_fits(moe.oqh_pair, width, True)
+        or not expert_kernels.expert_gemm_fits(down, inner, True)
+    ):
+        return None
+    order, ids, inverse = moe_order(experts)
+    k = experts.shape[-1]
+    rows = oqh.rotate(x[0], *moe.gate.rotation)
+    offsets = expert_kernels.expert_offsets(ids, moe.down.weight.shape[0])
+    act = expert_kernels.expert_gemm(
+        rows,
+        moe.oqh_pair,
+        offsets,
+        (order // k).astype(mx.uint32),
+        act=2 if moe.limit is None else 3,
+        limit=moe.limit,
+    )
+    hidden = oqh.rotate(act, *moe.down.rotation, dtype=x.dtype)
+    return moe_sum(expert_kernels.expert_gemm(hidden, down, offsets), inverse, weights)
+
+
 def moe_routed(moe, x: mx.array, experts: mx.array, weights: mx.array):
     """Weighted sum of each token's routed experts, [1, L, out], or None."""
+    if moe.oqh_pair is not None:
+        return _oqh_routed(moe, x, experts, weights)
     act = moe_activation(moe, x, experts)
     if act is None:
         return None

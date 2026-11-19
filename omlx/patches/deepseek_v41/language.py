@@ -1580,10 +1580,13 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             )
             prefetch = getattr(self, "_engram_prefetch", None)
             # A fully lazy prefill loop pins every intermediate until the logits
-            # eval (+14.5GB per 2048-token chunk). Prefill evals each layer so
-            # intermediates retire as the GPU runs, under a bounded pool.
-            # Decode/verify widths are only submitted (async_eval).
+            # eval (+14.5GB per 2048-token chunk). Prefill bounds that under a
+            # bounded pool: each layer is submitted, then the previous layer is
+            # waited on, so the CPU builds layer k+1 while the GPU runs layer k
+            # and at most two layers' intermediates are alive. Decode/verify
+            # widths are only submitted (async_eval).
             prefill_backpressure = end - begin >= 256
+            lagged = None
             with (
                 _prefill_cache_scope() if prefill_backpressure else nullcontext(),
                 prefetch.forward() if prefetch is not None else nullcontext(),
@@ -1638,7 +1641,10 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                             )
                         )
                     if prefill_backpressure:
-                        mx.eval(h, pre)
+                        mx.async_eval(h, pre)
+                        if lagged is not None:
+                            mx.eval(*lagged)
+                        lagged = (h, pre)
                     else:
                         # The GPU runs this layer while the next one is built.
                         mx.async_eval(h, pre)

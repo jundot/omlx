@@ -54,6 +54,10 @@ activations, M in 3..6, K % 64 == 0, N % 4 == 0.
 The mma path takes 2-, 3-, 4-, 5-, 6- and 8-bit affine, M in 7..24.
 It needs K % 256 == 0 and N % 16 == 0. Everything else falls back to stock.
 
+On M5 (NAX) GPUs, 4-, 5-, 6- and 8-bit group-64 weights with N >= 1024 take the
+skinny tensor-unit kernel (``omlx.custom_kernels.nax_skinny_qmm``) at ``mma``'s
+9..16-row shapes and at 17..48 rows. It reads each weight once for all rows.
+
 Blocks of four to eight rows (DFlash and Lightning MTP verifies) take
 ``sg8`` instead: bf16 or fp16 rows, 2- to 6-bit weights, N >= 1024. Each lane builds its simdgroup-matrix
 operands in registers from one packed word per 32 inputs (bf16 ``128 + q``,
@@ -72,6 +76,7 @@ from __future__ import annotations
 import logging
 import threading
 
+from omlx.custom_kernels import nax_skinny_qmm
 from omlx.custom_kernels.nax import is_nax_available
 
 from . import m1_verify_mma, m1_verify_qmv
@@ -1539,14 +1544,41 @@ def _m1_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
     return None
 
 
+def skinny_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
+    """NAX skinny kernel (``nax_skinny_qmm``) for a 9..48-row verify projection.
+
+    It rounds each dequantized weight to the row dtype like ``mma`` and stock's
+    multi-row qmm, so it replaces only those: stock from 17 rows, ``mma`` at 9..16.
+    Other 9..16-row calls keep stock's exact-code path, which rounds less. Outputs
+    under 1024 columns are not faster.
+    """
+    if not nax_skinny_qmm.MIN_ROWS <= int(M) <= nax_skinny_qmm.MAX_ROWS:
+        return False
+    import mlx.core as mx
+
+    if not (
+        int(bits) in nax_skinny_qmm.BITS
+        and int(group_size) == 64
+        and dtype in (mx.bfloat16, mx.float16)
+        and int(K) % 64 == 0
+        and int(N) % 32 == 0
+        and int(N) >= 1024
+        and is_nax_available()
+    ):
+        return False
+    return int(M) > _NAX_MMA_MAX_ROWS or mma_eligible(M, K, N, bits, group_size, dtype)
+
+
 def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
-    """Kernel an armed verify projection runs ("m1", "m1_mma", "sg8", "mma" or
-    "vk"), or None for the stock qmm."""
+    """Kernel an armed verify projection runs ("m1", "m1_mma", "sg8", "skinny",
+    "mma" or "vk"), or None for the stock qmm."""
     m1 = _m1_route(rows, K, N, bits, group_size, dtype)
     if m1:
         return m1
     if sg8_eligible(rows, K, N, bits, group_size, dtype):
         return "sg8"
+    if skinny_eligible(rows, K, N, bits, group_size, dtype):
+        return "skinny"
     if mma_eligible(rows, K, N, bits, group_size, dtype):
         return "mma"
     if rows <= 6 and vk_eligible(rows, K, N, bits, group_size, dtype):
@@ -1559,7 +1591,7 @@ def run_route(layer, x2, route: str, *, sums=None):
 
     Returns None when the route cannot read the layer's scales dtype.
     """
-    if route in ("m1", "m1_mma") and layer.scales.dtype != x2.dtype:
+    if route in ("m1", "m1_mma", "skinny") and layer.scales.dtype != x2.dtype:
         return None
     args = (x2, layer.weight, layer.scales, layer.biases)
     if route == "m1":
@@ -1572,6 +1604,9 @@ def run_route(layer, x2, route: str, *, sums=None):
         return vk_qmm_sg8(
             *args, group_size=layer.group_size, bits=layer.bits, sums=sums
         )
+    if route == "skinny":
+        K, N = int(x2.shape[1]), int(layer.scales.shape[0])
+        return nax_skinny_qmm.skinny_qmm(*args, K, N, bits=layer.bits)
     if route == "mma":
         return vk_qmm_mma(*args, group_size=layer.group_size, bits=layer.bits)
     return vk_qmm(*args, bits=layer.bits, group_size=layer.group_size)
@@ -1649,7 +1684,8 @@ def apply_verify_qmm_patch() -> bool:
     _patch_verify_layer_flush()
     _QL_PATCHED = True
     logger.info(
-        "MTP verify qmm patch applied (rows 2..6 split-K, 7..8 sg8, 9..24 mma%s)",
+        "MTP verify qmm patch applied (rows 2..6 split-K, 7..8 sg8, 9..24 mma%s%s)",
+        "; NAX: skinny 9..48" if is_nax_available() else "",
         "; M1: qmv 2..4, mma 5..16" if m1_verify_qmv.enabled() else "",
     )
     return True

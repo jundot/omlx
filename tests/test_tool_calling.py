@@ -6037,6 +6037,33 @@ def test_native_union_parameter_keeps_correct_python_literal_values(
     assert json.loads(calls[0].function.arguments)["v"] == expected
 
 
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '["a"]\n["b"]',
+        '"[\\"a\\"]\\n[\\"b\\"]"',
+        '"[\\"a\\"]\\n[\\"b\\"]',
+    ],
+)
+def test_native_array_parameter_merges_string_fragments(raw):
+    tools = [
+        {
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "properties": {"v": {"type": "array", "items": {"type": "string"}}}
+                },
+            }
+        }
+    ]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        _qwen_parser_tokenizer("mlx_lm.tool_parsers.qwen3_coder"),
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == ["a", "b"]
+
 def test_stream_filter_suppresses_envelope_with_long_tool_name():
     name = "t" * 120
     f = ToolCallStreamFilter(_make_tokenizer(), tools={name})
@@ -6085,3 +6112,4 @@ def test_think_tags_in_the_answer_survive_for_leading_thinking_models(
     cleaned, calls = parse_tool_calls("Strip ``<think>...</think>`` spans.", tok, None)
     assert calls is None
     assert cleaned == expected
+

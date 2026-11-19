@@ -1933,7 +1933,7 @@ function clusterV2Wizard() {
                     // The helper has its own version; an error text stays as is.
                     label = t('row_version_helper');
                     if (row.families) {
-                        detail = t(row.status === 'pass' ? 'version_ok_helper' : 'version_mismatch_helper')
+                        detail = t(row.status === 'fail' ? 'version_mismatch_helper' : 'version_ok_helper')
                             .replace('{version}', row.detail || '?');
                     }
                 } else if (row.key === 'version') {

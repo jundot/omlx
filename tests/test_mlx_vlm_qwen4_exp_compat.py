@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import mmap
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -678,6 +679,47 @@ def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_bf16_checkpoint():
         result[key], mx.ones((1,), dtype=mx.bfloat16)
     ).item()
 
+
+def test_qwen4_exp_sanitize_splits_quantized_fused_experts():
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    gate_up = mx.quantize(mx.random.normal((2, 128, 64)), group_size=64, bits=4)
+    down = mx.quantize(mx.random.normal((2, 64, 64)), group_size=64, bits=4)
+    prefix = "model.language_model.layers.0.mlp.experts"
+    weights = {}
+    for name, params in (("gate_up_proj", gate_up), ("down_proj", down)):
+        for suffix, value in zip(("weight", "scales", "biases"), params):
+            weights[f"{prefix}.{name}.{suffix}"] = value
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=1,
+                num_experts=2,
+                ple_layer_ids=(),
+            )
+        )
+    )
+
+    result = Model.sanitize(model, weights)
+
+    assert [key for key in result if ".experts." in key] == []
+    gate, up = mx.split(mx.dequantize(*gate_up, group_size=64, bits=4), 2, axis=-2)
+    expected = {
+        "gate_proj": gate,
+        "up_proj": up,
+        "down_proj": mx.dequantize(*down, group_size=64, bits=4),
+    }
+    for name, want in expected.items():
+        base = f"language_model.model.layers.0.mlp.switch_mlp.{name}"
+        got = mx.dequantize(
+            result[f"{base}.weight"],
+            result[f"{base}.scales"],
+            result[f"{base}.biases"],
+            group_size=64,
+            bits=4,
+        )
+        assert mx.array_equal(got, want).item(), name
 
 
 def test_qwen4_resident_ple_looks_up_shard_windows_on_device():
@@ -1778,6 +1820,52 @@ def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
     assert embedding.rows_read == 2
     assert embedding._shard_specs[0][3:] == (bits, 32)
     embedding.close()
+
+
+def test_disk_backed_ple_advises_a_decode_tokens_pages_before_copying(tmp_path):
+    """A token's per-shard gathers advise every page before the first copy; larger gathers keep the pool prefetch."""
+    embedding, table = _disk_ple(tmp_path, shards=4, rows=2048, dims=160, bits=4)
+    from mlx_vlm.models.qwen4_exp import language as ple
+
+    events = []
+
+    class RecordingMap(mmap.mmap):
+        def madvise(self, option, start, length):
+            events.append(("advise", start, start + length))
+            return super().madvise(option, start, length)
+
+    reader = next(iter(embedding._readers.values()))
+    copy_rows = reader.rows_np
+
+    def rows_np(key, rows):
+        events.append(("copy", key, int(rows[0])))
+        return copy_rows(key, rows)
+
+    reader._mapping.close()
+    reader._mapping = RecordingMap(reader._file.fileno(), 0, access=mmap.ACCESS_READ)
+    reader.rows_np = rows_np
+
+    # One decode token: a row in each of the four shards.
+    indices = mx.array([[5, 2048 + 900, 2 * 2048 + 2047, 3 * 2048 + 1500]], dtype=mx.int32)
+    values = embedding(indices)
+    assert mx.array_equal(values, mx.take(table, indices.reshape(-1), axis=0)[None]).item()
+    advised = [event for event in events if event[0] == "advise"]
+    assert len(advised) == 4 * 3 and events[: len(advised)] == advised
+    for _, key, row in events[len(advised) :]:
+        entry = reader._header[key]
+        start, end = entry["data_offsets"]
+        row_bytes = (end - start) // entry["shape"][0]
+        first = reader._data_start + start + row * row_bytes
+        assert any(
+            begin % ple._PLE_PAGE_SIZE == 0 and begin <= first and first + row_bytes <= stop
+            for _, begin, stop in advised
+        ), key
+
+    events.clear()
+    embedding(mx.array([list(range(ple._PLE_POOL_PREFETCH_ROWS + 1))], dtype=mx.int32))
+    assert [event[0] for event in events] == ["copy"] * 3
+    embedding.close()
+
 
 # ---------------------------------------------------------------------------
 # Continuous-batching join regressions (issue #3245, PR #3246)

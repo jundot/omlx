@@ -107,6 +107,8 @@ _RUNTIME_PATCHES_BY_TYPE: dict[str, tuple[str, ...]] = {
     "qwen4_exp": (),
     "minimax_m3": (),
     "minimax_m3_vl": (),
+    # Inkling 2 drafts with its bundled DSpark model.
+    "inkling2": (),
 }
 
 

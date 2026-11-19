@@ -198,30 +198,15 @@ def qmv_fast_layout(k: int, n: int, bits: int, *, gathered: bool = False) -> boo
     ) == 0
 
 
-# Each threadgroup takes the pair at sorted position ``y`` (pairs ordered by
-# expert, then by pair index) and output tile ``z``. The grid walks every
-# pair of one tile before the next tile, so pairs sharing an expert run back
-# to back and read that expert tile from cache. Per pair this follows
-# qmv_fast_impl (FAST) or the full-tile branch of qmv_impl.
+# Each threadgroup takes the pair at sorted position ``y`` and output tile
+# ``z``; ``order`` lists the pairs by expert, then by pair index. The grid
+# walks every pair of one tile before the next tile, so pairs sharing an
+# expert run back to back and read that expert tile from cache. Per pair this
+# follows qmv_fast_impl (FAST) or the full-tile branch of qmv_impl.
 _SOURCE = r"""
-    const int pos = int(threadgroup_position_in_grid.y);
     const uint simd_gid = simdgroup_index_in_threadgroup;
     const uint simd_lid = thread_index_in_simdgroup;
-    threadgroup int chosen;
-    const int first = int(simd_gid * SIMD_SIZE + simd_lid);
-    for (int p = first; p < N_PAIRS; p += 2 * SIMD_SIZE) {
-      const uint e = rhs[p];
-      int rank = 0;
-      for (int q = 0; q < N_PAIRS; ++q) {
-        const uint f = rhs[q];
-        rank += (f < e || (f == e && q < p)) ? 1 : 0;
-      }
-      if (rank == pos) {
-        chosen = p;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int pair = chosen;
+    const int pair = int(order[threadgroup_position_in_grid.y]);
     const int expert = int(rhs[pair]);
 
     const int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
@@ -282,6 +267,43 @@ _SOURCE = r"""
 """
 
 
+# One thread per pair: its rank by (expert, pair index) is its sorted position.
+_RANK_SOURCE = r"""
+    const uint p = thread_position_in_grid.x;
+    if (p >= N_PAIRS) return;
+    const uint e = rhs[p];
+    uint rank = 0;
+    for (uint q = 0; q < N_PAIRS; ++q) {
+      const uint f = rhs[q];
+      rank += (f < e || (f == e && q < p)) ? 1u : 0u;
+    }
+    order[rank] = p;
+"""
+
+
+@cache
+def _rank_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_moe_verify_pair_rank",
+        input_names=["rhs"],
+        output_names=["order"],
+        source=_RANK_SOURCE,
+    )
+
+
+def pair_order(rhs: mx.array) -> mx.array:
+    """Pair positions sorted by expert, then by pair index."""
+    pairs = int(rhs.shape[0])
+    return _rank_kernel()(
+        inputs=[rhs],
+        template=[("N_PAIRS", pairs)],
+        grid=(((pairs + 31) // 32) * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(pairs,)],
+        output_dtypes=[mx.uint32],
+    )[0]
+
+
 @cache
 def _kernel(bits: int, group_size: int, fast: bool):
     header = (
@@ -291,7 +313,7 @@ def _kernel(bits: int, group_size: int, fast: bool):
     )
     return mx.fast.metal_kernel(
         name=f"omlx_moe_verify_gather_b{bits}_gs{group_size}_{int(fast)}",
-        input_names=["x", "w", "scales", "biases", "rhs"],
+        input_names=["x", "w", "scales", "biases", "rhs", "order"],
         output_names=["y"],
         header=header,
         source=_SOURCE,
@@ -348,17 +370,21 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         return None
     top_k = int(indices.shape[-1])
     pairs = indices.reshape(rows * top_k)
-    gate_up_out = gather_qmv(gate_up, x.reshape(rows, width), pairs, top_k)
+    order = pair_order(pairs)
+    gate_up_out = gather_qmv(gate_up, x.reshape(rows, width), pairs, top_k, order)
     gate, up = mx.split(gate_up_out, 2, axis=-1)
-    out = gather_qmv(down, switch_mlp.activation(up, gate), pairs, 1)
+    out = gather_qmv(down, switch_mlp.activation(up, gate), pairs, 1, order)
     return out.reshape(batch, length, top_k, -1)
 
 
-def gather_qmv(linear, x: mx.array, rhs: mx.array, pairs_per_row: int) -> mx.array:
+def gather_qmv(
+    linear, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array
+) -> mx.array:
     """``gather_qmm`` over P (row, expert) pairs, pairs grouped by expert.
 
     ``rhs`` holds the expert of each pair; pair ``p`` reads row
-    ``p // pairs_per_row`` of ``x`` (``[R, K]``). Returns ``[P, N]``.
+    ``p // pairs_per_row`` of ``x`` (``[R, K]``). ``order`` is
+    ``pair_order(rhs)``. Returns ``[P, N]``.
     """
     weight, scales, biases = linear["weight"], linear["scales"], linear["biases"]
     k = int(x.shape[-1])
@@ -367,7 +393,7 @@ def gather_qmv(linear, x: mx.array, rhs: mx.array, pairs_per_row: int) -> mx.arr
     fast = qmv_fast_layout(k, n, int(linear.bits), gathered=True)
     kernel = _kernel(int(linear.bits), int(linear.group_size), fast)
     return kernel(
-        inputs=[x, weight, scales, biases, rhs],
+        inputs=[x, weight, scales, biases, rhs, order],
         template=[
             ("T", x.dtype),
             ("K_SIZE", k),

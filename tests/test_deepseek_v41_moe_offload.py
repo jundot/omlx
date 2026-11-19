@@ -679,10 +679,20 @@ def test_sorted_routes_chunk_on_expert_boundaries(tmp_path, monkeypatch):
         assert disk.slots.misses == 8 and disk.slots.hits == 0
         # Read-ahead must not outlive the call that started it.
         assert disk.slots._ahead == {}
-        # A second sweep evicts the last resident pair before reaching it:
-        # sorted routes over more experts than slots thrash by construction.
-        disk(x, idx, weights, sorted_indices=True)
-        assert disk.slots.misses == 16 and disk.slots.hits == 0
+        # A second sweep runs the resident pair (6, 7) first, before any miss
+        # evicts it: six reads instead of eight, same outputs.
+        calls.clear()
+        again = disk(x, idx, weights, sorted_indices=True)
+        mx.eval(again)
+        assert calls == [3, 4, 3, 5]
+        assert disk.slots.misses == 14 and disk.slots.hits == 2
+        assert disk.slots._ahead == {}
+        np.testing.assert_allclose(
+            again.astype(mx.float32),
+            expected.astype(mx.float32),
+            rtol=0.01,
+            atol=0.002,
+        )
     finally:
         plan.close()
 
@@ -1009,3 +1019,33 @@ def test_admin_validate_offload_mtp_family_gate(tmp_path, monkeypatch):
             settings,
         )
     assert error.value.status_code == 400
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_resident_first_groups_restore_the_sorted_route_order(tmp_path, seed):
+    """Non-contiguous groups (resident experts first) give every route its own output."""
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
+    rng = np.random.default_rng(seed)
+    try:
+        for k in range(4):
+            ids = sorted(rng.integers(0, 8, size=24).tolist())
+            idx = mx.array(ids)
+            mx.random.seed(seed * 10 + k)
+            x = mx.random.normal((len(ids), 1, 64)).astype(mx.bfloat16)
+            weights = mx.array(rng.uniform(0.1, 1.0, size=len(ids)).astype(np.float32))
+            before = set(disk.slots.slot_of)
+            misses = disk.slots.misses
+            actual = disk(x, idx, weights, sorted_indices=True)
+            expected = reference(x, idx, weights, sorted_indices=True)
+            mx.eval(actual, expected)
+            np.testing.assert_allclose(
+                actual.astype(mx.float32),
+                expected.astype(mx.float32),
+                rtol=0.01,
+                atol=0.002,
+            )
+            # Experts resident before the call are never read again by it.
+            assert disk.slots.misses - misses == len(set(ids) - before)
+            assert disk.slots._ahead == {}
+    finally:
+        plan.close()

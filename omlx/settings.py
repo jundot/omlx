@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -211,9 +212,13 @@ class ServerSettings:
     # Seconds between trivial GPU kernels submitted while a model is loaded
     # but idle, so the GPU stays out of its idle power state (the first
     # command buffer after ~1s+ of GPU idle stalls for up to seconds on
-    # large resident models). Ticks stop after 5 minutes without requests.
-    # 0 disables.
+    # large resident models). Ticks stop after gpu_keep_warm_idle_window
+    # seconds without requests. 0 disables.
     gpu_keep_warm_interval: float = 0.5
+    # Seconds without requests after which the keep-warm ticks stop (default
+    # 5 minutes). A client that talks to the server less often than this pays
+    # the first-command stall on every request; raise it to cover that gap.
+    gpu_keep_warm_idle_window: float = 300.0
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -263,6 +268,9 @@ class ServerSettings:
             max_request_body_size=data.get("max_request_body_size", "512MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),
             gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
+            gpu_keep_warm_idle_window=float(
+                data.get("gpu_keep_warm_idle_window", 300.0)
+            ),
         )
 
 
@@ -580,6 +588,8 @@ VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"
 
 # KV cache storage formats `splash serve --kv-format` accepts.
 SPLASH_KV_FORMATS = frozenset({"int8", "bf16"})
+# Activation precisions `splash serve --activations` accepts (Splash 1.6.1+).
+SPLASH_ACTIVATIONS = frozenset({"auto", "bf16"})
 
 
 @dataclass
@@ -1006,6 +1016,7 @@ class IntegrationSettings:
     # oMLX looks for an installed launcher itself.
     splash_path: str | None = None
     splash_kv_format: str = "int8"  # "int8" | "bf16"
+    splash_activations: str = "bf16"  # "auto" | "bf16" (Splash 1.6.1+)
     splash_max_memory_gb: float | None = None  # None = what the ceiling leaves
     splash_ssd_cache_gb: float | None = None  # None = oMLX's SSD cache size
     splash_ane_prefill: bool = True
@@ -1037,6 +1048,7 @@ class IntegrationSettings:
             "web_search_content_max_chars": self.web_search_content_max_chars,
             "splash_path": self.splash_path,
             "splash_kv_format": self.splash_kv_format,
+            "splash_activations": self.splash_activations,
             "splash_max_memory_gb": self.splash_max_memory_gb,
             "splash_ssd_cache_gb": self.splash_ssd_cache_gb,
             "splash_ane_prefill": self.splash_ane_prefill,
@@ -1078,6 +1090,7 @@ class IntegrationSettings:
             ),
             splash_path=data.get("splash_path") or None,
             splash_kv_format=data.get("splash_kv_format", "int8"),
+            splash_activations=data.get("splash_activations", "bf16"),
             splash_max_memory_gb=data.get("splash_max_memory_gb"),
             splash_ssd_cache_gb=data.get("splash_ssd_cache_gb"),
             splash_ane_prefill=data.get("splash_ane_prefill", True),
@@ -1782,6 +1795,10 @@ class GlobalSettings:
 
         if self.server.max_image_side_length < 0:
             errors.append("max_image_side_length must be non-negative")
+        if not math.isfinite(self.server.gpu_keep_warm_interval):
+            errors.append("gpu_keep_warm_interval must be finite")
+        if not math.isfinite(self.server.gpu_keep_warm_idle_window):
+            errors.append("gpu_keep_warm_idle_window must be finite")
 
         # Memory guard tier validation
         if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:
@@ -1929,6 +1946,10 @@ class GlobalSettings:
         if self.integrations.splash_kv_format not in SPLASH_KV_FORMATS:
             errors.append(
                 f"splash_kv_format must be one of {sorted(SPLASH_KV_FORMATS)}"
+            )
+        if self.integrations.splash_activations not in SPLASH_ACTIVATIONS:
+            errors.append(
+                f"splash_activations must be one of {sorted(SPLASH_ACTIVATIONS)}"
             )
         memory = self.integrations.splash_max_memory_gb
         if memory is not None and memory <= 0:
