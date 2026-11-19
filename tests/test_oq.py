@@ -9431,6 +9431,63 @@ class TestStreamedCalibration:
         for key, value in reference.items():
             assert metadata["sensitivity_map"][key] == pytest.approx(value, rel=1e-3)
 
+    @pytest.mark.parametrize("hadamard", [False, True], ids=["oqe", "oqh"])
+    @pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5"])
+    def test_qwen3_5_refined_output_matches_resident(
+        self, tmp_path, monkeypatch, model_type, hadamard
+    ):
+        """Streamed oQe/oQh refinement writes the same codes as the resident one."""
+        import omlx.oq as oq
+
+        if hadamard:
+            from omlx.custom_kernels.oqh import fast
+
+            if not fast.has_native():
+                pytest.skip("oQh kernels not built")
+
+        # Layers wide enough to be quantized and refined.
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "hidden_size", 256)
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "intermediate_size", 512)
+        for key in ("moe_intermediate_size", "shared_expert_intermediate_size"):
+            monkeypatch.setitem(_QWEN3_5_STREAM_EXPERTS, key, 256)
+        source = tmp_path / "source"
+        _qwen3_5_stream_source(source, model_type, vlm=False, mtp=False)
+        # As many rows as tokens: a gated delta net would apply a causal mask as
+        # a padding mask.
+        tokens = (mx.arange(16).reshape(4, 4) * 7 % 120 + 1).astype(mx.int32)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+
+        def build(name, stream):
+            out = tmp_path / name
+            oq.quantize_oq_streaming(
+                str(source),
+                str(out),
+                4,
+                enhanced=True,
+                hadamard=hadamard,
+                stream_calibration=stream,
+                imatrix_num_samples=4,
+                imatrix_seq_length=4,
+                imatrix_cache_path=str(tmp_path / f"{name}.npz"),
+                sensitivity_map_override={0: 1, 1: 1},
+            )
+            weights = {}
+            for f in sorted(out.glob("*.safetensors")):
+                weights.update(mx.load(str(f)))
+            return weights
+
+        resident = build("resident", False)
+        streamed = build("streamed", True)
+        assert resident.keys() == streamed.keys()
+        for key, want in resident.items():
+            # The streamed walk does not refine an untied lm_head.
+            if key.startswith("language_model.lm_head."):
+                continue
+            got = streamed[key]
+            if want.dtype == mx.bfloat16:
+                want, got = want.view(mx.uint16), got.view(mx.uint16)
+            np.testing.assert_array_equal(np.array(got), np.array(want), key)
+
     @pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5"])
     def test_qwen3_5_vlm_mtp_rows_keep_their_positions(self, tmp_path, model_type):
         """Two identical rows give the MTP head twice one row's statistics."""
