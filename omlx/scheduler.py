@@ -1384,6 +1384,11 @@ PromptProcessingBatch.prompt = _patched_ppb_prompt
 # ChunkedKVCache is included once the batch=1 patch above installs its
 # extract/filter/size pass-throughs; without it Llama-4 requests fall
 # back to the snapshot path unnecessarily.
+# A running prefill stores its completed prefix-cache blocks once this many
+# new ones are done, so the finish store only adds the tail and a new question
+# on the same prompt finds the blocks without waiting for it.
+_INCREMENTAL_STORE_MIN_BLOCKS = 4
+
 _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
     {
         "KVCache",
@@ -2657,6 +2662,13 @@ class Scheduler:
         # Track in-flight store futures per request_id for lookup wait /
         # shutdown wait.
         self._inflight_store_futures: dict[str, concurrent.futures.Future] = {}
+        # Blocks of a running prefill stored before it finishes
+        # (_maybe_incremental_store): tokens stored so far, stores queued or
+        # running per request, and requests released while one was queued.
+        self._incremental_stored: dict[str, int] = {}
+        self._incremental_futures: dict[str, concurrent.futures.Future] = {}
+        self._incremental_released: set[str] = set()
+        self._incremental_lock = threading.Lock()
         self._inflight_store_info: dict[str, _InflightStoreInfo] = {}
         # Admission-only cache freshness waits. A waiting request can pause at
         # the front of the queue for a relevant in-flight store without
@@ -4944,10 +4956,22 @@ class Scheduler:
                         request, prompt_cache, total_tokens
                     )
                     emitted_boundaries[request.request_id] = total_tokens
+                    if processed_tokens < total_length - 1:
+                        self._maybe_incremental_store(
+                            request, prompt_cache, total_tokens, True
+                        )
                 elif total_tokens in (tail_at, system_at):
                     self._emit_prefill_tail_snapshot(
                         request, prompt_cache, total_tokens
                     )
+            elif block_size > 0 and processed_tokens < total_length - 1:
+                total_tokens = base_size + processed_tokens
+                self._maybe_incremental_store(
+                    request,
+                    prompt_cache,
+                    total_tokens - total_tokens % block_size,
+                    False,
+                )
 
             Scheduler._check_post_prefill_memory(
                 self,
@@ -7727,6 +7751,7 @@ class Scheduler:
         self._note_memory_admission_progress()
 
         # Boundary snapshot
+        more = state.tokens_processed < state.total_length - 1
         if state.boundary_enabled:
             total_tokens = state.base_size + state.tokens_processed
             rid = state.request.request_id
@@ -7739,10 +7764,22 @@ class Scheduler:
                     state.request, state.cache, total_tokens
                 )
                 state.emitted_boundaries[rid] = total_tokens
+                if more:
+                    self._maybe_incremental_store(
+                        state.request, state.cache, total_tokens, True
+                    )
             elif total_tokens in (state.tail_at, state.system_at):
                 self._emit_prefill_tail_snapshot(
                     state.request, state.cache, total_tokens
                 )
+        elif more and self.config.paged_cache_block_size > 0:
+            total_tokens = state.base_size + state.tokens_processed
+            self._maybe_incremental_store(
+                state.request,
+                state.cache,
+                total_tokens - total_tokens % self.config.paged_cache_block_size,
+                False,
+            )
 
         # Progress callback so the admin UI prefilling list advances during
         # chunked prefill. _do_external_prefill calls _on_prompt_progress
@@ -8589,6 +8626,247 @@ class Scheduler:
             # No earlier boundary exists inside the indivisible image prefix.
             return token_count
         return block_size
+
+    def _incremental_store_allowed(self, request: "Request", prompt_cache: list[Any]) -> bool:
+        """The finish and cancel store rules, plus room on the store worker."""
+        if (
+            self.block_aware_cache is None
+            or self._store_cache_executor is None
+            or self._admission_paused
+            or getattr(request, "skip_cache_store", False)
+            or getattr(request, "specprefill_indices", None) is not None
+            or getattr(request, "vlm_extra_keys_for_cache", None) is not None
+            or getattr(request, "vlm_extra_key_ranges_for_cache", None)
+            or self._model_has_unreconstructible_cache()
+        ):
+            return False
+        # Under memory pressure the extra copy waits for the finish store.
+        if self._bypass_hot_cache_under_pressure():
+            return False
+        # Never queue in front of another request's finish store, and keep at
+        # most one of these per request in flight.
+        if any(not f.done() for f in self._inflight_store_futures.values()):
+            return False
+        pending = self._incremental_futures.get(request.request_id)
+        return pending is None or pending.done()
+
+    def _maybe_incremental_store(
+        self,
+        request: "Request",
+        prompt_cache: list[Any],
+        end_tokens: int,
+        with_snapshots: bool,
+    ) -> None:
+        """Store the blocks a running prefill completed since its last store.
+
+        Attention layers are cut from the live KV: a copy of only the new
+        blocks (``token_base`` = the stored prefix), materialized here on the
+        owner thread so no view pins the growing prefill buffer. With
+        ``with_snapshots`` (recurrent or sliding-window layers) this runs at a
+        boundary snapshot and those layers come from the snapshots at the new
+        block ends; the payload's own copy of them belongs to ``end_tokens``,
+        the last block of this store. The store runs on the store-cache worker
+        under the request's own block table, so the finish store finds these
+        blocks stored and adds the tail.
+        """
+        cache = self.block_aware_cache
+        block_size = self.config.paged_cache_block_size
+        if cache is None or block_size <= 0 or end_tokens <= 0 or end_tokens % block_size:
+            return
+        rid = request.request_id
+        start = self._incremental_stored.get(rid)
+        if start is None:
+            start = cache.stored_prefix_tokens(rid)
+        if (
+            not isinstance(start, int)
+            or end_tokens - start < _INCREMENTAL_STORE_MIN_BLOCKS * block_size
+            or not self._incremental_store_allowed(request, prompt_cache)
+        ):
+            return
+        tokens = list((request.prompt_token_ids or [])[:end_tokens])
+        if len(tokens) < end_tokens:
+            return
+        extracted, model_cache_config = self._extract_cache_states(prompt_cache)
+        if not extracted:
+            return
+        payload = cache.copy_payload_prefix(extracted, end_tokens, start)
+        if payload is None:
+            return
+        if self._incremental_converts_to_turboquant(prompt_cache):
+            converted = self._incremental_turboquant_payload(prompt_cache, payload, start)
+            if converted is None:
+                return
+            payload, model_cache_config = converted
+        provider = None
+        in_memory: dict[int, Any] = {}
+        if with_snapshots:
+            snapshots = self._boundary_cache_snapshots.get(rid) or {}
+            tcs: list[int] = []
+            for tc in range(start + block_size, end_tokens + 1, block_size):
+                if tc not in snapshots:
+                    continue
+                snap = snapshots[tc]
+                if snap is None:
+                    if self._boundary_snapshot_store is not None:
+                        tcs.append(tc)
+                    continue
+                if (
+                    isinstance(snap, tuple)
+                    and len(snap) == 2
+                    and snap[0] == self._PREFILL_SNAPSHOT_MARKER
+                ):
+                    in_memory[tc] = snap[1]
+                    tcs.append(tc)
+                    continue
+                extracted_snapshot, _ = self._extract_snapshot_cache_states(snap)
+                if extracted_snapshot:
+                    in_memory[tc] = extracted_snapshot
+                    tcs.append(tc)
+            provider = _BoundarySnapshotProvider(
+                store=self._boundary_snapshot_store,
+                request_id=rid,
+                valid_tcs=tcs,
+                in_memory_snapshots=in_memory,
+                paged_ssd_manager=self.paged_ssd_cache_manager,
+            )
+        arrays = self._collect_arrays_from_extracted_cache(payload)
+        for snap in in_memory.values():
+            arrays.extend(self._collect_arrays_from_extracted_cache(snap))
+        if arrays:
+            mx.eval(*arrays)
+        try:
+            future = self._store_cache_executor.submit(
+                self._incremental_store_worker,
+                rid,
+                tokens,
+                payload,
+                model_cache_config,
+                provider,
+            )
+        except Exception as e:  # noqa: BLE001 - the finish store stores it all
+            logger.debug("Incremental store not submitted for %s: %s", rid, e)
+            return
+        self._incremental_futures[rid] = future
+        self._incremental_stored[rid] = end_tokens
+
+    def _incremental_converts_to_turboquant(self, prompt_cache: list[Any]) -> bool:
+        """TurboQuant prefills dense and converts the full-attention layers at
+        the end; affine schemes prefill packed already."""
+        return (
+            getattr(self, "_turboquant_kv_bits", None) is not None
+            and getattr(self, "_turboquant_kv_scheme", "turboquant")
+            not in ("affine4", "affine8")
+            and self._turboquant_eligible(prompt_cache)
+        )
+
+    def _incremental_turboquant_payload(
+        self, prompt_cache: list[Any], payload: list[Any], start: int
+    ) -> tuple[list[Any], Any] | None:
+        """Quantize the cut dense layers the way the end of the prefill will.
+
+        TurboQuant quantizes each token on its own, so a block converted now
+        is byte-identical to the same block of the converted cache (the
+        layer left dense by ``turboquant_skip_last`` stays dense). Layouts the
+        end conversion treats specially (a restored TurboQuant prefix,
+        CacheList members) are left to the finish store. Returns the payload
+        and the layer signature of the converted cache.
+        """
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        from .turboquant_kv import quantized_cache_class
+
+        if len(payload) != len(prompt_cache) or any(
+            getattr(c, _RESTORED_TQ_PREFIX_ATTR, None) is not None
+            or isinstance(c, (CacheList, _vlm_cache.CacheList))
+            for c in prompt_cache
+        ):
+            return None
+        kv_indices = [
+            i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
+        ]
+        last = kv_indices[-1] if self._turboquant_skip_last and len(kv_indices) > 1 else -1
+        cache_class = quantized_cache_class("turboquant")
+        bits = float(self._turboquant_kv_bits)
+        out = []
+        layers = []
+        for i, (cache_obj, layer) in enumerate(zip(prompt_cache, payload)):
+            if not isinstance(cache_obj, (KVCache, _vlm_cache.KVCache)) or i == last:
+                out.append(layer)
+                layers.append(cache_obj)
+                continue
+            keys, values = layer["state"]
+            dense = KVCache()
+            dense.update_and_fetch(keys, values)
+            quantized_cache = cache_class.from_cache(dense, bits=bits)
+            converted, _ = self._extract_cache_states([quantized_cache])
+            if not converted:
+                return None
+            quantized = dict(converted[0])
+            if start:
+                quantized["token_base"] = start
+            out.append(quantized)
+            layers.append(quantized_cache)
+        _, model_cache_config = self._extract_cache_states(layers)
+        return out, model_cache_config
+
+    def _incremental_store_worker(
+        self,
+        request_id: str,
+        tokens: list[int],
+        payload: list[Any],
+        model_cache_config: Any | None,
+        snapshots: Any,
+    ) -> None:
+        """Store-cache worker side of ``_maybe_incremental_store``.
+
+        Unlike the finish store this keeps the request's block table and its
+        references: the request is still running, and its finish store (or
+        its release) owns them. A request released before this ran is not
+        stored; one released while it ran gives the new references back.
+        """
+        with self._incremental_lock:
+            if request_id in self._incremental_released:
+                return
+        try:
+            with _mx_buffer_access_lock:
+                _safe_sync_stream(self._stream)
+                self.block_aware_cache.store_cache(
+                    request_id,
+                    tokens,
+                    payload,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots=snapshots,
+                )
+        except Exception as e:  # noqa: BLE001 - the finish store stores what is left
+            logger.warning("Incremental store_cache failed for %s: %s", request_id, e)
+
+    # A released request waits this long for its incremental store to land in
+    # its block table, so the release returns those references too.
+    _INCREMENTAL_RELEASE_WAIT_S = 5.0
+
+    def _note_incremental_release(self, request_id: str) -> None:
+        """Settle a request's incremental stores before its cache is released.
+
+        Call before the block table is released. A queued store is skipped;
+        a running one is waited for (a few blocks), so its new references are
+        in the table the caller releases. The same request id may be admitted
+        again later (a requeue), so nothing is released behind its back.
+        """
+        self._incremental_stored.pop(request_id, None)
+        future = self._incremental_futures.pop(request_id, None)
+        if future is None or future.done():
+            return
+        with self._incremental_lock:
+            self._incremental_released.add(request_id)
+        if not future.cancel():
+            try:
+                future.result(timeout=self._INCREMENTAL_RELEASE_WAIT_S)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Incremental store for %s still running at release", request_id
+                )
+        with self._incremental_lock:
+            self._incremental_released.discard(request_id)
 
     def _emit_prefill_boundary_snapshot(
         self,
@@ -12778,6 +13056,8 @@ class Scheduler:
 
         # Release blocks for eviction (same as _cleanup_finished). A prefill
         # store in flight releases them itself when it completes.
+        if store_future is None:
+            self._note_incremental_release(request_id)
         if self.paged_cache_manager is not None and store_future is None:
             block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table is None and hasattr(request, "block_table"):
@@ -12889,6 +13169,9 @@ class Scheduler:
         """Store a cancelled request's extracted progress off-thread."""
         request_id = request.request_id
         tokens, cache_to_store, model_cache_config, snapshots = prepared
+        # Incremental stores ahead of this one on the same worker finish first.
+        self._incremental_stored.pop(request_id, None)
+        self._incremental_futures.pop(request_id, None)
         gate = self._store_cache_gate
         if gate is not None:
             gate.note_submitted()
@@ -14860,6 +15143,7 @@ class Scheduler:
         very memory pressure that triggered the rejection) and orphan
         ``_request_tables`` entries.
         """
+        self._note_incremental_release(request_id)
         if self.block_aware_cache is not None:
             self.block_aware_cache.release_cache(request_id)
         elif self.paged_cache_manager is not None:
@@ -15184,6 +15468,10 @@ class Scheduler:
                                 gate = self._store_cache_gate
                                 if gate is not None:
                                     gate.note_submitted()
+                                # Incremental stores ahead of this one on the
+                                # same worker finish first.
+                                self._incremental_stored.pop(request_id, None)
+                                self._incremental_futures.pop(request_id, None)
                                 try:
                                     store_future = self._store_cache_executor.submit(
                                         self._async_store_cache_worker,
@@ -15291,6 +15579,7 @@ class Scheduler:
                                 block_size,
                                 available_boundaries,
                             )
+                            self._note_incremental_release(request_id)
                             block_table = None
                             if self.paged_cache_manager:
                                 block_table = self.paged_cache_manager.get_block_table(
@@ -15307,6 +15596,7 @@ class Scheduler:
                             )
                     else:
                         # No extracted_cache to store, but ensure block leak guard.
+                        self._note_incremental_release(request_id)
                         block_table = None
                         if self.paged_cache_manager:
                             block_table = self.paged_cache_manager.get_block_table(
@@ -16084,6 +16374,7 @@ class Scheduler:
         self.running.pop(request_id, None)
         # Keep the blocks findable for the resume lookup, as an abort does, but
         # drop the table so the next admission starts a fresh one.
+        self._note_incremental_release(request_id)
         if self.paged_cache_manager is not None:
             table = (
                 self.paged_cache_manager.detach_block_table(request_id)
@@ -16764,6 +17055,8 @@ class Scheduler:
             self._store_cache_gate = None
             self._inflight_store_futures.clear()
             self._inflight_store_info.clear()
+            self._incremental_futures.clear()
+            self._incremental_stored.clear()
             self._cache_freshness_waits.clear()
             self._prefix_cache_prepared.clear()
         if self._boundary_snapshot_store is not None:
