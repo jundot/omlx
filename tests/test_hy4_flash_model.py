@@ -245,16 +245,7 @@ def test_ihc_and_head_match_independent_reference():
     )
 
 
-@pytest.mark.parametrize("packed", [False, True], ids=["bare-bf16", "native-oqh"])
-def test_public_text_shapes_without_materializing_weights(monkeypatch, packed):
-    # Shape-only: construct every normally random MLX weight as a scalar view,
-    # not a random operation that could accidentally materialize a giant bank.
-    # Routed banks already use scalar broadcasts; tables aren't MLX parameters.
-    def scalar_view(shape, **kwargs):
-        return mx.broadcast_to(mx.array(0.0), shape)
-
-    monkeypatch.setattr(mx.random, "normal", scalar_view)
-    monkeypatch.setattr(mx.random, "uniform", scalar_view)
+def _public_args(packed):
     engram_ids = [2, 12, 22, 32]
     # We need only the number of heads per order: the moduli affect external
     # table rows, not a single shape of the core text graph.
@@ -309,6 +300,24 @@ def test_public_text_shapes_without_materializing_weights(monkeypatch, packed):
                 for projection in ("gate_up_proj", "down_proj")
             },
         }
+    return args
+
+
+def _scalar_random(monkeypatch):
+    # Shape-only: construct every normally random MLX weight as a scalar view,
+    # not a random operation that could accidentally materialize a giant bank.
+    # Routed banks already use scalar broadcasts; tables aren't MLX parameters.
+    def scalar_view(shape, **kwargs):
+        return mx.broadcast_to(mx.array(0.0), shape)
+
+    monkeypatch.setattr(mx.random, "normal", scalar_view)
+    monkeypatch.setattr(mx.random, "uniform", scalar_view)
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["bare-bf16", "native-oqh"])
+def test_public_text_shapes_without_materializing_weights(monkeypatch, packed):
+    _scalar_random(monkeypatch)
+    args = _public_args(packed)
     shapes = {k: t.shape for k, t in tree_flatten(Model(args).parameters())}
     assert shapes["model.layers.1.hc_attn_layer.hc_pre.hc_fn"] == (8, 12288)
     assert shapes["model.layers.41.mlp.experts.down_proj.weight"] == (
@@ -333,3 +342,39 @@ def test_public_text_shapes_without_materializing_weights(monkeypatch, packed):
         if packed
         else "61639c87c9de2de9c78412734ba8c6625d992adb94a57d114af93b9bf7bf3148"
     )
+
+
+def test_public_trunk_quantization_matches_converter(monkeypatch):
+    """--trunk-bits 8: loader placeholders equal the converter's output specs."""
+    from omlx.patches.hy_v4_flash.convert import trunk_record
+    from omlx.patches.hy_v4_flash.quant_io import TRUNK_LINEAR, Spec, trunk_specs
+    from omlx.patches.hy_v4_flash.runner import quantize_trunk
+
+    _scalar_random(monkeypatch)
+    model = Model(_public_args(True))
+    bare = {k: tuple(t.shape) for k, t in tree_flatten(model.parameters())}
+    modules = sorted(
+        k.removesuffix(".weight") for k in bare if TRUNK_LINEAR.fullmatch(k)
+    )
+    # 42 x (q_a, q_b, kv_a, linear_gate, o_proj), the dense MLP, 41 x (3 shared
+    # + 2 latent routed projections) and the LM head; never kv_b_proj, the
+    # router, the sparse indexer or Engram.
+    assert len(modules) == 42 * 5 + 3 + 41 * 5 + 1
+    assert not any(
+        part in m
+        for m in modules
+        for part in ("kv_b_proj", "indexer", "engram", "mlp.gate.")
+    )
+    expected = {}
+    for m in modules:
+        spec = Spec("BF16", bare[m + ".weight"])
+        expected.update(
+            {k: v.shape for k, v in trunk_specs(m + ".weight", spec, 8).items()}
+        )
+    quantize_trunk(model, trunk_record(8, modules))
+    shapes = {k: tuple(t.shape) for k, t in tree_flatten(model.parameters())}
+    assert {k: shapes[k] for k in expected} == expected
+    assert len(shapes) == len(bare) + 2 * len(modules)
+    assert shapes["lm_head.scales"] == (120832, 48)
+    with pytest.raises(ValueError, match="not in model"):
+        quantize_trunk(Model(_args()), trunk_record(8, ["model.nope"]))

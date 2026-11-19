@@ -379,6 +379,12 @@ class Model(nn.Module):
             cache.batch_size = batch
         if logits_to_keep:
             hidden = hidden[:, -logits_to_keep:]
+        if not self.args.tie_word_embeddings and isinstance(
+            self.lm_head, nn.QuantizedLinear
+        ):
+            # Quantized trunk: dequantize-in-kernel with FP32 activations.
+            fp32 = self.args.enable_lm_head_fp32
+            return self.lm_head(hidden.astype(mx.float32) if fp32 else hidden)
         weight = (
             self.model.embed_tokens.weight
             if self.args.tie_word_embeddings

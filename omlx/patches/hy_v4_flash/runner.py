@@ -43,12 +43,38 @@ def weight_shapes(model):
     return {n: tuple(w.shape) for n, w in tree_flatten(model.parameters())}
 
 
+def quantize_trunk(model, trunk):
+    """Swap the listed trunk linears for nn.QuantizedLinear placeholders."""
+    if not trunk:
+        return
+    import mlx.nn as nn
+
+    wanted, seen = set(trunk["modules"]), set()
+
+    def pick(path, module):
+        if path in wanted:
+            seen.add(path)
+            return True
+        return False
+
+    nn.quantize(
+        model,
+        group_size=trunk["group_size"],
+        bits=trunk["bits"],
+        mode=trunk["mode"],
+        class_predicate=pick,
+    )
+    if seen != wanted:
+        raise ValueError(f"trunk modules not in model: {sorted(wanted - seen)[:8]}")
+
+
 def load_weights(model, artifact):
     """Check the complete index; evaluate one shard at a time, never all source tensors."""
     import mlx.core as mx
 
     from .quant_io import read_header
 
+    quantize_trunk(model, artifact.config.get("trunk_quantization"))
     shapes = weight_shapes(model)
     required = artifact.weight_map.keys()
     if shapes.keys() != required:
@@ -96,9 +122,12 @@ def prepare_fp32_head(model):
     one original head. Fail closed if the model explicitly requests another mode.
     """
     import mlx.core as mx
+    import mlx.nn as nn
 
     if model.args.tie_word_embeddings or not model.args.enable_lm_head_fp32:
         raise ValueError("precast requires an untied reference FP32 LM head")
+    if isinstance(model.lm_head, nn.QuantizedLinear):
+        return 0  # quantized trunk: FP32 activations, nothing to precast
     old = model.lm_head.weight
     if old.dtype == mx.float32:
         return 0
@@ -231,7 +260,7 @@ def main(argv=None):
         return convert(argv[1:])
     p = argparse.ArgumentParser(prog="omlx hy4-flash", description=__doc__)
     subs = p.add_subparsers(dest="command", required=True)
-    subs.add_parser("convert", help="stream and verify an oQh text export (8-bit default, --bits 4/5/6)")
+    subs.add_parser("convert", help="stream and verify an oQh text export (8-bit default, --bits 4/5/6, --trunk-bits 8)")
     subs.add_parser("stage-tables", help="verify and stage only the three late tables")
     for cmd, helptext in [
         ("inspect", "check the local oQh export"),

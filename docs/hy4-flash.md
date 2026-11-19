@@ -6,15 +6,16 @@
 
 - **Experts:** all 82 routed banks (41 layers × gate/up and down) are stored as signed 256-point Walsh–Hadamard-rotated, group-128 affine weights, **8-bit** by default. `convert --bits 4|5|6` writes smaller banks with the same rotation and groups; the bit width is recorded per bank in `config.json` and the manifest, and the runtime reads it from there. Activations are rotated before `gather_qmm`. Quantization is deterministic RTN, not calibrated.
 - **Other tensors:** the remaining 1,350 text tensors are copied byte-for-byte, in their source dtypes.
+- **Optional 8-bit trunk (`convert --trunk-bits 8`):** also stores the 419 dense trunk linears as stock MLX group-64 affine RTN (`nn.QuantizedLinear` layout: `weight`, `scales`, `biases`). These are the attention projections (`q_a`, `q_b`, `kv_a`, `linear_gate`, `o_proj`), the shared, dense and latent MLP projections, and the LM head. Batch-1 decode reads all of them on every token. `kv_b_proj` (raw weight in the absorbed MLA path), the router, the sparse indexer, Engram, iHC and the embeddings stay byte-exact. The module list is recorded in `config.json` (`trunk_quantization`) and the manifest; the loader quantizes exactly those modules before loading. The LM head keeps FP32 activations. Without the flag the trunk stays BF16 and the output is unchanged.
 - **Engram tables:** the four trained BF16 tables (layers 1, 11, 21 and 31) stay external and unchanged. Each run authenticates them against a small private receipt. Only the requested 192-byte rows are read.
-- **Size:** the core is 155.75 GiB in 141 shards at 8 bits and 86.57 GiB at 4 bits (5-bit about 104 GiB, 6-bit about 121 GiB). The first Engram table is 29.5 GiB; the three late tables total 88.5 GiB. They work from any local volume, but row reads are fastest on the internal SSD; other volumes get a warning.
+- **Size:** the core is 155.75 GiB in 141 shards at 8 bits and 86.57 GiB at 4 bits (5-bit about 104 GiB, 6-bit about 121 GiB). `--trunk-bits 8` saves another 5.5 GB (150.60 / 81.41 GiB). The first Engram table is 29.5 GiB; the three late tables total 88.5 GiB. They work from any local volume, but row reads are fastest on the internal SSD; other volumes get a warning.
 
 ## Convert, stage and verify
 
 ```sh
 REV=d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959
 hf download tencent/Hy4-flash --revision "$REV" --local-dir "$SRC"
-python -m omlx.cli hy4-flash convert --source "$SRC" --output "$OUT" --chunk-mib 32  # add --bits 4 for 128 GB Macs
+python -m omlx.cli hy4-flash convert --source "$SRC" --output "$OUT" --chunk-mib 32 --trunk-bits 8  # add --bits 4 for 128 GB Macs
 python -m omlx.cli hy4-flash inspect --model "$OUT" --verify-core
 umask 077
 python -m omlx.cli hy4-flash stage-tables --model "$OUT" --source "$SRC" --ssd-dir "$SSD"
@@ -33,7 +34,7 @@ MLX_ENABLE_TF32=0 python -m omlx.cli hy4-flash generate \
   --first-engram pread --prepare-engrams --precast-lm-head --json
 ```
 
-- **Memory:** all expert banks are loaded resident: about 156 GiB at 8 bits, or about 87 GiB at 4 bits, plus KV and scratch. Use `--first-engram pread` with 4-bit on 128 GB Macs. Run one model at a time on a machine with enough free unified memory. The command does not change wired-memory limits or swap.
+- **Memory:** all expert banks are loaded resident: about 156 GiB at 8 bits, or about 87 GiB at 4 bits (about 151 / 81 GiB with `--trunk-bits 8`), plus KV and scratch. The weights must fit in directly free memory: with too little, macOS pages GPU buffers and decode drops below 1 tok/s. Use `--first-engram pread` with 4-bit on 128 GB Macs. Run one model at a time on a machine with enough free unified memory. The command does not change wired-memory limits or swap.
 - **`--first-engram`:** `mlock` (the default) maps and wires the first table and fails if it cannot. `pread` never maps it and reads rows on demand like the late tables. This saves 29.5 GiB of RAM at negligible I/O cost: under 1 MB per table per 128 decoded tokens.
 - **`--prepare-engrams`:** starts each token's Engram row reads before the decoder layers.
 - **`--precast-lm-head`:** keeps the FP32 output projection resident (+0.69 GiB) instead of casting it on every token. Logits are unchanged.
@@ -59,6 +60,17 @@ Greedy decoding with the command above (`--first-engram pread`). The prompts are
 | M1 Ultra, 128 GiB | 13.8–14.5 tok/s | 126 / 115 tok/s | 94.6–96.1% |
 
 On the M5 Ultra, 4-bit decodes only about 4% faster than 8-bit: the per-token cost there is mostly not expert-weight bandwidth. Its main benefit is that the model fits 128 GB machines.
+
+**8-bit trunk (`--trunk-bits 8`)**, M5 Ultra, same prompts. A decode step is GPU-bound, and with a BF16 trunk about 11.8 GB of trunk weights were read per token next to the routed experts. Top-1 agreement is teacher-forced against the BF16-trunk 8-bit reference; no swap:
+
+| | Decode, 128 steps (code / prose) | Decode, 512 steps | Prefill, 2K / 8K tokens | Top-1 agreement | MLX peak |
+|---|---:|---:|---:|---:|---:|
+| 8-bit experts, BF16 trunk | 25.4–26.0 tok/s | 25.7–25.8 tok/s | | 100% (reference) | 168.7 GB |
+| 8-bit experts, 8-bit trunk | 29.3 / 29.4 tok/s | 28.9 tok/s | 339 / 308 tok/s | 97.7 / 96.9% | 163.2 GB |
+| 4-bit experts, BF16 trunk | 26.8 / 26.7 tok/s | 26.7 tok/s | 537 / 467 tok/s | 96.9 / 95.3% | 95.2 GB |
+| 4-bit experts, 8-bit trunk | 31.7 / 31.2 tok/s | 31.0 tok/s | 528 / 461 tok/s | 96.9 / 93.8% | 88.9 GB |
+
+The `generate` command above on the 4-bit/8-bit-trunk artifact decoded 255 steps at 30.7 tok/s (MLX peak 87.6 GB). Lower trunk widths were tried in memory and rejected: 4-bit attention dropped prose agreement to 86%.
 
 ## Long context
 

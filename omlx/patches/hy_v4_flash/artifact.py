@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .quant_io import SUPPORTED_BITS
+from .quant_io import SUPPORTED_BITS, SUPPORTED_TRUNK_BITS, TRUNK_GROUP, TRUNK_LINEAR
 
 SCHEMA = "hy4-flash-oqh/v1"
 SOURCE = "tencent/Hy4-flash"
@@ -61,6 +61,28 @@ def _validate_files(root, records, *, digest):
                 actual = hashlib.file_digest(f, "sha256").hexdigest()
             if actual != record["sha256"]:
                 raise ValueError(f"SHA-256 mismatch: {name}")
+
+
+def _validate_trunk(trunk, index):
+    """Optional MLX-quantized trunk: all or none of the eligible linears."""
+    eligible = {k.removesuffix(".weight") for k in index if TRUNK_LINEAR.fullmatch(k)}
+    if trunk is None:
+        if any(m + ".scales" in index for m in eligible):
+            raise ValueError("quantized trunk tensors without trunk_quantization")
+        return
+    modules = trunk.get("modules") if isinstance(trunk, dict) else None
+    if (
+        trunk.get("bits") not in SUPPORTED_TRUNK_BITS
+        or trunk.get("group_size") != TRUNK_GROUP
+        or trunk.get("mode") != "affine"
+        or not isinstance(modules, list)
+        or len(set(modules)) != len(modules)
+        or set(modules) != eligible
+        or not all(
+            m + suffix in index for m in modules for suffix in (".scales", ".biases")
+        )
+    ):
+        raise ValueError("invalid or incomplete trunk_quantization")
 
 
 @dataclass
@@ -127,6 +149,7 @@ class Artifact:
             raise ValueError(
                 "rotation plan does not cover exactly the routed expert banks"
             )
+        _validate_trunk(cfg.get("trunk_quantization"), index)
         return cls(root, doc, cfg, index)
 
     def summary(self):
@@ -139,6 +162,7 @@ class Artifact:
             "core_tensors": len(self.weight_map),
             "core_bytes": sum(v["size"] for v in self.manifest["core_shards"].values()),
             "rotated_expert_banks": len(self.config["omlx_oqh"]["tensors"]),
+            "trunk_bits": (self.config.get("trunk_quantization") or {}).get("bits"),
             "external_bf16_blocks": sorted(
                 int(k) for k in self.manifest.get("external_tables", {})
             ),

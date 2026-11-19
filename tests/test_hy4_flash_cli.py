@@ -88,7 +88,9 @@ def test_strict_physical_shape_loading(tmp_path):
     mx.save_safetensors(
         str(tmp_path / "s.safetensors"), {"weight": val}, metadata={"format": "mlx"}
     )
-    art = SimpleNamespace(root=tmp_path, weight_map={"weight": "s.safetensors"})
+    art = SimpleNamespace(
+        root=tmp_path, weight_map={"weight": "s.safetensors"}, config={}
+    )
     load_weights(layer, art)
     assert mx.array_equal(layer.weight, val).item()
     with pytest.raises(ValueError, match="shape"):
@@ -114,7 +116,7 @@ def test_shards_preserve_previously_assigned_array_list_entries(tmp_path):
             {name: mx.array([float(i + 10)])},
             metadata={"format": "mlx"},
         )
-    load_weights(model, SimpleNamespace(root=tmp_path, weight_map=index))
+    load_weights(model, SimpleNamespace(root=tmp_path, weight_map=index, config={}))
     assert mx.stack(model.scales).tolist() == [[10], [11], [12], [13]]
 
 

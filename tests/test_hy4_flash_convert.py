@@ -50,11 +50,12 @@ def snapshot(tmp_path, monkeypatch):
         "model.layers.1.mlp.gate.e_score_correction_bias": mx.array(
             [-0.0, 1.125, -3.25], dtype=mx.float32
         ),
-        "model.layers.1.mlp.shared_experts.down_proj.weight": bf((16, 16)),
-        "model.layers.1.mlp.routed_expert_down_proj.weight": bf((16, 32)),
-        "model.layers.1.self_attn.linear_gate.weight": bf((16, 32)),
+        "model.layers.1.mlp.shared_experts.down_proj.weight": bf((16, 64)),
+        "model.layers.1.mlp.routed_expert_down_proj.weight": bf((16, 128)),
+        "model.layers.1.self_attn.linear_gate.weight": bf((16, 64)),
+        "model.layers.1.self_attn.kv_b_proj.weight": bf((16, 64)),
         "model.layers.1.engram_layer.vocab_map": mx.arange(19, dtype=mx.int32),
-        "lm_head.weight": bf((64, 16)),
+        "lm_head.weight": bf((64, 64)),
     }
     table = bf((26, 96))
     cfg = {
@@ -319,6 +320,74 @@ def test_lower_bit_build_matches_mlx_rtn(snapshot, bits):
             assert raw_tensor(a) == raw_tensor(ref.astype(a.dtype))
     with pytest.raises(ValueError, match="bits"):
         c.inspect_source(s.src, bits=3)
+
+
+TRUNK = {
+    "lm_head",
+    "model.layers.1.mlp.routed_expert_down_proj",
+    "model.layers.1.mlp.shared_experts.down_proj",
+    "model.layers.1.self_attn.linear_gate",
+}
+
+
+def test_trunk_build_matches_nn_quantize(snapshot):
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from omlx.patches.hy_v4_flash import artifact
+
+    s = snapshot
+    # 64-row chunks: every trunk linear needs several row-aligned chunks.
+    manifest = c.build(s.src, s.out, budget=8 << 10, trunk_bits=8)
+    record = manifest["quantization"]["trunk"]
+    assert record["modules"] == sorted(TRUNK) and record["group_size"] == 64
+    cfg = disk_json(s.out / "config.json")
+    assert cfg["trunk_quantization"] == record
+    assert fmt.oqh_paths(cfg) == dict.fromkeys(
+        s.banks, {"bits": 8, "block": 256, "group_size": 128}
+    )
+    assert manifest["counts"]["trunk_linears"] == len(TRUNK)
+    values = {}
+    for fname in manifest["core_shards"]:
+        values.update(mx.load(str(s.out / fname)))
+    for name, original in s.native.items():
+        module = name.removesuffix(".weight")
+        if module in TRUNK:
+            linear = nn.Linear(*original.shape[::-1], bias=False)
+            linear.weight = original
+            gold = nn.QuantizedLinear.from_linear(linear, 64, 8)
+            for part in ("weight", "scales", "biases"):
+                got, ref = values[f"{module}.{part}"], getattr(gold, part)
+                assert got.dtype == ref.dtype and raw_tensor(got) == raw_tensor(ref)
+        else:  # router, kv_b_proj, Engram map, F32 bias: byte-exact
+            assert raw_tensor(values[name]) == raw_tensor(original)
+            assert module + ".scales" not in values
+    artifact._validate_trunk(cfg["trunk_quantization"], values)
+    with pytest.raises(ValueError, match="trunk bits"):
+        c.inspect_source(s.src, trunk_bits=4)
+
+
+def test_trunk_validation_is_all_or_nothing():
+    from omlx.patches.hy_v4_flash.artifact import _validate_trunk
+
+    index = {f"{m}.{p}": 0 for m in TRUNK for p in ("weight", "scales", "biases")}
+    index["model.layers.1.self_attn.kv_b_proj.weight"] = 0
+    good = c.trunk_record(8, TRUNK)
+    _validate_trunk(good, index)
+    for bad in (
+        dict(good, modules=sorted(TRUNK)[1:]),
+        dict(good, modules=sorted(TRUNK) + ["model.layers.1.self_attn.kv_b_proj"]),
+        dict(good, group_size=128),
+        dict(good, bits=4),
+    ):
+        with pytest.raises(ValueError, match="trunk_quantization"):
+            _validate_trunk(bad, index)
+    with pytest.raises(ValueError, match="without trunk_quantization"):
+        _validate_trunk(None, index)
+    bf16 = {f"{m}.weight": 0 for m in TRUNK}
+    _validate_trunk(None, bf16)
+    with pytest.raises(ValueError, match="trunk_quantization"):
+        _validate_trunk(good, bf16)
 
 
 def test_detached_dry_run(snapshot, capsys):

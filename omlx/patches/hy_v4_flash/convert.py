@@ -3,6 +3,7 @@
 
     omlx hy4-flash convert --source SNAPSHOT --dry-run
     omlx hy4-flash convert --source SNAPSHOT --output NEW_DIR [--chunk-mib 8] [--bits 8]
+                           [--trunk-bits 8]
 
 Dry-run reads only config, index and headers. With --headers DIR it accepts
 standalone <shard>.safetensors.header files (8-byte length + JSON, no payload).
@@ -11,14 +12,17 @@ including the omitted vision/drafter and the four unchanged external tables.
 It authenticates the ordered inventory of complete official LFS hashes before
 publishing. It never opens sources for write or downloads model code/weights.
 
-The sole lossy step is uncalibrated, group-affine RTN in the signed oQh
-basis (see quant_io.quantize_rows), 8-bit by default; --bits 4|5|6 writes
-smaller banks with the same rotation and groups. Neither activation data, Hessians nor
-GPTQ are used. Only the two released 3-D routed bank names in each sparse
-block qualify. The text trunk is byte-exact; vision and DFly are omitted, not
-silently downgraded. The four dedicated BF16 Engram files stay in the source
-or an independently verified store: the artifact contains portable locators,
-not copies or an implicit memory placement policy.
+By default the sole lossy step is uncalibrated, group-affine RTN in the
+signed oQh basis (see quant_io.quantize_rows), 8-bit; --bits 4|5|6 writes
+smaller banks with the same rotation and groups. Neither activation data,
+Hessians nor GPTQ are used. Only the two released 3-D routed bank names in
+each sparse block qualify. The text trunk is byte-exact unless --trunk-bits 8
+is given: then the dense attention/MLP projections and the LM head
+(quant_io.TRUNK_LINEAR) are also stored as plain MLX group-64 affine RTN, the
+same as nn.quantize. Vision and DFly are omitted, not silently downgraded.
+The four dedicated BF16 Engram files stay in the source or an independently
+verified store: the artifact contains portable locators, not copies or an
+implicit memory placement policy.
 
 One source and at most one destination shard open at a time, one row-aligned
 chunk on MLX; metadata scales with key count. A chunk bound is not a process
@@ -52,6 +56,9 @@ from .quant_io import (
     GROUP,
     MAX_HEADER,
     SUPPORTED_BITS,
+    SUPPORTED_TRUNK_BITS,
+    TRUNK_GROUP,
+    TRUNK_LINEAR,
     Spec,
     View,
     Writer,
@@ -59,8 +66,10 @@ from .quant_io import (
     chunks,
     read_header,
     require,
+    trunk_specs,
     unique,
     write_bank,
+    write_trunk,
 )
 
 REPO = "tencent/Hy4-flash"
@@ -154,7 +163,19 @@ def policy(text):
     return banks, tables
 
 
-def disposition(key, spec, banks, tables, bits=BITS):
+def trunk_record(bits, modules):
+    return {
+        "method": "mlx-affine-rtn",
+        "calibrated": False,
+        "bits": bits,
+        "group_size": TRUNK_GROUP,
+        "mode": "affine",
+        "stored_scale_bias_dtype": "BF16",
+        "modules": sorted(modules),
+    }
+
+
+def disposition(key, spec, banks, tables, bits=BITS, trunk_bits=None):
     if key in banks:
         require(spec == banks[key], f"wrong routed bank dtype/shape: {key}")
         return "routed", bank_specs(key, spec, bits)
@@ -174,6 +195,8 @@ def disposition(key, spec, banks, tables, bits=BITS):
         or key in {"model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"},
         f"unexpected source namespace: {key}",
     )
+    if trunk_bits and TRUNK_LINEAR.fullmatch(key):
+        return "trunk", trunk_specs(key, spec, trunk_bits)
     return "native", {key: spec}
 
 
@@ -192,6 +215,18 @@ class Plan:
     table_records: dict
     counts: dict
     bits: int = BITS
+    trunk_bits: int | None = None
+    trunk: dict[str, Spec] | None = None
+
+    def trunk_record(self):
+        modules = [k.removesuffix(".weight") for k in self.trunk or {}]
+        return trunk_record(self.trunk_bits, modules) if self.trunk_bits else None
+
+    def quantization(self):
+        q = dict(ALGORITHM, bits=self.bits)
+        if self.trunk_bits:
+            q["trunk"] = self.trunk_record()
+        return q
 
     def audit(self):
         return {
@@ -201,15 +236,19 @@ class Plan:
             "source_layout_sha256": LAYOUT_SHA256,
             "payloads_verified": False,
             "counts": self.counts,
-            "quantization": dict(ALGORITHM, bits=self.bits),
+            "quantization": self.quantization(),
             "routed_source_shapes": {k: list(s.shape) for k, s in self.banks.items()},
             "external_tables": self.table_records,
         }
 
 
-def inspect_source(src, headers=None, bits=BITS):
+def inspect_source(src, headers=None, bits=BITS, trunk_bits=None):
     """Header-only plan. The CLI has no option to substitute source pins."""
     require(bits in SUPPORTED_BITS, f"unsupported routed bank bits: {bits}")
+    require(
+        trunk_bits is None or trunk_bits in SUPPORTED_TRUNK_BITS,
+        f"unsupported trunk bits: {trunk_bits}",
+    )
     cfg = json.loads(asset_bytes(src, "config.json"), object_pairs_hook=unique)
     index = json.loads(asset_bytes(src, INDEX), object_pairs_hook=unique)
     text = cfg["text_config"]
@@ -243,7 +282,7 @@ def inspect_source(src, headers=None, bits=BITS):
         "missing or unexpected source shards/headers",
     )
     inputs, stamps, outputs, records, basis = {}, {}, {}, {}, {}
-    out_keys, counts, sizes = set(), Counter(), Counter()
+    out_keys, counts, sizes, trunk = set(), Counter(), Counter(), {}
     for name, keys in sorted(groups.items()):
         with (root / (name + suffix)).open("rb", buffering=0) as f:
             stamps[name] = stamp(os.fstat(f.fileno()))
@@ -254,7 +293,9 @@ def inspect_source(src, headers=None, bits=BITS):
         for k, v in views.items():
             s = v.spec
             basis[k] = [name, v.start, s.dtype, s.shape]
-            action, out = disposition(k, s, banks, tables, bits)
+            action, out = disposition(k, s, banks, tables, bits, trunk_bits)
+            if action == "trunk":
+                trunk[k] = s
             require(not out_keys.intersection(out), f"duplicate output key for {k}")
             out_keys.update(out)
             counts[action] += 1
@@ -278,6 +319,9 @@ def inspect_source(src, headers=None, bits=BITS):
             shard_out.update(out)
         if shard_out:
             outputs[name] = shard_out
+    if trunk_bits:
+        require(trunk, "no trunk linears matched")
+        sizes["native"] += sizes.pop("trunk")
     total = sum(sizes.values())
     require(
         total == index["metadata"]["total_size"], "source index total_size mismatch"
@@ -292,7 +336,7 @@ def inspect_source(src, headers=None, bits=BITS):
         "source_payload_bytes": total,
         "routed_banks": counts["routed"],
         "routed_source_bytes": sizes["routed"],
-        "native_tensors": counts["native"],
+        "native_tensors": counts["native"] + counts["trunk"],
         "native_bytes": sizes["native"],
         "external_tables": counts["external"],
         "external_bytes": sizes["external"],
@@ -305,7 +349,13 @@ def inspect_source(src, headers=None, bits=BITS):
             s.nbytes for part in outputs.values() for s in part.values()
         ),
     }
-    return Plan(text, banks, tables, inputs, stamps, outputs, records, counts, bits)
+    if trunk_bits:
+        counts["trunk_linears"] = len(trunk)
+        counts["trunk_source_bytes"] = sum(s.nbytes for s in trunk.values())
+    return Plan(
+        text, banks, tables, inputs, stamps, outputs, records, counts, bits,
+        trunk_bits, trunk or None,
+    )
 
 
 def hashed(data_chunks, whole):
@@ -334,12 +384,15 @@ def convert_shard(path, dest, plan, budget):
         for key, v in views.items():
             require(f.tell() == v.start, f"source position mismatch: {key}")
             limit = budget
-            if key in plan.banks:
+            trunk = plan.trunk is not None and key in plan.trunk
+            if key in plan.banks or trunk:
                 stride = 2 * v.spec.shape[-1]
                 limit = budget // stride * stride
             stream = hashed(chunks(f, v.spec.nbytes, limit), whole)
             if key in plan.banks:
                 write_bank(key, v.spec, stream, writer, plan.bits)
+            elif trunk and writer is not None:
+                write_trunk(key, v.spec, stream, writer, plan.trunk_bits)
             elif key in plan.tables:
                 digest = hashlib.sha256()
                 for data in stream:
@@ -393,7 +446,7 @@ def publish(stage, output):
         raise OSError(e, os.strerror(e), str(output))
 
 
-def build(src, output, *, budget=8 << 20, progress=None, bits=BITS):
+def build(src, output, *, budget=8 << 20, progress=None, bits=BITS, trunk_bits=None):
     src = src.resolve(strict=True)
     require(not os.path.lexists(output), "output already exists; no overwrite/resume")
     output = output.resolve()
@@ -402,9 +455,12 @@ def build(src, output, *, budget=8 << 20, progress=None, bits=BITS):
         "expected a new output outside source under an existing parent",
     )
     require(type(budget) is int and 0 < budget <= 64 << 20, "invalid input chunk size")
-    plan = inspect_source(src, bits=bits)
+    plan = inspect_source(src, bits=bits, trunk_bits=trunk_bits)
     require(
-        all(2 * s.shape[-1] <= budget for s in plan.banks.values()),
+        all(
+            2 * s.shape[-1] <= budget
+            for s in [*plan.banks.values(), *(plan.trunk or {}).values()]
+        ),
         "chunk smaller than a BF16 row",
     )
     assets = {
@@ -424,6 +480,9 @@ def build(src, output, *, budget=8 << 20, progress=None, bits=BITS):
         "version": fmt.FORMAT_VERSION,
         "tensors": {k: fmt.config_entry(plan.bits, BLOCK, GROUP) for k in plan.banks},
     }
+    if plan.trunk_bits:
+        # Kept out of the shared oQh block: these are stock MLX QuantizedLinear tensors.
+        config["trunk_quantization"] = plan.trunk_record()
     manifest = {
         "schema": SCHEMA,
         "text_only": True,
@@ -441,7 +500,7 @@ def build(src, output, *, budget=8 << 20, progress=None, bits=BITS):
             "transformers_reference_commit": TRANSFORMERS_COMMIT,
             "input_chunk_bytes": budget,
         },
-        "quantization": dict(ALGORITHM, bits=plan.bits),
+        "quantization": plan.quantization(),
         "external_tables": plan.table_records,
         "core_shards": {},
         "assets": {},
@@ -535,18 +594,28 @@ def main(argv=None):
         choices=SUPPORTED_BITS,
         help="routed expert bank bits, default 8; 4 fits 128 GB Macs",
     )
+    p.add_argument(
+        "--trunk-bits",
+        type=int,
+        choices=SUPPORTED_TRUNK_BITS,
+        help="also store the dense attention/MLP projections and LM head as MLX "
+        "group-64 affine RTN; default keeps the trunk byte-exact BF16",
+    )
     args = p.parse_args(argv)
     if args.headers is not None and not args.dry_run:
         p.error("--headers is only valid with --dry-run")
     try:
         if args.dry_run:
-            result = inspect_source(args.source, args.headers, args.bits).audit()
+            result = inspect_source(
+                args.source, args.headers, args.bits, args.trunk_bits
+            ).audit()
         else:
             m = build(
                 args.source,
                 args.output,
                 budget=args.chunk_mib << 20,
                 bits=args.bits,
+                trunk_bits=args.trunk_bits,
                 progress=lambda n: print(n, file=sys.stderr, flush=True),
             )
             result = {

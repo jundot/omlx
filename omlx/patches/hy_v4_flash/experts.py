@@ -73,6 +73,11 @@ class _Linear(nn.Module):
     def __call__(self, x):
         return x @ self.weight.T
 
+    def to_quantized(self, group_size=64, bits=8, mode="affine", **_):
+        # Same x @ W.T contract, so a quantized trunk (``--trunk-bits``) can use
+        # stock nn.QuantizedLinear for the shared/dense/latent projections.
+        return nn.QuantizedLinear.from_linear(self, group_size, bits, mode)
+
 
 class _RMSNorm(nn.Module):
     def __init__(self, width, eps):

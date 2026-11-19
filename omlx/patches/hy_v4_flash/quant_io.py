@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import struct
 import sys
@@ -22,6 +23,17 @@ BITS, BLOCK, GROUP = 8, 256, 128
 # Routed-bank widths the converter writes and the runtime loads. 8 is the
 # reference export; lower widths trade quality for memory (4 fits 128 GB).
 SUPPORTED_BITS = (4, 5, 6, 8)
+# Optional plain MLX affine quantization of the dense BF16 trunk linears
+# (``--trunk-bits``). Decode at batch size 1 is bandwidth-bound, and these
+# weights are read on every token. kv_b_proj (raw weight in the absorbed MLA
+# path), the router, the sparse indexer, Engram, iHC and embeddings stay exact.
+TRUNK_GROUP = 64
+SUPPORTED_TRUNK_BITS = (8,)
+TRUNK_LINEAR = re.compile(
+    r"(?:model\.layers\.\d+\.(?:self_attn\.(?:q_a_proj|q_b_proj|kv_a_proj_with_mqa"
+    r"|linear_gate|o_proj)|mlp\.(?:(?:shared_experts\.)?(?:gate|up|down)_proj"
+    r"|routed_expert_(?:down|up)_proj))|lm_head)\.weight"
+)
 
 
 def require(ok, message):
@@ -250,3 +262,39 @@ def write_bank(key, spec, data_chunks, writer, bits=BITS):
         writer.append(key + ".weight", p)
         writer.append(key + ".oqh_scales", s)
         writer.append(key + ".oqh_biases", b)
+
+
+def trunk_specs(key, spec, bits):
+    require(
+        spec.dtype == "BF16"
+        and len(spec.shape) == 2
+        and all(spec.shape)
+        and spec.shape[-1] % TRUNK_GROUP == 0,
+        f"expected BF16 [out,in] trunk linear with {TRUNK_GROUP}-wide groups: {key}",
+    )
+    n, k = spec.shape
+    base = key.removesuffix(".weight")
+    return {
+        key: Spec("U32", (n, k * bits // 32)),
+        base + ".scales": Spec("BF16", (n, k // TRUNK_GROUP)),
+        base + ".biases": Spec("BF16", (n, k // TRUNK_GROUP)),
+    }
+
+
+def write_trunk(key, spec, data_chunks, writer, bits):
+    """Row-chunked ``mx.quantize`` of a BF16 linear, identical to nn.QuantizedLinear."""
+    import mlx.core as mx
+    import numpy as np
+
+    require(sys.byteorder == "little", "conversion requires little-endian MLX")
+    base, k = key.removesuffix(".weight"), spec.shape[-1]
+    for data in data_chunks:
+        w = mx.array(np.frombuffer(data, dtype="<u2")).view(mx.bfloat16).reshape(-1, k)
+        p, s, b = mx.quantize(w, group_size=TRUNK_GROUP, bits=bits, mode="affine")
+        s = s.astype(mx.bfloat16).view(mx.uint16)
+        b = b.astype(mx.bfloat16).view(mx.uint16)
+        mx.eval(p, s, b)
+        require(p.dtype == mx.uint32, "unexpected packed weight dtype")
+        writer.append(key, p)
+        writer.append(base + ".scales", s)
+        writer.append(base + ".biases", b)
