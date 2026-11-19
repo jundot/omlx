@@ -307,7 +307,14 @@ class MCPClientManager:
         """
         from .config import load_mcp_config
 
-        new_config = load_mcp_config()
+        try:
+            new_config = load_mcp_config()
+        except Exception as e:
+            # Broken/invalid MCP config -> clean domain error, not an unhandled
+            # exception that surfaces as a 500 on POST /admin/api/mcp/reload
+            # (oMLX discussion #4672 hardening).
+            logger.error("MCP config failed to load: %s", e)
+            raise ValueError(f"MCP config invalid: {e}") from e
         async with self._lock:
             # Drop servers that were removed from the config.
             for name in [

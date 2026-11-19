@@ -7173,7 +7173,11 @@ async def reload_mcp_servers(is_admin: bool = Depends(require_admin)):
     manager = get_mcp_manager()
     if manager is None:
         raise HTTPException(status_code=503, detail="MCP manager not initialized")
-    result = await manager.reload_config()
+    try:
+        result = await manager.reload_config()
+    except ValueError as e:
+        # Malformed MCP config -> clean 400, not an unhandled 500 (#4672 hardening).
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return {"status": "ok", **result}
 
 
