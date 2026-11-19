@@ -55,7 +55,7 @@ def test_route_takes_only_supported_9_to_48_row_calls(monkeypatch):
         for M in (9, 48):
             assert vq._verify_route(M, 6144, 5120, bits, 64, bf16) == "skinny"
     for M in (8, 49):
-        assert vq._verify_route(M, 6144, 5120, 5, 64, bf16) != "skinny"
+        assert vq._verify_route(M, 6144, 5120, 8, 64, bf16) != "skinny"
     # 9..16 rows replace mma only; narrower outputs keep stock's exact-code path.
     assert not vq.skinny_eligible(16, 4096, 1024, 4, 64, bf16)
     assert vq.skinny_eligible(17, 4096, 1024, 4, 64, bf16)

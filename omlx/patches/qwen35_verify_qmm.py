@@ -54,9 +54,9 @@ activations, M in 3..6, K % 64 == 0, N % 4 == 0.
 The mma path takes 2-, 3-, 4-, 5-, 6- and 8-bit affine, M in 7..24.
 It needs K % 256 == 0 and N % 16 == 0. Everything else falls back to stock.
 
-On M5 (NAX) GPUs, 9..48 rows of 4-, 5-, 6- and 8-bit group-64 weights take the
-skinny tensor-unit kernel (``omlx.custom_kernels.nax_skinny_qmm``) before ``mma``.
-It reads each weight once for all rows.
+On M5 (NAX) GPUs, 4-, 5-, 6- and 8-bit group-64 weights with N >= 1024 take the
+skinny tensor-unit kernel (``omlx.custom_kernels.nax_skinny_qmm``) at ``mma``'s
+9..16-row shapes and at 17..48 rows. It reads each weight once for all rows.
 
 Blocks of four to eight rows (DFlash and Lightning MTP verifies) take
 ``sg8`` instead: bf16 or fp16 rows, 2- to 6-bit weights, N >= 1024. Each lane builds its simdgroup-matrix
@@ -1553,7 +1553,7 @@ def skinny_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -
     under 1024 columns are not faster.
     """
     if not nax_skinny_qmm.MIN_ROWS <= int(M) <= nax_skinny_qmm.MAX_ROWS:
-        return False  # most verify calls (single-request windows) stop here
+        return False
     import mlx.core as mx
 
     if not (

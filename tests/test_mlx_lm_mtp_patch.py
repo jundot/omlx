@@ -6272,7 +6272,7 @@ def _stock_quantized_linear_call(self, x):
     )
 
 
-def _batched_decode_spy(monkeypatch, nax=False, bits=4):
+def _batched_decode_spy(monkeypatch, nax=False, bits=4, out=288):
     """Enable batched decode routing on small layers and record each route.
 
     The patch wraps a stock call, so verify wrappers installed by other tests
@@ -6295,7 +6295,7 @@ def _batched_decode_spy(monkeypatch, nax=False, bits=4):
     monkeypatch.setattr(qwen35_verify_qmm, "run_route", spy)
     assert batched_decode_qmm.apply_batched_decode_qmm_patch()
     mx.random.seed(5)
-    layer = nn.QuantizedLinear(512, 288, bias=False, bits=bits, group_size=64)
+    layer = nn.QuantizedLinear(512, out, bias=False, bits=bits, group_size=64)
     layer.scales = layer.scales.astype(mx.bfloat16)
     layer.biases = layer.biases.astype(mx.bfloat16)
     return layer, calls
@@ -6337,10 +6337,12 @@ def test_batched_decode_routes_one_token_rows(monkeypatch, shape, bits, routed):
     assert calls == ([routed] if routed else [])
 
 
-@pytest.mark.parametrize("rows,routed", [(16, "mma"), (24, None)])
-def test_batched_decode_stops_at_sixteen_rows_on_nax(monkeypatch, rows, routed):
+@pytest.mark.parametrize(
+    "rows,out,routed", [(16, 288, "mma"), (16, 1024, "mma"), (24, 288, None)]
+)
+def test_batched_decode_stops_at_sixteen_rows_on_nax(monkeypatch, rows, out, routed):
     """NAX GPUs keep stock MLX past 16 rows, where its tensor-unit qmm wins."""
-    layer, calls = _batched_decode_spy(monkeypatch, nax=True)
+    layer, calls = _batched_decode_spy(monkeypatch, nax=True, out=out)
     layer((mx.random.normal((rows, 1, 512)) * 0.5).astype(mx.bfloat16))
     assert calls == ([routed] if routed else [])
 
