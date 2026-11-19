@@ -525,9 +525,9 @@ async def create_transcription(
 ):
     """OpenAI-compatible audio transcription endpoint (Speech-to-Text).
 
-    Compatible STT models support non-streaming ``diarized_json`` with timed speaker labels.
-    Omitted or automatic chunking passes the whole file to the selected engine.
-    Other response formats and ``temperature`` retain the existing behavior.
+    ``response_format=diarized_json`` returns speaker turns from backends with
+    timed speaker labels, without streaming and with ``chunking_strategy``
+    omitted or ``auto``. Other formats and ``temperature`` are ignored.
 
     ``stream=true`` switches the response to OpenAI's transcription SSE
     format: ``transcript.text.delta`` events with incremental text followed
@@ -585,6 +585,13 @@ async def create_transcription(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a speech-to-text model",
         )
+    if diarized and not (
+        isinstance(engine, STTEngine) and engine.supports_diarization()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{resolved_model}' does not return timed speaker labels.",
+        )
 
     # Save uploaded file to a temp path so the engine can open it by path.
     # Remap video container extensions to .m4a so mlx-audio routes them
@@ -616,11 +623,8 @@ async def create_transcription(
                     pass
 
         transcribe_kwargs: dict = {"language": language}
-        backend_module = type(getattr(engine, "_model", None)).__module__
-        if diarized and backend_module.startswith(
-            "mlx_audio.stt.models.nemotron_transcribe."
-        ):
-            transcribe_kwargs.update(task="saa", word_timestamps=True)
+        if diarized:
+            transcribe_kwargs["diarize"] = True
         if prompt is not None:
             transcribe_kwargs["prompt"] = prompt
         if effective_max_tokens is not None:
@@ -648,11 +652,6 @@ async def create_transcription(
             )
 
         result = await engine.transcribe(tmp_path, **transcribe_kwargs)
-        if diarized:
-            from mlx_audio.stt.utils import load_audio
-
-            samples = await asyncio.to_thread(load_audio, tmp_path, sr=16000)
-            duration = len(samples) / 16000
     except HTTPException:
         raise
     except Exception as exc:
@@ -669,44 +668,39 @@ async def create_transcription(
     # Build response directly from the dict returned by STTEngine
     segments = result.get("segments") or None
     if diarized:
-        if not any(
-            s.get("speaker", s.get("speaker_id")) is not None for s in segments or []
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail="This transcription returned no timed speaker labels.",
-            )
+        duration = result["duration"]
         annotated = []
-        for segment in segments:
-            speaker = segment.get("speaker", segment.get("speaker_id"))
-            start, end = segment.get("start"), segment.get("end")
-            text = segment.get("text")
+        for segment in segments or []:
+            speaker, start, end, text = (
+                segment[key] for key in ("speaker", "start", "end", "text")
+            )
             if (
-                isinstance(speaker, bool)
-                or not isinstance(speaker, (str, int))
-                or not str(speaker).strip()
-                or not isinstance(text, str)
+                not isinstance(text, str)
                 or not isinstance(start, (int, float))
                 or not isinstance(end, (int, float))
-                or not 0 <= start <= end <= duration
+                or not 0 <= start <= end
             ):
                 raise HTTPException(
                     status_code=502,
                     detail="The transcription engine returned incomplete diarization.",
                 )
+            # Model-printed times can round past the decoded length.
             annotated.append(
                 {
                     "type": "transcript.text.segment",
                     "id": f"seg_{len(annotated)}",
                     "speaker": str(speaker),
-                    "start": start,
-                    "end": end,
+                    "start": min(start, duration),
+                    "end": min(end, duration),
                     "text": text,
                 }
             )
-        text = re.sub(r"<spk:\d+>\s*", "", result.get("text", "")).strip()
-        if backend_module.startswith("mlx_audio.stt.models.vibevoice_asr."):
-            text = " ".join(segment["text"] for segment in annotated)
+        text = result["text"]
+        if text and not annotated:
+            raise HTTPException(
+                status_code=502,
+                detail="The transcription engine returned text without speaker segments.",
+            )
         return JSONResponse(
             {
                 "task": "transcribe",

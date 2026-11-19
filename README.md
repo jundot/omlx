@@ -306,9 +306,9 @@ curl http://127.0.0.1:8000/v1/audio/transcriptions \
   -F "chunking_strategy=auto"
 ```
 
-The response includes text, the audio duration, and segments with `speaker`, `start`, `end`, and `text`. Speaker labels identify speakers within that recording. Nemotron uses its native speaker-attributed task and requires the timestamp-alignment files from the checkpoint.
+The response includes text, the audio duration, and one segment per speaker turn with `speaker`, `start`, `end`, and `text`. Speaker labels are local to the recording.
 
-For this format, oMLX supports non-streaming requests with `chunking_strategy=auto` or the field omitted. It passes the entire file to the model, subject to the model's input limit and the server's upload limit. If the engine returns no speaker labels, oMLX returns HTTP 422. Incomplete labels or invalid timing return HTTP 502.
+Streaming is not supported, and `chunking_strategy` must be `auto` or omitted; the whole file goes to the model. Models without timed speaker labels, including Nemotron checkpoints without the CTC alignment files, return HTTP 400.
 
 ### Tool Calling & Structured Output
 
