@@ -17,6 +17,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 
 import concurrent.futures
 import copy
+import functools
 import gc
 import json
 import sys
@@ -2291,6 +2292,30 @@ class TestSchedulerQueryMethods:
         assert scheduler.get_request("nonexistent") is None
 
 
+class _SlotCache:
+    """The ExpertCache slot surface the offload release uses, without arrays."""
+
+    def __init__(self, capacity, floor, expert_bytes, fails=False):
+        self.full_capacity = capacity
+        self.capacity = capacity
+        self.floor = floor
+        self.expert_bytes = expert_bytes
+        self.fails = fails
+
+    def release_slots(self, capacity):
+        if self.fails:
+            raise RuntimeError("slot allocation failed")
+        capacity = max(capacity, self.floor)
+        freed = (self.capacity - capacity) * self.expert_bytes
+        self.capacity = min(self.capacity, capacity)
+        return freed
+
+    def restore_slots(self):
+        added = (self.full_capacity - self.capacity) * self.expert_bytes
+        self.capacity = self.full_capacity
+        return added
+
+
 class TestSchedulerStatistics:
     """Tests for Scheduler.get_stats()."""
 
@@ -2385,6 +2410,52 @@ class TestSchedulerStatistics:
         with patch.object(scheduler_module, "_sync_and_clear_cache") as clear:
             reclaim()
         clear.assert_called_once_with(scheduler._stream)
+
+    def test_offload_slots_a_failed_release_shrank_are_restored_at_decode(
+        self, mock_model, mock_tokenizer
+    ):
+        """A release that raises partway leaves the caches it reached shrunk.
+
+        The next decode step has to restore those too, instead of serving from
+        the smaller bank until the model unloads."""
+        from omlx.patches.moe_expert_offload import (
+            releasable_moe_offload_bytes,
+            release_moe_offload_slots,
+            restore_moe_offload_slots,
+        )
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        shrunk = _SlotCache(capacity=16, floor=4, expert_bytes=100)
+        failed = _SlotCache(capacity=16, floor=4, expert_bytes=100, fails=True)
+        caches = [shrunk, failed]
+        scheduler.moe_offload_release = functools.partial(
+            release_moe_offload_slots, caches
+        )
+        scheduler.moe_offload_releasable = functools.partial(
+            releasable_moe_offload_bytes, caches
+        )
+        scheduler.moe_offload_restore = functools.partial(
+            restore_moe_offload_slots, caches
+        )
+        scheduler._reclaim_prefill_headroom = MagicMock()
+
+        with patch.object(scheduler_module, "_sync_and_clear_cache"):
+            with pytest.raises(RuntimeError, match="slot allocation failed"):
+                scheduler.release_moe_offload_slots("prefilling", 1000)
+            assert shrunk.capacity == 10  # half the slots above the floor
+            assert scheduler._moe_offload_slots_released is True
+
+            scheduler._schedule_waiting = MagicMock(return_value=([], []))
+            scheduler._process_batch_responses = MagicMock(return_value=([], set()))
+            scheduler._cleanup_finished = MagicMock()
+            scheduler.running = {"row-0": MagicMock()}
+            scheduler.batch_generator = MagicMock()
+            for _ in range(2):
+                scheduler.batch_generator.next_generated.return_value = iter([])
+                scheduler.step()
+
+        assert shrunk.capacity == 16
+        assert scheduler._moe_offload_slots_released is False
 
 
 class TestSchedulerReset:
