@@ -229,9 +229,10 @@ def _append(batch):
 
 
 @pytest.mark.parametrize("stays", [0, 1])
-def test_a_row_leaving_is_kept_as_a_view_until_the_next_token(stays):
+def test_a_row_leaving_is_kept_as_a_view_until_the_next_token(monkeypatch, stays):
     """The rows that stay are not copied when a row leaves, only at the next
-    token."""
+    token. That copy runs inside the scheduler's deferred clear window after a
+    finish (#435), so it must not clear the pool itself."""
     tokens = 4096
     batches = [
         BatchAffine8KVCache.merge(
@@ -245,6 +246,8 @@ def test_a_row_leaving_is_kept_as_a_view_until_the_next_token(stays):
     ]
     mx.eval(expected, [(batch.keys, batch.values) for batch in batches])
     kept = sum(part.nbytes for parts in expected for part in parts)
+    clears = []
+    monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(True))
     mx.synchronize()
     before = mx.get_active_memory()
     mx.reset_peak_memory()
@@ -259,6 +262,7 @@ def test_a_row_leaving_is_kept_as_a_view_until_the_next_token(stays):
         _append(batch)
     mx.eval([(batch.keys, batch.values) for batch in batches])
 
+    assert clears == []
     for batch, parts in zip(batches, expected):
         assert batch.left_padding.tolist() == [0]
         assert batch.offset.tolist() == [tokens + 1]

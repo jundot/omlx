@@ -740,8 +740,9 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         A view of a larger buffer cannot be written in place, so the next
         token would copy it anyway. Copying here, one layer per call and
         evaluated at once, lets the old buffer go before the next layer copies
-        its own, and the pool is cleared under the same size gate as a
-        restore's.
+        its own. The pool is not cleared here: this runs in the first decode
+        steps after a request finished, inside the scheduler's deferred clear
+        window (#435), and that deferred clear reclaims the old buffer.
         """
         self._rows_view = False
         if self.keys is None:
@@ -751,9 +752,6 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         mx.eval(self.keys, self.values)
         self._cached_state = None
         self._cached_state_offset = -1
-        from .cache.prefix_cache import _RESTORE_POOL_FLUSH_BYTES, BlockAwarePrefixCache
-
-        BlockAwarePrefixCache._flush_restore_pool_if_over(_RESTORE_POOL_FLUSH_BYTES)
 
     def extend(self, other: "BatchTurboQuantKVCache"):
         if not isinstance(other, BatchTurboQuantKVCache):
