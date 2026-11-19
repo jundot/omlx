@@ -11277,6 +11277,8 @@ def _collect_imatrix_streaming(
         _format_size(int(batch_plan["capture_budget_bytes"])),
     )
 
+    dp = _streamed_source_plan(source, config)
+
     while processed_samples < max_samples:
         round_start = processed_samples
         round_stop = min(round_start + step_samples, max_samples)
@@ -11296,7 +11298,7 @@ def _collect_imatrix_streaming(
         for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
             source, config, trust_remote_code=trust_remote_code
         ):
-            prefix = f"{_STREAM_TEXT_LAYER_PREFIX}{layer_idx}."
+            prefix = f"{_streamed_text_namespace(dp)}layers.{layer_idx}."
             layer_installed = collector.install(block, name_prefix=prefix)
             if round_index == 0:
                 installed += layer_installed
