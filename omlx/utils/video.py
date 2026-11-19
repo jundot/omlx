@@ -85,8 +85,8 @@ def _decode_video_data_uri(
             f"{subject} must use a base64 video data URI.", field=field
         )
 
-    estimated_size = len(encoded) * 3 // 4
-    if estimated_size > DEFAULT_MAX_VIDEO_BYTES:
+    max_encoded_size = 4 * ((DEFAULT_MAX_VIDEO_BYTES + 2) // 3)
+    if len(encoded) > max_encoded_size:
         raise InvalidRequestError(
             f"Video payload exceeds {DEFAULT_MAX_VIDEO_BYTES} bytes.",
             field=field,
@@ -97,6 +97,10 @@ def _decode_video_data_uri(
         raise InvalidRequestError(
             f"{subject} contains invalid base64 data.", field=field
         ) from exc
+    if len(payload) > DEFAULT_MAX_VIDEO_BYTES:
+        raise InvalidRequestError(
+            f"Video payload exceeds {DEFAULT_MAX_VIDEO_BYTES} bytes.", field=field
+        )
     if not payload:
         raise InvalidRequestError("Video payload is empty.", field=field)
 
