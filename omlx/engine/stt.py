@@ -14,6 +14,8 @@ import asyncio
 import gc
 import logging
 import re
+import shutil
+import subprocess
 import threading
 import unicodedata
 from collections.abc import AsyncIterator
@@ -118,6 +120,30 @@ def _normalize_result_language(raw_lang: Any) -> Any:
     if isinstance(raw_lang, str) and raw_lang.lower() == "none":
         return None
     return raw_lang
+
+
+def _audio_duration(audio_path: str) -> float | None:
+    """Return the audio length in seconds from file metadata."""
+    import miniaudio
+
+    try:
+        return miniaudio.get_file_info(audio_path).duration
+    except miniaudio.DecodeError:
+        pass
+    # mlx-audio decodes the formats miniaudio cannot read (M4A, Opus) with ffmpeg.
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None
+    probe = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries", "format=duration"]
+        + ["-of", "csv=p=0", audio_path],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        return float(probe.stdout)
+    except ValueError:
+        return None
 
 
 def _map_stt_prompt_kwargs(model: Any, prompt: str | None) -> dict[str, str]:
@@ -861,22 +887,23 @@ class STTEngine(BaseNonStreamingEngine):
                     "text": result.text or "",
                     "language": raw_lang,
                     "segments": segments,
-                    "duration": getattr(
-                        result, "total_time", 0.0
+                    "duration": (
+                        audio.shape[-1] / model.sample_rate
+                        if diarize
+                        else _audio_duration(audio_path)
                     ),
                 }
                 if diarize:
                     output["text"], output["segments"] = _speaker_turns(
                         model, output["text"], segments
                     )
-                    output["duration"] = audio.shape[-1] / model.sample_rate
                 return output
             # Fallback for unexpected return types
             return {
                 "text": str(result),
                 "language": language,
                 "segments": [],
-                "duration": 0.0,
+                "duration": _audio_duration(audio_path),
             }
 
         activity_id = self._begin_activity(

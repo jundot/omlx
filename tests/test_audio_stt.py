@@ -243,6 +243,23 @@ class TestSTTEngineLanguageForwarding:
 
         assert "language" not in generate_kwargs
 
+    @pytest.mark.asyncio
+    async def test_transcribe_reports_audio_length(self, tmp_path):
+        """``duration`` is the audio length, not the backend's processing time."""
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                return SimpleNamespace(text="hi", segments=[], total_time=9.0)
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(_make_wav_bytes(duration_secs=1.5))
+        engine = STTEngine("whisper")
+        engine._model = FakeModel()
+
+        result = await engine.transcribe(str(audio_path))
+
+        assert result["duration"] == pytest.approx(1.5)
+
 
 @pytest.fixture
 def server_audio_client():
