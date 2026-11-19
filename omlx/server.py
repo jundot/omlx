@@ -4102,6 +4102,28 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
 
+@app.get("/v1/models/{model_id}/status")
+async def model_status(model_id: str, _: bool = Depends(verify_api_key)):
+    """Read-only residency/status for a single model (oMLX discussion #4295).
+
+    Answers 'is this model currently resident?' without the side effect of an
+    unload probe (which would actually evict a resident model). Returns
+    resident + loading state + a best-effort memory estimate.
+    """
+    if _server_state.engine_pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    entry = _server_state.engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    loading = bool(getattr(entry, "is_loading", False))
+    resident = entry.engine is not None and not loading
+    resp: dict = {"id": model_id, "resident": resident, "loading": loading}
+    if resident:
+        engine = getattr(entry, "engine", None)
+        resp["memory_bytes"] = getattr(engine, "estimated_memory_bytes", None)
+    return resp
+
+
 # =============================================================================
 # Embeddings Endpoint
 # =============================================================================

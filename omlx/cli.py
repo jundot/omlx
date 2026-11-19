@@ -851,6 +851,40 @@ def lifecycle_command(args) -> int:
     return 1
 
 
+def mcp_reload_command(args) -> int:
+    """omlx mcp reload: runtime reload of MCP servers (oMLX discussion #4672).
+
+    Talks to the running server's admin API, so the inference model pool and
+    live session are never touched -- only the MCP child processes restart.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    from .settings import GlobalSettings
+
+    settings = GlobalSettings.load()
+    host = settings.server.host
+    port = settings.server.port
+    api_key = settings.auth.api_key
+    url = f"http://{host}:{port}/admin/api/mcp/reload"
+    req = urllib.request.Request(url, method="POST")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()
+        print(f"omlx mcp reload failed: {e.code} {detail}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as e:
+        print(f"omlx mcp reload failed: {e.reason}", file=sys.stderr)
+        return 1
+    print(json.dumps(json.loads(body), indent=2))
+    return 0
+
+
 def diagnose_menubar() -> int:
     """Diagnose why the oMLX menubar icon might be missing.
 
@@ -1162,6 +1196,25 @@ Examples:
                 action="store_true",
                 help="Return after sending the request without waiting for server health",
             )
+
+    # MCP management
+    mcp_parser = subparsers.add_parser(
+        "mcp",
+        help="Manage oMLX MCP servers",
+        description="Manage oMLX MCP server connections.",
+    )
+    mcp_subparsers = mcp_parser.add_subparsers(
+        dest="mcp_command", help="MCP commands"
+    )
+    mcp_reload_parser = mcp_subparsers.add_parser(
+        "reload",
+        help="Reload MCP server config without restarting inference",
+        description=(
+            "Reload the MCP server list without evicting resident models or "
+            "dropping the live :8000 session. Only the MCP child processes "
+            "restart."
+        ),
+    )
 
     # Serve command (multi-model)
     serve_parser = subparsers.add_parser(
@@ -1641,6 +1694,11 @@ Example directory structure:
             sys.exit(diagnose_command(args))
         elif args.command == "cluster":
             sys.exit(cluster_command(args))
+        elif args.command == "mcp":
+            if getattr(args, "mcp_command", None) == "reload":
+                sys.exit(mcp_reload_command(args))
+            mcp_parser.print_help()
+            sys.exit(1)
         else:
             parser.print_help()
             sys.exit(1)
