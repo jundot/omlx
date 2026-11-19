@@ -10546,7 +10546,7 @@ def _iter_streamed_layer_blocks(
 
 
 def _streamed_embed_weight(source, config: dict):
-    """Source the token embedding table (bf16 on disk) for the stage-0 pass."""
+    """Source the token embedding table (bf16 on disk)."""
     dp = _streamed_source_plan(source, config)
     weight = dp.pop(_STREAM_EMBED_KEY)
     mx.eval(weight)
@@ -11137,17 +11137,9 @@ def _collect_imatrix_streaming(
     )
     micro_batch_size = int(batch_plan["micro_batch_size"])
 
-    # Stage 0 sources the embedding table, builds the sensitivity boundary and
-    # the per-family masks, then drops the table. Each round re-sources it and
-    # embeds only its own slice of the draw (embed_rows below), then drops it
-    # again. Embedding the whole adaptive draw up front kept every sample
-    # resident for the whole pass: at 2048 tokens on a hyper-connection model
-    # that is ~47 MB per sample, ~45 GB for a 962-sample draw, past the
-    # active-memory ceiling after layer 0. Per-round embedding is row-wise
-    # identical (an embedding lookup and the hc tile both act per row), so the
-    # statistics do not change; resident memory is one round, whatever the
-    # draw size, and never more than before. The cost is one table read per
-    # round (seconds, against minutes per round).
+    # Stage 0 sources the embedding table for the sensitivity boundary and the
+    # per-family masks. Each round re-sources it and embeds only its own rows,
+    # so one round of layer-0 inputs is resident, not the whole adaptive draw.
     calib_data = calib_data[:max_samples]
     is_qwen4_exp = _stream_source_model_type(config) == "qwen4_exp"
     if is_qwen4_exp:
@@ -11156,9 +11148,9 @@ def _collect_imatrix_streaming(
         # The mmap PLE configure happens inside _iter_streamed_layer_blocks,
         # AFTER the pre-load patches that could re-install the module.
         _qwen4_exp_apply_compat_patch()
+
     def embed_rows(weight, lo: int, hi: int):
-        """Layer-0 inputs for draw rows [lo, hi): embedded, then the same
-        per-family transform the whole draw used to get at stage 0."""
+        """Layer-0 inputs for draw rows [lo, hi)."""
         rows = _streamed_embed(weight, calib_data[lo:hi], config)
         if is_qwen4_exp:
             rows, _, _ = _streamed_qwen4_exp_state(config, calib_data[lo:hi], rows)
@@ -11171,22 +11163,6 @@ def _collect_imatrix_streaming(
     # One row, only to derive the per-family masks and state below.
     embedded = _streamed_embed(embed_weight, calib_data[:1], config)
     mx.eval(embedded)
-    # Report the draw's layer-0 footprint up front, so a run that cannot fit
-    # is visible before the imatrix pass instead of at the guard.
-    row_bytes = int(embed_rows(embed_weight, 0, 1).nbytes)
-    logger.info(
-        "oQe imatrix streaming: draw %d samples x %d tokens = %d tokens; "
-        "layer-0 inputs %s per sample, %s for the whole draw, %s per round "
-        "of %d (active-memory limit %s)",
-        int(calib_data.shape[0]),
-        int(calib_data.shape[1]),
-        int(calib_data.shape[0]) * int(calib_data.shape[1]),
-        _format_size(row_bytes),
-        _format_size(row_bytes * int(calib_data.shape[0])),
-        _format_size(row_bytes * min(int(num_samples), int(calib_data.shape[0]))),
-        min(int(num_samples), int(calib_data.shape[0])),
-        _format_size(_OQE_STREAM_ACTIVE_LIMIT_BYTES),
-    )
     sens_state = None
     if measure_sensitivity:
         # Build the sensitivity boundary while the embedding table is still
@@ -11209,11 +11185,9 @@ def _collect_imatrix_streaming(
     mx.clear_cache()
 
     if is_qwen4_exp:
-        # The per-layer mask schedule comes from config.layer_types and the
-        # position ids from the draw's shape; the hc tile is applied per round
-        # in embed_rows (tiling commutes with row slicing, so the per-slot rows
-        # stay bitwise-equal to the resident per-batch tiling). The forward
-        # state is sliced per micro-batch below, exactly like the resident
+        # Build the per-layer mask schedule from config.layer_types. embed_rows
+        # applies the hc tile per round (slicing commutes with the tile), and the
+        # forward state is sliced per micro-batch below, like the resident
         # collector's per-batch _prepare_layer_inputs call.
         _, q4_layer_masks, q4_position_ids = _streamed_qwen4_exp_state(
             config, calib_data, embedded
