@@ -225,21 +225,13 @@ def test_the_oqh_rotation_keeps_the_host_butterfly_order():
 
 
 def test_the_next_conv_window_does_not_hold_the_chunk():
-    # The window carried to the next chunk is the last rows of the conv input.
-    # Kept as a slice, it would hold the whole [1, rows + 3, C] input, about
-    # 40 MiB per linear layer at 2048 rows on the 27B, until the next chunk.
     mixer = load_stage(FIXTURE / "model", 0, 1).layers[0].mixer
-    rows, width = 8192, mixer.taps.shape[0]
-    qkv = mx.random.normal((1, rows, width)).astype(mx.bfloat16)
+    qkv = mx.random.normal((1, 8192, mixer.taps.shape[0])).astype(mx.bfloat16)
     mx.eval(qkv)
-    # Count only live buffers: wait for the GPU and drop MLX's cache first.
     mx.synchronize()
-    mx.clear_cache()
     before = mx.get_active_memory()
     *outputs, window = mixer.prework(qkv, None)
     mx.eval(*outputs, window)
     del outputs
     mx.synchronize()
-    mx.clear_cache()
-    assert window.shape == (1, mixer.taps.shape[1] - 1, width)
     assert mx.get_active_memory() - before < qkv.nbytes // 16

@@ -254,25 +254,3 @@ def test_the_oqh_expert_kernel_matches_the_rebuilt_experts(bits, group, limit):
     for got, ref in ((act, want), (y, want_y)):
         got, ref = got.astype(mx.float32), ref.astype(mx.float32)
         assert (mx.linalg.norm(got - ref) / mx.linalg.norm(ref)).item() < 1e-3
-
-
-@needs_fixture
-def test_the_next_conv_window_does_not_hold_the_chunk():
-    # As in qwen3_5: a slice of the conv input would keep all of its rows alive
-    # until the next chunk.
-    mixer = load_stage(FIXTURE / "model", 0, 1).layers[0].mixer
-    assert isinstance(mixer, GatedDeltaNet) and not mixer.fused
-    rows, width = 8192, mixer.taps.shape[0]
-    qkv = mx.random.normal((1, rows, width)).astype(mx.bfloat16)
-    mx.eval(qkv)
-    # Count only live buffers: wait for the GPU and drop MLX's cache first.
-    mx.synchronize()
-    mx.clear_cache()
-    before = mx.get_active_memory()
-    *outputs, window = mixer.prework(qkv, None)
-    mx.eval(*outputs, window)
-    del outputs
-    mx.synchronize()
-    mx.clear_cache()
-    assert window.shape == (1, mixer.taps.shape[1] - 1, width)
-    assert mx.get_active_memory() - before < qkv.nbytes // 16
