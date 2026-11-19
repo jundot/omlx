@@ -1139,6 +1139,9 @@ Examples:
         help="Print the oMLX version and exit",
     )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
+    subparsers.add_parser(
+        "hy4-flash", help="Convert and run the single-sequence Hy4 Flash text model"
+    )
 
     for name, help_text in (
         ("start", "Start oMLX as a managed background server"),
@@ -1613,6 +1616,10 @@ Example directory structure:
     # inconsistently retains it when known options precede it, and stripping it
     # afterward cannot distinguish it from a separator intended for the tool.
     argv = sys.argv[1:]
+    if argv[:1] == ["hy4-flash"]:
+        from .patches.hy_v4_flash.runner import main as hy4_flash_main
+
+        sys.exit(hy4_flash_main(argv[1:]))
     if argv[:1] == ["launch"] and "--" in argv[2:]:
         separator_index = argv.index("--", 2)
         args, extra_args = parser.parse_known_args(argv[:separator_index])
