@@ -268,8 +268,6 @@ _SOURCE = r"""
 
 
 # One thread per pair: its rank by (expert, pair index) is its sorted position.
-# Done once per projection instead of once per threadgroup, where the P
-# comparisons cost about as much as the down projection's useful work.
 _RANK_SOURCE = r"""
     const uint p = thread_position_in_grid.x;
     if (p >= N_PAIRS) return;
@@ -380,17 +378,14 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
 
 
 def gather_qmv(
-    linear, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array | None = None
+    linear, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array
 ) -> mx.array:
     """``gather_qmm`` over P (row, expert) pairs, pairs grouped by expert.
 
     ``rhs`` holds the expert of each pair; pair ``p`` reads row
     ``p // pairs_per_row`` of ``x`` (``[R, K]``). ``order`` is
-    ``pair_order(rhs)``; pass it to share one ordering between projections.
-    Returns ``[P, N]``.
+    ``pair_order(rhs)``. Returns ``[P, N]``.
     """
-    if order is None:
-        order = pair_order(rhs)
     weight, scales, biases = linear["weight"], linear["scales"], linear["biases"]
     k = int(x.shape[-1])
     n = int(weight.shape[-2])
