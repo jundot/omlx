@@ -74,7 +74,7 @@ DeepSeek V4.1 **CED prefill** is on unless turned off in the model's settings. *
 `omlx-cuda-helper` (`apps/omlx-cuda-helper/`) turns a Linux machine with NVIDIA GPUs into a helper. This Mac uses it like a helper Mac: choose it under **Prefill Accelerator** in the model's settings. Its README covers the build and the options. What differs from a helper Mac:
 
 - **No SSH and no oMLX on the helper.** The helper is a small daemon without a UI. Pair it in the Cluster tab with the 6-digit code it prints in its log; this Mac then drives it over a control channel that the pairing key protects. In the Cluster tab it has no Join button, because it can only be a prefill helper.
-- **Compatibility is per model family**, not per oMLX version. The checks list the families the helper serves and name the side to update when they disagree.
+- **Compatibility is per model family**, not per oMLX version. The checks list the families the helper serves and name the side to update when they disagree. A helper older than the one this oMLX comes with gets a warning with the update command.
 - **Two GPUs run as a pipeline.** Each GPU holds a range of layers. GPU memory decides how many layers the helper takes, and with it the speedup.
 - **Long prompts drop layers.** When the next chunk's cache would not fit in the helper's GPU memory, the helper drops the layers the prompt does not use first, then its last layers one at a time, and this Mac runs them from that chunk on. The helper loads them again while no prompt waits.
 - **INT8 Activation Prefill** does not apply to the helper's layers.

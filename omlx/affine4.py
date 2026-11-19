@@ -43,8 +43,9 @@ _MIN_NATIVE_TOKENS = 256
 # 16-row chunks were faster than 32 rows on M3 Ultra and M5 Max and 24 rows on M5 Pro.
 # 16 rows at dim 512 use 23 KiB of the 32 KiB threadgroup memory.
 _MAX_PADDED_ROWS = 16
-# Longer query blocks (prefill) keep the dequantized fused-SDPA route.
-_MAX_NATIVE_QUERY_LENGTH = 24
+# Longer query blocks keep the dequantized fused-SDPA route.
+_MAX_NATIVE_QUERY_LENGTH = 39
+_MAX_NATIVE_QUERY_LENGTH_SMALL_DIM = 48
 # Bound each unfused float32 score matrix to 64 MiB, or one query row.
 _MAX_SCORE_ELEMENTS = 16 * 1024 * 1024
 _NATIVE_LAUNCHABLE = {}
@@ -853,7 +854,10 @@ def _native_attention(
     warps = _attention_warps(dim)
     total_rows = repeats * query_length
     group = min(total_rows, _MAX_PADDED_ROWS)
-    if not group or dim % warps or query_length > _MAX_NATIVE_QUERY_LENGTH:
+    max_query_length = (
+        _MAX_NATIVE_QUERY_LENGTH if dim > 128 else _MAX_NATIVE_QUERY_LENGTH_SMALL_DIM
+    )
+    if not group or dim % warps or query_length > max_query_length:
         return None
     chunks = (total_rows + group - 1) // group
     padded_rows = _padded_rows(group)

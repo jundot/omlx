@@ -797,7 +797,7 @@ component.formatSizeBytes = (bytes) => (bytes / 1024 ** 3).toFixed(1) + ' GB';
 component.apiFetch = async (url) => url.startsWith('/admin/api/prefill-helper/check')
   ? { name: 'gpu-box', rows: [
       { key: 'control', status: 'pass', detail: '192.168.1.230:8851' },
-      { key: 'version', status: 'pass', detail: '0.1.0', families: ['qwen4_exp'], fix: '' },
+      { key: 'version', status: 'warn', detail: '0.1.0', families: ['qwen4_exp'], fix: 'To update ...' },
       { key: 'memory', status: 'pass', bytes: 101786320896, gpus: 2 },
     ] }
   : {};
@@ -813,7 +813,7 @@ process.stdout.write(JSON.stringify({
 """
     )
 
-    # The helper takes no layers, and its own version is not a mismatch.
+    # The helper takes no layers, and an older helper version is not a mismatch.
     assert result["split"] == {
         "nodes": ["node-a", "node-b"],
         "hosts": ["node-a", "node-b"],

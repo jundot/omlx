@@ -189,7 +189,10 @@ def _is_dspark_model(config: Any) -> bool:
 
 
 def _materialize_cache_arrays(cache: Optional[Any]) -> None:
-    """Detach DeepSeek-V4 cache update graphs from prior decode steps."""
+    """Detach DeepSeek-V4 cache update graphs from prior decode steps.
+
+    ``mx.async_eval`` cuts the graphs like ``mx.eval`` without blocking the forward.
+    """
     if cache is None:
         return
 
@@ -206,7 +209,7 @@ def _materialize_cache_arrays(cache: Optional[Any]) -> None:
                     cache_arrays.append(value)
 
     if cache_arrays:
-        mx.eval(*cache_arrays)
+        mx.async_eval(*cache_arrays)
 
 
 @dataclass

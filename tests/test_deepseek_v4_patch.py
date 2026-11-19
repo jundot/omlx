@@ -1241,10 +1241,14 @@ class TestCacheMaterialization:
         leaf_c = Leaf(mx.array([3], dtype=mx.int32))
         calls = []
 
-        def fake_eval(*arrays):
+        def fake_async_eval(*arrays):
             calls.append(arrays)
 
-        monkeypatch.setattr(dsv4.mx, "eval", fake_eval)
+        def blocking_eval(*arrays):
+            raise AssertionError("cache materialization must not block")
+
+        monkeypatch.setattr(dsv4.mx, "async_eval", fake_async_eval)
+        monkeypatch.setattr(dsv4.mx, "eval", blocking_eval)
 
         dsv4._materialize_cache_arrays([CacheList(leaf_a, leaf_b), leaf_c, None])
 
