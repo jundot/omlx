@@ -60,7 +60,8 @@ operands in registers from one packed word per 32 inputs (bf16 ``128 + q``,
 exact), so no threadgroup dequant tile is needed; the group fold removes
 ``128 * sum(x)`` and applies scale and bias. The verifier's projection tuples
 share one launch (``vk_group_sg8``, mixed 4/5-bit widths allowed) and the dense
-MLP's gate/up/SiLU is one launch (``vk_swiglu_sg8``).
+MLP's gate/up/SiLU is one launch (``vk_swiglu_sg8``). On tensor-unit GPUs a single
+projection below six rows stays on stock qmm.
 
 The armed verifier also fuses each residual add with the next RMSNorm
 (bit-exact to the separate ops) and submits the partial graph every few
@@ -98,9 +99,7 @@ _NAX_MMA_MAX_ROWS = 16
 # Draft k/v and conv projections (N 1024..1280) also gain from sg8.
 _MIN_SG8_ROUTE_N = 1024
 _SG8_MIN_ROWS = 4
-# A single projection (not the fused swiglu or grouped launches) at 4 and 5
-# rows runs on stock qmv on GPUs with tensor units: stock keeps one pass over
-# the weights through five rows and sg8 only wins from six.
+# On tensor-unit GPUs stock qmm beats sg8 for a single projection below 6 rows.
 _SG8_SINGLE_MIN_ROWS_NAX = 6
 
 

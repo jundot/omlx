@@ -78,6 +78,17 @@ def test_qmv_disabled_when_the_gate_is_off(qmv_off):
     assert qwen35_verify_qmm._verify_route(4, 5120, 17408, 4, 64, mx.float16) == "sg8"
 
 
+def test_tensor_unit_single_projection_takes_sg8_from_six_rows(qmv_off, monkeypatch):
+    monkeypatch.setattr(m1_verify_mma, "enabled", lambda: False)
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: True)
+    route = qwen35_verify_qmm._verify_route
+    assert [route(r, 6144, 5120, 5, 64, mx.bfloat16) for r in (4, 5, 6)] == [
+        None,
+        None,
+        "sg8",
+    ]
+
+
 def test_takes_priority_over_sg8_and_split_k(qmv_only):
     f16 = mx.float16
     assert qwen35_verify_qmm._verify_route(4, 5120, 17408, 4, 64, f16) == "m1"
@@ -122,7 +133,6 @@ def test_armed_quantized_linear_uses_m1_route(qmv_only):
 
 @pytest.fixture
 def mma_on(monkeypatch):
-    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: False)
     monkeypatch.setattr(m1_verify_mma, "enabled", lambda: True)
     monkeypatch.setattr(m1_verify_qmv, "enabled", lambda: True)
 
