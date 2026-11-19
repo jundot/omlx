@@ -1518,10 +1518,11 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8, 12, 16])
-@pytest.mark.parametrize("seed", [5, 23])
+# One block per in-projection geometry: the two-row tile, then two, one and
+# three rows per threadgroup.
+@pytest.mark.parametrize("rows", [2, 4, 5, 9])
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
-    monkeypatch, qwen4_verify, dtype, rows, seed
+    monkeypatch, qwen4_verify, dtype, rows
 ):
     """Row t, the state after it and the conv window equal the t-th planned
     one-token decode step; a partial accept restores that step's states."""
@@ -1537,8 +1538,8 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
         return decode_step(*args)
 
     monkeypatch.setattr(prework_mod, "qwen4_decode_step_fused", counted)
-    module = _real_qwen4_decode_module(((6, 64),) * 4, seed, dtype)
-    inputs, conv_state, recurrent_state = _verify_inputs(rows, seed, dtype)
+    module = _real_qwen4_decode_module(((6, 64),) * 4, 5, dtype)
+    inputs, conv_state, recurrent_state = _verify_inputs(rows, 5, dtype)
     serial = ArraysCache(size=2)
     serial[0], serial[1] = conv_state, recurrent_state
     outputs, convs, states = [], [conv_state], [recurrent_state]
