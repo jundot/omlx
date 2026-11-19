@@ -21,6 +21,7 @@ from fastapi import APIRouter, HTTPException
 
 from .. import __version__
 from ..cluster.registry import get_device_registry
+from ..oqh import format as oqh_format
 from . import launcher
 from .adapters import adapter_for_model
 from .lending import active_lending, forget_host, recorded_host
@@ -124,7 +125,10 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
         "link": target.link,
         "device": info.get("device"),
         "version": info.get("version"),
-        "version_ok": transport.incompatible(info, adapter, row["name"]) is None,
+        "version_ok": transport.incompatible(
+            info, adapter, row["name"], oqh_format.checkpoint_version(model_path)
+        )
+        is None,
         "layers_fit": held,
         "budget": info.get("budget"),
         "on_battery": bool(info.get("on_battery")),

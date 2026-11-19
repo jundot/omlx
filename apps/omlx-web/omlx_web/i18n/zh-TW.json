@@ -450,6 +450,8 @@
   "models.oq.combine_mtp_donor_help": "Graft the MTP head from a same-architecture donor checkpoint (e.g. the base model of a fine-tune) into the quantized output. Tokenizer and geometry must match exactly; the output name gets a -mtp suffix.",
   "models.oq.enhanced_label": "增強量化（oQe）",
   "models.oq.enhanced_help": "使用 imatrix 校準，依啟動值重要性對仿射量化加權。",
+  "models.oq.hadamard_label": "旋轉編碼 (oQh)",
+  "models.oq.hadamard_help": "與 oQe 大小相同但誤差更低：權重以 Hadamard 旋轉基底儲存，每列一個縮放係數。執行需要 oQh 核心。",
   "models.oq.imatrix_reuse_cache": "重複使用 imatrix 快取",
   "models.oq.imatrix_reuse_cache_help": "在可用時使用相容的已快取 imatrix；否則收集新的。",
   "models.oq.imatrix_cache_path": "Imatrix 快取路徑",

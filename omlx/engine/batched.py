@@ -23,6 +23,7 @@ from ..model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from ..oqh.format import is_oqh_checkpoint
 from ..patches.mlx_lm_mtp import drafter_target
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
@@ -380,12 +381,14 @@ class BatchedEngine(BaseEngine):
         # resident slot tensors (#1304).
         moe_offload_wrapped = 0
         offload_stats = offload_release = offload_restore = None
+        offload_releasable = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
                 moe_offload_caches,
                 moe_offload_stats,
+                releasable_moe_offload_bytes,
                 release_moe_offload_slots,
                 restore_moe_offload_slots,
             )
@@ -425,6 +428,9 @@ class BatchedEngine(BaseEngine):
                 offload_stats = functools.partial(moe_offload_stats, caches=caches)
                 offload_release = functools.partial(release_moe_offload_slots, caches)
                 offload_restore = functools.partial(restore_moe_offload_slots, caches)
+                offload_releasable = functools.partial(
+                    releasable_moe_offload_bytes, caches
+                )
 
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
@@ -543,7 +549,11 @@ class BatchedEngine(BaseEngine):
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
-        if a8_prefill_on(self._model_settings):
+        # A8 and ANE prefill read affine weights; oQh linears have none.
+        oqh = is_oqh_checkpoint(self._model_name)
+        if oqh and a8_prefill_on(self._model_settings):
+            logger.warning("A8 prefill does not read oQh weights; it stays off")
+        elif a8_prefill_on(self._model_settings):
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -561,6 +571,9 @@ class BatchedEngine(BaseEngine):
 
         ane_backend = ane_prefill_backend(self.model_type)
         ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+        if ane_enabled and oqh:
+            logger.warning("ANE prefill does not read oQh weights; it stays off")
+            ane_enabled = False
         if ane_enabled:
             validate_ane_prefill(self._model_settings.to_dict(), self.model_type)
             ane_fraction = ane_prefill_fraction(
@@ -762,6 +775,7 @@ class BatchedEngine(BaseEngine):
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
+        scheduler.moe_offload_releasable = offload_releasable
         if ane_prefill_sequence_length:
             from ..patches.qwen35_ane_prefill import (
                 configure_qwen35_ane_prefill_scheduler,

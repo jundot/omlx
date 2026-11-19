@@ -26373,6 +26373,78 @@
         }
       }
     },
+    "quant.enhanced.hadamard.label" : {
+      "comment" : "Toggle label that builds the oQh variant of an oQe model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rotierte Codes (oQh)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rotated codes (oQh)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Codici ruotati (oQh)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повёрнутые коды (oQh)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "旋转编码 (oQh)"
+          }
+        }
+      }
+    },
+    "quant.enhanced.hadamard.sub" : {
+      "comment" : "Toggle sublabel explaining the oQh variant",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gleiche Größe wie oQe bei geringerem Fehler: Die Gewichte liegen in einer Hadamard-rotierten Basis mit einer Skala pro Zeile. Zum Ausführen werden die oQh-Kernel benötigt."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Same size as oQe with lower error: weights are stored in a Hadamard-rotated basis with one scale per row. Needs the oQh kernels to run."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stessa dimensione di oQe con errore minore: i pesi sono salvati in una base ruotata di Hadamard con una scala per riga. Per l'esecuzione servono i kernel oQh."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Тот же размер, что у oQe, при меньшей ошибке: веса хранятся в базисе с поворотом Адамара и одним масштабом на строку. Для запуска нужны ядра oQh."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "与 oQe 大小相同但误差更低：权重以 Hadamard 旋转基存储，每行一个缩放系数。运行需要 oQh 内核。"
+          }
+        }
+      }
+    },
     "quant.enhanced.reuse.label" : {
       "comment" : "Toggle label for reusing a compatible oQe imatrix cache",
       "extractionState" : "manual",

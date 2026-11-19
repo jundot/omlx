@@ -450,6 +450,8 @@
   "models.oq.combine_mtp_donor_help": "将同一架构的捐赠检查点（如微调的基座模型）的 MTP 头嫁接到量化输出中。分词器和结构必须完全匹配；输出名称追加 -mtp 后缀。",
   "models.oq.enhanced_label": "增强量化（oQe）",
   "models.oq.enhanced_help": "使用 imatrix 校准，按激活重要性加权仿射量化。",
+  "models.oq.hadamard_label": "旋转编码 (oQh)",
+  "models.oq.hadamard_help": "与 oQe 大小相同但误差更低：权重以 Hadamard 旋转基存储，每行一个缩放系数。运行需要 oQh 内核。",
   "models.oq.imatrix_reuse_cache": "复用 imatrix 缓存",
   "models.oq.imatrix_reuse_cache_help": "可用时使用兼容的已缓存 imatrix；否则重新收集。",
   "models.oq.imatrix_cache_path": "imatrix 缓存路径",

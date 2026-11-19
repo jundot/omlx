@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import random
 import types
 
 import mlx.core as mx
@@ -10,6 +12,9 @@ import pytest
 
 q35 = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
 from mlx_lm.models.cache import BatchKVCache  # noqa: E402
+from mlx_vlm.speculative import cache_state  # noqa: E402
+
+from omlx.patches import qwen35_deferred_realign as dr  # noqa: E402
 
 DTYPE = mx.bfloat16
 Q_HEADS, KV_HEADS, D = 24, 4, 256
@@ -249,3 +254,115 @@ def test_a_mask_that_hides_more_than_padding_is_not_claimed(patched, monkeypatch
     assert patched.mod.apply_qwen35_padded_row_attention_patch()
     cache, *_ = _step([SHORT + 3000, LONG], 4)
     assert not hasattr(cache, patched.mod._ROWS_ATTR)
+
+
+def _bank(lengths, seed=0):
+    mx.random.seed(seed)
+    total = max(lengths)
+    cache = BatchKVCache([total - n for n in lengths])
+    k = mx.random.normal((len(lengths), KV_HEADS, total, D)).astype(DTYPE)
+    v = mx.random.normal((len(lengths), KV_HEADS, total, D)).astype(DTYPE)
+    cache.update_and_fetch(k, v)
+    return cache
+
+
+def _pair(lengths):
+    """A stock cache and a copy that defers its ragged rollbacks."""
+    ref, exp = _bank(lengths), _bank(lengths)
+    exp.__dict__[dr.MARK] = True
+    return ref, exp
+
+
+def _cycle(caches, block, accepted, seed):
+    """One verify block, then the rollback an MTP commit runs."""
+    mx.random.seed(seed)
+    batch = caches[0].left_padding.size
+    k = mx.random.normal((batch, KV_HEADS, block, D)).astype(DTYPE)
+    v = mx.random.normal((batch, KV_HEADS, block, D)).astype(DTYPE)
+    for c in caches:
+        c.update_and_fetch(k, v)
+        cache_state._trim_append_caches([c], [a + 1 for a in accepted], block)
+
+
+def _live_rows(cache):
+    """Each row's keys and values, read without a realignment."""
+    tails = cache.__dict__.get(dr.TAIL) or [0] * cache.left_padding.size
+    return [
+        (cache._keys[r, :, p : cache._idx - t], cache._values[r, :, p : cache._idx - t])
+        for r, (p, t) in enumerate(zip(cache.left_padding.tolist(), tails))
+    ]
+
+
+def _assert_same_rows(ref, exp):
+    assert mx.array_equal(ref.offset, exp.offset).item()
+    for (rk, rv), (ek, ev) in zip(_live_rows(ref), _live_rows(exp), strict=True):
+        assert mx.array_equal(rk, ek).item() and mx.array_equal(rv, ev).item()
+
+
+def test_ragged_rollbacks_defer_and_keep_rows_exact(patched):
+    # Three rows past a bank-growth boundary, tails capped at _MAX_TAIL.
+    ref, exp = _pair([300, 500, 700])
+    rng = random.Random(7)
+    saw_tail = grew_with_tails = False
+    for step in range(40):
+        block = rng.choice([3, 4, 5])
+        width, had_tails = exp._logical_width(), dr.tails(exp) is not None
+        _cycle([ref, exp], block, [rng.randrange(block) for _ in range(3)], step)
+        saw_tail |= dr.tails(exp) is not None
+        grew_with_tails |= had_tails and exp._logical_width() > width
+        assert max(exp.__dict__.get(dr.TAIL) or [0]) <= dr._MAX_TAIL
+        _assert_same_rows(ref, exp)
+    assert saw_tail and grew_with_tails
+
+
+@pytest.mark.parametrize("block,verify", [(1, True), (4, True), (4, False)])
+def test_tail_attention_matches_the_realigned_cache(patched, block, verify):
+    ref, exp = _pair([3000, 9000])
+    layer2 = _pair([3000, 9000])[1]
+    _cycle([ref, exp, layer2], 4, [3, 1], seed=11)
+    assert dr.tails(exp) == [0, 2]
+    mx.random.seed(21)
+    q = mx.random.normal((2, Q_HEADS, block, D)).astype(DTYPE)
+    nk = mx.random.normal((2, KV_HEADS, block, D)).astype(DTYPE)
+    nv = mx.random.normal((2, KV_HEADS, block, D)).astype(DTYPE)
+    outs = []
+    for c, c2 in ((ref, ref), (exp, layer2)):
+        with dr.verifying() if verify else contextlib.nullcontext():
+            h = mx.zeros((2, block, 8), dtype=DTYPE)
+            mask = q35._create_qwen3_5_attention_mask(h, c)
+            decode = isinstance(mask, str)
+            pads = c._qwen3_5_decode_left_padding if decode else None
+            q35._set_qwen3_5_decode_left_padding([c, None, c2], _layers(), pads)
+            keys, values = c.update_and_fetch(nk, nv)
+            if verify:
+                outs.append(_call(q, keys, values, c, None if decode else mask))
+            else:
+                # An ordinary forward runs masked SDPA over the whole bank.
+                outs.append(
+                    q35.scaled_dot_product_attention(
+                        q, keys, values, cache=c, scale=SCALE, mask=mask
+                    )
+                )
+    assert dr.tails(exp) == dr.tails(layer2) == ([0, 2] if verify else None)
+    assert mx.array_equal(outs[0], outs[1]).item()
+
+
+@pytest.mark.parametrize(
+    "touch",
+    [
+        lambda c: c.filter([1]),
+        lambda c: c.extend(_bank([5000], seed=2)),
+        lambda c: c.extract(1).state[0],
+        lambda c: c.state,
+    ],
+    ids=["filter", "extend", "extract", "state"],
+)
+def test_other_cache_access_realigns_first(patched, touch):
+    ref, exp = _pair([3000, 9000])
+    _cycle([ref, exp], 4, [3, 0], seed=1)
+    assert dr.tails(exp) == [0, 3]
+    a, b = touch(ref), touch(exp)
+    assert dr.tails(exp) is None
+    _assert_same_rows(ref, exp)
+    if isinstance(a, mx.array):
+        assert mx.array_equal(a, b).item()

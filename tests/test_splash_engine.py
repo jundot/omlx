@@ -433,15 +433,20 @@ class TestCompatibility:
         assert "Qwen3.8-Flash-Next needs a GGUF" in reason
         assert splash_mod.splash_draft_to_download(model, None, []) is None
 
-    def test_supported_checkpoint_resolves_with_its_draft(self, tmp_path, launchers):
+    def test_supported_checkpoint_resolves_with_its_draft(
+        self, tmp_path, launchers, monkeypatch
+    ):
         launchers("splash")
+        monkeypatch.setenv("HOME", str(tmp_path))
         model = _write_model(tmp_path / "Qwen3.8-27B-4bit")
         other = _write_draft(
             tmp_path / "other-draft", text={**QWEN38_TEXT, "hidden_size": 1}
         )
         draft = _write_draft(tmp_path / "z-lab" / "Qwen3.8-27B-DFlash2")
 
-        target, reason = resolve_splash_target(model, None, [str(other), str(draft)])
+        target, reason = resolve_splash_target(
+            model, None, [str(other), "~/z-lab/Qwen3.8-27B-DFlash2"]
+        )
 
         assert reason == ""
         assert target.family == "Qwen3.8-27B"
@@ -474,6 +479,12 @@ class TestCompatibility:
         assert resolve_splash_target(model, None, [str(draft)])[0] is None
         launchers("splash", version="1.3.1")
         assert resolve_splash_target(model, None, [str(draft)])[0] is not None
+        # The oQh variant of the same level keeps its rotated tensors out of Splash.
+        config = json.loads((model / "config.json").read_text())
+        config["omlx_oqh"] = {"version": 1, "tensors": {}}
+        (model / "config.json").write_text(json.dumps(config))
+        target, reason = resolve_splash_target(model, None, [str(draft)])
+        assert target is None and "oQh" in reason
 
     @pytest.mark.parametrize(
         "quantization_config",

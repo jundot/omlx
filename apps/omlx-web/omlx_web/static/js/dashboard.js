@@ -637,6 +637,7 @@
             oqPreserveNgram: false,
             oqMtpAssistantPath: '',
             oqEnhanced: false,
+            oqHadamard: false,
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
             oqeStrictImatrix: false,
@@ -8224,6 +8225,7 @@
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
+                        payload.hadamard = this.oqHadamardActive();
                         payload.imatrix_reuse_cache = this.oqeReuseImatrixCache;
                         payload.imatrix_cache_path = this.oqeImatrixCachePath.trim();
                         payload.imatrix_strict = this.oqeStrictImatrix;
@@ -8237,7 +8239,7 @@
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', 'oQ' + this.oqLevel + (this.oqEnhanced ? 'e' : ''));
+                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', this.oqLevelLabel(this.oqLevel));
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
@@ -8386,7 +8388,18 @@
             },
 
             oqLevelLabel(level) {
-                return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
+                return `oQ${level}${this.oqHadamardActive() ? 'h' : (this.oqEnhanced ? 'e' : '')}`;
+            },
+
+            oqSelectedModelSupportsOqh() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!model?.oqh_supported) return false;
+                // DeepSeek V4.1 takes oQh below oQ4 only.
+                return model.oqh_max_level == null || this.oqLevel < model.oqh_max_level;
+            },
+
+            oqHadamardActive() {
+                return this.oqEnhanced && this.oqHadamard && this.oqSelectedModelSupportsOqh();
             },
 
             oqSelectedModelIsVLM() {

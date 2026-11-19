@@ -45,6 +45,7 @@ from transformers import AutoTokenizer
 from ..api.utils import _consolidate_system_messages
 from ..exceptions import InvalidRequestError
 from ..gguf import SPLIT_VARIANT
+from ..oqh.format import is_oqh_config
 from ..request import DecodeMarks, add_decode_mark, live_decode_rate
 from ..utils.hardware import get_chip_name, parse_chip_info
 from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
@@ -545,6 +546,8 @@ def _is_nvfp4_or_fp8(quant_config: dict) -> bool:
 
 
 def _quantization_problem(config: dict, binary: SplashBinary) -> str:
+    if is_oqh_config(config):
+        return "Splash does not read oQh weights"
     quant = config.get("quantization")
     if not isinstance(quant, dict):
         quant_config = config.get("quantization_config") or {}
@@ -583,7 +586,7 @@ def _is_splash_draft(draft: dict, text: dict) -> bool:
 def find_splash_draft(text_config: dict, candidates: Iterable[str]) -> Path | None:
     """The first DFlash2 draft among ``candidates`` that fits ``text_config``."""
     for candidate in candidates:
-        path = Path(candidate)
+        path = Path(candidate).expanduser()
         draft = _read_config(path)
         if draft is not None and _is_splash_draft(draft, text_config):
             return path

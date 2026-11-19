@@ -450,6 +450,8 @@
   "models.oq.combine_mtp_donor_help": "Den MTP-Kopf eines Spender-Checkpoints mit gleicher Architektur (z. B. des Basismodells eines Fine-Tunings) in das quantisierte Ausgabemodell übernehmen. Tokenizer und Geometrie müssen exakt übereinstimmen. Der Ausgabename erhält den Zusatz -mtp.",
   "models.oq.enhanced_label": "Erweiterte Quantisierung (oQe)",
   "models.oq.enhanced_help": "Die affine Quantisierung mithilfe einer imatrix-Kalibrierung nach der Bedeutung der Aktivierungen gewichten.",
+  "models.oq.hadamard_label": "Rotierte Codes (oQh)",
+  "models.oq.hadamard_help": "Gleiche Größe wie oQe bei geringerem Fehler: Die Gewichte liegen in einer Hadamard-rotierten Basis mit einer Skala pro Zeile. Zum Ausführen werden die oQh-Kernel benötigt.",
   "models.oq.imatrix_reuse_cache": "imatrix-Cache wiederverwenden",
   "models.oq.imatrix_reuse_cache_help": "Eine kompatible zwischengespeicherte imatrix verwenden, sofern vorhanden; andernfalls eine neue erfassen.",
   "models.oq.imatrix_cache_path": "Pfad zum imatrix-Cache",

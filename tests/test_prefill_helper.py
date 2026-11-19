@@ -1528,6 +1528,11 @@ def test_agent_transport_drives_a_helper_daemon(tmp_path, monkeypatch):
     assert "does not support" in agent.incompatible(info, GLM, "nvidia1")
     older = {**info, "contracts": {"deepseek_v41": DSV41.contract - 1}}
     assert "update the helper" in agent.incompatible(older, DSV41, "nvidia1")
+    # oQh weights need a helper whose family reads that format version.
+    assert "oQh" in agent.incompatible(info, DSV41, "nvidia1", oqh=1)
+    reads = {**info, "oqh": {"deepseek_v41": 1}}
+    assert agent.incompatible(reads, DSV41, "nvidia1", oqh=1) is None
+    assert "oQh" in agent.incompatible(reads, DSV41, "nvidia1", oqh=2)
 
     # A copy stopped halfway resumes from the bytes the helper kept.
     model = tmp_path / "Model"
@@ -1941,6 +1946,10 @@ def test_only_a_model_that_gets_a_helper_has_an_adapter(tmp_path):
     config["quantization_config"]["quant_method"] = "paroquant"
     (tmp_path / "config.json").write_text(json.dumps(config))
     assert adapter_for_model("qwen3_5", "vlm", path) is None
+    # A Mac helper loads oQh as the server does; a CUDA helper says what it reads.
+    config = {"model_type": "qwen3_5", "omlx_oqh": {"version": 1, "tensors": {}}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert adapter_for_model("qwen3_5", "vlm", path) is QWEN35
     # The other families keep their adapter on every engine.
     assert adapter_for_model("qwen4-exp", "batched", path) is QWEN4
 

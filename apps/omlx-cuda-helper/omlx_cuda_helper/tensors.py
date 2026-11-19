@@ -9,7 +9,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from . import checkpoint
+from . import checkpoint, oqh
 from .wire import HostArray
 
 # Cache rows grow every chunk, so a freed buffer never fits again; cap what MLX keeps.
@@ -143,7 +143,17 @@ class Linear:
     ):
         weight = weights[f"{prefix}.weight"]
         self.quant = None
-        if f"{prefix}.scales" in weights:
+        # oQh: the input rotation (signs, block) and the row scale of wide codes.
+        self.rotation = None
+        self.post = None
+        if oqh.is_oqh(weights, prefix):
+            if not dense:
+                raise ValueError(f"oQh {prefix} is read only as a dense weight")
+            scales, biases, sizes, self.post = oqh.affine_view(weights, prefix)
+            signs = weights[f"{prefix}.{oqh.SIGNS}"]
+            self.rotation = (signs, int(signs.shape[-1]))
+            weight = unpack(weight, scales, biases, sizes, dtype or scales.dtype)
+        elif f"{prefix}.scales" in weights:
             scales, biases = weights[f"{prefix}.scales"], weights.get(
                 f"{prefix}.biases"
             )
@@ -157,9 +167,23 @@ class Linear:
 
     def parameters(self) -> list[mx.array]:
         extra = [a for a in self.quant[:2] if a is not None] if self.quant else []
+        if self.rotation is not None:
+            extra.append(self.rotation[0])
+        if self.post is not None:
+            extra.append(self.post)
         return [self.weight, *extra]
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def rotated(self, x: mx.array) -> mx.array | None:
+        """x in this layer's oQh basis, None for a layer without one."""
+        return None if self.rotation is None else oqh.rotate(x, *self.rotation)
+
+    def __call__(self, x: mx.array, rotated: mx.array | None = None) -> mx.array:
+        """x @ W.T; an oQh layer takes ``rotated`` (its basis) or rotates x."""
+        if self.rotation is not None:
+            x = self.rotated(x) if rotated is None else rotated
+            y = x @ self.weight.T
+            # The host rounds the product, then the row scale product.
+            return y if self.post is None else y * self.post
         if self.quant is None:
             return x @ self.weight.T
         scales, biases, quant = self.quant

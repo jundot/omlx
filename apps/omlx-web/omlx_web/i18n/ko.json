@@ -450,6 +450,8 @@
   "models.oq.combine_mtp_donor_help": "Graft the MTP head from a same-architecture donor checkpoint (e.g. the base model of a fine-tune) into the quantized output. Tokenizer and geometry must match exactly; the output name gets a -mtp suffix.",
   "models.oq.enhanced_label": "Enhanced quantization (oQe)",
   "models.oq.enhanced_help": "imatrix calibration으로 activation 중요도에 따라 affine quantization을 가중합니다.",
+  "models.oq.hadamard_label": "회전 코드 (oQh)",
+  "models.oq.hadamard_help": "oQe와 같은 크기에 오차가 더 작습니다. 가중치를 Hadamard 회전 기저에 행마다 스케일 하나로 저장합니다. 실행하려면 oQh 커널이 필요합니다.",
   "models.oq.imatrix_reuse_cache": "imatrix cache 재사용",
   "models.oq.imatrix_reuse_cache_help": "호환되는 cached imatrix가 있으면 사용하고, 없으면 새로 수집합니다.",
   "models.oq.imatrix_cache_path": "imatrix cache path",

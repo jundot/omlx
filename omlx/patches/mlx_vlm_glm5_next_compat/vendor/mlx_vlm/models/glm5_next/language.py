@@ -102,12 +102,13 @@ _DECODE_EVAL_EVERY = 8
 
 
 def _decode_hc_pre(connection, norm, x: mx.array):
-    """HC collapse plus the branch's input RMSNorm for B == 1, L <= 8.
+    """HC collapse plus the branch's input RMSNorm for B * L <= 8 tokens.
 
     Two dispatches (``hc_mix`` and ``exact_hc_norm``) replace the
-    cast/RMS/mix-GEMV/sinkhorn-collapse/RMSNorm chain; every row equals the
-    reference ``connection(x)`` followed by ``norm`` (the one-token GEMV
-    reduction, which the reference also uses per token for L <= 8).
+    cast/RMS/mix-GEMV/sinkhorn-collapse/RMSNorm chain. Every row uses the
+    one-token GEMV reduction: one sequence equals the reference
+    ``connection(x)`` followed by ``norm`` (which also reduces per token for
+    L <= 8), and a batch row equals its one-token decode.
     Returns None when the shape or module state is not covered.
     """
     if (
@@ -115,8 +116,7 @@ def _decode_hc_pre(connection, norm, x: mx.array):
         or connection.training
         or connection.hc_mult != 4
         or x.ndim != 4
-        or x.shape[0] != 1
-        or not 1 <= x.shape[1] <= _DECODE_BLOCK
+        or not 1 <= x.shape[0] * x.shape[1] <= _DECODE_BLOCK
     ):
         return None
     mixes = _decode_kernels.hc_mix(
@@ -125,6 +125,23 @@ def _decode_hc_pre(connection, norm, x: mx.array):
     if mixes is None:
         return None
     return exact_hc_norm(connection, norm, x, mixes)
+
+
+def _routed_projections(sw, x2):
+    """Routed gate / up of a SwitchGLU for the fused kernels, and x in the
+    experts' basis when they are oQh (None otherwise)."""
+    if getattr(sw, "oqh_experts", None) is not None:
+        return sw.gate_proj, sw.up_proj, sw.oqh_rotated_input(x2)
+    if "gate_up_proj" in sw:
+        return sw.gate_up_proj, None, None
+    return sw.gate_proj, sw.up_proj, None
+
+
+def _routed_act(sw, act, top_k):
+    """oQh experts read the routed activations in their down projection's basis."""
+    if getattr(sw, "oqh_experts", None) is None:
+        return None
+    return sw.down_proj.rotate(act[:, :top_k])
 
 
 def _switch_projections(sw):
@@ -593,7 +610,8 @@ class Glm5NextLinearAttention(nn.Module):
         return mx.concatenate([outs[g][..., a:b] for g, a, b in runs], axis=-1)
 
     def _decode_step(self, inputs, mask, cache, capture=None):
-        """Fused layer body for one sequence and S <= 8 tokens (bit-identical).
+        """Fused layer body for one sequence and S <= 8 tokens (bit-identical),
+        or a batch decode step of up to 8 one-token rows.
 
         One kernel (``decode_kernels.kda_decode_step``) replaces the conv,
         SiLU, l2norm, gate projections, delta rule and RMSNormGated ops
@@ -608,8 +626,10 @@ class Glm5NextLinearAttention(nn.Module):
         fg = self.forget_gate
         if (
             not _DECODE_FUSION
-            or B != 1
             or not 1 <= S <= _DECODE_BLOCK
+            # Batched verify keeps the reference body: rollback_rows replays
+            # its capture tuple.
+            or (B > 1 and (S > 1 or capture is not None or B > _DECODE_BLOCK))
             or mask is not None
             or cache is None
             or getattr(cache, "lengths", None) is not None
@@ -2264,18 +2284,19 @@ class Glm5NextMoE(nn.Module):
         )
         if logits is None:
             return None
-        if "gate_up_proj" in sw:
-            routed_gate, routed_up = sw.gate_up_proj, None
-        else:
-            routed_gate, routed_up = sw.gate_proj, sw.up_proj
+        routed_gate, routed_up, x_rot = _routed_projections(sw, x2)
         fused = dk.moe_gate_up_swiglu(
             x2, None, limit, routed_gate, routed_up, shared.gate_proj, shared.up_proj,
             select=(*logits, gate.top_k, gate.routed_scaling_factor, gate.norm_topk_prob),
+            x_rot=x_rot,
         )
         if fused is None:
             return None
         act, routes, weights = fused
-        y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
+        y = dk.moe_down_combine(
+            act, routes, weights, sw.down_proj, shared.down_proj,
+            act_rot=_routed_act(sw, act, gate.top_k),
+        )
         return None if y is None else y.reshape(x.shape)
 
     def _decode_experts(self, x, indices, scores):
@@ -2303,12 +2324,6 @@ class Glm5NextMoE(nn.Module):
             )
         ):
             return None
-        # Separate gate/up projections, or one fused [gate; up] gate_up_proj
-        # (MoE gate/up fusion); the kernels read either layout in place.
-        if "gate_up_proj" in sw:
-            routed_gate, routed_up = sw.gate_up_proj, None
-        else:
-            routed_gate, routed_up = sw.gate_proj, sw.up_proj
         limit = getattr(sw.activation, "limit", None)
         if limit is None or (shared is not None and shared.limit != limit):
             return None
@@ -2316,15 +2331,22 @@ class Glm5NextMoE(nn.Module):
         x2 = x.reshape(T, D)
         routes = indices.reshape(T, -1).astype(mx.uint32)
         weights = scores.reshape(T, -1)
+        top_k = routes.shape[1]
         dk = _decode_kernels
+        # Separate gate/up projections, or one fused [gate; up] gate_up_proj
+        # (MoE gate/up fusion); the kernels read either layout in place.
+        routed_gate, routed_up, x_rot = _routed_projections(sw, x2)
         if shared is not None and T == 1:
             act = dk.moe_gate_up_swiglu(
                 x2, routes, limit, routed_gate, routed_up,
-                shared.gate_proj, shared.up_proj,
+                shared.gate_proj, shared.up_proj, x_rot=x_rot,
             )
             if act is None:
                 return None
-            y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
+            y = dk.moe_down_combine(
+                act, routes, weights, sw.down_proj, shared.down_proj,
+                act_rot=_routed_act(sw, act, top_k),
+            )
         else:
             fused = None
             # A shared projection on an armed verify route leaves the
@@ -2337,15 +2359,16 @@ class Glm5NextMoE(nn.Module):
                 # the multi-row qmv_wide arithmetic its own T > 1 call uses.
                 fused = dk.moe_gate_up_swiglu(
                     x2, routes, limit, routed_gate, routed_up,
-                    shared.gate_proj, shared.up_proj, shared_wide=True,
+                    shared.gate_proj, shared.up_proj, shared_wide=True, x_rot=x_rot,
                 )
             if fused is not None:
                 act, shared_act = fused
+                act_rot = _routed_act(sw, act, top_k)
                 # The shared expert's down projection (qmv_wide rows) folds
                 # into the combine kernel when covered.
                 y = dk.moe_down_combine(
                     act, routes, weights, sw.down_proj, shared.down_proj,
-                    shared_act=shared_act,
+                    shared_act=shared_act, act_rot=act_rot,
                 )
                 if y is not None:
                     return y.reshape(x.shape)
@@ -2353,11 +2376,16 @@ class Glm5NextMoE(nn.Module):
                     shared.down_proj, shared_act.reshape(1, T, -1)
                 ).reshape(T, D)
             else:
-                act = dk.moe_gate_up_swiglu(x2, routes, limit, routed_gate, routed_up)
+                act = dk.moe_gate_up_swiglu(
+                    x2, routes, limit, routed_gate, routed_up, x_rot=x_rot
+                )
                 if act is None:
                     return None
+                act_rot = _routed_act(sw, act, top_k)
                 shared_y = None if shared is None else shared(x).reshape(T, D)
-            y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared_y=shared_y)
+            y = dk.moe_down_combine(
+                act, routes, weights, sw.down_proj, shared_y=shared_y, act_rot=act_rot
+            )
         return None if y is None else y.reshape(x.shape)
 
 
@@ -2387,6 +2415,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.compile_ffn = True
         self._ffn_c = None
         self._ffn_rc = None
+        self._ffn_vc = None
         self._ffn_dc = None
         self._ffn_eager_shapes = set()
 
@@ -2415,25 +2444,39 @@ class Glm5NextDecoderLayer(nn.Module):
             xn, post, comb = fused
         r = self.self_attn(xn, mask, cache)
         x = _decode_hc_expand(r, residual, post, comb)
-        # Short verification shares the decode compiler; prefill remains eager.
-        if self.compile_ffn and x.shape[0] == 1 and 1 <= x.shape[1] <= _DECODE_BLOCK:
-            # A trace keeps the row-exact branches it was traced with, so each
-            # mode compiles its own.
-            exact = _row_exact_armed()
-            shape = (x.shape, x.dtype, exact)
-            if x.shape[1] > 1 and shape not in self._ffn_eager_shapes:
-                # Prime bitwise kernel checks once per verification shape;
-                # they cannot evaluate their canaries inside a compiled trace.
-                self._ffn_eager_shapes.add(shape)
-                return self._ffn_block(x)
-            if exact:
-                if self._ffn_rc is None:
-                    self._ffn_rc = mx.compile(self._ffn_block)
-                return self._ffn_rc(x)
+        return self._ffn_half(x)
+
+    def _ffn_half(self, x: mx.array) -> mx.array:
+        # Blocks of B * L <= 8 tokens (decode, short verification and batch
+        # decode) share the decode compiler; prefill remains eager.
+        B, L = x.shape[:2]
+        if not self.compile_ffn or not 1 <= B * L <= _DECODE_BLOCK:
+            return self._ffn_block(x)
+        # The FFN half is token-wise, so batch rows run as one block on the
+        # fused kernels.
+        rows = x.reshape(1, B * L, *x.shape[2:])
+        # A trace keeps the verify routes it was traced with, so each mode
+        # compiles its own.
+        exact, armed = _row_exact_armed(), _verify_qmm_armed()
+        shape = (rows.shape, rows.dtype, exact, armed)
+        if B * L > 1 and shape not in self._ffn_eager_shapes:
+            # Prime bitwise kernel checks once per verification shape;
+            # they cannot evaluate their canaries inside a compiled trace.
+            self._ffn_eager_shapes.add(shape)
+            return self._ffn_block(rows).reshape(x.shape)
+        if exact:
+            if self._ffn_rc is None:
+                self._ffn_rc = mx.compile(self._ffn_block)
+            fn = self._ffn_rc
+        elif armed:
+            if self._ffn_vc is None:
+                self._ffn_vc = mx.compile(self._ffn_block)
+            fn = self._ffn_vc
+        else:
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
-            return self._ffn_c(x)
-        return self._ffn_block(x)
+            fn = self._ffn_c
+        return fn(rows).reshape(x.shape)
 
     def _ffn_block(self, x: mx.array) -> mx.array:
         # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.

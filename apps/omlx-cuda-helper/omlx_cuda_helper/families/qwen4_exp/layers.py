@@ -16,6 +16,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from ... import checkpoint, oqh
 from ...tensors import from_host, unpack
 from ...wire import HostArray
 from . import kernels
@@ -28,6 +29,9 @@ from .ops import (
     stream_norm,
     unit_scale,
 )
+
+# Relative error the oQh expert kernel may have against the experts rebuilt dense.
+_OQH_EXPERT_ERROR = 3e-3
 
 
 def checked_conv(taps: mx.array, dilation: int, dtype: mx.Dtype):
@@ -382,6 +386,11 @@ class MoE:
         self.shared_down = w.linear("shared_expert.down_proj")
         self.shared_scale = w.linear("shared_expert_gate")
         banks = w.at("switch_mlp")
+        # oQh banks: (signs, block) of the rotated inputs of gate | up and down.
+        self.oqh = f"gate_proj.{checkpoint.OQH_SIGNS}" in banks
+        if self.oqh:
+            self.in_rotation = self._rotation(banks, ("gate_proj", "up_proj"))
+            self.down_rotation = self._rotation(banks, ("down_proj",))
         # Gate and up share their input rows: one gather computes both.
         self.gate_up = self._bank(banks, ("gate_proj", "up_proj"))
         self.down = self._bank(banks, ("down_proj",))
@@ -391,11 +400,36 @@ class MoE:
         self.expert_kernel = False
 
     @staticmethod
+    def _rotation(w: Weights, names: tuple[str, ...]) -> tuple[mx.array, int]:
+        """(signs, block) the projections of one input share."""
+        signs = [w[f"{name}.{checkpoint.OQH_SIGNS}"] for name in names]
+        if any(not mx.array_equal(s, signs[0]).item() for s in signs[1:]):
+            raise ValueError(f"oQh {', '.join(names)} read differently rotated inputs")
+        return signs[0], int(signs[0].shape[-1])
+
+    @staticmethod
     def _bank(w: Weights, names: tuple[str, ...]) -> tuple:
         """(weight, scales, biases, quantization) of expert projections.
 
         Several projections of the same input are joined along their outputs.
+        An oQh bank of row scales has biases None and group size 0.
         """
+        if f"{names[0]}.{checkpoint.OQH_SIGNS}" in w:
+            group = f"{names[0]}.oqh_scales" in w
+            parts = (
+                ("weight", "oqh_scales", "oqh_biases")
+                if group
+                else ("weight", "rscale")
+            )
+            joined = [
+                mx.concatenate([w[f"{name}.{part}"] for name in names], axis=1)
+                for part in parts
+            ]
+            inputs = w[f"{names[0]}.{checkpoint.OQH_SIGNS}"].size
+            bits = joined[0].shape[-1] * 32 // inputs
+            size = inputs // joined[1].shape[-1] if group else 0
+            quant = {"bits": bits, "group_size": size, "mode": "affine", "oqh": True}
+            return joined[0], joined[1], joined[2] if group else None, quant
         if f"{names[0]}.scales" not in w:
             # Dense banks are stored [experts, out, in]; gather_mm wants in first.
             parts = [w[f"{name}.weight"].swapaxes(-1, -2) for name in names]
@@ -448,8 +482,11 @@ class MoE:
         widths = ((self.gate_up, x.shape[1]), (self.down, self.inner))
         if (
             dtype == mx.bfloat16
-            and self.swiglu is not None
-            and all(kernels.expert_gemm_fits(bank, width) for bank, width in widths)
+            and (self.oqh or self.swiglu is not None)
+            and all(
+                kernels.expert_gemm_fits(bank, width, self.oqh)
+                for bank, width in widths
+            )
         ):
             self.expert_kernel = self._experts_match(dtype)
 
@@ -460,13 +497,31 @@ class MoE:
         than a launch block holds at once.
         """
         tokens, count = 256, self.gate_up[0].shape[0]
-        x = mx.random.normal((1, tokens, self.router.weight.shape[1])).astype(dtype)
-        others = mx.random.randint(1, count, (1, tokens, self.top_k - 1))
+        keys = mx.random.split(mx.random.key(11), 2)
+        width = self.router.weight.shape[1]
+        x = mx.random.normal((1, tokens, width), key=keys[0]).astype(dtype)
+        # The oQh reference rebuilds the experts in use dense: keep them few.
+        spread = min(count, 4 * self.top_k) if self.oqh else count
+        others = mx.random.randint(1, spread, (1, tokens, self.top_k - 1), key=keys[1])
         chosen = mx.concatenate([mx.zeros((1, tokens, 1), mx.int32), others], -1)
         self.expert_kernel = False
         want = self.experts(x, chosen)[0]
         self.expert_kernel = True
-        if mx.array_equal(self.experts(x, chosen)[0], want).item():
+        got = self.experts(x, chosen)[0]
+        if self.oqh:
+            # The reference rebuilds the experts dense and sums in another
+            # order, and the rotations spread each rounding over a block: only
+            # the error counts, bounded as for the other families' experts.
+            a, b = got.astype(mx.float32), want.astype(mx.float32)
+            error = (mx.linalg.norm(a - b) / mx.linalg.norm(b)).item()
+            if error <= _OQH_EXPERT_ERROR:
+                return True
+            kernels.logger.warning(
+                "oQh expert kernel differs from its reference by %.2e; using it", error
+            )
+            self.expert_kernel = False
+            return False
+        if mx.array_equal(got, want).item():
             return True
         kernels.logger.warning("Expert kernel differs; using gather_qmm")
         return False
@@ -475,6 +530,8 @@ class MoE:
     def _gather(x: mx.array, bank: tuple, experts: mx.array) -> mx.array:
         """Rows [n, 1, in] through each row's expert; ``experts`` is sorted."""
         weight, scales, biases, quant = bank
+        if quant is not None and quant.get("oqh"):
+            return oqh.bank_gather(x, bank, experts)
         if quant is None:
             return mx.gather_mm(x, weight, rhs_indices=experts, sorted_indices=True)
         return mx.gather_qmm(
@@ -517,13 +574,20 @@ class MoE:
         order = mx.argsort(flat)
         ids = flat[order].astype(mx.uint32)
         rows = x.reshape(x.shape[1], -1)
+        if self.oqh:
+            rows = oqh.rotate(rows, *self.in_rotation)
         # gather_qmm takes its sorted expert kernel, whose sums this kernel
-        # reproduces, from four routes an expert on.
-        if self.expert_kernel and ids.shape[0] >= 4 * self.gate_up[0].shape[0]:
+        # reproduces, from four routes an expert on. oQh banks take the
+        # kernel at any count: gather_qmm has no form for some of them.
+        count = self.gate_up[0].shape[0]
+        if self.expert_kernel and (self.oqh or ids.shape[0] >= 4 * count):
             # Each route reads its token's row; gate, up and SwiGLU in one launch.
             src = (order // k).astype(mx.uint32)
-            offsets = kernels.expert_offsets(ids, self.gate_up[0].shape[0])
-            hidden = kernels.expert_gemm(rows, self.gate_up, offsets, src, swiglu=True)
+            offsets = kernels.expert_offsets(ids, count)
+            act = 2 if self.oqh else 1
+            hidden = kernels.expert_gemm(rows, self.gate_up, offsets, src, act=act)
+            if self.oqh:
+                hidden = oqh.rotate(hidden, *self.down_rotation, dtype=rows.dtype)
             y = kernels.expert_gemm(hidden, self.down, offsets)
             return y[:, None], mx.argsort(order)
         if self.gather is not None:
@@ -531,7 +595,12 @@ class MoE:
         else:
             routed = rows[order // k][:, None]
         both = self._gather(routed, self.gate_up, ids)
-        hidden = (self.swiglu or self._swiglu)(both)
+        if self.oqh:
+            inner = both.shape[-1] // 2
+            gate, up = both[..., :inner], both[..., inner:]
+            hidden = oqh.act_rotate(gate, up, *self.down_rotation)
+        else:
+            hidden = (self.swiglu or self._swiglu)(both)
         return self._gather(hidden, self.down, ids), mx.argsort(order)
 
     def combined(self, y: mx.array, positions: mx.array, scores: mx.array) -> mx.array:
