@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused MoE routing and combine for Flint decode and speculative verify.
+"""Fused MoE routing and combine for Flint decode and short blocks.
 
 Flint's MoE block (mlx-vlm ``models/flint``) routes with a sigmoid over 256
 expert logits, adds a selection-only bias, takes the top 6 and renormalizes
@@ -10,13 +10,12 @@ multiply, k-sum, cast, shared add, residual add) about six more. Across 47
 MoE layers these launches are pure overhead: measured ~1.7 ms of an
 ~11 ms decode step on M4 Max for a router whose weights are 1 MB a layer.
 
-This patch runs one-token MoE layers, and the few rows that a speculative
-verify forward or a small decode batch carries (up to ``_MAX_ROWS``), as:
+This patch runs MoE layers of up to ``_MAX_ROWS`` token rows (decode steps,
+verify blocks and short prefill tails) as:
 
 1. the gate linear (unchanged),
 2. one router launch: precise sigmoid (MLX's ``Sigmoid`` formula), bias add,
-   top-k by repeated threadgroup argmax, renormalization in fp32 (one
-   threadgroup per row),
+   top-k by repeated threadgroup argmax, renormalization in fp32,
 3. the routed experts and shared expert (unchanged modules),
 4. one combine launch: fp32 score-weighted k-sum rounded to the activation
    dtype, plus the shared expert, plus the residual, with the stock
@@ -27,11 +26,8 @@ ties of ``sigmoid + bias``. Those are common: the gate logits are bf16
 and the shipped bias is zero, so ties resolve to the highest expert index,
 mlx argpartition's pinned behavior at this shape. The
 k-sums run in selection order rather than argpartition's, so outputs can
-differ from the composed path by reduction-order rounding. A verify row runs
-the same router and combine arithmetic as the one-token step that would
-decode it, and a DFlash verify of 2-5 rows saves ~1 ms a forward on M5 Pro
-(flint oQ6e, 47 MoE layers). Batched decode and verify rows (up to
-``_MAX_ROWS`` in all) route the same way, row by row. Prefill chunks keep the
+differ from the composed path by reduction-order rounding. Each row routes on
+its own, so a row gets the same result in any block. Longer blocks keep the
 original body.
 """
 
@@ -47,8 +43,6 @@ logger = logging.getLogger(__name__)
 _ROUTER_THREADS = 256
 _MAX_EXPERTS = 1024
 _MAX_TOP_K = 16
-# Rows routed by the fused kernels: a speculative verify block, or the one-token
-# rows (or verify blocks) of a few batched sequences.
 _MAX_ROWS = 16
 
 _ROUTER_SOURCE = """
@@ -79,7 +73,8 @@ _ROUTER_SOURCE = """
         int bi = -1;
         for (int e = int(t); e < E; e += TG) {
             float v = choice[e];
-            if (v >= bv) { bv = v; bi = e; }
+            // Not (v >= bv): a NaN row still picks in-range experts.
+            if (!(v < bv)) { bv = v; bi = e; }
         }
         for (ushort off = 16; off > 0; off >>= 1) {
             float ov = simd_shuffle_xor(bv, off);
@@ -152,12 +147,11 @@ def _combine_kernel():
 def fused_router(logits: mx.array, bias: mx.array, top_k: int):
     """Top-k sigmoid routing of every row of ``logits (..., E)``.
 
-    Returns ``(indices uint32, weights f32)`` shaped ``logits.shape[:-1] + (K,)``
-    (``(K,)`` for one row).
+    Returns ``(indices uint32, weights f32)`` shaped ``logits.shape[:-1] + (K,)``.
     """
     num_experts = logits.shape[-1]
     rows = logits.size // num_experts
-    lead = tuple(logits.shape[:-1]) if rows > 1 else ()
+    lead = tuple(logits.shape[:-1])
     indices, weights = _router_kernel()(
         inputs=[logits.reshape(rows, num_experts), bias],
         template=[("E", num_experts), ("K", top_k), ("TG", _ROUTER_THREADS)],
@@ -170,11 +164,7 @@ def fused_router(logits: mx.array, bias: mx.array, top_k: int):
 
 
 def fused_combine(routed, weights, shared, residual):
-    """``residual + ((routed * weights).sum(-2) + shared)`` with stock roundings.
-
-    ``routed`` is ``(..., rows, K, D)``, ``weights`` ``(rows, K)`` (or ``(K,)``),
-    ``shared`` and ``residual`` ``(..., rows, D)``.
-    """
+    """``residual + ((routed * weights).sum(-2) + shared)`` with stock roundings."""
     dim = residual.shape[-1]
     rows = residual.size // dim
     top_k = weights.shape[-1]
@@ -188,15 +178,7 @@ def fused_combine(routed, weights, shared, residual):
     )[0]
 
 
-def _one_token(x) -> bool:
-    return x.ndim == 3 and x.shape[0] * x.shape[1] == 1
-
-
 def _fused_rows(x) -> bool:
-    """Up to ``_MAX_ROWS`` token rows: one token, a speculative verify block, or
-    the decode / verify rows of a small batch (every row routes on its own).
-    The gate is the row count, so the last prefill chunk of a single sequence
-    also takes this path when it has ``_MAX_ROWS`` tokens or fewer (same result)."""
     return x.ndim == 3 and 1 <= x.shape[0] * x.shape[1] <= _MAX_ROWS
 
 
@@ -210,11 +192,11 @@ def _moe_eligible(mlp, x) -> bool:
 
 
 def apply_flint_decode_patch() -> bool:
-    """Route one-token and verify-block Flint MoE layers through the fused
-    router and combine.
+    """Route Flint MoE layers of up to ``_MAX_ROWS`` token rows through the
+    fused router and combine.
 
     Wraps ``DecoderLayer.__call__`` so the residual add folds into the
-    combine launch; dense-MLP layers and prefill chunks keep the original body.
+    combine launch; dense-MLP layers and longer blocks keep the original body.
     """
     if not mx.metal.is_available():
         return False
