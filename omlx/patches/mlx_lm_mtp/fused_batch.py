@@ -84,6 +84,80 @@ def _supports_batch_rollback_all(caches):
     return all(_supports_batch_rollback(c) for c in caches)
 
 
+def _mixed_row_ends(leaf):
+    """Each row's written end in one attention layer of a mixed batch, or None.
+
+    A quantized ragged-trim cache keeps each row at its own end. A plain batch
+    KV cache with a deferred tail (``qwen35_deferred_realign``) keeps row ``r``
+    ending at ``_idx - tail[r]``; without a tail every row ends at ``_idx``.
+    """
+    if getattr(type(leaf), "_omlx_ragged_trim", False):
+        return tuple(leaf._ends())
+    if type(leaf) is BatchKVCache or (
+        vlm_cache is not None and type(leaf) is vlm_cache.BatchKVCache
+    ):
+        end = int(leaf._idx)
+        tail = getattr(leaf, "__dict__", {}).get("_omlx_tail")
+        if tail and any(tail):
+            return tuple(end - t for t in tail)
+        rows = getattr(leaf, "offset", None)
+        count = int(rows.shape[0]) if hasattr(rows, "shape") and rows.ndim else 1
+        return tuple([end] * count)
+    return None
+
+
+def _mixed_rows_agree(caches) -> bool:
+    """Whether every attention layer of a mixed batch ends each row at the
+    same column, so the one mask the model builds fits all of them."""
+    layouts = set()
+    for leaf in _cache_leaves(caches):
+        ends = _mixed_row_ends(leaf)
+        if ends is not None:
+            layouts.add(ends)
+            if len(layouts) > 1:
+                return False
+    return True
+
+
+def _align_mixed_rows_if_needed(caches) -> bool:
+    """Realign a mixed batch only when its layers disagree on the row ends.
+
+    The quantized layers keep ragged ends after a per-row rollback and the plain
+    layer keeps the same ends as a deferred tail, so most cycles move nothing.
+    They disagree when the plain layer realigns (its tail grew past the bound,
+    or a filter/extend/outside read realigned it); then every layer is
+    realigned once.
+    """
+    if _mixed_rows_agree(caches):
+        _trim_common_tail(caches)
+        return False
+    _align_mixed_rows(caches)
+    return True
+
+
+def _trim_common_tail(caches) -> None:
+    """Drop the part of a plain layer's deferred tail that every row shares.
+
+    When every row's tail is at least ``m``, the last ``m`` columns of the bank
+    are dropped tokens of every row. Ending the bank at the longest row keeps
+    its width equal to the quantized layers', which the shared mask assumes.
+    Each row still ends at the same column.
+    """
+    for leaf in _cache_leaves(caches):
+        tail = getattr(leaf, "__dict__", {}).get("_omlx_tail")
+        if not tail:
+            continue
+        common = min(tail)
+        if common <= 0:
+            continue
+        leaf._idx = int(leaf._idx) - common
+        rest = [t - common for t in tail]
+        if any(rest):
+            leaf.__dict__["_omlx_tail"] = rest
+        else:
+            leaf.__dict__.pop("_omlx_tail", None)
+
+
 def _align_mixed_rows(caches):
     """End every row at the last column again, in every attention layer.
 
@@ -317,6 +391,10 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     whole_batch = cache is not None
     if cache is None:
         cache = bg._merge_row_caches([row.prompt_cache for _, row, _ in rows])
+    if whole_batch and _ragged_mixed_with_plain_kv(cache):
+        # A filter, extend or outside read between cycles may have realigned
+        # the plain layer while the quantized layers kept ragged ends.
+        _align_mixed_rows_if_needed(cache)
     uids = [state.uid for _, _, state in rows]
     bg._set_batched_mrope_deltas(batch, uids)
     inputs = mx.stack(
@@ -434,7 +512,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         with _ragged_trim_rows(cache, accepted_rows, depth):
             batch.model.rollback_speculative_cache(cache, gdn, accepted_rows, depth + 1)
         if _ragged_mixed_with_plain_kv(cache):
-            _align_mixed_rows(cache)
+            _align_mixed_rows_if_needed(cache)
         commit_ms = (time.perf_counter() - started) * 1000 / len(rows)
         for (index, row, _), (_, finish) in zip(rows, deferred):
             bg._set_singleton_mrope_delta(row)
