@@ -27,7 +27,6 @@ directly skips it and calls the module instead.
 
 from __future__ import annotations
 
-import functools
 import logging
 import os
 import re
@@ -37,7 +36,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..utils.hardware import get_gpu_core_count
+from ..custom_kernels import nax_skinny_qmm
 
 logger = logging.getLogger(__name__)
 
@@ -309,164 +308,6 @@ _GEMM_SOURCE = """
 """
 
 
-_SKINNY_SOURCE = """
-    // Verify-width rows (9..48) against a packed weight, reading every weight
-    // once. A threadgroup owns 32 output columns and all rows; its S
-    // simdgroups split K by quant group (interleaved) and meet in threadgroup
-    // memory. Each simdgroup issues 16x32x16 tensor ops: x rows on the left
-    // (16 rows per fragment), the dequantized weight rows as the transposed
-    // right operand.
-    //
-    // Inside a 64-wide quant group, K is permuted so a lane's 16 codes of a
-    // weight row are one 8-byte load: logical column fn + c of K step j is
-    // physical column 16 * (fn / 4) + 4 * j + c, for x and w alike, so the
-    // dot products are unchanged. Dequantization matches the GEMM: fp32
-    // scale * q + bias rounded once to bfloat.
-    using namespace mlx::steel;
-    using Frag = BaseNAXFrag;
-    constexpr int GROUPS = K / 64;
-
-    const int M = x_shape[0];
-    const int sg = int(simdgroup_index_in_threadgroup);
-    const uint lane = thread_index_in_simdgroup;
-    const short2 coord = Frag::get_coord();
-    const int fm = coord.y;
-    const int fn = coord.x;
-    const int q4 = fn >> 2;
-    const int n0 = int(threadgroup_position_in_grid.x) * 32;
-
-    // This lane's weight rows: columns n0 + 16 f + fm + 8 i of the packed tile.
-    const device uint* wrow[2][2];
-    const device bfloat* srow[2][2];
-    const device bfloat* brow[2][2];
-    STEEL_PRAGMA_UNROLL
-    for (int f = 0; f < 2; ++f) {
-        STEEL_PRAGMA_UNROLL
-        for (int i = 0; i < 2; ++i) {
-            const int n = n0 + 16 * f + fm + 8 * i;
-            const ulong tile = ulong(n / TILE_N);
-            const int col = n % TILE_N;
-            wrow[f][i] = (const device uint*)w + (tile * GROUPS * TILE_N + col) * 8 + 2 * q4;
-            srow[f][i] = sc + tile * GROUPS * TILE_N + col * 4;
-            brow[f][i] = bi + tile * GROUPS * TILE_N + col * 4;
-        }
-    }
-    const device bfloat* xrow[RF][2];
-    STEEL_PRAGMA_UNROLL
-    for (int t = 0; t < RF; ++t) {
-        STEEL_PRAGMA_UNROLL
-        for (int i = 0; i < 2; ++i) {
-            xrow[t][i] = x + ulong(min(16 * t + fm + 8 * i, M - 1)) * K + 16 * q4;
-        }
-    }
-
-    Frag::dtype_frag_t<float> acc[RF][2];
-    STEEL_PRAGMA_UNROLL
-    for (int t = 0; t < RF; ++t) {
-        acc[t][0] = Frag::dtype_frag_t<float>(0);
-        acc[t][1] = Frag::dtype_frag_t<float>(0);
-    }
-
-    for (int g = sg; g < GROUPS; g += S) {
-        uint2 wv[2][2];
-        float s[2][2];
-        float b[2][2];
-        const int at = (g >> 2) * TILE_N * 4 + (g & 3);
-        STEEL_PRAGMA_UNROLL
-        for (int f = 0; f < 2; ++f) {
-            STEEL_PRAGMA_UNROLL
-            for (int i = 0; i < 2; ++i) {
-                wv[f][i] = *(const device uint2*)(wrow[f][i] + g * TILE_N * 8);
-                s[f][i] = float(srow[f][i][at]);
-                b[f][i] = float(brow[f][i][at]);
-            }
-        }
-        STEEL_PRAGMA_UNROLL
-        for (int j = 0; j < 4; ++j) {
-            Frag::dtype_frag_t<bfloat> A[RF];
-            STEEL_PRAGMA_UNROLL
-            for (int t = 0; t < RF; ++t) {
-                STEEL_PRAGMA_UNROLL
-                for (int i = 0; i < 2; ++i) {
-                    const vec<bfloat, 4> xv =
-                        *(const device vec<bfloat, 4>*)(xrow[t][i] + 64 * g + 4 * j);
-                    STEEL_PRAGMA_UNROLL
-                    for (int c = 0; c < 4; ++c) {
-                        A[t][4 * i + c] = xv[c];
-                    }
-                }
-            }
-            Frag::dtype_frag_t<bfloat> B[2];
-            STEEL_PRAGMA_UNROLL
-            for (int f = 0; f < 2; ++f) {
-                STEEL_PRAGMA_UNROLL
-                for (int i = 0; i < 2; ++i) {
-                    const uint word = (j & 2) ? wv[f][i].y : wv[f][i].x;
-                    STEEL_PRAGMA_UNROLL
-                    for (int c = 0; c < 4; ++c) {
-                        const uint q = (word >> (4 * (4 * (j & 1) + c))) & 0xFu;
-                        B[f][4 * i + c] = static_cast<bfloat>(fma(s[f][i], float(q), b[f][i]));
-                    }
-                }
-            }
-            STEEL_PRAGMA_UNROLL
-            for (int t = 0; t < RF; ++t) {
-                Frag::mma(
-                    acc[t][0], acc[t][1], A[t], metal::false_type{},
-                    B[0], B[1], metal::true_type{});
-            }
-        }
-    }
-
-    // Sum the S partials one 16-row fragment at a time (bounded threadgroup
-    // memory for every RF) and store from simdgroup 0.
-    threadgroup float red[(S > 1 ? S - 1 : 1) * 2 * 8 * 32];
-    STEEL_PRAGMA_UNROLL
-    for (int t = 0; t < RF; ++t) {
-        if (S > 1) {
-            if (sg > 0) {
-                STEEL_PRAGMA_UNROLL
-                for (int f = 0; f < 2; ++f) {
-                    STEEL_PRAGMA_UNROLL
-                    for (int e = 0; e < 8; ++e) {
-                        red[(((sg - 1) * 2 + f) * 8 + e) * 32 + lane] = acc[t][f][e];
-                    }
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
-                for (int o = 0; o < S - 1; ++o) {
-                    STEEL_PRAGMA_UNROLL
-                    for (int f = 0; f < 2; ++f) {
-                        STEEL_PRAGMA_UNROLL
-                        for (int e = 0; e < 8; ++e) {
-                            acc[t][f][e] += red[((o * 2 + f) * 8 + e) * 32 + lane];
-                        }
-                    }
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (sg == 0) {
-            STEEL_PRAGMA_UNROLL
-            for (int i = 0; i < 2; ++i) {
-                const int r = 16 * t + fm + 8 * i;
-                if (r < M) {
-                    device bfloat* yp = y + ulong(r) * N + n0 + fn;
-                    STEEL_PRAGMA_UNROLL
-                    for (int f = 0; f < 2; ++f) {
-                        STEEL_PRAGMA_UNROLL
-                        for (int c = 0; c < 4; ++c) {
-                            yp[16 * f + c] = static_cast<bfloat>(acc[t][f][4 * i + c]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-"""
-
-
 def _steel_header() -> str:
     """MLX's steel NAX tile headers, inlined for a JIT kernel."""
     root = os.path.join(
@@ -513,13 +354,6 @@ def _kernels():
             header=_steel_header(),
             source=_GEMM_SOURCE,
         )
-        _KERNELS["skinny"] = mx.fast.metal_kernel(
-            name="omlx_qwen35_packed_skinny",
-            input_names=["x", "w", "sc", "bi"],
-            output_names=["y"],
-            header=_steel_header(),
-            source=_SKINNY_SOURCE,
-        )
     return _KERNELS
 
 
@@ -555,63 +389,15 @@ def _gemm_tile(M: int) -> tuple[int, int, int, int]:
     return 128, 64, 2, 2
 
 
-# The skinny K split is the largest power of two up to 8 that keeps 32-column
-# threadgroups x split within this many simdgroups per GPU core (tuned on M5).
-_SKINNY_SIMDGROUPS_PER_CORE = 16
-
-# Core count assumed when it cannot be read (M5 Max). It changes speed, not results.
-_FALLBACK_GPU_CORES = 32
-
-
-@functools.cache
-def _gpu_cores() -> int:
-    cores = get_gpu_core_count()
-    if cores:
-        return cores
-    logger.warning(
-        "GPU core count unavailable; sizing the skinny kernel's K split for %d cores",
-        _FALLBACK_GPU_CORES,
-    )
-    return _FALLBACK_GPU_CORES
-
-
 # Up to 8 rows the small kernel stays: it applies scale and bias after the code
 # dot product, so it rounds less. From 64 rows the GEMM can be faster.
-_SKINNY_MAX_ROWS = 48
-
-
-@functools.cache
-def _skinny_split(N: int) -> int:
-    """Simdgroups splitting K in a skinny threadgroup, from the shape alone.
-
-    Every row count of a shape uses the same split, so a row's result does not
-    depend on how many rows share the call.
-    """
-    budget = _SKINNY_SIMDGROUPS_PER_CORE * _gpu_cores()
-    split = 1
-    while split < 8 and (N // 32) * split * 2 <= budget:
-        split *= 2
-    return split
+_SKINNY_MAX_ROWS = nax_skinny_qmm.MAX_ROWS
 
 
 def _skinny(x2: mx.array, w, sc, bi, K: int, N: int) -> mx.array:
-    M = int(x2.shape[0])
-    s = _skinny_split(N)
-    (y,) = _kernels()["skinny"](
-        inputs=[x2, w, sc, bi],
-        template=[
-            ("K", K),
-            ("N", N),
-            ("TILE_N", TILE_N),
-            ("RF", -(-M // 16)),
-            ("S", s),
-        ],
-        grid=(32 * s * (N // 32), 1, 1),
-        threadgroup=(32 * s, 1, 1),
-        output_shapes=[(M, N)],
-        output_dtypes=[mx.bfloat16],
+    return nax_skinny_qmm.skinny_qmm(
+        x2, w, sc, bi, K, N, bits=4, packed=True, tile_n=TILE_N
     )
-    return y
 
 
 def packed_matmul(x2: mx.array, w, sc, bi, K: int, N: int) -> mx.array:
