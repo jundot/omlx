@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -64,6 +64,9 @@ class _TieredExactPrefixCache:
         self.tokens: list[int] | None = None
         self.layer_states: list[dict[str, Any]] | None = None
         self.restore_promotions: list[bool] = []
+        # Whether each restore ran inside the target-model stream context.
+        self.restore_in_stream: list[bool] = []
+        self.trace: dict[str, Any] | None = None
 
     def restore_exact_prefix(
         self,
@@ -74,6 +77,8 @@ class _TieredExactPrefixCache:
     ) -> list[Any] | None:
         del request_id
         self.restore_promotions.append(promote_to_hot_cache)
+        if self.trace is not None:
+            self.restore_in_stream.append(self.trace["stream_depth"] > 0)
         if tokens != self.tokens or self.layer_states is None:
             return None
         restored_layers = [_CacheLayer() for _ in self.layer_states]
@@ -162,6 +167,7 @@ def _run(
         "evaluations": [],
         "sparse_calls": [],
         "sparse_progress": [],
+        "stream_depth": 0,
         "streams": [],
         "syncs": [],
         "system_progress": [],
@@ -202,10 +208,18 @@ def _run(
         trace["rope"] = rope
         kwargs["progress_callback"](0, len(tokens))
 
+    @contextmanager
     def use_stream(selected_stream: Any):
         assert selected_stream is stream
         trace["streams"].append(selected_stream)
-        return nullcontext()
+        trace["stream_depth"] += 1
+        try:
+            yield
+        finally:
+            trace["stream_depth"] -= 1
+
+    if exact_prefix_cache is not None:
+        exact_prefix_cache.trace = trace
 
     with (
         patch.object(target_workflow, "make_prompt_cache", return_value=prompt_cache),
@@ -423,6 +437,7 @@ def test_github_2177_restores_static_prefix_from_tiered_cache():
     assert warm_trace["model"].calls == []
     assert warm_result.static_prefix_cached_tokens == len(static_prefix_tokens)
     assert exact_prefix_cache.restore_promotions == [True, False]
+    assert exact_prefix_cache.restore_in_stream == [True, True]
     assert "system 5 static-cached" in warm_logger.info_messages[-1]
 
 

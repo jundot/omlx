@@ -5465,7 +5465,7 @@ async def create_chat_completion(
             # Process response_format if specified
             if response_format and not tool_calls:
                 cleaned_text, _, is_valid, error = parse_json_output(
-                    cleaned_text or regular_content, response_format
+                    cleaned_text, response_format
                 )
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
@@ -9131,7 +9131,7 @@ async def create_response(
             # Process response_format if specified
             if response_format and not tool_calls:
                 cleaned_text, _, is_valid, error = parse_json_output(
-                    cleaned_text or regular_content, response_format
+                    cleaned_text, response_format
                 )
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
