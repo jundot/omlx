@@ -84,37 +84,28 @@ def test_http_extraction_does_not_promote_reasoning_calls():
     assert not result.tool_calls_from_thinking
 
 
+PARTIAL = CALL.partition("</｜DSML｜ parameter>")[0]
+
+
 @pytest.mark.parametrize(
-    "finish_reason,closing,error",
+    "text,errors",
     [
-        ("stop", "", "incomplete"),
-        ("length", "", "incomplete"),
-        ("stop", Tokenizer.tool_call_end, "malformed"),
+        ("Checking. " + PARTIAL, ("incomplete",)),
+        ("Checking. " + PARTIAL + Tokenizer.tool_call_end, ("malformed",)),
+        (
+            "Checking. " + PARTIAL + Tokenizer.tool_call_end + PARTIAL,
+            ("malformed", "incomplete"),
+        ),
+        (f"The tag `{Tokenizer.tool_call_start}` opens a call.", ()),
     ],
 )
-def test_http_extraction_rejects_unparsed_dsml(finish_reason, closing, error):
-    partial, _, _ = CALL.partition("</｜DSML｜ parameter>")
+def test_http_extraction_reports_rejected_dsml(text, errors):
     tools = [{"type": "function", "function": {"name": "get"}}]
     result = extract_tool_calls_with_thinking(
-        "",
-        "Checking.\n\n" + partial + closing,
-        Tokenizer({}),
-        tools,
-        finish_reason=finish_reason,
+        "", text, Tokenizer({}), tools, finish_reason="length"
     )
-    assert result.cleaned_text == "Checking."
-    assert result.parse_errors == (error,)
-    assert not result.tool_calls
-
-
-def test_http_extraction_does_not_flag_quoted_dsml_opener():
-    text = f"The tag `{Tokenizer.tool_call_start}` opens a call."
-    tools = [{"type": "function", "function": {"name": "get"}}]
-    result = extract_tool_calls_with_thinking(
-        "", text, Tokenizer({}), tools, finish_reason="stop"
-    )
-    assert result.cleaned_text == text
-    assert not result.parse_errors
+    assert result.parse_errors == errors
+    assert result.cleaned_text == ("Checking." if errors else text)
     assert not result.tool_calls
 
 

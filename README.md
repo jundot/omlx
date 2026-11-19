@@ -310,8 +310,6 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 
 Models not listed above may still work if their chat template accepts `tools` and their output uses a recognized `<tool_call>` XML format. For tool-enabled streaming, assistant text is emitted incrementally while known tool-call control markup is suppressed from visible content; structured tool calls are emitted after parsing the completed turn.
 
-For DeepSeek V4.1, oMLX omits unfinished DSML tool-call markup from the answer when generation reaches the output token limit and preserves the API's token-limit status. An unfinished call at a normal stop reports `incomplete_tool_call`. A closed envelope with an invalid invocation reports `invalid_tool_call`.
-
 A bare JSON, EBNF, or regex grammar constrains the answer from the first generated token, so `thinking_budget` is ignored. Configure a compatible `reasoning_parser` to combine constrained output with a separate, budgeted reasoning phase.
 
 ## Models

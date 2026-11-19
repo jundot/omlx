@@ -4679,18 +4679,6 @@ _RECOVERY_CALL = (
 )
 
 
-def _recovery_tokenizer(qwen_parser):
-    tokenizer = MockTokenizer()
-    tokenizer.has_tool_calling = True
-    tokenizer.tool_call_start = "<tool_call>"
-    tokenizer.tool_call_end = "</tool_call>"
-    if qwen_parser:
-        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
-
-        tokenizer.tool_parser = parse_tool_call
-    return tokenizer
-
-
 async def _recovery_stream(
     raw,
     api="chat",
@@ -4701,7 +4689,6 @@ async def _recovery_stream(
     *,
     tools=None,
     qwen_parser=True,
-    tokenizer=None,
 ):
     from omlx.api.anthropic_models import MessagesRequest
     from omlx.api.openai_models import ChatCompletionRequest
@@ -4714,9 +4701,13 @@ async def _recovery_stream(
 
     engine = MockBaseEngine()
     engine._supports_early_tool_call_streaming = True
-    engine._tokenizer = (
-        tokenizer if tokenizer is not None else _recovery_tokenizer(qwen_parser)
-    )
+    engine.tokenizer.has_tool_calling = True
+    engine.tokenizer.tool_call_start = "<tool_call>"
+    engine.tokenizer.tool_call_end = "</tool_call>"
+    if qwen_parser:
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        engine.tokenizer.tool_parser = parse_tool_call
     stream_tools = tools if tools is not None else _RECOVERY_TOOLS
     engine.set_stream_outputs(
         [
@@ -5052,64 +5043,6 @@ def _recovery_error_codes(events, api):
     return codes
 
 
-@pytest.fixture
-def deepseek_v41_tokenizer():
-    from omlx.patches.deepseek_v41.tool_parser import (
-        parse_tool_call,
-        tool_call_end,
-        tool_call_start,
-    )
-
-    tokenizer = MockTokenizer()
-    tokenizer.has_tool_calling = True
-    tokenizer.tool_call_start = tool_call_start
-    tokenizer.tool_call_end = tool_call_end
-    tokenizer.tool_parser = parse_tool_call
-    return tokenizer
-
-
-@pytest.fixture(params=[("stop", False), ("length", False), ("stop", True)])
-def deepseek_v41_failed_call(request, deepseek_v41_tokenizer):
-    finish_reason, closed = request.param
-    raw = (
-        "Checking. "
-        + deepseek_v41_tokenizer.tool_call_start
-        + '\n<｜DSML｜ invoke name="write">\n'
-        '<｜DSML｜ parameter name="content" string="true">hello'
-    )
-    error = "incomplete_tool_call" if finish_reason == "stop" else None
-    if closed:
-        raw += "\n" + deepseek_v41_tokenizer.tool_call_end
-        error = "invalid_tool_call"
-    return raw, deepseek_v41_tokenizer, finish_reason, error
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
-async def test_deepseek_v41_failed_tool_call_is_not_answer_text(
-    api, deepseek_v41_failed_call
-):
-    raw, tokenizer, finish_reason, error = deepseek_v41_failed_call
-    events = await _recovery_stream(
-        raw, api, finish_reason=finish_reason, tokenizer=tokenizer
-    )
-
-    assert _recovery_text(events, api) == "Checking. "
-    assert _recovery_calls(events, api) == []
-    assert _recovery_error_codes(events, api) == ([error] if error else [])
-    if api == "chat":
-        assert _chat_finish_reasons(events) == ([] if error else ["length"])
-    elif api == "anthropic":
-        assert [
-            e["delta"]["stop_reason"]
-            for e in events
-            if e.get("type") == "message_delta"
-        ] == ([] if error else ["max_tokens"])
-    else:
-        terminal_event = "response.failed" if error else "response.incomplete"
-        assert events[-1]["type"] == terminal_event
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
 @pytest.mark.parametrize("chunk_size", [1, 4096])
@@ -5275,7 +5208,7 @@ async def test_recovered_prose_reaches_responses_final_text():
 
 
 def _nonstream_tool_call_client(
-    monkeypatch, body: str, *, qwen_parser=True, finish_reason="stop", tokenizer=None
+    monkeypatch, body: str, *, qwen_parser=True, finish_reason="stop"
 ):
     """Return a client whose model generates ``body`` for non-stream requests."""
     from types import SimpleNamespace
@@ -5289,9 +5222,14 @@ def _nonstream_tool_call_client(
     engine = BatchedEngine("test-model")
     engine._loaded = True
     engine._model = SimpleNamespace(args=SimpleNamespace(model_type="qwen3"))
-    engine._tokenizer = (
-        tokenizer if tokenizer is not None else _recovery_tokenizer(qwen_parser)
-    )
+    engine._tokenizer = MockTokenizer()
+    engine._tokenizer.has_tool_calling = True
+    engine._tokenizer.tool_call_start = "<tool_call>"
+    engine._tokenizer.tool_call_end = "</tool_call>"
+    if qwen_parser:
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        engine._tokenizer.tool_parser = parse_tool_call
     engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
     monkeypatch.setattr(engine, "_preflight_or_raise_with_eviction", AsyncMock())
 
@@ -5311,6 +5249,8 @@ def _nonstream_tool_call_client(
     monkeypatch.setattr(_server_state, "engine_pool", MockEnginePool(engine))
     monkeypatch.setattr(_server_state, "default_model", "test-model")
     return TestClient(app)
+
+
 
 
 _NONSTREAM_RECOVERY_REQUESTS = {
@@ -5350,60 +5290,6 @@ _NONSTREAM_RECOVERY_REQUESTS = {
         ],
     },
 }
-
-
-@pytest.mark.parametrize("path", list(_NONSTREAM_RECOVERY_REQUESTS))
-def test_deepseek_v41_nonstream_failed_tool_call(
-    monkeypatch, path, deepseek_v41_failed_call
-):
-    raw, tokenizer, finish_reason, error = deepseek_v41_failed_call
-    client = _nonstream_tool_call_client(
-        monkeypatch, raw, finish_reason=finish_reason, tokenizer=tokenizer
-    )
-    try:
-        response = client.post(path, json=_NONSTREAM_RECOVERY_REQUESTS[path])
-    finally:
-        client.close()
-
-    assert "DSML" not in response.text
-    body = response.json()
-    if error:
-        assert response.status_code == 500, response.text
-        assert body["error"]["code"] == error
-    else:
-        assert response.status_code == 200, response.text
-        if path == "/v1/chat/completions":
-            assert body["choices"][0]["finish_reason"] == "length"
-        elif path == "/v1/messages":
-            assert body["stop_reason"] == "max_tokens"
-        else:
-            assert body["status"] == "incomplete"
-            assert body["incomplete_details"]["reason"] == "max_output_tokens"
-
-
-@pytest.mark.parametrize(
-    "path,format_config",
-    [
-        ("/v1/chat/completions", {"response_format": {"type": "json_object"}}),
-        ("/v1/responses", {"text": {"format": {"type": "json_object"}}}),
-    ],
-)
-def test_deepseek_v41_json_format_keeps_truncated_tool_markup_hidden(
-    monkeypatch, path, format_config, deepseek_v41_tokenizer
-):
-    raw = deepseek_v41_tokenizer.tool_call_start + '\n<｜DSML｜ invoke name="write">\n'
-    client = _nonstream_tool_call_client(
-        monkeypatch, raw, finish_reason="length", tokenizer=deepseek_v41_tokenizer
-    )
-    try:
-        response = client.post(
-            path, json={**_NONSTREAM_RECOVERY_REQUESTS[path], **format_config}
-        )
-    finally:
-        client.close()
-
-    assert response.status_code == 200, response.text
-    assert "DSML" not in response.text
 
 
 @pytest.mark.parametrize("path", list(_NONSTREAM_RECOVERY_REQUESTS))

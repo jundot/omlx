@@ -2539,8 +2539,15 @@ def extract_tool_calls_with_thinking(
         and dsml_start == "<｜DSML｜ calls>"
         and dsml_start in regular_content
     ):
-        # V4.1's output parser returns a rejected envelope as text. Keep the
-        # stream filter from restoring it as prose, including on a length cut.
+        # V4.1's output parser returns rejected envelopes as text.
+        errors = []
+        if any(
+            payload.lstrip().startswith("<｜DSML｜ invoke")
+            for payload in _marker_payloads(
+                regular_content, dsml_start, tokenizer.tool_call_end
+            )
+        ):
+            errors.append("malformed")
         stream_filter = ToolCallStreamFilter(tokenizer, tools=tools)
         visible = stream_filter.feed(regular_content) + stream_filter.finish()
         if (
@@ -2548,14 +2555,8 @@ def extract_tool_calls_with_thinking(
             and stream_filter.take_recovery_candidate().startswith(dsml_start)
         ):
             cleaned_text = visible.strip()
-            parse_errors = ("incomplete",)
-        elif any(
-            re.match(r"\s*<｜DSML｜ invoke(?:\s|>|$)", payload)
-            for payload in _marker_payloads(
-                regular_content, dsml_start, "</｜DSML｜ calls>"
-            )
-        ):
-            parse_errors = ("malformed",)
+            errors.append("incomplete")
+        parse_errors = tuple(errors)
 
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer, tools=tools)
     tool_calls_from_thinking = False
