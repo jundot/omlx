@@ -11,6 +11,7 @@ import asyncio
 import gc
 import logging
 import time
+from collections.abc import Callable
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
@@ -98,6 +99,19 @@ class EmbeddingEngine(BaseNonStreamingEngine):
     def processor(self) -> Any:
         """Get the processor/tokenizer."""
         return self._model.processor if self._model else None
+
+    def max_input_tokens(self, max_length: int | None = None) -> int | None:
+        """Per-input token limit ``embed(max_length=...)`` applies, if loaded."""
+        return self._model.effective_max_length(max_length) if self._model else None
+
+    async def run_tokenizer(self, fn: Callable[[], Any]) -> Any:
+        """Run processor/tokenizer work on the thread embed() uses.
+
+        HF fast tokenizers switch shared truncation state on every call, so
+        tokenizer calls must not overlap a running embedding batch.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(get_mlx_executor(), fn)
 
     @property
     def hidden_size(self) -> Optional[int]:
