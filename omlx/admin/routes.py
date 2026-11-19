@@ -7140,6 +7140,12 @@ def get_session_context(is_admin: bool = Depends(require_admin)):
     prompt_tokens = int(snap.get("total_prompt_tokens", 0))
     completion_tokens = int(snap.get("total_completion_tokens", 0))
     total_tokens = prompt_tokens + completion_tokens
+    # Current-window = last completed request (prompt+completion). This is what
+    # the dashboard shows and what context_usage.py needs for a no-lag,
+    # <=ceiling handoff trigger -- distinct from the cumulative total_tokens
+    # above, which sums across every request and exceeds the ceiling on long
+    # sessions (the 2026-11-19 1992% context bug).
+    current_total_tokens = int(snap.get("current_total_tokens", 0))
 
     model_id = None
     ceiling = get_max_context_window(None)
@@ -7157,6 +7163,7 @@ def get_session_context(is_admin: bool = Depends(require_admin)):
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
+        "current_total_tokens": current_total_tokens,
         "context_ceiling": ceiling or 0,
         "pct_of_ceiling": pct,
         "model_id": model_id,

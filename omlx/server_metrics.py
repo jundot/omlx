@@ -178,6 +178,9 @@ class ServerMetrics:
             self.total_completion_tokens += completion_tokens
             self.total_cached_tokens += cached_tokens
             self.total_requests += 1
+            # Current-window (last completed request) tokens.
+            self._last_prompt_tokens = prompt_tokens
+            self._last_completion_tokens = completion_tokens
             self.total_prefill_duration += prefill_duration
             self.total_generation_duration += generation_duration
 
@@ -333,7 +336,7 @@ class ServerMetrics:
                     )
                 return self._build_snapshot(0, 0, 0, 0, 0.0, 0.0, uptime)
 
-            return self._build_snapshot(
+            snap = self._build_snapshot(
                 self.total_prompt_tokens,
                 self.total_completion_tokens,
                 self.total_cached_tokens,
@@ -342,6 +345,12 @@ class ServerMetrics:
                 self.total_generation_duration,
                 uptime,
             )
+            snap["current_prompt_tokens"] = self._last_prompt_tokens
+            snap["current_completion_tokens"] = self._last_completion_tokens
+            snap["current_total_tokens"] = (
+                self._last_prompt_tokens + self._last_completion_tokens
+            )
+            return snap
 
     def clear_metrics(self) -> None:
         """Clear session metrics. Thread-safe."""
@@ -350,6 +359,13 @@ class ServerMetrics:
             self.total_completion_tokens = 0
             self.total_cached_tokens = 0
             self.total_requests = 0
+            # Current-window (last completed request) — the live context gauge
+            # the web-admin dashboard shows; consumed by context_usage.py for a
+            # no-lag current-window handoff trigger. Distinct from the cumulative
+            # session totals below, which sum across every request and exceed the
+            # ceiling on long sessions (the 2026-11-19 1992% context bug).
+            self._last_prompt_tokens = 0
+            self._last_completion_tokens = 0
             self.total_prefill_duration = 0.0
             self.total_generation_duration = 0.0
             self._per_model.clear()
