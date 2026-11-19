@@ -535,3 +535,22 @@ def test_chunk_sizing_leaves_out_the_pool_of_a_deferred_clear(monkeypatch):
     assert sched._pool_clear_deferred is False
     assert sched._prefill_chunk_pool is None
     assert sch.Scheduler._prefill_sizing_usage_bytes(sched) == 9_000
+
+
+def test_a_chunk_after_a_deferred_clear_is_not_measured():
+    """Its footprint still holds the pool the deferred clear would have freed,
+    so it must not raise the chunk predictor."""
+    seen = []
+    sched = SimpleNamespace(
+        _pool_clear_deferred=True,
+        memory_monitor=None,
+        _prefill_min_chunk_tokens=1,
+        _prefill_transient_tracker=SimpleNamespace(
+            record_reclaim=lambda b: seen.append(("reclaim", b)),
+            clear_reclaim=lambda: seen.append(("clear",)),
+        ),
+    )
+    sch.Scheduler._record_chunk_transient(
+        sched, 2048, 0, 5 << 30, request_id="r", loop_label="t"
+    )
+    assert seen == []

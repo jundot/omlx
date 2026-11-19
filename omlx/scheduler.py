@@ -6440,7 +6440,13 @@ class Scheduler:
         observations. Negative deltas record released buffers; positive deltas
         repay reallocation charges. Partial speed-priority chunks do not
         replace representative overhead or full-step measurements.
+
+        A chunk that started with its pool clear deferred (_clear_cache) also
+        carries the pool the clear would have freed, so it is not recorded:
+        the predictor keeps what the chunks with a cleared pool measured.
         """
+        if getattr(self, "_pool_clear_deferred", False):
+            return
         delta = post_bytes - pre_bytes - unowned_pool_bytes
         monitor = getattr(self, "memory_monitor", None)
         if (
