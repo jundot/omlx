@@ -4870,6 +4870,62 @@ def test_kda_decode_step_from_empty_cache(width, monkeypatch):
     assert _mismatches(fused_cache[1], reference_cache[1]) == 0
 
 
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize(
+    "gate_bits,float_proj",
+    # float: gate projections run outside the kernel (a_pre / gate_pre rows).
+    [(8, False), (5, False), (8, True)],
+)
+def test_kda_batch_decode_rows_match_one_sequence_kernel(
+    gate_bits, float_proj, monkeypatch
+):
+    language = _language()
+    layer = _kda_layer(gate_bits=gate_bits, seed=40 + gate_bits, float_proj=float_proj)
+    cache = _arrays_cache()
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    prompt = (mx.random.normal((3, 12, 1024)) * 0.8).astype(mx.bfloat16)
+    mx.eval(layer(prompt, cache=cache))
+    monkeypatch.setattr(language, "_DECODE_FUSION", True)
+    calls = []
+    kernel = dk.kda_decode_step
+
+    def recording(*args, **kwargs):
+        out = kernel(*args, **kwargs)
+        calls.append((args, kwargs, out))
+        return out
+
+    monkeypatch.setattr(dk, "kda_decode_step", recording)
+    for step in range(3):
+        x = (mx.random.normal((3, 1, 1024)) * (0.5 + step)).astype(mx.bfloat16)
+        mx.eval(layer(x, cache=cache))
+        assert len(calls) == step + 1
+        args, kwargs, out = calls[-1]
+        assert out is not None and args[0].shape[0] == 3
+        assert (kwargs["a_pre"] is not None) == float_proj
+        # The layer keeps the batch kernel's new states.
+        assert _mismatches(cache[0], out[1]) == 0
+        assert _mismatches(cache[1], out[2]) == 0
+        proj, conv_state, conv_w, a_log, dt_bias, state, norm_w = args
+        for b in range(3):
+            row = slice(b, b + 1)
+            row_kwargs = {
+                k: v[row] if k in ("a_pre", "gate_pre") and v is not None else v
+                for k, v in kwargs.items()
+            }
+            single = kernel(
+                proj[row],
+                conv_state[row],
+                conv_w,
+                a_log,
+                dt_bias,
+                state[row],
+                norm_w,
+                **row_kwargs,
+            )
+            for got, want in zip(out, single):
+                assert _mismatches(got[row], want) == 0, (b, gate_bits, float_proj)
+
+
 # ---------------------------------------------------------------------------
 # MoE router (one token)
 # ---------------------------------------------------------------------------

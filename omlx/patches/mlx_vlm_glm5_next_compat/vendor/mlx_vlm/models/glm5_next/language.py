@@ -610,7 +610,8 @@ class Glm5NextLinearAttention(nn.Module):
         return mx.concatenate([outs[g][..., a:b] for g, a, b in runs], axis=-1)
 
     def _decode_step(self, inputs, mask, cache, capture=None):
-        """Fused layer body for one sequence and S <= 8 tokens (bit-identical).
+        """Fused layer body for one sequence and S <= 8 tokens (bit-identical),
+        or a batch decode step of up to 8 one-token rows.
 
         One kernel (``decode_kernels.kda_decode_step``) replaces the conv,
         SiLU, l2norm, gate projections, delta rule and RMSNormGated ops
@@ -625,8 +626,10 @@ class Glm5NextLinearAttention(nn.Module):
         fg = self.forget_gate
         if (
             not _DECODE_FUSION
-            or B != 1
             or not 1 <= S <= _DECODE_BLOCK
+            # Batched verify keeps the reference body: rollback_rows replays
+            # its capture tuple.
+            or (B > 1 and (S > 1 or capture is not None or B > _DECODE_BLOCK))
             or mask is not None
             or cache is None
             or getattr(cache, "lengths", None) is not None
