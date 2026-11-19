@@ -437,27 +437,8 @@ def test_github_2177_restores_static_prefix_from_tiered_cache():
     assert warm_trace["model"].calls == []
     assert warm_result.static_prefix_cached_tokens == len(static_prefix_tokens)
     assert exact_prefix_cache.restore_promotions == [True, False]
-    assert "system 5 static-cached" in warm_logger.info_messages[-1]
-
-
-def test_static_prefix_restore_runs_on_the_target_stream():
-    # The reconstruct chain is lazy; built on the worker's default stream it
-    # becomes a cross-stream fence inside the prefill (#2330 hazard).
-    exact_prefix_cache = _TieredExactPrefixCache()
-    common_args = {
-        "system_token_count": 5,
-        "conversation_token_count": 12,
-        "selected_indices": [0, 5, 10],
-        "exact_prefix_cache": exact_prefix_cache,
-        "static_prefix_tokens": list(range(5)),
-        "extract_cache_states": _extract_cache_states,
-    }
-
-    _run(**common_args)
-    warm_result, _, _ = _run(**common_args, conversation_start=2_000)
-
-    assert warm_result.static_prefix_cached_tokens == 5
     assert exact_prefix_cache.restore_in_stream == [True, True]
+    assert "system 5 static-cached" in warm_logger.info_messages[-1]
 
 
 def test_static_prefix_hit_supersedes_a_shorter_block_cache_hit():

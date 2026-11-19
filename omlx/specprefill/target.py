@@ -118,11 +118,8 @@ def run_specprefill_target_prefill(
         static_prefix_cached_tokens = 0
         if exact_prefix_cache is not None and static_prefix_tokens:
             full_static_prefix_tokens = list(static_prefix_tokens)
-            # Rebuild on the target-model stream, as the scheduler does for
-            # its own prefix-cache restore (#2330). The reconstruct chain is
-            # lazy, and leaving it on this thread's default stream makes the
-            # prefill below wait on it through a cross-stream fence, which
-            # can hang under MLX_METAL_FAST_SYNCH=1.
+            # Build the lazy restore chain on the target stream; otherwise the
+            # prefill below waits on it through a cross-stream fence (#2330).
             with mx.stream(stream):
                 restored_cache = exact_prefix_cache.restore_exact_prefix(
                     f"{request.request_id}:specprefill-static-restore",
