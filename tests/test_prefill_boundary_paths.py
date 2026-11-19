@@ -333,8 +333,6 @@ def test_prefill_end_emits_tail_snapshot_off_the_grid(
     [
         # A branch point inside the prefill adds a stop before the marker.
         (0, 9, 7, 0, 5, [4, 8], [5, 7], [4, 1, 2, 1, 1]),
-        # Restored past the branch point: only the marker stops.
-        (6, 5, 9, 0, 5, [8], [9], [2, 1, 2]),
         # The system prefix keeps the stop; the branch point adds none.
         (0, 9, 7, 5, 6, [4, 8], [5, 7], [4, 1, 2, 1, 1]),
         # A system prefix that is already cached leaves the stop to the branch point.

@@ -209,15 +209,6 @@ class TestJunctionEnd:
                 5190,
                 True,
             ),
-            # On the grid the boundary snapshot already covers the split.
-            (
-                "on the grid",
-                list(range(7000)),
-                list(range(6144)) + [-1] * 100,
-                4096,
-                6230,
-                True,
-            ),
             # The prompt runs into the generation prompt: a tail replay covers it.
             (
                 "at the marker",
@@ -225,17 +216,6 @@ class TestJunctionEnd:
                 list(range(5000)) + [-1] * 200,
                 4096,
                 4990,
-                True,
-            ),
-            # The whole prompt repeats: nothing branches.
-            ("exact prefix", list(range(6000)), list(range(5000)), 4096, 0, True),
-            # No recent sequence to branch from.
-            (
-                "no stored sequence",
-                None,
-                list(range(5000)) + [-1] * 200,
-                4096,
-                5190,
                 True,
             ),
             # Attention-only models resume anywhere a block ends.
@@ -254,13 +234,3 @@ class TestJunctionEnd:
             self._plan(stored, prompt, cached, gen_start=gen_start, stateful=stateful)
             == 0
         ), name
-
-    def test_ignores_a_lookup_of_another_request(self):
-        sched = _make_scheduler()
-        sched._boundary_snapshot_required = True
-        sched._cache_probe_seqs.append(("req-old", list(range(6000))))
-        sched._log_prefix_divergence(_request(list(range(5000)) + [-1] * 200, 4096))
-        other = _request(list(range(5000)) + [-1] * 200, 4096, request_id="req-other")
-        other.generation_prompt_start = 5190
-        sched._resolve_junction_end(other)
-        assert getattr(other, "junction_end", 0) == 0

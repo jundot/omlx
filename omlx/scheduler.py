@@ -3006,26 +3006,16 @@ class Scheduler:
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
 
-    def _shared_tail_end(self, request: "Request") -> int:
-        """Token count of the shared tail this request captured, or 0.
-
-        That is the end of its system prefix or its branch point, whichever the
-        prefill stopped at.
-        """
-        snapshots = self._boundary_cache_snapshots.get(request.request_id) or {}
-        for end in (
-            getattr(request, "system_prefix_end", 0) or 0,
-            getattr(request, "junction_end", 0) or 0,
-        ):
-            if end > 0 and end in snapshots:
-                return end
-        return 0
-
     def _prepare_system_prefix_store(
         self, request: "Request", full_cache: list[Any]
     ) -> tuple[list[int], list[Any], Any, Any] | None:
         """Build the shared-tail payload (system prefix or branch point)."""
-        system_end = self._shared_tail_end(request)
+        snapshots = self._boundary_cache_snapshots.get(request.request_id) or {}
+        ends = (
+            getattr(request, "system_prefix_end", 0) or 0,
+            getattr(request, "junction_end", 0) or 0,
+        )
+        system_end = next((end for end in ends if end > 0 and end in snapshots), 0)
         if system_end <= 0:
             return None
         try:
@@ -8498,11 +8488,8 @@ class Scheduler:
     def _resolve_junction_end(self, request: "Request") -> None:
         """Plan a shared tail where this prompt leaves a recently stored sequence.
 
-        A hybrid model resumes only at a block boundary or at a stored tail. A
-        prompt that shares more tokens with a recent sequence than the lookup
-        could restore re-prefills the gap, and so does every later prompt that
-        branches at the same place. This prefill stops at the branch point so
-        the store keeps a tail the next one resumes from.
+        Hybrid models resume only at a block boundary or a stored tail, so later
+        prompts that branch at the same place resume at this one.
         """
         block_size = self.config.paged_cache_block_size
         lookup = getattr(self, "_last_prefix_cache_lookup", None)
@@ -8572,12 +8559,7 @@ class Scheduler:
         n_tokens: int,
         boundary_enabled: bool,
     ) -> int | None:
-        """Return the shared-tail stop this prefill crosses, if any.
-
-        The shared system prefix comes first; the branch point (junction) only
-        takes the stop when no system prefix needs it, so a prefill never
-        stops twice for shared tails.
-        """
+        """Return the shared-tail stop this prefill crosses; the system prefix wins."""
         if not boundary_enabled:
             return None
         prefill_end = base_size + n_tokens - 1
