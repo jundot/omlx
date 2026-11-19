@@ -6799,3 +6799,234 @@ def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
     actual, _ = generate(model, prompts, limits)
     assert fired
     assert actual == expected
+
+
+class _TrackingMtpCountingModel(CountingModel):
+    """CountingModel that counts mtp_forward and return_hidden calls."""
+
+    def __init__(self, *, chain: bool = True, depth: int = 3):
+        super().__init__()
+        self._omlx_mtp_chain = chain
+        self._omlx_mtp_depth = depth
+        self.mtp_calls = 0
+        self.return_hidden_calls = 0
+
+    def __call__(self, inputs, cache=None, return_hidden=False, n_confirmed=0):
+        if return_hidden:
+            self.return_hidden_calls += 1
+        return super().__call__(
+            inputs, cache=cache, return_hidden=return_hidden, n_confirmed=n_confirmed
+        )
+
+    def mtp_forward(self, hidden, tokens, cache, return_hidden=False, **kwargs):
+        self.mtp_calls += 1
+        return super().mtp_forward(
+            hidden, tokens, cache, return_hidden=return_hidden, **kwargs
+        )
+
+
+@pytest.mark.parametrize("chain", [True, False])
+@pytest.mark.parametrize("join_step", [None, 1, 2, 3])
+def test_lightning_mtp_streams_first_token_before_init(chain, join_step):
+    """Lightning MTP emits token 0 before _post_init_mtp's extra backbone
+    forward and initial mtp_forward, and stays greedy-equivalent with late joins."""
+    prompts = [[1, 2], [10, 11, 12]]
+    limits = [10, 6]
+    standard = _TrackingMtpCountingModel(chain=chain, depth=3)
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, prompts, limits)
+
+    model = _TrackingMtpCountingModel(chain=chain, depth=3)
+    bg.apply()
+    cache_rollback.apply()
+    gen = BatchGenerator(
+        model,
+        sampler=lambda lp: mx.argmax(lp, -1),
+        prefill_batch_size=len(prompts),
+        max_tokens=max(limits),
+    )
+    output, terminal = {}, {}
+    mtp_calls_at_first_token = None
+    hidden_calls_at_first_token = None
+    try:
+        (first_uid,) = gen.insert(prompts[:1], max_tokens=limits[:1])
+        output[first_uid] = []
+        uids = [first_uid]
+        for step in range(100):
+            if step == join_step:
+                (late_uid,) = gen.insert(prompts[1:], max_tokens=limits[1:])
+                output[late_uid] = []
+                uids.append(late_uid)
+            _, responses = gen.next()
+            for response in responses:
+                assert response.uid not in terminal
+                if response.uid == first_uid and not output[first_uid]:
+                    mtp_calls_at_first_token = model.mtp_calls
+                    hidden_calls_at_first_token = model.return_hidden_calls
+                output[response.uid].append(response.token)
+                if response.finish_reason:
+                    terminal[response.uid] = response
+            if len(terminal) == len(uids) and (join_step is None or step >= join_step):
+                break
+    finally:
+        gen.close()
+
+    # Token 0 came out before _post_init_mtp ran its extra return_hidden=True
+    # backbone forward or any mtp_forward draft call.
+    assert mtp_calls_at_first_token == 0
+    assert hidden_calls_at_first_token == 0
+    assert model.mtp_calls > 0
+    assert model.return_hidden_calls > 0
+    assert output[first_uid] == expected[0]
+    if join_step is not None:
+        assert output[uids[1]] == expected[1]
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "stop_tokens", "expected_reason"),
+    [
+        (1, None, "length"),
+        (10, {3}, "stop"),
+    ],
+)
+def test_lightning_mtp_early_first_token_terminates_without_init(
+    max_tokens, stop_tokens, expected_reason
+):
+    """If token 0 hits EOS or max_tokens=1, _post_init_mtp never runs."""
+    model = _TrackingMtpCountingModel(chain=True, depth=3)
+    output, terminal = generate(
+        model,
+        [[1, 2]],
+        [max_tokens],
+        stop_tokens=stop_tokens,
+    )
+    assert output[0] == [3]
+    assert terminal[0].finish_reason == expected_reason
+    assert model.mtp_calls == 0
+    assert model.return_hidden_calls == 0
+
+
+def test_lightning_mtp_cancellation_after_early_first_token():
+    """Removing a request right after token 0 clears pending state cleanly."""
+    model = _TrackingMtpCountingModel(chain=True, depth=3)
+    bg.apply()
+    cache_rollback.apply()
+    gen = BatchGenerator(
+        model,
+        sampler=lambda lp: mx.argmax(lp, -1),
+        prefill_batch_size=2,
+        max_tokens=8,
+    )
+    try:
+        (uid1,) = gen.insert([[1, 2]], max_tokens=[8])
+        got1 = []
+        for _ in range(10):
+            _, responses = gen.next()
+            got1.extend(r.token for r in responses if r.uid == uid1)
+            if got1:
+                break
+        assert got1 == [3]
+        assert model.mtp_calls == 0
+        assert bg._generation_batch_has_active_mtp(gen._generation_batch)
+
+        gen.remove([uid1])
+        assert not bg._generation_batch_has_active_mtp(gen._generation_batch)
+        assert getattr(gen._generation_batch, "_omlx_first_token_emitted", None) is None
+
+        # A follow-up request runs to completion with exact greedy output.
+        (uid2,) = gen.insert([[10, 11]], max_tokens=[6])
+        got2 = []
+        done = False
+        for _ in range(30):
+            _, responses = gen.next()
+            for r in responses:
+                if r.uid == uid2:
+                    got2.append(r.token)
+                    if r.finish_reason:
+                        done = True
+            if done:
+                break
+        assert done
+        assert got2 == [12, 13, 14, 15, 16, 17]
+        assert model.mtp_calls > 0
+    finally:
+        gen.close()
+
+
+def test_lightning_mtp_early_first_token_fallback_does_not_duplicate(monkeypatch):
+    """If _post_init_mtp fails on call #2 after token 0 streamed, standard
+    decode advances cleanly without emitting token 0 twice."""
+    standard = _TrackingMtpCountingModel(chain=True, depth=3)
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, [[1, 2]], [8])
+
+    model = _TrackingMtpCountingModel(chain=True, depth=3)
+    fired = []
+
+    def fail_once(gen_batch, **kwargs):
+        if not fired:
+            fired.append(True)
+            raise bg._MtpStepFallback("simulated init failure")
+        return orig_post_init(gen_batch, **kwargs)
+
+    orig_post_init = bg._post_init_mtp
+    monkeypatch.setattr(bg, "_post_init_mtp", fail_once)
+    actual, terminal = generate(model, [[1, 2]], [8])
+    assert fired
+    assert actual == expected
+    assert terminal[0].finish_reason == "length"
+
+
+def test_lightning_mtp_early_first_token_defers_on_block_boundary():
+    """When token 0 lands directly on a cache block boundary, defer early emit
+    so prompt_cache includes token 0 before scheduler boundary capture runs."""
+    model = _TrackingMtpCountingModel(chain=True, depth=3)
+    model._omlx_mtp_commit_align = 4  # prompt len 3 + token 0 = 4 (boundary!)
+    bg.apply()
+    cache_rollback.apply()
+    gen = BatchGenerator(
+        model,
+        sampler=lambda lp: mx.argmax(lp, -1),
+        prefill_batch_size=1,
+        max_tokens=6,
+    )
+    try:
+        (uid,) = gen.insert([[1, 2, 3]], max_tokens=[6])
+        mtp_at_first = None
+        got = []
+        for _ in range(30):
+            _, responses = gen.next()
+            for r in responses:
+                if r.uid == uid:
+                    if not got:
+                        mtp_at_first = model.mtp_calls
+                    got.append(r.token)
+            if len(got) >= 6:
+                break
+        assert mtp_at_first is not None and mtp_at_first > 0
+        assert got == [4, 5, 6, 7, 8, 9]
+    finally:
+        gen.close()
+
+
+def test_lightning_mtp_early_first_token_preserves_stats():
+    """init_emits and total_emits stay exact when token 0 streams early."""
+    logged = []
+    orig_log = bg._log_mtp_stats
+
+    def capture_stats(uid, stats, finish_reason):
+        logged.append((uid, stats.init_emits, stats.cycles, stats.draft_emits, stats.bonus_emits, stats.verify_emits))
+        return orig_log(uid, stats, finish_reason)
+
+    model = _TrackingMtpCountingModel(chain=True, depth=2)
+    bg._log_mtp_stats = capture_stats
+    try:
+        output, _ = generate(model, [[1, 2]], [10])
+    finally:
+        bg._log_mtp_stats = orig_log
+    assert len(output[0]) == 10
+    assert len(logged) == 1
+    _, init_emits, cycles, draft_emits, bonus_emits, verify_emits = logged[0]
+    assert init_emits == 2
+    assert init_emits + draft_emits + bonus_emits + verify_emits == 10
+    assert cycles > 0
