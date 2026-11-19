@@ -353,8 +353,17 @@ def inspect_source(src, headers=None, bits=BITS, trunk_bits=None):
         counts["trunk_linears"] = len(trunk)
         counts["trunk_source_bytes"] = sum(s.nbytes for s in trunk.values())
     return Plan(
-        text, banks, tables, inputs, stamps, outputs, records, counts, bits,
-        trunk_bits, trunk or None,
+        text,
+        banks,
+        tables,
+        inputs,
+        stamps,
+        outputs,
+        records,
+        counts,
+        bits,
+        trunk_bits,
+        trunk or None,
     )
 
 
