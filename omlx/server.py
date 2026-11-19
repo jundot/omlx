@@ -5457,8 +5457,12 @@ async def create_chat_completion(
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
-            # Process response_format if specified
-            if response_format and not tool_calls:
+            # An empty length-limited answer may have had a tool payload removed.
+            if (
+                response_format
+                and not tool_calls
+                and (cleaned_text or output.finish_reason != "length")
+            ):
                 cleaned_text, _, is_valid, error = parse_json_output(
                     cleaned_text or regular_content, response_format
                 )
@@ -9037,8 +9041,12 @@ async def create_response(
                         except (json.JSONDecodeError, AttributeError):
                             pass
 
-            # Process response_format if specified
-            if response_format and not tool_calls:
+            # An empty length-limited answer may have had a tool payload removed.
+            if (
+                response_format
+                and not tool_calls
+                and (cleaned_text or output.finish_reason != "length")
+            ):
                 cleaned_text, _, is_valid, error = parse_json_output(
                     cleaned_text or regular_content, response_format
                 )

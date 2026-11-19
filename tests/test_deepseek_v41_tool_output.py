@@ -84,6 +84,40 @@ def test_http_extraction_does_not_promote_reasoning_calls():
     assert not result.tool_calls_from_thinking
 
 
+@pytest.mark.parametrize(
+    "finish_reason,closing,error",
+    [
+        ("stop", "", "incomplete"),
+        ("length", "", "incomplete"),
+        ("stop", Tokenizer.tool_call_end, "malformed"),
+    ],
+)
+def test_http_extraction_rejects_unparsed_dsml(finish_reason, closing, error):
+    partial, _, _ = CALL.partition("</｜DSML｜ parameter>")
+    tools = [{"type": "function", "function": {"name": "get"}}]
+    result = extract_tool_calls_with_thinking(
+        "",
+        "Checking.\n\n" + partial + closing,
+        Tokenizer({}),
+        tools,
+        finish_reason=finish_reason,
+    )
+    assert result.cleaned_text == "Checking."
+    assert result.parse_errors == (error,)
+    assert not result.tool_calls
+
+
+def test_http_extraction_does_not_flag_quoted_dsml_opener():
+    text = f"The tag `{Tokenizer.tool_call_start}` opens a call."
+    tools = [{"type": "function", "function": {"name": "get"}}]
+    result = extract_tool_calls_with_thinking(
+        "", text, Tokenizer({}), tools, finish_reason="stop"
+    )
+    assert result.cleaned_text == text
+    assert not result.parse_errors
+    assert not result.tool_calls
+
+
 def test_server_thinking_filter_preserves_literal_dsml():
     from omlx.api.tool_calling import ToolCallStreamFilter
 
