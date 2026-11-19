@@ -199,6 +199,8 @@ def test_portable_attention_masks_sinks_and_dimensions(
         (2, 2, 3, 7, 64, 700, mx.float16, Affine4KVCache, True),
         (1, 4, 8, 6, 128, 2049, mx.bfloat16, Affine8KVCache, True),
         (2, 4, 8, 8, 128, 1025, mx.float16, Affine4KVCache, True),
+        (1, 2, 3, 39, 256, 1500, mx.bfloat16, Affine8KVCache, True),
+        (1, 2, 4, 48, 128, 1500, mx.bfloat16, Affine4KVCache, False),
     ],
 )
 def test_actual_native_matches_portable(
@@ -682,37 +684,3 @@ def test_batch_left_padding_is_read_from_the_device_once_per_assignment(monkeypa
     mask = cache._attention_mask(None, 1, 16)
     assert len(reads) == 2
     assert mask[:, 0, 0, :].tolist() == [[False] * 3 + [True] * 13, [True] * 16]
-
-
-@pytest.mark.parametrize("dim,rows", [(256, 25), (256, 39), (128, 30), (128, 48)])
-@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
-@pytest.mark.parametrize("with_sinks", [False, True])
-def test_causal_rows_over_24_run_in_one_native_call(
-    monkeypatch, dim, rows, cache_class, with_sinks
-):
-    """Causal blocks up to the native limit take one native call (16-row
-    chunks) instead of dequantizing K/V for fused SDPA."""
-    require_tensor_ops()
-    heads, repeats, tokens = 2, 3, 1500
-    cache = cache_class()
-    cache.update_and_fetch(
-        random((1, heads, tokens, dim), mx.bfloat16),
-        random((1, heads, tokens, dim), mx.bfloat16, 1),
-    )
-    q = random((1, heads * repeats, rows, dim), mx.bfloat16, 2)
-    sinks = mx.linspace(4, 9, heads * repeats) if with_sinks else None
-    calls = []
-    native = affine4._native_attention
-
-    def counting(*args, **kwargs):
-        out = native(*args, **kwargs)
-        calls.append(out is not None)
-        return out
-
-    monkeypatch.setattr(affine4, "_native_attention", counting)
-    output = cache.attention(q, scale=dim**-0.5, mask="causal", sinks=sinks)
-    assert calls == [True]
-    expected = dense(cache, q, mask="causal", sinks=sinks)
-    assert mx.allclose(
-        output.astype(mx.float32), expected.astype(mx.float32), atol=2e-2, rtol=2e-2
-    ).item()

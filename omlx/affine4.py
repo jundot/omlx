@@ -43,9 +43,7 @@ _MIN_NATIVE_TOKENS = 256
 # 16-row chunks were faster than 32 rows on M3 Ultra and M5 Max and 24 rows on M5 Pro.
 # 16 rows at dim 512 use 23 KiB of the 32 KiB threadgroup memory.
 _MAX_PADDED_ROWS = 16
-# Query rows one native call takes (as 16-row chunks). Longer blocks keep the
-# dequantized fused-SDPA route, which wins from 40 rows above dim 128 and from
-# 64 rows at dim 128 and below (M5 Pro, 64K-245K affine8 tokens).
+# Longer query blocks keep the dequantized fused-SDPA route.
 _MAX_NATIVE_QUERY_LENGTH = 39
 _MAX_NATIVE_QUERY_LENGTH_SMALL_DIM = 48
 # Bound each unfused float32 score matrix to 64 MiB, or one query row.
