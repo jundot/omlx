@@ -272,9 +272,12 @@ def load(
                 mtp_resident=config.preserve_mtp,
             )
             model._moe_offload_plan = offload
+            # The banks the scheduler's sized release/restore hooks act on.
+            model._moe_offload_slots = []
             for layer_id, layer in enumerate(model.language_model.layers):
                 prefix = f"language_model.layers.{layer_id}.ffn.experts"
                 layer.ffn.experts = OffloadedExpert(layer.ffn.experts, offload, prefix)
+                model._moe_offload_slots.append(layer.ffn.experts.slots)
             logger.info(
                 "DeepSeek V4.1 MoE offload: %d/%d experts resident per layer "
                 "(%.2f GiB -> %.2f GiB expert weights)%s",

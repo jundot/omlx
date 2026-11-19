@@ -1704,6 +1704,34 @@ def _audio_feature_cache_key_ranges(
     return ranges
 
 
+def wire_moe_offload_slot_hooks(scheduler, model) -> bool:
+    """Give every sized release/restore target under ``model`` the shared hooks.
+
+    DeepSeek V4.1 keeps its expert banks outside ``ExpertCache``. An engine
+    that offloaded both kinds gets one hook over the union, so wiring the banks
+    never drops the caches' hook. Returns whether anything was wired.
+    """
+    slots = getattr(model, "_moe_offload_slots", None) or []
+    if not slots:
+        return False
+    from ..patches.moe_expert_offload import (
+        moe_offload_caches,
+        releasable_moe_offload_bytes,
+        release_moe_offload_slots,
+        restore_moe_offload_slots,
+    )
+
+    banks = [*moe_offload_caches(model), *slots]
+    scheduler.moe_offload_release = functools.partial(
+        release_moe_offload_slots, banks
+    )
+    scheduler.moe_offload_restore = functools.partial(restore_moe_offload_slots, banks)
+    scheduler.moe_offload_releasable = functools.partial(
+        releasable_moe_offload_bytes, banks
+    )
+    return True
+
+
 class VLMBatchedEngine(BaseEngine):
     """
     VLM engine with continuous batching, tiered KV cache, and boundary snapshots.
@@ -2533,6 +2561,10 @@ class VLMBatchedEngine(BaseEngine):
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
         scheduler.moe_offload_releasable = offload_releasable
+        # DeepSeek V4.1 keeps its expert banks outside ExpertCache; give them
+        # the same sized release/restore hooks so a long prefill can borrow
+        # their slots and the next decode step grows them back.
+        wire_moe_offload_slot_hooks(scheduler, self._vlm_model)
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled and self.model_type == "glm5_next":
