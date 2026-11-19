@@ -22,7 +22,7 @@ from fastapi import APIRouter, HTTPException
 from .. import __version__
 from ..cluster.registry import get_device_registry
 from ..oqh import format as oqh_format
-from . import launcher
+from . import agent, launcher
 from .adapters import adapter_for_model
 from .lending import active_lending, forget_host, recorded_host
 from .manager import (
@@ -205,8 +205,11 @@ def _check(node_id: str) -> dict:
     }
     if "contracts" in info:
         # A helper daemon has its own version; the model families it can
-        # serve decide, not an equal version.
+        # serve decide, not an equal version. An older release only warns.
         version.update(families=sorted(info["contracts"]), fix=problem or "")
+        update = None if problem else agent.outdated(info)
+        if update:
+            version.update(status="warn", fix=update)
     else:
         version["expected"] = __version__
     rows.append(version)
