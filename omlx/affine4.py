@@ -131,6 +131,63 @@ def _tile_launch(signature, cache, queries, run):
         return None
 
 
+# Verify rows (speculative verify, short tails) per query: more run as more tiles,
+# which pay off only on longer histories.
+_TILE_VERIFY_MAX_ROWS = 16
+_TILE_VERIFY_TWO_TILE_MIN_KEYS = 32768
+# Query heads per KV head with tests and measured numbers on this route.
+_TILE_VERIFY_GROUPS = (6, 8)
+
+
+@lru_cache(maxsize=1)
+def _gpu_cores() -> int | None:
+    try:
+        from .utils.hardware import get_gpu_core_count
+
+        return get_gpu_core_count()
+    except Exception:
+        return None
+
+
+def _tile_verify_attention(cache, queries, keys_state, values_state, scale, mask):
+    """2-16 causal rows at the end of a long history, batch 1; None otherwise."""
+    states = _affine8_states(cache, keys_state, values_state)
+    if states is None:
+        return None
+    ks, vs = states
+    batch, heads, rows, _ = queries.shape
+    tokens = int(ks.indices.shape[-2])
+    kv_heads = int(ks.indices.shape[1])
+    if batch != 1 or heads % kv_heads or queries.dtype != mx.bfloat16:
+        return None
+    group = heads // kv_heads
+    from .utils import affine8_tile_attention as tile
+
+    per_tile = tile.tile_rows(rows, group)
+    tiles = -(-rows // per_tile)
+    if (
+        group not in _TILE_VERIFY_GROUPS
+        or not 2 <= rows <= _TILE_VERIFY_MAX_ROWS
+        or tokens < _TILE_MIN_KEYS
+        or (tiles > 1 and tokens < _TILE_VERIFY_TWO_TILE_MIN_KEYS)
+    ):
+        return None
+    # Left padding or ragged row ends turn the mask into an array: not this route.
+    if not (isinstance(mask, str) and mask == "causal"):
+        return None
+    if cache._attention_mask(mask, rows, tokens) != "causal":
+        return None
+    split = tile.verify_splits(tokens, kv_heads * tiles, _gpu_cores())
+
+    def run():
+        rotated_queries = cache.key_codec.prepare_queries(queries)
+        return tile.verify(rotated_queries, ks, vs, scale, split=split)
+
+    return _tile_launch(
+        ("verify", group, per_tile, str(ks.norms.dtype)), cache, queries, run
+    )
+
+
 def _tile_prefill_attention(cache, queries, keys_state, values_state, scale):
     """A causal prefill chunk (a multiple of 8 rows) at the end of a long
     history, batch 1; None otherwise."""
@@ -1506,6 +1563,12 @@ class Affine4KVCache(TurboQuantKVCache):
             )
         if self.key_codec is None or self.value_codec is None:
             self.rebuild_codecs(keys_state, values_state)
+        if sinks is None and _tile_attention_available():
+            output = _tile_verify_attention(
+                self, queries, keys_state, values_state, scale, mask
+            )
+            if output is not None:
+                return output
         output = _native_attention(
             self, queries, keys_state, values_state, scale, mask, sinks
         )

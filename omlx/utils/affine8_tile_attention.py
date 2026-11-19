@@ -13,10 +13,10 @@ rescaled only when some row max grew), fold the value scale into P and store P a
 accumulator) with V read in place. A tile may cover only a share of the history pages (a split); the splits of a tile
 write their partials with their row max and sum, and a combine kernel merges them.
 
-Entry point:
+Two entry points share the tile:
 - ``prefill``: a prefill chunk (a multiple of 8 rows), INT8 queries, 32-key pages, over K and V copied by ``prepare_kv``.
-The tile also takes bf16 queries, rows that do not fill a tile and K and V read in place through their strides, for
-entry points with few rows.
+- ``verify``: 2-16 rows (speculative verify, short tails), bf16 queries, 64-key pages, K and V read in place through the
+  strided views ``update_and_fetch`` returns, the history split across many threadgroups so the few rows fill the GPU.
 
 oMLX affine8 cache: Hadamard-rotated, signed int8 codes (uint32 words viewed as int8), one scale per (token, KV head),
 token-major K and V. Queries come in rotated; the output is fp32 in the rotated space.
@@ -505,4 +505,49 @@ def prefill(rq, k, v, scale, *, split=1):
         split=split,
         split_x=False,
         scale_vec=True,
+    )
+
+
+# ---- verify: 2-16 rows, bf16 queries, 64-key pages, K and V read in place -----------------------------------------
+
+VERIFY_PAGE = 64
+MAX_SPLITS = 64
+# A split reads at least this many pages, and the splits of all tiles aim at this many threadgroups per GPU core.
+MIN_SPLIT_PAGES = 16
+THREADGROUPS_PER_CORE = 8
+
+
+def verify_splits(tokens: int, groups: int, cores: int | None) -> int:
+    """Splits per tile for ``tokens`` keys and ``groups`` tiles (KV heads x row tiles) on ``cores`` GPU cores."""
+    pages = -(-tokens // VERIFY_PAGE)
+    by_pages = max(1, pages // MIN_SPLIT_PAGES)
+    by_cores = -(-THREADGROUPS_PER_CORE * cores // groups) if cores else MAX_SPLITS
+    return max(1, min(by_pages, by_cores, MAX_SPLITS))
+
+
+def verify(rq, keys, values, scale, *, split):
+    """Causal attention of rotated bf16 queries [1, H, n, 256] (the last n keys) over affine8 states (indices
+    [1, Hk, T, 64] uint32, norms [1, Hk, T], the strided views ``update_and_fetch`` returns are fine); fp32 output
+    [1, H, n, 256] in the rotated space."""
+    _, heads, n, dim = rq.shape
+    kv_heads = int(keys.indices.shape[1])
+    tokens = int(keys.indices.shape[2])
+    assert dim == D and n <= tokens
+    return _launch(
+        rq.astype(mx.bfloat16),
+        None,
+        (keys.indices, keys.norms),
+        (values.indices, values.norms),
+        scale,
+        kv_heads=kv_heads,
+        n=n,
+        tokens=tokens,
+        extent=tokens,
+        axis=1,
+        rows=tile_rows(n, heads // kv_heads),
+        page=VERIFY_PAGE,
+        qk8=False,
+        split=split,
+        split_x=True,
+        scale_vec=False,
     )
