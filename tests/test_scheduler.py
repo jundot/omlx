@@ -3854,10 +3854,11 @@ class TestSchedulerBoundarySnapshots:
         assert provider.tail_terminal_token_count == (7 if not persists else None)
         assert 4 in provider
 
+    @pytest.mark.parametrize("shared_end", ["system_prefix_end", "junction_end"])
     def test_boundary_override_keeps_system_prefix_tail_for_its_own_store(
-        self, mock_model, mock_tokenizer
+        self, mock_model, mock_tokenizer, shared_end
     ):
-        """Only the side store picks the system-prefix tail as its terminal."""
+        """Only the side store picks a shared tail as its terminal."""
         config = SchedulerConfig(paged_cache_block_size=4)
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
         request = Request(
@@ -3866,7 +3867,7 @@ class TestSchedulerBoundarySnapshots:
             sampling_params=SamplingParams(),
         )
         request.generation_prompt_start = 7
-        request.system_prefix_end = 6
+        setattr(request, shared_end, 6)
         scheduler.requests[request.request_id] = request
         raw = {4: object(), 6: object(), 7: object()}
         extracted = {tc: [{"state": (tc,)}] for tc in raw}
