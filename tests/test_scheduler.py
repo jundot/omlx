@@ -2386,6 +2386,15 @@ class TestSchedulerStatistics:
             reclaim()
         clear.assert_called_once_with(scheduler._stream)
 
+    def test_a_failed_offload_release_still_marks_slots_for_restore(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.moe_offload_release = MagicMock(side_effect=RuntimeError)
+        with pytest.raises(RuntimeError):
+            scheduler.release_moe_offload_slots("prefilling", 1000)
+        assert scheduler._moe_offload_slots_released is True
+
 
 class TestSchedulerReset:
     """Tests for Scheduler reset methods."""
