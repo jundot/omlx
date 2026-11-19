@@ -39,6 +39,12 @@ _default_generation_stream = generation_stream
 _mx_buffer_access_lock = threading.RLock()
 
 
+# Set while an incremental prefill store holds _mx_buffer_access_lock: a
+# prefill chunk's routine pool clear is deferred to the next chunk instead of
+# waiting for the store.
+background_store_holds_lock = threading.Event()
+
+
 @contextmanager
 def mx_buffer_lock_released():
     """Let go of ``_mx_buffer_access_lock`` while this thread waits on I/O.
@@ -78,7 +84,7 @@ def clear_thread_streams() -> None:
     mx.clear_streams()
 
 
-def _sync_and_clear_cache(stream=None):
+def _sync_and_clear_cache(stream=None, *, defer_to_background_store=False):
     """Synchronize in-flight GPU work before clearing the Metal buffer cache.
 
     Without synchronization, mx.clear_cache() can release Metal buffers that
@@ -92,9 +98,22 @@ def _sync_and_clear_cache(stream=None):
     reading tensor bytes via the Python buffer protocol (#1106).
 
     See: https://github.com/jundot/omlx/issues/300, #888, #1106
+
+    ``defer_to_background_store``: while an incremental prefill store holds
+    the lock, return False instead of waiting for it. The caller clears on a
+    later chunk.
     """
+    if defer_to_background_store and background_store_holds_lock.is_set():
+        if not _mx_buffer_access_lock.acquire(blocking=False):
+            return False
+        try:
+            _sync_and_clear_locked(stream)
+        finally:
+            _mx_buffer_access_lock.release()
+        return True
     with _mx_buffer_access_lock:
         _sync_and_clear_locked(stream)
+    return True
 
 
 def _sync_and_clear_locked(stream=None):

@@ -19,6 +19,7 @@ from omlx.cache.prefix_cache import BlockAwarePrefixCache
 from omlx.utils.metal_sync import (
     _mx_buffer_access_lock,
     _sync_and_clear_cache,
+    background_store_holds_lock,
     mx_buffer_lock_released,
 )
 
@@ -478,9 +479,9 @@ def test_a_released_queued_store_drops_its_copy_bytes(prefix_factory):
     assert sched._incremental_copy_bytes_in_flight() == 0
 
 
-def test_the_routine_clear_waits_for_a_store_holding_the_lock():
-    """The clear between prefill chunks is not skipped while a store holds
-    the buffer lock: it waits (one block, see mx_buffer_lock_released)."""
+def test_a_plain_clear_waits_for_a_store_holding_the_lock():
+    """A clear that is not a routine one between prefill chunks waits for a
+    store that holds the buffer lock (one block, see mx_buffer_lock_released)."""
     done = threading.Event()
     with _mx_buffer_access_lock:
         worker = threading.Thread(target=lambda: (_sync_and_clear_cache(), done.set()))
@@ -488,3 +489,49 @@ def test_the_routine_clear_waits_for_a_store_holding_the_lock():
         assert not done.wait(0.2)
     worker.join(5)
     assert done.is_set()
+
+
+def test_the_routine_clear_is_deferred_while_a_store_holds_the_lock():
+    """Between prefill chunks the clear does not wait for a store that holds
+    the lock: it reports that it did not run, and runs once the lock is free."""
+    result = {}
+    background_store_holds_lock.set()
+    try:
+        with _mx_buffer_access_lock:
+            worker = threading.Thread(
+                target=lambda: result.setdefault(
+                    "cleared", _sync_and_clear_cache(defer_to_background_store=True)
+                )
+            )
+            worker.start()
+            worker.join(5)
+        assert result == {"cleared": False}
+        assert _sync_and_clear_cache(defer_to_background_store=True) is True
+    finally:
+        background_store_holds_lock.clear()
+
+
+def test_chunk_sizing_leaves_out_the_pool_of_a_deferred_clear(monkeypatch):
+    """While the routine clear is deferred, the next chunk is sized as if it
+    ran: the pool is left out, never below active memory."""
+    sched = SimpleNamespace(
+        _stream=None,
+        _prefill_chunk_pool=object(),
+        _pool_clear_deferred=False,
+        _last_mlx_cache_memory_bytes=3_000,
+        _last_mlx_active_memory_bytes=4_000,
+        _current_usage_bytes=lambda: 9_000,
+        _incremental_copy_bytes_in_flight=lambda: 0,
+    )
+    monkeypatch.setattr(sch, "_sync_and_clear_cache", lambda *a, **k: False)
+    sch.Scheduler._clear_cache(sched, defer_to_background_store=True)
+    assert sched._pool_clear_deferred is True
+    assert sched._prefill_chunk_pool is not None
+    assert sch.Scheduler._prefill_sizing_usage_bytes(sched) == 6_000
+    sched._last_mlx_cache_memory_bytes = 8_000
+    assert sch.Scheduler._prefill_sizing_usage_bytes(sched) == 4_000
+    monkeypatch.setattr(sch, "_sync_and_clear_cache", lambda *a, **k: True)
+    sch.Scheduler._clear_cache(sched, defer_to_background_store=True)
+    assert sched._pool_clear_deferred is False
+    assert sched._prefill_chunk_pool is None
+    assert sch.Scheduler._prefill_sizing_usage_bytes(sched) == 9_000

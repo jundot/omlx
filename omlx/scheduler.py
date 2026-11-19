@@ -124,6 +124,7 @@ from .utils.hardware import format_bytes
 from .utils.metal_sync import (
     _default_generation_stream,
     _mx_buffer_access_lock,
+    background_store_holds_lock,
     _sync_and_clear_cache,
     clear_thread_streams,
     set_chunk_memory_limit,
@@ -2677,6 +2678,9 @@ class Scheduler:
         # Bytes of each queued or running store's block copy, which chunk
         # sizing leaves out (_incremental_copy_bytes_in_flight).
         self._incremental_copy_bytes: dict[str, int] = {}
+        # A routine clear between prefill chunks deferred while a store held
+        # the buffer lock (_clear_cache); chunk sizing leaves the pool out.
+        self._pool_clear_deferred = False
         self._inflight_store_info: dict[str, _InflightStoreInfo] = {}
         # Admission-only cache freshness waits. A waiting request can pause at
         # the front of the queue for a relevant in-flight store without
@@ -5025,7 +5029,7 @@ class Scheduler:
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
-            Scheduler._clear_cache(self)
+            Scheduler._clear_cache(self, defer_to_background_store=True)
             if vlm_embeds is None:
                 self._accrue_decode_debt(time.perf_counter() - _trace_chunk_start)
             if getattr(request, "benchmark_trace", False):
@@ -6291,8 +6295,14 @@ class Scheduler:
             return False
         return current >= self._memory_limit_bytes
 
-    def _clear_cache(self) -> None:
-        """Clear the Metal pool and account for flat-overhead buffers that may return."""
+    def _clear_cache(self, defer_to_background_store: bool = False) -> None:
+        """Clear the Metal pool and account for flat-overhead buffers that may return.
+
+        ``defer_to_background_store``: a routine clear between prefill chunks
+        does not wait for an incremental store that holds the buffer lock. It
+        is deferred to the next chunk, and chunk sizing leaves the pool out
+        until then (_prefill_sizing_usage_bytes), as if it had been cleared.
+        """
         tracker = getattr(self, "_prefill_transient_tracker", None)
         track = (
             tracker is not None
@@ -6302,7 +6312,13 @@ class Scheduler:
         # release, so a footprint delta read here can miss the whole pool.
         pooled = int(mx.get_cache_memory())
         residual = _graphics_residual() if pooled > 0 else None
-        _sync_and_clear_cache(self._stream)
+        if defer_to_background_store:
+            if _sync_and_clear_cache(self._stream, defer_to_background_store=True) is False:
+                self._pool_clear_deferred = True
+                return
+        else:
+            _sync_and_clear_cache(self._stream)
+        self._pool_clear_deferred = False
         if residual is not None:
             Scheduler._note_pool_release(self, residual)
         self._prefill_chunk_pool = None
@@ -7589,7 +7605,7 @@ class Scheduler:
         )
 
         if self._should_clear_after_chunk():
-            Scheduler._clear_cache(self)
+            Scheduler._clear_cache(self, defer_to_background_store=True)
         chunk_dt = time.perf_counter() - head.started
         for plan, before in zip(plans, processed_before):
             state = plan.state
@@ -8784,7 +8800,15 @@ class Scheduler:
         """
         copy_in_flight = getattr(self, "_incremental_copy_bytes_in_flight", None)
         in_flight = copy_in_flight() if callable(copy_in_flight) else 0
-        return max(0, int(self._current_usage_bytes()) - int(in_flight))
+        usage = int(self._current_usage_bytes()) - int(in_flight)
+        if getattr(self, "_pool_clear_deferred", False):
+            # The routine clear before this chunk was deferred while a store
+            # held the lock. Size as if it ran: leave the pool out, never
+            # below active memory.
+            pool = int(getattr(self, "_last_mlx_cache_memory_bytes", 0) or 0)
+            active = int(getattr(self, "_last_mlx_active_memory_bytes", 0) or 0)
+            usage = max(active, usage - pool)
+        return max(0, usage)
 
     def _incremental_copy_bytes_in_flight(self) -> int:
         """Bytes of the block copies of queued or running incremental stores.
@@ -8885,14 +8909,18 @@ class Scheduler:
                 return
         try:
             with _mx_buffer_access_lock:
-                _safe_sync_stream(self._stream)
-                self.block_aware_cache.store_cache(
-                    request_id,
-                    tokens,
-                    payload,
-                    model_cache_config=model_cache_config,
-                    boundary_snapshots=snapshots,
-                )
+                background_store_holds_lock.set()
+                try:
+                    _safe_sync_stream(self._stream)
+                    self.block_aware_cache.store_cache(
+                        request_id,
+                        tokens,
+                        payload,
+                        model_cache_config=model_cache_config,
+                        boundary_snapshots=snapshots,
+                    )
+                finally:
+                    background_store_holds_lock.clear()
         except Exception as e:  # noqa: BLE001 - the finish store stores what is left
             logger.warning("Incremental store_cache failed for %s: %s", request_id, e)
         finally:
