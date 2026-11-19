@@ -262,6 +262,25 @@ def _pad_state_left(state, pad_length: int):
     return _concat_state(pad, state)
 
 
+def _shift_state_rows(state, moves, end: int):
+    """Move each listed row's live tokens right inside the same buffer.
+
+    ``moves`` holds ``(row, start, shift)``: row ``row`` keeps its tokens in
+    ``[start, end - shift)`` and ends at ``end`` afterwards. Rows that are not
+    listed are not touched, so only the shifted rows' live windows are copied.
+    """
+    if state is None:
+        return
+    for field in state:
+        if isinstance(field, mx.array):
+            for row, start, shift in moves:
+                # A real copy of the source window: it overlaps the target.
+                window = mx.array(field[row : row + 1, :, start : end - shift]) + 0
+                field[row : row + 1, :, start + shift : end] = window
+        else:
+            _shift_state_rows(field, moves, end)
+
+
 def _roll_state(state, shifts, axis: int = 2):
     """Roll a quantized state along its token axis by per-row ``shifts``.
 
@@ -468,9 +487,17 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         end = self._phys_end
         shifts = [end - row_end for row_end in self._row_ends]
         if self.keys is not None:
-            amounts = mx.array(shifts)[:, None]
-            self.keys = _roll_state(_slice_state(self.keys, end), amounts, axis=2)
-            self.values = _roll_state(_slice_state(self.values, end), amounts, axis=2)
+            # Only the short rows move, inside the buffer, keeping its spare
+            # capacity. Their columns left of the new start become padding.
+            mx.eval(self.left_padding)
+            starts = [int(p) for p in self.left_padding.tolist()]
+            moves = [
+                (row, start, shift)
+                for row, (start, shift) in enumerate(zip(starts, shifts))
+                if shift > 0
+            ]
+            _shift_state_rows(self.keys, moves, end)
+            _shift_state_rows(self.values, moves, end)
             mx.eval(self.keys, self.values)
         self.left_padding = self.left_padding + mx.array(shifts)
         self._row_ends = None
