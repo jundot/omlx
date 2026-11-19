@@ -1616,7 +1616,7 @@ def test_a_helper_daemon_moves_to_a_faster_wired_link(monkeypatch):
     assert agent._fastest_link(lan) is lan
 
 
-def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch):
+def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch, caplog):
     # The first GPU also holds the shared tensors; each keeps 8 GiB spare.
     gib = 1 << 30
     assert manager_module.fit_layers(2 * gib, [4 * gib] * 20, [20 * gib] * 2, 19) == 5
@@ -1664,6 +1664,11 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch):
     assert rows[2]["families"] == ["qwen4_exp"] and "expected" not in rows[2]
     assert "docker pull jundot/omlx-cuda-helper" in rows[2]["fix"]
     assert (rows[3]["bytes"], rows[3]["gpus"]) == (84 * gib, 2)
+    # Starting a model on it logs the same steps.
+    monkeypatch.setattr(manager_module, "forget_host", lambda node: None)
+    with caplog.at_level("WARNING", logger=manager_module.logger.name):
+        manager_module._reach(daemon, "n", lambda *a, **k: None, QWEN4, "/m")
+    assert "nvidia1 is outdated" in caplog.text and "docker pull" in caplog.text
     # The helper release in this tree passes.
     helper_init = Path(__file__).parents[1] / "apps/omlx-cuda-helper/omlx_cuda_helper"
     released = f'__version__ = "{agent.MIN_HELPER_VERSION}"'
