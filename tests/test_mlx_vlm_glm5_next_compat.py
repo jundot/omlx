@@ -3321,30 +3321,38 @@ def _hyper_connection(hidden=4096, seed=0, bf16_fn=False):
 @pytest.mark.usefixtures("glm5_fused_decode")
 @pytest.mark.parametrize("bf16_fn", [False, True])
 @pytest.mark.parametrize("hidden", [4096, 1024])
-@pytest.mark.parametrize("length", [1, 2, 4, 8])
-def test_decode_hc_pre_is_bitwise_reference(hidden, length, bf16_fn):
+@pytest.mark.parametrize(
+    ("batch", "length"), [(1, 1), (1, 2), (1, 4), (1, 8), (4, 1), (2, 3)]
+)
+def test_decode_hc_pre_is_bitwise_reference(hidden, batch, length, bf16_fn):
     """BF16-valued mix weights (the checkpoints') are read from their BF16
     copy (``mix_weights``); fp32 weights from the fp32 array."""
     language = _language()
     hc, norm = _hyper_connection(hidden, seed=length, bf16_fn=bf16_fn)
     assert (dk.mix_weights(hc).dtype == mx.bfloat16) == bf16_fn
     for trial in range(3):
-        x = (mx.random.normal((1, length, 4, hidden)) * (1 + 2 * trial)).astype(
-            mx.bfloat16
-        )
-        collapsed, post, comb = hc(x)
-        reference = norm(collapsed)
+        x = (
+            mx.random.normal((batch, length, 4, hidden)) * (1 + 2 * trial)
+        ).astype(mx.bfloat16)
         fused = language._decode_hc_pre(hc, norm, x)
         assert fused is not None
         normalized, fused_post, fused_comb = fused
-        assert _mismatches(normalized, reference) == 0
-        assert _mismatches(fused_post, post) == 0
-        assert _mismatches(fused_comb, comb) == 0
-        # Each verify row equals the one-token decode of that row.
-        for row in range(length):
-            single = language._decode_hc_pre(hc, norm, x[:, row : row + 1])
-            assert _mismatches(single[0], normalized[:, row : row + 1]) == 0
-            assert _mismatches(single[2], fused_comb[:, row : row + 1]) == 0
+        # The reference mixes a batch's rows in one GEMM; the fused rows keep
+        # the one-token reduction.
+        if batch == 1:
+            collapsed, post, comb = hc(x)
+            assert _mismatches(normalized, norm(collapsed)) == 0
+            assert _mismatches(fused_post, post) == 0
+            assert _mismatches(fused_comb, comb) == 0
+        # Each batch or verify row equals the one-token decode of that row.
+        for b in range(batch):
+            for row in range(length):
+                single = language._decode_hc_pre(
+                    hc, norm, x[b : b + 1, row : row + 1]
+                )
+                at = (slice(b, b + 1), slice(row, row + 1))
+                assert _mismatches(single[0], normalized[at]) == 0
+                assert _mismatches(single[2], fused_comb[at]) == 0
 
 
 def _check_one_token_hc_expand(hidden):
@@ -3540,7 +3548,7 @@ def test_decode_hc_pre_declines_uncovered_inputs():
     language = _language()
     hc, norm = _hyper_connection(1024)
     assert (
-        language._decode_hc_pre(hc, norm, mx.zeros((2, 1, 4, 1024), mx.bfloat16))
+        language._decode_hc_pre(hc, norm, mx.zeros((2, 5, 4, 1024), mx.bfloat16))
         is None
     )
     assert (
