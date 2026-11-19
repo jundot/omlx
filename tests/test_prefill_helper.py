@@ -1442,6 +1442,7 @@ def _fake_daemon(root, events):
                 "version": "0.1.0",
                 "data_protocol": wire.PROTOCOL,
                 "contracts": {"deepseek_v41": DSV41.contract},
+                "oqh": {"deepseek_v41": 1},
                 "gpus": [{**_GPU, "free": 40 << 30}, {**_GPU, "free": 44 << 30}],
                 "disk_free": 1 << 40,
                 "link_mbps": 1000,
@@ -1529,10 +1530,9 @@ def test_agent_transport_drives_a_helper_daemon(tmp_path, monkeypatch):
     older = {**info, "contracts": {"deepseek_v41": DSV41.contract - 1}}
     assert "update the helper" in agent.incompatible(older, DSV41, "nvidia1")
     # oQh weights need a helper whose family reads that format version.
-    assert "oQh" in agent.incompatible(info, DSV41, "nvidia1", oqh=1)
-    reads = {**info, "oqh": {"deepseek_v41": 1}}
-    assert agent.incompatible(reads, DSV41, "nvidia1", oqh=1) is None
-    assert "oQh" in agent.incompatible(reads, DSV41, "nvidia1", oqh=2)
+    assert agent.incompatible(info, DSV41, "nvidia1", oqh=1) is None
+    assert "oQh" in agent.incompatible(info, DSV41, "nvidia1", oqh=2)
+    assert "oQh" in agent.incompatible({**info, "oqh": {}}, DSV41, "nvidia1", oqh=1)
 
     # A copy stopped halfway resumes from the bytes the helper kept.
     model = tmp_path / "Model"

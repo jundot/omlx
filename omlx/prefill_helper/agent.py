@@ -328,6 +328,7 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
         "version": info.get("version"),
         "data_protocol": info.get("data_protocol"),
         "contracts": info.get("contracts") or {},
+        "oqh": info.get("oqh") or {},
         "budgets": budgets,
         "budget": sum(budgets),
         "memory": sum(int(gpu["total"]) for gpu in gpus),
