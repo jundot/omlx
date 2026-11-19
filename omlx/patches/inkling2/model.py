@@ -706,6 +706,9 @@ class Inkling2TextModel(nn.Module):
 
     @property
     def num_visits(self) -> int:
+        if self._core_start is None:
+            # The prefill helper keeps only the first layers of a plain model.
+            return len(self.layers)
         return len(self._schedule)
 
     def __call__(self, inputs, cache=None, input_embeddings=None, capture=None):
