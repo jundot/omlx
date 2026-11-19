@@ -53,49 +53,118 @@ _FUSED_QUANTIZE_LAUNCHABLE = {}
 _DEQUANTIZE_LAUNCHABLE = {}
 
 
-# Prefill attention straight from the int8 codes (INT8 Q x INT8 K on the
-# tensor ops). OMLX_ATTN_Q8Q=0 turns it off.
-_Q8Q_ATTENTION = __import__("os").environ.get("OMLX_ATTN_Q8Q", "1") == "1"
-_Q8Q_MIN_KEYS = int(__import__("os").environ.get("OMLX_ATTN_Q8Q_MIN_KEYS", "16384"))
-_Q8Q_SPLIT = int(__import__("os").environ.get("OMLX_ATTN_Q8Q_SPLIT", "8"))
-_Q8Q_SPLIT_MIN_KEYS = 65536
+# Attention of the last rows of a long affine8 history on the tensor ops
+# (omlx/utils/affine8_tile_attention.py). The first launch of each kernel
+# signature is evaluated; a launch error turns that signature off and the
+# current route runs instead.
+_TILE_MIN_KEYS = 16384
+# Prefill chunks over long histories run several threadgroups per tile.
+_TILE_PREFILL_SPLIT = 8
+_TILE_PREFILL_SPLIT_MIN_KEYS = 65536
+_TILE_LAUNCHABLE = {}
 
 
-def _q8q_prefill_attention(cache, queries, keys_state, values_state, scale):
-    """One causal chunk of rows at the end of the history, head dim 256,
-    batch 1, the whole GQA group of a KV head in one tile; None otherwise.
-    See omlx/utils/q8q_attention.py."""
-    ks = getattr(keys_state, "_state", keys_state)
-    vs = getattr(values_state, "_state", values_state)
-    if not (hasattr(ks, "indices") and hasattr(vs, "indices")):
+@lru_cache(maxsize=1)
+def _nax_tensor_ops() -> bool:
+    if not _tensor_ops_available():
+        return False
+    try:
+        from .custom_kernels.nax import is_nax_available
+
+        return bool(is_nax_available())
+    except Exception:
+        return False
+
+
+def _tile_attention_available() -> bool:
+    return mx.default_device() == mx.gpu and _nax_tensor_ops()
+
+
+def _affine8_states(cache, keys_state, values_state):
+    """The affine8 states the tile reads, or None for other caches."""
+    if not (
+        isinstance(keys_state, TurboQuantMSEState)
+        and isinstance(values_state, TurboQuantMSEState)
+        and isinstance(cache.key_codec, Affine8Codec)
+        and isinstance(cache.value_codec, Affine8Codec)
+        and cache.key_codec.dim == 256
+        and cache.value_codec.dim == 256
+    ):
         return None
-    batch, heads, rows, dim = queries.shape
+    ks, vs = keys_state, values_state
+    if (
+        ks.indices.ndim != 4
+        or ks.norms.ndim != 3
+        or ks.indices.dtype != mx.uint32
+        or vs.indices.dtype != mx.uint32
+        or int(ks.indices.shape[-1]) != 64
+        or vs.indices.shape != ks.indices.shape
+        or tuple(ks.norms.shape) != tuple(ks.indices.shape[:3])
+        or tuple(vs.norms.shape) != tuple(ks.norms.shape)
+        or ks.norms.dtype not in (mx.float16, mx.float32)
+        or vs.norms.dtype != ks.norms.dtype
+    ):
+        return None
+    return ks, vs
+
+
+def _tile_launch(signature, cache, queries, run):
+    """Runs ``run()`` (rotated fp32 output) and rotates it back; None when the
+    signature failed before or fails now."""
+    if _TILE_LAUNCHABLE.get(signature) is False:
+        return None
+    try:
+        output = cache.value_codec._rotate_inverse(run()).astype(queries.dtype)
+        if signature not in _TILE_LAUNCHABLE:
+            mx.eval(output)
+            _TILE_LAUNCHABLE[signature] = True
+            logger.info("Affine8 tile attention active (%s)", signature)
+        return output
+    except (RuntimeError, ValueError) as error:
+        if is_command_buffer_error(error):
+            raise
+        _TILE_LAUNCHABLE[signature] = False
+        logger.warning(
+            "Affine8 tile attention unavailable for %s; using the current route",
+            signature,
+        )
+        return None
+
+
+def _tile_prefill_attention(cache, queries, keys_state, values_state, scale):
+    """A causal prefill chunk (a multiple of 8 rows) at the end of a long
+    history, batch 1; None otherwise."""
+    states = _affine8_states(cache, keys_state, values_state)
+    if states is None:
+        return None
+    ks, vs = states
+    batch, heads, rows, _ = queries.shape
     tokens = int(ks.indices.shape[-2])
     kv_heads = int(ks.indices.shape[1])
     if (
         batch != 1
-        or dim != 256
-        or kv_heads <= 0
         or heads % kv_heads
+        or (heads // kv_heads) * 8 > 48
         or rows % 8
         or rows > tokens
-        or tokens < _Q8Q_MIN_KEYS
-        or int(vs.indices.shape[-2]) != tokens
+        or tokens < _TILE_MIN_KEYS
     ):
         return None
-    from .utils import q8q_attention as _q8q
+    from .utils import affine8_tile_attention as tile
 
-    rotated_queries = cache.key_codec.prepare_queries(queries).astype(mx.bfloat16)
-    k = _q8q.prepare_kv(ks.indices, ks.norms)
-    v = _q8q.prepare_kv(vs.indices, vs.norms)
-    # Long histories run several threadgroups per tile (shorter threadgroups
-    # keep the GPU busier); short ones gain nothing from the extra combine.
-    split = _Q8Q_SPLIT if tokens >= _Q8Q_SPLIT_MIN_KEYS else 1
-    rotated_output = _q8q.run(rotated_queries, k, v, scale, split=split)
-    output = cache.value_codec._rotate_inverse(rotated_output).astype(queries.dtype)
-    mx.eval(output)
-    output = mx.array(output)
-    mx.eval(output)
+    split = _TILE_PREFILL_SPLIT if tokens >= _TILE_PREFILL_SPLIT_MIN_KEYS else 1
+
+    def run():
+        rotated_queries = cache.key_codec.prepare_queries(queries).astype(mx.bfloat16)
+        k = tile.prepare_kv(ks.indices, ks.norms)
+        v = tile.prepare_kv(vs.indices, vs.norms)
+        return tile.prefill(rotated_queries, k, v, scale, split=split)
+
+    output = _tile_launch(("prefill", heads // kv_heads, split), cache, queries, run)
+    if output is not None:
+        mx.eval(output)
+        output = mx.array(output)
+        mx.eval(output)
     return output
 
 
@@ -1455,14 +1524,11 @@ class Affine4KVCache(TurboQuantKVCache):
             and (effective_mask is None or isinstance(effective_mask, str))
         ):
             if (
-                _Q8Q_ATTENTION
-                and sinks is None
+                sinks is None
                 and effective_mask == "causal"
-                and self.key_codec.bits == 8
-                and self.value_codec.bits == 8
-                and _tensor_ops_available()
+                and _tile_attention_available()
             ):
-                output = _q8q_prefill_attention(
+                output = _tile_prefill_attention(
                     self, queries, keys_state, values_state, scale
                 )
                 if output is not None:
