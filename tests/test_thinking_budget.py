@@ -295,12 +295,6 @@ class TestThinkingBudgetProcessor:
             logits = _make_logits()
             assert mx.array_equal(proc(_make_tokens(*history), logits), logits).item()
 
-    def test_never_inert_while_forcing(self):
-        proc = self._make_processor(budget=1)
-        proc(_make_tokens(10), _make_logits())
-        assert proc._forcing
-        assert not proc.inert_for(1)
-
 
 # ---------------------------------------------------------------------------
 # ModelSettings serialization

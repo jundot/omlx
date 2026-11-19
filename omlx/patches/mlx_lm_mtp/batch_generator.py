@@ -1699,14 +1699,7 @@ def _apply_processors(processors, prev_tokens, logits_2d):
 
 
 def _live_processors(procs, positions: int):
-    """The processors that can change logits within the next ``positions`` calls.
-
-    A processor that declares itself inert for those calls (the thinking
-    budget, far from its budget) is left out. Draft steps rewind processor
-    state afterwards, and verify rows only advance it, so calling an inert
-    processor there just reads the tokens back from the GPU at every step,
-    which stalls the MTP cycle.
-    """
+    """Processors that can change logits within the next ``positions`` calls."""
     if not procs:
         return procs
     live = [
@@ -1716,11 +1709,7 @@ def _live_processors(procs, positions: int):
 
 
 class _HostTokens:
-    """Token history whose tail past ``base`` is host ints.
-
-    Processors read only ``len()`` and the positions they haven't accepted
-    yet, which all lie in the tail, so they can advance without a GPU read.
-    """
+    """Token history with host ints past ``base``, where processors read new tokens."""
 
     def __init__(self, base: int, tail: List[int]):
         self._base = base
@@ -1736,12 +1725,7 @@ class _HostTokens:
 
 
 def _advance_processors(procs, base: int, emitted: List[int]) -> None:
-    """Advance inert processors over the tokens emitted this cycle.
-
-    One call per emitted position, as the verify rows would have made, with
-    the history read from host ints. The processors are inert for these
-    positions, so the logits argument is never touched.
-    """
+    """Advance inert processors one call per emitted token, as the verify rows would."""
     for j in range(len(emitted)):
         history = _HostTokens(base, emitted[: j + 1])
         for proc in procs:
@@ -3196,8 +3180,7 @@ def _dspark_next_drafts(
     # Drafts are speculative — processor calls shape the draft
     # distribution but must not advance the thinking budget (they would
     # count tokens that are only emitted if verified later). Checkpoint
-    # before the loop and rewind after. Processors inert for the whole
-    # chain are skipped (see _live_processors).
+    # before the loop and rewind after.
     draft_procs = _live_processors(procs, depth)
     snap = _snap_snapshotable(draft_procs)
 
@@ -3292,9 +3275,6 @@ def _chain_next_drafts(
     if begin is not None:
         begin(state.mtp_cache, depth)
 
-    # Only processors that can act on this chain shape the drafts (see
-    # _live_processors); without any, the drafts take the top-k sampling
-    # and coarse-head paths a processor-free request gets.
     draft_procs = _live_processors(procs, depth)
     sparse_k = _sparse_top_k(sampler) if draft_procs is None else 0
     coarse = _coarse_draft_head(model) if 0 < sparse_k <= 32 else None
@@ -4433,9 +4413,7 @@ def _run_verify_cycle_chain(
         prev_rows[0] = buf.update_and_fetch(state.next_main)
         for j in range(k):
             prev_rows[j + 1] = buf.update_and_fetch(state.drafts[j : j + 1])
-    # Processors that can't change any row's logits skip the rows; once the
-    # accept count is known they advance over the emitted tokens from host
-    # ids instead (_advance_processors).
+    # Inert processors skip the rows and advance over the emitted tokens below.
     verify_procs = _live_processors(procs, k + 1)
     deferred_procs = [p for p in procs or [] if p not in (verify_procs or [])]
 
