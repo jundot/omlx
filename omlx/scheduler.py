@@ -124,6 +124,7 @@ from .utils.hardware import format_bytes
 from .utils.metal_sync import (
     _default_generation_stream,
     _mx_buffer_access_lock,
+    background_store_holds_lock,
     _sync_and_clear_cache,
     clear_thread_streams,
     set_chunk_memory_limit,
@@ -5017,7 +5018,7 @@ class Scheduler:
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
-            Scheduler._clear_cache(self)
+            Scheduler._clear_cache(self, defer_to_background_store=True)
             if vlm_embeds is None:
                 self._accrue_decode_debt(time.perf_counter() - _trace_chunk_start)
             if getattr(request, "benchmark_trace", False):
@@ -6283,8 +6284,13 @@ class Scheduler:
             return False
         return current >= self._memory_limit_bytes
 
-    def _clear_cache(self) -> None:
-        """Clear the Metal pool and account for flat-overhead buffers that may return."""
+    def _clear_cache(self, defer_to_background_store: bool = False) -> None:
+        """Clear the Metal pool and account for flat-overhead buffers that may return.
+
+        ``defer_to_background_store``: a routine clear between prefill chunks
+        is skipped, not waited for, while an incremental prefill store holds
+        the buffer lock; the next chunk clears.
+        """
         tracker = getattr(self, "_prefill_transient_tracker", None)
         track = (
             tracker is not None
@@ -6294,7 +6300,11 @@ class Scheduler:
         # release, so a footprint delta read here can miss the whole pool.
         pooled = int(mx.get_cache_memory())
         residual = _graphics_residual() if pooled > 0 else None
-        _sync_and_clear_cache(self._stream)
+        if defer_to_background_store:
+            if _sync_and_clear_cache(self._stream, defer_to_background_store=True) is False:
+                return
+        else:
+            _sync_and_clear_cache(self._stream)
         if residual is not None:
             Scheduler._note_pool_release(self, residual)
         self._prefill_chunk_pool = None
@@ -7581,7 +7591,7 @@ class Scheduler:
         )
 
         if self._should_clear_after_chunk():
-            Scheduler._clear_cache(self)
+            Scheduler._clear_cache(self, defer_to_background_store=True)
         chunk_dt = time.perf_counter() - head.started
         for plan, before in zip(plans, processed_before):
             state = plan.state
@@ -8829,14 +8839,18 @@ class Scheduler:
                 return
         try:
             with _mx_buffer_access_lock:
-                _safe_sync_stream(self._stream)
-                self.block_aware_cache.store_cache(
-                    request_id,
-                    tokens,
-                    payload,
-                    model_cache_config=model_cache_config,
-                    boundary_snapshots=snapshots,
-                )
+                background_store_holds_lock.set()
+                try:
+                    _safe_sync_stream(self._stream)
+                    self.block_aware_cache.store_cache(
+                        request_id,
+                        tokens,
+                        payload,
+                        model_cache_config=model_cache_config,
+                        boundary_snapshots=snapshots,
+                    )
+                finally:
+                    background_store_holds_lock.clear()
         except Exception as e:  # noqa: BLE001 - the finish store stores what is left
             logger.warning("Incremental store_cache failed for %s: %s", request_id, e)
 

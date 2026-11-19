@@ -39,6 +39,11 @@ _default_generation_stream = generation_stream
 _mx_buffer_access_lock = threading.RLock()
 
 
+# Set while an incremental prefill store holds _mx_buffer_access_lock: a
+# prefill chunk's routine pool clear skips that chunk instead of waiting.
+background_store_holds_lock = threading.Event()
+
+
 @contextmanager
 def mx_buffer_lock_released():
     """Let go of ``_mx_buffer_access_lock`` while this thread waits on I/O.
@@ -47,7 +52,9 @@ def mx_buffer_lock_released():
     whose bytes are already copied out needs no Metal buffer. Waiting on a
     full SSD write queue under the lock would stall every prefill chunk's
     ``mx.clear_cache``, so the lock is released for the wait and taken back
-    after. A thread that does not hold the lock is unaffected.
+    after. Called once per stored block, this also lets a waiting prefill
+    chunk in between blocks instead of after the whole store. A thread that
+    does not hold the lock is unaffected.
     """
     lock = _mx_buffer_access_lock
     if not lock._is_owned():
@@ -55,6 +62,8 @@ def mx_buffer_lock_released():
         return
     state = lock._release_save()
     try:
+        # Give a thread blocked on the lock the chance to take it now.
+        time.sleep(0)
         yield
     finally:
         lock._acquire_restore(state)
@@ -74,7 +83,7 @@ def clear_thread_streams() -> None:
     mx.clear_streams()
 
 
-def _sync_and_clear_cache(stream=None):
+def _sync_and_clear_cache(stream=None, *, defer_to_background_store=False):
     """Synchronize in-flight GPU work before clearing the Metal buffer cache.
 
     Without synchronization, mx.clear_cache() can release Metal buffers that
@@ -89,26 +98,42 @@ def _sync_and_clear_cache(stream=None):
 
     See: https://github.com/jundot/omlx/issues/300, #888, #1106
     """
+    if defer_to_background_store and background_store_holds_lock.is_set():
+        # A routine clear between prefill chunks can wait for the next chunk;
+        # an incremental store is copying blocks out under the lock.
+        if not _mx_buffer_access_lock.acquire(blocking=False):
+            return False
+        try:
+            _sync_and_clear_locked(stream)
+        finally:
+            _mx_buffer_access_lock.release()
+        return True
     with _mx_buffer_access_lock:
-        # The engine stream may not have in-flight work on the current thread
-        # (for example, during teardown before that thread submits work). On
-        # some MLX builds mx.synchronize raises "There is no Stream(gpu, 0) in
-        # current thread" in that case; swallow it since there is nothing to
-        # drain. Any other error is a failed command buffer, and MLX clears it
-        # on raise, so swallowing it would hide the discarded results.
-        target = stream if stream is not None else _default_generation_stream
-        try:
-            mx.synchronize(target)
-        except RuntimeError as exc:
-            exit_if_gpu_submissions_ignored(exc)
-            if "no Stream" not in str(exc):
-                raise
-        try:
-            mx.synchronize()  # default stream
-            mx.clear_cache()
-        except RuntimeError as exc:
-            exit_if_gpu_submissions_ignored(exc)
+        _sync_and_clear_locked(stream)
+    return True
+
+
+def _sync_and_clear_locked(stream=None):
+    """Body of _sync_and_clear_cache; call with _mx_buffer_access_lock held."""
+    # The engine stream may not have in-flight work on the current thread
+    # (for example, during teardown before that thread submits work). On
+    # some MLX builds mx.synchronize raises "There is no Stream(gpu, 0) in
+    # current thread" in that case; swallow it since there is nothing to
+    # drain. Any other error is a failed command buffer, and MLX clears it
+    # on raise, so swallowing it would hide the discarded results.
+    target = stream if stream is not None else _default_generation_stream
+    try:
+        mx.synchronize(target)
+    except RuntimeError as exc:
+        exit_if_gpu_submissions_ignored(exc)
+        if "no Stream" not in str(exc):
             raise
+    try:
+        mx.synchronize()  # default stream
+        mx.clear_cache()
+    except RuntimeError as exc:
+        exit_if_gpu_submissions_ignored(exc)
+        raise
 
 
 # The kernel footprint keeps charging freed Metal buffers until the driver
