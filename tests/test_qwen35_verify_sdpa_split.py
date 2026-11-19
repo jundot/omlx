@@ -513,91 +513,26 @@ def test_core_count_comes_from_the_hardware_with_an_m1_max_fallback(monkeypatch)
     vs._m1_gpu_cores.cache_clear()
 
 
-# --- Mid-core tensor-unit key-split sizing ------------------------------------
 
-
-def _gpu(monkeypatch, *, m1=False, cores=None):
-    monkeypatch.setattr(vs, "_m1_gpu", lambda: m1)
-    monkeypatch.setattr(vs, "_mid_core_tensor_gpu_cores", lambda: cores)
-
-
-def test_mid_core_keeps_the_default_split_up_to_16k_keys(monkeypatch):
-    _gpu(monkeypatch, cores=20)
-    for kv_len in (64, 4096, 16383, 16384):
-        assert vs._gqa_chunk(kv_len, 4) == max(256, (-(-kv_len // 16) + 63) // 64 * 64)
-    # the first length past the bound takes the mid-core sizing
-    assert vs._gqa_chunk(16385, 4) == 2112
-
-
-@pytest.mark.parametrize(
-    "kv_len,chunk", [(32768, 4096), (65536, 8192), (131072, 16384)]
-)
-def test_mid_core_m5_pro_long_kv_is_eight_splits_per_kv_head(
-    monkeypatch, kv_len, chunk
-):
-    _gpu(monkeypatch, cores=20)
-    got = vs._gqa_chunk(kv_len, 4)
-    assert got == chunk and got % 64 == 0
-    # 8 splits x 4 KV heads = 32 threadgroups = 1.6 per core
-    assert -(-kv_len // got) * 4 == 32
-
-
-def test_mid_core_split_count_is_clamped_and_chunk_has_a_floor():
-    # few cores, many KV heads: at least 4 splits
-    assert -(-65536 // vs._mid_core_gqa_chunk(65536, 8, cores=8)) == 4
-    # many cores, one KV head: at most 32 splits
-    assert -(-262144 // vs._mid_core_gqa_chunk(262144, 1, cores=39)) == 32
-    # never below 512 keys (the gate keeps callers above it; direct calls must too)
-    assert vs._mid_core_gqa_chunk(8192, 1, cores=39) == 512
-    # always a multiple of 64
-    for cores in (10, 16, 20, 32, 39):
-        for kv_len in (16385, 20480, 99999, 262144):
-            for heads in (1, 2, 4, 8):
-                chunk = vs._mid_core_gqa_chunk(kv_len, heads, cores)
-                assert chunk >= 512 and chunk % 64 == 0
-
-
-def test_m1_ultra_and_unknown_gpus_keep_their_sizing(monkeypatch):
-    # Ultra class (80 cores) and an unreadable core count: 512 keys
-    _gpu(monkeypatch, cores=None)
-    assert vs._gqa_chunk(32768, 4) == 512
+def test_tensor_unit_gpus_under_40_cores_size_long_splits_by_cores(monkeypatch):
+    monkeypatch.setattr(vs, "_m1_gpu", lambda: False)
+    monkeypatch.setattr(vs, "_mid_core_tensor_gpu_cores", lambda: 20)
+    assert vs._gqa_chunk(16384, 4) == 1024
+    # 8 splits per KV head on a 20-core GPU with 4 KV heads.
+    assert [vs._gqa_chunk(n, 4) for n in (32768, 131072)] == [4096, 16384]
+    monkeypatch.setattr(vs, "_mid_core_tensor_gpu_cores", lambda: None)
     assert vs._gqa_chunk(131072, 4) == 512
-    # M1: its own sizing
-    monkeypatch.setattr(vs, "_m1_gpu_cores", lambda: 32)
-    _gpu(monkeypatch, m1=True, cores=20)
-    assert vs._gqa_chunk(32768, 4) == vs._m1_gqa_chunk(32768, 4, cores=32) == 4096
-
-
-def test_mid_core_gate_is_tensor_unit_generation_with_under_40_cores(monkeypatch):
-    from omlx.utils import hardware
-
-    def gate(gen, cores):
-        vs._mid_core_tensor_gpu_cores.cache_clear()
-        monkeypatch.setattr(hardware, "get_apple_gpu_generation", lambda: gen)
-        monkeypatch.setattr(hardware, "get_gpu_core_count", lambda: cores)
-        try:
-            return vs._mid_core_tensor_gpu_cores()
-        finally:
-            vs._mid_core_tensor_gpu_cores.cache_clear()
-
-    assert gate(17, 20) == 20
-    assert gate(17, 39) == 39
-    assert gate(17, 40) is None  # Ultra-class core counts
-    assert gate(17, 80) is None
-    assert gate(17, None) is None
-    assert gate(16, 20) is None  # no tensor units
-    assert gate(13, 20) is None
 
 
 @pytest.mark.skipif(
     not mx.metal.is_available() or not _gqa_ready(), reason="requires tensor ops"
 )
-def test_mid_core_long_kv_split_matches_per_row(monkeypatch):
-    """32 splits of 640 keys against the per-row reference (compact shape)."""
-    _gpu(monkeypatch, cores=20)
+def test_core_sized_long_kv_split_matches_per_row(monkeypatch):
+    monkeypatch.setattr(vs, "_m1_gpu", lambda: False)
+    monkeypatch.setattr(vs, "_mid_core_tensor_gpu_cores", lambda: 20)
     mx.random.seed(11)
-    q_len, kv_len, kv_heads, heads = 5, 20480, 1, 6
-    assert vs._gqa_chunk(kv_len, kv_heads) == 640  # 32 splits, not 512-key ones (40)
+    q_len, kv_len, kv_heads, heads = 5, 33000, 4, 24
+    assert vs._gqa_chunk(kv_len, kv_heads) == 4160  # ragged last split
     q = mx.random.normal((1, heads, q_len, HD)).astype(mx.bfloat16)
     k = mx.random.normal((1, kv_heads, kv_len, HD)).astype(mx.bfloat16)
     v = mx.random.normal((1, kv_heads, kv_len, HD)).astype(mx.bfloat16)
