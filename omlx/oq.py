@@ -10555,7 +10555,12 @@ def _iter_streamed_layer_blocks(
         items = _streamed_layer_items(dp, layer_idx, skip_key=skip_key)
         if _is_muse_spark(config):
             items = muse_spark_layout.calibration_items(items, layer_idx, config)
-        block = layer_cls(args, layer_idx)
+        _block_args = (
+            (args, args.layers_block_type[layer_idx], layer_idx)
+            if _stream_source_model_type(config) == "jamba"
+            else (args, layer_idx)
+        )
+        block = layer_cls(*_block_args)
         # Freshly constructed modules default to training mode; loaded models
         # run in eval mode. Layer implementations may branch on the flag
         # (Qwen3.5-family GDN picks its fused kernel with
