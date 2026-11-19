@@ -1687,6 +1687,7 @@ class TestClaudeCodeIntegration:
         assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "qwen3.5"
         assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "131072"
         assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
+        assert env["CLAUDE_CODE_AUTO_MODE_SERVER"] == "0"
         # Bundled-python vars must be stripped so claude code subprocess hooks
         # don't inherit our cpython-3.11 stack.
         assert "PYTHONHOME" not in env

@@ -102,12 +102,13 @@ _DECODE_EVAL_EVERY = 8
 
 
 def _decode_hc_pre(connection, norm, x: mx.array):
-    """HC collapse plus the branch's input RMSNorm for B == 1, L <= 8.
+    """HC collapse plus the branch's input RMSNorm for B * L <= 8 tokens.
 
     Two dispatches (``hc_mix`` and ``exact_hc_norm``) replace the
-    cast/RMS/mix-GEMV/sinkhorn-collapse/RMSNorm chain; every row equals the
-    reference ``connection(x)`` followed by ``norm`` (the one-token GEMV
-    reduction, which the reference also uses per token for L <= 8).
+    cast/RMS/mix-GEMV/sinkhorn-collapse/RMSNorm chain. Every row uses the
+    one-token GEMV reduction: one sequence equals the reference
+    ``connection(x)`` followed by ``norm`` (which also reduces per token for
+    L <= 8), and a batch row equals its one-token decode.
     Returns None when the shape or module state is not covered.
     """
     if (
@@ -115,8 +116,7 @@ def _decode_hc_pre(connection, norm, x: mx.array):
         or connection.training
         or connection.hc_mult != 4
         or x.ndim != 4
-        or x.shape[0] != 1
-        or not 1 <= x.shape[1] <= _DECODE_BLOCK
+        or not 1 <= x.shape[0] * x.shape[1] <= _DECODE_BLOCK
     ):
         return None
     mixes = _decode_kernels.hc_mix(
@@ -610,7 +610,8 @@ class Glm5NextLinearAttention(nn.Module):
         return mx.concatenate([outs[g][..., a:b] for g, a, b in runs], axis=-1)
 
     def _decode_step(self, inputs, mask, cache, capture=None):
-        """Fused layer body for one sequence and S <= 8 tokens (bit-identical).
+        """Fused layer body for one sequence and S <= 8 tokens (bit-identical),
+        or a batch decode step of up to 8 one-token rows.
 
         One kernel (``decode_kernels.kda_decode_step``) replaces the conv,
         SiLU, l2norm, gate projections, delta rule and RMSNormGated ops
@@ -625,8 +626,10 @@ class Glm5NextLinearAttention(nn.Module):
         fg = self.forget_gate
         if (
             not _DECODE_FUSION
-            or B != 1
             or not 1 <= S <= _DECODE_BLOCK
+            # Batched verify keeps the reference body: rollback_rows replays
+            # its capture tuple.
+            or (B > 1 and (S > 1 or capture is not None or B > _DECODE_BLOCK))
             or mask is not None
             or cache is None
             or getattr(cache, "lengths", None) is not None
@@ -2412,6 +2415,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.compile_ffn = True
         self._ffn_c = None
         self._ffn_rc = None
+        self._ffn_vc = None
         self._ffn_dc = None
         self._ffn_eager_shapes = set()
 
@@ -2440,25 +2444,39 @@ class Glm5NextDecoderLayer(nn.Module):
             xn, post, comb = fused
         r = self.self_attn(xn, mask, cache)
         x = _decode_hc_expand(r, residual, post, comb)
-        # Short verification shares the decode compiler; prefill remains eager.
-        if self.compile_ffn and x.shape[0] == 1 and 1 <= x.shape[1] <= _DECODE_BLOCK:
-            # A trace keeps the row-exact branches it was traced with, so each
-            # mode compiles its own.
-            exact = _row_exact_armed()
-            shape = (x.shape, x.dtype, exact)
-            if x.shape[1] > 1 and shape not in self._ffn_eager_shapes:
-                # Prime bitwise kernel checks once per verification shape;
-                # they cannot evaluate their canaries inside a compiled trace.
-                self._ffn_eager_shapes.add(shape)
-                return self._ffn_block(x)
-            if exact:
-                if self._ffn_rc is None:
-                    self._ffn_rc = mx.compile(self._ffn_block)
-                return self._ffn_rc(x)
+        return self._ffn_half(x)
+
+    def _ffn_half(self, x: mx.array) -> mx.array:
+        # Blocks of B * L <= 8 tokens (decode, short verification and batch
+        # decode) share the decode compiler; prefill remains eager.
+        B, L = x.shape[:2]
+        if not self.compile_ffn or not 1 <= B * L <= _DECODE_BLOCK:
+            return self._ffn_block(x)
+        # The FFN half is token-wise, so batch rows run as one block on the
+        # fused kernels.
+        rows = x.reshape(1, B * L, *x.shape[2:])
+        # A trace keeps the verify routes it was traced with, so each mode
+        # compiles its own.
+        exact, armed = _row_exact_armed(), _verify_qmm_armed()
+        shape = (rows.shape, rows.dtype, exact, armed)
+        if B * L > 1 and shape not in self._ffn_eager_shapes:
+            # Prime bitwise kernel checks once per verification shape;
+            # they cannot evaluate their canaries inside a compiled trace.
+            self._ffn_eager_shapes.add(shape)
+            return self._ffn_block(rows).reshape(x.shape)
+        if exact:
+            if self._ffn_rc is None:
+                self._ffn_rc = mx.compile(self._ffn_block)
+            fn = self._ffn_rc
+        elif armed:
+            if self._ffn_vc is None:
+                self._ffn_vc = mx.compile(self._ffn_block)
+            fn = self._ffn_vc
+        else:
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
-            return self._ffn_c(x)
-        return self._ffn_block(x)
+            fn = self._ffn_c
+        return fn(rows).reshape(x.shape)
 
     def _ffn_block(self, x: mx.array) -> mx.array:
         # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.
