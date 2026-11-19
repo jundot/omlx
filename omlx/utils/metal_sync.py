@@ -18,7 +18,7 @@ given, resolved on the calling thread.
 import threading
 import time
 from collections import deque
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 
 import mlx.core as mx
 from mlx_lm.generate import generation_stream
@@ -37,6 +37,27 @@ _default_generation_stream = generation_stream
 # inference thread concurrently issues a reclaim-triggering mx op.
 # See: https://github.com/jundot/omlx/issues/1106
 _mx_buffer_access_lock = threading.RLock()
+
+
+@contextmanager
+def mx_buffer_lock_released():
+    """Let go of ``_mx_buffer_access_lock`` while this thread waits on I/O.
+
+    The store-cache worker holds the lock across ``store_cache``, but a block
+    whose bytes are already copied out needs no Metal buffer. Waiting on a
+    full SSD write queue under the lock would stall every prefill chunk's
+    ``mx.clear_cache``, so the lock is released for the wait and taken back
+    after. A thread that does not hold the lock is unaffected.
+    """
+    lock = _mx_buffer_access_lock
+    if not lock._is_owned():
+        yield
+        return
+    state = lock._release_save()
+    try:
+        yield
+    finally:
+        lock._acquire_restore(state)
 
 
 def clear_thread_streams() -> None:
