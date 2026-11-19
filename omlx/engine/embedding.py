@@ -12,7 +12,7 @@ import gc
 import logging
 import time
 from collections.abc import Callable
-from typing import Any, Dict, List, Optional, TypeVar, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 
@@ -22,8 +22,6 @@ from .base import BaseNonStreamingEngine
 from .forward_fairness import ForwardFairnessGate
 
 logger = logging.getLogger(__name__)
-
-T = TypeVar("T")
 
 
 def _input_length(item: Union[str, Dict[str, str]]) -> int:
@@ -106,7 +104,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         """Per-input token limit ``embed(max_length=...)`` applies, if loaded."""
         return self._model.effective_max_length(max_length) if self._model else None
 
-    async def run_tokenizer(self, fn: Callable[[], T]) -> T:
+    async def run_tokenizer(self, fn: Callable[[], Any]) -> Any:
         """Run processor/tokenizer work on the thread embed() uses.
 
         HF fast tokenizers switch shared truncation state on every call, so

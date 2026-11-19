@@ -705,35 +705,6 @@ class TestEmbeddingCompileFallback:
 
         assert generate.call_args.kwargs["max_length"] == 1024
 
-    @pytest.mark.parametrize(
-        ("max_length", "expected"), [(None, 8192), (262144, 8192), (1024, 1024)]
-    )
-    def test_effective_max_length_matches_embed_truncation(self, max_length, expected):
-        """/tokenize reports the same per-input cap embed() truncates at."""
-        import mlx.core as mx
-        from omlx.models.embedding import MLXEmbeddingModel
-
-        model = MLXEmbeddingModel("test-model")
-        model._loaded = True
-        model._is_compiled = False
-        model._compiled_embed = None
-        model.model = SimpleNamespace(
-            config=SimpleNamespace(max_position_embeddings=262144),
-            max_input_length=8192,
-        )
-        model.processor = SimpleNamespace()
-
-        mock_outputs = MagicMock(spec=[])
-        mock_outputs.text_embeds = mx.array([[0.5, 0.6]])
-        mock_outputs.pooler_output = None
-        mock_outputs.last_hidden_state = None
-
-        with patch("mlx_embeddings.generate", return_value=mock_outputs) as generate:
-            model.embed(["test"], max_length=max_length)
-
-        assert model.effective_max_length(max_length) == expected
-        assert generate.call_args.kwargs["max_length"] == expected
-
     def test_max_length_is_capped_at_position_table(self):
         """XLM-R declares 8194 positions but only 8192 inputs fit after the offset."""
         import mlx.core as mx

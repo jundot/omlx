@@ -1772,6 +1772,7 @@ async def get_engine_for_model(
     model: str | None = None,
     *,
     lease: _LLMEngineLease | None = None,
+    allow_embedding: bool = False,
 ) -> BaseEngine:
     """
     Get LLM engine for the specified model (or default).
@@ -1780,6 +1781,7 @@ async def get_engine_for_model(
 
     Args:
         model: Model ID to get engine for, or None for default
+        allow_embedding: Also accept an EmbeddingEngine (tokenizer routes).
 
     Returns:
         The loaded engine
@@ -1788,7 +1790,7 @@ async def get_engine_for_model(
         HTTPException: If model not found or memory error
     """
     if lease is None:
-        return await get_engine(model, EngineType.LLM)
+        return await get_engine(model, EngineType.LLM, _allow_embedding=allow_embedding)
 
     leased: list[str] = []
     engine = await get_engine(
@@ -1796,6 +1798,7 @@ async def get_engine_for_model(
         EngineType.LLM,
         _lease=True,
         _leased_out=leased,
+        _allow_embedding=allow_embedding,
     )
     if leased:
         lease.model_id = leased[0]
@@ -8399,26 +8402,13 @@ def _token_strings(tokenizer, token_ids: list[int]) -> list[str]:
     return [tokenizer.decode([token_id]) for token_id in token_ids]
 
 
-async def _get_tokenizer_engine(
-    model: str | None, lease: _LLMEngineLease
-) -> BaseEngine | EmbeddingEngine:
-    leased: list[str] = []
-    engine = await get_engine(
-        model,
-        EngineType.LLM,
-        _lease=True,
-        _leased_out=leased,
-        _allow_embedding=True,
-    )
-    if leased:
-        lease.model_id = leased[0]
-    return engine
-
-
 def _embedding_tokenizer(engine: EmbeddingEngine, model: str | None):
     # mlx-embeddings returns either a tokenizer or a processor that holds one.
     # count_tokens() falls back to a whitespace estimate; /tokenize must not.
     processor = engine.processor
+    # TokenizerWrapper forwards attributes but not len().
+    if type(processor).__name__ == "TokenizerWrapper":
+        processor = processor._tokenizer
     for candidate in (processor, getattr(processor, "tokenizer", None)):
         if callable(getattr(candidate, "encode", None)) and callable(
             getattr(candidate, "decode", None)
@@ -8427,20 +8417,6 @@ def _embedding_tokenizer(engine: EmbeddingEngine, model: str | None):
     raise InvalidRequestError(
         f"Model '{model}' does not expose a tokenizer with encode/decode, "
         "so it cannot be tokenized.",
-        field="model",
-    )
-
-
-def _embedding_vocab_size(tokenizer) -> int:
-    # mlx-embeddings' TokenizerWrapper forwards attributes but not len().
-    for candidate in (tokenizer, getattr(tokenizer, "_tokenizer", None)):
-        try:
-            return len(candidate)
-        except TypeError:
-            continue
-    raise InvalidRequestError(
-        "Token ids cannot be validated: the model's tokenizer does not "
-        "report its vocabulary size.",
         field="model",
     )
 
@@ -8550,7 +8526,9 @@ async def tokenize(
 
     lease = _LLMEngineLease()
     try:
-        engine = await _get_tokenizer_engine(request.model, lease)
+        engine = await get_engine_for_model(
+            request.model, lease=lease, allow_embedding=True
+        )
         await _raise_if_llm_lease_abort_requested(lease)
         resolved_model = _serving_model_id(lease, request.model)
         if isinstance(engine, EmbeddingEngine):
@@ -8606,16 +8584,16 @@ async def detokenize(
 
     lease = _LLMEngineLease()
     try:
-        engine = await _get_tokenizer_engine(request.model, lease)
+        engine = await get_engine_for_model(
+            request.model, lease=lease, allow_embedding=True
+        )
         await _raise_if_llm_lease_abort_requested(lease)
         if isinstance(engine, EmbeddingEngine):
             tokenizer = _embedding_tokenizer(
                 engine, request.model or _serving_model_id(lease, request.model)
             )
             prompt = await engine.run_tokenizer(
-                lambda: _decode_token_ids(
-                    tokenizer, request.tokens, _embedding_vocab_size(tokenizer)
-                )
+                lambda: _decode_token_ids(tokenizer, request.tokens, len(tokenizer))
             )
         else:
             tokenizer = engine.tokenizer
