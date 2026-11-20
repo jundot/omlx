@@ -102,6 +102,8 @@ from .planner import (
     plan_unequal_pipeline,
     remote_model_layout,
     synthetic_model_layout,
+    tensor_split_from_dict,
+    tensor_split_to_dict,
     with_mtp_head,
 )
 from .probe import collect_cluster_status
@@ -513,6 +515,9 @@ class ClusterPlanRequest(BaseModel):
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
     # Lightning MTP: reserve the draft head on rank zero.
     mtp: bool = False
+    # DeepSeek V4.1 shares per rank, {"attention": [...], "experts": [...]}.
+    # None splits evenly when that fits, otherwise by each node's memory.
+    tensor_split: dict[str, list[int]] | None = Field(default=None, max_length=2)
 
 
 class ClusterHostRequest(BaseModel):
@@ -563,6 +568,9 @@ class ClusterDeploymentRequest(BaseModel):
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
+    # DeepSeek V4.1 shares per rank, {"attention": [...], "experts": [...]}.
+    # None splits evenly when that fits, otherwise by each node's memory.
+    tensor_split: dict[str, list[int]] | None = Field(default=None, max_length=2)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
@@ -778,6 +786,7 @@ _PLACEMENT_FIELDS = (
     "memory_guard_tier",
     "tensor_parallel_rank",
     "tensor_parallel_size",
+    "tensor_parallel_split",
 )
 
 
@@ -875,6 +884,18 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
     }
 
 
+def _tensor_split_arg(value: dict[str, list[int]] | None) -> Any:
+    """``plan_hybrid``'s ``tensor_split`` for a request's optional override."""
+
+    if not value:
+        return "auto"
+    try:
+        tensor_split_from_dict(value)
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from exc
+    return value
+
+
 def _create_cluster_plan(request: ClusterPlanRequest):
     if (
         request.tensor_parallel_size > 1
@@ -927,6 +948,7 @@ def _create_cluster_plan(request: ClusterPlanRequest):
             ),
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=head_bytes,
+            tensor_split=_tensor_split_arg(request.tensor_split),
         )
     elif request.allocation == "proportional":
         plan = plan_proportional_pipeline(
@@ -990,6 +1012,9 @@ class ClusterAutoconfigureRequest(BaseModel):
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     # None follows the checkpoint and the model's saved Lightning MTP setting.
     mtp: bool | None = None
+    # DeepSeek V4.1 shares per rank, {"attention": [...], "experts": [...]}.
+    # None splits evenly when that fits, otherwise by each node's memory.
+    tensor_split: dict[str, list[int]] | None = Field(default=None, max_length=2)
 
 
 def _measured_link_profiles(
@@ -1303,6 +1328,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
             engram_ssd_offload=engram_ssd_offload,
+            tensor_split=_tensor_split_arg(request.tensor_split),
         )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1412,6 +1438,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
             engram_ssd_offload=engram_ssd_offload,
+            tensor_split=_tensor_split_arg(request.tensor_split),
         )
         choice = replace(choice, plan=ordered_plan)
     for group in tp_groups_spanning_slow_links(
@@ -1652,6 +1679,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             ),
             "mtp": mtp,
             "tensor_parallel_size": choice.tensor_parallel_size,
+            "tensor_split": request.tensor_split,
             "nodes": [node.model_dump() for node in profiled_request_nodes],
             "hosts": activation_hosts,
             "preflight": True,
@@ -2949,6 +2977,7 @@ def _create_deployment(
         target_context_tokens=request.target_context_tokens,
         path_map=request.path_map,
         mtp=request.mtp,
+        tensor_split=request.tensor_split,
     )
     plan = _create_cluster_plan(plan_request)
     execution = _execution_for_request(
@@ -3007,6 +3036,7 @@ def _build_performance_plan(
     context_tokens: int,
     mtp: bool = False,
     engram_ssd_offload: bool = False,
+    tensor_split: Any = "auto",
 ) -> ShardPlan:
     """Build a shard plan using the hybrid planner when tensor parallelism is active."""
 
@@ -3019,6 +3049,7 @@ def _build_performance_plan(
             microbatch_size=microbatch_size,
             context_tokens=context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
+            tensor_split=tensor_split,
         )
     return plan_unequal_pipeline(
         with_mtp_head(model) if mtp else model,
@@ -3061,6 +3092,15 @@ def _performance_optimized_deployment(
     nodes = _node_budgets(request.nodes, profiles=profiles)
     # Keep the approved plan's Engram decision instead of rereading settings.
     engram_ssd_offload = any(item.ssd_weight_bytes for item in deployment.assignments)
+    # And its tensor split, so tuning re-measures the shares the user approved.
+    approved_split = next(
+        (
+            tensor_split_to_dict(item.tensor_parallel_split)
+            for item in deployment.assignments
+            if item.tensor_parallel_split
+        ),
+        "auto",
+    )
     plan = _build_performance_plan(
         model,
         nodes,
@@ -3070,6 +3110,7 @@ def _performance_optimized_deployment(
         context_tokens=request.target_context_tokens,
         mtp=deployment.execution.mtp,
         engram_ssd_offload=engram_ssd_offload,
+        tensor_split=approved_split,
     )
     execution = tune_execution_settings(
         deployment.execution,
@@ -3089,6 +3130,7 @@ def _performance_optimized_deployment(
             context_tokens=request.target_context_tokens,
             mtp=deployment.execution.mtp,
             engram_ssd_offload=engram_ssd_offload,
+            tensor_split=approved_split,
         )
     deployment_id = (
         request.deployment_id.strip()
