@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -15,6 +17,7 @@ from mlx_lm.models.cache import (  # noqa: E402
     CacheList,
 )
 
+from omlx import oq  # noqa: E402
 from omlx.adapter.output_parser import correct_tool_parser_type  # noqa: E402
 from omlx.engine.vlm import _apply_template_thinking_mode  # noqa: E402
 from omlx.patches.hy_v4.model import (  # noqa: E402
@@ -234,6 +237,85 @@ def test_dfly_cycles_roll_back_to_the_accepted_prefix(kind):
         assert lm.mtp_partial_rollback(cache, accepted, 3)
         committed += accepted + 1
         row = accepted
+
+
+def _checkpoint(path, cfg, model):
+    """Save a tiny model as an oMLX-layout BF16 checkpoint."""
+    weights = {
+        k: v.astype(mx.bfloat16) if v.dtype == mx.float32 else v
+        for k, v in tree_flatten(model.parameters())
+    }
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(cfg))
+    mx.save_safetensors(str(path / "model.safetensors"), weights)
+
+
+def test_calibration_walk_matches_native_forward(model):
+    # Past the index top-k, so shared indexer layers read the carried top-k.
+    lm, core = model.language_model, model.language_model.model
+    tokens = mx.array(_ids(5, n=24)[None].astype(np.int32))
+    inputs = core.embed_tokens(tokens)
+    inputs, masks, state = oq._prepare_layer_inputs(model, model.layers, tokens, inputs)
+    for i, layer in enumerate(model.layers):
+        inputs, aux = oq._forward_layer_result(
+            layer, inputs, masks[i], state, layer_idx=i
+        )
+        oq._commit_layer_forward_aux(state, i, aux)
+    engram = lm._engram_inputs(tokens, None) if lm.config.engram_layer_ids else None
+    native = core(tokens, engram_inputs=engram)
+    assert mx.array_equal(core.norm(core.hc_head(inputs)), native).item()
+
+
+@pytest.mark.parametrize("kind", ["hy4", "flash"])
+def test_streamed_calibration_matches_resident(tmp_path, monkeypatch, kind):
+    from mlx_vlm.utils import load_model
+
+    from omlx.patches.hy_v4 import apply_patch
+
+    apply_patch()
+    cfg = _hy4_config() if kind == "hy4" else _flash_config()
+    source = tmp_path / "source"
+    _checkpoint(source, cfg, _model(cfg))
+    resident_model = load_model(source, lazy=False, strict=True)
+    tokens = mx.array(np.stack([_ids(10 + i, n=12) for i in range(4)]).astype(np.int32))
+    monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+    monkeypatch.setattr("mlx_lm.tokenizer_utils.load", lambda *a, **kw: object())
+    resident, _ = oq._collect_imatrix_from_model(
+        resident_model,
+        object(),
+        cfg,
+        calib_dataset=oq._OQE_CALIB_DATASET,
+        num_samples=2,
+        seq_length=12,
+    )
+    sensitivity = oq._measure_sensitivity_from_model(
+        resident_model, object(), cfg, 4, num_samples=2, seq_length=12
+    )
+    streamed = oq._load_or_collect_imatrix(
+        str(source),
+        cfg,
+        cache_path=str(tmp_path / "imatrix.npz"),
+        reuse_cache=False,
+        num_samples=2,
+        seq_length=12,
+        strict=True,
+        trust_remote_code=False,
+        stream_calibration=True,
+        measure_sensitivity=True,
+        sensitivity_oq_level=4,
+        sensitivity_num_samples=2,
+        sensitivity_seq_length=12,
+        require_mtp_entries=False,
+    )
+    assert "language_model.lm_head" in streamed.entries
+    assert streamed.entries.keys() == resident.keys()
+    for name, entry in resident.items():
+        np.testing.assert_array_equal(streamed.entries[name].counts, entry.counts)
+        np.testing.assert_allclose(
+            streamed.entries[name].in_sum2, entry.in_sum2, rtol=1e-5
+        )
+    measured = streamed.metadata["collection"]["sensitivity_map"]
+    assert measured == pytest.approx(sensitivity, abs=1e-6)
 
 
 def test_sanitize_dequantizes_fp8_and_stacks_experts():

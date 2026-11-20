@@ -9105,25 +9105,29 @@ def _forward_gemma4_layer_result(block, inputs, mask, state, layer_idx: int):
 _HY_V4_LAYER_STATE_KIND = "hy_v4"
 
 
-def _prepare_hy_v4_layer_inputs(model, calib_data, inputs):
+def _hy_v4_layer_inputs(args, media_token_ids, calib_data, inputs):
     """Hy4 layer inputs as its own forward builds them.
 
     Layers run on hc_mult identical streams, take the mask of their attention
     kind, the top-k of the previous sparse layer (shared indexer layers reuse
     it) and, on Hy4-flash, the prompt's Engram n-grams.
     """
-    language_model = model.language_model
-    text_model = language_model.model
-    args = language_model.config
+    from omlx.patches.hy_v4.language import engram_inputs
+
     b, length, d = inputs.shape
     streams = mx.contiguous(
         mx.broadcast_to(inputs[:, :, None, :], (b, length, args.hc_mult, d))
     )
-    by_kind = text_model._masks(inputs, [None] * len(text_model.layers))
-    masks = [by_kind.get(kind) for kind in args.attention_kinds]
+    by_kind = {
+        "sparse": create_attention_mask(inputs, None, return_array=True),
+        "sliding": create_attention_mask(
+            inputs, None, window_size=args.sliding_window, return_array=True
+        ),
+    }
+    masks = [by_kind[kind] for kind in args.attention_kinds]
     engram = None
     if args.engram_layer_ids:
-        engram = language_model._engram_inputs(calib_data, None)
+        engram = engram_inputs(calib_data, args, media_token_ids)
     state = {
         "kind": _HY_V4_LAYER_STATE_KIND,
         "kinds": tuple(args.attention_kinds),
@@ -9131,6 +9135,30 @@ def _prepare_hy_v4_layer_inputs(model, calib_data, inputs):
         "prev_topk": None,
     }
     return streams, masks, state
+
+
+def _prepare_hy_v4_layer_inputs(model, calib_data, inputs):
+    language_model = model.language_model
+    return _hy_v4_layer_inputs(
+        language_model.config, language_model.media_token_ids, calib_data, inputs
+    )
+
+
+def _streamed_hy_v4_state(config: dict, calib_data, embedded):
+    """Streamed counterpart of _prepare_hy_v4_layer_inputs."""
+    from omlx.patches.hy_v4.config import ModelConfig
+
+    model_config = ModelConfig.from_dict(config)
+    media = (model_config.image_token_id, model_config.video_token_id)
+    return _hy_v4_layer_inputs(model_config.text_config, media, calib_data, embedded)
+
+
+def _hy_v4_slot_state(state: dict, lo: int, hi: int) -> dict:
+    """The forward state of draw rows [lo, hi) of a streamed round."""
+    engram = state["engram"]
+    if engram is not None:
+        engram = tuple(part[lo:hi] for part in engram)
+    return {**state, "engram": engram}
 
 
 def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None:
@@ -10498,6 +10526,7 @@ _QWEN3_5_STREAM_MODEL_TYPES = frozenset(
 _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset(
     {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark", "flint"}
     | _QWEN3_5_STREAM_MODEL_TYPES
+    | set(_HY_V4_MODEL_TYPES)
 )
 
 
@@ -10526,6 +10555,11 @@ def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
         from mlx_vlm.models.flint.language import DecoderLayer
 
         return ModelConfig.from_dict(config), DecoderLayer
+    if _is_hy_v4_config(config):
+        from omlx.patches.hy_v4.config import ModelConfig
+        from omlx.patches.hy_v4.language import DecoderLayer
+
+        return ModelConfig.from_dict(config).text_config, DecoderLayer
     if _stream_source_model_type(config) == "qwen4_exp":
         from mlx_vlm.models.qwen4_exp.config import TextConfig
         from mlx_vlm.models.qwen4_exp.language import Qwen4ExpDecoderLayer
@@ -10939,6 +10973,18 @@ def _streamed_sensitivity_state(
             "position_ids": {"kind": _FLINT_LAYER_STATE_KIND},
             "scores": {},
         }
+    if _is_hy_v4_config(config):
+        inputs, layer_masks, position_ids = _streamed_hy_v4_state(
+            config, calib_data, inputs
+        )
+        mx.eval(inputs)
+        return {
+            "inputs": inputs,
+            "mask": None,
+            "layer_masks": layer_masks,
+            "position_ids": position_ids,
+            "scores": {},
+        }
     if _stream_source_model_type(config) == "glm5_next":
         inputs, attention_mask = _streamed_glm5_next_state(config, inputs)
         mx.eval(inputs)
@@ -11074,6 +11120,22 @@ def _collect_streamed_qwen4_mtp(source, config, collector, calib_data, working, 
     return installed
 
 
+def _streamed_hy_v4_hc_head(plan, config: dict):
+    """Hy4's stream-collapsing head, sourced from the checkpoint."""
+    from omlx.patches.hy_v4.config import ModelConfig
+    from omlx.patches.hy_v4.layers import HyperHead
+
+    head = HyperHead(ModelConfig.from_dict(config).text_config)
+    prefix = "language_model.model.hc_head."
+    head.load_weights(
+        [(k[len(prefix) :], plan.pop(k)) for k in list(plan) if k.startswith(prefix)],
+        strict=True,
+    )
+    head.eval()
+    mx.eval(head.parameters())
+    return head
+
+
 def _collect_streamed_untied_lm_head(source, config, collector, working) -> int:
     """Streamed counterpart of _collect_untied_lm_head_imatrix."""
     plan = _streamed_source_plan(source, config)
@@ -11081,6 +11143,9 @@ def _collect_streamed_untied_lm_head(source, config, collector, working) -> int:
     head_key = "language_model.lm_head.weight"
     if head_key not in plan or norm_key not in plan:
         return 0
+    collapse = None
+    if _is_hy_v4_config(config):
+        collapse = _streamed_hy_v4_hc_head(plan, config)
     head_weight = plan.pop(head_key)
     norm_weight = plan.pop(norm_key)
     text_config = config.get("text_config") or config
@@ -11094,9 +11159,14 @@ def _collect_streamed_untied_lm_head(source, config, collector, working) -> int:
     mx.eval(norm.parameters(), head.parameters())
     before = len(collector.entries)
     for hidden in working:
-        h = hidden.mean(axis=2) if getattr(hidden, "ndim", 0) == 4 else hidden
+        if collapse is not None:
+            h = collapse(hidden)
+        elif getattr(hidden, "ndim", 0) == 4:
+            h = hidden.mean(axis=2)
+        else:
+            h = hidden
         collector.collect_dense("language_model.lm_head", head, norm(h))
-    del norm, head, head_weight, norm_weight
+    del norm, head, head_weight, norm_weight, collapse
     mx.clear_cache()
     return 1 if len(collector.entries) > before else 0
 
@@ -11295,6 +11365,8 @@ def _collect_imatrix_streaming(
         # AFTER the pre-load patches that could re-install the module.
         _qwen4_exp_apply_compat_patch()
 
+    is_hy_v4 = _is_hy_v4_config(config)
+
     def embed_rows(weight, lo: int, hi: int):
         """Layer-0 inputs for draw rows [lo, hi)."""
         rows = _streamed_embed(weight, calib_data[lo:hi], config)
@@ -11302,6 +11374,8 @@ def _collect_imatrix_streaming(
             rows, _, _ = _streamed_qwen4_exp_state(config, calib_data[lo:hi], rows)
         elif is_glm5_next:
             rows, _ = _streamed_glm5_next_state(config, rows)
+        elif is_hy_v4:
+            rows, _, _ = _streamed_hy_v4_state(config, calib_data[lo:hi], rows)
         mx.eval(rows)
         return rows
 
@@ -11344,6 +11418,14 @@ def _collect_imatrix_streaming(
         _, glm5_attention_mask = _streamed_glm5_next_state(config, embedded)
         mask = glm5_attention_mask
         position_ids = {"kind": _GLM5_NEXT_LAYER_STATE_KIND}
+    elif is_hy_v4:
+        # Masks from one row serve every micro-batch; the Engram n-grams are
+        # sliced per micro-batch below.
+        _, hy_layer_masks, hy_state = _streamed_hy_v4_state(
+            config, calib_data, embedded
+        )
+        mask = None
+        position_ids = None
     elif _stream_source_model_type(config) == "flint":
         mask = None
         position_ids = {"kind": _FLINT_LAYER_STATE_KIND}
@@ -11404,6 +11486,8 @@ def _collect_imatrix_streaming(
                 _streamed_qwen4_exp_slot_state(calib_data, q4_position_ids, lo, hi)
                 for lo, hi in ranges
             ]
+        elif is_hy_v4:
+            slot_states = [_hy_v4_slot_state(hy_state, lo, hi) for lo, hi in ranges]
         elif isinstance(position_ids, mx.array):
             slot_states = [position_ids[lo:hi] for lo, hi in ranges]
         else:
@@ -11434,6 +11518,8 @@ def _collect_imatrix_streaming(
                     )
             if is_qwen4_exp:
                 layer_mask = q4_layer_masks[layer_idx]
+            elif is_hy_v4:
+                layer_mask = hy_layer_masks[layer_idx]
             elif is_glm5_next:
                 layer_mask = None if bool(getattr(block, "is_linear", False)) else mask
             elif _is_recurrent_layer(block):
@@ -11520,7 +11606,7 @@ def _collect_imatrix_streaming(
                 },
             )
 
-        if is_glm5_next or _stream_source_model_type(config) == "flint":
+        if is_glm5_next or is_hy_v4 or _stream_source_model_type(config) == "flint":
             head_entries = _collect_streamed_untied_lm_head(
                 source, config, collector, working
             )
@@ -12079,10 +12165,14 @@ def _refine_oqe_streamed(source, config, writer, stats, *, trust_remote_code, pr
     del embed_weight
     mx.eval(embedded)
     q4_masks = q4_position_ids = None
+    hy_masks = hy_state = None
     if is_qwen4_exp:
         embedded, q4_masks, q4_position_ids = _streamed_qwen4_exp_state(
             config, calib, embedded
         )
+        mask = position_ids = None
+    elif _is_hy_v4_config(config):
+        embedded, hy_masks, hy_state = _streamed_hy_v4_state(config, calib, embedded)
         mask = position_ids = None
     elif is_glm5_next:
         embedded, mask = _streamed_glm5_next_state(config, embedded)
@@ -12107,14 +12197,14 @@ def _refine_oqe_streamed(source, config, writer, stats, *, trust_remote_code, pr
         0, int(calib.shape[0]), max(1, int(plan["micro_batch_size"]))
     )
     working = [embedded[lo:hi] for lo, hi in ranges]
-    slot_states = (
-        [
+    slot_states = None
+    if is_qwen4_exp:
+        slot_states = [
             _streamed_qwen4_exp_slot_state(calib, q4_position_ids, lo, hi)
             for lo, hi in ranges
         ]
-        if is_qwen4_exp
-        else None
-    )
+    elif hy_state is not None:
+        slot_states = [_hy_v4_slot_state(hy_state, lo, hi) for lo, hi in ranges]
     text_config = config.get("text_config") or config
     total_layers = int(text_config.get("num_hidden_layers") or 0)
     for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
@@ -12122,6 +12212,8 @@ def _refine_oqe_streamed(source, config, writer, stats, *, trust_remote_code, pr
     ):
         if is_qwen4_exp:
             layer_mask = q4_masks[layer_idx]
+        elif hy_masks is not None:
+            layer_mask = hy_masks[layer_idx]
         elif is_glm5_next:
             layer_mask = None if bool(getattr(block, "is_linear", False)) else mask
         elif _is_recurrent_layer(block):

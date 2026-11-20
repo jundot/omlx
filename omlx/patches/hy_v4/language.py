@@ -117,6 +117,47 @@ def _cache_extent(cache) -> tuple[int, int]:
     return first, int(end)
 
 
+def engram_inputs(
+    ids: mx.array, args: TextConfig, media_token_ids, history=None
+) -> tuple[mx.array, mx.array]:
+    """Engram n-grams [B, L, max_order] of ``ids`` and their keep mask.
+
+    ``history`` is the token-history cache of a decode; without it positions
+    before the sequence read as padding.
+    """
+    pad = args.engram_pad_id
+    width = args.engram_max_ngram_size - 1
+    b, length = ids.shape
+    total = length
+    parts = []
+    if history is not None:
+        tokens, _ = history.update_and_fetch(
+            ids.astype(mx.int32)[:, None, :, None],
+            mx.zeros((b, 1, length, 0), dtype=mx.int32),
+        )
+        tokens = tokens[:, 0, :, 0]
+        total = tokens.shape[1]
+        lead = tokens[:, max(0, total - length - width) : total - length]
+        if lead.shape[1]:
+            parts.append(lead)
+    missing = width - sum(p.shape[1] for p in parts)
+    if missing:
+        parts.insert(0, mx.full((b, missing), pad, dtype=mx.int32))
+    parts.append(ids.astype(mx.int32))
+    window = mx.concatenate(parts, axis=1)
+    left = getattr(history, "left_padding", None)
+    if left is not None:
+        slots = mx.arange(total - length - width, total)[None]
+        window = mx.where(slots < left[:, None], pad, window)
+    ngrams = mx.stack(
+        [window[:, width - j : width - j + length] for j in range(width + 1)],
+        axis=-1,
+    )
+    image, video = media_token_ids
+    keep = (ids != image) & (ids != video) & (ids != pad)
+    return ngrams, keep
+
+
 class LanguageModel(nn.Module):
     """Hy4 text model, also the embedded-drafter host for oMLX's MTP loop.
 
@@ -246,43 +287,11 @@ class LanguageModel(nn.Module):
         return caches
 
     def _engram_inputs(self, ids: mx.array, cache) -> tuple[mx.array, mx.array]:
-        args = self.config
-        pad = args.engram_pad_id
-        width = args.engram_max_ngram_size - 1
-        b, length = ids.shape
         history = None
         if cache is not None and isinstance(cache[0], CacheList):
             entries = cache[0].caches
             history = entries[2] if len(entries) > 2 else None
-        total = length
-        parts = []
-        if history is not None:
-            tokens, _ = history.update_and_fetch(
-                ids.astype(mx.int32)[:, None, :, None],
-                mx.zeros((b, 1, length, 0), dtype=mx.int32),
-            )
-            tokens = tokens[:, 0, :, 0]
-            total = tokens.shape[1]
-            lead = tokens[:, max(0, total - length - width) : total - length]
-            if lead.shape[1]:
-                parts.append(lead)
-        # Positions before the start of the sequence read as padding.
-        missing = width - sum(p.shape[1] for p in parts)
-        if missing:
-            parts.insert(0, mx.full((b, missing), pad, dtype=mx.int32))
-        parts.append(ids.astype(mx.int32))
-        window = mx.concatenate(parts, axis=1)
-        left = getattr(history, "left_padding", None)
-        if left is not None:
-            slots = mx.arange(total - length - width, total)[None]
-            window = mx.where(slots < left[:, None], pad, window)
-        ngrams = mx.stack(
-            [window[:, width - j : width - j + length] for j in range(width + 1)],
-            axis=-1,
-        )
-        image, video = self.media_token_ids
-        keep = (ids != image) & (ids != video) & (ids != pad)
-        return ngrams, keep
+        return engram_inputs(ids, self.config, self.media_token_ids, history)
 
     def project(self, hidden: mx.array) -> mx.array:
         head = (
