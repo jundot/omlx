@@ -36,7 +36,7 @@ from omlx.patches.hy_v4 import (  # noqa: E402
     layers,
 )
 from omlx.patches.hy_v4.config import VisionConfig  # noqa: E402
-from omlx.patches.hy_v4.flash import CompressedIndexer  # noqa: E402
+from omlx.patches.hy_v4.flash import CompressedIndexer, Engram  # noqa: E402
 from omlx.patches.hy_v4.language import set_dspark_verify_armed  # noqa: E402
 from omlx.patches.hy_v4.layers import Indexer  # noqa: E402
 from omlx.patches.hy_v4.model import (  # noqa: E402
@@ -165,6 +165,28 @@ def _run(model, ids, chunks):
 @pytest.fixture(params=["hy4", "flash"], scope="module")
 def model(request):
     return _model(_hy4_config() if request.param == "hy4" else _flash_config())
+
+
+def test_flash_engram_gate_matches_bf16_pytorch():
+    config = _flash_config()
+    config["text_config"].update(hidden_size=8, hc_mult=1)
+    engram = Engram(ModelConfig.from_dict(config).text_config, layer_id=2)
+    engram.set_dtype(mx.bfloat16)
+    # Unit keys and values make each output channel equal to the gate.
+    for proj in (engram.key_projs[0], engram.value_proj):
+        proj.weight = mx.zeros_like(proj.weight)
+        proj.bias = mx.ones_like(proj.bias)
+    streams = mx.array(
+        [[-2, -2, -1, 0, 0, 0, 0, 0], [-1, 0, 0, 0, 0, 1, 1, 2]], dtype=mx.bfloat16
+    )[None, :, None, :]
+    ngrams = mx.zeros((1, 2, engram.max_order), dtype=mx.int32)
+    out = engram(streams, ngrams, mx.ones((1, 2), dtype=mx.bool_))
+
+    # Recorded from the Transformers gate with BF16 RMS-normalized queries.
+    assert out.dtype == mx.bfloat16
+    np.testing.assert_array_equal(
+        out[0, :, 0, 0].astype(mx.float32), [0.21484375, 0.74609375]
+    )
 
 
 def test_incremental_matches_full_forward(model):
