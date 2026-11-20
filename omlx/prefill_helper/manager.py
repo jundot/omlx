@@ -4,12 +4,14 @@
 One worker thread walks the steps (find the Mac, check its oMLX and memory,
 find or copy the files, start the helper, attach it) and then watches the
 connection. A lost helper is detached at once and retried with backoff;
-problems a retry cannot fix (version, memory, disk, pairing) wait for the
-user. Model files are copied at once when 50 GB stay free, else after the
-user agrees. While this Mac loads the model, the helper is copied to and
-started on the other Mac, and the loaded model takes it over; nothing is
-copied or started twice. The measured speeds of each model and helper Mac are kept on disk, so
-a restarted helper splits its first prompt by them instead of guessing.
+problems a retry cannot fix (version, disk, pairing) wait for the user. The
+helper's GPU budget and a split that does not fit are retried too: they are
+answers about a probe, and a probe can recover. Model files are copied at
+once when 50 GB stay free, else after the user agrees. While this Mac loads
+the model, the helper is copied to and started on the other Mac, and the
+loaded model takes it over; nothing is copied or started twice. The measured
+speeds of each model and helper Mac are kept on disk, so a restarted helper
+splits its first prompt by them instead of guessing.
 On Auto, a helper that runs out of GPU memory at start tries one layer fewer.
 """
 
@@ -70,6 +72,15 @@ class _CancelledError(Exception):
     """The helper choice changed while its files were being prepared."""
 
 
+class _ProbeError(Exception):
+    """The helper answered, but its GPU probe cannot plan a split.
+
+    The answer can change without the user doing anything — a container's
+    NVML recovers, another session ends, memory frees — so this is retried
+    like an unreachable helper rather than waiting for the user.
+    """
+
+
 def transport_for(node_id: str) -> Any:
     """What drives a paired device: SSH for a Mac, the control channel for a
     helper daemon. Both modules offer the same functions."""
@@ -100,6 +111,42 @@ def helper_budget(info: dict) -> list[int]:
         freed = int(float(lending.get("active_gib") or 0) * 2**30)
         budget = min(budget, int(info["available"]) + freed)
     return [budget]
+
+
+def probe_cause(name: str, budgets: list[int]) -> str | None:
+    """Why the helper's probe cannot plan a split, or None when it can.
+
+    A helper that has lost its GPUs reports no devices at all; one whose
+    memory is held elsewhere reports zero bytes.
+    """
+    if budgets and max(budgets) > 0:
+        return None
+    if budgets:
+        return f"{name} reports no free GPU memory"
+    return f"{name} reports no GPU devices"
+
+
+def probe_budget(info: dict, name: str) -> list[int]:
+    """The helper's per-GPU budget, or _ProbeError when the probe is unusable.
+
+    Both a probe that reports no devices and one that reports zero bytes are
+    answers about the probe, not a plan result: neither may be recorded as
+    "does not fit", or a helper whose probe recovers would keep the old
+    verdict. Measured 2026-11-20: ``nvidia-smi`` failed inside the helper
+    container, ``gpus.gpus()`` returned ``[]``, the host planned 0 layers and
+    prefill ran locally with no warning naming why.
+    """
+    try:
+        budgets = helper_budget(info)
+    except (KeyError, TypeError, ValueError):
+        budgets = []
+    cause = probe_cause(name, budgets)
+    if cause is None:
+        return budgets
+    until = "until it frees some" if budgets else "until its GPU probe answers again"
+    reason = f"{cause}; prefill stays on this Mac {until}."
+    logger.warning("Prefill helper not armed: %s", reason)
+    raise _ProbeError(reason)
 
 
 def copy_plan(size: int, free: int, copies: list[dict]) -> dict:
@@ -165,12 +212,19 @@ def held_layers(
                 f"At most {limit} layers of this model can run on a helper."
             )
         if fixed > held:
-            raise _PermanentError(
-                f"{fixed} layers do not fit in {name}'s GPU memory; at most {held} do."
+            needed = shared + _RESERVE_BYTES + sum(per_layer[:fixed])
+            raise _ProbeError(
+                f"{name} has {sum(budgets) / 2**30:.1f} GiB of GPU memory free; "
+                f"{fixed} layers need about {needed / 2**30:.1f} GiB. Prefill "
+                "stays on this Mac until the helper's memory changes."
             )
         held = fixed
     if held < 1:
-        raise _PermanentError(f"Not even one layer fits in {name}'s GPU memory.")
+        raise _ProbeError(
+            f"{name} has {sum(budgets) / 2**30:.1f} GiB of GPU memory free; not "
+            "even one layer fits. Prefill stays on this Mac until the helper's "
+            "memory changes."
+        )
     return held
 
 
@@ -200,8 +254,12 @@ def _launch_fitting(
             if not auto or not is_metal_out_of_memory(error):
                 raise
             if held == 1:
+                # The helper started and failed on one layer, unlike a probe
+                # that finds no room: starting it again would fail the same
+                # way, so this waits for the user.
                 raise _PermanentError(
-                    f"Not even one layer fits in {target.name}'s GPU memory."
+                    f"{target.name} ran out of GPU memory at launch, even with "
+                    "one layer."
                 ) from error
         logger.warning(
             "Prefill helper on %s ran out of GPU memory with %d layers; trying %d",
@@ -419,7 +477,7 @@ class FilePrep:
             held = held_layers(
                 self.adapter,
                 self.model_path,
-                helper_budget(info),
+                probe_budget(info, target.name),
                 target.name,
                 self.layers,
             )
@@ -462,6 +520,10 @@ class FilePrep:
                 raise _CancelledError
         except _CancelledError:
             self._set("stopped")
+        except _ProbeError as error:
+            # The probe's answer, not a copy problem: retried at load.
+            logger.warning("Prefill helper files not prepared: %s", error)
+            self._set("offline", reason=str(error))
         except Exception as error:  # SSH, version, memory, disk
             logger.warning("Prefill helper files not prepared: %s", error)
             self._set("error", reason=str(error))
@@ -490,7 +552,7 @@ def prepare(
             prep is not None
             and not restart
             and (prep.node_id, prep.layers) == (node_id, layers)
-            and prep.status()["state"] not in ("error", "stopped")
+            and prep.status()["state"] not in ("error", "stopped", "offline")
             # A check never replaces a copy; a copy replaces a check.
             and (check_only or not prep.check_only)
             and (launch is None or prep.launch_with(launch))
@@ -701,6 +763,13 @@ class PrefillHelperManager:
             except _PermanentError as error:
                 wanted = False
                 self._set("error", reason=str(error))
+            except _ProbeError as error:
+                # The helper answered but cannot plan a split. Retried like an
+                # unreachable helper, so a probe that recovers re-plans without
+                # the user pressing Retry.
+                logger.warning("Prefill helper not armed: %s", error)
+                attempt += 1
+                self._set("offline", reason=str(error))
             except Exception as error:  # network, SSH, helper crash
                 logger.warning("Prefill helper did not start: %s", error)
                 attempt += 1
@@ -726,7 +795,7 @@ class PrefillHelperManager:
             held = held_layers(
                 self.adapter,
                 self.model_path,
-                helper_budget(info),
+                probe_budget(info, target.name),
                 target.name,
                 self.fixed_layers,
             )
