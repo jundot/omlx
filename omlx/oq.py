@@ -11989,6 +11989,9 @@ def _refine_oqe_streamed(source, config, writer, stats, *, trust_remote_code, pr
             layer_mask = q4_masks[layer_idx]
         elif is_glm5_next:
             layer_mask = None if bool(getattr(block, "is_linear", False)) else mask
+        elif _is_recurrent_layer(block):
+            # Gated delta nets read a mask as a padding mask.
+            layer_mask = None
         else:
             layer_mask = mask
 
