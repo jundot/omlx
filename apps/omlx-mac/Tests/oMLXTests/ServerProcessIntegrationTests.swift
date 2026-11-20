@@ -245,6 +245,47 @@ final class ServerProcessIntegrationTests: XCTestCase {
         }
     }
 
+    /// A port already held by a verified oMLX server (real /health 200, as
+    /// the dev_server.py stub returns) must be adoptable: adoptExternal()
+    /// takes over the pid, and stop() on the adopting instance must reach
+    /// through PortConflictResolver.killExternal(_:) and actually terminate
+    /// the process it doesn't own — not just flip local state to .stopped.
+    func testAdoptExternalServerAndStopKillsIt() async throws {
+        let runtime = try PythonRuntime.resolve()
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let port = Self.findFreePort()
+
+        let external = ServerProcess(runtime: runtime, port: port, basePath: base)
+        addTeardownBlock { @MainActor in await external.stop(timeout: 2) }
+        try external.start()
+        try await waitForPort(port)
+        let externalPID = try XCTUnwrap(external.pid)
+
+        let controller = ServerProcess(runtime: runtime, port: port, basePath: base)
+        guard case .portConflict(let conflict) = try controller.start() else {
+            return XCTFail("Expected .portConflict when starting against an occupied port.")
+        }
+        XCTAssertTrue(conflict.isOMLX, "dev_server.py answers /health 200 — should be detected as oMLX.")
+        XCTAssertEqual(conflict.pid, externalPID)
+
+        XCTAssertTrue(controller.adoptExternal(conflict))
+        if case .running(let pid) = controller.state {
+            XCTAssertEqual(pid, externalPID)
+        } else {
+            XCTFail("adoptExternal should transition to .running; state=\(controller.state)")
+        }
+        XCTAssertEqual(controller.pid, externalPID, "pid should surface the adopted pid, not an owned Process.")
+
+        await controller.stop(timeout: 5)
+        if case .stopped = controller.state {} else {
+            XCTFail("controller didn't transition to .stopped after stop(); state=\(controller.state)")
+        }
+        XCTAssertFalse(Self.isPortInUse(port: port),
+                       "stop() on the adopting instance must kill the external pid via killExternal, not no-op.")
+    }
+
     func testOfflinePortApplyDoesNotNeedHTTPOrStartServer() async throws {
         try await checkOfflinePortApply(occupied: false)
     }
