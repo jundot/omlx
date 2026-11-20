@@ -133,6 +133,8 @@ class TextConfig(BaseModelConfig):
             params = self.rope_params(kind)
             if params.get("rope_type", "default") != "default":
                 raise ValueError(f"Unsupported Hy4 RoPE type: {params['rope_type']!r}")
+            if params.get("mrope_interleaved", True) is not True:
+                raise ValueError("Only interleaved Hy4 M-RoPE is supported")
         if self.is_flash:
             self.compressed_indexer_compress_ratio = (
                 self.compressed_indexer_compress_ratio or self.index_kpool or 4
@@ -166,6 +168,18 @@ class TextConfig(BaseModelConfig):
             )
             if self.index_topk % self.compressed_indexer_compress_ratio:
                 raise ValueError("index_topk must be a multiple of the group size")
+
+    @property
+    def mrope_section(self) -> list | None:
+        """Time, height, width channel counts of the interleaved M-RoPE."""
+        sections = {
+            tuple(section)
+            for kind in set(self.attention_kinds)
+            if (section := self.rope_params(kind).get("mrope_section")) is not None
+        }
+        if len(sections) > 1:
+            raise ValueError("Hy4 attention kinds must share one mrope_section")
+        return list(sections.pop()) if sections else None
 
     def rope_params(self, kind: str) -> dict:
         """RoPE parameters of one attention kind ("sparse" or "sliding")."""
@@ -201,6 +215,12 @@ class TextConfig(BaseModelConfig):
 
 @dataclass
 class VisionConfig(BaseModelConfig):
+    """Vision tower and projector (Hy4 defaults; Hy4-flash ships its own sizes).
+
+    The released checkpoints also carry ``rope_2d_*`` fields, but neither the
+    transformers nor the vLLM implementation enables 2D RoPE for them.
+    """
+
     model_type: str = "hy_v4_vl"
     hidden_size: int = 1536
     intermediate_size: int = 6144
@@ -209,6 +229,33 @@ class VisionConfig(BaseModelConfig):
     out_hidden_size: int = 6144
     patch_size: int = 16
     spatial_merge_size: int = 2
+    num_channels: int = 3
+    rms_norm_eps: float = 1e-5
+    max_image_size: int = 2048
+    interpolate_mode: str = "bilinear"
+    projector_type: str | None = "rmsnorm_mlp_adapter"
+    use_2d_rope: bool = False
+    cat_extra_token: int = 0
+    temporal_patch_size: int = 1
+
+    @classmethod
+    def from_dict(cls, params):
+        # A checkpoint without vision_config is text-only.
+        return super().from_dict(params) if params else None
+
+    def __post_init__(self):
+        if self.projector_type != "rmsnorm_mlp_adapter":
+            raise ValueError(f"Unsupported Hy4 projector: {self.projector_type!r}")
+        if self.use_2d_rope or self.cat_extra_token:
+            raise ValueError("Hy4 vision 2D RoPE and extra image tokens are unused")
+        if self.interpolate_mode != "bilinear":
+            raise ValueError(
+                f"Unsupported Hy4 interpolation: {self.interpolate_mode!r}"
+            )
+        if self.temporal_patch_size != 1:
+            raise ValueError("Hy4 vision supports temporal_patch_size 1 only")
+        if self.max_image_size % self.patch_size:
+            raise ValueError("max_image_size must be a multiple of patch_size")
 
 
 @dataclass

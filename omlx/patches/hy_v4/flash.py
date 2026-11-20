@@ -9,7 +9,7 @@ import numpy as np
 
 from . import exact, indexing
 from .config import TextConfig
-from .rope import TrailingRoPE, rope_at
+from .rope import TrailingRoPE, rope_at, rotate, rotate_pairs
 
 _ROW_CHUNK = 256
 _FP8_MAX = 448.0
@@ -58,7 +58,24 @@ class CompressedIndexer(nn.Module):
         self.rope = TrailingRoPE(self.rope_dims, self.rope_base)
         self._weight_scale = h**-0.5 * d**-0.5
 
-    def _encode(self, tokens, cache, start, positions):
+    def _group_planes(self, start, length, positions):
+        """[3, B, length] rotary positions of the first slot of the group that
+        ends at each new slot, from the slot position history.
+
+        Slots before the group's span clamp to slot 0; they never close a group.
+        """
+        slot = mx.maximum(start + mx.arange(length) - (self.ratio - 1), 0)
+        history = positions.history
+        if history is None:
+            if positions.general:
+                raise ValueError("Image input needs the slot position history")
+            return mx.broadcast_to(
+                positions.offset[None, :, None] + slot[None, None] - start,
+                (3, positions.offset.shape[0], length),
+            )
+        return history[:, :, slot]
+
+    def _encode(self, tokens, cache, start, slots, positions=None):
         """Pooled key of every group that ends at one of the new slots.
 
         Each new slot pools the ``ratio`` token keys ending at it; only slots
@@ -80,22 +97,35 @@ class CompressedIndexer(nn.Module):
         g = mx.stack([gates[:, j : j + length] + ape[j] for j in range(r)], axis=2)
         pooled = (v * mx.softmax(g, axis=2, precise=True)).sum(axis=2)
         pooled = self.key_norm(pooled).astype(tokens.dtype)
-        pooled = rope_at(pooled, positions - (r - 1), self.rope_dims, self.rope_base)
-        closes = (positions >= r - 1) & (positions % r == r - 1)
+        if positions is None:
+            pooled = rope_at(pooled, slots - (r - 1), self.rope_dims, self.rope_base)
+        else:
+            planes = self._group_planes(start, length, positions)
+            cos, sin = positions.tables_of(planes, self.rope_base, self.rope_dims)
+            pooled = rotate_pairs(pooled, cos, sin, self.rope_dims)
+        closes = (slots >= r - 1) & (slots % r == r - 1)
         return mx.where(closes[..., None], pooled, mx.zeros_like(pooled))
 
-    def __call__(self, x, qr, mask, cache, offset=0) -> mx.array | list | None:
+    def __call__(
+        self, x, qr, mask, cache, offset=0, positions=None
+    ) -> mx.array | list | None:
         if exact.block(x):
             # Per-row selections (None below the top-k) of a verify block.
             return [
-                self(x[:, i : i + 1], qr[:, i : i + 1], None, cache)
+                self(
+                    x[:, i : i + 1],
+                    qr[:, i : i + 1],
+                    None,
+                    cache,
+                    positions=None if positions is None else positions.row(i),
+                )
                 for i in range(x.shape[1])
             ]
         b, length, _ = x.shape
         start, left = cache_layout(cache, b)
-        positions = start + mx.arange(length)[None] - left[:, None]
+        slots = start + mx.arange(length)[None] - left[:, None]
         tokens = self.token_key_norm(self.token_key_projection(x)).astype(x.dtype)
-        pooled = self._encode(tokens, cache, start, positions)
+        pooled = self._encode(tokens, cache, start, slots, positions)
         if cache is not None:
             _, pooled = cache.update_and_fetch(tokens[:, None], pooled[:, None])
             pooled = pooled[:, 0]
@@ -109,18 +139,23 @@ class CompressedIndexer(nn.Module):
             pooled, mx.minimum(ends, total - 1)[..., None], axis=1
         ).astype(mx.float32)
         q = self.query_projection(qr).reshape(b, length, self.n_heads, self.head_dim)
-        q = self.rope(q.swapaxes(1, 2), start - left if b > 1 else start - left[0])
+        q = rotate(
+            self.rope,
+            q.swapaxes(1, 2),
+            start - left if b > 1 else start - left[0],
+            positions,
+        )
         w = self.head_weight_projection(x).astype(mx.float32) * self._weight_scale
-        own = positions // self.ratio
+        own = slots // self.ratio
         keep = min(self.group_topk - 1, count)
         expand = mx.arange(self.ratio)
         native = self._native_select(q, groups, w, own, valid, keep)
         if native is not None:
             chosen, picked = native
-            slots = mx.where(picked, left[:, None, None] + chosen * self.ratio, total)
+            picks = mx.where(picked, left[:, None, None] + chosen * self.ratio, total)
             own_slots = left[:, None, None] + own[..., None] * self.ratio
-            slots = mx.concatenate([slots, own_slots], axis=-1).astype(mx.int32)
-            indices = (slots[..., None] + expand).flatten(-2)
+            picks = mx.concatenate([picks, own_slots], axis=-1).astype(mx.int32)
+            indices = (picks[..., None] + expand).flatten(-2)
             return indices[:, None].astype(mx.int32)
         q = q.astype(mx.float32)
         w = w.swapaxes(-1, -2)[..., None]
@@ -139,10 +174,10 @@ class CompressedIndexer(nn.Module):
             # A row with fewer closed groups than keep also picks masked groups,
             # possibly its own one again; point those past the cache instead.
             picked = mx.take_along_axis(logits, chosen, axis=-1) > -mx.inf
-            slots = mx.where(picked, left[:, None, None] + chosen * self.ratio, total)
+            picks = mx.where(picked, left[:, None, None] + chosen * self.ratio, total)
             own_slots = left[:, None, None] + own_rows[..., None] * self.ratio
-            slots = mx.concatenate([slots, own_slots], axis=-1).astype(mx.int32)
-            out.append((slots[..., None] + expand).flatten(-2))
+            picks = mx.concatenate([picks, own_slots], axis=-1).astype(mx.int32)
+            out.append((picks[..., None] + expand).flatten(-2))
         indices = out[0] if len(out) == 1 else mx.concatenate(out, axis=1)
         return indices[:, None].astype(mx.int32)
 

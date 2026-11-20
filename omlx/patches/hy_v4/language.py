@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
@@ -22,6 +23,7 @@ from .layers import (
     MoE,
     hc_expand,
 )
+from .rope import Positions
 
 
 class DecoderLayer(nn.Module):
@@ -42,12 +44,20 @@ class DecoderLayer(nn.Module):
             self.engram_layer = Engram(args, layer + 1)
 
     def __call__(
-        self, streams, mask=None, cache=None, prev_topk=None, engram_inputs=None
+        self,
+        streams,
+        mask=None,
+        cache=None,
+        prev_topk=None,
+        engram_inputs=None,
+        positions=None,
     ):
         if "engram_layer" in self and engram_inputs is not None:
             streams = streams + self.engram_layer(streams, *engram_inputs)
         x, post = self.hc_attn_layer(streams)
-        x, topk = self.self_attn(self.input_layernorm(x), mask, cache, prev_topk)
+        x, topk = self.self_attn(
+            self.input_layernorm(x), mask, cache, prev_topk, positions
+        )
         streams = hc_expand(x, streams, post)
         x, post = self.hc_mlp_layer(streams)
         x = self.mlp(self.post_attention_layernorm(x))
@@ -80,7 +90,14 @@ class TextModel(nn.Module):
             )
         return masks
 
-    def __call__(self, inputs, cache=None, inputs_embeds=None, engram_inputs=None):
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        inputs_embeds=None,
+        engram_inputs=None,
+        positions=None,
+    ):
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         if cache is None:
             cache = [None] * len(self.layers)
@@ -92,7 +109,9 @@ class TextModel(nn.Module):
         prev_topk = None
         kinds = self.args.attention_kinds
         for layer, c, kind in zip(self.layers, cache, kinds):
-            streams, topk = layer(streams, masks.get(kind), c, prev_topk, engram_inputs)
+            streams, topk = layer(
+                streams, masks.get(kind), c, prev_topk, engram_inputs, positions
+            )
             if kind == "sparse":
                 prev_topk = topk
         return self.norm(self.hc_head(streams))
@@ -102,6 +121,24 @@ def _latent_cache(cache):
     if isinstance(cache, CacheList):
         return cache[0]
     return cache
+
+
+def _slot_history(cache):
+    """The slot-history cache entry (layer 0), if the model keeps one."""
+    if cache is not None and isinstance(cache[0], CacheList):
+        entries = cache[0].caches
+        return entries[2] if len(entries) > 2 else None
+    return None
+
+
+def _history_planes(history) -> mx.array | None:
+    """[3, B, slots] rotary position of every slot held by ``history``."""
+    values = getattr(history, "values", None)
+    if values is None or values.shape[-1] != 3:
+        return None
+    end = getattr(history, "_idx", None)
+    end = history.offset if end is None else end
+    return mx.moveaxis(values[:, 0, :end], -1, 0)
 
 
 def _cache_extent(cache) -> tuple[int, int]:
@@ -118,13 +155,29 @@ def _cache_extent(cache) -> tuple[int, int]:
     return first, int(end)
 
 
+def _history_values(history, planes, b: int, length: int) -> mx.array:
+    """[b, 1, length, 3] rotary positions stored beside the token ids.
+
+    Without explicit ``planes`` the call continues plain text from the cache's
+    row offsets. A history restored from before positions were stored keeps its
+    zero-width values.
+    """
+    if history.values is not None and history.values.shape[-1] == 0:
+        return mx.zeros((b, 1, length, 0), dtype=mx.int32)
+    if planes is None:
+        start = mx.array(history.offset).reshape(-1, 1)
+        planes = mx.broadcast_to((start + mx.arange(length))[None], (3, b, length))
+    return planes.transpose(1, 2, 0)[:, None].astype(mx.int32)
+
+
 def engram_inputs(
-    ids: mx.array, args: TextConfig, media_token_ids, history=None
+    ids: mx.array, args: TextConfig, media_token_ids, history=None, planes=None
 ) -> tuple[mx.array, mx.array]:
     """Engram n-grams [B, L, max_order] of ``ids`` and their keep mask.
 
-    ``history`` is the token-history cache of a decode; without it positions
-    before the sequence read as padding.
+    ``history`` is the slot-history cache of a decode; without it positions
+    before the sequence read as padding. It keeps every slot's token id (keys)
+    and its [3] rotary positions (values, from ``planes`` when given).
     """
     pad = args.engram_pad_id
     width = args.engram_max_ngram_size - 1
@@ -134,7 +187,7 @@ def engram_inputs(
     if history is not None:
         tokens, _ = history.update_and_fetch(
             ids.astype(mx.int32)[:, None, :, None],
-            mx.zeros((b, 1, length, 0), dtype=mx.int32),
+            _history_values(history, planes, b, length),
         )
         tokens = tokens[:, 0, :, 0]
         total = tokens.shape[1]
@@ -188,6 +241,8 @@ class LanguageModel(nn.Module):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.media_token_ids = (120120, 120124)
         self._dfly_cache = None
+        # Not an array attribute, which nn.Module would count as a parameter.
+        self._position_delta = SimpleNamespace(value=None)
         self.configure_mtp(False)
 
     def configure_mtp(self, enabled: bool, depth: int = 5) -> None:
@@ -250,11 +305,15 @@ class LanguageModel(nn.Module):
             valid = (index >= first) & (index < end)
             safe = mx.clip(index, first, end - 1)
             histories.append((kv.keys[:, :, safe], kv.values[:, :, safe], valid))
+        start = end - first
+        if self._position_delta.value is not None:
+            # Image context: the anchor's position is its slot plus the delta.
+            start = start + self._position_delta.value
         block = dfly.block_hidden(
             self.model.embed_tokens,
             hidden_rows[:, -1:],
             anchor.reshape(-1)[:1],
-            end - first,
+            start,
             histories,
             width,
         )
@@ -307,12 +366,44 @@ class LanguageModel(nn.Module):
             caches.append(CacheList(*entries))
         return caches
 
-    def _engram_inputs(self, ids: mx.array, cache) -> tuple[mx.array, mx.array]:
-        history = None
-        if cache is not None and isinstance(cache[0], CacheList):
-            entries = cache[0].caches
-            history = entries[2] if len(entries) > 2 else None
-        return engram_inputs(ids, self.config, self.media_token_ids, history)
+    def _engram_inputs(
+        self, ids: mx.array, cache, positions=None
+    ) -> tuple[mx.array, mx.array]:
+        planes = None if positions is None else positions.planes
+        return engram_inputs(
+            ids, self.config, self.media_token_ids, _slot_history(cache), planes
+        )
+
+    def _positions(self, position_ids, inputs_embeds, length: int):
+        """Rotary positions of this call, or None to follow the cache offsets.
+
+        Merged image embeddings carry general [3, B, L] positions. Without
+        them (decode, text chunks) the planes are consecutive text positions
+        and only their per-row start matters.
+        """
+        if position_ids is None:
+            return None
+        planes = position_ids
+        if planes.ndim == 2:
+            planes = mx.broadcast_to(planes[None], (3,) + planes.shape)
+        if planes.ndim != 3 or planes.shape[0] != 3 or planes.shape[-1] != length:
+            raise ValueError(
+                f"position_ids {tuple(position_ids.shape)} do not match "
+                f"{length} input tokens"
+            )
+        return Positions(
+            planes.astype(mx.int32),
+            inputs_embeds is not None,
+            self.config.mrope_section,
+        )
+
+    def _note_position_delta(self, positions, cache, length: int) -> None:
+        """Remember position minus slot of the call's last token for the drafter."""
+        delta = None
+        if positions is not None and cache is not None:
+            slot = mx.array(_latent_cache(cache[0]).offset).reshape(-1)[:1]
+            delta = positions.planes[0, :1, -1] - (slot + length - 1)
+        self._position_delta.value = delta
 
     def project(self, hidden: mx.array) -> mx.array:
         head = (
@@ -332,18 +423,28 @@ class LanguageModel(nn.Module):
         cache: Any | None = None,
         inputs_embeds: mx.array | None = None,
         mask: mx.array | None = None,
+        position_ids: mx.array | None = None,
         **kwargs,
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
+        length = (inputs if inputs_embeds is None else inputs_embeds).shape[1]
+        positions = self._positions(position_ids, inputs_embeds, length)
         if self._omlx_mtp_decode_enabled and cache is not None:
             # The drafter reads these caches after the generator's rollback.
             self._dfly_cache = cache
+            self._note_position_delta(positions, cache, length)
         engram_inputs = None
         if self.config.engram_layer_ids:
-            engram_inputs = self._engram_inputs(inputs, cache)
+            engram_inputs = self._engram_inputs(inputs, cache, positions)
+            if positions is not None:
+                positions.history = (
+                    positions.planes
+                    if cache is None
+                    else _history_planes(_slot_history(cache))
+                )
         with exact.scope(inputs if inputs is not None else inputs_embeds, cache):
-            hidden = self.model(inputs, cache, inputs_embeds, engram_inputs)
+            hidden = self.model(inputs, cache, inputs_embeds, engram_inputs, positions)
             logits = None if kwargs.get("skip_logits") else self.project(hidden)
         return LanguageModelOutput(
             logits=logits,

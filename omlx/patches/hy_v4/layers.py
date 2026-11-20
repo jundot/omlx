@@ -26,7 +26,7 @@ from . import exact, indexing
 from . import kernels as hc_kernels
 from .config import TextConfig
 from .flash import CompressedIndexer
-from .rope import TrailingRoPE
+from .rope import TrailingRoPE, rotate
 
 _ROW_CHUNK = 256
 # Up to this many query rows, attention gathers each row's own keys instead of
@@ -366,7 +366,9 @@ class Indexer(nn.Module):
         self.rope = TrailingRoPE(args.qk_rope_head_dim, args.rope_theta("sparse"))
         self._weight_scale = self.n_heads**-0.5 * self.head_dim**-0.5
 
-    def __call__(self, x, qr, mask, cache, offset=0) -> mx.array | list | None:
+    def __call__(
+        self, x, qr, mask, cache, offset=0, positions=None
+    ) -> mx.array | list | None:
         if exact.block(x):
             # Per-row selections (None below the top-k) of a verify block.
             length = x.shape[1]
@@ -379,14 +381,15 @@ class Indexer(nn.Module):
                     exact.row_mask(mask, i, keys - length + i + 1),
                     cache,
                     offset + i,
+                    None if positions is None else positions.row(i),
                 )
                 for i in range(length)
             ]
         b, s, _ = x.shape
         q = self.wq_b(qr).reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
-        q = self.rope(q, offset)
+        q = rotate(self.rope, q, offset, positions)
         k = self.k_norm(self.wk(x).astype(mx.float32)).astype(x.dtype)
-        k = self.rope(k.reshape(b, 1, s, self.head_dim), offset)
+        k = rotate(self.rope, k.reshape(b, 1, s, self.head_dim), offset, positions)
         if cache is not None:
             k, _ = cache.update_and_fetch(k, mx.zeros((b, 1, s, 0), dtype=k.dtype))
         total = k.shape[2]
@@ -533,7 +536,7 @@ class Attention(nn.Module):
             return cache, None
         return cache[0], (cache[1] if len(cache.caches) > 1 else None)
 
-    def __call__(self, x, mask, cache=None, prev_topk=None):
+    def __call__(self, x, mask, cache=None, prev_topk=None, positions=None):
         b, length, _ = x.shape
         kv_cache, index_cache = self._caches(cache)
         gate = mx.sigmoid(exact.linear(self.linear_gate, x)).reshape(
@@ -549,14 +552,14 @@ class Attention(nn.Module):
         latent = self.kv_a_layernorm(latent)[:, None]
         k_pe = k_pe.reshape(b, 1, length, self.rope_dim)
         offset = rope_offset(kv_cache)
-        q_pe = self.rope(q_pe, offset)
-        k_pe = self.rope(k_pe, offset)
+        q_pe = rotate(self.rope, q_pe, offset, positions)
+        k_pe = rotate(self.rope, k_pe, offset, positions)
         # oMLX's BatchKVCache advances its offset array in place, so every use
         # of ``offset`` must come before the latent cache update.
         topk = None
         indexer = self.index_module
         if indexer is not None:
-            topk = indexer(x, qr, mask, index_cache, offset=offset)
+            topk = indexer(x, qr, mask, index_cache, offset=offset, positions=positions)
         elif self.kind == "sparse":
             topk = prev_topk
         if self._capture_topk:

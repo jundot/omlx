@@ -2,31 +2,41 @@
 """mlx-vlm model module for Hy4 (``hy_v4_vl``) and Hy4-flash (``hy_v4_flash``).
 
 Registered as ``mlx_vlm.models.hy_v4_vl`` and ``mlx_vlm.models.hy_v4_flash``.
-Vision input is not wired yet and the vision tower is skipped at load. The
-DFly2 drafter is attached as ``language_model.dfly`` when the checkpoint
-ships it.
+Image features replace the image placeholder slots of the prompt embeddings;
+the prompt's rotary positions come from ``rope_index``. The DFly2 drafter is
+attached as ``language_model.dfly`` when the checkpoint ships it.
 """
 
 from __future__ import annotations
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 
 from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active, is_mtp_depth_fixed
 from .config import ModelConfig, TextConfig, VisionConfig
 from .dfly import DFlyConfig, DFlyModel
 from .language import LanguageModel
+from .rope import rope_index
+from .vision import VisionModel, grid_rows
 
-__all__ = ["Model", "ModelConfig", "TextConfig", "VisionConfig", "LanguageModel"]
+__all__ = [
+    "Model",
+    "ModelConfig",
+    "TextConfig",
+    "VisionConfig",
+    "LanguageModel",
+    "VisionModel",
+]
 
 _FP8_BLOCK = 128
 _SKIPPED_PREFIXES = (
-    "vit.",
     "visual.",
     "model.mtp_layers.",
     "model.dfly_layers.confidence_head.",
 )
+_VISION_PREFIX = "vit."
 _DFLY_PREFIX = "model.dfly_layers."
 _EXPERT_NAMES = ("gate_proj", "up_proj", "down_proj")
 _DFLY_FFN_RATIO = 3
@@ -125,6 +135,9 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
+        self.vision_tower = (
+            None if config.vision_config is None else VisionModel(config.vision_config)
+        )
         self.language_model = LanguageModel(config.text_config)
         self.language_model.media_token_ids = (
             config.image_token_id,
@@ -148,15 +161,57 @@ class Model(nn.Module):
     def make_cache(self):
         return self.language_model.make_cache()
 
+    def encode_image(self, pixel_values, image_grid_thw=None, **kwargs):
+        """[image tokens, hidden] features of the images, in order."""
+        if self.vision_tower is None:
+            raise ValueError("This Hy4 checkpoint was loaded without a vision tower")
+        if image_grid_thw is None:
+            raise ValueError("Hy4 image input needs image_grid_thw")
+        return self.vision_tower(pixel_values, image_grid_thw)
+
     def get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
-        if pixel_values is not None:
-            raise ValueError("Hy4 image input is not supported yet")
         embeds = self.language_model.model.embed_tokens(input_ids)
-        return InputEmbeddingsFeatures(inputs_embeds=embeds)
+        features = kwargs.get("cached_image_features")
+        if pixel_values is None and features is None:
+            return InputEmbeddingsFeatures(inputs_embeds=embeds)
+        if kwargs.get("pixel_values_videos") is not None:
+            raise ValueError("Hy4 video input is not supported")
+        grids = kwargs.get("image_grid_thw")
+        if features is None:
+            features = self.encode_image(pixel_values, grids)
+        elif grids is None:
+            raise ValueError("Hy4 image input needs image_grid_thw")
+
+        ids = np.asarray(input_ids)
+        slots = np.flatnonzero(ids == self.config.image_token_id)
+        if len(slots) != features.shape[0]:
+            raise ValueError(
+                f"{features.shape[0]} image features for {len(slots)} image tokens"
+            )
+        flat = embeds.reshape(-1, embeds.shape[-1])
+        flat[mx.array(slots)] = features.astype(embeds.dtype)
+
+        mask = kwargs.get("mask")
+        planes, deltas = rope_index(
+            ids,
+            self.config.image_token_id,
+            grid_rows(grids),
+            self.config.vision_config.spatial_merge_size,
+            None if mask is None else np.asarray(mask),
+        )
+        return InputEmbeddingsFeatures(
+            inputs_embeds=flat.reshape(embeds.shape),
+            position_ids=mx.array(planes),
+            rope_deltas=mx.array(deltas),
+        )
 
     def __call__(self, input_ids, pixel_values=None, mask=None, cache=None, **kwargs):
         if pixel_values is not None:
-            raise ValueError("Hy4 image input is not supported yet")
+            merged = self.get_input_embeddings(
+                input_ids, pixel_values, mask=mask, **kwargs
+            )
+            kwargs["inputs_embeds"] = merged.inputs_embeds
+            kwargs["position_ids"] = merged.position_ids
         return self.language_model(input_ids, cache=cache, **kwargs)
 
     def sanitize(self, weights: dict) -> dict:
@@ -166,6 +221,7 @@ class Model(nn.Module):
         weights = {
             k: v for k, v in weights.items() if not k.startswith(_SKIPPED_PREFIXES)
         }
+        self._sanitize_vision(weights)
         # mlx-vlm's FP8 transform already turned 2D block-FP8 linears into
         # MXFP8 when it ran; keep the routed experts in the same format then.
         experts_mxfp8 = any(k.endswith(".scales") for k in weights)
@@ -185,6 +241,26 @@ class Model(nn.Module):
                 k = "language_model." + k
             out[k] = v
         return out
+
+    def _sanitize_vision(self, weights):
+        """Rename ``vit.*`` to ``vision_tower.*`` and drop it without a vision config.
+
+        The patch embedding and the 1x1 projector conv become matrices; the 2x2
+        projector conv becomes a channels-last kernel.
+        """
+        for key in [k for k in weights if k.startswith(_VISION_PREFIX)]:
+            value = weights.pop(key)
+            if self.config.vision_config is None:
+                continue
+            name = "vision_tower." + key[len(_VISION_PREFIX) :]
+            name = name.replace("perceive.proj.0.", "perceive.proj_conv.")
+            name = name.replace("perceive.proj.2.", "perceive.proj_out.")
+            if value.ndim == 4:
+                if name.endswith("proj_conv.weight"):
+                    value = value.transpose(0, 2, 3, 1)
+                else:
+                    value = value.reshape(value.shape[0], -1)
+            weights[name] = value
 
     def _sanitize_dfly(self, weights, args):
         """Rename ``model.dfly_layers.*`` and detach the drafter when absent.

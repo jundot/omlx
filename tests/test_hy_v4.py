@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import json
+import zlib
 
 import numpy as np
 import pytest
+from PIL import Image
 
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
@@ -21,8 +23,13 @@ from mlx_lm.models.cache import (  # noqa: E402
 from omlx import oq  # noqa: E402
 from omlx.adapter.output_parser import correct_tool_parser_type  # noqa: E402
 from omlx.custom_kernels import nax  # noqa: E402
-from omlx.engine.vlm import _apply_template_thinking_mode  # noqa: E402
+from omlx.engine.vlm import (  # noqa: E402
+    _apply_template_thinking_mode,
+    _count_image_tokens_real,
+)
+from omlx.models.vlm import VLMModelAdapter  # noqa: E402
 from omlx.patches.hy_v4 import exact, indexing, layers  # noqa: E402
+from omlx.patches.hy_v4.config import VisionConfig  # noqa: E402
 from omlx.patches.hy_v4.flash import CompressedIndexer  # noqa: E402
 from omlx.patches.hy_v4.language import set_dspark_verify_armed  # noqa: E402
 from omlx.patches.hy_v4.layers import Indexer  # noqa: E402
@@ -31,7 +38,13 @@ from omlx.patches.hy_v4.model import (  # noqa: E402
     ModelConfig,
     dequantize_block_fp8,
 )
+from omlx.patches.hy_v4.processor import (  # noqa: E402
+    HyV4ImageProcessor,
+    HyV4Processor,
+)
+from omlx.patches.hy_v4.rope import rope_index  # noqa: E402
 from omlx.patches.hy_v4.tool_parser import parse_tool_call  # noqa: E402
+from omlx.patches.hy_v4.vision import VisionModel  # noqa: E402
 from omlx.patches.mlx_lm_mtp import cache_rollback  # noqa: E402
 from omlx.patches.qwen35_verify_qmm import apply_verify_qmm_patch  # noqa: E402
 
@@ -66,7 +79,11 @@ def _hy4_config():
         _COMMON,
         model_type="hy_v4",
         indexer_types=["full", "full", "shared", "shared", "full", "shared"],
-        rope_parameters={"rope_type": "default", "rope_theta": 10000000.0},
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000000.0,
+            "mrope_section": [4, 2, 2],
+        },
     )
     return {"model_type": "hy_v4_vl", "text_config": text}
 
@@ -82,8 +99,16 @@ def _flash_config():
         + ["sliding_attention"] * 3
         + ["deepseek_sparse_attention"],
         rope_parameters={
-            "deepseek_sparse_attention": {"rope_type": "default", "rope_theta": 1e7},
-            "sliding_attention": {"rope_type": "default", "rope_theta": 1e4},
+            "deepseek_sparse_attention": {
+                "rope_type": "default",
+                "rope_theta": 1e7,
+                "mrope_section": [4, 2, 2],
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": 1e4,
+                "mrope_section": [4, 2, 2],
+            },
         },
         sliding_window=8,
         compressed_indexer_compress_ratio=4,
@@ -702,3 +727,366 @@ def test_tool_calls_and_thinking_switches():
         _apply_template_thinking_mode("hy_v4_flash", kwargs)
         assert kwargs.get("reasoning_effort") == expected
         assert "enable_thinking" not in kwargs
+
+
+_TINY_VISION = dict(
+    hidden_size=32,
+    intermediate_size=64,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    out_hidden_size=16,
+    patch_size=4,
+    spatial_merge_size=2,
+    max_image_size=64,
+)
+_IMAGE_ID = 300
+# One 8 x 12 patch image: 4 merged rows of 6 columns plus a newline slot each.
+_GRID = [[1, 8, 12]]
+_IMAGE_SLOTS = 4 * (6 + 1)
+
+
+def _vision_value(name, shape):
+    """Portable per-tensor weights, also used to record the reference values."""
+    x = np.random.default_rng(zlib.crc32(name.encode())).standard_normal(shape)
+    x = x.astype(np.float32)
+    if name.endswith("norm.weight") or "layernorm.weight" in name:
+        return 1 + 0.1 * x
+    if name.endswith(".bias"):
+        return 0.1 * x
+    if name.endswith("image_newline"):
+        return x
+    if name.endswith("position_embedding.weight"):
+        return 0.5 * x
+    return x * shape[-1] ** -0.5
+
+
+@pytest.mark.parametrize(
+    ("grid", "seed", "row_sums", "row_norms"),
+    [
+        # The 16 x 16 position table is resampled down to 4 x 6 patches.
+        (
+            (1, 4, 6),
+            1,
+            [-3.4509, -6.5598, 8.1656, -4.0989, 0.9282, 0.9485, 4.2884, -4.0989],
+            [5.5319, 5.4043, 4.6774, 3.5577, 3.2572, 5.5758, 7.4323, 3.5577],
+        ),
+        # And up to 24 columns: a wide image is not limited to the table size.
+        (
+            (1, 2, 24),
+            2,
+            [3.9254, -0.5263, 4.648, -0.2905, 0.2562, 1.8193, -2.6161]
+            + [-3.2218, -5.719, 0.8748, 0.9433, 1.9788, -4.0989],
+            [5.136, 5.0762, 5.8957, 4.9402, 5.3277, 5.8483, 4.3241]
+            + [4.7421, 5.6187, 3.4543, 3.7057, 3.1879, 3.5577],
+        ),
+    ],
+)
+def test_vision_tower_matches_the_transformers_reference(
+    grid, seed, row_sums, row_norms
+):
+    tower = VisionModel(VisionConfig.from_dict(_TINY_VISION))
+    params = [
+        (name, mx.array(_vision_value(name, value.shape)))
+        for name, value in tree_flatten(tower.parameters())
+    ]
+    tower.update(tree_unflatten(params))
+    shape = (grid[1] * grid[2], 3 * 4 * 4)
+    pixels = np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
+    out = np.array(tower(mx.array(pixels), [list(grid)]))
+    # Merged rows of columns / 2 slots, each closed by the newline vector.
+    assert out.shape == (len(row_sums), 16)
+    for newline in out[grid[2] // 2 :: grid[2] // 2 + 1]:
+        np.testing.assert_array_equal(newline, out[-1])
+    # Recorded from transformers' HYV4VLVisionModel with the same weights.
+    np.testing.assert_allclose(out.sum(-1), row_sums, atol=5e-4)
+    np.testing.assert_allclose(np.linalg.norm(out, axis=-1), row_norms, atol=5e-4)
+
+
+def _vision_config(config):
+    config = json.loads(json.dumps(config))
+    config.update(image_token_id=_IMAGE_ID, video_token_id=_IMAGE_ID + 1)
+    config["vision_config"] = dict(_TINY_VISION, out_hidden_size=128)
+    return config
+
+
+def test_sanitize_maps_checkpoint_vision_weights():
+    model = Model(ModelConfig.from_dict(_vision_config(_hy4_config())))
+    own = dict(tree_flatten(model.vision_tower.parameters()))
+    raw = {}
+    for name, value in own.items():
+        # The checkpoint stores torch conv layouts and numbered projector layers.
+        key = "vit." + name.replace("proj_conv", "proj.0").replace("proj_out", "proj.2")
+        if name.endswith("patch_embedding.weight"):
+            value = value.reshape(value.shape[0], 3, 4, 4)
+        elif name.endswith("proj_conv.weight"):
+            value = value.transpose(0, 3, 1, 2)
+        elif name.endswith("proj_out.weight"):
+            value = value[:, :, None, None]
+        raw[key] = value
+    out = model.sanitize(dict(raw))
+    assert out.keys() == {"vision_tower." + name for name in own}
+    for name, value in own.items():
+        assert mx.array_equal(out["vision_tower." + name], value).item()
+
+    text_only = Model(ModelConfig.from_dict(_hy4_config()))
+    assert text_only.vision_tower is None
+    assert text_only.sanitize(dict(raw)) == {}
+
+
+def _image(width, height, mode="RGB"):
+    channels = 4 if mode == "RGBA" else 3
+    rng = np.random.default_rng(width + height)
+    return Image.fromarray(
+        rng.integers(0, 256, (height, width, channels), dtype=np.uint8), mode
+    )
+
+
+@pytest.mark.parametrize(
+    ("size", "mode", "grid", "tokens", "total", "magnitude"),
+    [
+        ((31, 17), "RGB", [1, 4, 6], 8, -172.5095, 7472.8944),
+        ((200, 150), "RGB", [1, 10, 12], 35, -243.1197, 35381.4603),
+        ((1000, 700), "RGB", [1, 44, 62], 704, 1313.2888, 820166.5362),
+        ((4000, 40), "RGB", [1, 2, 250], 126, -640.0552, 151049.4651),
+        # Transparent pixels are composited onto white.
+        ((40, 40), "RGBA", [1, 4, 4], 6, 6053.4905, 6701.1297),
+    ],
+)
+def test_image_processor_matches_the_transformers_reference(
+    size, mode, grid, tokens, total, magnitude
+):
+    processor = HyV4ImageProcessor()
+    out = processor(_image(*size, mode))
+    assert out["image_grid_thw"].tolist() == [grid]
+    assert out["pixel_values"].shape == (grid[1] * grid[2], 3 * 16 * 16)
+    # Reference sums over the float32 pixel values (rescale, mean/std 0.5).
+    pixels = out["pixel_values"].astype(np.float64)
+    assert pixels.sum() == pytest.approx(total, abs=1e-3)
+    assert np.abs(pixels).sum() == pytest.approx(magnitude, abs=1e-3)
+    height, width = size[1], size[0]
+    assert processor.count_image_tokens(height, width) == tokens
+    assert tokens <= processor.max_image_tokens
+    # The request-size guard counts the row newline slots too.
+    guard = _count_image_tokens_real(
+        [], HyV4Processor(processor, _Tokenizer()), images=[_image(*size, mode)]
+    )
+    assert guard == tokens
+
+
+class _Tokenizer:
+    image_token = "<img>"
+    model_input_names = ["input_ids", "attention_mask"]
+
+    def convert_tokens_to_ids(self, token):
+        return 7 if token == self.image_token else 1
+
+    def __call__(self, texts, **kwargs):
+        assert kwargs["add_special_tokens"] is False
+        words = [t.replace("<img>", " <img> ").split() for t in texts]
+        ids = [[self.convert_tokens_to_ids(w) for w in row] for row in words]
+        return {"input_ids": ids, "attention_mask": [[1] * len(r) for r in ids]}
+
+
+def test_processor_expands_image_placeholders_to_the_token_count():
+    processor = HyV4Processor(HyV4ImageProcessor(), _Tokenizer())
+    images = [_image(31, 17), _image(40, 40, "RGBA")]
+    out = processor(
+        text="a <img> b <img> c", images=images, padding=True, return_tensors="np"
+    )
+    # Grids 4 x 6 and 4 x 4 take 2 x 4 and 2 x 3 slots, newline slots included.
+    ids = out["input_ids"][0]
+    assert (ids == 7).sum() == 8 + 6
+    assert ids.tolist() == [1] + [7] * 8 + [1] + [7] * 6 + [1]
+    assert out["mm_token_type_ids"][0].tolist() == [int(i == 7) for i in ids]
+    assert out["image_grid_thw"].tolist() == [[1, 4, 6], [1, 4, 4]]
+    with pytest.raises(ValueError, match="image placeholders"):
+        processor(text="a <img> b", images=images)
+    with pytest.raises(ValueError, match="no images"):
+        processor(text="a <img> b")
+    with pytest.raises(ValueError, match="image input only"):
+        processor(text="a", videos=[object()])
+
+
+def test_rope_index_follows_the_reference_rule():
+    # Text counts all three planes together. A 2 x 3 merged grid fills 2 x 4
+    # slots (a newline closes every row): rows and columns count from the
+    # image's first position and text resumes after the largest one.
+    ids = np.array([[11, 12] + [_IMAGE_ID] * 8 + [13, 14, 15]])
+    planes, deltas = rope_index(ids, _IMAGE_ID, [[1, 4, 6]], 2)
+    assert planes[:, 0].tolist() == [
+        [0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 6, 7, 8],
+        [0, 1, 2, 2, 2, 2, 3, 3, 3, 3, 6, 7, 8],
+        [0, 1, 2, 3, 4, 5, 2, 3, 4, 5, 6, 7, 8],
+    ]
+    assert deltas.tolist() == [[-4]]
+    # A left-padded row ignores its padding.
+    padded = np.concatenate([np.zeros((1, 2), int), ids], axis=1)
+    mask = np.array([[0, 0] + [1] * 13])
+    shifted, _ = rope_index(padded, _IMAGE_ID, [[1, 4, 6]], 2, mask)
+    assert shifted[:, 0, 2:].tolist() == planes[:, 0].tolist()
+    assert shifted[:, 0, :2].tolist() == [[0, 0]] * 3
+    with pytest.raises(ValueError, match="image_grid_thw"):
+        rope_index(ids, _IMAGE_ID, [[1, 8, 12]], 2)
+
+
+@pytest.fixture(params=["hy4", "flash"], scope="module")
+def image_model(request):
+    config = _hy4_config() if request.param == "hy4" else _flash_config()
+    return _model(_vision_config(config))
+
+
+def _image_prompt(model):
+    ids = np.concatenate(
+        [_ids(5, n=6), np.full(_IMAGE_SLOTS, _IMAGE_ID), _ids(6, n=10)]
+    ).astype(np.int32)
+    pixels = mx.array(
+        np.random.default_rng(3).standard_normal((96, 48)).astype(np.float32)
+    )
+    merged = model.get_input_embeddings(
+        mx.array(ids[None]), pixels, image_grid_thw=mx.array(_GRID)
+    )
+    return ids, merged
+
+
+def test_image_features_replace_the_placeholder_slots(image_model):
+    ids, merged = _image_prompt(image_model)
+    slots = slice(6, 6 + _IMAGE_SLOTS)
+    pixels = np.random.default_rng(3).standard_normal((96, 48)).astype(np.float32)
+    features = image_model.encode_image(mx.array(pixels), mx.array(_GRID))
+    assert features.shape == (_IMAGE_SLOTS, 128)
+    embeds = np.array(merged.inputs_embeds[0])
+    np.testing.assert_array_equal(embeds[slots], np.array(features))
+    text = image_model.language_model.model.embed_tokens(mx.array(ids[None]))
+    np.testing.assert_array_equal(embeds[:6], np.array(text[0, :6]))
+    np.testing.assert_array_equal(embeds[slots.stop :], np.array(text[0, slots.stop :]))
+    # The image starts at position 6; its largest position is 12 (the newline
+    # column), so the 10 text tokens after it run 13 .. 22.
+    planes = np.array(merged.position_ids[:, 0])
+    assert planes[0, slots].tolist() == [6] * _IMAGE_SLOTS
+    assert planes[1, slots].tolist() == [6 + i // 7 for i in range(_IMAGE_SLOTS)]
+    assert planes[2, slots].tolist() == [6 + i % 7 for i in range(_IMAGE_SLOTS)]
+    assert planes[:, slots.stop :].tolist() == [list(range(13, 23))] * 3
+    assert np.array(merged.rope_deltas).tolist() == [[-21]]
+    with pytest.raises(ValueError, match="image tokens"):
+        image_model.get_input_embeddings(
+            mx.array(np.delete(ids, 10)[None]),
+            mx.array(pixels),
+            image_grid_thw=mx.array(_GRID),
+        )
+
+
+def test_image_prompt_chunks_and_decode_follow_the_positions(image_model):
+    lm = image_model.language_model
+    ids, merged = _image_prompt(image_model)
+    embeds, planes = merged.inputs_embeds, merged.position_ids
+    full = np.array(
+        lm(
+            mx.array(ids[None]),
+            cache=image_model.make_cache(),
+            inputs_embeds=embeds,
+            position_ids=planes,
+        ).logits[0]
+    )
+    # Chunks split the image and its compressed-indexer groups anywhere.
+    for chunks in ([11, 5, 28], [7, 9, 3, 25]):
+        cache, outs, start = image_model.make_cache(), [], 0
+        for size in chunks:
+            part = slice(start, start + size)
+            outs.append(
+                lm(
+                    mx.array(ids[None, part]),
+                    cache=cache,
+                    inputs_embeds=embeds[:, part],
+                    position_ids=planes[..., part],
+                ).logits
+            )
+            start += size
+        np.testing.assert_allclose(
+            np.array(mx.concatenate(outs, axis=1))[0], full, atol=2e-4
+        )
+    # Counting the image slots one by one instead gives other logits.
+    sequential = mx.broadcast_to(mx.arange(len(ids))[None, None], (3, 1, len(ids)))
+    other = lm(
+        mx.array(ids[None]),
+        cache=image_model.make_cache(),
+        inputs_embeds=embeds,
+        position_ids=sequential,
+    ).logits
+    assert np.abs(np.array(other[0]) - full).max() > 0.1
+
+    # Decode continues at slot + delta through the server adapter.
+    extra = _ids(9, n=12).astype(np.int32)
+    extended = np.concatenate([ids, extra])
+    grown = mx.concatenate([embeds, lm.model.embed_tokens(mx.array(extra[None]))], 1)
+    extended_planes, _ = rope_index(extended[None], _IMAGE_ID, _GRID, 2)
+    reference = np.array(
+        lm(
+            mx.array(extended[None]),
+            cache=image_model.make_cache(),
+            inputs_embeds=grown,
+            position_ids=mx.array(extended_planes),
+        ).logits[0]
+    )
+    cache = image_model.make_cache()
+    lm(mx.array(ids[None]), cache=cache, inputs_embeds=embeds, position_ids=planes)
+    adapter = VLMModelAdapter(image_model)
+    adapter.set_step_rope_deltas(merged.rope_deltas.reshape(-1), [0])
+    steps = [
+        np.array(adapter(mx.array([[int(token)]]), cache=cache))[0, 0]
+        for token in extra
+    ]
+    np.testing.assert_allclose(np.stack(steps), reference[len(ids) :], atol=2e-4)
+
+
+def test_text_decode_through_the_adapter_is_unchanged(model):
+    # Text requests reach the model with plain position ids and delta 0.
+    ids = _ids(1).astype(np.int32)
+    lm = model.language_model
+    cache, plain = model.make_cache(), model.make_cache()
+    lm(mx.array(ids[None, :24]), cache=cache)
+    positions = mx.broadcast_to(mx.arange(24)[None, None], (3, 1, 24))
+    lm(mx.array(ids[None, :24]), cache=plain, position_ids=positions)
+    adapter = VLMModelAdapter(model)
+    adapter.set_step_rope_deltas(mx.array([0]), [0])
+    for token in ids[24:]:
+        step = mx.array([[int(token)]])
+        expected = lm(step, cache=cache).logits
+        assert mx.array_equal(adapter(step, cache=plain), expected).item()
+
+
+@pytest.mark.parametrize("kind", ["hy4", "flash"])
+def test_dfly_anchor_position_includes_the_image_delta(kind):
+    config = _hy4_config() if kind == "hy4" else _flash_config()
+    model = _model(_with_dfly(_vision_config(config)))
+    lm = model.language_model
+    lm.configure_mtp(True, 3)
+    ids, merged = _image_prompt(model)
+    out = lm(
+        mx.array(ids[None]),
+        cache=model.make_cache(),
+        inputs_embeds=merged.inputs_embeds,
+        position_ids=merged.position_ids,
+        return_hidden=True,
+    )
+    assert lm._position_delta.value.tolist() == [-21]
+    hidden, anchor = out.hidden_states[0], mx.array([int(ids[-1])])
+    shifted = np.array(lm.dspark_forward(hidden, anchor, draft_length=3)[0])
+    lm._position_delta.value = None
+    plain = np.array(lm.dspark_forward(hidden, anchor, draft_length=3)[0])
+    assert np.abs(shifted - plain).max() > 1e-3
+
+
+def test_flash_history_restored_without_positions_still_serves_text():
+    model = _model(_flash_config())
+    lm = model.language_model
+    ids = _ids(1).astype(np.int32)
+    expected = _run(model, ids, [24] + [1] * 16)
+    cache = model.make_cache()
+    lm(mx.array(ids[None, :24]), cache=cache)
+    # Cache blocks written before positions were stored carry zero-width values.
+    history = cache[0].caches[2]
+    history.values = history.values[..., :0]
+    steps = [
+        np.array(lm(mx.array([[int(t)]]), cache=cache).logits)[0, 0] for t in ids[24:]
+    ]
+    np.testing.assert_allclose(np.stack(steps), expected[24:], atol=2e-4)

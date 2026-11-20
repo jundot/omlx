@@ -337,7 +337,7 @@ def _load_text_model_with_tokenizer_fallback(
     """Load a text-only mlx-vlm family with a tokenizer-only fallback.
 
     Used when the checkpoint's processor class is missing from the installed
-    transformers (Cohere2 MoE, Hy4).
+    transformers (Cohere2 MoE).
     """
     from mlx_vlm.utils import get_model_path, load_model, load_processor
     from transformers import AutoTokenizer
@@ -1627,6 +1627,8 @@ def _count_image_tokens_real(
     minp = getattr(ip, "min_pixels", None)
     maxp = getattr(ip, "max_pixels", None)
     qwen_ok = all(isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp))
+    # Processors with extra placeholder tokens (Hy4's row newlines) count exactly.
+    token_counter = getattr(ip, "count_image_tokens", None)
     patch_counter = getattr(ip, "get_number_of_image_patches", None)
     glm_ok = (
         callable(patch_counter)
@@ -1652,8 +1654,13 @@ def _count_image_tokens_real(
 
     total = 0
     for wh in dimensions:
-        if wh is None or not (qwen_ok or glm_ok):
+        if wh is None or not (qwen_ok or glm_ok or callable(token_counter)):
             total += upper_bound
+        elif callable(token_counter):
+            try:
+                total += int(token_counter(wh[1], wh[0]))
+            except Exception:
+                total += upper_bound
         elif glm_ok:
             try:
                 total += int(patch_counter(wh[1], wh[0]) // (ms**2))
@@ -2154,7 +2161,7 @@ class VLMBatchedEngine(BaseEngine):
                             self._model_settings, "moe_expert_offload_enabled", False
                         ),
                     )
-                if model_type in (COHERE2_MOE_MODEL_TYPE, "hy_v4_vl", "hy_v4_flash"):
+                if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_text_model_with_tokenizer_fallback(
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
