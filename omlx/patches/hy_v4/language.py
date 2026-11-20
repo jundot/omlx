@@ -320,6 +320,8 @@ class LanguageModel(nn.Module):
             if self.config.tie_word_embeddings
             else self.lm_head
         )
+        if self.config.enable_lm_head_fp32 and isinstance(head, nn.Linear):
+            return exact.fp32_head(head, hidden)
         if self.config.enable_lm_head_fp32:
             hidden = hidden.astype(mx.float32)
         return exact.linear(head, hidden)

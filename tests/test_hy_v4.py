@@ -21,7 +21,7 @@ from mlx_lm.models.cache import (  # noqa: E402
 from omlx import oq  # noqa: E402
 from omlx.adapter.output_parser import correct_tool_parser_type  # noqa: E402
 from omlx.engine.vlm import _apply_template_thinking_mode  # noqa: E402
-from omlx.patches.hy_v4 import indexing  # noqa: E402
+from omlx.patches.hy_v4 import exact, indexing  # noqa: E402
 from omlx.patches.hy_v4.flash import CompressedIndexer  # noqa: E402
 from omlx.patches.hy_v4.language import set_dspark_verify_armed  # noqa: E402
 from omlx.patches.hy_v4.layers import Indexer  # noqa: E402
@@ -259,10 +259,12 @@ def _quantized_model(kind, bits, dfly=False, calm=False, dtype=mx.bfloat16):
         lm.lm_head.weight = lm.lm_head.weight * 8
     model.set_dtype(dtype)
     if bits:
+        mxfp8 = bits == "mxfp8"
         nn.quantize(
             model.language_model,
-            group_size=64,
-            bits=bits,
+            group_size=32 if mxfp8 else 64,
+            bits=8 if mxfp8 else bits,
+            mode="mxfp8" if mxfp8 else "affine",
             # oQ keeps the compressed indexer's fp32 key pooling in float.
             class_predicate=lambda path, m: hasattr(m, "to_quantized")
             and not isinstance(m, nn.Embedding)
@@ -280,7 +282,7 @@ def _decode_logits(lm, cache, tokens):
 
 
 @pytest.mark.parametrize("batched", [False, True])
-@pytest.mark.parametrize("bits", [None, 4, 3])
+@pytest.mark.parametrize("bits", [None, 4, 3, "mxfp8"])
 @pytest.mark.parametrize("kind", ["hy4", "flash"])
 def test_exact_verify_rows_match_decode(kind, bits, batched):
     # Past the index top-k and the 8-slot sliding window, so sparse selection
@@ -320,6 +322,30 @@ def test_exact_verify_rows_match_decode(kind, bits, batched):
         _decode_logits(lm, cache, tail), _decode_logits(lm, reference, tail)
     ):
         assert mx.array_equal(got, want).item()
+
+
+def test_exact_block_kernels_match_one_row_calls():
+    # Release-sized layers: the weight-once MXFP8 kernel and the bf16-storage
+    # fp32 head, whose tiny-model shapes take the per-row fallback instead.
+    linear = nn.Linear(512, 1024, bias=False)
+    linear.weight = mx.random.normal((1024, 512)) * 0.05
+    mxfp8 = linear.to_quantized(group_size=32, bits=8, mode="mxfp8")
+    head = nn.Linear(256, 4096, bias=False)
+    head.weight = (mx.random.normal((4096, 256)) * 0.05).astype(mx.bfloat16)
+    x = mx.random.normal((1, 7, 512)).astype(mx.bfloat16)
+    h = mx.random.normal((1, 7, 256)).astype(mx.bfloat16)
+    one_x = [mxfp8(x[:, i : i + 1]) for i in range(7)]
+    one_h = [exact.fp32_head(head, h[:, i : i + 1]) for i in range(7)]
+    exact.set_armed(True)
+    try:
+        with exact.scope(mx.zeros((1, 7), dtype=mx.int32), [None]):
+            rows_x = exact.linear(mxfp8, x)
+            rows_h = exact.fp32_head(head, h)
+    finally:
+        exact.set_armed(False)
+    assert mx.array_equal(rows_x, mx.concatenate(one_x, axis=1)).item()
+    assert rows_h.dtype == mx.float32
+    assert mx.array_equal(rows_h, mx.concatenate(one_h, axis=1)).item()
 
 
 def _generate(model, prompts, count, use_mtp):

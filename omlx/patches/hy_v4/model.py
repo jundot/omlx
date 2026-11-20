@@ -179,11 +179,6 @@ class Model(nn.Module):
             _split_kv_b(weights, i, args)
         self._sanitize_dfly(weights, args)
 
-        if args.enable_lm_head_fp32 and "lm_head.weight" in weights:
-            head = weights["lm_head.weight"]
-            if mx.issubdtype(head.dtype, mx.floating):
-                weights["lm_head.weight"] = head.astype(mx.float32)
-
         out = {}
         for k, v in weights.items():
             if k.startswith(("model.", "lm_head.", "dfly.")):

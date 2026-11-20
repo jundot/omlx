@@ -26,9 +26,14 @@ import threading
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..deepseek_v4 import verify_qmv
 from ..qwen35_verify_qmm import set_verify_qmm_armed
 
 MAX_ROWS = 16
+# The weight-once MXFP8 kernel covers this many rows per call.
+_MXFP8_ROWS = 8
+# Rows per call of the fp32 head kernel.
+_HEAD_ROWS = 6
 _STATE = threading.local()
 
 
@@ -90,7 +95,72 @@ def rowwise(fn, x: mx.array) -> mx.array:
 
 
 def linear(module, x: mx.array) -> mx.array:
-    """``module(x)``; an unquantized layer runs row by row inside a block."""
-    if isinstance(module, nn.Linear) and block(x):
+    """``module(x)``, with decode's bits per row inside a block.
+
+    Unquantized layers run row by row; MXFP8 layers take the weight-once
+    kernel; other quantized layers take the row-exact kernels armed with the
+    block.
+    """
+    if not block(x):
+        return module(x)
+    if isinstance(module, nn.Linear):
         return rowwise(module, x)
+    if getattr(module, "mode", None) == "mxfp8":
+        out = _mxfp8_rows(module, x)
+        if out is not None:
+            return out
     return module(x)
+
+
+def _mxfp8_rows(module, x: mx.array) -> mx.array | None:
+    k = x.shape[-1]
+    rows = x.reshape(-1, k)
+    if (
+        module.bits != 8
+        or k % 512
+        or rows.shape[0] > _MXFP8_ROWS
+        or x.dtype not in (mx.bfloat16, mx.float16)
+    ):
+        return None
+    out = verify_qmv.exact_rows_qmv(
+        rows,
+        module.weight,
+        module.scales,
+        None,
+        group_size=int(module.group_size),
+        mxfp8=True,
+    )
+    out = out.reshape(*x.shape[:-1], out.shape[-1])
+    if "bias" in module:
+        out = out + module.bias
+    return out
+
+
+def fp32_head(head, hidden: mx.array) -> mx.array:
+    """Logits in fp32 from a bf16 head, the same kernel for decode and verify.
+
+    The weight stays bf16 (half the reads of an fp32 copy); the kernel
+    multiplies and accumulates in fp32, so the math matches an fp32 head.
+    """
+    k = hidden.shape[-1]
+    n = head.weight.shape[0]
+    rows = hidden.reshape(-1, k)
+    eligible = (
+        isinstance(head, nn.Linear)
+        and head.weight.dtype == hidden.dtype
+        and hidden.dtype in (mx.bfloat16, mx.float16)
+        and k % 128 == 0
+        and n >= 4096
+        and n % 32 == 0
+    )
+    if eligible and (rows.shape[0] <= _HEAD_ROWS or block(hidden)):
+        out = mx.concatenate(
+            [
+                verify_qmv.dspark_head_gemv(head, rows[i : i + _HEAD_ROWS])
+                for i in range(0, rows.shape[0], _HEAD_ROWS)
+            ]
+        )
+        return out.reshape(*hidden.shape[:-1], n)
+    if block(hidden):
+        return rowwise(lambda r: head(r.astype(mx.float32)), hidden)
+    return head(hidden.astype(mx.float32))
