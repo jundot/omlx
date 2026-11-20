@@ -74,6 +74,18 @@ def _dashboard(name: str) -> str:
     return (DASHBOARD / name).read_text(encoding="utf-8")
 
 
+def _cluster_dashboard() -> str:
+    """The cluster dashboard template, under either of its names.
+
+    This branch was written when the page was `_cluster_v2.html`; main has since
+    renamed it back to `_cluster.html`, and the test runs on both trees.
+    """
+    for name in ("_cluster.html", "_cluster_v2.html"):
+        if (DASHBOARD / name).exists():
+            return _dashboard(name)
+    raise AssertionError("cluster dashboard template not found")
+
+
 def test_dashboard_error_strings_use_red_600():
     """Inline errors across the dashboard use the 4.5:1 red step."""
     assert 'x-show="logError" class="text-red-600"' in _dashboard("_logs.html")
@@ -90,5 +102,5 @@ def test_dashboard_error_strings_use_red_600():
 
 def test_dashboard_icons_keep_red_500_as_an_accent():
     """Status icons are accents, not text, so they stay on red-500."""
-    cluster = _dashboard("_cluster_v2.html")
+    cluster = _cluster_dashboard()
     assert cluster.count('class="w-4 h-4 text-red-500"') == 2
