@@ -14,10 +14,12 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.mla import MultiLinear
+from mlx_vlm.models.base import create_attention_mask
 
 from ...custom_kernels.attention import fast as attn_fast
-from ..deepseek_v4.switch_layers import SwitchGLU
-from . import indexing
+from ...oqh.modules import exact_rows as oqh_exact_rows
+from ..deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
+from . import exact, indexing
 from . import kernels as hc_kernels
 from .config import TextConfig
 from .flash import CompressedIndexer
@@ -174,7 +176,8 @@ class MLP(nn.Module):
             self.post_fc2_norm = nn.RMSNorm(d, eps=args.rms_norm_eps)
 
     def __call__(self, x: mx.array) -> mx.array:
-        y = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        act = nn.silu(exact.linear(self.gate_proj, x)) * exact.linear(self.up_proj, x)
+        y = exact.linear(self.down_proj, act)
         if "post_fc2_norm" in self:
             y = self.post_fc2_norm(y)
         return y
@@ -217,7 +220,11 @@ class Router(nn.Module):
         self._scale = args.routed_scaling_factor
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
-        logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        weight_t = self.weight.astype(mx.float32).T
+        if exact.block(x):
+            logits = exact.rowwise(lambda r: r.astype(mx.float32) @ weight_t, x)
+        else:
+            logits = x.astype(mx.float32) @ weight_t
         scores = mx.sigmoid(logits)
         choice = scores + self.e_score_correction_bias.astype(mx.float32)
         if self._n_group > 1:
@@ -267,18 +274,45 @@ class MoE(nn.Module):
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         inds, weights = self.gate(x)
-        routed = (
-            self.routed_expert_down_proj(x) if "routed_expert_down_proj" in self else x
-        )
-        y = self.switch_mlp(routed, inds, scores=weights, weighted_sum=True)
-        if y.ndim == routed.ndim + 1:
-            y = (y * weights[..., None].astype(y.dtype)).sum(axis=-2)
+        routed = x
+        if "routed_expert_down_proj" in self:
+            routed = exact.linear(self.routed_expert_down_proj, x)
+        if exact.block(x):
+            y = self._exact_experts(routed, inds, weights)
+        else:
+            y = self.switch_mlp(routed, inds, scores=weights, weighted_sum=True)
+            if y.ndim == routed.ndim + 1:
+                y = (y * weights[..., None].astype(y.dtype)).sum(axis=-2)
         if "routed_expert_up_proj" in self:
-            y = self.routed_expert_up_proj(y)
+            y = exact.linear(self.routed_expert_up_proj, y)
         y = y + self.shared_experts(x)
         if "combine_output_norm" in self:
             y = self.combine_output_norm(y)
         return y.reshape(shape)
+
+    def _exact_experts(self, routed, inds, weights):
+        """Routed experts of a verify block with one-token decode arithmetic.
+
+        Decode's top-k routes stay below the sort threshold, so they run the
+        unsorted gather; rows are grouped to stay below it as well.
+        """
+        switch = self.switch_mlp
+        k = inds.shape[-1]
+        if hasattr(switch, "oqh_experts"):
+            with oqh_exact_rows():
+                parts = [switch(routed, inds, scores=weights, weighted_sum=True)]
+        else:
+            group = max(1, (_sort_threshold(*switch.projections()) - 1) // k)
+            parts = [
+                switch(routed[i : i + group], inds[i : i + group], scores=weights)
+                for i in range(0, routed.shape[0], group)
+            ]
+        y = mx.concatenate(parts) if len(parts) > 1 else parts[0]
+        rows = [
+            (y[i : i + 1] * weights[i : i + 1, :, None].astype(y.dtype)).sum(axis=-2)
+            for i in range(y.shape[0])
+        ]
+        return mx.concatenate(rows)
 
 
 class Indexer(nn.Module):
@@ -302,7 +336,22 @@ class Indexer(nn.Module):
         self.rope = TrailingRoPE(args.qk_rope_head_dim, args.rope_theta("sparse"))
         self._weight_scale = self.n_heads**-0.5 * self.head_dim**-0.5
 
-    def __call__(self, x, qr, mask, cache, offset=0) -> mx.array | None:
+    def __call__(self, x, qr, mask, cache, offset=0) -> mx.array | list | None:
+        if exact.block(x):
+            # Per-row selections (None below the top-k) of a verify block.
+            length = x.shape[1]
+            mask = as_4d_mask(mask)
+            keys = 0 if mask is None else mask.shape[-1]
+            return [
+                self(
+                    x[:, i : i + 1],
+                    qr[:, i : i + 1],
+                    exact.row_mask(mask, i, keys - length + i + 1),
+                    cache,
+                    offset + i,
+                )
+                for i in range(length)
+            ]
         b, s, _ = x.shape
         q = self.wq_b(qr).reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
         q = self.rope(q, offset)
@@ -457,13 +506,16 @@ class Attention(nn.Module):
     def __call__(self, x, mask, cache=None, prev_topk=None):
         b, length, _ = x.shape
         kv_cache, index_cache = self._caches(cache)
-        gate = mx.sigmoid(self.linear_gate(x)).reshape(
+        gate = mx.sigmoid(exact.linear(self.linear_gate, x)).reshape(
             b, length, self.num_heads, self.v_head_dim
         )
-        qr = self.q_a_layernorm(self.q_a_proj(x))
-        q = self.q_b_proj(qr).reshape(b, length, self.num_heads, -1).swapaxes(1, 2)
+        qr = self.q_a_layernorm(exact.linear(self.q_a_proj, x))
+        q = exact.linear(self.q_b_proj, qr)
+        q = q.reshape(b, length, self.num_heads, -1).swapaxes(1, 2)
         q_nope, q_pe = mx.split(q, [self.nope], axis=-1)
-        latent, k_pe = mx.split(self.kv_a_proj_with_mqa(x), [self.rank], axis=-1)
+        latent, k_pe = mx.split(
+            exact.linear(self.kv_a_proj_with_mqa, x), [self.rank], axis=-1
+        )
         latent = self.kv_a_layernorm(latent)[:, None]
         k_pe = k_pe.reshape(b, 1, length, self.rope_dim)
         offset = rope_offset(kv_cache)
@@ -480,10 +532,19 @@ class Attention(nn.Module):
         if self._capture_topk:
             # DFly reuses this layer's selection for the last committed row.
             self._captured_topk = topk
+        sinks = self.learnable_sink_param.astype(x.dtype)
+        if exact.block(x):
+            out = self._exact_rows(
+                q_nope, q_pe, latent, k_pe, topk, mask, kv_cache, sinks
+            )
+            out = out.swapaxes(1, 2) * gate
+            out = exact.linear(self.o_proj, out.reshape(b, length, -1))
+            if "post_proj_norm" in self:
+                out = self.post_proj_norm(out)
+            return out, topk
         if kv_cache is not None:
             latent, k_pe = kv_cache.update_and_fetch(latent, k_pe)
 
-        sinks = self.learnable_sink_param.astype(x.dtype)
         if length == 1:
             out = self._decode(q_nope, q_pe, latent, k_pe, topk, mask, sinks)
         elif length <= _VERIFY_ROWS:
@@ -495,6 +556,53 @@ class Attention(nn.Module):
         if "post_proj_norm" in self:
             out = self.post_proj_norm(out)
         return out, topk
+
+    def _exact_rows(self, q_nope, q_pe, latent, k_pe, topk, mask, kv_cache, sinks):
+        """One-token decode steps for the rows of an exact verify block.
+
+        ``topk`` holds each row's own selection. A sliding window takes the
+        rows one at a time, so its ring has decode's physical layout; each row
+        keeps a copy of its step's view and the mask decode built for it.
+        """
+        length = q_nope.shape[2]
+        views = []
+        if self.kind == "sliding":
+            batched = hasattr(kv_cache, "left_padding")
+            for i in range(length):
+                row_mask = None
+                if batched:
+                    row_mask = create_attention_mask(
+                        latent[:, 0, i : i + 1],
+                        kv_cache,
+                        window_size=self.window,
+                        return_array=True,
+                    )
+                lat, pe = kv_cache.update_and_fetch(
+                    latent[..., i : i + 1, :], k_pe[..., i : i + 1, :]
+                )
+                views.append((lat + 0, pe + 0, row_mask))
+        else:
+            lat, pe = kv_cache.update_and_fetch(latent, k_pe)
+            total = lat.shape[2]
+            for i in range(length):
+                end = total - length + i + 1
+                row_mask = exact.row_mask(as_4d_mask(mask), i, end)
+                views.append((lat[..., :end, :], pe[..., :end, :], row_mask))
+        rows = []
+        for i, (lat, pe, row_mask) in enumerate(views):
+            row_topk = topk[i] if isinstance(topk, list) else None
+            rows.append(
+                self._decode(
+                    q_nope[:, :, i : i + 1],
+                    q_pe[:, :, i : i + 1],
+                    lat,
+                    pe,
+                    row_topk,
+                    row_mask,
+                    sinks,
+                )
+            )
+        return mx.concatenate(rows, axis=2)
 
     def _decode(self, q_nope, q_pe, latent, k_pe, topk, mask, sinks):
         if topk is not None:

@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import indexing
+from . import exact, indexing
 from .config import TextConfig
 from .rope import TrailingRoPE, rope_at
 
@@ -84,7 +84,13 @@ class CompressedIndexer(nn.Module):
         closes = (positions >= r - 1) & (positions % r == r - 1)
         return mx.where(closes[..., None], pooled, mx.zeros_like(pooled))
 
-    def __call__(self, x, qr, mask, cache, offset=0) -> mx.array | None:
+    def __call__(self, x, qr, mask, cache, offset=0) -> mx.array | list | None:
+        if exact.block(x):
+            # Per-row selections (None below the top-k) of a verify block.
+            return [
+                self(x[:, i : i + 1], qr[:, i : i + 1], None, cache)
+                for i in range(x.shape[1])
+            ]
         b, length, _ = x.shape
         start, left = cache_layout(cache, b)
         positions = start + mx.arange(length)[None] - left[:, None]
@@ -292,13 +298,13 @@ class Engram(nn.Module):
         x = x.reshape(*x.shape[:2], -1)
         gates = []
         for i in range(self.hc_mult):
-            key = _rms(self.key_projs[i](x), self.norm_key[i].weight)
+            key = _rms(exact.linear(self.key_projs[i], x), self.norm_key[i].weight)
             query = _rms(streams[:, :, i], self.norm_query[i].weight)
             dot = (key * query).astype(mx.float32).sum(axis=-1) * self.hidden_size**-0.5
             dot = mx.sqrt(mx.maximum(mx.abs(dot), 1e-6)) * mx.sign(dot)
             gates.append(mx.sigmoid(dot).astype(dtype))
         gates = mx.stack(gates, axis=2)[..., None]
-        main = self.unified_pre_gamma * _rms(self.value_proj(x), None)
+        main = self.unified_pre_gamma * _rms(exact.linear(self.value_proj, x), None)
         main = main.astype(dtype)[:, :, None, :]
         scales = mx.stack(self.unified_per_hc_scales).astype(dtype)
         out = gates * main + scales * main

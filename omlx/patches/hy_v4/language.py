@@ -11,6 +11,7 @@ from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
 from mlx_vlm.models.base import LanguageModelOutput, create_attention_mask
 
 from ..deepseek_v41.mtp import AcceptanceDepthController
+from . import exact
 from .config import TextConfig
 from .flash import Engram
 from .layers import (
@@ -158,6 +159,11 @@ def engram_inputs(
     return ngrams, keep
 
 
+def set_dspark_verify_armed(flag: bool) -> None:
+    """The MTP generator arms this around draft verify forwards."""
+    exact.set_armed(flag)
+
+
 class LanguageModel(nn.Module):
     """Hy4 text model, also the embedded-drafter host for oMLX's MTP loop.
 
@@ -167,8 +173,10 @@ class LanguageModel(nn.Module):
     rolls the target caches back with ``mtp_partial_rollback``.
     """
 
-    # One request at a time: the drafter reads that request's target caches.
-    _omlx_mtp_multi_request = False
+    # Batched requests draft too. Each row verifies alone on the cache the
+    # generator extracts for it, so the drafter reads that row's caches.
+    _omlx_mtp_multi_request = True
+    _omlx_mtp_independent_verify = True
 
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -229,12 +237,16 @@ class LanguageModel(nn.Module):
         for kv_layer, index_layer in zip(dfly.cfg.kv_layers, dfly.cfg.index_layers):
             kv = _latent_cache(target[kv_layer])
             topk = self.layers[index_layer].self_attn._captured_topk
+            pick = row
+            if isinstance(topk, list):
+                # An exact verify block keeps one selection per row.
+                topk, pick = topk[row], 0
             if topk is None:
                 # Shorter than the indexer's top-k: every committed slot.
                 latent = kv.keys[..., first:end, :]
                 histories.append((latent, kv.values[..., first:end, :], None))
                 continue
-            index = topk[0, 0, row]
+            index = topk[0, 0, pick]
             valid = (index >= first) & (index < end)
             safe = mx.clip(index, first, end - 1)
             histories.append((kv.keys[:, :, safe], kv.values[:, :, safe], valid))
@@ -256,13 +268,22 @@ class LanguageModel(nn.Module):
         return self.project(hidden)
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
+        """Drop the rejected drafts from every target cache.
+
+        Returns False, touching nothing, when a cache cannot drop them (a
+        rotated ring without the generator's undo log); the generator then
+        falls back.
+        """
         rejected = int(num_drafts) - int(accepted)
         if rejected <= 0:
             return True
+        entries = []
         for c in cache:
             if c is not None:
-                c.trim(rejected)
-        return True
+                entries.extend(getattr(c, "caches", None) or (c,))
+        if not all(e.is_trimmable() for e in entries):
+            return False
+        return all(e.trim(rejected) == rejected for e in entries)
 
     @property
     def layers(self):
@@ -300,8 +321,8 @@ class LanguageModel(nn.Module):
             else self.lm_head
         )
         if self.config.enable_lm_head_fp32:
-            return head(hidden.astype(mx.float32))
-        return head(hidden)
+            hidden = hidden.astype(mx.float32)
+        return exact.linear(head, hidden)
 
     def __call__(
         self,
@@ -319,8 +340,9 @@ class LanguageModel(nn.Module):
         engram_inputs = None
         if self.config.engram_layer_ids:
             engram_inputs = self._engram_inputs(inputs, cache)
-        hidden = self.model(inputs, cache, inputs_embeds, engram_inputs)
-        logits = None if kwargs.get("skip_logits") else self.project(hidden)
+        with exact.scope(inputs if inputs is not None else inputs_embeds, cache):
+            hidden = self.model(inputs, cache, inputs_embeds, engram_inputs)
+            logits = None if kwargs.get("skip_logits") else self.project(hidden)
         return LanguageModelOutput(
             logits=logits,
             hidden_states=[hidden] if kwargs.get("return_hidden") else None,

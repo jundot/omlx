@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
 
 from mlx.utils import tree_flatten, tree_unflatten  # noqa: E402
 from mlx_lm.models.cache import (  # noqa: E402
@@ -22,6 +23,7 @@ from omlx.adapter.output_parser import correct_tool_parser_type  # noqa: E402
 from omlx.engine.vlm import _apply_template_thinking_mode  # noqa: E402
 from omlx.patches.hy_v4 import indexing  # noqa: E402
 from omlx.patches.hy_v4.flash import CompressedIndexer  # noqa: E402
+from omlx.patches.hy_v4.language import set_dspark_verify_armed  # noqa: E402
 from omlx.patches.hy_v4.layers import Indexer  # noqa: E402
 from omlx.patches.hy_v4.model import (  # noqa: E402
     Model,
@@ -30,6 +32,7 @@ from omlx.patches.hy_v4.model import (  # noqa: E402
 )
 from omlx.patches.hy_v4.tool_parser import parse_tool_call  # noqa: E402
 from omlx.patches.mlx_lm_mtp import cache_rollback  # noqa: E402
+from omlx.patches.qwen35_verify_qmm import apply_verify_qmm_patch  # noqa: E402
 
 VOCAB = 320
 SEQ = 40
@@ -240,6 +243,170 @@ def test_dfly_cycles_roll_back_to_the_accepted_prefix(kind):
         assert lm.mtp_partial_rollback(cache, accepted, 3)
         committed += accepted + 1
         row = accepted
+
+
+def _quantized_model(kind, bits, dfly=False, calm=False, dtype=mx.bfloat16):
+    config = _hy4_config() if kind == "hy4" else _flash_config()
+    if calm:
+        # No discrete routing or slot selection, and wide logit gaps, so batch
+        # rounding (in fp32) does not flip a token; logic errors still do.
+        config["text_config"].update(
+            n_routed_experts=4, num_experts_per_tok=4, index_topk=64
+        )
+    model = _model(_with_dfly(config) if dfly else config)
+    if calm:
+        lm = model.language_model
+        lm.lm_head.weight = lm.lm_head.weight * 8
+    model.set_dtype(dtype)
+    if bits:
+        nn.quantize(
+            model.language_model,
+            group_size=64,
+            bits=bits,
+            # oQ keeps the compressed indexer's fp32 key pooling in float.
+            class_predicate=lambda path, m: hasattr(m, "to_quantized")
+            and not isinstance(m, nn.Embedding)
+            and "compressed_indexer.key_" not in path
+            and m.weight.shape[-1] % 64 == 0,
+        )
+    mx.eval(model.parameters())
+    return model
+
+
+def _decode_logits(lm, cache, tokens):
+    return [
+        lm(mx.array([[int(t)]], dtype=mx.int32), cache=cache).logits for t in tokens
+    ]
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("bits", [None, 4, 3])
+@pytest.mark.parametrize("kind", ["hy4", "flash"])
+def test_exact_verify_rows_match_decode(kind, bits, batched):
+    # Past the index top-k and the 8-slot sliding window, so sparse selection
+    # and a rotated ring are both in play. mlx-lm's generator hands even one
+    # request one-row batch caches.
+    apply_verify_qmm_patch()
+    cache_rollback.apply()
+    model = _quantized_model(kind, bits)
+    lm = model.language_model
+    ids = _ids(7, n=SEQ)
+    prompt, block = 28, 6
+
+    def primed():
+        cache = _batch_cache(model, [0]) if batched else model.make_cache()
+        lm(mx.array(ids[None, :prompt].astype(np.int32)), cache=cache)
+        return cache
+
+    decoded = _decode_logits(lm, primed(), ids[prompt : prompt + block])
+    cache = primed()
+    cache_rollback.set_undo_armed(True)
+    set_dspark_verify_armed(True)
+    try:
+        rows = lm(
+            mx.array(ids[None, prompt : prompt + block].astype(np.int32)), cache=cache
+        ).logits
+    finally:
+        set_dspark_verify_armed(False)
+        cache_rollback.set_undo_armed(False)
+    assert mx.array_equal(rows, mx.concatenate(decoded, axis=1)).item()
+
+    # Keep the bonus row and two drafts, then both caches decode alike.
+    assert lm.mtp_partial_rollback(cache, accepted=2, num_drafts=block - 1)
+    reference = primed()
+    _decode_logits(lm, reference, ids[prompt : prompt + 3])
+    tail = ids[prompt + 3 : prompt + 9] + 1
+    for got, want in zip(
+        _decode_logits(lm, cache, tail), _decode_logits(lm, reference, tail)
+    ):
+        assert mx.array_equal(got, want).item()
+
+
+def _generate(model, prompts, count, use_mtp):
+    """Greedy tokens per prompt from mlx-lm's BatchGenerator with the MTP loop."""
+    from types import SimpleNamespace
+
+    from mlx_lm.generate import BatchGenerator
+
+    from omlx.models.vlm import VLMModelAdapter
+
+    lm = model.language_model
+    lm.configure_mtp(use_mtp, 3)
+    lm._omlx_mtp_depth_fixed = True
+    adapter = VLMModelAdapter(
+        SimpleNamespace(
+            config=SimpleNamespace(model_type=lm.model_type), language_model=lm
+        )
+    )
+    generator = BatchGenerator(
+        adapter,
+        max_tokens=count,
+        prefill_step_size=512,
+        sampler=lambda lp: mx.argmax(lp, -1),
+    )
+    tokens = {}
+    try:
+        uids = generator.insert([list(map(int, p)) for p in prompts])
+        for _ in range(8 * count):
+            _, responses = generator.next()
+            for r in responses:
+                tokens.setdefault(r.uid, []).append(r.token)
+            if all(len(tokens.get(u, [])) >= count for u in uids):
+                break
+    finally:
+        generator.close()
+    return [tokens[u][:count] for u in uids]
+
+
+@pytest.mark.parametrize("bits", [4, 3])
+@pytest.mark.parametrize("kind", ["hy4", "flash"])
+def test_mtp_generation_matches_greedy(monkeypatch, kind, bits):
+    """Through the generator (draft, exact verify, accept, rollback), alone and
+    with a second request, MTP emits each request's own greedy tokens."""
+    from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+
+    assert apply_mlx_lm_mtp_patch()
+    model = _quantized_model(kind, bits, dfly=True)
+    lm = model.language_model
+    drafts = []
+    original = type(lm).dspark_forward
+
+    def tracked(self, *args, **kwargs):
+        drafts.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(lm), "dspark_forward", tracked)
+    prompt = _ids(11, n=26)
+    expected = _generate(model, [prompt], 24, use_mtp=False)
+    assert _generate(model, [prompt], 24, use_mtp=True) == expected
+    assert drafts, "the MTP loop must draft"
+
+
+@pytest.mark.parametrize("kind", ["hy4", "flash"])
+def test_mtp_drafts_for_concurrent_requests(monkeypatch, kind):
+    """Two requests draft at once, each from its own caches.
+
+    In fp32 the batched and single-request arithmetic agree far below the
+    logit gaps, so each request must emit what it emits alone.
+    """
+    from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+
+    assert apply_mlx_lm_mtp_patch()
+    model = _quantized_model(kind, None, dfly=True, calm=True, dtype=mx.float32)
+    lm = model.language_model
+    drafts = []
+    original = type(lm).dspark_forward
+
+    def tracked(self, *args, **kwargs):
+        drafts.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(lm), "dspark_forward", tracked)
+    prompts = [_ids(11, n=26), _ids(12, n=19)]
+    expected = [_generate(model, [p], 20, use_mtp=False)[0] for p in prompts]
+    drafts.clear()
+    assert _generate(model, prompts, 20, use_mtp=True) == expected
+    assert len(drafts) > 2
 
 
 def _checkpoint(path, cfg, model):
