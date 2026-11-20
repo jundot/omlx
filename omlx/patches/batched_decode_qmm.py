@@ -11,7 +11,7 @@ one-token decode rows too.
 Only (rows, 1, K) inputs with at least ``MIN_ROWS`` rows are routed, and only
 while no speculative verify or one-row exactness mode is armed. Those modes
 own their (rows, 1, K) calls. Prefill chunks and single-request decode keep
-their paths. On applegpu_g13 the M1-class kernels also serve 2 to 5 rows of
+their paths. On applegpu_g13 the M1-class kernels also serve 3 to 5 rows of
 the larger projections. On GPUs with the NAX tensor unit, mma stops at 16
 rows.
 """
@@ -37,8 +37,11 @@ _ROUTES = ("m1", "sg8", "mma", "m1_mma", "vk")
 _SMALL_ROWS_ROUTES = ("m1", "m1_mma")
 # Fewest rows served. Below MIN_ROWS only the M1 kernels run, and only for
 # projections with at least _M1_MIN_WEIGHT weights: 512x2048 projections were
-# 14-39% slower than stock at every row count measured.
-_M1_MIN_ROWS = 2
+# 14-39% slower than stock at every row count measured, and two-row calls of
+# the large projections measured 3.7-5.5% slower than stock on 4-bit A3B and
+# 2-3% slower on 6-bit with the wrapper kept in place, so two rows stay on
+# stock.
+_M1_MIN_ROWS = 3
 _M1_MIN_WEIGHT = 1 << 21
 
 _PATCHED = False

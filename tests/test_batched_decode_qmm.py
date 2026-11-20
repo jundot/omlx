@@ -54,7 +54,7 @@ def _routes_taken(monkeypatch, linear, x):
     return taken, linear(x)
 
 
-@pytest.mark.parametrize("rows,route", [(2, "m1"), (3, "m1"), (4, "m1"), (5, "m1_mma")])
+@pytest.mark.parametrize("rows,route", [(3, "m1"), (4, "m1"), (5, "m1_mma")])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_few_decode_rows_take_the_m1_kernels(
     monkeypatch, m1_batched_decode, rows, route, dtype
@@ -87,6 +87,15 @@ def test_one_row_and_mismatched_dtype_keep_the_stock_path(
     assert taken == []
     taken, _ = _routes_taken(
         monkeypatch, _linear(4, mx.float16), mx.ones((4, 1, K), dtype=mx.bfloat16)
+    )
+    assert taken == []
+
+
+def test_two_rows_keep_the_stock_path(monkeypatch, m1_batched_decode):
+    # Two-row calls measured slower through the M1 kernels even at the large
+    # projections the size floor admits, so the floor starts at three rows.
+    taken, _ = _routes_taken(
+        monkeypatch, _linear(4, mx.float16), mx.ones((2, 1, K), dtype=mx.float16)
     )
     assert taken == []
 
