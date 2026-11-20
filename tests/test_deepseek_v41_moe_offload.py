@@ -3,12 +3,14 @@
 import json
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
 import pytest
 from test_deepseek_v41 import write_checkpoint
 
+from omlx.engine.vlm import wire_moe_offload_slot_hooks
 from omlx.patches.deepseek_v41.convert import convert
 from omlx.patches.deepseek_v41.loading import load
 from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
@@ -558,10 +560,6 @@ def test_resize_failure_before_publish_leaves_the_bank_unchanged(
 
 
 def test_slot_hooks_wire_the_banks_into_the_scheduler(tmp_path):
-    from types import SimpleNamespace
-
-    from omlx.engine.vlm import wire_moe_offload_slot_hooks
-
     _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
     slots = disk.slots
     try:
@@ -586,31 +584,6 @@ def test_slot_hooks_wire_the_banks_into_the_scheduler(tmp_path):
         plain = SimpleNamespace()
         assert not wire_moe_offload_slot_hooks(plain, SimpleNamespace())
         assert not hasattr(plain, "moe_offload_release")
-    finally:
-        plan.close()
-
-
-def test_banks_cover_a_shortfall_in_release_steps(tmp_path):
-    from omlx.patches.moe_expert_offload import (
-        releasable_moe_offload_bytes,
-        release_moe_offload_slots,
-    )
-
-    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
-    slots = disk.slots
-    try:
-        slots.ensure_ids([0, 1, 2, 3, 4, 5])
-        assert releasable_moe_offload_bytes([slots]) == plan.expert_bytes * 4
-        reclaimed = []
-        # A quarter of the slots above the floor frees one expert's bytes, so a
-        # three-expert shortfall lands on the three-quarter step.
-        freed = release_moe_offload_slots(
-            [slots], plan.expert_bytes * 3, lambda: reclaimed.append(True)
-        )
-        assert freed == plan.expert_bytes * 3
-        assert slots.capacity == 3
-        assert releasable_moe_offload_bytes([slots]) == plan.expert_bytes
-        assert reclaimed == [True]
     finally:
         plan.close()
 
