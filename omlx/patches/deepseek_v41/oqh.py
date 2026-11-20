@@ -2,12 +2,9 @@
 """oQh routed experts of a DeepSeek V4.1 export.
 
 The main export leaves out the experts the oQh plan covers. This pass loads the
-source model and runs the calibration text through it a few layers at a time,
-as pipeline stages: each row's stream (h, pre and the shared cross-layer state)
-carries over to the next group, so no layer runs twice. The oQe Gram collector
-records each routed expert's inputs (w3 shares w1's) while its group runs; the
-pass quantizes those experts against their Grams and adds them to the export,
-one module per writer call so each stays in one shard.
+source model and runs the calibration text through it a few layers at a time
+(iter_expert_grams); the pass quantizes those experts against their Grams and
+adds them to the export, one module per writer call so each stays in one shard.
 """
 
 import logging
@@ -47,7 +44,7 @@ def planned_bytes(inventory, allocation, names) -> int:
     )
 
 
-def _float_experts(module, first: int, stop: int) -> mx.array:
+def float_experts(module, first: int, stop: int) -> mx.array:
     if isinstance(module, QuantizedProjection):
         return mx.dequantize(
             module.weight[first:stop],
@@ -70,7 +67,7 @@ def _quantize_module(collector, owner, name, module, bits):
     out_dim = int(module.weight.shape[-2])
     for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
         gram = oq._shrunk_gram(collector.switch_gram(owner, first, stop))
-        weight = _float_experts(module, first, stop)
+        weight = float_experts(module, first, stop)
         p, r, b0, b1 = quantize.quantize(weight, gram, bits, signs, block)
         packed.append(p)
         rscale.append(r)
@@ -86,29 +83,36 @@ def _quantize_module(collector, owner, name, module, bits):
     return values, fmt.config_entry(bits, block), before, after
 
 
-def write_experts(
+def expert_layer(name: str) -> int:
+    return int(name.split("layers.")[1].split(".")[0])
+
+
+def expert_owner(collector, name: str) -> str:
+    """The collector entry holding name's inputs (w3 shares w1's)."""
+    owner = collector.aliases.get(name, name)
+    if owner not in collector.switch_rows:
+        raise RuntimeError(f"V4.1: no calibration input for {name}")
+    return owner
+
+
+def iter_expert_grams(
     source,
-    writer,
-    widths: dict[str, int],
+    layers,
     *,
     num_samples: int,
     seq_length: int,
     layers_per_pass: int = 2,
-    progress=None,
-) -> dict:
-    """Quantize the planned experts from the source model and add them to writer.
+):
+    """Yield (layer, routed experts, Gram collector) for each of layers, in order.
 
-    Returns {"entries": {module: config entry}, "bytes": written bytes,
-    "hessian_before": ..., "hessian_after": ...}.
+    Loads the source model and runs the oQe refinement calibration text through
+    it a few layers at a time, as pipeline stages: each row's stream (h, pre and
+    the shared cross-layer state) carries over to the next group, so no layer
+    runs twice. A layer's collector holds its routed experts' inputs until the
+    caller resumes the generator.
     """
-    by_layer: dict[int, dict[str, int]] = {}
-    for name, bits in widths.items():
-        layer = int(name.split("layers.")[1].split(".")[0])
-        by_layer.setdefault(layer, {})[name] = bits
-    layers = sorted(by_layer)
+    layers = sorted(layers)
     model, processor = load(source, engram_ssd_offload=True)
-    entries, written = {}, 0
-    before = after = 0.0
     try:
         tokens = oq._load_calibration_data(
             processor.tokenizer,
@@ -117,7 +121,7 @@ def write_experts(
             seq_length,
         )
         if tokens is None or len(tokens) == 0:
-            raise ValueError("V4.1 oQh requires nonempty calibration data")
+            raise ValueError("V4.1 expert calibration requires nonempty text")
         core = model.language_model
         stages = (core.start_idx, core.end_idx)
         # Each row's stream after the layers run so far, the next stage's input.
@@ -154,42 +158,63 @@ def write_experts(
                     collector.restore(core.layers[i].ffn.experts)
             stage_start = group[-1] + 1
             for i in group:
-                collector = collectors[i]
-                experts = core.layers[i].ffn.experts
-                for part in _EXPERTS:
-                    name = f"language_model.layers.{i}.ffn.experts.{part}"
-                    if name not in by_layer[i]:
-                        continue
-                    owner = collector.aliases.get(name, name)
-                    if owner not in collector.switch_rows:
-                        raise RuntimeError(f"V4.1 oQh: no calibration input for {name}")
-                    values, entry, b0, b1 = _quantize_module(
-                        collector,
-                        owner,
-                        name,
-                        getattr(experts, part),
-                        by_layer[i][name],
-                    )
-                    writer.add(values)
-                    written += sum(v.nbytes for v in values.values())
-                    entries[name] = entry
-                    before, after = before + b0, after + b1
-                    del values
-                collector.switch_rows.clear()
+                yield i, core.layers[i].ffn.experts, collectors[i]
+                collectors[i].switch_rows.clear()
                 mx.clear_cache()
-            if progress is not None:
-                progress(min(start + layers_per_pass, len(layers)), len(layers))
-            logger.info(
-                "V4.1 oQh: layers %s done (%d/%d)",
-                group,
-                min(start + layers_per_pass, len(layers)),
-                len(layers),
-            )
     finally:
         model.close()
         del model, processor
         mx.synchronize()
         mx.clear_cache()
+
+
+def write_experts(
+    source,
+    writer,
+    widths: dict[str, int],
+    *,
+    num_samples: int,
+    seq_length: int,
+    layers_per_pass: int = 2,
+    progress=None,
+) -> dict:
+    """Quantize the planned experts from the source model and add them to writer.
+
+    Returns {"entries": {module: config entry}, "bytes": written bytes,
+    "hessian_before": ..., "hessian_after": ...}.
+    """
+    by_layer: dict[int, dict[str, int]] = {}
+    for name, bits in widths.items():
+        by_layer.setdefault(expert_layer(name), {})[name] = bits
+    entries, written = {}, 0
+    before = after = 0.0
+    grams = iter_expert_grams(
+        source,
+        by_layer,
+        num_samples=num_samples,
+        seq_length=seq_length,
+        layers_per_pass=layers_per_pass,
+    )
+    for done, (i, experts, collector) in enumerate(grams, start=1):
+        for part in _EXPERTS:
+            name = f"language_model.layers.{i}.ffn.experts.{part}"
+            if name not in by_layer[i]:
+                continue
+            values, entry, b0, b1 = _quantize_module(
+                collector,
+                expert_owner(collector, name),
+                name,
+                getattr(experts, part),
+                by_layer[i][name],
+            )
+            writer.add(values)
+            written += sum(v.nbytes for v in values.values())
+            entries[name] = entry
+            before, after = before + b0, after + b1
+            del values
+        if progress is not None:
+            progress(done, len(by_layer))
+        logger.info("V4.1 oQh: layer %d done (%d/%d)", i, done, len(by_layer))
     return {
         "entries": entries,
         "bytes": written,

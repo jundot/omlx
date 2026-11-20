@@ -1,10 +1,10 @@
-// oMLX Cluster v2 wizard — Alpine.js component backing
-// omlx_web/templates/dashboard/_cluster_v2.html.
+// oMLX Cluster wizard — Alpine.js component backing
+// omlx_web/templates/dashboard/_cluster.html.
 //
-// Contract (ops/notes/omlx_cluster_v2_spec.md, Module C): consume ONLY the
-// Module A/B endpoints plus the pre-existing planner/activate API:
+// Contract (Module C): consume ONLY the Module A/B endpoints plus the
+// planner/activate API:
 //
-//   Module A/B (cluster v2):
+//   Module A/B:
 //     GET    /api/cluster/devices               — {paired, discovered, self}, polled at 1 Hz
 //     POST   /api/cluster/pair/approve          — {node_id, code}
 //     POST   /api/cluster/pair/deny             — {node_id}
@@ -12,7 +12,6 @@
 //     GET    /api/cluster/pair/join             — local join snapshot, polled at 1 Hz (drives approval)
 //     POST   /api/cluster/pair/join/cancel      — abandon the join in progress
 //     POST   /api/cluster/devices/manual        — {ip, port} seed + probe a peer by address
-//     DELETE /api/cluster/devices/{node_id}     — unpair
 //     GET    /api/cluster/discovery/health      — {multicast_rx_within_5s: bool,
 //           last_multicast_rx_at: float|null, mdns_active: bool, transport: str}
 //           Powers the "Local network permission" self-test check row.
@@ -43,11 +42,11 @@
 // never a modal). N device cards are rendered; there is no 2-Mac cap.
 //
 // This file is loaded as a plain script before Alpine initializes, exactly
-// like dashboard.js, so `clusterV2Wizard` is a global factory referenced from
-// x-data in _cluster_v2.html.
+// like dashboard.js, so `clusterWizard` is a global factory referenced from
+// x-data in _cluster.html.
 
-function clusterV2Wizard() {
-    const CLUSTER_V2_API = {
+function clusterWizard() {
+    const CLUSTER_API = {
         devices: '/api/cluster/devices',
         discoveryHealth: '/api/cluster/discovery/health',
         pairApprove: '/api/cluster/pair/approve',
@@ -56,8 +55,6 @@ function clusterV2Wizard() {
         pairJoinCancel: '/api/cluster/pair/join/cancel',
         pairJoinCleanup: '/api/cluster/pair/join/cleanup',
         manualDevice: '/api/cluster/devices/manual',
-        unpair: (nodeId) =>
-            `/api/cluster/devices/${encodeURIComponent(nodeId)}`,
         sshUser: (nodeId) => `/api/cluster/devices/${encodeURIComponent(nodeId)}/ssh-user`,
         models: '/admin/api/cluster/models',
         catalogue: '/admin/api/cluster/catalogue',
@@ -81,20 +78,20 @@ function clusterV2Wizard() {
 
     // exo-style data layer: one snapshot endpoint polled once per second
     // while the tab is visible; the UI is a pure function of the snapshot.
-    const CLUSTER_V2_POLL_MS = 1000;
-    const CLUSTER_V2_DEPLOYMENTS_EVERY_TICKS = 5;
-    // A missing v2 backend (404) flips the error state immediately; flaky
+    const CLUSTER_POLL_MS = 1000;
+    const CLUSTER_DEPLOYMENTS_EVERY_TICKS = 5;
+    // A missing cluster backend (404) flips the error state immediately; flaky
     // networks get a few grace failures first.
-    const CLUSTER_V2_FAILURE_GRACE = 3;
+    const CLUSTER_FAILURE_GRACE = 3;
 
-    const CLUSTER_V2_LINK_META = {
-        tb: { label: window.t('cluster.v2.link.thunderbolt'), icon: 'zap' },
-        ethernet: { label: window.t('cluster.v2.link.ethernet'), icon: 'cable' },
-        wifi: { label: window.t('cluster.v2.link.wifi'), icon: 'wifi' },
+    const CLUSTER_LINK_META = {
+        tb: { label: window.t('cluster.link.thunderbolt'), icon: 'zap' },
+        ethernet: { label: window.t('cluster.link.ethernet'), icon: 'cable' },
+        wifi: { label: window.t('cluster.link.wifi'), icon: 'wifi' },
         // This is the address used to find/control the peer. It is not the
         // collective fabric selected by the signed deployment.
-        tailscale: { label: window.t('cluster.v2.link.tailscale_control'), icon: 'globe' },
-        unknown: { label: window.t('cluster.v2.link.network'), icon: 'help-circle' },
+        tailscale: { label: window.t('cluster.link.tailscale_control'), icon: 'globe' },
+        unknown: { label: window.t('cluster.link.network'), icon: 'help-circle' },
     };
 
     // Offline mirror of omlx/cluster/node_role.py (NodeRole.reserve_for):
@@ -103,71 +100,22 @@ function clusterV2Wizard() {
     // these same numbers from the server; this mirror exists only so the
     // usable-budget labels still render when that endpoint is unreachable.
     // If node_role.py changes, this mirror must change with it.
-    const CLUSTER_V2_ROLE_FALLBACK = {
+    const CLUSTER_ROLE_FALLBACK = {
         workstation: {
             key: 'workstation',
-            label: window.t('cluster.v2.role.workstation'),
+            label: window.t('cluster.role.workstation'),
             reserve_bytes: 32 * 1024 ** 3,
             reserve_fraction: 0.5,
         },
         headless: {
             key: 'headless',
-            label: window.t('cluster.v2.role.headless'),
+            label: window.t('cluster.role.headless'),
             reserve_bytes: 0,
             reserve_fraction: 0.1,
         },
     };
 
-    // English fallbacks for the cluster.v2.* strings the wizard adds. The
-    // dashboard resolves window.t against en.json-filled locale_json, so these
-    // only matter when window.t is unavailable (offline component tests).
-    // Keep in sync with omlx_web/i18n/en.json.
-    const CLUSTER_V2_STRINGS = {
-        'cluster.v2.strategy.title': 'How the model is split',
-        'cluster.v2.strategy.auto': 'Auto',
-        'cluster.v2.strategy.tensor': 'Tensor',
-        'cluster.v2.strategy.pipeline': 'Pipeline',
-        'cluster.v2.strategy.recommended': 'Recommended',
-        'cluster.v2.strategy.hint.auto':
-            'oMLX picks the split that fits this model and your link',
-        'cluster.v2.strategy.hint.tensor':
-            'Every Mac works on every token — needs a fast link',
-        'cluster.v2.strategy.hint.pipeline':
-            'Each Mac holds a different slice of the layers',
-        'cluster.v2.strategy.tensor_needs_two':
-            'Tensor parallelism needs 2+ Macs',
-        'cluster.v2.strategy.tensor_unsupported':
-            "This model's attention heads cannot be split across Macs",
-        'cluster.v2.strategy.pipeline_unsupported':
-            'This model does not support pipeline stages — use Tensor instead',
-        'cluster.v2.split.tensor_caption':
-            'Tensor split — each Mac holds 1/{count} of every layer',
-        'cluster.v2.split.tensor_share': '1/{count} of every layer',
-        'cluster.v2.models.on_every_mac': 'on every Mac',
-        'cluster.v2.models.partial':
-            'on {have} of {total} Macs — copied at activation',
-        'cluster.v2.staging.title':
-            'Copying the model to your Macs — {done} of {total} ready',
-        'cluster.v2.staging.waiting': 'waiting',
-        'cluster.v2.staging.checking': 'checking what is already there…',
-        'cluster.v2.staging.copying': 'copying {done} of {total} files',
-        'cluster.v2.staging.already_there': 'already has it',
-        'cluster.v2.staging.ready': 'ready',
-        'cluster.v2.staging.failed': 'copy failed',
-        'cluster.v2.staging.lost':
-            'The coordinator restarted mid-copy — press Activate to resume.',
-        'cluster.v2.staging.unsupported':
-            'This build cannot copy models automatically — trying to activate directly.',
-        'cluster.v2.staging.button_copying_one': 'Copying model to 1 Mac…',
-        'cluster.v2.staging.button_copying': 'Copying model to {count} Macs…',
-        'cluster.v2.checks.beacon_label':
-            'Local network permission (discovery only)',
-        'cluster.v2.steps.plan_hint_tensor': 'Every layer, on every Mac',
-    };
-    const t = (key) =>
-        typeof window !== 'undefined' && typeof window.t === 'function'
-            ? window.t(key)
-            : CLUSTER_V2_STRINGS[key] || key;
+    const t = (key) => window.t(key);
 
     return {
         // ---- snapshot state -------------------------------------------------
@@ -225,7 +173,6 @@ function clusterV2Wizard() {
             probes: {},
             benchmark: null,
             benchmarkRunning: false,
-            ranAt: null,
         },
         // Prefill Accelerator checks for one paired Mac (GET /check).
         accelerator: { nodeId: null, running: false, result: null, error: '', copies: null, deleting: [] },
@@ -289,7 +236,6 @@ function clusterV2Wizard() {
         // Dedicated 1 Hz poller — NOT tick(), which early-returns when the
         // tab is hidden; activation must survive a tab switch.
         stagingTimer: null,
-        confirmUnpairFor: '',
         confirmDeactivateFor: '',
         confirmForgetFor: '',
         confirmUnloadFor: '',
@@ -331,7 +277,7 @@ function clusterV2Wizard() {
         init() {
             if (this.pollTimer !== null) return;
             this.tick();
-            this.pollTimer = setInterval(() => this.tick(), CLUSTER_V2_POLL_MS);
+            this.pollTimer = setInterval(() => this.tick(), CLUSTER_POLL_MS);
         },
 
         wizardVisible() {
@@ -350,7 +296,7 @@ function clusterV2Wizard() {
                 this.tickCount += 1;
                 if (
                     !this.deploymentsLoaded ||
-                    this.tickCount % CLUSTER_V2_DEPLOYMENTS_EVERY_TICKS === 0
+                    this.tickCount % CLUSTER_DEPLOYMENTS_EVERY_TICKS === 0
                 ) {
                     await this.refreshDeployments();
                 }
@@ -377,7 +323,7 @@ function clusterV2Wizard() {
             });
             if (response.status === 401) {
                 window.location.href = '/admin';
-                throw new Error(window.t('cluster.v2.err.sign_in_required'));
+                throw new Error(window.t('cluster.err.sign_in_required'));
             }
             if (!response.ok) {
                 let detail = `${response.status} ${response.statusText}`;
@@ -402,7 +348,7 @@ function clusterV2Wizard() {
 
         async refreshDevices() {
             try {
-                const payload = await this.apiFetch(CLUSTER_V2_API.devices);
+                const payload = await this.apiFetch(CLUSTER_API.devices);
                 this.devicesPayload = payload || {};
                 this.devicesLoaded = true;
                 this.devicesError = '';
@@ -410,12 +356,12 @@ function clusterV2Wizard() {
                 this.devicesUnreachable = false;
             } catch (error) {
                 this.devicesFailureCount += 1;
-                this.devicesError = error?.message || window.t('cluster.v2.err.api_unreachable');
-                // 404 means the v2 discovery backend is not serving — that is
+                this.devicesError = error?.message || window.t('cluster.err.api_unreachable');
+                // 404 means the discovery backend is not serving — that is
                 // a hard, actionable failure, not network noise.
                 if (
                     error?.status === 404 ||
-                    this.devicesFailureCount >= CLUSTER_V2_FAILURE_GRACE
+                    this.devicesFailureCount >= CLUSTER_FAILURE_GRACE
                 ) {
                     this.devicesUnreachable = true;
                 }
@@ -424,7 +370,7 @@ function clusterV2Wizard() {
 
         async refreshDeployments() {
             try {
-                const payload = await this.apiFetch(CLUSTER_V2_API.deployments);
+                const payload = await this.apiFetch(CLUSTER_API.deployments);
                 this.deploymentsPayload = payload?.deployments || [];
                 this.deploymentsLoaded = true;
                 this.ensureColdModelSelection();
@@ -434,7 +380,7 @@ function clusterV2Wizard() {
                 if (this.deploymentsLoaded) {
                     this.notify(
                         'warning',
-                        error?.message || window.t('cluster.v2.err.refresh_deployments'),
+                        error?.message || window.t('cluster.err.refresh_deployments'),
                     );
                 }
             }
@@ -443,7 +389,7 @@ function clusterV2Wizard() {
         async refreshRuntime() {
             const revision = ++this.runtimeRevision;
             try {
-                const payload = await this.apiFetch(CLUSTER_V2_API.runtime);
+                const payload = await this.apiFetch(CLUSTER_API.runtime);
                 if (revision !== this.runtimeRevision) return;
                 this.runtimePayload = payload || { jobs: [], launchers: [] };
                 this.runtimeLoaded = true;
@@ -456,14 +402,14 @@ function clusterV2Wizard() {
                 this.runtimePayload = null;
                 this.runtimeLoaded = false;
                 this.runtimeError =
-                    error?.message || window.t('cluster.v2.err.runtime_unavailable');
+                    error?.message || window.t('cluster.err.runtime_unavailable');
             }
         },
 
         async refreshDiscoveryHealth() {
             try {
                 this.discoveryHealth = await this.apiFetch(
-                    CLUSTER_V2_API.discoveryHealth,
+                    CLUSTER_API.discoveryHealth,
                 );
                 this.discoveryHealthUnsupported = false;
             } catch (error) {
@@ -486,7 +432,7 @@ function clusterV2Wizard() {
             if (this.join.busy) return;
             const revision = this.joinRevision;
             try {
-                const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoin);
+                const snapshot = await this.apiFetch(CLUSTER_API.pairJoin);
                 if (!snapshot || revision !== this.joinRevision) return;
                 const previous = this.join.state;
                 this.join = { ...this.join, ...snapshot, busy: false };
@@ -498,7 +444,7 @@ function clusterV2Wizard() {
                     this.joinApprovedNotified = true;
                     this.notify(
                         'success',
-                        window.t('cluster.v2.toast.joined_cluster').replace('{name}', this.joinTargetName()),
+                        window.t('cluster.toast.joined_cluster').replace('{name}', this.joinTargetName()),
                     );
                     await this.refreshDevices();
                     this.choosePurpose(true);
@@ -510,7 +456,7 @@ function clusterV2Wizard() {
                     this.joinDeniedNotified = true;
                     this.notify(
                         'error',
-                        window.t('cluster.v2.toast.join_denied').replace('{name}', this.joinTargetName()),
+                        window.t('cluster.toast.join_denied').replace('{name}', this.joinTargetName()),
                     );
                     // Denied is terminal server-side; reset locally so the
                     // panel clears instead of sticking on the refusal.
@@ -523,7 +469,7 @@ function clusterV2Wizard() {
                 if (error?.status !== 404) {
                     this.join = {
                         ...this.join,
-                        error: error?.message || window.t('cluster.v2.err.join_status_unavailable'),
+                        error: error?.message || window.t('cluster.err.join_status_unavailable'),
                     };
                 }
             }
@@ -566,7 +512,7 @@ function clusterV2Wizard() {
         },
 
         allDevices() {
-            // N device cards — the v1 GUI's 2-Mac cap is gone.
+            // N device cards; there is no 2-Mac cap.
             const devices = [];
             const self = this.selfDevice();
             if (self) devices.push({ ...self, is_self: true, paired: true });
@@ -717,33 +663,33 @@ function clusterV2Wizard() {
             );
             if (capability?.active === false) {
                 return {
-                    label: window.t('cluster.v2.batch.label_unavailable'),
+                    label: window.t('cluster.batch.label_unavailable'),
                     detail:
                         capability.reason ||
-                        window.t('cluster.v2.batch.unavailable_reason'),
+                        window.t('cluster.batch.unavailable_reason'),
                     tone: 'bg-amber-50 border-amber-200 text-amber-700',
                     target,
                 };
             }
             if (target <= 1 || capability?.enabled === false) {
                 return {
-                    label: window.t('cluster.v2.batch.label_sequential'),
-                    detail: window.t('cluster.v2.batch.sequential_detail'),
+                    label: window.t('cluster.batch.label_sequential'),
+                    detail: window.t('cluster.batch.sequential_detail'),
                     tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
                     target,
                 };
             }
             if (lastSize > 1) {
                 return {
-                    label: window.t('cluster.v2.batch.label_batched').replace('{n}', String(lastSize)),
-                    detail: window.t('cluster.v2.batch.batched_detail').replace('{last}', String(lastSize)).replace('{target}', String(target)),
+                    label: window.t('cluster.batch.label_batched').replace('{n}', String(lastSize)),
+                    detail: window.t('cluster.batch.batched_detail').replace('{last}', String(lastSize)).replace('{target}', String(target)),
                     tone: 'bg-green-50 border-green-200 text-green-700',
                     target,
                 };
             }
             return {
-                label: window.t('cluster.v2.batch.label_automatic'),
-                detail: window.t('cluster.v2.batch.automatic_detail').replace('{target}', String(target)),
+                label: window.t('cluster.batch.label_automatic'),
+                detail: window.t('cluster.batch.automatic_detail').replace('{target}', String(target)),
                 tone: 'bg-green-50 border-green-200 text-green-700',
                 target,
             };
@@ -779,14 +725,14 @@ function clusterV2Wizard() {
                 Number(metrics?.active_request_metrics_truncated || 0),
             );
             if (active > 0) {
-                return `${window.t('cluster.v2.req.active_count').replace('{n}', String(active))}${hidden ? ` · ${window.t('cluster.v2.req.not_shown').replace('{n}', String(hidden))}` : ''}`;
+                return `${window.t('cluster.req.active_count').replace('{n}', String(active))}${hidden ? ` · ${window.t('cluster.req.not_shown').replace('{n}', String(hidden))}` : ''}`;
             }
-            return metrics?.last_request ? window.t('cluster.v2.req.last_completed') : window.t('cluster.v2.req.waiting');
+            return metrics?.last_request ? window.t('cluster.req.last_completed') : window.t('cluster.req.waiting');
         },
 
         requestPhaseLabel(request) {
             // Stable, untranslated identifier. The display site localises it
-            // via window.t('cluster.v2.phase.<id>'); requestPhaseTone() switches
+            // via window.t('cluster.phase.<id>'); requestPhaseTone() switches
             // on the same identifiers, so the two never drift apart.
             if (request?._history) {
                 return request?.status === 'failed' ? 'failed' : 'complete';
@@ -823,7 +769,7 @@ function clusterV2Wizard() {
                 cached > 0 &&
                 uncached <= Math.max(16, Math.floor(prompt * 0.01))
             ) {
-                return window.t('cluster.v2.req.cache_hit');
+                return window.t('cluster.req.cache_hit');
             }
             // The last progress sample freezes at the compute boundary. Keep
             // its average after decode begins; TTFT also includes queueing and
@@ -835,23 +781,23 @@ function clusterV2Wizard() {
         },
 
         requestPrefillDetail(request) {
-            if (request?.prefill_progress?.active) return window.t('cluster.v2.req.live_average');
+            if (request?.prefill_progress?.active) return window.t('cluster.req.live_average');
             const prompt = Math.max(0, Number(request?.prompt_tokens || 0));
             const cached = Math.min(
                 prompt,
                 Math.max(0, Number(request?.cached_tokens || 0)),
             );
             if (cached > 0) {
-                return window.t('cluster.v2.req.prefill_reuse')
+                return window.t('cluster.req.prefill_reuse')
                 .replace('{cached}', cached.toLocaleString())
                 .replace('{new}', Math.max(0, prompt - cached).toLocaleString());
             }
-            return window.t('cluster.v2.req.prompt_average');
+            return window.t('cluster.req.prompt_average');
         },
 
         requestDecodeRate(request) {
             const tokens = Math.max(0, Number(request?.completion_tokens || 0));
-            if (!request?._history && tokens === 1) return window.t('cluster.v2.req.measuring');
+            if (!request?._history && tokens === 1) return window.t('cluster.req.measuring');
             return this.formatRequestRate(request?.decode_tps);
         },
 
@@ -865,15 +811,15 @@ function clusterV2Wizard() {
             if (progress?.active) {
                 const processed = Math.max(0, Number(progress.processed || 0));
                 const total = Math.max(0, Number(progress.total || 0));
-                return window.t('cluster.v2.req.prefill_progress').replace('{processed}', processed.toLocaleString()).replace('{total}', total.toLocaleString());
+                return window.t('cluster.req.prefill_progress').replace('{processed}', processed.toLocaleString()).replace('{total}', total.toLocaleString());
             }
             const uncached = Math.max(0, prompt - cached);
-            return `${window.t('cluster.v2.req.new_tokens').replace('{n}', uncached.toLocaleString())}${cached ? ` · ${window.t('cluster.v2.req.cached_tokens').replace('{n}', cached.toLocaleString())}` : ''}`;
+            return `${window.t('cluster.req.new_tokens').replace('{n}', uncached.toLocaleString())}${cached ? ` · ${window.t('cluster.req.cached_tokens').replace('{n}', cached.toLocaleString())}` : ''}`;
         },
 
         requestDecodeDetail(request) {
             const tokens = Math.max(0, Number(request?.completion_tokens || 0));
-            return window.t('cluster.v2.req.generated').replace('{n}', tokens.toLocaleString());
+            return window.t('cluster.req.generated').replace('{n}', tokens.toLocaleString());
         },
 
         deploymentRuntimeLauncher(deployment = this.configuredDeployment()) {
@@ -970,7 +916,7 @@ function clusterV2Wizard() {
                 : '';
             return tail
                 ? String(tail)
-                : window.t('cluster.v2.deploy.worker_stopped');
+                : window.t('cluster.deploy.worker_stopped');
         },
 
         deploymentStatus(deployment = this.configuredDeployment()) {
@@ -978,10 +924,10 @@ function clusterV2Wizard() {
             if (state === 'ready') {
                 return {
                     state,
-                    eyebrow: window.t('cluster.v2.deploy.status_running'),
-                    label: window.t('cluster.v2.deploy.status_ready'),
+                    eyebrow: window.t('cluster.deploy.status_running'),
+                    label: window.t('cluster.deploy.status_ready'),
                     detail:
-                        window.t('cluster.v2.deploy.status_running_detail'),
+                        window.t('cluster.deploy.status_running_detail'),
                     tone: 'bg-green-50 border-green-200 text-green-700',
                     pulse: true,
                 };
@@ -989,10 +935,10 @@ function clusterV2Wizard() {
             if (state === 'loading') {
                 return {
                     state,
-                    eyebrow: window.t('cluster.v2.deploy.status_starting'),
-                    label: window.t('cluster.v2.deploy.status_loading'),
+                    eyebrow: window.t('cluster.deploy.status_starting'),
+                    label: window.t('cluster.deploy.status_loading'),
                     detail:
-                        window.t('cluster.v2.deploy.status_starting_detail'),
+                        window.t('cluster.deploy.status_starting_detail'),
                     tone: 'bg-blue-50 border-blue-200 text-blue-700',
                     pulse: true,
                 };
@@ -1000,8 +946,8 @@ function clusterV2Wizard() {
             if (state === 'failed') {
                 return {
                     state,
-                    eyebrow: window.t('cluster.v2.deploy.status_attention'),
-                    label: window.t('cluster.v2.deploy.status_failed'),
+                    eyebrow: window.t('cluster.deploy.status_attention'),
+                    label: window.t('cluster.deploy.status_failed'),
                     detail: this.deploymentFailureReason(deployment),
                     tone: 'bg-red-50 border-red-200 text-red-700',
                     pulse: false,
@@ -1010,20 +956,20 @@ function clusterV2Wizard() {
             if (state === 'unknown') {
                 return {
                     state,
-                    eyebrow: window.t('cluster.v2.deploy.status_configured'),
-                    label: window.t('cluster.v2.deploy.status_checking'),
+                    eyebrow: window.t('cluster.deploy.status_configured'),
+                    label: window.t('cluster.deploy.status_checking'),
                     detail: this.runtimeError
-                        ? window.t('cluster.v2.deploy.status_runtime_unavailable').replace('{message}', this.runtimeError)
-                        : window.t('cluster.v2.deploy.status_checking_detail'),
+                        ? window.t('cluster.deploy.status_runtime_unavailable').replace('{message}', this.runtimeError)
+                        : window.t('cluster.deploy.status_checking_detail'),
                     tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
                     pulse: true,
                 };
             }
             return {
                 state: 'configured',
-                eyebrow: window.t('cluster.v2.deploy.status_configured'),
-                label: window.t('cluster.v2.deploy.status_not_loaded'),
-                detail: window.t('cluster.v2.deploy.status_not_loaded_detail'),
+                eyebrow: window.t('cluster.deploy.status_configured'),
+                label: window.t('cluster.deploy.status_not_loaded'),
+                detail: window.t('cluster.deploy.status_not_loaded_detail'),
                 tone: 'bg-amber-50 border-amber-200 text-amber-700',
                 pulse: false,
             };
@@ -1035,11 +981,11 @@ function clusterV2Wizard() {
                     deployment?.prompt_cache_ssd,
             );
             return enabled
-                ? window.t('cluster.v2.deploy.cache_memory_ssd').replace(
+                ? window.t('cluster.deploy.cache_memory_ssd').replace(
                       '{gib}',
                       String(Math.round(Number(deployment?.execution?.prompt_cache_ssd_max_bytes || 20 * (1024 ** 3)) / (1024 ** 3))),
                   )
-                : window.t('cluster.v2.deploy.cache_memory_only');
+                : window.t('cluster.deploy.cache_memory_only');
         },
 
         // =====================================================================
@@ -1093,17 +1039,17 @@ function clusterV2Wizard() {
             // to mix Plan and Active semantics during activation.
             const wizard = this.wizardState();
             const steps = [
-                { key: 'discover', title: window.t('cluster.v2.steps.discover_title'), hint: window.t('cluster.v2.steps.discover_hint') },
-                { key: 'pair', title: window.t('cluster.v2.steps.pair_title'), hint: window.t('cluster.v2.steps.pair_hint') },
-                { key: 'checks', title: window.t('cluster.v2.steps.checks_title'), hint: window.t('cluster.v2.steps.checks_hint') },
-                { key: 'plan', title: window.t('cluster.v2.steps.plan_title'), hint: this.planStepHint() },
-                { key: 'active', title: window.t('cluster.v2.steps.active_title'), hint: window.t('cluster.v2.steps.active_hint') },
+                { key: 'discover', title: window.t('cluster.steps.discover_title'), hint: window.t('cluster.steps.discover_hint') },
+                { key: 'pair', title: window.t('cluster.steps.pair_title'), hint: window.t('cluster.steps.pair_hint') },
+                { key: 'checks', title: window.t('cluster.steps.checks_title'), hint: window.t('cluster.steps.checks_hint') },
+                { key: 'plan', title: window.t('cluster.steps.plan_title'), hint: this.planStepHint() },
+                { key: 'active', title: window.t('cluster.steps.active_title'), hint: window.t('cluster.steps.active_hint') },
             ];
             if (wizard === 'accelerator' || wizard === 'helper') {
                 // Prefill Accelerator ends at its checks; nothing is split or activated.
                 const ready =
                     wizard === 'helper' || (!this.accelerator.running && this.acceleratorReady());
-                steps[2].hint = window.t('cluster.v2.steps.accelerator_checks_hint');
+                steps[2].hint = window.t('cluster.steps.accelerator_checks_hint');
                 return steps.slice(0, 3).map((step, index) => ({
                     ...step,
                     state: index < 2 || ready ? 'done' : 'active',
@@ -1229,19 +1175,19 @@ function clusterV2Wizard() {
 
         activationProgressLabel() {
             const labels = {
-                staging: window.t('cluster.v2.progress.staging'),
-                starting: window.t('cluster.v2.progress.starting'),
-                preflight: window.t('cluster.v2.progress.preflight'),
-                initializing: window.t('cluster.v2.progress.initializing'),
-                initializing_full_replica: window.t('cluster.v2.progress.initializing_full_replica'),
-                loading_weights: window.t('cluster.v2.progress.loading_weights'),
-                materializing_fixed: window.t('cluster.v2.progress.materializing_fixed'),
-                materializing_layers: window.t('cluster.v2.progress.materializing_layers'),
-                tensor_ready: window.t('cluster.v2.progress.tensor_ready'),
-                weights_resident: window.t('cluster.v2.progress.weights_resident'),
-                validating: window.t('cluster.v2.progress.validating'),
-                warming_prefill_shape: window.t('cluster.v2.progress.warming_prefill_shape'),
-                ready: window.t('cluster.v2.progress.ready'),
+                staging: window.t('cluster.progress.staging'),
+                starting: window.t('cluster.progress.starting'),
+                preflight: window.t('cluster.progress.preflight'),
+                initializing: window.t('cluster.progress.initializing'),
+                initializing_full_replica: window.t('cluster.progress.initializing_full_replica'),
+                loading_weights: window.t('cluster.progress.loading_weights'),
+                materializing_fixed: window.t('cluster.progress.materializing_fixed'),
+                materializing_layers: window.t('cluster.progress.materializing_layers'),
+                tensor_ready: window.t('cluster.progress.tensor_ready'),
+                weights_resident: window.t('cluster.progress.weights_resident'),
+                validating: window.t('cluster.progress.validating'),
+                warming_prefill_shape: window.t('cluster.progress.warming_prefill_shape'),
+                ready: window.t('cluster.progress.ready'),
             };
             const stage = this.activationLoadStage();
             return labels[stage] || labels.starting;
@@ -1253,7 +1199,7 @@ function clusterV2Wizard() {
             }
             const jobs = this.activationRuntimeJobs();
             if (!jobs.length) {
-                return window.t('cluster.v2.progress.preparing_launcher');
+                return window.t('cluster.progress.preparing_launcher');
             }
             const ready = jobs.filter(
                 (job) => job?.phase === 'ready' && job?.live === true,
@@ -1262,15 +1208,15 @@ function clusterV2Wizard() {
                 jobs.length,
                 ...jobs.map((job) => Math.max(0, Number(job?.world_size || 0))),
             );
-            return window.t('cluster.v2.progress.ranks_ready').replace('{ready}', String(ready)).replace('{expected}', String(expected));
+            return window.t('cluster.progress.ranks_ready').replace('{ready}', String(ready)).replace('{expected}', String(expected));
         },
 
         // Step-4 hint is strategy-aware: a tensor split gives every Mac every
         // layer, so "Layers per Mac" would describe the wrong thing.
         planStepHint() {
             return this.planStrategy === 'tensor'
-                ? t('cluster.v2.steps.plan_hint_tensor')
-                : window.t('cluster.v2.steps.plan_hint_pipeline');
+                ? t('cluster.steps.plan_hint_tensor')
+                : window.t('cluster.steps.plan_hint_pipeline');
         },
 
         // =====================================================================
@@ -1301,7 +1247,7 @@ function clusterV2Wizard() {
             return (
                 device?.friendly_name ||
                 device?.node_id?.slice(0, 8) ||
-                window.t('cluster.v2.device.unknown')
+                window.t('cluster.device.unknown')
             );
         },
 
@@ -1312,7 +1258,7 @@ function clusterV2Wizard() {
 
         deviceRamLabel(device) {
             const ram = this.deviceRamGb(device);
-            return ram ? `${ram} GB` : window.t('cluster.v2.device.memory_unknown');
+            return ram ? `${ram} GB` : window.t('cluster.device.memory_unknown');
         },
 
         deviceChipLabel(device) {
@@ -1320,8 +1266,8 @@ function clusterV2Wizard() {
                 device?.caps?.chip ||
                 window.t(
                     this.deviceHelperOnly(device)
-                        ? 'cluster.v2.device.cuda_helper'
-                        : 'cluster.v2.device.apple_silicon',
+                        ? 'cluster.device.cuda_helper'
+                        : 'cluster.device.apple_silicon',
                 )
             );
         },
@@ -1337,8 +1283,8 @@ function clusterV2Wizard() {
 
         deviceLinkMeta(device) {
             return (
-                CLUSTER_V2_LINK_META[device?.link] ||
-                CLUSTER_V2_LINK_META.unknown
+                CLUSTER_LINK_META[device?.link] ||
+                CLUSTER_LINK_META.unknown
             );
         },
 
@@ -1353,19 +1299,19 @@ function clusterV2Wizard() {
         },
 
         deviceStateLabel(device) {
-            if (device?.is_self) return window.t('cluster.v2.device.this_mac');
-            if (device?.state === 'awaiting_approval') return window.t('cluster.v2.device.wants_to_join');
-            if (device?.paired) return window.t('cluster.v2.device.paired');
-            if (device?.state === 'dead') return window.t('cluster.v2.device.unreachable');
-            if (device?.state === 'suspect') return window.t('cluster.v2.device.connection_shaky');
-            return window.t('cluster.v2.device.found_nearby');
+            if (device?.is_self) return window.t('cluster.device.this_mac');
+            if (device?.state === 'awaiting_approval') return window.t('cluster.device.wants_to_join');
+            if (device?.paired) return window.t('cluster.device.paired');
+            if (device?.state === 'dead') return window.t('cluster.device.unreachable');
+            if (device?.state === 'suspect') return window.t('cluster.device.connection_shaky');
+            return window.t('cluster.device.found_nearby');
         },
 
         combinedMemoryLabel() {
             const total = this.allDevices()
                 .filter((device) => !this.deviceHelperOnly(device))
                 .reduce((sum, device) => sum + (this.deviceRamGb(device) || 0), 0);
-            return total ? window.t('cluster.v2.device.combined').replace('{n}', String(total)) : '';
+            return total ? window.t('cluster.device.combined').replace('{n}', String(total)) : '';
         },
 
         // =====================================================================
@@ -1388,8 +1334,8 @@ function clusterV2Wizard() {
         pairingStepOne(device = this.pairing.target) {
             // A helper daemon has no screen; its code is in its log.
             const key = this.deviceHelperOnly(device)
-                ? 'cluster.v2.pairing.step1_helper'
-                : 'cluster.v2.pairing.step1';
+                ? 'cluster.pairing.step1_helper'
+                : 'cluster.pairing.step1';
             return window.t(key)
                 .replaceAll('{name}', this.deviceName(device))
                 .replaceAll('{self}', this.deviceName(this.selfDevice()));
@@ -1428,23 +1374,23 @@ function clusterV2Wizard() {
             const code = (this.pairing.code || '').trim();
             if (!device || this.pairing.busy) return;
             if (!/^\d{6}$/.test(code)) {
-                this.pairing.error = window.t('cluster.v2.pair.code_hint');
+                this.pairing.error = window.t('cluster.pair.code_hint');
                 return;
             }
             if (this.membershipPanelOpen && !this.membershipPairingReady()) {
-                this.pairing.error = window.t('cluster.v2.membership.waiting_request');
+                this.pairing.error = window.t('cluster.membership.waiting_request');
                 return;
             }
             this.pairing.busy = true;
             this.pairing.error = '';
             try {
-                await this.apiFetch(CLUSTER_V2_API.pairApprove, {
+                await this.apiFetch(CLUSTER_API.pairApprove, {
                     method: 'POST',
                     body: JSON.stringify({ node_id: device.node_id, code }),
                 });
                 this.notify(
                     'success',
-                    window.t('cluster.v2.toast.peer_joined').replace('{name}', this.deviceName(device)),
+                    window.t('cluster.toast.peer_joined').replace('{name}', this.deviceName(device)),
                 );
                 this.cancelPairing();
                 if (this.deviceHelperOnly(device)) {
@@ -1474,16 +1420,16 @@ function clusterV2Wizard() {
                 if (error?.status === 404 || error?.status === 409) {
                     this.pairing.error = window.t(
                         this.deviceHelperOnly(device)
-                            ? 'cluster.v2.pair.no_request_helper'
-                            : 'cluster.v2.pair.no_request',
+                            ? 'cluster.pair.no_request_helper'
+                            : 'cluster.pair.no_request',
                     );
                 } else if (error?.status === 403 || error?.status === 429) {
                     this.pairing.error =
                         error.message ||
-                        window.t('cluster.v2.pair.lockout');
+                        window.t('cluster.pair.lockout');
                 } else {
                     this.pairing.error =
-                        error?.message || window.t('cluster.v2.err.pairing_failed');
+                        error?.message || window.t('cluster.err.pairing_failed');
                 }
             } finally {
                 this.pairing.busy = false;
@@ -1493,47 +1439,22 @@ function clusterV2Wizard() {
         async submitPairDenial(device) {
             if (!device) return;
             try {
-                await this.apiFetch(CLUSTER_V2_API.pairDeny, {
+                await this.apiFetch(CLUSTER_API.pairDeny, {
                     method: 'POST',
                     body: JSON.stringify({ node_id: device.node_id }),
                 });
                 this.notify(
                     'info',
-                    window.t('cluster.v2.toast.join_request_denied').replace('{name}', this.deviceName(device)),
+                    window.t('cluster.toast.join_request_denied').replace('{name}', this.deviceName(device)),
                 );
             } catch (error) {
                 this.notify(
                     'error',
-                    error?.message || window.t('cluster.v2.err.deny_join'),
+                    error?.message || window.t('cluster.err.deny_join'),
                 );
             }
             if (this.pairing.target?.node_id === device?.node_id) {
                 this.cancelPairing();
-            }
-        },
-
-        async unpairDevice(device) {
-            if (!device) return;
-            // Two-step confirm — destructive, but never a modal.
-            if (this.confirmUnpairFor !== device.node_id) {
-                this.confirmUnpairFor = device.node_id;
-                return;
-            }
-            this.confirmUnpairFor = '';
-            try {
-                await this.apiFetch(CLUSTER_V2_API.unpair(device.node_id), {
-                    method: 'DELETE',
-                });
-                this.notify(
-                    'info',
-                    window.t('cluster.v2.toast.device_removed').replace('{name}', this.deviceName(device)),
-                );
-                await this.refreshDevices();
-            } catch (error) {
-                this.notify(
-                    'error',
-                    error?.message || window.t('cluster.v2.err.unpair'),
-                );
             }
         },
 
@@ -1551,7 +1472,7 @@ function clusterV2Wizard() {
                 this.join.target_name ||
                 this.join.coordinator_name ||
                 this.join.coordinator_addr ||
-                window.t('cluster.v2.join.other_mac')
+                window.t('cluster.join.other_mac')
             );
         },
 
@@ -1596,7 +1517,7 @@ function clusterV2Wizard() {
             if (!target) {
                 this.notify(
                     'error',
-                    window.t('cluster.v2.toast.no_address').replace('{name}', this.deviceName(device)),
+                    window.t('cluster.toast.no_address').replace('{name}', this.deviceName(device)),
                 );
                 return;
             }
@@ -1608,7 +1529,7 @@ function clusterV2Wizard() {
             const revision = ++this.joinRevision;
             this.join.busy = true;
             try {
-                const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoin, {
+                const snapshot = await this.apiFetch(CLUSTER_API.pairJoin, {
                     method: 'POST',
                     body: JSON.stringify({ coordinator_addr: coordinatorAddr }),
                 });
@@ -1627,7 +1548,7 @@ function clusterV2Wizard() {
                 this.join.busy = false;
                 this.notify(
                     'error',
-                    error?.message || window.t('cluster.v2.err.reach_mac'),
+                    error?.message || window.t('cluster.err.reach_mac'),
                 );
             }
         },
@@ -1644,7 +1565,7 @@ function clusterV2Wizard() {
             this.join.busy = true;
             try {
                 const snapshot = await this.apiFetch(
-                    CLUSTER_V2_API.pairJoinCancel,
+                    CLUSTER_API.pairJoinCancel,
                     { method: 'POST' },
                 );
                 if (revision !== this.joinRevision) return;
@@ -1658,8 +1579,8 @@ function clusterV2Wizard() {
                     this.notify(
                         snapshot?.cleanup_pending ? 'warning' : 'info',
                         snapshot?.cleanup_pending
-                            ? window.t('cluster.v2.toast.join_cancelled_pending')
-                            : window.t('cluster.v2.toast.join_cancelled'),
+                            ? window.t('cluster.toast.join_cancelled_pending')
+                            : window.t('cluster.toast.join_cancelled'),
                     );
                 }
             } catch (error) {
@@ -1668,7 +1589,7 @@ function clusterV2Wizard() {
                 if (!options.silent) {
                     this.notify(
                         'error',
-                        error?.message || window.t('cluster.v2.err.cancel_join'),
+                        error?.message || window.t('cluster.err.cancel_join'),
                     );
                 }
             }
@@ -1684,16 +1605,16 @@ function clusterV2Wizard() {
             const revision = ++this.joinRevision;
             this.join.busy = true;
             try {
-                const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoinCleanup, {
+                const snapshot = await this.apiFetch(CLUSTER_API.pairJoinCleanup, {
                     method: 'DELETE',
                 });
                 if (revision !== this.joinRevision) return;
                 this.join = { ...this.join, ...snapshot, busy: false };
-                this.notify('info', window.t('cluster.v2.join.cleanup_forgotten'));
+                this.notify('info', window.t('cluster.join.cleanup_forgotten'));
             } catch (error) {
                 if (revision !== this.joinRevision) return;
                 this.join.busy = false;
-                this.notify('error', error?.message || window.t('cluster.v2.join.forget_cleanup_error'));
+                this.notify('error', error?.message || window.t('cluster.join.forget_cleanup_error'));
             }
         },
 
@@ -1706,27 +1627,27 @@ function clusterV2Wizard() {
             const raw = (this.manualAddr || '').trim();
             const match = raw.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$/);
             if (!match) {
-                this.manualError = window.t('cluster.v2.manual.invalid_addr');
+                this.manualError = window.t('cluster.manual.invalid_addr');
                 return;
             }
             const ip = match[1];
             const port = match[2] ? parseInt(match[2], 10) : 8000;
             const octetsOk = ip.split('.').every((part) => Number(part) <= 255);
             if (!octetsOk || !(port >= 1 && port <= 65535)) {
-                this.manualError = window.t('cluster.v2.manual.out_of_range');
+                this.manualError = window.t('cluster.manual.out_of_range');
                 return;
             }
             this.manualBusy = true;
             this.manualError = '';
             try {
-                const result = await this.apiFetch(CLUSTER_V2_API.manualDevice, {
+                const result = await this.apiFetch(CLUSTER_API.manualDevice, {
                     method: 'POST',
                     body: JSON.stringify({ ip, port }),
                 });
                 await this.refreshDevices();
                 if (result && result.verified) {
                     const name = result.peer?.friendly_name || ip;
-                    this.notify('success', window.t('cluster.v2.toast.found_peer').replace('{name}', name).replace('{ip}', ip));
+                    this.notify('success', window.t('cluster.toast.found_peer').replace('{name}', name).replace('{ip}', ip));
                     if (options.beginJoin !== false) {
                         // First-cluster setup may join in either direction.
                         // An existing coordinator only discovers here: the
@@ -1736,13 +1657,13 @@ function clusterV2Wizard() {
                 } else {
                     this.notify(
                         'warning',
-                        window.t('cluster.v2.toast.no_node_answered'),
+                        window.t('cluster.toast.no_node_answered'),
                     );
                 }
                 this.manualAddr = '';
             } catch (error) {
                 this.manualError =
-                    error?.message || window.t('cluster.v2.err.add_address');
+                    error?.message || window.t('cluster.err.add_address');
             } finally {
                 this.manualBusy = false;
             }
@@ -1787,7 +1708,7 @@ function clusterV2Wizard() {
 
         helperRoleText() {
             const role = this.helperRole || {};
-            const key = role.active ? 'cluster.v2.helper.active' : 'cluster.v2.helper.idle';
+            const key = role.active ? 'cluster.helper.active' : 'cluster.helper.idle';
             return window.t(key)
                 .replaceAll('{host}', this.helperRoleHost())
                 .replace('{n}', role.layers ?? '')
@@ -1865,7 +1786,7 @@ function clusterV2Wizard() {
             } catch (error) {
                 if (this.accelerator.nodeId === device.node_id) {
                     this.accelerator.error =
-                        error?.message || window.t('cluster.v2.err.probe_failed');
+                        error?.message || window.t('cluster.err.probe_failed');
                 }
             } finally {
                 if (this.accelerator.nodeId === device.node_id) {
@@ -1906,7 +1827,7 @@ function clusterV2Wizard() {
         acceleratorRows() {
             const rows = this.accelerator.result?.rows || [];
             const name = this.acceleratorName();
-            const t = (key) => window.t('cluster.v2.accelerator.' + key);
+            const t = (key) => window.t('cluster.accelerator.' + key);
             const size = (bytes) => this.formatSizeBytes(Number(bytes || 0));
             // A helper daemon answers on its control channel instead of SSH.
             const helper = rows.some((row) => row.key === 'control');
@@ -1980,7 +1901,6 @@ function clusterV2Wizard() {
                 this.refreshDiscoveryHealth(),
             ]);
             this.checks.running = false;
-            this.checks.ranAt = Date.now();
         },
 
         async saveSSHUser(device) {
@@ -1989,7 +1909,7 @@ function clusterV2Wizard() {
             const value = String(this.sshUserDrafts[nodeId] ?? device.ssh_user ?? '').trim();
             this.sshUserSaving = {...this.sshUserSaving, [nodeId]: true};
             try {
-                const saved = await this.apiFetch(CLUSTER_V2_API.sshUser(nodeId), {
+                const saved = await this.apiFetch(CLUSTER_API.sshUser(nodeId), {
                     method: 'PUT',
                     body: JSON.stringify({ssh_user: value || null}),
                 });
@@ -2003,9 +1923,9 @@ function clusterV2Wizard() {
                 this.checks.benchmark = null;
                 this.checks.started = false;
                 await this.refreshDevices();
-                this.notify('success', window.t('cluster.v2.device.ssh_user_saved'));
+                this.notify('success', window.t('cluster.device.ssh_user_saved'));
             } catch (error) {
-                this.notify('error', error?.message || window.t('cluster.v2.device.ssh_user_error'));
+                this.notify('error', error?.message || window.t('cluster.device.ssh_user_error'));
             } finally {
                 this.sshUserSaving = {...this.sshUserSaving, [nodeId]: false};
             }
@@ -2040,7 +1960,7 @@ function clusterV2Wizard() {
         async probePeer(peer) {
             const ssh = this.sshTargetFor(peer);
             try {
-                const result = await this.apiFetch(CLUSTER_V2_API.peerProbe, {
+                const result = await this.apiFetch(CLUSTER_API.peerProbe, {
                     method: 'POST',
                     body: JSON.stringify({ ssh }),
                 });
@@ -2054,7 +1974,7 @@ function clusterV2Wizard() {
                     [peer.node_id]: {
                         ok: false,
                         ssh,
-                        error: error?.message || window.t('cluster.v2.err.probe_failed'),
+                        error: error?.message || window.t('cluster.err.probe_failed'),
                     },
                 };
             }
@@ -2066,7 +1986,7 @@ function clusterV2Wizard() {
                 this.checks.benchmark = {
                     ok: false,
                     error:
-                        window.t('cluster.v2.checks.bench_need_model'),
+                        window.t('cluster.checks.bench_need_model'),
                 };
                 return;
             }
@@ -2079,13 +1999,13 @@ function clusterV2Wizard() {
                 if (!proposal) {
                     this.checks.benchmark = {
                         ok: false,
-                        error: this.planError || window.t('cluster.v2.err.calibration_failed'),
+                        error: this.planError || window.t('cluster.err.calibration_failed'),
                     };
                 }
             } catch (error) {
                 this.checks.benchmark = {
                     ok: false,
-                    error: error?.message || window.t('cluster.v2.err.benchmark_failed'),
+                    error: error?.message || window.t('cluster.err.benchmark_failed'),
                 };
             } finally {
                 this.checks.benchmarkRunning = false;
@@ -2113,7 +2033,7 @@ function clusterV2Wizard() {
                 );
                 rows.push({
                     key: 'ssh',
-                    label: window.t('cluster.v2.checks.ssh_label'),
+                    label: window.t('cluster.checks.ssh_label'),
                     status: !this.checks.started
                         ? 'pending'
                         : running
@@ -2126,15 +2046,15 @@ function clusterV2Wizard() {
                         ? 'fail'
                         : 'running',
                     detail: failures.length
-                        ? window.t('cluster.v2.checks.ssh_fail')
+                        ? window.t('cluster.checks.ssh_fail')
                               .replace('{names}', failures.map((peer) => this.deviceName(peer)).join(', '))
                         : warnings.length
                         ? warnings.join(' ')
-                        : window.t('cluster.v2.checks.ssh_ok'),
+                        : window.t('cluster.checks.ssh_ok'),
                     fix: failures.length
-                        ? window.t('cluster.v2.checks.ssh_fix')
+                        ? window.t('cluster.checks.ssh_fix')
                         : warnings.length
-                        ? window.t('cluster.v2.checks.warn_fix')
+                        ? window.t('cluster.checks.warn_fix')
                         : '',
                 });
             }
@@ -2144,7 +2064,7 @@ function clusterV2Wizard() {
             {
                 const model = this.selectedModel();
                 let status = 'skipped';
-                let detail = window.t('cluster.v2.checks.model_skipped');
+                let detail = window.t('cluster.checks.model_skipped');
                 if (model) {
                     const holders = new Set(
                         (model.locations || []).map((loc) => loc.node_id),
@@ -2159,20 +2079,20 @@ function clusterV2Wizard() {
                     );
                     if (missing.length) {
                         status = 'fail';
-                        detail = window.t('cluster.v2.checks.model_missing')
+                        detail = window.t('cluster.checks.model_missing')
                         .replace('{model}', this.shortModelName(model))
                         .replace('{names}', missing.map((device) => this.deviceName(device)).join(', '));
                     } else {
                         status = 'pass';
-                        detail = window.t('cluster.v2.checks.model_on_every').replace('{model}', this.shortModelName(model));
+                        detail = window.t('cluster.checks.model_on_every').replace('{model}', this.shortModelName(model));
                     }
                 }
                 rows.push({
                     key: 'model',
-                    label: window.t('cluster.v2.checks.model_label'),
+                    label: window.t('cluster.checks.model_label'),
                     status,
                     detail,
-                    fix: window.t('cluster.v2.checks.model_fix'),
+                    fix: window.t('cluster.checks.model_fix'),
                 });
             }
 
@@ -2181,17 +2101,17 @@ function clusterV2Wizard() {
                 const mismatches = this.versionMismatches();
                 rows.push({
                     key: 'version',
-                    label: window.t('cluster.v2.checks.version_label'),
+                    label: window.t('cluster.checks.version_label'),
                     status: mismatches.length ? 'fail' : 'pass',
                     detail: mismatches.length
                         ? mismatches
                               .map(
                                   (m) =>
-                                      window.t('cluster.v2.checks.version_mismatch').replace('{name}', m.name).replace('{peer}', String(m.peerVersion)).replace('{self}', String(m.selfVersion)),
+                                      window.t('cluster.checks.version_mismatch').replace('{name}', m.name).replace('{peer}', String(m.peerVersion)).replace('{self}', String(m.selfVersion)),
                               )
                               .join(' ')
-                        : window.t('cluster.v2.checks.version_ok'),
-                    fix: window.t('cluster.v2.checks.version_fix'),
+                        : window.t('cluster.checks.version_ok'),
+                    fix: window.t('cluster.checks.version_fix'),
                 });
             }
 
@@ -2203,10 +2123,10 @@ function clusterV2Wizard() {
                 if (!fabricMembers.length && !this.selfDevice()?.caps?.jaccl) {
                     rows.push({
                         key: 'rdma',
-                        label: window.t('cluster.v2.checks.rdma_label'),
+                        label: window.t('cluster.checks.rdma_label'),
                         status: 'skipped',
                         detail:
-                            window.t('cluster.v2.checks.rdma_skipped'),
+                            window.t('cluster.checks.rdma_skipped'),
                         fix: '',
                     });
                 } else {
@@ -2220,17 +2140,17 @@ function clusterV2Wizard() {
                     });
                     rows.push({
                         key: 'rdma',
-                        label: window.t('cluster.v2.checks.rdma_label'),
+                        label: window.t('cluster.checks.rdma_label'),
                         status: this.checks.running
                             ? 'running'
                             : failing.length
                             ? 'fail'
                             : 'pass',
                         detail: failing.length
-                            ? window.t('cluster.v2.checks.rdma_fail')
+                            ? window.t('cluster.checks.rdma_fail')
                                   .replace('{names}', failing.map((peer) => this.deviceName(peer)).join(', '))
-                            : window.t('cluster.v2.checks.rdma_ok'),
-                        fix: window.t('cluster.v2.checks.rdma_fix'),
+                            : window.t('cluster.checks.rdma_ok'),
+                        fix: window.t('cluster.checks.rdma_fix'),
                     });
                 }
             }
@@ -2240,7 +2160,7 @@ function clusterV2Wizard() {
                 const bench = this.checks.benchmark;
                 rows.push({
                     key: 'benchmark',
-                    label: window.t('cluster.v2.checks.bench_label'),
+                    label: window.t('cluster.checks.bench_label'),
                     status: this.checks.benchmarkRunning
                         ? 'running'
                         : bench
@@ -2252,12 +2172,12 @@ function clusterV2Wizard() {
                         : 'pending',
                     detail: bench
                         ? bench.ok
-                            ? window.t('cluster.v2.checks.bench_ok')
+                            ? window.t('cluster.checks.bench_ok')
                             : bench.error
                         : !this.selectedModelPath
-                        ? window.t('cluster.v2.checks.bench_runs_auto')
-                        : window.t('cluster.v2.checks.bench_measuring'),
-                    fix: window.t('cluster.v2.checks.bench_fix'),
+                        ? window.t('cluster.checks.bench_runs_auto')
+                        : window.t('cluster.checks.bench_measuring'),
+                    fix: window.t('cluster.checks.bench_fix'),
                 });
             }
 
@@ -2269,29 +2189,29 @@ function clusterV2Wizard() {
             {
                 const health = this.discoveryHealth;
                 let status = 'pending';
-                let detail = window.t('cluster.v2.checks.beacon_checking');
+                let detail = window.t('cluster.checks.beacon_checking');
                 let fix =
-                    window.t('cluster.v2.checks.beacon_fix');
+                    window.t('cluster.checks.beacon_fix');
                 if (health) {
                     if (health.multicast_rx_within_5s) {
                         status = 'pass';
-                        detail = window.t('cluster.v2.checks.beacon_ok');
+                        detail = window.t('cluster.checks.beacon_ok');
                     } else {
                         status = 'warn';
                         detail =
-                            window.t('cluster.v2.checks.beacon_none');
+                            window.t('cluster.checks.beacon_none');
                     }
                 } else if (this.discoveryHealthUnsupported) {
                     status = 'skipped';
                     detail =
-                        window.t('cluster.v2.checks.beacon_unsupported');
+                        window.t('cluster.checks.beacon_unsupported');
                     fix = '';
                 } else if (this.checks.running) {
                     status = 'running';
                 }
                 rows.push({
                     key: 'multicast',
-                    label: t('cluster.v2.checks.beacon_label'),
+                    label: t('cluster.checks.beacon_label'),
                     status,
                     detail,
                     fix,
@@ -2331,7 +2251,7 @@ function clusterV2Wizard() {
         async loadNodeRoles() {
             if (this.roleOptions.length) return;
             try {
-                const payload = await this.apiFetch(CLUSTER_V2_API.nodeRoles);
+                const payload = await this.apiFetch(CLUSTER_API.nodeRoles);
                 this.roleOptions = payload?.roles || [];
             } catch (error) {
                 // The mirrored fallback constants keep the budget labels
@@ -2342,8 +2262,8 @@ function clusterV2Wizard() {
         roleSpecFor(key) {
             return (
                 this.roleOptions.find((role) => role.key === key) ||
-                CLUSTER_V2_ROLE_FALLBACK[key] ||
-                CLUSTER_V2_ROLE_FALLBACK.headless
+                CLUSTER_ROLE_FALLBACK[key] ||
+                CLUSTER_ROLE_FALLBACK.headless
             );
         },
 
@@ -2399,7 +2319,7 @@ function clusterV2Wizard() {
                 0,
                 capacity - this.reserveBytesFor(role, capacity),
             );
-            return window.t('cluster.v2.role.usable').replace('{gb}', String(Math.round(usable / 1024 ** 3))).replace('{role}', this.roleLabel(role));
+            return window.t('cluster.role.usable').replace('{gb}', String(Math.round(usable / 1024 ** 3))).replace('{role}', this.roleLabel(role));
         },
 
         // What flipping every workstation node to headless would free up.
@@ -2471,14 +2391,14 @@ function clusterV2Wizard() {
             this.modelsLoading = true;
             this.modelsError = '';
             try {
-                const payload = await this.apiFetch(CLUSTER_V2_API.models, {
+                const payload = await this.apiFetch(CLUSTER_API.models, {
                     method: 'POST',
                     body: JSON.stringify({ hosts: this.inventoryHosts() }),
                 });
                 this.modelOptions = payload?.models || [];
             } catch (error) {
                 this.modelsError =
-                    error?.message || window.t('cluster.v2.err.list_models');
+                    error?.message || window.t('cluster.err.list_models');
             } finally {
                 this.modelsLoading = false;
             }
@@ -2525,7 +2445,7 @@ function clusterV2Wizard() {
                 segments.pop();
             }
             if (segments[segments.length - 1] === 'snapshots') segments.pop();
-            let name = segments.pop() || raw || window.t('cluster.v2.model.this_model');
+            let name = segments.pop() || raw || window.t('cluster.model.this_model');
             const hub = /^models--([^/]+?)--(.+)$/.exec(name);
             if (hub) name = `${hub[1]}/${hub[2]}`;
             return name;
@@ -2546,8 +2466,8 @@ function clusterV2Wizard() {
                 (this.selfDevice() ? 1 : 0) + this.splitDevices().length;
             if (!total) return '';
             const have = Math.min(holders.size, total);
-            if (have >= total) return t('cluster.v2.models.on_every_mac');
-            return t('cluster.v2.models.partial')
+            if (have >= total) return t('cluster.models.on_every_mac');
+            return t('cluster.models.partial')
                 .replace('{have}', String(have))
                 .replace('{total}', String(total));
         },
@@ -2577,21 +2497,21 @@ function clusterV2Wizard() {
             return [
                 {
                     key: 'interactive',
-                    label: window.t('cluster.v2.exec.interactive'),
-                    limits: window.t('cluster.v2.exec.interactive_limits'),
-                    detail: window.t('cluster.v2.exec.interactive_detail'),
+                    label: window.t('cluster.exec.interactive'),
+                    limits: window.t('cluster.exec.interactive_limits'),
+                    detail: window.t('cluster.exec.interactive_detail'),
                 },
                 {
                     key: 'balanced',
-                    label: window.t('cluster.v2.exec.balanced'),
-                    limits: window.t('cluster.v2.exec.balanced_limits'),
-                    detail: window.t('cluster.v2.exec.balanced_detail'),
+                    label: window.t('cluster.exec.balanced'),
+                    limits: window.t('cluster.exec.balanced_limits'),
+                    detail: window.t('cluster.exec.balanced_detail'),
                 },
                 {
                     key: 'throughput',
-                    label: window.t('cluster.v2.exec.throughput'),
-                    limits: window.t('cluster.v2.exec.throughput_limits'),
-                    detail: window.t('cluster.v2.exec.throughput_detail'),
+                    label: window.t('cluster.exec.throughput'),
+                    limits: window.t('cluster.exec.throughput_limits'),
+                    detail: window.t('cluster.exec.throughput_detail'),
                 },
             ];
         },
@@ -2685,26 +2605,26 @@ function clusterV2Wizard() {
             return [
                 {
                     key: 'auto',
-                    label: t('cluster.v2.strategy.auto'),
+                    label: t('cluster.strategy.auto'),
                     disabled: false,
                     disabledReason: '',
                 },
                 {
                     key: 'tensor',
-                    label: t('cluster.v2.strategy.tensor'),
+                    label: t('cluster.strategy.tensor'),
                     disabled: tensorDisabled,
                     disabledReason: !tensorDisabled
                         ? ''
                         : nodeCount < 2
-                        ? t('cluster.v2.strategy.tensor_needs_two')
-                        : t('cluster.v2.strategy.tensor_unsupported'),
+                        ? t('cluster.strategy.tensor_needs_two')
+                        : t('cluster.strategy.tensor_unsupported'),
                 },
                 {
                     key: 'pipeline',
-                    label: t('cluster.v2.strategy.pipeline'),
+                    label: t('cluster.strategy.pipeline'),
                     disabled: pipelineUnsupported,
                     disabledReason: pipelineUnsupported
-                        ? t('cluster.v2.strategy.pipeline_unsupported')
+                        ? t('cluster.strategy.pipeline_unsupported')
                         : '',
                 },
             ];
@@ -2719,7 +2639,7 @@ function clusterV2Wizard() {
         },
 
         strategyHint() {
-            return t(`cluster.v2.strategy.hint.${this.planStrategy}`);
+            return t(`cluster.strategy.hint.${this.planStrategy}`);
         },
 
         setPlanStrategy(key) {
@@ -2772,7 +2692,7 @@ function clusterV2Wizard() {
             if (!candidates.length) return;
             this.catalogueLoading = true;
             try {
-                const payload = await this.apiFetch(CLUSTER_V2_API.catalogue, {
+                const payload = await this.apiFetch(CLUSTER_API.catalogue, {
                     method: 'POST',
                     body: JSON.stringify({
                         nodes: this.planNodes(),
@@ -2796,14 +2716,14 @@ function clusterV2Wizard() {
         },
 
         tensorShareLabel() {
-            return t('cluster.v2.split.tensor_share').replace(
+            return t('cluster.split.tensor_share').replace(
                 '{count}',
                 String(this.plan?.tensor_parallel_size || 1),
             );
         },
 
         tensorCaptionLabel() {
-            return t('cluster.v2.split.tensor_caption').replace(
+            return t('cluster.split.tensor_caption').replace(
                 '{count}',
                 String(this.plan?.tensor_parallel_size || 1),
             );
@@ -2821,7 +2741,6 @@ function clusterV2Wizard() {
                     // workstation reserve unless the plan step says otherwise.
                     role: this.nodeRole(self.node_id, true),
                     memory_guard_tier: 'balanced',
-                    accelerator: 'metal',
                 });
             }
             for (const peer of this.splitDevices()) {
@@ -2831,7 +2750,6 @@ function clusterV2Wizard() {
                         (this.deviceRamGb(peer) || 0) * 1024 ** 3,
                     role: this.nodeRole(peer.node_id, false),
                     memory_guard_tier: 'balanced',
-                    accelerator: 'metal',
                 });
             }
             return nodes.map((node) => {
@@ -2904,7 +2822,7 @@ function clusterV2Wizard() {
                 if (sourcePython) body.model_source_python = sourcePython;
 
                 const proposal = await this.apiFetch(
-                    CLUSTER_V2_API.autoconfigure,
+                    CLUSTER_API.autoconfigure,
                     {
                         method: 'POST',
                         body: JSON.stringify(body),
@@ -2917,7 +2835,7 @@ function clusterV2Wizard() {
                     typeof proposal.activation !== 'object'
                 ) {
                     throw new Error(
-                        window.t('cluster.v2.err.plan_missing_signature'),
+                        window.t('cluster.err.plan_missing_signature'),
                     );
                 }
                 if (
@@ -2925,7 +2843,7 @@ function clusterV2Wizard() {
                     proposal.plan.placement_signature
                 ) {
                     throw new Error(
-                        window.t('cluster.v2.err.plan_signature_mismatch'),
+                        window.t('cluster.err.plan_signature_mismatch'),
                     );
                 }
                 this.planProposal = proposal;
@@ -2939,13 +2857,13 @@ function clusterV2Wizard() {
                               result: probe || null,
                               error:
                                   probe?.reason ||
-                                  window.t('cluster.v2.err.calibration_incomplete'),
+                                  window.t('cluster.err.calibration_incomplete'),
                           };
                 return proposal;
             } catch (error) {
                 if (revision !== this.planRequestRevision) return null;
                 this.planError =
-                    error?.message || window.t('cluster.v2.err.build_layer_split');
+                    error?.message || window.t('cluster.err.build_layer_split');
                 this.planFitFailure = this.parseFitFailure(this.planError);
                 this.checks.benchmark = {
                     ok: false,
@@ -2984,7 +2902,7 @@ function clusterV2Wizard() {
             );
             return device
                 ? this.deviceName(device)
-                : assignment.node_id || window.t('cluster.v2.plan.rank').replace('{n}', String(assignment.rank));
+                : assignment.node_id || window.t('cluster.plan.rank').replace('{n}', String(assignment.rank));
         },
 
         resolvedBackend() {
@@ -3005,8 +2923,8 @@ function clusterV2Wizard() {
 
         backendLabel() {
             return this.resolvedBackend().startsWith('jaccl')
-                ? window.t('cluster.v2.backend.jaccl')
-                : window.t('cluster.v2.backend.ring');
+                ? window.t('cluster.backend.jaccl')
+                : window.t('cluster.backend.ring');
         },
 
         deploymentFabricLabel() {
@@ -3014,8 +2932,8 @@ function clusterV2Wizard() {
                 this.configuredDeployment()?.backend || this.resolvedBackend(),
             );
             return backend.startsWith('jaccl')
-                ? window.t('cluster.v2.deploy.fabric_jaccl')
-                : window.t('cluster.v2.deploy.fabric_ring');
+                ? window.t('cluster.deploy.fabric_jaccl')
+                : window.t('cluster.deploy.fabric_ring');
         },
 
         deploymentHosts() {
@@ -3100,19 +3018,19 @@ function clusterV2Wizard() {
 
         async measurePlanNodes(hosts, nodes) {
             const roles = Object.fromEntries(nodes.map((node) => [node.node_id, node.role]));
-            const result = await this.apiFetch(CLUSTER_V2_API.nodeBudgets, {
+            const result = await this.apiFetch(CLUSTER_API.nodeBudgets, {
                 method: 'POST',
                 body: JSON.stringify({hosts: hosts.map(({node_id, ssh, python_executable}) => ({node_id, ssh, python_executable})), roles}),
             });
             const measured = result?.nodes;
             if (!Array.isArray(measured) || measured.length !== nodes.length ||
                 new Set(measured.map((node) => node.node_id)).size !== nodes.length) {
-                throw new Error(window.t('cluster.v2.err.memory_probe_incomplete'));
+                throw new Error(window.t('cluster.err.memory_probe_incomplete'));
             }
             const resolved = nodes.map((node) => {
                 const budget = measured.find((item) => item.node_id === node.node_id);
                 if (!budget || budget.unusable || !(Number(budget.capacity_bytes) > 0)) {
-                    throw new Error(window.t('cluster.v2.err.memory_budget_unavailable').replace('{node}', node.node_id));
+                    throw new Error(window.t('cluster.err.memory_budget_unavailable').replace('{node}', node.node_id));
                 }
                 return {...node, capacity_bytes: Number(budget.capacity_bytes), reserve_bytes: Number(budget.reserve_bytes || 0)};
             });
@@ -3144,7 +3062,7 @@ function clusterV2Wizard() {
             this.stagingActivation = activation;
             let job;
             try {
-                job = await this.apiFetch(CLUSTER_V2_API.stage, {
+                job = await this.apiFetch(CLUSTER_API.stage, {
                     method: 'POST',
                     body: JSON.stringify({
                         activation,
@@ -3159,7 +3077,7 @@ function clusterV2Wizard() {
                     // handling to activation's 409 below.
                     this.notify(
                         'warning',
-                        window.t('cluster.v2.toast.plan_changed'),
+                        window.t('cluster.toast.plan_changed'),
                     );
                     this.activateBusy = false;
                     this.stagingActivation = null;
@@ -3168,12 +3086,12 @@ function clusterV2Wizard() {
                     // A server older than /stage: degrade to the pre-staging
                     // behavior instead of bricking activation — the
                     // activation preflight reports whatever is still missing.
-                    this.notify('warning', t('cluster.v2.staging.unsupported'));
+                    this.notify('warning', t('cluster.staging.unsupported'));
                     await this.postActivation(activation, this.stagingPurpose);
                 } else {
                     this.stagingActivation = null;
                     this.failStaging(
-                        error?.message || t('cluster.v2.staging.failed'),
+                        error?.message || t('cluster.staging.failed'),
                     );
                     this.activateBusy = false;
                 }
@@ -3183,7 +3101,7 @@ function clusterV2Wizard() {
             this.stagingJob = job;
             this.stagingTimer = setInterval(
                 () => this.pollStagingJob(),
-                CLUSTER_V2_POLL_MS,
+                CLUSTER_POLL_MS,
             );
         },
 
@@ -3199,7 +3117,7 @@ function clusterV2Wizard() {
             this.stagingPollBusy = true;
             try {
                 snapshot = await this.apiFetch(
-                    CLUSTER_V2_API.stageJob(jobId),
+                    CLUSTER_API.stageJob(jobId),
                 );
             } catch (error) {
                 if (generation !== this.stagingGeneration) return;
@@ -3209,8 +3127,8 @@ function clusterV2Wizard() {
                 this.stopStagingPoll();
                 this.failStaging(
                     error?.status === 404
-                        ? t('cluster.v2.staging.lost')
-                        : error?.message || t('cluster.v2.staging.failed'),
+                        ? t('cluster.staging.lost')
+                        : error?.message || t('cluster.staging.failed'),
                 );
                 this.activateBusy = false;
                 return;
@@ -3222,7 +3140,7 @@ function clusterV2Wizard() {
             if (snapshot.status === 'completed') {
                 if (snapshot.ready !== true) {
                     this.stopStagingPoll();
-                    this.failStaging(window.t('cluster.v2.err.staging_not_ready'));
+                    this.failStaging(window.t('cluster.err.staging_not_ready'));
                     this.activateBusy = false;
                     return;
                 }
@@ -3237,7 +3155,7 @@ function clusterV2Wizard() {
                 // Activate retries — only missing files move again.
                 this.stopStagingPoll();
                 this.failStaging(
-                    snapshot.error || t('cluster.v2.staging.failed'),
+                    snapshot.error || t('cluster.staging.failed'),
                 );
                 this.activateBusy = false;
             }
@@ -3251,7 +3169,7 @@ function clusterV2Wizard() {
         },
 
         failStaging(message) {
-            this.stagingError = message || t('cluster.v2.staging.failed');
+            this.stagingError = message || t('cluster.staging.failed');
             this.notify('error', this.stagingError);
         },
 
@@ -3280,21 +3198,21 @@ function clusterV2Wizard() {
                 // ready with nothing copied = the node already held the
                 // complete model (the copying blip is sub-second).
                 return (node.bytes_total || 0) > 0
-                    ? t('cluster.v2.staging.ready')
-                    : t('cluster.v2.staging.already_there');
+                    ? t('cluster.staging.ready')
+                    : t('cluster.staging.already_there');
             }
             if (status === 'failed') {
-                return node.error || t('cluster.v2.staging.failed');
+                return node.error || t('cluster.staging.failed');
             }
             if (status === 'copying') {
                 if (!(node.files_total > 0)) {
-                    return t('cluster.v2.staging.checking');
+                    return t('cluster.staging.checking');
                 }
-                return t('cluster.v2.staging.copying')
+                return t('cluster.staging.copying')
                     .replace('{done}', String(node.files_completed || 0))
                     .replace('{total}', String(node.files_total || 0));
             }
-            return t('cluster.v2.staging.waiting');
+            return t('cluster.staging.waiting');
         },
 
         stagingOverallLabel() {
@@ -3302,7 +3220,7 @@ function clusterV2Wizard() {
             const done = nodes.filter(
                 (node) => node.status === 'ready',
             ).length;
-            return t('cluster.v2.staging.title')
+            return t('cluster.staging.title')
                 .replace('{done}', String(done))
                 .replace('{total}', String(nodes.length));
         },
@@ -3311,8 +3229,8 @@ function clusterV2Wizard() {
             const missing = this.nodesMissingModel().length;
             return t(
                 missing === 1
-                    ? 'cluster.v2.staging.button_copying_one'
-                    : 'cluster.v2.staging.button_copying',
+                    ? 'cluster.staging.button_copying_one'
+                    : 'cluster.staging.button_copying',
             ).replace('{count}', String(missing));
         },
 
@@ -3330,18 +3248,18 @@ function clusterV2Wizard() {
             const generation = this.stagingGeneration;
             if (!activation) {
                 this.activateBusy = false;
-                this.notify('error', window.t('cluster.v2.err.activation_missing'));
+                this.notify('error', window.t('cluster.err.activation_missing'));
                 return;
             }
             try {
-                await this.apiFetch(CLUSTER_V2_API.deployments, {
+                await this.apiFetch(CLUSTER_API.deployments, {
                     method: 'POST',
                     body: JSON.stringify(activation),
                 });
                 if (generation !== this.stagingGeneration) return;
                 this.notify(
                     'success',
-                    window.t('cluster.v2.toast.activated'),
+                    window.t('cluster.toast.activated'),
                 );
                 this.stage = null;
                 this.choosingModel = false;
@@ -3360,14 +3278,14 @@ function clusterV2Wizard() {
                 if (error?.status === 409) {
                     this.notify(
                         'warning',
-                        window.t('cluster.v2.toast.plan_changed'),
+                        window.t('cluster.toast.plan_changed'),
                     );
                     this.stagingActivation = null;
                     await this.refreshActivationProposal(purpose);
                 } else {
                     this.notify(
                         'error',
-                        error?.message || window.t('cluster.v2.err.activation_failed'),
+                        error?.message || window.t('cluster.err.activation_failed'),
                     );
                 }
             } finally {
@@ -3416,20 +3334,20 @@ function clusterV2Wizard() {
             if (!body || this.executionReplanBusy) return;
             this.executionReplanBusy = true;
             try {
-                const preview = await this.apiFetch(CLUSTER_V2_API.replan, {
+                const preview = await this.apiFetch(CLUSTER_API.replan, {
                     method: 'POST',
                     body: JSON.stringify(body),
                 });
                 const signature = preview?.plan?.placement_signature;
                 if (typeof signature !== 'string' || signature.length < 16) {
-                    throw new Error(window.t('cluster.v2.err.replan_unsigned'));
+                    throw new Error(window.t('cluster.err.replan_unsigned'));
                 }
                 this.executionReplan = { profile, body, preview };
             } catch (error) {
                 this.executionReplan = null;
                 this.notify(
                     'error',
-                    error?.message || window.t('cluster.v2.err.preview_profile'),
+                    error?.message || window.t('cluster.err.preview_profile'),
                 );
             } finally {
                 this.executionReplanBusy = false;
@@ -3442,7 +3360,7 @@ function clusterV2Wizard() {
             if (!pending || !signature || this.executionReplanBusy) return;
             this.executionReplanBusy = true;
             try {
-                await this.apiFetch(CLUSTER_V2_API.replan, {
+                await this.apiFetch(CLUSTER_API.replan, {
                     method: 'POST',
                     body: JSON.stringify({
                         ...pending.body,
@@ -3453,7 +3371,7 @@ function clusterV2Wizard() {
                 this.executionReplan = null;
                 this.notify(
                     'success',
-                    window.t('cluster.v2.toast.profile_applied'),
+                    window.t('cluster.toast.profile_applied'),
                 );
                 await this.refreshDeployments();
                 await this.refreshRuntime();
@@ -3461,7 +3379,7 @@ function clusterV2Wizard() {
                 this.notify(
                     error?.status === 409 ? 'warning' : 'error',
                     error?.message ||
-                        window.t('cluster.v2.err.apply_replan'),
+                        window.t('cluster.err.apply_replan'),
                 );
             } finally {
                 this.executionReplanBusy = false;
@@ -3563,7 +3481,7 @@ function clusterV2Wizard() {
                     ]),
                 );
                 const measured = await this.apiFetch(
-                    CLUSTER_V2_API.nodeBudgets,
+                    CLUSTER_API.nodeBudgets,
                     {
                         method: 'POST',
                         body: JSON.stringify({
@@ -3583,12 +3501,12 @@ function clusterV2Wizard() {
                     throw new Error(
                         unavailable
                             .map((node) =>
-                                window.t('cluster.v2.err.node_probe')
+                                window.t('cluster.err.node_probe')
                                     .replace('{node}', node.node_id)
                                     .replace(
                                         '{message}',
                                         node.error
-                                            || window.t('cluster.v2.err.memory_probe_unavailable'),
+                                            || window.t('cluster.err.memory_probe_unavailable'),
                                     ),
                             )
                             .join(' · '),
@@ -3605,13 +3523,12 @@ function clusterV2Wizard() {
                         reserve_bytes: Number(node.reserve_bytes || 0),
                         role: roles[node.node_id] || 'headless',
                         memory_guard_tier: 'balanced',
-                        accelerator: 'metal',
                         ...(performance ? { performance } : {}),
                     };
                 });
                 const execution = this.deploymentExecution(deployment) || {};
                 const proposal = await this.apiFetch(
-                    CLUSTER_V2_API.autoconfigure,
+                    CLUSTER_API.autoconfigure,
                     {
                         method: 'POST',
                         body: JSON.stringify({
@@ -3651,11 +3568,11 @@ function clusterV2Wizard() {
                     this.membershipError =
                         proposal?.fabric_blocker ||
                         proposal?.preflight ||
-                        window.t('cluster.v2.membership.not_ready');
+                        window.t('cluster.membership.not_ready');
                 }
             } catch (error) {
                 this.membershipError =
-                    error?.message || window.t('cluster.v2.err.preview_expanded');
+                    error?.message || window.t('cluster.err.preview_expanded');
             } finally {
                 this.membershipBusy = false;
             }
@@ -3672,15 +3589,15 @@ function clusterV2Wizard() {
             );
             return device
                 ? this.deviceName(device)
-                : assignment?.node_id || window.t('cluster.v2.plan.rank').replace('{n}', String(assignment?.rank ?? '?'));
+                : assignment?.node_id || window.t('cluster.plan.rank').replace('{n}', String(assignment?.rank ?? '?'));
         },
 
         membershipPlanDetail(assignment) {
             const gib = Number(assignment?.planned_weight_bytes || 0) / (1024 ** 3);
             const tp = Number(assignment?.tensor_parallel_size || 1);
             return tp > 1
-                ? window.t('cluster.v2.membership.tensor_rank').replace('{rank}', String(Number(assignment?.tensor_parallel_rank || 0) + 1)).replace('{tp}', String(tp)).replace('{gib}', gib.toFixed(1))
-                : window.t('cluster.v2.membership.layers').replace('{start}', String(assignment?.start_layer ?? 0)).replace('{end}', String(assignment?.end_layer ?? 0)).replace('{gib}', gib.toFixed(1));
+                ? window.t('cluster.membership.tensor_rank').replace('{rank}', String(Number(assignment?.tensor_parallel_rank || 0) + 1)).replace('{tp}', String(tp)).replace('{gib}', gib.toFixed(1))
+                : window.t('cluster.membership.layers').replace('{start}', String(assignment?.start_layer ?? 0)).replace('{end}', String(assignment?.end_layer ?? 0)).replace('{gib}', gib.toFixed(1));
         },
 
         async applyMembershipExpansion() {
@@ -3761,19 +3678,19 @@ function clusterV2Wizard() {
             this.clusterLifecycleBusy = true;
             this.hydratePlannerFromDeployment(deployment);
             try {
-                await this.apiFetch(CLUSTER_V2_API.deploymentUnload(id), {
+                await this.apiFetch(CLUSTER_API.deploymentUnload(id), {
                     method: 'POST',
                 });
                 this.notify(
                     'success',
-                    window.t('cluster.v2.toast.weights_unloaded'),
+                    window.t('cluster.toast.weights_unloaded'),
                 );
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
                 this.notify(
                     error?.status === 409 ? 'warning' : 'error',
-                    error?.message || window.t('cluster.v2.err.unload_failed'),
+                    error?.message || window.t('cluster.err.unload_failed'),
                 );
             } finally {
                 this.clusterLifecycleBusy = false;
@@ -3785,19 +3702,19 @@ function clusterV2Wizard() {
             if (!id || this.clusterLifecycleBusy) return;
             this.clusterLifecycleBusy = true;
             try {
-                await this.apiFetch(CLUSTER_V2_API.deploymentLoad(id), {
+                await this.apiFetch(CLUSTER_API.deploymentLoad(id), {
                     method: 'POST',
                 });
                 this.notify(
                     'success',
-                    window.t('cluster.v2.toast.weights_loaded'),
+                    window.t('cluster.toast.weights_loaded'),
                 );
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
                 this.notify(
                     error?.status === 409 ? 'warning' : 'error',
-                    error?.message || window.t('cluster.v2.err.load_failed'),
+                    error?.message || window.t('cluster.err.load_failed'),
                 );
             } finally {
                 this.clusterLifecycleBusy = false;
@@ -3828,7 +3745,7 @@ function clusterV2Wizard() {
             this.clusterLifecycleBusy = true;
             this.hydratePlannerFromDeployment(deployment);
             try {
-                await this.apiFetch(CLUSTER_V2_API.deployment(id), {
+                await this.apiFetch(CLUSTER_API.deployment(id), {
                     method: 'DELETE',
                 });
                 this.confirmChangeModelFor = '';
@@ -3839,12 +3756,12 @@ function clusterV2Wizard() {
                 this.enterPlan();
                 this.notify(
                     'info',
-                    window.t('cluster.v2.toast.model_changed'),
+                    window.t('cluster.toast.model_changed'),
                 );
             } catch (error) {
                 this.notify(
                     error?.status === 409 ? 'warning' : 'error',
-                    error?.message || window.t('cluster.v2.err.change_model'),
+                    error?.message || window.t('cluster.err.change_model'),
                 );
             } finally {
                 this.clusterLifecycleBusy = false;
@@ -3864,12 +3781,12 @@ function clusterV2Wizard() {
             try {
                 await this.apiFetch('/admin/api/cluster/forget' +
                     (nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''), {method: 'DELETE'});
-                this.notify('info', window.t('cluster.v2.toast.forgotten_local'));
+                this.notify('info', window.t('cluster.toast.forgotten_local'));
                 await this.refreshDevices();
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
-                this.notify('error', error?.message || window.t('cluster.v2.err.unpair'));
+                this.notify('error', error?.message || window.t('cluster.err.unpair'));
             } finally {
                 this.clusterLifecycleBusy = false;
             }
@@ -3888,16 +3805,16 @@ function clusterV2Wizard() {
             this.confirmUnloadFor = '';
             this.clusterLifecycleBusy = true;
             try {
-                await this.apiFetch(CLUSTER_V2_API.deployment(id) + (localOnly ? "?local_only=true" : ""), {
+                await this.apiFetch(CLUSTER_API.deployment(id) + (localOnly ? "?local_only=true" : ""), {
                     method: 'DELETE',
                 });
-                this.notify('info', window.t(localOnly ? 'cluster.v2.toast.forgotten_local' : 'cluster.v2.toast.deactivated'));
+                this.notify('info', window.t(localOnly ? 'cluster.toast.forgotten_local' : 'cluster.toast.deactivated'));
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
                 this.notify(
                     'error',
-                    error?.message || window.t('cluster.v2.err.deactivate'),
+                    error?.message || window.t('cluster.err.deactivate'),
                 );
             } finally {
                 this.clusterLifecycleBusy = false;
@@ -3964,16 +3881,16 @@ function clusterV2Wizard() {
                 const port = this.selfDevice()?.http_port || window.location.port || 8000;
                 return [
                     {
-                        text: 'cluster.v2.cuda_guide.windows_docker',
+                        text: 'cluster.cuda_guide.windows_docker',
                         command: 'winget install -e --id Docker.DockerDesktop',
                     },
                     {
-                        text: 'cluster.v2.cuda_guide.windows_firewall',
+                        text: 'cluster.cuda_guide.windows_firewall',
                         command: 'New-NetFirewallRule -DisplayName "oMLX helper" -Direction Inbound '
                             + '-Protocol TCP -LocalPort 8850-8852 -Action Allow',
                     },
                     {
-                        text: 'cluster.v2.cuda_guide.windows_run',
+                        text: 'cluster.cuda_guide.windows_run',
                         command: 'docker run -d --name omlx-helper --restart unless-stopped --gpus all '
                             + `-p 8850-8852:8850-8852 -v omlx-helper:/data ${image} `
                             + `--no-mdns --pair ${this.cudaGuideMacAddress()}:${port}\n`
@@ -3982,12 +3899,12 @@ function clusterV2Wizard() {
                 ];
             }
             if (this.cudaGuideOs === 'spark') {
-                return [{ text: 'cluster.v2.cuda_guide.spark_run', command: run }];
+                return [{ text: 'cluster.cuda_guide.spark_run', command: run }];
             }
             const keyring = '/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg';
             return [
                 {
-                    text: 'cluster.v2.cuda_guide.linux_docker',
+                    text: 'cluster.cuda_guide.linux_docker',
                     command: [
                         'curl -fsSL https://get.docker.com | sudo sh',
                         'curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey'
@@ -3999,7 +3916,7 @@ function clusterV2Wizard() {
                         'sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker',
                     ].join('\n'),
                 },
-                { text: 'cluster.v2.cuda_guide.linux_run', command: run },
+                { text: 'cluster.cuda_guide.linux_run', command: run },
             ];
         },
 

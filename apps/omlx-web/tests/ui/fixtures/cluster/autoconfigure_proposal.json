@@ -1,5 +1,5 @@
 {
-  "_comment": "POST /admin/api/cluster/autoconfigure — the complete server-owned plan and activation contract that v2 must preserve unchanged.",
+  "_comment": "POST /admin/api/cluster/autoconfigure — the complete server-owned plan and activation contract that the wizard must preserve unchanged.",
   "backend": "ring",
   "backend_reason": "live fabric probe selected the TCP ring",
   "tensor_parallel_size": 2,

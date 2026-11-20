@@ -3914,7 +3914,11 @@ class BlockAwarePrefixCache(CacheManager):
                         )
                         return None
                     from ..affine4 import Affine4KVCache, Affine8KVCache
-                    from ..turboquant_kv import _concat_state_token_axis, _state_length
+                    from ..turboquant_kv import (
+                        _join_state_token_axis,
+                        _spare_capacity,
+                        _state_length,
+                    )
 
                     cache_class = (
                         Affine8KVCache if expected_scheme == "affine8" else Affine4KVCache
@@ -3957,8 +3961,12 @@ class BlockAwarePrefixCache(CacheManager):
                             )
                             return None
                         parts.append((ks, vs))
-                    keys = _concat_state_token_axis([ks for ks, _ in parts])
-                    values = _concat_state_token_axis([vs for _, vs in parts])
+                    # Leave room so the first appended token does not regrow.
+                    capacity = _spare_capacity(
+                        sum(_state_length(ks) for ks, _ in parts)
+                    )
+                    keys = _join_state_token_axis([ks for ks, _ in parts], capacity)
+                    values = _join_state_token_axis([vs for _, vs in parts], capacity)
                     cache = cache_class()
                     cache.meta_state = (str(block_table.num_tokens), *affine_meta[1:])
                     cache.rebuild_codecs(keys, values)

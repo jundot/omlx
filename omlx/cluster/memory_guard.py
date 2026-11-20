@@ -96,13 +96,6 @@ _REMEDY = (
     "close other apps, or add a Mac."
 )
 
-_CUDA_CEILING_FRACTION = {
-    "safe": 0.85,
-    "balanced": 0.90,
-    "aggressive": 0.95,
-    "custom": 0.90,
-}
-
 
 def _operator_memory_settings() -> tuple[str, float, bool]:
     """The memory-guard settings this Mac's operator actually chose.
@@ -134,56 +127,6 @@ def _operator_memory_settings() -> tuple[str, float, bool]:
         return ("balanced", 0.0, True)
 
 
-def _cuda_ceiling_breakdown(
-    tier: str,
-    *,
-    custom_ceiling_gb: float,
-) -> dict[str, int] | None:
-    """Return a CUDA-device ceiling without substituting host RAM for VRAM.
-
-    The macOS enforcer deliberately reasons about system RAM and Metal's wired
-    limit. On a discrete CUDA machine that would advertise host RAM as model
-    capacity, which can exceed VRAM by hundreds of GiB. Modern MLX exposes both
-    total and live free CUDA memory; the free-memory limit is essential when a
-    separate service (for example vLLM) already owns most of a unified-memory
-    GB10. Older MLX builds without that field retain the physical-size bound.
-    """
-
-    try:
-        import mlx.core as mx
-
-        if not mx.cuda.is_available():
-            return None
-        info = mx.device_info()
-        physical = int(
-            info.get("total_memory") or info.get("memory_size") or 0
-        )
-        raw_free = info.get("free_memory")
-        free = int(raw_free or 0) if raw_free is not None else None
-    except Exception:
-        return None
-    if physical <= 0:
-        return None
-    normalized = tier if tier in _CUDA_CEILING_FRACTION else "balanced"
-    if normalized == "custom" and custom_ceiling_gb > 0:
-        budget = min(physical, int(custom_ceiling_gb * 1024**3))
-    else:
-        budget = int(physical * _CUDA_CEILING_FRACTION[normalized])
-    dynamic = (
-        max(0, int(free * _CUDA_CEILING_FRACTION[normalized]))
-        if free is not None
-        else budget
-    )
-    return {
-        "static": budget,
-        "dynamic": dynamic,
-        # Kept for the existing status/error schema. On CUDA this is the
-        # accelerator's physical allocation cap, not a Metal wired limit.
-        "metal_cap": physical,
-        "hard_limit": min(physical, budget, dynamic),
-    }
-
-
 def ceiling_breakdown(
     memory_guard_tier: str = "",
     *,
@@ -210,23 +153,13 @@ def ceiling_breakdown(
     ``None`` keeps one definition of the limit instead of a second copy here.
     """
 
+    from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+
     operator_tier, operator_custom_gb, operator_enabled = _operator_memory_settings()
     tier = str(memory_guard_tier or "").strip().lower() or operator_tier
     resolved_custom_gb = (
         operator_custom_gb if custom_ceiling_gb is None else float(custom_ceiling_gb)
     )
-    cuda = _cuda_ceiling_breakdown(
-        tier,
-        custom_ceiling_gb=resolved_custom_gb,
-    )
-    if cuda is not None:
-        return cuda
-
-    # CUDA workers return above and should not need the macOS/server engine
-    # dependency graph merely to read device memory.  In particular, a
-    # lightweight worker may intentionally omit optional mlx-vlm packages.
-    from omlx.process_memory_enforcer import ProcessMemoryEnforcer
-
     enforcer = ProcessMemoryEnforcer(
         engine_pool=None,  # type: ignore[arg-type]
         memory_guard_tier=tier,

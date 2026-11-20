@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime-membership v2 tests: backend selection, N-node launch manifest,
+"""Runtime-membership tests: backend selection, N-node launch manifest,
 and ring-backend verified-teardown parity.
 
 All offline: process groups, killpg, SSH sweeps, pools, and probes are mocked.
@@ -94,51 +94,6 @@ def test_members_from_host_records_reads_complete_matrices():
     selection = select_cluster_backend(members)
     assert selection.backend == "ring"
     assert selection.blockers == ("a",)
-
-
-def test_backend_selection_endpoint():
-    response = _client().post(
-        "/admin/api/cluster/backend-selection",
-        json={
-            "members": [
-                {
-                    "node_id": "studio",
-                    "rdma_ctl_enabled": True,
-                    "rdma_devices": ["rdma_en5"],
-                },
-                {"node_id": "macbook", "rdma_ctl_enabled": False},
-            ]
-        },
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["backend"] == "ring"
-    assert payload["blockers"] == ["macbook"]
-    assert {m["node_id"] for m in payload["members"]} == {"studio", "macbook"}
-
-
-def test_backend_selection_endpoint_all_rdma_picks_jaccl():
-    response = _client().post(
-        "/admin/api/cluster/backend-selection",
-        json={
-            "members": [
-                {
-                    "node_id": "a",
-                    "rdma_ctl_enabled": True,
-                    "rdma_devices": ["rdma_en1"],
-                },
-                {
-                    "node_id": "b",
-                    "rdma_ctl_enabled": True,
-                    "rdma_devices": ["rdma_en5"],
-                },
-            ]
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json()["backend"] == "jaccl"
 
 
 # ---------------------------------------------------------------------------

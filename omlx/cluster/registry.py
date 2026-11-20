@@ -198,7 +198,7 @@ def get_cluster_registry() -> ClusterRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Cluster v2: trusted device inventory (paired nodes) + discovered device cache
+# Trusted device inventory (paired nodes) + discovered device cache
 # ---------------------------------------------------------------------------
 
 import time  # noqa: E402

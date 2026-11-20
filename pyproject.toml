@@ -133,7 +133,7 @@ mcp = [
     "mcp>=2.0.0,<3",
 ]
 cluster = [
-    # mDNS advertise/browse for cluster v2 peer discovery (_omlx._tcp.local.).
+    # mDNS advertise/browse for cluster peer discovery (_omlx._tcp.local.).
     # Pure-Python; works in launchd agents. Absence disables mDNS only — the
     # IPv6 multicast fallback, manual peer add, and Tailscale paths keep
     # working (see omlx/cluster/discovery.py).

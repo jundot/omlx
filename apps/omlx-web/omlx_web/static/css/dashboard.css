@@ -33,11 +33,11 @@
     /* Cluster status is operational data, not decorative helper copy. Keep
        its cache/fabric labels and request metrics readable in dark mode even
        when the global muted palette is intentionally subtle. */
-    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-600,
-    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-500 {
+    [data-theme="dark"] [data-cluster-active] .text-neutral-600,
+    [data-theme="dark"] [data-cluster-active] .text-neutral-500 {
         color: rgb(var(--palette-zinc-300)) !important;
     }
-    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-400 {
+    [data-theme="dark"] [data-cluster-active] .text-neutral-400 {
         color: rgb(var(--palette-zinc-400)) !important;
     }
 
@@ -76,19 +76,19 @@
     /* Tensor segments use a semantic palette instead of theme-remapped
        Tailwind utilities. This prevents white-on-light text when dark-mode
        utility overrides alter a segment background independently. */
-    .cluster-v2-tensor-segment {
+    .cluster-tensor-segment {
         color: rgb(var(--palette-slate-50));
         text-shadow: none;
         -webkit-font-smoothing: antialiased;
     }
-    .cluster-v2-tensor-segment--0 { background: rgb(var(--palette-zinc-900)); }
-    .cluster-v2-tensor-segment--1 { background: rgb(var(--palette-zinc-700)); }
-    .cluster-v2-tensor-segment--2 { background: rgb(var(--palette-zinc-600)); }
-    .cluster-v2-tensor-segment--3 {
+    .cluster-tensor-segment--0 { background: rgb(var(--palette-zinc-900)); }
+    .cluster-tensor-segment--1 { background: rgb(var(--palette-zinc-700)); }
+    .cluster-tensor-segment--2 { background: rgb(var(--palette-zinc-600)); }
+    .cluster-tensor-segment--3 {
         color: rgb(var(--palette-zinc-900));
         background: rgb(var(--palette-zinc-300));
     }
-    .cluster-v2-tensor-segment--4 {
+    .cluster-tensor-segment--4 {
         color: rgb(var(--palette-zinc-800));
         background: rgb(var(--palette-zinc-200));
     }

@@ -45,6 +45,44 @@ MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next", "qwen4_exp")
 
 
+# Paths that run the targeted projections from the checkpoint weights, or
+# bypass the model forward, so an adapter would be skipped without notice.
+_LORA_CONFLICTS = (
+    ("dflash_enabled", "DFlash"),
+    ("vlm_mtp_enabled", "VLM MTP"),
+    ("qwen35_ane_prefill_enabled", "ANE prefill"),
+    ("moe_expert_offload_enabled", "MoE expert offload"),
+    ("prefill_helper_node_id", "a Prefill Accelerator"),
+    ("external_engine", "an external engine"),
+)
+
+
+def lora_adapter_conflict(settings: dict) -> str | None:
+    """Name the first enabled setting that cannot run with a LoRA adapter."""
+    for key, label in _LORA_CONFLICTS:
+        if settings.get(key):
+            return label
+    return None
+
+
+def resolve_lora_conflicts(data: dict) -> tuple:
+    """Clear the settings a LoRA adapter cannot run with; returns (data, names).
+
+    The adapter wins because it shapes output content while the others change
+    speed or placement. Used for profile merges and persisted files so
+    ``ModelSettings.__post_init__`` does not reject the whole blob.
+    """
+    if not data.get("lora_adapter"):
+        return data, []
+    names = [key for key, _ in _LORA_CONFLICTS if data.get(key)]
+    if not names:
+        return data, []
+    resolved = dict(data)
+    for key in names:
+        resolved[key] = False if key.endswith("_enabled") else None
+    return resolved, names
+
+
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
     fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
     if (
@@ -563,6 +601,10 @@ class ModelSettings:
         None  # Tokens per draft round (None = mlx-vlm default)
     )
 
+    # LoRA adapter folder applied on top of the weights at load (PEFT or mlx).
+    # The adapter is never served on its own; profiles can expose a variant.
+    lora_adapter: Optional[str] = None
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
@@ -658,6 +700,13 @@ class ModelSettings:
                     "vlm_mtp decode path does not apply"
                 )
         validate_moe_expert_offload(self.to_dict())
+        if self.lora_adapter:
+            conflict = lora_adapter_conflict(self.to_dict())
+            if conflict:
+                raise ValueError(
+                    f"A LoRA adapter cannot be combined with {conflict}; "
+                    "turn it off or remove the adapter"
+                )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
@@ -893,6 +942,14 @@ class ModelSettingsManager:
                         "re-enable A8 prefill.",
                         model_id,
                         ", ".join(prefill_conflicts),
+                    )
+                model_data, lora_conflicts = resolve_lora_conflicts(model_data)
+                if lora_conflicts:
+                    logger.warning(
+                        "Model '%s': %s turned off on load; it cannot be "
+                        "combined with the LoRA adapter.",
+                        model_id,
+                        ", ".join(lora_conflicts),
                     )
                 try:
                     self._settings[model_id] = ModelSettings.from_dict(model_data)
@@ -1316,6 +1373,7 @@ class ModelSettingsManager:
         merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
         merged, _ = resolve_vlm_mtp_conflicts(merged)
         merged, _ = resolve_qwen35_prefill_conflicts(merged)
+        merged, _ = resolve_lora_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:

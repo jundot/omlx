@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -3622,6 +3623,29 @@ class TestDiscoverSanitizePlan:
         for k, info in plan.items():
             assert info["transform"] == "passthrough"
             assert info["sources"] == [k]
+
+    def test_overlapping_discoveries_restore_mlx_functions(self, sf_file):
+        idx = _LazyTensorIndex([sf_file[0]])
+        real_eval, real_stack = mx.eval, mx.stack
+        entered, first_done = threading.Event(), threading.Event()
+
+        def second(weights):
+            entered.set()
+            first_done.wait(5)
+            return weights
+
+        other = threading.Thread(target=_discover_sanitize_plan, args=(second, idx))
+
+        def first(weights):
+            other.start()
+            # Unserialized, the second run saves this run's stand-ins here.
+            entered.wait(0.2)
+            return weights
+
+        _discover_sanitize_plan(first, idx)
+        first_done.set()
+        other.join(5)
+        assert mx.eval is real_eval and mx.stack is real_stack
 
     def test_rename_sanitize(self, sf_file):
         path, tensors = sf_file
@@ -9271,6 +9295,26 @@ class TestStreamedCalibration:
         for key, value in reference.items():
             assert metadata["sensitivity_map"][key] == pytest.approx(value, rel=rel)
 
+    def test_streaming_embeds_one_round_at_a_time(self, tmp_path, monkeypatch):
+        from tests.test_mlx_vlm_muse_glimmer_compat import _spark_oq_source
+        import omlx.oq as oq
+
+        _spark_oq_source(tmp_path, nvfp4=False)
+        config = json.loads((tmp_path / "config.json").read_text())
+        tokens = mx.array([[1 + i + 6 * r for i in range(6)] for r in range(8)])
+        monkeypatch.setattr(oq, "load_mlx_lm_tokenizer", lambda *a, **kw: object())
+        rows = []
+        embed = oq._streamed_embed
+        monkeypatch.setattr(
+            oq,
+            "_streamed_embed",
+            lambda w, data, cfg: rows.append(data.shape[0]) or embed(w, data, cfg),
+        )
+        oq._collect_imatrix_streaming(
+            tmp_path, object(), config, num_samples=2, seq_length=6, calib_data=tokens
+        )
+        assert rows and max(rows) <= 2, rows
+
     def test_muse_spark_sensitivity_qdq_skips_passthrough_experts(self, tmp_path):
         import omlx.oq as oq
         from omlx.patches.muse_spark import oq_layout
@@ -9386,6 +9430,49 @@ class TestStreamedCalibration:
         assert reference and metadata["sensitivity_map"].keys() == reference.keys()
         for key, value in reference.items():
             assert metadata["sensitivity_map"][key] == pytest.approx(value, rel=1e-3)
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5"])
+    def test_qwen3_5_refined_output_matches_resident(
+        self, tmp_path, monkeypatch, model_type
+    ):
+        """Streamed oQe refinement writes the same codes as the resident one."""
+        import omlx.oq as oq
+
+        # Layers wide enough to be quantized and refined.
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "hidden_size", 256)
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "intermediate_size", 512)
+        for key in ("moe_intermediate_size", "shared_expert_intermediate_size"):
+            monkeypatch.setitem(_QWEN3_5_STREAM_EXPERTS, key, 256)
+        source = tmp_path / "source"
+        _qwen3_5_stream_source(source, model_type, vlm=False, mtp=False)
+        tokens = (mx.arange(16).reshape(4, 4) * 7 % 120 + 1).astype(mx.int32)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+
+        def build(name, stream):
+            out = tmp_path / name
+            oq.quantize_oq_streaming(
+                str(source),
+                str(out),
+                4,
+                enhanced=True,
+                stream_calibration=stream,
+                imatrix_num_samples=4,
+                imatrix_seq_length=4,
+                imatrix_cache_path=str(tmp_path / f"{name}.npz"),
+                sensitivity_map_override={0: 1, 1: 1},
+            )
+            weights = {}
+            for f in sorted(out.glob("*.safetensors")):
+                weights.update(mx.load(str(f)))
+            return weights
+
+        resident = build("resident", False)
+        streamed = build("streamed", True)
+        assert resident.keys() == streamed.keys()
+        for key, want in resident.items():
+            # The streamed walk does not refine an untied lm_head.
+            if not key.startswith("language_model.lm_head."):
+                assert mx.array_equal(streamed[key], want), key
 
     @pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5"])
     def test_qwen3_5_vlm_mtp_rows_keep_their_positions(self, tmp_path, model_type):

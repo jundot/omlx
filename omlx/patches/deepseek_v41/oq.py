@@ -8,7 +8,8 @@ source weights fit their independent budget at original precision, that
 allocation dominates every lossy alternative: neither sensitivity ranking nor
 an imatrix can improve it. Levels below oQ4 measure layer sensitivity and
 projection input statistics, then use the official mixed-bit allocator and
-weighted affine arithmetic for the e variants.
+weighted affine arithmetic for the e variants, whose re-rounded routed experts
+then get the oQe code refinement (refine_experts).
 """
 
 import json
@@ -22,11 +23,26 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from ...oq import (
+    _OQE_REFINE_SAMPLES,
+    _OQE_REFINE_SEQ_LENGTH,
+    _OQRefineWriter,
+    _refine_affine_codes,
+    _shrunk_gram,
+)
 from ...oqh import format as oqh_format
 from ...oqh import targets as oqh_targets
 from .convert import iter_source_weights, source_engram_tables, strip_draft_config
 from .oq_inventory import projection_inventory
-from .oqh import plan_widths, planned_bytes, write_experts
+from .oqh import (
+    expert_layer,
+    expert_owner,
+    float_experts,
+    iter_expert_grams,
+    plan_widths,
+    planned_bytes,
+    write_experts,
+)
 from .sharding import ShardWriter
 from .storage import TensorFile, decode_array
 
@@ -368,6 +384,90 @@ def copy_engram(
     return spec
 
 
+def refine_experts(source, destination, weight_map, quantized, progress=None):
+    """oQe code refinement of an export's affine routed experts, written in place.
+
+    The routed experts are the FP4 source re-rounded to affine codes, so the
+    dequantized source is the target the codes approximate. Each expert's codes
+    are re-picked against its calibration Gram, as the generic oQe refinement
+    does; scales and biases stay, so the export keeps its size and format.
+    """
+    names = {
+        name
+        for name, spec in quantized.items()
+        if name.startswith("language_model.layers.")
+        and ".ffn.experts." in name
+        and spec.get("mode") == "affine"
+    }
+    stats = {"tensors": 0, "kept": 0, "before": 0.0, "after": 0.0}
+    if not names:
+        return {"status": "skipped", "reason": "no affine routed experts"}
+    layers = {expert_layer(name) for name in names}
+    # The writer only sees these tensors: V4.1 specs have no global default for
+    # the rest, and flushing a shard keeps every tensor it does not rewrite.
+    expert_map = {k: v for k, v in weight_map.items() if k.rsplit(".", 1)[0] in names}
+    writer = _OQRefineWriter(Path(destination), expert_map, quantized)
+    grams = iter_expert_grams(
+        source,
+        layers,
+        num_samples=_OQE_REFINE_SAMPLES,
+        seq_length=_OQE_REFINE_SEQ_LENGTH,
+    )
+    for done, (i, experts, collector) in enumerate(grams, start=1):
+        for part in ("w1", "w3", "w2"):
+            name = f"language_model.layers.{i}.ffn.experts.{part}"
+            if name not in names:
+                continue
+            owner = expert_owner(collector, name)
+            module = getattr(experts, part)
+            packed, scales, biases = writer.read(name)
+            bits, group_size = writer.spec(name)
+            n_exp, out_dim, in_dim = (
+                int(packed.shape[0]),
+                int(packed.shape[1]),
+                int(packed.shape[2]) * 32 // bits,
+            )
+            parts, before, after, changed = [], 0.0, 0.0, False
+            for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
+                hessian = _shrunk_gram(collector.switch_gram(owner, first, stop))
+                result = _refine_affine_codes(
+                    float_experts(module, first, stop),
+                    packed[first:stop],
+                    scales[first:stop],
+                    biases[first:stop],
+                    hessian,
+                    bits,
+                    group_size,
+                )
+                del hessian
+                if result is None:
+                    parts.append(packed[first:stop])
+                else:
+                    parts.append(result[0])
+                    before, after, changed = before + result[1], after + result[2], True
+                mx.clear_cache()
+            if changed:
+                writer.write(name, mx.concatenate(parts))
+                stats["tensors"] += 1
+                stats["before"] += before
+                stats["after"] += after
+            else:
+                stats["kept"] += 1
+        writer.layer_done(i)
+        if progress is not None:
+            progress(done, len(layers))
+        logger.info("V4.1 oQe refine: layer %d done (%d/%d)", i, done, len(layers))
+    writer.finish()
+    gain = 1.0 - stats["after"] / stats["before"] if stats["before"] > 0 else 0.0
+    logger.info(
+        "V4.1 oQe refine: %d expert tensors refined (%d kept), Hessian error -%.1f%%",
+        stats["tensors"],
+        stats["kept"],
+        100.0 * gain,
+    )
+    return {"status": "done", **stats, "hessian_error_reduction": round(gain, 4)}
+
+
 def quantize(
     source,
     destination,
@@ -658,6 +758,19 @@ def quantize(
             raise ValueError("V4.1 oQh experts exceed their affine budget")
         report["oqh"] = {k: v for k, v in oqh_report.items() if k != "entries"}
     output_map = writer.finish()
+    if enhanced and allocation and not hadamard:
+        report["refine"] = refine_experts(
+            source,
+            destination,
+            output_map,
+            quantized,
+            progress=lambda done, total: _emit_progress(
+                progress_callback,
+                "refine",
+                99,
+                f"V4.1 oQe code refinement, layer {done}/{total}",
+            ),
+        )
     report["shard_count"] = len(set(output_map.values()))
     for spec in exported_tables.values():
         spec["weight_file"] = output_map[spec["weight_key"]]

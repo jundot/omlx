@@ -4520,6 +4520,46 @@ class TestSchedulerRotatingBlockAlignment:
                 scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
             )
 
+    @pytest.mark.parametrize(
+        "usage_gb,store_running,expected",
+        [(41, False, "clear,submit"), (39, False, "submit"), (41, True, "submit")],
+    )
+    def test_cleanup_finished_clears_pool_before_store_under_pressure(
+        self, mock_model, mock_tokenizer, usage_gb, store_running, expected
+    ):
+        """Under pressure, clear the pool before the store takes the lock (#5454)."""
+        gib = 1024**3
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 40 * gib
+        scheduler._current_usage_bytes = MagicMock(return_value=usage_gb * gib)
+        order = []
+        executor = scheduler._store_cache_executor = MagicMock()
+        executor.submit.side_effect = lambda *args: order.append("submit")
+        request = Request(request_id="r", prompt="hi", sampling_params=SamplingParams())
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request._extracted_cache = [{"state": "cache"}]
+        scheduler.running["r"] = scheduler.requests["r"] = request
+        # Held like a running store; the timer makes a blocking acquire fail, not hang.
+        lock = threading.Lock()
+        if store_running:
+            lock.acquire()
+            threading.Timer(5, lock.release).start()
+        with (
+            patch.object(scheduler_module, "_mx_buffer_access_lock", lock),
+            patch.object(mx, "get_cache_memory", return_value=8 * gib),
+            patch(
+                "omlx.scheduler._sync_and_clear_cache",
+                side_effect=lambda *args: order.append("clear"),
+            ),
+        ):
+            scheduler._cleanup_finished({"r"})
+
+        assert ",".join(order) == expected
+
     def test_cleanup_finished_skips_clear_cache_when_no_finished(
         self, mock_model, mock_tokenizer
     ):

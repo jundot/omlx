@@ -50,6 +50,7 @@ from ..api.utils import (
 from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
+from ..lora_adapters import apply_adapter
 from ..model_settings import (
     a8_prefill_on,
     ane_prefill_backend,
@@ -1704,6 +1705,34 @@ def _audio_feature_cache_key_ranges(
     return ranges
 
 
+def wire_moe_offload_slot_hooks(scheduler, model) -> bool:
+    """Give every sized release/restore target under ``model`` the shared hooks.
+
+    DeepSeek V4.1 keeps its expert banks outside ``ExpertCache``. An engine
+    that offloaded both kinds gets one hook over the union, so wiring the banks
+    never drops the caches' hook. Returns whether anything was wired.
+    """
+    slots = getattr(model, "_moe_offload_slots", None) or []
+    if not slots:
+        return False
+    from ..patches.moe_expert_offload import (
+        moe_offload_caches,
+        releasable_moe_offload_bytes,
+        release_moe_offload_slots,
+        restore_moe_offload_slots,
+    )
+
+    banks = [*moe_offload_caches(model), *slots]
+    scheduler.moe_offload_release = functools.partial(
+        release_moe_offload_slots, banks
+    )
+    scheduler.moe_offload_restore = functools.partial(restore_moe_offload_slots, banks)
+    scheduler.moe_offload_releasable = functools.partial(
+        releasable_moe_offload_bytes, banks
+    )
+    return True
+
+
 class VLMBatchedEngine(BaseEngine):
     """
     VLM engine with continuous batching, tiered KV cache, and boundary snapshots.
@@ -2253,6 +2282,15 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("t5 bias free skipped", exc_info=True)
 
+        # After the fp16 recast so the adapter takes the activation dtype, and
+        # before the fusions and packers that replace the projections.
+        lora_path = getattr(self._model_settings, "lora_adapter", None)
+        if lora_path:
+            wrapped = await loop.run_in_executor(
+                get_mlx_executor(), apply_adapter, self._vlm_model, lora_path
+            )
+            logger.info("LoRA adapter %s: %d projections", lora_path, wrapped)
+
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
@@ -2533,6 +2571,10 @@ class VLMBatchedEngine(BaseEngine):
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
         scheduler.moe_offload_releasable = offload_releasable
+        # DeepSeek V4.1 keeps its expert banks outside ExpertCache; give them
+        # the same sized release/restore hooks so a long prefill can borrow
+        # their slots and the next decode step grows them back.
+        wire_moe_offload_slot_hooks(scheduler, self._vlm_model)
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled and self.model_type == "glm5_next":
@@ -2669,6 +2711,16 @@ class VLMBatchedEngine(BaseEngine):
                 apply_flint_decode_patch()
             except Exception:
                 logger.debug("Flint decode patch not applied", exc_info=True)
+
+        # Gemma 4 MoE (26B-A4B): top-k routing and the weighted combine in one
+        # launch each per layer, for decode and speculative verify rows.
+        if self.model_type == "gemma4":
+            try:
+                from ..patches.gemma4_moe_decode import apply_gemma4_moe_decode_patch
+
+                apply_gemma4_moe_decode_patch()
+            except Exception:
+                logger.debug("Gemma 4 MoE decode patch not applied", exc_info=True)
 
         # LFM3 text tower (shared by LFM3, -VL, -Audio and -Omni): one-launch
         # RoPE instead of about fifteen array ops per q/k call.

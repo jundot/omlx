@@ -199,6 +199,8 @@ def test_portable_attention_masks_sinks_and_dimensions(
         (2, 2, 3, 7, 64, 700, mx.float16, Affine4KVCache, True),
         (1, 4, 8, 6, 128, 2049, mx.bfloat16, Affine8KVCache, True),
         (2, 4, 8, 8, 128, 1025, mx.float16, Affine4KVCache, True),
+        (1, 2, 3, 39, 256, 1500, mx.bfloat16, Affine8KVCache, True),
+        (1, 2, 4, 48, 128, 1500, mx.bfloat16, Affine4KVCache, False),
     ],
 )
 def test_actual_native_matches_portable(

@@ -61,6 +61,7 @@ The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The reque
 | `POST /admin/api/models/{model_id}/settings/reset` | Reset per-model settings |
 | `GET`, `POST /admin/api/models/{model_id}/settings/optimal` | List or apply benchmarked optimal settings |
 | `POST /admin/api/models/{model_id}/settings/recipe` | Apply a shared settings recipe |
+| `GET /admin/api/models/{model_id}/lora-adapters` | List LoRA adapters in the model folders, each with why it does not fit this model |
 | `GET`, `POST /admin/api/models/{model_id}/profiles`, `PUT`, `DELETE .../profiles/{name}`, `POST .../profiles/{name}/apply` | Per-model profiles |
 | `GET`, `POST /admin/api/profile-templates`, `PUT`, `DELETE .../{name}` | Global profile templates |
 

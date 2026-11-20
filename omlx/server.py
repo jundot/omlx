@@ -598,7 +598,7 @@ async def lifespan(app: FastAPI):
 
         bonjour_task = asyncio.create_task(_bonjour_supervisor())
 
-    # Cluster v2: always-on peer discovery (mDNS + IPv6 multicast fallback +
+    # Cluster: always-on peer discovery (mDNS + IPv6 multicast fallback +
     # manual + Tailscale). Best-effort: discovery failures must never block
     # serving.
     discovery_service = None
@@ -899,7 +899,6 @@ def _register_cluster_routes() -> None:
     global _cluster_routes_registered
     if _cluster_routes_registered:
         return
-    from .cluster.routes import join_router as cluster_join_router
     from .cluster.routes import router as cluster_router
     from .cluster.routes import set_cluster_getters
 
@@ -911,27 +910,7 @@ def _register_cluster_routes() -> None:
             Depends(require_distributed_inference_enabled),
         ],
     )
-    # Cluster v2 model-sync manifest: admin-gated like the rest of the
-    # cluster surface; peers use it to compare model contents before sync.
-    from .cluster.modelsync import manifest_router as cluster_manifest_router
-    from .cluster.modelsync import set_modelsync_getters
-
-    set_modelsync_getters(get_engine_pool)
-    app.include_router(
-        cluster_manifest_router,
-        dependencies=[
-            Depends(require_admin),
-            Depends(require_distributed_inference_enabled),
-        ],
-    )
-    # The bootstrap bytes are public but pinned by SHA-256 in an admin-created
-    # command. Claim/source/complete authenticate with one-time enrollment
-    # credentials, not the browser's admin cookie.
-    app.include_router(
-        cluster_join_router,
-        dependencies=[Depends(require_distributed_inference_enabled)],
-    )
-    # Cluster v2: /api/cluster/node_id is a deliberately unauthenticated,
+    # Cluster: /api/cluster/node_id is a deliberately unauthenticated,
     # rate-limited probe peers use to verify announced addresses before any
     # pairing trust exists; /api/cluster/devices requires admin per-route.
     from .cluster.discovery_routes import discovery_router
@@ -940,10 +919,10 @@ def _register_cluster_routes() -> None:
         discovery_router,
         dependencies=[Depends(require_distributed_inference_enabled)],
     )
-    # Cluster v2 pairing (Module B): pair/request carries only a salted PBKDF2
+    # Cluster pairing (Module B): pair/request carries only a salted PBKDF2
     # verifier bound to the node and SSH identities; pair/status returns a
-    # code-encrypted cluster key only after admin approval. Approve, deny, and
-    # unpair are admin-only like every other cluster mutation.
+    # code-encrypted cluster key only after admin approval. Approve and deny
+    # are admin-only like every other cluster mutation.
     from .cluster.pairing_routes import pair_admin_router, pair_router
 
     app.include_router(
@@ -2647,10 +2626,7 @@ def init_server(
             else 300.0
         ),
     )
-    from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
-    from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager
-    from .cluster.rdma.store import configure_rdma_link_store
     from .cluster.registry import (
         configure_cluster_registry,
         configure_device_registry,
@@ -2659,11 +2635,8 @@ def init_server(
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
-    configure_cluster_enrollment(base_path)
-    configure_rdma_link_store(base_path)
-    configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
-    # Cluster v2: stable node identity + trusted device inventory. Best
+    # Cluster: stable node identity + trusted device inventory. Best
     # effort — a failure here must never block local inference. Configured
     # before the pairing manager so pairing approvals persist into the real
     # device registry instead of the schema-compatible fallback store.
@@ -2673,12 +2646,12 @@ def init_server(
         configure_node_identity(base_path)
         configure_device_registry(base_path / "cluster" / "devices.json")
     except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Cluster v2 identity/device stores unavailable: %s", exc)
+        logger.warning("Cluster identity/device stores unavailable: %s", exc)
     try:
         device_registry = get_device_registry()
     except RuntimeError:
         device_registry = None
-    # Cluster v2 pairing manager, bridged onto Module A's DeviceRegistry when
+    # Cluster pairing manager, bridged onto Module A's DeviceRegistry when
     # available (DeviceRegistryBridge adapts the API and fails loudly on
     # drift); otherwise the schema-compatible fallback store is used. Resolve
     # capabilities lazily because the discovery service starts later.
@@ -2687,7 +2660,6 @@ def init_server(
     configure_pairing_manager(
         base_path,
         registry=device_registry,
-        enrollment_store=get_cluster_enrollment(),
         caps_provider=announced_caps,
         address_provider=announced_addrs,
         http_port=global_settings.server.port if global_settings else 8000,

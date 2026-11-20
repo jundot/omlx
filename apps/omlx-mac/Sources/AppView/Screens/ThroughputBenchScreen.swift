@@ -68,6 +68,11 @@ struct ThroughputBenchScreen: View {
                 promptLengths: $vm.promptLengths,
                 genLength: $vm.genLength,
                 batchSizes: $vm.batchSizes,
+                forceLmEngine: $vm.forceLmEngine,
+                externalEnabled: $vm.externalEnabled,
+                externalBaseUrl: $vm.externalBaseUrl,
+                externalApiKey: $vm.externalApiKey,
+                externalModel: $vm.externalModel,
                 running: vm.running,
                 canRun: vm.canRun,
                 pendingFlags: vm.pendingFeatureFlags,
@@ -166,12 +171,18 @@ private struct ConfigurationSection: View {
     @Binding var promptLengths: Set<Int>
     @Binding var genLength: String
     @Binding var batchSizes: Set<Int>
+    @Binding var forceLmEngine: Bool
+    @Binding var externalEnabled: Bool
+    @Binding var externalBaseUrl: String
+    @Binding var externalApiKey: String
+    @Binding var externalModel: String
     let running: Bool
     let canRun: Bool
     let pendingFlags: [String]
     let onRun: () -> Void
     let onCancel: () -> Void
 
+    @State private var advancedOpen = false
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -200,8 +211,11 @@ private struct ConfigurationSection: View {
                     width: .controlWide,
                     options: modelOptions
                 )
+                .disabled(running || externalEnabled)
             }
-            GPUPowerBenchNotice(model: models.first { $0.id == selectedModelId })
+            if !externalEnabled {
+                GPUPowerBenchNotice(model: models.first { $0.id == selectedModelId })
+            }
 
             Row(label: String(localized: "bench.throughput.row.context.label",
                               defaultValue: "Benchmark Context",
@@ -285,6 +299,58 @@ private struct ConfigurationSection: View {
                     selection: $batchSizes,
                     format: { "\($0)" }
                 )
+                .disabled(running)
+            }
+
+            FreeRow {
+                DisclosureGroup(isExpanded: $advancedOpen) {
+                    VStack(spacing: 0) {
+                        Row(label: String(localized: "bench.throughput.advanced.force_lm",
+                                          defaultValue: "Force mlx-lm engine",
+                                          comment: "Throughput benchmark option to force the LM engine"),
+                            sublabel: String(localized: "bench.throughput.advanced.force_lm_hint",
+                                             defaultValue: "Use mlx-lm for this benchmark. VLM MTP drafters are ignored, so results measure the LM-only baseline.",
+                                             comment: "Explanation of the force mlx-lm benchmark option")) {
+                            RowSwitch(isOn: $forceLmEngine)
+                                .disabled(externalEnabled)
+                        }
+                        Row(label: String(localized: "bench.throughput.advanced.external",
+                                          defaultValue: "Use external OpenAI-compatible endpoint",
+                                          comment: "Throughput benchmark option to target an external API"),
+                            sublabel: String(localized: "bench.throughput.advanced.external_hint",
+                                             defaultValue: "Benchmark a remote model. The endpoint must support streamed token usage. Results stay local.",
+                                             comment: "Requirements and upload behavior for external throughput benchmarks"),
+                            isLast: !externalEnabled) {
+                            RowSwitch(isOn: $externalEnabled)
+                        }
+                        if externalEnabled {
+                            Row(label: String(localized: "bench.throughput.advanced.base_url",
+                                              defaultValue: "Base URL",
+                                              comment: "External benchmark API base URL field label")) {
+                                TextInput(text: $externalBaseUrl, placeholder: "https://api.openai.com/v1",
+                                          width: .controlWide)
+                            }
+                            Row(label: String(localized: "bench.throughput.advanced.api_key",
+                                              defaultValue: "API key",
+                                              comment: "External benchmark API key field label")) {
+                                TextInput(text: $externalApiKey, isSecure: true, width: .controlWide)
+                            }
+                            Row(label: String(localized: "bench.throughput.advanced.model",
+                                              defaultValue: "Model ID",
+                                              comment: "External benchmark model identifier field label"),
+                                isLast: true) {
+                                TextInput(text: $externalModel, placeholder: "gpt-4o-mini", width: .controlWide)
+                            }
+                        }
+                    }
+                    .padding(.top, 6)
+                } label: {
+                    Text(String(localized: "bench.throughput.advanced.title",
+                                defaultValue: "Advanced options",
+                                comment: "Disclosure label for advanced throughput benchmark options"))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                        .foregroundStyle(theme.text)
+                }
                 .disabled(running)
             }
 
@@ -976,6 +1042,10 @@ private struct SkippedBanner: View {
             return String(localized: "bench.throughput.upload.skipped.custom_generation_length",
                           defaultValue: "Results with a generation length other than 128 tokens are not submitted so they stay comparable with other submissions.",
                           comment: "Skipped-upload reason when the benchmark used a generation length other than 128 tokens")
+        case "lora_adapter":
+            return String(localized: "bench.throughput.upload.skipped.lora_adapter",
+                          defaultValue: "Results with a LoRA adapter are not submitted because the leaderboard lists them under the base model.",
+                          comment: "Skipped-upload reason when the benchmarked model had a LoRA adapter")
         default:
             return String(localized: "bench.throughput.upload.skipped.default",
                           defaultValue: "The server skipped uploading these results.",
