@@ -207,7 +207,8 @@ _SOURCE = r"""
     const uint simd_gid = simdgroup_index_in_threadgroup;
     const uint simd_lid = thread_index_in_simdgroup;
     const int pair = int(order[threadgroup_position_in_grid.y]);
-    const int expert = int(rhs[pair]);
+    // An expert stack can pass 2 GiB, so its offsets need 64 bits.
+    const size_t expert = size_t(rhs[pair]);
 
     const int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
     const int in_vec_size_g = K_SIZE / GS;
