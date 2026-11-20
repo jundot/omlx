@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -495,6 +497,14 @@ _TINY_VISION = dict(
     mlp_ratio=2.0,
 )
 
+# Prelude 0-5, core 6-11 three times, coda 12-17: 30 layer visits. MXFP8 only:
+# the random NVFP4 codes reach ~1e7 activations, and three core passes turn
+# that bf16 noise into chunking-dependent logits.
+_TINY_LOOP = dict(
+    formats=("mxfp8",) * 18,
+    loop_config=dict(core_start=6, core_end=12, num_passes=3, gate_rank=8),
+)
+
 
 def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None, **dims):
     from mlx.utils import tree_flatten
@@ -544,8 +554,9 @@ def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None, **dims)
     return model
 
 
-def test_inkling2_incremental_and_chunked_match_full_forward():
-    model = _inkling2_tiny()
+@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
+def test_inkling2_incremental_and_chunked_match_full_forward(dims):
+    model = _inkling2_tiny(**dims)
     ids = mx.random.randint(0, 300, (1, 26))
     full = model(ids)[..., :300]
     cache = model.make_cache()
@@ -560,8 +571,47 @@ def test_inkling2_incremental_and_chunked_match_full_forward():
     assert mx.abs(full[:, 11:] - tail).max().item() < 1e-3
 
 
-def test_inkling2_verify_rollback_matches_sequential_decode():
-    model = _inkling2_tiny()
+def test_inkling2_loop_controller_ignores_prefill_chunking():
+    from omlx.patches.inkling2.model import _mix_messages
+
+    # Release shapes: the 2H = 4608 -> r = 64 down projection is where a plain
+    # matmul picks a row-count dependent kernel.
+    hidden, rank, rows = 2304, 64, 2048
+    for n in (1, 3):
+        x = mx.random.normal((n, 1, rows, hidden))
+        msg = mx.random.normal((n, 1, rows, hidden))
+        down = mx.random.normal((n, 2, hidden, rank)) * 0.02
+        gates = mx.random.normal((n, rank, 2 * hidden)) * 0.1
+        full = _mix_messages(x, msg, down, gates)
+        part = _mix_messages(x[:, :, :1000], msg[:, :, :1000], down, gates)
+        assert mx.array_equal(part, full[:, :, :1000])
+
+
+def test_inkling2_loop_model_type_uses_inkling2(tmp_path):
+    from mlx_lm.utils import _get_classes
+
+    from omlx.patches.inkling2 import apply_inkling2_patch
+    from omlx.patches.inkling2 import model as inkling2
+    from omlx.patches.inkling2.dspark import bundled_inkling2_dspark_path
+    from omlx.utils.model_loading import normalize_inkling2_modelopt_quant
+
+    assert apply_inkling2_patch()
+    assert _get_classes({"model_type": "inkling2_loop"})[0] is inkling2.Model
+    release = {
+        "model_type": "inkling2_loop",
+        "quantization_config": {"quant_method": "modelopt"},
+    }
+    assert "quantization_config" not in normalize_inkling2_modelopt_quant(release)
+    mtp = {"markov_head_type": "rnn_hidden"}
+    config = {"model_type": "inkling2_loop", "mtp_config": mtp}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "mtp.safetensors").touch()
+    assert bundled_inkling2_dspark_path(tmp_path) is not None
+
+
+@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
+def test_inkling2_verify_rollback_matches_sequential_decode(dims):
+    model = _inkling2_tiny(**dims)
     ids = mx.random.randint(0, 300, (1, 30))
     reference = model.make_cache()
     model(ids[:, :20], cache=reference)

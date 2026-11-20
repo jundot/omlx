@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bundled DSpark drafter for Inkling 2 (``mtp.safetensors``).
 
-A five-layer block drafter. Each layer mixes the target's context taps (the
-partial block sums entering ``target_layer_ids[:-1]`` and the final-norm
-output) with its own softmax weights and projects them to context K/V. The
+A small block drafter. Each layer mixes the target's context taps (the
+partial block sums entering the layer visits ``target_layer_ids[:-1]`` and the
+final-norm output) with its own softmax weights and projects them to context
+K/V. Looped targets count every pass through a core layer as a visit. The
 block attends to that context and to itself in both directions, and the mask
 positions propose through the target LM head plus an RNN Markov head.
 
@@ -22,6 +23,8 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import INKLING2_MODEL_TYPES
+
 logger = logging.getLogger(__name__)
 
 DRAFT_FILENAME = "mtp.safetensors"
@@ -36,7 +39,9 @@ def bundled_inkling2_dspark_path(model_path: str | Path) -> Path | None:
     except (OSError, json.JSONDecodeError):
         return None
     mtp = config.get("mtp_config") or {}
-    if config.get("model_type") != "inkling2" or not mtp or not weights.is_file():
+    if config.get("model_type") not in INKLING2_MODEL_TYPES:
+        return None
+    if not mtp or not weights.is_file():
         return None
     if mtp.get("markov_head_type") != "rnn_hidden":
         return None

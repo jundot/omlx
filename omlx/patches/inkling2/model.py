@@ -8,6 +8,10 @@
   over the last ``rel_extent`` keys. Every attention row has a sink logit.
 - Routed experts keep the checkpoint's NVFP4 and MXFP8 codes in MLX's native
   carriers; the NVFP4 tensor scale is applied after the matmul.
+- Looped checkpoints (``loop_config``) run the core layers several times per
+  token. Every later pass restarts from the prelude output and reads the
+  previous pass's blocks only through gated messages. Each layer visit owns
+  its cache entry, so caches and draft taps count visits, not layers.
 """
 
 from __future__ import annotations
@@ -66,6 +70,7 @@ class TextArgs:
     final_logit_softcapping: float = 30.0
     # Per-layer expert carrier: "nvfp4", "mxfp8" or "affine" (oQ output).
     expert_formats: list | None = None
+    loop_config: dict | None = None
 
     @classmethod
     def from_dict(cls, params: dict) -> TextArgs:
@@ -83,6 +88,34 @@ class TextArgs:
         if self.local_layer_ids is not None:
             return i in set(self.local_layer_ids)
         return bool((i + 1) % 6)
+
+    @property
+    def loop_core(self) -> range:
+        loop = self.loop_config
+        return range(loop["core_start"], loop["core_end"]) if loop else range(0)
+
+    def layer_schedule(self) -> list[tuple[int, int]]:
+        """``(layer, pass)`` for every layer visit in execution order."""
+        n = self.num_hidden_layers
+        if not self.loop_config:
+            return [(i, 0) for i in range(n)]
+        core = self.loop_core
+        block = self.n_layers_per_attn_res_block
+        passes = int(self.loop_config["num_passes"])
+        if (
+            not 0 < core.start < core.stop <= n
+            or core.start % block
+            or core.stop % block
+            or passes < 2
+        ):
+            # The message bank is the blocks one pass writes, so the core must
+            # start and end on attention-residual block boundaries.
+            raise ValueError(f"Unsupported Inkling 2 loop_config: {self.loop_config}")
+        return (
+            [(i, 0) for i in range(core.start)]
+            + [(i, p) for p in range(passes) for i in core]
+            + [(i, 0) for i in range(core.stop, n)]
+        )
 
 
 @dataclass
@@ -308,6 +341,29 @@ class AttnResQuery(nn.Module):
         return kernels.attn_res_mix(blocks, partial_n, self.query, self.scale)
 
 
+def _mix_messages(x, message, down, gain_forget):
+    """Loop controllers: ``(1 - tanh(forget)) * x + tanh(gain) * message``.
+
+    ``x`` and ``message`` are [N, B, L, H] FP32, one row per controlled input.
+    ``down`` is [N, 2, H, r] (the x and message halves) and ``gain_forget``
+    [N, r, 2H], both FP32 copies of BF16 weights.
+    """
+    n, b, length, hidden = x.shape
+    rows = b * length
+    # Like the reference, the down projection takes BF16-rounded inputs,
+    # accumulates in FP32 and rounds once. It runs as a batched matmul over
+    # the halves: a single [rows, 2H] x [2H, r] matmul gets a row-count
+    # dependent kernel, so prefill chunking would change the result.
+    z = mx.stack([_unit_rms(x), _unit_rms(message)], axis=1)
+    z = z.astype(mx.bfloat16).astype(mx.float32).reshape(2 * n, rows, hidden)
+    low = (z @ down.reshape(2 * n, hidden, -1)).reshape(n, 2, rows, -1).sum(axis=1)
+    low = low.astype(mx.bfloat16).astype(mx.float32)
+    gates = (low @ gain_forget).reshape(n, b, length, 2 * hidden)
+    gain = mx.tanh(gates[..., :hidden])
+    forget = mx.tanh(gates[..., hidden:])
+    return (1.0 - forget) * x + gain * message
+
+
 def _static_conv(x, w, state, scale):
     """Depthwise causal conv (taps: ``w[:, K-1]`` is the current token).
 
@@ -412,7 +468,17 @@ class Inkling2Attention(nn.Module):
         b, length, _ = xq.shape
         dkv = self.dkv
         if self.sliding:
-            q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
+            if xk is None:
+                q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
+            else:
+                # Looped passes give q, k and v their own inputs; one stacked
+                # projection serves all three.
+                pq, pk, pv = mx.split(
+                    self.in_proj(mx.concatenate([xq, xk, xv], axis=0)), 3, axis=0
+                )
+                q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
+                k = pk[..., self._cuts[0] : self._cuts[1]]
+                v = pv[..., self._cuts[1] : self._cuts[2]]
             k, ks = _static_conv(k, self.k_conv, ks, self._sconv_scale)
             v, vs = _static_conv(v, self.v_conv, vs, self._sconv_scale)
         else:
@@ -511,6 +577,13 @@ class Inkling2Layer(nn.Module):
         if layer_idx > 0:
             self.attn_input = AttnResQuery(h, 1 if self.sliding else 3)
         self.mlp_input = AttnResQuery(h, 1)
+        if layer_idx in args.loop_core:
+            # Message queries and controllers for the q, k, v and MLP inputs,
+            # in that order. Only passes after the first use them.
+            rank = int(args.loop_config["gate_rank"])
+            self.loop_message = AttnResQuery(h, 4)
+            self.loop_down = mx.zeros((4, 2, h, rank), dtype=mx.float32)
+            self.loop_gain_forget = mx.zeros((4, rank, 2 * h), dtype=mx.float32)
         self.attn = Inkling2Attention(args, layer_idx)
         self.mlp = Inkling2MoE(args, w13_spec, w2_spec)
         if self.sliding:
@@ -530,7 +603,7 @@ class Inkling2Layer(nn.Module):
         self._pre_compiled = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
         self._post_compiled = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
 
-    def _pre(self, h, blocks, ks, vs, tau=None):
+    def _pre(self, h, blocks, ks, vs, tau=None, messages=None):
         dtype = h.dtype
         h_n = _unit_rms(h.astype(mx.float32))
         if self.layer_idx == 0:
@@ -538,19 +611,28 @@ class Inkling2Layer(nn.Module):
         else:
             mixed = self.attn_input(blocks, h_n)
             if self.sliding:
-                xq = mixed[:, :, 0]
+                xq = xk = xv = mixed[:, :, 0]
             else:
                 xq, xk, xv = mixed[:, :, 0], mixed[:, :, 1], mixed[:, :, 2]
-        if self.sliding:
+        if messages is not None:
+            xq, xk, xv = _mix_messages(
+                mx.stack([xq, xk, xv]),
+                messages[:, :, :3].transpose(2, 0, 1, 3),
+                self.loop_down[:3],
+                self.loop_gain_forget[:3],
+            )
+        if self.sliding and messages is None:
             xq = self.attn_norm(xq).astype(dtype)
             xk = xv = None
+        elif self.sliding:
+            xq, xk, xv = (self.attn_norm(x).astype(dtype) for x in (xq, xk, xv))
         else:
             xq = self.q_input_norm(xq).astype(dtype)
             xk = self.k_input_norm(xk).astype(dtype)
             xv = self.v_input_norm(xv).astype(dtype)
         return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
 
-    def _post(self, out, gate, h, mlp_blocks, s2, s3):
+    def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
         a = self.attn.output(out, gate)
         a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
         if self.is_boundary:
@@ -558,13 +640,21 @@ class Inkling2Layer(nn.Module):
         else:
             residual = h.astype(mx.float32) + a.astype(mx.float32)
         y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
+        if messages is not None:
+            y = _mix_messages(
+                y[None],
+                messages[None, :, :, 3],
+                self.loop_down[3:],
+                self.loop_gain_forget[3:],
+            )[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
         m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
         return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
 
-    def __call__(self, h, blocks, cache=None):
+    def __call__(self, h, blocks, cache=None, bank=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
-        FP32 completed blocks; extended in place at a block boundary."""
+        FP32 completed blocks; extended in place at a block boundary.
+        ``bank``: the previous loop pass's ``(blocks, partial_n)`` messages."""
         b, length, hidden = h.shape
         kv = cache[0] if cache is not None else None
         conv = cache[1] if cache is not None else None
@@ -579,14 +669,14 @@ class Inkling2Layer(nn.Module):
         compiled = length <= _COMPILED_MAX_TOKENS
         pre = self._pre_compiled if compiled else self._pre
         post = self._post_compiled if compiled else self._post
-        pre_args = (h, blocks, states[0], states[1])
-        if tau is not None:
-            pre_args = (*pre_args, tau)
-        q, k, v, rel, gate, sink, ks, vs, h_n = pre(*pre_args)
+        messages = self.loop_message(*bank) if bank is not None else None
+        q, k, v, rel, gate, sink, ks, vs, h_n = pre(
+            h, blocks, states[0], states[1], tau, messages
+        )
         out = self.attn.attend(q, k, v, rel, sink, kv)
         if self.is_boundary:
             blocks.append(h_n)
-        h, s2, s3 = post(out, gate, h, blocks, states[2], states[3])
+        h, s2, s3 = post(out, gate, h, blocks, states[2], states[3], messages)
         if conv is not None:
             windows = (ks, vs, s2, s3)
             if 1 < length <= _COMPILED_MAX_TOKENS:
@@ -611,26 +701,52 @@ class Inkling2TextModel(nn.Module):
         ]
         self.final_input = AttnResQuery(args.hidden_size, 1)
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self._schedule = tuple(args.layer_schedule())
+        self._core_start = args.loop_core.start if args.loop_config else None
+
+    @property
+    def num_visits(self) -> int:
+        if self._core_start is None:
+            # The prefill helper keeps only the first layers of a plain model.
+            return len(self.layers)
+        return len(self._schedule)
 
     def __call__(self, inputs, cache=None, input_embeddings=None, capture=None):
-        """``capture`` maps draft feature ids to fill: ``i`` < num layers is
-        the partial block sum entering layer ``i``; ``num layers`` is the
-        final-norm output."""
+        """``capture`` maps draft feature ids to fill: ``i`` < num visits is
+        the partial block sum entering layer visit ``i``; ``num visits`` is
+        the final-norm output."""
         if input_embeddings is not None:
             h = input_embeddings
         else:
             h = self.embed_norm(self.embed(inputs))
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * self.num_visits
+        elif len(cache) != self.num_visits:
+            # A per-layer cache would silently skip the later loop passes.
+            raise ValueError(
+                f"Inkling 2 needs one cache entry per layer visit "
+                f"({self.num_visits}), got {len(cache)}"
+            )
         blocks: list = []
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
-            if capture is not None and i in capture:
-                capture[i] = h
-            h = layer(h, blocks, cache=c)
+        prelude = bank = None
+        for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, cache)):
+            if idx == self._core_start and prelude is None:
+                prelude = (h, list(blocks))
+            elif idx == self._core_start:
+                # The next pass restarts from the prelude output; the blocks
+                # the last pass wrote become its message bank.
+                bank = (
+                    blocks[len(prelude[1]) + 1 :],
+                    _unit_rms(h.astype(mx.float32)),
+                )
+                h, blocks = prelude[0], list(prelude[1])
+            if capture is not None and visit in capture:
+                capture[visit] = h
+            h = self.layers[idx](h, blocks, cache=c, bank=bank if loop_pass else None)
         x = self.final_input(blocks, _unit_rms(h.astype(mx.float32)))[:, :, 0]
         out = self.norm(x).astype(h.dtype)
-        if capture is not None and len(self.layers) in capture:
-            capture[len(self.layers)] = out
+        if capture is not None and self.num_visits in capture:
+            capture[self.num_visits] = out
         return out
 
 
@@ -781,7 +897,11 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        return [CacheList(KVCache(), ArraysCache(4)) for _ in self.model.layers]
+        # One entry per layer visit: each loop pass keeps its own KV and conv
+        # states.
+        return [
+            CacheList(KVCache(), ArraysCache(4)) for _ in range(self.model.num_visits)
+        ]
 
     def sanitize(self, weights: dict) -> dict:
         out, formats = sanitize_weights(self, weights)
@@ -799,13 +919,16 @@ class Model(nn.Module):
     @property
     def cast_predicate(self):
         def predicate(key: str) -> bool:
-            # Attention-residual queries, router and NVFP4 tensor scales are
-            # FP32 in the source checkpoint and stay FP32.
+            # Attention-residual and loop message queries, router and NVFP4
+            # tensor scales are FP32 in the source checkpoint and stay FP32.
+            # The loop controller weights are widened to FP32 at load.
             return not (
                 key.endswith(".query")
                 or key.endswith("router_weight")
                 or key.endswith("router_bias")
                 or key.endswith(".global_scale")
+                or key.endswith("loop_down")
+                or key.endswith("loop_gain_forget")
             )
 
         return predicate

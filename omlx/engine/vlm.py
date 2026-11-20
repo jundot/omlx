@@ -61,6 +61,7 @@ from ..models.vlm import VLMModelAdapter
 from ..oqh.format import is_oqh_checkpoint
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
+from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2 import vlm as inkling2_vlm
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
@@ -2152,7 +2153,7 @@ class VLMBatchedEngine(BaseEngine):
                             getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                         ),
                     )
-                if model_type == "inkling2":
+                if model_type in INKLING2_MODEL_TYPES:
                     return inkling2_vlm.load(self._model_name)
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
