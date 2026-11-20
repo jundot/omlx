@@ -533,7 +533,7 @@ class ShardPlan:
     # case the per-rank byte reservation is zero, but the operator's requested
     # runtime limit must still be visible and part of the plan identity.
     target_context_tokens: int = _DEFAULT_CONTEXT_TOKENS
-    # node_id → absolute model path on that node (cluster v2). Display and
+    # node_id → absolute model path on that node. Display and
     # staging metadata only: the layer split is path-independent, so the map
     # is deliberately excluded from ``plan_hash``. Empty means every node
     # loads the shared coordinator path — the legacy behavior.

@@ -229,7 +229,6 @@ def cluster_home(tmp_path, monkeypatch):
     ssh_dir = home / ".ssh"
     monkeypatch.setattr(ssh_keys, "_SSH_DIR", ssh_dir)
     monkeypatch.setattr(ssh_keys, "_SSH_KEY_PATH", ssh_dir / "omlx_cluster")
-    monkeypatch.setattr(ssh_keys, "_SSH_PUBKEY_PATH", ssh_dir / "omlx_cluster.pub")
     return home
 
 

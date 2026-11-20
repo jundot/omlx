@@ -290,20 +290,18 @@ def test_plan_carries_the_selected_model_holder_to_remote_measurement(monkeypatc
         )
 
     monkeypatch.setattr(routes, "remote_model_layout", fake_layout)
-    response = _client().post(
-        "/admin/api/cluster/plan",
-        json={
-            "model_path": "/models/m3",
-            "model_source": "studio",
-            "model_source_python": "/opt/omlx/bin/python",
-            "nodes": [
+    routes._create_cluster_plan(
+        routes.ClusterPlanRequest(
+            model_path="/models/m3",
+            model_source="studio",
+            model_source_python="/opt/omlx/bin/python",
+            nodes=[
                 {"node_id": "MacBook", "capacity_bytes": 1 << 30},
                 {"node_id": "Studio", "capacity_bytes": 1 << 30},
             ],
-        },
+        )
     )
 
-    assert response.status_code == 200
     assert asked == {
         "host": "studio",
         "path": "/models/m3",

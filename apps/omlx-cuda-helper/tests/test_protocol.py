@@ -49,7 +49,6 @@ def host(tmp_path):
     calls = []
     manager = PairingManager(
         None,
-        None,
         base_path=tmp_path / "host",
         identity={
             "node_id": "host-node",

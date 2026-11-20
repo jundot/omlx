@@ -745,12 +745,10 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
         {"node_id": "local", "capacity_bytes": 1024**3},
         {"node_id": "studio", "capacity_bytes": 1024**3},
     ]
+    preview = routes._create_cluster_plan(
+        routes.ClusterPlanRequest(model_path=str(root), nodes=nodes)
+    )
     with TestClient(app) as client:
-        preview = client.post(
-            "/admin/api/cluster/plan",
-            json={"model_path": str(root), "nodes": nodes},
-        )
-        assert preview.status_code == 200, preview.text
         activation = {
             "model_path": str(root),
             "backend": "ring",
@@ -768,7 +766,7 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
                 },
             ],
             "preflight": True,
-            "approved_placement": preview.json()["placement_signature"],
+            "approved_placement": routes._placement_signature(preview.to_dict()),
         }
         response = client.post(
             "/admin/api/cluster/stage",

@@ -28,7 +28,6 @@ from .control_plane import RankControlPlane
 from .deployment import (
     decode_worker_contract,
     decode_worker_path_map,
-    decode_worker_stage_links,
 )
 from .jaccl_lease import acquire_jaccl_communicator_lease
 from .liveness import PeerWatchdog
@@ -48,7 +47,6 @@ from .pipeline_compat import (
 from .planner import PipelineAssignment, tensor_split_to_dict
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
-from .rdma.stage_transport import install_stage_links
 from .runtime_optimizations import (
     install_runtime_optimizations,
     wait_for_pipeline_peers_on_host,
@@ -1459,9 +1457,9 @@ def run_worker(args: argparse.Namespace) -> int:
     if args.plan_hash != plan_hash:
         raise RuntimeError("worker plan hash does not match launch contract")
 
-    # Cluster v2: a deployment may give each node its own absolute model path.
-    # The rank's path comes from the signed contract's path_map; nodes without
-    # an entry keep the shared --model argument, the pre-v2 behavior.
+    # A deployment may give each node its own absolute model path. The rank's
+    # path comes from the signed contract's path_map; nodes without an entry
+    # keep the shared --model argument.
     path_map = decode_worker_path_map(args.plan)
     if path_map:
         rank_model_path = path_map.get(assignments[rank].node_id)
@@ -1651,14 +1649,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 if execution.mtp
                 else None
             )
-            # Installed first so the runtime optimizations wrap the RDMA-aware send.
             with (
-                install_stage_links(
-                    mx,
-                    group,
-                    decode_worker_stage_links(args.plan),
-                    rank=rank,
-                ) as stage_links,
                 install_runtime_optimizations(
                     provider.model,
                     group,
@@ -1700,7 +1691,6 @@ def run_worker(args: argparse.Namespace) -> int:
                         profile.to_dict() for profile in performance_profiles
                     ],
                     optimizations=optimizations,
-                    stage_links=stage_links,
                     output_protocol=protocol or None,
                 )
                 _emit_event(
@@ -1719,7 +1709,6 @@ def run_worker(args: argparse.Namespace) -> int:
                         "capacity_bytes": assignment.capacity_bytes,
                         "reserve_bytes": assignment.reserve_bytes,
                         "headroom_bytes": assignment.headroom_bytes,
-                        "stage_links": stage_links,
                     }
                 )
                 if rank == 0:

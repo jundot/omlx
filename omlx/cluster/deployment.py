@@ -26,7 +26,6 @@ from .planner import (
     normalize_node_role,
     tensor_split_from_dict,
 )
-from .rdma.stage_plan import StageLink, validate_stage_links
 
 DistributedBackend = Literal["ring", "jaccl", "jaccl-ring"]
 
@@ -370,11 +369,9 @@ class ClusterDeployment:
     tensor_parallel_size: int = 1
     target_context_tokens: int = 8192
     # node_id → absolute model path on that node. Empty means every node uses
-    # ``model`` — the pre-v2 same-absolute-path requirement. Entries override
+    # ``model``, the original same-absolute-path requirement. Entries override
     # only the nodes they name; the coordinator path stays the fallback.
     path_map: dict[str, str] = field(default_factory=dict)
-    # RDMA stage edges for one launch only; never stored or compared.
-    stage_links: tuple[StageLink, ...] = field(default=(), compare=False)
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.deployment_id) is None:
@@ -420,9 +417,6 @@ class ClusterDeployment:
             char not in "0123456789abcdef" for char in self.plan_hash
         ):
             raise ValueError("plan_hash must be a lowercase SHA-256 digest")
-        object.__setattr__(
-            self, "stage_links", validate_stage_links(self.stage_links, len(self.hosts))
-        )
 
         assignments = sorted(self.assignments, key=lambda item: item.rank)
         if [item.rank for item in assignments] != list(range(len(self.hosts))):
@@ -583,7 +577,6 @@ class ClusterDeployment:
                 ],
                 "tensor_parallel_size": self.tensor_parallel_size,
                 "path_map": dict(sorted(self.path_map.items())),
-                "stage_links": [link.to_dict() for link in self.stage_links],
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -684,17 +677,3 @@ def decode_worker_path_map(encoded: str) -> dict[str, str]:
     return validate_model_path_map(payload.get("path_map"))
 
 
-def decode_worker_stage_links(encoded: str) -> tuple[StageLink, ...]:
-    """Stage edges this launch verified onto RDMA; older contracts carry none."""
-
-    payload = _decode_worker_payload(encoded)
-    return validate_stage_links(
-        payload.get("stage_links"), len(payload.get("assignments", []))
-    )
-
-
-def decode_worker_plan(encoded: str) -> tuple[str, tuple[PipelineAssignment, ...]]:
-    """Backward-compatible assignment-only worker plan decoder."""
-
-    plan_hash, assignments, _, _ = decode_worker_contract(encoded)
-    return plan_hash, assignments

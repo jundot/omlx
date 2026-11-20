@@ -1,6 +1,6 @@
 {
   "_state": "device_card",
-  "_comment": "Three unpaired peers stream in — proves the v1 two-Mac cap is gone.",
+  "_comment": "Three unpaired peers stream in — proves there is no two-Mac cap.",
   "paired": [],
   "discovered": [
     {
