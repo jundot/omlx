@@ -12448,10 +12448,12 @@ def _load_or_collect_imatrix(
                     {"cache_path": str(path), "entry_count": len(cache.entries)},
                 )
                 return cache
-            logger.info(
-                "oQe imatrix: cache missing required expert coverage, recollecting %s",
-                path,
-            )
+            else:
+                logger.info(
+                    "oQe imatrix: cache missing required expert coverage, "
+                    "recollecting %s",
+                    path,
+                )
         else:
             logger.info("oQe imatrix: cache metadata mismatch, recollecting %s", path)
 
