@@ -23,6 +23,7 @@ import shutil
 import struct as _struct
 import sys
 import tempfile
+import threading
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
@@ -3238,6 +3239,11 @@ def _block_dequant_fp8(weight_raw, scale_raw, w_dtype, s_dtype):
     return weight
 
 
+# Discovery swaps mlx.core functions process-wide. Serialize it so an
+# overlapping run cannot save another run's stand-ins as the originals.
+_SANITIZE_DISCOVERY_LOCK = threading.RLock()
+
+
 def _discover_sanitize_plan(sanitize_fn, lazy_index):
     """Run sanitize on _TrackedTensors to discover the key mapping and
     transforms without materializing any real data.
@@ -3245,6 +3251,11 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     Returns a dict: output_key -> {sources, transform, shape, axis}
     or None if discovery fails.
     """
+    with _SANITIZE_DISCOVERY_LOCK:
+        return _discover_sanitize_plan_locked(sanitize_fn, lazy_index)
+
+
+def _discover_sanitize_plan_locked(sanitize_fn, lazy_index):
     import mlx.core as mx
 
     # Build tracked dict mirroring the lazy index (logical view hides scale
@@ -10546,7 +10557,7 @@ def _iter_streamed_layer_blocks(
 
 
 def _streamed_embed_weight(source, config: dict):
-    """Source the token embedding table (bf16 on disk) for the stage-0 pass."""
+    """Source the token embedding table (bf16 on disk)."""
     dp = _streamed_source_plan(source, config)
     weight = dp.pop(_STREAM_EMBED_KEY)
     mx.eval(weight)
@@ -11137,10 +11148,9 @@ def _collect_imatrix_streaming(
     )
     micro_batch_size = int(batch_plan["micro_batch_size"])
 
-    # Stage 0: source the embedding table once, embed the full adaptive-max
-    # draw, drop the table. Embedding everything up front (6.4 GB at the
-    # 1024x512 ceiling) means an escalation round re-streams layers only
-    # for its own sample slice instead of re-running stage 0.
+    # Stage 0 sources the embedding table for the sensitivity boundary and the
+    # per-family masks. Each round re-sources it and embeds only its own rows,
+    # so one round of layer-0 inputs is resident, not the whole adaptive draw.
     calib_data = calib_data[:max_samples]
     is_qwen4_exp = _stream_source_model_type(config) == "qwen4_exp"
     if is_qwen4_exp:
@@ -11149,8 +11159,20 @@ def _collect_imatrix_streaming(
         # The mmap PLE configure happens inside _iter_streamed_layer_blocks,
         # AFTER the pre-load patches that could re-install the module.
         _qwen4_exp_apply_compat_patch()
+
+    def embed_rows(weight, lo: int, hi: int):
+        """Layer-0 inputs for draw rows [lo, hi)."""
+        rows = _streamed_embed(weight, calib_data[lo:hi], config)
+        if is_qwen4_exp:
+            rows, _, _ = _streamed_qwen4_exp_state(config, calib_data[lo:hi], rows)
+        elif is_glm5_next:
+            rows, _ = _streamed_glm5_next_state(config, rows)
+        mx.eval(rows)
+        return rows
+
     embed_weight = _streamed_embed_weight(source, config)
-    embedded = _streamed_embed(embed_weight, calib_data, config)
+    # One row, only to derive the per-family masks and state below.
+    embedded = _streamed_embed(embed_weight, calib_data[:1], config)
     mx.eval(embedded)
     sens_state = None
     if measure_sensitivity:
@@ -11174,20 +11196,17 @@ def _collect_imatrix_streaming(
     mx.clear_cache()
 
     if is_qwen4_exp:
-        # hc-tile once at stage 0 (slicing commutes with the tile, so the
-        # per-slot rows stay bitwise-equal to the resident per-batch tiling)
-        # and build the per-layer mask schedule from config.layer_types; the
-        # forward state is sliced per micro-batch below, exactly like the
-        # resident collector's per-batch _prepare_layer_inputs call.
-        embedded, q4_layer_masks, q4_position_ids = _streamed_qwen4_exp_state(
+        # Build the per-layer mask schedule from config.layer_types. embed_rows
+        # applies the hc tile per round (slicing commutes with the tile), and the
+        # forward state is sliced per micro-batch below, like the resident
+        # collector's per-batch _prepare_layer_inputs call.
+        _, q4_layer_masks, q4_position_ids = _streamed_qwen4_exp_state(
             config, calib_data, embedded
         )
-        mx.eval(embedded)
         mask = None
         position_ids = None
     elif is_glm5_next:
-        embedded, glm5_attention_mask = _streamed_glm5_next_state(config, embedded)
-        mx.eval(embedded)
+        _, glm5_attention_mask = _streamed_glm5_next_state(config, embedded)
         mask = glm5_attention_mask
         position_ids = {"kind": _GLM5_NEXT_LAYER_STATE_KIND}
     elif _stream_source_model_type(config) == "flint":
@@ -11204,6 +11223,8 @@ def _collect_imatrix_streaming(
             noncausal=_noncausal_attention(config),
         )
         mask = layer_masks[0]
+
+    del embedded
 
     text_config = config.get("text_config") or {}
     total_layers = int(
@@ -11239,7 +11260,10 @@ def _collect_imatrix_streaming(
         round_start = processed_samples
         round_stop = min(round_start + step_samples, max_samples)
         ranges = _stream_round_micro_ranges(round_start, round_stop, micro_batch_size)
-        working = [embedded[lo:hi] for lo, hi in ranges]
+        round_weight = _streamed_embed_weight(source, config)
+        working = [embed_rows(round_weight, lo, hi) for lo, hi in ranges]
+        del round_weight
+        mx.clear_cache()
         if is_qwen4_exp:
             slot_states = [
                 _streamed_qwen4_exp_slot_state(calib_data, q4_position_ids, lo, hi)
@@ -11477,6 +11501,7 @@ _OQE_REFINE_EXPERT_BYTES = 4 << 30
 # inputs and many outputs, so their ranges must count the weights too.
 _OQE_REFINE_WEIGHT_COPIES = 10
 # Model types whose calibration walk runs outside the generic layer path.
+# V4.1 never reaches this path: its exporter refines its routed experts itself.
 _OQE_REFINE_UNSUPPORTED_TYPES = frozenset({"deepseek_v41", "muse_spark"})
 
 
@@ -12424,10 +12449,12 @@ def _load_or_collect_imatrix(
                     {"cache_path": str(path), "entry_count": len(cache.entries)},
                 )
                 return cache
-            logger.info(
-                "oQe imatrix: cache missing required expert coverage, recollecting %s",
-                path,
-            )
+            else:
+                logger.info(
+                    "oQe imatrix: cache missing required expert coverage, "
+                    "recollecting %s",
+                    path,
+                )
         else:
             logger.info("oQe imatrix: cache metadata mismatch, recollecting %s", path)
 

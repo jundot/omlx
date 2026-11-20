@@ -382,8 +382,11 @@ class ExpertOffloadPlan:
 class _ExpertSlots:
     def __init__(self, expert, plan, prefix):
         self.expert, self.plan, self.prefix = expert, plan, prefix
+        # Runtime bank size. The shared plan keeps its loaded capacity, so a
+        # resize here leaves every other layer's bank alone.
+        self.capacity = plan.capacity
         self.slot_of = {}
-        self.free = list(range(plan.capacity))
+        self.free = list(range(self.capacity))
         self.hits = self.misses = 0
         self.fetched_bytes = 0
         # Experts whose reads a prefill started early: expert -> the same
@@ -392,7 +395,7 @@ class _ExpertSlots:
         for proj in _PROJECTIONS:
             sample = plan.fetch(prefix, proj, 0)
             values = {
-                field: mx.zeros((plan.capacity, *array.shape), dtype=array.dtype)
+                field: mx.zeros((self.capacity, *array.shape), dtype=array.dtype)
                 for field, array in sample.items()
             }
             spec = plan.layers[prefix][proj]
@@ -430,7 +433,7 @@ class _ExpertSlots:
                     target = owner.view(mx.uint16) if owner.dtype == mx.bfloat16 else owner
                     mx.eval(target)
                     view = np.asarray(memoryview(target))
-                    if view.shape[0] != self.plan.capacity or view[0].nbytes != slab.nbytes:
+                    if view.shape[0] != self.capacity or view[0].nbytes != slab.nbytes:
                         return None
                     if _data_ptr(owner) != view.ctypes.data:
                         return None
@@ -466,23 +469,124 @@ class _ExpertSlots:
             count, then = self._uses.get(expert, (0.0, now))
             self._uses[expert] = (count * math.exp(-decay * (now - then)) + 1.0, now)
 
+    def _hotness(self, expert, decay):
+        """The ranking key ``_victim`` and ``_resize`` share: higher is hotter.
+
+        ``log(count) - decay * (now - then)`` orders the decayed counts; the
+        ``now`` term is common to every candidate, so ``then`` stands in for it.
+        """
+        count, then = self._uses.get(expert, (1.0, 0))
+        return math.log(count) + decay * then
+
     def _victim(self, protected):
         """The resident expert outside ``protected`` with the lowest decayed count.
 
-        log(count) - decay * (now - then) orders the decayed counts; the ``now``
-        term is common to every candidate, so ``then`` stands in for it. Ties go
-        to the least recently used, the order ``slot_of`` keeps.
+        Ties go to the least recently used, the order ``slot_of`` keeps.
         """
         decay = math.log(2.0) / EVICTION_HALF_LIFE
         best, best_key = None, None
         for expert in self.slot_of:
             if expert in protected:
                 continue
-            count, then = self._uses.get(expert, (1.0, 0))
-            key = math.log(count) + decay * then
+            key = self._hotness(expert, decay)
             if best_key is None or key < best_key:
                 best, best_key = expert, key
         return best
+
+    @property
+    def full_capacity(self):
+        """The plan's loaded slot count; ``restore_slots`` grows back to it."""
+        return self.plan.capacity
+
+    @property
+    def floor(self):
+        """The routing top-k floor the release cannot shrink below."""
+        return self.plan.floor
+
+    @property
+    def expert_bytes(self):
+        """Resident bytes one slot costs, as the plan's per-expert average."""
+        return self.plan.expert_bytes
+
+    def release_slots(self, target):
+        """Shrink this bank to ``target`` slots, keeping the hottest experts.
+
+        Returns the bytes given up. The shared plan keeps its loaded capacity,
+        so the other layers' banks are untouched."""
+        target = max(self.floor, min(int(target), self.full_capacity))
+        if target >= self.capacity:
+            return 0
+        freed = (self.capacity - target) * self.expert_bytes
+        self._resize(target)
+        return freed
+
+    def restore_slots(self):
+        """Grow back to the plan's capacity; misses refill the empty slots."""
+        if self.capacity >= self.full_capacity:
+            return 0
+        added = (self.full_capacity - self.capacity) * self.expert_bytes
+        self._resize(self.full_capacity)
+        return added
+
+    def _resize(self, capacity):
+        """Move the bank to ``capacity`` slots, keeping the hottest experts.
+
+        ``slot_of`` is ordered least to most recently used, which is the order
+        ``_victim`` breaks ties by, so the kept experts are compacted in that
+        order and the new slots trail them. Every replacement array is
+        materialized before the bank publishes the new capacity, so a failed
+        allocation leaves the old bank in place."""
+        decay = math.log(2.0) / EVICTION_HALF_LIFE
+        order = list(self.slot_of)
+        compact = len(order) > capacity
+        if compact:
+            recent = {expert: i for i, expert in enumerate(order)}
+            keep = sorted(
+                order, key=lambda e: (-self._hotness(e, decay), -recent[e])
+            )[:capacity]
+            keep.sort(key=recent.__getitem__)
+        else:
+            keep = order
+        # A bank whose slots are already 0..n-1 needs no gather: every kept
+        # expert sits in the slot it keeps. That is the restore path, and the
+        # copy covers the whole bank, so skipping the gather holds the
+        # transient at old + new instead of old + gather + new.
+        in_place = not compact and sorted(self.slot_of.values()) == list(
+            range(len(order))
+        )
+        index = (
+            None
+            if in_place
+            else mx.array([self.slot_of[expert] for expert in keep], dtype=mx.int32)
+        )
+        replacements = []
+        for proj in _PROJECTIONS:
+            lin = getattr(self.expert, proj)
+            for field in _fields(self.plan.layers[self.prefix][proj]):
+                previous = getattr(lin, field, None)
+                if previous is None:
+                    raise ValueError(f"Missing expert bank field {proj}.{field}")
+                if previous.shape[0] != self.capacity:
+                    raise ValueError(
+                        f"Unexpected expert bank capacity for {proj}.{field}"
+                    )
+                resized = mx.zeros((capacity, *previous.shape[1:]), previous.dtype)
+                if keep:
+                    resized[: len(keep)] = (
+                        previous[: len(keep)]
+                        if in_place
+                        else mx.take(previous, index, axis=0)
+                    )
+                replacements.append((lin, field, resized))
+        mx.eval(*(array for _, _, array in replacements))
+        for lin, field, array in replacements:
+            setattr(lin, field, array)
+        self.capacity = capacity
+        if not in_place:
+            self.slot_of = {expert: slot for slot, expert in enumerate(keep)}
+        self.free = list(range(len(keep), capacity))
+        # The host views alias the old buffers; rebuild them for the new bank.
+        self._views = self._slot_views()
 
     def ensure(self, indices):
         slots = self.ensure_ids(indices.reshape(-1).tolist())
@@ -542,7 +646,7 @@ class _ExpertSlots:
         every read this call started is drained before it raises.
         """
         needed = list(dict.fromkeys(ids))
-        if len(needed) > self.plan.capacity:
+        if len(needed) > self.capacity:
             raise ValueError("Expert working set exceeds resident capacity")
         self._score(needed)
         if self._views is not None:
@@ -756,7 +860,7 @@ class OffloadedExpert(nn.Module):
         flat_i = indices.reshape(-1, indices.shape[-1])
         flat_x = x.reshape(-1, 1, 1, x.shape[-1])
         flat_w = None if weights is None else weights.reshape(flat_i.shape)
-        step = max(1, self.slots.plan.capacity // flat_i.shape[-1])
+        step = max(1, self.slots.capacity // flat_i.shape[-1])
         outputs = []
         for start in range(0, flat_i.shape[0], step):
             idx = flat_i[start : start + step]
@@ -788,7 +892,7 @@ class OffloadedExpert(nn.Module):
         experts = [int(e) for e in np.unique(np.asarray(ids, dtype=np.int64))]
         hits = [e for e in experts if e in resident]
         misses = [e for e in experts if e not in resident]
-        capacity = self.slots.plan.capacity
+        capacity = self.slots.capacity
         groups = [hits] if hits else []
         groups += [misses[i : i + capacity] for i in range(0, len(misses), capacity)]
         return groups

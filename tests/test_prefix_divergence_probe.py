@@ -174,3 +174,63 @@ class TestDivergenceProbe:
 
         assert "first divergence at token 1" in caplog.text
         assert "<decode failed>" in caplog.text
+
+
+class TestJunctionEnd:
+    """A prompt that leaves a recent sequence off the grid plans a shared tail there."""
+
+    @staticmethod
+    def _plan(stored, prompt, cached, *, gen_start=0, stateful=True):
+        sched = _make_scheduler()
+        sched._boundary_snapshot_required = stateful
+        if stored is not None:
+            sched._cache_probe_seqs.append(("req-old", stored))
+        request = _request(prompt, cached_tokens=cached)
+        request.generation_prompt_start = gen_start
+        sched._log_prefix_divergence(request)
+        sched._resolve_junction_end(request)
+        return getattr(request, "junction_end", 0)
+
+    def test_plans_the_branch_point_the_lookup_could_not_reuse(self):
+        stored = list(range(6000))
+        prompt = list(range(5000)) + [-1] * 200
+        # 5000 shared tokens, 4096 restorable: 904 tokens the tail saves.
+        assert self._plan(stored, prompt, 4096, gen_start=5190) == 5000
+
+    @pytest.mark.parametrize(
+        "name,stored,prompt,cached,gen_start,stateful",
+        [
+            # 392 saved tokens do not pay for a snapshot and its files.
+            (
+                "small gain",
+                list(range(6000)),
+                list(range(5000)) + [-1] * 200,
+                4608,
+                5190,
+                True,
+            ),
+            # The prompt runs into the generation prompt: a tail replay covers it.
+            (
+                "at the marker",
+                list(range(6000)),
+                list(range(5000)) + [-1] * 200,
+                4096,
+                4990,
+                True,
+            ),
+            # Attention-only models resume anywhere a block ends.
+            (
+                "stateless model",
+                list(range(6000)),
+                list(range(5000)) + [-1] * 200,
+                4096,
+                5190,
+                False,
+            ),
+        ],
+    )
+    def test_plans_nothing(self, name, stored, prompt, cached, gen_start, stateful):
+        assert (
+            self._plan(stored, prompt, cached, gen_start=gen_start, stateful=stateful)
+            == 0
+        ), name

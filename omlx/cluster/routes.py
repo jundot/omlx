@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
-import ipaddress
 import json
 import logging
 import re
@@ -16,13 +14,11 @@ import sys
 import threading
 import time
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query, Response
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..exceptions import ModelBusyError, ModelNotFoundError
@@ -39,45 +35,28 @@ from .autoconfigure import (
     tp_groups_spanning_slow_links,
 )
 from .backends import (
-    MemberFabric,
     members_from_host_records,
     select_cluster_backend,
 )
 from .catalogue import ModelFit, assess_model, catalogue_for_cluster
-from .collective import (
-    CollectiveSmokeError,
-    run_local_collective_smoke,
-    run_local_pipeline_smoke,
-)
 from .deployment import (
     ClusterDeployment,
     ClusterHost,
     validate_model_path_map,
     validate_ssh_target,
 )
-from .discovery import (
-    discover_all_peers,
-    record_peer_transports,
-    verify_pairing_token,
-)
-from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
-from .guidance import explain
-from .incidents import Severity, get_cluster_incidents
 from .launch import (
-    CudaFabricProbeHost,
     DistributedLaunchError,
     DistributedTeardownError,
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
     probe_remote_host,
     run_cluster_performance_probe,
-    run_cuda_fabric_probe,
     stop_deployment_processes,
 )
 from .liveness import (
     PeerLostError,
     check_peers,
-    describe_failure,
     raise_if_peer_lost,
 )
 from .model_inventory import (
@@ -102,10 +81,10 @@ from .planner import (
     plan_unequal_pipeline,
     remote_model_layout,
     synthetic_model_layout,
+    tensor_split_from_dict,
+    tensor_split_to_dict,
     with_mtp_head,
 )
-from .probe import collect_cluster_status
-from .rdma.link_routes import cluster_rdma_link_verify, cluster_rdma_links
 from .registry import get_cluster_registry, get_device_registry
 from .identity import get_node_identity
 from .replan import (
@@ -130,144 +109,20 @@ from .staging import (
     stage_manifest,
 )
 from .strategy_benchmarks import get_strategy_benchmark_store
-from .supervisor import run_worker_smoke
 from .transport import (
-    LinkAuthorizationCancelledError,
-    LinkSetupError,
-    assess_link,
-    configure_link,
     detect_cluster_transports,
     link_warnings,
     probe_host_interfaces,
     resolve_link_addresses,
     verify_link_reachability,
 )
-from .worker_bundle import (
-    build_cuda_join_command,
-    cuda_bootstrap_program,
-    worker_source_bundle,
-    worker_source_digest,
-)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
-join_router = APIRouter(prefix="/cluster/join", tags=["cluster-enrollment"])
 
 _get_engine_pool: Any | None = None
 _get_settings_manager: Any | None = None
-
-
-class ClusterPairingTokenRequest(BaseModel):
-    shared_secret: str = Field(min_length=16, max_length=256)
-
-
-class ClusterPairingTokenVerificationRequest(ClusterPairingTokenRequest):
-    token: str = Field(min_length=1, max_length=16 * 1024)
-
-
-class ClusterKeyExchangeTokenRequest(ClusterPairingTokenRequest):
-    node_id: str = Field(min_length=1, max_length=255)
-
-
-class ClusterKeyExchangeRequest(ClusterPairingTokenRequest):
-    exchange_token: str = Field(min_length=1, max_length=64 * 1024)
-
-
-class ClusterJoinKeyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    controller_ip: str = Field(min_length=2, max_length=64)
-    controller_port: int = Field(ge=1, le=65535)
-    scheme: Literal["http", "https"] = "http"
-    ttl_seconds: int = Field(default=1800, ge=30, le=1800)
-
-
-class ClusterWorkerClaimRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    node_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,255}$")
-    hostname: str = Field(pattern=r"^[A-Za-z0-9._-]{1,255}$")
-    ssh_user: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
-    ssh_port: int = Field(default=22, ge=1, le=65535)
-    addresses: list[str] = Field(min_length=1, max_length=8)
-    accelerator: Literal["cuda"]
-    platform: str = Field(min_length=1, max_length=255)
-
-
-class ClusterWorkerCompleteRequest(ClusterWorkerClaimRequest):
-    python_executable: str = Field(
-        pattern=r"^/[A-Za-z0-9._/+:-]{1,1023}$",
-    )
-    source_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
-    ssh_host_public_key: str = Field(min_length=32, max_length=8192)
-    ssh_host_fingerprint: str = Field(
-        pattern=r"^SHA256:[A-Za-z0-9+/]{40,64}$"
-    )
-    runtime: dict[str, str] = Field(default_factory=dict, max_length=16)
-
-
-def _join_bearer(authorization: str | None) -> str:
-    prefix = "Bearer "
-    if (
-        not isinstance(authorization, str)
-        or not authorization.startswith(prefix)
-        or not 32 <= len(authorization.removeprefix(prefix)) <= 512
-    ):
-        raise HTTPException(status_code=401, detail="invalid enrollment credential")
-    token = authorization.removeprefix(prefix)
-    if token != token.strip() or any(char.isspace() for char in token):
-        raise HTTPException(status_code=401, detail="invalid enrollment credential")
-    return token
-
-
-def _join_addresses(values: list[str]) -> tuple[str, ...]:
-    addresses: list[str] = []
-    for value in values:
-        try:
-            address = ipaddress.ip_address(value)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="invalid worker IP address") from exc
-        if address.is_unspecified or address.is_multicast or address.is_loopback:
-            raise HTTPException(status_code=400, detail="worker IP must be LAN-reachable")
-        if address.version != 4 or not (address.is_private or address.is_link_local):
-            raise HTTPException(
-                status_code=400,
-                detail="worker must use a private or link-local IPv4 address",
-            )
-        normalized = str(address)
-        if normalized not in addresses:
-            addresses.append(normalized)
-    return tuple(addresses)
-
-
-def _controller_url(request: ClusterJoinKeyRequest) -> str:
-    try:
-        address = ipaddress.ip_address(request.controller_ip)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="controller must be a literal IP") from exc
-    if (
-        address.version != 4
-        or address.is_unspecified
-        or address.is_multicast
-        or address.is_loopback
-        or not (address.is_private or address.is_link_local)
-    ):
-        raise HTTPException(status_code=400, detail="controller must use a local IP")
-    return f"{request.scheme}://{address}:{request.controller_port}"
-
-
-def _validated_ssh_targets(hosts: str) -> list[str]:
-    """Parse and validate comma-separated SSH destinations from a query."""
-
-    try:
-        return [
-            validate_ssh_target(item.strip())
-            for item in hosts.split(",")
-            if item.strip()
-        ]
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def inspect_safetensors_layout(model_path: str | Path):
@@ -417,42 +272,6 @@ def _redact_diagnostic(value: Any, *, field: str = "", depth: int = 0) -> Any:
     return str(value)[:4096]
 
 
-def _record_cluster_incident(
-    severity: Severity,
-    state_code: str,
-    message: str,
-    *,
-    source: str = "coordinator",
-    job_id: str | None = None,
-    deployment_id: str | None = None,
-) -> None:
-    """Best-effort incident funnel for the routes layer.
-
-    Failure paths call this immediately before re-raising, so nothing here may
-    mask the original error: an unconfigured store (worker-only installs,
-    bare test apps) or a failed save is swallowed. The message is redacted at
-    record time so the stored copy is already safe to serve.
-    """
-
-    try:
-        store = get_cluster_incidents()
-    except RuntimeError:
-        return
-    redacted = str(_redact_diagnostic(str(message)))
-    try:
-        store.record(
-            severity,
-            source,
-            state_code,
-            redacted,
-            guidance_code=explain(redacted).code,
-            job_id=job_id,
-            deployment_id=deployment_id,
-        )
-    except Exception:  # noqa: BLE001 - logging must never outrank the failure
-        return
-
-
 class ClusterPlanNodeRequest(BaseModel):
     """One rank-ordered memory budget supplied by the admin UI."""
 
@@ -472,19 +291,8 @@ class ClusterPlanNodeRequest(BaseModel):
     # "headless" or "workstation" — decides how much is held back for the
     # person using this Mac. See omlx/cluster/node_role.py.
     role: str = Field(default="headless", max_length=32)
-    memory_guard_tier: Literal["safe", "balanced", "aggressive", "custom"] = (
-        "balanced"
-    )
+    memory_guard_tier: Literal["safe", "balanced", "aggressive", "custom"] = "balanced"
     performance: dict[str, Any] | None = None
-    accelerator: Literal["metal", "cuda", "cpu"] | None = None
-    fabric_kind: str | None = Field(default=None, max_length=64)
-    fabric_group_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=64,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
-    )
-    fabric_verified: bool = False
 
 
 class ClusterPlanRequest(BaseModel):
@@ -494,8 +302,8 @@ class ClusterPlanRequest(BaseModel):
     # SSH target of the Mac that owns the complete model. Empty/local keeps
     # planning on the coordinator; a peer source is measured on that peer.
     model_source: str | None = Field(default=None, max_length=255)
-    # Interpreter reported by the source node's live probe. macOS and Linux
-    # installations do not share a filesystem layout, so the coordinator's
+    # Interpreter reported by the source node's live probe. App and source
+    # installs do not share a filesystem layout, so the coordinator's
     # executable must never be assumed to exist on a remote model owner.
     model_source_python: str | None = Field(default=None, max_length=4096)
     model_size_bytes: int | None = Field(default=None, gt=0)
@@ -508,11 +316,14 @@ class ClusterPlanRequest(BaseModel):
     pipeline_microbatch_size: int | None = Field(default=None, gt=0, le=256)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
-    # Cluster v2: optional node_id → absolute model path on that node. Empty
+    # Optional node_id → absolute model path on that node. Empty
     # keeps the legacy same-absolute-path-on-every-node behavior.
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
     # Lightning MTP: reserve the draft head on rank zero.
     mtp: bool = False
+    # DeepSeek V4.1 shares per rank, {"attention": [...], "experts": [...]}.
+    # None splits evenly when that fits, otherwise by each node's memory.
+    tensor_split: dict[str, list[int]] | None = Field(default=None, max_length=2)
 
 
 class ClusterHostRequest(BaseModel):
@@ -563,6 +374,9 @@ class ClusterDeploymentRequest(BaseModel):
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
+    # DeepSeek V4.1 shares per rank, {"attention": [...], "experts": [...]}.
+    # None splits evenly when that fits, otherwise by each node's memory.
+    tensor_split: dict[str, list[int]] | None = Field(default=None, max_length=2)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
@@ -571,8 +385,8 @@ class ClusterDeploymentRequest(BaseModel):
     # one dropped the role and the split cap without saying so. Activation is a
     # GUI workflow: callers must preview and name the placement they approve.
     approved_placement: str = Field(min_length=16, max_length=64)
-    # Cluster v2: node_id → absolute model path on that node. Nodes not listed
-    # load ``model_path`` — the pre-v2 shared-path behavior.
+    # node_id → absolute model path on that node. Nodes not listed load
+    # ``model_path``, the shared path.
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
     mtp: bool = False
 
@@ -582,31 +396,6 @@ class ClusterPeerProbeRequest(BaseModel):
 
     ssh: str = Field(min_length=1, max_length=255)
     route_to: str | None = Field(default=None, max_length=64)
-
-
-class ClusterCudaFabricMemberRequest(BaseModel):
-    """One dashboard-selected CUDA worker in a proposed direct-link pair."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    node_id: str = Field(min_length=1, max_length=128)
-    ssh: str = Field(min_length=1, max_length=255)
-
-
-class ClusterCudaFabricVerifyRequest(BaseModel):
-    """A bounded two-worker NCCL verification started from the dashboard."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    hosts: list[ClusterCudaFabricMemberRequest] = Field(min_length=2, max_length=2)
-
-
-class ClusterLinkSetupRequest(BaseModel):
-    """One pair in the detected fabric; no command text crosses the API."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    hosts: list[str] = Field(min_length=2, max_length=2)
 
 
 def _reserve_bytes_for(node: ClusterPlanNodeRequest) -> int:
@@ -683,47 +472,6 @@ def _node_budgets(
     return budgets
 
 
-def _coalesce_verified_cuda_groups(
-    host_order: list[str],
-    hosts: list[ClusterHostRequest],
-    nodes: list[ClusterPlanNodeRequest],
-) -> list[str]:
-    """Keep a verified two-worker CUDA fabric adjacent in the outer Ring."""
-
-    node_by_id = {node.node_id.strip(): node for node in nodes}
-    group_by_ssh: dict[str, str] = {}
-    members_by_group: dict[str, list[str]] = {}
-    for host in hosts:
-        node = node_by_id.get(host.node_id.strip())
-        if (
-            node is None
-            or node.accelerator != "cuda"
-            or not node.fabric_verified
-            or not node.fabric_group_id
-        ):
-            continue
-        group = node.fabric_group_id
-        group_by_ssh[host.ssh] = group
-        members_by_group.setdefault(group, []).append(host.ssh)
-    eligible = {
-        group: set(members)
-        for group, members in members_by_group.items()
-        if len(set(members)) == 2
-    }
-    ordered: list[str] = []
-    emitted: set[str] = set()
-    for ssh in host_order:
-        group = group_by_ssh.get(ssh)
-        if group not in eligible:
-            ordered.append(ssh)
-            continue
-        if group in emitted:
-            continue
-        ordered.extend(item for item in host_order if item in eligible[group])
-        emitted.add(group)
-    return ordered
-
-
 def _model_and_nodes(request: ClusterPlanRequest):
     """Resolve the request's model layout and rank-ordered node budgets."""
 
@@ -778,6 +526,7 @@ _PLACEMENT_FIELDS = (
     "memory_guard_tier",
     "tensor_parallel_rank",
     "tensor_parallel_size",
+    "tensor_parallel_split",
 )
 
 
@@ -875,6 +624,18 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
     }
 
 
+def _tensor_split_arg(value: dict[str, list[int]] | None) -> Any:
+    """``plan_hybrid``'s ``tensor_split`` for a request's optional override."""
+
+    if not value:
+        return "auto"
+    try:
+        tensor_split_from_dict(value)
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from exc
+    return value
+
+
 def _create_cluster_plan(request: ClusterPlanRequest):
     if (
         request.tensor_parallel_size > 1
@@ -927,6 +688,7 @@ def _create_cluster_plan(request: ClusterPlanRequest):
             ),
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=head_bytes,
+            tensor_split=_tensor_split_arg(request.tensor_split),
         )
     elif request.allocation == "proportional":
         plan = plan_proportional_pipeline(
@@ -990,6 +752,9 @@ class ClusterAutoconfigureRequest(BaseModel):
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     # None follows the checkpoint and the model's saved Lightning MTP setting.
     mtp: bool | None = None
+    # DeepSeek V4.1 shares per rank, {"attention": [...], "experts": [...]}.
+    # None splits evenly when that fits, otherwise by each node's memory.
+    tensor_split: dict[str, list[int]] | None = Field(default=None, max_length=2)
 
 
 def _measured_link_profiles(
@@ -1178,29 +943,6 @@ def _resolve_fabric(
     }
 
 
-@router.get("/fabric")
-async def cluster_fabric(hosts: str = Query(...)):
-    """The addresses these Macs answer on, and the backend they allow.
-
-    Both are read rather than asked for. The address fields were the ones that
-    broke a launch, and a backend is a consequence of the cable rather than a
-    preference — so neither is a control the user has to get right.
-    """
-
-    host_list = _validated_ssh_targets(hosts)
-    if len(host_list) < 2:
-        raise HTTPException(
-            status_code=400, detail="a distributed cluster needs at least two hosts"
-        )
-    # A probe failure here is an unpaired or unreachable Mac, not a server
-    # fault. An unhandled raise became a scrubbed 500 that swallowed the SSH
-    # stderr the dashboard needs to explain pairing.
-    try:
-        return await asyncio.to_thread(_resolve_fabric, host_list)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
 @router.post("/autoconfigure")
 async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     """Build a complete cluster configuration from peers and a model.
@@ -1248,7 +990,6 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 detect_cluster_transports, requested_host_order
             )
             transports = tuple(matrix.transports)
-            record_peer_transports(transports)
         except (RuntimeError, OSError) as exc:
             # A fabric we cannot probe is not a reason to refuse to configure —
             # it only means the choice is made without link information, which
@@ -1303,6 +1044,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
             engram_ssd_offload=engram_ssd_offload,
+            tensor_split=_tensor_split_arg(request.tensor_split),
         )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1370,20 +1112,11 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     )
     warnings.extend(placement.warnings)
     placed_host_order = list(placement.hosts or requested_host_order)
-    grouped_host_order = _coalesce_verified_cuda_groups(
-        placed_host_order,
-        list(request.hosts),
-        list(request.nodes),
-    )
-    if grouped_host_order != placed_host_order:
-        warnings.append(
-            "Verified ConnectX CUDA workers were kept adjacent in the outer Ring."
-        )
     ordered_hosts = list(request.hosts)
     ordered_request_nodes = list(request.nodes)
-    if grouped_host_order:
+    if placed_host_order:
         by_ssh = {host.ssh: host for host in request.hosts}
-        ordered_hosts = [by_ssh[ssh] for ssh in grouped_host_order if ssh in by_ssh]
+        ordered_hosts = [by_ssh[ssh] for ssh in placed_host_order if ssh in by_ssh]
         request_node_by_id = {node.node_id: node for node in request.nodes}
         budget_by_id = {node.node_id: node for node in nodes}
         ordered_request_nodes = [
@@ -1412,6 +1145,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
             engram_ssd_offload=engram_ssd_offload,
+            tensor_split=_tensor_split_arg(request.tensor_split),
         )
         choice = replace(choice, plan=ordered_plan)
     for group in tp_groups_spanning_slow_links(
@@ -1652,30 +1386,13 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             ),
             "mtp": mtp,
             "tensor_parallel_size": choice.tensor_parallel_size,
+            "tensor_split": request.tensor_split,
             "nodes": [node.model_dump() for node in profiled_request_nodes],
             "hosts": activation_hosts,
             "preflight": True,
             "approved_placement": plan_payload["placement_signature"],
         },
     }
-
-
-class ClusterGuidanceRequest(BaseModel):
-    """A failure message the dashboard wants turned into next steps."""
-
-    message: str = Field(default="", max_length=4096)
-
-
-@router.post("/guidance")
-async def cluster_guidance(request: ClusterGuidanceRequest):
-    """Explain a cluster failure in terms a user can act on.
-
-    Kept as its own endpoint rather than folded into every error body: the
-    existing handlers return a plain string ``detail`` that callers and tests
-    already depend on, and an explanation is only ever needed after a failure.
-    """
-
-    return explain(request.message).to_dict()
 
 
 class ClusterStageRequest(BaseModel):
@@ -1688,13 +1405,6 @@ class ClusterStageRequest(BaseModel):
 _STAGING_JOBS: dict[str, dict[str, Any]] = {}
 _STAGING_JOBS_LOCK = threading.Lock()
 _MAX_STAGING_JOBS = 32
-
-# The coordinator narrates deaths: the first health poll that sees a
-# previously-healthy deployment report unhealthy records the incident, once
-# per transition rather than once per poll. In-memory is enough — after a
-# server restart the next healthy poll re-arms the transition.
-_PEER_HEALTH_LAST_HEALTHY: dict[str, bool] = {}
-_PEER_HEALTH_LOCK = threading.Lock()
 
 
 def _staging_job_snapshot(job_id: str) -> dict[str, Any] | None:
@@ -1770,7 +1480,7 @@ def _run_staging_job(
         )
         failed_nodes: list[str] = []
         for host, assignment in zip(deployment.hosts, assignments):
-            # Cluster v2: files land at the node's path_map entry when one
+            # Files land at the node's path_map entry when one
             # exists. Otherwise preserve the cross-account behavior by
             # resolving the portable model path in the remote Mac's home.
             explicit_destination = deployment.path_map.get(host.node_id)
@@ -1904,14 +1614,6 @@ def _run_staging_job(
                 job["error"] = "Model staging failed on " + ", ".join(failed_nodes)
 
         _update_staging_job(job_id, complete)
-        if failed_nodes:
-            _record_cluster_incident(
-                Severity.ERROR,
-                "staging_failed",
-                "Model staging failed on " + ", ".join(failed_nodes),
-                job_id=job_id,
-                deployment_id=deployment.deployment_id,
-            )
     except Exception as exc:  # noqa: BLE001 - background job reports the failure
         def fail(job: dict[str, Any], *, error=str(exc)) -> None:
             job["status"] = "failed"
@@ -1919,14 +1621,6 @@ def _run_staging_job(
             job["error"] = error
 
         _update_staging_job(job_id, fail)
-        # Already on the staging worker thread: a blocking record is fine.
-        _record_cluster_incident(
-            Severity.ERROR,
-            "staging_failed",
-            str(exc),
-            job_id=job_id,
-            deployment_id=deployment.deployment_id,
-        )
 
 
 @router.post("/stage")
@@ -2005,20 +1699,6 @@ async def cluster_stage_status(job_id: str):
     return snapshot
 
 
-@router.get("/status")
-async def cluster_status(route_to: str | None = None):
-    """Return this node's read-only distributed capability snapshot."""
-
-    try:
-        status = await asyncio.to_thread(
-            collect_cluster_status,
-            route_to=route_to,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return status.to_dict() | {"runtime_jobs": read_runtime_markers()}
-
-
 def _reconcile_runtime_ownership(payload: dict[str, Any], pool: Any) -> None:
     """Retained marker files do not establish engine ownership."""
     loaded: set[str] = set()
@@ -2086,581 +1766,6 @@ async def cluster_runtime():
     return payload
 
 
-@router.get("/diagnostics")
-async def cluster_diagnostics():
-    """Downloadable, bounded evidence for one cluster support report.
-
-    The bundle is deliberately read-only. It captures the same local status,
-    runtime markers, launcher tails, approved plans, and staging progress that
-    are otherwise spread across several panels, while removing credentials and
-    shortening unbounded worker output before the browser downloads it.
-    """
-
-    errors: list[str] = []
-    try:
-        status = await asyncio.to_thread(collect_cluster_status)
-        status_payload: dict[str, Any] | None = status.to_dict()
-    except (OSError, RuntimeError, ValueError) as exc:
-        status_payload = None
-        errors.append(f"local status: {type(exc).__name__}: {exc}")
-
-    try:
-        runtime_payload = await cluster_runtime()
-    except (OSError, RuntimeError, ValueError) as exc:
-        runtime_payload = {"jobs": [], "launchers": []}
-        errors.append(f"runtime: {type(exc).__name__}: {exc}")
-
-    deployments: list[ClusterDeployment] = []
-    registry_payload: dict[str, Any]
-    try:
-        registry = get_cluster_registry()
-        deployments = list(registry.list())[:16]
-        registry_payload = registry.to_dict()
-    except RuntimeError as exc:
-        registry_payload = {"schema_version": 1, "deployments": []}
-        errors.append(f"registry: {type(exc).__name__}: {exc}")
-
-    peer_health: list[dict[str, Any]] = []
-    for deployment in deployments:
-        try:
-            health = await asyncio.to_thread(
-                check_peers,
-                {
-                    rank: (host.node_id, host.ssh)
-                    for rank, host in enumerate(deployment.hosts)
-                },
-                deployment_id=deployment.deployment_id,
-                require_heartbeat=True,
-            )
-            peer_health.append(
-                {
-                    "deployment_id": deployment.deployment_id,
-                    "healthy": all(item.healthy for item in health),
-                    "summary": describe_failure(health),
-                    "peers": [item.to_dict() for item in health],
-                }
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            errors.append(
-                f"peer health for {deployment.deployment_id}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-    with _STAGING_JOBS_LOCK:
-        staging_jobs = json.loads(
-            json.dumps(list(_STAGING_JOBS.values())[-_MAX_STAGING_JOBS:])
-        )
-    incidents: list[dict[str, Any]] = []
-    try:
-        incidents = [
-            incident.to_dict() for incident in get_cluster_incidents().list()
-        ]
-    except RuntimeError as exc:
-        errors.append(f"incidents: {type(exc).__name__}: {exc}")
-    payload = {
-        "schema_version": 1,
-        "generated_at": datetime.now(UTC).isoformat(),
-        "scope": "local-only cluster support bundle",
-        "status": status_payload,
-        "runtime": runtime_payload,
-        "registry": registry_payload,
-        "peer_health": peer_health,
-        "staging_jobs": staging_jobs,
-        "incidents": incidents,
-        "errors": errors,
-    }
-    return _redact_diagnostic(payload)
-
-
-@router.get("/incidents")
-async def cluster_incidents(since: int = Query(default=0, ge=0)):
-    """Return incidents after the caller's cursor, plus the new cursor.
-
-    The ``since`` cursor makes monotonic merge a server-enforced property: a
-    poll can only ever add records the browser has not seen, so no refresh can
-    wipe error state. Dismissal (below) is the only removal path.
-    """
-
-    try:
-        store = get_cluster_incidents()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    incidents = [incident.to_dict() for incident in store.list(since_seq=since)]
-    for item in incidents:
-        item["message"] = _redact_diagnostic(item["message"])
-    return {
-        "incidents": incidents,
-        "latest_seq": store.latest_seq(),
-        # Identity of the seq numbering. A corrupt-log reset restarts seq at
-        # 1 under a new epoch; a client holding an old cursor must detect the
-        # change and restart from 0 instead of going silent forever.
-        "epoch": store.epoch,
-    }
-
-
-@router.post("/incidents/{incident_id}/dismiss")
-async def dismiss_cluster_incident(incident_id: str):
-    """Mark one incident dismissed — server-owned, so it survives reloads."""
-
-    try:
-        store = get_cluster_incidents()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    if not store.dismiss(incident_id):
-        raise HTTPException(status_code=404, detail="Unknown incident.")
-    return {"ok": True}
-
-
-@router.get("/discover")
-async def cluster_discover():
-    """Return untrusted Bonjour peer suggestions without enrolling them."""
-
-    return await asyncio.to_thread(discover_all_peers)
-
-
-@router.post("/pairing-token")
-async def cluster_pairing_token(request: ClusterPairingTokenRequest):
-    """Generate a pairing token for QR code exchange.
-
-    Advanced (legacy): step 1 of the 3-step copy-paste relay. The cluster v2
-    wizard uses POST /api/cluster/pair/request + /pair/approve instead; this
-    endpoint is kept working unchanged for the legacy flow.
-    """
-
-    from .discovery import generate_pairing_token
-
-    try:
-        token = generate_pairing_token(shared_secret=request.shared_secret)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"pairing_token": token}
-
-
-@router.post("/verify-pairing-token")
-async def cluster_verify_pairing_token(
-    request: ClusterPairingTokenVerificationRequest,
-):
-    """Verify a pairing token received via QR code scan.
-
-    Advanced (legacy): part of the 3-step copy-paste relay; superseded by the
-    cluster v2 code-based pairing flow but kept working unchanged.
-    """
-
-    return {
-        "valid": verify_pairing_token(
-            request.token,
-            shared_secret=request.shared_secret,
-        )
-    }
-
-
-@router.post("/join-keys")
-async def cluster_create_join_key(
-    request: ClusterJoinKeyRequest,
-    response: Response,
-):
-    """Create one expiring, single-use CUDA worker join command."""
-
-    from .ssh_keys import get_or_create_ssh_key
-
-    controller_url = _controller_url(request)
-    try:
-        source_digest = await asyncio.to_thread(worker_source_digest)
-        key_pair = await asyncio.to_thread(get_or_create_ssh_key)
-        join_key, record = get_cluster_enrollment().issue_join_key(
-            controller_url=controller_url,
-            source_digest=source_digest,
-            ttl=request.ttl_seconds,
-        )
-    except (EnrollmentError, OSError, RuntimeError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    command = build_cuda_join_command(
-        controller_url=controller_url,
-        join_key=join_key,
-        controller_key_fingerprint=key_pair.fingerprint,
-        source_digest=source_digest,
-    )
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Pragma"] = "no-cache"
-    return record | {
-        "command": command,
-        "controller_key_fingerprint": key_pair.fingerprint,
-        "single_use": True,
-    }
-
-
-@router.get("/join-status")
-async def cluster_join_status():
-    """List pending commands and credential-free enrolled CUDA nodes."""
-
-    try:
-        return get_cluster_enrollment().to_dict()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-@router.delete("/join-keys/{join_id}")
-async def cluster_revoke_join_key(join_id: str):
-    if not re.fullmatch(r"[a-f0-9]{16}", join_id):
-        raise HTTPException(status_code=400, detail="invalid join-key ID")
-    if not get_cluster_enrollment().revoke_join_key(join_id):
-        raise HTTPException(status_code=404, detail="join key not found")
-    return {"ok": True, "join_id": join_id}
-
-
-@join_router.get("/bootstrap.py")
-async def cluster_cuda_bootstrap_program():
-    """Serve the bootstrap whose SHA-256 is pinned in the admin command."""
-
-    return PlainTextResponse(
-        cuda_bootstrap_program(),
-        media_type="text/x-python; charset=utf-8",
-        headers={
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
-
-
-@join_router.post("/claim")
-async def cluster_claim_join_key(
-    request: ClusterWorkerClaimRequest,
-    response: Response,
-    authorization: str | None = Header(default=None),
-):
-    """Consume a join key and return a short-lived source-download session."""
-
-    from .ssh_keys import get_or_create_ssh_key
-
-    raw_key = _join_bearer(authorization)
-    addresses = _join_addresses(request.addresses)
-    try:
-        session_token, session = get_cluster_enrollment().claim(
-            raw_key,
-            node_id=request.node_id,
-            hostname=request.hostname,
-            ssh_user=request.ssh_user,
-            ssh_port=request.ssh_port,
-            addresses=addresses,
-        )
-        key_pair = await asyncio.to_thread(get_or_create_ssh_key)
-    except (EnrollmentError, RuntimeError):
-        # Bearer failures intentionally have one response so callers cannot
-        # distinguish expired, revoked, and already-used credentials.
-        raise HTTPException(
-            status_code=401, detail="invalid enrollment credential"
-        ) from None
-    response.headers["Cache-Control"] = "no-store"
-    return {
-        "session_token": session_token,
-        "session_expires_at": session.expires_at,
-        "source_digest": session.source_digest,
-        "controller_public_key": key_pair.public_key,
-        "controller_key_fingerprint": key_pair.fingerprint,
-    }
-
-
-@join_router.get("/source")
-async def cluster_cuda_worker_source(
-    authorization: str | None = Header(default=None),
-):
-    """Download the exact controller source snapshot under a join session."""
-
-    raw_session = _join_bearer(authorization)
-    try:
-        get_cluster_enrollment().authorize_session(raw_session)
-    except (EnrollmentError, RuntimeError):
-        raise HTTPException(
-            status_code=401, detail="invalid enrollment credential"
-        ) from None
-    bundle = await asyncio.to_thread(worker_source_bundle)
-    return Response(
-        content=bundle,
-        media_type="application/gzip",
-        headers={
-            "Cache-Control": "no-store",
-            "Content-Disposition": 'attachment; filename="omlx-cluster-worker.tar.gz"',
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
-
-
-@join_router.post("/complete")
-async def cluster_complete_worker_join(
-    request: ClusterWorkerCompleteRequest,
-    authorization: str | None = Header(default=None),
-):
-    """Pin the worker's SSH identity and persist it without join secrets."""
-
-    from .ssh_keys import pin_enrolled_host_key, ssh_public_key_fingerprint
-
-    raw_session = _join_bearer(authorization)
-    addresses = _join_addresses(request.addresses)
-    try:
-        session = get_cluster_enrollment().authorize_session(raw_session)
-    except (EnrollmentError, RuntimeError):
-        raise HTTPException(
-            status_code=401, detail="invalid enrollment credential"
-        ) from None
-    try:
-        observed_fingerprint = ssh_public_key_fingerprint(
-            request.ssh_host_public_key
-        )
-    except (ValueError, TypeError) as exc:
-        raise HTTPException(status_code=400, detail="invalid worker SSH host key") from exc
-    if not hmac.compare_digest(observed_fingerprint, request.ssh_host_fingerprint):
-        raise HTTPException(status_code=400, detail="worker SSH fingerprint mismatch")
-    if request.source_digest != session.source_digest:
-        raise HTTPException(status_code=400, detail="worker source digest mismatch")
-    if (
-        request.node_id != session.node_id
-        or request.hostname != session.hostname
-        or request.ssh_user != session.ssh_user
-        or request.ssh_port != session.ssh_port
-        or addresses != session.addresses
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="worker identity changed after claiming the join key",
-        )
-
-    primary_address = addresses[0]
-    ssh_target = f"{request.ssh_user}@{primary_address}"
-    now = time.time()
-    node = EnrolledNode(
-        node_id=request.node_id,
-        hostname=request.hostname,
-        ssh=ssh_target,
-        ssh_user=request.ssh_user,
-        ssh_port=request.ssh_port,
-        addresses=addresses,
-        accelerator=request.accelerator,
-        platform=request.platform,
-        python_executable=request.python_executable,
-        source_digest=request.source_digest,
-        ssh_host_fingerprint=request.ssh_host_fingerprint,
-        joined_at=now,
-        last_seen_at=now,
-    )
-    try:
-        # Pin first: complete() persists the node and consumes the session,
-        # so a later pin failure would leave an enrolled node with no retry.
-        await asyncio.to_thread(
-            pin_enrolled_host_key,
-            hostname=primary_address,
-            public_key=request.ssh_host_public_key,
-        )
-        enrolled = get_cluster_enrollment().complete(raw_session, node)
-    except (EnrollmentError, OSError, RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return enrolled.to_dict()
-
-
-@router.get("/ssh-key")
-async def cluster_ssh_key():
-    """Get the current SSH key pair information."""
-
-    from .ssh_keys import get_ssh_key_info
-
-    return await asyncio.to_thread(get_ssh_key_info)
-
-
-@router.post("/ssh-key/generate")
-async def cluster_generate_ssh_key(
-    overwrite: bool = Query(default=False),
-):
-    """Create the managed SSH key, rotating it only when explicitly requested."""
-
-    from .ssh_keys import generate_ssh_key_pair
-
-    try:
-        key_pair = await asyncio.to_thread(
-            generate_ssh_key_pair,
-            overwrite=overwrite,
-        )
-        return {
-            "success": True,
-            "available": True,
-            "key_type": key_pair.key_type,
-            "fingerprint": key_pair.fingerprint,
-            "public_key": key_pair.public_key,
-            "private_key_path": str(key_pair.private_key_path),
-            "public_key_path": str(key_pair.public_key_path),
-            "created_at": key_pair.created_at,
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@router.post("/ssh-key/exchange-token")
-async def cluster_generate_key_exchange_token(
-    request: ClusterKeyExchangeTokenRequest,
-):
-    """Generate a key exchange token for pairing with a peer.
-
-    Advanced (legacy): step 3 of the copy-paste relay. Cluster v2 pairing
-    (POST /api/cluster/pair/approve) drives the same SSH TOFU primitives
-    programmatically; this endpoint remains for the manual flow.
-    """
-
-    from .ssh_keys import generate_key_exchange_for_peer
-
-    try:
-        node_id = validate_ssh_target(request.node_id)
-        token = await asyncio.to_thread(
-            generate_key_exchange_for_peer,
-            node_id=node_id,
-            shared_secret=request.shared_secret,
-        )
-        return {"exchange_token": token}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@router.post("/ssh-key/exchange")
-async def cluster_exchange_keys(request: ClusterKeyExchangeRequest):
-    """Exchange SSH keys with a peer using their exchange token.
-
-    Advanced (legacy): step 3 of the copy-paste relay; kept working unchanged
-    alongside the cluster v2 code-based pairing flow.
-    """
-
-    from .ssh_keys import exchange_keys_with_peer
-
-    result = await asyncio.to_thread(
-        exchange_keys_with_peer,
-        peer_token=request.exchange_token,
-        shared_secret=request.shared_secret,
-    )
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["error"])
-    return result
-
-
-@router.post("/ssh-key/store-keychain")
-async def cluster_store_key_in_keychain():
-    """Store the SSH key fingerprint in macOS Keychain."""
-
-    from .ssh_keys import store_key_in_keychain
-
-    success = await asyncio.to_thread(store_key_in_keychain)
-    return {"stored": success}
-
-
-@router.get("/transports")
-async def cluster_transports(hosts: str = Query(...)):
-    """Detect available transports for the given cluster hosts.
-
-    Returns transport info (TB4, TB5, Ethernet, RDMA) and the recommended backend.
-    """
-
-    host_list = _validated_ssh_targets(hosts)
-    if not host_list:
-        raise HTTPException(status_code=400, detail="at least one host is required")
-    try:
-        matrix = await asyncio.to_thread(detect_cluster_transports, host_list)
-        # Cache the result so /discover can report transports without paying
-        # for an SSH round trip on its own request path.
-        record_peer_transports(matrix.transports)
-        return {
-            "transports": [t.__dict__ for t in matrix.transports],
-            "backend": matrix.backend,
-        }
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@router.get("/peer-health")
-async def cluster_peer_health(hosts: str = Query(...), deployment_id: str = ""):
-    """Is every rank still answering?
-
-    A collective cannot proceed without all of them, so a peer that has gone
-    away should be visible as a stated failure rather than a hung request.
-    """
-
-    # Validate the complete optional ``user@host`` item before extracting the
-    # hostname used in the human-readable health result. Passing an unchecked
-    # leading-dash item to OpenSSH would let it be parsed as a client option.
-    entries = _validated_ssh_targets(hosts)
-    hosts_by_rank = {
-        index: (item.split("@")[-1], item) for index, item in enumerate(entries)
-    }
-    health = await asyncio.to_thread(
-        check_peers,
-        hosts_by_rank,
-        deployment_id=deployment_id,
-        require_heartbeat=bool(deployment_id),
-    )
-    healthy = all(item.healthy for item in health)
-    if deployment_id:
-        with _PEER_HEALTH_LOCK:
-            was_healthy = _PEER_HEALTH_LAST_HEALTHY.get(deployment_id)
-            _PEER_HEALTH_LAST_HEALTHY[deployment_id] = healthy
-        if was_healthy and not healthy:
-            lost = next((item for item in health if not item.healthy), None)
-            # to_thread: the store fsyncs while holding its lock, which must
-            # not stall the event loop mid-stream for every other request.
-            await asyncio.to_thread(
-                _record_cluster_incident,
-                Severity.ERROR,
-                "peer_unhealthy",
-                describe_failure(health),
-                source=(
-                    f"peer:{lost.node_id}"
-                    if lost is not None and lost.node_id
-                    else "coordinator"
-                ),
-                deployment_id=deployment_id,
-            )
-    return {
-        "peers": [item.to_dict() for item in health],
-        "healthy": healthy,
-        "summary": describe_failure(health),
-    }
-
-
-@router.get("/link-status")
-async def cluster_link_status(hosts: str = Query(...)):
-    """Report whether the fabric is actually usable, and how to fix it if not.
-
-    Device presence is not readiness: RDMA can be enabled but the port down, or
-    active but unroutable. Each state has a different remedy and one of them
-    needs administrator rights oMLX does not have, so the page has to say so
-    rather than silently falling back to TCP.
-    """
-
-    host_list = _validated_ssh_targets(hosts)
-    status = await asyncio.to_thread(assess_link, host_list)
-    payload = status.to_dict()
-    # The detail string embeds remote SSH stderr; the commands are pasteable
-    # fixes whose user@host must survive, so only detail is redacted.
-    payload["detail"] = _redact_diagnostic(payload["detail"])
-    return payload
-
-
-@router.post("/link-setup")
-async def cluster_link_setup(request: ClusterLinkSetupRequest):
-    """Authorize, configure, and verify the Thunderbolt fast path.
-
-    This is intentionally narrow: the browser cannot supply shell commands or
-    interface names. The server discovers the active RDMA ports and macOS owns
-    the administrator credential prompt.
-    """
-
-    try:
-        hosts = [validate_ssh_target(host) for host in request.hosts]
-        status = await asyncio.to_thread(configure_link, hosts)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except LinkAuthorizationCancelledError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except LinkSetupError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return status.to_dict()
-
-
 @router.post("/peer-probe")
 async def cluster_peer_probe(request: ClusterPeerProbeRequest):
     """Probe a trusted known_hosts peer without changing either Mac."""
@@ -2675,191 +1780,6 @@ async def cluster_peer_probe(request: ClusterPeerProbeRequest):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/cuda-fabric/verify")
-async def cluster_cuda_fabric_verify(request: ClusterCudaFabricVerifyRequest):
-    """Prove a selected CUDA pair with an isolated NCCL direct-link test."""
-
-    try:
-        members = [
-            host.model_copy(update={"ssh": validate_ssh_target(host.ssh.strip())})
-            for host in request.hosts
-        ]
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if len({host.ssh for host in members}) != 2:
-        raise HTTPException(
-            status_code=400,
-            detail="CUDA fabric verification requires two distinct workers",
-        )
-
-    async def capability_for(host: ClusterCudaFabricMemberRequest) -> dict[str, Any]:
-        try:
-            return await asyncio.to_thread(probe_remote_host, host.ssh)
-        except (DistributedLaunchError, OSError, ValueError) as exc:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Could not inspect {host.node_id}: {exc}",
-            ) from exc
-
-    capabilities = await asyncio.gather(
-        *(capability_for(host) for host in members)
-    )
-    probe_hosts: list[CudaFabricProbeHost] = []
-    for host, capability in zip(members, capabilities):
-        status = capability.get("status") or {}
-        node = status.get("node") or {}
-        runtime = status.get("runtime") or {}
-        transport = status.get("transport") or {}
-        rdma = transport.get("rdma") or {}
-        if node.get("accelerator") != "cuda":
-            raise HTTPException(
-                status_code=409,
-                detail=f"{host.node_id} did not report a CUDA accelerator",
-            )
-        if "nccl" not in set(node.get("distributed_backends") or []):
-            raise HTTPException(
-                status_code=409,
-                detail=f"{host.node_id} did not report MLX NCCL support",
-            )
-        if node.get("fabric_kind") != "connectx-7":
-            raise HTTPException(
-                status_code=409,
-                detail=f"{host.node_id} did not report a ConnectX interface",
-            )
-        addresses = rdma.get("addresses") or {}
-        interfaces = rdma.get("network_interfaces") or {}
-        endpoints = [
-            (
-                str(addresses[device]),
-                str(interfaces[device]),
-                str(device),
-            )
-            for device in rdma.get("devices") or []
-            if addresses.get(device) and interfaces.get(device)
-        ]
-        if not endpoints:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"{host.node_id} has ConnectX hardware but no direct-link IP. "
-                    "Assign the ConnectX link in the device network settings, "
-                    "then press Verify again."
-                ),
-            )
-        try:
-            probe_hosts.append(
-                CudaFabricProbeHost(
-                    node_id=host.node_id,
-                    ssh=host.ssh,
-                    ips=tuple(endpoint[0] for endpoint in endpoints),
-                    interfaces=tuple(endpoint[1] for endpoint in endpoints),
-                    rdma_devices=tuple(endpoint[2] for endpoint in endpoints),
-                    python_executable=runtime.get("python_executable") or None,
-                )
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    try:
-        return await asyncio.to_thread(
-            run_cuda_fabric_probe,
-            (probe_hosts[0], probe_hosts[1]),
-        )
-    except DistributedLaunchError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-@router.post("/worker-smoke")
-async def cluster_worker_smoke(
-    timeout: float = Query(default=5.0, gt=0.0, le=30.0),
-):
-    """Exercise the isolated worker lifecycle without initializing MLX/JACCL."""
-
-    try:
-        return await asyncio.to_thread(run_worker_smoke, timeout=timeout)
-    except (OSError, RuntimeError, TimeoutError) as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-@router.post("/collective-smoke")
-async def cluster_collective_smoke(
-    timeout: float = Query(default=20.0, gt=0.0, le=60.0),
-):
-    """Run a two-rank loopback MLX collective without loading a model."""
-
-    try:
-        return await asyncio.to_thread(run_local_collective_smoke, timeout=timeout)
-    except (CollectiveSmokeError, OSError, RuntimeError, TimeoutError) as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-@router.post("/pipeline-smoke")
-async def cluster_pipeline_smoke(
-    timeout: float = Query(default=30.0, gt=0.0, le=90.0),
-):
-    """Run an unequal two-rank Nemotron-H graph without model weights."""
-
-    try:
-        return await asyncio.to_thread(run_local_pipeline_smoke, timeout=timeout)
-    except (CollectiveSmokeError, OSError, RuntimeError, TimeoutError) as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-@router.post("/plan")
-async def cluster_plan(request: ClusterPlanRequest):
-    """Plan explicit contiguous layers across rank-ordered node budgets."""
-
-    try:
-        plan = await asyncio.to_thread(_create_cluster_plan, request)
-    except (OSError, PlanningError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    # The signature travels back with the plan so activation can prove it is
-    # launching the thing that was shown here, and not a re-plan built from a
-    # payload that quietly dropped the reserve, the cap or the role.
-    return _plan_with_signature(plan.to_dict())
-
-
-class ClusterBackendMemberRequest(BaseModel):
-    """One member's observed RDMA capability, from local or peer probes."""
-
-    node_id: str = Field(min_length=1, max_length=128)
-    rdma_ctl_enabled: bool = False
-    rdma_devices: list[str] = Field(default_factory=list, max_length=16)
-
-
-class ClusterBackendSelectionRequest(BaseModel):
-    """Which collective backend should this exact member set use?"""
-
-    members: list[ClusterBackendMemberRequest] = Field(min_length=2, max_length=64)
-
-
-@router.post("/backend-selection")
-async def cluster_backend_selection(
-    request: ClusterBackendSelectionRequest,
-) -> dict[str, Any]:
-    """jaccl when rdma_ctl is enabled on ALL members, else the TCP ring.
-
-    The plan view renders this decision (including which members block JACCL)
-    before anyone approves a placement; the replan endpoint makes the same
-    call when asked for ``backend="auto"``.
-    """
-
-    try:
-        selection = select_cluster_backend(
-            tuple(
-                MemberFabric(
-                    node_id=member.node_id.strip(),
-                    rdma_ctl_enabled=member.rdma_ctl_enabled,
-                    rdma_devices=tuple(member.rdma_devices),
-                )
-                for member in request.members
-            )
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return selection.to_dict()
 
 
 def _deployment_id(model_path: Path, plan_hash: str) -> str:
@@ -2949,6 +1869,7 @@ def _create_deployment(
         target_context_tokens=request.target_context_tokens,
         path_map=request.path_map,
         mtp=request.mtp,
+        tensor_split=request.tensor_split,
     )
     plan = _create_cluster_plan(plan_request)
     execution = _execution_for_request(
@@ -3007,6 +1928,7 @@ def _build_performance_plan(
     context_tokens: int,
     mtp: bool = False,
     engram_ssd_offload: bool = False,
+    tensor_split: Any = "auto",
 ) -> ShardPlan:
     """Build a shard plan using the hybrid planner when tensor parallelism is active."""
 
@@ -3019,6 +1941,7 @@ def _build_performance_plan(
             microbatch_size=microbatch_size,
             context_tokens=context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
+            tensor_split=tensor_split,
         )
     return plan_unequal_pipeline(
         with_mtp_head(model) if mtp else model,
@@ -3061,6 +1984,15 @@ def _performance_optimized_deployment(
     nodes = _node_budgets(request.nodes, profiles=profiles)
     # Keep the approved plan's Engram decision instead of rereading settings.
     engram_ssd_offload = any(item.ssd_weight_bytes for item in deployment.assignments)
+    # And its tensor split, so tuning re-measures the shares the user approved.
+    approved_split = next(
+        (
+            tensor_split_to_dict(item.tensor_parallel_split)
+            for item in deployment.assignments
+            if item.tensor_parallel_split
+        ),
+        "auto",
+    )
     plan = _build_performance_plan(
         model,
         nodes,
@@ -3070,6 +2002,7 @@ def _performance_optimized_deployment(
         context_tokens=request.target_context_tokens,
         mtp=deployment.execution.mtp,
         engram_ssd_offload=engram_ssd_offload,
+        tensor_split=approved_split,
     )
     execution = tune_execution_settings(
         deployment.execution,
@@ -3089,6 +2022,7 @@ def _performance_optimized_deployment(
             context_tokens=request.target_context_tokens,
             mtp=deployment.execution.mtp,
             engram_ssd_offload=engram_ssd_offload,
+            tensor_split=approved_split,
         )
     deployment_id = (
         request.deployment_id.strip()
@@ -3701,23 +2635,8 @@ async def _activate_and_report(
     except PeerLostError as exc:
         # 409: the cluster is not in a state to start. Launching into a peer
         # that is not answering yields a collective that blocks forever.
-        await asyncio.to_thread(
-            _record_cluster_incident,
-            Severity.ERROR,
-            "activation_peer_lost",
-            str(exc),
-            deployment_id=deployment.deployment_id if deployment else None,
-        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ModelBusyError as exc:
-        await asyncio.to_thread(
-            _record_cluster_incident,
-            Severity.ERROR,
-            "activation_model_busy",
-            "This model is serving a request and cannot change cluster "
-            "topology until that request finishes.",
-            deployment_id=deployment.deployment_id if deployment else None,
-        )
         raise HTTPException(
             status_code=409,
             detail=(
@@ -3726,31 +2645,10 @@ async def _activate_and_report(
             ),
         ) from exc
     except DistributedLaunchError as exc:
-        await asyncio.to_thread(
-            _record_cluster_incident,
-            Severity.ERROR,
-            "activation_launch_failed",
-            str(exc),
-            deployment_id=deployment.deployment_id if deployment else None,
-        )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ModelNotFoundError as exc:
-        await asyncio.to_thread(
-            _record_cluster_incident,
-            Severity.ERROR,
-            "activation_model_not_found",
-            str(exc),
-            deployment_id=deployment.deployment_id if deployment else None,
-        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (OSError, PlanningError, ValueError) as exc:
-        await asyncio.to_thread(
-            _record_cluster_incident,
-            Severity.ERROR,
-            "activation_rejected",
-            str(exc),
-            deployment_id=deployment.deployment_id if deployment else None,
-        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "ok": True,
@@ -4214,8 +3112,3 @@ async def load_cluster_deployment(deployment_id: str):
         "canary_completion_tokens": canary.completion_tokens,
         "ranks": status.get("ranks", []),
     }
-
-
-# RDMA links over MCDMA: inventory with live evidence, and on-demand verification.
-router.add_api_route("/rdma-links", cluster_rdma_links, methods=["GET"])
-router.add_api_route("/rdma-links/verify", cluster_rdma_link_verify, methods=["POST"])

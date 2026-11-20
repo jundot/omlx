@@ -8,9 +8,13 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
+from mlx_lm.utils import load_model  # noqa: E402
+
 from omlx.custom_kernels.oqh import fast  # noqa: E402
+from omlx.lora_adapters import LoRALinear, apply_adapter  # noqa: E402
 from omlx.oqh import format as fmt  # noqa: E402
 from omlx.oqh import quantize, targets  # noqa: E402
+from omlx.oqh.loading import install_load_hook  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not fast.has_native(), reason="oQh kernels not built")
 
@@ -500,6 +504,39 @@ def test_load_hook_serves_the_checkpoint_with_fusion(tmp_path, moe, group_size):
     assert _rel(mlp(h), rows) < 0.03
 
 
+def test_lora_adapter_runs_on_fused_oqh_layers(tmp_path):
+    """Wrapped oQh projections leave the fused MLP and match the float twin."""
+    path, ref, _ = _tiny_qwen(tmp_path, False)
+    install_load_hook()
+    model, _ = load_model(path)
+    assert type(model.model.layers[0].mlp).__name__.startswith("Oqh")
+
+    mx.random.seed(5)
+    tensors = {}
+    twin = dict(ref.model.layers[0].named_modules())
+    for name in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"):
+        out_dims, in_dims = twin[name].weight.shape
+        key = f"base_model.model.model.layers.0.{name}"
+        tensors[f"{key}.lora_A.weight"] = mx.random.normal((8, in_dims)) * 0.05
+        tensors[f"{key}.lora_B.weight"] = mx.random.normal((out_dims, 8)) * 0.05
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text(
+        json.dumps({"peft_type": "LORA", "r": 8, "lora_alpha": 32})
+    )
+    mx.save_safetensors(str(adapter / "adapter_model.safetensors"), tensors)
+
+    ids = mx.array([[1, 5, 9, 2, 7, 3, 11, 4]])
+    base = ref(ids).astype(mx.float32)
+    assert apply_adapter(model, adapter) == apply_adapter(ref, adapter) == 3
+    mlp = model.model.layers[0].mlp
+    assert not type(mlp).__name__.startswith("Oqh")
+    assert isinstance(mlp.gate_proj, LoRALinear)
+    want = ref(ids).astype(mx.float32)
+    assert _rel(want, base) > 0.05
+    assert _rel(model(ids).astype(mx.float32), want) < 0.03
+
+
 def _tiny_qwen4_exp(tmp_path, monkeypatch):
     """A tiny Qwen4-Exp source whose experts the oQh kernels can serve."""
     from dataclasses import asdict
@@ -918,6 +955,7 @@ def test_deepseek_v41_oqh_stages_match_one_forward(tmp_path, monkeypatch):
 
 
 def test_deepseek_v41_tensor_split_keeps_oqh_blocks():
+    from omlx.patches.deepseek_v41.config import TensorSplit
     from omlx.patches.deepseek_v41.loading import tensor_slice
 
     up = "language_model.layers.0.ffn.experts.w1"
@@ -930,3 +968,15 @@ def test_deepseek_v41_tensor_split_keeps_oqh_blocks():
     # w2 splits its inputs: whole blocks of signs, every row scale.
     assert tensor_slice(f"{down}.rscale", rscale, 1, 2) is rscale
     assert tensor_slice(f"{down}.oqh_signs", signs, 1, 2).tolist() == signs[4:].tolist()
+    # An uneven split moves whole blocks; one finer than a block is refused.
+    split = TensorSplit((1, 1), (3, 1))
+    assert (
+        tensor_slice(f"{up}.rscale", rscale, 1, 2, split).tolist()
+        == rscale[:, 6:].tolist()
+    )
+    assert (
+        tensor_slice(f"{down}.oqh_signs", signs, 0, 2, split).tolist()
+        == signs[:6].tolist()
+    )
+    with pytest.raises(ValueError):
+        tensor_slice(f"{down}.oqh_signs", signs, 0, 2, TensorSplit((1, 1), (15, 1)))

@@ -31,7 +31,7 @@ def _max_rel(y: mx.array, ref: mx.array) -> float:
     return (mx.abs(y.astype(mx.float32) - ref).max() / mx.abs(ref).max()).item()
 
 
-# N = 384 splits K across 8 simdgroups on every M5 GPU; N = 25600 does not split.
+# N = 384 splits K across 8 simdgroups on every M5 GPU, N = 25600 across 2.
 @pytest.mark.parametrize("K,N", [(1024, 384), (512, 25600)])
 def test_skinny_matches_reference_at_every_row_count(K, N):
     layer = _linear(K, N, seed=K + N)

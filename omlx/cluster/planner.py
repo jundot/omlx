@@ -6,12 +6,13 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import math
 import re
 import struct
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
@@ -127,6 +128,13 @@ class ModelLayout:
     # The Lightning MTP draft head. Ranks load it only when a plan enables MTP,
     # and then only rank zero, which drafts. Absent from the layer bytes.
     mtp_weight_bytes: int = 0
+    # Architectures whose tensor-parallel ranks may hold uneven shares
+    # (DeepSeek V4.1): the whole units each split axis divides into, as
+    # (attention, experts), and the resident layer bytes each axis carries.
+    # The rest of a layer is replicated on every rank. Empty means the
+    # architecture only splits evenly.
+    tensor_parallel_split_units: tuple[int, ...] = ()
+    tensor_parallel_split_bytes: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.fixed_weight_bytes < 0:
@@ -184,6 +192,18 @@ class ModelLayout:
             )
         ):
             raise ValueError("tensor_parallel_ssd_layer_bytes must fit each layer")
+        units, split_bytes = (
+            self.tensor_parallel_split_units,
+            self.tensor_parallel_split_bytes,
+        )
+        if (units or split_bytes) and (
+            len(units) != 2
+            or len(split_bytes) != 2
+            or min(units) < 1
+            or min(split_bytes) < 0
+            or sum(split_bytes) > sum(self.tensor_parallel_layer_bytes)
+        ):
+            raise ValueError("tensor-parallel split units and bytes are malformed")
 
     @property
     def layer_count(self) -> int:
@@ -226,6 +246,13 @@ class ModelLayout:
             )
         if self.mtp_weight_bytes:
             payload["mtp_weight_bytes"] = self.mtp_weight_bytes
+        if self.tensor_parallel_split_units:
+            payload["tensor_parallel_split_units"] = list(
+                self.tensor_parallel_split_units
+            )
+            payload["tensor_parallel_split_bytes"] = list(
+                self.tensor_parallel_split_bytes
+            )
         return payload
 
     @classmethod
@@ -278,6 +305,14 @@ class ModelLayout:
                     for value in payload.get("tensor_parallel_ssd_layer_bytes", ())
                 ),
                 mtp_weight_bytes=int(payload.get("mtp_weight_bytes", 0)),
+                tensor_parallel_split_units=tuple(
+                    int(value)
+                    for value in payload.get("tensor_parallel_split_units", ())
+                ),
+                tensor_parallel_split_bytes=tuple(
+                    int(value)
+                    for value in payload.get("tensor_parallel_split_bytes", ())
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanningError(f"model layout is malformed: {exc}") from exc
@@ -402,6 +437,10 @@ class PipelineAssignment:
     predicted_compute_seconds: float | None = None
     predicted_send_seconds: float | None = None
     predicted_stage_seconds: float | None = None
+    # Every rank's share of an uneven tensor-parallel split, in the model's
+    # whole units: ((attention per rank), (experts per rank)). Each rank reads
+    # its own entry. Empty means an equal split.
+    tensor_parallel_split: tuple[tuple[int, ...], ...] = ()
 
     def __post_init__(self) -> None:
         # Normalised on the way in, not read leniently on the way out: this
@@ -467,6 +506,11 @@ class PipelineAssignment:
             "kv_bytes_per_token": self.kv_bytes_per_token,
             "max_context_tokens": self.max_context_tokens,
         }
+        if self.tensor_parallel_split:
+            # Omitted for equal splits so existing plan hashes stay the same.
+            result["tensor_parallel_split"] = tensor_split_to_dict(
+                self.tensor_parallel_split
+            )
         if self.predicted_stage_seconds is not None:
             result["predicted_compute_seconds"] = self.predicted_compute_seconds
             result["predicted_send_seconds"] = self.predicted_send_seconds
@@ -489,7 +533,7 @@ class ShardPlan:
     # case the per-rank byte reservation is zero, but the operator's requested
     # runtime limit must still be visible and part of the plan identity.
     target_context_tokens: int = _DEFAULT_CONTEXT_TOKENS
-    # node_id → absolute model path on that node (cluster v2). Display and
+    # node_id → absolute model path on that node. Display and
     # staging metadata only: the layer split is path-independent, so the map
     # is deliberately excluded from ``plan_hash``. Empty means every node
     # loads the shared coordinator path — the legacy behavior.
@@ -846,6 +890,190 @@ def _deepseek_v41_tensor_divisors(
         if width and group_size and width % group_size == 0:
             values.append(width // group_size)
     return tuple(dict.fromkeys(values))
+
+
+# Expert widths per rank stay a multiple of at least this many neurons.
+_DEEPSEEK_V41_EXPERT_SPLIT_MIN = 64
+_DEEPSEEK_V41_ATTENTION_SPLIT = ("attn.wq_b", "attn.wo_a", "attn.wo_b")
+_DEEPSEEK_V41_EXPERT_SPLIT = ("experts.w1", "experts.w2", "experts.w3")
+
+
+def _tensor_split_units(config: dict[str, Any]) -> tuple[int, ...]:
+    """(attention, expert) units of an uneven TP split, or () if unsupported.
+
+    DeepSeek V4.1 ranks hold whole output groups (each a fixed run of heads)
+    and whole expert blocks. A block holds whole w2 quantization groups and
+    oQh rotation blocks, and two shared w2 groups, which the fused decode MoE
+    kernel needs on every rank.
+    """
+
+    if config.get("model_type") != "deepseek_v41":
+        return ()
+    heads = _config_int(config, "num_attention_heads", 0)
+    groups = _config_int(config, "o_groups", 0)
+    lora = _config_int(config, "o_lora_rank", 0)
+    width = _config_int(config, "moe_intermediate_size", 0, maximum=1_000_000)
+    if not (heads and groups and lora and width) or heads % groups:
+        return ()
+    unit = _DEEPSEEK_V41_EXPERT_SPLIT_MIN
+    spec = config.get("omlx_deepseek_v41")
+    modules = spec.get("quantized_modules") if isinstance(spec, dict) else None
+    inputs = [
+        (name, entry.get("group_size", 32))
+        for name, entry in (modules or {}).items()
+        if isinstance(entry, dict)
+    ]
+    oqh = oqh_format.oqh_paths(config)
+    if oqh_format.is_oqh_config(config) and not oqh:
+        return ()  # Unknown oQh format version: blocks are not known.
+    for name, entry in oqh.items():
+        inputs.append((name, math.lcm(entry["block"], entry.get("group_size", 1))))
+    for name, size in inputs:
+        if name.endswith("shared_experts.w2"):
+            unit = math.lcm(unit, 2 * size)
+        elif name.endswith("experts.w2"):
+            unit = math.lcm(unit, size)
+        elif name.endswith("attn.wo_b") and lora % size:
+            return ()
+    if width % unit:
+        return ()
+    return (groups, width // unit)
+
+
+def _tensor_split_kind(name: str) -> int | None:
+    """0 for attention-split, 1 for expert-split DeepSeek V4.1 tensors."""
+
+    if name.endswith("attn.attn_sink"):
+        return 0
+    module = name.rpartition(".")[0]
+    if module.endswith(_DEEPSEEK_V41_ATTENTION_SPLIT):
+        return 0
+    if module.endswith(_DEEPSEEK_V41_EXPERT_SPLIT):
+        return 1
+    return None
+
+
+def tensor_split_to_dict(
+    split: Sequence[Sequence[int]],
+) -> dict[str, list[int]]:
+    attention, experts = split
+    return {"attention": list(attention), "experts": list(experts)}
+
+
+def tensor_split_from_dict(payload: Any) -> tuple[tuple[int, ...], ...]:
+    """Decode ``{"attention": [...], "experts": [...]}``; empty for none."""
+
+    if not payload:
+        return ()
+    if not isinstance(payload, Mapping):
+        raise ValueError("tensor_parallel_split must be an object")
+    try:
+        split = tuple(
+            tuple(int(part) for part in payload[key])
+            for key in ("attention", "experts")
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("tensor_parallel_split is malformed") from exc
+    if len(split[0]) != len(split[1]) or any(
+        part < 1 for parts in split for part in parts
+    ):
+        raise ValueError("tensor_parallel_split is malformed")
+    return split
+
+
+def _split_rank_bytes(
+    model: ModelLayout, split: Sequence[Sequence[int]], tp_rank: int
+) -> int:
+    """Resident layer bytes ``tp_rank`` holds under an uneven split."""
+
+    total = sum(model.tensor_parallel_layer_bytes)
+    shared = total - sum(model.tensor_parallel_split_bytes)
+    held = shared
+    for axis_bytes, units, parts in zip(
+        model.tensor_parallel_split_bytes, model.tensor_parallel_split_units, split
+    ):
+        held += axis_bytes * parts[tp_rank] // units
+    return held
+
+
+def _apportion(units: int, weights: Sequence[float]) -> list[int]:
+    """Whole ``units`` in proportion to ``weights``, at least one each."""
+
+    total = sum(weights)
+    exact = [units * weight / total for weight in weights]
+    parts = [max(1, int(value)) for value in exact]
+    while sum(parts) > units:
+        index = max(
+            (i for i, part in enumerate(parts) if part > 1),
+            key=lambda i: parts[i] - exact[i],
+        )
+        parts[index] -= 1
+    while sum(parts) < units:
+        index = max(range(len(parts)), key=lambda i: exact[i] - parts[i])
+        parts[index] += 1
+    return parts
+
+
+def proportional_tensor_split(
+    model: ModelLayout,
+    group: Sequence[NodeBudget],
+    *,
+    resident_bytes: Sequence[int],
+) -> tuple[tuple[int, ...], ...]:
+    """An uneven split sized to each rank, refusing one that cannot fit.
+
+    Shares follow measured decode bandwidth when every rank has a profile, so
+    the ranks finish each layer together, and otherwise the memory each rank
+    has left for split weights. ``resident_bytes`` is what each rank holds
+    besides its share (fixed and replicated weights, KV cache). A rank that
+    would overflow gives expert units to the rank with the most room.
+    """
+
+    units = model.tensor_parallel_split_units
+    if not units:
+        raise PlanningError("this architecture only splits tensors evenly")
+    room = [
+        node.usable_bytes - resident for node, resident in zip(group, resident_bytes)
+    ]
+    if any(value <= 0 for value in room):
+        raise PlanningError("replicated weights leave no room for a tensor split")
+    if all(node.performance is not None for node in group):
+        weights = [
+            float(node.performance.decode_weight_bytes_per_second) for node in group
+        ]
+    else:
+        weights = [float(value) for value in room]
+    split = [_apportion(count, weights) for count in units]
+
+    def overflow(tp_rank: int) -> int:
+        held = sum(
+            axis_bytes * parts[tp_rank] // count
+            for axis_bytes, count, parts in zip(
+                model.tensor_parallel_split_bytes, units, split
+            )
+        )
+        return held - room[tp_rank]
+
+    experts = split[1]
+    for _ in range(units[1]):
+        over = [overflow(rank) for rank in range(len(group))]
+        worst = max(range(len(group)), key=lambda rank: over[rank])
+        if over[worst] <= 0:
+            break
+        spare = min(range(len(group)), key=lambda rank: over[rank])
+        if experts[worst] <= 1 or spare == worst:
+            break
+        experts[worst] -= 1
+        experts[spare] += 1
+    if any(overflow(rank) > 0 for rank in range(len(group))):
+        raise PlanningError(
+            "no uneven tensor split fits every node: "
+            + ", ".join(
+                f"{node.node_id} over by {max(0, overflow(rank))} bytes"
+                for rank, node in enumerate(group)
+            )
+        )
+    return tuple(tuple(parts) for parts in split)
 
 
 def _model_source(model_type: str) -> str:
@@ -1266,9 +1494,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     mtp_bytes = 0
     layer_sizes: dict[int, int] = {}
     ssd_sizes: dict[int, int] = {}
+    # Per layer: resident bytes on the (attention, expert) uneven-split axes.
+    split_sizes: dict[int, list[int]] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
     config = _model_config(root)
+    split_units = _tensor_split_units(config)
     unloaded = _VISION_WEIGHT_PREFIXES + _cluster_unloaded_prefixes(config)
     mtp_prefixes = _cluster_mtp_prefixes(config)
     engram_names, engram_files = _engram_tables(config)
@@ -1319,6 +1550,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
                     ssd_sizes[layer_index] = (
                         ssd_sizes.get(layer_index, 0) + tensor_bytes
                     )
+                elif split_units:
+                    kind = _tensor_split_kind(name)
+                    if kind is not None:
+                        split_sizes.setdefault(layer_index, [0, 0])[
+                            kind
+                        ] += tensor_bytes
             tensor_count += 1
         intervals.sort()
         for previous, current in zip(intervals, intervals[1:]):
@@ -1375,6 +1612,15 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             else ()
         ),
         mtp_weight_bytes=mtp_bytes,
+        tensor_parallel_split_units=split_units if split_sizes else (),
+        tensor_parallel_split_bytes=(
+            tuple(
+                sum(split_sizes.get(index, (0, 0))[kind] for index in expected_indices)
+                for kind in (0, 1)
+            )
+            if split_units and split_sizes
+            else ()
+        ),
     )
 
 
@@ -2271,6 +2517,196 @@ def with_mtp_head(model: ModelLayout) -> ModelLayout:
     return _with_head_on_last_layer(model, model.mtp_weight_bytes)
 
 
+def _tensor_stage_assignment(
+    model: ModelLayout,
+    node: NodeBudget,
+    *,
+    tp_rank: int,
+    tensor_parallel_size: int,
+    layers: tuple[int, int],
+    held_layer_bytes: int,
+    fixed_bytes: int,
+    kv_bytes: int,
+    workload_profile: ExecutionProfileName,
+    microbatch_size: int,
+    performance_aware: bool,
+    split: tuple[tuple[int, ...], ...] = (),
+) -> PipelineAssignment:
+    """One tensor-parallel member's assignment of a hybrid stage."""
+
+    start, end = layers
+    compute_seconds, send_seconds, stage_seconds = _predict_stage_seconds(
+        held_layer_bytes,
+        node,
+        activation_bytes_per_token=model.activation_bytes_per_token,
+        workload_profile=workload_profile,
+        microbatch_size=microbatch_size,
+    )
+    return PipelineAssignment(
+        node_id=node.node_id,
+        rank=node.rank,
+        start_layer=start,
+        end_layer=end,
+        layer_weight_bytes=held_layer_bytes,
+        fixed_weight_bytes=fixed_bytes,
+        reserve_bytes=node.reserve_bytes,
+        capacity_bytes=node.capacity_bytes,
+        manual_memory_limit=node.manual_memory_limit,
+        role=node.role,
+        memory_guard_tier=node.memory_guard_tier,
+        tensor_parallel_rank=tp_rank,
+        tensor_parallel_size=tensor_parallel_size,
+        kv_cache_bytes=kv_bytes,
+        kv_bytes_per_token=_kv_bytes_per_token_for_stage(
+            model, end - start, tensor_parallel_size
+        ),
+        max_context_tokens=_max_context_for_stage(
+            model,
+            node,
+            layer_count=end - start,
+            weight_bytes=fixed_bytes + held_layer_bytes,
+            tensor_parallel_size=tensor_parallel_size,
+        ),
+        sharded_weight_bytes=held_layer_bytes if tensor_parallel_size > 1 else 0,
+        predicted_compute_seconds=compute_seconds if performance_aware else None,
+        predicted_send_seconds=send_seconds if performance_aware else None,
+        predicted_stage_seconds=stage_seconds if performance_aware else None,
+        tensor_parallel_split=split,
+    )
+
+
+def _hybrid_shard_plan(
+    model: ModelLayout,
+    ordered_nodes: Sequence[NodeBudget],
+    assignments: list[PipelineAssignment],
+    *,
+    tensor_parallel_size: int,
+    pipeline_stages: int,
+    performance_aware: bool,
+    workload_profile: ExecutionProfileName,
+    microbatch_size: int,
+    context_tokens: int,
+) -> ShardPlan:
+    """The hybrid plan of ``assignments``, hashed over every assignment field."""
+
+    assignments = sorted(assignments, key=lambda a: a.rank)
+    hash_payload = {
+        "model": model.to_dict(),
+        "context_tokens": context_tokens,
+        "assignments": [a.to_dict() for a in assignments],
+        "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_stages": pipeline_stages,
+        "workload_profile": workload_profile,
+        "microbatch_size": microbatch_size,
+    }
+    plan_hash = hashlib.sha256(
+        json.dumps(hash_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return ShardPlan(
+        model=model,
+        assignments=tuple(assignments),
+        plan_hash=plan_hash,
+        optimization="performance" if performance_aware else "memory",
+        workload_profile=workload_profile,
+        performance_profiles=(
+            tuple(node.performance for node in ordered_nodes)
+            if performance_aware
+            else ()
+        ),
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_stages=pipeline_stages,
+        target_context_tokens=context_tokens,
+    )
+
+
+def _plan_uneven_tensor(
+    model: ModelLayout,
+    nodes: Sequence[NodeBudget],
+    split: tuple[tuple[int, ...], ...],
+    *,
+    workload_profile: ExecutionProfileName,
+    microbatch_size: int,
+    context_tokens: int,
+    head_rank_extra_bytes: int,
+) -> ShardPlan:
+    """One tensor-parallel stage over every node, each holding its own share.
+
+    ``split`` is an explicit share per rank, or empty to size one from the
+    nodes. Replicated weights, KV cache and rank zero's draft head are counted
+    per rank, so the plan matches what each rank measures after loading.
+    """
+
+    ordered = sorted(nodes, key=lambda item: item.rank)
+    if [node.rank for node in ordered] != list(range(len(ordered))):
+        raise ValueError("node ranks must be unique and contiguous from zero")
+    if len({node.node_id for node in ordered}) != len(ordered):
+        raise ValueError("node IDs must be unique")
+    size = len(ordered)
+    layers = model.layer_count
+    shared_layer_bytes = sum(model.tensor_parallel_layer_bytes) - sum(
+        model.tensor_parallel_split_bytes
+    )
+    kv_bytes = _kv_bytes_for_stage(model, layers, context_tokens, size)
+    fixed = [
+        model.fixed_weight_bytes + (head_rank_extra_bytes if node.rank == 0 else 0)
+        for node in ordered
+    ]
+    if split:
+        if len(split[0]) != size or any(
+            sum(parts) != units
+            for parts, units in zip(split, model.tensor_parallel_split_units)
+        ):
+            raise PlanningError(
+                "tensor split must give every node a share totalling "
+                f"{model.tensor_parallel_split_units} units"
+            )
+    else:
+        split = proportional_tensor_split(
+            model,
+            ordered,
+            resident_bytes=[
+                fixed[rank] + shared_layer_bytes + kv_bytes for rank in range(size)
+            ],
+        )
+    performance_aware = all(node.performance is not None for node in ordered)
+    assignments = []
+    for tp_rank, node in enumerate(ordered):
+        held = _split_rank_bytes(model, split, tp_rank)
+        planned = fixed[tp_rank] + held + kv_bytes
+        if planned > node.usable_bytes:
+            raise PlanningError(
+                f"tensor split does not fit node {node.node_id}: "
+                f"{planned} > {node.usable_bytes}"
+            )
+        assignments.append(
+            _tensor_stage_assignment(
+                model,
+                node,
+                tp_rank=tp_rank,
+                tensor_parallel_size=size,
+                layers=(0, layers),
+                held_layer_bytes=held,
+                fixed_bytes=fixed[tp_rank],
+                kv_bytes=kv_bytes,
+                workload_profile=workload_profile,
+                microbatch_size=microbatch_size,
+                performance_aware=performance_aware,
+                split=split,
+            )
+        )
+    return _hybrid_shard_plan(
+        model,
+        ordered,
+        assignments,
+        tensor_parallel_size=size,
+        pipeline_stages=1,
+        performance_aware=performance_aware,
+        workload_profile=workload_profile,
+        microbatch_size=microbatch_size,
+        context_tokens=context_tokens,
+    )
+
+
 def plan_hybrid(
     model: ModelLayout,
     nodes: Sequence[NodeBudget],
@@ -2281,12 +2717,20 @@ def plan_hybrid(
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
     head_rank_extra_bytes: int = 0,
     engram_ssd_offload: bool = False,
+    tensor_split: str | Mapping[str, Sequence[int]] = "auto",
 ) -> ShardPlan:
     """Plan hybrid pipeline + tensor parallelism across nodes.
 
     ``head_rank_extra_bytes`` are weights only rank zero holds (an unsharded
     Lightning MTP head). ``engram_ssd_offload`` matters only without tensor
     parallelism, because tensor-parallel ranks always read Engram from SSD.
+
+    ``tensor_split`` decides how a single tensor-parallel stage divides each
+    layer on architectures that support uneven shares
+    (``ModelLayout.tensor_parallel_split_units``): ``"equal"``, ``"auto"``
+    (equal when it fits, otherwise sized to each node), or an explicit
+    ``{"attention": [...], "experts": [...]}`` in rank order. Other
+    architectures always split evenly.
 
     Combines contiguous pipeline stages with tensor-parallel weight sharding.
     The world is 2D: pipeline_stages * tensor_parallel_size == len(nodes).
@@ -2338,7 +2782,8 @@ def plan_hybrid(
 
     # Refuse impossible tensor parallelism here rather than after every rank
     # has loaded its weights. shard() does n_heads //= N and n_kv_heads //= N,
-    # and most mlx-lm architectures do not implement shard() at all.
+    # and most mlx-lm architectures do not implement shard() at all. An uneven
+    # split changes the shares, not the degrees a model supports.
     if tensor_parallel_size > 1:
         incompatible = tuple(
             value
@@ -2350,6 +2795,52 @@ def plan_hybrid(
                 "tensor-parallel architecture dimensions "
                 f"{incompatible} are not divisible by tensor_parallel_size "
                 f"({tensor_parallel_size})"
+            )
+
+    if isinstance(tensor_split, str):
+        if tensor_split not in ("auto", "equal"):
+            raise ValueError(f"unknown tensor_split {tensor_split!r}")
+        explicit = ()
+    else:
+        explicit = tensor_split_from_dict(tensor_split)
+    uneven_possible = bool(model.tensor_parallel_split_units and pipeline_stages == 1)
+    if explicit and not uneven_possible:
+        raise PlanningError(
+            "an uneven tensor split needs one tensor-parallel stage of an "
+            "architecture that supports it"
+        )
+    if explicit:
+        return _plan_uneven_tensor(
+            model,
+            nodes,
+            explicit,
+            workload_profile=workload_profile,
+            microbatch_size=microbatch_size,
+            context_tokens=context_tokens,
+            head_rank_extra_bytes=head_rank_extra_bytes,
+        )
+    if tensor_split == "auto" and uneven_possible:
+        try:
+            return plan_hybrid(
+                model,
+                nodes,
+                tensor_parallel_size=tensor_parallel_size,
+                workload_profile=workload_profile,
+                microbatch_size=microbatch_size,
+                context_tokens=context_tokens,
+                head_rank_extra_bytes=head_rank_extra_bytes,
+                engram_ssd_offload=engram_ssd_offload,
+                tensor_split="equal",
+            )
+        except PlanningError:
+            return _plan_uneven_tensor(
+                model,
+                nodes,
+                (),
+                workload_profile=workload_profile,
+                microbatch_size=microbatch_size,
+                context_tokens=context_tokens,
+                head_rank_extra_bytes=head_rank_extra_bytes,
             )
 
     # Validate ranks
@@ -2450,88 +2941,29 @@ def plan_hybrid(
                     f"hybrid shard does not fit node {node.node_id}: "
                     f"{planned} > {node.usable_bytes}"
                 )
-            compute_seconds, send_seconds, stage_seconds = _predict_stage_seconds(
-                held_layer_bytes,
-                node,
-                activation_bytes_per_token=model.activation_bytes_per_token,
-                workload_profile=workload_profile,
-                microbatch_size=microbatch_size,
-            )
             assignments.append(
-                PipelineAssignment(
-                    node_id=node.node_id,
-                    rank=node.rank,
-                    start_layer=start,
-                    end_layer=end,
-                    layer_weight_bytes=held_layer_bytes,
-                    fixed_weight_bytes=fixed_bytes,
-                    reserve_bytes=node.reserve_bytes,
-                    capacity_bytes=node.capacity_bytes,
-                    manual_memory_limit=node.manual_memory_limit,
-                    role=node.role,
-                    memory_guard_tier=node.memory_guard_tier,
-                    tensor_parallel_rank=tp_rank,
+                _tensor_stage_assignment(
+                    model,
+                    node,
+                    tp_rank=tp_rank,
                     tensor_parallel_size=tensor_parallel_size,
-                    kv_cache_bytes=kv_bytes,
-                    kv_bytes_per_token=_kv_bytes_per_token_for_stage(
-                        model, end - start, tensor_parallel_size
-                    ),
-                    max_context_tokens=_max_context_for_stage(
-                        model,
-                        node,
-                        layer_count=end - start,
-                        weight_bytes=fixed_bytes + held_layer_bytes,
-                        tensor_parallel_size=tensor_parallel_size,
-                    ),
-                    sharded_weight_bytes=(
-                        held_layer_bytes if tensor_parallel_size > 1 else 0
-                    ),
-                    predicted_compute_seconds=(
-                        compute_seconds if performance_aware else None
-                    ),
-                    predicted_send_seconds=(
-                        send_seconds if performance_aware else None
-                    ),
-                    predicted_stage_seconds=(
-                        stage_seconds if performance_aware else None
-                    ),
+                    layers=(start, end),
+                    held_layer_bytes=held_layer_bytes,
+                    fixed_bytes=fixed_bytes,
+                    kv_bytes=kv_bytes,
+                    workload_profile=workload_profile,
+                    microbatch_size=microbatch_size,
+                    performance_aware=performance_aware,
                 )
             )
-
-    # Sort by rank for consistent ordering
-    assignments.sort(key=lambda a: a.rank)
-
-    # Build performance profiles if available
-    profiles = (
-        tuple(
-            node.performance for node in ordered_nodes if node.performance is not None
-        )
-        if performance_aware
-        else ()
-    )
-
-    # Compute plan hash covering all assignment fields
-    hash_payload = {
-        "model": model.to_dict(),
-        "context_tokens": context_tokens,
-        "assignments": [a.to_dict() for a in assignments],
-        "tensor_parallel_size": tensor_parallel_size,
-        "pipeline_stages": pipeline_stages,
-        "workload_profile": workload_profile,
-        "microbatch_size": microbatch_size,
-    }
-    plan_hash = hashlib.sha256(
-        json.dumps(hash_payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-    return ShardPlan(
-        model=model,
-        assignments=tuple(assignments),
-        plan_hash=plan_hash,
-        optimization="performance" if performance_aware else "memory",
-        workload_profile=workload_profile,
-        performance_profiles=profiles,
+    return _hybrid_shard_plan(
+        model,
+        ordered_nodes,
+        assignments,
         tensor_parallel_size=tensor_parallel_size,
         pipeline_stages=pipeline_stages,
-        target_context_tokens=context_tokens,
+        performance_aware=performance_aware,
+        workload_profile=workload_profile,
+        microbatch_size=microbatch_size,
+        context_tokens=context_tokens,
     )

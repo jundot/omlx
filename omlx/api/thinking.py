@@ -700,3 +700,12 @@ class ThinkingBudgetProcessor:
                 # Lazily-created attr absent from the snapshot: drop it so
                 # the next __call__ re-baselines from the history it sees.
                 delattr(self, name)
+
+    def inert_for(self, positions: int) -> bool:
+        """Whether the next ``positions`` calls leave every logit unchanged."""
+        if self._forcing or self._waiting_utf8:
+            return False
+        if self._done:
+            # A re-entry into thinking restarts the count at zero.
+            return positions < self._budget
+        return self._thinking_tokens + positions < self._budget

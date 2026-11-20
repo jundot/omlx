@@ -49,7 +49,7 @@ enum BenchmarkWarmupMode: String, Codable, CaseIterable, Sendable {
 /// `batch_sizes` are server-validated against a known whitelist
 /// (1024…200000 / 2…8). `generation_length` is free-form int.
 ///
-/// The server always publishes results to the public omlx.ai
+/// The server publishes eligible results to the public omlx.ai
 /// leaderboard after the bench completes (matching the browser admin
 /// panel). Submission is anonymous — the payload carries an
 /// owner_hash derived from hardware fingerprint, not user identity.
@@ -61,6 +61,14 @@ struct BenchStartRequest: Encodable, Sendable {
     let promptLengths: [Int]
     let generationLength: Int
     let batchSizes: [Int]
+    let forceLmEngine: Bool
+    let external: BenchExternalEndpoint?
+}
+
+struct BenchExternalEndpoint: Encodable, Sendable {
+    let baseUrl: String
+    let apiKey: String
+    let model: String
 }
 
 struct BenchStartResponse: Codable, Sendable {

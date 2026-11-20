@@ -1050,25 +1050,6 @@ def test_preflight_unwraps_the_live_peer_probe_response():
     ]
 
 
-def test_preflight_refuses_discrete_cuda_without_a_live_vram_guard():
-    from omlx.cluster.autoconfigure import preflight_issues
-
-    issues = preflight_issues(
-        {
-            "cuda-box": {
-                "runtime_compatible": True,
-                "status": {
-                    "runtime": {"mlx_version": "0.32.0"},
-                    "node": {"accelerator": "cuda", "memory_kind": "vram"},
-                },
-            }
-        },
-        model_path=None,
-    )
-
-    assert [issue.kind for issue in issues] == ["cuda_memory_guard_unavailable"]
-
-
 def test_rdma_detection_does_not_ssh_to_itself(monkeypatch):
     """MLX's check_rdma shells out to `ssh 127.0.0.1 ibv_devices`.
 

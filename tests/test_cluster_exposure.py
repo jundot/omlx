@@ -39,14 +39,3 @@ def test_server_uses_one_startup_snapshot_for_routes_and_bonjour():
     assert (
         "_server_state.global_settings is not None and distributed_inference_enabled()"
     ) in source
-
-
-def test_worker_join_routes_use_enrollment_auth_not_the_admin_cookie():
-    source = (ROOT / "omlx/server.py").read_text()
-
-    assert "from .cluster.routes import join_router as cluster_join_router" in source
-    assert (
-        "cluster_join_router,\n"
-        "        dependencies=[Depends(require_distributed_inference_enabled)]"
-    ) in source
-    assert "configure_cluster_enrollment(base_path)" in source

@@ -117,6 +117,7 @@ _GPU_SERIAL_TESTS = {
     },
     "test_qwen35_verify_sdpa_split.py": {
         "test_chain_tail_matches_cache_writes",
+        "test_wide_causal_matches_per_row",
     },
     "test_qwen4_batch_qsa_indexer.py": {
         "test_indexer_capacity_matches_concatenate_bit_for_bit",
@@ -228,7 +229,6 @@ def cluster_home(tmp_path, monkeypatch):
     ssh_dir = home / ".ssh"
     monkeypatch.setattr(ssh_keys, "_SSH_DIR", ssh_dir)
     monkeypatch.setattr(ssh_keys, "_SSH_KEY_PATH", ssh_dir / "omlx_cluster")
-    monkeypatch.setattr(ssh_keys, "_SSH_PUBKEY_PATH", ssh_dir / "omlx_cluster.pub")
     return home
 
 

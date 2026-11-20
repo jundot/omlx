@@ -764,6 +764,62 @@ def test_official_oq3_reuses_signed_imatrix_and_applies_real_plan(
         assert all(table["bits"] == 4 for table in saved["engram_tables"].values())
 
 
+def test_official_oq3_refines_routed_expert_codes_in_place(tmp_path, monkeypatch):
+    """oQ3e re-picks the routed experts' codes and leaves every other tensor alone."""
+    from test_deepseek_v41 import write_checkpoint
+
+    from omlx import oq
+    from omlx.patches.deepseek_v41 import oq as converter
+    from omlx.patches.deepseek_v41.loading import load
+
+    source, _ = write_checkpoint(tmp_path, vision=False, dim=64)
+    tokens = mx.array([[3, 4, 5, 6, 7, 8, 9, 10], [9, 8, 7, 6, 5, 4, 3, 11]])
+    monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+
+    def export(name):
+        output = tmp_path / name
+        oq.quantize_oq_streaming(
+            str(source),
+            str(output),
+            3,
+            enhanced=True,
+            target_bpw=32,
+            hard_cap_bpw=32,
+            imatrix_num_samples=2,
+            imatrix_seq_length=8,
+            sensitivity_map_override={i: 1.0 for i in range(5)},
+        )
+        tensors = {}
+        for shard in output.glob("*.safetensors"):
+            tensors.update(mx.load(str(shard)))
+        return output, tensors
+
+    refined, after = export("refined")
+    monkeypatch.setattr(converter, "refine_experts", lambda *a, **kw: None)
+    _, before = export("plain")
+
+    report = json.loads((refined / "quantization_report.json").read_text())["refine"]
+    assert report["status"] == "done" and report["tensors"] > 0
+    assert report["after"] < report["before"]
+    assert after.keys() == before.keys()
+    codes = {
+        key
+        for key in after
+        if key.startswith("language_model.layers.")
+        and ".ffn.experts." in key
+        and key.endswith(".weight")
+    }
+    assert any(not mx.array_equal(after[key], before[key]).item() for key in codes)
+    for key in after.keys() - codes:
+        assert mx.array_equal(after[key], before[key]).item(), key
+
+    model, _ = load(refined)
+    try:
+        assert mx.isfinite(model(mx.array([[3, 4, 5, 6, 7]]))).all().item()
+    finally:
+        model.close()
+
+
 def test_expert_requantization_cancellation_does_not_process_remaining_experts():
     from omlx.patches.deepseek_v41.oq import requantize_projection
 

@@ -2203,8 +2203,8 @@ def dsa_attention_rows(
 # ---------------------------------------------------------------------------
 #
 # Everything between the fused input projection and o_proj of a
-# Glm5NextLinearAttention layer, for one sequence and T <= 8 tokens, in one
-# dispatch with one 1024-thread threadgroup per head:
+# Glm5NextLinearAttention layer, for B sequences of T <= 8 tokens each, in one
+# dispatch with one 1024-thread threadgroup per (head, sequence):
 #
 #   1. depthwise short conv over [conv_state, q|k|v] + SiLU (bf16), and the
 #      new conv state (MLX depthwise_conv_1d + the compiled nn.silu);
@@ -2222,6 +2222,23 @@ def dsa_attention_rows(
 # to its dtype here too and products are never contracted into the adds that
 # consumed them in a different kernel.
 _KDA_SOURCE = r"""
+  // Per-sequence rows (grid y); B == 1 reads row 0 only.
+  const size_t bb = size_t(threadgroup_position_in_grid.y);
+  const device T* proj = proj_rows + bb * size_t(TOK * PROJ_W);
+#if HAS_CONV_STATE
+  const device T* conv_state = conv_state_rows + bb * size_t(9 * QKV);
+#endif
+#if HAS_STATE
+  const device float* state_in = state_in_rows + bb * size_t(QKV) * size_t(DK);
+#endif
+#if PRE_AG
+  const device T* a_pre = a_pre_rows + bb * size_t(TOK * QKV);
+  const device T* gate_pre = gate_pre_rows + bb * size_t(TOK * QKV);
+#endif
+  device T* y = y_rows + bb * size_t(TOK * QKV);
+  device T* conv_state_out = conv_state_out_rows + bb * size_t(9 * QKV);
+  device float* state_out = state_out_rows + bb * size_t(QKV) * size_t(DK);
+
   constexpr int CK = 4;
   constexpr int NROW = CK - 1 + TOK;
   constexpr int NP = 3 * QKV;
@@ -2482,13 +2499,13 @@ def _kda_kernel(
     pre_ag: bool,
     gate5: bool = False,
 ):
-    inputs = ["proj", "conv_w", "a_log", "dt_bias", "norm_w", "consts"]
+    inputs = ["proj_rows", "conv_w", "a_log", "dt_bias", "norm_w", "consts"]
     if has_conv_state:
-        inputs.append("conv_state")
+        inputs.append("conv_state_rows")
     if has_state:
-        inputs.append("state_in")
+        inputs.append("state_in_rows")
     if pre_ag:
-        inputs += ["a_pre", "gate_pre"]
+        inputs += ["a_pre_rows", "gate_pre_rows"]
     else:
         inputs += ["fb_w", "fb_s", "fb_b", "gb_w", "gb_s", "gb_b"]
     return mx.fast.metal_kernel(
@@ -2497,7 +2514,7 @@ def _kda_kernel(
             f"{'_q5' if gate5 else ''}"
         ),
         input_names=inputs,
-        output_names=["y", "conv_state_out", "state_out"],
+        output_names=["y_rows", "conv_state_out_rows", "state_out_rows"],
         header=_QMV_HEADER,
         source=_source(
             _KDA_SOURCE,
@@ -2532,18 +2549,19 @@ def kda_decode_step(
     a_pre: Optional[mx.array] = None,
     gate_pre: Optional[mx.array] = None,
 ):
-    """Fused KDA layer body for one sequence and T <= 8 tokens.
+    """Fused KDA layer body for B sequences of T <= 8 tokens each.
 
-    ``proj`` is the fused q|k|v|f_a|g_a|b projection [1, T, W] (bf16/fp16).
+    ``proj`` is the fused q|k|v|f_a|g_a|b projection [B, T, W] (bf16/fp16).
     The forget/output gate projections are either the affine quantized
     ``f_b``/``g_b`` layers (K == 128, 4- or 8-bit: MLX's qmv_quad path) or
-    precomputed ``a_pre``/``gate_pre`` [1, T, H * Dk]. Returns
-    ``(y [1, T, H * Dk], conv_state [1, 3, 3 * H * Dk], state [1, H, Dk, Dk])``
-    or None when the shapes are not covered.
+    precomputed ``a_pre``/``gate_pre`` [B, T, H * Dk]. Returns
+    ``(y [B, T, H * Dk], conv_state [B, 3, 3 * H * Dk], state [B, H, Dk, Dk])``
+    or None when the shapes are not covered. Each sequence's rows equal the
+    B == 1 call on that sequence's inputs.
     """
-    if proj.ndim != 3 or proj.shape[0] != 1 or proj.dtype not in (mx.bfloat16, mx.float16):
+    if proj.ndim != 3 or proj.dtype not in (mx.bfloat16, mx.float16):
         return None
-    _, T, width = proj.shape
+    B, T, width = proj.shape
     qkv = heads * head_dim
     if not 1 <= T <= 8 or head_dim != 128 or heads < 1:
         return None
@@ -2556,11 +2574,11 @@ def kda_decode_step(
     if dt_bias.size != qkv or dt_bias.dtype != mx.float32:
         return None
     if conv_state is not None and (
-        conv_state.shape != (1, 3, 3 * qkv) or conv_state.dtype != proj.dtype
+        conv_state.shape != (B, 3, 3 * qkv) or conv_state.dtype != proj.dtype
     ):
         return None
     if state is not None and (
-        state.shape != (1, heads, head_dim, head_dim) or state.dtype != mx.float32
+        state.shape != (B, heads, head_dim, head_dim) or state.dtype != mx.float32
     ):
         return None
     pre = a_pre is not None
@@ -2568,7 +2586,7 @@ def kda_decode_step(
     template = [("T", proj.dtype), ("TOK", T), ("DK", head_dim), ("QKV", qkv),
                 ("PROJ_W", width), ("OFF_FA", off_fa), ("OFF_GA", off_ga), ("OFF_B", off_b)]
     if pre:
-        if gate_pre is None or a_pre.shape != (1, T, qkv) or gate_pre.shape != (1, T, qkv):
+        if gate_pre is None or a_pre.shape != (B, T, qkv) or gate_pre.shape != (B, T, qkv):
             return None
         if a_pre.dtype != proj.dtype or gate_pre.dtype != proj.dtype:
             return None
@@ -2608,9 +2626,9 @@ def kda_decode_step(
     y, conv_out, state_out = kernel(
         inputs=inputs,
         template=template,
-        grid=(1024 * heads, 1, 1),
+        grid=(1024 * heads, B, 1),
         threadgroup=(1024, 1, 1),
-        output_shapes=[(1, T, qkv), (1, 3, 3 * qkv), (1, heads, head_dim, head_dim)],
+        output_shapes=[(B, T, qkv), (B, 3, 3 * qkv), (B, heads, head_dim, head_dim)],
         output_dtypes=[proj.dtype, proj.dtype, mx.float32],
     )
     return y, conv_out, state_out

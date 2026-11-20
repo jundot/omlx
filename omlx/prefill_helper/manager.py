@@ -245,6 +245,9 @@ def _reach(
     problem = launcher.incompatible(info, adapter, target.name, oqh)
     if problem is not None:
         raise _PermanentError(problem)
+    update = agent.outdated(info) if "contracts" in info else None
+    if update:
+        logger.warning("Prefill helper on %s is outdated. %s", target.name, update)
     return target, info
 
 

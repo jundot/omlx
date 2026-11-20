@@ -3,12 +3,14 @@
 import json
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
 import pytest
 from test_deepseek_v41 import write_checkpoint
 
+from omlx.engine.vlm import wire_moe_offload_slot_hooks
 from omlx.patches.deepseek_v41.convert import convert
 from omlx.patches.deepseek_v41.loading import load
 from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
@@ -462,6 +464,128 @@ def _synthetic_affine_experts(tmp_path, fraction, seed=412):
     raw = {"omlx_deepseek_v41": {"version": 1, "quantized_modules": specs}}
     plan = ExpertOffloadPlan(tmp_path, raw, mapping, config, fraction)
     return reference, OffloadedExpert(Expert(config, True), plan, prefix), plan
+
+
+def test_release_slots_keeps_hot_banks_and_routes(tmp_path):
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1, 2, 3, 4, 5])
+        idx = mx.array([3, 2, 0, 5]).reshape(1, 2, 2)
+        x = mx.random.normal((1, 2, 1, 1, 64)).astype(mx.bfloat16)
+        weights = mx.full(idx.shape, 0.5, dtype=mx.bfloat16)
+        before = np.array(disk(x, idx, weights).view(mx.uint16))
+        # Whole-reference heat, as the eviction policy ranks it. Experts 1 and 4
+        # are the cold tail; 1 and 3 tie, so the more recently used 3 stays.
+        slots._uses = {
+            0: (4.0, 0),
+            1: (1.0, 0),
+            2: (2.0, 0),
+            3: (1.0, 0),
+            4: (0.5, 0),
+            5: (5.0, 0),
+        }
+        assert slots.release_slots(4) == plan.expert_bytes * 2
+        assert slots.capacity == 4 and plan.capacity == 6
+        # Compacted least to most recently used: the probe call above touched
+        # 3, 2, 0, 5 in that order, so _victim keeps its tie-break order.
+        assert list(slots.slot_of) == [3, 2, 0, 5]
+        # The contract that order exists for: the cold tail goes first, and a
+        # tie goes to the least recently used expert.
+        assert slots._victim(set()) == 3
+        assert slots.free == []
+        misses = slots.misses
+        np.testing.assert_array_equal(disk(x, idx, weights).view(mx.uint16), before)
+        assert slots.misses == misses
+    finally:
+        plan.close()
+
+
+def test_restore_slots_grows_back_and_refills_on_misses(tmp_path):
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1, 2, 3, 4, 5])
+        assert slots.release_slots(3) == plan.expert_bytes * 3
+        assert slots.capacity == 3 and slots.free == []
+        assert set(slots.slot_of) == {3, 4, 5}
+        assert slots.restore_slots() == plan.expert_bytes * 3
+        assert slots.capacity == plan.capacity == 6
+        assert slots.free == [3, 4, 5]
+        assert slots.restore_slots() == 0
+        assert slots.release_slots(6) == 0
+
+        idx = mx.array([0, 1, 2, 3, 4, 5]).reshape(1, 2, 3)
+        x = mx.random.normal((1, 2, 1, 1, 64)).astype(mx.bfloat16)
+        weights = mx.full(idx.shape, 0.5, dtype=mx.bfloat16)
+        np.testing.assert_array_equal(
+            disk(x, idx, weights).view(mx.uint16),
+            reference(x, idx, weights).view(mx.uint16),
+        )
+        assert set(slots.slot_of) == {0, 1, 2, 3, 4, 5}
+    finally:
+        plan.close()
+
+
+def test_resize_failure_before_publish_leaves_the_bank_unchanged(
+    tmp_path, monkeypatch
+):
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1])
+        bank = slots.expert.w1.weight
+        other = slots.expert.w3.weight
+        before = list(slots.slot_of.items())
+        before_free = list(slots.free)
+        before_views = slots._views
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("replacement allocation failed")
+
+        # Every replacement array is materialized by this one eval before any
+        # of them is published, so a failed allocation is the only failure
+        # point: the setattr loop after it cannot fail.
+        with monkeypatch.context() as patch:
+            patch.setattr(mx, "eval", fail)
+            with pytest.raises(RuntimeError, match="allocation failed"):
+                slots.release_slots(4)
+        assert slots.capacity == 6 and slots.expert.w1.weight is bank
+        assert slots.expert.w3.weight is other
+        assert list(slots.slot_of.items()) == before
+        assert slots.free == before_free
+        assert slots._views is before_views
+    finally:
+        plan.close()
+
+
+def test_slot_hooks_wire_the_banks_into_the_scheduler(tmp_path):
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1, 2, 3])
+        scheduler = SimpleNamespace()
+        model = SimpleNamespace(_moe_offload_slots=[slots])
+        assert wire_moe_offload_slot_hooks(scheduler, model)
+        assert scheduler.moe_offload_releasable() == plan.expert_bytes * (
+            slots.capacity - slots.floor
+        )
+        reclaimed = []
+        assert (
+            scheduler.moe_offload_release(
+                plan.expert_bytes, lambda: reclaimed.append(True)
+            )
+            == plan.expert_bytes
+        )
+        assert slots.capacity == 5 and reclaimed == [True]
+        scheduler.moe_offload_restore(lambda: reclaimed.append(True))
+        assert slots.capacity == 6 and reclaimed == [True, True]
+        # A model without banks keeps whatever hooks it already had.
+        plain = SimpleNamespace()
+        assert not wire_moe_offload_slot_hooks(plain, SimpleNamespace())
+        assert not hasattr(plain, "moe_offload_release")
+    finally:
+        plan.close()
 
 
 def _eviction_reference(sequence, capacity, half_life):

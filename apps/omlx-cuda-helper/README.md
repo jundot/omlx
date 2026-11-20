@@ -34,6 +34,8 @@ Docker Desktop does not pass discovery through to the container, so the helper a
 
 The volume holds the helper's identity, its pairings, the model files oMLX copies to it and the compiled kernels. To use model folders already on the machine, mount them at `/data/models`. Other commands run in the container, for example `docker exec omlx-helper omlx-cuda-helper --state-dir /data status`.
 
+To update, run `docker pull jundot/omlx-cuda-helper`, then `docker rm -f omlx-helper` and the same `docker run` command. The volume keeps the pairing and the model files. The Prefill Accelerator checks warn when the helper is older than the one the Mac's oMLX comes with.
+
 The amd64 image runs on GPUs from the Ampere generation on (RTX 30, 40 and 50, RTX A and Ada, A100, H100), the arm64 image on GB10. Only 2x RTX A6000 on Linux has been tested so far, not Windows or DGX Spark.
 
 To build the image yourself, run `docker buildx build --platform linux/amd64 -t omlx-cuda-helper .` in this folder (about an hour on 6 cores; MLX is built from source). Build the arm64 image on an arm64 machine, such as a Mac with Apple silicon or the DGX Spark itself: under emulation it takes many hours.

@@ -2531,6 +2531,33 @@ def extract_tool_calls_with_thinking(
         )
     else:
         cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
+
+    dsml_start = getattr(tokenizer, "tool_call_start", None)
+    if (
+        tools
+        and not tool_calls
+        and dsml_start == "<｜DSML｜ calls>"
+        and dsml_start in regular_content
+    ):
+        # V4.1's output parser returns rejected envelopes as text.
+        errors = []
+        if any(
+            payload.lstrip().startswith("<｜DSML｜ invoke")
+            for payload in _marker_payloads(
+                regular_content, dsml_start, tokenizer.tool_call_end
+            )
+        ):
+            errors.append("malformed")
+        stream_filter = ToolCallStreamFilter(tokenizer, tools=tools)
+        visible = stream_filter.feed(regular_content) + stream_filter.finish()
+        if (
+            stream_filter.recovery_candidate_is_payload()
+            and stream_filter.take_recovery_candidate().startswith(dsml_start)
+        ):
+            cleaned_text = visible.strip()
+            errors.append("incomplete")
+        parse_errors = tuple(errors)
+
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer, tools=tools)
     tool_calls_from_thinking = False
 

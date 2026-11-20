@@ -840,6 +840,28 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen35_ane_prefill_enabled"] as? Bool, false)
     }
 
+    func testLoRAAdapterPickerAndWorkingBody() throws {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "m", configModelType: "qwen3_5")
+        vm.loraAdapters = [
+            LoRAAdapterDTO(id: "fits", path: "/models/fits", baseModel: "Qwen/Base", rank: 32,
+                           targets: ["q_proj"], sizeFormatted: "638 MB", problem: nil),
+            LoRAAdapterDTO(id: "misfit", path: "/models/misfit", baseModel: nil, rank: 8,
+                           targets: ["q_proj"], sizeFormatted: nil, problem: "too many layers"),
+        ]
+        XCTAssertTrue(vm.workingSettingsBody()[ProfileSettingsKey.loraAdapter]?.value is NSNull)
+
+        // A saved adapter stays selectable even when it no longer fits.
+        vm.loraAdapter = "/models/misfit"
+        XCTAssertEqual(vm.loraAdapterOptions().map(\.0), ["", "/models/fits", "/models/misfit"])
+        vm.loraAdapter = "/elsewhere/adapter"
+        XCTAssertEqual(vm.loraAdapterOptions().map(\.0), ["", "/elsewhere/adapter", "/models/fits"])
+        XCTAssertEqual(
+            vm.workingSettingsBody()[ProfileSettingsKey.loraAdapter]?.value as? String,
+            "/elsewhere/adapter"
+        )
+    }
+
     func testGPUPowerLimitSendsZeroWhenOff() throws {
         let vm = ModelSettingsScreenVM()
         XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 0)

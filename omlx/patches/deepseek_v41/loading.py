@@ -57,11 +57,16 @@ _TENSOR_ROWS = ("attn.wq_b", "attn.wo_a", "experts.w1", "experts.w3")
 _TENSOR_COLUMNS = ("attn.wo_b", "experts.w2")
 
 
-def tensor_slice(key, value, rank, size):
+_EXPERT_PROJECTIONS = ("experts.w1", "experts.w2", "experts.w3")
+
+
+def tensor_slice(key, value, rank, size, split=None):
     """This rank's part of checkpoint tensor ``key``.
 
     oQh experts split their row scales with the rows of w1 / w3; w2 keeps
     every row scale, and each rank takes whole rotation blocks of its signs.
+    ``split`` (a ``TensorSplit``) gives each rank its own share of the
+    attention and expert axes instead of an equal one.
     """
     module, _, name = key.rpartition(".")
     if key.endswith("attn.attn_sink"):
@@ -76,7 +81,13 @@ def tensor_slice(key, value, rank, size):
         axis = 0 if name == "oqh_signs" else -1
     else:
         return value
-    return mx.contiguous(mx.split(value, size, axis=axis)[rank])
+    if split is None:
+        return mx.contiguous(mx.split(value, size, axis=axis)[rank])
+    kind = "experts" if module.endswith(_EXPERT_PROJECTIONS) else "attention"
+    start, end = split.bounds(kind, rank, value.shape[axis])
+    view = [slice(None)] * value.ndim
+    view[axis] = slice(start, end)
+    return mx.contiguous(value[tuple(view)])
 
 
 def set_module(model, path, module):
@@ -104,6 +115,7 @@ def load(
     stage=None,
     tensor=None,
     mtp_head=False,
+    tensor_split=None,
 ):
     """Load a converted or source checkpoint.
 
@@ -112,7 +124,8 @@ def load(
     ``tensor`` (a distributed group) makes a tensor-parallel rank that reads
     only its slice of the split projections. ``mtp_head`` keeps the DSpark
     stages on the cluster rank that drafts; a tensor-parallel rank holds them
-    whole, since drafting runs there alone.
+    whole, since drafting runs there alone. ``tensor_split`` (a
+    ``TensorSplit``) gives the tensor-parallel ranks uneven shares.
     """
     path = Path(path)
     if (path / "conversion.inprogress.json").exists():
@@ -144,7 +157,9 @@ def load(
         config.preserve_mtp = bool(mtp_head and stage is not None)
         config.vision_n_layers = 0
     if tensor is not None:
-        config = config.tensor_shard(tensor.size())
+        config = config.tensor_shard(tensor.size(), tensor.rank(), tensor_split)
+    elif tensor_split is not None:
+        raise ValueError("A DeepSeek V4.1 tensor split needs a tensor-parallel group")
     if source_checkpoint and preserve_mtp is None:
         from ..mlx_lm_mtp import is_mtp_active
 
@@ -272,9 +287,12 @@ def load(
                 mtp_resident=config.preserve_mtp,
             )
             model._moe_offload_plan = offload
+            # The banks the scheduler's sized release/restore hooks act on.
+            model._moe_offload_slots = []
             for layer_id, layer in enumerate(model.language_model.layers):
                 prefix = f"language_model.layers.{layer_id}.ffn.experts"
                 layer.ffn.experts = OffloadedExpert(layer.ffn.experts, offload, prefix)
+                model._moe_offload_slots.append(layer.ffn.experts.slots)
             logger.info(
                 "DeepSeek V4.1 MoE offload: %d/%d experts resident per layer "
                 "(%.2f GiB -> %.2f GiB expert weights)%s",
@@ -328,7 +346,11 @@ def load(
                                 value
                                 if key.startswith("language_model.mtp.")
                                 else tensor_slice(
-                                    key, value, tensor.rank(), tensor.size()
+                                    key,
+                                    value,
+                                    tensor.rank(),
+                                    tensor.size(),
+                                    tensor_split,
                                 )
                             )
                             for key, value in values.items()

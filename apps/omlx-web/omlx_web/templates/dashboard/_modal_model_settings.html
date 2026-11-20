@@ -1362,6 +1362,29 @@
                             <!-- Empty state -->
                             <p x-show="modelSettings.ctKwargEntries.length === 0" class="text-xs text-neutral-400 text-center py-1">{{ t('modal.model_settings.no_kwargs') }}</p>
                         </div>
+
+                        <!-- LoRA Adapter -->
+                        <div class="px-4 py-3.5 space-y-2" x-show="!modelSettings.is_diffusion_model" x-cloak>
+                            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 sm:gap-6">
+                                <div class="min-w-0">
+                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.lora_adapter') }}</span>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.lora_adapter_hint') }}</p>
+                                </div>
+                                <select x-model="modelSettings.lora_adapter" class="{{ ms_field }}">
+                                    <option value="">{{ t('modal.model_settings.lora_adapter_none') }}</option>
+                                    <template x-for="a in loraAdapterOptions()" :key="a.path">
+                                        <option :value="a.path"
+                                                :disabled="!!a.problem && a.path !== modelSettings.lora_adapter"
+                                                :selected="modelSettings.lora_adapter === a.path"
+                                                x-text="loraAdapterLabel(a)"></option>
+                                    </template>
+                                </select>
+                            </div>
+                            <p x-show="selectedLoraAdapter()?.base_model" class="text-xs text-neutral-400"
+                               x-text="window.t('modal.model_settings.lora_adapter_info').replace('{base}', selectedLoraAdapter()?.base_model || '').replace('{targets}', (selectedLoraAdapter()?.targets || []).join(', '))"></p>
+                            <p x-show="loraAdapterProblem()" class="text-xs text-amber-700" x-text="loraAdapterProblem()"></p>
+                            <p x-show="loraAdapters.length === 0 && !modelSettings.lora_adapter" class="text-xs text-neutral-400">{{ t('modal.model_settings.lora_adapter_empty') }}</p>
+                        </div>
                     </div>
 
                     <!-- Embedding audio input (EmbeddingGemma 2) -->

@@ -26,7 +26,7 @@ active_deployment = test_cluster_replan.active_deployment
 
 
 def test_join_http_flow_completes_both_sides_and_cancels(tmp_path, monkeypatch):
-    coordinator, joiner, _, enrollments, _ = _loopback_pair(tmp_path)
+    coordinator, joiner, enrollments, _ = _loopback_pair(tmp_path)
     monkeypatch.setattr(pairing_routes, "_get_pairing_manager", lambda: joiner)
     app = FastAPI()
     app.include_router(pairing_routes.pair_admin_router)
@@ -86,7 +86,7 @@ def test_expired_join_retains_retry_address_and_clears_code(tmp_path):
 
 
 def test_cancel_prevents_delayed_approval_from_completing_a_new_join(tmp_path):
-    coordinator, joiner, _, enrollments, _ = _loopback_pair(tmp_path)
+    coordinator, joiner, enrollments, _ = _loopback_pair(tmp_path)
     shown = joiner.ui_session.begin("coordinator:8000")
     coordinator.approve(joiner.node_id, shown["code"])
     approval = coordinator.join_status(joiner.node_id)
@@ -319,7 +319,7 @@ def test_staging_reads_destination_path_map(tmp_path, monkeypatch):
 
 
 def test_cancel_then_retry_same_coordinator_over_http(tmp_path, monkeypatch):
-    coordinator, joiner, _, enrollments, _ = _loopback_pair(tmp_path)
+    coordinator, joiner, enrollments, _ = _loopback_pair(tmp_path)
     monkeypatch.setattr(pairing_routes, "_get_pairing_manager", lambda: joiner)
     app = FastAPI()
     app.include_router(pairing_routes.pair_admin_router)

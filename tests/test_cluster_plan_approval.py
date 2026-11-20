@@ -195,17 +195,21 @@ def _activate(model_path, *, auto_tune: bool, approved_placement: str = "", **ex
     return _client().post("/admin/api/cluster/deployments", json=body)
 
 
+def _plan(body: dict) -> dict:
+    """Plan and sign the way activation does."""
+
+    plan = routes._create_cluster_plan(routes.ClusterPlanRequest(**body))
+    return routes._plan_with_signature(plan.to_dict())
+
+
 def _preview(model_path) -> dict:
-    response = _client().post(
-        "/admin/api/cluster/plan",
-        json={
+    return _plan(
+        {
             "model_path": str(model_path),
             "nodes": _nodes(),
             "tensor_parallel_size": 1,
-        },
+        }
     )
-    assert response.status_code == 200, response.text
-    return response.json()
 
 
 def _by_node(plan: dict) -> dict[str, dict]:
@@ -228,27 +232,24 @@ def test_a_role_raises_a_reserve_and_can_never_be_silenced_by_one(cluster):
     assert mbp["reserve_bytes"] == _WORKSTATION_RESERVE
     assert mbp["reserve_bytes"] > _TYPED_RESERVE_GIB * GiB
     # ...and a role never lowers a reserve the caller deliberately raised.
-    generous = _client().post(
-        "/admin/api/cluster/plan",
-        json={
+    generous = _plan(
+        {
             "model_path": str(cluster),
             "nodes": [
                 dict(_nodes()[0], reserve_bytes=80 * GiB, max_weight_bytes=0),
                 _nodes()[1],
             ],
-        },
+        }
     )
-    assert generous.status_code == 200, generous.text
-    assert _by_node(generous.json())["mbp"]["reserve_bytes"] == 80 * GiB
+    assert _by_node(generous)["mbp"]["reserve_bytes"] == 80 * GiB
 
 
 def test_a_manual_memory_slider_replaces_the_automatic_role_default(cluster):
     """The number shown beside the slider must be the number planning uses."""
 
     manual_reserve = 18 * GiB
-    response = _client().post(
-        "/admin/api/cluster/plan",
-        json={
+    plan = _plan(
+        {
             "model_path": str(cluster),
             "nodes": [
                 dict(
@@ -259,18 +260,17 @@ def test_a_manual_memory_slider_replaces_the_automatic_role_default(cluster):
                 ),
                 _nodes()[1],
             ],
-        },
+        }
     )
 
-    assert response.status_code == 200, response.text
-    mbp = _by_node(response.json())["mbp"]
+    mbp = _by_node(plan)["mbp"]
     assert mbp["role"] == "workstation"
     assert mbp["manual_memory_limit"] is True
     assert mbp["reserve_bytes"] == manual_reserve
 
 
 def test_preview_and_activation_produce_the_same_plan(cluster):
-    """The seam: /plan and /deployments must plan the same thing.
+    """The seam: a preview and /deployments must plan the same thing.
 
     Before the fix they did not even take the same planner branch, and the
     activation payload carried neither the role nor the cap.
@@ -423,16 +423,13 @@ def test_precomputed_profiles_skip_the_post_staging_probe(cluster, monkeypatch):
         dict(_nodes()[0], performance=_profile("mbp", 0, 20e9)),
         dict(_nodes()[1], performance=_profile("studio", 1, 60e9)),
     ]
-    preview_response = _client().post(
-        "/admin/api/cluster/plan",
-        json={
+    preview = _plan(
+        {
             "model_path": str(cluster),
             "nodes": profiled_nodes,
             "tensor_parallel_size": 1,
-        },
+        }
     )
-    assert preview_response.status_code == 200, preview_response.text
-    preview = preview_response.json()
     monkeypatch.setattr(
         routes,
         "run_cluster_performance_probe",

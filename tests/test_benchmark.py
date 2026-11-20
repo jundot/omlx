@@ -2,6 +2,8 @@
 """Tests for the admin benchmark module."""
 
 import asyncio
+import contextvars
+import heapq
 import json
 import logging
 import time
@@ -2443,11 +2445,16 @@ class TestAneBenchmarkTrace:
 # =============================================================================
 
 
+# The virtual time of the token the current stream last received.
+_STREAM_NOW = contextvars.ContextVar("stream_now", default=None)
+
+
 class _CappedCore:
     """Engine core that admits `cap` requests at a time, like the scheduler.
 
     Each admitted request prefills for `prefill_s`, then emits one token per
-    `step_s`. Requests beyond the cap wait in the queue.
+    `step_s`. Requests beyond the cap wait in the queue. `perf_counter` is a
+    virtual clock on that schedule, so timings do not depend on the runner.
     """
 
     def __init__(self, cap, prefill_s=0.05, step_s=0.005):
@@ -2458,29 +2465,49 @@ class _CappedCore:
         self._requests = {}
         self.running = 0
         self.peak_running = 0
+        self.latest = 0.0
+        self._free_slots = []
+
+    def perf_counter(self):
+        """A stream reads its own token times; any other caller the latest one."""
+        now = _STREAM_NOW.get()
+        return self.latest if now is None else now
 
     async def add_request(self, prompt, sampling_params, skip_cache_store=False):
         request_id = f"request-{len(self._requests)}"
-        self._requests[request_id] = (len(prompt), sampling_params.max_tokens)
+        self._requests[request_id] = (
+            len(prompt),
+            sampling_params.max_tokens,
+            self.latest,
+        )
         return request_id
 
     async def stream_outputs(self, request_id):
         if self._sem is None:
             self._sem = asyncio.Semaphore(self.cap)
-        prompt_len, max_tokens = self._requests[request_id]
+        prompt_len, max_tokens, submitted = self._requests[request_id]
         async with self._sem:
             self.running += 1
             self.peak_running = max(self.peak_running, self.running)
+            # A slot frees when the request holding it ends, whichever that is.
+            freed = heapq.heappop(self._free_slots) if self._free_slots else 0.0
+            decode_start = max(submitted, freed) + self.prefill_s
             try:
                 await asyncio.sleep(self.prefill_s)
                 for count in range(1, max_tokens + 1):
                     await asyncio.sleep(self.step_s)
+                    now = decode_start + count * self.step_s
+                    self.latest = max(self.latest, now)
+                    _STREAM_NOW.set(now)
                     yield SimpleNamespace(
                         completion_tokens=count,
                         prompt_tokens=prompt_len,
                         finished=count == max_tokens,
                     )
             finally:
+                heapq.heappush(
+                    self._free_slots, decode_start + max_tokens * self.step_s
+                )
                 self.running -= 1
 
 
@@ -2502,14 +2529,16 @@ class TestBatchWiderThanConcurrencyCap:
                 batch_size=batch_size,
             )
 
-        two = await run(2)
-        eight = await run(8)
+        with patch("omlx.admin.benchmark.time.perf_counter", core.perf_counter):
+            two = await run(2)
+            eight = await run(8)
 
         assert core.peak_running == 2
         assert eight["total_gen_tokens"] == 160
-        # Same cap, same real throughput: the 8x row must stay near the 2x
-        # row instead of reporting about 4x of it.
-        assert eight["tg_tps"] < two["tg_tps"] * 1.5
+        # Same cap, same real throughput: two rows at one token per step each,
+        # where dividing every wave's tokens by the last wave reported ~4x.
+        assert two["tg_tps"] == pytest.approx(2 / core.step_s, rel=0.01)
+        assert eight["tg_tps"] == pytest.approx(two["tg_tps"], rel=0.01)
 
     def test_tokens_after_counts_only_later_tokens(self):
         from omlx.admin.benchmark import _tokens_after

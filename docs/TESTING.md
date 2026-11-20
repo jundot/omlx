@@ -29,7 +29,7 @@ Run `python -m pytest -q tests/test_audio_stt.py -k Qwen3ASRAudioQuantization` t
 
 The autouse `cluster_home` fixture gives each test a temporary directory for cluster interpreter shims and SSH files. It preserves explicit shim `home` arguments and leaves `HOME` unchanged so model discovery paths still work. The shim unit tests import the original function directly and provide their own temporary paths or patch `HOME` to verify the real default-path behavior.
 
-The audio model-list smoke test checks that app startup publishes its shim inside the isolated directory. The cluster GET-route smoke test checks that `/ssh-key` creates its key pair there.
+The audio model-list smoke test checks that app startup publishes its shim inside the isolated directory.
 
 # macOS readability theme tests
 
@@ -135,7 +135,7 @@ Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `om
 
 # Cluster join recovery tests
 
-Run `python -m pytest -q tests/test_cluster_pairing_session.py tests/test_cluster_pairing.py tests/test_cluster_ui_integration.py apps/omlx-web/tests/ui/test_cluster_v2_wizard.py` to check joining, cancellation, and approval. Session tests recreate a manager with the same base path to verify that the original code and cancellation proof survive a restart. They also cover offline cancellation, switching peers while cleanup is pending, rejected requests versus lost responses, and storage failures. Wizard tests check that delayed responses cannot restore a cancelled join and that pending cleanup leaves new pairing controls available.
+Run `python -m pytest -q tests/test_cluster_pairing_session.py tests/test_cluster_pairing.py tests/test_cluster_ui_integration.py apps/omlx-web/tests/ui/test_cluster_wizard.py` to check joining, cancellation, and approval. Session tests recreate a manager with the same base path to verify that the original code and cancellation proof survive a restart. They also cover offline cancellation, switching peers while cleanup is pending, rejected requests versus lost responses, and storage failures. Wizard tests check that delayed responses cannot restore a cancelled join and that pending cleanup leaves new pairing controls available.
 
 For a two-Mac smoke test, start isolated servers with separate base paths. Request a join, restart only the joining server, then cancel and retry; the coordinator must remove the original pending request. Repeat with the coordinator offline: cancellation must return `state: idle` with `cleanup_pending: true`, and joining a different reachable Mac must work. Restore the coordinator and poll the join endpoint to verify cleanup. Keep existing approval/cancel race and token-ownership tests in the run; never relax the coordinator's token check to make a stale request disappear.
 
@@ -215,6 +215,10 @@ Run `python -m pytest -q tests/test_bailing_hybrid_patch.py -k mtp` for the Ling
 ### Batched DFlash drafter
 
 Run `python -m pytest tests/test_dflash_batched.py tests/test_mlx_lm_mtp_patch.py -q -k "dflash or block_drafter or drafter"`. `test_dflash_batched.py` builds tiny DFlash2, Laguna and Muse Glimmer drafters with random weights and checks that the batched forward matches each family's mlx-vlm `draft_block` (MiMo's value scale and trained mask embedding against a v1 reference with scaled `v_proj` weights and a replaced mask-token row), that rows drafted together match the same rows drafted alone across ring wrap-around, ragged context segments and cohort changes, and covers prefill seed window slicing, prefix-hit context restore, block-size clamping and verify-mode parsing. The `block_drafter` cases in `test_mlx_lm_mtp_patch.py` drive the Lightning MTP verify path with a table drafter on the CountingModel harness and require token parity with standard decoding, one context entry per committed position (including late joins) and release of finished rows; the drafter-target cases check layer captures on Qwen3 and Qwen3.5 text targets and require greedy parity with plain decode for tiny Qwen3 and Laguna targets, including Laguna's sliding window wrapping; on NAX hosts `test_mimo_v2_patch.py` also checks that MiMo's fused decode loop reports the same layer captures as the reference loop. Real drafter acceptance and throughput need a target checkpoint with its DFlash draft and are measured against the standard batched engine.
+
+### LoRA adapters
+
+Run `python -m pytest -q tests/test_lora_adapters.py tests/test_oqh.py -k "lora or adapter"` after `make kernels`, plus `tests/test_admin_model_settings.py tests/test_model_settings.py tests/test_model_discovery.py tests/test_accuracy_upload.py -k "lora or adapter"`. Tiny models check that PEFT and mlx-format adapters add the scaled update (per-module `alpha_pattern` included) on dense and quantized projections, that a refused adapter leaves the model unchanged, which PEFT options and targets are refused, and that the SSD cache numerics change with the adapter. The oQh case wraps the MLP projections of a tiny oQh Qwen3.5 checkpoint and requires the fused MLP to be released and the output to match the float twin with the same adapter. The settings cases cover the conflicting accelerators, profile merges that drop them, and a save path that checks the adapter only when it changes. Real adapters need a local checkpoint: compare each wrapped projection with the PEFT tensors read by key, then compare base and adapter logprobs through the API.
 
 # VLM cache boundary tests
 

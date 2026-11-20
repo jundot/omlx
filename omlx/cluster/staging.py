@@ -227,11 +227,6 @@ def _model_identity_digest(model_path: str | Path) -> str:
     return hasher.hexdigest()
 
 
-# Public name for the digest; the manifest endpoint and peer comparison in
-# ``modelsync.py`` share this exact identity definition with staging.
-model_identity_digest = _model_identity_digest
-
-
 def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
     """Read the full shard map from the index even on a partially staged rank."""
 

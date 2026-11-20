@@ -110,7 +110,7 @@ class GatedDeltaNet:
         eps = 1e-6 * scale**2
         q = (scale**2) * mx.fast.rms_norm(q, None, eps)
         k = scale * mx.fast.rms_norm(k, None, eps)
-        return q, k, v, conv_in[:, rows:]
+        return q, k, v, mx.contiguous(conv_in[:, rows:])
 
     def gates(self, a: mx.array, b: mx.array) -> tuple[mx.array, mx.array]:
         """(decay in float32, update rate) of each step and value head."""

@@ -17,6 +17,7 @@ from typing import Any
 from ..adapter.output_parser import repair_tool_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..lora_adapters import apply_adapter
 from ..model_settings import (
     a8_prefill_on,
     ane_prefill_backend,
@@ -443,6 +444,14 @@ class BatchedEngine(BaseEngine):
             self._model,
             self._model_settings,
         )
+        # After the fp16 recast so the adapter takes the activation dtype, and
+        # before the fusions and packers that replace the projections.
+        lora_path = getattr(self._model_settings, "lora_adapter", None)
+        if lora_path:
+            wrapped = await loop.run_in_executor(
+                get_mlx_executor(), apply_adapter, self._model, lora_path
+            )
+            logger.info("LoRA adapter %s: %d projections", lora_path, wrapped)
 
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
