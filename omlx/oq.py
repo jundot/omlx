@@ -11501,6 +11501,7 @@ _OQE_REFINE_EXPERT_BYTES = 4 << 30
 # inputs and many outputs, so their ranges must count the weights too.
 _OQE_REFINE_WEIGHT_COPIES = 10
 # Model types whose calibration walk runs outside the generic layer path.
+# V4.1 never reaches this path: its exporter refines its routed experts itself.
 _OQE_REFINE_UNSUPPORTED_TYPES = frozenset({"deepseek_v41", "muse_spark"})
 
 
