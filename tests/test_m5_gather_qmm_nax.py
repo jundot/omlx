@@ -24,6 +24,7 @@ import omlx.patches.m5_gather_qmm as patch_mod
 import omlx.patches.m5_gather_qmm_nax as nax
 from omlx.patches import mlx_vlm_minimax_m3_compat as minimax_compat
 from omlx.patches import moe_gate_up_fusion as fusion
+from omlx.patches.hy_v4.layers import ClampedSwiGLU as HyClampedSwiGLU
 from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
 from omlx.patches.moe_routes import sort_routes
 
@@ -718,12 +719,14 @@ def test_reference_activation_matches_the_model_activations():
         _assert_bitwise(act(x_up, x_gate), plain, type(act).__module__)
     _assert_bitwise(lm_swiglu(x_gate, x_up), plain)
     _assert_bitwise(lang.Glm5NextClampedSwiGLU(None)(x_up, x_gate), plain)
+    _assert_bitwise(HyClampedSwiGLU(0.0)(x_up, x_gate), plain)
     for limit in (10.0, 7.3):
-        _assert_bitwise(
-            lang.Glm5NextClampedSwiGLU(limit)(x_up, x_gate),
-            nax.reference_activation(x_up, x_gate, limit),
-            f"limit={limit}",
-        )
+        for act in (lang.Glm5NextClampedSwiGLU(limit), HyClampedSwiGLU(limit)):
+            _assert_bitwise(
+                act(x_up, x_gate),
+                nax.reference_activation(x_up, x_gate, limit),
+                f"{type(act).__module__} limit={limit}",
+            )
     minimax_compat.apply_mlx_vlm_minimax_m3_compat_patch()
     minimax = importlib.import_module("mlx_vlm.models.minimax_m3_vl.language")
     up_scale, gate_scale = mx.random.uniform(
@@ -801,6 +804,8 @@ def test_activation_classes():
         assert patch_mod._swiglu_limit(act) is None
     assert patch_mod._swiglu_limit(lang.Glm5NextClampedSwiGLU(10)) == 10.0
     assert patch_mod._swiglu_limit(lang.Glm5NextClampedSwiGLU(None)) is None
+    assert patch_mod._swiglu_limit(HyClampedSwiGLU(10.0)) == 10.0
+    assert patch_mod._swiglu_limit(HyClampedSwiGLU(0.0)) is None
 
     class SubSwiGLU(DsaSwiGLU):  # a subclass may compute something else
         pass

@@ -231,9 +231,13 @@ _SWIGLU_ACTIVATIONS = frozenset(
         ("omlx.patches.deepseek_v4.switch_layers", "SwiGLU"),
     }
 )
-# ... or GLM-5.3's clamped SwiGLU (``limit`` attribute; None: plain).
+# ... or a clamped SwiGLU: silu(min(gate, limit)) * clip(up, -limit, limit)
+# (``limit`` attribute; None: plain). GLM-5.3 and Hy4 clamp the same way.
 _CLAMPED_SWIGLU_ACTIVATIONS = frozenset(
-    {("mlx_vlm.models.glm5_next.language", "Glm5NextClampedSwiGLU")}
+    {
+        ("mlx_vlm.models.glm5_next.language", "Glm5NextClampedSwiGLU"),
+        ("omlx.patches.hy_v4.layers", "ClampedSwiGLU"),
+    }
 )
 _UNSUPPORTED = object()
 
