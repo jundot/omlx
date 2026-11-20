@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from . import indexing
 from .config import TextConfig
 from .rope import TrailingRoPE, rope_at
 
@@ -103,12 +104,20 @@ class CompressedIndexer(nn.Module):
         ).astype(mx.float32)
         q = self.query_projection(qr).reshape(b, length, self.n_heads, self.head_dim)
         q = self.rope(q.swapaxes(1, 2), start - left if b > 1 else start - left[0])
-        q = q.astype(mx.float32)
         w = self.head_weight_projection(x).astype(mx.float32) * self._weight_scale
-        w = w.swapaxes(-1, -2)[..., None]
         own = positions // self.ratio
         keep = min(self.group_topk - 1, count)
         expand = mx.arange(self.ratio)
+        native = self._native_select(q, groups, w, own, valid, keep)
+        if native is not None:
+            chosen, picked = native
+            slots = mx.where(picked, left[:, None, None] + chosen * self.ratio, total)
+            own_slots = left[:, None, None] + own[..., None] * self.ratio
+            slots = mx.concatenate([slots, own_slots], axis=-1).astype(mx.int32)
+            indices = (slots[..., None] + expand).flatten(-2)
+            return indices[:, None].astype(mx.int32)
+        q = q.astype(mx.float32)
+        w = w.swapaxes(-1, -2)[..., None]
         keys_t = groups[:, None].swapaxes(-1, -2)
         out = []
         for lo in range(0, length, _ROW_CHUNK):
@@ -130,6 +139,29 @@ class CompressedIndexer(nn.Module):
             out.append((slots[..., None] + expand).flatten(-2))
         indices = out[0] if len(out) == 1 else mx.concatenate(out, axis=1)
         return indices[:, None].astype(mx.int32)
+
+    def _native_select(self, q, groups, w, own, valid, keep):
+        """(groups [B, L, keep], usable mask) on the sparse_index kernels.
+
+        The native top-k takes 512 columns, one more than the closed groups a
+        row keeps, so the weakest of the 512 is dropped.
+        """
+        if keep + 1 not in indexing.NATIVE_TOPK or groups.shape[1] < keep + 1:
+            return None
+        scores = indexing.scores(q, groups[:, None], w, causal=False)
+        if scores is None:
+            return None
+        count = groups.shape[1]
+        visible = (mx.arange(count)[None, None] < own[..., None]) & valid[:, None]
+        scores = mx.where(visible[:, None], scores, -mx.inf)
+        chosen = indexing.topk(scores, keep + 1)
+        if chosen is None:
+            return None
+        picked = mx.take_along_axis(scores, chosen, axis=-1)[:, 0]
+        best = mx.argpartition(-picked, kth=keep - 1, axis=-1)[..., :keep]
+        chosen = mx.take_along_axis(chosen[:, 0], best, axis=-1)
+        picked = mx.take_along_axis(picked, best, axis=-1)
+        return chosen, picked > -mx.inf
 
 
 def cache_layout(cache, batch: int) -> tuple[int, mx.array]:

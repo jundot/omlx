@@ -20,6 +20,9 @@ from mlx_lm.models.cache import (  # noqa: E402
 from omlx import oq  # noqa: E402
 from omlx.adapter.output_parser import correct_tool_parser_type  # noqa: E402
 from omlx.engine.vlm import _apply_template_thinking_mode  # noqa: E402
+from omlx.patches.hy_v4 import indexing  # noqa: E402
+from omlx.patches.hy_v4.flash import CompressedIndexer  # noqa: E402
+from omlx.patches.hy_v4.layers import Indexer  # noqa: E402
 from omlx.patches.hy_v4.model import (  # noqa: E402
     Model,
     ModelConfig,
@@ -316,6 +319,48 @@ def test_streamed_calibration_matches_resident(tmp_path, monkeypatch, kind):
         )
     measured = streamed.metadata["collection"]["sensitivity_map"]
     assert measured == pytest.approx(sensitivity, abs=1e-6)
+
+
+@pytest.mark.skipif(not indexing.available(), reason="needs sparse_index kernels")
+@pytest.mark.parametrize("kind", ["hy4", "flash"])
+def test_native_index_selection_matches_mlx(monkeypatch, kind):
+    # Release geometry: 128-dim heads, top-k 2048 (512 flash groups).
+    config = _hy4_config() if kind == "hy4" else _flash_config()
+    config["text_config"].update(
+        index_topk=2048,
+        index_n_heads=32,
+        index_head_dim=128,
+        compressed_indexer_num_attention_heads=16,
+        compressed_indexer_head_dim=128,
+    )
+    args = ModelConfig.from_dict(config).text_config
+    indexer = Indexer(args) if kind == "hy4" else CompressedIndexer(args)
+    mx.random.seed(3)
+    indexer.update(
+        tree_unflatten(
+            [
+                (k, (mx.random.normal(v.shape) * v.shape[-1] ** -0.5).astype(v.dtype))
+                for k, v in tree_flatten(indexer.parameters())
+            ]
+        )
+    )
+    total = 2600
+    x = mx.random.normal((2, total, args.hidden_size)).astype(mx.bfloat16)
+    qr = mx.random.normal((2, total, args.q_lora_rank)).astype(mx.bfloat16)
+    mask = mx.arange(total)[:, None] >= mx.arange(total)
+    native = np.array(indexer(x, qr, mask, None))
+    monkeypatch.setattr(indexing, "available", lambda: False)
+    reference = np.array(indexer(x, qr, mask, None))
+    assert native.shape == reference.shape
+    overlap = []
+    for a, b in zip(
+        native.reshape(-1, native.shape[-1]), reference.reshape(-1, native.shape[-1])
+    ):
+        a, b = set(a[a < total]), set(b[b < total])
+        assert len(a) == len(b)
+        overlap.append(len(a & b) / max(len(b), 1))
+    # bf16 scores reorder only near-ties at the cutoff.
+    assert np.mean(overlap) > 0.995 and np.min(overlap) > 0.95
 
 
 def test_sanitize_dequantizes_fp8_and_stacks_experts():

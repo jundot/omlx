@@ -17,6 +17,7 @@ from mlx_lm.models.mla import MultiLinear
 
 from ...custom_kernels.attention import fast as attn_fast
 from ..deepseek_v4.switch_layers import SwitchGLU
+from . import indexing
 from . import kernels as hc_kernels
 from .config import TextConfig
 from .flash import CompressedIndexer
@@ -313,7 +314,11 @@ class Indexer(nn.Module):
         if total <= self.topk:
             return None
         w = self.weights_proj(x.astype(mx.float32)).astype(mx.float32)
-        w = (w * self._weight_scale).swapaxes(-1, -2)[..., None]
+        w = w * self._weight_scale
+        native = self._native_select(q, k, w, mask, total)
+        if native is not None:
+            return native
+        w = w.swapaxes(-1, -2)[..., None]
         kf = k.astype(mx.float32).swapaxes(-1, -2)
         out = []
         for start in range(0, s, _ROW_CHUNK):
@@ -329,6 +334,19 @@ class Indexer(nn.Module):
             picked = mx.take_along_axis(scores, chosen, axis=-1)
             out.append(mx.where(picked > -mx.inf, chosen, total).astype(mx.int32))
         return out[0] if len(out) == 1 else mx.concatenate(out, axis=2)
+
+    def _native_select(self, q, k, w, mask, total) -> mx.array | None:
+        """The same selection on the sparse_index kernels (bf16 scores)."""
+        scores = indexing.scores(q, k, w, causal=True)
+        if scores is None:
+            return None
+        if mask is not None:
+            scores = mx.where(mask, scores, -mx.inf)
+        chosen = indexing.topk(scores, self.topk)
+        if chosen is None:
+            return None
+        picked = mx.take_along_axis(scores, chosen, axis=-1)
+        return mx.where(picked > -mx.inf, chosen, total)
 
 
 def sparse_mask(indices: mx.array, total: int) -> mx.array:
