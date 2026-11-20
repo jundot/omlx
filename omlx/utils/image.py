@@ -236,7 +236,7 @@ def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
     return _load_image_bytes(img_bytes, field=field)
 
 
-def read_image_dims(url_or_base64: str, *, field: str = "image_url") -> Tuple[int, int]:
+def read_image_dims(url_or_base64: str, *, field: str = "image_url") -> tuple[int, int]:
     """Return ``(width, height)`` without decoding the pixels.
 
     Validates the value exactly like :func:`load_image` (data-URI envelope,
