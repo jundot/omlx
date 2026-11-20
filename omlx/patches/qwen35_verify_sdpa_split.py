@@ -46,6 +46,7 @@ import struct
 
 import mlx.core as mx
 
+from ..utils.hardware import get_apple_gpu_generation, get_gpu_core_count
 from .qwen35_verify_qmm import is_row_exact_armed
 
 logger = logging.getLogger(__name__)
@@ -591,6 +592,32 @@ def _m1_gqa_chunk(kv_len: int, kv_heads: int, cores: int | None = None) -> int:
     return min(4096, max(512, (many + 63) // 64 * 64))
 
 
+@functools.cache
+def _mid_core_tensor_gpu_cores() -> int | None:
+    """Core count of a tensor-unit (M5+) GPU under 40 cores, else None."""
+    if get_apple_gpu_generation() < 17:
+        return None
+    cores = get_gpu_core_count()
+    return cores if cores and cores < 40 else None
+
+
+def _gqa_chunk(kv_len: int, kv_heads: int) -> int:
+    """Keys per split of the tensor-op verify kernel."""
+    if kv_len <= 16384:
+        return max(256, (-(-kv_len // 16) + 63) // 64 * 64)
+    if _m1_gpu():
+        return _m1_gqa_chunk(kv_len, kv_heads)
+    cores = _mid_core_tensor_gpu_cores()
+    if cores:
+        # 512-key splits give far more threadgroups than these GPUs have cores,
+        # and the combine pays for each; aim for about 1.6 per core instead.
+        splits = max(4, min(32, -(-8 * cores // (5 * kv_heads))))
+        return max(512, (-(-kv_len // splits) + 63) // 64 * 64)
+    # Short splits beyond 16k keys keep a KV head's blocks in cache between
+    # splits; measured best on M3 Ultra from 2k to 64k keys.
+    return 512
+
+
 def _gqa_causal_sdpa(queries, keys, values, scale):
     """Causal verify attention for up to eight rows, one pass per KV head."""
     _, heads, q_len, dim = queries.shape
@@ -604,14 +631,7 @@ def _gqa_causal_sdpa(queries, keys, values, scale):
     fused = mx.contiguous(
         rows.reshape(kv_heads, group, _WIDE_MAX_ROWS, dim).transpose(0, 2, 1, 3)
     )
-    # Short splits beyond 16k keys keep a KV head's blocks in cache between
-    # splits; measured best on M3 Ultra from 2k to 64k keys.
-    if kv_len > 16384 and _m1_gpu():
-        chunk = _m1_gqa_chunk(kv_len, kv_heads)
-    elif kv_len > 16384:
-        chunk = 512
-    else:
-        chunk = max(256, (-(-kv_len // 16) + 63) // 64 * 64)
+    chunk = _gqa_chunk(kv_len, kv_heads)
     n_splits = -(-kv_len // chunk)
     scale_bits = struct.unpack("<I", struct.pack("<f", float(scale)))[0]
     params = mx.array([kv_len, q_len, chunk, n_splits, scale_bits], dtype=mx.uint32)
@@ -1017,9 +1037,11 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
         )
 
     q35_lang._qwen3_5_left_padded_attention = patched_target_verify_attention
+    # Read the core count at load time; system_profiler takes ~0.2s.
     if _m1_gpu():
-        # Read the core count at load time; system_profiler takes ~0.2s.
         _m1_gpu_cores()
+    else:
+        _mid_core_tensor_gpu_cores()
     _PATCHED = True
     logger.info("Qwen3.5/3.6 verify-width causal vector attention patch applied")
     return True

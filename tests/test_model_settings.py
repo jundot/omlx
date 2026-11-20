@@ -14,6 +14,7 @@ from omlx.model_settings import (
     ModelSettingsManager,
     a8_prefill_on,
     ced_prefill_on,
+    resolve_lora_conflicts,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
 )
@@ -953,6 +954,37 @@ def test_prefill_conflict_resolution_leaves_clean_dicts_alone():
         assert conflicts == []
         # Unchanged dicts are returned as-is, not copied.
         assert resolved is data
+
+
+def test_lora_adapter_conflicts_raise_and_profile_merges_drop_them(tmp_path):
+    """Paths that skip the wrapped projections cannot run with an adapter; a
+    profile merged over such a base keeps the adapter and drops the others."""
+    with pytest.raises(ValueError, match="DFlash"):
+        ModelSettings(lora_adapter="/a", dflash_enabled=True)
+    resolved, names = resolve_lora_conflicts(
+        {
+            "lora_adapter": "/a",
+            "dflash_enabled": True,
+            "prefill_helper_node_id": "m5",
+            "max_tokens": 4,
+        }
+    )
+    assert names == ["dflash_enabled", "prefill_helper_node_id"]
+    settings = ModelSettings.from_dict(resolved)
+    assert (settings.dflash_enabled, settings.prefill_helper_node_id) == (False, None)
+    assert (settings.lora_adapter, settings.max_tokens) == ("/a", 4)
+
+    # A hand-edited file keeps the model's other settings.
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps(
+            {
+                "version": SETTINGS_VERSION,
+                "models": {"m": {"lora_adapter": "/a", "dflash_enabled": True}},
+            }
+        )
+    )
+    loaded = ModelSettingsManager(tmp_path).get_settings("m")
+    assert (loaded.lora_adapter, loaded.dflash_enabled) == ("/a", False)
 
 
 def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):

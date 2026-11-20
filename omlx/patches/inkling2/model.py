@@ -196,9 +196,9 @@ class ExpertProj(nn.Module):
         self.mode = spec["mode"]
         self.bits = spec["bits"]
         self.group_size = spec["group_size"]
-        per = 32 // self.bits
+        packed_dims = in_dims * self.bits // 32
         groups = in_dims // self.group_size
-        self.weight = mx.zeros((experts, out_dims, in_dims // per), dtype=mx.uint32)
+        self.weight = mx.zeros((experts, out_dims, packed_dims), dtype=mx.uint32)
         if self.mode == "affine":
             self.scales = mx.zeros((experts, out_dims, groups), dtype=mx.bfloat16)
             self.biases = mx.zeros((experts, out_dims, groups), dtype=mx.bfloat16)

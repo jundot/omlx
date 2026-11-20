@@ -110,7 +110,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 PACKAGING_DIR="$REPO_ROOT/packaging"
 # Every native package setup.py builds; keep in sync with its ext_modules.
-CUSTOM_KERNEL_NAMES=(attention lowbit quant_matmul sparse_index)
+CUSTOM_KERNEL_NAMES=(attention lowbit oqh quant_matmul sparse_index)
 CUSTOM_KERNEL_DIRS=()
 for _kernel in "${CUSTOM_KERNEL_NAMES[@]}"; do
     CUSTOM_KERNEL_DIRS+=("$REPO_ROOT/omlx/custom_kernels/$_kernel")

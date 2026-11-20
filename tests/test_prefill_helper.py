@@ -3,6 +3,7 @@
 import itertools
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -642,6 +643,11 @@ _REMOTE = HelperTarget("node", "M5max", "me@10.0.0.2", "10.0.0.2", "thunderbolt"
 
 
 def _remote(home):
+    shim = home / ".omlx" / "bin" / "omlx-cluster-python"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+    shim.chmod(0o755)
+
     def runner(argv, **kwargs):
         # Run the remote command here, with HOME pointing at the fake Mac.
         command = argv[-1]
@@ -1436,6 +1442,7 @@ def _fake_daemon(root, events):
                 "version": "0.1.0",
                 "data_protocol": wire.PROTOCOL,
                 "contracts": {"deepseek_v41": DSV41.contract},
+                "oqh": {"deepseek_v41": 1},
                 "gpus": [{**_GPU, "free": 40 << 30}, {**_GPU, "free": 44 << 30}],
                 "disk_free": 1 << 40,
                 "link_mbps": 1000,
@@ -1522,6 +1529,10 @@ def test_agent_transport_drives_a_helper_daemon(tmp_path, monkeypatch):
     assert "does not support" in agent.incompatible(info, GLM, "nvidia1")
     older = {**info, "contracts": {"deepseek_v41": DSV41.contract - 1}}
     assert "update the helper" in agent.incompatible(older, DSV41, "nvidia1")
+    # oQh weights need a helper whose family reads that format version.
+    assert agent.incompatible(info, DSV41, "nvidia1", oqh=1) is None
+    assert "oQh" in agent.incompatible(info, DSV41, "nvidia1", oqh=2)
+    assert "oQh" in agent.incompatible({**info, "oqh": {}}, DSV41, "nvidia1", oqh=1)
 
     # A copy stopped halfway resumes from the bytes the helper kept.
     model = tmp_path / "Model"
@@ -1605,7 +1616,7 @@ def test_a_helper_daemon_moves_to_a_faster_wired_link(monkeypatch):
     assert agent._fastest_link(lan) is lan
 
 
-def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch):
+def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch, caplog):
     # The first GPU also holds the shared tensors; each keeps 8 GiB spare.
     gib = 1 << 30
     assert manager_module.fit_layers(2 * gib, [4 * gib] * 20, [20 * gib] * 2, 19) == 5
@@ -1639,11 +1650,11 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch):
     )
     monkeypatch.setattr(helper_routes, "transport_for", lambda node: daemon)
     rows = helper_routes._check("n")["rows"]
-    # No SSH and no battery on a helper daemon; its own version is fine.
+    # No SSH and no battery on a helper daemon; an older helper only warns.
     assert [(r["key"], r["status"]) for r in rows] == [
         ("control", "pass"),
         ("link", "warn"),
-        ("version", "pass"),
+        ("version", "warn"),
         ("memory", "pass"),
         ("disk", "pass"),
     ]
@@ -1651,7 +1662,20 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch):
     # This Mac's port is 10 Gb, the helper's 1 Gb: the slower end is the link.
     assert rows[1]["speed_mbps"] == 1000
     assert rows[2]["families"] == ["qwen4_exp"] and "expected" not in rows[2]
+    assert "docker pull jundot/omlx-cuda-helper" in rows[2]["fix"]
     assert (rows[3]["bytes"], rows[3]["gpus"]) == (84 * gib, 2)
+    # Starting a model on it logs the same steps.
+    monkeypatch.setattr(manager_module, "forget_host", lambda node: None)
+    with caplog.at_level("WARNING", logger=manager_module.logger.name):
+        manager_module._reach(daemon, "n", lambda *a, **k: None, QWEN4, "/m")
+    assert "nvidia1 is outdated" in caplog.text and "docker pull" in caplog.text
+    # The helper release in this tree passes.
+    helper_init = Path(__file__).parents[1] / "apps/omlx-cuda-helper/omlx_cuda_helper"
+    released = f'__version__ = "{agent.MIN_HELPER_VERSION}"'
+    assert released in (helper_init / "__init__.py").read_text()
+    info["version"] = agent.MIN_HELPER_VERSION
+    version = helper_routes._check("n")["rows"][2]
+    assert (version["status"], version["fix"]) == ("pass", "")
 
 
 # ---------------------------------------------------------------------------
@@ -1800,6 +1824,17 @@ def test_qwen4_split_matches_whole_model(layers, k, prefix):
     )
 
 
+def test_qwen4_prefix_of_a_decoded_cache_sends_text_positions():
+    lm = _qwen4(4)
+    cache = lm.make_cache()
+    lm(mx.array(np.random.default_rng(5).integers(3, 58, (1, 9))), cache=cache)
+    text = cache[2].index_position_ids
+    # A decode step leaves the ids in MRoPE form.
+    cache[2].index_position_ids = mx.broadcast_to(text[None], (3, *text.shape))
+    sent = QWEN4.prefix_state(cache, 3)["2.ip"]
+    np.testing.assert_array_equal(np.asarray(sent), np.asarray(text))
+
+
 # ---------------------------------------------------------------------------
 # Qwen3.5: Gated DeltaNet and full-attention layers on either side of the cut.
 # ---------------------------------------------------------------------------
@@ -1924,6 +1959,10 @@ def test_only_a_model_that_gets_a_helper_has_an_adapter(tmp_path):
     config["quantization_config"]["quant_method"] = "paroquant"
     (tmp_path / "config.json").write_text(json.dumps(config))
     assert adapter_for_model("qwen3_5", "vlm", path) is None
+    # A Mac helper loads oQh as the server does; a CUDA helper says what it reads.
+    config = {"model_type": "qwen3_5", "omlx_oqh": {"version": 1, "tensors": {}}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert adapter_for_model("qwen3_5", "vlm", path) is QWEN35
     # The other families keep their adapter on every engine.
     assert adapter_for_model("qwen4-exp", "batched", path) is QWEN4
 

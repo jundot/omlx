@@ -3,6 +3,7 @@
 import base64
 import json
 import zlib
+from dataclasses import replace
 
 import pytest
 
@@ -107,6 +108,10 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "MLX_MAX_MB_PER_BUFFER=512" in envs
     assert "JACCL_PROGRESS_TIMEOUT_MS=30000" in envs
     assert "JACCL_TIMEOUT_ACTION=teardown-exit" in envs
+    # Fast fences only for JACCL tensor parallelism.
+    for backend, value in (("jaccl", "1"), ("ring", "0")):
+        tensor = replace(_deployment(backend), tensor_parallel_size=2)
+        assert f"MLX_METAL_FAST_SYNCH={value}" in tensor.hostfile_dict()["envs"]
 
 
 def test_hostfile_envs_respect_operator_overrides(monkeypatch):
@@ -125,6 +130,10 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     # Untouched knobs keep their tuned defaults.
     assert "MLX_MAX_MB_PER_BUFFER=512" in envs
     assert "JACCL_TIMEOUT_ACTION=teardown-exit" in envs
+    # An operator can keep fast fences off for JACCL tensor parallelism too.
+    monkeypatch.setenv("MLX_METAL_FAST_SYNCH", "0")
+    tensor = replace(deployment, tensor_parallel_size=2)
+    assert "MLX_METAL_FAST_SYNCH=0" in tensor.hostfile_dict()["envs"]
 
 
 def test_deployment_round_trip_preserves_the_selected_context():

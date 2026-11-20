@@ -59,11 +59,6 @@ def _divides_heads(model: ModelLayout, tensor_parallel_size: int) -> bool:
         return True
     if not model.supports_tensor_parallel:
         return False
-    if model.tensor_parallel_split_units:
-        # Uneven shares: every rank needs at least one unit of each axis.
-        return all(
-            units >= tensor_parallel_size for units in model.tensor_parallel_split_units
-        )
     return all(
         divisor > 0 and divisor % tensor_parallel_size == 0
         for divisor in model.tensor_parallel_divisors

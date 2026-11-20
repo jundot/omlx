@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import math
 import re
 import struct
 import subprocess
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from ..model_discovery import _VISION_WEIGHT_PREFIXES
+from ..oqh import format as oqh_format
 from .node_role import ROLES
 from .performance import ExecutionProfileName, NodePerformanceProfile
 from .staging import DEFAULT_REMOTE_PYTHON, is_local_host, run_remote_python
@@ -725,6 +727,8 @@ def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
     model_type = config.get("model_type")
     if not isinstance(model_type, str):
         return False
+    if oqh_format.is_oqh_config(config):
+        return model_type in oqh_format.TENSOR_PARALLEL_TYPES
     if supports_model_type(model_type):
         return True
     if not model_type.replace("_", "").isalnum():
@@ -780,6 +784,9 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
     heads = _config_int(config, "num_attention_heads", 1)
     kv_heads = _config_int(config, "num_key_value_heads", heads)
     values = [heads, kv_heads]
+    if oqh_format.is_oqh_config(config):
+        # oQh input-split blocks fit this many ranks (see oqh.format.block_for).
+        values.append(oqh_format.TP_BLOCK_RANKS)
     model_type = config.get("model_type")
     if model_type == "deepseek_v41":
         return _deepseek_v41_tensor_divisors(config, heads)
@@ -867,13 +874,14 @@ def _deepseek_v41_tensor_divisors(
     """
 
     groups = _config_int(config, "o_groups", 1)
+    oqh = [oqh_format.TP_BLOCK_RANKS] if oqh_format.is_oqh_config(config) else []
     widths = {
         "attn.wo_b": groups * _config_int(config, "o_lora_rank", 1),
         "experts.w2": _config_int(
             config, "moe_intermediate_size", 1, maximum=1_000_000
         ),
     }
-    values = [heads, groups]
+    values = [heads, groups, *oqh]
     spec = config.get("omlx_deepseek_v41")
     modules = spec.get("quantized_modules") if isinstance(spec, dict) else None
     for name, entry in (modules or {}).items():
@@ -884,8 +892,8 @@ def _deepseek_v41_tensor_divisors(
     return tuple(dict.fromkeys(values))
 
 
-# Must match omlx.patches.deepseek_v41.config.EXPERT_SPLIT_UNIT.
-_DEEPSEEK_V41_EXPERT_SPLIT_UNIT = 64
+# Expert widths per rank stay a multiple of at least this many neurons.
+_DEEPSEEK_V41_EXPERT_SPLIT_MIN = 64
 _DEEPSEEK_V41_ATTENTION_SPLIT = ("attn.wq_b", "attn.wo_a", "attn.wo_b")
 _DEEPSEEK_V41_EXPERT_SPLIT = ("experts.w1", "experts.w2", "experts.w3")
 
@@ -893,18 +901,41 @@ _DEEPSEEK_V41_EXPERT_SPLIT = ("experts.w1", "experts.w2", "experts.w3")
 def _tensor_split_units(config: dict[str, Any]) -> tuple[int, ...]:
     """(attention, expert) units of an uneven TP split, or () if unsupported.
 
-    DeepSeek V4.1 ranks can hold any whole number of output groups (each a
-    fixed run of heads) and of 64-neuron expert blocks, which keeps the fused
-    decode MoE kernel and whole quantization groups on every rank.
+    DeepSeek V4.1 ranks hold whole output groups (each a fixed run of heads)
+    and whole expert blocks. A block holds whole w2 quantization groups and
+    oQh rotation blocks, and two shared w2 groups, which the fused decode MoE
+    kernel needs on every rank.
     """
 
     if config.get("model_type") != "deepseek_v41":
         return ()
     heads = _config_int(config, "num_attention_heads", 0)
     groups = _config_int(config, "o_groups", 0)
+    lora = _config_int(config, "o_lora_rank", 0)
     width = _config_int(config, "moe_intermediate_size", 0, maximum=1_000_000)
-    unit = _DEEPSEEK_V41_EXPERT_SPLIT_UNIT
-    if not (heads and groups and width) or heads % groups or width % unit:
+    if not (heads and groups and lora and width) or heads % groups:
+        return ()
+    unit = _DEEPSEEK_V41_EXPERT_SPLIT_MIN
+    spec = config.get("omlx_deepseek_v41")
+    modules = spec.get("quantized_modules") if isinstance(spec, dict) else None
+    inputs = [
+        (name, entry.get("group_size", 32))
+        for name, entry in (modules or {}).items()
+        if isinstance(entry, dict)
+    ]
+    oqh = oqh_format.oqh_paths(config)
+    if oqh_format.is_oqh_config(config) and not oqh:
+        return ()  # Unknown oQh format version: blocks are not known.
+    for name, entry in oqh.items():
+        inputs.append((name, math.lcm(entry["block"], entry.get("group_size", 1))))
+    for name, size in inputs:
+        if name.endswith("shared_experts.w2"):
+            unit = math.lcm(unit, 2 * size)
+        elif name.endswith("experts.w2"):
+            unit = math.lcm(unit, size)
+        elif name.endswith("attn.wo_b") and lora % size:
+            return ()
+    if width % unit:
         return ()
     return (groups, width // unit)
 
@@ -2486,6 +2517,108 @@ def with_mtp_head(model: ModelLayout) -> ModelLayout:
     return _with_head_on_last_layer(model, model.mtp_weight_bytes)
 
 
+def _tensor_stage_assignment(
+    model: ModelLayout,
+    node: NodeBudget,
+    *,
+    tp_rank: int,
+    tensor_parallel_size: int,
+    layers: tuple[int, int],
+    held_layer_bytes: int,
+    fixed_bytes: int,
+    kv_bytes: int,
+    workload_profile: ExecutionProfileName,
+    microbatch_size: int,
+    performance_aware: bool,
+    split: tuple[tuple[int, ...], ...] = (),
+) -> PipelineAssignment:
+    """One tensor-parallel member's assignment of a hybrid stage."""
+
+    start, end = layers
+    compute_seconds, send_seconds, stage_seconds = _predict_stage_seconds(
+        held_layer_bytes,
+        node,
+        activation_bytes_per_token=model.activation_bytes_per_token,
+        workload_profile=workload_profile,
+        microbatch_size=microbatch_size,
+    )
+    return PipelineAssignment(
+        node_id=node.node_id,
+        rank=node.rank,
+        start_layer=start,
+        end_layer=end,
+        layer_weight_bytes=held_layer_bytes,
+        fixed_weight_bytes=fixed_bytes,
+        reserve_bytes=node.reserve_bytes,
+        capacity_bytes=node.capacity_bytes,
+        manual_memory_limit=node.manual_memory_limit,
+        role=node.role,
+        memory_guard_tier=node.memory_guard_tier,
+        tensor_parallel_rank=tp_rank,
+        tensor_parallel_size=tensor_parallel_size,
+        kv_cache_bytes=kv_bytes,
+        kv_bytes_per_token=_kv_bytes_per_token_for_stage(
+            model, end - start, tensor_parallel_size
+        ),
+        max_context_tokens=_max_context_for_stage(
+            model,
+            node,
+            layer_count=end - start,
+            weight_bytes=fixed_bytes + held_layer_bytes,
+            tensor_parallel_size=tensor_parallel_size,
+        ),
+        sharded_weight_bytes=held_layer_bytes if tensor_parallel_size > 1 else 0,
+        predicted_compute_seconds=compute_seconds if performance_aware else None,
+        predicted_send_seconds=send_seconds if performance_aware else None,
+        predicted_stage_seconds=stage_seconds if performance_aware else None,
+        tensor_parallel_split=split,
+    )
+
+
+def _hybrid_shard_plan(
+    model: ModelLayout,
+    ordered_nodes: Sequence[NodeBudget],
+    assignments: list[PipelineAssignment],
+    *,
+    tensor_parallel_size: int,
+    pipeline_stages: int,
+    performance_aware: bool,
+    workload_profile: ExecutionProfileName,
+    microbatch_size: int,
+    context_tokens: int,
+) -> ShardPlan:
+    """The hybrid plan of ``assignments``, hashed over every assignment field."""
+
+    assignments = sorted(assignments, key=lambda a: a.rank)
+    hash_payload = {
+        "model": model.to_dict(),
+        "context_tokens": context_tokens,
+        "assignments": [a.to_dict() for a in assignments],
+        "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_stages": pipeline_stages,
+        "workload_profile": workload_profile,
+        "microbatch_size": microbatch_size,
+    }
+    plan_hash = hashlib.sha256(
+        json.dumps(hash_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return ShardPlan(
+        model=model,
+        assignments=tuple(assignments),
+        plan_hash=plan_hash,
+        optimization="performance" if performance_aware else "memory",
+        workload_profile=workload_profile,
+        performance_profiles=(
+            tuple(node.performance for node in ordered_nodes)
+            if performance_aware
+            else ()
+        ),
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_stages=pipeline_stages,
+        target_context_tokens=context_tokens,
+    )
+
+
 def _plan_uneven_tensor(
     model: ModelLayout,
     nodes: Sequence[NodeBudget],
@@ -2545,69 +2678,32 @@ def _plan_uneven_tensor(
                 f"tensor split does not fit node {node.node_id}: "
                 f"{planned} > {node.usable_bytes}"
             )
-        compute_seconds, send_seconds, stage_seconds = _predict_stage_seconds(
-            held,
-            node,
-            activation_bytes_per_token=model.activation_bytes_per_token,
-            workload_profile=workload_profile,
-            microbatch_size=microbatch_size,
-        )
         assignments.append(
-            PipelineAssignment(
-                node_id=node.node_id,
-                rank=node.rank,
-                start_layer=0,
-                end_layer=layers,
-                layer_weight_bytes=held,
-                fixed_weight_bytes=fixed[tp_rank],
-                reserve_bytes=node.reserve_bytes,
-                capacity_bytes=node.capacity_bytes,
-                manual_memory_limit=node.manual_memory_limit,
-                role=node.role,
-                memory_guard_tier=node.memory_guard_tier,
-                tensor_parallel_rank=tp_rank,
+            _tensor_stage_assignment(
+                model,
+                node,
+                tp_rank=tp_rank,
                 tensor_parallel_size=size,
-                sharded_weight_bytes=held,
-                kv_cache_bytes=kv_bytes,
-                kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, layers, size),
-                max_context_tokens=_max_context_for_stage(
-                    model,
-                    node,
-                    layer_count=layers,
-                    weight_bytes=fixed[tp_rank] + held,
-                    tensor_parallel_size=size,
-                ),
-                predicted_compute_seconds=(
-                    compute_seconds if performance_aware else None
-                ),
-                predicted_send_seconds=send_seconds if performance_aware else None,
-                predicted_stage_seconds=(stage_seconds if performance_aware else None),
-                tensor_parallel_split=split,
+                layers=(0, layers),
+                held_layer_bytes=held,
+                fixed_bytes=fixed[tp_rank],
+                kv_bytes=kv_bytes,
+                workload_profile=workload_profile,
+                microbatch_size=microbatch_size,
+                performance_aware=performance_aware,
+                split=split,
             )
         )
-    hash_payload = {
-        "model": model.to_dict(),
-        "context_tokens": context_tokens,
-        "assignments": [a.to_dict() for a in assignments],
-        "tensor_parallel_size": size,
-        "pipeline_stages": 1,
-        "workload_profile": workload_profile,
-        "microbatch_size": microbatch_size,
-    }
-    return ShardPlan(
-        model=model,
-        assignments=tuple(assignments),
-        plan_hash=hashlib.sha256(
-            json.dumps(hash_payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
-        optimization="performance" if performance_aware else "memory",
-        workload_profile=workload_profile,
-        performance_profiles=(
-            tuple(node.performance for node in ordered) if performance_aware else ()
-        ),
+    return _hybrid_shard_plan(
+        model,
+        ordered,
+        assignments,
         tensor_parallel_size=size,
         pipeline_stages=1,
-        target_context_tokens=context_tokens,
+        performance_aware=performance_aware,
+        workload_profile=workload_profile,
+        microbatch_size=microbatch_size,
+        context_tokens=context_tokens,
     )
 
 
@@ -2631,9 +2727,8 @@ def plan_hybrid(
 
     ``tensor_split`` decides how a single tensor-parallel stage divides each
     layer on architectures that support uneven shares
-    (``ModelLayout.tensor_parallel_split_units``): ``"equal"``,
-    ``"proportional"`` (sized to each node), ``"auto"`` (equal when it fits,
-    otherwise proportional), or an explicit
+    (``ModelLayout.tensor_parallel_split_units``): ``"equal"``, ``"auto"``
+    (equal when it fits, otherwise sized to each node), or an explicit
     ``{"attention": [...], "experts": [...]}`` in rank order. Other
     architectures always split evenly.
 
@@ -2685,19 +2780,36 @@ def plan_hybrid(
             pipeline_stages=pipeline_stages,
         )
 
-    if tensor_split not in ("auto", "equal") and not isinstance(tensor_split, str):
-        explicit = tensor_split_from_dict(tensor_split)
-    elif tensor_split in ("auto", "equal", "proportional"):
+    # Refuse impossible tensor parallelism here rather than after every rank
+    # has loaded its weights. shard() does n_heads //= N and n_kv_heads //= N,
+    # and most mlx-lm architectures do not implement shard() at all. An uneven
+    # split changes the shares, not the degrees a model supports.
+    if tensor_parallel_size > 1:
+        incompatible = tuple(
+            value
+            for value in model.tensor_parallel_divisors
+            if value % tensor_parallel_size
+        )
+        if incompatible:
+            raise PlanningError(
+                "tensor-parallel architecture dimensions "
+                f"{incompatible} are not divisible by tensor_parallel_size "
+                f"({tensor_parallel_size})"
+            )
+
+    if isinstance(tensor_split, str):
+        if tensor_split not in ("auto", "equal"):
+            raise ValueError(f"unknown tensor_split {tensor_split!r}")
         explicit = ()
     else:
-        raise ValueError(f"unknown tensor_split {tensor_split!r}")
+        explicit = tensor_split_from_dict(tensor_split)
     uneven_possible = bool(model.tensor_parallel_split_units and pipeline_stages == 1)
-    if (explicit or tensor_split == "proportional") and not uneven_possible:
+    if explicit and not uneven_possible:
         raise PlanningError(
             "an uneven tensor split needs one tensor-parallel stage of an "
             "architecture that supports it"
         )
-    if explicit or tensor_split == "proportional":
+    if explicit:
         return _plan_uneven_tensor(
             model,
             nodes,
@@ -2729,22 +2841,6 @@ def plan_hybrid(
                 microbatch_size=microbatch_size,
                 context_tokens=context_tokens,
                 head_rank_extra_bytes=head_rank_extra_bytes,
-            )
-
-    # Refuse impossible tensor parallelism here rather than after every rank
-    # has loaded its weights. shard() does n_heads //= N and n_kv_heads //= N,
-    # and most mlx-lm architectures do not implement shard() at all.
-    if tensor_parallel_size > 1:
-        incompatible = tuple(
-            value
-            for value in model.tensor_parallel_divisors
-            if value % tensor_parallel_size
-        )
-        if incompatible:
-            raise PlanningError(
-                "tensor-parallel architecture dimensions "
-                f"{incompatible} are not divisible by tensor_parallel_size "
-                f"({tensor_parallel_size})"
             )
 
     # Validate ranks
@@ -2845,88 +2941,29 @@ def plan_hybrid(
                     f"hybrid shard does not fit node {node.node_id}: "
                     f"{planned} > {node.usable_bytes}"
                 )
-            compute_seconds, send_seconds, stage_seconds = _predict_stage_seconds(
-                held_layer_bytes,
-                node,
-                activation_bytes_per_token=model.activation_bytes_per_token,
-                workload_profile=workload_profile,
-                microbatch_size=microbatch_size,
-            )
             assignments.append(
-                PipelineAssignment(
-                    node_id=node.node_id,
-                    rank=node.rank,
-                    start_layer=start,
-                    end_layer=end,
-                    layer_weight_bytes=held_layer_bytes,
-                    fixed_weight_bytes=fixed_bytes,
-                    reserve_bytes=node.reserve_bytes,
-                    capacity_bytes=node.capacity_bytes,
-                    manual_memory_limit=node.manual_memory_limit,
-                    role=node.role,
-                    memory_guard_tier=node.memory_guard_tier,
-                    tensor_parallel_rank=tp_rank,
+                _tensor_stage_assignment(
+                    model,
+                    node,
+                    tp_rank=tp_rank,
                     tensor_parallel_size=tensor_parallel_size,
-                    kv_cache_bytes=kv_bytes,
-                    kv_bytes_per_token=_kv_bytes_per_token_for_stage(
-                        model, end - start, tensor_parallel_size
-                    ),
-                    max_context_tokens=_max_context_for_stage(
-                        model,
-                        node,
-                        layer_count=end - start,
-                        weight_bytes=fixed_bytes + held_layer_bytes,
-                        tensor_parallel_size=tensor_parallel_size,
-                    ),
-                    sharded_weight_bytes=(
-                        held_layer_bytes if tensor_parallel_size > 1 else 0
-                    ),
-                    predicted_compute_seconds=(
-                        compute_seconds if performance_aware else None
-                    ),
-                    predicted_send_seconds=(
-                        send_seconds if performance_aware else None
-                    ),
-                    predicted_stage_seconds=(
-                        stage_seconds if performance_aware else None
-                    ),
+                    layers=(start, end),
+                    held_layer_bytes=held_layer_bytes,
+                    fixed_bytes=fixed_bytes,
+                    kv_bytes=kv_bytes,
+                    workload_profile=workload_profile,
+                    microbatch_size=microbatch_size,
+                    performance_aware=performance_aware,
                 )
             )
-
-    # Sort by rank for consistent ordering
-    assignments.sort(key=lambda a: a.rank)
-
-    # Build performance profiles if available
-    profiles = (
-        tuple(
-            node.performance for node in ordered_nodes if node.performance is not None
-        )
-        if performance_aware
-        else ()
-    )
-
-    # Compute plan hash covering all assignment fields
-    hash_payload = {
-        "model": model.to_dict(),
-        "context_tokens": context_tokens,
-        "assignments": [a.to_dict() for a in assignments],
-        "tensor_parallel_size": tensor_parallel_size,
-        "pipeline_stages": pipeline_stages,
-        "workload_profile": workload_profile,
-        "microbatch_size": microbatch_size,
-    }
-    plan_hash = hashlib.sha256(
-        json.dumps(hash_payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-    return ShardPlan(
-        model=model,
-        assignments=tuple(assignments),
-        plan_hash=plan_hash,
-        optimization="performance" if performance_aware else "memory",
-        workload_profile=workload_profile,
-        performance_profiles=profiles,
+    return _hybrid_shard_plan(
+        model,
+        ordered_nodes,
+        assignments,
         tensor_parallel_size=tensor_parallel_size,
         pipeline_stages=pipeline_stages,
-        target_context_tokens=context_tokens,
+        performance_aware=performance_aware,
+        workload_profile=workload_profile,
+        microbatch_size=microbatch_size,
+        context_tokens=context_tokens,
     )

@@ -12,6 +12,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 from omlx_cuda_helper.families import glm5_next  # noqa: E402
+from omlx_cuda_helper.families.glm5_next import kernels, model  # noqa: E402
 from omlx_cuda_helper.families.glm5_next.stage import load_stage  # noqa: E402
 
 # Recorded by tests/fixtures/record_prefill_contract.py in the oMLX tree.
@@ -228,3 +229,35 @@ def test_plan_counts_what_a_stage_holds(tmp_path):
         v.nbytes for n, v in stored.items() if n.startswith(f"{LAYERS}1.mlp.switch_")
     )
     assert packed_layers[1] == layers[1] - bank + bank // 8 + bank // 16
+
+
+@pytest.mark.skipif(not kernels.active(), reason="CUDA kernels")
+def test_oqh_experts_on_the_kernel_match_the_rebuilt_banks():
+    raw = json.loads((FIXTURE / "model/config.json").read_text())
+    config = model.Config.from_dict(raw.get("text_config") or raw)
+    experts, hidden, inner, key = 8, 512, 256, mx.random.key(3)
+    weights = {
+        "mlp.gate.weight": mx.random.normal((experts, hidden), key=key),
+        "mlp.gate.e_score_correction_bias": mx.zeros((experts,)),
+    }
+    for name, (n, k, bits) in {
+        "gate_proj": (inner, hidden, 3),
+        "up_proj": (inner, hidden, 3),
+        "down_proj": (hidden, inner, 4),
+    }.items():
+        prefix = f"mlp.switch_mlp.{name}"
+        codes = mx.random.randint(0, 2**31, (experts, n, k * bits // 32), key=key)
+        weights[f"{prefix}.weight"] = codes.astype(mx.uint32)
+        rscale = mx.random.uniform(0.01, 0.02, (experts, n), key=key)
+        weights[f"{prefix}.rscale"] = rscale.astype(mx.bfloat16)
+        # Gate and up read one input, so they share their signs.
+        signs = mx.random.uniform(shape=(k,), key=mx.random.key(k)) < 0.5
+        signs = mx.where(signs, -1.0, 1.0).astype(mx.bfloat16)
+        weights[f"{prefix}.oqh_signs"] = signs.reshape(-1, 256)
+    moe = model.Moe(weights, "mlp", lambda module: None, config)
+    x = mx.random.normal((1, 96, hidden), key=key).astype(mx.bfloat16)
+    chosen, routes = moe.route(x)
+    banks = (moe.gate, moe.up, moe.down)
+    want = model.routed(banks, x, chosen, routes, moe.limit).astype(mx.float32)
+    got = kernels.moe_routed(moe, x, chosen, routes).astype(mx.float32)
+    assert (mx.linalg.norm(got - want) / mx.linalg.norm(want)).item() < 3e-3

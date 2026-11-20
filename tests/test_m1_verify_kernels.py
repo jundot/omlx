@@ -14,6 +14,7 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 
 @pytest.fixture
 def qmv_only(monkeypatch):
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: False)
     monkeypatch.setattr(m1_verify_qmv, "enabled", lambda: True)
     # Pin the 5-16 row MMA route off so the sg8/qmv boundaries stay visible
     # (the MMA tests below cover it).
@@ -24,6 +25,7 @@ def qmv_only(monkeypatch):
 
 @pytest.fixture
 def qmv_off(monkeypatch):
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: False)
     monkeypatch.setattr(m1_verify_qmv, "enabled", lambda: False)
 
 
@@ -74,6 +76,17 @@ def test_row_and_shape_gating(qmv_only):
 def test_qmv_disabled_when_the_gate_is_off(qmv_off):
     assert not m1_verify_qmv.eligible(2, 2048, 1024, 4, 64, mx.float16)
     assert qwen35_verify_qmm._verify_route(4, 5120, 17408, 4, 64, mx.float16) == "sg8"
+
+
+def test_tensor_unit_single_projection_takes_sg8_from_six_rows(qmv_off, monkeypatch):
+    monkeypatch.setattr(m1_verify_mma, "enabled", lambda: False)
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: True)
+    route = qwen35_verify_qmm._verify_route
+    assert [route(r, 6144, 5120, 5, 64, mx.bfloat16) for r in (4, 5, 6)] == [
+        None,
+        None,
+        "sg8",
+    ]
 
 
 def test_takes_priority_over_sg8_and_split_k(qmv_only):

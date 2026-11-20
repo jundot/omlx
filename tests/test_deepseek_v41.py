@@ -1571,8 +1571,10 @@ import mlx.core as mx
 import numpy as np
 
 group = mx.distributed.init(backend="ring", strict=True)
+from omlx.patches.deepseek_v41.config import TensorSplit
 from omlx.patches.deepseek_v41.loading import load
 
+split = TensorSplit.from_dict(json.loads(sys.argv[2]))
 ids = np.random.default_rng(16).integers(3, 60, (2, 14), dtype=np.int32)
 steps = [ids[:, :9], ids[:, 9:12], ids[:, 12:13], ids[:, 13:14]]
 
@@ -1587,8 +1589,10 @@ def run(model):
 full, _ = load(sys.argv[1])
 reference = run(full)
 full.close()
-model, _ = load(sys.argv[1], tensor=group, engram_ssd_offload=True)
-assert model.language_model.layers[0].attn.attn_sink.shape == (1,)
+model, _ = load(sys.argv[1], tensor=group, engram_ssd_offload=True, tensor_split=split)
+# One head per output group.
+heads = split.attention[group.rank()] if split else 1
+assert model.language_model.layers[0].attn.attn_sink.shape == (heads,)
 for r, g in zip(reference, run(model)):
     assert mx.allclose(r, g, atol=1e-3, rtol=1e-3).item(), mx.abs(r - g).max()
 print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)
@@ -1623,16 +1627,73 @@ def pack_split_projections(target):
 
 
 @pytest.mark.slow
-def test_tensor_parallel_ranks_match_single_process(tmp_path):
+@pytest.mark.parametrize(
+    ("shape", "split"),
+    [
+        # Two heads, output groups and 32-wide quantization groups per split width.
+        (dict(moe_inter_dim=64), None),
+        # Rank 0 holds three of four output groups and two of three 32-neuron
+        # expert blocks.
+        (
+            dict(moe_inter_dim=96, n_heads=4, o_groups=4),
+            {"attention": [3, 1], "experts": [2, 1]},
+        ),
+    ],
+)
+def test_tensor_parallel_ranks_match_single_process(tmp_path, shape, split):
     from omlx.patches.deepseek_v41.convert import convert
 
-    # Two heads, output groups and 32-wide quantization groups per split width.
-    source, _ = write_checkpoint(tmp_path, moe_inter_dim=64, o_lora_rank=32, **_ENGRAM)
+    # Some random weights put a discrete choice (routing, top-k) within
+    # rounding of a tie, so even an equal split differs. Fix the weights.
+    mx.random.seed(0)
+    source, _ = write_checkpoint(tmp_path, o_lora_rank=32, **shape, **_ENGRAM)
     target = tmp_path / "converted"
     convert(source, target)
     pack_split_projections(target)
 
-    run_two_ranks(tmp_path, _TENSOR_RANK, target)
+    run_two_ranks(tmp_path, _TENSOR_RANK, target, json.dumps(split))
+
+
+def test_uneven_tensor_shard_shapes():
+    from omlx.patches.deepseek_v41.config import TensorSplit
+
+    config = ModelConfig(n_heads=64, o_groups=8, moe_inter_dim=2304)
+    shard = config.tensor_shard(2, 1, TensorSplit((5, 3), (12, 6)))
+
+    # Blocks are moe_inter_dim / sum(experts) wide: 18 blocks of 128 here.
+    assert (shard.n_heads, shard.o_groups, shard.moe_inter_dim) == (24, 3, 768)
+    with pytest.raises(ValueError):
+        config.tensor_shard(2, 0, TensorSplit((5, 3), (25, 10)))
+
+
+@pytest.mark.parametrize(
+    ("key", "shape", "axis", "first"),
+    [
+        ("attn.wq_b.weight", (64 * 4, 6), 0, 160),
+        ("attn.wo_b.weight", (6, 8 * 16), 1, 80),
+        ("attn.attn_sink", (64,), 0, 40),
+        ("ffn.experts.w1.weight", (2, 2304, 4), 1, 1600),
+        ("ffn.shared_experts.w2.scales", (4, 2304 // 32), 1, 50),
+        ("attn.wkv.weight", (8, 8), None, None),
+    ],
+)
+def test_uneven_tensor_slices_partition_each_split_axis(key, shape, axis, first):
+    from omlx.patches.deepseek_v41.config import TensorSplit
+    from omlx.patches.deepseek_v41.loading import tensor_slice
+
+    split = TensorSplit((5, 3), (25, 11))
+    value = mx.arange(int(np.prod(shape))).reshape(shape)
+
+    parts = [
+        tensor_slice(f"language_model.layers.0.{key}", value, rank, 2, split)
+        for rank in range(2)
+    ]
+
+    if axis is None:
+        assert parts[0] is value
+        return
+    assert parts[0].shape[axis] == first
+    assert mx.array_equal(mx.concatenate(parts, axis=axis), value).item()
 
 
 # One tensor-parallel rank prefilling through mlx-lm's prompt loop with the

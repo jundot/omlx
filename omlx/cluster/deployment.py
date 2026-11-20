@@ -52,7 +52,10 @@ _MAX_PLAN_BYTES = 256 * 1024
 # keeps their value, and everyone else gets the default.
 #
 # Match MLX's disabled fast-sync default: fast fences can deadlock across
-# CPU/GPU streams (https://github.com/ml-explore/mlx/pull/4005).
+# CPU/GPU streams (https://github.com/ml-explore/mlx/pull/4005), and a TCP ring
+# stalled in long prefill with them. JACCL tensor parallelism turns them on:
+# every layer hands its all_sum to the CPU stream, and the default fence made
+# two-Mac DeepSeek V4.1 decode about 1.6x slower.
 #
 # MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER bound how much work lands in
 # one Metal command buffer. An unbounded buffer overruns the GPU driver's
@@ -76,10 +79,13 @@ _RANK_ENV_DEFAULTS = (
 )
 
 
-def _hostfile_envs() -> list[str]:
+def _hostfile_envs(fast_synch: bool = False) -> list[str]:
+    defaults = dict(_RANK_ENV_DEFAULTS)
+    if fast_synch:
+        defaults["MLX_METAL_FAST_SYNCH"] = "1"
     return [
         f"{name}={os.environ.get(name) or default}"
-        for name, default in _RANK_ENV_DEFAULTS
+        for name, default in defaults.items()
     ]
 
 
@@ -480,7 +486,9 @@ class ClusterDeployment:
     def hostfile_dict(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
-            "envs": _hostfile_envs(),
+            "envs": _hostfile_envs(
+                fast_synch=self.backend == "jaccl" and self.tensor_parallel_size > 1
+            ),
             "hosts": [
                 {
                     "ssh": host.ssh,

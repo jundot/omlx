@@ -96,10 +96,12 @@ def build_upload_context(request: Any, engine_pool: Any) -> dict:
 
     feature_flags: list[dict] = []
     model_settings: dict | None = None
+    lora_adapter = None
     sm = getattr(engine_pool, "_settings_manager", None)
     if sm is not None:
         try:
             ms = sm.get_settings(request.model_id)
+            lora_adapter = getattr(ms, "lora_adapter", None)
             model_type = (
                 str(getattr(entry, "config_model_type", "") or "")
                 .replace("-", "_")
@@ -141,6 +143,8 @@ def build_upload_context(request: Any, engine_pool: Any) -> dict:
         "model_settings": model_settings,
         "submission_group": str(uuid.uuid4()),
         "owner_hash_full": owner_hash_full,
+        # Not uploaded: the leaderboard files scores under the base checkpoint.
+        "lora_adapter": lora_adapter,
     }
 
 
@@ -233,6 +237,8 @@ async def upload_intelligence_result(
     """Upload one suite result. Never raises; returns the outcome dict."""
     if result_data.get("total", 0) < _MIN_UPLOAD_QUESTIONS:
         return {"skipped": "min_questions"}
+    if ctx.get("lora_adapter"):
+        return {"skipped": "lora_adapter"}
     try:
         return await _do_upload(ctx, result_data)
     except Exception as e:  # noqa: BLE001

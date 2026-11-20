@@ -7,7 +7,6 @@ Batch rows are evaluated independently so late admission cannot share history.
 """
 
 import math
-import os
 import threading
 from contextlib import contextmanager, nullcontext
 from functools import cache, lru_cache
@@ -811,10 +810,6 @@ def _send_stage(h, pre, destination):
     mx.eval(mx.distributed.send(payload, destination))
 
 
-# Read once: MLX fixes its GPU/CPU synchronisation mode at start-up.
-_FAST_SYNCH = os.environ.get("MLX_METAL_FAST_SYNCH") == "1"
-
-
 def _gather_stage(x):
     """Rank 0's rows of ``x``: it holds the last layers."""
     gathered = mx.distributed.all_gather(x)
@@ -966,14 +961,7 @@ class Block(nn.Module):
 
     def sum_ranks(self, x):
         group = self._tensor_group
-        if group is None:
-            return x
-        if _FAST_SYNCH:
-            # With fast GPU/CPU synchronisation the JACCL reduction can run on
-            # the CPU stream while the GPU keeps encoding: the GPU waits on a
-            # shared event instead of ending its command buffer per layer.
-            return mx.distributed.all_sum(x, group=group, stream=mx.cpu)
-        return mx.distributed.all_sum(x, group=group)
+        return x if group is None else mx.distributed.all_sum(x, group=group)
 
     def __call__(self, h, pre, cache, shared, start, image_mask, ced_tail=None):
         if (
@@ -1592,10 +1580,13 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             )
             prefetch = getattr(self, "_engram_prefetch", None)
             # A fully lazy prefill loop pins every intermediate until the logits
-            # eval (+14.5GB per 2048-token chunk). Prefill evals each layer so
-            # intermediates retire as the GPU runs, under a bounded pool.
-            # Decode/verify widths are only submitted (async_eval).
+            # eval (+14.5GB per 2048-token chunk). Prefill bounds that under a
+            # bounded pool: each layer is submitted, then the previous layer is
+            # waited on, so the CPU builds layer k+1 while the GPU runs layer k
+            # and at most two layers' intermediates are alive. Decode/verify
+            # widths are only submitted (async_eval).
             prefill_backpressure = end - begin >= 256
+            lagged = None
             with (
                 _prefill_cache_scope() if prefill_backpressure else nullcontext(),
                 prefetch.forward() if prefetch is not None else nullcontext(),
@@ -1650,7 +1641,10 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                             )
                         )
                     if prefill_backpressure:
-                        mx.eval(h, pre)
+                        mx.async_eval(h, pre)
+                        if lagged is not None:
+                            mx.eval(*lagged)
+                        lagged = (h, pre)
                     else:
                         # The GPU runs this layer while the next one is built.
                         mx.async_eval(h, pre)

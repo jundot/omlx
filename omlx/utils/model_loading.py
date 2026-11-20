@@ -564,6 +564,11 @@ def maybe_apply_pre_load_patches(
     Safe to call repeatedly; the patches are idempotent.
     """
     from ..model_settings import validate_moe_expert_offload
+    from ..oqh.loading import install_load_hook, require_native
+
+    # Before any patch captures a model class's load_weights (see the Bonsai
+    # note below). The hook only acts on weights that hold oQh tensors.
+    install_load_hook()
 
     if model_settings is not None:
         validate_moe_expert_offload(
@@ -654,6 +659,7 @@ def maybe_apply_pre_load_patches(
         return
 
     normalize_qwen35_text_config(config)
+    require_native(config)
 
     # Bonsai t5 load patch must run FIRST — before any other patch that wraps
     # load_weights on a model subclass (e.g. mlx_vlm_mtp qwen35_vlm_runtime).
@@ -1398,6 +1404,8 @@ def dflash_draft_for(
     if model_settings is None or not getattr(model_settings, "dflash_enabled", False):
         return None
     configured = getattr(model_settings, "dflash_draft_model", None)
+    if configured and configured.startswith("~"):
+        configured = str(Path(configured).expanduser())
     return configured or bundled_dflash_draft(model_path)
 
 
@@ -1587,8 +1595,14 @@ def checkpoint_has_bf16_leaves(model_path: str) -> bool:
         try:
             with open(shard, "rb") as handle:
                 header_len = int.from_bytes(handle.read(8), "little")
+                # A non-safetensors file, such as a git-lfs pointer, reads as a
+                # huge length.
+                if header_len > shard.stat().st_size:
+                    continue
                 header = json.loads(handle.read(header_len))
         except (OSError, ValueError):
+            continue
+        if not isinstance(header, dict):
             continue
         for name, spec in header.items():
             if (

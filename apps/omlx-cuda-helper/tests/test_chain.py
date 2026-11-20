@@ -13,13 +13,14 @@ import time
 import weakref
 from pathlib import Path
 
+import mlx.core as mx
 import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fake_family.stage import FakeStage  # noqa: E402
-from omlx_cuda_helper import families, gpus, wire, worker  # noqa: E402
+from omlx_cuda_helper import families, gpus, tensors, wire, worker  # noqa: E402
 from omlx_cuda_helper.control import ControlServer  # noqa: E402
 from omlx_cuda_helper.files import ModelStore  # noqa: E402
 from omlx_cuda_helper.state import State  # noqa: E402
@@ -185,6 +186,22 @@ class _FailsFirst(FakeStage):
             self.failed = True
             raise RuntimeError("out of memory")
         return super().run(job, **chunk)
+
+
+class _Caches(FakeStage):
+    """Sends a view of an MLX buffer each chunk, as real stages do."""
+
+    def run(self, job, **chunk):
+        boundary, state = super().run(job, **chunk)
+        return boundary, {
+            **state,
+            f"{self.first}.mlx": tensors.to_host(mx.zeros(1 << 20)),
+        }
+
+
+def test_a_job_gives_the_mlx_cache_back(tmp_path):
+    _run(_serve(_Caches(0, 6), tmp_path, "s0"))
+    _until(lambda: mx.get_cache_memory() == 0)
 
 
 def test_a_job_that_ends_early_frees_both_stages(tmp_path, monkeypatch):

@@ -816,6 +816,38 @@ def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch
     assert long_plan["placement_signature"] != short_plan["placement_signature"]
 
 
+def test_cluster_plan_validates_and_signs_a_tensor_split(monkeypatch):
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    layout = ModelLayout(
+        source="v41",
+        fixed_weight_bytes=gib,
+        layer_weight_bytes=(8 * gib,) * 8,
+        tensor_parallel_divisors=(64, 8, 36),
+        supports_tensor_parallel=True,
+        tensor_parallel_split_units=(8, 36),
+        tensor_parallel_split_bytes=(4 * gib, 56 * gib),
+    )
+    monkeypatch.setattr(routes, "inspect_safetensors_layout", lambda path: layout)
+    nodes = [
+        {"node_id": n, "capacity_bytes": c * gib} for n, c in (("a", 256), ("b", 128))
+    ]
+
+    def plan(split):
+        payload = {"model_path": "/m", "tensor_parallel_size": 2, "nodes": nodes}
+        return _client().post(
+            "/admin/api/cluster/plan", json=payload | {"tensor_split": split}
+        )
+
+    first = plan({"attention": [5, 3], "experts": [25, 11]})
+    second = plan({"attention": [5, 3], "experts": [24, 12]})
+    assert first.status_code == second.status_code == 200
+    # Approving one split must not approve another.
+    assert first.json()["placement_signature"] != second.json()["placement_signature"]
+    assert plan({"attention": [5]}).status_code == 400
+
+
 def test_selected_context_is_the_runtime_kv_ceiling():
     request = SimpleNamespace(
         execution_profile="balanced",

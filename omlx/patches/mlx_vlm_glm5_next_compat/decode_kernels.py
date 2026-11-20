@@ -234,6 +234,36 @@ inline void glm_qmv_rows(
   }
 }
 
+// glm_qmv_rows for oQh rows: codes q with one scale per row, w = s * (q - center).
+// The caller multiplies each row's partial sums by its scale.
+template <typename T, int K, int bits, int RPS>
+inline void glm_oqh_rows(
+    const device uint8_t* ws,
+    const device T* x,
+    uint simd_lid,
+    thread float* result) {
+  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int pack_factor = glm_pack_factor<bits>();
+  constexpr int bytes_per_pack = glm_bytes_per_pack<bits>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * 32;
+  constexpr int in_vec_size_w = K * bytes_per_pack / pack_factor;
+  constexpr float center = float((1 << bits) - 1) / 2.0f;
+
+  thread float x_thread[values_per_thread];
+  ws += simd_lid * packs_per_thread * bytes_per_pack;
+  x += simd_lid * values_per_thread;
+  for (int k = 0; k < K; k += block_size) {
+    float sum = glm_load_vector<T, values_per_thread, bits>(x, x_thread);
+    for (int row = 0; row < RPS; row++) {
+      result[row] += glm_qdot<values_per_thread, bits>(
+          ws + row * in_vec_size_w, x_thread, 1.0f, -center, sum);
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    x += block_size;
+  }
+}
+
 // Verbatim copy of MLX quantized.h dequantize (U = float) for 4/5/6/8 bits.
 template <int N, int bits>
 inline void glm_dequantize(const device uint8_t* w, float scale, float bias, thread float* w_local) {
@@ -492,17 +522,34 @@ _GATE_UP_SOURCE = r"""
     const int expert = int(indices[token * TOPK + r]);
 #endif
     constexpr int WB = K * RBITS / 8;   // bytes per weight row
-    constexpr int G = K / RGS;          // groups per row
     // ESTRIDE rows per expert; a fused [gate; up] tensor (ESTRIDE = 2N) is
     // passed as both gate and up with the up rows UP_OFF = N further on.
     const size_t row0 = size_t(expert) * ESTRIDE + out_row;
     const size_t urow0 = row0 + UP_OFF;
+#if ROUTED_OQH
+    // oQh experts read the rotated input; the shared expert keeps x.
+    const device T* xq = x_rot + token * K;
+    glm_oqh_rows<T, K, RBITS, RPS>((const device uint8_t*)gate_w + row0 * WB, xq, simd_lid, g_res);
+    glm_oqh_rows<T, K, RBITS, RPS>((const device uint8_t*)up_w + urow0 * WB, xq, simd_lid, u_res);
+    for (int row = 0; row < RPS; row++) {
+      g_res[row] *= float(gate_rs[row0 + row]);
+      u_res[row] *= float(up_rs[urow0 + row]);
+    }
+#else
+    constexpr int G = K / RGS;          // groups per row
+#if ROUTED_ROT
+    // Group-scale oQh experts: affine codes on the rotated input.
+    const device T* xa = x_rot + token * K;
+#else
+    const device T* xa = xr;
+#endif
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
         (const device uint8_t*)gate_w + row0 * WB, gate_s + row0 * G,
-        gate_b + row0 * G, xr, simd_lid, g_res);
+        gate_b + row0 * G, xa, simd_lid, g_res);
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
         (const device uint8_t*)up_w + urow0 * WB, up_s + urow0 * G,
-        up_b + urow0 * G, xr, simd_lid, u_res);
+        up_b + urow0 * G, xa, simd_lid, u_res);
+#endif
   } else {
 #if HAS_SHARED
     constexpr int WB = K * SBITS / 8;
@@ -627,14 +674,30 @@ _DOWN_SOURCE = r"""
 
   float acc[RPS] = {0};
   constexpr int WB = K * RBITS / 8;
-  constexpr int G = K / RGS;
   for (int r = 0; r < TOPK; r++) {
     const int expert = int(indices[token * TOPK + r]);
     const size_t row0 = size_t(expert) * N + out_row;
     float res[RPS] = {0};
+#if ROUTED_OQH
+    // act_rot holds the rotated routed activations, [T, TOPK, K].
+    glm_oqh_rows<T, K, RBITS, RPS>(
+        (const device uint8_t*)down_w + row0 * WB,
+        act_rot + (size_t(token) * TOPK + r) * K, simd_lid, res);
+    for (int row = 0; row < RPS; row++) {
+      res[row] *= float(down_rs[row0 + row]);
+    }
+#else
+    constexpr int G = K / RGS;
+#if ROUTED_ROT
+    // Group-scale oQh experts read act_rot like the row-scale ones.
+    const device T* xa = act_rot + (size_t(token) * TOPK + r) * K;
+#else
+    const device T* xa = act + (size_t(token) * RT + r) * K;
+#endif
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
         (const device uint8_t*)down_w + row0 * WB, down_s + row0 * G,
-        down_b + row0 * G, act + (size_t(token) * RT + r) * K, simd_lid, res);
+        down_b + row0 * G, xa, simd_lid, res);
+#endif
     const float score = scores[token * TOPK + r];
     for (int row = 0; row < RPS; row++) {
       float v = simd_sum(res[row]);
@@ -714,14 +777,21 @@ def _gate_up_kernel(
     shared_wide: bool = False,
     slot_major: bool = False,
     select: bool = False,
+    oqh: Optional[str] = None,
 ):
+    """``oqh``: None for affine experts, "rows" or "groups" for oQh experts."""
     routes = ["sel_sig", "sel_biased", "sel_scaling"] if select else ["indices"]
-    inputs = ["x"] + routes + ["limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
+    if oqh == "rows":
+        routed = ["gate_w", "gate_rs", "up_w", "up_rs"]
+    else:
+        routed = ["gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
+    inputs = ["x"] + (["x_rot"] if oqh else []) + routes + ["limit"] + routed
     if has_shared or shared_wide:
         inputs += ["sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"]
     suffix = "_widesh" if shared_wide else ("_shared" if has_shared else "")
     suffix += "_sm" if slot_major else ""
     suffix += "_select" if select else ""
+    suffix += f"_oqh_{oqh}" if oqh else ""
     outputs = ["out", "shared_out"] if shared_wide else ["out"]
     if select:
         outputs += ["sel_indices", "sel_scores"]
@@ -736,6 +806,8 @@ def _gate_up_kernel(
             SHARED_WIDE=int(shared_wide),
             SLOT_MAJOR=int(slot_major),
             SELECT=int(select),
+            ROUTED_OQH=int(oqh == "rows"),
+            ROUTED_ROT=int(oqh == "groups"),
         ),
     )
 
@@ -746,8 +818,11 @@ def _down_kernel(
     add_shared_y: bool,
     slot_major: bool = False,
     shared_wide: bool = False,
+    oqh: Optional[str] = None,
 ):
-    inputs = ["act", "indices", "scores", "down_w", "down_s", "down_b"]
+    """``oqh``: None for affine experts, "rows" or "groups" for oQh experts."""
+    routed = ["down_w", "down_rs"] if oqh == "rows" else ["down_w", "down_s", "down_b"]
+    inputs = ["act"] + (["act_rot"] if oqh else []) + ["indices", "scores"] + routed
     if has_shared:
         inputs += ["sh_down_w", "sh_down_s", "sh_down_b"]
         if shared_wide:
@@ -758,6 +833,7 @@ def _down_kernel(
         "_shared" if has_shared else ("_add" if add_shared_y else "")
     )
     suffix += "_sm" if slot_major else ""
+    suffix += f"_oqh_{oqh}" if oqh else ""
     return mx.fast.metal_kernel(
         name=f"glm5_moe_down_combine{suffix}",
         input_names=inputs,
@@ -769,6 +845,8 @@ def _down_kernel(
             ADD_SHARED_Y=int(add_shared_y and not has_shared),
             SLOT_MAJOR=int(slot_major),
             SHARED_WIDE_DOWN=int(shared_wide),
+            ROUTED_OQH=int(oqh == "rows"),
+            ROUTED_ROT=int(oqh == "groups"),
         ),
     )
 
@@ -785,6 +863,13 @@ def _qmv_fast_ok(bits: int, group_size: int, n: int, k: int) -> bool:
     return n % 8 == 0 and k % (values_per_thread * 32) == 0
 
 
+def _oqh_parts(layer):
+    """(weight, rscale, bits) of oQh experts: uniform codes with one scale per row."""
+    if "rscale" not in layer or "oqh_signs" not in layer:
+        return None
+    return layer["weight"], layer["rscale"], int(layer.bits)
+
+
 def _affine_parts(layer):
     """(weight, scales, biases, bits, group_size) of an affine quantized layer."""
     if getattr(layer, "mode", "affine") != "affine":
@@ -793,6 +878,29 @@ def _affine_parts(layer):
     if biases is None or "bias" in layer:
         return None
     return layer["weight"], layer["scales"], biases, int(layer.bits), int(layer.group_size)
+
+
+def _oqh_group_parts(layer):
+    """(weight, scales, biases, bits, group_size) of oQh experts with group scales."""
+    if "oqh_scales" not in layer or "oqh_signs" not in layer:
+        return None
+    return (
+        layer["weight"],
+        layer["oqh_scales"],
+        layer["oqh_biases"],
+        int(layer.bits),
+        int(layer.group_size),
+    )
+
+
+_ROUTED_PARTS = {None: _affine_parts, "rows": _oqh_parts, "groups": _oqh_group_parts}
+
+
+def _oqh_mode(layer, rotated) -> Optional[str]:
+    """None for affine experts; for oQh ones (a rotated input) "rows" or "groups"."""
+    if rotated is None:
+        return None
+    return "rows" if "rscale" in layer else "groups"
 
 
 def moe_gate_up_swiglu(
@@ -808,6 +916,7 @@ def moe_gate_up_swiglu(
     nsg: int = 2,
     shared_wide: bool = False,
     select=None,
+    x_rot: Optional[mx.array] = None,
 ):
     """Clamped-SwiGLU activations for every (token, routed expert[, shared]).
 
@@ -824,6 +933,10 @@ def moe_gate_up_swiglu(
     threadgroup replays the router's top-k selection, and the call returns
     ``(act, indices [1, top_k] uint32, scores [1, top_k] fp32)`` like
     ``moe_router`` + this kernel, or None when not covered.
+
+    ``x_rot`` (x in the experts' oQh basis) means the routed experts are oQh:
+    they read it with their row or group scales, while the shared expert
+    reads ``x``.
     """
     if select is not None:
         if shared_wide or x.ndim != 2 or x.shape[0] != 1:
@@ -835,13 +948,23 @@ def moe_gate_up_swiglu(
         if sig.dtype != mx.float32 or biased.dtype != mx.float32 or E_r > 1024:
             return None
         indices = mx.zeros((1, sel_topk), dtype=mx.uint32)  # shape only
+    oqh = _oqh_mode(routed_gate, x_rot)
     fused_gu = routed_up is None
-    parts = [_affine_parts(m) for m in ((routed_gate,) if fused_gu else (routed_gate, routed_up))]
+    routed = (routed_gate,) if fused_gu else (routed_gate, routed_up)
+    parts = [_ROUTED_PARTS[oqh](m) for m in routed]
     if any(p is None for p in parts) or x.ndim != 2 or indices.ndim != 2:
         return None
     if fused_gu:
         parts = parts * 2
-    (gw, gs, gb, rbits, rgs), (uw, us, ub, ubits, ugs) = parts
+    if oqh and (x_rot.shape != x.shape or x_rot.dtype != x.dtype):
+        return None
+    if oqh == "rows":
+        # Any group width that the row layout divides passes the shape check.
+        (gw, gs, rbits), (uw, us, ubits) = parts
+        gb = ub = None
+        rgs = ugs = 128
+    else:
+        (gw, gs, gb, rbits, rgs), (uw, us, ub, ubits, ugs) = parts
     if (rbits, rgs) != (ubits, ugs) or gw.shape != uw.shape or gw.ndim != 3:
         return None
     T, K = x.shape
@@ -864,11 +987,15 @@ def moe_gate_up_swiglu(
         routes = [sig, biased, mx.array([sel_scaling], dtype=mx.float32)]
     else:
         routes = [indices]
-    inputs = [x] + routes + [mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub]
+    limits = [mx.array([limit], dtype=mx.float32)]
+    rows = [gw, gs, uw, us] if oqh == "rows" else [gw, gs, gb, uw, us, ub]
+    inputs = [x] + ([x_rot] if oqh else []) + routes + limits + rows
     template = [
         ("T", x.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
-        ("RGS", rgs), ("RPS", rps), ("NSG", nsg), ("ESTRIDE", estride), ("UP_OFF", up_off),
+        ("RPS", rps), ("NSG", nsg), ("ESTRIDE", estride), ("UP_OFF", up_off),
     ]
+    if oqh != "rows":
+        template.append(("RGS", rgs))
     if select is not None:
         template += [("NE", E_r), ("SEL_NORM", int(bool(sel_norm) and sel_topk > 1))]
     if has_shared:
@@ -889,7 +1016,7 @@ def moe_gate_up_swiglu(
         inputs += [sgw, sgs, sgb, suw, sus, sub]
         template += [("SBITS", sbits), ("SGS", sgsz)]
     slot_major = _slot_major(T)
-    kernel = _gate_up_kernel(has_shared, shared_wide, slot_major, select is not None)
+    kernel = _gate_up_kernel(has_shared, shared_wide, slot_major, select is not None, oqh)
     STATS["moe_gate_up"] += 1
     tiles = N // (rps * nsg)
     slots = T * topk + 1 if shared_wide else T * (topk + int(has_shared))
@@ -944,6 +1071,7 @@ def moe_down_combine(
     shared_act: Optional[mx.array] = None,
     rps: int = 4,
     nsg: int = 2,
+    act_rot: Optional[mx.array] = None,
 ) -> Optional[mx.array]:
     """Routed down projections combined with the routing weights (+ shared).
 
@@ -952,12 +1080,18 @@ def moe_down_combine(
     last activation slot (``shared_down``), from ``shared_act`` [T, K] (the
     ``shared_wide`` gate/up output, with the multi-row qmv_wide arithmetic)
     or added from a precomputed ``shared_y`` [T, N].  Returns [T, N] in
-    ``act.dtype``.
+    ``act.dtype``. ``act_rot`` [T, TOPK, K] (the routed activations in the
+    experts' oQh basis) means the routed experts are oQh.
     """
-    p = _affine_parts(routed_down)
+    oqh = _oqh_mode(routed_down, act_rot)
+    p = _ROUTED_PARTS[oqh](routed_down)
     if p is None or act.ndim != 3 or scores.dtype != mx.float32:
         return None
-    dw, ds, db, rbits, rgs = p
+    if oqh == "rows":
+        dw, ds, rbits = p
+        db, rgs = None, 128
+    else:
+        dw, ds, db, rbits, rgs = p
     T, rt, K = act.shape
     E, N, _ = dw.shape
     topk = indices.shape[1]
@@ -971,11 +1105,16 @@ def moe_down_combine(
         return None
     if not _qmv_fast_ok(rbits, rgs, N, K) or N % (rps * nsg):
         return None
-    inputs = [act, indices, scores, dw, ds, db]
+    if oqh and (act_rot.shape != (T, topk, K) or act_rot.dtype != act.dtype):
+        return None
+    rows = [dw, ds] if oqh == "rows" else [dw, ds, db]
+    inputs = [act] + ([act_rot] if oqh else []) + [indices, scores] + rows
     template = [
         ("T", act.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
-        ("RGS", rgs), ("RPS", rps), ("NSG", nsg),
+        ("RPS", rps), ("NSG", nsg),
     ]
+    if oqh != "rows":
+        template.append(("RGS", rgs))
     if has_shared:
         sp = _affine_parts(shared_down)
         if sp is None:
@@ -997,7 +1136,7 @@ def moe_down_combine(
             return None
         inputs.append(shared_y)
     slot_major = _slot_major(T)
-    kernel = _down_kernel(has_shared, shared_y is not None, slot_major, shared_wide)
+    kernel = _down_kernel(has_shared, shared_y is not None, slot_major, shared_wide, oqh)
     STATS["moe_down"] += 1
     if shared_wide:
         STATS["moe_down_shared_wide"] += 1
@@ -2064,8 +2203,8 @@ def dsa_attention_rows(
 # ---------------------------------------------------------------------------
 #
 # Everything between the fused input projection and o_proj of a
-# Glm5NextLinearAttention layer, for one sequence and T <= 8 tokens, in one
-# dispatch with one 1024-thread threadgroup per head:
+# Glm5NextLinearAttention layer, for B sequences of T <= 8 tokens each, in one
+# dispatch with one 1024-thread threadgroup per (head, sequence):
 #
 #   1. depthwise short conv over [conv_state, q|k|v] + SiLU (bf16), and the
 #      new conv state (MLX depthwise_conv_1d + the compiled nn.silu);
@@ -2083,6 +2222,23 @@ def dsa_attention_rows(
 # to its dtype here too and products are never contracted into the adds that
 # consumed them in a different kernel.
 _KDA_SOURCE = r"""
+  // Per-sequence rows (grid y); B == 1 reads row 0 only.
+  const size_t bb = size_t(threadgroup_position_in_grid.y);
+  const device T* proj = proj_rows + bb * size_t(TOK * PROJ_W);
+#if HAS_CONV_STATE
+  const device T* conv_state = conv_state_rows + bb * size_t(9 * QKV);
+#endif
+#if HAS_STATE
+  const device float* state_in = state_in_rows + bb * size_t(QKV) * size_t(DK);
+#endif
+#if PRE_AG
+  const device T* a_pre = a_pre_rows + bb * size_t(TOK * QKV);
+  const device T* gate_pre = gate_pre_rows + bb * size_t(TOK * QKV);
+#endif
+  device T* y = y_rows + bb * size_t(TOK * QKV);
+  device T* conv_state_out = conv_state_out_rows + bb * size_t(9 * QKV);
+  device float* state_out = state_out_rows + bb * size_t(QKV) * size_t(DK);
+
   constexpr int CK = 4;
   constexpr int NROW = CK - 1 + TOK;
   constexpr int NP = 3 * QKV;
@@ -2343,13 +2499,13 @@ def _kda_kernel(
     pre_ag: bool,
     gate5: bool = False,
 ):
-    inputs = ["proj", "conv_w", "a_log", "dt_bias", "norm_w", "consts"]
+    inputs = ["proj_rows", "conv_w", "a_log", "dt_bias", "norm_w", "consts"]
     if has_conv_state:
-        inputs.append("conv_state")
+        inputs.append("conv_state_rows")
     if has_state:
-        inputs.append("state_in")
+        inputs.append("state_in_rows")
     if pre_ag:
-        inputs += ["a_pre", "gate_pre"]
+        inputs += ["a_pre_rows", "gate_pre_rows"]
     else:
         inputs += ["fb_w", "fb_s", "fb_b", "gb_w", "gb_s", "gb_b"]
     return mx.fast.metal_kernel(
@@ -2358,7 +2514,7 @@ def _kda_kernel(
             f"{'_q5' if gate5 else ''}"
         ),
         input_names=inputs,
-        output_names=["y", "conv_state_out", "state_out"],
+        output_names=["y_rows", "conv_state_out_rows", "state_out_rows"],
         header=_QMV_HEADER,
         source=_source(
             _KDA_SOURCE,
@@ -2393,18 +2549,19 @@ def kda_decode_step(
     a_pre: Optional[mx.array] = None,
     gate_pre: Optional[mx.array] = None,
 ):
-    """Fused KDA layer body for one sequence and T <= 8 tokens.
+    """Fused KDA layer body for B sequences of T <= 8 tokens each.
 
-    ``proj`` is the fused q|k|v|f_a|g_a|b projection [1, T, W] (bf16/fp16).
+    ``proj`` is the fused q|k|v|f_a|g_a|b projection [B, T, W] (bf16/fp16).
     The forget/output gate projections are either the affine quantized
     ``f_b``/``g_b`` layers (K == 128, 4- or 8-bit: MLX's qmv_quad path) or
-    precomputed ``a_pre``/``gate_pre`` [1, T, H * Dk]. Returns
-    ``(y [1, T, H * Dk], conv_state [1, 3, 3 * H * Dk], state [1, H, Dk, Dk])``
-    or None when the shapes are not covered.
+    precomputed ``a_pre``/``gate_pre`` [B, T, H * Dk]. Returns
+    ``(y [B, T, H * Dk], conv_state [B, 3, 3 * H * Dk], state [B, H, Dk, Dk])``
+    or None when the shapes are not covered. Each sequence's rows equal the
+    B == 1 call on that sequence's inputs.
     """
-    if proj.ndim != 3 or proj.shape[0] != 1 or proj.dtype not in (mx.bfloat16, mx.float16):
+    if proj.ndim != 3 or proj.dtype not in (mx.bfloat16, mx.float16):
         return None
-    _, T, width = proj.shape
+    B, T, width = proj.shape
     qkv = heads * head_dim
     if not 1 <= T <= 8 or head_dim != 128 or heads < 1:
         return None
@@ -2417,11 +2574,11 @@ def kda_decode_step(
     if dt_bias.size != qkv or dt_bias.dtype != mx.float32:
         return None
     if conv_state is not None and (
-        conv_state.shape != (1, 3, 3 * qkv) or conv_state.dtype != proj.dtype
+        conv_state.shape != (B, 3, 3 * qkv) or conv_state.dtype != proj.dtype
     ):
         return None
     if state is not None and (
-        state.shape != (1, heads, head_dim, head_dim) or state.dtype != mx.float32
+        state.shape != (B, heads, head_dim, head_dim) or state.dtype != mx.float32
     ):
         return None
     pre = a_pre is not None
@@ -2429,7 +2586,7 @@ def kda_decode_step(
     template = [("T", proj.dtype), ("TOK", T), ("DK", head_dim), ("QKV", qkv),
                 ("PROJ_W", width), ("OFF_FA", off_fa), ("OFF_GA", off_ga), ("OFF_B", off_b)]
     if pre:
-        if gate_pre is None or a_pre.shape != (1, T, qkv) or gate_pre.shape != (1, T, qkv):
+        if gate_pre is None or a_pre.shape != (B, T, qkv) or gate_pre.shape != (B, T, qkv):
             return None
         if a_pre.dtype != proj.dtype or gate_pre.dtype != proj.dtype:
             return None
@@ -2469,9 +2626,9 @@ def kda_decode_step(
     y, conv_out, state_out = kernel(
         inputs=inputs,
         template=template,
-        grid=(1024 * heads, 1, 1),
+        grid=(1024 * heads, B, 1),
         threadgroup=(1024, 1, 1),
-        output_shapes=[(1, T, qkv), (1, 3, 3 * qkv), (1, heads, head_dim, head_dim)],
+        output_shapes=[(B, T, qkv), (B, 3, 3 * qkv), (B, heads, head_dim, head_dim)],
         output_dtypes=[proj.dtype, proj.dtype, mx.float32],
     )
     return y, conv_out, state_out

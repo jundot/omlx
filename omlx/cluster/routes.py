@@ -515,9 +515,8 @@ class ClusterPlanRequest(BaseModel):
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
     # Lightning MTP: reserve the draft head on rank zero.
     mtp: bool = False
-    # Uneven tensor-parallel shares for architectures that support them
-    # (DeepSeek V4.1): {"attention": [...], "experts": [...]} in rank order.
-    # None lets the planner choose (equal when it fits, else sized to memory).
+    # DeepSeek V4.1 shares per rank, {"attention": [...], "experts": [...]}.
+    # None splits evenly when that fits, otherwise by each node's memory.
     tensor_split: dict[str, list[int]] | None = Field(default=None, max_length=2)
 
 
@@ -569,9 +568,8 @@ class ClusterDeploymentRequest(BaseModel):
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
-    # Uneven tensor-parallel shares for architectures that support them
-    # (DeepSeek V4.1): {"attention": [...], "experts": [...]} in rank order.
-    # None lets the planner choose (equal when it fits, else sized to memory).
+    # DeepSeek V4.1 shares per rank, {"attention": [...], "experts": [...]}.
+    # None splits evenly when that fits, otherwise by each node's memory.
     tensor_split: dict[str, list[int]] | None = Field(default=None, max_length=2)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     # ``placement_signature`` from the /plan response the user was shown. The
@@ -1014,9 +1012,8 @@ class ClusterAutoconfigureRequest(BaseModel):
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     # None follows the checkpoint and the model's saved Lightning MTP setting.
     mtp: bool | None = None
-    # Uneven tensor-parallel shares for architectures that support them
-    # (DeepSeek V4.1): {"attention": [...], "experts": [...]} in rank order.
-    # None lets the planner choose (equal when it fits, else sized to memory).
+    # DeepSeek V4.1 shares per rank, {"attention": [...], "experts": [...]}.
+    # None splits evenly when that fits, otherwise by each node's memory.
     tensor_split: dict[str, list[int]] | None = Field(default=None, max_length=2)
 
 
@@ -3322,9 +3319,7 @@ async def cluster_models(request: ClusterModelInventoryRequest) -> dict[str, Any
             models = await asyncio.to_thread(
                 remote_model_inventory,
                 validated,
-                python_executable=(
-                    host.python_executable or "~/omlx-distributed/.venv/bin/python"
-                ),
+                python_executable=host.python_executable or DEFAULT_REMOTE_PYTHON,
             )
             source_python = host.python_executable or DEFAULT_REMOTE_PYTHON
             models = [

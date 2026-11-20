@@ -2349,19 +2349,28 @@ class TestSchedulerStatistics:
         self, mock_model, mock_tokenizer
     ):
         """Slots are released only while no other request runs on the engine,
-        and the next decode step restores them once, whatever its batch width."""
+        and the next decode step restores them once, whatever its batch width.
+        Both get a reclaim on the scheduler's stream."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         release = MagicMock(return_value=3 * 1024**3)
         scheduler.moe_offload_release = release
         scheduler.moe_offload_restore = MagicMock()
         scheduler._reclaim_prefill_headroom = MagicMock()
         scheduler.running["decoding"] = MagicMock()
-        assert scheduler.release_moe_offload_slots("prefilling") == 0
+        assert scheduler.release_moe_offload_slots("prefilling", 2 * 1024**3) == 0
         release.assert_not_called()
         del scheduler.running["decoding"]
-        assert scheduler.release_moe_offload_slots("prefilling") == 3 * 1024**3
+        assert (
+            scheduler.release_moe_offload_slots("prefilling", 2 * 1024**3)
+            == 3 * 1024**3
+        )
         release.assert_called_once()
+        need, reclaim = release.call_args.args
+        assert need == 2 * 1024**3
         scheduler._reclaim_prefill_headroom.assert_called_once()
+        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear:
+            reclaim()
+        clear.assert_called_once_with(scheduler._stream)
 
         scheduler._schedule_waiting = MagicMock(return_value=([], []))
         scheduler._process_batch_responses = MagicMock(return_value=([], set()))
@@ -2371,7 +2380,20 @@ class TestSchedulerStatistics:
         for _ in range(2):
             scheduler.batch_generator.next_generated.return_value = iter([])
             scheduler.step()
-        scheduler.moe_offload_restore.assert_called_once_with()
+        scheduler.moe_offload_restore.assert_called_once()
+        (reclaim,) = scheduler.moe_offload_restore.call_args.args
+        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear:
+            reclaim()
+        clear.assert_called_once_with(scheduler._stream)
+
+    def test_a_failed_offload_release_still_marks_slots_for_restore(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.moe_offload_release = MagicMock(side_effect=RuntimeError)
+        with pytest.raises(RuntimeError):
+            scheduler.release_moe_offload_slots("prefilling", 1000)
+        assert scheduler._moe_offload_slots_released is True
 
 
 class TestSchedulerReset:
@@ -3832,10 +3854,11 @@ class TestSchedulerBoundarySnapshots:
         assert provider.tail_terminal_token_count == (7 if not persists else None)
         assert 4 in provider
 
+    @pytest.mark.parametrize("shared_end", ["system_prefix_end", "junction_end"])
     def test_boundary_override_keeps_system_prefix_tail_for_its_own_store(
-        self, mock_model, mock_tokenizer
+        self, mock_model, mock_tokenizer, shared_end
     ):
-        """Only the side store picks the system-prefix tail as its terminal."""
+        """Only the side store picks a shared tail as its terminal."""
         config = SchedulerConfig(paged_cache_block_size=4)
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
         request = Request(
@@ -3844,7 +3867,7 @@ class TestSchedulerBoundarySnapshots:
             sampling_params=SamplingParams(),
         )
         request.generation_prompt_start = 7
-        request.system_prefix_end = 6
+        setattr(request, shared_end, 6)
         scheduler.requests[request.request_id] = request
         raw = {4: object(), 6: object(), 7: object()}
         extracted = {tc: [{"state": (tc,)}] for tc in raw}
