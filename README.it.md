@@ -292,6 +292,7 @@ Sostituisce le API di OpenAI e Anthropic senza modifiche lato client. Supporta l
 | `POST /v1/rerank` | Reranking di documenti |
 | `POST /v1/systemone` | Decisioni tipizzate con modelli decisionali o modelli di chat (TypeSafe System One) |
 | `GET /v1/models` | Elenco dei modelli disponibili |
+| `GET /v1/models/{model_id}` | Recupera un modello |
 | `POST /tokenize`, `POST /detokenize` | API del tokenizer compatibile con vLLM (anche sotto `/v1`) |
 
 L'API di amministrazione per impostazioni, modelli, download, quantizzazione e benchmark accetta la chiave API principale come token Bearer e funziona anche in modalità headless. Vedi [Admin API](docs/admin-api.md).
