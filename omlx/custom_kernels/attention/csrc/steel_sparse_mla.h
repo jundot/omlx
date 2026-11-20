@@ -106,6 +106,7 @@ template <
     const device uint* TopkLength [[buffer(5)]],
     device T* O [[buffer(6)]],
     const constant GlmDsaSparseMlaParams* params [[buffer(7)]],
+    const device float* Sinks [[buffer(8), function_constant(has_sinks)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]]) { // clang-format on
@@ -175,6 +176,16 @@ template <
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < rows_per_thread; ++i) {
     max_score[i] = Limits<AccumType>::finite_min;
+  }
+  // A sink is one extra logit per head with a zero value: it seeds the
+  // running max and adds exp(sink - max) to the denominator. Row i of this
+  // thread's tile is head tm + i * kFragSize + sm (the Otile store layout).
+  if (has_sinks) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < rows_per_thread; ++i) {
+      max_score[i] = M_LOG2E_F * AccumType(Sinks[tm + i * kFragSize + sm]);
+      sum_score[i] = 1;
+    }
   }
 
   const device T* q_latent_base = Q_latent +

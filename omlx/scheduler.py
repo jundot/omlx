@@ -1933,6 +1933,9 @@ def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_
     return max(1, next_n)
 
 
+_HY_V4_PREFILL_FLOOR = 4096
+
+
 def _glm5_next_prefill_floor() -> int:
     """Return the wide-prefill floor for GLM-5.3 (0 when the host cannot use it).
 
@@ -3443,6 +3446,16 @@ class Scheduler:
                     return 0
             if model_type.startswith("glm5_next"):
                 return _glm5_next_prefill_floor()
+            if model_type.startswith("hy_v4"):
+                from .settings import get_system_memory
+
+                # Top-16-of-512 (Hy4-flash) and top-8-of-256 (Hy4) routing
+                # leave ~64 rows per expert at a 2048-token chunk. Attention per
+                # query does not grow with the chunk: sparse layers read 2048
+                # slots and sliding ones 512.
+                if get_system_memory() >= 64 * 1024**3:
+                    return _HY_V4_PREFILL_FLOOR
+                return 0
             if model_type == "deepseek_v41":
                 # Top-6-of-384 routing leaves ~32 rows per expert at 2048 tokens;
                 # 8192 fills the gather_qmm tiles better.
