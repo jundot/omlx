@@ -46,9 +46,7 @@ async def test_v1_messages_validation_error_uses_anthropic_shape():
             }
         ]
     )
-    response = await server.validation_exception_handler(
-        _request("/v1/messages"), exc
-    )
+    response = await server.validation_exception_handler(_request("/v1/messages"), exc)
 
     assert response.status_code == 400
     body = json.loads(response.body)
