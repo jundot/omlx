@@ -1067,7 +1067,7 @@ class TestRequestTranslation:
         assert value("--draft-model") == str((tmp_path / "draft").resolve())
         assert value("--idle-release") == "off"
         assert value("--kv-format") == "bf16"
-        assert value("--max-context") == str(splash_mod.SPLASH_MAX_CONTEXT)
+        assert value("--max-context") == "1000000"
         assert value("--max-memory") == str(24 * GIB)
         assert value("--max-cache-disk") == str(5 * GIB)
         assert value("--cache-dir") == str(tmp_path / "ssd")

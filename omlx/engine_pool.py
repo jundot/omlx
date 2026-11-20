@@ -2401,6 +2401,16 @@ class EnginePool:
                 entry.model_id,
             )
             requested_context = None
+        native = getattr(entry, "model_context_length", None) or 0
+        if requested_context and native and requested_context > native:
+            logger.warning(
+                "Splash: %s serves a %d-token window, past its %d-token "
+                "native window; YaRN rope scaling engages and changes "
+                "answers",
+                entry.model_id,
+                requested_context,
+                native,
+            )
         return SplashEngine(
             model_name=entry.model_path,
             model_id=entry.model_id,

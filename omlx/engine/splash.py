@@ -155,7 +155,13 @@ ACTIVATIONS_VERSION = (1, 6, 1)
 _PRUNED_EXPERTS_MULTIPLE = 8
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
 _COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
+# The conservative default: a family's native window. Splash's serve accepts
+# up to 1010000 tokens; past a family's native window it engages YaRN rope
+# scaling, which is static and changes answers, so only an explicit model
+# max_context_window above the native window reaches that far - the same
+# setting that extends the native engine's window the same way.
 SPLASH_MAX_CONTEXT = 262144
+SPLASH_ABSOLUTE_MAX_CONTEXT = 1010000
 SPLASH_INSTALL_HINT = (
     "Splash is not installed: brew install incoai/tap/splash (M3 or later), "
     "or splash-m1 for M1/M2 Macs (https://github.com/paperniuk/splash/releases)"
@@ -770,7 +776,9 @@ def splash_memory_estimate(
     """
     path = Path(model_path)
     text = _text_config(_read_config(path) or {}) or {}
-    context = min(max_context or SPLASH_MAX_CONTEXT, SPLASH_MAX_CONTEXT)
+    context = min(
+        max_context or SPLASH_MAX_CONTEXT, SPLASH_ABSOLUTE_MAX_CONTEXT
+    )
     kv = _kv_bytes_per_token(text, kv_format) * context
     draft = int(_safetensors_bytes(draft_path) * _DRAFT_LOAD_RATIO)
     return _weight_bytes(path) + draft + _RUNTIME_RESERVE_BYTES + kv
@@ -1372,7 +1380,7 @@ class SplashEngine(BaseEngine):
         if options.max_context:
             command += [
                 "--max-context",
-                str(min(options.max_context, SPLASH_MAX_CONTEXT)),
+                str(min(options.max_context, SPLASH_ABSOLUTE_MAX_CONTEXT)),
             ]
         if options.max_memory_bytes > 0:
             command += ["--max-memory", str(options.max_memory_bytes)]
