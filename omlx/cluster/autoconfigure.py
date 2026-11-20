@@ -151,6 +151,8 @@ def choose_parallelism(
     context_tokens: int = 8192,
     head_rank_extra_bytes: int = 0,
     engram_ssd_offload: bool = False,
+    moe_offload_layer_bytes: tuple[int, ...] = (),
+    moe_expert_offload_resident_fraction: float = 0.0,
 ) -> ParallelismChoice:
     """Pick the tensor-parallel degree and produce the plan it implies.
 
@@ -274,6 +276,10 @@ def choose_parallelism(
                 context_tokens=context_tokens,
                 head_rank_extra_bytes=head_rank_extra_bytes,
                 engram_ssd_offload=engram_ssd_offload,
+                moe_offload_layer_bytes=moe_offload_layer_bytes,
+                moe_expert_offload_resident_fraction=(
+                    moe_expert_offload_resident_fraction
+                ),
             )
         except PlanningError as exc:
             last_error = exc
