@@ -1262,7 +1262,12 @@ def estimate_offload_admission_bytes(
                 return full_size
             if kind == "inkling2_loop":
                 projs, nvfp4_ok = ("w13", "w2"), True
-            if kind in ("qwen3_5_moe", "inkling2_loop"):
+            if kind in (
+                "qwen3_5_moe",
+                "inkling2_loop",
+                "mimo_v2",
+                "mimo_v2_flash",
+            ):
                 from .moe_offload_compat import moe_offload_compatibility
 
                 if not moe_offload_compatibility(model_dir)[0]:
