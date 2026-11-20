@@ -19,9 +19,29 @@ from .. import checkpoint
 # This module must not import ``oqh``: that module imports mlx.core, and the
 # daemon runs ``plan()`` in-process, so reaching it from here takes session
 # start down on a box whose MLX is missing or broken.
+#
+# That is a standing constraint on future work, not a note about one commit.
+# The planning surface can no longer use ``oqh`` at all, so when a later oQh
+# change needs a fact here, the fact goes to ``checkpoint`` — which reads the
+# headers without a GPU library — and the GPU-side code stays in ``oqh``.
+# ``is_oqh`` and ``OQH_SIGNS`` moved there for exactly this reason. If someone
+# re-adds the import instead, tests/test_gpu_free_planning.py refuses it, and
+# that refusal is the intended behaviour rather than an obstacle to route
+# around.
 
 CONTRACT = 1
 FIRST_STAGE_MIN = 1
+
+# The expert projections a MoE layer banks. The loader joins the first two into
+# one gathered bank and takes the third on its own; the plan refuses oQh signs
+# on either, so both read this one list.
+BANK_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+
+def is_banked(name: str) -> bool:
+    """Whether the loader banks this tensor: a MoE layer's expert projections."""
+    return ".switch_mlp." in name and name.rpartition(".")[2] in BANK_PROJECTIONS
+
 
 def resident(tensor: str) -> bool:
     """Whether a helper loads this tensor: the embedding and the layers."""
@@ -68,6 +88,15 @@ def plan(model_dir: str | Path) -> tuple[int, list[int]]:
         base = name.removesuffix(".weight")
         layer = checkpoint.layer_of(name)
         if base == name or layer is None or not resident(name):
+            continue
+        # An expert bank is 3-D [experts, out, in]; unpacking one to dense
+        # 16-bit would multiply the memory estimate by the expert count.
+        if len(weight.shape) != 2:
+            # The loader refuses an oQh bank and only ever banks the expert
+            # projections, so the estimate asks its question the same way: a
+            # signed tensor the loader never banks is skipped like any other.
+            if is_banked(base) and checkpoint.is_oqh(index, base):
+                raise ValueError(f"oQh expert banks are not supported: {name}")
             continue
         signs = index.get(f"{base}.{checkpoint.OQH_SIGNS}")
         if signs is not None:

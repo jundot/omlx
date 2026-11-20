@@ -107,6 +107,16 @@ CONFIGS = {
             ],
         },
     },
+    "qwen3_5_moe": lambda lm: {
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            **asdict(lm.args),
+            "layer_types": [
+                "linear_attention" if layer.is_linear else "full_attention"
+                for layer in lm.model.layers
+            ],
+        },
+    },
     "deepseek_v41": _deepseek_v41_config,
     # The runtime layout (oQ's), with each layer's expert carrier.
     "inkling2": lambda lm: {

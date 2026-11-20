@@ -40,6 +40,12 @@ class Weights:
     def __getitem__(self, name: str) -> mx.array:
         return self.arrays[self.root + name]
 
+    def __contains__(self, name: str) -> bool:
+        return self.root + name in self.arrays
+
+    def quantization(self, name: str) -> dict[str, Any] | None:
+        return checkpoint.quantization(self.config, self.root + name)
+
     def linear(self, name: str) -> Linear:
         """A dense linear layer in the dtype the checkpoint computes in."""
         path = self.root + name
