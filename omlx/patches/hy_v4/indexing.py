@@ -141,6 +141,44 @@ def _nax_scores(q, keys, weights, causal):
     return out[None, None]
 
 
+def decode_rows_ready(heads: int, keys: int, dtype) -> bool:
+    """Whether one-row selections over ``keys`` keys run the decode kernel."""
+    return (
+        heads == _DECODE_HEADS
+        and keys >= _DECODE_MIN_KEYS
+        and dtype in (mx.bfloat16, mx.float16)
+        and available()
+        and index_fast.has_symbol("dsa_decode_scores")
+    )
+
+
+def decode_rows_select(q, keys, weights, totals: list[int], mask, k: int) -> list:
+    """Each row's one-row decode selection, from one score and top-k call.
+
+    Row ``i`` of ``q`` [1, H, L, 128] sees the first ``totals[i]`` of the
+    [1, 1, T, 128] keys; the decode kernels score every key on its own and
+    the top-k ignores -inf columns, so the rows get the bits of separate
+    one-row calls. Masked picks point at the row's own key count, as decode's.
+    """
+    length, total = q.shape[2], keys.shape[2]
+    rows = mx.contiguous(q[0].swapaxes(0, 1)[:, :, None])
+    keys = mx.broadcast_to(
+        mx.contiguous(keys.astype(q.dtype)), (length, 1, total, keys.shape[-1])
+    )
+    scores = index_fast.dsa_decode_scores(
+        rows, keys, mx.contiguous(weights[0].astype(q.dtype))
+    )
+    counts = mx.array(totals)
+    visible = mx.arange(total)[None] < counts[:, None]
+    if mask is not None:
+        visible = visible & mask[0, 0]
+    scores = mx.where(visible[:, None, None], scores, -mx.inf)
+    chosen = index_fast.dsa_topk_indices(scores, k).astype(mx.int32)
+    picked = mx.take_along_axis(scores, chosen, axis=-1)
+    out = mx.where(picked > -mx.inf, chosen, counts[:, None, None, None])
+    return [out[i : i + 1].astype(mx.int32) for i in range(length)]
+
+
 def topk(values: mx.array, k: int) -> mx.array | None:
     """Indices [B, 1, L, k] of the k largest of [B, 1, L, T] scores, or None."""
     if k not in NATIVE_TOPK or values.shape[-1] < k or not available():

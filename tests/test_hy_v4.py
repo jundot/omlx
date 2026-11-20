@@ -18,6 +18,7 @@ from mlx_lm.models.cache import (  # noqa: E402
     BatchKVCache,
     BatchRotatingKVCache,
     CacheList,
+    KVCache,
 )
 
 from omlx import oq  # noqa: E402
@@ -28,7 +29,12 @@ from omlx.engine.vlm import (  # noqa: E402
     _count_image_tokens_real,
 )
 from omlx.models.vlm import VLMModelAdapter  # noqa: E402
-from omlx.patches.hy_v4 import exact, indexing, layers  # noqa: E402
+from omlx.patches.hy_v4 import (  # noqa: E402
+    exact,
+    indexing,
+    language,  # noqa: E402
+    layers,
+)
 from omlx.patches.hy_v4.config import VisionConfig  # noqa: E402
 from omlx.patches.hy_v4.flash import CompressedIndexer  # noqa: E402
 from omlx.patches.hy_v4.language import set_dspark_verify_armed  # noqa: E402
@@ -310,12 +316,13 @@ def _decode_logits(lm, cache, tokens):
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("bits", [None, 4, 3, "mxfp8"])
 @pytest.mark.parametrize("kind", ["hy4", "flash"])
-def test_exact_verify_rows_match_decode(kind, bits, batched):
+def test_exact_verify_rows_match_decode(monkeypatch, kind, bits, batched):
     # Past the index top-k and the 8-slot sliding window, so sparse selection
     # and a rotated ring are both in play. mlx-lm's generator hands even one
     # request one-row batch caches.
     apply_verify_qmm_patch()
     cache_rollback.apply()
+    monkeypatch.setattr(language, "EXACT_VERIFY", True)
     model = _quantized_model(kind, bits)
     lm = model.language_model
     ids = _ids(7, n=SEQ)
@@ -362,16 +369,72 @@ def test_exact_block_kernels_match_one_row_calls():
     h = mx.random.normal((1, 7, 256)).astype(mx.bfloat16)
     one_x = [mxfp8(x[:, i : i + 1]) for i in range(7)]
     one_h = [exact.fp32_head(head, h[:, i : i + 1]) for i in range(7)]
+    one_d = [head(h[:, i : i + 1]) for i in range(7)]
     exact.set_armed(True)
     try:
         with exact.scope(mx.zeros((1, 7), dtype=mx.int32), [None]):
             rows_x = exact.linear(mxfp8, x)
             rows_h = exact.fp32_head(head, h)
+            rows_d = exact.linear(head, h)
     finally:
         exact.set_armed(False)
     assert mx.array_equal(rows_x, mx.concatenate(one_x, axis=1)).item()
+    assert mx.array_equal(rows_d, mx.concatenate(one_d, axis=1)).item()
     assert rows_h.dtype == mx.float32
     assert mx.array_equal(rows_h, mx.concatenate(one_h, axis=1)).item()
+
+
+@pytest.mark.skipif(not indexing.available(), reason="needs sparse_index kernels")
+def test_exact_block_index_selection_matches_one_row_decode():
+    # Release geometry past the top-k, where a verify block scores its rows
+    # in one decode-kernel call; each row must select what its decode step did.
+    config = _hy4_config()
+    config["text_config"].update(
+        index_topk=2048, index_n_heads=32, index_head_dim=128, hidden_size=256
+    )
+    args = ModelConfig.from_dict(config).text_config
+    indexer = Indexer(args)
+    mx.random.seed(5)
+    indexer.update(
+        tree_unflatten(
+            [
+                (k, mx.random.normal(v.shape) * v.shape[-1] ** -0.5)
+                for k, v in tree_flatten(indexer.parameters())
+            ]
+        )
+    )
+    indexer.set_dtype(mx.bfloat16)
+    prompt, rows = 2100, 6
+    x = mx.random.normal((1, prompt + rows, args.hidden_size)).astype(mx.bfloat16)
+    qr = mx.random.normal((1, prompt + rows, args.q_lora_rank)).astype(mx.bfloat16)
+
+    def primed():
+        cache = KVCache()
+        indexer(x[:, :prompt], qr[:, :prompt], None, cache)
+        return cache
+
+    cache = primed()
+    decoded = [
+        indexer(
+            x[:, prompt + i : prompt + i + 1],
+            qr[:, prompt + i : prompt + i + 1],
+            None,
+            cache,
+            prompt + i,
+        )
+        for i in range(rows)
+    ]
+    cache = primed()
+    mask = mx.arange(prompt, prompt + rows)[:, None] >= mx.arange(prompt + rows)
+    exact.set_armed(True)
+    try:
+        with exact.scope(mx.zeros((1, rows), dtype=mx.int32), [cache]):
+            block = indexer(x[:, prompt:], qr[:, prompt:], mask, cache, prompt)
+    finally:
+        exact.set_armed(False)
+    assert len(block) == rows
+    for got, want in zip(block, decoded):
+        assert mx.array_equal(got, want).item()
 
 
 def _generate(model, prompts, count, use_mtp):
@@ -418,6 +481,7 @@ def test_mtp_generation_matches_greedy(monkeypatch, kind, bits):
     from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
 
     assert apply_mlx_lm_mtp_patch()
+    monkeypatch.setattr(language, "EXACT_VERIFY", True)
     model = _quantized_model(kind, bits, dfly=True)
     lm = model.language_model
     drafts = []

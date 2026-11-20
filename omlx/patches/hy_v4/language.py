@@ -212,9 +212,16 @@ def engram_inputs(
     return ngrams, keep
 
 
+# Decode-exact verify gives greedy MTP output the bits of decoding without
+# MTP, but its per-row work in the cache-reading parts costs Hy4-flash about
+# 70 ms per six-row verify on M3 Ultra, more than drafting gains. It stays off
+# until those parts get dedicated kernels.
+EXACT_VERIFY = False
+
+
 def set_dspark_verify_armed(flag: bool) -> None:
     """The MTP generator arms this around draft verify forwards."""
-    exact.set_armed(flag)
+    exact.set_armed(flag and EXACT_VERIFY)
 
 
 class LanguageModel(nn.Module):

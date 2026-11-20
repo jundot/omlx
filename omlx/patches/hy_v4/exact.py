@@ -104,12 +104,28 @@ def linear(module, x: mx.array) -> mx.array:
     if not block(x):
         return module(x)
     if isinstance(module, nn.Linear):
-        return rowwise(module, x)
+        return _dense_rows(module, x)
     if getattr(module, "mode", None) == "mxfp8":
         out = _mxfp8_rows(module, x)
         if out is not None:
             return out
     return module(x)
+
+
+def _dense_rows(module, x: mx.array) -> mx.array:
+    """Unquantized rows: the weight-once GEMV of one-row decode where its
+    layout allows (bf16, wide outputs), otherwise one call per row."""
+    rows = x.reshape(-1, x.shape[-1])
+    chunks = [rows[i : i + _HEAD_ROWS] for i in range(0, rows.shape[0], _HEAD_ROWS)]
+    if all(len(c) < 2 or verify_qmv.dense_eligible(module, c) for c in chunks):
+        out = mx.concatenate(
+            [
+                module(c) if len(c) < 2 else verify_qmv.exact_verify_gemv(module, c)
+                for c in chunks
+            ]
+        )
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+    return rowwise(module, x)
 
 
 def _mxfp8_rows(module, x: mx.array) -> mx.array | None:

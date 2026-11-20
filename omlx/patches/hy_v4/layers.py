@@ -61,6 +61,15 @@ def _nax_attention(queries, keys, values, scale, mask, sinks):
         return None
 
 
+def _cache_length(cache) -> int | None:
+    """Key slots of a one-row cache before this call (physical for batch caches)."""
+    if cache is None:
+        return None
+    if hasattr(cache, "left_padding"):
+        return int(cache._idx)
+    return int(cache.offset)
+
+
 def masked_min(dtype) -> mx.array:
     return mx.array(mx.finfo(dtype).min, dtype)
 
@@ -338,11 +347,7 @@ class MoE(nn.Module):
                 for i in range(0, routed.shape[0], group)
             ]
         y = mx.concatenate(parts) if len(parts) > 1 else parts[0]
-        rows = [
-            (y[i : i + 1] * weights[i : i + 1, :, None].astype(y.dtype)).sum(axis=-2)
-            for i in range(y.shape[0])
-        ]
-        return mx.concatenate(rows)
+        return (y * weights[..., None].astype(y.dtype)).sum(axis=-2)
 
 
 class Indexer(nn.Module):
@@ -371,6 +376,9 @@ class Indexer(nn.Module):
     ) -> mx.array | list | None:
         if exact.block(x):
             # Per-row selections (None below the top-k) of a verify block.
+            folded = self._exact_select(x, qr, mask, cache, offset, positions)
+            if folded is not None:
+                return folded
             length = x.shape[1]
             mask = as_4d_mask(mask)
             keys = 0 if mask is None else mask.shape[-1]
@@ -416,6 +424,30 @@ class Indexer(nn.Module):
             picked = mx.take_along_axis(scores, chosen, axis=-1)
             out.append(mx.where(picked > -mx.inf, chosen, total).astype(mx.int32))
         return out[0] if len(out) == 1 else mx.concatenate(out, axis=2)
+
+    def _exact_select(self, x, qr, mask, cache, offset, positions) -> list | None:
+        """A verify block's per-row selections, scored together.
+
+        Only while every row would decode sparse on the decode-score kernel;
+        otherwise each row runs the one-row path in turn.
+        """
+        length = x.shape[1]
+        before = _cache_length(cache)
+        if before is None or before < self.topk:
+            return None
+        q = exact.linear(self.wq_b, qr)
+        if not indexing.decode_rows_ready(self.n_heads, before + 1, q.dtype):
+            return None
+        q = q.reshape(1, length, self.n_heads, self.head_dim).swapaxes(1, 2)
+        q = rotate(self.rope, q, offset, positions)
+        k = self.k_norm(exact.linear(self.wk, x).astype(mx.float32)).astype(x.dtype)
+        k = rotate(self.rope, k.reshape(1, 1, length, self.head_dim), offset, positions)
+        k, _ = cache.update_and_fetch(k, mx.zeros((1, 1, length, 0), dtype=k.dtype))
+        w = exact.linear(self.weights_proj, x.astype(mx.float32)).astype(mx.float32)
+        totals = [before + i + 1 for i in range(length)]
+        return indexing.decode_rows_select(
+            q, k, w * self._weight_scale, totals, as_4d_mask(mask), self.topk
+        )
 
     def _native_select(self, q, k, w, mask, total) -> mx.array | None:
         """The same selection on the sparse_index kernels (bf16 scores)."""
