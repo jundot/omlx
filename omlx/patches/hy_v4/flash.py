@@ -121,11 +121,12 @@ class CompressedIndexer(nn.Module):
             ]
             logits = mx.where(visible, logits, -mx.inf)
             chosen = mx.argpartition(-logits, kth=keep - 1, axis=-1)[..., :keep]
-            chosen = mx.concatenate(
-                [chosen.astype(mx.int32), own_rows[..., None].astype(mx.int32)],
-                axis=-1,
-            )
-            slots = left[:, None, None] + chosen * self.ratio
+            # A row with fewer closed groups than keep also picks masked groups,
+            # possibly its own one again; point those past the cache instead.
+            picked = mx.take_along_axis(logits, chosen, axis=-1) > -mx.inf
+            slots = mx.where(picked, left[:, None, None] + chosen * self.ratio, total)
+            own_slots = left[:, None, None] + own_rows[..., None] * self.ratio
+            slots = mx.concatenate([slots, own_slots], axis=-1).astype(mx.int32)
             out.append((slots[..., None] + expand).flatten(-2))
         indices = out[0] if len(out) == 1 else mx.concatenate(out, axis=1)
         return indices[:, None].astype(mx.int32)

@@ -15,12 +15,17 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.mla import MultiLinear
 
+from ...custom_kernels.attention import fast as attn_fast
 from ..deepseek_v4.switch_layers import SwitchGLU
+from . import kernels as hc_kernels
 from .config import TextConfig
 from .flash import CompressedIndexer
 from .rope import TrailingRoPE
 
 _ROW_CHUNK = 256
+# Up to this many query rows, attention gathers each row's own keys instead of
+# running the prefill-shaped kernels (draft verify blocks, short chunks).
+_VERIFY_ROWS = 16
 
 
 def masked_min(dtype) -> mx.array:
@@ -31,6 +36,20 @@ def rope_offset(cache) -> Any:
     if cache is None:
         return 0
     return cache.offset
+
+
+class _FusedWeight:
+    """The fp32 mix weight transposed for the fused kernel, rebuilt on reload."""
+
+    def __init__(self):
+        self._source = None
+        self._value = None
+
+    def get(self, weight: mx.array) -> mx.array:
+        if self._source is not weight:
+            self._value = mx.contiguous(weight.astype(mx.float32).T)
+            self._source = weight
+        return self._value
 
 
 class HyperConnectionPre(nn.Module):
@@ -49,8 +68,22 @@ class HyperConnectionPre(nn.Module):
         self._eps = args.hc_eps
         self._norm_eps = args.rms_norm_eps
         self._magnitude = args.hc_magnitude
+        self._fused = _FusedWeight()
 
     def __call__(self, streams: mx.array) -> tuple[mx.array, mx.array]:
+        if not hc_kernels.available():
+            return self.reference(streams)
+        return hc_kernels.hc_pre(
+            streams,
+            self._fused.get(self.hc_fn),
+            self.hc_base.astype(mx.float32),
+            self.hc_scale.astype(mx.float32),
+            self._norm_eps,
+            self._eps,
+            self._magnitude,
+        )
+
+    def reference(self, streams: mx.array) -> tuple[mx.array, mx.array]:
         flat = streams.astype(mx.float32).flatten(-2)
         inv_rms = mx.rsqrt(
             mx.mean(flat * flat, axis=-1, keepdims=True) + self._norm_eps
@@ -74,6 +107,7 @@ class HyperConnection(nn.Module):
         return self.hc_pre(streams)
 
 
+@mx.compile
 def hc_expand(update: mx.array, streams: mx.array, post: mx.array) -> mx.array:
     """Add one sublayer output to every stream, scaled by its post gate."""
     out = (
@@ -92,8 +126,23 @@ class HyperHead(nn.Module):
         self.hc_head_scale = mx.ones((1,), dtype=mx.float32)
         self._eps = args.hc_eps
         self._norm_eps = args.rms_norm_eps
+        self._fused = _FusedWeight()
 
     def __call__(self, streams: mx.array) -> mx.array:
+        if not hc_kernels.available():
+            return self.reference(streams)
+        collapsed, _ = hc_kernels.hc_pre(
+            streams,
+            self._fused.get(self.hc_head_fn),
+            self.hc_head_base.astype(mx.float32),
+            self.hc_head_scale.astype(mx.float32),
+            self._norm_eps,
+            self._eps,
+            None,
+        )
+        return collapsed
+
+    def reference(self, streams: mx.array) -> mx.array:
         flat = streams.astype(mx.float32).flatten(-2)
         inv_rms = mx.rsqrt(
             mx.mean(flat * flat, axis=-1, keepdims=True) + self._norm_eps
@@ -272,11 +321,12 @@ class Indexer(nn.Module):
             scores = (scores * w[:, :, start:stop]).sum(axis=1, keepdims=True)
             if mask is not None:
                 scores = mx.where(mask[..., start:stop, :], scores, -mx.inf)
-            out.append(
-                mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[
-                    ..., : self.topk
-                ].astype(mx.int32)
-            )
+            chosen = mx.argpartition(-scores, kth=self.topk - 1, axis=-1)
+            chosen = chosen[..., : self.topk]
+            # A row with fewer visible keys than topk also picks masked ones
+            # (padding or future slots); point those past the cache instead.
+            picked = mx.take_along_axis(scores, chosen, axis=-1)
+            out.append(mx.where(picked > -mx.inf, chosen, total).astype(mx.int32))
         return out[0] if len(out) == 1 else mx.concatenate(out, axis=2)
 
 
@@ -291,6 +341,34 @@ def sparse_mask(indices: mx.array, total: int) -> mx.array:
     hits = mx.zeros((b, 1, length, total + 1), dtype=mx.bool_)
     hits = mx.put_along_axis(hits, target, mx.array(True), axis=-1)
     return hits[..., :total]
+
+
+_TOKEN_BITS = 16
+_QUERY_BLOCK = 32
+
+
+def block_masks(mask: mx.array, length: int, total: int):
+    """Pack a boolean [..., length, total] mask for block-mask attention.
+
+    Returns the [B, 1, ceil(length / 32), ceil(total / 16)] block mask and the
+    [B, 1, length, ceil(total / 16)] per-row 16-key bitmask.
+    """
+    mask = as_4d_mask(mask)
+    mask = mx.broadcast_to(mask, mask.shape[:2] + (length, total))
+    pad_k = (-total) % _TOKEN_BITS
+    if pad_k:
+        mask = mx.pad(mask, [(0, 0)] * 3 + [(0, pad_k)])
+    weights = mx.left_shift(
+        mx.array(1, dtype=mx.uint32), mx.arange(_TOKEN_BITS, dtype=mx.uint32)
+    )
+    bits = (
+        mask.reshape(*mask.shape[:3], -1, _TOKEN_BITS).astype(mx.uint32) * weights
+    ).sum(axis=-1)
+    bits = bits.astype(mx.uint32)
+    pad_q = (-length) % _QUERY_BLOCK
+    rows = mx.pad(bits, [(0, 0), (0, 0), (0, pad_q), (0, 0)]) if pad_q else bits
+    blocks = rows.reshape(*rows.shape[:2], -1, _QUERY_BLOCK, rows.shape[-1])
+    return mx.any(blocks != 0, axis=3), bits
 
 
 def as_4d_mask(mask: mx.array | None) -> mx.array | None:
@@ -339,6 +417,8 @@ class Attention(nn.Module):
                 self.compressed_indexer = CompressedIndexer(args)
             elif args.indexer_types[layer] == "full":
                 self.indexer = Indexer(args)
+        self._capture_topk = False
+        self._captured_topk = None
 
     @property
     def index_module(self) -> nn.Module | None:
@@ -370,19 +450,25 @@ class Attention(nn.Module):
         offset = rope_offset(kv_cache)
         q_pe = self.rope(q_pe, offset)
         k_pe = self.rope(k_pe, offset)
-        if kv_cache is not None:
-            latent, k_pe = kv_cache.update_and_fetch(latent, k_pe)
-
+        # oMLX's BatchKVCache advances its offset array in place, so every use
+        # of ``offset`` must come before the latent cache update.
         topk = None
         indexer = self.index_module
         if indexer is not None:
             topk = indexer(x, qr, mask, index_cache, offset=offset)
         elif self.kind == "sparse":
             topk = prev_topk
+        if self._capture_topk:
+            # DFly reuses this layer's selection for the last committed row.
+            self._captured_topk = topk
+        if kv_cache is not None:
+            latent, k_pe = kv_cache.update_and_fetch(latent, k_pe)
 
         sinks = self.learnable_sink_param.astype(x.dtype)
         if length == 1:
-            out = self._decode(q_nope, q_pe, latent, k_pe, topk, mask, sinks, offset)
+            out = self._decode(q_nope, q_pe, latent, k_pe, topk, mask, sinks)
+        elif length <= _VERIFY_ROWS:
+            out = self._verify(q_nope, q_pe, latent, k_pe, topk, mask, sinks)
         else:
             out = self._prefill(q_nope, q_pe, latent, k_pe, topk, mask, sinks)
         out = out.swapaxes(1, 2) * gate
@@ -391,7 +477,7 @@ class Attention(nn.Module):
             out = self.post_proj_norm(out)
         return out, topk
 
-    def _decode(self, q_nope, q_pe, latent, k_pe, topk, mask, sinks, offset):
+    def _decode(self, q_nope, q_pe, latent, k_pe, topk, mask, sinks):
         if topk is not None:
             total = latent.shape[2]
             index = topk[:, :, 0, :, None]
@@ -422,7 +508,81 @@ class Attention(nn.Module):
         )
         return self.unembed_out(out)
 
+    def _verify(self, q_nope, q_pe, latent, k_pe, topk, mask, sinks):
+        """Absorbed attention for a few rows (draft verify, short chunks).
+
+        Each row attends only to its own selection, folded into the batch
+        axis, so the cost does not grow with the context.
+        """
+        b, heads, length, _ = q_nope.shape
+        total = latent.shape[2]
+        q_latent = self.embed_q(q_nope)
+        rows = mx.arange(total - length, total)
+        mask = as_4d_mask(mask)
+        if topk is None:
+            keep = rows[:, None] >= mx.arange(total)
+            if mask is not None:
+                keep = keep & mask
+            scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+            scores = mx.where(keep, scores, masked_min(scores.dtype))
+            out = mx.fast.scaled_dot_product_attention(
+                q_latent, latent, latent, scale=self.scale, mask=scores, sinks=sinks
+            )
+            return self.unembed_out(out)
+        index = topk[:, 0]
+        keep = (index < total) & (index <= rows[:, None])
+        safe = mx.minimum(index, total - 1)
+        if mask is not None:
+            mask = mx.broadcast_to(mask, (b, 1, length, total))
+            keep = keep & mx.take_along_axis(mask[:, 0], safe, axis=-1)
+        width = index.shape[-1]
+        gather = safe.reshape(b, length * width, 1)
+        lat = mx.take_along_axis(latent[:, 0], gather, axis=1)
+        pe = mx.take_along_axis(k_pe[:, 0], gather, axis=1)
+        lat = lat.reshape(b * length, 1, width, -1)
+        pe = pe.reshape(b * length, 1, width, -1)
+        q_pe = q_pe.swapaxes(1, 2).reshape(b * length, heads, 1, -1)
+        q_latent = q_latent.swapaxes(1, 2).reshape(b * length, heads, 1, -1)
+        scores = (q_pe * self.scale) @ pe.swapaxes(-1, -2)
+        keep = keep.reshape(b * length, 1, 1, width)
+        scores = mx.where(keep, scores, masked_min(scores.dtype))
+        out = mx.fast.scaled_dot_product_attention(
+            q_latent, lat, lat, scale=self.scale, mask=scores, sinks=sinks
+        )
+        out = out.reshape(b, length, heads, -1).swapaxes(1, 2)
+        return self.unembed_out(out)
+
+    def _sparse_kernel(self, q_nope, q_pe, latent, k_pe, topk):
+        """Absorbed sparse MLA over the selected slots on the native kernel.
+
+        Out-of-range and future slots are skipped by the kernel; the indexers
+        send masked picks past the cache, so batch padding never enters.
+        """
+        if not (
+            attn_fast.NATIVE_AVAILABLE
+            and self.num_heads in (32, 64)
+            and self.rank == 512
+            and self.rope_dim == 64
+            and topk.shape[-1] == 2048
+            and q_nope.dtype in (mx.float16, mx.bfloat16)
+        ):
+            return None
+        out = attn_fast.sparse_mla_attention(
+            self.embed_q(q_nope).astype(q_nope.dtype),
+            q_pe,
+            latent.astype(q_nope.dtype),
+            k_pe.astype(q_nope.dtype),
+            topk.astype(mx.uint32),
+            self.scale,
+            sinks=self.learnable_sink_param,
+        )
+        return self.unembed_out(out)
+
     def _prefill(self, q_nope, q_pe, latent, k_pe, topk, mask, sinks):
+        if topk is not None:
+            out = self._sparse_kernel(q_nope, q_pe, latent, k_pe, topk)
+            if out is not None:
+                return out
         total = latent.shape[2]
         if mask is None:
             length = q_nope.shape[2]
@@ -440,6 +600,23 @@ class Attention(nn.Module):
         )
         values = self.unembed_out(latent)
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
+        if (
+            attn_fast.NATIVE_AVAILABLE
+            and queries.shape[-1] == 256
+            and values.shape[-1] == 256
+            and queries.dtype in (mx.float16, mx.bfloat16)
+        ):
+            block_mask, token_mask = block_masks(mask, queries.shape[2], total)
+            return attn_fast.block_mask_attention(
+                queries,
+                keys.astype(queries.dtype),
+                values.astype(queries.dtype),
+                block_mask,
+                token_mask,
+                self.scale,
+                causal=True,
+                sinks=self.learnable_sink_param,
+            )
         return mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask, sinks=sinks
         )

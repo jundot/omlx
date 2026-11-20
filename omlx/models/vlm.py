@@ -77,6 +77,10 @@ def restore_bonsai_quantized_modules(model: nn.Module) -> int:
     return restored
 
 
+# Language models whose forward accepts ``skip_logits`` for cache-only prefill.
+_SKIP_LOGITS_MODEL_TYPES = frozenset({"qwen4_exp", "hy_v4_vl", "hy_v4_flash"})
+
+
 class VLMModelAdapter(nn.Module):
     """
     Adapter wrapping a VLM's language_model for BatchGenerator compatibility.
@@ -234,7 +238,7 @@ class VLMModelAdapter(nn.Module):
     @property
     def supports_skip_lm_head(self) -> bool:
         """Whether the wrapped official language model has a cache-only pass."""
-        return self.model_type == "qwen4_exp"
+        return self.model_type in _SKIP_LOGITS_MODEL_TYPES
 
     @property
     def config(self):
@@ -652,7 +656,7 @@ class VLMModelAdapter(nn.Module):
             # Scheduler prefill chunks discard their logits. Translate the
             # shared cache-only contract into the official Qwen model hook so
             # those chunks do not project every token over the full vocabulary.
-            if self.model_type == "qwen4_exp":
+            if self.model_type in _SKIP_LOGITS_MODEL_TYPES:
                 kwargs["skip_logits"] = True
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
