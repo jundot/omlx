@@ -1293,6 +1293,11 @@ def _guard_effective_stage(
     if assignment_honored:
         return
 
+    # Nothing to divide: one rank holds every layer, so there is no boundary for
+    # a loader to ignore, whatever the architecture can otherwise do.
+    if world_size < 2:
+        return
+
     layer_count = max((int(item.end_layer) for item in assignments), default=0)
     if layer_count <= 0:
         return
