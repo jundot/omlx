@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Offline smoke tests for the cluster v2 wizard (Module C).
+"""Offline smoke tests for the cluster wizard (Module C).
 
 The wizard is a client-side Alpine component, so "rendering each state with
 fixture JSON" is verified offline in two halves:
 
 1. The Jinja side: dashboard.html renders with every state's markup present,
    each guarded by its ``wizardState() === '<state>'`` expression.
-2. The data side: tests/ui/fixtures/cluster_v2/*.json pin the endpoint
+2. The data side: tests/ui/fixtures/cluster/*.json pin the endpoint
    payloads the wizard consumes — one fixture per state transition — and are
-   checked against the PeerRecord / plan / deployment contracts from
-   ops/notes/omlx_cluster_v2_spec.md.
+   checked against the PeerRecord / plan / deployment contracts.
 
 Nothing here starts a server, opens a socket, or touches mlx.
 """
@@ -25,10 +24,10 @@ import pytest
 from omlx_web import routes as webui
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = ROOT / "tests/ui/fixtures/cluster_v2"
+FIXTURES = ROOT / "tests/ui/fixtures/cluster"
 
-TEMPLATE = "omlx_web/templates/dashboard/_cluster_v2.html"
-JAVASCRIPT = "omlx_web/static/js/cluster_v2.js"
+TEMPLATE = "omlx_web/templates/dashboard/_cluster.html"
+JAVASCRIPT = "omlx_web/static/js/cluster.js"
 DASHBOARD = "omlx_web/templates/dashboard.html"
 
 WIZARD_STATES = (
@@ -61,11 +60,8 @@ PEER_RECORD_FIELDS = {
 ALLOWED_ENDPOINTS = {
     "/api/cluster/pair/join/cleanup",
     "/api/cluster/pair/invite",
-
-
     "/admin/api/cluster/forget",
     "/api/cluster/devices",
-    "/api/cluster/node_id",
     "/api/cluster/discovery/health",  # Module C stub, pending Module A impl
     "/api/cluster/pair/approve",
     "/api/cluster/pair/deny",
@@ -96,34 +92,45 @@ def _fixtures():
 def test_dashboard_renders_every_wizard_state():
     rendered = webui.templates.get_template("dashboard.html").render()
 
-    assert "data-cluster-v2-wizard" in rendered
+    assert "data-cluster-wizard" in rendered
     for state in WIZARD_STATES:
-        assert f'data-cluster-v2-state="{state}"' in rendered, state
+        assert f'data-cluster-state="{state}"' in rendered, state
 
 
 def test_each_state_section_is_guarded_by_its_state_machine_value():
     template = _read(TEMPLATE)
 
     for state in WIZARD_STATES:
-        assert f'data-cluster-v2-state="{state}"' in template, state
+        assert f'data-cluster-state="{state}"' in template, state
     # Each guarded state marker sits on an element whose x-show pins exactly
     # the state it names.
     for match in re.finditer(
-        r'x-show="wizardState\(\) === \'(\w+)\'"[^>]*data-cluster-v2-state="(\w+)"',
+        r'x-show="wizardState\(\) === \'(\w+)\'"[^>]*data-cluster-state="(\w+)"',
         template,
     ):
         assert match.group(1) == match.group(2)
     guarded = {
         m.group(2)
         for m in re.finditer(
-            r'x-show="wizardState\(\) === \'(\w+)\'"[^>]*data-cluster-v2-state="(\w+)"',
+            r'x-show="wizardState\(\) === \'(\w+)\'"[^>]*data-cluster-state="(\w+)"',
             template,
         )
     }
     # device_card shares its section guard with later states, so it is checked
     # separately; every other state must be guarded 1:1.
-    assert guarded >= {"empty", "discovering", "pairing", "checks", "plan", "active", "error"}
-    assert "['device_card', 'pairing', 'checks', 'plan'].includes(wizardState())" in template
+    assert guarded >= {
+        "empty",
+        "discovering",
+        "pairing",
+        "checks",
+        "plan",
+        "active",
+        "error",
+    }
+    assert (
+        "['device_card', 'pairing', 'checks', 'plan'].includes(wizardState())"
+        in template
+    )
 
 
 def test_fixtures_cover_every_state_and_honor_the_peer_contract():
@@ -152,7 +159,9 @@ def test_fixtures_cover_every_state_and_honor_the_peer_contract():
             missing = PEER_RECORD_FIELDS - set(device)
             assert not missing, f"{name}: {device.get('node_id')}: {missing}"
             caps = device["caps"]
-            assert {"chip", "ram_gb", "backends", "thunderbolt", "jaccl"} <= set(caps), name
+            assert {"chip", "ram_gb", "backends", "thunderbolt", "jaccl"} <= set(
+                caps
+            ), name
             for addr in device["addrs"]:
                 assert {"ip", "if_type"} <= set(addr), name
 
@@ -189,29 +198,28 @@ def test_wizard_consumes_only_contract_endpoints():
     ):
         assert endpoint in javascript
 
-    # DELETE /api/cluster/devices/{node_id} (unpair).
-    assert re.search(r"`/api/cluster/devices/\$\{encodeURIComponent\(nodeId\)\}`", javascript)
     # GET /admin/api/cluster/stage/{job_id} (auto-staging progress poll).
-    assert re.search(r"`/admin/api/cluster/stage/\$\{encodeURIComponent\(id\)\}`", javascript)
+    assert re.search(
+        r"`/admin/api/cluster/stage/\$\{encodeURIComponent\(id\)\}`", javascript
+    )
 
 
 def test_polling_is_one_hertz_and_visibility_gated():
     javascript = _read(JAVASCRIPT)
 
-    assert "CLUSTER_V2_POLL_MS = 1000" in javascript
+    assert "CLUSTER_POLL_MS = 1000" in javascript
     assert "document.hidden" in javascript
     assert "this.mainTab === 'cluster'" in javascript
-    assert "clusterLegacyView" not in javascript
-    assert "setInterval(() => this.tick(), CLUSTER_V2_POLL_MS)" in javascript
+    assert "setInterval(() => this.tick(), CLUSTER_POLL_MS)" in javascript
 
 
 def test_errors_are_toasts_and_banners_never_modals():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-toasts" in template
-    assert "data-cluster-v2-error" in template
-    # No modal overlay primitives anywhere in the v2 partial.
+    assert "data-cluster-toasts" in template
+    assert "data-cluster-error" in template
+    # No modal overlay primitives anywhere in the cluster partial.
     assert "fixed inset-0" not in template
     assert "x-model" not in template or "showModal" not in template
     assert "notify(type, message" in javascript
@@ -221,8 +229,8 @@ def test_version_mismatch_banner_is_actionable_and_keeps_the_device():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-version-mismatch" in template
-    assert "cluster.v2.version_mismatch.title" in template
+    assert "data-cluster-version-mismatch" in template
+    assert "cluster.version_mismatch.title" in template
     assert "brew upgrade omlx" in template
     assert "versionMismatches()" in javascript
     # The banner compares peer vs self versions and names both.
@@ -242,7 +250,7 @@ def test_multicast_self_test_stub_degrades_gracefully():
     assert "/api/cluster/discovery/health" in javascript
     assert "discoveryHealthUnsupported" in javascript
     assert "error?.status === 404" in javascript
-    assert "cluster.v2.discovering.local_network" in template
+    assert "cluster.discovering.local_network" in template
     # The fixture pins the stub contract for whoever implements it.
     health = _fixtures()["discovery_health_ok.json"]
     assert "multicast_rx_within_5s" in health
@@ -252,10 +260,10 @@ def test_pairing_flow_uses_module_b_endpoints():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-pairing" in template
-    assert "data-cluster-v2-pair-code" in template
-    assert "data-cluster-v2-approve" in template
-    assert "data-cluster-v2-deny" in template
+    assert "data-cluster-pairing" in template
+    assert "data-cluster-pair-code" in template
+    assert "data-cluster-approve" in template
+    assert "data-cluster-deny" in template
     assert "submitPairApproval" in javascript
     assert "submitPairDenial" in javascript
     # Six-digit code, validated client-side before any request leaves.
@@ -272,7 +280,7 @@ def test_checks_rows_cover_the_six_spec_checks():
 
     for key in ("ssh", "model", "version", "rdma", "benchmark", "multicast"):
         assert f"key: '{key}'" in javascript, key
-    assert "data-cluster-v2-check-row" in template
+    assert "data-cluster-check-row" in template
     assert "runBenchmark()" in javascript
     assert "checksBlockingPass()" in javascript
 
@@ -282,7 +290,7 @@ def test_plan_state_renders_the_signed_layer_split_bar():
     javascript = _read(JAVASCRIPT)
     plan = _fixtures()["plan_response.json"]
 
-    assert "data-cluster-v2-split-bar" in template
+    assert "data-cluster-split-bar" in template
     assert "assignment.layer_count / Math.max(planTotalLayers(), 1)" in template
     assert "placement_signature" in javascript
     assert "approved_placement" in javascript
@@ -303,25 +311,25 @@ def test_configured_deployment_panel_lists_devices_and_deactivates():
     javascript = _read(JAVASCRIPT)
     deployments = _fixtures()["deployments_active.json"]
 
-    assert "data-cluster-v2-active" in template
-    assert "data-cluster-v2-active-device" in template
-    assert "data-cluster-v2-active-fabric" in template
-    assert "data-cluster-v2-runtime-state" in template
-    assert "data-cluster-v2-deactivate" in template
-    assert "data-cluster-v2-model-lifecycle" in template
-    assert "data-cluster-v2-change-model" in template
-    assert "data-cluster-v2-unload-weights" in template
-    assert "data-cluster-v2-load-weights" in template
-    assert "data-cluster-v2-change-model-confirm" in template
+    assert "data-cluster-active" in template
+    assert "data-cluster-active-device" in template
+    assert "data-cluster-active-fabric" in template
+    assert "data-cluster-runtime-state" in template
+    assert "data-cluster-deactivate" in template
+    assert "data-cluster-model-lifecycle" in template
+    assert "data-cluster-change-model" in template
+    assert "data-cluster-unload-weights" in template
+    assert "data-cluster-load-weights" in template
+    assert "data-cluster-change-model-confirm" in template
     assert "configuredDeployment()" in template
     assert "deploymentStatus().label" in template
     assert "deactivateDeployment" in javascript
     assert "changeClusterModel" in javascript
     assert "unloadDeploymentWeights" in javascript
     assert "loadDeploymentWeights" in javascript
-    assert "cluster.v2.link.tailscale_control" in javascript
-    assert "cluster.v2.deploy.fabric_jaccl" in javascript
-    assert "cluster.v2.active.fabric_note" in template
+    assert "cluster.link.tailscale_control" in javascript
+    assert "cluster.deploy.fabric_jaccl" in javascript
+    assert "cluster.active.fabric_note" in template
     assert re.search(
         r"`/admin/api/cluster/deployments/\$\{encodeURIComponent\(id\)\}`",
         javascript,
@@ -334,9 +342,7 @@ def test_configured_deployment_panel_lists_devices_and_deactivates():
 
 
 def test_change_model_reuses_onboarding_with_current_serving_settings():
-    result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+    result = _run_wizard(_WIZARD_TWO_MACS + """
 global.setTimeout = () => 0;
 const deployment = {
   deployment_id: 'pool-a', model: '/models/old',
@@ -385,8 +391,7 @@ component.apiFetch = async (url, options = {}) => {
     calls,
   }));
 })();
-"""
-    )
+""")
 
     assert result["stage"] == "plan"
     assert result["deployments"] == []
@@ -560,8 +565,7 @@ process.stdout.write(JSON.stringify(samples));
 
 def test_runtime_poll_failure_revokes_a_previous_ready_snapshot():
     fixtures = _fixtures()
-    result = _run_wizard(
-        f"""
+    result = _run_wizard(f"""
 component.deploymentsPayload = {json.dumps(fixtures['deployments_active.json']['deployments'])};
 component.runtimePayload = {json.dumps(fixtures['runtime_ready.json'])};
 component.runtimeLoaded = true;
@@ -579,8 +583,7 @@ component.apiFetch = async () => {{ throw new Error('runtime endpoint down'); }}
     detail: component.deploymentStatus().detail,
   }}));
 }})();
-"""
-    )
+""")
 
     assert result["before"] == "ready"
     assert result["after"] == "unknown"
@@ -592,8 +595,7 @@ component.apiFetch = async () => {{ throw new Error('runtime endpoint down'); }}
 
 
 def test_active_card_prefers_loaded_runtime_owner_over_stale_registry_order():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 component.deploymentsPayload = [
   { deployment_id: 'ds4-cold', model: '/models/ds4', serving_mode: 'sharded' },
   { deployment_id: 'qwen-phase', model: '/models/qwen',
@@ -611,8 +613,7 @@ process.stdout.write(JSON.stringify({
   mode: component.configuredDeployment().serving_mode,
   state: component.deploymentRuntimeState(),
 }));
-"""
-    )
+""")
 
     assert result == {
         "fallback": "ds4-cold",
@@ -623,8 +624,7 @@ process.stdout.write(JSON.stringify({
 
 
 def test_activation_progress_tracks_rank_stages_until_readiness():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 component.deploymentsPayload = [{ deployment_id: 'pool-a', model: '/models/qwen' }];
 component.deploymentsLoaded = true;
 component.runtimeLoaded = true;
@@ -649,8 +649,7 @@ const ready = {
   steps: component.wizardSteps().map((step) => step.state),
 };
 process.stdout.write(JSON.stringify({ loading, ready }));
-"""
-    )
+""")
 
     assert result["loading"] == {
         "visible": True,
@@ -665,14 +664,13 @@ process.stdout.write(JSON.stringify({ loading, ready }));
     }
 
     template = _read(TEMPLATE)
-    assert "data-cluster-v2-activation-progress" in template
-    assert "data-cluster-v2-activation-progress-bar" in template
+    assert "data-cluster-activation-progress" in template
+    assert "data-cluster-activation-progress-bar" in template
     assert '<i data-lucide="check" class="w-3 h-3"></i>' not in template
 
 
 def test_prefill_accelerator_reopens_for_a_mac_in_use_and_ends_at_its_checks():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 (async () => {
 component.devicesPayload = { paired: [{ node_id: 'm5', friendly_name: 'M5max' }] };
 component.devicesLoaded = true;
@@ -696,8 +694,7 @@ process.stdout.write(JSON.stringify({
   reopened, running, ready, changed: component.wizardState(),
 }));
 })();
-"""
-    )
+""")
 
     assert result == {
         "reopened": ["accelerator", "m5"],
@@ -708,11 +705,10 @@ process.stdout.write(JSON.stringify({
 
 
 def test_a_paired_helper_daemon_reopens_before_any_model_uses_it():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 (async () => {
 const reopen = async (...paired) => {
-  const page = clusterV2Wizard();
+  const page = clusterWizard();
   page.devicesPayload = { paired };
   page.devicesLoaded = true;
   page.deploymentsLoaded = true;
@@ -729,8 +725,7 @@ const helper = await reopen(
 const mac = await reopen({ node_id: 'm5', friendly_name: 'M5max' });
 process.stdout.write(JSON.stringify({ helper, mac }));
 })();
-"""
-    )
+""")
 
     # The helper that answers comes first. A paired Mac may also split a
     # model, so it stays on the device cards.
@@ -738,8 +733,7 @@ process.stdout.write(JSON.stringify({ helper, mac }));
 
 
 def test_a_helper_mac_shows_whom_it_helps_until_setup_changes():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 component.devicesPayload = { paired: [{ node_id: 'm3', friendly_name: 'HJKmac' }] };
 component.helperRole = { active: false, helps: { node_id: 'm3', name: 'HJKmac' } };
 const idle = [component.wizardState(), component.helperRoleText()];
@@ -757,8 +751,7 @@ component.startAccelerator({ node_id: 'm3' });
 process.stdout.write(JSON.stringify({
   idle, busy, steps, afterPairing, changed, picked: component.wizardState(),
 }));
-"""
-    )
+""")
 
     assert result["idle"][0] == "helper"
     assert result["idle"][1].startswith("It starts when HJKmac loads")
@@ -772,8 +765,7 @@ process.stdout.write(JSON.stringify({
 
 
 def test_a_helper_daemon_pairs_by_its_log_code_and_never_joins_a_split():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 (async () => {
 const helper = {
   node_id: 'gpu', friendly_name: 'gpu-box', version: '0.1.0', paired: true, addrs: [],
@@ -810,8 +802,7 @@ process.stdout.write(JSON.stringify({
   rows: component.acceleratorRows().map((row) => [row.label, row.detail]),
 }));
 })();
-"""
-    )
+""")
 
     # The helper takes no layers, and an older helper version is not a mismatch.
     assert result["split"] == {
@@ -830,8 +821,7 @@ process.stdout.write(JSON.stringify({
 
 
 def test_retry_loading_ownership_supersedes_retained_failure_marker():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 component.deploymentsPayload = [{ deployment_id: 'pool-a', model: '/models/qwen' }];
 component.deploymentsLoaded = true;
 component.runtimeLoaded = true;
@@ -861,8 +851,7 @@ const ready = {
   progress: component.activationProgressVisible(),
 };
 process.stdout.write(JSON.stringify({ retry, ready }));
-"""
-    )
+""")
 
     assert result["retry"] == {
         "state": "loading",
@@ -879,8 +868,7 @@ process.stdout.write(JSON.stringify({ retry, ready }));
 
 
 def test_active_cluster_can_preview_a_signed_three_mac_membership_plan():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 component.devicesPayload = {
   self: { node_id: 'node-a', friendly_name: 'Studio', paired: true,
     caps: { ram_gb: 256, chip: 'M3 Ultra', jaccl: true },
@@ -954,8 +942,7 @@ component.apiFetch = async (url, options = {}) => {
     error: component.membershipError,
   }));
 })();
-"""
-    )
+""")
 
     assert result["candidates"] == ["node-c"]
     assert result["request"]["deployment_id"] == "pool-a"
@@ -976,17 +963,16 @@ component.apiFetch = async (url, options = {}) => {
     assert result["error"] == ""
 
     template = _read(TEMPLATE)
-    assert "data-cluster-v2-add-mac" in template
-    assert "data-cluster-v2-membership-preview" in template
-    assert "data-cluster-v2-membership-plan" in template
-    assert "data-cluster-v2-membership-apply" in template
-    assert "data-cluster-v2-plan-add-mac" in template
-    assert "data-cluster-v2-plan-add-mac-panel" in template
+    assert "data-cluster-add-mac" in template
+    assert "data-cluster-membership-preview" in template
+    assert "data-cluster-membership-plan" in template
+    assert "data-cluster-membership-apply" in template
+    assert "data-cluster-plan-add-mac" in template
+    assert "data-cluster-plan-add-mac-panel" in template
 
 
 def test_plan_add_mac_reopens_pairing_without_losing_model_selection():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 component.devicesPayload = {
   self: { node_id: 'node-a', paired: true, caps: { ram_gb: 64 }, addrs: [] },
   paired: [{ node_id: 'node-b', paired: true, caps: { ram_gb: 64 }, addrs: [] }],
@@ -1016,8 +1002,7 @@ const closed = {
   open: component.membershipPanelOpen,
 };
 process.stdout.write(JSON.stringify({ opened, closed }));
-"""
-    )
+""")
 
     assert result["opened"] == {
         "wizard": "device_card",
@@ -1065,14 +1050,13 @@ process.stdout.write(JSON.stringify({
 
     template = _read(TEMPLATE)
     assert 'x-for="deployment in deploymentsPayload"' not in template
-    assert template.count("data-cluster-v2-model-lifecycle") == 1
-    assert template.count("data-cluster-v2-load-weights") == 1
-    assert template.count("data-cluster-v2-deactivate") == 1
+    assert template.count("data-cluster-model-lifecycle") == 1
+    assert template.count("data-cluster-load-weights") == 1
+    assert template.count("data-cluster-deactivate") == 1
 
 
 def test_active_panel_preserves_per_request_prefill_and_decode_rates():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 component.deploymentsPayload = [{ deployment_id: 'pool-a', model: '/models/m' }];
 component.runtimePayload = { jobs: [
   // Rank zero is the coordinator and owns end-to-end request telemetry.
@@ -1141,8 +1125,7 @@ process.stdout.write(JSON.stringify({
     detail: component.requestPrefillDetail(cached),
   },
 }));
-"""
-    )
+""")
 
     assert result["active"] == {
         "ids": [41, 42],
@@ -1163,10 +1146,10 @@ process.stdout.write(JSON.stringify({
     }
 
     template = _read(TEMPLATE)
-    assert "data-cluster-v2-request-speeds" in template
-    assert "data-cluster-v2-request-speed-row" in template
-    assert "data-cluster-v2-request-prefill-rate" in template
-    assert "data-cluster-v2-request-decode-rate" in template
+    assert "data-cluster-request-speeds" in template
+    assert "data-cluster-request-speed-row" in template
+    assert "data-cluster-request-prefill-rate" in template
+    assert "data-cluster-request-decode-rate" in template
 
 
 def test_serving_profile_drives_the_server_owned_signed_plan():
@@ -1216,16 +1199,15 @@ component.apiFetch = async (url, options) => {
     ]
 
     template = _read(TEMPLATE)
-    assert "data-cluster-v2-serving-profile" in template
-    assert "data-cluster-v2-serving-profile-option" in template
-    assert "data-cluster-v2-context-reservation" in template
-    assert "cluster.v2.plan.context_aria" in template
-    assert "cluster.v2.plan.batching_note" in template
+    assert "data-cluster-serving-profile" in template
+    assert "data-cluster-serving-profile-option" in template
+    assert "data-cluster-context-reservation" in template
+    assert "cluster.plan.context_aria" in template
+    assert "cluster.plan.batching_note" in template
 
 
 def test_active_serving_status_uses_resolved_runtime_limits_and_batch_evidence():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 component.deploymentsPayload = [{
   deployment_id: 'pool-a', model: '/models/m',
   execution: {
@@ -1258,8 +1240,7 @@ process.stdout.write(JSON.stringify({
   prompt: execution.prompt_concurrency,
   batch,
 }));
-"""
-    )
+""")
 
     assert result["profile"] == "Throughput"
     assert result["decode"] == 12
@@ -1269,15 +1250,14 @@ process.stdout.write(JSON.stringify({
     assert "5 of 8" in result["batch"]["detail"]
 
     template = _read(TEMPLATE)
-    assert "data-cluster-v2-serving-status" in template
-    assert "data-cluster-v2-batching-state" in template
-    assert "data-cluster-v2-decode-concurrency" in template
-    assert "data-cluster-v2-prompt-concurrency" in template
+    assert "data-cluster-serving-status" in template
+    assert "data-cluster-batching-state" in template
+    assert "data-cluster-decode-concurrency" in template
+    assert "data-cluster-prompt-concurrency" in template
 
 
 def test_active_profile_change_uses_preview_signature_for_replan_apply():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 global.setTimeout = () => 0;
 component.deploymentsPayload = [{
   deployment_id: 'pool-a', model: '/models/m', target_context_tokens: 131072,
@@ -1315,8 +1295,7 @@ component.apiFetch = async (url, options) => {
     cleared: component.executionReplan,
   }));
 })();
-"""
-    )
+""")
 
     assert result["pending"] == "throughput"
     assert len(result["bodies"]) == 2
@@ -1332,9 +1311,9 @@ component.apiFetch = async (url, options) => {
     assert result["cleared"] is None
 
     template = _read(TEMPLATE)
-    assert "data-cluster-v2-serving-replan" in template
-    assert "data-cluster-v2-serving-replan-confirm" in template
-    assert "data-cluster-v2-serving-replan-apply" in template
+    assert "data-cluster-serving-replan" in template
+    assert "data-cluster-serving-replan-confirm" in template
+    assert "data-cluster-serving-replan-apply" in template
 
 
 def test_dark_tensor_controls_use_explicit_high_contrast_palette():
@@ -1344,16 +1323,16 @@ def test_dark_tensor_controls_use_explicit_high_contrast_palette():
     assert (
         ":data-selected=\"planStrategy === option.key ? 'true' : 'false'\"" in template
     )
-    assert "cluster-v2-tensor-segment" in template
+    assert "cluster-tensor-segment" in template
     assert ':data-tensor-tone="index % 5"' in template
     assert (
-        ".cluster-v2-tensor-segment--2 { background: rgb(var(--palette-zinc-600)); }"
+        ".cluster-tensor-segment--2 { background: rgb(var(--palette-zinc-600)); }"
         in stylesheet
     )
-    assert '[data-theme="dark"] [data-cluster-v2-active] .text-neutral-600' in stylesheet
+    assert '[data-theme="dark"] [data-cluster-active] .text-neutral-600' in stylesheet
     assert "color: rgb(var(--palette-zinc-300)) !important" in stylesheet
 
-    tensor_bar = template.split("data-cluster-v2-split-bar-tensor", 1)[1].split(
+    tensor_bar = template.split("data-cluster-split-bar-tensor", 1)[1].split(
         "</template>", 1
     )[0]
     assert "bg-neutral-400 text-white" not in tensor_bar
@@ -1374,21 +1353,19 @@ def test_one_hertz_tick_polls_runtime_ownership_and_not_just_deployments():
     assert "=== 'ready'" in active
 
 
-def test_cluster_v2_is_the_sole_dashboard_flow():
+def test_cluster_wizard_is_the_sole_dashboard_flow():
     dashboard = _read(DASHBOARD)
-    template = _read(TEMPLATE)
 
-    assert '{% include "dashboard/_cluster.html" %}' not in dashboard
-    assert dashboard.count('{% include "dashboard/_cluster_v2.html" %}') == 1
-    assert "clusterLegacyView" not in dashboard + template
-    assert "Advanced (legacy)" not in dashboard + template
-    # cluster_v2.js loads before dashboard.js so the factory exists when
-    # Alpine initializes x-data="clusterV2Wizard()".
-    scripts = dashboard.index("js/cluster_v2.js"), dashboard.index("js/dashboard.js")
+    assert dashboard.count('{% include "dashboard/_cluster.html" %}') == 1
+    # cluster.js loads before dashboard.js so the factory exists when
+    # Alpine initializes x-data="clusterWizard()".
+    scripts = dashboard.index("js/cluster.js"), dashboard.index("js/dashboard.js")
     assert scripts[0] < scripts[1]
 
 
-@pytest.mark.parametrize("fixture_name", sorted(p.name for p in FIXTURES.glob("*.json")))
+@pytest.mark.parametrize(
+    "fixture_name", sorted(p.name for p in FIXTURES.glob("*.json"))
+)
 def test_fixtures_are_valid_json_with_state_annotations(fixture_name):
     payload = json.loads((FIXTURES / fixture_name).read_text())
 
@@ -1404,10 +1381,10 @@ def test_joiner_panel_renders_the_six_digit_code():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-joining" in template
-    assert "data-cluster-v2-join-code" in template
-    assert "data-cluster-v2-join-countdown" in template
-    assert "data-cluster-v2-join-cancel" in template
+    assert "data-cluster-joining" in template
+    assert "data-cluster-join-code" in template
+    assert "data-cluster-join-countdown" in template
+    assert "data-cluster-join-cancel" in template
     assert "joinActive()" in javascript
     assert "joinCountdownLabel()" in javascript
     # An active local join lands in the pairing wizard state, alongside (never
@@ -1438,7 +1415,7 @@ def test_joiner_poll_drives_approval_and_survives_reloads():
     assert "joined" in approved
     assert "this.refreshDevices()" in approved
     denied = javascript.split("snapshot.state === 'denied'", 1)[1]
-    assert "cluster.v2.toast.join_denied" in denied
+    assert "cluster.toast.join_denied" in denied
     # Denied is terminal server-side; the UI clears it via the cancel endpoint.
     assert "/api/cluster/pair/join/cancel" in javascript
 
@@ -1447,7 +1424,7 @@ def test_show_code_instead_posts_the_best_reachable_address():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-show-code" in template
+    assert "data-cluster-show-code" in template
     assert "beginJoinAsJoiner" in javascript
     assert "bestDeviceAddr" in javascript
     # Manual/Thunderbolt/ethernet/tailscale IPv4 win; a bare link-local fe80::
@@ -1468,19 +1445,19 @@ def test_loopback_only_macs_explain_the_bind_instead_of_offering_pairing():
     assert "device?.caps?.loopback_only" in javascript
     # This Mac: a banner, because peers can never reach it.
     assert 'x-show="deviceLoopbackOnly(selfDevice())"' in template
-    assert "cluster.v2.loopback.self_notice" in template
+    assert "cluster.loopback.self_notice" in template
     # Other Macs: every pairing entry point is disabled with the reason shown.
     assert ':disabled="deviceLoopbackOnly(device)"' in template
     assert ':disabled="join.busy || deviceLoopbackOnly(device)"' in template
     assert ':disabled="pairing.busy || deviceLoopbackOnly(device)"' in template
-    assert template.count("cluster.v2.loopback.peer_notice") == 2
+    assert template.count("cluster.loopback.peer_notice") == 2
 
 
 def test_expired_join_offers_start_again_not_a_dead_end():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-join-restart" in template
+    assert "data-cluster-join-restart" in template
     assert "restartJoin" in javascript
     # Restart reuses the remembered coordinator address with a fresh code.
     assert "this.join.coordinator_addr" in javascript
@@ -1490,9 +1467,9 @@ def test_add_by_ip_validates_then_offers_the_join_flow():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-manual-add" in template
-    assert "data-cluster-v2-manual-input" in template
-    assert "data-cluster-v2-manual-submit" in template
+    assert "data-cluster-manual-add" in template
+    assert "data-cluster-manual-input" in template
+    assert "data-cluster-manual-submit" in template
     assert "submitManualPeer" in javascript
     assert "/api/cluster/devices/manual" in javascript
     # Client-side validation before any request leaves: IPv4 + optional port.
@@ -1515,14 +1492,12 @@ def _run_wizard(body: str) -> dict:
     # the real English catalog so runtime assertions still read the shipped
     # strings. A missing key falls through as the key itself, which makes a
     # forgotten catalog entry visible rather than silently blank.
-    catalog = json.loads(
-        (ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8")
-    )
+    catalog = json.loads((ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8"))
     script = f"""
 {_read(JAVASCRIPT)}
 const __catalog = {json.dumps(catalog, ensure_ascii=False)};
 global.window = {{ t: (key) => (key in __catalog ? __catalog[key] : key) }};
-const component = clusterV2Wizard();
+const component = clusterWizard();
 {body}
 """
     result = subprocess.run(
@@ -1575,11 +1550,11 @@ def test_plan_step_has_a_per_node_role_picker_with_defaults_unchanged():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-node-roles" in template
-    assert "data-cluster-v2-role-picker" in template
-    assert "data-cluster-v2-role-workstation" in template
-    assert "data-cluster-v2-role-headless" in template
-    assert "data-cluster-v2-usable-budget" in template
+    assert "data-cluster-node-roles" in template
+    assert "data-cluster-role-picker" in template
+    assert "data-cluster-role-workstation" in template
+    assert "data-cluster-role-headless" in template
+    assert "data-cluster-usable-budget" in template
     # Default stays as it always was: this Mac workstation, peers headless.
     assert "isSelf ? 'workstation' : 'headless'" in javascript
     # Changing a role re-runs the plan (on click — no silent flips).
@@ -1600,7 +1575,7 @@ def test_role_reserve_math_comes_from_the_server_with_a_synced_mirror():
     assert "reserve_fraction" in javascript
     # The offline mirror names the module it mirrors so they cannot drift
     # apart silently.
-    mirror = javascript.split("CLUSTER_V2_ROLE_FALLBACK", 2)[0]
+    mirror = javascript.split("CLUSTER_ROLE_FALLBACK", 2)[0]
     assert "node_role.py" in mirror
 
     # The fixture pins the endpoint contract against node_role.py itself.
@@ -1619,9 +1594,9 @@ def test_fit_failure_banner_is_actionable_and_never_silent():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-fit-banner" in template
-    assert "data-cluster-v2-fit-switch-headless" in template
-    assert "cluster.v2.plan.switch_headless" in template
+    assert "data-cluster-fit-banner" in template
+    assert "data-cluster-fit-switch-headless" in template
+    assert "cluster.plan.switch_headless" in template
     assert "parseFitFailure" in javascript
     assert r"at least (\d+) additional bytes" in javascript
     assert "canFixWithHeadless" in javascript
@@ -1634,8 +1609,7 @@ def test_fit_failure_banner_is_actionable_and_never_silent():
 
 def test_role_picker_defaults_reserve_math_and_replan():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+        _WIZARD_TWO_MACS + """
 const gib = 1024 ** 3;
 let replans = 0;
 component.runPlan = async () => { replans += 1; };
@@ -1670,8 +1644,7 @@ process.stdout.write(JSON.stringify({
 
 def test_fit_failure_parses_the_shortfall_and_flips_only_on_click():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+        _WIZARD_TWO_MACS + """
 const gib = 1024 ** 3;
 // A 274 GiB model across a 256 + 128 GiB pair: the workstation reserve on
 // this Mac is exactly what makes the plan fail.
@@ -1728,39 +1701,37 @@ component.switchAllToHeadless().then(() => {
 def test_strategy_picker_renders_between_models_and_roles():
     template = _read(TEMPLATE)
 
-    assert "data-cluster-v2-strategy-picker" in template
+    assert "data-cluster-strategy-picker" in template
     # Same segmented control as the role picker.
-    picker = template.split("data-cluster-v2-strategy-picker", 1)[1].split(
-        "data-cluster-v2-node-roles", 1
+    picker = template.split("data-cluster-strategy-picker", 1)[1].split(
+        "data-cluster-node-roles", 1
     )[0]
     assert "segmented__item--active" in picker
-    assert ':data-cluster-v2-strategy="option.key"' in picker
+    assert ':data-cluster-strategy="option.key"' in picker
     # Green "Recommended" pill, exactly one at a time.
-    assert "data-cluster-v2-strategy-recommended" in picker
-    assert (
-        "bg-green-50 border-green-200 text-green-700" in picker
-    )
+    assert "data-cluster-strategy-recommended" in picker
+    assert "bg-green-50 border-green-200 text-green-700" in picker
     assert "recommendedStrategy() === option.key" in picker
     # Disabled options explain themselves.
-    assert ":disabled=\"option.disabled\"" in picker
-    assert ":title=\"option.disabledReason\"" in picker
+    assert ':disabled="option.disabled"' in picker
+    assert ':title="option.disabledReason"' in picker
 
 
 def test_persistent_prompt_cache_defaults_on_and_can_be_disabled():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-prompt-cache-ssd" in template
-    assert "data-cluster-v2-prompt-cache-ssd-toggle" in template
-    assert "data-cluster-v2-prompt-cache-ssd-cap" in template
-    assert "data-cluster-v2-active-cache-mode" in template
+    assert "data-cluster-prompt-cache-ssd" in template
+    assert "data-cluster-prompt-cache-ssd-toggle" in template
+    assert "data-cluster-prompt-cache-ssd-cap" in template
+    assert "data-cluster-active-cache-mode" in template
     assert 'x-model="promptCacheSsd"' in template
     assert '@change="runPlan()"' in template
     assert "promptCacheSsd: true" in javascript
     assert "promptCacheSsdMaxGiB: 20" in javascript
     assert "prompt_cache_ssd: this.promptCacheSsd" in javascript
     assert "prompt_cache_ssd_max_bytes" in javascript
-    assert "cluster.v2.plan.prompt_reuse_blurb" in template
+    assert "cluster.plan.prompt_reuse_blurb" in template
 
     result = _run_wizard(
         _WIZARD_TWO_MACS + """
@@ -1917,8 +1888,7 @@ process.stdout.write(JSON.stringify({
 
 def test_catalogue_drives_the_recommendation_badge_and_capability_locks():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+        _WIZARD_TWO_MACS + """
 let catalogueCalls = 0;
 component.apiFetch = async (url) => {
   if (url.endsWith('/catalogue')) {
@@ -1977,7 +1947,7 @@ component.apiFetch = async (url) => {
 component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
 component.selectedModelPath = '/models/m';
 
-const slow = clusterV2Wizard();
+const slow = clusterWizard();
 slow.devicesPayload = {
   self: { node_id: 'node-c', caps: { ram_gb: 128 }, addrs: [] },
   paired: [
@@ -2175,8 +2145,7 @@ process.stdout.write(JSON.stringify({
 
 def test_peer_runtime_warning_is_amber_and_does_not_block_planning():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+        _WIZARD_TWO_MACS + """
 component.checks.started = true;
 component.checks.probes = {
   'node-b': {
@@ -2204,7 +2173,7 @@ def test_split_bar_has_a_tensor_variant_and_width_transitions():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
-    assert "data-cluster-v2-split-bar-tensor" in template
+    assert "data-cluster-split-bar-tensor" in template
     assert "planIsTensor()" in template
     assert "tensorShareLabel()" in template
     assert template.count("transition-[width] duration-700 ease-out") >= 2
@@ -2256,8 +2225,16 @@ component.selectedModelPath = '/models/m';
 """ + _WIZARD_SIGNED_PROPOSAL
 
 
-def _stage_node(node_id, rank, status, files_total=0, files_completed=0,
-                bytes_total=0, bytes_completed=0, error=""):
+def _stage_node(
+    node_id,
+    rank,
+    status,
+    files_total=0,
+    files_completed=0,
+    bytes_total=0,
+    bytes_completed=0,
+    error="",
+):
     return {
         "node_id": node_id,
         "rank": rank,
@@ -2331,9 +2308,7 @@ component.apiFetch = async (url, options) => {
             json.dumps(_stage_node("node-a", 0, "ready")),
             json.dumps(_stage_node("node-b", 1, "copying", 10, 3, 100, 30)),
             json.dumps(_stage_node("node-a", 0, "ready")),
-            json.dumps(
-                _stage_node("node-b", 1, "ready", 10, 10, 100, 100)
-            ),
+            json.dumps(_stage_node("node-b", 1, "ready", 10, 10, 100, 100)),
         ),
     )
 
@@ -2383,10 +2358,7 @@ component.apiFetch = async (url, options) => {
 
 def test_staging_is_skipped_when_every_mac_has_the_model():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + _WIZARD_TIMER_STUBS
-        + _WIZARD_SIGNED_PROPOSAL
-        + """
+        _WIZARD_TWO_MACS + _WIZARD_TIMER_STUBS + _WIZARD_SIGNED_PROPOSAL + """
 component.modelOptions = [{
   model_path: '/models/m', id: 'm', model_source: '127.0.0.1',
   locations: [
@@ -2475,10 +2447,7 @@ component.apiFetch = async (url, options) => {
 
 def test_stage_poll_404_is_a_retryable_lost_job():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + _WIZARD_TIMER_STUBS
-        + _WIZARD_PARTIAL_MODEL
-        + """
+        _WIZARD_TWO_MACS + _WIZARD_TIMER_STUBS + _WIZARD_PARTIAL_MODEL + """
 const jobId = 'a'.repeat(24);
 let stagePosts = 0;
 component.apiFetch = async (url, options) => {
@@ -2561,7 +2530,11 @@ component.apiFetch = async (url, options) => {
             json.dumps(_stage_node("node-a", 0, "ready")),
             json.dumps(
                 _stage_node(
-                    "node-b", 1, "failed", 10, 4,
+                    "node-b",
+                    1,
+                    "failed",
+                    10,
+                    4,
                     error="Failed to copy: model-00002-of-00076.safetensors",
                 )
             ),
@@ -2583,10 +2556,10 @@ component.apiFetch = async (url, options) => {
 def test_staging_progress_rows_render_per_node_file_counts():
     template = _read(TEMPLATE)
 
-    assert "data-cluster-v2-staging" in template
-    assert "data-cluster-v2-staging-node" in template
-    assert "data-cluster-v2-staging-error" in template
-    assert "data-cluster-v2-staging-dismiss" in template
+    assert "data-cluster-staging" in template
+    assert "data-cluster-staging-node" in template
+    assert "data-cluster-staging-error" in template
+    assert "data-cluster-staging-dismiss" in template
     # Per-node thin bar over file counts — never a global byte %.
     assert "node.files_completed || 0" in template
     assert "Math.max(node.files_total || 0, 1)" in template
@@ -2619,7 +2592,11 @@ process.stdout.write(JSON.stringify({
             json.dumps(_stage_node("node-c", 2, "queued")),
             json.dumps(
                 _stage_node(
-                    "node-d", 3, "failed", 4, 1,
+                    "node-d",
+                    3,
+                    "failed",
+                    4,
+                    1,
                     error="Failed to copy: model-00002-of-00076.safetensors",
                 )
             ),
@@ -2640,10 +2617,7 @@ process.stdout.write(JSON.stringify({
 
 def test_old_server_without_stage_degrades_to_direct_activation():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + _WIZARD_TIMER_STUBS
-        + _WIZARD_PARTIAL_MODEL
-        + """
+        _WIZARD_TWO_MACS + _WIZARD_TIMER_STUBS + _WIZARD_PARTIAL_MODEL + """
 const calls = [];
 component.apiFetch = async (url, options) => {
   const body = options && options.body ? JSON.parse(options.body) : null;
@@ -2722,7 +2696,7 @@ process.stdout.write(JSON.stringify({state: component.wizardState(), active: com
 """)
     assert result == {"state": "device_card", "active": False}
     template = _read(TEMPLATE)
-    assert "data-cluster-v2-join-cleanup" in template
+    assert "data-cluster-join-cleanup" in template
     assert 'x-show="join.cleanup_pending"' in template
 
 
@@ -2840,8 +2814,8 @@ console.log(JSON.stringify({sent, user: peer.ssh_user, plan: component.plan,
 
 def test_ssh_repair_form_only_belongs_to_failed_check():
     template = _read(TEMPLATE)
-    form = template.index("data-cluster-v2-ssh-user")
-    checks = template.index("data-cluster-v2-checks")
+    form = template.index("data-cluster-ssh-user")
+    checks = template.index("data-cluster-checks")
     assert form > checks
     assert "row.key === 'ssh' && row.status === 'fail'" in template[checks:form]
     assert "checks.probes[peer.node_id]?.ok === false" in template[checks:form]
@@ -2857,7 +2831,7 @@ def test_discovered_membership_card_offers_pairing_with_a_persistent_form():
     start = template.index(":key=\"'membership-found-' + device.node_id\"")
     end = template.index("</template>", start)
     assert '@click="beginMembershipPairing(device)"' in template[start:end]
-    form = template.index("data-cluster-v2-membership-pairing-form")
+    form = template.index("data-cluster-membership-pairing-form")
     assert form > end
     assert 'x-show="pairing.target"' in template[end:form]
     assert '@keydown.enter="submitPairApproval(pairing.target)"' in template[form:]
@@ -3048,8 +3022,8 @@ def test_forget_member_and_entire_cluster_have_separate_confirmations():
     ]
     assert result["busy"] is False
     template = _read(TEMPLATE)
-    assert 'data-cluster-v2-forget-device' in template
-    assert 'data-cluster-v2-forget-all' in template
+    assert "data-cluster-forget-device" in template
+    assert "data-cluster-forget-all" in template
 
 
 @pytest.mark.parametrize(

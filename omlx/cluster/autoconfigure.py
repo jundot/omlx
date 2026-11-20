@@ -702,16 +702,6 @@ def preflight_issues(
                         )
                     )
 
-        node = payload.get("node") or {}
-        if node.get("accelerator") == "cuda" and node.get("memory_kind") == "vram":
-            issues.append(
-                PreflightIssue(
-                    node_id,
-                    "cuda_memory_guard_unavailable",
-                    "discrete CUDA VRAM cannot yet be monitored during model loading",
-                )
-            )
-
         models = payload.get("models")
         if model_path and isinstance(models, (list, tuple)) and model_path not in models:
             issues.append(
@@ -743,7 +733,6 @@ def describe_preflight(issues: Sequence[PreflightIssue]) -> str:
         "model_missing": "missing the model",
         "runtime_mismatch": "running a different MLX version",
         "import_missing": "missing a Python package this model needs",
-        "cuda_memory_guard_unavailable": "using unsupported discrete CUDA memory",
     }
     for kind, nodes in by_kind.items():
         parts.append(f"{', '.join(sorted(set(nodes)))} {labels.get(kind, kind)}")

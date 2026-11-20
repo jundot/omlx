@@ -7,18 +7,9 @@ preserving its existing OpenAI-compatible API. The first implementation uses
 contiguous pipeline stages: each rank loads only its assigned transformer
 layers, while rank zero remains the API coordinator.
 
-Experimental Mac + NVIDIA execution is available through the outer MLX Ring
-compatibility path. See the [heterogeneous model-pool guide](heterogeneous-cluster.md)
-for the logical Metal/CUDA memory pool, automatic placement, GUI worker
-enrollment, hardware gates, and the still-pending hierarchical Ring/NCCL
-gateway.
-
 The implementation currently provides:
 
 - read-only Thunderbolt, RDMA interface, IP, route, memory, and runtime probes;
-- untrusted Bonjour suggestions for Macs advertising SSH;
-- GUI-generated, ten-minute, single-use CUDA worker enrollment with pinned
-  bootstrap/source digests and pinned SSH identities;
 - prompt-free SSH trust-on-first-use: new peer aliases are recorded in the
   user's `known_hosts`, while changed keys are still refused;
 - exact oMLX, MLX, MLX-LM, cluster-protocol, remote model-path, and bounded
@@ -96,12 +87,6 @@ Rank zero is the Mac whose dashboard activates the deployment. It owns the
 late pipeline layers and the private inference coordinator. For a 256 GiB Mac
 paired with a 128 GiB Mac, rank zero should normally be the larger machine.
 
-For an Ubuntu/Debian CUDA worker, no oMLX desktop installation is required.
-Use **Cluster > Add a CUDA worker** on the coordinator and paste its generated
-command into the Linux account the worker should use. The installer creates a
-minimal environment at `/opt/omlx-cluster-worker/venv`, verifies it, and adds
-the worker to the pool. Use one newly generated command per physical box.
-
 ## Use the GUI
 
 Start this source build on both Macs. In **Settings > Advanced**, enable
@@ -112,37 +97,9 @@ enabled.
 ### Automatic Peer Discovery
 
 
-oMLX uses Bonjour/mDNS to discover nearby Macs advertising SSH or the oMLX
-specific `_omlx._tcp` service. The discovery is read-only and never implies
-trust. Discovered peers appear under **Detected nearby** with their hostname
-and service type.
-
-For manual pairing, generate a shared pairing secret on one Mac and copy it to
-the other. Enter the same secret on both dashboards before generating and
-exchanging the short-lived SSH key tokens. The secret authenticates the token
-with HMAC-SHA256; an unkeyed or altered token is rejected.
-
-### CUDA Worker Enrollment
-
-The CUDA card is the normal Linux path; the older two-dashboard key exchange is
-only for peer Macs. The coordinator must listen on a LAN-reachable address.
-Configure the main API key first, or save it together with **Settings > Server
-host** set to `0.0.0.0`. Then restart oMLX and enter the Studio's private IPv4
-address in the card. oMLX refuses a non-loopback bind until an API key is
-configured.
-
-Select **Generate join command**, copy it, and paste it into one CUDA worker. The
-command expires after thirty minutes and can be claimed only once. It may ask for
-`sudo`; package installation, the worker-only virtual environment, SSH key
-exchange, source verification, live imports, and pool selection happen
-automatically. Generate a fresh command for the second CUDA worker. No join
-credential is stored
-in browser storage or in the completed node registry.
-
-The current execution mode still launches both CUDA boxes as physical ranks in
-the outer Ring. A successful ConnectX/NCCL verification keeps the CUDA pair
-adjacent and uses its direct-link addressing, but does not yet turn it into the
-future one-gateway hierarchical Ring-to-NCCL supernode.
+oMLX uses Bonjour/mDNS on the oMLX-specific `_omlx._tcp` service, plus an
+IPv6 multicast fallback, to discover nearby Macs. The discovery is read-only
+and never implies trust; a Mac is trusted only after code-based pairing.
 
 ### Setup Flow
 
@@ -293,32 +250,21 @@ contains a SHA-256 digest checked by every worker before loading.
 All cluster endpoints use the existing oMLX admin authentication:
 
 ```text
-GET    /admin/api/cluster/status
 GET    /admin/api/cluster/runtime
-GET    /admin/api/cluster/discover
 POST   /admin/api/cluster/peer-probe
-POST   /admin/api/cluster/worker-smoke
-POST   /admin/api/cluster/collective-smoke
-POST   /admin/api/cluster/pipeline-smoke
-POST   /admin/api/cluster/plan
-POST   /admin/api/cluster/join-keys
-GET    /admin/api/cluster/join-status
-DELETE /admin/api/cluster/join-keys/{join_id}
+POST   /admin/api/cluster/autoconfigure
+POST   /admin/api/cluster/stage
+GET    /admin/api/cluster/stage/{job_id}
 GET    /admin/api/cluster/deployments
 POST   /admin/api/cluster/deployments
 DELETE /admin/api/cluster/deployments/{deployment_id}
+POST   /admin/api/cluster/replan
+DELETE /admin/api/cluster/forget
 ```
 
 Deployment records contain hostnames, communication IPs, RDMA device names,
 assignments, and the plan hash. They never contain passwords, private keys, or
 SSH options. The registry is written atomically with mode `0600`.
-
-The bootstrap transport endpoints live under `/cluster/join`. They do not use
-the browser admin cookie: `/claim` consumes the one-time bearer key, while
-`/source` and `/complete` require the resulting short-lived session. The
-bootstrap program itself is public only while Distributed Inference is enabled
-and is sent with no-store headers; its exact digest is embedded in the
-authenticated admin command before it is executed.
 
 ## Current compatibility
 
@@ -372,7 +318,7 @@ the two target Macs:
    single-stream decode, concurrent aggregate decode, cache hit rate, pipeline
    utilization, and long-context KV growth.
 
-### Different SSH usernames in the Cluster v2 wizard
+### Different SSH usernames in the Cluster wizard
 
 Pairing installs each Mac's key in the account that runs oMLX, and each Mac sends that account name with its pairing request or approval. The other Mac stores it and uses it for peer checks, model discovery and new plans, so Macs with different usernames need no extra setup.
 
