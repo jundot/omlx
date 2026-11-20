@@ -301,6 +301,32 @@ def _join_state_token_axis(states, capacity: int):
         start += _state_length(state)
     return _place_states(states[0], placements, _state_rows(states[0]), capacity)
 
+def _write_state_rows(dst, src, starts):
+    """Write row ``b`` of ``src`` at token column ``starts[b]`` of ``dst``."""
+    length = _state_length(src)
+    for dst_field, src_field in zip(dst, src):
+        if isinstance(dst_field, mx.array):
+            for row, start in enumerate(starts):
+                dst_field[row : row + 1, :, start : start + length] = src_field[
+                    row : row + 1
+                ]
+        else:
+            _write_state_rows(dst_field, src_field, starts)
+
+
+
+
+def _shift_state_rows(state, moves, end: int):
+    """Shift each ``(row, start, shift)`` row's live tokens right to end at ``end``."""
+    for field in state:
+        if isinstance(field, mx.array):
+            for row, start, shift in moves:
+                # A real copy of the source window: it overlaps the target.
+                window = mx.array(field[row : row + 1, :, start : end - shift]) + 0
+                field[row : row + 1, :, start + shift : end] = window
+        else:
+            _shift_state_rows(field, moves, end)
+
 
 def _roll_state(state, shifts, axis: int = 2):
     """Roll a quantized state along its token axis by per-row ``shifts``.
@@ -402,6 +428,9 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         # also must not be derived from _state_length(self.keys): that is the
         # step-allocated capacity, not the written end.
         self._phys_end = 0
+        # Per-row written ends after trim_rows (host ints); None: all end at
+        # _phys_end.
+        self._row_ends: list[int] | None = None
 
     @property
     def _idx(self):
@@ -413,6 +442,8 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         return _growth_step(_state_length(self.keys) if self.keys is not None else 0)
 
     def trim(self, n):
+        if self._row_ends is not None:
+            return self.trim_rows([n] * len(self._row_ends))
         position = self._idx
         n = min(position, n)
         self.offset -= n
@@ -421,12 +452,91 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         self._cached_state_offset = -1
         return n
 
+    # Rows drop different counts in place; the mask hides columns past each end.
+    _omlx_ragged_trim = True
+
+    def _ends(self) -> list[int]:
+        if self._row_ends is not None:
+            return list(self._row_ends)
+        return [self._phys_end] * int(self.offset.shape[0])
+
+    def _set_ends(self, ends: list[int]) -> None:
+        self._phys_end = max(ends) if ends else 0
+        self._row_ends = None if len(set(ends)) <= 1 else list(ends)
+        self._cached_state = None
+        self._cached_state_offset = -1
+
+    def trim_rows(self, counts) -> int:
+        """Drop the newest ``counts[b]`` written tokens of each row ``b``."""
+        counts = [max(0, int(n)) for n in counts]
+        if isinstance(self.offset, int) or (
+            self._row_ends is None and len(set(counts)) == 1
+        ):
+            return self.trim(counts[0])
+        ends = self._ends()
+        counts = [min(n, end) for n, end in zip(counts, ends)]
+        self.offset = self.offset - mx.array(counts, dtype=self.offset.dtype)
+        self._set_ends([end - n for end, n in zip(ends, counts)])
+        return max(counts)
+
+    def _update_rows(self, keys: mx.array, values: mx.array):
+        """Append ``keys``/``values`` row by row at each row's own end."""
+        self._ensure_codecs(keys, values)
+        new_keys, new_values = self._try_fused_kv_quantize(keys, values)
+        if new_keys is None:
+            new_keys = self.key_codec.quantize(keys)
+            new_values = self.value_codec.quantize(values)
+        ends = self._ends()
+        n_new = keys.shape[2]
+        used = self._phys_end
+        needed = max(ends) + n_new
+        self.keys = _reserve_state_capacity(self.keys, used, needed, self.cache_step)
+        self.values = _reserve_state_capacity(
+            self.values, used, needed, self.cache_step
+        )
+        _write_state_rows(self.keys, new_keys, ends)
+        _write_state_rows(self.values, new_values, ends)
+        self.offset = self.offset + n_new
+        self._set_ends([end + n_new for end in ends])
+        if n_new > 16:
+            mx.eval(self.keys, self.values)
+        ks, vs = self.state
+        return (
+            _QuantizedStateProxy(ks, self._phys_end, keys.shape[1]),
+            _QuantizedStateProxy(vs, self._phys_end, keys.shape[1]),
+        )
+
+    def _align_row_ends(self) -> None:
+        """Shift short rows right so every row ends at ``_phys_end`` again."""
+        if self._row_ends is None:
+            return
+        end = self._phys_end
+        shifts = [end - row_end for row_end in self._row_ends]
+        if self.keys is not None:
+            # Only short rows move, in place; their vacated columns become padding.
+            mx.eval(self.left_padding)
+            starts = [int(p) for p in self.left_padding.tolist()]
+            moves = [
+                (row, start, shift)
+                for row, (start, shift) in enumerate(zip(starts, shifts))
+                if shift > 0
+            ]
+            _shift_state_rows(self.keys, moves, end)
+            _shift_state_rows(self.values, moves, end)
+            mx.eval(self.keys, self.values)
+        self.left_padding = self.left_padding + mx.array(shifts)
+        self._row_ends = None
+        self._cached_state = None
+        self._cached_state_offset = -1
+
     # ---- update_and_fetch override for B>1 only ----------------------------
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         if isinstance(self.offset, int):
             # B=1: parent's method directly (zero overhead)
             return super().update_and_fetch(keys, values)
+        if self._row_ends is not None:
+            return self._update_rows(keys, values)
         # B>1: track per-request offset separately from state offset
         T_new = keys.shape[2]
         # Append at the written physical end (see __init__._phys_end note).
@@ -456,6 +566,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
     @state.setter
     def state(self, value):
         TurboQuantKVCache.state.fset(self, value)
+        self._row_ends = None
         # The parent fset resets to int-offset (B=1) bookkeeping, where the
         # parent's offset is the write cursor (and trim() may move it back).
         # Drop any stale batch-mode value so _ensure_array_offset re-derives
@@ -473,6 +584,15 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         offset = self.offset
         if isinstance(offset, int):
             return create_attention_mask(N, offset, return_array, window_size)
+        if self._row_ends is not None:
+            # Row b's queries sit at its own end.
+            ends = mx.array(self._row_ends)[:, None, None]
+            queries = ends + mx.arange(N)[None, :, None]
+            columns = mx.arange(max(self._row_ends) + N)[None, None, :]
+            mask = (columns <= queries) & (columns >= self.left_padding[:, None, None])
+            if window_size is not None:
+                mask = mask & (columns > queries - window_size)
+            return mask[:, None]
         if (
             isinstance(offset, mx.array)
             and offset.size == 1
@@ -526,6 +646,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
     def finalize(self):
         if self._right_padding is None:
             return
+        self._align_row_ends()
         padding = self._right_padding
         if self.keys is not None:
             # Roll the already-quantized state directly (_roll_state) rather
@@ -546,6 +667,9 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
     def filter(self, batch_indices):
         self._ensure_array_offset()
+        ends = None
+        if self._row_ends is not None:
+            ends = mx.array(self._row_ends)[batch_indices].reshape(-1).tolist()
         if self.keys is not None:
             self.keys = _filter_state(self.keys, batch_indices)
             self.values = _filter_state(self.values, batch_indices)
@@ -566,6 +690,8 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 self.values = _slice_state_range(self.values, min_left_pad, capacity)
             self._phys_end -= min_left_pad
             self.left_padding = self.left_padding - min_left_pad
+        if ends is not None:
+            self._set_ends([end - min_left_pad for end in ends])
         self._cached_state = None
         self._cached_state_offset = -1
 
@@ -579,6 +705,8 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             raise ValueError("Cannot extend caches with mixed quantization configs")
         self._ensure_array_offset()
         other._ensure_array_offset()
+        self._align_row_ends()
+        other._align_row_ends()
         # Align on the WRITTEN ends: _state_length is step-allocated capacity,
         # and padding a joining row by capacity difference would bury its
         # content behind unwritten columns.
