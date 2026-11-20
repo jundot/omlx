@@ -386,6 +386,23 @@ def normalize_hy_v3_rope_config(cfg: dict) -> dict:
     return cfg
 
 
+# Official SenseNova-Loop family markers (ModelScope `SenseNova/SenseNova-Loop-9B`).
+# The vendor publishes the checkpoint as a vLLM-style multimodal config
+# (`model_type="sensenova_loop"`, `architectures=["SenseNovaLoopForConditionalGeneration"]`)
+# whose text backbone is byte-identical to mlx-lm's qwen3_5 text_config. oMLX routes
+# the official marker to the qwen3_5 text implementation; the VLM-only vision keys
+# (vision_config / image_token_id / ...) are ignored by qwen3_5.Model and the
+# `model.visual.*` weights are dropped by its sanitize, so the same config loads as
+# a text-only model. Keeping the official marker in config.json (instead of
+# rewriting it to qwen3_5 on disk) means a stock official checkpoint plus this
+# patch loads unchanged -- the PR is usable by downstream users.
+_SENSENOVA_LOOP_MODEL_TYPES = ("sensenova_loop", "sensenova_loop_text")
+_SENSENOVA_LOOP_ARCHITECTURES = (
+    "SenseNovaLoopForConditionalGeneration",
+    "SenseNovaLoopForCausalLM",
+)
+
+
 def normalize_laguna_compressed_quant(cfg: dict) -> dict:
     """Map Laguna compressed-tensors metadata to mlx-lm quantization settings.
 
@@ -884,6 +901,19 @@ def maybe_apply_pre_load_patches(
 
         if apply_inkling2_patch():
             logger.info("Inkling 2 pre-load patch applied for %s", model_name)
+
+    # SenseNova Loop: register the self-contained Loop/MHC architecture
+    # (mlx_lm.models.sensenova_loop) **independent of MTP**.  The Loop/MHC
+    # classes must exist before mlx-lm resolves the model classes, whether or
+    # not an MTP head is present.  The MTP slot/rollback adaptation is applied
+    # separately (sensenova_loop_mtp.apply_mtp) only when MTP is active.
+    if model_type in _SENSENOVA_LOOP_MODEL_TYPES:
+        from ..patches.mlx_lm_mtp.sensenova_loop import apply as apply_sl_arch
+
+        if apply_sl_arch():
+            logger.info(
+                "SenseNova Loop architecture registered for %s", model_name
+            )
 
     text_config = config.get("text_config")
     text_model_type = (
@@ -1566,6 +1596,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type == "step3p7"
         or model_type == "bailing_hybrid"
         or model_type in ("hy_v4_vl", "hy_v4_flash")
+        or model_type in _SENSENOVA_LOOP_MODEL_TYPES
     )
 
 
