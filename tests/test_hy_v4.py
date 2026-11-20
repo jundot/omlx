@@ -23,6 +23,7 @@ from omlx.patches.hy_v4.model import (  # noqa: E402
     dequantize_block_fp8,
 )
 from omlx.patches.hy_v4.tool_parser import parse_tool_call  # noqa: E402
+from omlx.patches.mlx_lm_mtp import cache_rollback  # noqa: E402
 
 VOCAB = 320
 SEQ = 40
@@ -164,6 +165,75 @@ def test_left_padded_batch_rows_match_single_runs(model, short):
         single = _run(model, seq, [len(seq)])
         expected = single[start - 1 : start - 1 + len(got)]
         np.testing.assert_allclose(np.stack(got), expected, atol=2e-4)
+
+
+def _with_dfly(config):
+    return dict(
+        config,
+        dfly_num_hidden_layers=2,
+        dfly_block_size=4,
+        dfly_mask_token_id=VOCAB - 1,
+        dfly_target_kv_layers=[1, 5],
+        dfly_target_index_layer=[1, 5],
+    )
+
+
+def _draft_block(lm, hidden, row, anchor):
+    block, _ = lm.dspark_forward(
+        hidden[:, : row + 1], mx.array([int(anchor)]), draft_length=3
+    )
+    return np.array(block)
+
+
+@pytest.mark.parametrize("kind", ["hy4", "flash"])
+def test_dfly_cycles_roll_back_to_the_accepted_prefix(kind):
+    # Verify blocks of 4 on an 8-slot sliding window rotate the ring, close
+    # compressed-indexer groups and extend the Engram history; a rejected
+    # tail must leave every cache as if only the accepted prefix had run.
+    cache_rollback.apply()
+    model = _model(_with_dfly(_hy4_config() if kind == "hy4" else _flash_config()))
+    lm = model.language_model
+    lm.configure_mtp(True, 3)
+    seq = _ids(4, n=SEQ + 8)
+    reference = _run(model, seq, [len(seq)])
+
+    cache = model.make_cache()
+    committed = 20
+    out = lm(
+        mx.array(seq[None, :committed].astype(np.int32)),
+        cache=cache,
+        return_hidden=True,
+    )
+    row = committed - 1
+    for accepted in (3, 0, 1, 2, 3):
+        anchor = seq[committed]
+        drafted = _draft_block(lm, out.hidden_states[0], row, anchor)
+        fresh = model.make_cache()
+        plain = lm(
+            mx.array(seq[None, :committed].astype(np.int32)),
+            cache=fresh,
+            return_hidden=True,
+        )
+        expected = _draft_block(lm, plain.hidden_states[0], committed - 1, anchor)
+        np.testing.assert_allclose(drafted, expected, atol=2e-4)
+
+        block = seq[committed : committed + 4].copy()
+        block[accepted + 1 :] += 1
+        cache_rollback.set_undo_armed(True)
+        try:
+            out = lm(
+                mx.array(block[None].astype(np.int32)), cache=cache, return_hidden=True
+            )
+        finally:
+            cache_rollback.set_undo_armed(False)
+        np.testing.assert_allclose(
+            np.array(out.logits[0, : accepted + 1]),
+            reference[committed : committed + accepted + 1],
+            atol=2e-4,
+        )
+        assert lm.mtp_partial_rollback(cache, accepted, 3)
+        committed += accepted + 1
+        row = accepted
 
 
 def test_sanitize_dequantizes_fp8_and_stacks_experts():

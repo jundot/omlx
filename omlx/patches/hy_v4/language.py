@@ -10,6 +10,7 @@ import mlx.nn as nn
 from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
 from mlx_vlm.models.base import LanguageModelOutput, create_attention_mask
 
+from ..deepseek_v41.mtp import AcceptanceDepthController
 from .config import TextConfig
 from .flash import Engram
 from .layers import (
@@ -100,7 +101,32 @@ def _latent_cache(cache):
     return cache
 
 
+def _cache_extent(cache) -> tuple[int, int]:
+    """(first, end) cache slots of a one-request latent KV cache.
+
+    A batch cache that once held longer rows keeps left padding before
+    ``first``; positions count from ``first``.
+    """
+    end = getattr(cache, "_idx", None)
+    if end is None:
+        return 0, int(cache.offset)
+    left = getattr(cache, "left_padding", None)
+    first = int(left.reshape(-1)[0].item()) if left is not None else 0
+    return first, int(end)
+
+
 class LanguageModel(nn.Module):
+    """Hy4 text model, also the embedded-drafter host for oMLX's MTP loop.
+
+    With DFly2 armed the generator drives decoding through ``dspark_forward``
+    (one draft block from the target's last committed row) and
+    ``dspark_step_logits`` (one corrected draft slot after the other), and
+    rolls the target caches back with ``mtp_partial_rollback``.
+    """
+
+    # One request at a time: the drafter reads that request's target caches.
+    _omlx_mtp_multi_request = False
+
     def __init__(self, config: TextConfig):
         super().__init__()
         self.args = config
@@ -110,6 +136,90 @@ class LanguageModel(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.media_token_ids = (120120, 120124)
+        self._dfly_cache = None
+        self.configure_mtp(False)
+
+    def configure_mtp(self, enabled: bool, depth: int = 5) -> None:
+        """Arm DFly2 drafting (only when the drafter is attached)."""
+        enabled = bool(enabled) and "dfly" in self
+        self._omlx_mtp_decode_enabled = enabled
+        self._omlx_dspark_decode_enabled = enabled
+        self._omlx_mtp_chain = True
+        self._omlx_mtp_head_clone = False
+        self._omlx_mtp_rowwise_unsupported = True
+        if "dfly" in self:
+            # The generator caps its depth at dspark_block_size draft tokens.
+            self.config.dspark_block_size = self.dfly.cfg.block_size - 1
+            self._omlx_mtp_depth = max(1, min(depth, self.config.dspark_block_size))
+            index_layers = set(self.dfly.cfg.index_layers)
+            for i, layer in enumerate(self.layers):
+                layer.self_attn._capture_topk = enabled and i in index_layers
+
+    def get_mtp_module(self):
+        return self.dfly if self._omlx_mtp_decode_enabled else None
+
+    def make_mtp_cache(self):
+        # DFly2 keeps no cache of its own.
+        return []
+
+    def make_mtp_depth_controller(self, depth):
+        return AcceptanceDepthController(depth)
+
+    def dspark_append_context(self, hidden_rows, cache, **_):
+        """DFly2 reads the target's caches directly; there is nothing to append."""
+
+    def dspark_forward(self, hidden_rows, anchor, cache=None, *, draft_length=None):
+        """Final-normed hidden of one draft block.
+
+        ``hidden_rows`` ends with the target's post-norm hidden of the row
+        that produced ``anchor``; the target caches were already rolled back,
+        so their length is the anchor's position.
+        """
+        target = self._dfly_cache
+        if target is None:
+            raise RuntimeError("DFly2 needs a target forward before drafting")
+        dfly = self.dfly
+        width = 1 + int(draft_length or dfly.cfg.block_size - 1)
+        first, end = _cache_extent(_latent_cache(target[0]))
+        row = hidden_rows.shape[1] - 1
+        histories = []
+        for kv_layer, index_layer in zip(dfly.cfg.kv_layers, dfly.cfg.index_layers):
+            kv = _latent_cache(target[kv_layer])
+            topk = self.layers[index_layer].self_attn._captured_topk
+            if topk is None:
+                # Shorter than the indexer's top-k: every committed slot.
+                latent = kv.keys[..., first:end, :]
+                histories.append((latent, kv.values[..., first:end, :], None))
+                continue
+            index = topk[0, 0, row]
+            valid = (index >= first) & (index < end)
+            safe = mx.clip(index, first, end - 1)
+            histories.append((kv.keys[:, :, safe], kv.values[:, :, safe], valid))
+        block = dfly.block_hidden(
+            self.model.embed_tokens,
+            hidden_rows[:, -1:],
+            anchor.reshape(-1)[:1],
+            end - first,
+            histories,
+            width,
+        )
+        return block, None
+
+    def dspark_step_logits(self, block, index, previous):
+        """Logits of draft slot ``index`` corrected with the previous token."""
+        hidden = self.dfly.correct(
+            self.model.embed_tokens, block[:, index + 1], previous
+        )
+        return self.project(hidden)
+
+    def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
+        rejected = int(num_drafts) - int(accepted)
+        if rejected <= 0:
+            return True
+        for c in cache:
+            if c is not None:
+                c.trim(rejected)
+        return True
 
     @property
     def layers(self):
@@ -192,6 +302,9 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
+        if self._omlx_mtp_decode_enabled and cache is not None:
+            # The drafter reads these caches after the generator's rollback.
+            self._dfly_cache = cache
         engram_inputs = None
         if self.config.engram_layer_ids:
             engram_inputs = self._engram_inputs(inputs, cache)

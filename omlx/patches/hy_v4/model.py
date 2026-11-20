@@ -2,8 +2,9 @@
 """mlx-vlm model module for Hy4 (``hy_v4_vl``) and Hy4-flash (``hy_v4_flash``).
 
 Registered as ``mlx_vlm.models.hy_v4_vl`` and ``mlx_vlm.models.hy_v4_flash``.
-Vision input is not wired yet; the vision tower and the DFly2 drafter weights
-are skipped at load.
+Vision input is not wired yet and the vision tower is skipped at load. The
+DFly2 drafter is attached as ``language_model.dfly`` when the checkpoint
+ships it.
 """
 
 from __future__ import annotations
@@ -12,13 +13,21 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 
+from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active, is_mtp_depth_fixed
 from .config import ModelConfig, TextConfig, VisionConfig
+from .dfly import DFlyConfig, DFlyModel
 from .language import LanguageModel
 
 __all__ = ["Model", "ModelConfig", "TextConfig", "VisionConfig", "LanguageModel"]
 
 _FP8_BLOCK = 128
-_SKIPPED_PREFIXES = ("vit.", "visual.", "model.dfly_layers.", "model.mtp_layers.")
+_SKIPPED_PREFIXES = (
+    "vit.",
+    "visual.",
+    "model.mtp_layers.",
+    "model.dfly_layers.confidence_head.",
+)
+_DFLY_PREFIX = "model.dfly_layers."
 _EXPERT_NAMES = ("gate_proj", "up_proj", "down_proj")
 
 
@@ -59,6 +68,16 @@ class Model(nn.Module):
             config.image_token_id,
             config.video_token_id,
         )
+        if config.dfly_num_hidden_layers:
+            text = config.text_config
+            # Both releases size the draft FFN at 3x and the correction MLP at
+            # 1x the hidden size; sanitize checks the shapes.
+            dfly = DFlyConfig.from_model(
+                config, 3 * text.hidden_size, post_proj_norm=text.is_flash
+            )
+            self.language_model.dfly = DFlyModel(text, dfly, text.hidden_size)
+            self.language_model.configure_mtp(is_mtp_active(), get_mtp_depth())
+            self.language_model._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
     @property
     def layers(self):
@@ -96,6 +115,7 @@ class Model(nn.Module):
         for i in range(args.num_hidden_layers):
             self._sanitize_experts(weights, i, args, experts_mxfp8)
             self._split_kv_b(weights, i, args)
+        self._sanitize_dfly(weights, args)
 
         if args.enable_lm_head_fp32 and "lm_head.weight" in weights:
             head = weights["lm_head.weight"]
@@ -104,7 +124,7 @@ class Model(nn.Module):
 
         out = {}
         for k, v in weights.items():
-            if k.startswith(("model.", "lm_head.")):
+            if k.startswith(("model.", "lm_head.", "dfly.")):
                 k = "language_model." + k
             out[k] = v
         return out
@@ -141,13 +161,46 @@ class Model(nn.Module):
             else:
                 weights[f"{target}.weight"] = w
 
+    def _sanitize_dfly(self, weights, args):
+        """Rename ``model.dfly_layers.*`` and detach the drafter when absent."""
+        names = [k for k in weights if k.startswith(_DFLY_PREFIX)]
+        lm = self.language_model
+        if not names:
+            if "dfly" in lm:
+                del lm["dfly"]
+                lm.configure_mtp(False)
+            return
+        for key in names:
+            rest = key[len(_DFLY_PREFIX) :]
+            if rest[0].isdigit():
+                rest = "layers." + rest
+            weights["dfly." + rest] = weights.pop(key)
+        # Draft layers have the shape of the target's sparse attention layers.
+        dims = args.head_dims(args.attention_kinds.index("sparse"))
+        for i in range(len(lm.dfly.layers)):
+            self._split_kv_b(
+                weights, i, args, prefix=f"dfly.layers.{i}.self_attn", dims=dims
+            )
+        expected = {
+            "dfly.layers.0.mlp.gate_proj.weight": lm.dfly.layers[0].mlp.gate_proj,
+            "dfly.hidden_correction.gate_proj.weight": (
+                lm.dfly.hidden_correction.gate_proj
+            ),
+        }
+        for name, module in expected.items():
+            got = weights.get(name)
+            if got is not None and got.shape[0] != module.weight.shape[0]:
+                raise ValueError(
+                    f"{name} has {got.shape[0]} rows, expected {module.weight.shape[0]}"
+                )
+
     @staticmethod
-    def _split_kv_b(weights, layer, args):
-        prefix = f"model.layers.{layer}.self_attn"
+    def _split_kv_b(weights, layer, args, prefix=None, dims=None):
+        prefix = prefix or f"model.layers.{layer}.self_attn"
         w = weights.pop(f"{prefix}.kv_b_proj.weight", None)
         if w is None:
             return
-        heads, nope, _, value = args.head_dims(layer)
+        heads, nope, _, value = dims or args.head_dims(layer)
         w = w.reshape(heads, nope + value, args.kv_lora_rank)
         weights[f"{prefix}.embed_q.weight"] = mx.contiguous(
             w[:, :nope, :].swapaxes(-1, -2)

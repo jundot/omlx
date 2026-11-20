@@ -3199,9 +3199,16 @@ def _dspark_next_drafts(
     draft_procs = _live_processors(procs, depth)
     snap = _snap_snapshotable(draft_procs)
 
+    # Hosts whose next slot depends on the previous draft beyond an additive
+    # bias (DFly2 re-projects a corrected hidden) supply dspark_step_logits;
+    # dspark_forward's first result is then their opaque block state.
+    step_logits = getattr(host, "dspark_step_logits", None)
     for idx in range(depth):
-        bias, _ = host.dspark_markov(previous)
-        logits_2d = logits[:, idx, :] + bias
+        if step_logits is not None:
+            logits_2d = step_logits(logits, idx, previous)
+        else:
+            bias, _ = host.dspark_markov(previous)
+            logits_2d = logits[:, idx, :] + bias
         if draft_procs is not None and prev_buf is not None:
             prefix = mx.concatenate(
                 [prev_buf.astype(mx.int32), anchor.reshape(1).astype(mx.int32)]

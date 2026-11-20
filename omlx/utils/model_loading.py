@@ -1214,6 +1214,9 @@ def _has_mtp_heads(config: dict) -> bool:
     """True iff the model config declares any MTP head layers."""
     if _has_dspark_heads(config):
         return True
+    # Hy4 and Hy4-flash ship a DFly2 block drafter.
+    if int(config.get("dfly_num_hidden_layers", 0) or 0) > 0:
+        return True
     if int(config.get("mtp_num_hidden_layers", 0) or 0) > 0:
         return True
     if int(config.get("num_nextn_predict_layers", 0) or 0) > 0:
@@ -1235,6 +1238,8 @@ _MTP_WEIGHT_PREFIXES = (
     "language_model.mtp.",
     "model.mtp.",
     "model.language_model.mtp.",
+    "model.dfly_layers.",
+    "language_model.dfly.",
 )
 
 
@@ -1454,6 +1459,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
         or model_type == "bailing_hybrid"
+        or model_type in ("hy_v4_vl", "hy_v4_flash")
     )
 
 
