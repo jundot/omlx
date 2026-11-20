@@ -20,7 +20,8 @@ module.exports = {
         sans: ['Inter', 'system-ui', 'sans-serif'],
       },
       // Neutral utilities read the theme.css channels (dark values in
-      // dashboard.css). text-400 takes the 500 step for AA (#4727).
+      // dashboard.css); text-400 takes the 500 step for AA (#4727), and the
+      // two light text steps take the darker 107 channel for WCAG AA (#4400).
       textColor: {
         neutral: {
           300: 'rgb(var(--text-scale-300) / <alpha-value>)',
