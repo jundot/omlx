@@ -1614,7 +1614,7 @@ class TestAdapterDetection:
         assert _is_adapter_dir(tmp_path) is False
 
     def test_discover_skips_lora_adapter(self, tmp_path):
-        """discover_models should skip LoRA adapter directories."""
+        """discover_models collects LoRA adapters apart from the models."""
         # Normal model
         model_dir = tmp_path / "llama-3b"
         model_dir.mkdir()
@@ -1628,12 +1628,14 @@ class TestAdapterDetection:
         (adapter_dir / "adapter_config.json").write_text("{}")
         (adapter_dir / "adapters.safetensors").write_bytes(b"0" * 100)
 
-        models = discover_models(tmp_path)
+        adapters = {}
+        models = discover_models(tmp_path, adapters=adapters)
         assert "llama-3b" in models
         assert "my-lora" not in models
+        assert adapters == {"my-lora": str(adapter_dir)}
 
     def test_discover_skips_nested_lora_adapter(self, tmp_path):
-        """discover_models should skip LoRA adapters in org folders."""
+        """discover_models collects LoRA adapters in org folders too."""
         org_dir = tmp_path / "my-org"
         org_dir.mkdir()
 
@@ -1649,9 +1651,11 @@ class TestAdapterDetection:
         (adapter_dir / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
         (adapter_dir / "adapter_config.json").write_text("{}")
 
-        models = discover_models(tmp_path)
+        adapters = {}
+        models = discover_models(tmp_path, adapters=adapters)
         assert "llama-3b" in models
         assert "my-lora" not in models
+        assert adapters == {"my-lora": str(adapter_dir)}
 
 
 class TestDiscoveredModel:

@@ -70,6 +70,7 @@
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
+        'lora_adapter',
     ]);
     const DIFFUSION_UNSUPPORTED_CT_KWARGS = new Set([
         'enable_thinking',
@@ -333,6 +334,7 @@
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
+            loraAdapters: [],
             aneTuning: {
                 tuningId: null,
                 modelId: null,
@@ -1916,6 +1918,35 @@
                 const profile = this.profiles.find(p => p.name === this.activeProfileName);
                 return this.matchingProfileTemplate(profile)?.name || null;
             },
+            async loadLoraAdapters(modelId) {
+                this.loraAdapters = [];
+                try {
+                    const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/lora-adapters`);
+                    if (r.ok) this.loraAdapters = (await r.json()).adapters || [];
+                    else if (r.status === 401) window.location.href = '/admin';
+                } catch (_) { /* network error */ }
+            },
+            loraAdapterOptions() {
+                const current = this.modelSettings.lora_adapter;
+                // A saved path outside the model folders still shows as selected.
+                if (current && !this.loraAdapters.some(a => a.path === current)) {
+                    return [{ id: current, path: current, problem: null }, ...this.loraAdapters];
+                }
+                return this.loraAdapters;
+            },
+            loraAdapterLabel(a) {
+                const parts = [a.id];
+                if (a.rank) parts.push('r' + a.rank);
+                if (a.size_formatted) parts.push(a.size_formatted);
+                return parts.join(' · ');
+            },
+            selectedLoraAdapter() {
+                const current = this.modelSettings.lora_adapter;
+                return current ? this.loraAdapters.find(a => a.path === current) || null : null;
+            },
+            loraAdapterProblem() {
+                return this.selectedLoraAdapter()?.problem || '';
+            },
             async loadProfilesForModel(modelId) {
                 const seq = this._applySeq;
                 this.profiles = [];
@@ -2324,6 +2355,7 @@
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
+                    lora_adapter: isDiffusion ? '' : (s.lora_adapter || ''),
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     external_engine: s.external_engine || '',
@@ -3087,6 +3119,7 @@
                     await Promise.all([
                         this.loadProfilesForModel(model.id),
                         this.loadTemplates(),
+                        this.loadLoraAdapters(model.id),
                     ]);
                     if (this.reasoningParsers.length === 0) {
                         try {
@@ -3698,6 +3731,7 @@
                         && ms.vlm_mtp_draft_block_size
                         ? parseInt(ms.vlm_mtp_draft_block_size)
                         : null,
+                    lora_adapter: ms.lora_adapter || null,
                     trust_remote_code: ms.trust_remote_code,
                     external_engine: ms.external_engine || null,
                 };
@@ -3762,6 +3796,7 @@
                         vlm_mtp_enabled: false,
                         vlm_mtp_draft_model: null,
                         vlm_mtp_draft_block_size: null,
+                        lora_adapter: null,
                     });
                 }
                 if (this.selectedModel?.embedding_audio_supported) {
@@ -6071,6 +6106,7 @@
                     splash: 'bench.upload_skipped.reason_splash',
                     ane_aligned_prompt: 'bench.upload_skipped.reason_ane_aligned_prompt',
                     custom_generation_length: 'bench.upload_skipped.reason_custom_generation_length',
+                    lora_adapter: 'bench.upload_skipped.reason_lora_adapter',
                 };
                 return window.t(keys[reason] || 'bench.upload_skipped.reason_default');
             },
@@ -9235,7 +9271,7 @@
             // A downloaded checkpoint with Hub changes offers Update instead of the download buttons.
             hfShowsUpdate() {
                 const detail = this.hfModelDetail;
-                return !!(detail && !detail.is_adapter && !detail.unsupported_reason && detail.layout !== 'gguf'
+                return !!(detail && !detail.unsupported_reason && detail.layout !== 'gguf'
                     && detail.update_files?.length && this.isModelDownloaded(detail.repo_id));
             },
 

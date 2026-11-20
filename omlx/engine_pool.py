@@ -67,6 +67,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_metal_out_of_memory,
 )
+from .lora_adapters import adapter_info
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     detect_model_type,
@@ -456,6 +457,8 @@ class EnginePool:
         self._starting_external: dict[str, SplashEngine] = {}
         # Scanned model roots, kept for org-qualified display/upload names.
         self._model_dirs: list[Path] = []
+        # LoRA adapter folders found in the model roots, by adapter id.
+        self._lora_adapters: dict[str, str] = {}
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
@@ -730,6 +733,9 @@ class EnginePool:
             if draft is not None:
                 # BF16 draft weights plus the folded [vocab, rank] Markov head.
                 extra += draft.stat().st_size + 201024 * 256 * 2
+        lora_path = getattr(runtime_settings, "lora_adapter", None)
+        if lora_path and (info := adapter_info(lora_path)) is not None:
+            extra += info.resident_bytes
         return base + extra
 
     def _dflash_drafter_estimated_bytes(
@@ -1485,6 +1491,8 @@ class EnginePool:
             add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
             add("vlm_mtp_draft_block_size", data.get("vlm_mtp_draft_block_size"))
 
+        add("lora_adapter", data.get("lora_adapter") or None)
+
         return tuple(signature)
 
     @property
@@ -1565,7 +1573,9 @@ class EnginePool:
         self._model_dirs = dirs
 
         gguf_root = _gguf_model_root()
-        discovered = discover_models_from_dirs(dirs, gguf_root)
+        adapters: dict[str, str] = {}
+        discovered = discover_models_from_dirs(dirs, gguf_root, adapters)
+        self._lora_adapters = adapters
 
         pinned_set = set(pinned_models or [])
 
@@ -1633,6 +1643,10 @@ class EnginePool:
                 logger.warning(f"Pinned model not found: {model_id}")
 
         logger.info(f"Discovered {len(self._entries)} models")
+
+    def lora_adapters(self) -> dict[str, str]:
+        """LoRA adapter folders found in the model roots, by adapter id."""
+        return dict(self._lora_adapters)
 
     _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
         "llm": "batched",
@@ -4170,6 +4184,13 @@ class EnginePool:
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
             deployment = self._distributed_deployment_for_entry(entry)
+            if getattr(model_settings, "lora_adapter", None) and (
+                deployment is not None or effective_type not in ("batched", "vlm")
+            ):
+                raise ValueError(
+                    "A LoRA adapter applies only to a language or vision-language "
+                    f"model served on this Mac; remove it from {model_id}'s settings"
+                )
             base_resident_size = self._entry_resident_size(entry)
             if (
                 deployment is None

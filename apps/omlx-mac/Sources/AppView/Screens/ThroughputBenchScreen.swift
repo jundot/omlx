@@ -976,6 +976,10 @@ private struct SkippedBanner: View {
             return String(localized: "bench.throughput.upload.skipped.custom_generation_length",
                           defaultValue: "Results with a generation length other than 128 tokens are not submitted so they stay comparable with other submissions.",
                           comment: "Skipped-upload reason when the benchmark used a generation length other than 128 tokens")
+        case "lora_adapter":
+            return String(localized: "bench.throughput.upload.skipped.lora_adapter",
+                          defaultValue: "Results with a LoRA adapter are not submitted because the leaderboard lists them under the base model.",
+                          comment: "Skipped-upload reason when the benchmarked model had a LoRA adapter")
         default:
             return String(localized: "bench.throughput.upload.skipped.default",
                           defaultValue: "The server skipped uploading these results.",

@@ -50,6 +50,7 @@ from ..api.utils import (
 from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
+from ..lora_adapters import apply_adapter
 from ..model_settings import (
     a8_prefill_on,
     ane_prefill_backend,
@@ -2252,6 +2253,15 @@ class VLMBatchedEngine(BaseEngine):
                 )
         except Exception:
             logger.debug("t5 bias free skipped", exc_info=True)
+
+        # After the fp16 recast so the adapter takes the activation dtype, and
+        # before the fusions and packers that replace the projections.
+        lora_path = getattr(self._model_settings, "lora_adapter", None)
+        if lora_path:
+            wrapped = await loop.run_in_executor(
+                get_mlx_executor(), apply_adapter, self._vlm_model, lora_path
+            )
+            logger.info("LoRA adapter %s: %d projections", lora_path, wrapped)
 
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
