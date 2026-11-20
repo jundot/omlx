@@ -16,7 +16,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ... import checkpoint
+from ... import checkpoint, oqh
 from ...tensors import Linear
 from . import kernels
 
@@ -68,6 +68,7 @@ class GatedDeltaNet:
         self.b = w.linear("in_proj_b")
         self.a = w.linear("in_proj_a")
         self.out = w.linear("out_proj")
+        oqh.check_shared(self.qkv, self.z, self.b, self.a)
         self.taps = w["conv1d.weight"][..., 0].astype(mx.float32)
         self.decay = mx.exp(w["A_log"].astype(mx.float32))
         self.dt_bias = w["dt_bias"]
@@ -109,24 +110,36 @@ class GatedDeltaNet:
         eps = 1e-6 * scale**2
         q = (scale**2) * mx.fast.rms_norm(q, None, eps)
         k = scale * mx.fast.rms_norm(k, None, eps)
-        return q, k, v, conv_in[:, rows:]
+        return q, k, v, mx.contiguous(conv_in[:, rows:])
 
     def gates(self, a: mx.array, b: mx.array) -> tuple[mx.array, mx.array]:
         """(decay in float32, update rate) of each step and value head."""
         return mx.exp(-self.decay * nn.softplus(a + self.dt_bias)), mx.sigmoid(b)
 
     def finish(self, y: mx.array, z: mx.array) -> mx.array:
-        """The recurrence output normalized and gated, [1, rows, value width]."""
+        """The recurrence output normalized and gated, [1, rows, value width].
+
+        For an oQh out_proj it is the rotated output: the host rotates the
+        float32 gated value and rounds once.
+        """
         y = mx.fast.rms_norm(y, self.norm_weight, self.eps)
+        if self.out.rotation is not None:
+            rows = (1, y.shape[1], -1)
+            return oqh.gate_rotate(y.reshape(rows), z.reshape(rows), *self.out.rotation)
         gate = nn.silu(z.reshape(y.shape).astype(mx.float32))
         gated = (gate * y.astype(mx.float32)).astype(y.dtype)
         return gated.reshape(1, y.shape[1], -1)
 
-    def __call__(self, x: mx.array, cache: list) -> mx.array:
-        q, k, v, cache[0] = self.prework(self.qkv(x), cache[0])
-        gamma, beta = self.gates(self.a(x), self.b(x))
+    def __call__(
+        self, x: mx.array, cache: list, rot: mx.array | None = None
+    ) -> mx.array:
+        """``rot``: x rotated for the input projections, when the norm made it."""
+        rot = self.qkv.rotated(x) if rot is None else rot
+        q, k, v, cache[0] = self.prework(self.qkv(x, rot), cache[0])
+        gamma, beta = self.gates(self.a(x, rot), self.b(x, rot))
         y, cache[1] = mx.fast.gated_delta_update(q, k, v, gamma, beta, cache[1])
-        return self.out(self.finish(y, self.z(x)))
+        finished = self.finish(y, self.z(x, rot))
+        return self.out(finished, finished if self.out.rotation is not None else None)
 
 
 class KVCache:
@@ -194,6 +207,7 @@ class Attention:
         self.k_proj = w.linear("k_proj")
         self.v_proj = w.linear("v_proj")
         self.o_proj = w.linear("o_proj")
+        oqh.check_shared(self.q_proj, self.k_proj, self.v_proj)
         self.q_norm = w["q_norm.weight"]
         self.k_norm = w["k_norm.weight"]
         self.fused = False
@@ -261,12 +275,19 @@ class Attention:
         out = outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=-2)
         return out.reshape(1, self.heads, rows, dim).transpose(0, 2, 1, 3)
 
-    def __call__(self, x: mx.array, cache: KVCache, frequencies: mx.array) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        cache: KVCache,
+        frequencies: mx.array,
+        rot: mx.array | None = None,
+    ) -> mx.array:
         rows = x.shape[1]
-        projected = self.q_proj(x).reshape(1, rows, self.heads, 2 * self.head_dim)
+        rot = self.q_proj.rotated(x) if rot is None else rot
+        projected = self.q_proj(x, rot).reshape(1, rows, self.heads, 2 * self.head_dim)
         queries, gate = projected[..., : self.head_dim], projected[..., self.head_dim :]
-        keys = self.k_proj(x).reshape(1, rows, self.kv_heads, self.head_dim)
-        values = self.v_proj(x).reshape(1, rows, self.kv_heads, self.head_dim)
+        keys = self.k_proj(x, rot).reshape(1, rows, self.kv_heads, self.head_dim)
+        values = self.v_proj(x, rot).reshape(1, rows, self.kv_heads, self.head_dim)
         queries = mx.fast.rms_norm(queries, self.q_norm, self.eps).transpose(0, 2, 1, 3)
         keys = mx.fast.rms_norm(keys, self.k_norm, self.eps).transpose(0, 2, 1, 3)
         positions = mx.arange(cache.offset, cache.offset + rows, dtype=mx.int32)
@@ -292,6 +313,7 @@ class Layer:
         self.gate = w.linear("mlp.gate_proj")
         self.up = w.linear("mlp.up_proj")
         self.down = w.linear("mlp.down_proj")
+        oqh.check_shared(self.gate, self.up)
 
     def parameters(self) -> list[mx.array]:
         linears = (self.gate, self.up, self.down)
@@ -305,15 +327,32 @@ class Layer:
     def new_cache(self) -> Any:
         return [None, None] if self.linear else KVCache()
 
-    def mlp(self, x: mx.array) -> mx.array:
-        return self.down(nn.silu(self.gate(x)) * self.up(x))
+    def mlp(self, x: mx.array, rot: mx.array | None = None) -> mx.array:
+        if self.down.rotation is None:
+            return self.down(nn.silu(self.gate(x)) * self.up(x))
+        # oQh: the activation is taken in float32 and rotated for down.
+        rot = self.gate.rotated(x) if rot is None else rot
+        act = oqh.act_rotate(self.gate(x, rot), self.up(x, rot), *self.down.rotation)
+        return self.down(act, act)
+
+    def _norm(self, x: mx.array, weight: mx.array, reader: Linear) -> tuple:
+        """(normed x, its rotation for oQh ``reader`` from the same kernel or None).
+
+        Unused, the plain output is never computed.
+        """
+        normed = mx.fast.rms_norm(x, weight, self.eps)
+        rotation = reader.rotation
+        if rotation is None or not oqh.norm_fits(x.shape[-1], rotation[1]):
+            return normed, None
+        return normed, oqh.norm_rotate(x, weight, *rotation, self.eps)
 
     def __call__(
         self, x: mx.array, cache: Any, frequencies: mx.array | None
     ) -> mx.array:
-        normed = mx.fast.rms_norm(x, self.input_norm, self.eps)
+        reader = self.mixer.qkv if self.linear else self.mixer.q_proj
+        normed, rot = self._norm(x, self.input_norm, reader)
         if self.linear:
-            h = x + self.mixer(normed, cache)
+            h = x + self.mixer(normed, cache, rot)
         else:
-            h = x + self.mixer(normed, cache, frequencies)
-        return h + self.mlp(mx.fast.rms_norm(h, self.post_norm, self.eps))
+            h = x + self.mixer(normed, cache, frequencies, rot)
+        return h + self.mlp(*self._norm(h, self.post_norm, self.gate))

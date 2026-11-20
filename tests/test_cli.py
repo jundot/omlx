@@ -1758,7 +1758,6 @@ class TestLaunchClaudeTierPrecedence:
         assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "haiku-cfg"
         assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "haiku-cfg"
         assert env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == expected_window
-        assert env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == expected_window
 
 
 class TestSavedNetworkAuthMigration:

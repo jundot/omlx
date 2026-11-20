@@ -129,15 +129,15 @@ class TestStatusEndpoint:
         scheduler = MagicMock(spec=["waiting"])
         scheduler.waiting = [1, 2]  # 2 waiting
 
-        core = MagicMock(spec=["_output_collectors", "scheduler"])
-        core._output_collectors = {"req-1": None, "req-2": None, "req-3": None}
+        core = MagicMock(spec=["scheduler"])
         core.scheduler = scheduler
 
         async_core = MagicMock(spec=["engine"])
         async_core.engine = core
 
-        engine = MagicMock(spec=["_engine"])
+        engine = MagicMock(spec=["_engine", "active_request_count"])
         engine._engine = async_core
+        engine.active_request_count.return_value = 3
 
         entry = MagicMock(spec=["is_loading", "engine"])
         entry.is_loading = False
@@ -160,6 +160,34 @@ class TestStatusEndpoint:
         data = resp.json()
         assert data["active_requests"] == 3
         assert data["waiting_requests"] == 2
+
+    def test_counts_splash_engine_without_async_core(self, client):
+        """Splash engines report their own count; they have no _engine (#5296)."""
+        engine = MagicMock(spec=["active_request_count", "has_active_requests"])
+        engine.has_active_requests.return_value = True
+        engine.active_request_count.return_value = 2
+
+        entry = MagicMock(spec=["is_loading", "engine"])
+        entry.is_loading = False
+        entry.engine = engine
+
+        pool = MagicMock(spec=[
+            "model_count", "loaded_model_count", "get_loaded_model_ids",
+            "current_model_memory", "_entries",
+        ])
+        pool.model_count = 1
+        pool.loaded_model_count = 1
+        pool.get_loaded_model_ids.return_value = ["splash-model"]
+        pool.current_model_memory = 0
+        pool._entries = {"splash-model": entry}
+
+        self._state.engine_pool = pool
+
+        resp = client.get("/api/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active_requests"] == 2
+        assert data["waiting_requests"] == 0
 
     def test_requires_auth_when_api_key_set(self, client):
         """The endpoint should require an API key when one is configured."""

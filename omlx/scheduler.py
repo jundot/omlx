@@ -67,6 +67,9 @@ from .exceptions import (
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
+from .patches.mlx_lm_mtp.batch_generator import (
+    _spec_command_buffers as _decode_command_buffers,
+)
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.vlm_batch_kv_capacity import (
     allow_early_kv_growth,
@@ -908,6 +911,10 @@ def _omlx_advance_grammar_rows(self) -> None:
 
 _original_generation_batch_step = GenerationBatch._step
 
+# Decode of small-active MoE models is bound by command-buffer commits. Dense
+# decode keeps MLX's caps because larger buffers slow it on M5.
+_DECODE_CAPS_TYPES = frozenset({"qwen3_5_moe", "qwen3_6_moe"})
+
 
 def _patched_generation_batch_step(self):
     # Build per-batch mRoPE deltas from UID mapping before each step.
@@ -930,6 +937,9 @@ def _patched_generation_batch_step(self):
     # is there to guarantee.
     _omlx_advance_grammar_rows(self)
 
+    if getattr(model, "model_type", None) in _DECODE_CAPS_TYPES:
+        with _decode_command_buffers(model):
+            return _original_generation_batch_step(self)
     return _original_generation_batch_step(self)
 
 
@@ -2765,8 +2775,9 @@ class Scheduler:
         self.total_completion_tokens = 0
         # Set by the engine when MoE expert offload wrapped the model.
         self.moe_offload_stats: Callable[[], dict] | None = None
-        self.moe_offload_release: Callable[[], int] | None = None
-        self.moe_offload_restore: Callable[[], None] | None = None
+        self.moe_offload_release: Callable[..., int] | None = None
+        self.moe_offload_restore: Callable[..., None] | None = None
+        self.moe_offload_releasable: Callable[[], int] | None = None
         self._moe_offload_slots_released = False
 
         # Step counter for periodic cleanup
@@ -3009,10 +3020,14 @@ class Scheduler:
     def _prepare_system_prefix_store(
         self, request: "Request", full_cache: list[Any]
     ) -> tuple[list[int], list[Any], Any, Any] | None:
-        """Build the shared system-prefix tail payload on the inference thread."""
-        system_end = getattr(request, "system_prefix_end", 0) or 0
+        """Build the shared-tail payload (system prefix or branch point)."""
         snapshots = self._boundary_cache_snapshots.get(request.request_id) or {}
-        if system_end <= 0 or system_end not in snapshots:
+        ends = (
+            getattr(request, "system_prefix_end", 0) or 0,
+            getattr(request, "junction_end", 0) or 0,
+        )
+        system_end = next((end for end in ends if end > 0 and end in snapshots), 0)
+        if system_end <= 0:
             return None
         try:
             override = self._get_boundary_store_override(
@@ -3022,7 +3037,7 @@ class Scheduler:
             )
         except Exception as e:
             logger.debug(
-                "System prefix snapshot unavailable for %s: %s", request.request_id, e
+                "Shared tail snapshot unavailable for %s: %s", request.request_id, e
             )
             return None
         if override is None:
@@ -3046,7 +3061,7 @@ class Scheduler:
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool,
     ) -> None:
-        """Store the shared system-prefix tail beside the request's own chain."""
+        """Store the shared tail (system prefix or branch point) by the request."""
         tokens, cache, model_cache_config, provider = system_store
         store_id = f"{request_id}#system"
         block_size = self.config.paged_cache_block_size
@@ -3079,7 +3094,7 @@ class Scheduler:
                 _store_shared_tail=True,
             )
         except Exception as e:
-            logger.debug("System prefix store failed for %s: %s", request_id, e)
+            logger.debug("Shared tail store failed for %s: %s", request_id, e)
         finally:
             table = (
                 self.paged_cache_manager.detach_block_table(store_id)
@@ -5187,6 +5202,25 @@ class Scheduler:
     # naturally exhausted, and a pass with nothing left to give costs one
     # ~100ms pause before the guard falls back to throttling as before.
     _MAX_PREFILL_EVICTION_RETRIES = 2
+    # A sized offload slot release reaches the floor in at most four steps.
+    _MAX_OFFLOAD_SLOT_PAUSES = 4
+
+    def _offload_slot_pause(self, request_id: str, request: Any) -> bool:
+        """True when this pause's ladder will release MoE offload slots.
+
+        Such pauses keep the two counted pauses for the hot cache and idle
+        models. The release is skipped while another request runs, so then
+        the pause counts."""
+        releasable = getattr(self, "moe_offload_releasable", None)
+        if releasable is None:
+            return False
+        if getattr(request, "prefill_offload_pauses", 0) >= getattr(
+            self, "_MAX_OFFLOAD_SLOT_PAUSES", Scheduler._MAX_OFFLOAD_SLOT_PAUSES
+        ):
+            return False
+        if any(rid != request_id for rid in getattr(self, "running", {})):
+            return False
+        return releasable() > 0
 
     def _raise_prefill_eviction_if_available(
         self,
@@ -5207,12 +5241,16 @@ class Scheduler:
             "_MAX_PREFILL_EVICTION_RETRIES",
             Scheduler._MAX_PREFILL_EVICTION_RETRIES,
         )
-        if request.prefill_eviction_retries >= max_retries:
-            return
         if target_cap <= 0 or predicted_transient <= 0:
             return
-
-        request.prefill_eviction_retries += 1
+        if Scheduler._offload_slot_pause(self, request_id, request):
+            request.prefill_offload_pauses = (
+                getattr(request, "prefill_offload_pauses", 0) + 1
+            )
+        elif request.prefill_eviction_retries >= max_retries:
+            return
+        else:
+            request.prefill_eviction_retries += 1
         config = getattr(self, "config", None)
         eviction_request = PrefillEvictionRequest(
             request_id=request_id,
@@ -6419,17 +6457,23 @@ class Scheduler:
                 total / 1024**2,
             )
 
-    def release_moe_offload_slots(self, request_id: str) -> int:
+    def release_moe_offload_slots(
+        self, request_id: str, need_bytes: int | None = None
+    ) -> int:
         """Release the offload slots for ``request_id``'s prefill; return the bytes.
 
-        Skipped while another request runs; the next decode step restores them."""
+        ``need_bytes`` is the prefill's shortfall: the release covers it in
+        coarse steps instead of shrinking every cache to its floor. Skipped
+        while another request runs; the next decode step restores them."""
         if self.moe_offload_release is None or any(
             rid != request_id for rid in self.running
         ):
             return 0
-        released = self.moe_offload_release()
+        self._moe_offload_slots_released = True
+        released = self.moe_offload_release(
+            need_bytes, lambda: Scheduler._clear_cache(self)
+        )
         if released:
-            self._moe_offload_slots_released = True
             self._reclaim_prefill_headroom()
         return released
 
@@ -8477,6 +8521,43 @@ class Scheduler:
         if 0 < n < limit and n % block_size:
             request.system_prefix_end = n
 
+    # Fewest re-prefill tokens a branch point must save to get a shared tail:
+    # below it the re-prefill costs less than the snapshot and its two SSD files.
+    _JUNCTION_MIN_TOKENS = 512
+
+    def _resolve_junction_end(self, request: "Request") -> None:
+        """Plan a shared tail where this prompt leaves a recently stored sequence.
+
+        Hybrid models resume only at a block boundary or a stored tail, so later
+        prompts that branch at the same place resume at this one.
+        """
+        block_size = self.config.paged_cache_block_size
+        lookup = getattr(self, "_last_prefix_cache_lookup", None)
+        if (
+            block_size <= 0
+            or not lookup
+            or lookup.get("request_id") != request.request_id
+            or not self._detect_boundary_snapshot_need()
+        ):
+            return
+        branch = lookup.get("common_prefix_tokens", 0)
+        prompt_len = len(request.prompt_token_ids or [])
+        limit = getattr(request, "generation_prompt_start", 0) or prompt_len - 1
+        if (
+            branch - (request.cached_tokens or 0) < self._JUNCTION_MIN_TOKENS
+            or branch % block_size == 0
+            or branch >= limit
+        ):
+            return
+        request.junction_end = branch
+        logger.info(
+            "prefix cache: request %s leaves a stored prompt at token %d "
+            "(reused %d); its prefill stops there to keep a shared tail",
+            request.request_id,
+            branch,
+            request.cached_tokens or 0,
+        )
+
     def _minimum_prefill_prefix(self, request: "Request") -> int:
         prompt_token_ids = getattr(request, "prompt_token_ids", None)
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
@@ -8518,14 +8599,19 @@ class Scheduler:
         n_tokens: int,
         boundary_enabled: bool,
     ) -> int | None:
-        """Return the shared system-prefix stop when this prefill crosses it."""
-        system_end = getattr(request, "system_prefix_end", 0) or 0
+        """Return the shared-tail stop this prefill crosses; the system prefix wins."""
+        if not boundary_enabled:
+            return None
         prefill_end = base_size + n_tokens - 1
-        if not boundary_enabled or not base_size < system_end < prefill_end:
-            return None
-        if system_end < self._minimum_prefill_prefix(request):
-            return None
-        return system_end
+        for end in (
+            getattr(request, "system_prefix_end", 0) or 0,
+            getattr(request, "junction_end", 0) or 0,
+        ):
+            if base_size < end < prefill_end and end >= self._minimum_prefill_prefix(
+                request
+            ):
+                return end
+        return None
 
     def _emit_prefill_tail_snapshot(
         self,
@@ -9688,9 +9774,9 @@ class Scheduler:
         """
         Return boundary-aligned cache payload when final request ends on partial block.
 
-        The shared system-prefix tail is a terminal only with ``system_tail``;
-        it carries no intermediate snapshots because its store reuses the
-        cached full blocks.
+        A shared tail (system prefix or branch point) is a terminal only with
+        ``system_tail``; it carries no intermediate snapshots because its store
+        reuses the cached full blocks.
 
         Returns:
             Tuple of (truncated_tokens, extracted_cache, model_cache_config,
@@ -9739,13 +9825,16 @@ class Scheduler:
         valid_counts = sorted(
             tc for tc in snapshots if 0 < tc <= limit and tc % block_size == 0
         )
-        system_end = getattr(request, "system_prefix_end", 0) or 0
+        shared_ends = {
+            getattr(request, "system_prefix_end", 0) or 0,
+            getattr(request, "junction_end", 0) or 0,
+        }
         tail_counts = [
             tc
             for tc in snapshots
             if 0 < tc <= limit
             and tc % block_size != 0
-            and (tc == system_end) == system_tail
+            and (tc in shared_ends) == system_tail
         ]
         if not valid_counts and not tail_counts:
             miss("no_aligned_snapshots", len(snapshots))
@@ -11345,6 +11434,7 @@ class Scheduler:
         # sequences: one INFO line for large re-prefills (#2333/#2349
         # triage), decoded token context at DEBUG (issue #1003).
         self._log_prefix_divergence(request)
+        self._resolve_junction_end(request)
 
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
@@ -15963,7 +16053,7 @@ class Scheduler:
             ) and self.running:
                 if self._moe_offload_slots_released:
                     self._moe_offload_slots_released = False
-                    self.moe_offload_restore()
+                    self.moe_offload_restore(lambda: Scheduler._clear_cache(self))
                 _t_decode_start = time.perf_counter()
                 if self.batch_generator is not None:
                     responses = list(self.batch_generator.next_generated())
@@ -16336,6 +16426,7 @@ class Scheduler:
         self.model = None
         self.tokenizer = None
         self._logprob_detokenizer = None
+        self._prefill_helper_retry = None  # Its helper holds the language model.
 
         # Release all cache-related references for GC
         if self._boundary_snapshot_store is not None:

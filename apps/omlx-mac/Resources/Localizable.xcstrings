@@ -7954,6 +7954,438 @@
         }
       }
     },
+    "bench.throughput.advanced.api_key" : {
+      "comment" : "External benchmark API key field label",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Schlüssel"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API key"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chiave API"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API キー"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API 키"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-ключ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API 密钥"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API 金鑰"
+          }
+        }
+      }
+    },
+    "bench.throughput.advanced.base_url" : {
+      "comment" : "External benchmark API base URL field label",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Basis-URL"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Base URL"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "URL di base"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ベース URL"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 URL"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Базовый URL"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "基础 URL"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "基礎 URL"
+          }
+        }
+      }
+    },
+    "bench.throughput.advanced.external" : {
+      "comment" : "Throughput benchmark option to target an external API",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Externen OpenAI-kompatiblen Endpunkt verwenden"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use external OpenAI-compatible endpoint"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usa un endpoint esterno compatibile con OpenAI"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "外部の OpenAI 互換エンドポイントを使用"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "외부 OpenAI 호환 엔드포인트 사용"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использовать внешний OpenAI-совместимый эндпоинт"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用外部 OpenAI 兼容端点"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用外部 OpenAI 相容端點"
+          }
+        }
+      }
+    },
+    "bench.throughput.advanced.external_hint" : {
+      "comment" : "Requirements and upload behavior for external throughput benchmarks",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Misst ein entferntes Modell. Der Endpunkt muss Token-Nutzungsdaten beim Streaming liefern. Ergebnisse bleiben lokal."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benchmark a remote model. The endpoint must support streamed token usage. Results stay local."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Misura un modello remoto. L’endpoint deve fornire i dati di utilizzo dei token in streaming. I risultati restano locali."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リモートモデルを測定します。エンドポイントはストリーミングでのトークン使用量に対応している必要があります。結果はローカルに保持されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "원격 모델을 측정합니다. 엔드포인트는 스트리밍 토큰 사용량을 지원해야 합니다. 결과는 로컬에 보관됩니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Измерение удалённой модели. Эндпоинт должен передавать расход токенов в потоке. Результаты остаются локально."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "测试远程模型。端点必须支持在流式响应中提供令牌使用量。结果仅保存在本地。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "測試遠端模型。端點必須支援在串流回應中提供權杖使用量。結果僅儲存在本機。"
+          }
+        }
+      }
+    },
+    "bench.throughput.advanced.force_lm" : {
+      "comment" : "Throughput benchmark option to force the LM engine",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "mlx-lm-Engine erzwingen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Force mlx-lm engine"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Forza il motore mlx-lm"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "mlx-lm エンジンを強制使用"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "mlx-lm 엔진 강제 사용"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Принудительно использовать движок mlx-lm"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "强制使用 mlx-lm 引擎"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "強制使用 mlx-lm 引擎"
+          }
+        }
+      }
+    },
+    "bench.throughput.advanced.force_lm_hint" : {
+      "comment" : "Explanation of the force mlx-lm benchmark option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "mlx-lm für diesen Benchmark verwenden. VLM-MTP-Draft-Modelle werden ignoriert, sodass die Ergebnisse die reine LM-Referenzleistung messen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use mlx-lm for this benchmark. VLM MTP drafters are ignored, so results measure the LM-only baseline."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usa mlx-lm per questo benchmark. I drafter VLM MTP vengono ignorati, quindi i risultati misurano le prestazioni di base del solo LM."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このベンチマークで mlx-lm を使用します。VLM MTP ドラフターは無視されるため、LM 単体のベースラインを測定します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 벤치마크에 mlx-lm을 사용합니다. VLM MTP drafter는 무시되므로 LM 단독 기준 성능을 측정합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использовать mlx-lm для этого бенчмарка. VLM MTP-драфтеры игнорируются, поэтому результаты измеряют базовый сценарий только для LM."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此基准测试使用 mlx-lm。VLM MTP drafter 将被忽略，结果仅衡量 LM 基线。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此基準測試使用 mlx-lm。VLM MTP drafter 會被忽略，因此結果衡量的是僅 LM 的基準。"
+          }
+        }
+      }
+    },
+    "bench.throughput.advanced.model" : {
+      "comment" : "External benchmark model identifier field label",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell-ID"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model ID"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ID modello"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "モデル ID"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모델 ID"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ID модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型 ID"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型 ID"
+          }
+        }
+      }
+    },
+    "bench.throughput.advanced.title" : {
+      "comment" : "Disclosure label for advanced throughput benchmark options",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweiterte Optionen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Advanced options"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Opzioni avanzate"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "詳細オプション"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "고급 옵션"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Расширенные параметры"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "高级选项"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "進階選項"
+          }
+        }
+      }
+    },
     "bench.throughput.batch.baseline_label" : {
       "comment" : "Row label for the synthetic 1x baseline in the batch results table",
       "extractionState" : "manual",
@@ -9892,6 +10324,78 @@
         }
       }
     },
+    "bench.throughput.upload.skipped.ane_aligned_prompt" : {
+      "comment" : "Skipped-upload reason when the benchmark used ANE-aligned prompt lengths",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse mit ANE-angepassten Prompts werden nicht gesendet, weil ihre Prompt-Längen nicht den Standard-PP-Stufen entsprechen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE-aligned prompt results are not submitted because their prompt lengths do not match the standard PP buckets."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I risultati con prompt allineati ad ANE non vengono inviati perché le lunghezze dei prompt non corrispondono ai livelli PP standard."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Результаты с промптами, выровненными под ANE, не отправляются, потому что длины промптов не совпадают со стандартными группами PP."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 对齐提示词的结果不会提交，因为其提示词长度与标准 PP 档位不一致。"
+          }
+        }
+      }
+    },
+    "bench.throughput.upload.skipped.custom_generation_length" : {
+      "comment" : "Skipped-upload reason when the benchmark used a generation length other than 128 tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse mit einer anderen Generierungslänge als 128 Tokens werden nicht gesendet, damit sie mit anderen Einsendungen vergleichbar bleiben."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Results with a generation length other than 128 tokens are not submitted so they stay comparable with other submissions."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I risultati con una lunghezza di generazione diversa da 128 token non vengono inviati, così restano confrontabili con gli altri invii."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Результаты с длиной генерации, отличной от 128 токенов, не отправляются, чтобы оставаться сопоставимыми с другими результатами."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "生成长度不是 128 tokens 的结果不会提交，以便与其他提交结果保持可比。"
+          }
+        }
+      }
+    },
     "bench.throughput.upload.skipped.default" : {
       "comment" : "Fallback skipped-upload reason when the server didn't provide one",
       "extractionState" : "manual",
@@ -9924,6 +10428,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "服务器跳过了上传这些结果。"
+          }
+        }
+      }
+    },
+    "bench.throughput.upload.skipped.lora_adapter" : {
+      "comment" : "Skipped-upload reason when the benchmarked model had a LoRA adapter",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse mit einem LoRA-Adapter werden nicht eingereicht, weil die Rangliste sie dem Basismodell zuordnet."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Results with a LoRA adapter are not submitted because the leaderboard lists them under the base model."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I risultati con un adattatore LoRA non vengono inviati perché la classifica li attribuisce al modello base."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Результаты с LoRA-адаптером не отправляются, потому что рейтинг относит их к базовой модели."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用 LoRA 适配器的结果在排行榜上会归入基础模型，因此不会提交。"
+          }
+        }
+      }
+    },
+    "bench.throughput.upload.skipped.splash" : {
+      "comment" : "Skipped-upload reason when the benchmark ran on the Splash engine",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash-Ergebnisse werden nicht gesendet, weil sie die Splash-Engine statt oMLX messen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash results are not submitted because they measure the Splash engine, not oMLX."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I risultati di Splash non vengono inviati perché misurano il motore Splash, non oMLX."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Результаты Splash не отправляются, потому что они измеряют движок Splash, а не oMLX."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash 结果不会提交，因为它们测量的是 Splash 引擎，而不是 oMLX。"
           }
         }
       }
@@ -11473,38 +12049,38 @@
         }
       }
     },
-    "downloads.card.lora_warning" : {
-      "comment" : "Warning banner shown in the model card sheet when the repo is an adapter rather than a full model",
+    "downloads.card.lora_info" : {
+      "comment" : "Note in the model card sheet when the repo is a LoRA adapter rather than a full model",
       "extractionState" : "manual",
       "localizations" : {
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Dies ist ein LoRA-Adapter. Zum Ausführen benötigt er ein kompatibles Basismodell. Einzeln heruntergeladen lässt er sich nicht in oMLX laden."
+            "value" : "Dies ist ein LoRA-Adapter. Nach dem Herunterladen in den erweiterten Einstellungen eines Basismodells auswählen."
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "This is a LoRA adapter. It needs a compatible base model to run — downloading on its own won't load in oMLX."
+            "value" : "This is a LoRA adapter. After it downloads, choose it in a base model's Advanced Settings."
           }
         },
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Questo è un adattatore LoRA. Per funzionare richiede un modello di base compatibile — scaricato da solo, non può essere caricato in oMLX."
+            "value" : "Questo è un adattatore LoRA. Dopo il download, sceglilo nelle impostazioni avanzate di un modello base."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Это LoRA-адаптер. Для запуска нужна совместимая базовая модель — сам по себе он не загрузится в oMLX."
+            "value" : "Это LoRA-адаптер. После загрузки выберите его в расширенных настройках базовой модели."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "这是一个 LoRA 适配器。它需要兼容的基座模型才能运行 — 单独下载无法在 oMLX 中加载。"
+            "value" : "这是一个 LoRA 适配器。下载后，请在基础模型的高级设置中选择它。"
           }
         }
       }
@@ -13727,78 +14303,6 @@
         }
       }
     },
-    "integrations.section.claude_code" : {
-      "comment" : "Section header for the Claude Code integration",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code"
-          }
-        }
-      }
-    },
-    "integrations.section.claude_code.sub" : {
-      "comment" : "Subtitle for the Claude Code section",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Leitet Anfragen von Claude Code an lokale Modelle oder die Cloud weiter"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Route Claude Code requests to local models or the cloud"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Instrada le richieste di Claude Code verso i modelli locali o il cloud"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Направлять запросы Claude Code в локальные модели или облако"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "将 Claude Code 请求路由到本地模型或云端"
-          }
-        }
-      }
-    },
     "integrations.section.markitdown" : {
       "comment" : "Section header for MarkItDown document conversion",
       "extractionState" : "manual",
@@ -14183,6 +14687,126 @@
         }
       }
     },
+    "integrations.section.applications" : {
+      "comment" : "Section header for the per-tool launcher grid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applications"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "應用"
+          }
+        }
+      }
+    },
+    "integrations.section.applications.sub" : {
+      "comment" : "Subtitle for the Applications section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model and launcher command for each tool that talks to oMLX."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每个对接 oMLX 的工具的默认模型与启动命令。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每個對接 oMLX 的工具的預設模型與啟動指令。"
+          }
+        }
+      }
+    },
+    "integrations.tool.claude" : {
+      "comment" : "Display name for the Claude Code integration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        }
+      }
+    },
+    "integrations.applications.hint" : {
+      "comment" : "Hint under the tool grid while no tool is selected",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pick a tool to see its launcher command."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "点击工具查看它的启动命令。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "點選工具查看它的啟動指令。"
+          }
+        }
+      }
+    },
+    "integrations.panel.model" : {
+      "comment" : "Row label for the per-tool default model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Default model"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "默认模型"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "預設模型"
+          }
+        }
+      }
+    },
     "integrations.section.mcp" : {
       "comment" : "Section header for the MCP config path row",
       "extractionState" : "manual",
@@ -14255,114 +14879,6 @@
         }
       }
     },
-    "integrations.section.other" : {
-      "comment" : "Section header for the additional integrations list",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Weitere Integrationen"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Other Integrations"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Altre integrazioni"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Другие интеграции"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "其他集成"
-          }
-        }
-      }
-    },
-    "integrations.section.other.sub" : {
-      "comment" : "Subtitle for the Other Integrations section",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Standardmodell und Startbefehl für jede benannte Integration"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Default model + launcher command for each named integration"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Modello predefinito + comando di avvio per ogni integrazione"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Модель по умолчанию и команда запуска для каждой интеграции"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "每个命名集成的默认模型 + 启动器命令"
-          }
-        }
-      }
-    },
-    "integrations.section.setup_command" : {
-      "comment" : "Section header for the Claude Code setup command block",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Einrichtungsbefehl"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Setup Command"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Comando di configurazione"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Команда настройки"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "设置命令"
-          }
-        }
-      }
-    },
     "integrations.setup.advanced.cloud" : {
       "comment" : "Explanation of the advanced env recipe in cloud mode",
       "extractionState" : "manual",
@@ -14395,42 +14911,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "重置 Anthropic 环境变量，使真正的 `claude` 二进制文件与云端通信。"
-          }
-        }
-      }
-    },
-    "integrations.setup.advanced.label" : {
-      "comment" : "Disclosure label revealing the advanced env-var recipe for running claude directly",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Erweitert: claude direkt ausführen"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Advanced — run `claude` directly"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Avanzate — esegui `claude` direttamente"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Дополнительно — запускать `claude` напрямую"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "高级 — 直接运行 `claude`"
           }
         }
       }
@@ -14827,6 +15307,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "A parità di memoria, int8 contiene circa il doppio del contesto di bf16."
+          }
+        }
+      }
+    },
+    "integrations.splash.activations" : {
+      "comment" : "Row label for the Splash attention activation precision",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktivierungspräzision"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Activation Precision"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Precisione delle attivazioni"
+          }
+        }
+      }
+    },
+    "integrations.splash.activations.sub" : {
+      "comment" : "Sublabel for the Splash attention activation precision",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf M5 und neuer hält bf16 die Attention in bf16; auto lässt Splash int8 wählen, wo es schneller ist. Gilt ab Splash 1.6.1."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "bf16 keeps attention in bf16 on M5 and later; auto lets Splash use int8 where it is faster. Applies to Splash 1.6.1 and later."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Su M5 e successivi bf16 mantiene l'attenzione in bf16; auto lascia che Splash usi int8 dove è più veloce. Vale da Splash 1.6.1."
           }
         }
       }
@@ -26313,6 +26841,78 @@
         }
       }
     },
+    "quant.enhanced.hadamard.label" : {
+      "comment" : "Toggle label that builds the oQh variant of an oQe model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rotierte Codes (oQh)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rotated codes (oQh)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Codici ruotati (oQh)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повёрнутые коды (oQh)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "旋转编码 (oQh)"
+          }
+        }
+      }
+    },
+    "quant.enhanced.hadamard.sub" : {
+      "comment" : "Toggle sublabel explaining the oQh variant",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gleiche Größe wie oQe bei geringerem Fehler: Die Gewichte liegen in einer Hadamard-rotierten Basis mit einer Skala pro Zeile. Zum Ausführen werden die oQh-Kernel benötigt."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Same size as oQe with lower error: weights are stored in a Hadamard-rotated basis with one scale per row. Needs the oQh kernels to run."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stessa dimensione di oQe con errore minore: i pesi sono salvati in una base ruotata di Hadamard con una scala per riga. Per l'esecuzione servono i kernel oQh."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Тот же размер, что у oQe, при меньшей ошибке: веса хранятся в базисе с поворотом Адамара и одним масштабом на строку. Для запуска нужны ядра oQh."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "与 oQe 大小相同但误差更低：权重以 Hadamard 旋转基存储，每行一个缩放系数。运行需要 oQh 内核。"
+          }
+        }
+      }
+    },
     "quant.enhanced.reuse.label" : {
       "comment" : "Toggle label for reusing a compatible oQe imatrix cache",
       "extractionState" : "manual",
@@ -37026,6 +37626,258 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "即使用戶端或代理請求不同的值，也強制使用此處設定的 Temperature、Top P 與 Top K。"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_adapter.empty" : {
+      "comment" : "Shown when the model folders hold no LoRA adapter",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine LoRA-Adapter gefunden. Einen Adapterordner (mit adapter_config.json) in einen Modellordner legen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No LoRA adapters found. Put an adapter folder (with adapter_config.json) in a model folder."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nessun adattatore LoRA trovato. Metti una cartella dell'adattatore (con adapter_config.json) in una cartella dei modelli."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA-адаптеры не найдены. Поместите папку адаптера (с adapter_config.json) в папку моделей."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未找到 LoRA 适配器。请将适配器文件夹（含 adapter_config.json）放入模型文件夹。"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_adapter.info" : {
+      "comment" : "LoRA adapter details: training base model and adapted projections",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Trainiert auf %1$@ · %2$@"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Trained on %1$@ · %2$@"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Addestrato su %1$@ · %2$@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обучен на %1$@ · %2$@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "基于 %1$@ 训练 · %2$@"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_adapter.label" : {
+      "comment" : "Row label for the LoRA adapter picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adapter"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adapter"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adattatore"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Адаптер"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "适配器"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_adapter.none" : {
+      "comment" : "LoRA adapter picker option that applies no adapter",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keiner"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "None"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nessuno"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нет"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_adapter.section" : {
+      "comment" : "Section header above the LoRA adapter picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA-Adapter"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA Adapter"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adattatore LoRA"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA-адаптер"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA 适配器"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_adapter.sub" : {
+      "comment" : "Sublabel for the LoRA adapter picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adapter, die nicht zu diesem Modell passen, werden nicht aufgeführt. Wirkt nach dem Neuladen des Modells."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adapters that do not fit this model are not listed. Applies after the model reloads."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gli adattatori non compatibili con questo modello non sono elencati. Si applica dopo il ricaricamento del modello."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Адаптеры, не подходящие к этой модели, не показаны. Применяется после перезагрузки модели."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "不适用于此模型的适配器不会列出。重新加载模型后生效。"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_adapter.subtitle" : {
+      "comment" : "Subtitle for the LoRA adapter section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einen LoRA-Adapter aus den Modellordnern auf diese Gewichte anwenden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply a LoRA adapter from the model folders on top of these weights."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applica un adattatore LoRA dalle cartelle dei modelli sopra questi pesi."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Применить LoRA-адаптер из папок моделей поверх этих весов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在这些权重之上应用模型文件夹中的 LoRA 适配器。"
           }
         }
       }

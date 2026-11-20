@@ -41,6 +41,7 @@ def _custom_kernel_build_kwargs() -> dict:
     shared = f"{root}/include"
     attention = f"{root}/attention/csrc"
     lowbit = f"{root}/lowbit/csrc"
+    oqh = f"{root}/oqh/csrc"
     quant = f"{root}/quant_matmul/csrc"
     sparse = f"{root}/sparse_index/csrc"
 
@@ -118,6 +119,17 @@ def _custom_kernel_build_kwargs() -> dict:
                         sources=[
                             f"{lowbit}/lowbit_qmv.metal",
                         ],
+                    ),
+                ],
+            ),
+            extension.MetalExtension(
+                "omlx.custom_kernels.oqh._ext",
+                sources=[f"{oqh}/bindings.cpp", f"{oqh}/oqh.cpp"],
+                include_dirs=[oqh, shared],
+                metal_libraries=[
+                    extension.MetalLibrary(
+                        "omlx_oqh_kernels",
+                        sources=[f"{oqh}/oqh.metal"],
                     ),
                 ],
             ),

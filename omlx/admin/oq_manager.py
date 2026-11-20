@@ -19,6 +19,8 @@ from typing import Callable, Optional
 try:
     import mlx.core as mx
 
+    from ..oqh import targets as oqh_targets
+
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
@@ -89,6 +91,11 @@ class QuantTask:
     imatrix_seq_length: int = 512
     mtp_assistant_model_path: str = ""
     preserve_ngram_table: bool = False
+    hadamard: bool = False
+
+    @property
+    def variant(self) -> str:
+        return "h" if self.hadamard else ("e" if self.enhanced else "")
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -112,6 +119,7 @@ class QuantTask:
             "output_size": self.output_size,
             "dtype": self.dtype,
             "enhanced": self.enhanced,
+            "hadamard": self.hadamard,
             "imatrix_cache_path": self.imatrix_cache_path,
         }
 
@@ -274,6 +282,10 @@ class OQManager:
                                 # mm_vision_tower). Same predicate as model_discovery.
                                 "is_vlm": _has_vision_subconfig(config),
                                 "has_mtp_heads": has_mtp,
+                                "oqh_supported": oqh_targets.supports(config),
+                                "oqh_max_level": getattr(
+                                    oqh_targets.scheme_for(config), "max_level", None
+                                ),
                                 "hidden_size": tc.get("hidden_size")
                                 or config.get("hidden_size")
                                 or (tc.get("dim") if is_v41 else 0)
@@ -319,6 +331,7 @@ class OQManager:
         imatrix_seq_length: int = 512,
         mtp_assistant_model_path: str = "",
         preserve_ngram_table: bool = False,
+        hadamard: bool = False,
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -414,6 +427,8 @@ class OQManager:
                         assistant.name,
                     )
 
+        # oQh builds on the oQe calibration.
+        enhanced = enhanced or hadamard
         output_name = resolve_output_name(
             output_base_name,
             oq_level,
@@ -421,6 +436,7 @@ class OQManager:
             preserve_mtp=preserve_mtp,
             enhanced=enhanced,
             preserve_ngram_table=preserve_ngram_table,
+            hadamard=hadamard,
         )
         if mtp_assistant_model_path and not output_name.endswith("-mtp"):
             output_name += "-mtp"
@@ -439,12 +455,13 @@ class OQManager:
                 and task.oq_level == oq_level
                 and task.dtype == dtype
                 and task.enhanced == enhanced
+                and task.hadamard == hadamard
                 and task.preserve_ngram_table == preserve_ngram_table
                 and task.status in _ACTIVE_STATUSES
             ):
                 raise ValueError(
                     f"Quantization for '{model_name}' at oQ{oq_level:g}"
-                    f"{'e' if enhanced else ''} "
+                    f"{'h' if hadamard else ('e' if enhanced else '')} "
                     f"({dtype}) is already in progress"
                 )
             # A failed job removes its output directory.
@@ -490,6 +507,7 @@ class OQManager:
             imatrix_seq_length=imatrix_seq_length,
             mtp_assistant_model_path=mtp_assistant_model_path,
             preserve_ngram_table=preserve_ngram_table,
+            hadamard=hadamard,
         )
         self._tasks[task_id] = task
 
@@ -499,7 +517,7 @@ class OQManager:
 
         logger.info(
             f"oQ quantization queued: {model_name} -> "
-            f"oQ{oq_level:g}{'e' if enhanced else ''} "
+            f"oQ{oq_level:g}{task.variant} "
             f"(task_id={task_id})"
         )
         return task
@@ -630,13 +648,13 @@ class OQManager:
                     if task_id in self._cancelled:
                         raise _QuantCancelled(f"Task {task_id} cancelled")
                     base_phase = phase.split("|", 1)[0]
-                    if base_phase.startswith("quantizing"):
+                    if base_phase.startswith("quantizing") or base_phase == "refine":
                         task.status = QuantStatus.QUANTIZING
                     elif base_phase == "saving":
                         task.status = QuantStatus.SAVING
                     else:
                         task.status = QuantStatus.LOADING
-                    task.phase = self._phase_label(phase, task.oq_level, task.enhanced)
+                    task.phase = self._phase_label(phase, task.oq_level, task.variant)
                     task.progress_detail = detail or ""
                     task.progress_meta = meta or {}
                     task.progress = pct
@@ -670,6 +688,7 @@ class OQManager:
                     imatrix_num_samples=task.imatrix_num_samples,
                     imatrix_seq_length=task.imatrix_seq_length,
                     preserve_ngram_table=task.preserve_ngram_table,
+                    hadamard=task.hadamard,
                 )
 
                 if task_id in self._cancelled:
@@ -781,13 +800,15 @@ class OQManager:
         return total_bytes > 0 and processed_bytes >= 0
 
     @staticmethod
-    def _phase_label(phase: str, oq_level: float, enhanced: bool = False) -> str:
+    def _phase_label(phase: str, oq_level: float, variant: str = "") -> str:
         """Human-readable phase label."""
-        oq_label = f"oQ{oq_level:g}{'e' if enhanced else ''}"
+        oq_label = f"oQ{oq_level:g}{variant}"
         labels = {
             "loading": "Loading model...",
             "imatrix": "Collecting oQe imatrix...",
             "quantizing": f"Quantizing to {oq_label}...",
+            "refine": "Refining oQe codes...",
+            "oqh": "Writing oQh tensors...",
             "saving": "Saving quantized model...",
         }
         # Handle progress: "quantizing_eta|792|879|0:02"

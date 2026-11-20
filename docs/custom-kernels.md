@@ -23,6 +23,7 @@ omlx/custom_kernels/
   sparse_index/    indexer and top-k kernels
   quant_matmul/    quantized matmul kernels, ANE offload
   lowbit/          T5 ternary kernels
+  oqh/             oQh rotated row-scale weights
   moe_staging/     MoE offload read buffers (native part is in quant_matmul)
   include/omlx/    shared C++ helpers
   _loader.py       loads each extension
@@ -35,6 +36,7 @@ omlx/custom_kernels/
 | `sparse_index` | choosing which KV blocks to attend to (indexer scores, top-k) | GLM, DeepSeek V4, Qwen4, MiniMax M3 |
 | `quant_matmul` | matmuls on quantized weights, MoE combine, ANE offload | Qwen3.5/3.6, GLM, DeepSeek V4/V4.1, MiMo, K2, MiniMax M3 |
 | `lowbit` | T5 (base-3 ternary) weights; 1-bit and 2-bit affine run on stock MLX | Bonsai T5 checkpoints |
+| `oqh` | oQh weights: row-scale GEMV and gather GEMV, and the norm / activation kernels that also write the Hadamard-rotated input | oQh checkpoints (Qwen3.5/3.6/3.8, Flash-Next, GLM-5.3, DeepSeek V4.1) |
 
 Each package has:
 

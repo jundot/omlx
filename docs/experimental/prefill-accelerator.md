@@ -65,7 +65,7 @@ The Cluster tab's Prefill Accelerator checks report which of these the Macs use.
 4. If the helper Mac lacks the model files, they are copied to `~/.omlx/prefill-helper/models` there. The copy starts on its own when at least 50 GB stays free. When deleting older copies there would keep 50 GB free, the row names them and **Delete and copy** removes them first. Otherwise the row shows the space left after copying and **Copy anyway** fills the disk past 50 GB. A model that does not fit at all is refused.
 5. When the model is loaded the helper starts, loads its layers and reports **Ready**. Long prompts then show "via <Mac>" in the prefill progress.
 
-**Layers on the helper** is **Auto** by default: each prompt is split by the measured speed of both Macs, and the measurements are kept per model and Mac so a restarted helper splits its first prompt the same way. A fixed number is available for testing.
+**Layers on the helper** is **Auto** by default. The helper loads every layer that fits, and each prompt is split by the measured speed of both Macs and the link, so a prompt can use fewer layers than the helper holds. The measurements are kept per model and Mac so a restarted helper splits its first prompt the same way. A fixed number asks for that many layers on every prompt instead of splitting by speed. More layers on the helper is not always faster, because the slower side of the split sets the pace: a fixed number above the one Auto picks can be slower than Auto.
 
 DeepSeek V4.1 **CED prefill** is on unless turned off in the model's settings. **INT8 Activation Prefill** is off unless turned on there. On a Mac without INT8 tensor units (M4 and earlier), INT8 Activation Prefill applies only to the helper's layers, and changing it restarts the helper without reloading the model.
 
@@ -74,9 +74,9 @@ DeepSeek V4.1 **CED prefill** is on unless turned off in the model's settings. *
 `omlx-cuda-helper` (`apps/omlx-cuda-helper/`) turns a Linux machine with NVIDIA GPUs into a helper. This Mac uses it like a helper Mac: choose it under **Prefill Accelerator** in the model's settings. Its README covers the build and the options. What differs from a helper Mac:
 
 - **No SSH and no oMLX on the helper.** The helper is a small daemon without a UI. Pair it in the Cluster tab with the 6-digit code it prints in its log; this Mac then drives it over a control channel that the pairing key protects. In the Cluster tab it has no Join button, because it can only be a prefill helper.
-- **Compatibility is per model family**, not per oMLX version. The checks list the families the helper serves and name the side to update when they disagree.
+- **Compatibility is per model family**, not per oMLX version. The checks list the families the helper serves and name the side to update when they disagree. A helper older than the one this oMLX comes with gets a warning with the update command.
 - **Two GPUs run as a pipeline.** Each GPU holds a range of layers. GPU memory decides how many layers the helper takes, and with it the speedup.
-- **Long prompts drop layers.** When the next chunk's cache would not fit in the helper's GPU memory, the helper drops its last layers one at a time and this Mac runs them from that chunk on. The helper loads them again while no prompt waits.
+- **Long prompts drop layers.** When the next chunk's cache would not fit in the helper's GPU memory, the helper drops the layers the prompt does not use first, then its last layers one at a time, and this Mac runs them from that chunk on. The helper loads them again while no prompt waits.
 - **INT8 Activation Prefill** does not apply to the helper's layers.
 - **The link matters more.** The checks warn below 5 GbE. **Auto** measures the link and what each layer sends, uses fewer layers on a slow link, and keeps a prompt on this Mac when the transfer alone would take longer than prefilling here.
 - **A direct Ethernet cable** to the helper is used when it is faster than the network both machines share. It needs no addresses (the helper is reached at its IPv6 link-local address), but discovery and pairing run on the shared network, so the helper stays on it too.
@@ -138,6 +138,13 @@ Each prompt is cut into a fixed chunk grid when it is admitted. For every chunk 
 Large lookup tables (DeepSeek V4.1 Engram, Qwen3.8 PLE) stay on this Mac. It reads each chunk's rows and sends them ahead, so the helper holds no table and reads nothing from its SSD.
 
 A benchmark waits up to 10 minutes for the helper to be ready, and an uploaded result names the helper's chip, memory, layers and link (never its name). Prompts shorter than 2,048 tokens and prompts with images prefill here. Other prompts queue for the helper in arrival order. If the helper disconnects or is stopped, the prompt continues here from the last finished chunk.
+
+## Measuring prefill speed
+
+- Prompts that go to the helper always prefill in chunks. The model's chunked prefill setting does not decide whether the helper runs.
+- The speed in the prefill progress is measured per chunk and moves from chunk to chunk. For a whole prompt, read the helper row in the model's settings ("last prompt N tokens in S s", `last_prompt` in `GET /admin/api/prefill-helper/models/{id}`) or run the built-in benchmark.
+- A repeated prompt hits the prefix cache and prefills only its new tokens. Check `usage.prompt_tokens_details.cached_tokens` in the response, or change the prompt between runs.
+- When the helper fails a prompt, this Mac logs `Prefill helper <name> left request <id> to this Mac: <reason>` and prefills the rest itself.
 
 ## On the helper Mac
 

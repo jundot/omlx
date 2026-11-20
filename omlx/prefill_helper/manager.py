@@ -31,6 +31,7 @@ from ..cluster.identity import get_node_identity
 from ..cluster.pairing import get_pairing_manager
 from ..cluster.registry import default_devices_path
 from ..exceptions import is_metal_out_of_memory
+from ..oqh import format as oqh_format
 from . import agent
 from . import launcher as default_launcher
 from .adapter import StageAdapter
@@ -223,9 +224,13 @@ def this_host() -> dict | None:
 
 
 def _reach(
-    launcher: Any, node_id: str, report: Callable[..., None], adapter: StageAdapter
+    launcher: Any,
+    node_id: str,
+    report: Callable[..., None],
+    adapter: StageAdapter,
+    model_path: str,
 ) -> tuple:
-    """The helper and its ``remote_info``, if it can serve this family."""
+    """The helper and its ``remote_info``, if it can serve this model."""
     try:
         target = launcher.resolve_target(node_id)
     except UnreachableError:
@@ -236,9 +241,13 @@ def _reach(
     forget_host(node_id)
     report("connecting", name=target.name, link=target.link)
     info = launcher.remote_info(target, host=this_host())
-    problem = launcher.incompatible(info, adapter, target.name)
+    oqh = oqh_format.checkpoint_version(model_path)
+    problem = launcher.incompatible(info, adapter, target.name, oqh)
     if problem is not None:
         raise _PermanentError(problem)
+    update = agent.outdated(info) if "contracts" in info else None
+    if update:
+        logger.warning("Prefill helper on %s is outdated. %s", target.name, update)
     return target, info
 
 
@@ -404,7 +413,9 @@ class FilePrep:
         try:
             if self._cancel.is_set():
                 raise _CancelledError
-            target, info = _reach(self.launcher, self.node_id, self._set, self.adapter)
+            target, info = _reach(
+                self.launcher, self.node_id, self._set, self.adapter, self.model_path
+            )
             held = held_layers(
                 self.adapter,
                 self.model_path,
@@ -709,7 +720,9 @@ class PrefillHelperManager:
         if adopted is not None:
             target, info, held, process = adopted
         else:
-            target, info = _reach(launcher, self.node_id, self._report, self.adapter)
+            target, info = _reach(
+                launcher, self.node_id, self._report, self.adapter, self.model_path
+            )
             held = held_layers(
                 self.adapter,
                 self.model_path,

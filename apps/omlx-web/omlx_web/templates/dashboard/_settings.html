@@ -84,6 +84,7 @@
                                         <option value="fr">{{ t('settings.language.fr') }}</option>
                                         <option value="pt-BR">{{ t('settings.language.pt-BR') }}</option>
                                         <option value="cs">{{ t('settings.language.cs') }}</option>
+                                        <option value="it">{{ t('settings.language.it') }}</option>
                                     </select>
                                 </div>
                             </div>
@@ -1409,6 +1410,18 @@
                                             class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="int8">int8</option>
                                         <option value="bf16">bf16</option>
+                                    </select>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.activations') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.activations_hint') }}</p>
+                                    </div>
+                                    <select x-model="globalSettings.integrations.splash_activations"
+                                            @change="saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="bf16">bf16</option>
+                                        <option value="auto">auto</option>
                                     </select>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">

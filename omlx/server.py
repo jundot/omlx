@@ -1472,6 +1472,7 @@ async def get_engine(
     engine_type: EngineType = EngineType.LLM,
     _lease: bool = False,
     _leased_out: list | None = None,
+    _allow_embedding: bool = False,
 ) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine, DecisionEngine]:
     """
     Get engine for the specified model and type.
@@ -1490,6 +1491,8 @@ async def get_engine(
             leased is appended to this list. Release using that id (not the
             request model) so the lease/release ids always match even when the
             pool falls back to the default model.
+        _allow_embedding: With EngineType.LLM, also accept an EmbeddingEngine
+            (for /tokenize and /detokenize). Model resolution stays LLM.
 
     Returns:
         The loaded engine of the appropriate type
@@ -1628,7 +1631,9 @@ async def get_engine(
             # fell through and crashed on `engine.model_type` with an unhandled
             # 500. Reject with a clear 400 pointing the caller at the right
             # endpoint.
-            if not isinstance(engine, BaseEngine):
+            if not isinstance(engine, BaseEngine) and not (
+                _allow_embedding and isinstance(engine, EmbeddingEngine)
+            ):
                 _endpoint_hint = _suggest_endpoint_for_engine(engine)
                 raise HTTPException(
                     status_code=400,
@@ -1767,6 +1772,7 @@ async def get_engine_for_model(
     model: str | None = None,
     *,
     lease: _LLMEngineLease | None = None,
+    allow_embedding: bool = False,
 ) -> BaseEngine:
     """
     Get LLM engine for the specified model (or default).
@@ -1775,6 +1781,7 @@ async def get_engine_for_model(
 
     Args:
         model: Model ID to get engine for, or None for default
+        allow_embedding: Also accept an EmbeddingEngine (tokenizer routes).
 
     Returns:
         The loaded engine
@@ -1783,7 +1790,7 @@ async def get_engine_for_model(
         HTTPException: If model not found or memory error
     """
     if lease is None:
-        return await get_engine(model, EngineType.LLM)
+        return await get_engine(model, EngineType.LLM, _allow_embedding=allow_embedding)
 
     leased: list[str] = []
     engine = await get_engine(
@@ -1791,6 +1798,7 @@ async def get_engine_for_model(
         EngineType.LLM,
         _lease=True,
         _leased_out=leased,
+        _allow_embedding=allow_embedding,
     )
     if leased:
         lease.model_id = leased[0]
@@ -3470,13 +3478,13 @@ async def server_status(_: bool = Depends(verify_api_key)):
             engine = entry.engine
             if engine is None:
                 continue
+            active_requests += engine.active_request_count()
             async_core = getattr(engine, "_engine", None)
             if async_core is None:
                 continue
             core = getattr(async_core, "engine", None)
             if core is None:
                 continue
-            active_requests += len(getattr(core, "_output_collectors", {}))
             sched = getattr(core, "scheduler", None)
             if sched is not None:
                 waiting_requests += len(getattr(sched, "waiting", []))
@@ -5460,7 +5468,7 @@ async def create_chat_completion(
             # Process response_format if specified
             if response_format and not tool_calls:
                 cleaned_text, _, is_valid, error = parse_json_output(
-                    cleaned_text or regular_content, response_format
+                    cleaned_text, response_format
                 )
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
@@ -8394,6 +8402,44 @@ def _token_strings(tokenizer, token_ids: list[int]) -> list[str]:
     return [tokenizer.decode([token_id]) for token_id in token_ids]
 
 
+def _embedding_tokenizer(engine: EmbeddingEngine, model: str | None):
+    # mlx-embeddings returns either a tokenizer or a processor that holds one.
+    # count_tokens() falls back to a whitespace estimate; /tokenize must not.
+    processor = engine.processor
+    # TokenizerWrapper forwards attributes but not len().
+    if type(processor).__name__ == "TokenizerWrapper":
+        processor = processor._tokenizer
+    for candidate in (processor, getattr(processor, "tokenizer", None)):
+        if callable(getattr(candidate, "encode", None)) and callable(
+            getattr(candidate, "decode", None)
+        ):
+            return candidate
+    raise InvalidRequestError(
+        f"Model '{model}' does not expose a tokenizer with encode/decode, "
+        "so it cannot be tokenized.",
+        field="model",
+    )
+
+
+def _encode_prompt(tokenizer, request) -> tuple[list[int], list[str] | None]:
+    token_ids = list(
+        tokenizer.encode(request.prompt, add_special_tokens=request.add_special_tokens)
+    )
+    if not request.return_token_strs:
+        return token_ids, None
+    return token_ids, _token_strings(tokenizer, token_ids)
+
+
+def _decode_token_ids(tokenizer, token_ids: list[int], vocab_size: int) -> str:
+    for i, token_id in enumerate(token_ids):
+        if token_id >= vocab_size:
+            raise InvalidRequestError(
+                f"Token id {token_id} is out of vocabulary (size {vocab_size}).",
+                field=f"tokens[{i}]",
+            )
+    return tokenizer.decode(token_ids)
+
+
 async def _tokenize_chat_messages(
     request: TokenizeChatRequest,
     engine: BaseEngine,
@@ -8459,6 +8505,9 @@ async def tokenize(
     /v1/chat/completions preparation and the engine's own prompt rendering, so
     the IDs are the ones generation would see. The context window is not
     enforced; ``max_model_len`` reports it instead.
+
+    Embedding models accept only ``prompt``, encoded with their tokenizer;
+    ``max_model_len`` is the per-input limit /v1/embeddings truncates at.
     """
     _reject_lone_surrogates(request)
     if isinstance(request, TokenizeChatRequest):
@@ -8477,27 +8526,44 @@ async def tokenize(
 
     lease = _LLMEngineLease()
     try:
-        engine = await get_engine_for_model(request.model, lease=lease)
+        engine = await get_engine_for_model(
+            request.model, lease=lease, allow_embedding=True
+        )
         await _raise_if_llm_lease_abort_requested(lease)
         resolved_model = _serving_model_id(lease, request.model)
-        tokenizer = engine.tokenizer
-        if isinstance(request, TokenizeChatRequest):
-            token_ids = await _tokenize_chat_messages(request, engine, resolved_model)
-        else:
-            token_ids = list(
-                tokenizer.encode(
-                    request.prompt, add_special_tokens=request.add_special_tokens
+        if isinstance(engine, EmbeddingEngine):
+            if isinstance(request, TokenizeChatRequest):
+                raise InvalidRequestError(
+                    "Embedding models have no chat template; tokenize a "
+                    "'prompt' instead of 'messages'.",
+                    field="messages",
                 )
+            tokenizer = _embedding_tokenizer(engine, request.model or resolved_model)
+            token_ids, token_strs = await engine.run_tokenizer(
+                lambda: _encode_prompt(tokenizer, request)
             )
+            max_model_len = engine.max_input_tokens(
+                get_embedding_max_length(request.model or resolved_model)
+            )
+        else:
+            tokenizer = engine.tokenizer
+            if isinstance(request, TokenizeChatRequest):
+                token_ids = await _tokenize_chat_messages(
+                    request, engine, resolved_model
+                )
+                token_strs = (
+                    _token_strings(tokenizer, token_ids)
+                    if request.return_token_strs
+                    else None
+                )
+            else:
+                token_ids, token_strs = _encode_prompt(tokenizer, request)
+            max_model_len = get_max_context_window(request.model or resolved_model)
         return TokenizeResponse(
             count=len(token_ids),
-            max_model_len=get_max_context_window(request.model or resolved_model),
+            max_model_len=max_model_len,
             tokens=token_ids,
-            token_strs=(
-                _token_strings(tokenizer, token_ids)
-                if request.return_token_strs
-                else None
-            ),
+            token_strs=token_strs,
         )
     finally:
         await lease.release()
@@ -8518,18 +8584,21 @@ async def detokenize(
 
     lease = _LLMEngineLease()
     try:
-        engine = await get_engine_for_model(request.model, lease=lease)
+        engine = await get_engine_for_model(
+            request.model, lease=lease, allow_embedding=True
+        )
         await _raise_if_llm_lease_abort_requested(lease)
-        tokenizer = engine.tokenizer
-        vocab_size = len(tokenizer)
-        for i, token_id in enumerate(request.tokens):
-            if token_id >= vocab_size:
-                raise InvalidRequestError(
-                    f"Token id {token_id} is out of vocabulary "
-                    f"(size {vocab_size}).",
-                    field=f"tokens[{i}]",
-                )
-        return DetokenizeResponse(prompt=tokenizer.decode(request.tokens))
+        if isinstance(engine, EmbeddingEngine):
+            tokenizer = _embedding_tokenizer(
+                engine, request.model or _serving_model_id(lease, request.model)
+            )
+            prompt = await engine.run_tokenizer(
+                lambda: _decode_token_ids(tokenizer, request.tokens, len(tokenizer))
+            )
+        else:
+            tokenizer = engine.tokenizer
+            prompt = _decode_token_ids(tokenizer, request.tokens, len(tokenizer))
+        return DetokenizeResponse(prompt=prompt)
     finally:
         await lease.release()
 
@@ -9040,7 +9109,7 @@ async def create_response(
             # Process response_format if specified
             if response_format and not tool_calls:
                 cleaned_text, _, is_valid, error = parse_json_output(
-                    cleaned_text or regular_content, response_format
+                    cleaned_text, response_format
                 )
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")

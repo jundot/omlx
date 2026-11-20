@@ -287,6 +287,29 @@ final class IntegrationsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.webSearchTestOK, false)
         XCTAssertEqual(vm.webSearchTestMessage, "Provider rate limited")
     }
+
+    /// Local mode shows the API key masked and copies the real one.
+    func testClaudeEnvRecipeMasksTheApiKey() async throws {
+        let (client, session) = try makeClient()
+        defer { session.invalidateAndCancel() }
+        let noKey = IntegrationsScreenVM()
+        await noKey.load(client: client)
+        noKey.claudeMode = "local"
+        XCTAssertEqual(noKey.claudeEnvRecipe, noKey.claudeEnvRecipeDisplay)
+        XCTAssertFalse(noKey.claudeEnvRecipe.contains("ANTHROPIC_AUTH_TOKEN="))
+
+        server.setApiKey("sk-live-secret")
+        let vm = IntegrationsScreenVM()
+        await vm.load(client: client)
+        vm.claudeMode = "local"
+        XCTAssertTrue(vm.claudeEnvRecipe.contains("sk-live-secret"))
+        XCTAssertFalse(vm.claudeEnvRecipeDisplay.contains("sk-live-secret"))
+        XCTAssertEqual(vm.claudeEnvRecipeDisplay.replacingOccurrences(of: "••••••••", with: "sk-live-secret"),
+                       vm.claudeEnvRecipe)
+
+        vm.claudeMode = "cloud"
+        XCTAssertEqual(vm.claudeEnvRecipe, vm.claudeEnvRecipeDisplay)
+    }
 }
 
 private final class IntegrationsSettingsServer: @unchecked Sendable {
@@ -300,6 +323,7 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
     private var heldPost: (@Sendable () -> Void)?
     private var recordedSearchRequests: [[String: Any]] = []
     private var searchResponse: [String: Any] = [:]
+    private var stats: [String: Any] = [:]
 
     var searchRequests: [[String: Any]] { lock.withLock { recordedSearchRequests } }
     var patches: [[String: Any]] { lock.withLock { recordedPatches } }
@@ -319,8 +343,22 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
             heldPost = nil
             recordedSearchRequests = []
             searchResponse = ["ok": true, "results": [["title": "Example", "url": "https://example.com", "snippet": "Example result"]]]
+            stats = Self.statsBody(apiKey: "")
         }
     }
+
+    /// Required stats aggregates plus the fields the command builders read.
+    private static func statsBody(apiKey: String) -> [String: Any] {
+        [
+            "total_tokens_served": 0, "total_cached_tokens": 0, "cache_efficiency": 0.0,
+            "total_prompt_tokens": 0, "total_completion_tokens": 0, "total_requests": 0,
+            "avg_prefill_tps": 0.0, "avg_generation_tps": 0.0, "uptime_seconds": 0.0,
+            "host": "127.0.0.1", "port": 8000, "api_key": apiKey, "cli_prefix": "omlx",
+            "active_models": ["models": [Any]()],
+        ]
+    }
+
+    func setApiKey(_ apiKey: String) { lock.withLock { stats = Self.statsBody(apiKey: apiKey) } }
 
     func setSearchResponse(_ body: [String: Any]) { lock.withLock { searchResponse = body } }
 
@@ -353,6 +391,8 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
         switch (request.httpMethod, request.url?.path) {
         case ("GET", "/admin/api/global-settings"):
             body = settings
+        case ("GET", "/admin/api/stats"):
+            body = stats
         case ("GET", "/admin/api/models"):
             modelReadCount += 1
             if modelReadsRejected {

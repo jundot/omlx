@@ -11,7 +11,7 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from omlx_cuda_helper import tensors  # noqa: E402
+from omlx_cuda_helper import oqh, tensors  # noqa: E402
 from omlx_cuda_helper.families import qwen3_5  # noqa: E402
 from omlx_cuda_helper.families.qwen3_5.stage import load_stage  # noqa: E402
 
@@ -152,3 +152,86 @@ def test_plan_counts_only_what_a_stage_loads():
     # A Hugging Face checkpoint needs the host's conversion first.
     with pytest.raises(ValueError, match="MLX layout"):
         qwen3_5.check_layout({"model.language_model.layers.0.mlp.up_proj.weight": 0})
+
+
+def _pack(codes: np.ndarray, bits: int) -> np.ndarray:
+    """Codes [rows, k] in MLX affine packing: one little-endian bit stream a row."""
+    words = np.zeros((codes.shape[0], codes.shape[1] * bits // 32), np.uint64)
+    for j in range(codes.shape[1]):
+        word, shift = divmod(bits * j, 32)
+        words[:, word] |= codes[:, j].astype(np.uint64) << shift
+        if shift + bits > 32:
+            words[:, word + 1] |= codes[:, j].astype(np.uint64) >> (32 - shift)
+    return (words & 0xFFFFFFFF).astype(np.uint32)
+
+
+def _bf16(a: np.ndarray) -> mx.array:
+    return mx.array(a.astype(np.float32)).astype(mx.bfloat16)
+
+
+@pytest.mark.skipif(not mx.cuda.is_available(), reason="oQh kernels run on CUDA")
+@pytest.mark.parametrize(
+    "bits, group, block", [(3, 0, 256), (6, 0, 128), (4, 128, 256)]
+)
+def test_an_oqh_linear_equals_its_weight_rotated_back(bits, group, block):
+    rng = np.random.default_rng(bits)
+    n, k = 64, 512
+    codes = rng.integers(0, 2**bits, (n, k))
+    signs = rng.choice([-1.0, 1.0], k)
+    prefix = "layers.0.mlp.down_proj"
+    weights = {
+        f"{prefix}.weight": mx.array(_pack(codes, bits)),
+        f"{prefix}.oqh_signs": _bf16(signs.reshape(-1, block)),
+    }
+    if group:
+        scales = np.array(
+            _bf16(rng.uniform(0.01, 0.02, (n, k // group))).astype(mx.float32)
+        )
+        biases = np.array(
+            _bf16(rng.normal(0, 0.05, (n, k // group))).astype(mx.float32)
+        )
+        rotated = codes * scales.repeat(group, 1) + biases.repeat(group, 1)
+        weights[f"{prefix}.oqh_scales"] = _bf16(scales)
+        weights[f"{prefix}.oqh_biases"] = _bf16(biases)
+    else:
+        rscale = np.array(_bf16(rng.uniform(0.01, 0.02, n)).astype(mx.float32))
+        rotated = rscale[:, None] * (codes - (2**bits - 1) / 2)
+        weights[f"{prefix}.rscale"] = _bf16(rscale)
+    # x is rotated as x diag(signs) H / sqrt(b) per block, so the plain weight
+    # is W H / sqrt(b) diag(signs).
+    hadamard = np.ones((1, 1))
+    while hadamard.shape[0] < block:
+        hadamard = np.block([[hadamard, hadamard], [hadamard, -hadamard]])
+    blocks = np.kron(np.eye(k // block), hadamard / np.sqrt(block))
+    plain = rotated @ blocks * signs
+    x = rng.normal(0, 1, (8, k))
+    got = np.array(tensors.Linear(weights, prefix, None)(_bf16(x)).astype(mx.float32))
+    want = x @ plain.T
+    assert np.linalg.norm(got - want) / np.linalg.norm(want) < 1e-2
+
+
+@pytest.mark.skipif(not mx.cuda.is_available(), reason="oQh kernels run on CUDA")
+def test_the_oqh_rotation_keeps_the_host_butterfly_order():
+    # The host rotates in float32 from bit 0 up and rounds once: equal bits.
+    signs = _bf16(np.random.default_rng(0).choice([-1.0, 1.0], 1024))
+    for block in (128, 256):
+        for dtype in (mx.bfloat16, mx.float32):
+            x = (mx.random.normal((64, 1024), key=mx.random.key(block)) * 3).astype(
+                dtype
+            )
+            got = oqh.rotate(x, signs, block, dtype=mx.bfloat16)
+            want = oqh.reference_rotate(x, signs, block, mx.bfloat16)
+            assert mx.array_equal(got, want).item()
+
+
+def test_the_next_conv_window_does_not_hold_the_chunk():
+    mixer = load_stage(FIXTURE / "model", 0, 1).layers[0].mixer
+    qkv = mx.random.normal((1, 8192, mixer.taps.shape[0])).astype(mx.bfloat16)
+    mx.eval(qkv)
+    mx.synchronize()
+    before = mx.get_active_memory()
+    *outputs, window = mixer.prework(qkv, None)
+    mx.eval(*outputs, window)
+    del outputs
+    mx.synchronize()
+    assert mx.get_active_memory() - before < qkv.nbytes // 16

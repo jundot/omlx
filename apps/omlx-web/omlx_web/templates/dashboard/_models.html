@@ -134,7 +134,11 @@
                                                     <span class="badge bg-neutral-100 text-neutral-500 border-neutral-200 flex-shrink-0 whitespace-nowrap"
                                                           :title="window.t('settings.models.table.gguf_tooltip')">GGUF</span>
                                                 </template>
-                                                <button x-data="{ copied: false }"
+                                                <template x-if="managerModelInfo(model.name)?.settings?.lora_adapter">
+                                                    <span class="badge bg-neutral-100 text-neutral-500 border-neutral-200 flex-shrink-0 whitespace-nowrap"
+                                                          :title="managerModelInfo(model.name)?.settings?.lora_adapter">LoRA</span>
+                                                </template>
+                                                <button x-data="{ copied: false }" x-show="model.model_format !== 'lora'"
                                                         @click.stop="copyToClipboard(apiModelName(model.name)); copied = true; setTimeout(() => copied = false, 2000)"
                                                         class="p-1 rounded-md transition-all flex-shrink-0"
                                                         :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
@@ -157,12 +161,13 @@
                                             <!-- Type -->
                                             <div class="hidden sm:flex w-24 justify-center">
                                                 <span class="badge bg-neutral-100 text-neutral-500 border-neutral-200 uppercase tracking-wide"
-                                                      x-text="managerModelInfo(model.name)?.model_type || 'llm'"></span>
+                                                      :title="model.model_format === 'lora' ? window.t('models.manager.lora_tooltip') : ''"
+                                                      x-text="model.model_format === 'lora' ? 'lora' : (managerModelInfo(model.name)?.model_type || 'llm')"></span>
                                             </div>
                                             <!-- Size -->
                                             <div class="hidden sm:block w-24 text-center text-xs text-neutral-500 tabular-nums" x-text="model.size_formatted"></div>
-                                            <!-- Actions -->
-                                            <div class="flex items-center justify-end gap-1 shrink-0">
+                                            <!-- Actions: as wide as the header column so rows without settings align -->
+                                            <div class="flex items-center justify-end gap-1 shrink-0 min-w-20">
                                                 <template x-if="managerModelInfo(model.name)">
                                                     <button @click="openModelSettingsFromManager(model.name)"
                                                             class="p-1.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all"
@@ -1459,6 +1464,21 @@
                                         </button>
                                     </div>
                                     <div x-show="oqEnhanced" x-cloak x-transition class="pl-4 border-l border-neutral-200 space-y-3">
+                                        <div x-show="oqSelectedModelSupportsOqh()" class="flex items-center justify-between">
+                                            <div class="flex-1 min-w-0 pr-3">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.hadamard_label') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.hadamard_help') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    role="switch"
+                                                    :aria-checked="oqHadamard"
+                                                    @click="oqHadamard = !oqHadamard"
+                                                    :class="oqHadamard ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="oqHadamard ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
                                         <div class="flex items-center justify-between">
                                             <div class="flex-1 min-w-0 pr-3">
                                                 <span class="text-sm text-neutral-600">{{ t('models.oq.imatrix_reuse_cache') }}</span>
@@ -2224,19 +2244,19 @@
                                         {{ t('models.detail.view_on_hf') }}
                                     </a>
                                     <div class="flex items-center gap-2">
-                                        <span x-show="!hfModelDetail.is_adapter && !hfFitsDisk(hfShowsUpdate() ? hfUpdateSize() : hfSelectionSize())" x-cloak
+                                        <span x-show="!hfFitsDisk(hfShowsUpdate() ? hfUpdateSize() : hfSelectionSize())" x-cloak
                                               class="text-xs text-red-600">{{ t('models.recommend.not_enough_space') }}</span>
                                         <button @click="closeModelDetail()"
                                                 class="px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">
                                             {{ t('models.detail.cancel') }}
                                         </button>
                                         <template x-if="hfModelDetail.is_adapter">
-                                            <span class="px-4 py-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-1.5">
-                                                <i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i>
-                                                {{ t('models.detail.lora_warning') }}
+                                            <span class="px-4 py-2 text-xs font-medium text-neutral-600 bg-neutral-50 border border-neutral-200 rounded-lg flex items-center gap-1.5">
+                                                <i data-lucide="info" class="w-3.5 h-3.5"></i>
+                                                {{ t('models.detail.lora_info') }}
                                             </span>
                                         </template>
-                                        <span x-show="!hfModelDetail.is_adapter && hfModelDetail.layout !== 'gguf' && isModelDownloaded(hfModelDetail.repo_id) && !hfShowsUpdate()" x-cloak
+                                        <span x-show="hfModelDetail.layout !== 'gguf' && isModelDownloaded(hfModelDetail.repo_id) && !hfShowsUpdate()" x-cloak
                                               class="badge bg-green-50 text-green-700 border-green-200 shrink-0 gap-1">
                                             <i data-lucide="check" class="w-3 h-3"></i>
                                             {{ t('models.browse.downloaded') }}
@@ -2255,7 +2275,7 @@
                                             <span class="px-4 py-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg max-w-md"
                                                   x-text="hfModelDetail.unsupported_reason"></span>
                                         </template>
-                                        <template x-if="!hfModelDetail.is_adapter && !hfModelDetail.unsupported_reason && (hfModelDetail.layout === 'gguf' || !isModelDownloaded(hfModelDetail.repo_id))">
+                                        <template x-if="!hfModelDetail.unsupported_reason && (hfModelDetail.layout === 'gguf' || !isModelDownloaded(hfModelDetail.repo_id))">
                                             <div class="flex items-center gap-2">
                                                 <button @click="submitHFDownload(null)"
                                                         :disabled="hfDownloading || !hfFitsDisk(hfDownloadAllSize())"
