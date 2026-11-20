@@ -57,7 +57,11 @@ from .cache.deepseek_v41_delta import is_delta as is_deepseek_v41_delta
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
-from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
+from .cache.prefix_cache import (
+    _RESTORE_POOL_FLUSH_BYTES,
+    BlockAwarePrefixCache,
+    cachelist_pm_member_plan,
+)
 from .decode_activity import get_decode_activity
 from .exceptions import (
     InvalidRequestError,
@@ -1143,7 +1147,33 @@ def _patched_merge_caches(caches):
                     f"{type(layer_cache)} does not yet support batching with history"
                 )
         return merged
-    return _original_merge_caches(caches)
+    # Merge layer by layer and drop each donor layer once merged; the stock
+    # loop keeps every request's cache alive until the last layer.
+    merged = []
+    # Indexed: zip/enumerate would keep the last donor tuple alive.
+    for i in range(len(caches[0])):
+        if not hasattr(caches[0][i], "merge"):
+            raise ValueError(
+                f"{type(caches[0][i])} does not yet support batching with history"
+            )
+        layer = caches[0][i].merge([c[i] for c in caches])
+        for c in caches:
+            if isinstance(c, list):
+                c[i] = None
+        _eval_cache_layer(layer)
+        merged.append(layer)
+    return merged
+
+
+def _eval_cache_layer(layer: Any) -> None:
+    """Materialize a merged or joined layer and flush the pool of its donors."""
+    try:
+        state = layer.state
+    except (AttributeError, NotImplementedError):
+        state = None
+    if state is not None:
+        mx.eval(state)
+    BlockAwarePrefixCache._flush_restore_pool_if_over(_RESTORE_POOL_FLUSH_BYTES)
 
 
 def _patched_extend_cache(cache_a, cache_b):
@@ -1154,17 +1184,17 @@ def _patched_extend_cache(cache_a, cache_b):
     # Materialize one layer before joining the next; otherwise all old,
     # padded and joined banks coexist in the lazy graph. The donor is consumed.
     extended = []
-    for i, (ca, cb) in enumerate(zip(cache_a, cache_b)):
+    # Indexed: zip/enumerate would keep the last donor tuple alive.
+    for i in range(min(len(cache_a), len(cache_b))):
+        ca, cb = cache_a[i], cache_b[i]
         layer = _extend_cache_layer(ca, cb)
         if isinstance(cache_b, list):
             cache_b[i] = None
+        # A singleton converted to a new batch layer is a donor too.
+        if isinstance(cache_a, list) and layer is not ca:
+            cache_a[i] = None
         del ca, cb
-        try:
-            state = layer.state
-        except (AttributeError, NotImplementedError):
-            state = None
-        if state is not None:
-            mx.eval(state)
+        _eval_cache_layer(layer)
         extended.append(layer)
     return extended
 
