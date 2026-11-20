@@ -805,7 +805,14 @@ class TestExceptionHandlers:
             headers={"content-type": "application/json"},
         )
         assert response.status_code == 400
-        assert response.json()["error"]["param"] == param
+        error = response.json()["error"]
+        if path.startswith("/v1/messages"):
+            # Anthropic envelope: the offending field is named in the message.
+            assert response.json()["type"] == "error"
+            assert error["type"] == "invalid_request_error"
+            assert param in error["message"]
+        else:
+            assert error["param"] == param
 
     def test_non_api_validation_error_with_value_error_ctx_returns_422(self):
         """A ValueError-raising validator on a non-/v1/ route must 422, not 500.
