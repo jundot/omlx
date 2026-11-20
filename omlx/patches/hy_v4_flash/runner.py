@@ -72,7 +72,7 @@ def load_weights(model, artifact):
     """Check the complete index; evaluate one shard at a time, never all source tensors."""
     import mlx.core as mx
 
-    from .quant_io import read_header
+    from .quant_io import checkpoint_dtype, read_header
 
     quantize_trunk(model, artifact.config.get("trunk_quantization"))
     shapes = weight_shapes(model)
@@ -86,14 +86,10 @@ def load_weights(model, artifact):
     for key, shard in artifact.weight_map.items():
         by_file[shard].add(key)
     dtypes = {"U32": mx.uint32, "I32": mx.int32, "F32": mx.float32, "BF16": mx.bfloat16}
-    expected_dtypes = {}
-    for bank in artifact.config.get("omlx_oqh", {}).get("tensors", {}):
-        expected_dtypes.update({f"{bank}.{field}": dtype for field, dtype in
-                               (("weight", "U32"), ("oqh_signs", "BF16"),
-                                ("oqh_scales", "BF16"), ("oqh_biases", "BF16"))})
-    for module in (artifact.config.get("trunk_quantization") or {}).get("modules", []):
-        expected_dtypes.update({f"{module}.{field}": dtype for field, dtype in
-                               (("weight", "U32"), ("scales", "BF16"), ("biases", "BF16"))})
+    packed_modules = set(artifact.config.get("omlx_oqh", {}).get("tensors", {}))
+    packed_modules.update(
+        (artifact.config.get("trunk_quantization") or {}).get("modules", [])
+    )
     plan = []
     for shard, keys in sorted(by_file.items()):
         path = member(artifact.root, shard)
@@ -103,13 +99,19 @@ def load_weights(model, artifact):
             raise ValueError(f"{shard}: index and actual header disagree")
         for name, view in header.items():
             spec = view.spec
-            if spec.shape != shapes[name] or spec.dtype != expected_dtypes.get(name, spec.dtype):
-                raise ValueError(f"{shard}: wrong checkpoint tensor type or shape: {name}")
+            if spec.shape != shapes[name] or spec.dtype != checkpoint_dtype(
+                name, packed_modules
+            ):
+                raise ValueError(
+                    f"{shard}: wrong checkpoint tensor type or shape: {name}"
+                )
         plan.append((path, header))
     for path, header in plan:
         weights = mx.load(str(path))
         if weights.keys() != header.keys():
-            raise ValueError(f"{path.name}: loaded tensors disagree with validated header")
+            raise ValueError(
+                f"{path.name}: loaded tensors disagree with validated header"
+            )
         for n, array in weights.items():
             if (
                 tuple(array.shape) != shapes[n]
@@ -192,9 +194,9 @@ def greedy(model, ids, *, eos, count, chunk):
         "prefill_seconds": first - start,
         "decode_steps": steps,
         "decode_seconds": finished - first,
-        "decode_tokens_per_second": steps / (finished - first)
-        if steps and finished > first
-        else None,
+        "decode_tokens_per_second": (
+            steps / (finished - first) if steps and finished > first else None
+        ),
     }
 
 
@@ -277,7 +279,10 @@ def main(argv=None):
         return convert(argv[1:])
     p = argparse.ArgumentParser(prog="omlx hy4-flash", description=__doc__)
     subs = p.add_subparsers(dest="command", required=True)
-    subs.add_parser("convert", help="stream and verify an oQh text export (8-bit default, --bits 4/5/6, --trunk-bits 8)")
+    subs.add_parser(
+        "convert",
+        help="stream and verify an oQh text export (8-bit default, --bits 4/5/6, --trunk-bits 8)",
+    )
     subs.add_parser("stage-tables", help="verify and stage only the three late tables")
     for cmd, helptext in [
         ("inspect", "check the local oQh export"),

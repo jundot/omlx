@@ -56,9 +56,12 @@ def _layers(tables):
         )
         layer.bind_tables(tables)
         layers.append(layer)
-    return SimpleNamespace(
-        layers=[SimpleNamespace(engram_layer=layer) for layer in layers]
-    ), layers
+    return (
+        SimpleNamespace(
+            layers=[SimpleNamespace(engram_layer=layer) for layer in layers]
+        ),
+        layers,
+    )
 
 
 @pytest.mark.parametrize("fp8", [True, False])
@@ -448,9 +451,9 @@ def test_verified_rows_prefix_dma_and_all_logits_bit_exact(artifact, monkeypatch
         def delayed(fd, n, off):
             if fd == late:
                 reading.set()
-                assert allow_disk.wait(10), (
-                    "decoder prefix was not submitted during late IO"
-                )
+                assert allow_disk.wait(
+                    10
+                ), "decoder prefix was not submitted during late IO"
             return pread(fd, n, off)
 
         def submit(streams):

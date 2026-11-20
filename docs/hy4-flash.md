@@ -22,7 +22,7 @@ python -m omlx.cli hy4-flash stage-tables --model "$OUT" --source "$SRC" --ssd-d
 python -m omlx.cli hy4-flash verify-tables --model "$OUT" --source "$SRC" --ssd-dir "$SSD" --receipt "$RECEIPT"
 ```
 
-`$OUT` must not exist yet. `stage-tables` is optional: it copies the three late tables to `$SSD` on the internal SSD. If you skip it, pass `--ssd-dir "$SRC"`. Keep `$SRC` and `$SSD` immutable after verification. `$RECEIPT` must be a new path in a private directory. Table files must be plain files: use `--local-dir`, not symlinked Hugging Face cache snapshots.
+`$OUT` must not exist yet. `stage-tables` is optional: it copies the three late tables to `$SSD` on the internal SSD. If you skip it, pass `--ssd-dir "$SRC"`. `inspect` validates the asset hashes, core shard sizes, quantization metadata and external table locators. Add `--verify-core` to hash the core payloads. Keep `$SRC` and `$SSD` immutable after verification. `$RECEIPT` must be a new path in a private directory. Table files must be plain files: use `--local-dir`, not symlinked Hugging Face cache snapshots.
 
 ## Generate
 
@@ -37,7 +37,7 @@ MLX_ENABLE_TF32=0 python -m omlx.cli hy4-flash generate \
 - **Memory:** all expert banks are loaded resident: about 156 GiB at 8 bits, or about 87 GiB at 4 bits (about 151 / 81 GiB with `--trunk-bits 8`), plus KV and scratch. The weights must fit in directly free memory: with too little, macOS pages GPU buffers and decode drops below 1 tok/s. Use `--first-engram pread` with 4-bit on 128 GB Macs. Run one model at a time on a machine with enough free unified memory. The command does not change wired-memory limits or swap.
 - **`--first-engram`:** `pread` (the default) never maps the first table; it reads rows on demand like the late tables. Explicit `mlock` adds about 29.5 GiB of wired memory on top of core weights, KV, scratch and OS headroom. The CLI validates the table receipt, identities and headers before loading the core, and does not fall back if wiring fails.
 - **`--prepare-engrams`:** starts each token's Engram row reads before the decoder layers.
-- **`--precast-lm-head`:** keeps the FP32 output projection resident (+0.69 GiB) instead of casting it on every token. Logits are unchanged.
+- **`--precast-lm-head`:** precasts the BF16 output projection to FP32 once (+0.69 GiB). With an 8-bit trunk, the head already uses FP32 activations and the flag adds no resident memory.
 - **Output:** `--json` reports prefill time, decode steps and decode tok/s separately, along with token IDs, MLX peak memory and per-table Engram counters. `MLX_ENABLE_TF32=0` keeps the FP32 router and indexer math reproducible.
 
 ## Historical measurements (MLX 0.32.4)
@@ -50,7 +50,7 @@ The following are single-stream **greedy decode** measurements from an earlier l
 | 4-bit experts, packed 8-bit trunk | 30.87 / 30.61 tok/s | 30.11 tok/s |
 | 4-bit experts, packed 8-bit trunk (instrumented repeat) | 30.17 / 30.17 tok/s | 29.97 tok/s |
 
-The public 4-bit model repository currently hosts the packed 8-bit trunk variant. Local profile result IDs: `goal1-baseline`, `goal12-t8` and `goal32-t8`. The instrumented repeat took 5.055 / 4.646 / 17.400 s for prefill plus decode, versus 5.063 / 5.067 / 19.370 s for the BF16 trunk (load excluded). Slower prefill nearly erased the short coding gain. Against an oQh8 reference continuation, teacher-forced top-1 agreement stayed at 96.90% for coding and fell from 95.35% to 93.80% for prose. That is not free-run equality. Boundary samples found no open or mapped expert shard files in the instrumented run; they do not prove continuous residency or zero expert I/O.
+The public 4-bit model repository currently hosts the packed 8-bit trunk variant. The instrumented repeat took 5.055 / 4.646 / 17.400 s for prefill plus decode, versus 5.063 / 5.067 / 19.370 s for the BF16 trunk (load excluded). Slower prefill nearly erased the short coding gain. Against an oQh8 reference continuation, teacher-forced top-1 agreement stayed at 96.90% for coding and fell from 95.35% to 93.80% for prose. That is not free-run equality. Boundary samples found no open or mapped expert shard files in the instrumented run; they do not prove continuous residency or zero expert I/O.
 
 A separate historical CLI smoke used a different, 36-token prompt with the packed 4-bit artifact: 0.641 s prefill, 255 decode steps at 30.74 tok/s, 23.03 s setup. It is not part of the profile comparison.
 

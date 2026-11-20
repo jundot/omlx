@@ -127,6 +127,42 @@ def read_header(f, *, detached=False) -> dict[str, View]:
     return ordered
 
 
+def valid_bank_spec(spec):
+    return (
+        isinstance(spec, dict)
+        and spec.keys() == {"bits", "block", "group_size"}
+        and all(type(value) is int for value in spec.values())
+        and spec["bits"] in SUPPORTED_BITS
+        and spec["block"] == BLOCK
+        and spec["group_size"] == GROUP
+    )
+
+
+def checkpoint_dtype(name, packed_modules):
+    """On-disk types of the pinned text checkpoint after conversion."""
+    module, _, field = name.rpartition(".")
+    if field == "weight" and module in packed_modules:
+        return "U32"
+    if name.endswith(".engram_layer.lookup_table"):
+        return "I32"
+    if (
+        name.startswith("model.hc_head.")
+        or ".hc_pre." in name
+        or name.endswith(
+            (
+                ".mlp.gate.e_score_correction_bias",
+                ".self_attn.learnable_sink_param",
+                ".compressed_indexer.intra_group_ape",
+                ".compressed_indexer.key_gate_projection.weight",
+                ".compressed_indexer.key_value_projection.weight",
+                ".compressed_indexer.key_norm.weight",
+            )
+        )
+    ):
+        return "F32"
+    return "BF16"
+
+
 def chunks(f, length, limit):
     """Exactly length bytes starting at the current file position."""
     require(length >= 0 and limit > 0, "invalid chunk extent")

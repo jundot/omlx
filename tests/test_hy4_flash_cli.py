@@ -13,6 +13,7 @@ import mlx.nn as nn
 import pytest
 
 from omlx.patches.hy_v4_flash import artifact as ar
+from omlx.patches.hy_v4_flash.residency import _PINS
 from omlx.patches.hy_v4_flash.runner import greedy, load_weights
 
 
@@ -51,6 +52,22 @@ def export(tmp_path):
         "schema": ar.SCHEMA,
         "text_only": True,
         "source": {"repo": ar.SOURCE, "revision": ar.REVISION},
+        "external_tables": {
+            str(block): {
+                "block": block,
+                "source_key": f"model.layers.{block}.engram_layer.multi_head_embedding.embedding.weight",
+                "source_shard": f"model-{4 - i:05d}-of-00148.safetensors",
+                "source_offset": 152,
+                "dtype": "BF16",
+                "shape": [(size - 152) // 192, 96],
+                "row_stride": 192,
+                "byte_length": size - 152,
+                "file_size": size,
+                "file_sha256": digest,
+                "payload_sha256": "0" * 64,
+            }
+            for i, (block, (size, digest)) in enumerate(_PINS.items())
+        },
         "assets": {
             n: record(root / n)
             for n in ("config.json", ar.INDEX, "chat_template.jinja", "tokenizer.json")
@@ -72,6 +89,50 @@ def test_integrity_and_optional_core_rehash(export):
         ar.Artifact.open(export)
 
 
+def test_inspect_rejects_missing_table_locator(export, capsys):
+    from omlx.patches.hy_v4_flash.runner import main
+
+    manifest = export / "manifest.json"
+    doc = json.loads(manifest.read_bytes())
+    del doc["external_tables"]["31"]
+    manifest.write_text(json.dumps(doc))
+    with pytest.raises(SystemExit) as exc:
+        main(["inspect", "--model", str(export)])
+    assert exc.value.code == 1
+    assert "four external Engram blocks" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "module, leaf, wrong_dtype",
+    [
+        ("engram_layer", "lookup_table", mx.float32),
+        ("self_attn", "learnable_sink_param", mx.int32),
+        ("input_layernorm", "weight", mx.uint32),
+    ],
+)
+def test_native_tensor_type_checked_before_payloads(
+    tmp_path, monkeypatch, module, leaf, wrong_dtype
+):
+    model = nn.Module()
+    model.model = nn.Module()
+    layer = nn.Module()
+    layer[module] = nn.Module()
+    layer[module][leaf] = mx.zeros((2,))
+    model.model.layers = [layer]
+    key = f"model.layers.0.{module}.{leaf}"
+    shard = "part.safetensors"
+    mx.save_safetensors(
+        str(tmp_path / shard),
+        {key: mx.zeros((2,), dtype=wrong_dtype)},
+        metadata={"format": "mlx"},
+    )
+    monkeypatch.setattr(mx, "load", lambda *_: pytest.fail("loaded invalid payload"))
+    with pytest.raises(ValueError, match=key):
+        load_weights(
+            model, SimpleNamespace(root=tmp_path, config={}, weight_map={key: shard})
+        )
+
+
 def test_reject_indirect_and_escaping_paths(export, tmp_path):
     for bad in ("../src", "./core.safetensors", "/tmp/a", "a/b", ".."):
         with pytest.raises(ValueError):
@@ -84,7 +145,7 @@ def test_reject_indirect_and_escaping_paths(export, tmp_path):
 
 def test_strict_physical_shape_loading(tmp_path):
     layer = nn.Linear(3, 4, bias=False)
-    val = mx.arange(12).reshape(4, 3).astype(mx.float32)
+    val = mx.arange(12).reshape(4, 3).astype(mx.bfloat16)
     mx.save_safetensors(
         str(tmp_path / "s.safetensors"), {"weight": val}, metadata={"format": "mlx"}
     )
@@ -113,7 +174,7 @@ def test_shards_preserve_previously_assigned_array_list_entries(tmp_path):
         index[name] = f"shard-{i}.safetensors"
         mx.save_safetensors(
             str(tmp_path / index[name]),
-            {name: mx.array([float(i + 10)])},
+            {name: mx.array([i + 10], dtype=mx.bfloat16)},
             metadata={"format": "mlx"},
         )
     load_weights(model, SimpleNamespace(root=tmp_path, weight_map=index, config={}))

@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 
 mx = pytest.importorskip("mlx.core")
-from omlx.custom_kernels.oqh import fast  # noqa: E402
+from mlx.utils import tree_unflatten  # noqa: E402
+
 from omlx.patches.hy_v4_flash.experts import build_mlp, rotate_activation  # noqa: E402
 
 _BANKS = ("experts.gate_up_proj", "experts.down_proj")
@@ -173,7 +174,11 @@ def _run(args, block, packed=(), bits=8):
     )
     w, x = _source(args, block)
     model = build_mlp(args, block)
-    model.load_weights(list(_checkpoint(w, packed, bits).items()), strict=True)
+    # The standalone runtime assigns tensors to its existing expert banks.
+    # The server's process-wide load_weights hook would replace those banks.
+    model.update(
+        tree_unflatten(list(_checkpoint(w, packed, bits).items())), strict=True
+    )
     got = model(mx.array(x).astype(mx.bfloat16))
     assert got.dtype == mx.bfloat16
     ref = _reference(args, w, x)
@@ -186,16 +191,13 @@ def test_dense_unclamped_swiglu_and_sandwich_norm():
     assert _run(_args(), 0) < 0.007
 
 
-_NEEDS_OQH = pytest.mark.skipif(not fast.has_native(), reason="oQh kernels not built")
-
-
 @pytest.mark.parametrize(
     "packed",
     [
         pytest.param((), id="bf16"),
-        pytest.param(_BANKS[:1], id="packed-gate-up", marks=_NEEDS_OQH),
-        pytest.param(_BANKS[1:], id="packed-down", marks=_NEEDS_OQH),
-        pytest.param(_BANKS, id="packed-both", marks=_NEEDS_OQH),
+        pytest.param(_BANKS[:1], id="packed-gate-up"),
+        pytest.param(_BANKS[1:], id="packed-down"),
+        pytest.param(_BANKS, id="packed-both"),
     ],
 )
 def test_latent_and_shared_experts_match_bf16_source(packed):
@@ -203,7 +205,6 @@ def test_latent_and_shared_experts_match_bf16_source(packed):
     assert err < (0.025 if packed else 0.007)
 
 
-@_NEEDS_OQH
 @pytest.mark.parametrize("bits, tol", [(4, 0.18), (5, 0.09), (6, 0.055)])
 def test_lower_bit_packed_experts_match_bf16_source(bits, tol):
     assert _run(_args(), 1, _BANKS, bits) < tol

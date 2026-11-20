@@ -44,32 +44,9 @@ def _rows(compressed, layer, multipliers):
     return rows
 
 
-def _read_bits(tables, block, rows):
-    """One worker per verified FD; caller holds the provider lifetime lock."""
-    table = tables._files[block]
-    spec = table.spec
-    unique, inverse = np.unique(rows.ravel(), return_inverse=True)
-    table.unchanged()
-    if block == residency._BLOCKS[0] and tables._hot is not None:
-        values = tables._hot.read_rows(spec, unique)
-    else:
-        values = np.empty((len(unique), spec.width), dtype="<u2")
-        for i, row in enumerate(unique):
-            raw = residency._read_exact(
-                table.fd, spec.stride, spec.offset + int(row) * spec.stride
-            )
-            values[i] = np.frombuffer(raw, dtype="<u2")
-            table.pread_calls += 1
-            table.pread_bytes += spec.stride
-    table.unchanged()
-    table.requested_rows += rows.size
-    table.unique_rows += len(unique)
-    return values[inverse].reshape(*rows.shape, spec.width)
-
-
 def _publish(slot, tables, block, rows):
     try:
-        bits = _read_bits(tables, block, rows)
+        bits = tables._read_rows(block, rows)
     except BaseException as exc:
         slot.set_exception(exc)
     else:

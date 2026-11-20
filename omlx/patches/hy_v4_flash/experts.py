@@ -13,12 +13,7 @@ import mlx.nn as nn
 
 from omlx.custom_kernels.oqh import fast
 
-from .quant_io import SUPPORTED_BITS
-
-_BLOCK = 256
-_GROUP = 128
-_BITS = 8
-_SPEC = {"bits": _BITS, "block": _BLOCK, "group_size": _GROUP}
+from .quant_io import BITS, BLOCK, GROUP, SUPPORTED_BITS, valid_bank_spec
 
 
 def _packed_paths(args):
@@ -45,16 +40,10 @@ def _packed_paths(args):
     for path, spec in entries.items():
         if path not in allowed:
             raise ValueError(f"unsupported HY-V4-Flash oQh tensor path: {path}")
-        if (
-            not isinstance(spec, dict)
-            or set(spec) != set(_SPEC)
-            or not all(type(v) is int for v in spec.values())
-            or spec["bits"] not in SUPPORTED_BITS
-            or {k: v for k, v in spec.items() if k != "bits"}
-            != {k: v for k, v in _SPEC.items() if k != "bits"}
-        ):
+        if not valid_bank_spec(spec):
             raise ValueError(
-                f"{path}: expected oQh {_SPEC} with bits in {SUPPORTED_BITS}, got {spec!r}"
+                f"{path}: expected oQh block {BLOCK}, group size {GROUP} "
+                f"and bits in {SUPPORTED_BITS}, got {spec!r}"
             )
     return entries
 
@@ -158,14 +147,14 @@ class _Router(nn.Module):
 def rotate_activation(x: mx.array, signs: mx.array) -> mx.array:
     """Apply H_256 diag(signs) to each 256-wide input block, on device."""
     width = x.shape[-1]
-    if width % _BLOCK or signs.shape != (width // _BLOCK, _BLOCK):
+    if width % BLOCK or signs.shape != (width // BLOCK, BLOCK):
         raise ValueError(
             f"invalid oQh rotation: input width {width}, signs {signs.shape}"
         )
     if fast.has_native() and x.dtype in (mx.float16, mx.bfloat16):
-        return fast.rotate(x, signs, _BLOCK)
+        return fast.rotate(x, signs, BLOCK)
     # Stock MLX also has a native normalized Walsh-Hadamard primitive.
-    blocks = x.reshape(*x.shape[:-1], -1, _BLOCK).astype(mx.float32) * signs
+    blocks = x.reshape(*x.shape[:-1], -1, BLOCK).astype(mx.float32) * signs
     return mx.hadamard_transform(blocks).reshape(x.shape).astype(x.dtype)
 
 
@@ -174,18 +163,18 @@ class _ExpertProjection(nn.Module):
 
     def __init__(self, experts, inputs, outputs, path, packed):
         super().__init__()
-        self._bits = packed["bits"] if packed else _BITS
+        self._bits = packed["bits"] if packed else BITS
         if packed:
-            if inputs <= 0 or inputs % _BLOCK:
+            if inputs <= 0 or inputs % BLOCK:
                 raise ValueError(
-                    f"{path}: oQh input width {inputs} must be a multiple of {_BLOCK}"
+                    f"{path}: oQh input width {inputs} must be a multiple of {BLOCK}"
                 )
             self.weight = _placeholder(
                 (experts, outputs, inputs * self._bits // 32), dtype=mx.uint32
             )
-            self.oqh_scales = _placeholder((experts, outputs, inputs // _GROUP))
-            self.oqh_biases = _placeholder((experts, outputs, inputs // _GROUP))
-            self.oqh_signs = _placeholder((inputs // _BLOCK, _BLOCK), 1)
+            self.oqh_scales = _placeholder((experts, outputs, inputs // GROUP))
+            self.oqh_biases = _placeholder((experts, outputs, inputs // GROUP))
+            self.oqh_signs = _placeholder((inputs // BLOCK, BLOCK), 1)
         else:
             self.weight = _placeholder((experts, outputs, inputs))
 
@@ -205,7 +194,7 @@ class _ExpertProjection(nn.Module):
             self.oqh_biases,
             rhs_indices=indices,
             transpose=True,
-            group_size=_GROUP,
+            group_size=GROUP,
             bits=self._bits,
             mode="affine",
         ).astype(x.dtype)

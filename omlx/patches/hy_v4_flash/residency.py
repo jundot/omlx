@@ -9,6 +9,8 @@ open_tables rechecks the receipt, file identities and headers. By default shard
 SSD for speed (a warning otherwise). close() releases mappings, locks and fds.
 """
 
+from __future__ import annotations
+
 import ctypes
 import errno
 import fcntl
@@ -29,9 +31,12 @@ import weakref
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import mlx.core as mx
 import numpy as np
+
+if TYPE_CHECKING:
+    import mlx.core as mx
 
 _REVISION = "d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959"
 _BLOCKS = (1, 11, 21, 31)
@@ -128,7 +133,7 @@ class _Spec:
     stride = 192
 
 
-def _specs(doc):
+def table_specs(doc):
     source = doc.get("source", {})
     _require(
         doc.get("schema") == "hy4-flash-oqh/v1"
@@ -347,7 +352,7 @@ def prepare_table_receipt(manifest, *, first_root, late_root, receipt) -> Path:
         raise FileExistsError(f"refusing to replace table receipt: {out}")
     doc, digest = _document(manifest)
     with ExitStack() as stack:
-        files = _open_files(stack, _specs(doc), first_root, late_root)
+        files = _open_files(stack, table_specs(doc), first_root, late_root)
         for t in files.values():
             payload, whole = hashlib.sha256(), hashlib.sha256(t.header)
             pos = t.spec.offset
@@ -462,7 +467,31 @@ class EngramTables:
         spec = self._files[block].spec
         return (spec.rows, spec.width)
 
+    def _read_rows(self, block, rows):
+        """One worker per verified FD; caller holds the provider lifetime lock."""
+        table = self._files[block]
+        spec = table.spec
+        unique, inverse = np.unique(rows.ravel(), return_inverse=True)
+        table.unchanged()
+        if block == _BLOCKS[0] and self._hot is not None:
+            values = self._hot.read_rows(spec, unique)
+        else:
+            values = np.empty((len(unique), spec.width), dtype="<u2")
+            for i, row in enumerate(unique):
+                raw = _read_exact(
+                    table.fd, spec.stride, spec.offset + int(row) * spec.stride
+                )
+                values[i] = np.frombuffer(raw, dtype="<u2")
+                table.pread_calls += 1
+                table.pread_bytes += spec.stride
+        table.unchanged()
+        table.requested_rows += rows.size
+        table.unique_rows += len(unique)
+        return values[inverse].reshape(*rows.shape, spec.width)
+
     def gather(self, block: int, row_ids: np.ndarray) -> mx.array:
+        import mlx.core as mx
+
         with self._lock:
             self._require_open()
             if type(block) is not int or block not in self._files:
@@ -478,28 +507,11 @@ class EngramTables:
                 )
             if ids.size and (ids.min() < 0 or ids.max() >= s.rows):
                 raise IndexError(f"Engram row outside block {block}")
-            unique, inverse = np.unique(ids.ravel(), return_inverse=True)
             try:
-                t.unchanged()
-                if block == _BLOCKS[0] and self._hot is not None:
-                    values = self._hot.read_rows(s, unique)
-                else:
-                    values = np.empty((len(unique), s.width), dtype="<u2")
-                    # No gaps, readahead, full-table buffers or cross-request row cache.
-                    for i, row in enumerate(unique):
-                        raw = _read_exact(
-                            t.fd, s.stride, s.offset + int(row) * s.stride
-                        )
-                        values[i] = np.frombuffer(raw, dtype="<u2")
-                        t.pread_calls += 1
-                        t.pread_bytes += s.stride
-                t.unchanged()
+                bits = self._read_rows(block, ids)
             except (OSError, ValueError):
                 self._release()
                 raise
-            t.requested_rows += ids.size
-            t.unique_rows += len(unique)
-            bits = values[inverse].reshape(*ids.shape, s.width)
             return mx.array(bits).view(mx.bfloat16)
 
     def stats(self):
@@ -531,9 +543,9 @@ class EngramTables:
                 first_locked_bytes=pages * mmap.PAGESIZE,
                 first_pages=pages,
                 first_mode="mlock" if wired else "pread",
-                first_resident_pages=self._hot.check_residency()
-                if live and wired
-                else 0,
+                first_resident_pages=(
+                    self._hot.check_residency() if live and wired else 0
+                ),
                 blocks=blocks,
             )
 
@@ -551,7 +563,7 @@ def open_tables(
     """
     _require(first_mode in ("mlock", "pread"), "unknown first Engram table mode")
     doc, digest = _document(manifest)
-    specs = _specs(doc)
+    specs = table_specs(doc)
     saved, _ = _document(receipt, private=True)
     _require(
         saved.get("schema") == _RECEIPT and saved.get("manifest_sha256") == digest,

@@ -9,7 +9,14 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .quant_io import SUPPORTED_BITS, SUPPORTED_TRUNK_BITS, TRUNK_GROUP, TRUNK_LINEAR
+from .quant_io import (
+    SUPPORTED_TRUNK_BITS,
+    TRUNK_GROUP,
+    TRUNK_LINEAR,
+    unique,
+    valid_bank_spec,
+)
+from .residency import table_specs
 
 SCHEMA = "hy4-flash-oqh/v1"
 SOURCE = "tencent/Hy4-flash"
@@ -17,17 +24,13 @@ REVISION = "d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959"
 INDEX = "model.safetensors.index.json"
 
 
-def _unique(pairs):
-    doc = dict(pairs)
-    if len(pairs) != len(doc):
-        raise ValueError("duplicate JSON key in model metadata")
-    return doc
-
-
 def _json(path):
     if not 0 < path.stat().st_size <= 32 << 20:
         raise ValueError(f"invalid metadata size: {path.name}")
-    return json.loads(path.read_bytes(), object_pairs_hook=_unique)
+    doc = json.loads(path.read_bytes(), object_pairs_hook=unique)
+    if not isinstance(doc, dict):
+        raise ValueError(f"expected a JSON object in {path.name}")
+    return doc
 
 
 def member(root, name):
@@ -83,7 +86,9 @@ def _validate_trunk(trunk, index):
         or not all(isinstance(m, str) for m in modules)
         or len(set(modules)) != len(modules)
         or set(modules) != eligible
-        or not all(m + suffix in index for m in modules for suffix in (".scales", ".biases"))
+        or not all(
+            m + suffix in index for m in modules for suffix in (".scales", ".biases")
+        )
     ):
         raise ValueError("invalid or incomplete trunk_quantization")
 
@@ -101,7 +106,9 @@ def _validate_quantization(manifest, targets, trunk):
     expected = dict(ALGORITHM, bits=next(iter(bits)))
     if trunk is not None:
         expected["trunk"] = trunk_record(trunk["bits"], trunk["modules"])
-        if any(trunk.get(k) != v for k, v in expected["trunk"].items() if k != "modules"):
+        if any(
+            trunk.get(k) != v for k, v in expected["trunk"].items() if k != "modules"
+        ):
             raise ValueError("invalid trunk_quantization format")
     # JSON comparison distinguishes exact integers, floats and booleans.
     if json.dumps(record, sort_keys=True) != json.dumps(expected, sort_keys=True):
@@ -119,23 +126,16 @@ class Artifact:
     def open(cls, directory: Path, *, verify_core: bool = False):
         root = Path(directory).resolve(strict=True)
         doc = _json(member(root, "manifest.json"))
-        src = doc.get("source", {})
-        if (
-            doc.get("schema") != SCHEMA
-            or doc.get("text_only") is not True
-            or src.get("repo") != SOURCE
-            or src.get("revision") != REVISION
-        ):
-            raise ValueError(
-                "expected the converted public Hy4 Flash instruct text artifact"
-            )
+        table_specs(doc)
         assets = doc.get("assets", {})
         required = {"config.json", INDEX, "tokenizer.json", "chat_template.jinja"}
-        if not required.issubset(assets):
+        if not isinstance(assets, dict) or not required.issubset(assets):
             raise ValueError("missing authenticated model, index, or tokenizer assets")
         _validate_files(root, assets, digest=True)
         core = doc.get("core_shards", {})
-        if any(not n.endswith(".safetensors") for n in core):
+        if not isinstance(core, dict) or any(
+            not n.endswith(".safetensors") for n in core
+        ):
             raise ValueError("unexpected core shard filename")
         _validate_files(root, core, digest=verify_core)
         cfg = _json(root / "config.json")
@@ -143,20 +143,23 @@ class Artifact:
             raise ValueError("expected a flattened Flash text configuration")
         iq = cfg.get("omlx_oqh", {})
         targets = iq.get("tensors", {}) if isinstance(iq, dict) else {}
-        if (not isinstance(targets, dict) or not targets
-                or type(iq.get("version")) is not int or iq["version"] != 1):
+        if (
+            not isinstance(targets, dict)
+            or not targets
+            or type(iq.get("version")) is not int
+            or iq["version"] != 1
+        ):
             raise ValueError("expected version-1 packed oQh tensors")
         index = _json(root / INDEX).get("weight_map")
         if (
             not isinstance(index, dict)
             or not index
+            or not all(isinstance(shard, str) for shard in index.values())
             or set(index.values()) != core.keys()
         ):
             raise ValueError("weight index does not describe exactly the core shards")
         for prefix, spec in targets.items():
-            if not isinstance(spec, dict) or any(type(v) is not int for v in spec.values()) or spec not in [
-                {"bits": b, "block": 256, "group_size": 128} for b in SUPPORTED_BITS
-            ] or not all(
+            if not valid_bank_spec(spec) or not all(
                 prefix + suffix in index
                 for suffix in (".weight", ".oqh_signs", ".oqh_scales", ".oqh_biases")
             ):

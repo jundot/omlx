@@ -211,9 +211,9 @@ def stage_tables(model, source, ssd_dir, *, check=False):
         _disjoint(root, target)
     manifest = model / "manifest.json"
     doc, digest = r._document(manifest)
-    # _specs independently pins whole-file LFS SHA/size, shard order, name, dtype,
+    # table_specs independently pins whole-file LFS SHA/size, shard order, name, dtype,
     # stride and extent. Also require the precise public rows and header offset.
-    specs = r._specs(doc)[1:]
+    specs = r.table_specs(doc)[1:]
     r._require(
         tuple(s.block for s in specs) == tuple(_ROWS)
         and all(s.rows == _ROWS[s.block] and s.offset == 152 for s in specs),
