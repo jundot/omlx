@@ -1316,6 +1316,78 @@ class TestVLMFallback:
         local.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_local_only_load_ignores_a_registered_cluster_deployment(
+        self, small_mock_model_dir
+    ):
+        """A "this Mac alone" load never becomes a distributed launch.
+
+        ``POST /api/models/{id}/load?local_only=true`` is the run-local
+        contract: a registry deployment for the same checkpoint is not adopted,
+        so a model that fits here loads here and one that does not is refused
+        here. This is the measured Qwen3.8 case: a stale 3-Mac deployment made a
+        plain load start ranks and fail on their admission.
+        """
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = entry.engine_type = "vlm"
+        deployment = _deployment(entry.model_path)
+        pool._cluster_registry = SimpleNamespace(get_for_model=lambda _: deployment)
+        local = MagicMock()
+        local.start = AsyncMock()
+
+        with (
+            patch(
+                "omlx.engine.distributed.DistributedBatchedEngine"
+            ) as distributed,
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=local) as cls,
+        ):
+            await pool._load_engine("model-a", local_only=True)
+
+        distributed.assert_not_called()
+        cls.assert_called_once()
+        assert entry.engine is local
+
+    @pytest.mark.asyncio
+    async def test_a_failed_deployment_is_not_rewritten_as_the_broken_llm_fallback(
+        self, small_mock_model_dir
+    ):
+        """A distributed launch failure must not retry the text-only loader.
+
+        The measured Qwen3.8 failure read "VLM loading failed ... falling back to
+        LLM" and then "Received 3748 parameters not in model": the first error was
+        the cluster preflight (a shard did not fit a rank), and the fallback
+        loaded the checkpoint through mlx-lm, which cannot accept its
+        vision/PLE tensors. The real verdict is the deployment's; surface it.
+        """
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = entry.engine_type = "vlm"
+        deployment = _deployment(entry.model_path)
+        pool._cluster_registry = SimpleNamespace(get_for_model=lambda _: deployment)
+        distributed = MagicMock()
+        distributed.start = AsyncMock(
+            side_effect=RuntimeError(
+                "Model does not fit the current per-node memory limits; "
+                "rank 0 (m5) needs 48.5 GiB but can admit 45.4 GiB right now"
+            )
+        )
+        distributed.stop = AsyncMock()
+
+        with (
+            patch(
+                "omlx.engine.distributed.DistributedBatchedEngine",
+                return_value=distributed,
+            ),
+            patch("omlx.engine_pool.BatchedEngine") as llm,
+            pytest.raises(Exception, match="needs 48.5 GiB"),
+        ):
+            await pool._load_engine("model-a")
+
+        llm.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_non_vlm_failure_still_raises(self, small_mock_model_dir):
         """Test that non-VLM engine failures propagate normally."""
         pool = _make_pool(ceiling=10 * 1024**3)
