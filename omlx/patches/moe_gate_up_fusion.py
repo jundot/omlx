@@ -43,12 +43,10 @@ _GLM_DSA_MODULE = "omlx.patches.glm_moe_dsa.switch_layers"
 _DEEPSEEK_V4_MODULE = "omlx.patches.deepseek_v4.switch_layers"
 
 # Loaded model classes whose module path marks a measured family: MiMo V2
-# (mlx-lm module, the omnimodal wrapper, DFlash targets), GLM-5.3 (mlx-vlm
-# glm5_next) and Hy4 (hy_v4, unchanged speed and bit-identical output on M3
-# Ultra; the M5 epilogue gain is unmeasured). DeepSeek V4 shares the DeepSeek
-# V4 SwitchGLU but has not been measured with the fused projection, so it
-# keeps its path.
-_FAMILY_TOKENS = ("mimo_v2", "glm5_next", "hy_v4")
+# (mlx-lm module, the omnimodal wrapper, DFlash targets) and GLM-5.3
+# (mlx-vlm glm5_next). DeepSeek V4 shares the DeepSeek V4 SwitchGLU but has
+# not been measured with the fused projection, so it keeps its path.
+_FAMILY_TOKENS = ("mimo_v2", "glm5_next")
 
 
 def _is_supported_family(model: Any) -> bool:
