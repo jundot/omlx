@@ -49,8 +49,9 @@ _PAGE_IO_POOL = ThreadPoolExecutor(
 ROW_BATCH_ROWS = 256
 ROW_BATCH_MAX_GAP = 65536
 ROW_READ_RETRY_SECONDS = 60.0
-# Lookups up to this many rows (a decode token, a short verify block) advise
-# their pages, then copy from the mapping: missing pages read all at once.
+# Default advise bound, for a table built without one. The model passes the
+# bound its own Engram tables imply -- hashes per token times a decode/verify
+# batch -- so this only covers direct constructions.
 ADVISE_MAX_ROWS = 64
 
 # mincore observes the file cache without faulting the mapping into memory.
@@ -171,7 +172,8 @@ class TensorFile:
             for page in np.unique(np.concatenate((first, last))).tolist():
                 self._mapping.madvise(mmap.MADV_WILLNEED, page * PAGE_SIZE, PAGE_SIZE)
 
-    def read(self, key, rows=None, *, metal_backed=False):
+    def read(self, key, rows=None, *, metal_backed=False, advised=False):
+        """Rows of ``key``; ``advised`` says the caller already advised their pages."""
         with self._lock:
             if self._mapping is None:
                 raise RuntimeError("Engram tensor file is closed")
@@ -226,7 +228,7 @@ class TensorFile:
                 gather_rows = rows.size
                 copied = None
                 row_bytes = (end - start) // view.shape[0] if view.shape[0] else 0
-                if rows.size <= ADVISE_MAX_ROWS and 0 < row_bytes <= PAGE_SIZE:
+                if advised and rows.size > 0 and 0 < row_bytes <= PAGE_SIZE:
                     # _read_rows advised these pages, so the copy waits about one read.
                     fresh, _ = self._unseen_rows(
                         rows.reshape(-1), self._start + start, row_bytes
@@ -400,6 +402,7 @@ class DiskEngramEmbedding(nn.Module):
         bias_key=None,
         bits=None,
         group_size=32,
+        advise_max_rows=None,
     ):
         super().__init__()
         self._lock = RLock()
@@ -424,6 +427,12 @@ class DiskEngramEmbedding(nn.Module):
         self._closed = False
         self._resident = None
         self._prefetched = None
+        # Rows one advise burst covers. A decode/verify lookup is
+        # ids_per_token x (1 + verify depth); the caller passes the bound its
+        # tables imply so a wider model still advises a whole batch.
+        self._advise_max_rows = (
+            ADVISE_MAX_ROWS if advise_max_rows is None else int(advise_max_rows)
+        )
 
     def make_resident(self):
         """Keep packed tensors in Metal-managed RAM with shared CPU views."""
@@ -468,7 +477,8 @@ class DiskEngramEmbedding(nn.Module):
                 (self._scales, self._scale_key),
                 (self._scales, self._bias_key),
             )
-            if self._resident is None and host.size <= ADVISE_MAX_ROWS:
+            advised = self._resident is None and host.size <= self._advise_max_rows
+            if advised:
                 # Start every page of all three tensors before copying any.
                 for reader, key in pairs:
                     if key is not None:
@@ -478,7 +488,7 @@ class DiskEngramEmbedding(nn.Module):
                 if key is None:
                     continue
                 if self._resident is None:
-                    result.append(reader.read(key, host.reshape(-1)))
+                    result.append(reader.read(key, host.reshape(-1), advised=advised))
                 else:
                     raw, dtype = self._resident[key]
                     rows = host.reshape(-1)
