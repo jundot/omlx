@@ -220,7 +220,7 @@ def _reference(queries, keys, values, mask):
 @pytest.mark.parametrize("length", [1, 4])
 def test_rows_match_an_independent_masked_reference(patched, length):
     # Unlike _solo, this shares no slicing with the patch.
-    cache, q, k, v, mask, _ = _step([SHORT + 3000, LONG], length)
+    cache, q, k, v, mask, _ = _step([SHORT, LONG], length)
     out = _call(q, k, v, cache, mask)
     assert out is not None and cache not in patched.calls
     ref = _reference(q, k, v, _padded_causal(cache, length))
