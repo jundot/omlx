@@ -507,3 +507,101 @@ def test_qwen_launch_keeps_tuned_flags(sushi_pack, fake_sushi, tmp_path):
     cmd = engine._serve_command(1)
     assert "--kv-quant" in cmd and "--mtp-head-kv-quant" in cmd
     assert "--ssd-budget-gb" not in cmd
+
+
+def test_streamed_pack_memory_floor_is_its_budget(dsv41_pack, tmp_path):
+    # Before Sushi's first /props, oMLX floors a starting engine's memory on
+    # this; a streamed pack must not count its whole size on disk.
+    gib = 1024**3
+    big = SushiEngine(
+        model_name=str(dsv41_pack), model_id="ds",
+        target=SushiTarget(None, "deepseek_v41", True),
+        log_dir=tmp_path, options=SushiOptions(), memory_budget_bytes=115 * gib,
+    )
+    sushi_mod._weights_bytes_cached.cache_clear()
+    (dsv41_pack / "model-00002.safetensors").write_bytes(b"\0" * 8192)
+    import os
+    os.truncate(dsv41_pack / "model-00002.safetensors", 300 * gib)  # sparse
+    sushi_mod._weights_bytes_cached.cache_clear()
+    assert big._weights_bytes() == 115 * gib
+    no_budget = SushiEngine(
+        model_name=str(dsv41_pack), model_id="ds",
+        target=SushiTarget(None, "deepseek_v41", True),
+        log_dir=tmp_path, options=SushiOptions(),
+    )
+    assert no_budget._weights_bytes() > 300 * gib
+
+
+def test_weights_size_is_cached_until_the_folder_changes(sushi_pack, monkeypatch):
+    sushi_mod._weights_bytes_cached.cache_clear()
+    first = sushi_mod._weights_bytes(sushi_pack)
+    scans = []
+    real_glob = Path.glob
+    monkeypatch.setattr(Path, "glob", lambda self, pat: (scans.append(1), real_glob(self, pat))[1])
+    assert sushi_mod._weights_bytes(sushi_pack) == first and scans == []
+    (sushi_pack / "model-00002.safetensors").write_bytes(b"\0" * 10)
+    os.utime(sushi_pack, ns=(1, 2))  # make sure the folder mtime moved
+    assert sushi_mod._weights_bytes(sushi_pack) == first + 10 and scans == [1]
+
+
+def test_tokenizer_cached_across_loads(sushi_pack, monkeypatch):
+    sushi_mod._load_tokenizer_cached.cache_clear()
+    loads = []
+
+    class FakeAuto:
+        @staticmethod
+        def from_pretrained(path):
+            loads.append(path)
+            return "tok"
+
+    import transformers
+    monkeypatch.setattr(transformers, "AutoTokenizer", FakeAuto)
+    assert sushi_mod._cached_tokenizer(sushi_pack) == "tok"
+    assert sushi_mod._cached_tokenizer(sushi_pack) == "tok"
+    assert len(loads) == 1
+
+
+def test_start_launches_before_tokenizer(fake_sushi, sushi_pack, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_SUSHI_ARGV", str(tmp_path / "argv.json"))
+    monkeypatch.setenv("FAKE_SUSHI_BODY", str(tmp_path / "body.json"))
+    monkeypatch.setattr(splash_mod, "STOP_TIMEOUT_SECONDS", 1)
+    order = []
+    real_popen = sushi_mod.subprocess.Popen
+
+    def popen(args, *a, **k):
+        if "serve" in " ".join(map(str, args)):  # not the --version probe
+            order.append("launch")
+        return real_popen(args, *a, **k)
+
+    monkeypatch.setattr(sushi_mod.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        SushiEngine, "_load_tokenizer",
+        lambda self: (order.append("tokenizer"), setattr(self, "_tokenizer", None)),
+    )
+    binary, _ = find_sushi_binary(str(fake_sushi))
+    engine = SushiEngine(
+        model_name=str(sushi_pack), model_id="q",
+        target=SushiTarget(binary, "qwen4_exp", True),
+        log_dir=tmp_path, options=SushiOptions(auto_wired_limit=False),
+    )
+
+    async def run():
+        await engine.start()
+        await engine.stop()
+
+    asyncio.run(run())
+    assert order[:2] == ["launch", "tokenizer"]
+
+
+def test_ssd_budget_skips_sysctl_unless_needed(monkeypatch):
+    import omlx.process_memory_enforcer as pme
+
+    calls = []
+    monkeypatch.setattr(pme, "get_iogpu_wired_limit_bytes", lambda: (calls.append(1), 0)[1])
+    gib = 1024**3
+    # Mirrors EnginePool._sushi_ssd_budget_gb's rule.
+    assert sushi_mod.sushi_default_ssd_budget_gb("qwen4_exp", 128 * gib, 0) is None
+    assert sushi_mod.sushi_default_ssd_budget_gb("deepseek_v41", 256 * gib, 0) is None
+    target = sushi_mod.wired_limit_target_mb(0, 128 * gib)
+    assert sushi_mod.sushi_default_ssd_budget_gb("deepseek_v41", 128 * gib, target) == 108
+    assert calls == []

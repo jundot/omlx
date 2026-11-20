@@ -2481,15 +2481,19 @@ class EnginePool:
         raise before launch)."""
         if options.ssd_budget_gb:
             return options.ssd_budget_gb
-        from .process_memory_enforcer import get_iogpu_wired_limit_bytes
-
+        model_type = self._sushi_model_type(entry)
         ram = physical_memory_bytes()
-        wired_mb = get_iogpu_wired_limit_bytes() // 1024**2
+        if sushi_default_ssd_budget_gb(model_type, ram, 0) is None:
+            return None  # resident here at any wired limit
         if options.auto_wired_limit:
-            wired_mb = max(wired_mb, wired_limit_target_mb(0, ram))
-        return sushi_default_ssd_budget_gb(
-            self._sushi_model_type(entry), ram, wired_mb
-        )
+            # oMLX raises the limit to this before launch if it is lower; a
+            # higher declared limit picks the same budget on these Macs.
+            wired_mb = wired_limit_target_mb(0, ram)
+        else:
+            from .process_memory_enforcer import get_iogpu_wired_limit_bytes
+
+            wired_mb = get_iogpu_wired_limit_bytes() // 1024**2
+        return sushi_default_ssd_budget_gb(model_type, ram, wired_mb)
 
     def _sushi_wanted_bytes(self, entry: EngineEntry) -> int:
         options = self._sushi_options()

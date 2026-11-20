@@ -53,6 +53,9 @@ from ..engine.splash import (
     inspect_splash_binary,
 )
 from ..engine.splash import (
+    _read_config as _read_splash_config,
+)
+from ..engine.splash import (
     scan_ssd_cache as scan_splash_ssd_cache,
 )
 from ..engine.sushi import (
@@ -1123,10 +1126,9 @@ def _sushi_pack_engine(model_info: dict) -> str | None:
     model_path = model_info.get("model_path")
     if not model_path or model_info.get("config_model_type") not in SUSHI_MODEL_TYPES:
         return None
-    try:
-        config = json.loads((Path(model_path) / "config.json").read_text())
-    except (OSError, ValueError):
-        return None
+    # The cached, mtime-keyed read the engine pool uses: this runs for every
+    # Sushi-type model each time the model list is fetched.
+    config = _read_splash_config(Path(model_path)) or {}
     return "sushi" if is_sushi_pack(config) else None
 
 

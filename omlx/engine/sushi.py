@@ -33,7 +33,6 @@ from typing import Any
 import httpx
 
 from ..exceptions import InvalidRequestError
-from . import splash as _splash
 from .base import GenerationOutput
 from .splash import (
     REQUEST_TIMEOUT_SECONDS,
@@ -49,6 +48,9 @@ logger = logging.getLogger(__name__)
 
 # Large packs (60+ GB) take minutes to map on first load.
 SUSHI_STARTUP_TIMEOUT_SECONDS = 1200
+# How often to ask a loading Sushi whether it is ready: a loopback GET, so
+# polling often costs nothing and the model is served as soon as it loads.
+SUSHI_READY_POLL_SECONDS = 0.5
 VERSION_TIMEOUT_SECONDS = 30
 SUSHI_API_KEY_ENV = "OMLX_SUSHI_API_KEY"
 
@@ -373,7 +375,21 @@ def raise_wired_limit(limit_mb: int) -> None:
 
 
 def _weights_bytes(path: Path) -> int:
-    return sum(f.stat().st_size for f in path.glob("*.safetensors"))
+    """Size of a pack's safetensors, cached until the folder changes.
+
+    Memory planning asks for it several times per load, and a streamed pack
+    has dozens of shards (DeepSeek-V4.1: 89).
+    """
+    try:
+        mtime = Path(path).stat().st_mtime_ns
+    except OSError:
+        return 0
+    return _weights_bytes_cached(str(path), mtime)
+
+
+@functools.lru_cache(maxsize=32)
+def _weights_bytes_cached(path: str, _mtime_ns: int) -> int:
+    return sum(f.stat().st_size for f in Path(path).glob("*.safetensors"))
 
 
 # DeepSeek-V4.1 (docs/usage.md): a 1M-token request's state, an image encode.
@@ -531,6 +547,39 @@ def pick_effort(requested: str | None, accepted: list[str]) -> str | None:
     return "on" if "on" in accepted else None
 
 
+# -- tokenizer -------------------------------------------------------------------
+
+
+def _cached_tokenizer(path: Path) -> Any:
+    """The pack's Hugging Face tokenizer, for oMLX's token counts, or None.
+
+    Kept across loads, keyed on tokenizer.json's mtime, so reloading a model
+    after an idle unload does not parse it (and import transformers) again.
+    """
+    tokenizer_file = Path(path) / "tokenizer.json"
+    try:
+        mtime = tokenizer_file.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+    return _load_tokenizer_cached(str(path), mtime)
+
+
+@functools.lru_cache(maxsize=4)
+def _load_tokenizer_cached(path: str, _mtime_ns: int) -> Any:
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(path)
+    except Exception as e:  # noqa: BLE001 - token counts fall back to estimates
+        logger.warning(
+            "Sushi: no Hugging Face tokenizer for %s (%s); token counts are "
+            "estimated",
+            path,
+            e,
+        )
+        return None
+
+
 # -- engine ----------------------------------------------------------------------
 
 
@@ -617,18 +666,7 @@ class SushiEngine(SplashEngine):
     def _load_tokenizer(self) -> None:
         config = _read_config(self._path) or {}
         self._model_type = config.get("model_type")
-        try:
-            from transformers import AutoTokenizer
-
-            self._tokenizer = AutoTokenizer.from_pretrained(str(self._path))
-        except Exception:  # noqa: BLE001 - token counts fall back to estimates
-            logger.warning(
-                "Sushi: no Hugging Face tokenizer for %s; token counts are "
-                "estimated",
-                self._path,
-                exc_info=True,
-            )
-            self._tokenizer = None
+        self._tokenizer = _cached_tokenizer(self._path)
 
     def _ensure_binary(self) -> None:
         if self._target.binary is not None:
@@ -731,7 +769,7 @@ class SushiEngine(SplashEngine):
             if self._process.poll() is None:
                 return
             raise RuntimeError(self.runtime_failed_reason)
-        await asyncio.to_thread(self._load_tokenizer)
+        # Fail fast on the binary and the wired limit, before anything slow.
         await asyncio.to_thread(self._ensure_binary)
         await asyncio.to_thread(self._ensure_wired_limit)
         port = _free_port()
@@ -753,11 +791,17 @@ class SushiEngine(SplashEngine):
                 env=sushi_env(self._api_key),
                 start_new_session=True,
             )
+        # The tokenizer only serves oMLX's token counts: load it while Sushi
+        # maps the weights instead of before launching it.
+        tokenizer = asyncio.create_task(asyncio.to_thread(self._load_tokenizer))
         try:
             await self._wait_until_ready()
+            await tokenizer
             await self._refresh_status()
             self._status_task = asyncio.create_task(self._poll_status())
         except BaseException:
+            if not tokenizer.done():
+                tokenizer.cancel()
             await self.stop()
             raise
 
@@ -799,7 +843,7 @@ class SushiEngine(SplashEngine):
                     self._base_url,
                 )
                 return
-            await asyncio.sleep(_splash.STARTUP_POLL_SECONDS)
+            await asyncio.sleep(SUSHI_READY_POLL_SECONDS)
         raise RuntimeError(
             f"Sushi did not load {self._path.name} within "
             f"{SUSHI_STARTUP_TIMEOUT_SECONDS}s; see {self._log_path}"
@@ -993,6 +1037,15 @@ class SushiEngine(SplashEngine):
         return int(memory.get(key) or 0)
 
     def _weights_bytes(self) -> int:
+        """What the process holds before Sushi's first /props report.
+
+        The inherited process_memory_bytes() floors on this until then, and
+        the pool counts a starting engine's memory too. A streamed pack keeps
+        only its budget resident, so the weights on disk (310 GB for
+        DeepSeek-V4.1) would overstate it several times over.
+        """
         if self._weights_size is None:
-            self._weights_size = _weights_bytes(self._path)
+            on_disk = _weights_bytes(self._path)
+            budget = self._memory_budget
+            self._weights_size = min(on_disk, budget) if budget > 0 else on_disk
         return self._weights_size
