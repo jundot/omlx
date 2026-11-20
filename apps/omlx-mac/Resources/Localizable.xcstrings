@@ -40007,7 +40007,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用 DFlash 前禁用 Lightning MTP。"
+            "value" : "启用 DFlash 前，请先关闭 Lightning MTP。"
           }
         }
       }
@@ -42509,7 +42509,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用 MTP 前禁用 DFlash。"
+            "value" : "启用 MTP 前，请先关闭 DFlash。"
           }
         }
       }
@@ -42575,7 +42575,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用 MTP 前禁用 TurboQuant KV。"
+            "value" : "启用 MTP 前，请先关闭 TurboQuant KV。"
           }
         }
       }
@@ -42611,7 +42611,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用 Lightning MTP 前禁用 VLM MTP。"
+            "value" : "启用 Lightning MTP 前，请先关闭 VLM MTP。"
           }
         }
       }
@@ -43259,7 +43259,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用此功能前禁用 VLM MTP。"
+            "value" : "启用此功能前，请先关闭 VLM MTP。"
           }
         }
       }
@@ -44332,7 +44332,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用 VLM MTP 前禁用 DFlash。"
+            "value" : "启用 VLM MTP 前，请先关闭 DFlash。"
           }
         }
       }
@@ -44398,7 +44398,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用 VLM MTP 前禁用 Lightning MTP。"
+            "value" : "启用 VLM MTP 前，请先关闭 Lightning MTP。"
           }
         }
       }
@@ -44434,7 +44434,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用 VLM MTP 前禁用 SpecPrefill。"
+            "value" : "启用 VLM MTP 前，请先关闭 SpecPrefill。"
           }
         }
       }
@@ -44470,7 +44470,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用 VLM MTP 前禁用 TurboQuant KV。"
+            "value" : "启用 VLM MTP 前，请先关闭 TurboQuant KV。"
           }
         }
       }
@@ -45854,7 +45854,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "这台 Mac 正在协助 %1$@ 进行提示词预填充：%3$@ 的 %2$lld 层。%4$@ 卸载该模型后即停止。"
+            "value" : "这台 Mac 正在协助 %1$@ 进行预填充：%3$@ 的 %2$lld 层。%4$@ 卸载该模型后即停止。"
           }
         }
       }
@@ -45998,7 +45998,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "服务器运行时间"
+            "value" : "服务器运行时长"
           }
         }
       }
@@ -57034,7 +57034,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "此 Mac 的 GPU 不支持功率限制。"
+            "value" : "这台 Mac 的 GPU 不支持功率限制。"
           }
         }
       }
