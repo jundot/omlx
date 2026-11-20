@@ -335,9 +335,11 @@ class Engram(nn.Module):
         for i in range(self.hc_mult):
             key = _rms(exact.linear(self.key_projs[i], x), self.norm_key[i].weight)
             query = _rms(streams[:, :, i], self.norm_query[i].weight)
-            dot = (key * query).astype(mx.float32).sum(axis=-1) * self.hidden_size**-0.5
+            # Round each gate intermediate to the activation dtype, as in PyTorch.
+            dot = (key * query).astype(mx.float32).sum(axis=-1).astype(dtype)
+            dot = (dot.astype(mx.float32) * self.hidden_size**-0.5).astype(dtype)
             dot = mx.sqrt(mx.maximum(mx.abs(dot), 1e-6)) * mx.sign(dot)
-            gates.append(mx.sigmoid(dot).astype(dtype))
+            gates.append(mx.sigmoid(dot.astype(mx.float32)).astype(dtype))
         gates = mx.stack(gates, axis=2)[..., None]
         main = self.unified_pre_gamma * _rms(exact.linear(self.value_proj, x), None)
         main = main.astype(dtype)[:, :, None, :]
