@@ -49,6 +49,9 @@ _PAGE_IO_POOL = ThreadPoolExecutor(
 ROW_BATCH_ROWS = 256
 ROW_BATCH_MAX_GAP = 65536
 ROW_READ_RETRY_SECONDS = 60.0
+# Lookups up to this many rows (a decode token, a short verify block) advise
+# their pages, then copy from the mapping: missing pages read all at once.
+ADVISE_MAX_ROWS = 64
 
 # mincore observes the file cache without faulting the mapping into memory.
 _MINCORE = ctypes.CDLL(None).mincore
@@ -157,6 +160,17 @@ class TensorFile:
             self._file.close()
             raise
 
+    def advise_rows(self, key, rows):
+        """Start reading the pages of ``rows`` of ``key`` in the background."""
+        with self._lock:
+            entry = self.header[key]
+            start, end = entry["data_offsets"]
+            row_bytes = (end - start) // entry["shape"][0]
+            offsets = self._start + start + np.asarray(rows).reshape(-1) * row_bytes
+            first, last = offsets // PAGE_SIZE, (offsets + row_bytes - 1) // PAGE_SIZE
+            for page in np.unique(np.concatenate((first, last))).tolist():
+                self._mapping.madvise(mmap.MADV_WILLNEED, page * PAGE_SIZE, PAGE_SIZE)
+
     def read(self, key, rows=None, *, metal_backed=False):
         with self._lock:
             if self._mapping is None:
@@ -212,6 +226,14 @@ class TensorFile:
                 gather_rows = rows.size
                 copied = None
                 row_bytes = (end - start) // view.shape[0] if view.shape[0] else 0
+                if rows.size <= ADVISE_MAX_ROWS and 0 < row_bytes <= PAGE_SIZE:
+                    # _read_rows advised these pages, so the copy waits about one read.
+                    fresh, _ = self._unseen_rows(
+                        rows.reshape(-1), self._start + start, row_bytes
+                    )
+                    copied = view[rows]
+                    self._seen_pages[fresh] = 1
+                    return copied, dtype
                 if rows.size and 0 < row_bytes <= PAGE_SIZE:
                     base = self._start + start
                     flat = rows.reshape(-1)
@@ -441,12 +463,18 @@ class DiskEngramEmbedding(nn.Module):
         with self._lock:
             if self._closed:
                 raise RuntimeError("Engram embedding is closed")
-            result = []
-            for reader, key in (
+            pairs = (
                 (self._weights, self._weight_key),
                 (self._scales, self._scale_key),
                 (self._scales, self._bias_key),
-            ):
+            )
+            if self._resident is None and host.size <= ADVISE_MAX_ROWS:
+                # Start every page of all three tensors before copying any.
+                for reader, key in pairs:
+                    if key is not None:
+                        reader.advise_rows(key, host)
+            result = []
+            for reader, key in pairs:
                 if key is None:
                     continue
                 if self._resident is None:
