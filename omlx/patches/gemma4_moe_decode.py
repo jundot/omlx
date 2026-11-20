@@ -1,31 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused MoE routing and combine for Gemma 4 decode and speculative verify rows.
 
-Gemma 4's MoE layers (26B-A4B: 128 experts, top 8) route with the logits of a
-linear layer: top-k by ``argpartition``, ``take_along_axis``, a softmax over
-the k kept logits, then a gather and multiply by ``per_expert_scale``. The
-experts' outputs are combined by ``(w * y).sum(-2)``. Composed from MLX ops
-that is about six launches in the router and two in the combine, per MoE
-layer, per step: the gain is the launches, not the arithmetic (the logits
-projection and the experts are unchanged).
+Gemma 4's MoE router (26B-A4B: 128 experts, top 8) and its combine take about
+eight small launches per layer per step. For up to ``_MAX_ROWS`` token rows this
+patch runs each as one launch; the logits projection and the experts are
+unchanged.
 
-For up to ``_MAX_ROWS`` token rows (one-token decode, a speculative verify
-block, a small decode batch) this patch runs:
+1. Router: top-k by repeated threadgroup argmax, then the softmax over the kept
+   logits and the ``per_expert_scale`` product with every rounding the stock
+   ops make (exp, the two four-wide partial sums, the reciprocal and the
+   products, all in the activation dtype).
+2. Combine: the k products summed in order, rounding to the activation dtype
+   after each add, as ``(w * y).sum(-2)`` does.
 
-1. the router as one launch per row: top-k by repeated threadgroup argmax,
-   then the softmax over the kept logits and the ``per_expert_scale`` product
-   with every rounding the stock ops make (exp, the two four-wide partial sums,
-   the reciprocal and the products, all in the activation dtype);
-2. the combine as one launch: the k products summed in order, rounding to the
-   activation dtype after each add, as ``(w * y).sum(-2)`` does.
-
-The kept experts come back in the order ``argpartition`` returns them. At
-these row widths that op is a stable ascending sort of the logits, so the
-slice of the largest k is ascending in (logit, expert index) and, among logits
-tied at the k-th place, keeps the highest index (bf16 logits collide often).
-The kernel selects and orders the same way, so router weights, expert indices
-and the combined output are bit-identical to the composed path. Prefill chunks
-keep the stock ops.
+At these widths ``argpartition`` is a stable ascending sort, so among logits
+tied at the k-th place it keeps the highest index. The kernel selects and
+orders the same way, so indices, weights and output are bit-identical to the
+composed path. Prefill chunks keep the stock ops.
 """
 
 from __future__ import annotations
@@ -42,8 +33,6 @@ _MAX_EXPERTS = 1024
 # The stock softmax sums four logits per lane; two lanes add in either order,
 # so up to eight kept experts reproduce it exactly.
 _MAX_TOP_K = 8
-# Rows routed by the fused kernels: a verify block, or the one-token rows of a
-# few batched sequences.
 _MAX_ROWS = 16
 
 _ROUTER_SOURCE = """
@@ -218,13 +207,14 @@ def _patch_classes(router_cls, experts_cls) -> None:
     def router_call(self, x):
         if not _router_eligible(self, x):
             return orig_router(self, x)
-        # ``scale * root_size`` is a constant of the layer: one launch per
-        # call in the stock router, computed once here.
+        # ``scale * root_size`` is constant per layer; compute it once.
         if getattr(self, "_omlx_norm_src", None) is not self.scale:
             self._omlx_norm_weight = self.scale * self._root_size
             self._omlx_norm_src = self.scale
         x = mx.fast.rms_norm(x, self._omlx_norm_weight, self.eps)
-        return fused_router(self.proj(x), self.per_expert_scale, self.config.top_k_experts)
+        return fused_router(
+            self.proj(x), self.per_expert_scale, self.config.top_k_experts
+        )
 
     def experts_call(self, x, top_k_indices, top_k_weights):
         if not (_fused_rows(top_k_weights) and top_k_weights.dtype == x.dtype):
