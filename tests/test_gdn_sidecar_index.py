@@ -379,6 +379,52 @@ def test_sidecars_are_indexed_from_stat_and_lru_survives_restart(
         finally:
             reduced.close()
 
+
+def test_auto_ceiling_trims_existing_cache_at_startup(tmp_path, monkeypatch):
+    """A cache already above the auto ceiling is trimmed, oldest first, on startup."""
+    import shutil
+
+    from omlx.cache import paged_ssd_cache
+
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(
+        shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(1000, 0, 1000)
+    )
+    signature = "signature-v1"
+    manager = _make_manager(cache_dir, auto_size=True)
+    try:
+        paths = []
+        for source_hash, content in ((b"a", b"a" * 7), (b"b", b"b" * 11)):
+            staged = tmp_path / f"{source_hash.decode()}.stage"
+            staged.write_bytes(content)
+            paths.append(
+                manager.commit_gdn_checkpoint_file(
+                    source_hash,
+                    staged,
+                    token_count=2048,
+                    model_name="model",
+                    cache_signature=signature,
+                    block_size=2048,
+                )
+            )
+        old = time.time() - 10
+        new = time.time() - 5
+        os.utime(paths[0], (old, old))
+        os.utime(paths[1], (new, new))
+    finally:
+        manager.close()
+
+    # Half of free space plus cache is far above 11 bytes, so only the ceiling binds.
+    monkeypatch.setattr(paged_ssd_cache, "AUTO_SSD_CACHE_MAX_BYTES", 11)
+    restarted = _make_manager(cache_dir, auto_size=True)
+    try:
+        assert restarted.max_size == 11
+        assert restarted._tracked_ssd_size() == 11
+        assert not paths[0].exists()
+        assert paths[1].exists()
+    finally:
+        restarted.close()
+
 @pytest.mark.parametrize("auto_size", [False, True])
 def test_sidecar_and_main_block_share_global_lru_budget(
     tmp_path, monkeypatch, auto_size
