@@ -17,6 +17,7 @@ from omlx.cluster.staging import (
     _REMOTE_INSTALL_SNIPPET,
     ShardInfo,
     fabric_transfer_address,
+    home_relative_model_path,
     index_shards,
     plan_cluster_staging,
     plan_staging,
@@ -393,7 +394,7 @@ def test_manifest_reads_the_exact_model_path_on_local_and_remote(tmp_path, monke
 
     assert manifest["ready"] is True
     assert all(node["missing_files"] == 0 for node in manifest["nodes"])
-    assert remote_calls == [("Studio.local", str(root))]
+    assert remote_calls == [("Studio.local", home_relative_model_path(str(root)))]
 
 
 def test_manifest_is_not_ready_when_a_remote_sidecar_is_missing(
