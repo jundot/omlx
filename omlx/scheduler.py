@@ -6190,6 +6190,34 @@ class Scheduler:
         if track:
             tracker.record_flat_reclaim(max(0, pooled))
 
+    # Matches ProcessMemoryEnforcer._POOL_RECLAIM_FLOOR.
+    _PRE_STORE_POOL_CLEAR_FLOOR_BYTES = 2 * 1024**3
+
+    def _clear_pool_before_store(self) -> None:
+        """Clear a large pool under pressure before a cache store starts.
+
+        The store worker holds _mx_buffer_access_lock for the whole store, so
+        any pool clear requested during the store waits until it ends.
+        """
+        if not self._prefill_memory_guard or self._memory_limit_bytes <= 0:
+            return
+        pooled = int(mx.get_cache_memory())
+        if pooled <= self._PRE_STORE_POOL_CLEAR_FLOOR_BYTES:
+            return
+        if self._current_usage_bytes() < self._memory_limit_bytes:
+            return
+        # Do not wait behind a store that already holds the lock.
+        if not _mx_buffer_access_lock.acquire(blocking=False):
+            return
+        try:
+            Scheduler._clear_cache(self)
+        finally:
+            _mx_buffer_access_lock.release()
+        logger.info(
+            "Cleared %.2fGB of pooled Metal buffers before cache store",
+            pooled / 1024**3,
+        )
+
     # A chunk always gets this much room above live MLX memory, so a tight
     # headroom makes MLX run the chunk slower instead of one op at a time.
     _CHUNK_BACKPRESSURE_FLOOR_BYTES = 512 * 1024**2
@@ -14944,6 +14972,7 @@ class Scheduler:
                                     request_id,
                                 )
 
+                            self._clear_pool_before_store()
                             if self._store_cache_executor is not None:
                                 # Hand host memcpy and disk write to the
                                 # background executor after the owner thread
