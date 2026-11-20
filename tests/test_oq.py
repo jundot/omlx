@@ -14,6 +14,7 @@ import pytest
 try:
     import mlx.core as mx
     import mlx.nn as nn
+    import mlx_lm.utils as mlx_lm_utils
     from mlx.utils import tree_flatten
 
     from omlx.patches.inkling2.vision import VisionArgs, VisionTower
@@ -95,6 +96,7 @@ from omlx.oq import (
     universal_quant_predicate,
     validate_quantizable,
 )
+from omlx.utils import model_loading
 
 # =============================================================================
 # Test universal_quant_predicate
@@ -9711,6 +9713,29 @@ class TestInkling2OQ:
                 base = key[: -len("weight")]
                 assert mx.array_equal(weight, loaded[base + "weight"]).item()
                 assert mx.array_equal(scales, loaded[base + "scales"]).item()
+
+    def test_release_modelopt_config_loads_as_before(
+        self, inkling2_source, tmp_path, monkeypatch
+    ):
+        # The releases declare their native experts as ModelOpt NVFP4.
+        release = tmp_path / "release"
+        _inkling2_source(release)
+        config = json.loads((release / "config.json").read_text())
+        config["quantization_config"] = {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+        }
+        (release / "config.json").write_text(json.dumps(config))
+        assert validate_quantizable(config)
+
+        monkeypatch.setattr(model_loading, "_MLX_LM_LOAD_CONFIG_PATCHED", False)
+        monkeypatch.setattr(mlx_lm_utils, "load_config", mlx_lm_utils.load_config)
+        model_loading._patch_mlx_lm_load_config()
+        expected = tree_flatten(_inkling2_model(inkling2_source).parameters())
+        loaded = dict(tree_flatten(_inkling2_model(release).parameters()))
+        assert loaded.keys() == dict(expected).keys()
+        for key, value in expected:
+            assert mx.array_equal(loaded[key], value, equal_nan=True).item(), key
 
     def test_oq4_passes_native_experts_through(self, inkling2_source, tmp_path):
         output = tmp_path / "oq4"

@@ -445,6 +445,23 @@ def normalize_mimo_mxfp4_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_inkling2_modelopt_quant(cfg: dict) -> dict:
+    """Drop the ModelOpt quantization_config of Inkling 2 releases.
+
+    The releases declare their native NVFP4 and MXFP8 experts as ModelOpt NVFP4.
+    The Inkling 2 loader builds the expert carriers itself, and mlx-lm's ModelOpt
+    branch would otherwise infer a format for them and fail.
+    """
+    if cfg.get("model_type") != "inkling2" or isinstance(
+        cfg.get("quantization"), dict
+    ):
+        return cfg
+    qc = cfg.get("quantization_config")
+    if isinstance(qc, dict) and qc.get("quant_method") == "modelopt":
+        del cfg["quantization_config"]
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -469,6 +486,7 @@ def _patch_mlx_lm_load_config() -> None:
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
         normalize_mimo_mxfp4_quant(cfg)
+        normalize_inkling2_modelopt_quant(cfg)
         normalize_raon1_mini_model_file(cfg)
         return cfg
 

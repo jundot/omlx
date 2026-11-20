@@ -4011,6 +4011,9 @@ def validate_quantizable(config: dict) -> bool:
             # Muse Spark NVFP4 experts pass through; the rest is BF16.
             if _is_muse_spark_modelopt_nvfp4(config):
                 return True
+            # Inkling 2 releases declare their native experts as ModelOpt NVFP4.
+            if inkling2_layout.is_inkling2(config) and quant_method == "modelopt":
+                return True
         return False
     return True
 
