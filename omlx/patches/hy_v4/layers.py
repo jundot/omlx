@@ -9,6 +9,7 @@ at load time, as in mlx-lm's DeepSeek-V3.2.
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 import mlx.core as mx
@@ -17,8 +18,10 @@ from mlx_lm.models.mla import MultiLinear
 from mlx_vlm.models.base import create_attention_mask
 
 from ...custom_kernels.attention import fast as attn_fast
+from ...custom_kernels.nax import is_nax_available
 from ...oqh.modules import exact_rows as oqh_exact_rows
 from ..deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
+from ..glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
 from . import exact, indexing
 from . import kernels as hc_kernels
 from .config import TextConfig
@@ -29,6 +32,33 @@ _ROW_CHUNK = 256
 # Up to this many query rows, attention gathers each row's own keys instead of
 # running the prefill-shaped kernels (draft verify blocks, short chunks).
 _VERIFY_ROWS = 16
+
+
+@functools.cache
+def _nax_host() -> bool:
+    return bool(is_nax_available())
+
+
+def _nax_attention(queries, keys, values, scale, mask, sinks):
+    """MLX's fused tensor-unit attention for the 256-wide heads, or None.
+
+    On M5 MLX has a split-head-dim kernel for 256-wide heads that takes the
+    boolean mask and the sinks; it must be requested explicitly for shorter
+    query blocks. Older MLX builds without ``force_fused`` keep the block-mask
+    kernel.
+    """
+    try:
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            sinks=sinks,
+            force_fused=True,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def masked_min(dtype) -> mx.array:
@@ -680,22 +710,37 @@ class Attention(nn.Module):
         return self.unembed_out(out)
 
     def _sparse_kernel(self, q_nope, q_pe, latent, k_pe, topk):
-        """Absorbed sparse MLA over the selected slots on the native kernel.
+        """Absorbed sparse MLA over the selected slots on the native kernels.
 
-        Out-of-range and future slots are skipped by the kernel; the indexers
-        send masked picks past the cache, so batch padding never enters.
+        Out-of-range and future slots are skipped by the kernels; the indexers
+        send masked picks past the cache, so batch padding never enters. M5
+        hosts take the tensor-unit kernel (one sequence) first.
         """
         if not (
-            attn_fast.NATIVE_AVAILABLE
-            and self.num_heads in (32, 64)
+            self.num_heads in (32, 64)
             and self.rank == 512
             and self.rope_dim == 64
             and topk.shape[-1] == 2048
             and q_nope.dtype in (mx.float16, mx.bfloat16)
         ):
             return None
+        q_latent = self.embed_q(q_nope).astype(q_nope.dtype)
+        if _nax_host() and q_nope.shape[0] == 1:
+            out = sparse_mla_attention_nax(
+                q_latent,
+                latent.astype(q_nope.dtype),
+                topk.astype(mx.int32),
+                self.scale,
+                q_pe=q_pe,
+                k_pe=k_pe,
+                sinks=self.learnable_sink_param,
+            )
+            if out is not None:
+                return self.unembed_out(out)
+        if not attn_fast.NATIVE_AVAILABLE:
+            return None
         out = attn_fast.sparse_mla_attention(
-            self.embed_q(q_nope).astype(q_nope.dtype),
+            q_latent,
             q_pe,
             latent.astype(q_nope.dtype),
             k_pe.astype(q_nope.dtype),
@@ -727,6 +772,17 @@ class Attention(nn.Module):
         )
         values = self.unembed_out(latent)
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
+        if queries.dtype in (mx.float16, mx.bfloat16) and _nax_host():
+            out = _nax_attention(
+                queries,
+                keys.astype(queries.dtype),
+                values.astype(queries.dtype),
+                self.scale,
+                mask,
+                sinks,
+            )
+            if out is not None:
+                return out
         if (
             attn_fast.NATIVE_AVAILABLE
             and queries.shape[-1] == 256

@@ -15,6 +15,11 @@ import logging
 import mlx.core as mx
 
 from ...custom_kernels.sparse_index import fast as index_fast
+from ..glm_moe_dsa.indexer_nax import (
+    indexer_scores_nax,
+    max_rows_per_call,
+    nax_indexer_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +34,9 @@ _MIN_ROWS = 32
 # The decode kernel is built for 32 heads and pays off from this many keys.
 _DECODE_HEADS = 32
 _DECODE_MIN_KEYS = 1024
+
+# Below the kernel's masked value, bf16(-1e30).
+_NAX_MASKED = -1e29
 
 _heads_ok: dict[int, bool] = {}
 
@@ -84,6 +92,10 @@ def scores(
     )
     if length < _MIN_ROWS and not decode:
         return None
+    if not decode and b == 1 and q.dtype == mx.bfloat16 and nax_indexer_available():
+        out = _nax_scores(q, keys, weights, causal)
+        if out is not None:
+            return out
     keys = mx.contiguous(keys.astype(q.dtype))
     if decode:
         return index_fast.dsa_decode_scores(
@@ -95,6 +107,38 @@ def scores(
         mx.contiguous(weights.astype(q.dtype)),
         causal=causal,
     )
+
+
+def _nax_scores(q, keys, weights, causal):
+    """The same scores on M5 tensor units (one sequence), or None.
+
+    The kernel masks key ``p`` for row ``s`` unless ``p <= before + s``; a
+    non-causal call places every key before the first row.
+    """
+    length, total = q.shape[2], keys.shape[2]
+    rows = q[0].swapaxes(0, 1)
+    pool = mx.contiguous(keys[0, 0].astype(mx.bfloat16))
+    w = weights[0].astype(mx.bfloat16)
+    before = total - length if causal else total
+    step = max_rows_per_call(total)
+    parts = []
+    for lo in range(0, length, step):
+        hi = min(length, lo + step)
+        part = indexer_scores_nax(
+            mx.contiguous(rows[lo:hi]),
+            pool,
+            mx.contiguous(w[lo:hi]),
+            before + lo,
+            total,
+            1,
+        )
+        if part is None:
+            return None
+        parts.append(part)
+    out = parts[0] if len(parts) == 1 else mx.concatenate(parts)
+    # The kernel writes bf16(-1e30) where the causal rule masks a key.
+    out = mx.where(out > _NAX_MASKED, out, -mx.inf)
+    return out[None, None]
 
 
 def topk(values: mx.array, k: int) -> mx.array | None:

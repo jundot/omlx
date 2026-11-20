@@ -20,8 +20,9 @@ from mlx_lm.models.cache import (  # noqa: E402
 
 from omlx import oq  # noqa: E402
 from omlx.adapter.output_parser import correct_tool_parser_type  # noqa: E402
+from omlx.custom_kernels import nax  # noqa: E402
 from omlx.engine.vlm import _apply_template_thinking_mode  # noqa: E402
-from omlx.patches.hy_v4 import exact, indexing  # noqa: E402
+from omlx.patches.hy_v4 import exact, indexing, layers  # noqa: E402
 from omlx.patches.hy_v4.flash import CompressedIndexer  # noqa: E402
 from omlx.patches.hy_v4.language import set_dspark_verify_armed  # noqa: E402
 from omlx.patches.hy_v4.layers import Indexer  # noqa: E402
@@ -554,6 +555,72 @@ def test_native_index_selection_matches_mlx(monkeypatch, kind):
         overlap.append(len(a & b) / max(len(b), 1))
     # bf16 scores reorder only near-ties at the cutoff.
     assert np.mean(overlap) > 0.995 and np.min(overlap) > 0.95
+
+
+def _sparse_reference(q, kv, idx, scale, q_pe, k_pe, sinks):
+    """fp32 sparse MLA with sinks: softmax over each row's usable slots."""
+    total, length = kv.shape[2], q.shape[2]
+    rows = []
+    for i in range(length):
+        sel = idx[0, 0, i]
+        valid = (sel >= 0) & (sel < total) & (sel <= total - length + i)
+        safe = mx.where(valid, sel, 0)
+        keys = kv[0, 0][safe].astype(mx.float32)
+        s = q[0, :, i].astype(mx.float32) @ keys.T
+        s = s + q_pe[0, :, i].astype(mx.float32) @ k_pe[0, 0][safe].astype(mx.float32).T
+        s = mx.where(valid[None], s * scale, -mx.inf)
+        p = mx.softmax(mx.concatenate([s, sinks[:, None]], axis=1), axis=-1)
+        rows.append(p[:, :-1] @ keys)
+    return mx.stack(rows, axis=1)[None]
+
+
+@pytest.mark.skipif(not nax.is_nax_available(), reason="needs M5 tensor units")
+def test_nax_paths_match_their_references():
+    from omlx.patches.glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
+
+    def rel(a, b):
+        a, b = a.astype(mx.float32), b.astype(mx.float32)
+        return (mx.abs(a - b).max() / mx.abs(b).max()).item()
+
+    mx.random.seed(0)
+    heads, length, total = 32, 16, 3000
+    q = (mx.random.normal((1, heads, length, 512)) * 0.3).astype(mx.bfloat16)
+    q_pe = (mx.random.normal((1, heads, length, 64)) * 0.3).astype(mx.bfloat16)
+    kv = (mx.random.normal((1, 1, total, 512)) * 0.3).astype(mx.bfloat16)
+    k_pe = (mx.random.normal((1, 1, total, 64)) * 0.3).astype(mx.bfloat16)
+    idx = mx.stack(
+        [
+            mx.random.permutation(total - length + i + 1)[:2048].astype(mx.int32)
+            for i in range(length)
+        ]
+    )[None, None]
+    sinks = mx.random.normal((heads,))
+    scale = 576**-0.5
+    out = sparse_mla_attention_nax(q, kv, idx, scale, q_pe=q_pe, k_pe=k_pe, sinks=sinks)
+    assert rel(out, _sparse_reference(q, kv, idx, scale, q_pe, k_pe, sinks)) < 2e-2
+
+    # Index scores: tensor units against the SIMD kernel (both bf16 out).
+    k = (mx.random.normal((1, 1, total, 128)) * 0.3).astype(mx.bfloat16)
+    w = mx.random.normal((1, 64, 32)).astype(mx.bfloat16)
+    qi = (mx.random.normal((1, 32, 64, 128)) * 0.3).astype(mx.bfloat16)
+    for causal in (True, False):
+        got = indexing._nax_scores(qi, k, w, causal)
+        want = indexing.index_fast.dsa_indexer_scores(qi, k, w, causal=causal)
+        finite = want > -mx.inf
+        assert mx.array_equal(got > -mx.inf, finite).item()
+        assert rel(mx.where(finite, got, 0), mx.where(finite, want, 0)) < 1e-2
+
+    # 256-wide heads with sinks: the fused SDPA against MLX's reference path.
+    qs = (mx.random.normal((1, 8, 64, 256)) * 0.3).astype(mx.bfloat16)
+    ks = (mx.random.normal((1, 8, 600, 256)) * 0.3).astype(mx.bfloat16)
+    vs = mx.random.normal((1, 8, 600, 256)).astype(mx.bfloat16)
+    mask = mx.arange(536, 600)[:, None] >= mx.arange(600)
+    sink = mx.random.normal((8,)).astype(mx.bfloat16)
+    fused = layers._nax_attention(qs, ks, vs, 0.0625, mask, sink)
+    plain = mx.fast.scaled_dot_product_attention(
+        qs, ks, vs, scale=0.0625, mask=mask, sinks=sink
+    )
+    assert rel(fused, plain) < 1e-2
 
 
 def test_sanitize_dequantizes_fp8_and_stacks_experts():

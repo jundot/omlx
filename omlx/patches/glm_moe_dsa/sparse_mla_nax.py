@@ -111,10 +111,10 @@ _SOURCE = """
     }
     float m_run[2] = {-FLT_MAX, -FLT_MAX};
     float l_run[2] = {0.0f, 0.0f};
-
+__SINK_INIT__
     const device T* qr0 = q + (ulong(head0 + fm) * L + qi) * D + fn;
     const device T* qr1 = q + (ulong(head0 + fm + 8) * L + qi) * D + fn;
-    const device int32_t* idx_row = idx + ulong(qi) * TOPK;
+__PE_SETUP__    const device int32_t* idx_row = idx + ulong(qi) * TOPK;
 
     auto stage = [&](int t, int b) {
         if (tid < uint(BK)) {
@@ -179,7 +179,7 @@ _SOURCE = """
                 }
                 qk_op.run(qa, kb, sc);
             }
-        }
+__PE_QK__        }
         bool ok[2][4];
         for (short tn = 0; tn < 2; ++tn) {
             for (short j = 0; j < 4; ++j) {
@@ -318,20 +318,70 @@ _SOURCE = """
     }
 """
 
-_KERNEL = None
+# Hy4's variant: a 64-wide RoPE part added to every score (q_pe . k_pe of the
+# same key row) and one learned sink per head, a key with a zero value that
+# only joins the softmax denominator (as in MLX's attention: the running max
+# starts at the sink, the running sum at one).
+_SINK_INIT = """\
+    for (short i = 0; i < 2; ++i) {
+        m_run[i] = float(sinks[head0 + fm + i * 8]) * 1.44269504088896341f;
+        l_run[i] = 1.0f;
+    }
+"""
+_PE_SETUP = """\
+    constexpr int DP = 64;
+    const device T* qp0 = q_pe + (ulong(head0 + fm) * L + qi) * DP + fn;
+    const device T* qp1 = q_pe + (ulong(head0 + fm + 8) * L + qi) * DP + fn;
+"""
+_PE_QK = """\
+            const device T* pr[2][2];
+            for (short tn = 0; tn < 2; ++tn) {
+                for (short i = 0; i < 2; ++i) {
+                    const int kp = sel[buf][j4 * 32 + tn * 16 + fm + i * 8];
+                    pr[tn][i] = k_pe + ulong(max(kp, 0)) * DP + fn;
+                }
+            }
+            for (short kk = 0; kk < DP; kk += 16) {
+                for (short j = 0; j < 4; ++j) {
+                    qa[j] = qp0[kk + j];
+                    qa[4 + j] = qp1[kk + j];
+                }
+                for (short tn = 0; tn < 2; ++tn) {
+                    for (short i = 0; i < 2; ++i) {
+                        for (short j = 0; j < 4; ++j) {
+                            kb[tn * 8 + i * 4 + j] = pr[tn][i][kk + j];
+                        }
+                    }
+                }
+                qk_op.run(qa, kb, sc);
+            }
+"""
+_D_PE = 64
+_KERNELS: dict = {}
 
 
-def _kernel():
-    global _KERNEL
-    if _KERNEL is None:
-        _KERNEL = mx.fast.metal_kernel(
-            name="omlx_glm_sparse_mla_nax_v2",
-            input_names=["q", "kv", "idx", "params", "scale"],
+def _source(rope: bool) -> str:
+    """GLM's NoPE kernel, or Hy4's with the RoPE part and per-head sinks."""
+    return (
+        _SOURCE.replace("__SINK_INIT__", _SINK_INIT if rope else "")
+        .replace("__PE_SETUP__", _PE_SETUP if rope else "")
+        .replace("__PE_QK__", _PE_QK if rope else "")
+    )
+
+
+def _kernel(rope: bool = False):
+    if rope not in _KERNELS:
+        inputs = ["q", "kv", "idx", "params", "scale"]
+        if rope:
+            inputs += ["q_pe", "k_pe", "sinks"]
+        _KERNELS[rope] = mx.fast.metal_kernel(
+            name="omlx_hy4_sparse_mla_nax" if rope else "omlx_glm_sparse_mla_nax_v2",
+            input_names=inputs,
             output_names=["out"],
             header=_HEADER,
-            source=_SOURCE,
+            source=_source(rope),
         )
-    return _KERNEL
+    return _KERNELS[rope]
 
 
 @lru_cache(maxsize=1)
@@ -349,14 +399,20 @@ def sparse_mla_attention_nax(
     kv_latent: mx.array,
     topk_indices: mx.array,
     scale: float,
+    *,
+    q_pe: mx.array | None = None,
+    k_pe: mx.array | None = None,
+    sinks: mx.array | None = None,
 ) -> Optional[mx.array]:
     """Causal sparse MLA for NoPE latents on the tensor units.
 
     q_latent: [1, H, L, 512], kv_latent: [1, 1, K, 512] (bf16/fp16, the
     last L rows are the queries' own positions), topk_indices:
     [1, 1, L, TOPK] int32 key rows (negative, >= K or past the query's
-    position = unused slot). Returns [1, H, L, 512] or None when the inputs
-    are outside what the kernel handles.
+    position = unused slot). Hy4 also passes its RoPE part, q_pe
+    [1, H, L, 64] and k_pe [1, 1, K, 64], and per-head sinks [H]. Returns
+    [1, H, L, 512] or None when the inputs are outside what the kernel
+    handles.
     """
     if not nax_sparse_mla_available():
         return None
@@ -380,12 +436,28 @@ def sparse_mla_attention_nax(
     topk = topk_indices.shape[-1]
     if L < 1 or K < L or topk_indices.shape[2] != L or topk < 1:
         return None
+    rope = q_pe is not None
+    if rope and (
+        k_pe is None
+        or sinks is None
+        or q_pe.shape != (1, H, L, _D_PE)
+        or k_pe.shape != (1, 1, K, _D_PE)
+        or sinks.shape != (H,)
+    ):
+        return None
     idx = topk_indices[0, 0]
     if idx.dtype != mx.int32:
         idx = idx.astype(mx.int32)
     params = mx.array([L, K, topk, K - L], dtype=mx.int32)
-    out = _kernel()(
-        inputs=[q_latent[0], kv_latent[0, 0], idx, params, mx.array([scale], mx.float32)],
+    inputs = [q_latent[0], kv_latent[0, 0], idx, params, mx.array([scale], mx.float32)]
+    if rope:
+        inputs += [
+            mx.contiguous(q_pe[0].astype(q_latent.dtype)),
+            mx.contiguous(k_pe[0, 0].astype(q_latent.dtype)),
+            sinks.astype(mx.float32),
+        ]
+    out = _kernel(rope)(
+        inputs=inputs,
         template=[("T", q_latent.dtype)],
         grid=(L * 256, H // _HEADS_PER_GROUP, 1),
         threadgroup=(256, 1, 1),
