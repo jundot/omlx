@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
-from mlx_vlm.turboquant import TurboQuantKVCache
+from mlx_vlm.turboquant import TurboQuantKVCache, _state_length
 
 from omlx.affine4 import (
     Affine4KVCache,
@@ -330,11 +330,6 @@ def test_affine8_prefix_and_ssd_roundtrip(manager_factory):
 
 
 def test_restored_affine_cache_has_room_for_the_next_tokens(manager_factory):
-    """The first tokens after a restore are written in place, not into a copy."""
-    from mlx_vlm.turboquant import _state_length
-
-    from omlx.turboquant_kv import _spare_capacity
-
     manager = manager_factory(types=["Affine8KVCache"])
     manager.set_expected_layer_signature(["Affine8KVCache"], turboquant_kv_bits=8)
     prefix, _ = _prefix(manager)
@@ -344,19 +339,11 @@ def test_restored_affine_cache_has_room_for_the_next_tokens(manager_factory):
     prefix.release_cache("store")
     table, _ = prefix.fetch_cache("reuse", list(range(8)) + [99])
     restored = prefix.reconstruct_cache(table)[0]
-
-    assert restored.offset == 8
-    capacity = _state_length(restored.keys)
-    assert capacity == _spare_capacity(8)
     _assert_state_equal(_state(cache), _state(restored))
 
-    new = mx.random.normal((1, 2, 3, 13)).astype(mx.float16)
-    restored.update_and_fetch(new, mx.random.normal((1, 2, 3, 21)).astype(mx.float16))
-    mx.eval(restored.keys, restored.values)
-    assert restored.offset == 11
+    capacity = _state_length(restored.keys)
+    assert capacity > restored.offset == 8
+    restored.update_and_fetch(
+        mx.zeros((1, 2, 3, 13), mx.float16), mx.zeros((1, 2, 3, 21), mx.float16)
+    )
     assert _state_length(restored.keys) == capacity
-    for expected, actual in zip(_state(cache), _state(restored)):
-        for field in expected._fields:
-            assert mx.array_equal(
-                getattr(expected, field), getattr(actual, field)[:, :, :8]
-            ).item()

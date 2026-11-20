@@ -3961,9 +3961,7 @@ class BlockAwarePrefixCache(CacheManager):
                             )
                             return None
                         parts.append((ks, vs))
-                    # The blocks go straight into a buffer with room to grow:
-                    # an exact-size concat is copied whole by the first token
-                    # appended to it.
+                    # Leave room so the first appended token does not regrow.
                     capacity = _spare_capacity(
                         sum(_state_length(ks) for ks, _ in parts)
                     )

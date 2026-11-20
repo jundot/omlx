@@ -1039,7 +1039,6 @@ class Affine4KVCache(TurboQuantKVCache):
 
     @property
     def cache_step(self):
-        # Every growth copies the whole packed state (see _growth_step).
         return _growth_step(_state_length(self.keys) if self.keys is not None else 0)
 
     @classmethod

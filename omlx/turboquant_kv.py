@@ -234,12 +234,8 @@ def _concat_state_batch(states):
     raise TypeError(f"Unsupported state type: {type(first)!r}")
 
 
-# A quantized cache grows by copying its whole packed state into a larger
-# buffer, and the buffer it leaves has a size nothing else asks for. At the
-# stock 256-token step a 245K-token cache is copied on its first append after
-# a restore or a join and again every 256 tokens. Long caches therefore grow
-# by 1/64 of their length, and a cache built from stored or joined states
-# starts with that much room.
+# Each growth copies the whole packed state, so long caches grow by 1/64 of
+# their length instead of the stock 256 tokens.
 _MIN_GROWTH_STEP = 256
 
 
@@ -248,18 +244,12 @@ def _growth_step(tokens: int) -> int:
     return max(_MIN_GROWTH_STEP, (tokens >> 6) // _MIN_GROWTH_STEP * _MIN_GROWTH_STEP)
 
 
-# Spare tokens a built state keeps at least: a decode step, a verify block or
-# a short suffix chunk fits without a growth copy.
+# Room for a decode step or a verify block without a growth copy.
 _MIN_SPARE_TOKENS = 64
 
 
 def _spare_capacity(tokens: int) -> int:
-    """Token capacity for a state of ``tokens`` that is about to be appended to.
-
-    The next step boundary past ``tokens + _MIN_SPARE_TOKENS``: between 64 and
-    ``step + 63`` spare tokens, so short and mid contexts carry at most one
-    growth step per row and layer.
-    """
+    """Next growth-step boundary past ``tokens + _MIN_SPARE_TOKENS``."""
     step = _growth_step(tokens)
     return (tokens + _MIN_SPARE_TOKENS + step - 1) // step * step
 
@@ -284,11 +274,7 @@ def _allocate_state_rows(state, rows: int, capacity: int):
 
 
 def _write_state_block(dst, src, row: int, start: int) -> None:
-    """Write ``src`` into ``dst`` at batch row ``row`` and token column ``start``.
-
-    Every leaf array of a packed state has the batch axis first and the token
-    axis third, so each takes the same row and column window.
-    """
+    """Write ``src`` into ``dst`` at batch row ``row`` and token column ``start``."""
     for dst_field, src_field in zip(dst, src):
         if isinstance(dst_field, mx.array):
             rows, length = src_field.shape[0], src_field.shape[2]
@@ -298,11 +284,7 @@ def _write_state_block(dst, src, row: int, start: int) -> None:
 
 
 def _place_states(reference, placements, rows: int, capacity: int):
-    """Build one state of ``rows`` x ``capacity`` from ``(state, row, start)``.
-
-    The states are written into one zero buffer, so nothing is padded or
-    concatenated on the way and the result has room to grow.
-    """
+    """Write ``(state, row, start)`` placements into one zero buffer."""
     out = _allocate_state_rows(reference, rows, capacity)
     for state, row, start in placements:
         if state is not None:
@@ -312,10 +294,6 @@ def _place_states(reference, placements, rows: int, capacity: int):
 
 def _join_state_token_axis(states, capacity: int):
     """Concatenate states along the token axis into a buffer of ``capacity``."""
-    states = [
-        state._state if isinstance(state, _QuantizedStateProxy) else state
-        for state in states
-    ]
     placements = []
     start = 0
     for state in states:
@@ -432,7 +410,6 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
     @property
     def cache_step(self):
-        # See _growth_step: every growth copies the whole batch state.
         return _growth_step(_state_length(self.keys) if self.keys is not None else 0)
 
     def trim(self, n):
@@ -583,8 +560,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         min_left_pad = int(self.left_padding.min().item())
         if min_left_pad > 0:
             if self.keys is not None:
-                # Keep the spare columns past the written end: cutting them
-                # off makes the next token copy the whole state again.
+                # Keep the spare columns past the written end.
                 capacity = _state_length(self.keys)
                 self.keys = _slice_state_range(self.keys, min_left_pad, capacity)
                 self.values = _slice_state_range(self.values, min_left_pad, capacity)
@@ -605,8 +581,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         other._ensure_array_offset()
         # Align on the WRITTEN ends: _state_length is step-allocated capacity,
         # and padding a joining row by capacity difference would bury its
-        # content behind unwritten columns. _trim also slices each side down
-        # to its written end, normalizing any over-allocation.
+        # content behind unwritten columns.
         s_idx = self._phys_end if self.keys is not None else 0
         o_idx = other._phys_end if other.keys is not None else 0
         max_idx = max(s_idx, o_idx)
@@ -614,7 +589,6 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         ref_values = self.values if self.values is not None else other.values
 
         def _trim(c, idx):
-            # Written part of each side; an empty side joins as zero rows.
             if c.keys is None:
                 return None, None
             return _slice_state(c.keys, idx), _slice_state(c.values, idx)
@@ -627,8 +601,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         o_ks, o_vs = _trim(other, o_idx)
 
         if max_idx > 0 and ref_keys is not None:
-            # Both sides go end-aligned into one buffer with room to grow,
-            # instead of a padded copy of the shorter side plus a batch concat.
+            # Both sides go end-aligned into one buffer with room to grow.
             capacity = _spare_capacity(max_idx)
             rows = s_rows + o_rows
             self.keys = _place_states(
@@ -738,8 +711,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 )
                 break
 
-        # Each request's state goes end-aligned into its row of one buffer
-        # with room to grow; an empty request leaves its row zero.
+        # An empty request keeps a zero row.
         rows = 0
         for p, c in zip(padding, caches):
             ks, vs = c.state
