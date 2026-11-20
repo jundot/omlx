@@ -1080,7 +1080,29 @@ class PagedCacheManager(CacheManager):
                     num_cached_tokens += tail_block.token_count
                     self.stats.hits += 1
 
-            return cached_blocks, num_cached_tokens
+        if token_ids and logger.isEnabledFor(logging.DEBUG):
+            # Use the final lookup result: a tail hit can extend the prefix
+            # past the first full-block miss.
+            matched_blocks = len(cached_blocks)
+            if num_cached_tokens == len(token_ids):
+                boundary = "end of prompt"
+            else:
+                boundary = f"block {matched_blocks} UNMATCHED"
+            if matched_blocks == 1:
+                boundary = f"block 0 HIT, {boundary}"
+            elif matched_blocks > 1:
+                boundary = f"blocks 0-{matched_blocks - 1} HIT, {boundary}"
+            logger.debug(
+                "Paged prefix match: matched_blocks=%d matched_tokens=%d "
+                "boundary_block=%d boundary_token=%d map=[%s]",
+                matched_blocks,
+                num_cached_tokens,
+                matched_blocks,
+                num_cached_tokens,
+                boundary,
+            )
+
+        return cached_blocks, num_cached_tokens
 
     # =========================================================================
     # Legacy hash methods (for backwards compatibility)
