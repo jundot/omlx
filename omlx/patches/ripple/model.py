@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from OrcaRouter's MLX port of Ricursive's Ripple implementation.
 # Source: orcarouter/Ripple-65B-abliterated-MLX @ f05d1fd49e6ff40388db462f1379140dedd2768a
-# Modified for registration and inference inside oMLX.
+# Modified for oMLX registration, DFlash2 hidden-state capture and cache rollback.
 
 # Ripple-65B (model_type "ricursive") for mlx-lm.
 #
@@ -16,6 +16,7 @@
 #   - the embeddings are multiplied by embed_scale; the RMSNorm weight multiplies directly (no 1+w)
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
@@ -91,6 +92,7 @@ class Attention(nn.Module):
         mask: mx.array | None = None,
         cache: Any | None = None,
         value_residual: mx.array | None = None,
+        verify_rows: bool = False,
     ) -> mx.array:
         batch_size, length, _ = x.shape
         queries = self.q_proj(x)
@@ -111,16 +113,36 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        if self.is_sliding:
-            offset = cache.offset if cache is not None else 0
-            queries = self.rope(queries, offset=offset)
-            keys = self.rope(keys, offset=offset)
-        if cache is not None:
-            keys, values = cache.update_and_fetch(keys, values)
+        if verify_rows and cache is not None and length > 1:
+            # Keep one-token attention arithmetic and physical ring order while
+            # the heavy projections still share one pass over their weights.
+            outputs = []
+            for row in range(length):
+                q = queries[:, :, row : row + 1]
+                k = keys[:, :, row : row + 1]
+                v = values[:, :, row : row + 1]
+                if self.is_sliding:
+                    q = self.rope(q, offset=cache.offset)
+                    k = self.rope(k, offset=cache.offset)
+                row_mask = create_attention_mask(x[:, row : row + 1], cache)
+                k, v = cache.update_and_fetch(k, v)
+                outputs.append(
+                    scaled_dot_product_attention(
+                        q, k, v, cache=cache, scale=self.scale, mask=row_mask
+                    )
+                )
+            output = mx.concatenate(outputs, axis=2)
+        else:
+            if self.is_sliding:
+                offset = cache.offset if cache is not None else 0
+                queries = self.rope(queries, offset=offset)
+                keys = self.rope(keys, offset=offset)
+            if cache is not None:
+                keys, values = cache.update_and_fetch(keys, values)
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
         output = output.transpose(0, 2, 1, 3).reshape(batch_size, length, -1)
         if self.gated:
             gate = self.g_proj(x)
@@ -158,8 +180,12 @@ class TransformerBlock(nn.Module):
         self.pre_feedforward_layernorm = nn.RMSNorm(args.hidden_size, eps=eps)
         self.post_feedforward_layernorm = nn.RMSNorm(args.hidden_size, eps=eps)
 
-    def __call__(self, x, mask=None, cache=None, value_residual=None):
-        r = self.self_attn(self.input_layernorm(x), mask, cache, value_residual)
+    def __call__(
+        self, x, mask=None, cache=None, value_residual=None, verify_rows=False
+    ):
+        r = self.self_attn(
+            self.input_layernorm(x), mask, cache, value_residual, verify_rows
+        )
         h = x + self.post_attention_layernorm(r)
         r = self.mlp(self.pre_feedforward_layernorm(h))
         return h + self.post_feedforward_layernorm(r)
@@ -180,7 +206,15 @@ class RicursiveModel(nn.Module):
             types.index("sliding_attention") if "sliding_attention" in types else None
         )
 
-    def __call__(self, inputs, cache=None, input_embeddings=None):
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings=None,
+        capture_layer_ids=(),
+        capture=None,
+        verify_rows=False,
+    ):
         h = (
             input_embeddings
             if input_embeddings is not None
@@ -200,9 +234,11 @@ class RicursiveModel(nn.Module):
             sliding_mask = create_attention_mask(
                 h, cache[self.first_sliding], window_size=self.args.sliding_window
             )
-        for layer, c in zip(self.layers, cache):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = sliding_mask if layer.self_attn.is_sliding else global_mask
-            h = layer(h, mask, c, value_residual)
+            h = layer(h, mask, c, value_residual, verify_rows)
+            if capture is not None and i in capture_layer_ids:
+                capture[i] = h
         return self.norm(h)
 
 
@@ -215,11 +251,64 @@ class Model(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs, cache=None, input_embeddings=None):
-        out = self.model(inputs, cache, input_embeddings)
+    _omlx_drafter_single_row = True
+    _omlx_mtp_row_exact_verify = True
+
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings=None,
+        *,
+        capture_layer_ids=None,
+        return_hidden=False,
+        n_confirmed=0,
+    ):
+        drafter = getattr(self, "_omlx_drafter", None)
+        scope = getattr(drafter, "scope_uids", None)
+        observe = (
+            scope
+            and capture_layer_ids is None
+            and not return_hidden
+            and inputs is not None
+            and inputs.shape == (len(scope), 1)
+        )
+        ids = drafter.target_layer_ids if observe else (capture_layer_ids or ())
+        capture = {} if ids else None
+        out = self.model(
+            inputs, cache, input_embeddings, ids, capture, bool(n_confirmed)
+        )
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(out)
-        return self.lm_head(out)
+            logits = self.model.embed_tokens.as_linear(out)
+        else:
+            logits = self.lm_head(out)
+        if capture is not None:
+            states = [capture[i] for i in ids]
+            if observe:
+                drafter.observe(scope, states)
+            else:
+                if return_hidden:
+                    states.append(out)
+                return SimpleNamespace(
+                    logits=logits, hidden_states=states, gdn_states=None
+                )
+        return (logits, out) if return_hidden else logits
+
+    def mtp_partial_rollback(self, caches, accepted, num_drafts):
+        count = int(num_drafts) - int(accepted)
+        if not count:
+            return True
+        if count < 0 or not all(c.is_trimmable() for c in caches):
+            return False
+        for cache in caches:
+            if cache.trim(count) != count:
+                raise RuntimeError("Ripple cache failed speculative trim")
+        return True
+
+    def rollback_speculative_cache(self, caches, state, accepted, block_size):
+        if not self.mtp_partial_rollback(caches, accepted, block_size - 1):
+            raise RuntimeError("Ripple caches cannot roll back this draft")
+        return accepted
 
     def sanitize(self, weights):
         return {k: v for k, v in weights.items() if "rotary_emb" not in k}

@@ -146,6 +146,8 @@ class DFlashDrafter:
         self._predraft: _Predraft | None = None
         # Sliding-window draft layers: block query j attends the context
         # window ending at its own position instead of the block's start.
+        self.no_rope_layers = frozenset()
+        self._allocated_slots = 256
         self.query_windows = False
         # A context copy that fills the block may replace the drafted block
         # (Lightning MTP's prompt lookup); the target still verifies it.
@@ -206,7 +208,26 @@ class DFlashDrafter:
     def capacity(self) -> int:
         # A block of spare slots lets a predraft write every verify row
         # without overwriting a position that is still attended.
-        return self.ring_slots + self.block_size
+        slots = self.ring_slots
+        if self.no_rope_layers:
+            slots = min(slots, self._allocated_slots)
+        return slots + self.block_size
+
+    def _grow_context(self, end: int) -> None:
+        # Grow before any modulo wrap, so stored slots retain absolute indices.
+        if end <= self._allocated_slots or self._allocated_slots >= self.ring_slots:
+            return
+        old = self.capacity
+        self._detach_cohort()
+        self._allocated_slots = min(self.ring_slots, 1 << (end - 1).bit_length())
+        pad = self.capacity - old
+        for row in self._rows.values():
+            if row.keys is None:
+                continue
+            widths = [(0, 0), (0, pad), (0, 0)]
+            row.keys = [mx.pad(k, widths) for k in row.keys]
+            row.values = [mx.pad(v, widths) for v in row.values]
+            row.pos = mx.pad(row.pos, [(0, pad)], constant_values=-1)
 
     def seed(self, uid: Any, captured: Sequence[mx.array]) -> None:
         """Queue prefill captures ``[(1, n, H), ...]`` as context for ``uid``."""
@@ -602,6 +623,14 @@ class DFlashDrafter:
         """
         model = self.model
         uids = [state.uid for state, *_ in rows]
+        if self.no_rope_layers:
+            end = max(
+                row.fed
+                + segment.shape[1]
+                + (row.restored.shape[1] if row.restored is not None else 0)
+                for _, row, segment, _, _ in rows
+            )
+            self._grow_context(end)
         slots = self.ring_slots
         capacity = self.capacity
         batch = len(rows)
@@ -751,6 +780,14 @@ class DFlashDrafter:
                 [ring_valid, mx.ones((batch, block), dtype=mx.bool_)], axis=1
             )[:, None, None, :]
 
+        sliding_mask = mask
+        if self.no_rope_layers:
+            sliding = int(model.config.sliding_window)
+            valid = ring_valid & (pos >= (totals - sliding + 1)[:, None])
+            sliding_mask = mx.concatenate(
+                [valid, mx.ones((batch, block), dtype=mx.bool_)], axis=1
+            )[:, None, None, :]
+
         new_keys, new_values = [], []
         for layer_index, layer in enumerate(model.layers):
             attn = layer.self_attn
@@ -778,7 +815,8 @@ class DFlashDrafter:
             ).transpose(0, 2, 1, 3)
             if self.value_scale is not None:
                 ctx_values = ctx_values * self.value_scale
-            ctx_keys = model.rope(ctx_keys, offset=base_arr)
+            if layer_index not in self.no_rope_layers:
+                ctx_keys = model.rope(ctx_keys, offset=base_arr)
 
             ring_keys = mx.stop_gradient(cohort.keys[layer_index])
             ring_values = mx.stop_gradient(cohort.values[layer_index])
@@ -801,8 +839,9 @@ class DFlashDrafter:
             ).transpose(0, 2, 1, 3)
             if self.value_scale is not None:
                 prop_values = prop_values * self.value_scale
-            queries = model.rope(queries, offset=query_offsets)
-            prop_keys = model.rope(prop_keys, offset=query_offsets)
+            if layer_index not in self.no_rope_layers:
+                queries = model.rope(queries, offset=query_offsets)
+                prop_keys = model.rope(prop_keys, offset=query_offsets)
             keys = mx.concatenate([ring_keys, prop_keys], axis=2)
             values = mx.concatenate([ring_values, prop_values], axis=2)
             attended = mx.fast.scaled_dot_product_attention(
@@ -810,7 +849,7 @@ class DFlashDrafter:
                 keys,
                 values,
                 scale=attn.scale,
-                mask=mask,
+                mask=sliding_mask if self.no_rope_layers and attn.is_sliding else mask,
                 sinks=getattr(attn, "attention_sink_bias", None),
             )
             attended = attended.transpose(0, 2, 1, 3).reshape(batch, block, -1)
