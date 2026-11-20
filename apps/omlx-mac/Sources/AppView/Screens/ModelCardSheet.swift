@@ -309,16 +309,16 @@ struct ModelCardSheet: View {
         .foregroundStyle(theme.textSecondary)
     }
 
-    // MARK: LoRA warning (gap #4)
+    // MARK: LoRA adapter note
 
     private var loraBanner: some View {
         HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
+            Image(systemName: "info.circle.fill")
                 .font(.system(size: 12))
-                .foregroundStyle(theme.warningText)
-            Text(String(localized: "downloads.card.lora_warning",
-                        defaultValue: "This is a LoRA adapter. It needs a compatible base model to run — downloading on its own won't load in oMLX.",
-                        comment: "Warning banner shown in the model card sheet when the repo is an adapter rather than a full model"))
+                .foregroundStyle(theme.textSecondary)
+            Text(String(localized: "downloads.card.lora_info",
+                        defaultValue: "This is a LoRA adapter. After it downloads, choose it in a base model's Advanced Settings.",
+                        comment: "Note in the model card sheet when the repo is a LoRA adapter rather than a full model"))
                 .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.text)
                 .fixedSize(horizontal: false, vertical: true)
@@ -326,10 +326,10 @@ struct ModelCardSheet: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(theme.warningBg)
+        .background(theme.groupBg)
         .overlay(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(theme.warningText.opacity(0.25), lineWidth: 0.5)
+                .strokeBorder(theme.textSecondary.opacity(0.25), lineWidth: 0.5)
         )
         .padding(.horizontal, 20)
         .padding(.bottom, 10)
@@ -567,10 +567,7 @@ struct ModelCardSheet: View {
                 .buttonStyle(.plain)
             }
             Spacer()
-            if dto.isAdapter != true {
-                // Adapters can't be downloaded as a runnable model;
-                // hide the action entirely so the user doesn't kick
-                // off a download that won't load.
+            Group {
                 if let reason = dto.unsupportedReason, !reason.isEmpty {
                     Text(reason)
                         .font(.omlxText(DesignTokens.FontSize.subheadline))

@@ -348,6 +348,18 @@ class TestUploadIntelligenceResult:
         assert outcome == {"skipped": "min_questions"}
         mock_to_thread.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_lora_adapter_runs_are_not_uploaded(self):
+        mock_to_thread = AsyncMock()
+
+        with patch("asyncio.to_thread", mock_to_thread):
+            outcome = await upload_intelligence_result(
+                MagicMock(), {**_ctx(), "lora_adapter": "/a"}, _result_data()
+            )
+
+        assert outcome == {"skipped": "lora_adapter"}
+        mock_to_thread.assert_not_awaited()
+
     def test_category_counts_derivation(self):
         from omlx.admin.accuracy_upload import _category_counts
 

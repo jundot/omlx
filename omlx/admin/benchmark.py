@@ -2093,6 +2093,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                     f"Benchmark: failed to read experimental flags for "
                     f"{request.model_id}: {e}"
                 )
+        lora_adapter = getattr(model_settings, "lora_adapter", None)
 
         # Phase 1: Unload all loaded models
         loaded_ids = engine_pool.get_loaded_model_ids()
@@ -2531,6 +2532,21 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 {
                     "type": "upload_skipped",
                     "reason": "custom_generation_length",
+                    "features": run.feature_flags,
+                },
+            )
+            return
+
+        if lora_adapter:
+            # The leaderboard files results under the base checkpoint, which
+            # an adapter run does not measure.
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "lora_adapter"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": "lora_adapter",
                     "features": run.feature_flags,
                 },
             )
