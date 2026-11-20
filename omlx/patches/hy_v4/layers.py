@@ -807,7 +807,13 @@ class Attention(nn.Module):
         )
         values = self.unembed_out(latent)
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
-        if queries.dtype in (mx.float16, mx.bfloat16) and _nax_host():
+        # Sliding windows keep the block-mask kernel on M5 too: it skips the
+        # blocks outside the window (measured 7.4 ms against 9.7 ms fused).
+        if (
+            self.kind != "sliding"
+            and queries.dtype in (mx.float16, mx.bfloat16)
+            and _nax_host()
+        ):
             out = _nax_attention(
                 queries,
                 keys.astype(queries.dtype),
