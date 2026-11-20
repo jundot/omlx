@@ -314,16 +314,6 @@ def wrap_spark_dspark(
         drafter.depth = max(1, min(drafter.depth, int(depth)))
     drafter.query_windows = False
     drafter.context_copy = True
-    # Instance flag: this Spark drafter installs the cross-stream
-    # materialization hook; every other DFlashDrafter keeps the stock
-    # ``_draft_batched`` (no hook).
-    drafter._omlx_spark_drafter = True
-    # Install the cross-stream materialization hook consumed by the upstream
-    # ``DFlashDrafter._draft_batched``. Without it the Spark drafter's
-    # intermediate activations (segments / padded / h_ctx) are built on the
-    # mlx-executor thread's TLS stream while decode runs on the mlx-engine
-    # thread, so they must be materialized on the current stream before use.
-    drafter._materialize_draft = _spark_materialize
     # The VLM engine's prefill path returns ``[captures..., last]`` = n_cap+1
     # layers in ``hidden_states``, but the drafter's ``project_context`` fc is
     # ``Linear(2560*n_targets, 2560)`` and needs exactly ``len(target_layer_ids)``
@@ -342,24 +332,6 @@ def wrap_spark_dspark(
     return drafter
 
 
-def _spark_materialize(phase: str, value):
-    """Materialize Spark draft intermediates on the current stream.
-
-    Called by the upstream ``DFlashDrafter._draft_batched`` hook at three
-    points: ``"segments"`` (a list, modified in place), ``"padded"`` and
-    ``"h_ctx"`` (arrays, returned materialized). The array/contiguous/eval
-    sequence forces the value onto the mlx-engine thread's current stream so
-    the subsequent project/attention math reads it consistently.
-    """
-    if phase == "segments":
-        for _i, _seg in enumerate(value):
-            value[_i] = mx.contiguous(mx.array(_seg))
-            mx.eval(value[_i])
-    elif phase in ("padded", "h_ctx"):
-        return mx.contiguous(mx.array(value))
-    return value
-
-
 def load_spark_dspark_drafter(
     path: str | Path,
     target_model: Any,
@@ -372,15 +344,12 @@ def load_spark_dspark_drafter(
     _patch_spark2_5_capture()
     _patch_gate_output_sigmoid()
     model = load_spark_dspark_model(path).bind(target_model)
-    # The drafter is loaded on the mlx-executor thread, so its weights bind
-    # that thread's ThreadLocalStream (gpu,3). The batched decode path runs
-    # on the mlx-engine thread whose current stream is DIFFERENT. The weights
-    # are NOT copied across streams: MLX matmul auto-synchronizes its operands
-    # across per-thread streams, so the packed weights stay where they are and
-    # the installed ``_materialize_draft`` hook only materializes the
-    # intermediate activations (segments / h_ctx / padded) on the current
-    # stream via ``mx.array`` + ``mx.contiguous`` + ``mx.eval``; see
-    # ``_spark_materialize`` for the full cross-stream rationale.
+    # The drafter is loaded on the mlx-executor thread while decode runs on
+    # the mlx-engine thread. MLX matmul auto-synchronizes its operands across
+    # per-thread streams, so the packed weights (and the intermediate
+    # activations they produce) are read correctly by the engine thread with
+    # no explicit materialization: MLX resolves the cross-stream dependency
+    # lazily at eval time.
     drafter = wrap_spark_dspark(model, str(path), depth, fixed)
     logger.info(
         "Spark DSpark drafter loaded: path=%s block=%d depth=%d adaptive=%s "
