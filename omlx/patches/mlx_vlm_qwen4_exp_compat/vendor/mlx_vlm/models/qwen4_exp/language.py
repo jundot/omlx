@@ -3625,7 +3625,13 @@ class DiskBackedShardedEmbedding(nn.Module):
         register_ple_resource(self, priority=1)
         model_path = Path(model_path)
         index_path = model_path / "model.safetensors.index.json"
-        weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+        if index_path.is_file():
+            weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+        else:
+            # A checkpoint saved as one model.safetensors has no index.
+            reader = _SafeTensorMMap(model_path / "model.safetensors")
+            self._readers[reader.path.name] = reader
+            weight_map = dict.fromkeys(reader._header, reader.path.name)
 
         def register_reader(key: str) -> _SafeTensorMMap:
             filename = weight_map[key]
