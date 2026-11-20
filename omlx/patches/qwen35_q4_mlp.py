@@ -1,10 +1,11 @@
 # ruff: noqa: N806
 """Qwen3.5/3.6 quantized MLP prefill matmul patch.
 
-This is an exact path: it replaces eligible affine QuantizedLinear calls
-inside the Qwen MLP with the same MLX quantized qmm implementation exposed via
-an oMLX native wrapper using a Qwen-friendly tile.  Decode and target-verify
-paths fall through to the original implementation.
+Replaces eligible affine QuantizedLinear calls inside the Qwen MLP with the
+same affine qmm math through an oMLX native wrapper with a Qwen-friendly tile.
+The tile changes the accumulation order, so outputs match stock MLX to
+rounding (about 1 ulp), not bit for bit. Decode and target-verify paths fall
+through to the original implementation.
 """
 
 from __future__ import annotations
