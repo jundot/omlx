@@ -7979,13 +7979,13 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "API key"
+            "value" : "API キー"
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "API key"
+            "value" : "API 키"
           }
         },
         "ru" : {
@@ -8033,13 +8033,13 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Base URL"
+            "value" : "ベース URL"
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Base URL"
+            "value" : "기본 URL"
           }
         },
         "ru" : {
@@ -8195,13 +8195,13 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Force mlx-lm engine"
+            "value" : "mlx-lm エンジンを強制使用"
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Force mlx-lm engine"
+            "value" : "mlx-lm 엔진 강제 사용"
           }
         },
         "ru" : {
@@ -8249,13 +8249,13 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Use mlx-lm for this benchmark. VLM MTP drafters are ignored, so results measure the LM-only baseline."
+            "value" : "このベンチマークで mlx-lm を使用します。VLM MTP ドラフターは無視されるため、LM 単体のベースラインを測定します。"
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Use mlx-lm for this benchmark. VLM MTP drafters are ignored, so results measure the LM-only baseline."
+            "value" : "이 벤치마크에 mlx-lm을 사용합니다. VLM MTP drafter는 무시되므로 LM 단독 기준 성능을 측정합니다."
           }
         },
         "ru" : {
@@ -8332,60 +8332,6 @@
         }
       }
     },
-    "bench.throughput.advanced.optional" : {
-      "comment" : "Placeholder for the optional external benchmark API key",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Optional"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Optional"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Facoltativa"
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "任意"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "선택 사항"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Необязательно"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "可选"
-          }
-        },
-        "zh-Hant" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "選填"
-          }
-        }
-      }
-    },
     "bench.throughput.advanced.title" : {
       "comment" : "Disclosure label for advanced throughput benchmark options",
       "extractionState" : "manual",
@@ -8411,13 +8357,13 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Advanced options"
+            "value" : "詳細オプション"
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Advanced options"
+            "value" : "고급 옵션"
           }
         },
         "ru" : {
@@ -8436,168 +8382,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "進階選項"
-          }
-        }
-      }
-    },
-    "bench.throughput.engine.auto" : {
-      "comment" : "Engine label identifying a throughput benchmark using automatic engine selection",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Automatische Engine"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Automatic engine"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Motore automatico"
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "エンジンを自動選択"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "엔진 자동 선택"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Автоматический выбор движка"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "自动选择引擎"
-          }
-        },
-        "zh-Hant" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "自動選擇引擎"
-          }
-        }
-      }
-    },
-    "bench.throughput.engine.external" : {
-      "comment" : "Engine label identifying an external throughput benchmark result",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Externe OpenAI-API"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "External OpenAI API"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "API OpenAI esterna"
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "外部 OpenAI API"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "외부 OpenAI API"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Внешний OpenAI API"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "外部 OpenAI API"
-          }
-        },
-        "zh-Hant" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "外部 OpenAI API"
-          }
-        }
-      }
-    },
-    "bench.throughput.engine.forced" : {
-      "comment" : "Engine label identifying a throughput benchmark with force mlx-lm enabled",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "mlx-lm erzwungen"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Forced mlx-lm"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "mlx-lm forzato"
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "mlx-lm を強制"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "mlx-lm 강제 사용"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Принудительно mlx-lm"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "强制使用 mlx-lm"
-          }
-        },
-        "zh-Hant" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "強制使用 mlx-lm"
           }
         }
       }

@@ -55,7 +55,7 @@ struct ThroughputBenchScreen: View {
                                  comment: "Throughput Bench screen subtitle describing the measurement sweep")
             )
 
-            if !vm.externalEnabled, let device = vm.device {
+            if let device = vm.device {
                 DeviceChip(device: device)
             }
 
@@ -87,14 +87,6 @@ struct ThroughputBenchScreen: View {
             }
 
             MessageBanner(error: vm.lastError)
-
-            if let description = vm.runDescription {
-                Text(description)
-                    .font(.omlxText(DesignTokens.FontSize.subheadline))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 14)
-            }
 
             if !vm.singleResults.isEmpty {
                 SingleResultsTable(results: vm.singleResults)
@@ -244,7 +236,7 @@ private struct ConfigurationSection: View {
             Row(label: String(localized: "bench.throughput.row.warmup.label",
                               defaultValue: "Warm-up",
                               comment: "Row label for the throughput benchmark warm-up mode"),
-                sublabel: externalEnabled ? nil : String(localized: "bench.throughput.row.warmup.sub",
+                sublabel: String(localized: "bench.throughput.row.warmup.sub",
                                  defaultValue: "The full block compiles and exercises the 2,048-token ANE prefill path before timing starts.",
                                  comment: "Explanation of the throughput benchmark warm-up options")) {
                 Segmented(selection: $warmupMode, options: [
@@ -294,7 +286,6 @@ private struct ConfigurationSection: View {
                     mono: true,
                     width: .controlCompact
                 )
-                .disabled(running)
             }
 
             Row(label: String(localized: "bench.throughput.row.batch_sizes.title",
@@ -322,7 +313,6 @@ private struct ConfigurationSection: View {
                                              comment: "Explanation of the force mlx-lm benchmark option")) {
                             RowSwitch(isOn: $forceLmEngine)
                                 .disabled(externalEnabled)
-                                .accessibilityLabel(String(localized: "bench.throughput.advanced.force_lm"))
                         }
                         Row(label: String(localized: "bench.throughput.advanced.external",
                                           defaultValue: "Use external OpenAI-compatible endpoint",
@@ -332,30 +322,24 @@ private struct ConfigurationSection: View {
                                              comment: "Requirements and upload behavior for external throughput benchmarks"),
                             isLast: !externalEnabled) {
                             RowSwitch(isOn: $externalEnabled)
-                                .accessibilityLabel(String(localized: "bench.throughput.advanced.external"))
                         }
                         if externalEnabled {
                             Row(label: String(localized: "bench.throughput.advanced.base_url",
                                               defaultValue: "Base URL",
                                               comment: "External benchmark API base URL field label")) {
-                                TextInput("bench.throughput.advanced.base_url", text: $externalBaseUrl,
-                                          placeholder: "https://api.openai.com/v1", width: .controlWide)
+                                TextInput(text: $externalBaseUrl, placeholder: "https://api.openai.com/v1",
+                                          width: .controlWide)
                             }
                             Row(label: String(localized: "bench.throughput.advanced.api_key",
                                               defaultValue: "API key",
                                               comment: "External benchmark API key field label")) {
-                                TextInput("bench.throughput.advanced.api_key", text: $externalApiKey,
-                                          placeholder: String(localized: "bench.throughput.advanced.optional",
-                                                              defaultValue: "Optional",
-                                                              comment: "Placeholder for the optional external benchmark API key"),
-                                          isSecure: true, width: .controlWide)
+                                TextInput(text: $externalApiKey, isSecure: true, width: .controlWide)
                             }
                             Row(label: String(localized: "bench.throughput.advanced.model",
                                               defaultValue: "Model ID",
                                               comment: "External benchmark model identifier field label"),
                                 isLast: true) {
-                                TextInput("bench.throughput.advanced.model", text: $externalModel,
-                                          placeholder: "gpt-4o-mini", width: .controlWide)
+                                TextInput(text: $externalModel, placeholder: "gpt-4o-mini", width: .controlWide)
                             }
                         }
                     }
@@ -1007,7 +991,8 @@ private struct OwnerHashRow: View {
     }
 }
 
-/// External endpoint results measure remote hardware and are not uploaded.
+/// Shown when the server skips the community upload. Unknown reasons fall
+/// back to a generic message.
 private struct SkippedBanner: View {
     let reason: String?
 

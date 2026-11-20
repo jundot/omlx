@@ -45,10 +45,6 @@ final class ThroughputBenchScreenVM {
     var externalModel: String = ""
     var exportOpen: Bool = false
 
-    // Keep credentials out of the snapshot used to identify results and exports.
-    private var runTarget: (modelId: String, baseUrl: String?, forceLmEngine: Bool,
-                            contextProfile: BenchmarkContextProfile)?
-
     // Server state
     private(set) var models: [ModelDTO] = []
     private(set) var device: DeviceInfoDTO?
@@ -71,8 +67,8 @@ final class ThroughputBenchScreenVM {
     private weak var client: OMLXClient?
     @ObservationIgnored
     private var pollTask: Task<Void, Never>?
-    @ObservationIgnored
-    private var cancelRequested = false
+    /// Export header of the last run, fixed at start since the form can change afterwards.
+    private var runHeader: [String] = []
 
     // MARK: Derived
 
@@ -81,20 +77,14 @@ final class ThroughputBenchScreenVM {
     }
 
     var startRequest: BenchStartRequest? {
+        let baseUrl = externalBaseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = externalModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !promptLengths.isEmpty, !batchSizes.isEmpty,
-              let generationLength = Int(genLength), generationLength > 0 else { return nil }
-        let external: BenchExternalEndpoint?
-        if externalEnabled {
-            let baseUrl = externalBaseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
-            let model = externalModel.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let url = URL(string: baseUrl),
-                  ["http", "https"].contains(url.scheme ?? ""),
-                  let host = url.host, !host.isEmpty, !model.isEmpty else { return nil }
-            external = BenchExternalEndpoint(baseUrl: baseUrl, apiKey: externalApiKey, model: model)
-        } else {
-            guard !selectedModelId.isEmpty else { return nil }
-            external = nil
-        }
+              let generationLength = Int(genLength), generationLength > 0,
+              externalEnabled ? !baseUrl.isEmpty && !model.isEmpty : !selectedModelId.isEmpty
+        else { return nil }
+        let external = externalEnabled
+            ? BenchExternalEndpoint(baseUrl: baseUrl, apiKey: externalApiKey, model: model) : nil
         return BenchStartRequest(
             modelId: external?.model ?? selectedModelId,
             contextProfile: contextProfile,
@@ -103,28 +93,9 @@ final class ThroughputBenchScreenVM {
             promptLengths: promptLengths.sorted(),
             generationLength: generationLength,
             batchSizes: batchSizes.sorted(),
-            forceLmEngine: externalEnabled ? false : forceLmEngine,
+            forceLmEngine: forceLmEngine && !externalEnabled,
             external: external
         )
-    }
-
-    var runDescription: String? {
-        guard let target = runTarget else { return nil }
-        let engine: String
-        if target.baseUrl != nil {
-            engine = String(localized: "bench.throughput.engine.external",
-                            defaultValue: "External OpenAI API",
-                            comment: "Engine label identifying an external throughput benchmark result")
-        } else if target.forceLmEngine {
-            engine = String(localized: "bench.throughput.engine.forced",
-                            defaultValue: "Forced mlx-lm",
-                            comment: "Engine label identifying a throughput benchmark with force mlx-lm enabled")
-        } else {
-            engine = String(localized: "bench.throughput.engine.auto",
-                            defaultValue: "Automatic engine",
-                            comment: "Engine label identifying a throughput benchmark using automatic engine selection")
-        }
-        return [target.modelId, target.baseUrl, engine].compactMap { $0 }.joined(separator: " · ")
     }
 
     /// Acceleration features the selected model has enabled, so the user knows
@@ -166,9 +137,7 @@ final class ThroughputBenchScreenVM {
 
     /// Monospaced two-table dump used by the Text export card.
     var exportText: String {
-        var lines = ["# Context: \((runTarget?.contextProfile ?? contextProfile).localizedLabel)"]
-        if let runDescription { lines.append("# \(runDescription)") }
-        lines.append("")
+        var lines = runHeader + [""]
         if !singleResults.isEmpty {
             lines.append("# Single request results")
             lines.append(
@@ -276,15 +245,12 @@ final class ThroughputBenchScreenVM {
 
     func runBenchmark(client: OMLXClient) {
         guard !running, let body = startRequest else { return }
-        stop()
         currentBenchId = nil
-        cancelRequested = false
-        var endpoint = body.external.flatMap { URLComponents(string: $0.baseUrl) }
-        endpoint?.user = nil
-        endpoint?.password = nil
-        endpoint?.query = nil
-        endpoint?.fragment = nil
-        runTarget = (body.modelId, endpoint?.string, body.forceLmEngine, body.contextProfile)
+        let model = body.external.map { "\($0.model) @ \($0.baseUrl)" } ?? body.modelId
+        let engine = body.external != nil ? "External OpenAI-compatible endpoint"
+            : body.forceLmEngine ? "Force mlx-lm" : "Auto"
+        runHeader = ["# Context: \(body.contextProfile.localizedLabel)",
+                     "# Model: \(model)", "# Engine: \(engine)"]
         // Wipe the previous run's tables so a new run doesn't accumulate
         // across unrelated configurations.
         singleResults = []
@@ -299,7 +265,6 @@ final class ThroughputBenchScreenVM {
                 guard let self else { return }
                 self.currentBenchId = resp.benchId
                 self.pollResults(client: client)
-                if self.cancelRequested { self.cancelBenchmark(client: client) }
             } catch {
                 self?.running = false
                 self?.lastError = error.omlxDescription
@@ -308,20 +273,17 @@ final class ThroughputBenchScreenVM {
     }
 
     func cancelBenchmark(client: OMLXClient) {
-        guard running else { return }
-        cancelRequested = true
-        // A pending start must supply its ID before we can cancel the server run.
-        guard let benchId = currentBenchId else { return }
+        // No server run to cancel until the start response arrives.
+        guard running, let benchId = currentBenchId else { return }
         Task { [weak self] in
             do {
                 _ = try await client.cancelBench(benchId: benchId)
                 guard let self, self.currentBenchId == benchId else { return }
                 self.running = false
-                self.lastError = nil
                 self.stop()
             } catch {
-                guard let self, self.currentBenchId == benchId else { return }
-                self.lastError = error.omlxDescription
+                // The poll still owns the run and ends it on a terminal status or 404.
+                self?.lastError = error.omlxDescription
             }
         }
     }
@@ -349,7 +311,7 @@ final class ThroughputBenchScreenVM {
                         self.uploadState = upload
                     }
                     switch resp.status.lowercased() {
-                    case "error", "failed", "cancelled":
+                    case "error", "cancelled":
                         self.running = false
                         return
                     case "completed":
@@ -364,10 +326,13 @@ final class ThroughputBenchScreenVM {
                         break
                     }
                 } catch {
-                    // Transient failures (server restart, dropped socket)
-                    // shouldn't kill the poll — log and try again.
                     guard !Task.isCancelled, self.currentBenchId == benchId else { return }
                     self.lastError = error.omlxDescription
+                    // 404 means a restarted server lost the run. Other failures are transient.
+                    if case OMLXClientError.http(status: 404, _) = error {
+                        self.running = false
+                        return
+                    }
                 }
                 try? await Task.sleep(for: .seconds(1))
             }
