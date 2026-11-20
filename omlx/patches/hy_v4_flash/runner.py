@@ -86,13 +86,30 @@ def load_weights(model, artifact):
     for key, shard in artifact.weight_map.items():
         by_file[shard].add(key)
     dtypes = {"U32": mx.uint32, "I32": mx.int32, "F32": mx.float32, "BF16": mx.bfloat16}
+    expected_dtypes = {}
+    for bank in artifact.config.get("omlx_oqh", {}).get("tensors", {}):
+        expected_dtypes.update({f"{bank}.{field}": dtype for field, dtype in
+                               (("weight", "U32"), ("oqh_signs", "BF16"),
+                                ("oqh_scales", "BF16"), ("oqh_biases", "BF16"))})
+    for module in (artifact.config.get("trunk_quantization") or {}).get("modules", []):
+        expected_dtypes.update({f"{module}.{field}": dtype for field, dtype in
+                               (("weight", "U32"), ("scales", "BF16"), ("biases", "BF16"))})
+    plan = []
     for shard, keys in sorted(by_file.items()):
         path = member(artifact.root, shard)
         with path.open("rb", buffering=0) as f:
             header = read_header(f)
         if header.keys() != keys:
             raise ValueError(f"{shard}: index and actual header disagree")
+        for name, view in header.items():
+            spec = view.spec
+            if spec.shape != shapes[name] or spec.dtype != expected_dtypes.get(name, spec.dtype):
+                raise ValueError(f"{shard}: wrong checkpoint tensor type or shape: {name}")
+        plan.append((path, header))
+    for path, header in plan:
         weights = mx.load(str(path))
+        if weights.keys() != header.keys():
+            raise ValueError(f"{path.name}: loaded tensors disagree with validated header")
         for n, array in weights.items():
             if (
                 tuple(array.shape) != shapes[n]
@@ -200,11 +217,6 @@ def generate(args, artifact):
     eos = artifact.config["eos_token_id"]
     eos = {eos} if isinstance(eos, int) else set(eos)
     setup = time.monotonic()
-    model = Model(ModelArgs.from_dict(artifact.config))
-    model.eval()
-    load_weights(model, artifact)
-    precast = args.precast_lm_head
-    head_growth = prepare_fp32_head(model) if precast else 0
     with open_tables(
         artifact.root / "manifest.json",
         first_root=args.source,
@@ -212,6 +224,11 @@ def generate(args, artifact):
         receipt=args.receipt,
         first_mode=args.first_engram,
     ) as provider:
+        model = Model(ModelArgs.from_dict(artifact.config))
+        model.eval()
+        load_weights(model, artifact)
+        precast = args.precast_lm_head
+        head_growth = prepare_fp32_head(model) if precast else 0
         model.set_engram_tables(provider)
         if prepare:
             from .prepared_engram import install_prepared_engram
@@ -319,8 +336,8 @@ def main(argv=None):
             a.add_argument(
                 "--first-engram",
                 choices=("mlock", "pread"),
-                default="mlock",
-                help="wire the first Engram table (default) or read its rows on demand",
+                default="pread",
+                help="read the first Engram table on demand (default) or explicitly wire it",
             )
             a.add_argument(
                 "--precast-lm-head",

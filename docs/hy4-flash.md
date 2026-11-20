@@ -35,42 +35,24 @@ MLX_ENABLE_TF32=0 python -m omlx.cli hy4-flash generate \
 ```
 
 - **Memory:** all expert banks are loaded resident: about 156 GiB at 8 bits, or about 87 GiB at 4 bits (about 151 / 81 GiB with `--trunk-bits 8`), plus KV and scratch. The weights must fit in directly free memory: with too little, macOS pages GPU buffers and decode drops below 1 tok/s. Use `--first-engram pread` with 4-bit on 128 GB Macs. Run one model at a time on a machine with enough free unified memory. The command does not change wired-memory limits or swap.
-- **`--first-engram`:** `mlock` (the default) maps and wires the first table and fails if it cannot. `pread` never maps it and reads rows on demand like the late tables. This saves 29.5 GiB of RAM at negligible I/O cost: under 1 MB per table per 128 decoded tokens.
+- **`--first-engram`:** `pread` (the default) never maps the first table; it reads rows on demand like the late tables. Explicit `mlock` adds about 29.5 GiB of wired memory on top of core weights, KV, scratch and OS headroom. The CLI validates the table receipt, identities and headers before loading the core, and does not fall back if wiring fails.
 - **`--prepare-engrams`:** starts each token's Engram row reads before the decoder layers.
 - **`--precast-lm-head`:** keeps the FP32 output projection resident (+0.69 GiB) instead of casting it on every token. Logits are unchanged.
 - **Output:** `--json` reports prefill time, decode steps and decode tok/s separately, along with token IDs, MLX peak memory and per-table Engram counters. `MLX_ENABLE_TF32=0` keeps the FP32 router and indexer math reproducible.
 
-## Measured (M5 Ultra, 256 GiB, MLX 0.32.4)
+## Historical measurements (MLX 0.32.4)
 
-Greedy decoding with the command above (`--first-engram pread`). The prompts are a 62-token coding request and a 74-token prose request.
+The following are single-stream **greedy decode** measurements from an earlier local profiling harness, not the CLI command above or a matched kernel A/B. The harness used its own greedy loop and a process-local MLX wired-memory limit. Neither profile nor the separate CLI result below is pinned to this candidate revision. All four Engram tables used positional reads; none was wired by the provider.
 
-| | Load | Prefill | Decode, 128 steps | Decode, 512 steps |
-|---|---:|---:|---:|---:|
-| Coding | 44 s | 0.35–1.5 s | 25.4–25.8 tok/s | 25.7–25.8 tok/s |
-| Prose | | 0.44 s | 25.7–26.0 tok/s | |
+| Artifact (M5 Ultra, 256 GiB) | Coding / prose, 128 decode steps | Coding, 512 decode steps |
+|---|---:|---:|
+| 4-bit experts, BF16 trunk | 26.86 / 26.83 tok/s | 26.72 tok/s |
+| 4-bit experts, packed 8-bit trunk | 30.87 / 30.61 tok/s | 30.11 tok/s |
+| 4-bit experts, packed 8-bit trunk (instrumented repeat) | 30.17 / 30.17 tok/s | 29.97 tok/s |
 
-- **Repeatability:** token IDs and FP32 logits are bit-identical across runs and match the `--first-engram mlock` reference.
-- **Resources:** process RSS peaked at 167.6 GB, with no swap.
+The public 4-bit model repository currently hosts the packed 8-bit trunk variant. Local profile result IDs: `goal1-baseline`, `goal12-t8` and `goal32-t8`. The instrumented repeat took 5.055 / 4.646 / 17.400 s for prefill plus decode, versus 5.063 / 5.067 / 19.370 s for the BF16 trunk (load excluded). Slower prefill nearly erased the short coding gain. Against an oQh8 reference continuation, teacher-forced top-1 agreement stayed at 96.90% for coding and fell from 95.35% to 93.80% for prose. That is not free-run equality. Boundary samples found no open or mapped expert shard files in the instrumented run; they do not prove continuous residency or zero expert I/O.
 
-**4-bit (`--bits 4`)**, same prompts and flags, MLX peak 95.2 GB, no swap:
-
-| | Decode | Prefill, 2K / 8K tokens | Top-1 agreement with 8-bit (teacher-forced) |
-|---|---:|---:|---:|
-| M5 Ultra, 256 GiB | 26.7–26.8 tok/s | 537 / 467 tok/s | 95.3–96.9% |
-| M1 Ultra, 128 GiB | 13.8–14.5 tok/s | 126 / 115 tok/s | 94.6–96.1% |
-
-On the M5 Ultra, 4-bit decodes only about 4% faster than 8-bit: the per-token cost there is mostly not expert-weight bandwidth. Its main benefit is that the model fits 128 GB machines.
-
-**8-bit trunk (`--trunk-bits 8`)**, M5 Ultra, same prompts. A decode step is GPU-bound, and with a BF16 trunk about 11.8 GB of trunk weights were read per token next to the routed experts. Top-1 agreement is teacher-forced against the BF16-trunk 8-bit reference; no swap:
-
-| | Decode, 128 steps (code / prose) | Decode, 512 steps | Prefill, 2K / 8K tokens | Top-1 agreement | MLX peak |
-|---|---:|---:|---:|---:|---:|
-| 8-bit experts, BF16 trunk | 25.4–26.0 tok/s | 25.7–25.8 tok/s | | 100% (reference) | 168.7 GB |
-| 8-bit experts, 8-bit trunk | 29.3 / 29.4 tok/s | 28.9 tok/s | 339 / 308 tok/s | 97.7 / 96.9% | 163.2 GB |
-| 4-bit experts, BF16 trunk | 26.8 / 26.7 tok/s | 26.7 tok/s | 537 / 467 tok/s | 96.9 / 95.3% | 95.2 GB |
-| 4-bit experts, 8-bit trunk | 31.7 / 31.2 tok/s | 31.0 tok/s | 528 / 461 tok/s | 96.9 / 93.8% | 88.9 GB |
-
-The `generate` command above on the 4-bit/8-bit-trunk artifact decoded 255 steps at 30.7 tok/s (MLX peak 87.6 GB). Lower trunk widths were tried in memory and rejected: 4-bit attention dropped prose agreement to 86%.
+A separate historical CLI smoke used a different, 36-token prompt with the packed 4-bit artifact: 0.641 s prefill, 255 decode steps at 30.74 tok/s, 23.03 s setup. It is not part of the profile comparison.
 
 ## Long context
 

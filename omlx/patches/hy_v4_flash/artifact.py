@@ -70,19 +70,42 @@ def _validate_trunk(trunk, index):
         if any(m + ".scales" in index for m in eligible):
             raise ValueError("quantized trunk tensors without trunk_quantization")
         return
-    modules = trunk.get("modules") if isinstance(trunk, dict) else None
+    if not isinstance(trunk, dict):
+        raise ValueError("trunk_quantization must be an object")
+    modules = trunk.get("modules")
     if (
-        trunk.get("bits") not in SUPPORTED_TRUNK_BITS
-        or trunk.get("group_size") != TRUNK_GROUP
+        type(trunk.get("bits")) is not int
+        or trunk["bits"] not in SUPPORTED_TRUNK_BITS
+        or type(trunk.get("group_size")) is not int
+        or trunk["group_size"] != TRUNK_GROUP
         or trunk.get("mode") != "affine"
         or not isinstance(modules, list)
+        or not all(isinstance(m, str) for m in modules)
         or len(set(modules)) != len(modules)
         or set(modules) != eligible
-        or not all(
-            m + suffix in index for m in modules for suffix in (".scales", ".biases")
-        )
+        or not all(m + suffix in index for m in modules for suffix in (".scales", ".biases"))
     ):
         raise ValueError("invalid or incomplete trunk_quantization")
+
+
+def _validate_quantization(manifest, targets, trunk):
+    # Older v1 exports may omit the manifest summary, but never a packed trunk.
+    if "quantization" not in manifest and trunk is None:
+        return
+    from .convert import ALGORITHM, trunk_record
+
+    record = manifest.get("quantization")
+    bits = {spec["bits"] for spec in targets.values()}
+    if not isinstance(record, dict) or len(bits) != 1:
+        raise ValueError("invalid manifest quantization record")
+    expected = dict(ALGORITHM, bits=next(iter(bits)))
+    if trunk is not None:
+        expected["trunk"] = trunk_record(trunk["bits"], trunk["modules"])
+        if any(trunk.get(k) != v for k, v in expected["trunk"].items() if k != "modules"):
+            raise ValueError("invalid trunk_quantization format")
+    # JSON comparison distinguishes exact integers, floats and booleans.
+    if json.dumps(record, sort_keys=True) != json.dumps(expected, sort_keys=True):
+        raise ValueError("manifest quantization disagrees with config and format")
 
 
 @dataclass
@@ -119,8 +142,9 @@ class Artifact:
         if cfg.get("model_type") != "hy_v4_flash" or "vision_config" in cfg:
             raise ValueError("expected a flattened Flash text configuration")
         iq = cfg.get("omlx_oqh", {})
-        targets = iq.get("tensors", {})
-        if iq.get("version") != 1 or not targets:
+        targets = iq.get("tensors", {}) if isinstance(iq, dict) else {}
+        if (not isinstance(targets, dict) or not targets
+                or type(iq.get("version")) is not int or iq["version"] != 1):
             raise ValueError("expected version-1 packed oQh tensors")
         index = _json(root / INDEX).get("weight_map")
         if (
@@ -130,7 +154,7 @@ class Artifact:
         ):
             raise ValueError("weight index does not describe exactly the core shards")
         for prefix, spec in targets.items():
-            if spec not in [
+            if not isinstance(spec, dict) or any(type(v) is not int for v in spec.values()) or spec not in [
                 {"bits": b, "block": 256, "group_size": 128} for b in SUPPORTED_BITS
             ] or not all(
                 prefix + suffix in index
@@ -150,6 +174,7 @@ class Artifact:
                 "rotation plan does not cover exactly the routed expert banks"
             )
         _validate_trunk(cfg.get("trunk_quantization"), index)
+        _validate_quantization(doc, targets, cfg.get("trunk_quantization"))
         return cls(root, doc, cfg, index)
 
     def summary(self):

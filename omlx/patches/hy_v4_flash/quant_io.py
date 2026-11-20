@@ -24,8 +24,8 @@ BITS, BLOCK, GROUP = 8, 256, 128
 # reference export; lower widths trade quality for memory (4 fits 128 GB).
 SUPPORTED_BITS = (4, 5, 6, 8)
 # Optional plain MLX affine quantization of the dense BF16 trunk linears
-# (``--trunk-bits``). Decode at batch size 1 is bandwidth-bound, and these
-# weights are read on every token. kv_b_proj (raw weight in the absorbed MLA
+# (``--trunk-bits``). These weights are used during decode.
+# kv_b_proj (raw weight in the absorbed MLA
 # path), the router, the sparse indexer, Engram, iHC and embeddings stay exact.
 TRUNK_GROUP = 64
 SUPPORTED_TRUNK_BITS = (8,)
