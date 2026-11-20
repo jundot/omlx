@@ -334,6 +334,7 @@ class ClusterHostRequest(BaseModel):
     ips: list[str] = Field(min_length=1, max_length=16)
     rdma: list[str | list[str] | None] = Field(default_factory=list, max_length=64)
     python_executable: str | None = Field(default=None, max_length=4096)
+    coordinator_ip: str | None = Field(default=None, max_length=64)
 
 
 def _validate_cluster_hosts(hosts: list[ClusterHostRequest]) -> None:
@@ -347,6 +348,7 @@ def _validate_cluster_hosts(hosts: list[ClusterHostRequest]) -> None:
                 ips=tuple(host.ips),
                 rdma=tuple(host.rdma),
                 python_executable=host.python_executable,
+                coordinator_ip=host.coordinator_ip,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -854,10 +856,11 @@ def _resolve_fabric(
             verified_links[key] = verify(link)
         return verified_links[key]
 
-    # Each host is described by its link to the first host that is not itself:
-    # that is the address the rest of the cluster reaches it on. Backend
-    # readiness is stricter: a collective is a full graph, so every pair must
-    # also answer before any fast backend is named or activation is allowed.
+    # Each host is described by its link to the first host that is not itself.
+    # For every host but the first that is its link to rank zero, so the peer
+    # end of it is where that host reaches rank zero. Backend readiness is
+    # stricter: a collective is a full graph, so every pair must also answer
+    # before any fast backend is named or activation is allowed.
     links = [
         resolve_link_addresses(
             host,
@@ -922,6 +925,23 @@ def _resolve_fabric(
         reason = blocker
     backend = "ring" if blocker else proposed
 
+    # mlx.launch announces rank zero by the first address of its entry, which
+    # is on its link to rank one. Macs cabled as a mesh share a different
+    # subnet with rank zero on every cable, so a rank that reaches rank zero
+    # elsewhere is told where.
+    announced = links[0].source.address if links[0].source else None
+    described = []
+    for index, (host, link) in enumerate(zip(hosts, links)):
+        entry = {
+            "host": host,
+            "ips": [link.source.address] if link.source else [],
+            "interface": link.source.interface if link.source else "",
+            "rdma": list(matrix.rows[index]) if backend != "ring" else [],
+        }
+        if index and link.peer and link.peer.address != announced:
+            entry["coordinator_ip"] = link.peer.address
+        described.append(entry)
+
     return {
         "ok": unresolved is None,
         "backend": backend,
@@ -931,15 +951,7 @@ def _resolve_fabric(
         "warnings": warnings,
         "link": (unresolved or links[0]).to_dict(),
         "rdma": rdma,
-        "hosts": [
-            {
-                "host": host,
-                "ips": [link.source.address] if link.source else [],
-                "interface": link.source.interface if link.source else "",
-                "rdma": list(matrix.rows[index]) if backend != "ring" else [],
-            }
-            for index, (host, link) in enumerate(zip(hosts, links))
-        ],
+        "hosts": described,
     }
 
 
@@ -1186,6 +1198,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             for host, discovered in zip(activation_hosts, fabric["hosts"]):
                 host["ips"] = discovered["ips"]
                 host["rdma"] = discovered["rdma"]
+                host["coordinator_ip"] = discovered.get("coordinator_ip")
         else:
             warnings.append(fabric.get("blocker") or fabric["link"]["reason"])
 
@@ -1245,6 +1258,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                         ips=tuple(host.get("ips") or ()),
                         rdma=tuple(host.get("rdma") or ()),
                         python_executable=host.get("python_executable"),
+                        coordinator_ip=host.get("coordinator_ip"),
                     )
                     for host in activation_hosts
                 ),
@@ -1904,6 +1918,7 @@ def _create_deployment(
                 ips=tuple(host.ips),
                 rdma=tuple(host.rdma),
                 python_executable=host.python_executable,
+                coordinator_ip=host.coordinator_ip,
             )
             for host in request.hosts
         ),

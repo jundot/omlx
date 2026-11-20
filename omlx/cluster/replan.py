@@ -81,6 +81,8 @@ def hosts_from_deployment(deployment: ClusterDeployment) -> list[dict[str, Any]]
         }
         if host.python_executable:
             payload["python_executable"] = host.python_executable
+        if host.coordinator_ip:
+            payload["coordinator_ip"] = host.coordinator_ip
         hosts.append(payload)
     return hosts
 

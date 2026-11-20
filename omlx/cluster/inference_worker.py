@@ -25,6 +25,7 @@ from typing import Any
 
 from ..cache.paged_ssd_cache import numerics_revision_for_model
 from .control_plane import RankControlPlane
+from .coordinator_route import coordinator_addresses, listen_addresses
 from .deployment import (
     decode_worker_contract,
     decode_worker_path_map,
@@ -1407,6 +1408,29 @@ def _apply_rank_wired_limit(budget_bytes: int) -> int:
     return int(applied or 0)
 
 
+def _rank_control_plane(
+    args: argparse.Namespace, *, rank: int, world_size: int
+) -> RankControlPlane | None:
+    """This rank's end of the rank-control channel, when the launch has one.
+
+    ``--control-host`` is the same for every rank. Macs cabled as a mesh reach
+    rank zero on a different address each, so a rank connects to its own and
+    rank zero listens on all of them.
+    """
+
+    if not (args.control_host and args.control_port and args.control_token):
+        return None
+    addresses = coordinator_addresses(world_size, args.control_host)
+    return RankControlPlane(
+        rank=rank,
+        world_size=world_size,
+        host=addresses[rank],
+        port=args.control_port,
+        token=args.control_token,
+        listen_hosts=listen_addresses(addresses),
+    )
+
+
 def run_worker(args: argparse.Namespace) -> int:
     """Initialize one strict rank, load only its layers, then serve on rank zero."""
 
@@ -1731,17 +1755,9 @@ def run_worker(args: argparse.Namespace) -> int:
                     world_size,
                     timeout=args.load_timeout,
                 )
-                control_context = (
-                    RankControlPlane(
-                        rank=rank,
-                        world_size=world_size,
-                        host=args.control_host,
-                        port=args.control_port,
-                        token=args.control_token,
-                    )
-                    if args.control_host and args.control_port and args.control_token
-                    else nullcontext(None)
-                )
+                control_context = _rank_control_plane(
+                    args, rank=rank, world_size=world_size
+                ) or nullcontext(None)
                 ssd_cache_dir = _prompt_cache_ssd_dir(
                     args, rank, numerics_revision_for_model(provider.model)
                 )

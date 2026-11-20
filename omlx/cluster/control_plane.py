@@ -8,11 +8,13 @@ import hmac
 import logging
 import pickle
 import secrets
+import selectors
 import socket
 import struct
 import threading
 import time
 import zlib
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, suppress
 from typing import Any
 
@@ -76,6 +78,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         host: str,
         port: int,
         token: str,
+        listen_hosts: Sequence[str] = (),
         connect_timeout: float = 120.0,
         io_timeout: float = 120.0,
     ) -> None:
@@ -90,10 +93,13 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         self.world_size = int(world_size)
         self.host = str(host)
         self.port = int(port)
+        # Macs cabled as a mesh reach rank zero on a different address each,
+        # so rank zero listens wherever a worker was told to connect.
+        self._listen_hosts = tuple(str(item) for item in listen_hosts) or (self.host,)
         self._token = encoded_token.ljust(64, b"\0")
         self._connect_timeout = float(connect_timeout)
         self._io_timeout = float(io_timeout)
-        self._listener: socket.socket | None = None
+        self._listeners: list[socket.socket] = []
         self._peers: dict[int, socket.socket] = {}
         self._stream: socket.socket | None = None
         self._stream_proxy: SystemSocketProxy | None = None
@@ -127,25 +133,41 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             hashlib.sha256,
         ).digest()
 
+    def _accept_one(self, timeout: float) -> tuple[socket.socket, Any] | None:
+        """The next worker connection on any listen address, if one arrives in time."""
+
+        # selectors rather than select(): a rank that holds many open files can
+        # hand these sockets descriptors select() cannot address.
+        with selectors.DefaultSelector() as selector:
+            for listener in self._listeners:
+                selector.register(listener, selectors.EVENT_READ)
+            for key, _events in selector.select(timeout):
+                with suppress(BlockingIOError):
+                    return key.fileobj.accept()
+        return None
+
     def _accept_workers(self) -> None:
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((self.host, self.port))
-        listener.listen(self.world_size - 1)
-        listener.settimeout(min(1.0, self._connect_timeout))
-        self._listener = listener
+        for host in self._listen_hosts:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._listeners.append(listener)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((host, self.port))
+            listener.listen(self.world_size - 1)
+            listener.setblocking(False)
         logger.info(
-            "[ControlPlane R0] listening on %s:%d (world_size=%d)",
-            self.host, self.port, self.world_size,
+            "[ControlPlane R0] listening on %s port %d (world_size=%d)",
+            ", ".join(self._listen_hosts),
+            self.port,
+            self.world_size,
         )
         deadline = time.monotonic() + self._connect_timeout
         while len(self._peers) < self.world_size - 1:
             if time.monotonic() >= deadline:
                 raise TimeoutError("rank-control workers did not connect")
-            try:
-                stream, _address = listener.accept()
-            except TimeoutError:
+            accepted = self._accept_one(min(1.0, self._connect_timeout))
+            if accepted is None:
                 continue
+            stream, _address = accepted
             remaining = max(0.1, deadline - time.monotonic())
             stream.settimeout(min(30.0, remaining))
             try:
@@ -594,10 +616,10 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         if self._stream_proxy is not None:
             self._stream_proxy.close()
             self._stream_proxy = None
-        if self._listener is not None:
+        for listener in self._listeners:
             with suppress(OSError):
-                self._listener.close()
-            self._listener = None
+                listener.close()
+        self._listeners.clear()
 
     def __exit__(self, *_exc: Any) -> None:
         self.close()
