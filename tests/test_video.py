@@ -245,3 +245,25 @@ def test_native_video_token_count_rejects_degenerate_frames():
         native_video_token_count(
             VideoInfo(48, 24.0, 8000, 16), processor.video_processor
         )
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_video_size_limit_uses_decoded_bytes(monkeypatch, limit, offset):
+    from omlx.utils import video
+
+    monkeypatch.setattr(video, "DEFAULT_MAX_VIDEO_BYTES", limit)
+    payload = b"x" * (limit + offset)
+    uri = "data:video/mp4;base64," + base64.b64encode(payload).decode()
+    if not payload:
+        with pytest.raises(InvalidRequestError, match="empty"):
+            write_video_data_uri(uri)
+    elif len(payload) > limit:
+        with pytest.raises(InvalidRequestError, match="exceeds"):
+            write_video_data_uri(uri)
+    else:
+        path, _ = write_video_data_uri(uri)
+        try:
+            assert path.read_bytes() == payload
+        finally:
+            path.unlink()
