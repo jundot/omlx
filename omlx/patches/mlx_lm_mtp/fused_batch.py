@@ -38,8 +38,7 @@ def _supports_batch_rollback(cache):
             and type(cache) in (vlm_cache.ArraysCache, vlm_cache.BatchKVCache)
         )
         or getattr(type(cache), "_omlx_mtp_batch_rollback_cache", False)
-        # Quantized batch caches (affine/turboquant) drop a different count per
-        # row in place (trim_rows); _ragged_trim_rows applies it below.
+        # Quantized batch caches trim each row in place (_ragged_trim_rows).
         or getattr(type(cache), "_omlx_ragged_trim", False)
     )
 
@@ -60,14 +59,10 @@ def _cache_leaves(caches):
 
 
 def _ragged_mixed_with_plain_kv(caches):
-    """Whether ``caches`` mixes ragged-trim caches with a plain batch KV cache.
+    """Whether ragged-trim caches sit next to a plain batch KV cache.
 
-    Ragged-trim caches keep each row at its own end, while a plain batch KV
-    cache is trimmed by the model's rollback (a uniform trim and a right-pad
-    roll that ends every row at ``_idx``). The model builds one attention mask
-    for all its attention layers, so the two kinds must not keep different
-    layouts. That happens when a model quantizes all but its last attention
-    layer (``turboquant_skip_last``, on by default).
+    The model builds one mask for all attention layers, so both kinds must end
+    each row at the same column (``turboquant_skip_last`` makes every batch mixed).
     """
     leaves = _cache_leaves(caches)
     ragged = any(getattr(type(c), "_omlx_ragged_trim", False) for c in leaves)
@@ -79,17 +74,10 @@ def _ragged_mixed_with_plain_kv(caches):
     return ragged and plain_kv
 
 
-def _supports_batch_rollback_all(caches):
-    """Whether one vector rollback can roll back every layer of ``caches``."""
-    return all(_supports_batch_rollback(c) for c in caches)
-
-
 def _mixed_row_ends(leaf):
     """Each row's written end in one attention layer of a mixed batch, or None.
 
-    A quantized ragged-trim cache keeps each row at its own end. A plain batch
-    KV cache with a deferred tail (``qwen35_deferred_realign``) keeps row ``r``
-    ending at ``_idx - tail[r]``; without a tail every row ends at ``_idx``.
+    A plain layer with a deferred tail ends row ``r`` at ``_idx - tail[r]``.
     """
     if getattr(type(leaf), "_omlx_ragged_trim", False):
         return tuple(leaf._ends())
@@ -122,11 +110,7 @@ def _mixed_rows_agree(caches) -> bool:
 def _align_mixed_rows_if_needed(caches) -> bool:
     """Realign a mixed batch only when its layers disagree on the row ends.
 
-    The quantized layers keep ragged ends after a per-row rollback and the plain
-    layer keeps the same ends as a deferred tail, so most cycles move nothing.
-    They disagree when the plain layer realigns (its tail grew past the bound,
-    or a filter/extend/outside read realigned it); then every layer is
-    realigned once.
+    They disagree after the plain layer realigns its deferred tail.
     """
     if _mixed_rows_agree(caches):
         _trim_common_tail(caches)
@@ -136,12 +120,9 @@ def _align_mixed_rows_if_needed(caches) -> bool:
 
 
 def _trim_common_tail(caches) -> None:
-    """Drop the part of a plain layer's deferred tail that every row shares.
+    """Drop the deferred-tail columns every row shares.
 
-    When every row's tail is at least ``m``, the last ``m`` columns of the bank
-    are dropped tokens of every row. Ending the bank at the longest row keeps
-    its width equal to the quantized layers', which the shared mask assumes.
-    Each row still ends at the same column.
+    The plain bank then ends at the longest row, as wide as the quantized layers.
     """
     for leaf in _cache_leaves(caches):
         tail = getattr(leaf, "__dict__", {}).get("_omlx_tail")
@@ -159,14 +140,7 @@ def _trim_common_tail(caches) -> None:
 
 
 def _align_mixed_rows(caches):
-    """End every row at the last column again, in every attention layer.
-
-    After a ragged rollback of a mixed batch the quantized layers keep each
-    row at its own end and the plain layers are rolled (or keep a deferred
-    tail). Rolling the quantized rows too, one layer at a time, gives every
-    layer the layout the model's single mask describes, without the deepcopy
-    of the whole batch cache the scalar rollback makes.
-    """
+    """End every row at the last column again, in every attention layer."""
     deferred = None
     for leaf in _cache_leaves(caches):
         if getattr(type(leaf), "_omlx_ragged_trim", False):
@@ -181,14 +155,9 @@ def _align_mixed_rows(caches):
 
 @contextlib.contextmanager
 def _ragged_trim_rows(cache, accepted, depth):
-    """Roll back ragged-trim batch caches per row, outside the model's rollback.
+    """Trim each row of the ragged-trim caches to ``accepted[b] + 1`` kept tokens.
 
-    The verify block appended ``depth + 1`` tokens to every row; row ``b``
-    keeps ``accepted[b] + 1``. Caches with ``trim_rows`` drop the rest of each
-    row in place (no packed state moves; their attention stops each row at its
-    own end). While the model's own rollback runs they read as speculating, so
-    mlx-vlm's append-cache trim (a uniform trim or a right-pad roll of the
-    whole cache) skips them.
+    They read as speculating meanwhile, so the model's own rollback skips them.
     """
     leaves = [
         entry
@@ -392,8 +361,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     if cache is None:
         cache = bg._merge_row_caches([row.prompt_cache for _, row, _ in rows])
     if whole_batch and _ragged_mixed_with_plain_kv(cache):
-        # A filter, extend or outside read between cycles may have realigned
-        # the plain layer while the quantized layers kept ragged ends.
+        # A filter, extend or outside read may have realigned the plain layer.
         _align_mixed_rows_if_needed(cache)
     uids = [state.uid for _, _, state in rows]
     bg._set_batched_mrope_deltas(batch, uids)
@@ -446,7 +414,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     vector_rollback = isinstance(gdn, SpeculativeCacheTransaction) or (
         whole_batch
         and gdn is not None
-        and _supports_batch_rollback_all(cache)
+        and all(_supports_batch_rollback(layer) for layer in cache)
         and any(
             getattr(host, "_omlx_mtp_batch_rollback", False)
             for host in (batch.model, getattr(batch.model, "_language_model", None))

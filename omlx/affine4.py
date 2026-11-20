@@ -880,10 +880,7 @@ def _native_attention(
         mask = mx.array(True)
     else:
         return None
-    # Rows of a ragged speculative rollback (BatchTurboQuantKVCache.trim_rows)
-    # end at their own columns; the kernels stop each row there, so a decode
-    # step without a mask (Qwen3.5's left-padded decode) never reads the
-    # dropped tokens of a shorter row.
+    # After trim_rows each row stops at its own end, also for a mask-less decode.
     row_ends = getattr(cache, "_row_ends", None) if is_batch else None
     if row_ends is not None and len(row_ends) == batch:
         valid_ends = mx.array([min(int(e), tokens) for e in row_ends], dtype=mx.int32)
@@ -1528,9 +1525,7 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
             raise ValueError(
                 f"Unsupported {self.quantization_scheme} attention mask: {mask}"
             )
-        # Rows of a ragged speculative rollback (trim_rows) end at their own
-        # columns. The native kernels stop each row there; the routes below
-        # need it in the mask, or a shorter row reads its dropped draft tokens.
+        # After trim_rows the routes below need each row's end in the mask.
         row_ends = getattr(self, "_row_ends", None)
         ends = None
         if row_ends is not None and len(row_ends) == self.left_padding.shape[0]:

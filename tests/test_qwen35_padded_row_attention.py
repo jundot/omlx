@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import random
 import types
 
@@ -12,9 +13,19 @@ import pytest
 
 q35 = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
 from mlx_lm.models.cache import BatchKVCache  # noqa: E402
+from mlx_vlm.models.qwen3_5.config import TextConfig  # noqa: E402
 from mlx_vlm.speculative import cache_state  # noqa: E402
 
 from omlx.patches import qwen35_deferred_realign as dr  # noqa: E402
+from omlx.patches.mlx_lm_mtp import batch_generator as bg  # noqa: E402
+from omlx.patches.mlx_lm_mtp import fused_batch  # noqa: E402
+from omlx.patches.turboquant_attention import (  # noqa: E402
+    apply_turboquant_attention_patch,
+)
+from omlx.patches.vlm_batch_kv_capacity import (  # noqa: E402
+    apply_batch_kv_capacity_patch,
+)
+from omlx.turboquant_kv import quantized_cache_class  # noqa: E402
 
 DTYPE = mx.bfloat16
 Q_HEADS, KV_HEADS, D = 24, 4, 256
@@ -366,3 +377,87 @@ def test_other_cache_access_realigns_first(patched, touch):
     _assert_same_rows(ref, exp)
     if isinstance(a, mx.array):
         assert mx.array_equal(a, b).item()
+
+
+@pytest.mark.parametrize("lengths", [(37, 30), (33, 33)])
+@pytest.mark.parametrize("deferred_tail", [False, True])
+def test_mixed_quantized_batch_rolls_back_like_the_deepcopy(
+    monkeypatch, deferred_tail, lengths
+):
+    """turboquant_skip_last: affine8 layers next to the plain last layer."""
+    mod, _ = _fresh_seams(monkeypatch)
+    apply_batch_kv_capacity_patch()
+    apply_turboquant_attention_patch()
+    mod.apply_qwen35_padded_row_attention_patch()
+    language = q35.LanguageModel(
+        TextConfig(
+            model_type="qwen3_5",
+            hidden_size=64,
+            intermediate_size=128,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=100,
+            num_key_value_heads=2,
+            max_position_embeddings=4096,
+            head_dim=64,
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.25,
+                "mrope_section": [2, 1, 1],
+            },
+            full_attention_interval=2,
+        )
+    )
+    mx.eval(language.parameters())
+    rows = []
+    for n in lengths:
+        row = language.make_cache()  # recurrent, attention, recurrent, attention
+        row[1] = quantized_cache_class("affine8")(bits=8)
+        tokens = mx.random.randint(0, 100, (1, n), key=mx.random.key(n))
+        mx.eval(language.model(tokens, cache=row))
+        rows.append(row)
+    cache = bg._merge_row_caches(rows)
+    depth = 3
+    for cycle, accepted in enumerate(
+        ([3, 0], [1, 2], [0, 0], [2, 3], [0, 1], [3, 1])
+    ):
+        block = mx.random.randint(0, 100, (2, depth + 1), key=mx.random.key(cycle))
+        mx.eval(language.model(block, cache=cache))
+        references = []
+        for kept in accepted:
+            view = copy.deepcopy(cache)
+            for layer in (view[1], view[3]):
+                layer.trim(depth - kept)
+            references.append(view)
+        if deferred_tail:
+            cache[3].__dict__["_omlx_tail_ok"] = True
+        # Select by type: reading ``keys`` on an instance realigns a deferred tail.
+        attention = [
+            c for c in fused_batch._cache_leaves(cache) if hasattr(type(c), "keys")
+        ]
+        with fused_batch._ragged_trim_rows(cache, accepted, depth):
+            cache_state._trim_append_caches(
+                attention, [a + 1 for a in accepted], depth + 1
+            )
+        fused_batch._align_mixed_rows_if_needed(cache)
+        for width in (1, depth + 1):
+            tokens = mx.random.randint(
+                0, 100, (2, width), key=mx.random.key(100 + cycle)
+            )
+            out = language.model(tokens, cache=copy.deepcopy(cache))
+            for row, view in enumerate(references):
+                ref = language.model(tokens, cache=copy.deepcopy(view))
+                assert mx.allclose(out[row], ref[row], atol=1e-4, rtol=1e-4).item(), (
+                    cycle,
+                    width,
+                    row,
+                )
+        step = mx.random.randint(0, 100, (2, 1), key=mx.random.key(200 + cycle))
+        mx.eval(language.model(step, cache=cache))

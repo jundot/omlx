@@ -230,11 +230,8 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
         if cache is not None and hasattr(cache, _ROWS_ATTR):
             delattr(cache, _ROWS_ATTR)
         length = h.shape[1]
-        # A quantized cache after a per-row speculative rollback keeps each row
-        # at its own end, and a plain layer next to it keeps the same ends as a
-        # deferred tail. With no left padding mlx-vlm gives a single-token
-        # decode no mask, which would read the dropped columns of the plain
-        # layer, so the decode takes the per-row seam here too.
+        # Without left padding mlx-vlm gives a decode no mask, which would read
+        # the dropped columns after a ragged rollback, so take the per-row seam.
         ragged = getattr(type(cache), "_omlx_ragged_trim", False) and (
             getattr(cache, "_row_ends", None) is not None
         )

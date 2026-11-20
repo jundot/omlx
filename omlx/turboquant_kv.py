@@ -236,13 +236,7 @@ def _concat_state_batch(states):
 
 
 def _write_state_rows(dst, src, starts):
-    """Write row ``b`` of ``src`` at token column ``starts[b]`` of ``dst``.
-
-    Every field of a packed state shares the token axis (2), so each leaf
-    array takes the same per-row column window.
-    """
-    if src is None:
-        return
+    """Write row ``b`` of ``src`` at token column ``starts[b]`` of ``dst``."""
     length = _state_length(src)
     for dst_field, src_field in zip(dst, src):
         if isinstance(dst_field, mx.array):
@@ -263,14 +257,7 @@ def _pad_state_left(state, pad_length: int):
 
 
 def _shift_state_rows(state, moves, end: int):
-    """Move each listed row's live tokens right inside the same buffer.
-
-    ``moves`` holds ``(row, start, shift)``: row ``row`` keeps its tokens in
-    ``[start, end - shift)`` and ends at ``end`` afterwards. Rows that are not
-    listed are not touched, so only the shifted rows' live windows are copied.
-    """
-    if state is None:
-        return
+    """Shift each ``(row, start, shift)`` row's live tokens right to end at ``end``."""
     for field in state:
         if isinstance(field, mx.array):
             for row, start, shift in moves:
@@ -391,10 +378,8 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         # also must not be derived from _state_length(self.keys): that is the
         # step-allocated capacity, not the written end.
         self._phys_end = 0
-        # Per-row written ends while rows of one batch end at different
-        # columns (a speculative verify that kept a different number of
-        # tokens per row, see trim_rows). None: every row ends at _phys_end.
-        # Host ints, so no device read decides where the next block goes.
+        # Per-row written ends after trim_rows (host ints); None: all end at
+        # _phys_end.
         self._row_ends: list[int] | None = None
 
     @property
@@ -413,9 +398,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         self._cached_state_offset = -1
         return n
 
-    # Ragged speculative rollback: rows drop different token counts without
-    # moving any packed state. Each row keeps writing at its own end and the
-    # mask hides the columns past it.
+    # Rows drop different counts in place; the mask hides columns past each end.
     _omlx_ragged_trim = True
 
     def _ends(self) -> list[int]:
@@ -430,18 +413,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         self._cached_state_offset = -1
 
     def trim_rows(self, counts) -> int:
-        """Drop the newest ``counts[b]`` written tokens of each row ``b``.
-
-        Returns the largest count dropped. A uniform count is a plain trim.
-        """
+        """Drop the newest ``counts[b]`` written tokens of each row ``b``."""
         counts = [max(0, int(n)) for n in counts]
-        if isinstance(self.offset, int) or len(counts) == 1:
-            if len(counts) != 1:
-                raise ValueError("trim_rows needs one count per batch row")
-            return self.trim(counts[0])
-        if len(counts) != int(self.offset.shape[0]):
-            raise ValueError("trim_rows needs one count per batch row")
-        if self._row_ends is None and len(set(counts)) == 1:
+        if isinstance(self.offset, int) or (
+            self._row_ends is None and len(set(counts)) == 1
+        ):
             return self.trim(counts[0])
         ends = self._ends()
         counts = [min(n, end) for n, end in zip(counts, ends)]
@@ -477,18 +453,13 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         )
 
     def _align_row_ends(self) -> None:
-        """Shift short rows right so every row ends at ``_phys_end`` again.
-
-        Joins, finalize and other batch reshaping assume end-aligned rows.
-        This copies the shifted rows' packed state once.
-        """
+        """Shift short rows right so every row ends at ``_phys_end`` again."""
         if self._row_ends is None:
             return
         end = self._phys_end
         shifts = [end - row_end for row_end in self._row_ends]
         if self.keys is not None:
-            # Only the short rows move, inside the buffer, keeping its spare
-            # capacity. Their columns left of the new start become padding.
+            # Only short rows move, in place; their vacated columns become padding.
             mx.eval(self.left_padding)
             starts = [int(p) for p in self.left_padding.tolist()]
             moves = [
@@ -560,8 +531,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         if isinstance(offset, int):
             return create_attention_mask(N, offset, return_array, window_size)
         if self._row_ends is not None:
-            # Row b's queries sit at its own end; columns past it are stale
-            # tokens a ragged rollback dropped.
+            # Row b's queries sit at its own end.
             ends = mx.array(self._row_ends)[:, None, None]
             queries = ends + mx.arange(N)[None, :, None]
             columns = mx.arange(max(self._row_ends) + N)[None, None, :]
@@ -669,8 +639,6 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self._phys_end -= min_left_pad
             self.left_padding = self.left_padding - min_left_pad
         if ends is not None:
-            # Survivors keep their own ends; columns past the longest one
-            # are dropped tokens and get overwritten by the next append.
             self._set_ends([end - min_left_pad for end in ends])
         self._cached_state = None
         self._cached_state_offset = -1
