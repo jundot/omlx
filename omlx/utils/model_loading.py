@@ -771,6 +771,12 @@ def maybe_apply_pre_load_patches(
         if apply_hy_v3_patch():
             logger.info("Hy3 pre-load patch applied for %s", model_name)
 
+    if model_type in ("hy_v4_vl", "hy_v4_flash"):
+        from ..patches.hy_v4 import apply_patch as apply_hy_v4_patch
+
+        if apply_hy_v4_patch():
+            logger.info("Hy4 pre-load patch applied for %s", model_name)
+
     if model_type == "inkling2":
         from ..patches.inkling2 import apply_inkling2_patch
 

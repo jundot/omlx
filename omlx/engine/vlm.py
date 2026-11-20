@@ -279,6 +279,37 @@ def _apply_minimax_m3_thinking_mode(
         template_kwargs["thinking_mode"] = "disabled"
 
 
+_HY_V4_THINKING_OFF = {"none", "off", "no_think"}
+
+
+def _apply_hy_v4_reasoning_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Map oMLX thinking switches to Hy4's reasoning_effort (no_think / high).
+
+    The Hy4 template raises on any other effort value, and the generic
+    fallback would then render its default ``high``, so an explicit "off"
+    must become ``no_think`` here.
+    """
+    if model_type not in ("hy_v4_vl", "hy_v4_flash"):
+        return
+    enable_thinking = template_kwargs.pop("enable_thinking", None)
+    effort = template_kwargs.get("reasoning_effort")
+    off = isinstance(effort, str) and effort.strip().lower() in _HY_V4_THINKING_OFF
+    if off or (effort is None and enable_thinking is False):
+        template_kwargs["reasoning_effort"] = "no_think"
+
+
+def _apply_template_thinking_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Translate oMLX thinking switches into model-specific template kwargs."""
+    _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+    _apply_hy_v4_reasoning_mode(model_type, template_kwargs)
+
+
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
     from mlx_vlm.tokenizer_utils import load_tokenizer
     from mlx_vlm.utils import StoppingCriteria
@@ -298,12 +329,16 @@ def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id
     return tokenizer
 
 
-def _load_cohere2_moe_text_model(
+def _load_text_model_with_tokenizer_fallback(
     model_name: str,
     *,
     trust_remote_code: bool = False,
 ):
-    """Load Cohere2 MoE through mlx-vlm with a tokenizer-only fallback."""
+    """Load a text-only mlx-vlm family with a tokenizer-only fallback.
+
+    Used when the checkpoint's processor class is missing from the installed
+    transformers (Cohere2 MoE, Hy4).
+    """
     from mlx_vlm.utils import get_model_path, load_model, load_processor
     from transformers import AutoTokenizer
 
@@ -325,7 +360,7 @@ def _load_cohere2_moe_text_model(
         )
     except Exception as exc:
         logger.debug(
-            "mlx-vlm processor load failed for Cohere2 MoE %s; "
+            "mlx-vlm processor load failed for %s; "
             "falling back to AutoTokenizer: %s",
             model_name,
             exc,
@@ -2119,8 +2154,8 @@ class VLMBatchedEngine(BaseEngine):
                             self._model_settings, "moe_expert_offload_enabled", False
                         ),
                     )
-                if model_type == COHERE2_MOE_MODEL_TYPE:
-                    return _load_cohere2_moe_text_model(
+                if model_type in (COHERE2_MOE_MODEL_TYPE, "hy_v4_vl", "hy_v4_flash"):
+                    return _load_text_model_with_tokenizer_fallback(
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
@@ -4312,7 +4347,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+        _apply_template_thinking_mode(model_type, template_kwargs)
 
         template_target = self._chat_template_target(model_type)
         if prompt_only:
@@ -4440,7 +4475,7 @@ class VLMBatchedEngine(BaseEngine):
                     prefix_template_kwargs["tools"] = tools
                 if chat_template_kwargs:
                     prefix_template_kwargs.update(chat_template_kwargs)
-                _apply_minimax_m3_thinking_mode(model_type, prefix_template_kwargs)
+                _apply_template_thinking_mode(model_type, prefix_template_kwargs)
 
                 images_consumed = 0
                 for msg_idx, msg_num_images in image_message_ranges:
@@ -4851,7 +4886,7 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs["enable_thinking"] = self._enable_thinking
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
-            _apply_minimax_m3_thinking_mode(self.model_type, template_kwargs)
+            _apply_template_thinking_mode(self.model_type, template_kwargs)
 
             try:
                 return apply_chat_template_with_reasoning_effort_fallback(
@@ -5868,7 +5903,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+        _apply_template_thinking_mode(model_type, template_kwargs)
 
         template_target = self._chat_template_target(model_type)
         try:

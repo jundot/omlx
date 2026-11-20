@@ -12,7 +12,7 @@ pytest.importorskip("mlx.core")
 from omlx.engine import vlm as vlm_module
 from omlx.engine.vlm import (
     VLMBatchedEngine,
-    _load_cohere2_moe_text_model,
+    _load_text_model_with_tokenizer_fallback,
 )
 from omlx.exceptions import InvalidRequestError
 
@@ -45,7 +45,7 @@ def test_cohere2_moe_loader_uses_upstream_processor(monkeypatch, tmp_path):
     monkeypatch.setattr(vlm_utils, "load_model", lambda *a, **k: model)
     monkeypatch.setattr(vlm_utils, "load_processor", lambda *a, **k: processor)
 
-    loaded_model, loaded_processor = _load_cohere2_moe_text_model("cohere")
+    loaded_model, loaded_processor = _load_text_model_with_tokenizer_fallback("cohere")
 
     assert loaded_model is model
     assert loaded_processor is processor
@@ -78,7 +78,7 @@ def test_cohere2_moe_loader_falls_back_to_tokenizer(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(vlm_utils, "StoppingCriteria", _FakeStoppingCriteria)
 
-    loaded_model, loaded_processor = _load_cohere2_moe_text_model("cohere")
+    loaded_model, loaded_processor = _load_text_model_with_tokenizer_fallback("cohere")
 
     assert loaded_model is model
     assert loaded_processor is tokenizer

@@ -1,0 +1,445 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Layers shared by Hy4 and Hy4-flash: iHC, gated MLA with sinks, MoE, DSA.
+
+Parameter names follow the released checkpoints (``linear_gate``,
+``learnable_sink_param``, ``hc_attn_layer.hc_pre.hc_fn``), not the renamed
+transformers modules. ``kv_b_proj`` is split into ``embed_q`` / ``unembed_out``
+at load time, as in mlx-lm's DeepSeek-V3.2.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import mlx.core as mx
+import mlx.nn as nn
+from mlx_lm.models.mla import MultiLinear
+
+from ..deepseek_v4.switch_layers import SwitchGLU
+from .config import TextConfig
+from .flash import CompressedIndexer
+from .rope import TrailingRoPE
+
+_ROW_CHUNK = 256
+
+
+def masked_min(dtype) -> mx.array:
+    return mx.array(mx.finfo(dtype).min, dtype)
+
+
+def rope_offset(cache) -> Any:
+    if cache is None:
+        return 0
+    return cache.offset
+
+
+class HyperConnectionPre(nn.Module):
+    """Identity hyper-connection gates (DeepSeek-V4 HC without the comb matrix).
+
+    The gates are computed in fp32 from the RMS-normalized flattened streams.
+    """
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        n = args.hc_mult
+        self.hc_fn = mx.zeros((2 * n, n * args.hidden_size), dtype=mx.float32)
+        self.hc_base = mx.zeros((2 * n,), dtype=mx.float32)
+        self.hc_scale = mx.ones((2,), dtype=mx.float32)
+        self._n = n
+        self._eps = args.hc_eps
+        self._norm_eps = args.rms_norm_eps
+        self._magnitude = args.hc_magnitude
+
+    def __call__(self, streams: mx.array) -> tuple[mx.array, mx.array]:
+        flat = streams.astype(mx.float32).flatten(-2)
+        inv_rms = mx.rsqrt(
+            mx.mean(flat * flat, axis=-1, keepdims=True) + self._norm_eps
+        )
+        mixes = (flat @ self.hc_fn.astype(mx.float32).T) * inv_rms
+        pre, post = mx.split(mixes, 2, axis=-1)
+        pre_base, post_base = mx.split(self.hc_base.astype(mx.float32), 2)
+        scale = self.hc_scale.astype(mx.float32)
+        pre = mx.sigmoid(pre * scale[0] + pre_base) + self._eps
+        post = self._magnitude * mx.sigmoid(post * scale[1] + post_base) + self._eps
+        collapsed = (pre[..., None] * streams.astype(mx.float32)).sum(axis=-2)
+        return collapsed.astype(streams.dtype), post
+
+
+class HyperConnection(nn.Module):
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.hc_pre = HyperConnectionPre(args)
+
+    def __call__(self, streams: mx.array) -> tuple[mx.array, mx.array]:
+        return self.hc_pre(streams)
+
+
+def hc_expand(update: mx.array, streams: mx.array, post: mx.array) -> mx.array:
+    """Add one sublayer output to every stream, scaled by its post gate."""
+    out = (
+        streams.astype(mx.float32)
+        + post[..., None] * update.astype(mx.float32)[..., None, :]
+    )
+    return out.astype(streams.dtype)
+
+
+class HyperHead(nn.Module):
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        n = args.hc_mult
+        self.hc_head_fn = mx.zeros((n, n * args.hidden_size), dtype=mx.float32)
+        self.hc_head_base = mx.zeros((n,), dtype=mx.float32)
+        self.hc_head_scale = mx.ones((1,), dtype=mx.float32)
+        self._eps = args.hc_eps
+        self._norm_eps = args.rms_norm_eps
+
+    def __call__(self, streams: mx.array) -> mx.array:
+        flat = streams.astype(mx.float32).flatten(-2)
+        inv_rms = mx.rsqrt(
+            mx.mean(flat * flat, axis=-1, keepdims=True) + self._norm_eps
+        )
+        mixes = (flat @ self.hc_head_fn.astype(mx.float32).T) * inv_rms
+        pre = (
+            mx.sigmoid(
+                mixes * self.hc_head_scale.astype(mx.float32)
+                + self.hc_head_base.astype(mx.float32)
+            )
+            + self._eps
+        )
+        out = (pre[..., None] * streams.astype(mx.float32)).sum(axis=-2)
+        return out.astype(streams.dtype)
+
+
+class MLP(nn.Module):
+    """Dense SwiGLU (dense layer and shared expert). Hy4-flash's dense layer
+    closes with ``post_fc2_norm`` (the sandwich norm)."""
+
+    def __init__(self, args: TextConfig, intermediate: int, post_norm: bool = False):
+        super().__init__()
+        d = args.hidden_size
+        self.gate_proj = nn.Linear(d, intermediate, bias=False)
+        self.up_proj = nn.Linear(d, intermediate, bias=False)
+        self.down_proj = nn.Linear(intermediate, d, bias=False)
+        if post_norm:
+            self.post_fc2_norm = nn.RMSNorm(d, eps=args.rms_norm_eps)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        y = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        if "post_fc2_norm" in self:
+            y = self.post_fc2_norm(y)
+        return y
+
+
+@mx.compile
+def _clamped_swiglu(up: mx.array, gate: mx.array, limit: mx.array) -> mx.array:
+    gate = mx.minimum(gate, limit)
+    up = mx.clip(up, -limit, limit)
+    return nn.silu(gate) * up
+
+
+class ClampedSwiGLU(nn.Module):
+    """SwiGLU with the routed experts' clamp: gate <= limit, |up| <= limit."""
+
+    def __init__(self, limit: float):
+        super().__init__()
+        self._limit = float(limit)
+
+    def __call__(self, up: mx.array, gate: mx.array) -> mx.array:
+        if self._limit <= 0:
+            return nn.silu(gate) * up
+        return _clamped_swiglu(up, gate, mx.array(self._limit, dtype=up.dtype))
+
+
+class Router(nn.Module):
+    """Sigmoid router with expert-bias correction (scores stay unbiased)."""
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.weight = mx.zeros((args.n_routed_experts, args.hidden_size))
+        self.e_score_correction_bias = mx.zeros(
+            (args.n_routed_experts,), dtype=mx.float32
+        )
+        self._top_k = args.num_experts_per_tok
+        self._n_group = args.n_group
+        self._topk_group = args.topk_group
+        self._norm = args.norm_topk_prob
+        self._scale = args.routed_scaling_factor
+
+    def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        scores = mx.sigmoid(logits)
+        choice = scores + self.e_score_correction_bias.astype(mx.float32)
+        if self._n_group > 1:
+            grouped = mx.unflatten(choice, -1, (self._n_group, -1))
+            best = mx.topk(grouped, 2, axis=-1).sum(axis=-1, keepdims=True)
+            drop = self._n_group - self._topk_group
+            groups = mx.argpartition(best, kth=drop - 1, axis=-2)[..., :drop, :]
+            grouped = mx.put_along_axis(grouped, groups, mx.array(-mx.inf), axis=-2)
+            choice = mx.flatten(grouped, -2, -1)
+        k = self._top_k
+        inds = mx.argpartition(-choice, kth=k - 1, axis=-1)[..., :k]
+        weights = mx.take_along_axis(scores, inds, axis=-1)
+        if self._norm:
+            weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+        return inds, weights * self._scale
+
+
+class MoE(nn.Module):
+    """Routed experts plus one shared expert.
+
+    Hy4-flash runs the routed experts in a latent width
+    (``routed_expert_down_proj`` / ``routed_expert_up_proj``) and closes the
+    block with ``combine_output_norm``.
+    """
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        d = args.hidden_size
+        width = args.routed_expert_hidden_size if args.is_flash else None
+        self.gate = Router(args)
+        if width:
+            self.routed_expert_down_proj = nn.Linear(d, width, bias=False)
+            self.routed_expert_up_proj = nn.Linear(width, d, bias=False)
+        self.switch_mlp = SwitchGLU(
+            width or d,
+            args.moe_intermediate_size,
+            args.n_routed_experts,
+            activation=ClampedSwiGLU(args.swiglu_limit),
+        )
+        self.shared_experts = MLP(
+            args, args.moe_intermediate_size * args.n_shared_experts
+        )
+        if args.is_flash:
+            self.combine_output_norm = nn.RMSNorm(d, eps=args.rms_norm_eps)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        inds, weights = self.gate(x)
+        routed = (
+            self.routed_expert_down_proj(x) if "routed_expert_down_proj" in self else x
+        )
+        y = self.switch_mlp(routed, inds, weights, weighted_sum=True)
+        if y.ndim == routed.ndim + 1:
+            y = (y * weights[..., None].astype(y.dtype)).sum(axis=-2)
+        if "routed_expert_up_proj" in self:
+            y = self.routed_expert_up_proj(y)
+        y = y + self.shared_experts(x)
+        if "combine_output_norm" in self:
+            y = self.combine_output_norm(y)
+        return y.reshape(shape)
+
+
+class Indexer(nn.Module):
+    """Hy4 DSA indexer: head-weighted ReLU scores over cached index keys.
+
+    Unlike DeepSeek-V3.2 it has no Hadamard rotation and rotates the trailing
+    ``qk_rope_head_dim`` channels. ``k_norm`` is a LayerNorm with bias.
+    """
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.n_heads = args.index_n_heads
+        self.head_dim = args.index_head_dim
+        self.topk = args.index_topk
+        self.wq_b = nn.Linear(
+            args.q_lora_rank, self.n_heads * self.head_dim, bias=False
+        )
+        self.wk = nn.Linear(args.hidden_size, self.head_dim, bias=False)
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.weights_proj = nn.Linear(args.hidden_size, self.n_heads, bias=False)
+        self.rope = TrailingRoPE(args.qk_rope_head_dim, args.rope_theta("sparse"))
+        self._weight_scale = self.n_heads**-0.5 * self.head_dim**-0.5
+
+    def __call__(self, x, qr, mask, cache, offset=0) -> mx.array | None:
+        b, s, _ = x.shape
+        q = self.wq_b(qr).reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
+        q = self.rope(q, offset)
+        k = self.k_norm(self.wk(x).astype(mx.float32)).astype(x.dtype)
+        k = self.rope(k.reshape(b, 1, s, self.head_dim), offset)
+        if cache is not None:
+            k, _ = cache.update_and_fetch(k, mx.zeros((b, 1, s, 0), dtype=k.dtype))
+        total = k.shape[2]
+        if total <= self.topk:
+            return None
+        w = self.weights_proj(x.astype(mx.float32)).astype(mx.float32)
+        w = (w * self._weight_scale).swapaxes(-1, -2)[..., None]
+        kf = k.astype(mx.float32).swapaxes(-1, -2)
+        out = []
+        for start in range(0, s, _ROW_CHUNK):
+            stop = min(s, start + _ROW_CHUNK)
+            scores = mx.maximum(q[:, :, start:stop].astype(mx.float32) @ kf, 0)
+            scores = (scores * w[:, :, start:stop]).sum(axis=1, keepdims=True)
+            if mask is not None:
+                scores = mx.where(mask[..., start:stop, :], scores, -mx.inf)
+            out.append(
+                mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[
+                    ..., : self.topk
+                ].astype(mx.int32)
+            )
+        return out[0] if len(out) == 1 else mx.concatenate(out, axis=2)
+
+
+def sparse_mask(indices: mx.array, total: int) -> mx.array:
+    """Boolean [B, 1, L, total] mask of the selected key slots.
+
+    Indices may point past ``total`` (an unfinished group). They land in a
+    spare column that is dropped, so they never clear a selected slot.
+    """
+    b, _, length, _ = indices.shape
+    target = mx.minimum(indices, total)
+    hits = mx.zeros((b, 1, length, total + 1), dtype=mx.bool_)
+    hits = mx.put_along_axis(hits, target, mx.array(True), axis=-1)
+    return hits[..., :total]
+
+
+def as_4d_mask(mask: mx.array | None) -> mx.array | None:
+    if mask is None or mask.ndim == 4:
+        return mask
+    return mask.reshape((1,) * (4 - mask.ndim) + mask.shape)
+
+
+class Attention(nn.Module):
+    """Gated MLA with learned per-head sinks.
+
+    Sparse layers attend to the top-k slots their indexer (or the previous full
+    layer, on Hy4's shared layers) selects; sliding layers (Hy4-flash) attend to
+    the last ``sliding_window`` keys.
+    """
+
+    def __init__(self, args: TextConfig, layer: int):
+        super().__init__()
+        self.kind = args.attention_kinds[layer]
+        heads, nope, rope, value = args.head_dims(layer)
+        self.num_heads = heads
+        self.nope = nope
+        self.rope_dim = rope
+        self.v_head_dim = value
+        self.rank = args.kv_lora_rank
+        self.scale = (nope + rope) ** -0.5
+        self.window = args.sliding_window if self.kind == "sliding" else None
+        d, bias = args.hidden_size, args.attention_bias
+        self.q_a_proj = nn.Linear(d, args.q_lora_rank, bias=bias)
+        self.q_a_layernorm = nn.RMSNorm(args.q_lora_rank, eps=args.rms_norm_eps)
+        self.q_b_proj = nn.Linear(args.q_lora_rank, heads * (nope + rope), bias=False)
+        self.kv_a_proj_with_mqa = nn.Linear(d, self.rank + rope, bias=bias)
+        self.kv_a_layernorm = nn.RMSNorm(self.rank, eps=args.rms_norm_eps)
+        self.embed_q = MultiLinear(nope, self.rank, heads)
+        self.unembed_out = MultiLinear(self.rank, value, heads)
+        self.linear_gate = nn.Linear(d, heads * value, bias=False)
+        self.o_proj = nn.Linear(heads * value, d, bias=bias)
+        self.learnable_sink_param = mx.full(
+            (heads,), args.learnable_sink_init, dtype=mx.float32
+        )
+        if args.is_flash:
+            self.post_proj_norm = nn.RMSNorm(d, eps=args.rms_norm_eps)
+        self.rope = nn.RoPE(rope, traditional=True, base=args.rope_theta(self.kind))
+        if self.kind == "sparse":
+            if args.is_flash:
+                self.compressed_indexer = CompressedIndexer(args)
+            elif args.indexer_types[layer] == "full":
+                self.indexer = Indexer(args)
+
+    @property
+    def index_module(self) -> nn.Module | None:
+        for name in ("indexer", "compressed_indexer"):
+            if name in self:
+                return self[name]
+        return None
+
+    def _caches(self, cache):
+        """(latent cache, indexer cache) of this layer."""
+        if cache is None:
+            return None, None
+        if self.kind == "sliding":
+            return cache, None
+        return cache[0], (cache[1] if len(cache.caches) > 1 else None)
+
+    def __call__(self, x, mask, cache=None, prev_topk=None):
+        b, length, _ = x.shape
+        kv_cache, index_cache = self._caches(cache)
+        gate = mx.sigmoid(self.linear_gate(x)).reshape(
+            b, length, self.num_heads, self.v_head_dim
+        )
+        qr = self.q_a_layernorm(self.q_a_proj(x))
+        q = self.q_b_proj(qr).reshape(b, length, self.num_heads, -1).swapaxes(1, 2)
+        q_nope, q_pe = mx.split(q, [self.nope], axis=-1)
+        latent, k_pe = mx.split(self.kv_a_proj_with_mqa(x), [self.rank], axis=-1)
+        latent = self.kv_a_layernorm(latent)[:, None]
+        k_pe = k_pe.reshape(b, 1, length, self.rope_dim)
+        offset = rope_offset(kv_cache)
+        q_pe = self.rope(q_pe, offset)
+        k_pe = self.rope(k_pe, offset)
+        if kv_cache is not None:
+            latent, k_pe = kv_cache.update_and_fetch(latent, k_pe)
+
+        topk = None
+        indexer = self.index_module
+        if indexer is not None:
+            topk = indexer(x, qr, mask, index_cache, offset=offset)
+        elif self.kind == "sparse":
+            topk = prev_topk
+
+        sinks = self.learnable_sink_param.astype(x.dtype)
+        if length == 1:
+            out = self._decode(q_nope, q_pe, latent, k_pe, topk, mask, sinks, offset)
+        else:
+            out = self._prefill(q_nope, q_pe, latent, k_pe, topk, mask, sinks)
+        out = out.swapaxes(1, 2) * gate
+        out = self.o_proj(out.reshape(b, length, -1))
+        if "post_proj_norm" in self:
+            out = self.post_proj_norm(out)
+        return out, topk
+
+    def _decode(self, q_nope, q_pe, latent, k_pe, topk, mask, sinks, offset):
+        if topk is not None:
+            total = latent.shape[2]
+            index = topk[:, :, 0, :, None]
+            valid = topk[:, :, 0, :] < total
+            safe = mx.minimum(index, total - 1)
+            latent = mx.take_along_axis(
+                latent, mx.broadcast_to(safe, safe.shape[:-1] + (latent.shape[-1],)), 2
+            )
+            k_pe = mx.take_along_axis(
+                k_pe, mx.broadcast_to(safe, safe.shape[:-1] + (k_pe.shape[-1],)), 2
+            )
+            keep = valid[:, :, None, :]
+            mask = as_4d_mask(mask)
+            if mask is not None:
+                mask = mx.broadcast_to(
+                    mask, (topk.shape[0],) + mask.shape[1:3] + (total,)
+                )
+                keep = keep & mx.take_along_axis(
+                    mask, mx.minimum(topk[:, :, :1, :], total - 1), axis=-1
+                )
+            mask = keep
+        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        if mask is not None:
+            pe_scores = mx.where(mask, pe_scores, masked_min(pe_scores.dtype))
+        q_latent = self.embed_q(q_nope)
+        out = mx.fast.scaled_dot_product_attention(
+            q_latent, latent, latent, scale=self.scale, mask=pe_scores, sinks=sinks
+        )
+        return self.unembed_out(out)
+
+    def _prefill(self, q_nope, q_pe, latent, k_pe, topk, mask, sinks):
+        total = latent.shape[2]
+        if mask is None:
+            length = q_nope.shape[2]
+            mask = mx.arange(total - length, total)[:, None] >= mx.arange(total)
+        if topk is not None:
+            mask = mask & sparse_mask(topk, total)
+        keys = mx.concatenate(
+            [
+                self.embed_q(latent, transpose=False),
+                mx.broadcast_to(
+                    k_pe, k_pe.shape[:1] + (self.num_heads,) + k_pe.shape[2:]
+                ),
+            ],
+            axis=-1,
+        )
+        values = self.unembed_out(latent)
+        queries = mx.concatenate([q_nope, q_pe], axis=-1)
+        return mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask, sinks=sinks
+        )

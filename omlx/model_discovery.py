@@ -98,6 +98,9 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
     # mlx-lm ships its own deepseek_v41 without the oMLX cache and kernels.
     "deepseek_v41",
     "glm5_next",
+    # Hy4 and Hy4-flash; their vision towers are not wired yet.
+    "hy_v4_vl",
+    "hy_v4_flash",
     "minimax_m3",
     # The VLM engine's loader also reads the earlier oMLX layout of text-only
     # Muse Spark conversions.
