@@ -190,6 +190,8 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 - **Hot tier (RAM)**: Frequently accessed blocks stay in memory for fast access.
 - **Cold tier (SSD)**: When the hot cache fills up, blocks are offloaded to SSD in safetensors format. On the next request with a matching prefix, they're restored from disk instead of recomputed from scratch - even after a server restart.
 
+At `--log-level debug`, the `Paged prefix match` message shows how many blocks and tokens the paged lookup matched, plus a compact boundary map. `boundary_block` is the zero-based position in the matched block chain (including any short tail), and `boundary_token` is the zero-based start of the unmatched suffix. A full match marks the end of the prompt instead. `UNMATCHED` means cache coverage ended there, not that a particular token differed; the lookup hashes blocks, not individual tokens. The report contains no prompt content, token IDs, or hashes and does not indicate whether KV restore ultimately succeeded.
+
 Optional [Affine4](docs/affine4.md) and [Affine8](docs/affine8.md) KV compression add signed 4-bit and 8-bit cache formats with Metal TensorOps decode attention and a portable fallback. Select either under **Model settings → Memory Saving → KV cache compression**.
 
 <p align="center">
