@@ -4,19 +4,15 @@
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
-# Expert neurons move between tensor-parallel ranks in blocks of this many:
-# the fused decode MoE kernel needs a per-rank width that is a multiple of 64,
-# and it keeps whole quantization groups in the column-split ``w2``.
-EXPERT_SPLIT_UNIT = 64
-
 
 @dataclass(frozen=True)
 class TensorSplit:
     """An uneven tensor-parallel split, as each rank's share in whole units.
 
     ``attention`` counts output groups (each holds ``n_heads / o_groups``
-    heads) and ``experts`` counts ``EXPERT_SPLIT_UNIT``-neuron blocks of every
-    routed and shared expert. Both are listed in rank order.
+    heads) and ``experts`` counts equal blocks of every routed and shared
+    expert's neurons. The planner picks the block width, so ``experts`` totals
+    ``moe_inter_dim / width``. Both are listed in rank order.
     """
 
     attention: tuple[int, ...]
@@ -33,9 +29,6 @@ class TensorSplit:
             raise ValueError("invalid DeepSeek V4.1 tensor split") from exc
         return cls(attention, experts)
 
-    def to_dict(self) -> dict[str, list[int]]:
-        return {"attention": list(self.attention), "experts": list(self.experts)}
-
     def validate(self, config: "ModelConfig", size: int) -> None:
         if len(self.attention) != size or len(self.experts) != size:
             raise ValueError(f"DeepSeek V4.1 tensor split must list {size} ranks")
@@ -46,11 +39,10 @@ class TensorSplit:
                 f"DeepSeek V4.1 attention split must total {config.o_groups} "
                 "output groups"
             )
-        if sum(self.experts) * EXPERT_SPLIT_UNIT != config.moe_inter_dim:
+        if config.moe_inter_dim % sum(self.experts):
             raise ValueError(
-                "DeepSeek V4.1 expert split must total "
-                f"{config.moe_inter_dim // EXPERT_SPLIT_UNIT} units of "
-                f"{EXPERT_SPLIT_UNIT} neurons"
+                f"DeepSeek V4.1 expert split of {sum(self.experts)} blocks does "
+                f"not divide {config.moe_inter_dim} neurons"
             )
 
     def bounds(self, kind: str, rank: int, length: int) -> tuple[int, int]:
@@ -334,7 +326,9 @@ class ModelConfig:
             self,
             n_heads=split.attention[rank] * (self.n_heads // self.o_groups),
             o_groups=split.attention[rank],
-            moe_inter_dim=split.experts[rank] * EXPERT_SPLIT_UNIT,
+            moe_inter_dim=self.moe_inter_dim
+            // sum(split.experts)
+            * split.experts[rank],
         )
 
     def ced_layout_supported(self) -> bool:

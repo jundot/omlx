@@ -955,6 +955,7 @@ def test_deepseek_v41_oqh_stages_match_one_forward(tmp_path, monkeypatch):
 
 
 def test_deepseek_v41_tensor_split_keeps_oqh_blocks():
+    from omlx.patches.deepseek_v41.config import TensorSplit
     from omlx.patches.deepseek_v41.loading import tensor_slice
 
     up = "language_model.layers.0.ffn.experts.w1"
@@ -967,3 +968,15 @@ def test_deepseek_v41_tensor_split_keeps_oqh_blocks():
     # w2 splits its inputs: whole blocks of signs, every row scale.
     assert tensor_slice(f"{down}.rscale", rscale, 1, 2) is rscale
     assert tensor_slice(f"{down}.oqh_signs", signs, 1, 2).tolist() == signs[4:].tolist()
+    # An uneven split moves whole blocks; one finer than a block is refused.
+    split = TensorSplit((1, 1), (3, 1))
+    assert (
+        tensor_slice(f"{up}.rscale", rscale, 1, 2, split).tolist()
+        == rscale[:, 6:].tolist()
+    )
+    assert (
+        tensor_slice(f"{down}.oqh_signs", signs, 0, 2, split).tolist()
+        == signs[:6].tolist()
+    )
+    with pytest.raises(ValueError):
+        tensor_slice(f"{down}.oqh_signs", signs, 0, 2, TensorSplit((1, 1), (15, 1)))

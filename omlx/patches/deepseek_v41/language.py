@@ -7,7 +7,6 @@ Batch rows are evaluated independently so late admission cannot share history.
 """
 
 import math
-import os
 import threading
 from contextlib import contextmanager, nullcontext
 from functools import cache, lru_cache
@@ -811,10 +810,6 @@ def _send_stage(h, pre, destination):
     mx.eval(mx.distributed.send(payload, destination))
 
 
-# Read once: MLX fixes its GPU/CPU synchronisation mode at start-up.
-_FAST_SYNCH = os.environ.get("MLX_METAL_FAST_SYNCH") == "1"
-
-
 def _gather_stage(x):
     """Rank 0's rows of ``x``: it holds the last layers."""
     gathered = mx.distributed.all_gather(x)
@@ -966,14 +961,7 @@ class Block(nn.Module):
 
     def sum_ranks(self, x):
         group = self._tensor_group
-        if group is None:
-            return x
-        if _FAST_SYNCH:
-            # With fast GPU/CPU synchronisation the JACCL reduction can run on
-            # the CPU stream while the GPU keeps encoding: the GPU waits on a
-            # shared event instead of ending its command buffer per layer.
-            return mx.distributed.all_sum(x, group=group, stream=mx.cpu)
-        return mx.distributed.all_sum(x, group=group)
+        return x if group is None else mx.distributed.all_sum(x, group=group)
 
     def __call__(self, h, pre, cache, shared, start, image_mask, ced_tail=None):
         if (

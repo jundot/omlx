@@ -1679,7 +1679,7 @@ def test_lightning_mtp_reaches_the_rank_load_settings(tmp_path):
     assert settings.mtp_adaptive_max_depth is None
 
 
-def test_v41_prefill_paths_reach_the_tensor_shard_loader(tmp_path):
+def test_v41_shard_options_reach_the_tensor_shard_loader(tmp_path):
     deployment = _deployment()
     args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
     # Off, a model-owned tensor shard loader gets no options.
@@ -1699,6 +1699,10 @@ def test_v41_prefill_paths_reach_the_tensor_shard_loader(tmp_path):
         "a8_prefill": True,
         "a8_prefill_min_tokens": 256,
     }
+    # Only an uneven plan sends its split.
+    uneven = SimpleNamespace(tensor_parallel_split=((5, 3), (25, 11)))
+    options = _tensor_shard_options(_execution_settings(args), uneven)
+    assert options["tensor_split"] == {"attention": [5, 3], "experts": [25, 11]}
 
 
 def test_the_node_role_reaches_the_rank_through_the_launched_argv(tmp_path):
