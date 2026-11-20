@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import logging
 import time
@@ -37,7 +38,142 @@ def _supports_batch_rollback(cache):
             and type(cache) in (vlm_cache.ArraysCache, vlm_cache.BatchKVCache)
         )
         or getattr(type(cache), "_omlx_mtp_batch_rollback_cache", False)
+        # Quantized batch caches trim each row in place (_ragged_trim_rows).
+        or getattr(type(cache), "_omlx_ragged_trim", False)
     )
+
+
+def _cache_leaves(caches):
+    """Leaf caches of a prompt cache list (CacheList parts flattened)."""
+    leaves, stack = [], list(caches)
+    while stack:
+        entry = stack.pop()
+        if entry is None:
+            continue
+        subs = getattr(entry, "caches", None)
+        if subs is not None:
+            stack.extend(subs)
+        else:
+            leaves.append(entry)
+    return leaves
+
+
+def _ragged_mixed_with_plain_kv(caches):
+    """Whether ragged-trim caches sit next to a plain batch KV cache.
+
+    The model builds one mask for all attention layers, so both kinds must end
+    each row at the same column (``turboquant_skip_last`` makes every batch mixed).
+    """
+    leaves = _cache_leaves(caches)
+    ragged = any(getattr(type(c), "_omlx_ragged_trim", False) for c in leaves)
+    plain_kv = any(
+        type(c) is BatchKVCache
+        or (vlm_cache is not None and type(c) is vlm_cache.BatchKVCache)
+        for c in leaves
+    )
+    return ragged and plain_kv
+
+
+def _mixed_row_ends(leaf):
+    """Each row's written end in one attention layer of a mixed batch, or None.
+
+    A plain layer with a deferred tail ends row ``r`` at ``_idx - tail[r]``.
+    """
+    if getattr(type(leaf), "_omlx_ragged_trim", False):
+        return tuple(leaf._ends())
+    if type(leaf) is BatchKVCache or (
+        vlm_cache is not None and type(leaf) is vlm_cache.BatchKVCache
+    ):
+        end = int(leaf._idx)
+        tail = getattr(leaf, "__dict__", {}).get("_omlx_tail")
+        if tail and any(tail):
+            return tuple(end - t for t in tail)
+        rows = getattr(leaf, "offset", None)
+        count = int(rows.shape[0]) if hasattr(rows, "shape") and rows.ndim else 1
+        return tuple([end] * count)
+    return None
+
+
+def _mixed_rows_agree(caches) -> bool:
+    """Whether every attention layer of a mixed batch ends each row at the
+    same column, so the one mask the model builds fits all of them."""
+    layouts = set()
+    for leaf in _cache_leaves(caches):
+        ends = _mixed_row_ends(leaf)
+        if ends is not None:
+            layouts.add(ends)
+            if len(layouts) > 1:
+                return False
+    return True
+
+
+def _align_mixed_rows_if_needed(caches) -> bool:
+    """Realign a mixed batch only when its layers disagree on the row ends.
+
+    They disagree after the plain layer realigns its deferred tail.
+    """
+    if _mixed_rows_agree(caches):
+        _trim_common_tail(caches)
+        return False
+    _align_mixed_rows(caches)
+    return True
+
+
+def _trim_common_tail(caches) -> None:
+    """Drop the deferred-tail columns every row shares.
+
+    The plain bank then ends at the longest row, as wide as the quantized layers.
+    """
+    for leaf in _cache_leaves(caches):
+        tail = getattr(leaf, "__dict__", {}).get("_omlx_tail")
+        if not tail:
+            continue
+        common = min(tail)
+        if common <= 0:
+            continue
+        leaf._idx = int(leaf._idx) - common
+        rest = [t - common for t in tail]
+        if any(rest):
+            leaf.__dict__["_omlx_tail"] = rest
+        else:
+            leaf.__dict__.pop("_omlx_tail", None)
+
+
+def _align_mixed_rows(caches):
+    """End every row at the last column again, in every attention layer."""
+    deferred = None
+    for leaf in _cache_leaves(caches):
+        if getattr(type(leaf), "_omlx_ragged_trim", False):
+            align = getattr(leaf, "_align_row_ends", None)
+            if callable(align):
+                align()
+        elif getattr(leaf, "__dict__", {}).get("_omlx_tail"):
+            if deferred is None:
+                from .. import qwen35_deferred_realign as deferred
+            deferred.realign(leaf)
+
+
+@contextlib.contextmanager
+def _ragged_trim_rows(cache, accepted, depth):
+    """Trim each row of the ragged-trim caches to ``accepted[b] + 1`` kept tokens.
+
+    They read as speculating meanwhile, so the model's own rollback skips them.
+    """
+    leaves = [
+        entry
+        for entry in _cache_leaves(cache)
+        if getattr(type(entry), "_omlx_ragged_trim", False)
+        and not getattr(entry, "is_speculating", False)
+    ]
+    drops = [max(0, int(depth) - int(a)) for a in accepted]
+    for entry in leaves:
+        entry.trim_rows(drops)
+        entry.is_speculating = True
+    try:
+        yield
+    finally:
+        for entry in leaves:
+            entry.__dict__.pop("is_speculating", None)
 
 
 def _independent_verify(model):
@@ -224,6 +360,9 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     whole_batch = cache is not None
     if cache is None:
         cache = bg._merge_row_caches([row.prompt_cache for _, row, _ in rows])
+    if whole_batch and _ragged_mixed_with_plain_kv(cache):
+        # A filter, extend or outside read may have realigned the plain layer.
+        _align_mixed_rows_if_needed(cache)
     uids = [state.uid for _, _, state in rows]
     bg._set_batched_mrope_deltas(batch, uids)
     inputs = mx.stack(
@@ -253,17 +392,22 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     elif depth > 0 and all(
         not bg._is_greedy(row) and bg._proc_list(row) is None for _, row, _ in rows
     ):
+        samplers = [bg._resolve_sampler(row) for _, row, _ in rows]
+        lps = [bg._logprobs(logits[index]) for index in range(len(rows))]
         stochastic_results = mx.stack(
             [
-                bg._stochastic_verify_tokens(
-                    bg._resolve_sampler(row),
-                    bg._logprobs(logits[index]),
-                    state.drafts,
-                    state.draft_accept_lps,
+                bg._verify_stochastic(
+                    samplers[index], lps[index], state.drafts, state.draft_accept_lps
                 )
-                for index, (_, row, state) in enumerate(rows)
+                for index, (_, _, state) in enumerate(rows)
             ]
         ).tolist()
+        stochastic_results = [
+            bg._settled_verify(
+                host, samplers[index], lps[index], state.drafts, state.draft_accept_lps
+            )
+            for index, (host, (_, _, state)) in enumerate(zip(stochastic_results, rows))
+        ]
     else:
         mx.eval(logits, hidden)
     verify_ms = (time.perf_counter() - started) * 1000 / len(rows)
@@ -332,9 +476,11 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         # The model updates KV padding and selects each row's GDN state in
         # place. No extraction or merge is needed for the next target call.
         started = time.perf_counter()
-        batch.model.rollback_speculative_cache(
-            cache, gdn, [accepted for accepted, _ in deferred], depth + 1
-        )
+        accepted_rows = [accepted for accepted, _ in deferred]
+        with _ragged_trim_rows(cache, accepted_rows, depth):
+            batch.model.rollback_speculative_cache(cache, gdn, accepted_rows, depth + 1)
+        if _ragged_mixed_with_plain_kv(cache):
+            _align_mixed_rows_if_needed(cache)
         commit_ms = (time.perf_counter() - started) * 1000 / len(rows)
         for (index, row, _), (_, finish) in zip(rows, deferred):
             bg._set_singleton_mrope_delta(row)

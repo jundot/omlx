@@ -41,6 +41,7 @@ enum AdminAPI {
     static let prefillLending = "\(prefillHelper)/lending"
     static let prefillLendingStop = "\(prefillHelper)/lending/stop"
     static func modelGenerationConfig(_ id: String) -> String { "\(models)/\(id)/generation_config" }
+    static func modelLoRAAdapters(_ id: String) -> String { "\(models)/\(id)/lora-adapters" }
     static let reloadModels    = "\(prefix)/reload"
 
     static func modelProfiles(_ id: String) -> String { "\(models)/\(id)/profiles" }

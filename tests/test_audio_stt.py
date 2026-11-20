@@ -243,6 +243,23 @@ class TestSTTEngineLanguageForwarding:
 
         assert "language" not in generate_kwargs
 
+    @pytest.mark.asyncio
+    async def test_transcribe_reports_audio_length(self, tmp_path):
+        """``duration`` is the audio length, not the backend's processing time."""
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                return SimpleNamespace(text="hi", segments=[], total_time=9.0)
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(_make_wav_bytes(duration_secs=1.5))
+        engine = STTEngine("whisper")
+        engine._model = FakeModel()
+
+        result = await engine.transcribe(str(audio_path))
+
+        assert result["duration"] == pytest.approx(1.5)
+
 
 @pytest.fixture
 def server_audio_client():
@@ -813,6 +830,141 @@ class TestSTTEndpointResponseFormat:
             data={"model": "whisper-tiny"},
         )
         assert "application/json" in response.headers.get("content-type", "")
+
+
+# ---------------------------------------------------------------------------
+# Diarized transcription
+# ---------------------------------------------------------------------------
+
+
+class TestSTTDiarization:
+    """``diarized_json`` speaker turns from the engine and the route."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("module", "text", "segments", "expected_text", "expected_segments"),
+        [
+            (
+                "mlx_audio.stt.models.nemotron_transcribe.nemotron_transcribe",
+                "<spk:0> Bonjour à tous. <spk:1> 你好。 <spk:0> Merci. <spk:1> Ça va.",
+                # Time-sorted words; "Ça" is aligned before speaker 0's "Merci.".
+                [
+                    {"speaker": 0, "start": 0.0, "end": 0.2, "text": "Bonjour"},
+                    {"speaker": 0, "start": 0.2, "end": 0.3, "text": "à"},
+                    {"speaker": 0, "start": 0.3, "end": 0.5, "text": "tous."},
+                    {"speaker": 1, "start": 0.6, "end": 0.7, "text": "你"},
+                    {"speaker": 1, "start": 0.7, "end": 0.8, "text": "好"},
+                    {"speaker": 1, "start": 0.82, "end": 0.85, "text": "Ça"},
+                    {"speaker": 0, "start": 0.86, "end": 0.9, "text": "Merci."},
+                    {"speaker": 1, "start": 0.92, "end": 0.99, "text": "va."},
+                ],
+                "Bonjour à tous. 你好。 Merci. Ça va.",
+                [
+                    {"speaker": 0, "start": 0.0, "end": 0.5, "text": "Bonjour à tous."},
+                    {"speaker": 1, "start": 0.6, "end": 0.8, "text": "你好。"},
+                    {"speaker": 0, "start": 0.86, "end": 0.9, "text": "Merci."},
+                    {"speaker": 1, "start": 0.82, "end": 0.99, "text": "Ça va."},
+                ],
+            ),
+            (
+                "mlx_audio.stt.models.vibevoice_asr.vibevoice_asr",
+                '[{"Start": 0, "End": 0.4, "Speaker": 0, "Content": "Hi."}, ...]',
+                [
+                    {"start": 0, "end": 0.4, "speaker_id": 0, "text": "Hi."},
+                    {"start": 0.4, "end": 1.0, "text": "[Silence]"},
+                ],
+                "Hi.",
+                [{"speaker": 0, "start": 0, "end": 0.4, "text": "Hi."}],
+            ),
+        ],
+    )
+    async def test_engine_returns_speaker_turns(
+        self, tmp_path, module, text, segments, expected_text, expected_segments
+    ):
+        generate_call = {}
+
+        class FakeModel:
+            __module__ = module
+            sample_rate = 16000
+            ctc_timestamp = object()
+            _alignment_tokenizer = object()
+
+            def generate(self, audio, **kwargs):
+                generate_call.update(kwargs=kwargs)
+                return SimpleNamespace(text=text, segments=segments, total_time=9.0)
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(_make_wav_bytes(duration_secs=1.0))
+        engine = STTEngine("diarizer")
+        engine._model = FakeModel()
+
+        assert engine.supports_diarization()
+        result = await engine.transcribe(str(audio_path), diarize=True)
+
+        assert ("task" in generate_call["kwargs"]) == ("nemotron" in module)
+        assert result["text"] == expected_text
+        assert result["segments"] == expected_segments
+        assert result["duration"] == 1.0
+
+        engine._model._alignment_tokenizer = None
+        assert engine.supports_diarization() == ("vibevoice" in module)
+
+    def _post(self, client, **data):
+        return client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "m", "response_format": "diarized_json", **data},
+        )
+
+    def test_route_clamps_end_past_duration(self, audio_client):
+        client, pool = audio_client
+        engine = pool.get_engine.return_value
+        engine.supports_diarization.return_value = True
+        engine.transcribe.return_value = {
+            "text": "Bonjour. Salut.",
+            "duration": 1.237,
+            "segments": [
+                {"speaker": 0, "start": 0.0, "end": 0.6, "text": "Bonjour."},
+                {"speaker": 1, "start": 0.6, "end": 1.24, "text": "Salut."},
+            ],
+        }
+
+        response = self._post(client)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert [s["speaker"] for s in body["segments"]] == ["0", "1"]
+        assert body["segments"][1]["end"] == 1.237
+        assert body["usage"] == {"type": "duration", "seconds": 2}
+        assert engine.transcribe.call_args.kwargs["diarize"] is True
+
+    @pytest.mark.parametrize(
+        ("data", "supported"),
+        [({"stream": "true"}, True), ({"chunking_strategy": "vad"}, True), ({}, False)],
+    )
+    def test_route_rejects_unsupported_requests(self, audio_client, data, supported):
+        client, pool = audio_client
+        engine = pool.get_engine.return_value
+        engine.supports_diarization.return_value = supported
+
+        assert self._post(client, **data).status_code == 400
+        engine.transcribe.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "segments",
+        [[{"speaker": 0, "start": 0.5, "end": 0.1, "text": "Hi."}], []],
+    )
+    def test_route_rejects_incomplete_diarization(self, audio_client, segments):
+        client, pool = audio_client
+        engine = pool.get_engine.return_value
+        engine.supports_diarization.return_value = True
+        engine.transcribe.return_value = {
+            "text": "Hi.",
+            "duration": 1.0,
+            "segments": segments,
+        }
+
+        assert self._post(client).status_code == 502
 
 
 # ---------------------------------------------------------------------------

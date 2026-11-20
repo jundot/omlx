@@ -177,6 +177,10 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.modelGenerationConfig(id))
     }
 
+    func listLoRAAdapters(id: String) async throws -> LoRAAdapterListResponse {
+        try await get(AdminAPI.modelLoRAAdapters(id))
+    }
+
     /// Server-side lookup of the best omlx.ai benchmarks for this device
     /// and model (proxied like the preset refresh).
     func listOptimalCandidates(id: String) async throws -> OptimalCandidatesDTO {

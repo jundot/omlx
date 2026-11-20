@@ -712,6 +712,135 @@ def test_deepseek_v41_tensor_plan_keeps_the_shared_kv_head_whole():
     assert set(_tensor_parallel_divisors(config)) == {64, 8, 128, 36, 72}
 
 
+def _v41_split_layout():
+    """V4.1-shaped: 8 output groups, 36 expert blocks, 40 layers of 7 GiB."""
+
+    return ModelLayout(
+        source="v41",
+        fixed_weight_bytes=2 * GIB,
+        layer_weight_bytes=(7 * GIB,) * 40,
+        tensor_parallel_heads=64,
+        tensor_parallel_divisors=(64, 8, 36),
+        supports_tensor_parallel=True,
+        tensor_parallel_split_units=(8, 36),
+        tensor_parallel_split_bytes=(10 * GIB, 260 * GIB),
+    )
+
+
+def _studio_and_macbook(*extra):
+    return [
+        NodeBudget("studio", 243 * GIB, reserve_bytes=8 * GIB, rank=0),
+        NodeBudget("macbook", 121 * GIB, reserve_bytes=3 * GIB, rank=1),
+        *extra,
+    ]
+
+
+def test_deepseek_v41_auto_split_is_equal_only_while_equal_fits():
+    model = _v41_split_layout()
+    pair = [NodeBudget(n, 243 * GIB, rank=i) for i, n in enumerate("ab")]
+    auto = plan_hybrid(model, pair, tensor_parallel_size=2)
+    equal = plan_hybrid(model, pair, tensor_parallel_size=2, tensor_split="equal")
+    assert auto.plan_hash == equal.plan_hash
+    assert all("tensor_parallel_split" not in a.to_dict() for a in auto.assignments)
+
+    nodes = _studio_and_macbook()
+    with pytest.raises(PlanningError):
+        plan_hybrid(model, nodes, tensor_parallel_size=2, tensor_split="equal")
+    studio, macbook = plan_hybrid(model, nodes, tensor_parallel_size=2).assignments
+    attention, experts = studio.tensor_parallel_split
+    assert sum(attention) == 8 and sum(experts) == 36 and experts[0] > experts[1]
+    # Each rank holds the replicated part plus its own share of each axis.
+    replicated = sum(model.tensor_parallel_layer_bytes) - 270 * GIB
+    assert studio.layer_weight_bytes == (
+        replicated + 10 * GIB * attention[0] // 8 + 260 * GIB * experts[0] // 36
+    )
+    for item, node in zip((studio, macbook), nodes):
+        assert item.planned_weight_bytes <= node.usable_bytes
+        decoded = _assignment_from_dict(item.to_dict())
+        assert decoded.tensor_parallel_split == studio.tensor_parallel_split
+    assert ModelLayout.from_dict(model.to_dict()) == model
+
+
+@pytest.mark.parametrize(
+    ("split", "error"),
+    [
+        ({"attention": [5, 2], "experts": [25, 11]}, "totalling"),
+        ({"attention": [5, 3], "experts": [36, 0]}, "malformed"),
+        ({"attention": [1, 7], "experts": [6, 30]}, "does not fit"),
+    ],
+)
+def test_deepseek_v41_explicit_split_must_cover_and_fit_every_rank(split, error):
+    with pytest.raises((PlanningError, ValueError), match=error):
+        plan_hybrid(
+            _v41_split_layout(),
+            _studio_and_macbook(),
+            tensor_parallel_size=2,
+            tensor_split=split,
+        )
+
+
+def test_uneven_split_keeps_the_supported_tensor_parallel_degrees():
+    nodes = _studio_and_macbook(NodeBudget("mini", 121 * GIB, rank=2))
+    with pytest.raises(PlanningError, match="not divisible"):
+        plan_hybrid(_v41_split_layout(), nodes, tensor_parallel_size=3)
+
+
+@pytest.mark.parametrize(
+    ("modules", "oqh", "units"),
+    [
+        ({"ffn.shared_experts.w2": {"bits": 8, "mode": "mxfp8"}}, {}, (8, 36)),
+        # The fused decode MoE kernel reads two shared w2 groups per step.
+        ({"ffn.shared_experts.w2": {"bits": 8, "group_size": 64}}, {}, (8, 18)),
+        ({}, {"ffn.experts.w2": {"bits": 4, "block": 128, "group_size": 128}}, (8, 18)),
+        ({}, {"attn.wo_b": {"bits": 4, "block": 256, "group_size": 2048}}, ()),
+    ],
+)
+def test_deepseek_v41_split_blocks_follow_the_checkpoint_format(modules, oqh, units):
+    from omlx.cluster.planner import _tensor_split_units
+
+    def scoped(entries):
+        return {f"language_model.layers.0.{k}": v for k, v in entries.items()}
+
+    config = {
+        "model_type": "deepseek_v41",
+        "text_config": {
+            "num_attention_heads": 64,
+            "o_groups": 8,
+            "o_lora_rank": 1024,
+            "moe_intermediate_size": 2304,
+        },
+        "omlx_deepseek_v41": {"quantized_modules": scoped(modules)},
+        **({"omlx_oqh": {"version": 1, "tensors": scoped(oqh)}} if oqh else {}),
+    }
+
+    assert _tensor_split_units(config) == units
+
+
+def test_inspection_measures_deepseek_v41_split_bytes(tmp_path):
+    text = {"num_attention_heads": 64, "o_groups": 8, "o_lora_rank": 1024}
+    text |= {"moe_intermediate_size": 2304, "num_hidden_layers": 2}
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v41", "text_config": text})
+    )
+    tensors = [("language_model.embed.weight", 100)]
+    for layer in range(2):
+        prefix = f"language_model.layers.{layer}."
+        tensors += [
+            (prefix + "attn.wq_b.weight", 10),
+            (prefix + "attn.wo_b.scales", 2),
+            (prefix + "attn.attn_sink", 1),
+            (prefix + "attn.wkv.weight", 5),
+            (prefix + "ffn.experts.w1.weight", 40),
+            (prefix + "ffn.shared_experts.w2.weight", 8),
+        ]
+    _write_safetensors(tmp_path / "model.safetensors", tensors)
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    assert layout.tensor_parallel_split_units == (8, 36)
+    assert layout.tensor_parallel_split_bytes == (2 * 13, 2 * 48)
+
+
 def test_tensor_plan_leaves_ssd_tables_out_of_rank_memory():
     from omlx.cluster.planner import plan_hybrid
 

@@ -1064,31 +1064,42 @@ def gather_rows(x: mx.array, src: mx.array) -> mx.array:
     )[0]
 
 
-# Routed rows times their expert's affine weights, one launch block a
-# (128-column tile, expert) over every row of that expert: each 64-wide K
-# chunk of the weight tile is dequantized once into shared memory for up to
-# 192 rows. The sums are those of the sorted-expert gather_qmm: one bf16
-# m16n8k16 step at a time in K order into a float32 accumulator, weights
-# rebuilt as code * scale + bias rounded once (the product is exact, so a
-# fused or a separate add gives the same weight), the output rounded once.
+# Routed rows times their expert's weights, one launch block a (128-column
+# tile, expert) over every row of that expert: each 64-wide K chunk of the
+# weight tile is dequantized once into shared memory for up to BM rows. The
+# sums are those of the sorted-expert gather_qmm: one bf16 m16n8k16 step at a
+# time in K order into a float32 accumulator, weights rebuilt as
+# code * scale + bias rounded once (the product is exact, so a fused or a
+# separate add gives the same weight), the output rounded once.
+# Codes of 2 to 5 bits sit in MLX affine packing, one little-endian bit stream
+# per row. GS is the affine group size; GS 0 reads one oQh row scale per row
+# and its bias -center * scale rounded as the host's row view rounds it.
 # Warp w takes columns [64 (w % 2), + 64) of the 16-row tiles w / 2,
 # w / 2 + 4 and w / 2 + 8, so a short expert's tiles spread over the warps.
-# With GATHER route r reads row src[r] of x; with SWIGLU the bank joins gate
-# and up rows and the output is silu(gate) * up.
+# With GATHER route r reads row src[r] of x. With ACT the bank joins gate and
+# up rows and the output is the activation: 1 silu(gate) * up with MLX's bf16
+# functors; for oQh rotations 2 the same and 3 the clamped SwiGLU
+# silu(min(gate, lim)) * clamp(up, -lim, lim), both float32 as the host's
+# oQh kernels keep them.
 _EXPERT_GEMM = """
-  constexpr int BM = 192, BN = 128, BK = 64, NT = 256, AP = BK + 8;
+  // 5-bit chunks hold more code bytes; fewer rows keep shared memory in bounds.
+  constexpr int BM = BITS == 5 ? 176 : 192, BN = 128, BK = 64, NT = 256, AP = BK + 8;
   constexpr int PACK = BK * BITS / 8, ROW = K * BITS / 8, CHUNKS = K / BK;
-  static_assert(BITS == 4 && BN * PACK / 16 == NT, "one 16-byte code copy a thread");
+  // A thread rebuilds half a row chunk: 32 codes in HALF bytes. With two
+  // copies a row, each thread copies the half it rebuilds.
+  constexpr int HALF = PACK / 2, CP = PACK % 16 == 0 ? 16 : 8;
+  constexpr bool OWN = 2 * CP == PACK && 2 * BN == NT;
+  constexpr float CENTER = 0.5f * float((1 << BITS) - 1);
   extern __shared__ __align__(16) unsigned char smem[];
   qsa_bf16 (*sa)[BM][AP] = reinterpret_cast<qsa_bf16 (*)[BM][AP]>(smem);
   qsa_bf16 (*sb)[BN][AP] = reinterpret_cast<qsa_bf16 (*)[BN][AP]>(smem + 2 * BM * AP * 2);
   unsigned char (*sq)[BN][PACK] = reinterpret_cast<unsigned char (*)[BN][PACK]>(
       smem + 2 * BM * AP * 2 + 2 * BN * AP * 2);
-  // With SWIGLU the tile's columns are 64 gate rows and the 64 up rows I apart.
+  // With ACT the tile's columns are 64 gate rows and the 64 up rows I apart.
   constexpr int I = N / 2;
   const int expert = blockIdx.y;
-  const int n0 = SWIGLU ? blockIdx.x * (BN / 2) : blockIdx.x * BN;
-  auto wrow = [&](int n) { return SWIGLU && n >= BN / 2 ? I + n0 + n - BN / 2 : n0 + n; };
+  const int n0 = ACT ? blockIdx.x * (BN / 2) : blockIdx.x * BN;
+  auto wrow = [&](int n) { return ACT && n >= BN / 2 ? I + n0 + n - BN / 2 : n0 + n; };
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int wm = warp >> 1, wn = warp & 1, g = lane >> 2, t = lane & 3;
   const int begin = offsets[expert], end = offsets[expert + 1];
@@ -1096,7 +1107,12 @@ _EXPERT_GEMM = """
   const unsigned char* codes = reinterpret_cast<const unsigned char*>(w) + size_t(expert) * N * ROW;
   // Thread tid rebuilds half (tid & 1) of weight row tid >> 1 of each chunk.
   const int qn = tid >> 1, half = tid & 1;
-  const size_t sat = (size_t(expert) * N + wrow(qn)) * (K / 64);
+  const size_t srow = size_t(expert) * N + wrow(qn);
+  auto scale_at = [&](int c) { return GS ? s[srow * (K / GS) + c * BK / GS] : s[srow]; };
+  auto bias_at = [&](int c) {
+    return GS ? b[srow * (K / GS) + c * BK / GS]
+              : __float2bfloat16(__bfloat162float(s[srow]) * -CENTER);
+  };
   for (int m0 = begin; m0 < end; m0 += BM) {
     const int rows = end - m0 < BM ? end - m0 : BM;
     // Chunk c's route rows into sa[c & 1], its weight codes into sq[c & 1].
@@ -1108,18 +1124,32 @@ _EXPERT_GEMM = """
       }
     };
     auto load_codes = [&](int c) {
-      for (int e = tid; e < BN * PACK / 16; e += NT) {
-        const int n = e / (PACK / 16), cc = e % (PACK / 16);
-        qsa_cp16(&sq[c & 1][n][16 * cc], codes + size_t(wrow(n)) * ROW + c * PACK + 16 * cc, true);
+      for (int e = tid; e < BN * PACK / CP; e += NT) {
+        const int n = e / (PACK / CP), cc = e % (PACK / CP);
+        const unsigned char* from = codes + size_t(wrow(n)) * ROW + c * PACK + CP * cc;
+        if (CP == 16) {
+          qsa_cp16(&sq[c & 1][n][CP * cc], from, true);
+        } else {
+          asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\\n" ::"r"(qsa_smem(&sq[c & 1][n][CP * cc])), "l"(from));
+        }
       }
     };
     // Chunk c's weights rebuilt from sq[c & 1] into sb[c & 1]: this thread's
-    // half row of 32 codes (which load_codes copies with this same thread),
-    // 8 to a word.
+    // half row of 32 codes, 8 to a 16-byte store.
     auto rebuild = [&](int c, qsa_bf16 sv, qsa_bf16 bv) {
       const float scale = __bfloat162float(sv), bias = __bfloat162float(bv);
-      const uint4 w4 = *reinterpret_cast<const uint4*>(&sq[c & 1][qn][half * PACK / 2]);
-      const uint32_t words[4] = {w4.x, w4.y, w4.z, w4.w};
+      uint32_t words[6] = {0, 0, 0, 0, 0, 0};
+      const unsigned char* from = &sq[c & 1][qn][half * HALF];
+      if (HALF == 16) {
+        const uint4 w4 = *reinterpret_cast<const uint4*>(from);
+        words[0] = w4.x, words[1] = w4.y, words[2] = w4.z, words[3] = w4.w;
+      } else if (HALF == 8) {
+        const uint2 w2 = *reinterpret_cast<const uint2*>(from);
+        words[0] = w2.x, words[1] = w2.y;
+      } else {
+        #pragma unroll
+        for (int i = 0; i < HALF / 4; ++i) words[i] = reinterpret_cast<const uint32_t*>(from)[i];
+      }
       #pragma unroll
       for (int part = 0; part < 4; ++part) {
         __nv_bfloat162 out[4];
@@ -1128,8 +1158,10 @@ _EXPERT_GEMM = """
           float pair[2];
           #pragma unroll
           for (int h = 0; h < 2; ++h) {
-            const float code = float((words[part] >> (8 * p + 4 * h)) & 15u);
-            pair[h] = fmaf(code, scale, bias);
+            const int bit = BITS * (part * 8 + 2 * p + h), wi = bit >> 5, sh = bit & 31;
+            uint32_t q = words[wi] >> sh;
+            if (sh + BITS > 32) q |= words[wi + 1] << (32 - sh);
+            pair[h] = fmaf(float(q & ((1u << BITS) - 1u)), scale, bias);
           }
           out[p] = __floats2bfloat162_rn(pair[0], pair[1]);
         }
@@ -1146,12 +1178,14 @@ _EXPERT_GEMM = """
     load_codes(0);
     if (CHUNKS > 1) load_codes(1);
     qsa_commit();
-    qsa_bf16 sv = s[sat], bv = b[sat];
+    qsa_bf16 sv = scale_at(0), bv = bias_at(0);
     qsa_wait<0>();
+    // Other threads copied some of this thread's codes.
+    if (!OWN) __syncthreads();
     rebuild(0, sv, bv);
     if (CHUNKS > 1) {
-      sv = s[sat + 1];
-      bv = b[sat + 1];
+      sv = scale_at(1);
+      bv = bias_at(1);
     }
     // Step c multiplies chunk c while it rebuilds chunk c + 1 and loads the
     // rows of c + 1 and the codes of c + 2, one barrier a step.
@@ -1164,8 +1198,8 @@ _EXPERT_GEMM = """
       if (c + 1 < CHUNKS) {
         rebuild(c + 1, sv, bv);
         if (c + 2 < CHUNKS) {
-          sv = s[sat + c + 2];
-          bv = b[sat + c + 2];
+          sv = scale_at(c + 2);
+          bv = bias_at(c + 2);
         }
       }
       #pragma unroll
@@ -1188,7 +1222,7 @@ _EXPERT_GEMM = """
         }
       }
     }
-    if (SWIGLU) {
+    if (ACT == 1) {
       // Gate and up of a row meet in shared memory: silu(gate) * up with
       // MLX's bf16 functors, as ``nn.silu(gate) * up`` runs.
       using namespace mlx::core::cu;
@@ -1215,6 +1249,34 @@ _EXPERT_GEMM = """
         }
         *reinterpret_cast<uint4*>(y + size_t(m0 + r) * I + n0 + c) = *reinterpret_cast<const uint4*>(out);
       }
+    } else if (ACT) {
+      // oQh: the float32 activation, which the host rotates before it
+      // rounds. Gate and up round as the host's matmuls round them.
+      qsa_bf16 (*so)[BN + 8] = reinterpret_cast<qsa_bf16 (*)[BN + 8]>(smem);
+      __syncthreads();
+      #pragma unroll
+      for (int i = 0; i < 3; ++i)
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+          #pragma unroll
+          for (int h = 0; h < 2; ++h)
+            *reinterpret_cast<__nv_bfloat162*>(&so[(wm + 4 * i) * 16 + g + 8 * h][wn * 64 + j * 8 + 2 * t]) =
+                __floats2bfloat162_rn(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
+      __syncthreads();
+      for (int e = tid; e < rows * (BN / 8); e += NT) {
+        const int r = e / (BN / 8), c = (e % (BN / 8)) * 4;
+        float f[4];
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          float a = __bfloat162float(so[r][c + q]), v = __bfloat162float(so[r][BN / 2 + c + q]);
+          if (ACT == 3) {
+            a = fminf(a, lim[0]);
+            v = fminf(fmaxf(v, -lim[0]), lim[0]);
+          }
+          f[q] = (a / (1.0f + expf(-a))) * v;
+        }
+        *reinterpret_cast<float4*>(y + size_t(m0 + r) * I + n0 + c) = make_float4(f[0], f[1], f[2], f[3]);
+      }
     } else {
       #pragma unroll
       for (int i = 0; i < 3; ++i)
@@ -1233,19 +1295,29 @@ _EXPERT_GEMM = """
   }
 """
 
+# Expert banks the kernel reads as (bits, group sizes): oMLX affine banks, and
+# oQh banks with row scales (group 0) or rotated affine groups.
+_AFFINE_FORMATS = ((4, (64,)),)
+_OQH_FORMATS = ((2, (0,)), (3, (0,)), (4, (0, 128)), (5, (0, 128)))
 
-def expert_gemm_fits(bank: tuple, width: int) -> bool:
+
+def expert_gemm_fits(bank: tuple, width: int, oqh: bool = False) -> bool:
     """Whether ``expert_gemm`` covers a packed expert bank and input width."""
     weight, scales, biases, quant = bank
     quant = quant or {}
+    bits, group = quant.get("bits"), quant.get("group_size")
+    formats = dict(_OQH_FORMATS if oqh else _AFFINE_FORMATS)
+    if scales is None or group not in formats.get(bits, ()):
+        return False
+    pack = 64 * bits // 8
     return (
-        biases is not None
-        and scales.dtype == biases.dtype == mx.bfloat16
+        (biases is not None or group == 0)
+        and scales.dtype == mx.bfloat16
+        and (biases is None or biases.dtype == mx.bfloat16)
         and quant.get("mode", "affine") == "affine"
-        and quant.get("bits") == 4
-        and quant.get("group_size") == 64
         and weight.shape[1] % 128 == 0
         and width % 64 == 0
+        and width * bits // 8 % (16 if pack % 16 == 0 else 8) == 0
     )
 
 
@@ -1263,44 +1335,56 @@ def expert_gemm(
     bank: tuple,
     offsets: mx.array,
     src: mx.array | None = None,
-    swiglu: bool = False,
+    act: int = 0,
+    limit: float | None = None,
 ) -> mx.array:
     """Rows of ``x`` [n, K] bf16 times each route's expert of ``bank``: [routes, N].
 
     Routes are sorted by expert and ``offsets`` (see ``expert_offsets``)
     bounds each expert's routes; route r reads row r of ``x``, or row
-    ``src[r]`` when given. With ``swiglu`` the bank's rows are the gate and
-    then the up projection and the result is [routes, N / 2] of
-    silu(gate) * up.
+    ``src[r]`` when given. With ``act`` the bank's rows are the gate and then
+    the up projection and the result is [routes, N / 2] of the activation
+    (see ``_EXPERT_GEMM``), float32 for ``act`` 2 and 3; 3 clamps at ``limit``.
     """
     weight, scales, biases, quant = bank
     count, width = weight.shape[0], weight.shape[1]
     routes = x.shape[0] if src is None else src.shape[0]
-    kernel = _EXPERT_KERNEL.get(quant["bits"])
+    bits = quant["bits"]
+    kernel = _EXPERT_KERNEL.get(bits)
     if kernel is None:
-        pack = 64 * quant["bits"] // 8
-        kernel = _EXPERT_KERNEL[quant["bits"]] = mx.fast.cuda_kernel(
+        rows = 176 if bits == 5 else 192
+        kernel = _EXPERT_KERNEL[bits] = mx.fast.cuda_kernel(
             name="qwen4_expert_gemm",
-            input_names=["x", "w", "s", "b", "offsets", "src"],
+            input_names=["x", "w", "s", "b", "offsets", "src", "lim"],
             output_names=["y"],
             source=_EXPERT_GEMM,
             header=_FUNCTORS + _borrowed("qsa_header.cuh"),
-            shared_memory=2 * 192 * 72 * 2 + 2 * 128 * 72 * 2 + 2 * 128 * pack,
+            shared_memory=2 * rows * 72 * 2 + 2 * 128 * 72 * 2 + 2 * 128 * 8 * bits,
         )
     gather = src is not None
+    lim = mx.array([0.0 if limit is None else limit], mx.float32)
     return kernel(
-        inputs=[x, weight, scales, biases, offsets, src if gather else offsets],
+        inputs=[
+            x,
+            weight,
+            scales,
+            scales if biases is None else biases,
+            offsets,
+            src if gather else offsets,
+            lim,
+        ],
         template=[
-            ("BITS", quant["bits"]),
+            ("BITS", bits),
+            ("GS", quant["group_size"]),
             ("K", x.shape[1]),
             ("N", width),
             ("GATHER", gather),
-            ("SWIGLU", swiglu),
+            ("ACT", act),
         ],
         grid=(width // 128 * 256, count, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(routes, width // 2 if swiglu else width)],
-        output_dtypes=[x.dtype],
+        output_shapes=[(routes, width // 2 if act else width)],
+        output_dtypes=[mx.float32 if act >= 2 else x.dtype],
     )[0]
 
 

@@ -24,6 +24,9 @@ struct OQModelInfo: Codable, Equatable, Sendable, Identifiable {
     let isQuantized: Bool
     let isVlm: Bool
     let hasMtpHeads: Bool
+    let oqhSupported: Bool?
+    /// oQh levels must stay below this one (DeepSeek V4.1: 4).
+    let oqhMaxLevel: Double?
 
     // Only populated on `source_models` rows.
     let numLayers: Int?
@@ -69,6 +72,7 @@ struct OQStartRequest: Encodable, Sendable {
     let dtype: String
     let preserveMtp: Bool
     let enhanced: Bool
+    let hadamard: Bool
     let imatrixCachePath: String
     let imatrixReuseCache: Bool
     let imatrixStrict: Bool

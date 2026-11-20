@@ -1361,6 +1361,30 @@ private struct AdvancedPage: View {
             ChatTemplateKwargsEditor(vm: vm, client: client)
         }
 
+        if showsLLMRows {
+            SectionHeader(
+                String(localized: "settings.advanced.lora_adapter.section",
+                       defaultValue: "LoRA Adapter",
+                       comment: "Section header above the LoRA adapter picker"),
+                subtitle: String(localized: "settings.advanced.lora_adapter.subtitle",
+                                 defaultValue: "Apply a LoRA adapter from the model folders on top of these weights.",
+                                 comment: "Subtitle for the LoRA adapter section")
+            )
+            ListGroup {
+                Row(label: String(localized: "settings.advanced.lora_adapter.label",
+                                  defaultValue: "Adapter",
+                                  comment: "Row label for the LoRA adapter picker"),
+                    sublabel: vm.loraAdapterDetail,
+                    isLast: true) {
+                    Popup(
+                        selection: vm.bindProfile($vm.loraAdapter),
+                        width: .controlWide,
+                        options: vm.loraAdapterOptions()
+                    )
+                }
+            }
+        }
+
         if vm.embeddingAudioSupported {
             SectionHeader(String(localized: "settings.advanced.embedding_audio.section",
                                  defaultValue: "Audio",

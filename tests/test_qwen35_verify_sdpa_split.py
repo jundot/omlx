@@ -511,3 +511,33 @@ def test_core_count_comes_from_the_hardware_with_an_m1_max_fallback(monkeypatch)
     assert vs._m1_gpu_cores() == 32
     assert vs._m1_gqa_chunk(27063, 2) == vs._m1_gqa_chunk(27063, 2, cores=32)
     vs._m1_gpu_cores.cache_clear()
+
+
+
+def test_tensor_unit_gpus_under_40_cores_size_long_splits_by_cores(monkeypatch):
+    monkeypatch.setattr(vs, "_m1_gpu", lambda: False)
+    monkeypatch.setattr(vs, "_mid_core_tensor_gpu_cores", lambda: 20)
+    assert vs._gqa_chunk(16384, 4) == 1024
+    # 8 splits per KV head on a 20-core GPU with 4 KV heads.
+    assert [vs._gqa_chunk(n, 4) for n in (32768, 131072)] == [4096, 16384]
+    monkeypatch.setattr(vs, "_mid_core_tensor_gpu_cores", lambda: None)
+    assert vs._gqa_chunk(131072, 4) == 512
+
+
+@pytest.mark.skipif(
+    not mx.metal.is_available() or not _gqa_ready(), reason="requires tensor ops"
+)
+def test_core_sized_long_kv_split_matches_per_row(monkeypatch):
+    monkeypatch.setattr(vs, "_m1_gpu", lambda: False)
+    monkeypatch.setattr(vs, "_mid_core_tensor_gpu_cores", lambda: 20)
+    mx.random.seed(11)
+    q_len, kv_len, kv_heads, heads = 5, 33000, 4, 24
+    assert vs._gqa_chunk(kv_len, kv_heads) == 4160  # ragged last split
+    q = mx.random.normal((1, heads, q_len, HD)).astype(mx.bfloat16)
+    k = mx.random.normal((1, kv_heads, kv_len, HD)).astype(mx.bfloat16)
+    v = mx.random.normal((1, kv_heads, kv_len, HD)).astype(mx.bfloat16)
+    scale = HD**-0.5
+    ref = _per_row_reference(q, k, v, scale).astype(mx.float32)
+    got = _gqa_causal_sdpa(q, k, v, scale).astype(mx.float32)
+    assert got.shape == ref.shape
+    assert mx.abs(ref - got).max().item() <= 2e-2

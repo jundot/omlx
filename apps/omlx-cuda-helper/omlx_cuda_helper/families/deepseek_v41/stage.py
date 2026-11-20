@@ -26,8 +26,6 @@ from .layers import COMPRESSED, INDEX_KEYS, PARTIAL_GATE, PARTIAL_KV, Block
 Arrays = dict[str, HostArray]
 _SLOTS = 7
 _OFFSET, _HISTORY = 0, 6
-# Freed buffers MLX may keep while a chunk runs.
-_POOL_BYTES = 1 << 30
 # Slots that grow with the prompt on KV-source layers.
 _GROWING = (COMPRESSED, INDEX_KEYS)
 
@@ -202,14 +200,6 @@ class Stage:
 
     def _forward(self, job, tokens, boundary, inputs):
         """Boundary arrays after one chunk; ``inputs`` is None while warming."""
-        # Unbounded, the pool keeps several times the memory a chunk needs.
-        limit = mx.set_cache_limit(_POOL_BYTES)
-        try:
-            return self._layers(job, tokens, boundary, inputs)
-        finally:
-            mx.set_cache_limit(limit)
-
-    def _layers(self, job, tokens, boundary, inputs):
         config: Config = self.config
         length, start = len(tokens), job.position
         if boundary is None:

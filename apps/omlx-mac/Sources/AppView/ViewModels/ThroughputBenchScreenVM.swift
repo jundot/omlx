@@ -35,9 +35,14 @@ final class ThroughputBenchScreenVM {
     var contextProfile: BenchmarkContextProfile = .codePython
     var warmupMode: BenchmarkWarmupMode = .quick
     var alignPromptToAne: Bool = false
-    var promptLengths: Set<Int> = [4096, 16384]
+    var promptLengths: Set<Int> = [1024, 4096]
     var genLength: String = "128"
     var batchSizes: Set<Int> = [2, 4]
+    var forceLmEngine: Bool = false
+    var externalEnabled: Bool = false
+    var externalBaseUrl: String = ""
+    var externalApiKey: String = ""
+    var externalModel: String = ""
     var exportOpen: Bool = false
 
     // Server state
@@ -62,21 +67,35 @@ final class ThroughputBenchScreenVM {
     private weak var client: OMLXClient?
     @ObservationIgnored
     private var pollTask: Task<Void, Never>?
-    /// Counts poll iterations spent waiting for the upload phase to
-    /// terminate after the bench itself completes. Reset on each new
-    /// run; capped at 120 (i.e. 2 min at 1 Hz) so a wedged upload
-    /// doesn't hold the poll loop hostage forever.
-    @ObservationIgnored
-    private var postCompleteTicks: Int = 0
+    /// Export header of the last run, fixed at start since the form can change afterwards.
+    private var runHeader: [String] = []
 
     // MARK: Derived
 
     var canRun: Bool {
-        !selectedModelId.isEmpty
-            && !running
-            && !promptLengths.isEmpty
-            && !batchSizes.isEmpty
-            && (Int(genLength) ?? 0) > 0
+        !running && startRequest != nil
+    }
+
+    var startRequest: BenchStartRequest? {
+        let baseUrl = externalBaseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = externalModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !promptLengths.isEmpty, !batchSizes.isEmpty,
+              let generationLength = Int(genLength), generationLength > 0,
+              externalEnabled ? !baseUrl.isEmpty && !model.isEmpty : !selectedModelId.isEmpty
+        else { return nil }
+        let external = externalEnabled
+            ? BenchExternalEndpoint(baseUrl: baseUrl, apiKey: externalApiKey, model: model) : nil
+        return BenchStartRequest(
+            modelId: external?.model ?? selectedModelId,
+            contextProfile: contextProfile,
+            warmupMode: warmupMode,
+            alignPromptToAne: alignPromptToAne,
+            promptLengths: promptLengths.sorted(),
+            generationLength: generationLength,
+            batchSizes: batchSizes.sorted(),
+            forceLmEngine: forceLmEngine && !externalEnabled,
+            external: external
+        )
     }
 
     /// Acceleration features the selected model has enabled, so the user knows
@@ -84,7 +103,8 @@ final class ThroughputBenchScreenVM {
     /// Derived from settings already fetched by `loadModels()` — no extra
     /// request. Mirrors `_FEATURE_FLAG_SPECS` in omlx/admin/benchmark.py.
     var pendingFeatureFlags: [String] {
-        guard let s = models.first(where: { $0.id == selectedModelId })?.settings else {
+        guard !externalEnabled,
+              let s = models.first(where: { $0.id == selectedModelId })?.settings else {
             return []
         }
         var flags: [String] = []
@@ -117,7 +137,7 @@ final class ThroughputBenchScreenVM {
 
     /// Monospaced two-table dump used by the Text export card.
     var exportText: String {
-        var lines = ["# Context: \(contextProfile.localizedLabel)", ""]
+        var lines = runHeader + [""]
         if !singleResults.isEmpty {
             lines.append("# Single request results")
             lines.append(
@@ -224,60 +244,46 @@ final class ThroughputBenchScreenVM {
     // MARK: Actions
 
     func runBenchmark(client: OMLXClient) {
-        guard canRun else { return }
-        let body = BenchStartRequest(
-            modelId: selectedModelId,
-            contextProfile: contextProfile,
-            warmupMode: warmupMode,
-            alignPromptToAne: alignPromptToAne,
-            promptLengths: promptLengths.sorted(),
-            generationLength: Int(genLength) ?? 128,
-            batchSizes: batchSizes.sorted()
-        )
+        guard !running, let body = startRequest else { return }
+        currentBenchId = nil
+        let model = body.external.map { "\($0.model) @ \($0.baseUrl)" } ?? body.modelId
+        let engine = body.external != nil ? "External OpenAI-compatible endpoint"
+            : body.forceLmEngine ? "Force mlx-lm" : "Auto"
+        runHeader = ["# Context: \(body.contextProfile.localizedLabel)",
+                     "# Model: \(model)", "# Engine: \(engine)"]
         // Wipe the previous run's tables so a new run doesn't accumulate
         // across unrelated configurations.
         singleResults = []
         batchResults = []
         uploadState = nil
-        postCompleteTicks = 0
         lastError = nil
         running = true
 
         Task { [weak self] in
             do {
                 let resp = try await client.startThroughputBench(body)
-                await MainActor.run {
-                    guard let self else { return }
-                    self.currentBenchId = resp.benchId
-                    self.pollResults(client: client)
-                }
+                guard let self else { return }
+                self.currentBenchId = resp.benchId
+                self.pollResults(client: client)
             } catch {
-                await MainActor.run {
-                    guard let self else { return }
-                    self.running = false
-                    self.lastError = error.omlxDescription
-                }
+                self?.running = false
+                self?.lastError = error.omlxDescription
             }
         }
     }
 
     func cancelBenchmark(client: OMLXClient) {
-        guard let benchId = currentBenchId else {
-            // Nothing to cancel server-side — flip the UI back regardless
-            // so we don't strand the screen in "Running…" forever.
-            running = false
-            return
-        }
+        // No server run to cancel until the start response arrives.
+        guard running, let benchId = currentBenchId else { return }
         Task { [weak self] in
             do {
                 _ = try await client.cancelBench(benchId: benchId)
+                guard let self, self.currentBenchId == benchId else { return }
+                self.running = false
+                self.stop()
             } catch {
-                await MainActor.run { self?.lastError = error.omlxDescription }
-            }
-            await MainActor.run {
-                self?.running = false
-                self?.pollTask?.cancel()
-                self?.pollTask = nil
+                // The poll still owns the run and ends it on a terminal status or 404.
+                self?.lastError = error.omlxDescription
             }
         }
     }
@@ -291,53 +297,41 @@ final class ThroughputBenchScreenVM {
         pollTask?.cancel()
         guard let benchId = currentBenchId else { return }
         pollTask = Task { [weak self] in
+            var postCompleteTicks = 0
             while !Task.isCancelled {
                 guard let self else { return }
                 do {
                     let resp = try await client.getBenchResults(benchId: benchId)
-                    await MainActor.run {
-                        if let profile = resp.contextProfile {
-                            self.contextProfile = profile
-                        }
-                        self.absorb(results: resp.results)
-                        if let err = resp.error, !err.isEmpty {
-                            self.lastError = err
-                        }
-                        if let upload = resp.uploadState {
-                            self.uploadState = upload
-                        }
-                        let status = resp.status.lowercased()
-                        let terminal = (status == "completed"
-                                        || status == "failed"
-                                        || status == "cancelled")
-                        if terminal {
-                            self.running = false
-                        }
+                    guard !Task.isCancelled, self.currentBenchId == benchId else { return }
+                    self.absorb(results: resp.results)
+                    if let err = resp.error, !err.isEmpty {
+                        self.lastError = err
                     }
-                    // Keep polling past `status=completed` until the upload
-                    // phase also terminates ("done" | "skipped"). The
-                    // backend writes upload state on the same BenchmarkRun
-                    // (benchmark.py:_upload_to_omlx_ai) and surfaces it
-                    // via /results, so this is just one more tick or two.
-                    // Cap with a 120 s safety net so a stuck upload
-                    // doesn't keep the poll alive forever.
-                    let (stillRunning, uploadDone, hitCap) = await MainActor.run {
-                        () -> (Bool, Bool, Bool) in
-                        let phase = self.uploadState?.phase ?? "idle"
-                        let isTerminal = (phase == "done" || phase == "skipped")
-                        self.postCompleteTicks += self.running ? 0 : 1
-                        return (self.running, isTerminal,
-                                self.postCompleteTicks >= 120)
+                    if let upload = resp.uploadState {
+                        self.uploadState = upload
                     }
-                    if !stillRunning && (uploadDone || hitCap) {
-                        await MainActor.run { self.postCompleteTicks = 0 }
+                    switch resp.status.lowercased() {
+                    case "error", "cancelled":
+                        self.running = false
                         return
+                    case "completed":
+                        self.running = false
+                        // Wait for uploads, capped at 120 completed polls (about two minutes).
+                        postCompleteTicks += 1
+                        let phase = self.uploadState?.phase ?? "idle"
+                        if phase == "done" || phase == "skipped" || postCompleteTicks >= 120 {
+                            return
+                        }
+                    default:
+                        break
                     }
                 } catch {
-                    // Transient failures (server restart, dropped socket)
-                    // shouldn't kill the poll — log and try again.
-                    await MainActor.run {
-                        self.lastError = error.omlxDescription
+                    guard !Task.isCancelled, self.currentBenchId == benchId else { return }
+                    self.lastError = error.omlxDescription
+                    // 404 means a restarted server lost the run. Other failures are transient.
+                    if case OMLXClientError.http(status: 404, _) = error {
+                        self.running = false
+                        return
                     }
                 }
                 try? await Task.sleep(for: .seconds(1))

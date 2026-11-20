@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the fused one-token Flint MoE decode path."""
+"""Tests for the fused Flint MoE decode path."""
 
 from __future__ import annotations
 
@@ -64,6 +64,33 @@ def test_combine_matches_stock_roundings(dtype):
     assert mx.array_equal(out, ref).item()
 
 
+def test_rows_match_one_row_kernels():
+    mx.random.seed(16)
+    logits = mx.random.normal((1, 16, 256)).astype(mx.bfloat16)
+    bias = mx.random.uniform(-0.05, 0.05, (256,))
+    routed = mx.random.normal((1, 16, 6, 512)).astype(mx.bfloat16)
+    shared = mx.random.normal((1, 16, 512)).astype(mx.bfloat16)
+    residual = mx.random.normal((1, 16, 512)).astype(mx.bfloat16)
+    idx, w = flint_decode.fused_router(logits, bias, 6)
+    out = flint_decode.fused_combine(routed, w, shared, residual)
+    for r in range(16):
+        one_idx, one_w = flint_decode.fused_router(logits[0, r], bias, 6)
+        assert idx[0, r].tolist() == one_idx.tolist()
+        assert mx.array_equal(w[0, r], one_w).item()
+        row = slice(r, r + 1)
+        one = flint_decode.fused_combine(
+            routed[:, row], w[:, row], shared[:, row], residual[:, row]
+        )
+        assert mx.array_equal(out[:, row], one).item()
+
+
+def test_nan_row_routes_to_in_range_experts():
+    logits = mx.random.normal((2, 1, 256)).astype(mx.bfloat16)
+    logits[1] = mx.nan
+    idx, _ = flint_decode.fused_router(logits, mx.zeros((256,)), 6)
+    assert max(idx[1, 0].tolist()) < 256
+
+
 def _tiny_layer():
     config = ModelConfig(
         hidden_size=256,
@@ -99,13 +126,32 @@ def test_patched_layer_matches_stock_decode():
     assert mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max().item() < 0.05
 
 
-def test_patched_layer_keeps_multi_row_path(monkeypatch):
+@pytest.mark.parametrize("shape", [(1, 4), (3, 1), (3, 5)])
+def test_patched_rows_match_stock(monkeypatch, shape):
+    layer = _tiny_layer()
+    assert flint_decode.apply_flint_decode_patch()
+    calls = []
+    router = flint_decode.fused_router
+    monkeypatch.setattr(
+        flint_decode, "fused_router", lambda *a: calls.append(1) or router(*a)
+    )
+    x = mx.random.normal((*shape, 256)).astype(mx.bfloat16)
+    mask = "causal" if shape[1] > 1 else None
+    out = layer(x, mask=mask)
+    ref = flint.DecoderLayer._omlx_flint_original_call(layer, x, mask=mask)
+    assert calls
+    assert out.shape == ref.shape and out.dtype == ref.dtype
+    assert mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max().item() < 0.05
+
+
+def test_patched_layer_keeps_long_block_path(monkeypatch):
     layer = _tiny_layer()
     assert flint_decode.apply_flint_decode_patch()
 
     def fail(*args, **kwargs):
-        raise AssertionError("multi-row calls must keep the stock body")
+        raise AssertionError("long blocks must keep the stock body")
 
     monkeypatch.setattr(flint_decode, "fused_router", fail)
-    out = layer(mx.random.normal((1, 3, 256)).astype(mx.bfloat16), mask="causal")
-    assert out.shape == (1, 3, 256)
+    for shape in [(1, flint_decode._MAX_ROWS + 1), (2, 9)]:
+        x = mx.random.normal((*shape, 256)).astype(mx.bfloat16)
+        assert layer(x, mask="causal").shape == (*shape, 256)

@@ -2349,19 +2349,28 @@ class TestSchedulerStatistics:
         self, mock_model, mock_tokenizer
     ):
         """Slots are released only while no other request runs on the engine,
-        and the next decode step restores them once, whatever its batch width."""
+        and the next decode step restores them once, whatever its batch width.
+        Both get a reclaim on the scheduler's stream."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         release = MagicMock(return_value=3 * 1024**3)
         scheduler.moe_offload_release = release
         scheduler.moe_offload_restore = MagicMock()
         scheduler._reclaim_prefill_headroom = MagicMock()
         scheduler.running["decoding"] = MagicMock()
-        assert scheduler.release_moe_offload_slots("prefilling") == 0
+        assert scheduler.release_moe_offload_slots("prefilling", 2 * 1024**3) == 0
         release.assert_not_called()
         del scheduler.running["decoding"]
-        assert scheduler.release_moe_offload_slots("prefilling") == 3 * 1024**3
+        assert (
+            scheduler.release_moe_offload_slots("prefilling", 2 * 1024**3)
+            == 3 * 1024**3
+        )
         release.assert_called_once()
+        need, reclaim = release.call_args.args
+        assert need == 2 * 1024**3
         scheduler._reclaim_prefill_headroom.assert_called_once()
+        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear:
+            reclaim()
+        clear.assert_called_once_with(scheduler._stream)
 
         scheduler._schedule_waiting = MagicMock(return_value=([], []))
         scheduler._process_batch_responses = MagicMock(return_value=([], set()))
@@ -2371,7 +2380,20 @@ class TestSchedulerStatistics:
         for _ in range(2):
             scheduler.batch_generator.next_generated.return_value = iter([])
             scheduler.step()
-        scheduler.moe_offload_restore.assert_called_once_with()
+        scheduler.moe_offload_restore.assert_called_once()
+        (reclaim,) = scheduler.moe_offload_restore.call_args.args
+        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear:
+            reclaim()
+        clear.assert_called_once_with(scheduler._stream)
+
+    def test_a_failed_offload_release_still_marks_slots_for_restore(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.moe_offload_release = MagicMock(side_effect=RuntimeError)
+        with pytest.raises(RuntimeError):
+            scheduler.release_moe_offload_slots("prefilling", 1000)
+        assert scheduler._moe_offload_slots_released is True
 
 
 class TestSchedulerReset:
@@ -3832,10 +3854,11 @@ class TestSchedulerBoundarySnapshots:
         assert provider.tail_terminal_token_count == (7 if not persists else None)
         assert 4 in provider
 
+    @pytest.mark.parametrize("shared_end", ["system_prefix_end", "junction_end"])
     def test_boundary_override_keeps_system_prefix_tail_for_its_own_store(
-        self, mock_model, mock_tokenizer
+        self, mock_model, mock_tokenizer, shared_end
     ):
-        """Only the side store picks the system-prefix tail as its terminal."""
+        """Only the side store picks a shared tail as its terminal."""
         config = SchedulerConfig(paged_cache_block_size=4)
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
         request = Request(
@@ -3844,7 +3867,7 @@ class TestSchedulerBoundarySnapshots:
             sampling_params=SamplingParams(),
         )
         request.generation_prompt_start = 7
-        request.system_prefix_end = 6
+        setattr(request, shared_end, 6)
         scheduler.requests[request.request_id] = request
         raw = {4: object(), 6: object(), 7: object()}
         extracted = {tc: [{"state": (tc,)}] for tc in raw}
@@ -4496,6 +4519,46 @@ class TestSchedulerRotatingBlockAlignment:
             assert scheduler._deferred_clear_at == (
                 scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
             )
+
+    @pytest.mark.parametrize(
+        "usage_gb,store_running,expected",
+        [(41, False, "clear,submit"), (39, False, "submit"), (41, True, "submit")],
+    )
+    def test_cleanup_finished_clears_pool_before_store_under_pressure(
+        self, mock_model, mock_tokenizer, usage_gb, store_running, expected
+    ):
+        """Under pressure, clear the pool before the store takes the lock (#5454)."""
+        gib = 1024**3
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 40 * gib
+        scheduler._current_usage_bytes = MagicMock(return_value=usage_gb * gib)
+        order = []
+        executor = scheduler._store_cache_executor = MagicMock()
+        executor.submit.side_effect = lambda *args: order.append("submit")
+        request = Request(request_id="r", prompt="hi", sampling_params=SamplingParams())
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request._extracted_cache = [{"state": "cache"}]
+        scheduler.running["r"] = scheduler.requests["r"] = request
+        # Held like a running store; the timer makes a blocking acquire fail, not hang.
+        lock = threading.Lock()
+        if store_running:
+            lock.acquire()
+            threading.Timer(5, lock.release).start()
+        with (
+            patch.object(scheduler_module, "_mx_buffer_access_lock", lock),
+            patch.object(mx, "get_cache_memory", return_value=8 * gib),
+            patch(
+                "omlx.scheduler._sync_and_clear_cache",
+                side_effect=lambda *args: order.append("clear"),
+            ),
+        ):
+            scheduler._cleanup_finished({"r"})
+
+        assert ",".join(order) == expected
 
     def test_cleanup_finished_skips_clear_cache_when_no_finished(
         self, mock_model, mock_tokenizer

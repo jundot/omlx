@@ -667,7 +667,8 @@ class SwitchGLU(nn.Module):
             weighted_sum
             and scores is not None
             and do_sort
-            and scores.shape[-1] in (6, 8)
+            and scores.shape[-1] in (6, 8, 16)
+            and scores.shape[-1] in quant_fast.moe_weighted_sum_top_ks()
             and scores.dtype == mx.float32
             and x.dtype in (mx.float16, mx.bfloat16)
             and quant_fast.has_symbol("moe_weighted_sum")

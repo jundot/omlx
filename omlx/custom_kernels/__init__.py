@@ -8,6 +8,7 @@ import importlib
 NATIVE_KERNEL_PACKAGES = (
     "attention",
     "lowbit",
+    "oqh",
     "quant_matmul",
     "sparse_index",
 )

@@ -12,6 +12,7 @@ from __future__ import annotations
 import getpass
 import ipaddress
 import json
+import logging
 import queue
 import re
 import secrets
@@ -39,6 +40,8 @@ from ..cluster.transport import (
 )
 from .adapter import StageAdapter
 from .worker import READY_PREFIX
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PYTHON = "~/.omlx/bin/omlx-cluster-python"
 COPY_DIR = "~/.omlx/prefill-helper/models"
@@ -239,7 +242,9 @@ def remote_info(
         raise LaunchError(f"oMLX is not installed on {target.name}.") from None
 
 
-def incompatible(info: dict, adapter: StageAdapter | None, name: str) -> str | None:
+def incompatible(
+    info: dict, adapter: StageAdapter | None, name: str, oqh: int | None = None
+) -> str | None:
     """Why this Mac cannot help, or None: it runs the helper from its own
     oMLX, so the versions must be equal."""
     if info.get("version") != __version__:
@@ -256,7 +261,7 @@ def required_files(
     return {name: (root / name).stat().st_size for name in dict.fromkeys(names)}
 
 
-# Runs on the helper with /usr/bin/python3 -I: finds a complete copy of the
+# Runs on the helper with its oMLX Python and -P (no cwd on sys.path): finds a complete copy of the
 # model in its model folders, else reports what the copy folder still lacks
 # and the other copies there (the running helper's is never offered).
 _PROBE = r"""
@@ -350,9 +355,12 @@ def locate_files(
 ) -> dict[str, Any]:
     """Where the helper already has the model, or what it is missing."""
     request = json.dumps({"name": model_name, "files": files, "copy_dir": COPY_DIR})
-    command = f"/usr/bin/python3 -I -c {shlex.quote(_PROBE)} {shlex.quote(request)}"
+    command = f"{target.python} -P -c {shlex.quote(_PROBE)} {shlex.quote(request)}"
     result = _ssh(target.ssh_target, command, runner=runner, timeout=120)
     if result.returncode != 0:
+        logger.warning(
+            "File check on %s failed: %s", target.name, result.stderr.strip()
+        )
         raise LaunchError(f"Could not check the model files on {target.name}.")
     return json.loads(result.stdout.strip().splitlines()[-1])
 
@@ -368,9 +376,12 @@ def delete_copies(
 ) -> int:
     """Remove other models' copies on the helper; returns its free bytes."""
     request = json.dumps({"names": names, "copy_dir": COPY_DIR})
-    command = f"/usr/bin/python3 -I -c {shlex.quote(_DELETE)} {shlex.quote(request)}"
+    command = f"{target.python} -P -c {shlex.quote(_DELETE)} {shlex.quote(request)}"
     result = _ssh(target.ssh_target, command, runner=runner, timeout=300)
     if result.returncode != 0:
+        logger.warning(
+            "Copy removal on %s failed: %s", target.name, result.stderr.strip()
+        )
         raise LaunchError(f"Could not remove model copies on {target.name}.")
     return int(json.loads(result.stdout.strip().splitlines()[-1])["free"])
 

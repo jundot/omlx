@@ -110,12 +110,14 @@ _GPU_SERIAL_TESTS = {
     "test_qwen35_moe_verify_window.py": {
         "test_batched_decode_rows_equal_one_token_decode",
         "test_kernel_failure_falls_back_to_the_composed_verifier",
+        "test_quantized_router_window_rows_equal_one_token_decode",
         "test_router_ties_and_high_experts",
         "test_top8_window_and_batched_rows_equal_one_token_decode",
         "test_window_rows_equal_one_token_decode",
     },
     "test_qwen35_verify_sdpa_split.py": {
         "test_chain_tail_matches_cache_writes",
+        "test_wide_causal_matches_per_row",
     },
     "test_qwen4_batch_qsa_indexer.py": {
         "test_indexer_capacity_matches_concatenate_bit_for_bit",
@@ -227,7 +229,6 @@ def cluster_home(tmp_path, monkeypatch):
     ssh_dir = home / ".ssh"
     monkeypatch.setattr(ssh_keys, "_SSH_DIR", ssh_dir)
     monkeypatch.setattr(ssh_keys, "_SSH_KEY_PATH", ssh_dir / "omlx_cluster")
-    monkeypatch.setattr(ssh_keys, "_SSH_PUBKEY_PATH", ssh_dir / "omlx_cluster.pub")
     return home
 
 

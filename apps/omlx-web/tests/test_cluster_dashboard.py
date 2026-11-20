@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Dashboard integration contracts for the sole Cluster v2 UI."""
+"""Dashboard integration contracts for the cluster UI."""
 
 import html
 import json
@@ -15,19 +15,16 @@ from omlx_web import routes as webui
 
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD = ROOT / "omlx_web/templates/dashboard.html"
-TEMPLATE = ROOT / "omlx_web/templates/dashboard/_cluster_v2.html"
-JAVASCRIPT = ROOT / "omlx_web/static/js/cluster_v2.js"
+TEMPLATE = ROOT / "omlx_web/templates/dashboard/_cluster.html"
+JAVASCRIPT = ROOT / "omlx_web/static/js/cluster.js"
 
 
-def test_dashboard_renders_only_the_cluster_v2_flow():
+def test_dashboard_renders_only_the_cluster_flow():
     rendered = webui.templates.get_template("dashboard.html").render()
     source = DASHBOARD.read_text(encoding="utf-8")
 
-    assert "data-cluster-v2-wizard" in rendered
-    assert source.count('{% include "dashboard/_cluster_v2.html" %}') == 1
-    assert '_cluster.html' not in source
-    assert "clusterLegacyView" not in source
-    assert not (TEMPLATE.parent / "_cluster.html").exists()
+    assert "data-cluster-wizard" in rendered
+    assert source.count('{% include "dashboard/_cluster.html" %}') == 1
 
 
 def test_cluster_navigation_exists_for_desktop_and_mobile():
@@ -50,7 +47,7 @@ def test_distributed_inference_remains_an_advanced_restart_scoped_opt_in():
     assert "settings.advanced.distributed_inference_hint" in settings
 
 
-def test_v2_uses_authenticated_cluster_admin_apis():
+def test_wizard_uses_authenticated_cluster_admin_apis():
     source = JAVASCRIPT.read_text(encoding="utf-8")
 
     for endpoint in (
@@ -71,7 +68,7 @@ def test_dashboard_does_not_reference_an_unbundled_alpine_plugin():
     assert "alpine-collapse" not in rendered
 
 
-def test_cluster_v2_template_tags_balance():
+def test_cluster_template_tags_balance():
     void = {
         "area", "base", "br", "col", "embed", "hr", "img", "input",
         "link", "meta", "param", "source", "track", "wbr",
@@ -106,7 +103,7 @@ def test_cluster_v2_template_tags_balance():
     assert parser.stack == []
 
 
-def test_every_cluster_v2_alpine_expression_parses_as_javascript():
+def test_every_cluster_alpine_expression_parses_as_javascript():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required to parse Alpine expressions")
@@ -158,10 +155,10 @@ console.log(JSON.stringify(failures));
     assert json.loads(result.stdout) == []
 
 
-def test_cluster_v2_javascript_parses():
+def test_cluster_javascript_parses():
     node = shutil.which("node")
     if node is None:
-        pytest.skip("node is required to parse cluster_v2.js")
+        pytest.skip("node is required to parse cluster.js")
     result = subprocess.run(
         [node, "--check", str(JAVASCRIPT)],
         capture_output=True,

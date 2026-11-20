@@ -61,6 +61,12 @@ SHAPES = [
     (2560, 1024, 5, 32),
     (768, 1024, 8, 64),
     (1280, 1024, 6, 64),
+    # oQ2/oQ3 layers: 2-bit qmv_fast reads one pack per thread, 3-bit packs
+    # eight values in three bytes; K = 768 takes 3-bit's non-fast arm.
+    (3072, 8192, 2, 64),
+    (640, 2560, 2, 128),
+    (1536, 3072, 3, 64),
+    (768, 520, 3, 32),
 ]
 
 
@@ -172,6 +178,8 @@ def _quantized(k, n, bits, group_size, dtype, seed):
         (2560, 1024, 4, 64),
         (1024, 520, 8, 32),
         (768, 1024, 8, 64),  # 8-bit qmv_fast block is 256 wide
+        (2560, 1024, 2, 64),
+        (3072, 2048, 3, 64),
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
@@ -230,6 +238,8 @@ def test_one_row_qmv_partial_outputs_equal_quantized_matmul(dtype, rps):
         (2560, 16480, 6, 64),  # DeltaNet stacked qkv/z/b/a in-projection
         (6144, 2560, 5, 128),  # DeltaNet out-projection
         (2560, 1024, 8, 64),
+        (2560, 1024, 2, 64),
+        (3072, 2048, 3, 64),
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])

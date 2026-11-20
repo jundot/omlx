@@ -77,6 +77,14 @@ def restore_bonsai_quantized_modules(model: nn.Module) -> int:
     return restored
 
 
+# Language models whose forward accepts ``skip_logits`` for cache-only prefill.
+_SKIP_LOGITS_MODEL_TYPES = frozenset({"qwen4_exp", "hy_v4_vl", "hy_v4_flash"})
+
+# M-RoPE language models whose layer caches are CacheLists (the position offset
+# lives on the first child) and whose rope parameters nest per attention kind.
+_HY_V4_MODEL_TYPES = frozenset({"hy_v4_vl", "hy_v4_flash"})
+
+
 class VLMModelAdapter(nn.Module):
     """
     Adapter wrapping a VLM's language_model for BatchGenerator compatibility.
@@ -104,6 +112,7 @@ class VLMModelAdapter(nn.Module):
         self._language_model = vlm_model.language_model
         self._uses_minimax_m3_positions = self._detect_minimax_m3(vlm_model)
         self._uses_mrope = self._detect_mrope(vlm_model)
+        self._offsets_in_cache_lists = self.model_type in _HY_V4_MODEL_TYPES
 
         # Pending vision embeddings state (set before prefill, cleared after)
         self._pending_embeds: Optional[mx.array] = None
@@ -234,7 +243,7 @@ class VLMModelAdapter(nn.Module):
     @property
     def supports_skip_lm_head(self) -> bool:
         """Whether the wrapped official language model has a cache-only pass."""
-        return self.model_type == "qwen4_exp"
+        return self.model_type in _SKIP_LOGITS_MODEL_TYPES
 
     @property
     def config(self):
@@ -380,6 +389,8 @@ class VLMModelAdapter(nn.Module):
         config = getattr(vlm_model, "config", None)
         if config is None:
             return False
+        if getattr(config, "model_type", None) in _HY_V4_MODEL_TYPES:
+            return True
         text_config = getattr(config, "text_config", None)
         if text_config is None:
             return False
@@ -389,6 +400,11 @@ class VLMModelAdapter(nn.Module):
         if isinstance(rope_cfg, dict):
             return "mrope_section" in rope_cfg
         return False
+
+    def _offset_owner(self, cache: Any) -> Any:
+        """The cache object whose ``offset`` gives the row positions."""
+        children = getattr(cache, "caches", None)
+        return children[0] if self._offsets_in_cache_lists and children else cache
 
     def clear_vlm_position_state(self) -> None:
         """Clear stale mRoPE position state from previous VLM requests.
@@ -652,7 +668,7 @@ class VLMModelAdapter(nn.Module):
             # Scheduler prefill chunks discard their logits. Translate the
             # shared cache-only contract into the official Qwen model hook so
             # those chunks do not project every token over the full vocabulary.
-            if self.model_type == "qwen4_exp":
+            if self.model_type in _SKIP_LOGITS_MODEL_TYPES:
                 kwargs["skip_logits"] = True
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
@@ -672,6 +688,7 @@ class VLMModelAdapter(nn.Module):
             if self._uses_mrope and self._batch_rope_deltas is not None and cache is not None:
                 offsets = None
                 for c in cache:
+                    c = self._offset_owner(c)
                     if hasattr(c, "offset"):
                         offsets = c.offset
                         break
@@ -714,6 +731,7 @@ class VLMModelAdapter(nn.Module):
             elif self._uses_mrope and cache is not None:
                 offsets = None
                 for c in cache:
+                    c = self._offset_owner(c)
                     if hasattr(c, "offset") and isinstance(c.offset, mx.array) and c.offset.ndim > 0:
                         offsets = c.offset
                         break

@@ -2,8 +2,6 @@
 """Tests for the RAM-proportional largest-remainder N-node allocator."""
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from omlx.cluster import routes
 from omlx.cluster.planner import (
@@ -18,10 +16,11 @@ from omlx.cluster.planner import (
 GIB = 1024**3
 
 
-def _client() -> TestClient:
-    app = FastAPI()
-    app.include_router(routes.router)
-    return TestClient(app)
+def _plan(body: dict) -> dict:
+    """Plan and sign the way activation does."""
+
+    plan = routes._create_cluster_plan(routes.ClusterPlanRequest(**body))
+    return routes._plan_with_signature(plan.to_dict())
 
 
 # ---------------------------------------------------------------------------
@@ -198,20 +197,19 @@ def test_proportional_plan_single_node_holds_everything():
 
 
 # ---------------------------------------------------------------------------
-# Route-level allocation selection
+# Allocation selection
 # ---------------------------------------------------------------------------
 
 
-def test_plan_route_runs_proportional_allocator(monkeypatch):
+def test_plan_runs_proportional_allocator(monkeypatch):
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
         lambda path: _model(layers=(10,) * 12),
     )
 
-    response = _client().post(
-        "/admin/api/cluster/plan",
-        json={
+    payload = _plan(
+        {
             "model_path": "/models/example",
             "allocation": "proportional",
             "nodes": [
@@ -219,58 +217,51 @@ def test_plan_route_runs_proportional_allocator(monkeypatch):
                 {"node_id": "b", "capacity_bytes": 100, "reserve_bytes": 10},
                 {"node_id": "c", "capacity_bytes": 60, "reserve_bytes": 10},
             ],
-        },
+        }
     )
 
-    assert response.status_code == 200, response.json()
-    payload = response.json()
     assert payload["optimization"] == "ram-proportional"
     assert payload["placement_signature"]
     counts = {item["node_id"]: item["layer_count"] for item in payload["assignments"]}
     assert counts["a"] > counts["b"] > counts["c"]
 
 
-def test_plan_route_defaults_to_balanced_allocator(monkeypatch):
+def test_plan_defaults_to_balanced_allocator(monkeypatch):
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
         lambda path: _model(layers=(10,) * 12),
     )
 
-    response = _client().post(
-        "/admin/api/cluster/plan",
-        json={
+    payload = _plan(
+        {
             "model_path": "/models/example",
             "nodes": [
                 {"node_id": "a", "capacity_bytes": 200, "reserve_bytes": 10},
                 {"node_id": "b", "capacity_bytes": 100, "reserve_bytes": 10},
             ],
-        },
+        }
     )
 
-    assert response.status_code == 200, response.json()
-    assert response.json()["optimization"] == "memory"
+    assert payload["optimization"] == "memory"
 
 
-def test_plan_route_rejects_proportional_tensor_parallel(monkeypatch):
+def test_plan_rejects_proportional_tensor_parallel(monkeypatch):
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
         lambda path: _model(layers=(10,) * 12),
     )
 
-    response = _client().post(
-        "/admin/api/cluster/plan",
-        json={
-            "model_path": "/models/example",
-            "allocation": "proportional",
-            "tensor_parallel_size": 2,
-            "nodes": [
-                {"node_id": "a", "capacity_bytes": 200, "reserve_bytes": 10},
-                {"node_id": "b", "capacity_bytes": 100, "reserve_bytes": 10},
-            ],
-        },
-    )
-
-    assert response.status_code == 400
-    assert "pipeline-only" in response.json()["detail"]
+    with pytest.raises(PlanningError, match="pipeline-only"):
+        _plan(
+            {
+                "model_path": "/models/example",
+                "allocation": "proportional",
+                "tensor_parallel_size": 2,
+                "nodes": [
+                    {"node_id": "a", "capacity_bytes": 200, "reserve_bytes": 10},
+                    {"node_id": "b", "capacity_bytes": 100, "reserve_bytes": 10},
+                ],
+            }
+        )

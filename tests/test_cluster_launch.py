@@ -19,7 +19,6 @@ from omlx.cluster import launch, memory_guard
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.inference_worker import _execution_settings, _tensor_shard_options
 from omlx.cluster.launch import (
-    CudaFabricProbeHost,
     DistributedLaunchError,
     _available_launch_ports,
     _cluster_ssh_argv,
@@ -33,7 +32,6 @@ from omlx.cluster.launch import (
     preflight_remote_hosts,
     probe_remote_host,
     probe_remote_system_host,
-    run_cuda_fabric_probe,
 )
 from omlx.cluster.models import CLUSTER_PROTOCOL_VERSION
 from omlx.cluster.planner import PipelineAssignment
@@ -190,75 +188,6 @@ def test_launcher_requires_an_explicit_random_control_token(tmp_path):
             _deployment(),
             **kwargs,
             control_token="public-plan-hash-is-not-a-secret",
-        )
-
-
-def test_cuda_fabric_probe_launches_a_real_two_rank_nccl_job():
-    captured = {}
-
-    def runner(argv, *, timeout, env):
-        captured["argv"] = argv
-        captured["timeout"] = timeout
-        captured["hostfile"] = json.loads(
-            Path(argv[argv.index("--hostfile") + 1]).read_text()
-        )
-        assert env["SSH_ASKPASS_REQUIRE"] == "never"
-        rate = 3 * 1024**3
-        stdout = "\n".join(
-            json.dumps(
-                {
-                    "type": "nccl_fabric_result",
-                    "rank": rank,
-                    "world_size": 2,
-                    "payload_bytes_per_second": rate,
-                }
-            )
-            for rank in (0, 1)
-        )
-        return subprocess.CompletedProcess(argv, 0, stdout, "")
-
-    result = run_cuda_fabric_probe(
-        (
-            CudaFabricProbeHost(
-                "spark-a",
-                "spark-a.local",
-                ("192.168.100.1", "192.168.101.1"),
-                ("enp1s0f0np0", "enp2s0f0np0"),
-                ("mlx5_0", "mlx5_1"),
-            ),
-            CudaFabricProbeHost(
-                "spark-b",
-                "spark-b.local",
-                ("192.168.100.2", "192.168.101.2"),
-                ("enp1s0f0np0", "enp2s0f0np0"),
-                ("mlx5_0", "mlx5_1"),
-            ),
-        ),
-        python_executable="/opt/omlx/bin/python",
-        runner=runner,
-    )
-
-    assert result["verified"] is True
-    assert result["transport"] == "nccl"
-    assert result["payload_bytes_per_second"] == 3 * 1024**3
-    assert result["group_id"].startswith("connectx-")
-    assert captured["hostfile"]["backend"] == "nccl"
-    assert [host["ips"] for host in captured["hostfile"]["hosts"]] == [
-        ["192.168.100.1", "192.168.101.1"],
-        ["192.168.100.2", "192.168.101.2"],
-    ]
-    assert captured["argv"][captured["argv"].index("--backend") + 1] == "nccl"
-    assert "omlx.cluster.nccl_fabric_worker" in captured["argv"]
-
-
-def test_cuda_fabric_member_rejects_an_interface_shell_fragment():
-    with pytest.raises(ValueError, match="invalid interface"):
-        CudaFabricProbeHost(
-            "spark-a",
-            "spark-a.local",
-            ("192.168.100.1",),
-            ("eth0;touch-nope",),
-            ("mlx5_0",),
         )
 
 
@@ -972,45 +901,6 @@ def test_peer_probe_rejects_protocol_drift():
         )
 
 
-def test_peer_probe_discovers_a_different_linux_python_path():
-    versions = _local_probe_versions()
-    status = {
-        "protocol_version": CLUSTER_PROTOCOL_VERSION,
-        "node": {"hostname": "spark-a"},
-        "runtime": {
-            "omlx_version": versions["omlx"],
-            "mlx_version": versions["mlx"],
-            "mlx_lm_version": versions["mlx-lm"],
-            "python_version": platform.python_version(),
-            "python_executable": "/opt/omlx/bin/python",
-        },
-        "transport": {},
-    }
-    commands = []
-
-    def runner(argv, **_kwargs):
-        command = argv[-1]
-        commands.append(command)
-        if "omlx.cli" in command and command.startswith("/opt/omlx/bin/python"):
-            return subprocess.CompletedProcess(argv, 0, json.dumps(status), "")
-        # Path-shaped candidates echo themselves (import os,omlx) so a
-        # launcher path survives discovery instead of being unwrapped to the
-        # bare interpreter it fronts.
-        if "import os,omlx" in command and command.startswith("/opt/omlx/bin/python"):
-            return subprocess.CompletedProcess(argv, 0, "/opt/omlx/bin/python\n", "")
-        return subprocess.CompletedProcess(argv, 127, "", "not found")
-
-    result = probe_remote_host(
-        "spark-a.local",
-        python_executable="/Applications/oMLX/python",
-        runner=runner,
-    )
-
-    assert result["runtime_compatible"] is True
-    assert commands[-1].startswith("/opt/omlx/bin/python")
-    assert result["status"]["runtime"]["python_executable"] == ("/opt/omlx/bin/python")
-
-
 def test_peer_probe_preserves_packaged_cluster_wrapper_path():
     versions = _local_probe_versions()
     status = {
@@ -1106,34 +996,6 @@ def test_remote_python_discovery_falls_back_to_packaged_source_launcher():
     )
 
 
-def test_remote_python_discovery_finds_gui_bootstrapped_cuda_worker():
-    commands = []
-
-    def runner(argv, **_kwargs):
-        command = argv[-1]
-        commands.append(command)
-        if command.startswith("/opt/omlx-cluster-worker/venv/bin/python"):
-            return subprocess.CompletedProcess(
-                argv,
-                0,
-                "/opt/omlx-cluster-worker/venv/bin/python\n",
-                "",
-            )
-        return subprocess.CompletedProcess(argv, 127, "", "not found")
-
-    discovered = discover_remote_python_executable(
-        "cuda-worker-1",
-        preferred="/missing/python",
-        runner=runner,
-    )
-
-    assert discovered == "/opt/omlx-cluster-worker/venv/bin/python"
-    assert any(
-        command.startswith("/opt/omlx-cluster-worker/venv/bin/python")
-        for command in commands
-    )
-
-
 @pytest.mark.parametrize(
     "discover",
     [discover_remote_python_executable, discover_remote_system_python],
@@ -1170,64 +1032,14 @@ def test_system_python_discovery_keeps_genuine_interpreter_failure():
         )
 
 
-def test_preinstall_cuda_host_remains_visible_but_not_runnable():
-    payload = {
-        "protocol_version": None,
-        "node": {
-            "hostname": "cuda-worker-1",
-            "accelerator": "cuda",
-            "physical_memory_bytes": 128 * 1024**3,
-            "distributed_backends": [],
-            "fabric_kind": "connectx-7",
-            "worker_runtime_ready": False,
-        },
-        "runtime": {
-            "python_executable": "/usr/bin/python3",
-            "omlx_version": "",
-            "mlx_version": "",
-            "mlx_lm_version": "",
-        },
-        "transport": {
-            "rdma": {
-                "devices": ["rocep1s0f1", "roceP2p1s0f1"],
-                "addresses": {
-                    "rocep1s0f1": "10.0.22.2",
-                    "roceP2p1s0f1": "10.0.23.2",
-                },
-            }
-        },
-    }
-
-    def runner(argv, **_kwargs):
-        command = argv[-1]
-        if "import sys; print(sys.executable)" in command:
-            return subprocess.CompletedProcess(argv, 0, "/usr/bin/python3\n", "")
-        if "worker_runtime_ready" in command:
-            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
-        return subprocess.CompletedProcess(argv, 1, "", "No module named 'omlx'")
-
-    result = probe_remote_system_host(
-        "cuda-worker-1",
-        preferred_python="/Applications/oMLX/python",
-        runner=runner,
-    )
-
-    assert result["ssh_reachable"] is True
-    assert result["bootstrap_required"] is True
-    assert result["runtime_compatible"] is False
-    assert result["status"]["node"]["accelerator"] == "cuda"
-    assert result["status"]["node"]["fabric_kind"] == "connectx-7"
-
-
 def test_peer_probe_falls_back_to_preinstall_hardware_inventory(monkeypatch):
     expected = {
         "ok": False,
-        "ssh": "cuda-worker-1",
+        "ssh": "studio",
         "ssh_reachable": True,
-        "status": {"node": {"accelerator": "cuda"}},
+        "status": {"node": {"hostname": "studio"}},
         "runtime_compatible": False,
         "runtime_mismatches": ["oMLX worker runtime is not installed"],
-        "bootstrap_required": True,
     }
     monkeypatch.setattr(
         launch,
@@ -1243,7 +1055,7 @@ def test_peer_probe_falls_back_to_preinstall_hardware_inventory(monkeypatch):
     )
 
     result = probe_remote_host(
-        "cuda-worker-1",
+        "studio",
         python_executable="/Applications/oMLX/python",
         runner=lambda argv, **_kwargs: subprocess.CompletedProcess(
             argv, 1, "", "No module named 'omlx'"
@@ -1259,12 +1071,11 @@ def test_peer_probe_keeps_legacy_packaged_worker_visible(monkeypatch):
         "ssh": "studio",
         "ssh_reachable": True,
         "status": {
-            "node": {"accelerator": "metal"},
+            "node": {"hostname": "studio"},
             "warnings": ["oMLX worker runtime is not installed on this node."],
         },
         "runtime_compatible": False,
         "runtime_mismatches": ["oMLX worker runtime is not installed"],
-        "bootstrap_required": True,
     }
     monkeypatch.setattr(
         launch,
@@ -1358,7 +1169,6 @@ def test_packaged_app_peer_is_runtime_ready_without_a_hand_made_shim():
     assert result["ok"] is True
     assert result["runtime_compatible"] is True
     assert result["runtime_mismatches"] == []
-    assert "bootstrap_required" not in result
     # The shim, not the bundled interpreter, must be carried forward: reusing
     # the raw binary loses the environment and fails the very next probe.
     assert result["status"]["runtime"]["python_executable"] == _PEER_SHIM
@@ -1436,7 +1246,7 @@ def _system_probe_runner(payload: dict, *, evidence: list[str]):
         command = argv[-1]
         if "import sys; print(sys.executable)" in command:
             return subprocess.CompletedProcess(argv, 0, "/usr/bin/python3\n", "")
-        if "worker_runtime_ready" in command:
+        if "worker_runtime_evidence" in command:
             body = json.loads(json.dumps(payload))
             body["node"]["worker_runtime_evidence"] = evidence
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
@@ -1447,7 +1257,7 @@ def _system_probe_runner(payload: dict, *, evidence: list[str]):
 
 _SYSTEM_PROBE_PAYLOAD = {
     "protocol_version": None,
-    "node": {"hostname": "studio", "accelerator": "metal"},
+    "node": {"hostname": "studio"},
     "runtime": {"python_executable": "/usr/bin/python3"},
     "transport": {},
     "warnings": [],
@@ -1461,7 +1271,6 @@ def test_preinstall_inventory_confirms_a_genuinely_absent_runtime():
         runner=_system_probe_runner(_SYSTEM_PROBE_PAYLOAD, evidence=[]),
     )
 
-    assert result["bootstrap_required"] is True
     assert result["runtime_compatible"] is False
     assert result["runtime_mismatches"] == ["oMLX worker runtime is not installed"]
     assert result["worker_runtime_evidence"] == []
@@ -1476,7 +1285,6 @@ def test_preinstall_inventory_will_not_claim_missing_when_omlx_is_installed():
         ),
     )
 
-    assert result["bootstrap_required"] is True
     assert result["runtime_compatible"] is False
     assert result["runtime_mismatches"] == ["oMLX worker runtime could not be verified"]
     assert result["worker_runtime_evidence"] == ["/Applications/oMLX.app"]
@@ -1679,7 +1487,7 @@ def test_lightning_mtp_reaches_the_rank_load_settings(tmp_path):
     assert settings.mtp_adaptive_max_depth is None
 
 
-def test_v41_prefill_paths_reach_the_tensor_shard_loader(tmp_path):
+def test_v41_shard_options_reach_the_tensor_shard_loader(tmp_path):
     deployment = _deployment()
     args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
     # Off, a model-owned tensor shard loader gets no options.
@@ -1699,6 +1507,10 @@ def test_v41_prefill_paths_reach_the_tensor_shard_loader(tmp_path):
         "a8_prefill": True,
         "a8_prefill_min_tokens": 256,
     }
+    # Only an uneven plan sends its split.
+    uneven = SimpleNamespace(tensor_parallel_split=((5, 3), (25, 11)))
+    options = _tensor_shard_options(_execution_settings(args), uneven)
+    assert options["tensor_split"] == {"attention": [5, 3], "experts": [25, 11]}
 
 
 def test_the_node_role_reaches_the_rank_through_the_launched_argv(tmp_path):
@@ -2617,7 +2429,6 @@ def test_local_only_teardown_never_contacts_remote_peer(
         )
         assert result["ranks_checked"] == 1
     assert calls == [[{"rank": 0, "node_id": "local", "ssh": "127.0.0.1"}]]
-
 
 
 def test_supervisor_local_stop_skips_remote_reaping(tmp_path, monkeypatch):

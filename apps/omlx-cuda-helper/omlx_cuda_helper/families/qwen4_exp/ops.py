@@ -48,6 +48,8 @@ class Weights:
 
     def float32(self, name: str) -> mx.array:
         """A linear weight in float32; a quantized one is not rounded."""
+        if f"{name}.{checkpoint.OQH_SIGNS}" in self:
+            raise ValueError(f"oQh {name}: this family reads oQh only in its experts")
         weight = self[f"{name}.weight"]
         if f"{name}.scales" in self:
             weight = unpack(

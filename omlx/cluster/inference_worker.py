@@ -28,7 +28,6 @@ from .control_plane import RankControlPlane
 from .deployment import (
     decode_worker_contract,
     decode_worker_path_map,
-    decode_worker_stage_links,
 )
 from .jaccl_lease import acquire_jaccl_communicator_lease
 from .liveness import PeerWatchdog
@@ -45,10 +44,9 @@ from .pipeline_compat import (
     install_pipeline_compatibility,
     pipeline_assignment_is_honored,
 )
-from .planner import PipelineAssignment
+from .planner import PipelineAssignment, tensor_split_to_dict
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
-from .rdma.stage_transport import install_stage_links
 from .runtime_optimizations import (
     install_runtime_optimizations,
     wait_for_pipeline_peers_on_host,
@@ -717,20 +715,27 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
     )
 
 
-def _tensor_shard_options(execution: ExecutionSettings) -> dict[str, Any]:
-    """Prefill paths DeepSeek V4.1's tensor-parallel loader builds a rank with.
+def _tensor_shard_options(
+    execution: ExecutionSettings, assignment: Any = None
+) -> dict[str, Any]:
+    """Options DeepSeek V4.1's tensor-parallel loader builds a rank with.
 
-    The coordinator turns them on only for that model, so other model-owned
-    loaders get no options.
+    The coordinator turns the prefill paths on only for that model, and only
+    its planner produces an uneven split, so other model-owned loaders get no
+    options.
     """
 
-    if not (execution.ced_prefill or execution.a8_prefill):
-        return {}
-    return {
-        "ced_prefill": execution.ced_prefill,
-        "a8_prefill": execution.a8_prefill,
-        "a8_prefill_min_tokens": execution.a8_prefill_min_tokens,
-    }
+    options: dict[str, Any] = {}
+    if execution.ced_prefill or execution.a8_prefill:
+        options.update(
+            ced_prefill=execution.ced_prefill,
+            a8_prefill=execution.a8_prefill,
+            a8_prefill_min_tokens=execution.a8_prefill_min_tokens,
+        )
+    split = getattr(assignment, "tensor_parallel_split", ())
+    if split:
+        options["tensor_split"] = tensor_split_to_dict(split)
+    return options
 
 
 def _prompt_cache_ssd_dir(
@@ -1452,9 +1457,9 @@ def run_worker(args: argparse.Namespace) -> int:
     if args.plan_hash != plan_hash:
         raise RuntimeError("worker plan hash does not match launch contract")
 
-    # Cluster v2: a deployment may give each node its own absolute model path.
-    # The rank's path comes from the signed contract's path_map; nodes without
-    # an entry keep the shared --model argument, the pre-v2 behavior.
+    # A deployment may give each node its own absolute model path. The rank's
+    # path comes from the signed contract's path_map; nodes without an entry
+    # keep the shared --model argument.
     path_map = decode_worker_path_map(args.plan)
     if path_map:
         rank_model_path = path_map.get(assignments[rank].node_id)
@@ -1617,7 +1622,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         },
                     ),
                     engram_ssd_offload=assignment.ssd_weight_bytes > 0,
-                    tensor_shard_options=_tensor_shard_options(execution),
+                    tensor_shard_options=_tensor_shard_options(execution, assignment),
                 ),
             ):
                 provider.load_default()
@@ -1644,14 +1649,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 if execution.mtp
                 else None
             )
-            # Installed first so the runtime optimizations wrap the RDMA-aware send.
             with (
-                install_stage_links(
-                    mx,
-                    group,
-                    decode_worker_stage_links(args.plan),
-                    rank=rank,
-                ) as stage_links,
                 install_runtime_optimizations(
                     provider.model,
                     group,
@@ -1693,7 +1691,6 @@ def run_worker(args: argparse.Namespace) -> int:
                         profile.to_dict() for profile in performance_profiles
                     ],
                     optimizations=optimizations,
-                    stage_links=stage_links,
                     output_protocol=protocol or None,
                 )
                 _emit_event(
@@ -1712,7 +1709,6 @@ def run_worker(args: argparse.Namespace) -> int:
                         "capacity_bytes": assignment.capacity_bytes,
                         "reserve_bytes": assignment.reserve_bytes,
                         "headroom_bytes": assignment.headroom_bytes,
-                        "stage_links": stage_links,
                     }
                 )
                 if rank == 0:

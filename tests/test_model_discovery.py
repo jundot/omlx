@@ -1614,7 +1614,7 @@ class TestAdapterDetection:
         assert _is_adapter_dir(tmp_path) is False
 
     def test_discover_skips_lora_adapter(self, tmp_path):
-        """discover_models should skip LoRA adapter directories."""
+        """discover_models collects LoRA adapters apart from the models."""
         # Normal model
         model_dir = tmp_path / "llama-3b"
         model_dir.mkdir()
@@ -1628,12 +1628,14 @@ class TestAdapterDetection:
         (adapter_dir / "adapter_config.json").write_text("{}")
         (adapter_dir / "adapters.safetensors").write_bytes(b"0" * 100)
 
-        models = discover_models(tmp_path)
+        adapters = {}
+        models = discover_models(tmp_path, adapters=adapters)
         assert "llama-3b" in models
         assert "my-lora" not in models
+        assert adapters == {"my-lora": str(adapter_dir)}
 
     def test_discover_skips_nested_lora_adapter(self, tmp_path):
-        """discover_models should skip LoRA adapters in org folders."""
+        """discover_models collects LoRA adapters in org folders too."""
         org_dir = tmp_path / "my-org"
         org_dir.mkdir()
 
@@ -1649,9 +1651,11 @@ class TestAdapterDetection:
         (adapter_dir / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
         (adapter_dir / "adapter_config.json").write_text("{}")
 
-        models = discover_models(tmp_path)
+        adapters = {}
+        models = discover_models(tmp_path, adapters=adapters)
         assert "llama-3b" in models
         assert "my-lora" not in models
+        assert adapters == {"my-lora": str(adapter_dir)}
 
 
 class TestDiscoveredModel:
@@ -2079,6 +2083,23 @@ class TestHfCacheDiscovery:
         result = _resolve_hf_cache_entry(entry)
         assert result is not None
         assert result.snapshot_path == snapshot
+
+    def test_resolve_corrupt_refs_main_falls_back_with_warning(self, tmp_path, caplog):
+        """Non-UTF-8 byte in refs/main falls back to snapshot with a warning.
+
+        Minefield 131: read_text() on a refs file holding a stray byte raised
+        UnicodeDecodeError out of discovery; resolution must instead fall back
+        and warn, naming the ref file.
+        """
+        entry, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "Qwen3-8B")
+        (entry / "refs" / "main").write_bytes(b"\xff")
+
+        with caplog.at_level(logging.WARNING):
+            result = _resolve_hf_cache_entry(entry)
+
+        assert result is not None
+        assert result.snapshot_path == snapshot
+        assert "refs/main" in caplog.text
 
     def test_discover_hf_cache_model(self, tmp_path):
         """HF cache entries are discovered as models."""

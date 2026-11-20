@@ -43,7 +43,9 @@ final class BenchDTODecodeTests: XCTestCase {
             alignPromptToAne: true,
             promptLengths: [1024],
             generationLength: 128,
-            batchSizes: [2]
+            batchSizes: [2],
+            forceLmEngine: true,
+            external: BenchExternalEndpoint(baseUrl: "https://example.test/v1", apiKey: "key", model: "remote")
         )
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -54,6 +56,9 @@ final class BenchDTODecodeTests: XCTestCase {
         XCTAssertEqual(object["context_profile"] as? String, "novel_ko")
         XCTAssertEqual(object["warmup_mode"] as? String, "ane_2048")
         XCTAssertEqual(object["align_prompt_to_ane"] as? Bool, true)
+        XCTAssertEqual(object["force_lm_engine"] as? Bool, true)
+        XCTAssertEqual(object["external"] as? [String: String],
+                       ["base_url": "https://example.test/v1", "api_key": "key", "model": "remote"])
     }
 
     @MainActor
@@ -62,7 +67,28 @@ final class BenchDTODecodeTests: XCTestCase {
         XCTAssertEqual(vm.contextProfile, .codePython)
         XCTAssertEqual(vm.warmupMode, .quick)
         XCTAssertFalse(vm.alignPromptToAne)
-        XCTAssertTrue(vm.exportText.hasPrefix("# Context: Code (Python)"))
+    }
+
+    @MainActor
+    func testPollEndsRunOnErrorStatusOrLostRun() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BenchStubProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = OMLXClient(host: "bench.test", session: session)
+        // "failed" reports status=error. "lost" is unknown to the server, like after a restart.
+        for benchId in ["failed", "lost"] {
+            BenchStubProtocol.benchId = benchId
+            let vm = ThroughputBenchScreenVM()
+            vm.selectedModelId = "model"
+            vm.runBenchmark(client: client)
+            for _ in 0..<200 where vm.running {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertFalse(vm.running, benchId)
+            XCTAssertNotNil(vm.lastError, benchId)
+            vm.stop()
+        }
     }
 
     func testDecodeResultsContextProfile() throws {
@@ -225,5 +251,28 @@ final class BenchDTODecodeTests: XCTestCase {
         XCTAssertFalse(response.running)
         XCTAssertNil(response.currentModel)
         XCTAssertNil(response.currentBenchId)
+    }
+}
+
+private final class BenchStubProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var benchId = ""
+
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "bench.test" }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func stopLoading() {}
+
+    override func startLoading() {
+        let (status, body): (Int, String) = switch request.url?.path {
+        case "/admin/api/bench/start":
+            (200, #"{"bench_id":"\#(Self.benchId)","status":"started","total_tests":1}"#)
+        case "/admin/api/bench/failed/results":
+            (200, #"{"bench_id":"failed","status":"error","results":[],"error":"Endpoint rejected the API key"}"#)
+        default:
+            (404, #"{"detail":"Benchmark not found"}"#)
+        }
+        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
     }
 }

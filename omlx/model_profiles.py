@@ -88,6 +88,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_keep_pct",
     "specprefill_threshold",
     "index_cache_freq",
+    "lora_adapter",
 )
 
 # Excluded — never stored in a profile or template.

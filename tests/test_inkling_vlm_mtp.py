@@ -622,6 +622,16 @@ def test_inkling2_model_is_freed_without_cyclic_gc():
         gc.enable()
 
 
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+def test_inkling2_affine_expert_carrier_matches_mlx_packing(bits):
+    from omlx.patches.inkling2.model import ExpertProj
+
+    # 64 columns hide a wrong 3/5/6-bit width; the real 4608 does not.
+    packed, _, _ = mx.quantize(mx.zeros((2, 8, 4608)), group_size=128, bits=bits)
+    proj = ExpertProj(2, 8, 4608, {"mode": "affine", "bits": bits, "group_size": 128})
+    assert proj.weight.shape == packed.shape
+
+
 @pytest.mark.parametrize(
     "batch, heads, kv_heads, length, keys, window, extent, left_padding",
     [

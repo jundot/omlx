@@ -31,6 +31,15 @@
 	-->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Ask AI uses the microphone so you can ask by voice.</string>
+	<!--
+	  Ask AI may use plain http to another server by a name like studio.lan.
+	  ATS blocks that, and no ATS key allows only user-entered hosts.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Ask AI can answer with an oMLX server on another Mac on your network, such as a Mac Studio.</string>
 	<key>NSHumanReadableCopyright</key>

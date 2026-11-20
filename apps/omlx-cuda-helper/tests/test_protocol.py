@@ -49,7 +49,6 @@ def host(tmp_path):
     calls = []
     manager = PairingManager(
         None,
-        None,
         base_path=tmp_path / "host",
         identity={
             "node_id": "host-node",
@@ -187,7 +186,7 @@ def test_an_integrated_gpu_holds_its_layers_in_system_ram(monkeypatch):
     )
     assert (card["free"], card["integrated"]) == (48600 << 20, False)
     # A prompt goes back to the host before the OS loses its share.
-    assert gpus.memory_limit(spark) == 112 << 30
+    assert gpus.memory_limit(spark) == spark["free"]
 
 
 def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):

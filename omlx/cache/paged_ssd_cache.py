@@ -409,6 +409,12 @@ def numerics_revision_for_model(model: Any) -> str | None:
     # Set by cast_bf16_params_to_fp16: KV computed before the recast is bf16.
     if any(getattr(module, "_omlx_fp16_recast", False) for module in modules):
         revisions.add("fp16-recast")
+    # Set by apply_adapter: KV depends on the LoRA weights.
+    revisions.update(
+        f"lora-{signature}"
+        for module in modules
+        if (signature := getattr(module, "_omlx_lora_signature", None))
+    )
     # DeepSeek V4.1 CED prefill stores approximate decoder states.
     if any(
         type(module).__module__ == _DEEPSEEK_V41_LANGUAGE_MODULE

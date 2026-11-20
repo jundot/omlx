@@ -214,14 +214,16 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let vlmMtpEnabled: Bool?
     let vlmMtpDraftModel: String?
     let vlmMtpDraftBlockSize: Int?
+    // LoRA adapter folder applied on top of the weights at load.
+    let loraAdapter: String?
 }
 
 /// Patch body for PUT /admin/api/models/{id}/settings. Flat snake-cased
 /// keys (Encoder converts via `.convertToSnakeCase`). `nil` fields are
 /// omitted by `encodeIfPresent` so the server merges instead of resetting.
 struct ModelSettingsPatch: Encodable, Equatable, Sendable {
-    var modelAlias: String? = nil
-    var modelTypeOverride: String? = nil
+    var modelAlias: String?? = nil
+    var modelTypeOverride: String?? = nil
     var maxContextWindow: Int? = nil
     var maxTokens: Int? = nil
     var temperature: Double? = nil
@@ -304,6 +306,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var vlmMtpEnabled: Bool? = nil
     var vlmMtpDraftModel: String? = nil
     var vlmMtpDraftBlockSize: Int? = nil
+    var loraAdapter: String? = nil // "" clears the adapter.
 }
 
 /// GET /admin/api/models/{id}/generation_config: the sampling values a new
@@ -315,6 +318,22 @@ struct GenerationConfigDTO: Decodable, Equatable, Sendable {
     var topP: Double? = nil
     var topK: Int? = nil
     var repetitionPenalty: Double? = nil
+}
+
+/// GET /admin/api/models/{id}/lora-adapters: adapters in the model folders.
+/// `problem` says why one does not fit this model; nil when it does.
+struct LoRAAdapterDTO: Decodable, Equatable, Sendable, Identifiable {
+    let id: String
+    let path: String
+    let baseModel: String?
+    let rank: Int
+    let targets: [String]
+    let sizeFormatted: String?
+    let problem: String?
+}
+
+struct LoRAAdapterListResponse: Decodable, Sendable {
+    let adapters: [LoRAAdapterDTO]
 }
 
 /// Body for POST /admin/api/models/{id}/settings/recipe.

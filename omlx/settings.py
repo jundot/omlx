@@ -588,6 +588,8 @@ VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"
 
 # KV cache storage formats `splash serve --kv-format` accepts.
 SPLASH_KV_FORMATS = frozenset({"int8", "bf16"})
+# Activation precisions `splash serve --activations` accepts (Splash 1.6.1+).
+SPLASH_ACTIVATIONS = frozenset({"auto", "bf16"})
 
 
 @dataclass
@@ -1014,6 +1016,7 @@ class IntegrationSettings:
     # oMLX looks for an installed launcher itself.
     splash_path: str | None = None
     splash_kv_format: str = "int8"  # "int8" | "bf16"
+    splash_activations: str = "bf16"  # "auto" | "bf16" (Splash 1.6.1+)
     splash_max_memory_gb: float | None = None  # None = what the ceiling leaves
     splash_ssd_cache_gb: float | None = None  # None = oMLX's SSD cache size
     splash_ane_prefill: bool = True
@@ -1045,6 +1048,7 @@ class IntegrationSettings:
             "web_search_content_max_chars": self.web_search_content_max_chars,
             "splash_path": self.splash_path,
             "splash_kv_format": self.splash_kv_format,
+            "splash_activations": self.splash_activations,
             "splash_max_memory_gb": self.splash_max_memory_gb,
             "splash_ssd_cache_gb": self.splash_ssd_cache_gb,
             "splash_ane_prefill": self.splash_ane_prefill,
@@ -1086,6 +1090,7 @@ class IntegrationSettings:
             ),
             splash_path=data.get("splash_path") or None,
             splash_kv_format=data.get("splash_kv_format", "int8"),
+            splash_activations=data.get("splash_activations", "bf16"),
             splash_max_memory_gb=data.get("splash_max_memory_gb"),
             splash_ssd_cache_gb=data.get("splash_ssd_cache_gb"),
             splash_ane_prefill=data.get("splash_ane_prefill", True),
@@ -1941,6 +1946,10 @@ class GlobalSettings:
         if self.integrations.splash_kv_format not in SPLASH_KV_FORMATS:
             errors.append(
                 f"splash_kv_format must be one of {sorted(SPLASH_KV_FORMATS)}"
+            )
+        if self.integrations.splash_activations not in SPLASH_ACTIVATIONS:
+            errors.append(
+                f"splash_activations must be one of {sorted(SPLASH_ACTIVATIONS)}"
             )
         memory = self.integrations.splash_max_memory_gb
         if memory is not None and memory <= 0:

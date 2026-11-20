@@ -4,6 +4,8 @@
 import asyncio
 import copy
 import json
+import shutil
+import struct
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pydantic
@@ -87,6 +89,80 @@ async def _update_settings(
 
     manager.set_settings.assert_called_once_with("ling", settings)
     return result
+
+
+def _write_lora_adapter(path):
+    """An mlx-format adapter; only its config and safetensors header are read."""
+    path.mkdir()
+    (path / "adapter_config.json").write_text(
+        json.dumps({"lora_parameters": {"rank": 1, "scale": 1.0}})
+    )
+    header = {
+        f"model.layers.0.self_attn.q_proj.lora_{name}": {
+            "dtype": "F32",
+            "shape": shape,
+            "data_offsets": offsets,
+        }
+        for name, shape, offsets in (("a", [2, 1], [0, 8]), ("b", [1, 2], [8, 16]))
+    }
+    raw = json.dumps(header).encode()
+    (path / "adapters.safetensors").write_bytes(
+        struct.pack("<Q", len(raw)) + raw + bytes(16)
+    )
+    return path
+
+
+@pytest.mark.asyncio
+async def test_lora_adapter_is_checked_when_it_changes(tmp_path):
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    config = {"num_hidden_layers": 1, "hidden_size": 4}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    settings = ModelSettings()
+
+    with pytest.raises(HTTPException) as missing:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(lora_adapter=str(tmp_path / "none")),
+        )
+    assert missing.value.status_code == 422
+
+    adapter = _write_lora_adapter(tmp_path / "adapter")
+    request = admin_routes.ModelSettingsRequest(lora_adapter=str(adapter))
+    with pytest.raises(HTTPException, match="model width 4") as misfit:
+        await _update_settings(pool, settings, request)
+    assert misfit.value.status_code == 422
+
+    (tmp_path / "config.json").write_text(json.dumps({**config, "hidden_size": 2}))
+    await _update_settings(pool, settings, request)
+    assert settings.lora_adapter == str(adapter)
+    # A new adapter is a new load-time variant.
+    assert entry.load_failed is False
+
+    # Whole-payload saves resend the path; a removed folder must not block them.
+    shutil.rmtree(adapter)
+    request = admin_routes.ModelSettingsRequest(lora_adapter=str(adapter), top_k=20)
+    await _update_settings(pool, settings, request)
+    assert settings.top_k == 20
+
+    with pytest.raises(HTTPException) as conflict:
+        admin_routes._validate_model_settings(
+            entry, {"lora_adapter": str(adapter), "dflash_enabled": True}
+        )
+    assert conflict.value.status_code == 400
+
+    # The picker still lists the saved adapter, with why it cannot load.
+    manager = MagicMock()
+    manager.get_settings.return_value = settings
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+    ):
+        listed = await admin_routes.list_lora_adapters("ling", is_admin=True)
+    assert [(a["path"], a["problem"]) for a in listed["adapters"]] == [
+        (str(adapter), "the adapter folder was not found")
+    ]
 
 
 @pytest.mark.asyncio
@@ -530,6 +606,33 @@ def test_model_options_report_oq_a8_support(config_type, kernels, expected):
     with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=kernels):
         options = admin_routes._model_options({"config_model_type": config_type}, None)
     assert options["a8_prefill_supported"] is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["a8_prefill_enabled", "qwen35_ane_prefill_enabled"])
+async def test_oqh_checkpoint_refuses_a8_and_ane_prefill(tmp_path, field):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "omlx_oqh": {"version": 1}})
+    )
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    entry.model_path = str(tmp_path)
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        options = admin_routes._model_options(
+            {"config_model_type": "qwen3_5", "model_path": str(tmp_path)}, None
+        )
+        with pytest.raises(admin_routes.HTTPException) as excinfo:
+            await _update_settings(
+                pool, settings, admin_routes.ModelSettingsRequest(**{field: True})
+            )
+
+    assert options["a8_prefill_supported"] is False
+    assert options["ane_prefill_backend"] is None
+    assert excinfo.value.status_code == 400
+    assert "oQh" in excinfo.value.detail
+    assert getattr(settings, field) in (None, False)
 
 
 @pytest.mark.asyncio
