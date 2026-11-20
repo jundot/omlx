@@ -137,8 +137,36 @@ def _patch_model(model_cls: Any) -> None:
     model_cls._omlx_drafter_target = True
 
 
+def _is_spark_target(model: Any) -> bool:
+    """True when ``model`` is an mlx_lm Spark X2.5/X2.6 DFlash target.
+
+    Spark is an independent plain-attention architecture whose decode loop
+    carries its own inline layer capture (via ``omlx.patches.spark_dspark``
+    ``_patch_spark2_5_capture``) plus ``mtp_partial_rollback``. Its inner
+    ``Spark2_5Model.__call__`` never calls the wrapped
+    ``TransformerBlock.__call__``, so the generic ``_Sink``/``_wrap_layer``
+    path cannot observe Spark's captures and would be dead code that also
+    re-wraps ``Model.__call__`` (load-order conflict risk).
+    """
+    return type(model).__module__ == "mlx_lm.models.spark2_5"
+
+
 def apply(model: Any) -> bool:
-    """Install the drafter hooks on ``model``'s classes. Idempotent."""
+    """Install the drafter hooks on ``model``'s classes. Idempotent.
+
+    Positive selection: a DFlash target is either a *generic* target
+    (Qwen3, Laguna, MiMo, Muse Glimmer, ...) that gains the standard
+    ``_Sink``/``_wrap_layer`` capture plus ``_patch_model`` hooks, or a
+    *specific* target. Spark X2.5/X2.6 is one such specific target: it
+    carries its own inline capture + ``mtp_partial_rollback`` via
+    ``load_spark_dspark_drafter``, so the generic hooks must not be
+    layered on top. This is inclusion (Spark is a DFlash target), not
+    exclusion (skip non-targets).
+    """
+    if _is_spark_target(model):
+        # Spark supplies a self-contained capture+rollback path; the
+        # generic hooks would be dead code on its inline decode loop.
+        return False
     layers = getattr(getattr(model, "model", None), "layers", None)
     if not layers:
         return False

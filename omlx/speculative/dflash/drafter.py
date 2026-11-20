@@ -634,6 +634,14 @@ class DFlashDrafter:
                 int(context.shape[1]) + (0 if prior is None else int(prior.shape[1]))
             )
             bases.append(row.fed + skip)
+        # Optional cross-stream materialization hook (Spark DSpark): the
+        # drafter may be loaded on an executor thread while decode runs on the
+        # mlx-engine thread, so intermediate activations built here must be
+        # materialized on the current stream before use. A no-op unless a
+        # subclass/adapter installs ``self._materialize_draft``.
+        _mat = getattr(self, "_materialize_draft", None)
+        if _mat is not None:
+            _mat("segments", segments)
         # Metal projections need a nonempty shape even when the window keeps no context.
         width = max(1, max(int(seg.shape[1]) for seg in segments))
         padded = mx.concatenate(
@@ -655,7 +663,11 @@ class DFlashDrafter:
             ],
             axis=0,
         )
+        if _mat is not None:
+            padded = _mat("padded", padded)
         h_ctx = variants.project_context(model, padded)
+        if _mat is not None:
+            h_ctx = _mat("h_ctx", h_ctx)
         if any(prior is not None for prior in restored):
             width = max(lengths)
             parts = []
