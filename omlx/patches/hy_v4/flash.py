@@ -243,7 +243,8 @@ class Engram(nn.Module):
         return rows.astype(mx.int32)
 
     def lookup(self, rows: mx.array) -> mx.array:
-        return self.multi_head_embedding.embedding.weight[rows]
+        # A module call, so an oQ-quantized table dequantizes only these rows.
+        return self.multi_head_embedding.embedding(rows)
 
     def __call__(self, streams: mx.array, ngrams: mx.array, keep: mx.array) -> mx.array:
         dtype = streams.dtype

@@ -191,12 +191,13 @@ class ClampedSwiGLU(nn.Module):
 
     def __init__(self, limit: float):
         super().__init__()
-        self._limit = float(limit)
+        # oQh's fused expert activation reads the same clamp from ``limit``.
+        self.limit = float(limit) if limit and limit > 0 else None
 
     def __call__(self, up: mx.array, gate: mx.array) -> mx.array:
-        if self._limit <= 0:
+        if self.limit is None:
             return nn.silu(gate) * up
-        return _clamped_swiglu(up, gate, mx.array(self._limit, dtype=up.dtype))
+        return _clamped_swiglu(up, gate, mx.array(self.limit, dtype=up.dtype))
 
 
 class Router(nn.Module):
@@ -268,7 +269,7 @@ class MoE(nn.Module):
         routed = (
             self.routed_expert_down_proj(x) if "routed_expert_down_proj" in self else x
         )
-        y = self.switch_mlp(routed, inds, weights, weighted_sum=True)
+        y = self.switch_mlp(routed, inds, scores=weights, weighted_sum=True)
         if y.ndim == routed.ndim + 1:
             y = (y * weights[..., None].astype(y.dtype)).sum(axis=-2)
         if "routed_expert_up_proj" in self:

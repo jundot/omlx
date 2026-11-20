@@ -29,6 +29,25 @@ _SKIPPED_PREFIXES = (
 )
 _DFLY_PREFIX = "model.dfly_layers."
 _EXPERT_NAMES = ("gate_proj", "up_proj", "down_proj")
+_DFLY_FFN_RATIO = 3
+
+
+# Float tensors oQ keeps at their checkpoint precision (FP32): the
+# hyper-connection mixes, attention sinks, the router bias and the compressed
+# indexer's key pooling.
+_FP32_KEYS = (
+    ".hc_attn_layer.",
+    ".hc_mlp_layer.",
+    ".hc_head.",
+    "learnable_sink_param",
+    "e_score_correction_bias",
+    ".compressed_indexer.",
+)
+
+
+def cast_predicate(key: str) -> bool:
+    """Whether oQ may cast this float tensor to the model dtype."""
+    return not any(part in key for part in _FP32_KEYS)
 
 
 def dequantize_block_fp8(weight: mx.array, scale: mx.array) -> mx.array:
@@ -58,6 +77,49 @@ def _fp8_scale_base(key: str) -> str | None:
     return None
 
 
+def _sanitize_experts(weights, layer, args, mxfp8):
+    prefix = f"model.layers.{layer}.mlp"
+    fused = weights.pop(f"{prefix}.experts.gate_up_proj", None)
+    if fused is not None:
+        mid = fused.shape[-2] // 2
+        parts = {
+            "gate_proj": fused[:, :mid],
+            "up_proj": fused[:, mid:],
+            "down_proj": weights.pop(f"{prefix}.experts.down_proj"),
+        }
+    elif f"{prefix}.experts.0.gate_proj.weight" in weights:
+        parts = {
+            name: mx.stack(
+                [
+                    weights.pop(f"{prefix}.experts.{e}.{name}.weight")
+                    for e in range(args.n_routed_experts)
+                ]
+            )
+            for name in _EXPERT_NAMES
+        }
+    else:
+        return
+    for name, w in parts.items():
+        target = f"{prefix}.switch_mlp.{name}"
+        if mxfp8:
+            packed, scales = mx.quantize(w, group_size=32, bits=8, mode="mxfp8")
+            weights[f"{target}.weight"] = packed
+            weights[f"{target}.scales"] = scales
+        else:
+            weights[f"{target}.weight"] = w
+
+
+def _split_kv_b(weights, layer, args, prefix=None, dims=None):
+    prefix = prefix or f"model.layers.{layer}.self_attn"
+    w = weights.pop(f"{prefix}.kv_b_proj.weight", None)
+    if w is None:
+        return
+    heads, nope, _, value = dims or args.head_dims(layer)
+    w = w.reshape(heads, nope + value, args.kv_lora_rank)
+    weights[f"{prefix}.embed_q.weight"] = mx.contiguous(w[:, :nope, :].swapaxes(-1, -2))
+    weights[f"{prefix}.unembed_out.weight"] = mx.contiguous(w[:, nope:, :])
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -73,7 +135,7 @@ class Model(nn.Module):
             # Both releases size the draft FFN at 3x and the correction MLP at
             # 1x the hidden size; sanitize checks the shapes.
             dfly = DFlyConfig.from_model(
-                config, 3 * text.hidden_size, post_proj_norm=text.is_flash
+                config, _DFLY_FFN_RATIO * text.hidden_size, post_proj_norm=text.is_flash
             )
             self.language_model.dfly = DFlyModel(text, dfly, text.hidden_size)
             self.language_model.configure_mtp(is_mtp_active(), get_mtp_depth())
@@ -113,8 +175,8 @@ class Model(nn.Module):
                 weights[base] = dequantize_block_fp8(weights[base], weights.pop(key))
 
         for i in range(args.num_hidden_layers):
-            self._sanitize_experts(weights, i, args, experts_mxfp8)
-            self._split_kv_b(weights, i, args)
+            _sanitize_experts(weights, i, args, experts_mxfp8)
+            _split_kv_b(weights, i, args)
         self._sanitize_dfly(weights, args)
 
         if args.enable_lm_head_fp32 and "lm_head.weight" in weights:
@@ -129,44 +191,16 @@ class Model(nn.Module):
             out[k] = v
         return out
 
-    @staticmethod
-    def _sanitize_experts(weights, layer, args, mxfp8):
-        prefix = f"model.layers.{layer}.mlp"
-        fused = weights.pop(f"{prefix}.experts.gate_up_proj", None)
-        if fused is not None:
-            mid = fused.shape[-2] // 2
-            parts = {
-                "gate_proj": fused[:, :mid],
-                "up_proj": fused[:, mid:],
-                "down_proj": weights.pop(f"{prefix}.experts.down_proj"),
-            }
-        elif f"{prefix}.experts.0.gate_proj.weight" in weights:
-            parts = {
-                name: mx.stack(
-                    [
-                        weights.pop(f"{prefix}.experts.{e}.{name}.weight")
-                        for e in range(args.n_routed_experts)
-                    ]
-                )
-                for name in _EXPERT_NAMES
-            }
-        else:
-            return
-        for name, w in parts.items():
-            target = f"{prefix}.switch_mlp.{name}"
-            if mxfp8:
-                packed, scales = mx.quantize(w, group_size=32, bits=8, mode="mxfp8")
-                weights[f"{target}.weight"] = packed
-                weights[f"{target}.scales"] = scales
-            else:
-                weights[f"{target}.weight"] = w
-
     def _sanitize_dfly(self, weights, args):
-        """Rename ``model.dfly_layers.*`` and detach the drafter when absent."""
+        """Rename ``model.dfly_layers.*`` and detach the drafter when absent.
+
+        oQ runs sanitize on a proxy without modules, so the layout comes from
+        the config.
+        """
         names = [k for k in weights if k.startswith(_DFLY_PREFIX)]
         lm = self.language_model
         if not names:
-            if "dfly" in lm:
+            if isinstance(lm, nn.Module) and "dfly" in lm:
                 del lm["dfly"]
                 lm.configure_mtp(False)
             return
@@ -177,32 +211,15 @@ class Model(nn.Module):
             weights["dfly." + rest] = weights.pop(key)
         # Draft layers have the shape of the target's sparse attention layers.
         dims = args.head_dims(args.attention_kinds.index("sparse"))
-        for i in range(len(lm.dfly.layers)):
-            self._split_kv_b(
+        for i in range(int(self.config.dfly_num_hidden_layers)):
+            _split_kv_b(
                 weights, i, args, prefix=f"dfly.layers.{i}.self_attn", dims=dims
             )
         expected = {
-            "dfly.layers.0.mlp.gate_proj.weight": lm.dfly.layers[0].mlp.gate_proj,
-            "dfly.hidden_correction.gate_proj.weight": (
-                lm.dfly.hidden_correction.gate_proj
-            ),
+            "dfly.layers.0.mlp.gate_proj.weight": _DFLY_FFN_RATIO * args.hidden_size,
+            "dfly.hidden_correction.gate_proj.weight": args.hidden_size,
         }
-        for name, module in expected.items():
+        for name, rows in expected.items():
             got = weights.get(name)
-            if got is not None and got.shape[0] != module.weight.shape[0]:
-                raise ValueError(
-                    f"{name} has {got.shape[0]} rows, expected {module.weight.shape[0]}"
-                )
-
-    @staticmethod
-    def _split_kv_b(weights, layer, args, prefix=None, dims=None):
-        prefix = prefix or f"model.layers.{layer}.self_attn"
-        w = weights.pop(f"{prefix}.kv_b_proj.weight", None)
-        if w is None:
-            return
-        heads, nope, _, value = dims or args.head_dims(layer)
-        w = w.reshape(heads, nope + value, args.kv_lora_rank)
-        weights[f"{prefix}.embed_q.weight"] = mx.contiguous(
-            w[:, :nope, :].swapaxes(-1, -2)
-        )
-        weights[f"{prefix}.unembed_out.weight"] = mx.contiguous(w[:, nope:, :])
+            if got is not None and got.shape[0] != rows:
+                raise ValueError(f"{name} has {got.shape[0]} rows, expected {rows}")

@@ -40,7 +40,9 @@ class DecoderLayer(nn.Module):
         if args.engram_layer_ids and layer + 1 in args.engram_layer_ids:
             self.engram_layer = Engram(args, layer + 1)
 
-    def __call__(self, streams, mask, cache, prev_topk, engram_inputs):
+    def __call__(
+        self, streams, mask=None, cache=None, prev_topk=None, engram_inputs=None
+    ):
         if "engram_layer" in self and engram_inputs is not None:
             streams = streams + self.engram_layer(streams, *engram_inputs)
         x, post = self.hc_attn_layer(streams)

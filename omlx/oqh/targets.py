@@ -122,8 +122,13 @@ GLM5_NEXT = Scheme(_ROUTED_ROLES, tensor_parallel=True, group_scales=True)
 # DeepSeek V4.1 likewise: its trunk, Engram tables and shared expert keep
 # their oQ formats. oQ4 keeps the source FP4 experts, so oQh is for lower levels.
 DEEPSEEK_V41 = Scheme(_V41_ROUTED_ROLES, tensor_parallel=True, max_level=4)
+# Hy4 and Hy4-flash: routed experts only, the trunk keeps its oQ format.
+# Hy4-flash's experts read a latent projection, which no norm can rotate.
+HY_V4 = Scheme(_ROUTED_ROLES, tensor_parallel=False, group_scales=True)
 _SCHEMES = {
     "deepseek_v41": DEEPSEEK_V41,
+    "hy_v4_vl": HY_V4,
+    "hy_v4_flash": HY_V4,
     "qwen3_5": QWEN,
     "qwen3_5_moe": QWEN,
     "qwen4_exp": QWEN4_EXP,
