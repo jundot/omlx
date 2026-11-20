@@ -11,8 +11,9 @@ each simdgroup owns ``RPSG`` adjacent output columns) and changes two things:
 
 - each lane unpacks its weight chunk once per output column and applies it
   to every row (the M rows stream past the unpacked tile in registers), and
-- the unpack is generated per bit width with compile-time shifts, so 5-bit
-  weights (common in oQ "e" mixes) get the same treatment as 4-bit.
+- the unpack is generated per bit width with compile-time shifts, so 5-, 6-
+  and 8-bit weights (oQ "e" mixes, 6-bit checkpoints) get the same
+  treatment as 4-bit.
 
 Measured on M1 Max (fp16; summed Qwen3.8-27B projection shapes per call,
 gain vs the route that served them before - stock qmv, vk split-K or sg8):
@@ -22,6 +23,16 @@ gain vs the route that served them before - stock qmv, vk split-K or sg8):
     5-bit  +17%   +26%    -5%  -17%
 
 so 4-bit routes up to 4 rows and 5-bit up to 3; deeper verifies keep sg8.
+
+6- and 8-bit were measured on M1 Ultra (fp16 and bf16; 2048x8192, 2048x4096,
+4096x2048 and 2560x9728 projections, gain vs the route that served them
+before - stock qmv at 2 and 3 rows, stock or sg8 at 4):
+
+    rows      2          3          4
+    6-bit   0..+36%   +21..+61%   +9..+48%
+    8-bit   0..+13%   +14..+42%   +20..+57%
+
+so both route up to 4 rows, as 4-bit does.
 
 Numerics: fp32 accumulation, per-group ``scale * sum(x*q) + bias * sum(x)``
 like qmv. Rows are not bit-identical to the one-row decode (same class as the
@@ -41,11 +52,12 @@ MIN_ROWS = 2
 # Largest row count each bit width still wins at (M1 Max sweep over the
 # Qwen3.8 projection shapes, vs the routes below it): beyond these, sg8's
 # simdgroup-matrix tiles are cheaper than streaming more rows per lane.
-_MAX_ROWS = {4: 4, 5: 3}
+_MAX_ROWS = {4: 4, 5: 3, 6: 4, 8: 4}
 MAX_ROWS = max(_MAX_ROWS.values())
-# Values each lane owns per K block: a 4-bit pair of words, or a whole
-# 5-word 5-bit run (32 values, so every lane starts word aligned).
-_VPT = {4: 16, 5: 32}
+# Values each lane owns per K block: 16 weights (a whole number of words at
+# 4, 6 and 8 bit), or a whole 5-word 5-bit run (32 values, so every lane
+# starts word aligned).
+_VPT = {4: 16, 5: 32, 6: 16, 8: 16}
 _SUPPORTED_BITS = frozenset(_VPT)
 # Tiny projections (GDN a/b heads, k/v of the draft) stay on stock qmv: the
 # per-launch overhead of a custom kernel outweighs the GPU win there.
@@ -58,7 +70,7 @@ def enabled() -> bool:
 
     on = get_apple_gpu_generation() == 13
     if on:
-        logger.info("M1 verify qmv enabled (4-bit rows 2..4, 5-bit rows 2..3)")
+        logger.info("M1 verify qmv enabled (4/6/8-bit rows 2..4, 5-bit rows 2..3)")
     return on
 
 
