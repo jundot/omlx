@@ -807,8 +807,9 @@ def test_trim_rows_keeps_each_row_through_filter_and_extend():
 
 
 def test_attention_blocks_wide_dim_split(monkeypatch):
-    """Head dims of 256 split long caches wider on GPUs of up to 20 cores:
-    affine8 from 48K tokens, affine4 from 128K."""
+    """Head dims of 256 split long caches wider on GPUs of up to 20 cores,
+    for launches of up to 2 row chunks (3 from 128K tokens): affine8 from 64K
+    tokens, affine4 from 128K."""
     blocks = affine4._attention_blocks
     # A larger GPU keeps the stock 168-group target.
     monkeypatch.setattr(affine4, "_wide_split_gpu", lambda: False)
@@ -820,7 +821,14 @@ def test_attention_blocks_wide_dim_split(monkeypatch):
     assert blocks(245_000, 4, 256, 8) == 168
     assert blocks(245_000, 4, 256, 4) == 84
     assert blocks(64_000, 4, 256, 4) == 42
-    assert blocks(64_000, 4, 256, 8) == 168
+    assert blocks(66_000, 4, 256, 8) == 168
+    assert blocks(60_000, 4, 256, 8) == 42
     assert blocks(32_000, 4, 256, 8) == 42
     # Never more blocks than 64-token tiles.
     assert blocks(1_000, 4, 256, 8) == (1_000 + 63) // 64
+    # 3 row chunks widen from 128K tokens; more than 3 keep the stock target.
+    assert blocks(66_000, 4, 256, 8, 2) == 168
+    assert blocks(66_000, 4, 256, 8, 3) == 42
+    assert blocks(245_000, 4, 256, 8, 3) == 168
+    assert blocks(245_000, 4, 256, 8, 4) == 42
+    assert blocks(245_000, 4, 256, 4, 6) == 42
