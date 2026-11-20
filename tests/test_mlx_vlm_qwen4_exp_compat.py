@@ -18,6 +18,9 @@ from mlx_lm.models.rope_utils import initialize_rope
 from omlx import memory_monitor
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 from omlx.patches import qwen35_yarn
+from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+    qwen4_exp_residency_estimate,
+)
 
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
 qwen4_language = importlib.import_module("mlx_vlm.models.qwen4_exp.language")
@@ -1595,7 +1598,8 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path, mtp_num_exp
         configure_mtp_runtime(tmp_path, enabled=False)
 
 
-def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
+@pytest.mark.parametrize("indexed", [True, False])
+def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path, indexed):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
 
@@ -1610,13 +1614,15 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
         .reshape(4, 4)
         .astype(mx.bfloat16),
     }
-    filename = "model-00001-of-00001.safetensors"
+    filename = "model-00001-of-00001.safetensors" if indexed else "model.safetensors"
     mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {key: filename for key in tensors}}),
-        encoding="utf-8",
-    )
+    if indexed:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: filename for key in tensors}}),
+            encoding="utf-8",
+        )
 
+    assert qwen4_exp_residency_estimate(tmp_path).supported
     embedding = DiskBackedShardedEmbedding(
         tmp_path, prefix, num_embeddings=8, dims=4, num_shards=2
     )
