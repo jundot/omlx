@@ -23,6 +23,7 @@ import shutil
 import struct as _struct
 import sys
 import tempfile
+import threading
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
@@ -3238,6 +3239,11 @@ def _block_dequant_fp8(weight_raw, scale_raw, w_dtype, s_dtype):
     return weight
 
 
+# Discovery swaps mlx.core functions process-wide. Serialize it so an
+# overlapping run cannot save another run's stand-ins as the originals.
+_SANITIZE_DISCOVERY_LOCK = threading.RLock()
+
+
 def _discover_sanitize_plan(sanitize_fn, lazy_index):
     """Run sanitize on _TrackedTensors to discover the key mapping and
     transforms without materializing any real data.
@@ -3245,6 +3251,11 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     Returns a dict: output_key -> {sources, transform, shape, axis}
     or None if discovery fails.
     """
+    with _SANITIZE_DISCOVERY_LOCK:
+        return _discover_sanitize_plan_locked(sanitize_fn, lazy_index)
+
+
+def _discover_sanitize_plan_locked(sanitize_fn, lazy_index):
     import mlx.core as mx
 
     # Build tracked dict mirroring the lazy index (logical view hides scale

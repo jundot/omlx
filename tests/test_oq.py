@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -3622,6 +3623,29 @@ class TestDiscoverSanitizePlan:
         for k, info in plan.items():
             assert info["transform"] == "passthrough"
             assert info["sources"] == [k]
+
+    def test_overlapping_discoveries_restore_mlx_functions(self, sf_file):
+        idx = _LazyTensorIndex([sf_file[0]])
+        real_eval, real_stack = mx.eval, mx.stack
+        entered, first_done = threading.Event(), threading.Event()
+
+        def second(weights):
+            entered.set()
+            first_done.wait(5)
+            return weights
+
+        other = threading.Thread(target=_discover_sanitize_plan, args=(second, idx))
+
+        def first(weights):
+            other.start()
+            # Unserialized, the second run saves this run's stand-ins here.
+            entered.wait(0.2)
+            return weights
+
+        _discover_sanitize_plan(first, idx)
+        first_done.set()
+        other.join(5)
+        assert mx.eval is real_eval and mx.stack is real_stack
 
     def test_rename_sanitize(self, sf_file):
         path, tensors = sf_file
