@@ -116,6 +116,7 @@ def _make_loaded_engine(model_type=None, tokenizer=None, **overrides):
 
     engine._vlm_model = mock_vlm_model
     engine._tokenizer = tokenizer or MockVLMTokenizer()
+    engine._processor = SimpleNamespace(tokenizer=engine._tokenizer)
     engine._loaded = True
     engine._engine = MagicMock()
 
@@ -1370,12 +1371,12 @@ class TestProcessChatMessages:
         assert kwargs == {"seed": 1}
 
     def test_count_chat_tokens_matches_prepared_prompt(self):
-        engine = _make_loaded_engine()
+        engine = _make_loaded_engine(model_type="test-vlm")
         messages = [{"role": "user", "content": "Hello"}]
 
         prompt, token_ids = engine.prepare_chat_prompt(messages)
 
-        assert token_ids == engine._tokenizer.encode(prompt)
+        assert token_ids == engine._tokenizer.encode(prompt, add_special_tokens=False)
         assert engine.count_chat_tokens(messages) == len(token_ids)
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
@@ -2723,7 +2724,7 @@ class TestCountChatTokens:
         tokenizer.apply_chat_template.return_value = "Hello World"
         tokenizer.encode.return_value = [1, 2]
 
-        engine = _make_loaded_engine(tokenizer=tokenizer)
+        engine = _make_loaded_engine(model_type="test-vlm", tokenizer=tokenizer)
 
         messages = [{"role": "user", "content": "Hello World"}]
         count = engine.count_chat_tokens(messages)
