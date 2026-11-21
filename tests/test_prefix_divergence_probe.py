@@ -303,6 +303,28 @@ class TestParagraphEnd:
         )
         assert got == (junction or 0), name
 
+    def test_break_ids_skip_a_single_newline_token(self):
+        # Runs of up to 4 newlines are one token each; 5 and 6 split as
+        # ["\n" * 4, "\n"] and ["\n" * 4, "\n\n"].
+        vocab = {"\n": 198, "\n\n": 271, "\n\n\n": 1358, "\n\n\n\n": 4969}
+
+        def encode(text, add_special_tokens=False):
+            ids = [7] if text.startswith("x:") else []
+            run = len(text) - (2 if text.startswith("x:") else 0)
+            while run:
+                piece = min(run, 4)
+                ids.append(vocab["\n" * piece])
+                run -= piece
+            return ids
+
+        sched = _make_scheduler()
+        sched.tokenizer = MagicMock()
+        sched.tokenizer.encode.side_effect = encode
+        sched.tokenizer.decode.side_effect = lambda ids: {
+            v: k for k, v in vocab.items()
+        }.get(ids[0], "x")
+        assert sched._paragraph_break_token_ids() == frozenset({271, 1358, 4969})
+
     def test_on_the_grid_plans_nothing(self):
         # A break that ends on a block boundary: the boundary snapshot covers it.
         block = 2048  # _make_scheduler's block size

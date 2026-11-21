@@ -8540,7 +8540,11 @@ class Scheduler:
                 if len(ids) == 1:
                     breaks.add(ids[0])
                 ids = self.tokenizer.encode("x:" + "\n" * n, add_special_tokens=False)
-                if ids and self.tokenizer.decode([ids[-1]]).strip("\n") == "":
+                if not ids:
+                    continue
+                # A run split as ["\n" * 4, "\n"] ends in a single newline: skip it.
+                decoded = self.tokenizer.decode([ids[-1]])
+                if len(decoded) >= 2 and decoded.strip("\n") == "":
                     breaks.add(ids[-1])
         except Exception:  # noqa: BLE001
             breaks = set()
