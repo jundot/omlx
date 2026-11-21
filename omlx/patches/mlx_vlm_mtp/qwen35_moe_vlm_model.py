@@ -143,6 +143,12 @@ def apply() -> bool:
                 # monkey-patch in omlx.oq when called with _TrackedTensor;
                 # the instance method on the tracker doesn't exist.
                 value = mx.moveaxis(value, 2, 1)
+            if key.endswith("patch_embed.proj.weight") and value.ndim == 5:
+                in_ch = getattr(
+                    getattr(self.config, "vision_config", None), "in_channels", 3
+                )
+                if value.shape[-1] != in_ch and value.shape[1] == in_ch:
+                    value = value.transpose(0, 2, 3, 4, 1)
             # Head norms follow the backbone: raw-HF shifts every gamma by
             # +1, MLX-format is loaded as stored. Legacy mixed heads are
             # repaired in ``norm_repair`` at load_weights time (see #3742).

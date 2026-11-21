@@ -4132,6 +4132,9 @@ def estimate_bpw_and_size(
     with open(config_path) as f:
         config = json.load(f)
 
+    if decision_kind(source, config) == "minicpm_jev":
+        config["_oq_non_quantizable"] = {"score"}
+
     weight_files = _source_weight_files(source)
     if not weight_files:
         return {
@@ -5315,6 +5318,7 @@ _SIDECAR_PATTERNS = (
     "added_tokens.json",
     "merges.txt",
     "vocab.json",
+    "decision_config.json",
 )
 
 # Processor configs describe image / audio preprocessing. A text-only
@@ -7483,7 +7487,13 @@ def quantize_oq_streaming(
         )
         text_only = True
     _validate_oq_dtype_for_model(config, dtype)
-    if decision_kind(source, config) == "d3":
+    kind = decision_kind(source, config)
+    if kind == "minicpm_jev" and text_only:
+        raise ValueError(
+            "MiniCPM-OCR-Jev reads images with its vision tower; text-only "
+            "output is not supported"
+        )
+    if kind == "d3":
         if text_only:
             raise ValueError(
                 "Decision 3.0 reads images with its vision tower; text-only "
@@ -7972,6 +7982,9 @@ def quantize_oq_streaming(
                 logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
+    if kind == "minicpm_jev":
+        # The precision-sensitive binary head is tiny; match mlx-vlm's policy.
+        config["_oq_non_quantizable"].add("score")
     config["_oq_sensitivity_map"] = {str(k): v for k, v in sensitivity_map.items()}
     logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
 
@@ -13203,6 +13216,8 @@ def _build_streaming_proxy_for_sensitivity(
             ) from e
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
+    if decision_kind(source, config) == "minicpm_jev":
+        config["_oq_non_quantizable"].add("score")
     config["_oq_use_budget_plan"] = False
     config["_oq_boost_map"] = {}
 

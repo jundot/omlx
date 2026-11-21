@@ -412,6 +412,8 @@ def to_systemone(request: DecisionRequest) -> dict:
     return {
         "model": request.model,
         "state": "\n\n".join(texts) if texts else "(see image)",
+        # Exact-text decision adapters validate the original part count.
+        "_text_parts": texts,
         "questions": questions,
         "images": images or None,
     }
