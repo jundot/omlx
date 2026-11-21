@@ -346,6 +346,14 @@ class CacheProbeRequest(BaseModel):
     - Hot SSD (in-RAM copy of SSD cache, ready to mount without disk read)
     - Disk SSD (persisted only, needs disk read to reuse)
     - Cold (fully uncached — would require full prefill)
+
+    When ``include_block_hashes`` is set, the response also carries the
+    chain-hashed block sequence (hex) the walk visited: the cached prefix
+    plus the first cold block (the next one prefill would materialise).
+    Consumers running the same engine build can use these to address
+    paged-SSD cache files directly (e.g. cross-node cache handoff); hashes
+    are deterministic for (model_name, parent, tokens), so equal prompts
+    yield equal chains.
     """
 
     model_id: str
@@ -353,6 +361,7 @@ class CacheProbeRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     thinking_budget: int | None = None
+    include_block_hashes: bool = False
 
 
 def _draft_path_is_unusable(value: str) -> bool:
@@ -8146,7 +8155,7 @@ async def probe_cache(
 
     total_tokens = len(token_ids)
     if total_tokens == 0:
-        return {
+        response: dict[str, Any] = {
             "model_id": request.model_id,
             "model_loaded": True,
             "total_tokens": 0,
@@ -8158,6 +8167,9 @@ async def probe_cache(
             "ssd_hit_tokens": 0,
             "cold_tokens": 0,
         }
+        if request.include_block_hashes:
+            response["block_hashes"] = []
+        return response
 
     # Compute chain-hashed block sequence.
     from ..cache.paged_cache import compute_block_hash
@@ -8178,6 +8190,7 @@ async def probe_cache(
     blocks_ssd_hot = 0
     blocks_ssd_disk = 0
     ssd_hit_tokens = 0
+    block_hashes: list[str] | None = [] if request.include_block_hashes else None
 
     parent_hash = b""
     total_blocks = (total_tokens + block_size - 1) // block_size
@@ -8195,6 +8208,8 @@ async def probe_cache(
             model_name=model_name,
         )
         parent_hash = block_hash
+        if block_hashes is not None:
+            block_hashes.append(block_hash.hex())
 
         in_ssd_hot = ssd_hot is not None and block_hash in ssd_hot
         in_ssd_disk = False
@@ -8216,7 +8231,7 @@ async def probe_cache(
     cached_blocks = blocks_ssd_hot + blocks_ssd_disk
     blocks_cold = max(total_blocks - cached_blocks, 0)
 
-    return {
+    response: dict[str, Any] = {
         "model_id": request.model_id,
         "model_loaded": True,
         "total_tokens": total_tokens,
@@ -8228,6 +8243,9 @@ async def probe_cache(
         "ssd_hit_tokens": ssd_hit_tokens,
         "cold_tokens": max(total_tokens - ssd_hit_tokens, 0),
     }
+    if block_hashes is not None:
+        response["block_hashes"] = block_hashes
+    return response
 
 
 # =============================================================================
