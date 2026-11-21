@@ -26,6 +26,7 @@ struct PerformanceScreen: View {
             SchedulerSection(vm: vm)
             MemoryLifecycleSection(vm: vm)
             CacheSection(vm: vm)
+            AdvancedSection(vm: vm)
 
             FooterBar(error: vm.lastError) {
                 Button(String(localized: "settings.button.reset_defaults",
@@ -426,6 +427,152 @@ private struct CacheSection: View {
                     width: .controlCompact
                 )
                 .disabled(!vm.cacheEnabled)
+            }
+        }
+    }
+}
+
+// MARK: - Advanced
+//
+// Rarely changed cache knobs, collapsed by default (same set as the web
+// dashboard's Settings → Advanced → Cache / GDN Cache Policy). Applied with
+// the screen's Apply button like every other row.
+
+private struct AdvancedSection: View {
+    @Bindable var vm: PerformanceScreenVM
+    @State private var expanded = false
+
+    /// Mirrors the web dashboard: buffer size and precision only matter when
+    /// GDN snapshots go to dedicated SSD files.
+    private var gdnSidecarControlsDisabled: Bool {
+        !vm.cacheEnabled || vm.hotCacheOnly || vm.gdnSnapshotStorage == "embedded"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            DisclosureSectionHeader(
+                title: String(localized: "performance.section.advanced",
+                              defaultValue: "Advanced",
+                              comment: "Disclosure header for the advanced performance settings"),
+                subtitle: String(localized: "performance.section.advanced.sub",
+                                 defaultValue: "Applying cache changes unloads loaded models; they reload on the next request.",
+                                 comment: "Subtitle for the advanced performance settings"),
+                isExpanded: $expanded
+            )
+
+            if expanded {
+                ListGroup {
+                    Row(
+                        label: String(localized: "performance.advanced.hot_cache_write_through",
+                                      defaultValue: "Write-Through Hot Cache",
+                                      comment: "Row label for the hot cache write-through toggle"),
+                        sublabel: String(localized: "performance.advanced.hot_cache_write_through.sub",
+                                         defaultValue: "Keep blocks in RAM and write them to SSD immediately. Old sessions survive restarts and crashes; recent sessions resume at RAM speed.",
+                                         comment: "Sublabel for the hot cache write-through toggle")
+                    ) {
+                        RowSwitch(isOn: $vm.hotCacheWriteThrough)
+                    }
+                    Row(
+                        label: String(localized: "performance.advanced.ane_compile_cache",
+                                      defaultValue: "Reuse Compiled ANE Programs",
+                                      comment: "Row label for the ANE compile cache toggle"),
+                        sublabel: String(localized: "performance.advanced.ane_compile_cache.sub",
+                                         defaultValue: "Keep the ANE programs macOS compiles for Qwen prefill so later loads reuse them. Cuts repeat load time. May require a server restart to take effect.",
+                                         comment: "Sublabel for the ANE compile cache toggle"),
+                        isLast: true
+                    ) {
+                        RowSwitch(isOn: $vm.aneCompileCache)
+                    }
+                }
+
+                SectionHeader(
+                    String(localized: "performance.section.gdn_cache",
+                           defaultValue: "GDN Cache Policy",
+                           comment: "Section header for the GDN cache policy rows"),
+                    subtitle: String(localized: "performance.section.gdn_cache.sub",
+                                     defaultValue: "Models with Gated DeltaNet (GDN) layers need an extra state snapshot to resume cached prompts without recomputing them.",
+                                     comment: "Subtitle for the GDN cache policy section")
+                )
+
+                ListGroup {
+                    Row(
+                        label: String(localized: "performance.gdn.snapshot_storage",
+                                      defaultValue: "Snapshot Storage",
+                                      comment: "Row label for the GDN snapshot storage picker"),
+                        sublabel: String(localized: "performance.gdn.snapshot_storage.sub",
+                                         defaultValue: "Auto uses separate SSD files when SSD cache is enabled, otherwise stores snapshots with the KV cache. Dedicated SSD Sidecar requires Hot Cache Only to be off.",
+                                         comment: "Sublabel for the GDN snapshot storage picker")
+                    ) {
+                        Popup(
+                            selection: $vm.gdnSnapshotStorage,
+                            width: .controlMedium,
+                            options: [
+                                ("auto", String(localized: "performance.gdn.snapshot_storage.auto",
+                                                defaultValue: "Auto (recommended)",
+                                                comment: "GDN snapshot storage option: automatic")),
+                                ("ssd_sidecar", String(localized: "performance.gdn.snapshot_storage.ssd_sidecar",
+                                                       defaultValue: "Dedicated SSD Sidecar",
+                                                       comment: "GDN snapshot storage option: separate SSD files")),
+                                ("embedded", String(localized: "performance.gdn.snapshot_storage.embedded",
+                                                    defaultValue: "With KV Cache",
+                                                    comment: "GDN snapshot storage option: stored with the KV cache blocks")),
+                            ]
+                        )
+                    }
+                    Row(
+                        label: String(localized: "performance.gdn.pending_write_limit",
+                                      defaultValue: "SSD Write Buffer",
+                                      comment: "Row label for the GDN SSD write buffer size"),
+                        sublabel: String(localized: "performance.gdn.pending_write_limit.sub",
+                                         defaultValue: "Maximum RAM for snapshots waiting to be written to SSD. When full, cache writes pause until space frees up.",
+                                         comment: "Sublabel for the GDN SSD write buffer size")
+                    ) {
+                        TextInput(
+                            text: $vm.gdnSsdPendingMaxSize,
+                            placeholder: "512MB",
+                            mono: true,
+                            width: .controlCompact
+                        )
+                        .disabled(gdnSidecarControlsDisabled)
+                    }
+                    Row(
+                        label: String(localized: "performance.gdn.sidecar_precision",
+                                      defaultValue: "SSD Snapshot Precision",
+                                      comment: "Row label for the GDN SSD snapshot precision picker"),
+                        sublabel: String(localized: "performance.gdn.sidecar_precision.sub",
+                                         defaultValue: "Precision of GDN state stored in SSD files. FP32 is exact; lower precision uses less space but adds reconstruction error.",
+                                         comment: "Sublabel for the GDN SSD snapshot precision picker"),
+                        warning: vm.gdnSidecarPrecision == "fp32"
+                            ? nil
+                            : String(localized: "performance.gdn.sidecar_precision.warning",
+                                     defaultValue: "Reduced precision can change greedy outputs, break bit-level reproducibility, and reduce output quality. Use FP32 unless you accept this trade-off.",
+                                     comment: "Warning under the GDN snapshot precision picker when a reduced precision is selected"),
+                        isLast: true
+                    ) {
+                        Popup(
+                            selection: $vm.gdnSidecarPrecision,
+                            width: .controlMedium,
+                            options: [
+                                ("fp32", String(localized: "performance.gdn.sidecar_precision.fp32",
+                                                defaultValue: "FP32 (exact, recommended)",
+                                                comment: "GDN snapshot precision option: FP32")),
+                                ("rht_int16", String(localized: "performance.gdn.sidecar_precision.rht_int16",
+                                                     defaultValue: "RHT + int16",
+                                                     comment: "GDN snapshot precision option: RHT + int16")),
+                                ("bf16", String(localized: "performance.gdn.sidecar_precision.bf16",
+                                                defaultValue: "BF16",
+                                                comment: "GDN snapshot precision option: BF16")),
+                                ("int8", String(localized: "performance.gdn.sidecar_precision.int8",
+                                                defaultValue: "Int8 (row-wise)",
+                                                comment: "GDN snapshot precision option: int8")),
+                                ("rht_int8", String(localized: "performance.gdn.sidecar_precision.rht_int8",
+                                                    defaultValue: "RHT + int8 (row-wise)",
+                                                    comment: "GDN snapshot precision option: RHT + int8")),
+                            ]
+                        )
+                        .disabled(gdnSidecarControlsDisabled)
+                    }
+                }
             }
         }
     }
