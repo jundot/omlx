@@ -4,6 +4,7 @@ import SwiftUI
 @Observable
 final class ModelsScreenVM {
     private(set) var allModels: [ModelDTO] = []
+    var librarySearch = ""
     var lastError: String?
     /// Library row the user just clicked "trash" on; non-nil drives the
     /// confirmation dialog. Cleared on cancel or after delete completes.

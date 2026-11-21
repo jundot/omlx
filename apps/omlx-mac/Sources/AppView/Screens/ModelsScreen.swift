@@ -26,6 +26,7 @@ struct ModelsScreen: View {
 
             LibrarySection(
                 models: vm.libraryModels,
+                searchText: $vm.librarySearch,
                 isModelLoaded: { id in vm.activeModels.contains(where: { $0.id == id }) },
                 deletingID: vm.deletingID,
                 updates: vm,
@@ -188,6 +189,7 @@ private struct ActiveBadge: View {
 
 private struct LibrarySection: View {
     let models: [ModelDTO]
+    @Binding var searchText: String
     let isModelLoaded: (String) -> Bool
     let deletingID: String?
     let updates: ModelsScreenVM
@@ -199,18 +201,27 @@ private struct LibrarySection: View {
     let onToggleFavorite: (String, Bool) -> Void
 
     @Environment(\.omlxTheme) private var theme
+    @FocusState private var searchFocused: Bool
 
     private var totalSize: Int64 {
         models.reduce(0) { $0 + $1.estimatedSize }
     }
 
     var body: some View {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let filteredModels = filterModelsByName(models, query: query)
+        let subtitle = query.isEmpty
+            ? String(localized: "models.library.subtitle",
+                     defaultValue: "Models: \(models.count) · \(formatBytes(totalSize)) on disk",
+                     comment: "Subtitle for the Model Library section. Placeholders: model count, total bytes on disk")
+            : String(localized: "models.library.search.subtitle",
+                     defaultValue: "Models: \(filteredModels.count) of \(models.count) · \(formatBytes(totalSize)) on disk",
+                     comment: "Subtitle while filtering the Model Library. Placeholders: matching count, total model count, total bytes on disk")
+
         SectionHeader(String(localized: "models.library.title",
                                     defaultValue: "Model Library",
                                     comment: "Section heading for the on-disk model library"),
-                      subtitle: String(localized: "models.library.subtitle",
-                                       defaultValue: "Models: \(models.count) · \(formatBytes(totalSize)) on disk",
-                                       comment: "Subtitle for the Model Library section. Placeholders: model count, total bytes on disk")) {
+                      subtitle: subtitle) {
             Button(action: onCheckUpdates) {
                 HStack(spacing: 5) {
                     if updates.isCheckingUpdates {
@@ -224,6 +235,43 @@ private struct LibrarySection: View {
             .buttonStyle(.omlx(.normal, size: .small))
             .disabled(updates.isCheckingUpdates || models.isEmpty)
         }
+
+        HStack(spacing: 8) {
+            let searchLabel = String(localized: "models.library.search.placeholder",
+                                     defaultValue: "Search models…",
+                                     comment: "Placeholder and accessibility label for the Model Library search field")
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(theme.textTertiary)
+                .accessibilityHidden(true)
+            TextField(searchLabel, text: $searchText, prompt: Text(searchLabel))
+                .textFieldStyle(.plain)
+                .font(.omlxText(DesignTokens.FontSize.body))
+                .foregroundStyle(theme.text)
+                .focused($searchFocused)
+                .frame(maxWidth: .infinity)
+            Button(String(localized: "models.library.search.clear",
+                          defaultValue: "Clear model search",
+                          comment: "Accessibility label for the button that clears the Model Library search"),
+                   systemImage: "xmark.circle.fill") {
+                searchText = ""
+                searchFocused = true
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.omlx(.plain, size: .small))
+            .opacity(searchText.isEmpty ? 0 : 1)
+            .disabled(searchText.isEmpty)
+            .accessibilityHidden(searchText.isEmpty)
+        }
+        .padding(.leading, 8)
+        .padding(.vertical, 2)
+        .background(theme.inputBg, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(searchFocused ? theme.inputBorderFocus : theme.inputBorder,
+                              lineWidth: searchFocused ? 2 : 0.5)
+        }
+        .padding(.horizontal, 28)
+        .padding(.bottom, 8)
 
         if let status = updates.updateStatus {
             Text(status)
@@ -253,11 +301,21 @@ private struct LibrarySection: View {
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 16)
                 }
+            } else if filteredModels.isEmpty {
+                FreeRow(isLast: true) {
+                    Text(String(localized: "models.library.search.empty",
+                                defaultValue: "No matching models",
+                                comment: "Empty-state message when the Model Library search has no matches"))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
+                        .foregroundStyle(theme.textTertiary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 16)
+                }
             } else {
-                ForEach(Array(models.enumerated()), id: \.element.id) { idx, m in
+                ForEach(Array(filteredModels.enumerated()), id: \.element.id) { idx, m in
                     LibraryRow(
                         model: m,
-                        isLast: idx == models.count - 1,
+                        isLast: idx == filteredModels.count - 1,
                         isLoaded: isModelLoaded(m.id),
                         deletingID: deletingID,
                         updates: updates,
@@ -593,6 +651,16 @@ struct ModelIconTile: View {
         case "audio_sts": return "person.wave.2"
         default: return "text.alignleft"
         }
+    }
+}
+
+func filterModelsByName(_ models: [ModelDTO], query: String) -> [ModelDTO] {
+    let query = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !query.isEmpty else { return models }
+    return models.filter {
+        $0.id.lowercased().contains(query)
+            || $0.displayTitle.lowercased().contains(query)
+            || ($0.displayAlias ?? "").lowercased().contains(query)
     }
 }
 
