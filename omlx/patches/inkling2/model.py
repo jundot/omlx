@@ -401,6 +401,31 @@ def _dynamic_conv(x, dyn, static_w, state, heads, scale):
     return out.astype(x.dtype), xp
 
 
+def _project_slice(
+    proj: nn.Module, x: mx.array, start: int, end: int | None
+) -> mx.array:
+    """Apply rows ``[start:end]`` of a plain Linear or QuantizedLinear."""
+    if type(proj) is nn.QuantizedLinear:
+        biases = proj.get("biases")
+        out = mx.quantized_matmul(
+            x,
+            proj.weight[start:end],
+            scales=proj.scales[start:end],
+            biases=biases[start:end] if biases is not None else None,
+            transpose=True,
+            group_size=proj.group_size,
+            bits=proj.bits,
+            mode=proj.mode,
+        )
+        if "bias" in proj:
+            out = out + proj.bias[start:end]
+        return out
+    w = proj.weight[start:end]
+    if "bias" in proj:
+        return mx.addmm(proj.bias[start:end], x, w.T)
+    return x @ w.T
+
+
 class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -429,6 +454,7 @@ class Inkling2Attention(nn.Module):
             self.in_proj = nn.Linear(h, sum(splits), bias=False)
             self.k_conv = mx.zeros((self.dkv, self.conv_k))
             self.v_conv = mx.zeros((self.dkv, self.conv_k))
+            self._tail_cuts = [dr, dr + dq]
         else:
             # q | r | gate | sink from the q input; k and v (plus their dynamic
             # conv taps) from their own attention-residual inputs.
@@ -470,9 +496,18 @@ class Inkling2Attention(nn.Module):
         if self.sliding:
             if xk is None:
                 q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
+            elif type(self.in_proj) in (nn.Linear, nn.QuantizedLinear):
+                # Looped passes give q, k and v their own inputs; project only
+                # the row slices of ``in_proj`` that each input uses.
+                c0, c1, c2 = self._cuts[0], self._cuts[1], self._cuts[2]
+                q = _project_slice(self.in_proj, xq, 0, c0)
+                k = _project_slice(self.in_proj, xk, c0, c1)
+                v = _project_slice(self.in_proj, xv, c1, c2)
+                tail = _project_slice(self.in_proj, xq, c2, None)
+                r, gate, sink = mx.split(tail, self._tail_cuts, axis=-1)
             else:
-                # Looped passes give q, k and v their own inputs; one stacked
-                # projection serves all three.
+                # Wrapped projections (e.g. LoRALinear) fall back to the full
+                # stacked call so the wrapper's forward is preserved.
                 pq, pk, pv = mx.split(
                     self.in_proj(mx.concatenate([xq, xk, xv], axis=0)), 3, axis=0
                 )

@@ -804,3 +804,220 @@ def test_inkling2_vision_encodes_images_independently_and_splices_tokens():
     assert mx.allclose(embeds[0, 1:3], alone.astype(embeds.dtype))
     with pytest.raises(ValueError):
         model.embed_inputs(mx.array([[image, 1]]), second, [[1, 1, 2]])
+
+
+def _wrap_in_proj(inner, *, lora=False):
+    import mlx.nn as nn
+
+    if not lora:
+
+        class _PassthroughProj(nn.Module):
+            def __init__(self, wrapped):
+                super().__init__()
+                self.wrapped = wrapped
+
+            def __call__(self, x):
+                return self.wrapped(x)
+
+        return _PassthroughProj(inner)
+
+    in_features = inner.weight.shape[1] if type(inner) is nn.Linear else 128
+    out_features = inner.weight.shape[0]
+    mx.random.seed(99)
+    a = (mx.random.normal((4, in_features)) * 0.02).astype(mx.bfloat16)
+    b = (mx.random.normal((4, out_features)) * 0.02).astype(mx.bfloat16)
+
+    class _LoRAProj(nn.Module):
+        def __init__(self, wrapped, lora_a, lora_b):
+            super().__init__()
+            self.wrapped = wrapped
+            self.lora_a = lora_a
+            self.lora_b = lora_b
+            self.calls = 0
+
+        def __call__(self, x):
+            self.calls += 1
+            return self.wrapped(x) + ((x @ self.lora_a.T) @ self.lora_b).astype(x.dtype)
+
+    return _LoRAProj(inner, a, b)
+
+
+@pytest.mark.parametrize(
+    "dtype, bias, quant",
+    [
+        (mx.float32, False, None),
+        (mx.bfloat16, False, None),
+        (mx.float16, False, None),
+        (mx.bfloat16, True, None),
+        (mx.bfloat16, False, {"group_size": 64, "bits": 8, "mode": "affine"}),
+        (mx.bfloat16, False, {"group_size": 64, "bits": 4, "mode": "affine"}),
+        (mx.bfloat16, False, {"group_size": 32, "bits": 8, "mode": "mxfp8"}),
+        (mx.bfloat16, False, {"group_size": 16, "bits": 4, "mode": "nvfp4"}),
+    ],
+    ids=["fp32", "bf16", "fp16", "bf16-bias", "affine8", "affine4", "mxfp8", "nvfp4"],
+)
+def test_inkling2_sliding_loop_projection_matches_stacked(
+    strict_math_device, dtype, bias, quant
+):
+    import mlx.nn as nn
+
+    from omlx.patches.inkling2.model import Inkling2Attention, TextArgs
+
+    args = TextArgs(
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        swa_num_attention_heads=4,
+        swa_num_key_value_heads=2,
+        swa_head_dim=32,
+        sliding_window_size=8,
+        rel_extent=8,
+        d_rel=8,
+        local_layer_ids=[0],
+    )
+    attn = Inkling2Attention(args, layer_idx=0)
+    mx.random.seed(11)
+    if bias:
+        attn.in_proj = nn.Linear(
+            args.hidden_size, attn.in_proj.weight.shape[0], bias=True
+        )
+    for p_name, arr in [
+        ("in_proj.weight", mx.random.normal(attn.in_proj.weight.shape) * 0.05),
+        ("k_conv", mx.random.normal(attn.k_conv.shape) * 0.1),
+        ("v_conv", mx.random.normal(attn.v_conv.shape) * 0.1),
+        ("q_scale", mx.random.normal(attn.q_scale.shape) * 0.1 + 1.0),
+        ("r_scale", mx.random.normal(attn.r_scale.shape) * 0.1 + 1.0),
+        ("rel_proj", mx.random.normal(attn.rel_proj.shape) * 0.1),
+    ]:
+        parts = p_name.split(".")
+        target = attn
+        for part in parts[:-1]:
+            target = getattr(target, part)
+        setattr(target, parts[-1], arr.astype(dtype))
+    if bias:
+        attn.in_proj.bias = (
+            mx.random.normal(attn.in_proj.bias.shape) * 0.05
+        ).astype(dtype)
+    if quant is not None:
+        attn.in_proj = nn.QuantizedLinear.from_linear(attn.in_proj, **quant)
+
+    stacked = _wrap_in_proj(attn.in_proj)
+    for b, length in ((1, 1), (1, 8), (2, 5), (1, 20)):
+        xq = (mx.random.normal((b, length, args.hidden_size)) * 0.2).astype(dtype)
+        xk = (mx.random.normal((b, length, args.hidden_size)) * 0.2).astype(dtype)
+        xv = (mx.random.normal((b, length, args.hidden_size)) * 0.2).astype(dtype)
+        ks = mx.random.normal((b, args.sconv_kernel_size - 1, attn.dkv)) * 0.1
+        vs = mx.random.normal((b, args.sconv_kernel_size - 1, attn.dkv)) * 0.1
+
+        got = attn.project(xq, xk, xv, ks, vs, None)
+        orig = attn.in_proj
+        attn.in_proj = stacked
+        try:
+            expected = attn.project(xq, xk, xv, ks, vs, None)
+        finally:
+            attn.in_proj = orig
+        for g, e in zip(got, expected):
+            diff = mx.abs(g.astype(mx.float32) - e.astype(mx.float32)).max().item()
+            assert diff < 1e-5
+
+    # Wrapped projections (e.g. LoRALinear) must stay on the wrapper forward.
+    base_proj = attn.in_proj
+    lora_proj = _wrap_in_proj(base_proj, lora=True)
+    xq = (mx.random.normal((1, 4, args.hidden_size)) * 0.2).astype(dtype)
+    xk = (mx.random.normal((1, 4, args.hidden_size)) * 0.2).astype(dtype)
+    xv = (mx.random.normal((1, 4, args.hidden_size)) * 0.2).astype(dtype)
+    ks = mx.random.normal((1, args.sconv_kernel_size - 1, attn.dkv)) * 0.1
+    vs = mx.random.normal((1, args.sconv_kernel_size - 1, attn.dkv)) * 0.1
+    got_base = attn.project(xq, xk, xv, ks, vs, None)
+    attn.in_proj = lora_proj
+    got_lora = attn.project(xq, xk, xv, ks, vs, None)
+    assert lora_proj.calls == 1
+    pq = mx.split(lora_proj(mx.concatenate([xq, xk, xv], axis=0)), 3, axis=0)[0]
+    _, _, _, _, exp_gate, exp_sink = mx.split(pq, attn._cuts, axis=-1)
+    assert mx.abs(got_lora[4].astype(mx.float32) - exp_gate.astype(mx.float32)).max().item() < 1e-6
+    assert mx.abs(got_lora[5].astype(mx.float32) - exp_sink.astype(mx.float32)).max().item() < 1e-6
+    assert mx.abs(got_lora[0].astype(mx.float32) - got_base[0].astype(mx.float32)).max().item() > 1e-3
+
+
+@pytest.mark.parametrize("quantize_in_proj", [False, True], ids=["bf16", "affine8"])
+def test_inkling2_loop_sliced_projection_text_and_image_parity(
+    strict_math_device, monkeypatch, quantize_in_proj
+):
+    import mlx.nn as nn
+
+    from omlx.patches.inkling2 import model as inkling2
+
+    def build_model():
+        m = _inkling2_tiny(**_TINY_LOOP, vision=_TINY_VISION)
+        # Keep image_token_id within the tiny vocab_size=320 on CPU.
+        m.args.image_token_id = 299
+        if quantize_in_proj:
+            for layer in m.model.layers:
+                if layer.sliding:
+                    layer.attn.in_proj = nn.QuantizedLinear.from_linear(
+                        layer.attn.in_proj, group_size=64, bits=8
+                    )
+            mx.eval(m.parameters())
+        return m
+
+    model_sliced = build_model()
+    model_stacked = build_model()
+    for layer in model_stacked.model.layers:
+        if layer.sliding:
+            layer.attn.in_proj = _wrap_in_proj(layer.attn.in_proj)
+
+    mx.random.seed(123)
+    text_ids = mx.random.randint(0, 300, (1, 29))
+    img_tok = model_sliced.args.image_token_id
+    mm_short = mx.array([[5, img_tok, img_tok, 9, 11, 13, 15, 17, 19, 21, 23, 25]])
+    mm_long = mx.concatenate([mm_short, mx.random.randint(0, 300, (1, 8))], axis=1)
+    pixels = mx.random.normal((2, 8, 8, 3))
+    grid = [[1, 1, 2]]
+
+    def run_all(m):
+        # Text-only: eager prefill (>16), compiled verify (<=16), compiled decode (1).
+        text_full = m(text_ids[:, :20])[..., :300]
+        t_cache = m.make_cache()
+        t_pre = m(text_ids[:, :20], cache=t_cache)[..., :300]
+        t_ver = m(text_ids[:, 20:28], cache=t_cache)[..., :300]
+        t_dec = m(text_ids[:, 28:29], cache=t_cache)[..., :300]
+
+        # Multimodal (text + image): compiled (<=16), eager (>16), and text decode.
+        mm_compiled = m(mm_short, pixel_values=pixels, image_grid_thw=grid)[..., :300]
+        mm_cache = m.make_cache()
+        mm_eager = m(
+            mm_long, cache=mm_cache, pixel_values=pixels, image_grid_thw=grid
+        )[..., :300]
+        mm_dec = m(mx.array([[42]]), cache=mm_cache)[..., :300]
+        return text_full, t_pre, t_ver, t_dec, mm_compiled, mm_eager, mm_dec
+
+    slice_calls = 0
+    orig_project_slice = inkling2._project_slice
+
+    def counting_slice(proj, x, start, end):
+        nonlocal slice_calls
+        slice_calls += 1
+        return orig_project_slice(proj, x, start, end)
+
+    monkeypatch.setattr(inkling2, "_project_slice", counting_slice)
+
+    # Eager forward on looped model hits _project_slice on the 5 core sliding
+    # layers across passes 1 and 2 (5 * 2 * 4 = 40 calls); pass 0 skips it.
+    model_sliced(text_ids[:, :20])
+    assert slice_calls == 40
+
+    # Plain non-looped model (pass 0 only, xk is None) never calls _project_slice.
+    slice_calls = 0
+    _inkling2_tiny(vision=_TINY_VISION)(text_ids[:, :20])
+    assert slice_calls == 0
+
+    sliced_out = run_all(model_sliced)
+
+    slice_calls = 0
+    stacked_out = run_all(model_stacked)
+    assert slice_calls == 0
+
+    for got, expected in zip(sliced_out, stacked_out):
+        assert mx.abs(got - expected).max().item() < 1e-5
