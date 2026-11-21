@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.omlx.secure-server-helper</string>
+	<!-- Path is relative to the bundle: the daemon binary ships inside oMLX.app
+	     so SMAppService can register and sign it as part of the app. -->
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/oMLXSecureServerHelper</string>
+	<key>MachServices</key>
+	<dict>
+		<key>com.omlx.secure-server-helper</key>
+		<true/>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- The sandboxed server is spawned by this daemon (through sudo, so that
+	     its sockets carry the sandbox uid). launchd kills a job's process group
+	     when the job exits unless told otherwise, which would take the running
+	     server down every time this daemon is restarted for an update. -->
+	<key>AbandonProcessGroup</key>
+	<true/>
+</dict>
+</plist>

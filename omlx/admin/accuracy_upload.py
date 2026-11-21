@@ -24,6 +24,7 @@ from typing import Any
 import requests
 
 from .._version import __version__
+from ..secure_mode import is_enabled as _secure_mode_enabled
 from ..utils.hardware import (
     compute_owner_hash,
     get_chip_name,
@@ -235,6 +236,9 @@ async def upload_intelligence_result(
     run: Any, ctx: dict, result_data: dict
 ) -> dict:
     """Upload one suite result. Never raises; returns the outcome dict."""
+    if _secure_mode_enabled():
+        # Secure Server mode: nothing leaves the box, so don't even try.
+        return {"skipped": "secure_server"}
     if result_data.get("total", 0) < _MIN_UPLOAD_QUESTIONS:
         return {"skipped": "min_questions"}
     if ctx.get("lora_adapter"):
