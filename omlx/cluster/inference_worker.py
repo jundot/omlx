@@ -1639,7 +1639,6 @@ def run_worker(args: argparse.Namespace) -> int:
                     ),
                     engram_ssd_offload=assignment.ssd_weight_bytes > 0,
                     tensor_shard_options=_tensor_shard_options(execution, assignment),
-                    tensor_shard_options=_tensor_shard_options(execution),
                     moe_expert_offload_resident_fraction=(
                         moe_expert_offload_resident_fraction
                     ),

@@ -516,29 +516,35 @@ def test_cluster_plan_prices_the_saved_moe_expert_offload_setting(
     )
     monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
     monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
-    body = {
-        "model_path": str(tmp_path),
-        "nodes": [
-            {"node_id": "local", "capacity_bytes": 128 * gib, "reserve_bytes": 2 * gib}
+    # Upstream's API refactor retired POST /plan in favour of /autoconfigure
+    # (which needs 2+ hosts). The intent here is the planner's pricing of the
+    # saved expert-offload setting, so drive the planner entry point directly.
+    request = routes.ClusterPlanRequest(
+        model_path=str(tmp_path),
+        layer_count=4,
+        nodes=[
+            routes.ClusterPlanNodeRequest(
+                node_id="local", capacity_bytes=128 * gib, reserve_bytes=2 * gib
+            )
         ],
-    }
+    )
 
-    offloaded = _client().post("/admin/api/cluster/plan", json=body)
+    offloaded = routes._create_cluster_plan(request)
     saved["v41"].moe_expert_offload_enabled = False
-    resident = _client().post("/admin/api/cluster/plan", json=body)
+    resident = routes._create_cluster_plan(request)
 
-    assert offloaded.status_code == resident.status_code == 200
-    assignment = offloaded.json()["assignments"][0]
-    assert assignment["moe_expert_offload_resident_fraction"] == 0.5
-    assert assignment["moe_offload_weight_bytes"] == 2 * gib
-    assert assignment["layer_weight_bytes"] == 16 * gib
-    assert assignment["planned_weight_bytes"] == gib + 16 * gib - 2 * gib
+    assignment = offloaded.assignments[0]
+    assert resident.assignments[0].moe_offload_weight_bytes == 0
+    assert assignment.moe_expert_offload_resident_fraction == 0.5
+    assert assignment.moe_offload_weight_bytes == 2 * gib
+    assert assignment.layer_weight_bytes == 16 * gib
+    assert assignment.planned_weight_bytes == gib + 16 * gib - 2 * gib
     assert calls == [(str(tmp_path), 0.5, False)]
 
-    untouched = resident.json()["assignments"][0]
-    assert untouched["layer_weight_bytes"] == 16 * gib
-    assert untouched["planned_weight_bytes"] == gib + 16 * gib
-    assert "moe_offload_weight_bytes" not in untouched
+    untouched = resident.assignments[0]
+    assert untouched.layer_weight_bytes == 16 * gib
+    assert untouched.planned_weight_bytes == gib + 16 * gib
+    assert untouched.moe_offload_weight_bytes == 0
 
 def test_moe_offload_allows_deepseek_v41_with_mtp(tmp_path, monkeypatch):
     from omlx.cluster.planner import ModelLayout

@@ -45,6 +45,7 @@ from .deployment import (
     validate_model_path_map,
     validate_ssh_target,
 )
+from .identity import get_node_identity
 from .launch import (
     DistributedLaunchError,
     DistributedTeardownError,
