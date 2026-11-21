@@ -27,6 +27,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
+from . import fast_decode as _fd
 from . import kernels
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
@@ -279,6 +280,8 @@ class Inkling2Experts(nn.Module):
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
+        if _fd.part("moe") and x.shape[0] <= 8:
+            return self._call_fused(x, inds, weights)
         xe = mx.expand_dims(x, (-2, -3))
         do_sort = inds.size >= 64
         idx = inds
@@ -299,6 +302,56 @@ class Inkling2Experts(nn.Module):
             weights = weights * s2
         out = mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
         return out.astype(x.dtype)
+
+    def _call_fused(self, x: mx.array, inds: mx.array, weights: mx.array):
+        if (
+            x.shape[0] == 1
+            and inds.size < 64
+            and _fd.part("nvfp4_moe")
+            and _fd.nvfp4_decode_eligible(self)
+        ):
+            # Single-token decode: one launch for gate+up+SwiGLU and one for
+            # down+combine, instead of two gather_qmm plus the epilogue.
+            return _fd.moe_decode_nvfp4(x, self, inds, weights)
+        """Short-row (decode/verify) path: fused epilogue launches.
+
+        Mirrors ``__call__`` shape for shape: the NVFP4 post-scale is folded
+        into the activation kernel, the activation is rounded to the
+        activation dtype exactly as the reference does, and the score-weighted
+        k-sum runs in one launch together with the per-expert down post-scale.
+        The two gather shapes are the reference's own (4-D when unsorted, the
+        flattened 3-D verify layout when sorted).
+        """
+        rows, k = inds.shape
+        do_sort = inds.size >= 64
+        xe = mx.expand_dims(x, (-2, -3))
+        idx = inds
+        inv = None
+        if do_sort:
+            xe, idx, inv = _gather_sort(xe, inds)
+            slots = (xe.shape[0], 1)
+            y = self.w13(xe, idx, True)
+            y = y.reshape(slots[0], 1, y.shape[-1])
+        else:
+            slots = (rows, k)
+            y = self.w13(xe, idx, False)
+            y = y.reshape(slots[0], slots[1], y.shape[-1])
+        s13 = self.w13.post_scale(idx)
+        s13 = mx.ones(slots, dtype=mx.float32) if s13 is None else s13.reshape(slots)
+        act = _fd.swiglu_scaled(
+            y, s13, float(self._gcap.item()), float(self._ucap.item())
+        )
+        if do_sort:
+            z = self.w2(act, idx, True)
+            z = z.reshape(slots[0], z.shape[-1])
+            z = _scatter_unsort(z, inv, inds.shape)
+        else:
+            z = self.w2(act[:, :, None, :], idx, False)
+            z = z.reshape(rows, k, z.shape[-1])
+        s2 = self.w2.post_scale(inds)
+        if s2 is None:
+            s2 = mx.ones((rows, k), dtype=mx.float32)
+        return _fd.moe_combine(z, s2, weights)
 
 
 class Inkling2MoE(nn.Module):
@@ -350,6 +403,8 @@ def _mix_messages(x, message, down, gain_forget):
     """
     n, b, length, hidden = x.shape
     rows = b * length
+    if _fd.part("msg") and rows <= 8:
+        return _messages_fused(x, message, down, gain_forget)
     # Like the reference, the down projection takes BF16-rounded inputs,
     # accumulates in FP32 and rounds once. It runs as a batched matmul over
     # the halves: a single [rows, 2H] x [2H, r] matmul gets a row-count
@@ -362,6 +417,21 @@ def _mix_messages(x, message, down, gain_forget):
     gain = mx.tanh(gates[..., :hidden])
     forget = mx.tanh(gates[..., hidden:])
     return (1.0 - forget) * x + gain * message
+
+
+def _messages_fused(x, message, down, gain_forget):
+    """``_mix_messages`` with the RMS, the bf16 round-trip and the gated lerp
+    each folded into one launch (reference arithmetic, same rounding points)."""
+    n, b, length, hidden = x.shape
+    rows = b * length
+    z = _fd.messages_prep(
+        x.reshape(n, rows, hidden), message.reshape(n, rows, hidden)
+    ).astype(mx.float32)
+    low = _fd.messages_low(z.reshape(2 * n, rows, hidden) @ down.reshape(2 * n, hidden, -1), rows)
+    gates = low.reshape(n, rows, -1) @ gain_forget
+    return _fd.messages_apply(
+        x.reshape(n, rows, hidden), message.reshape(n, rows, hidden), gates
+    ).reshape(n, b, length, hidden)
 
 
 def _static_conv(x, w, state, scale):
@@ -467,6 +537,7 @@ class Inkling2Attention(nn.Module):
         relative bias [B, L, H, R], gate, sink and the next conv states."""
         b, length, _ = xq.shape
         dkv = self.dkv
+        fast = _fd.part("conv") and length <= _SHORT_WINDOW and b == 1
         if self.sliding:
             if xk is None:
                 q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
@@ -479,8 +550,17 @@ class Inkling2Attention(nn.Module):
                 q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
                 k = pk[..., self._cuts[0] : self._cuts[1]]
                 v = pv[..., self._cuts[1] : self._cuts[2]]
-            k, ks = _static_conv(k, self.k_conv, ks, self._sconv_scale)
-            v, vs = _static_conv(v, self.v_conv, vs, self._sconv_scale)
+            if fast:
+                k, ks_t, ks_w = _fd.conv_short(k, self.k_conv, ks, self._sconv_scale)
+                v, vs_t, vs_w = _fd.conv_short(v, self.v_conv, vs, self._sconv_scale)
+                # Single token: the trimmed state is all the cache needs.
+                # A verify window keeps the padded window so MTP rollback can
+                # re-cut the short-conv state.
+                ks = ks_t if length == 1 else ks_w
+                vs = vs_t if length == 1 else vs_w
+            else:
+                k, ks = _static_conv(k, self.k_conv, ks, self._sconv_scale)
+                v, vs = _static_conv(v, self.v_conv, vs, self._sconv_scale)
         else:
             q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
             kp = self.k_proj(xk)
@@ -501,19 +581,42 @@ class Inkling2Attention(nn.Module):
                 self.n_kv,
                 self._dconv_scale,
             )
-        q = _l2_clip(
-            q.reshape(b, length, self.n_heads, self.head_dim),
-            self.q_scale,
-            self._qk_clip,
-        )
-        k = _l2_clip(
-            k.reshape(b, length, self.n_kv, self.head_dim), self._one, self._qk_clip
-        )
-        v = _unit_rms(v.reshape(b, length, self.n_kv, self.head_dim).astype(mx.float32))
-        v = v.astype(xq.dtype)
-        r = _l2_clip(
-            r.reshape(b, length, self.n_heads, self.d_rel), self.r_scale, self._r_clip
-        )
+        if fast and _fd.part("clip"):
+            rows = b * length
+            q = _fd.l2_clip_heads(
+                q.reshape(rows, self.n_heads, self.head_dim),
+                self.q_scale,
+                float(self._qk_clip.item()),
+            ).reshape(b, length, self.n_heads, self.head_dim)
+            k = _fd.l2_clip_heads(
+                k.reshape(rows, self.n_kv, self.head_dim),
+                self._one,
+                float(self._qk_clip.item()),
+            ).reshape(b, length, self.n_kv, self.head_dim)
+            v = _fd.unit_rms_heads(v.reshape(rows, self.n_kv, self.head_dim)).reshape(
+                b, length, self.n_kv, self.head_dim
+            )
+            r = _fd.l2_clip_heads(
+                r.reshape(rows, self.n_heads, self.d_rel),
+                self.r_scale,
+                float(self._r_clip.item()),
+            ).reshape(b, length, self.n_heads, self.d_rel)
+        else:
+            q = _l2_clip(
+                q.reshape(b, length, self.n_heads, self.head_dim),
+                self.q_scale,
+                self._qk_clip,
+            )
+            k = _l2_clip(
+                k.reshape(b, length, self.n_kv, self.head_dim), self._one, self._qk_clip
+            )
+            v = _unit_rms(
+                v.reshape(b, length, self.n_kv, self.head_dim).astype(mx.float32)
+            )
+            v = v.astype(xq.dtype)
+            r = _l2_clip(
+                r.reshape(b, length, self.n_heads, self.d_rel), self.r_scale, self._r_clip
+            )
         if tau is not None:
             q = (q.astype(mx.float32) * tau).astype(q.dtype)
             r = (r.astype(mx.float32) * tau).astype(r.dtype)
@@ -533,6 +636,20 @@ class Inkling2Attention(nn.Module):
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
         left_padding = getattr(kv, "left_padding", None) if kv is not None else None
+        if (
+            _fd.part("mask")
+            and left_padding is None
+            and q.shape[0] == 1
+            and q.shape[2] == 1
+        ):
+            lo = max(0, k.shape[2] - self.window) if self.window else 0
+            if lo:
+                k = k[:, :, lo:, :]
+                v = v[:, :, lo:, :]
+            mask = _fd.decode_mask(rel, k.shape[2])
+            return mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=mask, sinks=sink[0, 0]
+            )
         return kernels.banded_sink_attention(
             q,
             k,
@@ -564,6 +681,8 @@ def _cumsum(xs):
 # the layer through compiled stages; longer prefill chunks stay eager, since
 # every new chunk length would otherwise retrace all layers.
 _COMPILED_MAX_TOKENS = 16
+# Longest query window that takes the fused decode/verify kernels.
+_SHORT_WINDOW = 8
 
 
 class Inkling2Layer(nn.Module):
@@ -634,7 +753,11 @@ class Inkling2Layer(nn.Module):
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
         a = self.attn.output(out, gate)
-        a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
+        if _fd.part("conv") and a.shape[1] <= _SHORT_WINDOW:
+            a, s2t, s2w = _fd.conv_short(a, self.attn_conv, s2, self._conv_scale)
+            s2 = s2t if a.shape[1] == 1 else s2w
+        else:
+            a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
         if self.is_boundary:
             residual = a.astype(mx.float32)
         else:
@@ -648,7 +771,11 @@ class Inkling2Layer(nn.Module):
                 self.loop_gain_forget[3:],
             )[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
-        m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
+        if _fd.part("conv") and m.shape[1] <= _SHORT_WINDOW:
+            m, s3t, s3w = _fd.conv_short(m, self.mlp_conv, s3, self._conv_scale)
+            s3 = s3t if m.shape[1] == 1 else s3w
+        else:
+            m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
         return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
 
     def __call__(self, h, blocks, cache=None, bank=None):
@@ -684,6 +811,11 @@ class Inkling2Layer(nn.Module):
                 conv._omlx_verify_xp = dict(enumerate(windows))
             keep = self._conv_k - 1
             for slot, window in enumerate(windows):
+                if window.shape[1] == keep:
+                    # The fused decode conv already returns exactly the next
+                    # state in a fresh buffer, so no copy is needed.
+                    conv[slot] = window
+                    continue
                 # A small copy, so the state does not pin the chunk's window.
                 conv[slot] = window[:, -keep:] * 1.0
         return h
