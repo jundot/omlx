@@ -581,7 +581,7 @@ function clusterWizard() {
         init() {
             if (this.pollTimer !== null) return;
             this.tick();
-            this.pollTimer = setInterval(() => this.tick(), CLUSTER_V2_POLL_MS);
+            this.pollTimer = setInterval(() => this.tick(), CLUSTER_POLL_MS);
             this.restoreClusterMode();
             this.loadAssistantSession();
             this.loadAssistantProbeSetting();
@@ -1029,8 +1029,8 @@ function clusterWizard() {
             }
             if (lastSize > 1) {
                 return {
-                    label: window.t('cluster.v2.batch.label_batched').replace('{n}', String(lastSize)),
-                    detail: window.t('cluster.v2.batch.batched_detail')
+                    label: window.t('cluster.batch.label_batched').replace('{n}', String(lastSize)),
+                    detail: window.t('cluster.batch.batched_detail')
                         .replace('{last}', String(lastSize))
                         .replace('{target}', String(target)),
                     tone: 'bg-green-50 border-green-200 text-green-700',
@@ -1075,16 +1075,16 @@ function clusterWizard() {
                 Number(metrics?.active_request_metrics_truncated || 0),
             );
             if (active > 0) {
-                const activeLabel = window.t('cluster.v2.req.active_count')
+                const activeLabel = window.t('cluster.req.active_count')
                     .replace('{n}', String(active));
                 const hiddenLabel = hidden
-                    ? ` · ${window.t('cluster.v2.req.not_shown').replace('{n}', String(hidden))}`
+                    ? ` · ${window.t('cluster.req.not_shown').replace('{n}', String(hidden))}`
                     : '';
                 return `${activeLabel}${hiddenLabel}`;
             }
             return metrics?.last_request
-                ? window.t('cluster.v2.req.last_completed')
-                : window.t('cluster.v2.req.waiting');
+                ? window.t('cluster.req.last_completed')
+                : window.t('cluster.req.waiting');
         },
 
         requestPhaseLabel(request) {
@@ -1168,15 +1168,15 @@ function clusterWizard() {
             if (progress?.active) {
                 const processed = Math.max(0, Number(progress.processed || 0));
                 const total = Math.max(0, Number(progress.total || 0));
-                return window.t('cluster.v2.req.prefill_progress')
+                return window.t('cluster.req.prefill_progress')
                     .replace('{processed}', processed.toLocaleString())
                     .replace('{total}', total.toLocaleString());
             }
             const uncached = Math.max(0, prompt - cached);
-            const uncachedLabel = window.t('cluster.v2.req.new_tokens')
+            const uncachedLabel = window.t('cluster.req.new_tokens')
                 .replace('{n}', uncached.toLocaleString());
             const cachedLabel = cached
-                ? ` · ${window.t('cluster.v2.req.cached_tokens').replace('{n}', cached.toLocaleString())}`
+                ? ` · ${window.t('cluster.req.cached_tokens').replace('{n}', cached.toLocaleString())}`
                 : '';
             return `${uncachedLabel}${cachedLabel}`;
         },
@@ -1323,17 +1323,17 @@ function clusterWizard() {
                     eyebrow: window.t('cluster.deploy.status_configured'),
                     label: window.t('cluster.deploy.status_checking'),
                     detail: this.runtimeError
-                        ? window.t('cluster.v2.deploy.status_runtime_unavailable')
+                        ? window.t('cluster.deploy.status_runtime_unavailable')
                               .replace('{message}', this.runtimeError)
-                        : window.t('cluster.v2.deploy.status_checking_detail'),
+                        : window.t('cluster.deploy.status_checking_detail'),
                     tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
                     pulse: true,
                 };
             }
             return {
                 state: 'configured',
-                eyebrow: window.t('cluster.v2.deploy.status_saved_setup'),
-                label: window.t('cluster.v2.deploy.status_not_loaded'),
+                eyebrow: window.t('cluster.deploy.status_saved_setup'),
+                label: window.t('cluster.deploy.status_not_loaded'),
                 detail: this.deploymentSavedAtDetail(deployment),
                 tone: 'bg-amber-50 border-amber-200 text-amber-700',
                 pulse: false,
@@ -1346,7 +1346,7 @@ function clusterWizard() {
         // is only present when the registry knows the save moment — never
         // invented.
         deploymentSavedAtDetail(deployment = this.configuredDeployment()) {
-            const detail = window.t('cluster.v2.deploy.status_not_loaded_detail');
+            const detail = window.t('cluster.deploy.status_not_loaded_detail');
             const stamp = Number(
                 this.deploymentsSavedAt?.[deployment?.deployment_id] || 0,
             );
@@ -1355,7 +1355,7 @@ function clusterWizard() {
                 dateStyle: 'medium',
                 timeStyle: 'short',
             });
-            return `${detail} ${window.t('cluster.v2.deploy.saved_at').replace('{when}', when)}`;
+            return `${detail} ${window.t('cluster.deploy.saved_at').replace('{when}', when)}`;
         },
 
         deploymentCacheLabel(deployment = this.configuredDeployment()) {
@@ -1434,24 +1434,24 @@ function clusterWizard() {
             const steps = [
                 {
                     key: 'discover',
-                    title: window.t('cluster.v2.steps.discover_title'),
-                    hint: window.t('cluster.v2.steps.discover_hint'),
+                    title: window.t('cluster.steps.discover_title'),
+                    hint: window.t('cluster.steps.discover_hint'),
                 },
                 {
                     key: 'pair',
-                    title: window.t('cluster.v2.steps.pair_title'),
-                    hint: window.t('cluster.v2.steps.pair_hint'),
+                    title: window.t('cluster.steps.pair_title'),
+                    hint: window.t('cluster.steps.pair_hint'),
                 },
                 {
                     key: 'checks',
-                    title: window.t('cluster.v2.steps.checks_title'),
-                    hint: window.t('cluster.v2.steps.checks_hint'),
+                    title: window.t('cluster.steps.checks_title'),
+                    hint: window.t('cluster.steps.checks_hint'),
                 },
-                { key: 'plan', title: window.t('cluster.v2.steps.plan_title'), hint: this.planStepHint() },
+                { key: 'plan', title: window.t('cluster.steps.plan_title'), hint: this.planStepHint() },
                 {
                     key: 'active',
-                    title: window.t('cluster.v2.steps.active_title'),
-                    hint: window.t('cluster.v2.steps.active_hint'),
+                    title: window.t('cluster.steps.active_title'),
+                    hint: window.t('cluster.steps.active_hint'),
                 },
             ];
             if (wizard === 'accelerator' || wizard === 'helper') {
@@ -1617,7 +1617,7 @@ function clusterWizard() {
                 jobs.length,
                 ...jobs.map((job) => Math.max(0, Number(job?.world_size || 0))),
             );
-            return window.t('cluster.v2.progress.ranks_ready')
+            return window.t('cluster.progress.ranks_ready')
                 .replace('{ready}', String(ready))
                 .replace('{expected}', String(expected));
         },
@@ -2107,7 +2107,7 @@ function clusterWizard() {
                 await this.refreshDevices();
                 if (result && result.verified) {
                     const name = result.peer?.friendly_name || ip;
-                    const foundPeer = window.t('cluster.v2.toast.found_peer')
+                    const foundPeer = window.t('cluster.toast.found_peer')
                         .replace('{name}', name)
                         .replace('{ip}', ip);
                     this.notify('success', foundPeer);
@@ -2546,7 +2546,7 @@ function clusterWizard() {
                         .replace('{names}', missing.map((device) => this.deviceName(device)).join(', '));
                     } else {
                         status = 'pass';
-                        detail = window.t('cluster.v2.checks.model_on_every')
+                        detail = window.t('cluster.checks.model_on_every')
                             .replace('{model}', this.shortModelName(model));
                     }
                 }
@@ -2569,7 +2569,7 @@ function clusterWizard() {
                     detail: mismatches.length
                         ? mismatches
                               .map((m) =>
-                                  window.t('cluster.v2.checks.version_mismatch')
+                                  window.t('cluster.checks.version_mismatch')
                                       .replace('{name}', m.name)
                                       .replace('{peer}', String(m.peerVersion))
                                       .replace('{self}', String(m.selfVersion)),
@@ -2790,7 +2790,7 @@ function clusterWizard() {
                 0,
                 capacity - this.reserveBytesFor(role, capacity),
             );
-            return window.t('cluster.v2.role.usable')
+            return window.t('cluster.role.usable')
                 .replace('{gb}', String(Math.round(usable / 1024 ** 3)))
                 .replace('{role}', this.roleLabel(role));
         },
@@ -2918,7 +2918,7 @@ function clusterWizard() {
                 segments.pop();
             }
             if (segments[segments.length - 1] === 'snapshots') segments.pop();
-            let name = segments.pop() || raw || window.t('cluster.v2.model.this_model');
+            let name = segments.pop() || raw || window.t('cluster.model.this_model');
             const hub = /^models--(?<org>[^/]+?)--(?<repo>.+)$/.exec(name);
             if (hub) name = `${hub.groups.org}/${hub.groups.repo}`;
             return name;
@@ -3514,7 +3514,7 @@ function clusterWizard() {
                 const budget = measured.find((item) => item.node_id === node.node_id);
                 if (!budget || budget.unusable || !(Number(budget.capacity_bytes) > 0)) {
                     throw new Error(
-                        window.t('cluster.v2.err.memory_budget_unavailable')
+                        window.t('cluster.err.memory_budget_unavailable')
                             .replace('{node}', node.node_id),
                     );
                 }
@@ -4087,7 +4087,7 @@ function clusterWizard() {
             return device
                 ? this.deviceName(device)
                 : assignment?.node_id ||
-                      window.t('cluster.v2.plan.rank')
+                      window.t('cluster.plan.rank')
                           .replace('{n}', String(assignment?.rank ?? '?'));
         },
 
@@ -4097,12 +4097,12 @@ function clusterWizard() {
             const gibText = gib.toFixed(1);
             if (tp > 1) {
                 const rank = String(Number(assignment?.tensor_parallel_rank || 0) + 1);
-                return window.t('cluster.v2.membership.tensor_rank')
+                return window.t('cluster.membership.tensor_rank')
                     .replace('{rank}', rank)
                     .replace('{tp}', String(tp))
                     .replace('{gib}', gibText);
             }
-            return window.t('cluster.v2.membership.layers')
+            return window.t('cluster.membership.layers')
                 .replace('{start}', String(assignment?.start_layer ?? 0))
                 .replace('{end}', String(assignment?.end_layer ?? 0))
                 .replace('{gib}', gibText);
@@ -4317,7 +4317,7 @@ function clusterWizard() {
                     method: 'DELETE',
                 });
                 const message = window.t(
-                    localOnly ? 'cluster.v2.toast.forgotten_local' : 'cluster.v2.toast.deactivated',
+                    localOnly ? 'cluster.toast.forgotten_local' : 'cluster.toast.deactivated',
                 );
                 this.notify('info', message);
                 await this.refreshDeployments();
@@ -6052,7 +6052,7 @@ function clusterWizard() {
                         return null;
                     }
                     await new Promise((resolve) =>
-                        setTimeout(resolve, CLUSTER_V2_POLL_MS),
+                        setTimeout(resolve, CLUSTER_POLL_MS),
                     );
                 }
             } catch (error) {
@@ -6314,7 +6314,7 @@ function clusterWizard() {
                     return null;
                 }
                 await new Promise((resolve) =>
-                    setTimeout(resolve, CLUSTER_V2_POLL_MS),
+                    setTimeout(resolve, CLUSTER_POLL_MS),
                 );
             }
         },
@@ -7038,7 +7038,7 @@ function clusterWizard() {
             this.assistant.operationPollSkip = 0;
             this.assistant.operationTimer = setInterval(
                 () => this.pollAssistantOperation(),
-                CLUSTER_V2_POLL_MS,
+                CLUSTER_POLL_MS,
             );
         },
 

@@ -2952,8 +2952,8 @@ component.apiFetch = async (url) => { calls += 1; return tuneResponse; };
 
 
 def test_assistant_tuning_markup_is_ready_gated_and_measured_only():
-    template = (ROOT / "omlx_web/templates/dashboard/_cluster_v2.html").read_text()
-    javascript = (ROOT / "omlx_web/static/js/cluster_v2.js").read_text()
+    template = (ROOT / "omlx_web/templates/dashboard/_cluster.html").read_text()
+    javascript = (ROOT / "omlx_web/static/js/cluster.js").read_text()
 
     start = template.index("<!-- Tuning the winning deployment.")
     block = template[start : template.index("<!-- failed: one message", start)]
@@ -2962,22 +2962,22 @@ def test_assistant_tuning_markup_is_ready_gated_and_measured_only():
     # carries a stable marker for review and for these tests.
     assert 'x-show="assistantState() === \'ready\'"' in block
     for marker in (
-        "data-cluster-v2-assistant-tune>",
-        "data-cluster-v2-assistant-tune-redeploy>",
-        "data-cluster-v2-assistant-tune-busy",
-        "data-cluster-v2-assistant-tune-error",
-        "data-cluster-v2-assistant-tune-action",
-        "data-cluster-v2-assistant-tune-result",
-        "data-cluster-v2-assistant-tune-sampler",
-        "data-cluster-v2-assistant-tune-chunk",
-        "data-cluster-v2-assistant-tune-mtp",
-        "data-cluster-v2-assistant-tune-preset",
-        "data-cluster-v2-assistant-tune-redeploy-busy",
-        "data-cluster-v2-assistant-tune-redeploy-progress",
-        "data-cluster-v2-assistant-tune-redeploy-error",
-        "data-cluster-v2-assistant-tune-redeploy-row",
-        "data-cluster-v2-assistant-tune-redeploy-best",
-        "data-cluster-v2-assistant-tune-redeploy-stopped",
+        "data-cluster-assistant-tune>",
+        "data-cluster-assistant-tune-redeploy>",
+        "data-cluster-assistant-tune-busy",
+        "data-cluster-assistant-tune-error",
+        "data-cluster-assistant-tune-action",
+        "data-cluster-assistant-tune-result",
+        "data-cluster-assistant-tune-sampler",
+        "data-cluster-assistant-tune-chunk",
+        "data-cluster-assistant-tune-mtp",
+        "data-cluster-assistant-tune-preset",
+        "data-cluster-assistant-tune-redeploy-busy",
+        "data-cluster-assistant-tune-redeploy-progress",
+        "data-cluster-assistant-tune-redeploy-error",
+        "data-cluster-assistant-tune-redeploy-row",
+        "data-cluster-assistant-tune-redeploy-best",
+        "data-cluster-assistant-tune-redeploy-stopped",
     ):
         assert marker in block, marker
 
@@ -2994,7 +2994,7 @@ def test_assistant_tuning_markup_is_ready_gated_and_measured_only():
 
 
 def test_assistant_tuning_endpoints_and_poll_are_declared_and_generation_guarded():
-    javascript = (ROOT / "omlx_web/static/js/cluster_v2.js").read_text()
+    javascript = (ROOT / "omlx_web/static/js/cluster.js").read_text()
 
     assert "tune: '/admin/api/cluster/assistant/tune'" in javascript
     assert "tuneRedeploy: '/admin/api/cluster/assistant/tune-redeploy'" in javascript

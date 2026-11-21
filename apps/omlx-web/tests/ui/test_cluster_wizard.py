@@ -1565,7 +1565,7 @@ def test_a_device_card_identifies_the_mac_by_hardware_not_by_name():
     # The grid, the Find-devices list, the join request and the membership
     # candidates all print the same facts (2026-11-16: the discovery list still
     # showed the old "chip · ram" line and looked unchanged).
-    assert template.count("data-cluster-v2-device-spec") >= 6
+    assert template.count("data-cluster-device-spec") >= 6
     assert template.count("deviceSpecLine(device)") >= 6
     assert ':data-lucide="deviceIcon(device)"' in template
 
@@ -1599,13 +1599,13 @@ def test_the_rank0_pin_is_visible_in_the_plan_summary():
     """
     template = _read(TEMPLATE)
 
-    assert template.count("data-cluster-v2-assistant-coordinator-row") == 1
+    assert template.count("data-cluster-assistant-coordinator-row") == 1
     assert "setAssistantCoordinator(" in template
 
     # Above the advanced block, not inside it: the "Use all Macs" override and
     # the raw operation JSON stay collapsed, the pin does not.
-    pin = template.index("data-cluster-v2-assistant-coordinator-row")
-    advanced = template.index("data-cluster-v2-assistant-use-all-macs")
+    pin = template.index("data-cluster-assistant-coordinator-row")
+    advanced = template.index("data-cluster-assistant-use-all-macs")
     assert pin < advanced
 
 
@@ -1619,8 +1619,8 @@ def test_the_memory_tier_is_selectable_in_both_flows():
     javascript = _read(JAVASCRIPT)
 
     # Both surfaces carry the control, bound to the same state.
-    assert template.count("data-cluster-v2-assistant-tier-picker") == 1
-    assert template.count("data-cluster-v2-plan-tier") == 1
+    assert template.count("data-cluster-assistant-tier-picker") == 1
+    assert template.count("data-cluster-plan-tier") == 1
     assert template.count(':data-tier="option"') == 2
     assert "setPlanMemoryTier(option)" in template
 
@@ -3536,11 +3536,11 @@ def test_assistant_primary_path_has_no_ip_ssh_rank_layer_or_model_path_field():
     # preferred_coordinator — never IP/SSH/rank/layer/model-path inputs.
     assert "<input" not in card
     assert card.count("<select") == 1
-    assert "data-cluster-v2-assistant-coordinator" in card
+    assert "data-cluster-assistant-coordinator" in card
     assert "setAssistantCoordinator" in card
     assert "x-model" not in card
-    assert "data-cluster-v2-assistant-entry" in card
-    assert "data-cluster-v2-assistant-start-setup" in card
+    assert "data-cluster-assistant-entry" in card
+    assert "data-cluster-assistant-start-setup" in card
     # The plan-time inputs are the component's frozen object, not inputs.
     assert "runAssistantApply()" in card
     assert "assistantModelLabel()" in card
@@ -3635,8 +3635,8 @@ def test_the_network_preflight_shows_commands_and_executes_nothing():
 
     assert "runAssistantNetworkPreflight()" in javascript
     assert "copyAssistantNetworkCommands()" in javascript
-    assert "data-cluster-v2-assistant-network-preflight" in template
-    assert "data-cluster-v2-assistant-network-commands" in template
+    assert "data-cluster-assistant-network-preflight" in template
+    assert "data-cluster-assistant-network-commands" in template
     assert "Nothing is executed" in template
     block = javascript.split("runAssistantNetworkPreflight() {", 1)[1].split(
         "copyAssistantNetworkCommands", 1
@@ -3669,7 +3669,7 @@ def test_copy_diagnostics_is_one_block_without_secrets():
         assert field in block
     for forbidden in ("api_key", "password", "authorization", "ssh"):
         assert forbidden not in block.lower()
-    assert "data-cluster-v2-assistant-copy-diagnostics" in template
+    assert "data-cluster-assistant-copy-diagnostics" in template
     # The backend bundle is the source; the local block is the offline fallback.
     assert "ASSISTANT_API.diagnostics" in javascript
 
@@ -3722,8 +3722,8 @@ def test_assistant_endpoint_is_unreachable_until_ready():
     assert 'x-show="assistantState() === \'ready\'"' in card
     assert 'x-show="assistantReady()"' in card
     assert "assistantReady() ? assistant.endpoint.url : null" in card
-    assert "data-cluster-v2-assistant-open-chat" in card
-    assert "data-cluster-v2-assistant-connect-agent" in card
+    assert "data-cluster-assistant-open-chat" in card
+    assert "data-cluster-assistant-connect-agent" in card
 
     ready = javascript.split("assistantReady() {", 1)[1].split("},", 1)[0]
     assert "state === 'ready'" in ready
@@ -3749,26 +3749,26 @@ def test_assistant_search_affordance_and_api_map_entry_exist():
     assert "/admin/api/cluster/assistant/search" in ALLOWED_ENDPOINTS
 
     # The affordance lives inside the assistant card, gated to the plan stage.
-    assert "data-cluster-v2-assistant-search" in card
-    assert "data-cluster-v2-assistant-search-button" in card
+    assert "data-cluster-assistant-search" in card
+    assert "data-cluster-assistant-search-button" in card
     assert "runAssistantSearch()" in card
     assert "assistantSearchAvailable()" in card
     assert "assistantState() === 'planning' && assistantSearchAvailable()" in card
     # Priority + max-count controls (buttons, keeping the card input-free).
-    assert "data-cluster-v2-assistant-search-priority" in card
-    assert "data-cluster-v2-assistant-search-max-count" in card
+    assert "data-cluster-assistant-search-priority" in card
+    assert "data-cluster-assistant-search-max-count" in card
     assert "setAssistantSearchPriority(option.key)" in card
     assert "setAssistantSearchMaxCount(count)" in card
     # Result, busy and error surfaces.
-    assert "data-cluster-v2-assistant-search-busy" in card
-    assert "data-cluster-v2-assistant-search-best" in card
-    assert "data-cluster-v2-assistant-search-results" in card
-    assert "data-cluster-v2-assistant-search-errors" in card
-    assert "data-cluster-v2-assistant-search-error" in card
+    assert "data-cluster-assistant-search-busy" in card
+    assert "data-cluster-assistant-search-best" in card
+    assert "data-cluster-assistant-search-results" in card
+    assert "data-cluster-assistant-search-errors" in card
+    assert "data-cluster-assistant-search-error" in card
     # The card's primary path stays input-free; the rank-0 pin's Mac picker
     # (preferred_coordinator, frozen decision 2026-11-15) is the only select.
     assert card.count("<select") == 1
-    assert "data-cluster-v2-assistant-coordinator" in card
+    assert "data-cluster-assistant-coordinator" in card
     assert "<input" not in card
     assert "x-model" not in card
 
@@ -3837,7 +3837,7 @@ def test_assistant_search_is_single_flight_generation_guarded_and_measured_only(
     # No endpoint is offered from a search result: the endpoint stays gated on
     # assistantReady(), and search never transitions the state machine.
     card = _assistant_card()
-    search_block = card.split("data-cluster-v2-assistant-search>", 1)[1].split(
+    search_block = card.split("data-cluster-assistant-search>", 1)[1].split(
         'data-assistant-state="applying"', 1
     )[0]
     assert "assistant.endpoint" not in search_block
@@ -3881,9 +3881,9 @@ def test_assistant_handoff_links_come_from_the_endpoint_and_the_serving_id():
     javascript = _read(JAVASCRIPT)
 
     # One URL each, built by the component, never typed into the markup.
-    assert "data-cluster-v2-assistant-open-chat" in card
-    assert "data-cluster-v2-assistant-connect-agent" in card
-    assert "data-cluster-v2-assistant-agent-base-url" in card
+    assert "data-cluster-assistant-open-chat" in card
+    assert "data-cluster-assistant-connect-agent" in card
+    assert "data-cluster-assistant-agent-base-url" in card
     assert "assistantAgentBaseUrl()" in card
     assert "assistantAgentModelId()" in card
     assert "assistantChatUrl()" in javascript
@@ -3921,8 +3921,8 @@ def test_assistant_handoff_is_ready_gated_and_carries_no_secret():
     card = _assistant_card()
     ready = card.index('x-show="assistantState() === \'ready\'"')
     endpoint = card.index('x-show="assistantReady()"')
-    chat = card.index("data-cluster-v2-assistant-open-chat")
-    agent = card.index("data-cluster-v2-assistant-connect-agent")
+    chat = card.index("data-cluster-assistant-open-chat")
+    agent = card.index("data-cluster-assistant-connect-agent")
     assert ready < endpoint < chat < agent
 
     # The endpoint stays null until the operation proves it, and no key, token
@@ -4182,7 +4182,7 @@ def test_screen_4_rows_are_six_labels_in_the_corrected_order():
     assert "verifying the endpoint" in catalog["cluster.assistant.progress.loading"]
 
     # The card renders the rows; the component owns the mapping.
-    assert "data-cluster-v2-assistant-progress" in card
+    assert "data-cluster-assistant-progress" in card
     assert "assistantProgressRows()" in card
     assert "ASSISTANT_PROGRESS_ROWS" in javascript
 
@@ -4293,7 +4293,7 @@ def test_screen_4_failure_keeps_the_last_phase_and_one_action():
     assert fixture["progress"]["message"]
 
     # Still exactly one action button, labelled from error.action.
-    assert card.count("data-cluster-v2-assistant-action") == 1
+    assert card.count("data-cluster-assistant-action") == 1
     assert "assistantActionHandler(assistant.error?.action)" in card
 
 
@@ -4431,20 +4431,20 @@ SCREEN_6_STRINGS = (
 def test_screen_6_stop_and_start_again_are_ready_gated():
     card = _assistant_card()
 
-    assert "data-cluster-v2-assistant-stop" in card
-    assert "data-cluster-v2-assistant-stopped" in card
-    assert "data-cluster-v2-assistant-start-again" in card
+    assert "data-cluster-assistant-stop" in card
+    assert "data-cluster-assistant-stopped" in card
+    assert "data-cluster-assistant-start-again" in card
     assert "stopAssistantCluster()" in card
     assert "startAssistantAgain()" in card
 
     ready = card.index('x-show="assistantState() === \'ready\'"')
-    stop = card.index("data-cluster-v2-assistant-stop")
+    stop = card.index("data-cluster-assistant-stop")
     assert ready < stop
     # The stopped block is hidden until the backend (or a successful stop)
     # reports `stopped`; Start again lives only inside it.
     assert 'x-show="assistant.stopped"' in card
-    stopped = card.index("data-cluster-v2-assistant-stopped")
-    again = card.index("data-cluster-v2-assistant-start-again")
+    stopped = card.index("data-cluster-assistant-stopped")
+    again = card.index("data-cluster-assistant-start-again")
     assert stopped < again
 
 
@@ -4724,11 +4724,11 @@ def test_assistant_card_announces_progress_and_failures_and_hides_spinners():
 
     card = _assistant_card()
 
-    progress = re.search(r"<div[^>]*data-cluster-v2-assistant-progress>", card)
+    progress = re.search(r"<div[^>]*data-cluster-assistant-progress>", card)
     assert progress, "progress container missing"
     assert 'aria-live="polite"' in progress.group(0)
 
-    banner = re.search(r"<div[^>]*data-cluster-v2-assistant-error>", card)
+    banner = re.search(r"<div[^>]*data-cluster-assistant-error>", card)
     assert banner, "failure banner missing"
     assert 'role="alert"' in banner.group(0)
 
@@ -4798,23 +4798,23 @@ def test_the_assistant_is_the_default_flow_and_manual_setup_is_one_click():
     assert "setClusterMode(mode) {" in javascript
 
     for marker in (
-        "data-cluster-v2-mode",
-        "data-cluster-v2-mode-assistant",
-        "data-cluster-v2-mode-manual",
-        "data-cluster-v2-assistant-manual-link",
-        "data-cluster-v2-manual-progress",
-        "data-cluster-v2-manual-sections>",
-        "data-cluster-v2-manual-plan>",
+        "data-cluster-mode",
+        "data-cluster-mode-assistant",
+        "data-cluster-mode-manual",
+        "data-cluster-assistant-manual-link",
+        "data-cluster-manual-progress",
+        "data-cluster-manual-sections>",
+        "data-cluster-manual-plan>",
     ):
         assert marker in template, marker
 
     # The assistant section is the first thing after the header; the wizard
     # tiles and both manual regions follow it.
-    assistant = template.index("data-cluster-v2-assistant-section>")
+    assistant = template.index("data-cluster-assistant-section>")
     for manual in (
-        "data-cluster-v2-manual-progress>",
-        "data-cluster-v2-manual-sections>",
-        "data-cluster-v2-manual-plan>",
+        "data-cluster-manual-progress>",
+        "data-cluster-manual-sections>",
+        "data-cluster-manual-plan>",
     ):
         assert assistant < template.index(manual), manual
 
@@ -4835,7 +4835,7 @@ def test_the_assistant_is_the_default_flow_and_manual_setup_is_one_click():
         "plan",
         "active",
     ):
-        assert template.count(f'data-cluster-v2-state="{state}"') >= 1, state
+        assert template.count(f'data-cluster-state="{state}"') >= 1, state
 
 
 def test_the_choose_screen_re_measures_only_a_changed_model():
@@ -4846,11 +4846,11 @@ def test_the_choose_screen_re_measures_only_a_changed_model():
     assert "x-model" not in choose
     assert "<select" not in choose
     for marker in (
-        "data-cluster-v2-assistant-choose-candidate",
-        "data-cluster-v2-assistant-choose-context",
-        "data-cluster-v2-assistant-choose-context-option",
-        "data-cluster-v2-assistant-choose-back",
-        "data-cluster-v2-assistant-choose-continue",
+        "data-cluster-assistant-choose-candidate",
+        "data-cluster-assistant-choose-context",
+        "data-cluster-assistant-choose-context-option",
+        "data-cluster-assistant-choose-back",
+        "data-cluster-assistant-choose-continue",
     ):
         assert marker in choose, marker
 
@@ -4872,21 +4872,21 @@ def test_a_failure_owns_the_card_with_one_action_and_a_way_back():
         'data-assistant-screen="choose"', 1
     )[0]
 
-    assert "data-cluster-v2-assistant-error" in failed
-    assert failed.count("data-cluster-v2-assistant-action") == 1
+    assert "data-cluster-assistant-error" in failed
+    assert failed.count("data-cluster-assistant-action") == 1
     assert "assistantActionHandler(assistant.error?.action)" in failed
-    assert "data-cluster-v2-assistant-retry" in failed
-    assert "data-cluster-v2-assistant-back" in failed
-    assert "data-cluster-v2-assistant-failure-details" in failed
-    assert "data-cluster-v2-assistant-topology" in failed
-    assert "data-cluster-v2-assistant-free-space" in failed
+    assert "data-cluster-assistant-retry" in failed
+    assert "data-cluster-assistant-back" in failed
+    assert "data-cluster-assistant-failure-details" in failed
+    assert "data-cluster-assistant-topology" in failed
+    assert "data-cluster-assistant-free-space" in failed
     # No other screen's primary action lives inside the failure.
-    assert "data-cluster-v2-assistant-start-setup" not in failed
-    assert "data-cluster-v2-assistant-open-chat" not in failed
+    assert "data-cluster-assistant-start-setup" not in failed
+    assert "data-cluster-assistant-open-chat" not in failed
 
     # Warnings are amber notes on the plan, never an error (A7).
     warnings = re.search(
-        r"<div[^>]*data-cluster-v2-assistant-plan-warnings", card
+        r"<div[^>]*data-cluster-assistant-plan-warnings", card
     )
     assert warnings, "plan warnings missing"
     assert "amber" in warnings.group(0)
