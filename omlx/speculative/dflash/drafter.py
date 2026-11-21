@@ -182,10 +182,15 @@ class DFlashDrafter:
         )
         return hook if callable(hook) else None
 
+    # A drafter that sets ``state.draft_conf`` by its own means says so here.
+    states_chances = False
+
     def _proposal_count(self, state) -> int:
         """Drafts the row's depth controller asks to verify next."""
         count = min(self.depth, int(getattr(state, "depth", 0) or self.depth))
-        if self.confidence_windows and self._block_confidence() is not None:
+        if self.confidence_windows and (
+            self.states_chances or self._block_confidence() is not None
+        ):
             return count
         controller = getattr(state, "controller", None)
         if controller is not None:

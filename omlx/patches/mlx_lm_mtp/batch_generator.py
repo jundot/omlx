@@ -4632,6 +4632,23 @@ def _draft_policy_for(model: Any) -> Optional[Any]:
     return policy
 
 
+def _stated_chances(state: _MtpState) -> Optional[List[float]]:
+    """The draft head's chance per pending draft, read to the host (one sync).
+
+    ``state.draft_conf`` is a lazy array or a list of them, one per position.
+    """
+    import mlx.core as mx
+
+    conf = state.draft_conf
+    if conf is None:
+        return None
+    if isinstance(conf, (list, tuple)):
+        if not conf:
+            return None
+        conf = mx.concatenate([c.reshape(-1) for c in conf])
+    return [float(c) for c in conf.reshape(-1).tolist()]
+
+
 def _drafter_window(state: _MtpState) -> int:
     """Drafts of the draft head the next verify takes (its depth controller's)."""
     return int(state.controller.cur if state.controller is not None else state.depth)
@@ -4791,12 +4808,14 @@ def _run_verify_cycle_chain(
     own_forward = verify_result is None
     cycle_conf = None
     if drafter is not None and own_forward and policy is not None:
-        if state.draft_conf is not None and not state.copy_drafts:
+        if not state.copy_drafts:
+            cycle_conf = _stated_chances(state)
+        if cycle_conf:
             # The head stated each draft's chance: the window is the one with
             # the most expected tokens per millisecond for this block.
-            cycle_conf = [float(c) for c in state.draft_conf.reshape(-1).tolist()]
             _clip_block_drafts(state, policy.window(cycle_conf) - 1)
         elif not state.copy_drafts:
+            cycle_conf = None
             _clip_block_drafts(state, _drafter_window(state))
         # A lookup window was sized by the policy when it was proposed.
     elif drafter is not None and own_forward:
