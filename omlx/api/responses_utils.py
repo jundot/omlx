@@ -518,6 +518,7 @@ def build_message_output_item(
     text: str,
     item_id: Optional[str] = None,
     status: str = "completed",
+    phase: Optional[str] = None,
 ) -> OutputItem:
     """Build a message-type OutputItem."""
     return OutputItem(
@@ -526,6 +527,7 @@ def build_message_output_item(
         status=status,
         role="assistant",
         content=[OutputContent(type="output_text", text=text)],
+        phase=phase,
     )
 
 
