@@ -108,7 +108,7 @@ final class IntegrationsScreenVM {
     // which can drift after a hot-reload).
     private(set) var serverHost: String = "127.0.0.1"
     private(set) var serverPort: Int = 8000
-    private(set) var serverApiKey: String = ""
+    private(set) var serverApiKeySet: Bool = false
     private(set) var cliPrefix: String = "omlx"
 
     /// Popup options: a leading "Select model…" placeholder + every model id.
@@ -175,15 +175,23 @@ final class IntegrationsScreenVM {
         "\(cliCommandPrefix) launch claude_desktop"
     }
 
-    /// Env-var recipe that runs the real `claude` binary directly. Mirrors
-    /// `claudeCodeCommand` in dashboard.js — cloud form unsets the Anthropic
-    /// vars, local form sets them to point at the oMLX server.
-    var claudeEnvRecipe: String { claudeEnvRecipe(authToken: serverApiKey) }
-
-    /// `claudeEnvRecipe` with the API key masked, for display only. Mirrors
-    /// `claudeCodeCommandDisplay` in dashboard.js.
+    /// On-screen env-var recipe with the API key masked. Mirrors
+    /// `claudeCodeCommandDisplay` in dashboard.js. Copy uses
+    /// `claudeEnvRecipeForCopy(client:)`, which fetches the key once.
     var claudeEnvRecipeDisplay: String {
-        claudeEnvRecipe(authToken: serverApiKey.isEmpty ? "" : "••••••••")
+        claudeEnvRecipe(authToken: serverApiKeySet ? "••••••••" : "")
+    }
+
+    /// Build the real Claude env recipe, fetching the master key only when
+    /// one is configured and the caller is about to copy it.
+    func claudeEnvRecipeForCopy(client: OMLXClient) async throws -> String {
+        let token: String
+        if serverApiKeySet {
+            token = try await client.revealApiKey()
+        } else {
+            token = ""
+        }
+        return claudeEnvRecipe(authToken: token)
     }
 
     private func claudeEnvRecipe(authToken: String) -> String {
@@ -337,13 +345,13 @@ final class IntegrationsScreenVM {
             // Available models
             try await refreshModels(client: client)
 
-            // Stats — host/port/api_key/cli_prefix for the command builders.
+            // Stats — host/port/api_key_set/cli_prefix for the command builders.
             // Failure here is non-fatal: the screen still works against the
             // default `omlx` prefix and 127.0.0.1:8000.
             if let stats = try? await client.getStats() {
                 if let host = stats.host, !host.isEmpty { self.serverHost = host }
                 if let port = stats.port               { self.serverPort = port }
-                self.serverApiKey = stats.apiKey ?? ""
+                self.serverApiKeySet = stats.apiKeySet ?? false
                 if let prefix = stats.cliPrefix, !prefix.isEmpty {
                     self.cliPrefix = prefix
                 }
