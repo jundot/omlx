@@ -19,6 +19,7 @@ from mlx_lm.models.cache import (
 )
 from test_inkling_vlm_mtp import _inkling2_tiny
 
+from omlx.cache.type_registry import CacheTypeRegistry
 from omlx.patches.inkling2 import kernels
 from omlx.patches.inkling2 import model as inkling2_model
 from omlx.patches.inkling2.model import _temporal_kv, _trim_kv
@@ -199,4 +200,44 @@ def test_ring_model_matches_the_full_cache_model(monkeypatch):
         return out
 
     for expected, actual in zip(logits(False), logits(True)):
+        np.testing.assert_array_equal(expected, actual)
+
+
+def _ssd_round_trip(cache):
+    """Rebuild every entry through oMLX's cache handlers, as an SSD hit does."""
+    out = []
+    for entry in cache:
+        handler = CacheTypeRegistry.get_handler_for_object(entry)
+        out.append(
+            handler.deserialize_state(
+                handler.serialize_state(entry), handler.serialize_meta_state(entry)
+            )
+        )
+    return out
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_cache_survives_an_ssd_round_trip(monkeypatch, bounded):
+    monkeypatch.setattr(inkling2_model, "_SWA_BOUNDED", bounded)
+    monkeypatch.setattr(inkling2_model, "_SWA_SIZE", 0)
+    lm = _inkling2_tiny()
+    mx.eval(lm.parameters())
+    ids = mx.array(np.random.default_rng(11).integers(3, 58, (1, 40)))
+    caches = {}
+    for name in ("cold", "restored"):
+        cache = lm.make_cache()
+        for start, end in ((0, 12), (12, 24)):  # the 8-key ring has wrapped
+            lm(ids[:, start:end], cache=cache)
+        caches[name] = cache
+    caches["restored"] = _ssd_round_trip(caches["restored"])
+    ring = caches["restored"][0][0]
+    assert isinstance(ring, RotatingKVCache) is bounded
+    assert ring.offset == 24
+    out = {name: [] for name in caches}
+    bounds = [24, 32, *range(33, 41)]  # a prefill chunk, then decode
+    for start, end in zip(bounds, bounds[1:]):
+        for name, cache in caches.items():
+            step = lm(ids[:, start:end], cache=cache)
+            out[name].append(np.asarray(getattr(step, "logits", step)[:, -1]))
+    for expected, actual in zip(out["cold"], out["restored"]):
         np.testing.assert_array_equal(expected, actual)
