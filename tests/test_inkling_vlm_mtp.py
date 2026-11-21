@@ -981,3 +981,16 @@ def test_inkling2_vision_encodes_images_independently_and_splices_tokens():
     assert mx.allclose(embeds[0, 1:3], alone.astype(embeds.dtype))
     with pytest.raises(ValueError):
         model.embed_inputs(mx.array([[image, 1]]), second, [[1, 1, 2]])
+
+
+def test_inkling2_keeps_dense_kv_when_kv_quantization_is_on(mock_tokenizer):
+    """Its attention reads dense keys: a packed cache fails on the first forward."""
+    from omlx.scheduler import Scheduler
+
+    model = _inkling2_tiny()
+    scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+    scheduler._turboquant_kv_bits = 8.0
+    scheduler._turboquant_kv_scheme = "affine8"
+    assert not scheduler._turboquant_eligible(model.make_cache())
+
+
