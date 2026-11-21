@@ -2053,7 +2053,17 @@ def _make_inkling2_dspark_drafter_cls():
             samplers = [sampler for *_, sampler in rows]
             greedy = all(sampler is None for sampler in samplers)
             if markov is not None:
-                markov.prepare_block(draft_hidden, h_ctx_local, local_lengths, uids)
+                # A predraft's context holds every verify row and only ``counts``
+                # of them commit: the recurrent head starts from the newest
+                # committed row, not from the row of a draft the target rejected.
+                newest, held = h_ctx_local, local_lengths
+                if counts is not None:
+                    last = totals - 1 - local_base_arr
+                    newest = mx.take_along_axis(
+                        h_ctx_local, last[:, None, None], axis=1
+                    )
+                    held = [1] * batch
+                markov.prepare_block(draft_hidden, newest, held, uids)
                 if greedy and markov.screen_enabled and mx.default_device() == mx.gpu:
                     # Target 1: 2-bit screened exact head + calibrated conf[i]!
                     # Skips the 492 MB Q8 lm_head projection completely.
