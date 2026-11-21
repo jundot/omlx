@@ -28,6 +28,7 @@ from omlx.memory_monitor import (
     qwen4_text_mrope_broadcast as _broadcast_text_mrope_position_ids,
 )
 
+from omlx.lora_adapters import LoRALinear
 from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
 from omlx.patches.vlm_batch_kv_capacity import _ladder_capacity, _roll_logical_prefix
 from omlx.patches import row_exact_qmv
@@ -1466,6 +1467,18 @@ def _fused_tile(rows: int) -> tuple[int, int, bool]:
     return (2, 4, True) if rows % 2 == 0 else (1, 4, True)
 
 
+def _grouped_base(proj: nn.Module) -> nn.Module:
+    """The layer the grouped projection launch reads for ``proj``: the base
+    under a LoRA wrapper, else ``proj`` itself."""
+    return proj.base if isinstance(proj, LoRALinear) else proj
+
+
+def _grouped_output(proj: nn.Module, x: mx.array, y: mx.array) -> mx.array:
+    """``proj(x)`` from ``y``, the grouped launch's output of its base: a LoRA
+    wrapper adds its own delta; any other projection returns ``y``."""
+    return proj.add_delta(x, y) if isinstance(proj, LoRALinear) else y
+
+
 class Qwen4ExpRMSNorm(nn.Module):
     """Qwen4 RMSNorm, whose checkpoint weights are centered at zero.
 
@@ -2894,12 +2907,16 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 3 if position_ids is None else position_ids.ndim,
             )
             # The grouped launch reads quantized weights; dense projections keep the MLX ops.
+            # A LoRA-wrapped projection takes the launch on its base (delta added after).
             and all(
-                isinstance(proj, nn.QuantizedLinear)
+                isinstance(_grouped_base(proj), nn.QuantizedLinear)
                 for proj in (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj)
             )
             and row_exact_qmv._group_plan(
-                (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj),
+                tuple(
+                    _grouped_base(proj)
+                    for proj in (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj)
+                ),
                 x,
                 x.shape[0] * x.shape[1],
                 _fused_tile(x.shape[0] * x.shape[1]),
@@ -2913,10 +2930,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         index_positions)``, each value as the MLX ops compute it."""
         rows = x.shape[1]
         indexer = self.indexer
-        q_out, k_out, v_out, index_out = row_exact_qmv.quantized_linears_tiled(
-            (self.q_proj, self.k_proj, self.v_proj, indexer.index_qk_proj),
+        projections = (self.q_proj, self.k_proj, self.v_proj, indexer.index_qk_proj)
+        outputs = row_exact_qmv.quantized_linears_tiled(
+            tuple(_grouped_base(proj) for proj in projections),
             x,
             *_fused_tile(rows),
+        )
+        q_out, k_out, v_out, index_out = (
+            _grouped_output(proj, x, y) for proj, y in zip(projections, outputs)
         )
         if position_ids is None:
             # What the indexer and _prepare_projected_qkv build.
@@ -2933,10 +2954,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
     def _fused_output(self, output: mx.array, rows: int) -> mx.array:
         """``o_proj`` of the gated rows in one launch (each row's one-row bits)."""
         projected = row_exact_qmv.quantized_linears_tiled(
-            (self.o_proj,), output, *_fused_tile(rows)
+            (_grouped_base(self.o_proj),), output, *_fused_tile(rows)
         )
         if projected is not None:
-            return projected[0]
+            return _grouped_output(self.o_proj, output, projected[0])
         return self.o_proj(output) if rows == 1 else _VERIFIER._linear(self.o_proj, output)
 
     def _fused_forward(
