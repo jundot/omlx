@@ -404,6 +404,28 @@ def _dynamic_conv(x, dyn, static_w, state, heads, scale):
     return out.astype(x.dtype), xp
 
 
+def _linear_slice(proj: nn.Module, x: mx.array, start: int, stop: int | None) -> mx.array:
+    """Apply rows ``[start:stop]`` of a Linear or QuantizedLinear without copying."""
+    if isinstance(proj, nn.QuantizedLinear):
+        biases = proj.get("biases")
+        y = mx.quantized_matmul(
+            x,
+            proj.weight[start:stop],
+            proj.scales[start:stop],
+            None if biases is None else biases[start:stop],
+            transpose=True,
+            group_size=proj.group_size,
+            bits=proj.bits,
+            mode=getattr(proj, "mode", "affine"),
+        )
+    else:
+        y = x @ proj.weight[start:stop].T
+    bias = proj.get("bias")
+    if bias is not None:
+        y = y + bias[start:stop]
+    return y
+
+
 class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -457,6 +479,8 @@ class Inkling2Attention(nn.Module):
         if self.log_floor is None:
             return None
         offset = kv.offset if kv is not None else 0
+        if not isinstance(offset, mx.array) and int(offset) + length <= self.log_floor:
+            return None
         if isinstance(offset, mx.array):
             offset = offset.reshape(-1, 1)
         pos = mx.arange(length) + offset
@@ -474,14 +498,15 @@ class Inkling2Attention(nn.Module):
             if xk is None:
                 q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
             else:
-                # Looped passes give q, k and v their own inputs; one stacked
-                # projection serves all three.
-                pq, pk, pv = mx.split(
-                    self.in_proj(mx.concatenate([xq, xk, xv], axis=0)), 3, axis=0
-                )
-                q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
-                k = pk[..., self._cuts[0] : self._cuts[1]]
-                v = pv[..., self._cuts[1] : self._cuts[2]]
+                # Looped passes give q, k and v their own inputs; slice the
+                # packed projection into zero-copy row views so each row is
+                # multiplied by its own input once instead of 3x.
+                c0, c1, c2, c3, c4 = self._cuts
+                q = _linear_slice(self.in_proj, xq, 0, c0)
+                k = _linear_slice(self.in_proj, xk, c0, c1)
+                v = _linear_slice(self.in_proj, xv, c1, c2)
+                rgs = _linear_slice(self.in_proj, xq, c2, None)
+                r, gate, sink = mx.split(rgs, [c3 - c2, c4 - c2], axis=-1)
             k, ks = _static_conv(k, self.k_conv, ks, self._sconv_scale)
             v, vs = _static_conv(v, self.v_conv, vs, self._sconv_scale)
         else:
