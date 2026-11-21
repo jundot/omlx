@@ -86,6 +86,8 @@ VLM_MODEL_TYPES = {
     "glm5_next",
     "lfm3_audio",
     "qwen3_omni_moe",
+    "wemm_qwen3_5",
+    "wemm_qwen3_5_moe",
 }
 
 # Model families that are implemented in mlx-vlm rather than mlx-lm, mostly

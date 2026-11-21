@@ -26,7 +26,9 @@ DEFAULT_MAX_VIDEO_FRAMES = 16
 # temporal patches of two frames and 3D mRoPE with a time axis. mlx-vlm's
 # torch-free Qwen3-VL video processor turns a clip into pixel_values_videos +
 # video_grid_thw and renders the per-patch timestamps into the prompt.
-NATIVE_VIDEO_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
+NATIVE_VIDEO_MODEL_TYPES = frozenset(
+    {"qwen3_5", "qwen3_5_moe", "wemm_qwen3_5", "wemm_qwen3_5_moe"}
+)
 # Upper bound on sampled frames per clip (default sampling is 2 fps). Frames are
 # decoded at source resolution before resizing, so this bounds host memory
 # (~400 MB at 1080p); the prompt-token budget is set by max_pixels, not by it.
@@ -311,6 +313,8 @@ def attach_native_video_processor(
     except ImportError:
         logger.warning("mlx-vlm has no Qwen3-VL video processor; video input disabled")
         return False
+    if type(processor).__name__ == "WeMMProcessor":
+        return True
     # Only mlx-vlm's processor renders timestamped video placeholders without
     # transformers' torch-backed video metadata.
     if not isinstance(processor, Qwen3VLProcessor):
