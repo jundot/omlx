@@ -768,6 +768,46 @@ def test_inkling2_rows_with_different_windows_decode_together():
     assert diff[..., :300].max().item() < 1e-3
 
 
+def test_inkling2_restored_state_decodes_and_joins_like_the_live_one():
+    # The prefix cache rebuilds a sliding state as a plain ArraysCache inside
+    # oMLX's size wrapper, without the growth buffers.
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    from omlx.cache.type_handlers import SizedArraysCache
+
+    model = _inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOP)
+    ids = mx.random.randint(0, 300, (1, 50))
+    live = model.make_cache()
+    model(ids[:, :40], cache=live)
+    restored = []
+    for entry in live:
+        if isinstance(entry, KVCache):
+            copy = KVCache()
+            copy.state = entry.state
+        else:
+            plain = ArraysCache(len(entry.cache))
+            plain.cache = list(entry.cache)
+            copy = SizedArraysCache(plain, 40)
+        restored.append(copy)
+    restored = model.restore_cache(restored)
+    expected = [model(ids[:, 40:48], cache=live, return_hidden=True).logits]
+    assert model.mtp_partial_rollback(live, 2, 7)
+    got = [model(ids[:, 40:48], cache=restored, return_hidden=True).logits]
+    assert model.mtp_partial_rollback(restored, 2, 7)
+    for t in range(43, 46):
+        expected.append(model(ids[:, t : t + 1], cache=live))
+        got.append(model(ids[:, t : t + 1], cache=restored))
+    for a, b in zip(got, expected):
+        assert mx.array_equal(a, b)
+    # Another row joins the restored one.
+    other = model.make_cache()
+    model(ids[:, :7], cache=other)
+    for a, b in zip(restored, other):
+        if not isinstance(a, KVCache):
+            a.extend(b)
+            assert a.batch_size == 2
+
+
 def test_inkling2_fused_kernels_match_reference():
     from omlx.patches.inkling2 import kernels
 
