@@ -139,15 +139,6 @@ def _make_hc_sinkhorn_collapse_kernel():
 
             out4[d4] = U4(result);
         }
-
-        // Scalar tail for D not divisible by 4
-        #if (D % 4) != 0
-        for (uint d = D4 * 4 + tid; d < (uint)D; d += 256) {
-            float val = p0*(float)x_row[0*D+d] + p1*(float)x_row[1*D+d]
-                      + p2*(float)x_row[2*D+d] + p3*(float)x_row[3*D+d];
-            out_row[d] = (U)val;
-        }
-        #endif
     """
 
     return mx.fast.metal_kernel(
@@ -237,8 +228,11 @@ class HyperConnection(nn.Module):
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
         mixes = decode_matmul(z, self.fn.T)
 
+        # The kernel reads four streams and four-wide rows.
         use_ops = (
-            self.training
+            self.hc_mult != 4
+            or D % 4
+            or self.training
             or mx.default_device() != mx.gpu
             or not mx.metal.is_available()
         )
