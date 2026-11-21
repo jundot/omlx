@@ -145,6 +145,10 @@ Run `python -m pytest -q tests/test_hy_v4.py` for Hy4 and Hy4-flash. Tiny random
 
 `tests/test_oqh.py::test_hy_v4_experts_round_trip` checks oQh exports of both models against their dequantized twins.
 
+# Cluster mesh coordinator tests
+
+Run `python -m pytest -q tests/test_jaccl_side_channel.py tests/test_cluster_routes.py tests/test_cluster_performance.py` to check how each Mac of a cabled mesh reaches rank zero. The bootstrap tests announce 192.0.2.1, which no rank can reach, and send rank two to a second local IPv4 address: 127.0.0.2 on Linux, the default-route address on macOS. Without one they skip. On macOS they skip the in-process transport, because macOS bootstraps through the system Python sidecar. No test crosses a cable, so check a change to this path on three Macs cabled as a mesh, each cable on its own subnet, with the performance probe and a model launch.
+
 # DeepSeek V4.1 offline tests
 
 CED scheduler prefill, short suffix positions, full-logit scoring, DSpark

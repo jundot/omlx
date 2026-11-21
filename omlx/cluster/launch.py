@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import importlib.metadata
 import ipaddress
 import json
@@ -22,7 +23,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ from typing import Any
 
 from omlx.utils import hardware
 
+from .coordinator_route import COORDINATOR_ADDRESSES_ENV, listen_addresses
 from .deployment import ClusterDeployment, validate_ssh_target
 from .liveness import (
     _LOOPBACK_TARGETS,
@@ -999,21 +1001,61 @@ def _available_launch_ports(
     )
 
 
-def _available_control_port(host: str) -> int:
-    """Reserve a rank-zero TCP control port on the verified cluster address."""
+def _available_control_port(hosts: str | Sequence[str]) -> int:
+    """Reserve a rank-zero TCP control port on the verified cluster addresses.
 
+    Rank zero listens on one address per route a rank takes to it, so the port
+    has to be free on every one of them.
+    """
+
+    if isinstance(hosts, str):
+        hosts = (hosts,)
     try:
-        address = str(ipaddress.ip_address(host))
+        addresses = [str(ipaddress.ip_address(host)) for host in hosts]
     except ValueError as exc:
         raise DistributedLaunchError("rank-control host is not an IP address") from exc
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    error: OSError | None = None
+    for _ in range(16):
+        listeners: list[socket.socket] = []
         try:
-            listener.bind((address, 0))
+            port = 0
+            for address in addresses:
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listeners.append(listener)
+                listener.bind((address, port))
+                port = int(listener.getsockname()[1])
+            return port
         except OSError as exc:
-            raise DistributedLaunchError(
-                f"could not reserve rank-control port on {address}: {exc}"
-            ) from exc
-        return int(listener.getsockname()[1])
+            error = exc
+            # Only a port taken on a later address is worth another draw.
+            if len(listeners) < 2 or exc.errno != errno.EADDRINUSE:
+                break
+        finally:
+            for listener in listeners:
+                listener.close()
+    raise DistributedLaunchError(
+        f"could not reserve rank-control port on {', '.join(addresses)}: {error}"
+    ) from error
+
+
+def _launcher_environment(ssh_wrapper_directory: str | Path) -> dict[str, str]:
+    """The environment for ``mlx.launch`` and the local rank it starts.
+
+    ``mlx.launch`` runs rank zero as its own child process, so rank zero sees
+    this environment as well as what the hostfile exports.
+    """
+
+    environment = os.environ.copy()
+    environment["PATH"] = (
+        f"{ssh_wrapper_directory}{os.pathsep}{environment.get('PATH', '')}"
+    )
+    environment["SSH_ASKPASS_REQUIRE"] = "never"
+    environment["PYTHONUNBUFFERED"] = "1"
+    # Only the hostfile names where ranks reach rank zero. A value left in this
+    # process's environment would reach rank zero alone, and would name rank
+    # zero for a launch that may have a different number of ranks.
+    environment.pop(COORDINATOR_ADDRESSES_ENV, None)
+    return environment
 
 
 def _package_version(name: str) -> str:
@@ -1437,10 +1479,7 @@ def run_cluster_performance_probe(
                 ),
             ]
         )
-        environment = os.environ.copy()
-        environment["PATH"] = f"{temporary}{os.pathsep}{environment.get('PATH', '')}"
-        environment["SSH_ASKPASS_REQUIRE"] = "never"
-        environment["PYTHONUNBUFFERED"] = "1"
+        environment = _launcher_environment(temporary)
         try:
             completed = runner(argv, timeout=timeout, env=environment)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -2478,7 +2517,9 @@ class DistributedJobSupervisor:
         )
         self.port, self.collective_port = _available_launch_ports(self.deployment)
         control_host = self.deployment.hosts[0].ips[0]
-        self.control_port = _available_control_port(control_host)
+        self.control_port = _available_control_port(
+            listen_addresses(self.deployment.coordinator_addresses) or control_host
+        )
         # The plan hash is public deployment identity, not authentication.
         # Mint a fresh launch-scoped secret so an unauthenticated peer on the
         # fabric cannot join rank control by reading the signed plan.
@@ -2498,12 +2539,7 @@ class DistributedJobSupervisor:
         )
         self._phase = "loading"
         try:
-            environment = os.environ.copy()
-            environment["PATH"] = (
-                f"{self._temporary.name}{os.pathsep}{environment.get('PATH', '')}"
-            )
-            environment["SSH_ASKPASS_REQUIRE"] = "never"
-            environment["PYTHONUNBUFFERED"] = "1"
+            environment = _launcher_environment(self._temporary.name)
             self.process = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,

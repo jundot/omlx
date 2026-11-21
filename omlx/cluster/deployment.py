@@ -15,6 +15,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from .coordinator_route import (
+    COORDINATOR_ADDRESSES_ENV,
+    encode_coordinator_addresses,
+)
 from .performance import (
     ExecutionSettings,
     NodePerformanceProfile,
@@ -135,6 +139,15 @@ def _hostfile_ips(host: ClusterHost) -> list[str]:
     return routable + [ip for ip in host.ips if _link_local(ip)]
 
 
+def _validate_coordinator_ip(value: str) -> str:
+    value = value.strip()
+    try:
+        # Rank zero's bootstrap listeners are IPv4 sockets.
+        return str(ipaddress.IPv4Address(value))
+    except ValueError as exc:
+        raise ValueError(f"invalid coordinator IP: {value!r}") from exc
+
+
 def _validate_rdma_path(value: Any) -> RDMAPath:
     if value is None:
         return None
@@ -204,6 +217,10 @@ class ClusterHost:
     ips: tuple[str, ...]
     rdma: tuple[RDMAPath, ...] = ()
     python_executable: str | None = None
+    # Where this rank reaches rank zero, when that is not the address the
+    # launcher announces for rank zero. Macs cabled as a mesh share a different
+    # subnet with rank zero on every cable. Never set on rank zero itself.
+    coordinator_ip: str | None = None
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.node_id) is None:
@@ -221,6 +238,10 @@ class ClusterHost:
             if not path.is_absolute() or "\x00" in executable or len(executable) > 4096:
                 raise ValueError("cluster host Python executable must be absolute")
             object.__setattr__(self, "python_executable", executable)
+        if self.coordinator_ip is not None:
+            object.__setattr__(
+                self, "coordinator_ip", _validate_coordinator_ip(self.coordinator_ip)
+            )
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -233,6 +254,8 @@ class ClusterHost:
         }
         if self.python_executable:
             payload["python_executable"] = self.python_executable
+        if self.coordinator_ip:
+            payload["coordinator_ip"] = self.coordinator_ip
         return payload
 
     @classmethod
@@ -250,12 +273,16 @@ class ClusterHost:
         python_executable = payload.get("python_executable")
         if python_executable is not None and not isinstance(python_executable, str):
             raise ValueError("cluster host Python executable must be a string")
+        coordinator_ip = payload.get("coordinator_ip")
+        if coordinator_ip is not None and not isinstance(coordinator_ip, str):
+            raise ValueError("cluster host coordinator IP must be a string")
         return cls(
             node_id=node_id,
             ssh=ssh,
             ips=tuple(ips),
             rdma=tuple(rdma),
             python_executable=python_executable,
+            coordinator_ip=coordinator_ip,
         )
 
 
@@ -403,6 +430,8 @@ class ClusterDeployment:
             raise ValueError("host count must match pipeline assignment count")
         if self.hosts[0].ssh != "127.0.0.1":
             raise ValueError("rank 0 must use SSH target 127.0.0.1")
+        if self.hosts[0].coordinator_ip is not None:
+            raise ValueError("rank 0 is the coordinator and takes no coordinator IP")
         if len({host.node_id for host in self.hosts}) != len(self.hosts):
             raise ValueError("cluster node IDs must be unique")
         object.__setattr__(
@@ -477,12 +506,33 @@ class ClusterDeployment:
 
         return self.path_map.get(node_id, self.model)
 
+    @property
+    def coordinator_addresses(self) -> tuple[str, ...]:
+        """Where each rank reaches rank zero, indexed by rank.
+
+        Empty while one address serves every rank: the first IP of rank
+        zero's hostfile entry, which ``mlx.launch`` announces to all of them.
+        A rank given no address of its own uses that one, and it fills rank
+        zero's own entry.
+        """
+
+        if not any(host.coordinator_ip for host in self.hosts):
+            return ()
+        announced = _hostfile_ips(self.hosts[0])[0]
+        return tuple(host.coordinator_ip or announced for host in self.hosts)
+
     def hostfile_dict(self) -> dict[str, Any]:
+        envs = _hostfile_envs(
+            fast_synch=self.backend == "jaccl" and self.tensor_parallel_size > 1
+        )
+        if self.coordinator_addresses:
+            envs.append(
+                f"{COORDINATOR_ADDRESSES_ENV}="
+                f"{encode_coordinator_addresses(self.coordinator_addresses)}"
+            )
         return {
             "backend": self.backend,
-            "envs": _hostfile_envs(
-                fast_synch=self.backend == "jaccl" and self.tensor_parallel_size > 1
-            ),
+            "envs": envs,
             "hosts": [
                 {
                     "ssh": host.ssh,
