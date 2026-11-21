@@ -97,6 +97,180 @@ class Inkling2DSparkConfig:
         )
 
 
+_MARKOV_Q8_ARGMAX_P1_SOURCE = """
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint tg = threadgroup_position_in_grid.x;
+    const uint b = threadgroup_position_in_grid.y;
+    const uint num_tg = threadgroups_per_grid.x;
+
+    constexpr uint PER = R / 32;
+    const device bfloat* lp = latent + (size_t)b * R + lane * PER;
+    float lv[PER];
+    float lsum = 0.0f;
+    for (uint i = 0; i < PER; ++i) {
+        lv[i] = float(lp[i]);
+        lsum += lv[i];
+    }
+    const uint gi = (lane * PER) / GS;
+    constexpr uint K_W = R / 4;
+    constexpr uint K_GS = R / GS;
+
+    const uint chunk = (V_UNPAD + num_tg - 1) / num_tg;
+    const uint v_begin = tg * chunk;
+    const uint v_end = min((uint)V_UNPAD, v_begin + chunk);
+    const device bfloat* blp = base_logits + (size_t)b * V_FULL;
+
+    float best_v = -INFINITY;
+    uint best_i = 0;
+
+    for (uint v = v_begin + sg; v < v_end; v += 8) {
+        float sc = float(scales[(size_t)v * K_GS + gi]);
+        float bi = float(biases[(size_t)v * K_GS + gi]);
+        float d0 = 0.0f;
+        const device uint* wp = w_q + (size_t)v * K_W + lane * (PER / 4);
+        for (uint w = 0; w < PER / 4; ++w) {
+            uint pk = wp[w];
+            d0 += float((pk >> 0) & 0xFFu) * lv[w * 4 + 0]
+                + float((pk >> 8) & 0xFFu) * lv[w * 4 + 1]
+                + float((pk >> 16) & 0xFFu) * lv[w * 4 + 2]
+                + float((pk >> 24) & 0xFFu) * lv[w * 4 + 3];
+        }
+        float dot = simd_sum(d0 * sc + lsum * bi);
+        if (lane == 0) {
+            float score = float(blp[v]) + float(fold_bias[v]) + dot;
+            if (score > best_v || (score == best_v && v < best_i)) {
+                best_v = score;
+                best_i = v;
+            }
+        }
+    }
+    threadgroup float tg_v[8];
+    threadgroup uint tg_i[8];
+    if (lane == 0) {
+        tg_v[sg] = best_v;
+        tg_i[sg] = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0 && lane == 0) {
+        float bv = tg_v[0];
+        uint bi_idx = tg_i[0];
+        for (int i = 1; i < 8; ++i) {
+            if (tg_v[i] > bv || (tg_v[i] == bv && tg_i[i] < bi_idx)) {
+                bv = tg_v[i];
+                bi_idx = tg_i[i];
+            }
+        }
+        part_v[(size_t)b * num_tg + tg] = bv;
+        part_i[(size_t)b * num_tg + tg] = bi_idx;
+    }
+"""
+
+_MARKOV_ARGMAX_P2_SOURCE = """
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint b = threadgroup_position_in_grid.x;
+
+    float bv = -INFINITY;
+    uint bi = 0;
+    const device float* pv = part_v + (size_t)b * NTG;
+    const device uint* pi = part_i + (size_t)b * NTG;
+    for (uint i = tid; i < NTG; i += 128) {
+        float v = pv[i];
+        uint idx = pi[i];
+        if (v > bv || (v == bv && idx < bi)) {
+            bv = v;
+            bi = idx;
+        }
+    }
+    float sm = simd_max(bv);
+    uint win_i = simd_min((bv == sm) ? bi : 0xFFFFFFFFu);
+    threadgroup float red_v[4];
+    threadgroup uint red_i[4];
+    if (lane == 0) {
+        red_v[sg] = sm;
+        red_i[sg] = win_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0 && lane == 0) {
+        float fv = red_v[0];
+        uint fi = red_i[0];
+        for (int i = 1; i < 4; ++i) {
+            if (red_v[i] > fv || (red_v[i] == fv && red_i[i] < fi)) {
+                fv = red_v[i];
+                fi = red_i[i];
+            }
+        }
+        out_tok[b] = fi;
+    }
+"""
+
+_markov_q8_p1_kernel = None
+_markov_argmax_p2_kernel = None
+_MARKOV_FOLD_GROUP_SIZE = 64
+_MARKOV_FOLD_BITS = 8
+_MARKOV_ARGMAX_NTG = 256
+
+
+def _markov_q8_greedy_argmax(
+    latent: mx.array,
+    w_q: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    fold_bias: mx.array,
+    base_logits: mx.array,
+    v_unpad: int,
+) -> mx.array:
+    """Fused Q8 affine Markov projection + base_logits add + greedy argmax."""
+    global _markov_q8_p1_kernel, _markov_argmax_p2_kernel
+    if _markov_q8_p1_kernel is None:
+        _markov_q8_p1_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_markov_q8_p1",
+            input_names=[
+                "latent",
+                "w_q",
+                "scales",
+                "biases",
+                "fold_bias",
+                "base_logits",
+            ],
+            output_names=["part_v", "part_i"],
+            source=_MARKOV_Q8_ARGMAX_P1_SOURCE,
+        )
+        _markov_argmax_p2_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_markov_argmax_p2",
+            input_names=["part_v", "part_i"],
+            output_names=["out_tok"],
+            source=_MARKOV_ARGMAX_P2_SOURCE,
+        )
+    b, r = latent.shape
+    v_full = base_logits.shape[-1]
+    ntg = _MARKOV_ARGMAX_NTG
+    pv, pi = _markov_q8_p1_kernel(
+        inputs=[latent, w_q, scales, biases, fold_bias, base_logits],
+        template=[
+            ("R", r),
+            ("GS", _MARKOV_FOLD_GROUP_SIZE),
+            ("V_UNPAD", v_unpad),
+            ("V_FULL", v_full),
+        ],
+        grid=(ntg * 256, b, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(b, ntg), (b, ntg)],
+        output_dtypes=[mx.float32, mx.uint32],
+    )
+    return _markov_argmax_p2_kernel(
+        inputs=[pv, pi],
+        template=[("NTG", ntg)],
+        grid=(b * 128, 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(b,)],
+        output_dtypes=[mx.uint32],
+    )[0]
+
+
+@mx.compile
 def mix_rmsnorm(context: mx.array, alpha: mx.array, weight: mx.array, eps: float):
     """Softmax-weighted sum of the context taps, RMS-normalized.
 
@@ -179,6 +353,7 @@ class Inkling2MarkovHead(nn.Module):
         self.dflare_norm = nn.RMSNorm(h, eps=config.rms_norm_eps)
         self._eps = config.rms_norm_eps
         self._softcap = config.final_logit_softcapping
+        self._unpadded_vocab_size = config.unpadded_vocab_size
         self._vocab_bias = None
         if config.unpadded_vocab_size < config.vocab_size:
             self._vocab_bias = mx.where(
@@ -187,6 +362,9 @@ class Inkling2MarkovHead(nn.Module):
                 -mx.inf,
             ).astype(mx.float32)
         self._fold_weight = None
+        self._fold_wq = None
+        self._fold_scales = None
+        self._fold_biases = None
         self._fold_bias = None
         self._alpha = None
         self._f_rnn: dict[Any, mx.array] = {}
@@ -196,7 +374,12 @@ class Inkling2MarkovHead(nn.Module):
         self._step = 0
 
     def fold(self, lm_head: nn.Module) -> None:
-        """Fold the target LM head into the latent projection."""
+        """Fold the target LM head into the latent projection.
+
+        At release vocab/rank sizes the folded ``[V, rank]`` table is quantized
+        to 8-bit affine (matching the 8-bit target LM head) to halve per-step
+        DRAM bandwidth while preserving greedy draft agreement.
+        """
         if isinstance(lm_head, nn.QuantizedLinear):
             weight = mx.dequantize(
                 lm_head.weight,
@@ -216,9 +399,30 @@ class Inkling2MarkovHead(nn.Module):
             rows.append((head @ proj).astype(mx.bfloat16))
             biases.append((head @ bias).astype(mx.bfloat16))
             mx.eval(rows[-1], biases[-1])
-        self._fold_weight = mx.concatenate(rows, axis=0)
+        folded = mx.concatenate(rows, axis=0)
         self._fold_bias = mx.concatenate(biases, axis=0)
-        mx.eval(self._fold_weight, self._fold_bias)
+        if (
+            folded.shape[0] >= 1024
+            and self.rank % 128 == 0
+            and self.rank >= _MARKOV_FOLD_GROUP_SIZE
+        ):
+            self._fold_wq, self._fold_scales, self._fold_biases = mx.quantize(
+                folded,
+                group_size=_MARKOV_FOLD_GROUP_SIZE,
+                bits=_MARKOV_FOLD_BITS,
+                mode="affine",
+            )
+            self._fold_weight = None
+            mx.eval(
+                self._fold_wq,
+                self._fold_scales,
+                self._fold_biases,
+                self._fold_bias,
+            )
+        else:
+            self._fold_weight = folded
+            self._fold_wq = self._fold_scales = self._fold_biases = None
+            mx.eval(self._fold_weight, self._fold_bias)
 
     def prepare_block(self, draft_hidden, context, lengths, uids) -> None:
         """Reset the RNN for a new block; refresh each row's committed taps."""
@@ -239,7 +443,7 @@ class Inkling2MarkovHead(nn.Module):
         for uid in uids:
             self._f_rnn.pop(uid, None)
 
-    def apply_step_logits(self, base_logits: mx.array, prev_tokens: mx.array):
+    def _step_latent(self, prev_tokens: mx.array) -> mx.array:
         state = self._state
         dtype = state.dtype
         inputs = mx.concatenate(
@@ -257,9 +461,50 @@ class Inkling2MarkovHead(nn.Module):
         kept = (gate * state).astype(dtype)
         blend = ((1.0 - gate) * mx.tanh(proj[:, r : 2 * r]).astype(dtype)).astype(dtype)
         self._state = kept + blend
-        latent = mx.tanh(proj[:, 2 * r :]).astype(dtype)
-        bias = latent @ self._fold_weight.T + self._fold_bias
         self._step += 1
+        return mx.tanh(proj[:, 2 * r :]).astype(dtype)
+
+    def apply_step_greedy(
+        self, base_logits: mx.array, prev_tokens: mx.array
+    ) -> mx.array:
+        """Greedy Markov step: fused Q8 projection + add + argmax without full-vocab temps."""
+        if (
+            self._fold_wq is not None
+            and mx.default_device() == mx.gpu
+            and base_logits.dtype == mx.bfloat16
+            and self._state.dtype == mx.bfloat16
+            and self.rank % 128 == 0
+        ):
+            latent = self._step_latent(prev_tokens)
+            return _markov_q8_greedy_argmax(
+                latent,
+                self._fold_wq,
+                self._fold_scales,
+                self._fold_biases,
+                self._fold_bias,
+                base_logits,
+                self._unpadded_vocab_size,
+            )
+        return mx.argmax(self.apply_step_logits(base_logits, prev_tokens), axis=-1)
+
+    def apply_step_logits(self, base_logits: mx.array, prev_tokens: mx.array):
+        latent = self._step_latent(prev_tokens)
+        if self._fold_wq is not None:
+            bias = (
+                mx.quantized_matmul(
+                    latent,
+                    self._fold_wq,
+                    self._fold_scales,
+                    self._fold_biases,
+                    transpose=True,
+                    group_size=_MARKOV_FOLD_GROUP_SIZE,
+                    bits=_MARKOV_FOLD_BITS,
+                    mode="affine",
+                )
+                + self._fold_bias
+            )
+        else:
+            bias = latent @ self._fold_weight.T + self._fold_bias
         logits = base_logits.astype(mx.float32) + bias.astype(mx.float32)
         if self._softcap:
             logits = mx.tanh(logits / self._softcap) * self._softcap

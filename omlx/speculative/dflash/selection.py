@@ -47,23 +47,28 @@ def select_markov(markov, logits, anchors, samplers) -> list[tuple]:
     batch = len(samplers)
     prev = anchors.reshape(-1)
     tokens, accepts = [], [[] for _ in range(batch)]
+    greedy = all(sampler is None for sampler in samplers)
+    greedy_step = getattr(markov, "apply_step_greedy", None) if greedy else None
     for step in range(logits.shape[1]):
-        step_logits = markov.apply_step_logits(logits[:, step], prev)
-        if all(sampler is None for sampler in samplers):
-            prev = mx.argmax(step_logits, axis=-1)
+        if greedy_step is not None:
+            prev = greedy_step(logits[:, step], prev)
         else:
-            lp = step_logits - mx.logsumexp(step_logits, axis=-1, keepdims=True)
-            picks = []
-            for index, sampler in enumerate(samplers):
-                if sampler is None:
-                    picks.append(mx.argmax(step_logits[index : index + 1], axis=-1))
-                    continue
-                token, accept_lp = bg._sample_draft_with_logprobs(
-                    sampler, lp[index : index + 1]
-                )
-                picks.append(token.reshape(1))
-                accepts[index].append(accept_lp.reshape(-1))
-            prev = mx.concatenate(picks)
+            step_logits = markov.apply_step_logits(logits[:, step], prev)
+            if greedy:
+                prev = mx.argmax(step_logits, axis=-1)
+            else:
+                lp = step_logits - mx.logsumexp(step_logits, axis=-1, keepdims=True)
+                picks = []
+                for index, sampler in enumerate(samplers):
+                    if sampler is None:
+                        picks.append(mx.argmax(step_logits[index : index + 1], axis=-1))
+                        continue
+                    token, accept_lp = bg._sample_draft_with_logprobs(
+                        sampler, lp[index : index + 1]
+                    )
+                    picks.append(token.reshape(1))
+                    accepts[index].append(accept_lp.reshape(-1))
+                prev = mx.concatenate(picks)
         tokens.append(prev)
     return [
         ([token[index : index + 1] for token in tokens], accepts[index])
