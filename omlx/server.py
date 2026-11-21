@@ -1446,6 +1446,28 @@ def _wake_process_memory_enforcer(*, active: bool = False) -> None:
         wake(active=active)
 
 
+def _pick_fallback_model(pool) -> str | None:
+    """Choose the model to serve when a requested model is not found.
+
+    With ``model_fallback_target == "loaded"``, prefer the largest LLM that is
+    already loaded so the fallback never triggers a new (possibly huge) model
+    load. If none is loaded, or the target is ``"default"``, use the default
+    model.
+    """
+    gs = _server_state.global_settings
+    if gs and gs.model.model_fallback_target == "loaded":
+        best_id, best_size = None, -1
+        for mid in pool.get_loaded_model_ids():
+            entry = pool.get_entry(mid)
+            if entry is None or entry.model_type not in ("llm", "vlm"):
+                continue
+            if entry.estimated_size > best_size:
+                best_id, best_size = mid, entry.estimated_size
+        if best_id:
+            return best_id
+    return _server_state.default_model
+
+
 async def get_engine(
     model_id: str | None = None,
     engine_type: EngineType = EngineType.LLM,
@@ -1530,25 +1552,27 @@ async def get_engine(
         if _lease and _leased_out is not None:
             _leased_out.append(model_id)
     except ModelNotFoundError as e:
-        # Fallback to default model if enabled (LLM only)
-        if (
-            engine_type == EngineType.LLM
-            and _server_state.global_settings
-            and _server_state.global_settings.model.model_fallback
-            and _server_state.default_model
-        ):
+        # Fallback model if enabled (LLM only)
+        fallback_id = (
+            _pick_fallback_model(pool)
+            if (
+                engine_type == EngineType.LLM
+                and _server_state.global_settings
+                and _server_state.global_settings.model.model_fallback
+            )
+            else None
+        )
+        if fallback_id:
             logger.info(
                 f"Model '{model_id}' not found, falling back to "
-                f"default model '{_server_state.default_model}'"
+                f"model '{fallback_id}'"
             )
             try:
                 _wake_process_memory_enforcer(active=True)
                 _fallback_kwargs = {"_lease": True} if _lease else {}
-                fb_engine = await pool.get_engine(
-                    _server_state.default_model, **_fallback_kwargs
-                )
+                fb_engine = await pool.get_engine(fallback_id, **_fallback_kwargs)
                 if _lease and _leased_out is not None:
-                    _leased_out.append(_server_state.default_model)
+                    _leased_out.append(fallback_id)
                 return fb_engine
             except Exception:
                 pass  # Fall through to original 404
