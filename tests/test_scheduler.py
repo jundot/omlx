@@ -3933,6 +3933,60 @@ class TestSchedulerBoundarySnapshots:
         assert 3 not in provider
         assert len(provider) == 0
 
+    def test_prompt_tail_behind_a_decode_boundary_is_stored_as_a_shared_tail(
+        self, mock_model, mock_tokenizer
+    ):
+        """A reply that crosses a block boundary leaves its prompt restorable."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        request = Request(
+            request_id="req-crossed",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(7))
+        request.prompt_tail_end = 6
+        scheduler.requests[request.request_id] = request
+        raw = {4: object(), 6: object(), 8: object()}
+        extracted = {tc: [{"state": (tc,)}] for tc in raw}
+
+        def extract(raw_cache):
+            for tc, obj in raw.items():
+                if raw_cache is obj:
+                    return extracted[tc], f"config-{tc}"
+            raise AssertionError("unexpected raw cache")
+
+        def stores(snapshots):
+            scheduler._boundary_cache_snapshots[request.request_id] = {
+                tc: raw[tc] for tc in snapshots
+            }
+            with (
+                patch.object(scheduler, "_extract_cache_states", side_effect=extract),
+                patch.object(
+                    scheduler,
+                    "_merge_boundary_with_full_cache",
+                    side_effect=lambda boundary, full: boundary,
+                ),
+            ):
+                tokens, _, _, provider = scheduler._get_boundary_store_override(
+                    request.request_id, list(range(10))
+                )
+                shared = scheduler._prepare_shared_tail_stores(request, [])
+            return (
+                len(tokens),
+                provider.tail_terminal_token_count,
+                [(len(st[0]), st[3].tail_terminal_token_count) for st in shared],
+            )
+
+        # The store ends on the boundary the reply crossed; the prompt's tail
+        # goes beside it.
+        assert stores((4, 6, 8)) == (8, None, [(6, 6)])
+        # A reply inside the block: the tail is the store's own terminal.
+        assert stores((4, 6)) == (6, 6, [])
+        # So is a tail at a generation prompt the store must stop at.
+        request.generation_prompt_start = 6
+        assert stores((4, 6, 8)) == (6, 6, [])
+
     def test_cleanup_finished_pre_evals_intermediate_boundary_snapshots(
         self, mock_model, mock_tokenizer
     ):
@@ -7380,6 +7434,59 @@ class TestOutputParserSmoke:
             assert entry.logprob == pytest.approx(-0.0104, abs=0.002)
             assert [alt.token_id for alt in entry.top][0] == entry.token_id
             assert len(entry.top) == 2
+
+    def test_inkling_generation_opener_streams_from_the_first_token(self, mock_model):
+        """A prompt that ends past the reply's block header starts in that block.
+
+        Without the prompt tail the parser holds the text as a block head and
+        releases it only at the next marker.
+        """
+        mock_model.config.model_type = "inkling2_loop"
+        pieces = {
+            20: "<|message_model|>",
+            21: "<|content_text|>",
+            22: "<|end_message|>",
+            23: "<|content_model_end_sampling|>",
+            24: "<|content_thinking|>",
+            13: "Hello",
+            14: " world",
+        }
+
+        class Tokenizer(self._GemmaTokenizer):
+            def convert_tokens_to_ids(self, token):
+                return next((i for i, piece in pieces.items() if piece == token), None)
+
+            def encode(self, text, add_special_tokens=True):
+                return [self.convert_tokens_to_ids(text) or 10]
+
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=Tokenizer(pieces),
+            config=SchedulerConfig(model_name="Inkling-2-Mini"),
+        )
+        request = Request(
+            request_id="inkling-opener",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=4),
+            prompt_token_ids=[9, 22, 20, 21],
+            num_prompt_tokens=4,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        assert scheduler._detect_needs_think_prefix(request) is False
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        outputs, _ = scheduler._process_batch_responses(
+            [
+                SimpleNamespace(uid=99, token=token, finish_reason=None)
+                for token in (13, 14, 22)
+            ]
+        )
+
+        assert [output.new_text for output in outputs][:2] == ["Hello", " world"]
 
     def test_gemma4_prefilled_thought_after_tool_response(self, mock_model):
         """Tool continuations open the thought channel in the prompt.

@@ -245,6 +245,7 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .patches.inkling2 import INKLING2_MODEL_TYPES
 from .prefill_helper.routes import router as prefill_helper_router
 from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
 from .prefill_progress import get_prefill_tracker
@@ -5134,6 +5135,9 @@ async def create_chat_completion(
                 reasoning_parser=reasoning_parser,
             )
         )
+        merged_ct_kwargs = _grammar_opener_kwargs(
+            engine, compiled_grammar, merged_ct_kwargs
+        )
         # Fall back to prompt injection when grammar is not compiled. The degrade
         # is also surfaced to the caller as a Warning response header (#1241).
         # Only response formats that actually request grammar-constrained JSON
@@ -5796,6 +5800,25 @@ def _grammar_reasoning_parser(engine, reasoning_parser: str | None) -> str | Non
     if reasoning_parser is None and engine.model_type == "gpt_oss":
         return "harmony"
     return reasoning_parser
+
+
+def _grammar_opener_kwargs(
+    engine, compiled_grammar, chat_template_kwargs: dict | None
+) -> dict | None:
+    """Make an Inkling 2 content opener start the answer for a bare grammar.
+
+    A grammar without a reasoning phase constrains the first generated token,
+    so a prompt that ends inside a thinking block would put the answer there.
+    """
+    if (
+        compiled_grammar is None
+        or not chat_template_kwargs
+        or chat_template_kwargs.get("generation_opener") != "content"
+        or getattr(engine, "model_type", None) not in INKLING2_MODEL_TYPES
+        or getattr(compiled_grammar, "_omlx_has_thinking_phase", False) is True
+    ):
+        return chat_template_kwargs
+    return {**chat_template_kwargs, "generation_opener_answer": True}
 
 
 def _compile_with_structural_tag(
@@ -8773,6 +8796,9 @@ async def create_response(
                         response_format=rf,
                         chat_template_kwargs=merged_ct_kwargs or None,
                         reasoning_parser=reasoning_parser,
+                    )
+                    merged_ct_kwargs = _grammar_opener_kwargs(
+                        engine, compiled_grammar, merged_ct_kwargs
                     )
                 if native_response_format is None and compiled_grammar is None:
                     # Non-strict formats still degrade to prompt injection, so

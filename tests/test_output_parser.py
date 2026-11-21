@@ -1321,6 +1321,56 @@ class TestInklingOutputParserSession:
         assert stream == "<think>half a thought</think>"
         assert visible == stream
 
+    _MM, _THINK, _TEXT = "<|message_model|>", "<|content_thinking|>", "<|content_text|>"
+    _TOOL, _END = "<|content_invoke_tool_json|>", "<|end_message|>"
+    _STOP = "<|content_model_end_sampling|>"
+    _CALL = '{"name":"get_weather","args":{"city":"Seoul"}}'
+
+    @pytest.mark.parametrize(
+        "header, reply",
+        [
+            (2, [_MM, _TEXT, "Hello", " world", _END, _STOP]),
+            (2, [_MM, _THINK, "reason", _END, _MM, _TEXT, "Answer", _END, _STOP]),
+            (2, [_MM, _TEXT, '{"a":', " 1}", _END, _STOP]),
+            (3, [_MM, "get_weather", _TOOL, _CALL, _END, _STOP]),
+            (
+                2,
+                [_MM, _THINK, "need", _END, _MM, "get_weather", _TOOL, _CALL, _END, _STOP],
+            ),
+        ],
+        ids=["text", "reasoning+text", "json", "tool", "reasoning+tool"],
+    )
+    def test_reply_parses_the_same_with_its_opener_in_the_prompt(self, header, reply):
+        """A generation opener moves the reply's first tokens into the prompt."""
+        from omlx.api.thinking import extract_thinking
+
+        strings = ["<|message_user|>", "hi", *dict.fromkeys(reply)]
+        tokenizer, factory = self._factory(dict(enumerate(strings, 1)))
+        ids = [strings.index(piece) + 1 for piece in reply]
+        user = [1, 2, strings.index(self._END) + 1]
+
+        def parse(opener):
+            session = factory.create_session(tokenizer)
+            session.notify_prompt_tail(user + ids[:opener])
+            prefix = ""
+            if opener and reply[opener - 1] == self._THINK:
+                # What the scheduler does for a prompt that opens thinking.
+                session.notify_prefilled_thought()
+                prefix = factory.thinking_start_output_text
+            first = session.process_token(ids[opener]).stream_text
+            stream, visible, stopped, final = self._run(session, ids[opener + 1 :])
+            assert stopped and prefix + first + stream == prefix + first + visible
+            return first, extract_thinking(prefix + first + stream), final.tool_calls
+
+        _, parsed, tool_calls = parse(0)
+        assert tool_calls or parsed[1]
+        for opener in range(1, header + 1):
+            first, got, got_calls = parse(opener)
+            assert (got, got_calls) == (parsed, tool_calls)
+            if reply[opener - 1] in (self._THINK, self._TEXT):
+                # The first generated token streams at once, not at block end.
+                assert first == reply[opener]
+
     def test_non_inkling_models_unaffected(self):
         tokenizer = InklingTokenizer({0: "a", 1: "b"})
         factory = detect_output_parser(

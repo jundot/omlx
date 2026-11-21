@@ -2970,7 +2970,7 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
-        system_store: tuple[list[int], list[Any], Any, Any] | None = None,
+        shared_stores: list[tuple[list[int], list[Any], Any, Any]] | None = None,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -3031,11 +3031,11 @@ class Scheduler:
                     hot_cache_write_back=hot_cache_write_back,
                     _store_tail_terminal=store_tail_terminal,
                 )
-                if system_store is not None:
+                for shared_store in shared_stores or ():
                     # Before the release below, so the shared blocks stay pinned.
                     self._store_system_prefix(
                         request_id,
-                        system_store,
+                        shared_store,
                         extra_keys,
                         extra_key_token_start,
                         extra_key_ranges,
@@ -3050,40 +3050,73 @@ class Scheduler:
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
 
-    def _prepare_system_prefix_store(
+    def _superseded_tail_end(
+        self, request: "Request | None", snapshots: dict[int, Any]
+    ) -> int:
+        """Return the prompt tail a later block boundary takes the terminal from.
+
+        A reply that runs past the next block boundary ends its store on that
+        boundary, a block of generated tokens no later prompt matches. The
+        prompt's own tail then has to be kept as a shared tail, or a repeat of
+        the prompt resumes at the boundary before it.
+        """
+        tail = getattr(request, "prompt_tail_end", 0) or 0
+        block_size = self.config.paged_cache_block_size
+        if tail <= 0 or block_size <= 0 or tail not in snapshots:
+            return 0
+        marker = getattr(request, "generation_prompt_start", 0) or 0
+        if marker > 0 and not getattr(request, "generation_prompt_persists", False):
+            # The store stops at the generation prompt: no boundary past it
+            # can take the terminal, and the tail stays the store's own.
+            return 0
+        if any(tc > tail and tc % block_size == 0 for tc in snapshots):
+            return tail
+        return 0
+
+    def _prepare_shared_tail_stores(
         self, request: "Request", full_cache: list[Any]
-    ) -> tuple[list[int], list[Any], Any, Any] | None:
-        """Build the shared-tail payload (system prefix or branch point)."""
+    ) -> list[tuple[list[int], list[Any], Any, Any]]:
+        """Build the shared-tail payloads: the system prefix or branch point,
+        and the prompt tail when the reply ran past the next block boundary."""
         snapshots = self._boundary_cache_snapshots.get(request.request_id) or {}
         ends = (
             getattr(request, "system_prefix_end", 0) or 0,
             getattr(request, "junction_end", 0) or 0,
         )
-        system_end = next((end for end in ends if end > 0 and end in snapshots), 0)
-        if system_end <= 0:
-            return None
-        try:
-            override = self._get_boundary_store_override(
-                request.request_id,
-                list(request.prompt_token_ids[:system_end]),
-                system_tail=True,
+        shared_ends = [
+            next((end for end in ends if end > 0 and end in snapshots), 0),
+            self._superseded_tail_end(request, snapshots),
+        ]
+        stores = []
+        for shared_end in sorted({end for end in shared_ends if end > 0}):
+            try:
+                override = self._get_boundary_store_override(
+                    request.request_id,
+                    list(request.prompt_token_ids[:shared_end]),
+                    system_tail=True,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Shared tail snapshot unavailable for %s: %s",
+                    request.request_id,
+                    e,
+                )
+                continue
+            if override is None:
+                continue
+            tokens, boundary_cache, model_cache_config, provider = override
+            if getattr(provider, "tail_terminal_token_count", None) != shared_end:
+                continue
+            stores.append(
+                (
+                    tokens,
+                    self._merge_boundary_with_full_cache(boundary_cache, full_cache),
+                    model_cache_config
+                    or getattr(request, "_model_cache_config", None),
+                    provider,
+                )
             )
-        except Exception as e:
-            logger.debug(
-                "Shared tail snapshot unavailable for %s: %s", request.request_id, e
-            )
-            return None
-        if override is None:
-            return None
-        tokens, boundary_cache, model_cache_config, provider = override
-        if getattr(provider, "tail_terminal_token_count", None) != system_end:
-            return None
-        return (
-            tokens,
-            self._merge_boundary_with_full_cache(boundary_cache, full_cache),
-            model_cache_config or getattr(request, "_model_cache_config", None),
-            provider,
-        )
+        return stores
 
     def _store_system_prefix(
         self,
@@ -3818,6 +3851,13 @@ class Scheduler:
                 parser_session = self._output_parser_factory.create_session(
                     self.tokenizer
                 )
+            notify_tail = getattr(parser_session, "notify_prompt_tail", None)
+            if (
+                callable(notify_tail)
+                and request is not None
+                and request.prompt_token_ids
+            ):
+                notify_tail(request.prompt_token_ids)
             if request is not None and getattr(request, "needs_think_prefix", False):
                 notify = getattr(parser_session, "notify_prefilled_thought", None)
                 if callable(notify):
@@ -8703,6 +8743,11 @@ class Scheduler:
         self._on_prefill_boundary_snapshot(
             request.request_id, snapshot_cache, total_tokens, source="prefill_tail"
         )
+        if total_tokens not in (
+            getattr(request, "system_prefix_end", 0) or 0,
+            getattr(request, "junction_end", 0) or 0,
+        ):
+            request.prompt_tail_end = total_tokens
         _mtp_priming.capture_tail_boundary(self.model, request.request_id, total_tokens)
 
     def _build_sampler_and_processors(
@@ -9899,6 +9944,7 @@ class Scheduler:
         shared_ends = {
             getattr(request, "system_prefix_end", 0) or 0,
             getattr(request, "junction_end", 0) or 0,
+            self._superseded_tail_end(request, snapshots),
         }
         tail_counts = [
             tc
@@ -14941,7 +14987,7 @@ class Scheduler:
                                                 f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
                                                 f"intermediate snapshots)"
                                             )
-                                    system_store = self._prepare_system_prefix_store(
+                                    shared_stores = self._prepare_shared_tail_stores(
                                         request, cache_to_store
                                     )
                                 # Divergence probe (issues #1003, #2333):
@@ -14974,10 +15020,10 @@ class Scheduler:
                                                     snapshot_cache
                                                 )
                                             )
-                                    if system_store is not None:
+                                    for shared_store in shared_stores:
                                         pre_eval_arrays.extend(
                                             self._collect_arrays_from_extracted_cache(
-                                                system_store[1]
+                                                shared_store[1]
                                             )
                                         )
                                 with self._phase_timer("store_cache_main_dispatch"):
@@ -15043,7 +15089,7 @@ class Scheduler:
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
                                         hot_cache_write_back,
-                                        system_store,
+                                        shared_stores,
                                     )
                                 except BaseException:
                                     if gate is not None:
@@ -15060,8 +15106,9 @@ class Scheduler:
                                         extra_key_ranges=(
                                             request.vlm_extra_key_ranges_for_cache
                                         ),
-                                        shared_prefix_len=(
-                                            len(system_store[0]) if system_store else 0
+                                        shared_prefix_len=max(
+                                            (len(st[0]) for st in shared_stores),
+                                            default=0,
                                         ),
                                     )
                                 )
@@ -15077,7 +15124,7 @@ class Scheduler:
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
                                     hot_cache_write_back,
-                                    system_store,
+                                    shared_stores,
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "
