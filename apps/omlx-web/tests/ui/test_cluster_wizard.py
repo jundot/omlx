@@ -3287,7 +3287,7 @@ ASSISTANT_ACTIONS = (
 
 def _assistant_card() -> str:
     template = _read(TEMPLATE)
-    start = template.index("data-cluster-v2-assistant>")
+    start = template.index("data-cluster-assistant>")
     end = template.index("<!-- /Assistant -->", start)
     return template[start:end]
 
@@ -3371,8 +3371,8 @@ def test_assistant_primary_path_has_no_ip_ssh_rank_layer_or_model_path_field():
     assert "<input" not in card
     assert "<select" not in card
     assert "x-model" not in card
-    assert "data-cluster-v2-assistant-entry" in card
-    assert "data-cluster-v2-assistant-plan" in card
+    assert "data-cluster-assistant-entry" in card
+    assert "data-cluster-assistant-plan" in card
     # The plan-time inputs are the component's frozen object, not inputs.
     assert "runAssistantPlan()" not in card
     assert "assistantModelLabel()" in card
@@ -3382,8 +3382,8 @@ def test_assistant_primary_path_has_no_ip_ssh_rank_layer_or_model_path_field():
 def test_assistant_failure_renders_exactly_one_action_from_error_action():
     card = _assistant_card()
 
-    assert "data-cluster-v2-assistant-error" in card
-    assert card.count("data-cluster-v2-assistant-action") == 1
+    assert "data-cluster-assistant-error" in card
+    assert card.count("data-cluster-assistant-action") == 1
     assert "assistantActionHandler(assistant.error?.action)" in card
     assert "assistantActionLabel(assistant.error?.action)" in card
     # retry_coordinator shows the coordinator instruction next to the action.
@@ -3456,7 +3456,7 @@ def test_the_two_mac_fallback_is_explicit_and_signed():
     )[0]
     assert "runAssistantPlan" in confirm
     assert "topologyFallback" in confirm
-    assert "data-cluster-v2-assistant-two-mac-fallback" in template
+    assert "data-cluster-assistant-two-mac-fallback" in template
     assert "topology_incomplete" in template
     assert "assistant.missingLinks" in template
 
@@ -3547,7 +3547,7 @@ def test_assistant_component_never_stages_deploys_or_launches():
     block = javascript[start:end]
 
     for forbidden in (
-        "CLUSTER_V2_API",
+        "CLUSTER_API",
         "/deployments",
         "/stage",
         "/replan",
@@ -3654,7 +3654,7 @@ def test_a_small_mac_is_forced_to_headless_and_says_so():
 
     notes = javascript.split("assistantSmallMacNotes() {", 1)[1].split("},", 1)[0]
     assert "cluster.assistant.small_mac_note" in notes
-    assert "data-cluster-v2-assistant-small-mac" in card
+    assert "data-cluster-assistant-small-mac" in card
     assert "assistantSmallMacNotes()" in card
 
 
@@ -3670,10 +3670,10 @@ def test_free_space_panel_lists_only_the_mac_the_user_picked():
     javascript = _read(JAVASCRIPT)
     card = _assistant_card()
 
-    assert "data-cluster-v2-assistant-free-space" in card
-    assert "data-cluster-v2-assistant-free-space-node" in card
-    assert "data-cluster-v2-assistant-free-space-model" in card
-    assert "data-cluster-v2-assistant-free-space-delete" in card
+    assert "data-cluster-assistant-free-space" in card
+    assert "data-cluster-assistant-free-space-node" in card
+    assert "data-cluster-assistant-free-space-model" in card
+    assert "data-cluster-assistant-free-space-delete" in card
     assert "assistant.error?.action === 'free_disk_space'" in card
     assert "assistant.freeSpaceOpen" in card
 
@@ -3729,7 +3729,7 @@ def test_free_space_delete_is_a_two_step_confirm_then_a_remeasure():
     # number, not the card's assumption.
     assert "await this.runAssistantMeasure();" in delete
     assert "cluster.assistant.free_space.deleted" in delete
-    assert "data-cluster-v2-assistant-free-space-error" in card
+    assert "data-cluster-assistant-free-space-error" in card
 
 
 def test_free_space_action_opens_the_panel_and_never_deletes_from_the_browser():
@@ -3946,17 +3946,17 @@ def test_assistant_card_is_mounted_independently_of_the_wizard_state():
     """B3: the card lives in its own always-mounted section, not in plan."""
 
     template = _read(TEMPLATE)
-    assert "data-cluster-v2-assistant-section" in template
+    assert "data-cluster-assistant-section" in template
     assert re.search(
         r'<section x-show="assistantSurfaceVisible\(\)"[^>]*'
-        r'data-cluster-v2-assistant-section>',
+        r'data-cluster-assistant-section>',
         template,
     )
     # The plan section no longer contains the assistant card.
-    plan_start = template.index("data-cluster-v2-plan>")
+    plan_start = template.index("data-cluster-plan>")
     plan_end = template.index("</section>", plan_start)
-    assert "data-cluster-v2-assistant>" not in template[plan_start:plan_end]
+    assert "data-cluster-assistant>" not in template[plan_start:plan_end]
     # The assistant section is mounted before the plan section.
-    assert template.index("data-cluster-v2-assistant-section>") < template.index(
-        "data-cluster-v2-plan>"
+    assert template.index("data-cluster-assistant-section>") < template.index(
+        "data-cluster-plan>"
     )

@@ -9,11 +9,9 @@ import asyncio
 import json
 
 import pytest
-from tests.ui.test_cluster_v2_wizard import _WIZARD_TWO_MACS, _fixtures, _run_wizard
-
 from omlx.cluster import routes
 from tests.test_cluster_pairing import _loopback_pair
-from tests.ui.test_cluster_wizard import _WIZARD_TWO_MACS, _run_wizard
+from tests.ui.test_cluster_wizard import _WIZARD_TWO_MACS, _fixtures, _run_wizard
 
 def test_initial_plan_uses_measured_budgets_and_role_fraction():
     result = _run_wizard(_WIZARD_TWO_MACS + """

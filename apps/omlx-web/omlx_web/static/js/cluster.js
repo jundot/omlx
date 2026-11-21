@@ -68,14 +68,6 @@ function clusterWizard() {
         runtime: '/admin/api/cluster/runtime',
         deployments: '/admin/api/cluster/deployments',
         replan: '/admin/api/cluster/replan',
-        diagnostics: '/admin/api/cluster/diagnostics',
-        joinKeys: '/admin/api/cluster/join-keys',
-        joinStatus: '/admin/api/cluster/join-status',
-        revokeJoinKey: (id) =>
-            `/admin/api/cluster/join-keys/${encodeURIComponent(id)}`,
-        cudaFabricVerify: '/admin/api/cluster/cuda-fabric/verify',
-        rdmaLinks: '/admin/api/cluster/rdma-links',
-        rdmaLinkVerify: '/admin/api/cluster/rdma-links/verify',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
         deploymentLoad: (id) =>
@@ -3989,9 +3981,9 @@ function clusterWizard() {
             if (!this.cudaJoin.command) return '';
             const state = this.cudaJoinState();
             if (state?.status === 'used') {
-                return window.t('cluster.v2.cuda.used');
+                return window.t('cluster.cuda.used');
             }
-            if (state?.status === 'revoked') return window.t('cluster.v2.cuda.revoked');
+            if (state?.status === 'revoked') return window.t('cluster.cuda.revoked');
             const remaining = Math.ceil(
                 (Number(state?.expires_at || this.cudaJoin.expiresAt || 0) *
                     1000 -
@@ -3999,13 +3991,13 @@ function clusterWizard() {
                     60000,
             );
             return remaining > 0
-                ? window.t('cluster.v2.cuda.expires_in').replace('{n}', String(remaining))
-                : window.t('cluster.v2.cuda.expired');
+                ? window.t('cluster.cuda.expires_in').replace('{n}', String(remaining))
+                : window.t('cluster.cuda.expired');
         },
 
         async loadCudaJoinStatus() {
             try {
-                const payload = await this.apiFetch(CLUSTER_V2_API.joinStatus, {
+                const payload = await this.apiFetch(CLUSTER_API.joinStatus, {
                     cache: 'no-store',
                 });
                 this.cudaJoin.status = payload || { join_keys: [], nodes: [] };
@@ -4023,7 +4015,7 @@ function clusterWizard() {
                 this.cudaJoin.error = payload?.load_error || '';
             } catch (error) {
                 this.cudaJoin.error =
-                    error?.message || window.t('cluster.v2.err.cuda_status');
+                    error?.message || window.t('cluster.err.cuda_status');
             }
         },
 
@@ -4031,7 +4023,7 @@ function clusterWizard() {
             const id = String(this.cudaJoin.joinId || '').trim();
             if (!id) return;
             try {
-                await this.apiFetch(CLUSTER_V2_API.revokeJoinKey(id), {
+                await this.apiFetch(CLUSTER_API.revokeJoinKey(id), {
                     method: 'DELETE',
                 });
                 this.cudaJoin.command = '';
@@ -4046,7 +4038,7 @@ function clusterWizard() {
                     return;
                 }
                 this.cudaJoin.error =
-                    error?.message || window.t('cluster.v2.err.revoke_join');
+                    error?.message || window.t('cluster.err.revoke_join');
             }
         },
 
@@ -4055,7 +4047,7 @@ function clusterWizard() {
             const controllerIp = this.cudaJoinSuggestedIp();
             if (!controllerIp) {
                 this.cudaJoin.error =
-                    window.t('cluster.v2.cuda.controller_ip_required');
+                    window.t('cluster.cuda.controller_ip_required');
                 return;
             }
             this.cudaJoin.controllerIp = controllerIp;
@@ -4068,7 +4060,7 @@ function clusterWizard() {
                 }
                 const secure = window.location?.protocol === 'https:';
                 const port = Number(window.location?.port) || (secure ? 443 : 80);
-                const result = await this.apiFetch(CLUSTER_V2_API.joinKeys, {
+                const result = await this.apiFetch(CLUSTER_API.joinKeys, {
                     method: 'POST',
                     cache: 'no-store',
                     body: JSON.stringify({
@@ -4084,7 +4076,7 @@ function clusterWizard() {
                 await this.loadCudaJoinStatus();
             } catch (error) {
                 this.cudaJoin.error =
-                    error?.message || window.t('cluster.v2.err.cuda_join');
+                    error?.message || window.t('cluster.err.cuda_join');
             } finally {
                 this.cudaJoin.loading = false;
             }
@@ -4118,7 +4110,7 @@ function clusterWizard() {
             this.cudaFabricResult = null;
             try {
                 this.cudaFabricResult = await this.apiFetch(
-                    CLUSTER_V2_API.cudaFabricVerify,
+                    CLUSTER_API.cudaFabricVerify,
                     {
                         method: 'POST',
                         body: JSON.stringify({
@@ -4129,11 +4121,11 @@ function clusterWizard() {
                         }),
                     },
                 );
-                this.notify('success', window.t('cluster.v2.toast.cuda_verified'));
+                this.notify('success', window.t('cluster.toast.cuda_verified'));
                 await this.refreshDevices();
             } catch (error) {
                 this.cudaFabricError =
-                    error?.message || window.t('cluster.v2.err.cuda_verify');
+                    error?.message || window.t('cluster.err.cuda_verify');
             } finally {
                 this.cudaFabricLoading = false;
             }
@@ -4143,11 +4135,11 @@ function clusterWizard() {
             if (this.rdmaLinks.loading) return;
             this.rdmaLinks.loading = true;
             try {
-                this.rdmaLinks.data = await this.apiFetch(CLUSTER_V2_API.rdmaLinks);
+                this.rdmaLinks.data = await this.apiFetch(CLUSTER_API.rdmaLinks);
                 this.rdmaLinks.error = '';
             } catch (error) {
                 this.rdmaLinks.error =
-                    error?.message || window.t('cluster.v2.err.rdma_links');
+                    error?.message || window.t('cluster.err.rdma_links');
             } finally {
                 this.rdmaLinks.loading = false;
             }
@@ -4158,19 +4150,19 @@ function clusterWizard() {
             this.rdmaLinks.verifying = name;
             this.rdmaLinks.error = '';
             try {
-                const result = await this.apiFetch(CLUSTER_V2_API.rdmaLinkVerify, {
+                const result = await this.apiFetch(CLUSTER_API.rdmaLinkVerify, {
                     method: 'POST',
                     body: JSON.stringify({ link: name }),
                 });
                 if (result.verified) {
-                    this.notify('success', window.t('cluster.v2.toast.rdma_verified'));
+                    this.notify('success', window.t('cluster.toast.rdma_verified'));
                 } else {
-                    this.rdmaLinks.error = result.reason || window.t('cluster.v2.err.rdma_verify');
+                    this.rdmaLinks.error = result.reason || window.t('cluster.err.rdma_verify');
                 }
                 await this.refreshRdmaLinks();
             } catch (error) {
                 this.rdmaLinks.error =
-                    error?.message || window.t('cluster.v2.err.rdma_verify');
+                    error?.message || window.t('cluster.err.rdma_verify');
             } finally {
                 this.rdmaLinks.verifying = '';
             }
@@ -4181,7 +4173,7 @@ function clusterWizard() {
             if (!link.verified || !measured) {
                 return link.stale_reason || link.reason || '';
             }
-            return window.t('cluster.v2.rdma.measured')
+            return window.t('cluster.rdma.measured')
                 .replace('{latency}', measured.latency_p50_us.toFixed(1))
                 .replace('{to}', measured.to_peer_gbit_s.toFixed(1))
                 .replace('{from}', measured.from_peer_gbit_s.toFixed(1));
@@ -4192,7 +4184,7 @@ function clusterWizard() {
             this.diagnosticsLoading = true;
             this.diagnosticsError = '';
             try {
-                const report = await this.apiFetch(CLUSTER_V2_API.diagnostics, {
+                const report = await this.apiFetch(CLUSTER_API.diagnostics, {
                     cache: 'no-store',
                 });
                 const blob = new Blob(
@@ -4211,7 +4203,7 @@ function clusterWizard() {
                 URL.revokeObjectURL(url);
             } catch (error) {
                 this.diagnosticsError =
-                    error?.message || window.t('cluster.v2.err.diagnostics');
+                    error?.message || window.t('cluster.err.diagnostics');
             } finally {
                 this.diagnosticsLoading = false;
             }
@@ -4979,7 +4971,7 @@ function clusterWizard() {
             this.assistant.measurePollSkip = 0;
             this.assistant.measureTimer = setInterval(
                 () => this.pollAssistantMeasurement(),
-                CLUSTER_V2_POLL_MS,
+                CLUSTER_POLL_MS,
             );
         },
 
@@ -5447,8 +5439,8 @@ function clusterWizard() {
         pairingStepOne(device = this.pairing.target) {
             // A helper daemon has no screen; its code is in its log.
             const key = this.deviceHelperOnly(device)
-                ? 'cluster.v2.pairing.step1_helper'
-                : 'cluster.v2.pairing.step1';
+                ? 'cluster.pairing.step1_helper'
+                : 'cluster.pairing.step1';
             return window.t(key)
                 .replaceAll('{name}', this.deviceName(device))
                 .replaceAll('{self}', this.deviceName(this.selfDevice()));
