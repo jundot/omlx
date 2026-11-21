@@ -784,6 +784,10 @@ class Inkling2TextModel(nn.Module):
 
 
 class Model(nn.Module):
+    # ``attend`` reads the keys and values a cache returns as dense arrays; a
+    # packed (TurboQuant or affine) cache hands back codes it cannot use.
+    dense_kv_attention = True
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
