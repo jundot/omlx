@@ -2257,6 +2257,12 @@ class BlockAwarePrefixCache(CacheManager):
             # benign: a concurrent restore either already loaded the old
             # payload or sees the placeholder version, which the
             # walk-back/reject path handles like any partial match.
+            # Keep the block's lineage across the rewrite (chain_aware_lru
+            # and the SSD prefix-closure rules rely on parent_hash).
+            lineage = getattr(self.paged_ssd_cache, "get_block_lineage", None)
+            parent_hash, tail_terminal = (
+                lineage(block_hash) if callable(lineage) else (None, False)
+            )
             self.paged_ssd_cache.forget_block(block_hash)
             saved = self.paged_ssd_cache.save_block(
                 block_hash=block_hash,
@@ -2266,6 +2272,8 @@ class BlockAwarePrefixCache(CacheManager):
                 layer_cache_types=types or None,
                 layer_meta_states=meta.get("layer_meta_states"),
                 hot_cache_write_back=hot_cache_write_back,
+                parent_hash=parent_hash,
+                tail_terminal=tail_terminal,
             )
             if saved:
                 logger.debug(
@@ -2443,6 +2451,10 @@ class BlockAwarePrefixCache(CacheManager):
                 if snap_meta_state:
                     new_meta[i] = snap_meta_state
 
+            lineage = getattr(self.paged_ssd_cache, "get_block_lineage", None)
+            parent_hash, tail_terminal = (
+                lineage(block_hash) if callable(lineage) else (None, False)
+            )
             self.paged_ssd_cache.forget_block(block_hash)
             saved = self.paged_ssd_cache.save_block(
                 block_hash=block_hash,
@@ -2452,6 +2464,8 @@ class BlockAwarePrefixCache(CacheManager):
                 layer_cache_types=types or None,
                 layer_meta_states=new_meta,
                 hot_cache_write_back=hot_cache_write_back,
+                parent_hash=parent_hash,
+                tail_terminal=tail_terminal,
             )
             if not saved:
                 return False
