@@ -182,6 +182,17 @@ _VIBEVOICE_ASR_MODULE = "mlx_audio.stt.models.vibevoice_asr."
 _SPEAKER_TAG = re.compile(r"<spk:(\d+)>\s*", re.IGNORECASE)
 
 
+def _stt_model_has_mtp(model: Any) -> bool:
+    """True when the loaded STT model kept its MTP head (Nemotron Transcribe).
+
+    mlx-audio raises on ``speculative=True`` for conversions that dropped the
+    ``llm.mtp.*`` tensors, so the setting must stay a no-op for them.
+    """
+    if not type(model).__module__.startswith(_NEMOTRON_TRANSCRIBE_MODULE):
+        return False
+    return getattr(getattr(model, "llm", None), "mtp", None) is not None
+
+
 def _nemotron_turns(text: str, words: list[dict]) -> list[dict]:
     """Group Nemotron word timestamps into the transcript's speaker turns.
 
@@ -706,16 +717,20 @@ class STTEngine(BaseNonStreamingEngine):
     for mlx-audio backends that expose ``generate(..., stream=True)``.
     """
 
-    def __init__(self, model_name: str, **kwargs):
+    def __init__(self, model_name: str, mtp_enabled: bool = False, **kwargs):
         """
         Initialize the STT engine.
 
         Args:
             model_name: HuggingFace model name or local path
+            mtp_enabled: Decode with MTP speculative decoding in transcribe()
+                when the loaded model retains MTP weights (``stt_mtp_enabled``
+                model setting); ignored otherwise
             **kwargs: Additional model-specific parameters
         """
         super().__init__()
         self._model_name = model_name
+        self._mtp_enabled = mtp_enabled
         self._model = None
         self._kwargs = kwargs
         self._realtime_active = False
@@ -866,6 +881,9 @@ class STTEngine(BaseNonStreamingEngine):
                 audio = load_audio(audio_path, sr=model.sample_rate)
                 if type(model).__module__.startswith(_NEMOTRON_TRANSCRIBE_MODULE):
                     gen_kwargs.update(task="saa", word_timestamps=True)
+
+            if self._mtp_enabled and _stt_model_has_mtp(model):
+                gen_kwargs.setdefault("speculative", True)
 
             result = model.generate(audio, **gen_kwargs)
 
