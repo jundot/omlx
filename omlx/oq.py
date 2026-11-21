@@ -8799,8 +8799,8 @@ def _find_model_layers(model):
     if getattr(model, "model_type", None) == "muse_spark":
         # mlx-lm's Muse Spark normalizes its token embeddings.
         return model.model.language_model.embed, model.layers
-    if getattr(model, "model_type", None) == inkling2_layout.MODEL_TYPE:
-        return inkling2_layout.embed_fn(model), model.layers
+    if inkling2_layout.is_inkling2_model(model):
+        return inkling2_layout.embed_fn(model), inkling2_layout.walk_layers(model)
     if getattr(model, "model_type", None) == "spark2_5":
         # afm7 also uses ``embedding`` but keeps kv-reuse blocks outside model.layers.
         return model.model.embedding, model.model.layers
@@ -9181,8 +9181,21 @@ def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None
             state["intermediates"][layer_idx] = aux
     elif state.get("kind") == "glm_moe_dsa":
         state["prev_topk_indices"] = aux if aux is not None else fallback
-    elif state.get("kind") in (_KIMI_K3_LAYER_STATE_KIND, _INKLING2_LAYER_STATE_KIND):
+    elif state.get("kind") == _KIMI_K3_LAYER_STATE_KIND:
         state["blocks"] = aux
+    elif state.get("kind") == _INKLING2_LAYER_STATE_KIND:
+        state.update(aux)
+
+
+def _walk_layer_index(position_ids, step: int) -> int:
+    """The decoder layer that calibration walk step ``step`` runs."""
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _INKLING2_LAYER_STATE_KIND
+    ):
+        # A looped Inkling 2 layer runs once per pass.
+        return inkling2_layout.walk_layer_index(position_ids, step)
+    return step
 
 
 def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
@@ -9286,11 +9299,8 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
         isinstance(position_ids, dict)
         and position_ids.get("kind") == _INKLING2_LAYER_STATE_KIND
     ):
-        # A copy per call: a layer appends its completed block in place, and the
-        # sensitivity walk runs each block twice on the same inputs.
-        blocks = list(position_ids["blocks"])
         try:
-            return block(inputs, blocks, cache=None), blocks
+            return inkling2_layout.walk_step(block, position_ids, layer_idx, inputs)
         except (TypeError, ValueError, RuntimeError, AttributeError) as e:
             raise RuntimeError(
                 f"Inkling 2 calibration forward failed at layer {layer_idx}: {e}"
@@ -9609,10 +9619,13 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
     )
     if model_type == "flint":
         return inputs, [None] * len(layers), {"kind": _FLINT_LAYER_STATE_KIND}
-    if model_type == inkling2_layout.MODEL_TYPE:
+    if inkling2_layout.is_inkling2_model(model):
         # Layers mix the completed attention-residual blocks of earlier layers,
         # build their own masks and take no cache.
-        state = {"kind": _INKLING2_LAYER_STATE_KIND, "blocks": []}
+        state = {
+            "kind": _INKLING2_LAYER_STATE_KIND,
+            **inkling2_layout.walk_state(model),
+        }
         return inputs, [None] * len(layers), state
     gemma4_inputs = _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs)
     if gemma4_inputs is not None:
@@ -10042,7 +10055,7 @@ def _collect_language_model_lm_head_imatrix(model, hidden, collector) -> bool:
 
 def _collect_inkling2_lm_head_imatrix(model, hidden, state, collector) -> bool:
     """Capture the head input: the last layer's mixture of all blocks, normed."""
-    if str(getattr(model, "model_type", "")) != inkling2_layout.MODEL_TYPE:
+    if not inkling2_layout.is_inkling2_model(model):
         return False
     module = collector._original_modules.get("lm_head")
     if module is None or not isinstance(state, dict):
@@ -12845,8 +12858,9 @@ def _measure_sensitivity_from_model(
         if out_float is None:
             continue
 
+        layer = _walk_layer_index(position_ids, layer_idx)
         saved = _temporary_quantize_block(
-            block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE, layer_idx=layer_idx
+            block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE, layer_idx=layer
         )
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
@@ -12862,7 +12876,11 @@ def _measure_sensitivity_from_model(
             out_magnitude = (out_float**2).mean()
             mse_val = raw_mse / mx.maximum(out_magnitude, 1e-10)
             mx.eval(mse_val)
-            sensitivity[layer_idx] = mse_val.item()
+            value = mse_val.item()
+            # A layer that runs more than once keeps its worst run.
+            if layer in sensitivity:
+                value = max(sensitivity[layer], value)
+            sensitivity[layer] = value
 
         _restore_saved_weights(block, saved)
 
@@ -13621,7 +13639,12 @@ def _measure_sensitivity_from_quantized_model(
             out_mag = (ob32**2).mean()
             mse_val = raw_mse / mx.maximum(out_mag, 1e-10)
             mx.eval(mse_val)
-            sensitivity[layer_idx] = mse_val.item()
+            layer = _walk_layer_index(position_ids, layer_idx)
+            value = mse_val.item()
+            # A layer that runs more than once keeps its worst run.
+            if layer in sensitivity:
+                value = max(sensitivity[layer], value)
+            sensitivity[layer] = value
 
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = baseline_aux

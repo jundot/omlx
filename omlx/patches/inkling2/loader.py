@@ -51,17 +51,20 @@ def _expert_tensors(d: dict, which: str, out: dict, pre: str) -> str:
 
 def _loop_controllers(d: dict, out: dict, pre: str) -> None:
     """``down`` [r, 2H] -> [2, H, r] halves; ``gain`` and ``forget`` [H, r]
-    -> one [r, 2H] projection. Both are widened to FP32."""
+    -> one [r, 2H] projection. Both are widened to FP32.
+
+    Each part is cast and transposed before the final stack, because oQ's
+    streaming plan replays only a stack or concatenate as the last step."""
     downs, gates = [], []
     for m in _LOOP_INPUTS:
-        down = d.pop(f"controllers.{m}.down_weight")
+        down = d.pop(f"controllers.{m}.down_weight").astype(mx.float32)
         rank = down.shape[0]
         downs.append(down.reshape(rank, 2, -1).transpose(1, 2, 0))
-        gain = d.pop(f"controllers.{m}.gain_weight")
-        forget = d.pop(f"controllers.{m}.forget_weight")
-        gates.append(mx.concatenate([gain, forget], axis=0).T)
-    out[pre + "loop_down"] = mx.stack(downs).astype(mx.float32)
-    out[pre + "loop_gain_forget"] = mx.stack(gates).astype(mx.float32)
+        gain = d.pop(f"controllers.{m}.gain_weight").astype(mx.float32)
+        forget = d.pop(f"controllers.{m}.forget_weight").astype(mx.float32)
+        gates.append(mx.concatenate([gain.T, forget.T], axis=1))
+    out[pre + "loop_down"] = mx.stack(downs)
+    out[pre + "loop_gain_forget"] = mx.stack(gates)
 
 
 def _loop_message_queries(queries: dict, core: range, out: dict) -> None:
@@ -71,8 +74,8 @@ def _loop_message_queries(queries: dict, core: range, out: dict) -> None:
     kv = queries["middle_cycle_cross_pass_kv_queries"]
     for i, idx in enumerate(core):
         rows = [q[2 * i], kv[2 * i], kv[2 * i + 1], q[2 * i + 1]]
-        out[f"model.layers.{idx}.loop_message.query"] = mx.stack(rows).astype(
-            mx.float32
+        out[f"model.layers.{idx}.loop_message.query"] = mx.stack(
+            [row.astype(mx.float32) for row in rows]
         )
 
 
