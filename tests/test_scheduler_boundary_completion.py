@@ -790,3 +790,70 @@ def test_client_cancel_keeps_external_prefill_progress(
         )
     finally:
         scheduler.shutdown()
+
+
+def _running_pair(scheduler, ids):
+    rows = [
+        Request(
+            request_id=i,
+            prompt=list(range(3, 13)),
+            sampling_params=SamplingParams(max_tokens=64, temperature=0),
+        )
+        for i in ids
+    ]
+    for row in rows:
+        scheduler.add_request(row)
+    for _ in range(100):
+        scheduler.step()
+        if min(row.num_output_tokens for row in rows) >= 2:
+            return rows
+    raise AssertionError("rows never started decoding")
+
+
+def test_memory_requeue_stops_promising_when_step_cannot_requeue(
+    mock_tokenizer, tmp_path
+):
+    """A requeue step() cannot carry out must not be promised forever.
+
+    The enforcer treats a positive answer as "handled" and never aborts, so an
+    unfulfilled promise held the memory it was meant to free, once per poll.
+    """
+    _, scheduler, _ = _chunked_scheduler_rig(mock_tokenizer, tmp_path, "gdn")
+    try:
+        rows = _running_pair(scheduler, ["a", "b"])
+        real_row = scheduler._memory_requeue_row
+        scheduler._memory_requeue_row = lambda uid: None  # still in prefill batch
+        answers = []
+        for _ in range(10):
+            answers.append(scheduler.request_memory_requeue())
+            scheduler.step()
+            if answers[-1] == 0:
+                break
+        cap = Scheduler._MAX_MEMORY_REQUEUE_STALLS
+        assert answers == [2] * cap + [0]
+        assert [row.memory_requeues for row in rows] == [0, 0]
+
+        # Once the stalled requests leave, later ones are requeueable again.
+        for row in rows:
+            scheduler.abort_request(row.request_id)
+        scheduler.step()
+        scheduler._memory_requeue_row = real_row
+        _running_pair(scheduler, ["a", "b"])
+        assert scheduler.request_memory_requeue() == 2
+    finally:
+        scheduler.shutdown()
+        scheduler.batch_generator = None
+
+
+def test_memory_requeue_flag_never_drained_gives_up(mock_tokenizer, tmp_path):
+    """A step() stuck in a long prefill never drains the flag; polls must end."""
+    _, scheduler, _ = _chunked_scheduler_rig(mock_tokenizer, tmp_path, "gdn")
+    try:
+        _running_pair(scheduler, ["a", "b"])
+        answers = [scheduler.request_memory_requeue() for _ in range(10)]
+        cap = Scheduler._MAX_MEMORY_REQUEUE_STALLS
+        assert answers == [2] * cap + [0] * (10 - cap)
+        assert scheduler._pending_memory_requeue is False
+    finally:
+        scheduler.shutdown()
+        scheduler.batch_generator = None
