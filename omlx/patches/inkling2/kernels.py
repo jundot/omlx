@@ -1674,10 +1674,10 @@ _EXPERT_SWIGLU_SOURCE = """
     }
     float gcap = params[0];
     float ucap = params[1];
-    float eg = metal::exp(metal::clamp(-g, -80.0f, 80.0f));
+    float eg = metal::precise::exp(metal::clamp(-g, -80.0f, 80.0f));
     float sig = (g < -80.0f) ? 0.0f : (1.0f / (1.0f + eg));
-    float tg = metal::tanh(metal::clamp(g / gcap, -20.0f, 20.0f)) * gcap;
-    float tu = metal::tanh(metal::clamp(u / ucap, -20.0f, 20.0f)) * ucap;
+    float tg = metal::precise::tanh(metal::clamp(g / gcap, -20.0f, 20.0f)) * gcap;
+    float tu = metal::precise::tanh(metal::clamp(u / ucap, -20.0f, 20.0f)) * ucap;
     out[idx] = T(tg * sig * tu);
 """
 
