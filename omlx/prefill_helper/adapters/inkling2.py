@@ -234,6 +234,15 @@ class Inkling2Adapter(StageAdapter):
 
     def apply_state(self, cache: list, k: int, state: Arrays) -> None:
         for i in range(k):
+            if f"{i}.off" in state and not hasattr(cache[i][0], "_temporal_order"):
+                # A full cache cannot stand in for rows a ring dropped: refuse
+                # before writing anything, and the host prefills locally.
+                raise ValueError(
+                    f"Inkling 2 layer {i}: the prefix comes from a sliding-window "
+                    "ring but this side keeps a full KV cache; set "
+                    "OMLX_INKLING_SWA_CACHE the same on both Macs"
+                )
+        for i in range(k):
             kv, conv = cache[i][0], cache[i][1]
             keys = state[f"{i}.k"]
             if keys.shape[2]:
