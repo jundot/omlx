@@ -3064,6 +3064,11 @@ class Scheduler:
         block_size = self.config.paged_cache_block_size
         if tail <= 0 or block_size <= 0 or tail not in snapshots:
             return 0
+        marker = getattr(request, "generation_prompt_start", 0) or 0
+        if marker > 0 and not getattr(request, "generation_prompt_persists", False):
+            # The store stops at the generation prompt: no boundary past it
+            # can take the terminal, and the tail stays the store's own.
+            return 0
         if any(tc > tail and tc % block_size == 0 for tc in snapshots):
             return tail
         return 0

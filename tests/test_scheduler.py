@@ -3983,6 +3983,9 @@ class TestSchedulerBoundarySnapshots:
         assert stores((4, 6, 8)) == (8, None, [(6, 6)])
         # A reply inside the block: the tail is the store's own terminal.
         assert stores((4, 6)) == (6, 6, [])
+        # So is a tail at a generation prompt the store must stop at.
+        request.generation_prompt_start = 6
+        assert stores((4, 6, 8)) == (6, 6, [])
 
     def test_cleanup_finished_pre_evals_intermediate_boundary_snapshots(
         self, mock_model, mock_tokenizer
