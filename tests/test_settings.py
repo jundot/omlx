@@ -383,6 +383,7 @@ class TestSchedulerSettings:
         assert result == {
             "max_concurrent_requests": 8,
             "embedding_batch_size": 32,
+            "max_waiting_requests": 0,
             "chunked_prefill": False,
             "prefill_priority": "context",
             "concurrent_priority": "balanced",
