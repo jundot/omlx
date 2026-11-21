@@ -4,24 +4,60 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import socket
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("omlx_cuda_helper.gpus")
 
 _NO_MEMORY = ("[N/A]", "[Not Supported]")
 # The OS and other apps of a machine whose GPU shares its RAM, as the host keeps.
 _OS_BYTES = 16 << 30
 
 
-def _run(*command: str) -> str:
+@dataclass(frozen=True)
+class RunResult:
+    """What a command said: its output, its exit status and its error text.
+
+    ``returncode is None`` means the command never ran (no such binary, no
+    permission, a timeout) — a different thing from one that ran and printed
+    nothing.
+    """
+
+    stdout: str
+    returncode: int | None
+    stderr: str
+
+    @property
+    def failed(self) -> bool:
+        return self.returncode != 0
+
+
+def _run(*command: str) -> RunResult:
+    """Run *command* and keep everything it said.
+
+    The exit code and stderr are kept because a probe that fails and a probe
+    that finds nothing both print nothing on stdout: with only the output,
+    ``[]`` cannot be read. On 2026-11-20 an nvidia-smi failure inside the
+    container became an empty list, the host planned 0 layers, and prefill ran
+    locally with nothing naming why.
+    """
     try:
-        return subprocess.run(
+        done = subprocess.run(
             command, capture_output=True, text=True, timeout=10, check=False
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return RunResult("", None, str(error))
+    return RunResult(done.stdout, done.returncode, done.stderr)
+
+
+def _stdout(*command: str) -> str:
+    """Only the output, for callers that cannot act on a failure anyway."""
+    return _run(*command).stdout
 
 
 def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
@@ -31,13 +67,25 @@ def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
     reports none: it holds its layers in the system RAM, and its free memory
     leaves the OS its share.
     """
-    out = _run(
+    return probe(only)[0]
+
+
+def probe(
+    only: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """(GPUs, probe status) from one ``nvidia-smi`` call.
+
+    ``gpus`` answers "what GPUs are there"; the status answers the question it
+    cannot: whether an empty list means *no GPU* (``ok`` true) or *the probe
+    itself failed* (``ok`` false, with the error nvidia-smi printed).
+    """
+    result = _run(
         "nvidia-smi",
         "--query-gpu=index,name,memory.total,memory.free",
         "--format=csv,noheader,nounits",
     )
     found = []
-    for line in out.splitlines():
+    for line in result.stdout.splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) != 4:
             continue
@@ -61,7 +109,21 @@ def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
                     "integrated": integrated,
                 }
             )
-    return found
+    if found:
+        return found, {"ok": True, "error": ""}
+    reason = _why(result)
+    logger.warning("nvidia-smi reported no GPUs: %s", reason)
+    return [], {"ok": not result.failed, "error": "" if not result.failed else reason}
+
+
+def _why(result: RunResult) -> str:
+    """Why a probe found nothing, in nvidia-smi's own words where it has them."""
+    detail = result.stderr.strip()
+    if result.returncode is None:
+        return f"could not run nvidia-smi: {detail or 'unknown error'}"
+    if result.returncode != 0:
+        return f"nvidia-smi exited {result.returncode}: {detail or 'no error text'}"
+    return "nvidia-smi succeeded and listed no GPUs"
 
 
 def memory_limit(gpu: dict[str, Any]) -> int:
@@ -117,7 +179,7 @@ _VIRTUAL = ("docker", "br-", "veth", "virbr")
 def _interfaces() -> list[dict[str, Any]]:
     try:
         return json.loads(
-            _run("ip", "-j", "-4", "addr", "show", "scope", "global") or "[]"
+            _stdout("ip", "-j", "-4", "addr", "show", "scope", "global") or "[]"
         )
     except ValueError:
         return []
@@ -158,7 +220,7 @@ def links() -> list[dict[str, Any]]:
     is the one the Mac can reach.
     """
     try:
-        items = json.loads(_run("ip", "-j", "addr", "show") or "[]")
+        items = json.loads(_stdout("ip", "-j", "addr", "show") or "[]")
     except ValueError:
         return []
     found = []

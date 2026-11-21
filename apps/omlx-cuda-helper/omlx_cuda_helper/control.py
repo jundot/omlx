@@ -135,6 +135,29 @@ class ControlServer:
             self.supervisor.stop(owner)
             sock.close()
 
+    def _info(self, local: str) -> dict[str, Any]:
+        """What this machine is, as the host reads it before arming a split."""
+        total, available = gpus.memory()
+        found, probe = gpus.probe(self.gpu_indices)
+        return {
+            "op": "ok",
+            "version": __version__,
+            "data_protocol": DATA_PROTOCOL,
+            "contracts": self.contracts,
+            "oqh": self.oqh,
+            "gpus": found,
+            # Additive, never required: it tells "no GPU here" apart from "the
+            # probe failed", and carries the probe's own error text. A host
+            # that does not know this field must ignore it.
+            "gpu_probe": probe,
+            "ram": total,
+            "ram_available": available,
+            "disk_free": gpus.disk_free(self.store.root),
+            "link_mbps": gpus.link_mbps(local),
+            "links": gpus.links(),
+            "session": self.supervisor.status(),
+        }
+
     def _handle(
         self,
         meta: dict[str, Any],
@@ -155,21 +178,7 @@ class ControlServer:
         if op == "ping":
             return {"op": "ok"}
         if op == "info":
-            total, available = gpus.memory()
-            return {
-                "op": "ok",
-                "version": __version__,
-                "data_protocol": DATA_PROTOCOL,
-                "contracts": self.contracts,
-                "oqh": self.oqh,
-                "gpus": gpus.gpus(self.gpu_indices),
-                "ram": total,
-                "ram_available": available,
-                "disk_free": gpus.disk_free(self.store.root),
-                "link_mbps": gpus.link_mbps(local),
-                "links": gpus.links(),
-                "session": self.supervisor.status(),
-            }
+            return self._info(local)
         if op == "probe":
             files = {str(k): int(v) for k, v in (meta.get("files") or {}).items()}
             return {
