@@ -1030,3 +1030,105 @@ def test_inkling2_keeps_dense_kv_when_kv_quantization_is_on(mock_tokenizer):
     assert not scheduler._turboquant_eligible(model.make_cache())
 
 
+
+
+def test_inkling2_fp8_kv_attention_model_and_98k_budget():
+    from mlx_lm.models.cache import KVCache
+
+    from omlx.patches.inkling2 import cache as windows
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+
+    # 1. Bit-exact OCP E4M3 round-trip across all 254 finite codes + overflow clamp.
+    codes = mx.array([c for c in range(256) if (c & 0x7F) != 0x7F], dtype=mx.uint8)
+    dec = kernels.fp8_e4m3_dequantize(codes, mx.float32)
+    reenc = kernels.fp8_e4m3_quantize(dec)
+    mx.eval(dec, reenc)
+    assert mx.array_equal(codes, reenc).item()
+    clamped = kernels.fp8_e4m3_quantize(mx.array([448.0, 900.0, -900.0], dtype=mx.float32))
+    assert clamped.tolist() == [0x7E, 0x7E, 0xFE]
+
+    # 2. Realistic L2-clipped K & unit-RMS V attention parity (decode, verify, prefill, batched).
+    mx.random.seed(29)
+    hq, hkv, d, r, s = 12, 4, 128, 32, 256
+    q_raw = mx.random.normal((2, hq, 64, d))
+    q = (q_raw / (mx.sqrt(mx.sum(q_raw * q_raw, axis=-1, keepdims=True)) + 1e-6) * 10.0).astype(
+        mx.bfloat16
+    )
+    k_raw = mx.random.normal((2, hkv, s, d))
+    k = (k_raw / (mx.sqrt(mx.sum(k_raw * k_raw, axis=-1, keepdims=True)) + 1e-6) * 10.0).astype(
+        mx.bfloat16
+    )
+    v = mx.fast.rms_norm(mx.random.normal((2, hkv, s, d)), None, 1e-6).astype(mx.bfloat16)
+    rel = (mx.random.normal((2, 64, hq, r)) * 0.2).astype(mx.bfloat16)
+    sink = (mx.random.normal((2, 64, hq)) * 1.0).astype(mx.bfloat16)
+    k8, v8 = kernels.fp8_e4m3_quantize(k), kernels.fp8_e4m3_quantize(v)
+    kdq, vdq = kernels.fp8_e4m3_dequantize(k8), kernels.fp8_e4m3_dequantize(v8)
+    lp = mx.array([0, 23], dtype=mx.int32)
+    for b, length, lp_arg in ((1, 1, None), (1, 3, None), (1, 64, None), (2, 1, lp)):
+        o_bf = kernels.banded_sink_attention(
+            q[:b, :, :length], k[:b], v[:b], rel[:b, :length], sink[:b, :length],
+            scale=d**-0.5, window=0, left_padding=lp_arg,
+        )
+        o_f8 = kernels.banded_sink_attention(
+            q[:b, :, :length], k8[:b], v8[:b], rel[:b, :length], sink[:b, :length],
+            scale=d**-0.5, window=0, left_padding=lp_arg,
+        )
+        o_dq = kernels.banded_sink_attention(
+            q[:b, :, :length], kdq[:b], vdq[:b], rel[:b, :length], sink[:b, :length],
+            scale=d**-0.5, window=0, left_padding=lp_arg,
+        )
+        mx.eval(o_bf, o_f8, o_dq)
+        a, b_arr, c_arr = (
+            o_bf.astype(mx.float32).reshape(-1),
+            o_f8.astype(mx.float32).reshape(-1),
+            o_dq.astype(mx.float32).reshape(-1),
+        )
+        cos = (mx.sum(a * b_arr) / (mx.sqrt(mx.sum(a * a)) * mx.sqrt(mx.sum(b_arr * b_arr)))).item()
+        assert cos > 0.998, f"b={b} L={length} cos={cos}"
+        assert mx.abs(b_arr - c_arr).max().item() < 1e-2
+
+    # 3. End-to-end model prefill, verify + rollback, and decode under fp8_kv="all".
+    model = _bf16(_inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOP))
+    ids = mx.random.randint(0, 300, (1, 48))
+    ref_cache = model.make_cache()
+    ref_pre = model(ids[:, :32], cache=ref_cache)[:, -1, :300]
+    ref_dec = model(ids[:, 32:33], cache=ref_cache)[:, -1, :300]
+
+    model.set_fp8_kv("all")
+    fp8_cache = model.make_cache()
+    got_pre = model(ids[:, :32], cache=fp8_cache)[:, -1, :300]
+    got_ver = model(ids[:, 32:36], cache=fp8_cache, return_hidden=True).logits[:, 0, :300]
+    assert model.mtp_partial_rollback(fp8_cache, 0, 3)
+    got_next = model(ids[:, 33:34], cache=fp8_cache)[:, -1, :300]
+    mx.eval(ref_pre, ref_dec, got_pre, got_ver, got_next)
+    for kv, conv in model.model.visit_caches(fp8_cache):
+        arr = kv.keys if kv is not None else conv[windows.KEYS]
+        assert arr.dtype == mx.uint8
+    for a, b_arr in ((ref_pre, got_pre), (ref_dec, got_ver)):
+        af, bf = a.astype(mx.float32).reshape(-1), b_arr.astype(mx.float32).reshape(-1)
+        cos = (mx.sum(af * bf) / (mx.sqrt(mx.sum(af * af)) * mx.sqrt(mx.sum(bf * bf)))).item()
+        assert cos > 0.99
+
+    # 4. Release-size 98k context KV memory budget proof (<= 1.85 GB).
+    window, tokens, chunk = 1024, 98304, 2048
+    state = windows.ArraysCache(window=window)
+    z = mx.zeros((1, 8, chunk, 128), dtype=mx.uint8)
+    for _ in range(tokens // chunk):
+        windows.append(state, z, z)
+        mx.eval(state.cache[windows.KEYS], state.cache[windows.VALUES])
+    one = mx.zeros((1, 8, 1, 128), dtype=mx.uint8)
+    for _ in range(3):
+        windows.append(state, one, one)
+    buf = state.__dict__["_omlx_window"]
+    full = KVCache()
+    full.keys = mx.zeros((1, 8, tokens + 256, 128), dtype=mx.uint8)
+    full.values = mx.zeros((1, 8, tokens + 256, 128), dtype=mx.uint8)
+    total_bytes = 8 * (full.keys.nbytes + full.values.nbytes) + 40 * (
+        buf.keys.nbytes + buf.values.nbytes
+    )
+    assert total_bytes <= 1.85e9, f"98k FP8 KV exceeded 1.85 GB: {total_bytes / 1e9:.3f} GB"
+
+

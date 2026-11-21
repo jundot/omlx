@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import math
+import os
 import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -74,6 +75,9 @@ class TextArgs:
     # Per-layer expert carrier: "nvfp4", "mxfp8" or "affine" (oQ output).
     expert_formats: list | None = None
     loop_config: dict | None = None
+    # Unit-scale FP8 E4M3 KV cache: False (BF16), True/"all" (full + sliding),
+    # or "full" (8 full-attention visits only).
+    fp8_kv: str | bool = False
 
     @classmethod
     def from_dict(cls, params: dict) -> TextArgs:
@@ -83,7 +87,26 @@ class TextArgs:
             args.intermediate_size = int(params["moe_intermediate_size"])
         if "conv_kernel_size" in params:
             args.sconv_kernel_size = int(params["conv_kernel_size"])
+        if "fp8_kv" not in params:
+            env = os.environ.get("OMLX_INKLING2_FP8_KV", "").strip().lower()
+            if env in ("1", "true", "yes", "all"):
+                args.fp8_kv = "all"
+            elif env == "full":
+                args.fp8_kv = "full"
         return args
+
+    def uses_fp8_kv(self, layer_idx: int) -> bool:
+        mode = self.fp8_kv
+        if not mode:
+            return False
+        if isinstance(mode, str):
+            m = mode.strip().lower()
+            if m in ("", "0", "false", "no", "off"):
+                return False
+            if m == "full":
+                return not self.is_sliding(layer_idx)
+            return True
+        return True
 
     def is_sliding(self, i: int) -> bool:
         if self.layer_types is not None:
@@ -457,6 +480,7 @@ class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
         self.sliding = args.is_sliding(layer_idx)
+        self.fp8_kv = args.uses_fp8_kv(layer_idx)
         self.head_dim = args.swa_head_dim if self.sliding else args.head_dim
         self.n_heads = (
             args.swa_num_attention_heads if self.sliding else args.num_attention_heads
@@ -595,6 +619,15 @@ class Inkling2Attention(nn.Module):
 
     def attend(self, q, k, v, rel, sink, kv, state=None):
         left_padding = None
+        use_fp8 = self.fp8_kv
+        if not use_fp8:
+            if kv is not None and getattr(kv, "keys", None) is not None:
+                use_fp8 = kv.keys.dtype == mx.uint8
+            elif state is not None and state.cache[windows.KEYS] is not None:
+                use_fp8 = state.cache[windows.KEYS].dtype == mx.uint8
+        if use_fp8:
+            k = kernels.fp8_e4m3_quantize(k)
+            v = kernels.fp8_e4m3_quantize(v)
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
             left_padding = getattr(kv, "left_padding", None)
@@ -1077,6 +1110,17 @@ class Model(nn.Module):
         """Prefix-cache hook: restored sliding states become joinable again."""
         self.model.visit_caches(cache)
         return cache
+
+    def set_fp8_kv(self, mode: bool | str = True) -> None:
+        """Enable or disable unit-scale OCP FP8 E4M3 KV caching.
+
+        ``mode`` may be ``True``/``"all"`` (all 48 visits: <= 1.79 GB @ 98k),
+        ``"full"`` (8 full-attention visits only: <= 1.96 GB @ 98k), or
+        ``False`` (BF16).
+        """
+        self.args.text.fp8_kv = mode
+        for idx, layer in enumerate(self.model.layers):
+            layer.attn.fp8_kv = self.args.text.uses_fp8_kv(idx)
 
     def sanitize(self, weights: dict) -> dict:
         out, formats = sanitize_weights(self, weights)

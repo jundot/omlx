@@ -140,6 +140,166 @@ def _decode_attention(q, k, v, rel, sink, scale, window):
     )
 
 
+def _build_fp8_e4m3_lut_header() -> str:
+    """256-entry exact OCP FP8 E4M3 lookup table in Metal constant memory."""
+    vals = []
+    for c in range(256):
+        if (c & 0x7F) == 0x7F:
+            v = 0.0
+        else:
+            s = -1.0 if (c & 0x80) else 1.0
+            e = (c >> 3) & 0xF
+            m = c & 0x7
+            v = s * (
+                (m / 8.0) * (2.0**-6)
+                if e == 0
+                else (1.0 + m / 8.0) * (2.0 ** (e - 7))
+            )
+        vals.append(f"half({v:.8e}f)")
+    return (
+        "constant half FP8_E4M3_LUT[256] = {"
+        + ",".join(vals)
+        + "};\n"
+        + """
+inline half fp8_e4m3_to_half(uchar code) {
+    return FP8_E4M3_LUT[code];
+}
+
+inline uchar float_to_fp8_e4m3(float x) {
+    uint u = as_type<uint>(x);
+    uint sign = (u >> 24) & 0x80u;
+    float ax = metal::fabs(x);
+    if (!(ax < 448.0f)) {
+        return (ax >= 448.0f) ? uchar(sign | 0x7Eu) : uchar(0u);
+    }
+    if (ax < 0.015625f) {
+        uint q = uint(metal::rint(ax * 512.0f));
+        return uchar(sign | q);
+    }
+    uint ua = as_type<uint>(ax);
+    uint lsb = (ua >> 20) & 1u;
+    uint rounded = ua + 0x7FFFFu + lsb;
+    uint e = (rounded >> 23) - 120u;
+    uint m = (rounded >> 20) & 0x7u;
+    uint code = (e << 3) | m;
+    if (code > 0x7Eu) code = 0x7Eu;
+    return uchar(sign | code);
+}
+"""
+    )
+
+
+# Unit-scale IEEE/OCP FP8 E4M3 (1 sign, 4 exp bias 7, 3 mantissa; max +-448.0,
+# no inf; overflow clamps to +-448.0 so NaN codes 0x7F/0xFF are never emitted).
+_FP8_E4M3_HEADER = _build_fp8_e4m3_lut_header()
+
+_FP8_QUANTIZE_SOURCE = """
+    uint idx = thread_position_in_grid.x;
+    if (VEC4) {
+        uint base = idx * 4;
+        if (base + 3 < N) {
+            uchar4 out4;
+            out4.x = float_to_fp8_e4m3(float(x[base + 0]));
+            out4.y = float_to_fp8_e4m3(float(x[base + 1]));
+            out4.z = float_to_fp8_e4m3(float(x[base + 2]));
+            out4.w = float_to_fp8_e4m3(float(x[base + 3]));
+            *((device uchar4*)(out + base)) = out4;
+        }
+    } else if (idx < N) {
+        out[idx] = float_to_fp8_e4m3(float(x[idx]));
+    }
+"""
+
+_FP8_DEQUANTIZE_SOURCE = """
+    uint idx = thread_position_in_grid.x;
+    if (idx < N) {
+        out[idx] = OT(fp8_e4m3_to_half(x[idx]));
+    }
+"""
+
+_fp8_quantize_kernel = None
+_fp8_dequantize_kernel = None
+
+
+def fp8_e4m3_quantize(x: mx.array) -> mx.array:
+    """Quantize ``x`` to unit-scale OCP FP8 E4M3 codes (``uint8``, clamped to +-448)."""
+    global _fp8_quantize_kernel
+    if mx.default_device() == mx.gpu and x.size > 0:
+        if _fp8_quantize_kernel is None:
+            _fp8_quantize_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_fp8_quantize",
+                input_names=["x"],
+                output_names=["out"],
+                source=_FP8_QUANTIZE_SOURCE,
+                header=_FP8_E4M3_HEADER,
+            )
+        xc = mx.contiguous(x)
+        n = xc.size
+        vec4 = 1 if (n % 4 == 0) else 0
+        grid_x = (n // 4) if vec4 else n
+        return _fp8_quantize_kernel(
+            inputs=[xc],
+            template=[("T", xc.dtype), ("N", n), ("VEC4", vec4)],
+            grid=(grid_x, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[xc.shape],
+            output_dtypes=[mx.uint8],
+        )[0]
+    # CPU reference: exact IEEE/OCP FP8 E4M3 round-to-nearest-even.
+    u32 = lambda val: mx.array(val, dtype=mx.uint32)
+    xf = x.astype(mx.float32)
+    u = xf.view(mx.uint32)
+    sign = (u >> u32(24)) & u32(0x80)
+    ax = mx.abs(xf)
+    is_nan = mx.isnan(xf)
+    ax_safe = mx.where(is_nan, mx.array(0.0, dtype=mx.float32), ax)
+    sub = mx.round(mx.minimum(ax_safe, 0.015625) * 512.0).astype(mx.uint32)
+    ua = mx.maximum(ax_safe, 0.015625).view(mx.uint32)
+    lsb = (ua >> u32(20)) & u32(1)
+    rounded = ua + u32(0x7FFFF) + lsb
+    e = (rounded >> u32(23)) - u32(120)
+    m = (rounded >> u32(20)) & u32(0x7)
+    norm = mx.minimum((e << u32(3)) | m, u32(0x7E))
+    mag = mx.where(ax_safe < 0.015625, sub, norm)
+    mag = mx.where(ax_safe >= 448.0, u32(0x7E), mag)
+    code = mx.where(is_nan, u32(0), sign | mag)
+    return code.astype(mx.uint8)
+
+
+def fp8_e4m3_dequantize(x: mx.array, dtype=mx.bfloat16) -> mx.array:
+    """Dequantize unit-scale OCP FP8 E4M3 ``uint8`` codes to ``dtype``."""
+    global _fp8_dequantize_kernel
+    if mx.default_device() == mx.gpu and x.size > 0:
+        if _fp8_dequantize_kernel is None:
+            _fp8_dequantize_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_fp8_dequantize",
+                input_names=["x"],
+                output_names=["out"],
+                source=_FP8_DEQUANTIZE_SOURCE,
+                header=_FP8_E4M3_HEADER,
+            )
+        xc = mx.contiguous(x)
+        return _fp8_dequantize_kernel(
+            inputs=[xc],
+            template=[("OT", dtype), ("N", xc.size)],
+            grid=(xc.size, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[xc.shape],
+            output_dtypes=[dtype],
+        )[0]
+    u32 = lambda val: mx.array(val, dtype=mx.uint32)
+    code = x.astype(mx.uint32)
+    sgn = (code & u32(0x80)) << u32(8)
+    mag = code & u32(0x7F)
+    norm_h = (sgn | ((mag + u32(0x40)) << u32(7))).astype(mx.uint16).view(mx.float16)
+    zero_h = sgn.astype(mx.uint16).view(mx.float16)
+    sub_h = (
+        (sgn | u32(0x2400) | (mag << u32(7))).astype(mx.uint16).view(mx.float16)
+        - (sgn | u32(0x2400)).astype(mx.uint16).view(mx.float16)
+    )
+    return mx.where(mag >= 8, norm_h, mx.where(mag == 0, zero_h, sub_h)).astype(dtype)
+
+
 # Flash attention with the relative-bias band and per-query sinks, for
 # prefill-sized BF16 query blocks. One threadgroup runs 32 queries of one head
 # in four simdgroups (8 rows each) over 16-key tiles staged in half. Scores
@@ -169,10 +329,11 @@ _FLASH_SOURCE = """
     const int a_row = S - L + row;
     const float qscale = scale[0] * LOG2E;
 
-    // Q, K and V are BF16 values within half's range (L2-clipped q/k,
-    // unit-RMS v), so staging them in half is exact; scores accumulate in
-    // FP32 and the softmax scale is applied there. K is stored transposed
-    // and both tiles are padded by 16 bytes per row against bank conflicts.
+    // Q, K and V are BF16 (or unit-scale FP8 E4M3) values within half's range
+    // (L2-clipped q/k, unit-RMS v), so staging them in half is exact; scores
+    // accumulate in FP32 and the softmax scale is applied there. K is stored
+    // transposed and both tiles are padded by 16 bytes per row against bank
+    // conflicts.
     constexpr int LDK = BK + 8;
     constexpr int LDV = D + 8;
     threadgroup half Ks[D * LDK];
@@ -202,13 +363,59 @@ _FLASH_SOURCE = """
     int lo = WINDOW > 0 ? max(0, a_first - WINDOW + 1) : 0;
     lo = max(lo, lp);
     const int k_begin = (lo / BK) * BK;
-    const device T* kb_ptr = k + b * k_strides[0] + hk * k_strides[1];
-    const device T* vb_ptr = v + b * v_strides[0] + hk * v_strides[1];
-    const bool vec_kv = k_strides[3] == 1 && v_strides[3] == 1;
+    const device KT* kb_ptr = k + b * k_strides[0] + hk * k_strides[1];
+    const device KT* vb_ptr = v + b * v_strides[0] + hk * v_strides[1];
+    const bool vec_kv = FP8_KV
+        ? (k_strides[3] == 1 && v_strides[3] == 1
+           && (k_strides[2] % 16 == 0) && (v_strides[2] % 16 == 0))
+        : (k_strides[3] == 1 && v_strides[3] == 1);
 
     for (int k0 = k_begin; k0 <= a_last; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (vec_kv) {
+        if (FP8_KV) {
+            if (vec_kv) {
+                // 16 FP8 E4M3 values (16 bytes) per load.
+                for (int c = tid; c < BK * D / 16; c += NT) {
+                    const int r = c / (D / 16);
+                    const int col = (c % (D / 16)) * 16;
+                    const int key = k0 + r;
+                    uint4 kw = uint4(0);
+                    uint4 vw = uint4(0);
+                    if (key < S) {
+                        kw = *(const device uint4*)(kb_ptr + key * k_strides[2] + col);
+                        vw = *(const device uint4*)(vb_ptr + key * v_strides[2] + col);
+                    }
+                    threadgroup half* kd = Ks + col * LDK + r;
+                    threadgroup half* vd = Vs + r * LDV + col;
+                    for (int j = 0; j < 4; ++j) {
+                        uint kword = kw[j];
+                        uint vword = vw[j];
+                        kd[(4 * j + 0) * LDK] = fp8_e4m3_to_half(uchar(kword & 0xFFu));
+                        kd[(4 * j + 1) * LDK] = fp8_e4m3_to_half(uchar((kword >> 8) & 0xFFu));
+                        kd[(4 * j + 2) * LDK] = fp8_e4m3_to_half(uchar((kword >> 16) & 0xFFu));
+                        kd[(4 * j + 3) * LDK] = fp8_e4m3_to_half(uchar((kword >> 24) & 0xFFu));
+                        vd[4 * j + 0] = fp8_e4m3_to_half(uchar(vword & 0xFFu));
+                        vd[4 * j + 1] = fp8_e4m3_to_half(uchar((vword >> 8) & 0xFFu));
+                        vd[4 * j + 2] = fp8_e4m3_to_half(uchar((vword >> 16) & 0xFFu));
+                        vd[4 * j + 3] = fp8_e4m3_to_half(uchar((vword >> 24) & 0xFFu));
+                    }
+                }
+            } else {
+                for (int c = tid; c < BK * D; c += NT) {
+                    const int r = c / D;
+                    const int col = c % D;
+                    const int key = k0 + r;
+                    half kv = half(0.0h);
+                    half vv = half(0.0h);
+                    if (key < S) {
+                        kv = fp8_e4m3_to_half(uchar(kb_ptr[key * k_strides[2] + col * k_strides[3]]));
+                        vv = fp8_e4m3_to_half(uchar(vb_ptr[key * v_strides[2] + col * v_strides[3]]));
+                    }
+                    Ks[col * LDK + r] = kv;
+                    Vs[r * LDV + col] = vv;
+                }
+            }
+        } else if (vec_kv) {
             // 8 BF16 values (16 bytes) per load.
             for (int c = tid; c < BK * D / 8; c += NT) {
                 const int r = c / (D / 8);
@@ -260,22 +467,34 @@ _FLASH_SOURCE = """
         }
 
         float rmax = -INFINITY;
-        for (int kb = 0; kb < BK / 8; ++kb) {
-            for (int e = 0; e < 2; ++e) {
-                const int key = k0 + kb * 8 + fn + e;
-                const int d = a_row - key;
-                const bool vis = row_ok && d >= 0 && key >= lp
-                    && (WINDOW == 0 || d < WINDOW);
-                float s = Sf[kb].thread_elements()[e] * qscale;
-                if (vis) {
-                    if (d < R) {
-                        s += float(relp[d]) * LOG2E;
+        if (WINDOW == 0 && k0 >= lp && k0 + BK <= a_first - R + 1) {
+            // Full-attention tile completely beyond the relative-bias band:
+            // every key is strictly visible with zero relative bias.
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                float s0 = Sf[kb].thread_elements()[0] * qscale;
+                float s1 = Sf[kb].thread_elements()[1] * qscale;
+                Sf[kb].thread_elements()[0] = s0;
+                Sf[kb].thread_elements()[1] = s1;
+                rmax = max(rmax, max(s0, s1));
+            }
+        } else {
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                for (int e = 0; e < 2; ++e) {
+                    const int key = k0 + kb * 8 + fn + e;
+                    const int d = a_row - key;
+                    const bool vis = row_ok && d >= 0 && key >= lp
+                        && (WINDOW == 0 || d < WINDOW);
+                    float s = Sf[kb].thread_elements()[e] * qscale;
+                    if (vis) {
+                        if (d < R) {
+                            s += float(relp[d]) * LOG2E;
+                        }
+                    } else {
+                        s = -INFINITY;
                     }
-                } else {
-                    s = -INFINITY;
+                    Sf[kb].thread_elements()[e] = s;
+                    rmax = max(rmax, s);
                 }
-                Sf[kb].thread_elements()[e] = s;
-                rmax = max(rmax, s);
             }
         }
         rmax = max(rmax, simd_shuffle_xor(rmax, 1));
@@ -391,14 +610,59 @@ _GQA_DECODE_PART_SOURCE = """
     float l = SINGLE ? 1.0f : 0.0f;
     const device T* relp = rel + ((size_t)(b * L + q_pos) * HQ + h) * R;
 
-    const device T* kb_ptr = k + b * k_strides[0] + hkv * k_strides[1];
-    const device T* vb_ptr = v + b * v_strides[0] + hkv * v_strides[1];
-    const bool vec_kv = (k_strides[3] == 1 && v_strides[3] == 1
-        && (k_strides[2] % 8 == 0) && (v_strides[2] % 8 == 0));
+    const device KT* kb_ptr = k + b * k_strides[0] + hkv * k_strides[1];
+    const device KT* vb_ptr = v + b * v_strides[0] + hkv * v_strides[1];
+    const bool vec_kv = FP8_KV
+        ? (k_strides[3] == 1 && v_strides[3] == 1
+           && (k_strides[2] % 16 == 0) && (v_strides[2] % 16 == 0))
+        : (k_strides[3] == 1 && v_strides[3] == 1
+           && (k_strides[2] % 8 == 0) && (v_strides[2] % 8 == 0));
 
     for (int k0 = k_start; k0 < k_end; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (vec_kv) {
+        if (FP8_KV) {
+            if (vec_kv) {
+                for (int c = int(tid); c < BK * D / 16; c += NT) {
+                    const int r = c / (D / 16);
+                    const int col = (c % (D / 16)) * 16;
+                    const int key = k0 + r;
+                    uint4 kw = uint4(0);
+                    uint4 vw = uint4(0);
+                    if (key < k_end) {
+                        kw = *(const device uint4*)(kb_ptr + key * k_strides[2] + col);
+                        vw = *(const device uint4*)(vb_ptr + key * v_strides[2] + col);
+                    }
+                    threadgroup half* kd = Ks + col * LDK + r;
+                    threadgroup half* vd = Vs + r * LDV + col;
+                    for (int j = 0; j < 4; ++j) {
+                        uint kword = kw[j];
+                        uint vword = vw[j];
+                        kd[(4 * j + 0) * LDK] = fp8_e4m3_to_half(uchar(kword & 0xFFu));
+                        kd[(4 * j + 1) * LDK] = fp8_e4m3_to_half(uchar((kword >> 8) & 0xFFu));
+                        kd[(4 * j + 2) * LDK] = fp8_e4m3_to_half(uchar((kword >> 16) & 0xFFu));
+                        kd[(4 * j + 3) * LDK] = fp8_e4m3_to_half(uchar((kword >> 24) & 0xFFu));
+                        vd[4 * j + 0] = fp8_e4m3_to_half(uchar(vword & 0xFFu));
+                        vd[4 * j + 1] = fp8_e4m3_to_half(uchar((vword >> 8) & 0xFFu));
+                        vd[4 * j + 2] = fp8_e4m3_to_half(uchar((vword >> 16) & 0xFFu));
+                        vd[4 * j + 3] = fp8_e4m3_to_half(uchar((vword >> 24) & 0xFFu));
+                    }
+                }
+            } else {
+                for (int c = int(tid); c < BK * D; c += NT) {
+                    const int r = c / D;
+                    const int col = c % D;
+                    const int key = k0 + r;
+                    half kv = half(0.0h);
+                    half vv = half(0.0h);
+                    if (key < k_end) {
+                        kv = fp8_e4m3_to_half(uchar(kb_ptr[key * k_strides[2] + col * k_strides[3]]));
+                        vv = fp8_e4m3_to_half(uchar(vb_ptr[key * v_strides[2] + col * v_strides[3]]));
+                    }
+                    Ks[col * LDK + r] = kv;
+                    Vs[r * LDV + col] = vv;
+                }
+            }
+        } else if (vec_kv) {
             for (int c = int(tid); c < BK * D / 8; c += NT) {
                 const int r = c / (D / 8);
                 const int col = (c % (D / 8)) * 8;
@@ -449,22 +713,32 @@ _GQA_DECODE_PART_SOURCE = """
         }
 
         float rmax = -INFINITY;
-        for (int kb = 0; kb < BK / 8; ++kb) {
-            for (int e = 0; e < 2; ++e) {
-                const int key = k0 + kb * 8 + fn + e;
-                const int d = a_row - key;
-                const bool vis = row_ok && key < k_end && d >= 0 && key >= lp
-                    && (WINDOW == 0 || d < WINDOW);
-                float s = Sf[kb].thread_elements()[e] * qscale;
-                if (vis) {
-                    if (d < R) {
-                        s += float(relp[d]) * LOG2E;
+        if (WINDOW == 0 && k0 >= lp && k0 + BK <= k_end && k0 + BK <= a_first - R + 1) {
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                float s0 = row_ok ? Sf[kb].thread_elements()[0] * qscale : -INFINITY;
+                float s1 = row_ok ? Sf[kb].thread_elements()[1] * qscale : -INFINITY;
+                Sf[kb].thread_elements()[0] = s0;
+                Sf[kb].thread_elements()[1] = s1;
+                rmax = max(rmax, max(s0, s1));
+            }
+        } else {
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                for (int e = 0; e < 2; ++e) {
+                    const int key = k0 + kb * 8 + fn + e;
+                    const int d = a_row - key;
+                    const bool vis = row_ok && key < k_end && d >= 0 && key >= lp
+                        && (WINDOW == 0 || d < WINDOW);
+                    float s = Sf[kb].thread_elements()[e] * qscale;
+                    if (vis) {
+                        if (d < R) {
+                            s += float(relp[d]) * LOG2E;
+                        }
+                    } else {
+                        s = -INFINITY;
                     }
-                } else {
-                    s = -INFINITY;
+                    Sf[kb].thread_elements()[e] = s;
+                    rmax = max(rmax, s);
                 }
-                Sf[kb].thread_elements()[e] = s;
-                rmax = max(rmax, s);
             }
         }
         rmax = max(rmax, simd_shuffle_xor(rmax, 1));
@@ -557,7 +831,156 @@ _GQA_DECODE_RED_SOURCE = """
     }
 """
 
+# Register-streaming Split-K GQA decode kernel for L == 1 (1..6 query heads per
+# KV head): zero threadgroup KV staging and zero barriers inside the key loop,
+# reading each KV vector once across all G query heads via coalesced 4-byte
+# FP8 E4M3 loads (or BF16 loads).
+_GQA_DIRECT_DECODE_PART_SOURCE = """
+    constexpr float LOG2E = 1.4426950408889634f;
+    constexpr int D4 = D / 32;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint sg = tid / 32;
+    const uint lane = tid % 32;
+    const int sp = threadgroup_position_in_grid.x;
+    const int hkv = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+
+    const int S = dims[0];
+    const int NS = dims[1];
+    const int lp = dims[2 + b];
+    const float qscale = scale[0] * LOG2E;
+
+    const int a_row = S - 1;
+    int lo = WINDOW > 0 ? max(0, a_row - WINDOW + 1) : 0;
+    lo = max(lo, lp);
+    const int nk = max(0, a_row + 1 - lo);
+    const int per_sp = (nk + NS - 1) / NS;
+    const int k_start = lo + sp * per_sp;
+    const int k_end = min(a_row + 1, k_start + per_sp);
+
+    float qv[G][D4];
+    float ov[G][D4];
+    float mv[G];
+    float lv[G];
+    const device T* relp[G];
+    const int d_off = int(lane) * D4;
+    for (int g_idx = 0; g_idx < G; ++g_idx) {
+        int h = hkv * G + g_idx;
+        const device T* qp = q + b * q_strides[0] + h * q_strides[1]
+            + d_off * q_strides[3];
+        for (int i = 0; i < D4; ++i) {
+            qv[g_idx][i] = float(qp[i * q_strides[3]]) * qscale;
+            ov[g_idx][i] = 0.0f;
+        }
+        mv[g_idx] = -INFINITY;
+        lv[g_idx] = 0.0f;
+        relp[g_idx] = rel + ((size_t)b * HQ + h) * R;
+    }
+
+    const device KT* kb_ptr = k + b * k_strides[0] + hkv * k_strides[1];
+    const device KT* vb_ptr = v + b * v_strides[0] + hkv * v_strides[1];
+    const size_t ks2 = k_strides[2];
+    const size_t vs2 = v_strides[2];
+    const size_t ks3 = k_strides[3];
+    const size_t vs3 = v_strides[3];
+    const bool vec_kv = FP8_KV && ks3 == 1 && vs3 == 1 && (D4 == 4)
+        && (ks2 % 4 == 0) && (vs2 % 4 == 0);
+
+    for (int key = k_start + int(sg); key < k_end; key += NSG) {
+        float kv[D4];
+        float vv[D4];
+        if (FP8_KV && vec_kv) {
+            uchar4 kw = *(const device uchar4*)(kb_ptr + key * ks2 + d_off);
+            uchar4 vw = *(const device uchar4*)(vb_ptr + key * vs2 + d_off);
+            kv[0] = float(FP8_E4M3_LUT[kw.x]);
+            kv[1] = float(FP8_E4M3_LUT[kw.y]);
+            kv[2] = float(FP8_E4M3_LUT[kw.z]);
+            kv[3] = float(FP8_E4M3_LUT[kw.w]);
+            vv[0] = float(FP8_E4M3_LUT[vw.x]);
+            vv[1] = float(FP8_E4M3_LUT[vw.y]);
+            vv[2] = float(FP8_E4M3_LUT[vw.z]);
+            vv[3] = float(FP8_E4M3_LUT[vw.w]);
+        } else if (FP8_KV) {
+            const device KT* kp = kb_ptr + key * ks2;
+            const device KT* vp = vb_ptr + key * vs2;
+            for (int i = 0; i < D4; ++i) {
+                kv[i] = float(FP8_E4M3_LUT[uchar(kp[(d_off + i) * ks3])]);
+                vv[i] = float(FP8_E4M3_LUT[uchar(vp[(d_off + i) * vs3])]);
+            }
+        } else {
+            const device KT* kp = kb_ptr + key * ks2;
+            const device KT* vp = vb_ptr + key * vs2;
+            for (int i = 0; i < D4; ++i) {
+                kv[i] = float(kp[(d_off + i) * ks3]);
+                vv[i] = float(vp[(d_off + i) * vs3]);
+            }
+        }
+        const int d = a_row - key;
+        const bool has_rel = d < R;
+        for (int g_idx = 0; g_idx < G; ++g_idx) {
+            float dot = 0.0f;
+            for (int i = 0; i < D4; ++i) dot += kv[i] * qv[g_idx][i];
+            dot = simd_sum(dot);
+            if (has_rel) dot += float(relp[g_idx][d]) * LOG2E;
+            float m_new = max(mv[g_idx], dot);
+            float f_old = (mv[g_idx] == -INFINITY) ? 0.0f : fast::exp2(mv[g_idx] - m_new);
+            float p = fast::exp2(dot - m_new);
+            lv[g_idx] = lv[g_idx] * f_old + p;
+            mv[g_idx] = m_new;
+            for (int i = 0; i < D4; ++i) {
+                ov[g_idx][i] = ov[g_idx][i] * f_old + p * vv[i];
+            }
+        }
+    }
+
+    threadgroup float tg_m[NSG][G];
+    threadgroup float tg_l[NSG][G];
+    threadgroup float tg_o[NSG][G][D];
+    for (int g_idx = 0; g_idx < G; ++g_idx) {
+        if (lane == 0) {
+            tg_m[sg][g_idx] = mv[g_idx];
+            tg_l[sg][g_idx] = lv[g_idx];
+        }
+        for (int i = 0; i < D4; ++i) {
+            tg_o[sg][g_idx][d_off + i] = ov[g_idx][i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        for (int g_idx = 0; g_idx < G; ++g_idx) {
+            int h = hkv * G + g_idx;
+            float m = -INFINITY;
+            float l = 0.0f;
+            float oo[D4];
+            for (int i = 0; i < D4; ++i) oo[i] = 0.0f;
+            for (int s = 0; s < NSG; ++s) {
+                float ls = tg_l[s][g_idx];
+                if (ls == 0.0f) continue;
+                float ms = tg_m[s][g_idx];
+                float mn = max(m, ms);
+                float a0 = (m == -INFINITY) ? 0.0f : fast::exp2(m - mn);
+                float a1 = fast::exp2(ms - mn);
+                l = l * a0 + ls * a1;
+                m = mn;
+                for (int i = 0; i < D4; ++i) {
+                    oo[i] = oo[i] * a0 + tg_o[s][g_idx][d_off + i] * a1;
+                }
+            }
+            size_t base_ml = ((size_t)b * HQ + h) * NS + sp;
+            if (lane == 0) {
+                out_m[base_ml] = m;
+                out_l[base_ml] = l;
+            }
+            size_t base_o = base_ml * D;
+            for (int i = 0; i < D4; ++i) {
+                out_o[base_o + d_off + i] = oo[i];
+            }
+        }
+    }
+"""
+
 _gqa_decode_part_kernel = None
+_gqa_direct_part_kernel = None
 _gqa_decode_red_kernel = None
 
 
@@ -565,24 +988,88 @@ def gqa_flash_decode_attention(
     q, k, v, rel, sink, *, scale, window, left_padding=None
 ):
     """Fused Split-K GQA-packed banded-sink attention for BF16 verify/decode."""
-    global _gqa_decode_part_kernel, _gqa_decode_red_kernel
+    global _gqa_decode_part_kernel, _gqa_direct_part_kernel, _gqa_decode_red_kernel
     b, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
     g = hq // hkv
     r = rel.shape[-1]
+    fp8_kv = k.dtype == mx.uint8
+    if _gqa_decode_red_kernel is None:
+        _gqa_decode_red_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_gqa_decode_red",
+            input_names=["part_o", "part_m", "part_l", "sink"],
+            output_names=["out"],
+            source=_GQA_DECODE_RED_SOURCE,
+        )
+    lp = (
+        left_padding.astype(mx.int32)
+        if left_padding is not None
+        else mx.zeros((b,), dtype=mx.int32)
+    )
+    sc = mx.array([scale], dtype=mx.float32)
+    sink_f32 = mx.contiguous(sink.astype(mx.float32))
+    rel_c = mx.contiguous(rel)
+    nk_est = min(s, window + length - 1) if window else s
+    if length == 1 and g <= 6 and d <= 128 and (fp8_kv or nk_est >= 2048):
+        if _gqa_direct_part_kernel is None:
+            _gqa_direct_part_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_gqa_direct_part",
+                input_names=["q", "k", "v", "rel", "dims", "scale"],
+                output_names=["out_o", "out_m", "out_l"],
+                source=_GQA_DIRECT_DECODE_PART_SOURCE,
+                header=_FP8_E4M3_HEADER,
+                ensure_row_contiguous=False,
+            )
+        nsg = 4
+        base_tgs = b * hkv
+        ns = (
+            1
+            if nk_est <= 256
+            else min(32, max(1, (nk_est + 255) // 256))
+        )
+        if nk_est >= 2048 and ns < 16 and base_tgs <= 16:
+            ns = 16
+        if nk_est >= 8192 and ns < 32 and base_tgs <= 16:
+            ns = 32
+        dims = mx.concatenate([mx.array([s, ns], dtype=mx.int32), lp])
+        po, pm, pl = _gqa_direct_part_kernel(
+            inputs=[q, k, v, rel_c, dims, sc],
+            template=[
+                ("T", q.dtype),
+                ("KT", k.dtype),
+                ("D", d),
+                ("HQ", hq),
+                ("G", g),
+                ("R", r),
+                ("WINDOW", int(window)),
+                ("NSG", nsg),
+                ("FP8_KV", 1 if fp8_kv else 0),
+            ],
+            grid=(ns * nsg * 32, hkv, b),
+            threadgroup=(nsg * 32, 1, 1),
+            output_shapes=[
+                (b, hq, 1, ns, d),
+                (b, hq, 1, ns),
+                (b, hq, 1, ns),
+            ],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
+        return _gqa_decode_red_kernel(
+            inputs=[po, pm, pl, sink_f32],
+            template=[("T", q.dtype), ("D", d), ("HQ", hq), ("L", 1), ("NS", ns)],
+            grid=(b * hq * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(b, hq, 1, d)],
+            output_dtypes=[q.dtype],
+        )[0]
     if _gqa_decode_part_kernel is None:
         _gqa_decode_part_kernel = mx.fast.metal_kernel(
             name="omlx_inkling2_gqa_decode_part",
             input_names=["q", "k", "v", "rel", "sink", "dims", "scale"],
             output_names=["out_o", "out_m", "out_l"],
             source=_GQA_DECODE_PART_SOURCE,
+            header=_FP8_E4M3_HEADER,
             ensure_row_contiguous=False,
-        )
-        _gqa_decode_red_kernel = mx.fast.metal_kernel(
-            name="omlx_inkling2_gqa_decode_red",
-            input_names=["part_o", "part_m", "part_l", "sink"],
-            output_names=["out"],
-            source=_GQA_DECODE_RED_SOURCE,
         )
     n_rows = g * length
     nsg = min(4, max(1, (n_rows + 7) // 8))
@@ -590,7 +1077,6 @@ def gqa_flash_decode_attention(
     nqt = (n_rows + bq - 1) // bq
     # Match bounded vs unbounded sliding caches identically: once keys drop,
     # s >= window + length - 1 so nk_est is invariant to dropped prefix keys.
-    nk_est = min(s, window + length - 1) if window else s
     base_tgs = b * hkv * nqt
     ns = (
         1
@@ -604,17 +1090,12 @@ def gqa_flash_decode_attention(
         ns = 8
     if nk_est >= 2048 and ns < 16 and base_tgs <= 16:
         ns = 16
-    lp = (
-        left_padding.astype(mx.int32)
-        if left_padding is not None
-        else mx.zeros((b,), dtype=mx.int32)
-    )
+    if nk_est >= 8192 and ns < 32 and base_tgs <= 16:
+        ns = 32
     dims = mx.concatenate([mx.array([length, s, ns], dtype=mx.int32), lp])
-    sc = mx.array([scale], dtype=mx.float32)
-    sink_f32 = mx.contiguous(sink.astype(mx.float32))
-    rel_c = mx.contiguous(rel)
     tpl = [
         ("T", q.dtype),
+        ("KT", k.dtype),
         ("OT", q.dtype if ns == 1 else mx.float32),
         ("D", d),
         ("HQ", hq),
@@ -623,6 +1104,7 @@ def gqa_flash_decode_attention(
         ("WINDOW", int(window)),
         ("NSG", nsg),
         ("SINGLE", 1 if ns == 1 else 0),
+        ("FP8_KV", 1 if fp8_kv else 0),
     ]
     nt = nsg * 32
     if ns == 1:
@@ -670,16 +1152,18 @@ def _use_flash(length: int, window: int) -> bool:
 
 
 def flash_banded_attention(q, k, v, rel, sink, *, scale, window, left_padding=None):
-    """``banded_sink_attention`` for BF16 prefill blocks; same arguments and result."""
+    """``banded_sink_attention`` for BF16 prefill blocks (BF16 or FP8 E4M3 K/V)."""
     global _flash_kernel
     b, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
+    fp8_kv = k.dtype == mx.uint8
     if _flash_kernel is None:
         _flash_kernel = mx.fast.metal_kernel(
             name="omlx_inkling2_flash_banded",
             input_names=["q", "k", "v", "rel", "sink", "dims", "scale"],
             output_names=["out"],
             source=_FLASH_SOURCE,
+            header=_FP8_E4M3_HEADER,
             ensure_row_contiguous=False,
         )
     lp = (
@@ -700,11 +1184,13 @@ def flash_banded_attention(q, k, v, rel, sink, *, scale, window, left_padding=No
         ],
         template=[
             ("T", q.dtype),
+            ("KT", k.dtype),
             ("D", d),
             ("HQ", hq),
             ("HKV", hkv),
             ("R", rel.shape[-1]),
             ("WINDOW", int(window)),
+            ("FP8_KV", 1 if fp8_kv else 0),
         ],
         grid=(((length + 31) // 32) * 128, hq, b),
         threadgroup=(128, 1, 1),
@@ -727,15 +1213,20 @@ def banded_sink_attention(
 ) -> mx.array:
     """Attention with a relative bias band and per-query sink logits.
 
-    q: [B, Hq, L, D]; k, v: [B, Hkv, S, D] (queries are the last L keys);
-    rel: [B, L, Hq, R] bias by backward distance d (applied for d < R);
-    sink: [B, L, Hq] logits of a zero-value sink. ``window`` > 0 limits
-    keys to d < window (sliding layers use window == R).
+    q: [B, Hq, L, D]; k, v: [B, Hkv, S, D] (queries are the last L keys; may be
+    ``uint8`` unit-scale OCP FP8 E4M3 codes); rel: [B, L, Hq, R] bias by
+    backward distance d (applied for d < R); sink: [B, L, Hq] logits of a
+    zero-value sink. ``window`` > 0 limits keys to d < window (sliding layers
+    use window == R).
     """
     b, hq, length, d = q.shape
-    if b == 1 and length == 1 and left_padding is None:
+    fp8_kv = k.dtype == mx.uint8
+    if b == 1 and length == 1 and left_padding is None and not fp8_kv:
         return _decode_attention(q, k, v, rel, sink, scale, window)
-    if q.dtype == mx.bfloat16 and _use_flash(length, window):
+    if q.dtype == mx.bfloat16 and (
+        _use_flash(length, window)
+        or (fp8_kv and length >= _FLASH_MIN_QUERIES and mx.default_device() == mx.gpu)
+    ):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )
@@ -754,6 +1245,9 @@ def banded_sink_attention(
 
 def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
     """MLX SDPA over an additive mask that carries the bias band and sinks."""
+    if k.dtype == mx.uint8:
+        k = fp8_e4m3_dequantize(k, q.dtype)
+        v = fp8_e4m3_dequantize(v, q.dtype)
     b, hq, length, d = q.shape
     s = k.shape[2]
     r = rel.shape[-1]
