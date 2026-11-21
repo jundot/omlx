@@ -217,6 +217,8 @@ class ServerMetrics:
 
         if self.usage_history is not None:
             try:
+                from .client_identity import current_client
+
                 self.usage_history.record(
                     model_id=model_id,
                     prompt_tokens=prompt_tokens,
@@ -225,6 +227,7 @@ class ServerMetrics:
                     prefill_duration=prefill_duration,
                     generation_duration=generation_duration,
                     request_duration=request_duration,
+                    client=current_client(),
                 )
             except Exception:
                 if not self._history_record_failed:
@@ -386,13 +389,16 @@ def get_server_metrics() -> ServerMetrics:
 
 
 def reset_server_metrics(
-    stats_path: Optional[Path] = None, *, usage_history_enabled: bool = True
+    stats_path: Optional[Path] = None,
+    *,
+    usage_history_enabled: bool = True,
+    usage_by_client: bool = False,
 ) -> None:
     """Reset metrics (called on server start).
 
     If a previous instance exists and has a stats_path, save before resetting.
-    ``usage_history_enabled`` seeds the recorder from settings; the toggle can
-    still be flipped at runtime through the admin API.
+    ``usage_history_enabled`` and ``usage_by_client`` seed the recorder from
+    settings; both toggles can still be flipped at runtime through the admin API.
     """
     global _server_metrics
     if _server_metrics is not None:
@@ -403,7 +409,9 @@ def reset_server_metrics(
 
         try:
             _server_metrics.usage_history = UsageHistory(
-                stats_path.parent / "usage.sqlite3", enabled=usage_history_enabled
+                stats_path.parent / "usage.sqlite3",
+                enabled=usage_history_enabled,
+                by_client=usage_by_client,
             )
         except Exception:
             logger.warning("Usage history initialization failed; serving continues")
