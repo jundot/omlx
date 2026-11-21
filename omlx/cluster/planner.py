@@ -118,18 +118,14 @@ class ModelLayout:
     # MLA models keep one latent cache per layer that every tensor-parallel
     # member holds whole; sharding divides the heads, not this cache.
     kv_replicated_across_tp: bool = False
-    # Prefill peak one attention chunk adds on top of the resident weights and
-    # KV, expressed per token of context and priced at
-    # ``_PREFILL_REFERENCE_CHUNK``. A plan charges ``per_token × context ×
-    # chunk / reference`` to the stage that prefills it, so a throughput plan
-    # (4096-token chunks) reserves four times the transient of an interactive
-    # one instead of the same zero every profile used to get.
-    # The price is ``MemoryMonitor.estimate_prefill_peak_bytes`` on the generic
-    # SDPA path — the transient the rank guard refuses a request over. Models
-    # with a prefill profile of their own (Qwen4 QSA, GLM-5 sparse MLA,
-    # DeepSeek V4.1) are admitted by the guard against that profile instead,
-    # which prices a bounded key set and comes out smaller, so a plan is
-    # conservative against admission rather than optimistic.
+    # DEPRECATED — always 0 from inspection, never charged by the planner.
+    # The generic per-stage prefill price was withdrawn after the review
+    # (2026-11-20): it double-charged the whole-model KV of the new tokens on
+    # top of each stage's kv_cache_bytes and depended on process state (the
+    # sdpa256 tiled route registers at load). The review's acceptance is that
+    # other models' plans stay as they are on main; the runtime request guard
+    # still prices the real transient. The field survives only so persisted
+    # layouts and payloads decode unchanged. See ``_prefill_transient_bytes``.
     # MLA layouts keep 0: the generic formula cannot price a packed latent
     # cache, and that is a known gap, not a claim that their prefill is free.
     prefill_transient_bytes_per_context_token: int = 0
@@ -254,19 +250,6 @@ class ModelLayout:
         ssd = self.tensor_parallel_ssd_layer_bytes or (0,) * self.layer_count
         return tuple(whole - part for whole, part in zip(self.layer_weight_bytes, ssd))
 
-    def prefill_transient_bytes(self, context_tokens: int, chunk_tokens: int) -> int:
-        """Prefill peak one rank must hold above its resident weights and KV.
-
-        Zero when the checkpoint's prefill shape is unknown, which keeps every
-        plan that predates this reservation byte-for-byte identical.
-        """
-
-        per_token = self.prefill_transient_bytes_per_context_token
-        if per_token <= 0 or context_tokens <= 0 or chunk_tokens <= 0:
-            return 0
-        scaled = per_token * int(context_tokens) * int(chunk_tokens)
-        return -(-scaled // _PREFILL_REFERENCE_CHUNK)
-
     def table_prefill_transient_bytes(self, chunk_tokens: int) -> int:
         """Measured prefill working set of the stage holding the SSD table.
 
@@ -321,10 +304,6 @@ class ModelLayout:
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
         }
         # Omitted when 0 so existing plan hashes stay the same.
-        if self.prefill_transient_bytes_per_context_token:
-            payload["prefill_transient_bytes_per_context_token"] = (
-                self.prefill_transient_bytes_per_context_token
-            )
         # Omitted when unrestricted so existing plan hashes stay the same.
         if self.pipeline_stage_starts:
             payload["pipeline_stage_starts"] = list(self.pipeline_stage_starts)
@@ -1431,21 +1410,6 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     return _hybrid_kv_average(kv_heads * head_dim * 2 * dtype_size, config)
 
 
-_PREFILL_REFERENCE_CHUNK = 4096
-_PREFILL_REFERENCE_CONTEXT = 8192
-
-# The measured prefill working set of the stage holding the SSD lookup table:
-# (chunk tokens, bytes above the loaded footprint). Qwen4-Exp PLE, live on a
-# 128 GiB + 32 GiB split; 4096 is the envelope of the largest chunk that
-# completed (25 GiB Metal ceiling - 8.75 GiB loaded). See
-# ``ModelLayout.table_prefill_transient_bytes`` for the scaling rule.
-_TABLE_PREFILL_POINTS: tuple[tuple[int, int], ...] = (
-    (1024, int(7.25 * 1024**3)),
-    (2048, int(13.25 * 1024**3)),
-    (4096, int(16.25 * 1024**3)),
-)
-
-
 def _qwen4_ple_layer_ids(config: dict[str, Any]) -> tuple[int, ...]:
     """The zero-based layers whose Qwen4-Exp PLE n-gram table can live on SSD.
 
@@ -1470,78 +1434,24 @@ def _qwen4_ple_layer_ids(config: dict[str, Any]) -> tuple[int, ...]:
     return tuple(sorted(layers))
 
 
-def _prefill_transient_bytes_per_context_token(config: dict[str, Any]) -> int:
-    """Prefill peak one chunk adds on top of weights and KV, per context token.
-
-    Loading a stage is only half of admitting it: one prefill chunk allocates
-    an attention score matrix that is gone again by the time the next chunk
-    starts, so it never shows up in resident weights or KV and the plan used to
-    price it at zero. That is how a split with 13 GiB of plan headroom died in
-    prefill.
-
-    The number is ``MemoryMonitor.estimate_prefill_peak_bytes`` on the generic
-    SDPA path, which is what the rank guard refuses a request over when the
-    model has no prefill profile of its own. Profile models (Qwen4 QSA, GLM-5
-    sparse MLA, DeepSeek V4.1) are admitted against a gathered/selected key set
-    instead and price lower, so this reservation is an upper bound on that
-    admission rather than a match for it.
-
-    The peak is linear in the chunk and (for the dense and tiled SDPA paths)
-    linear in the context, so one number priced at
-    ``_PREFILL_REFERENCE_CHUNK`` / ``_PREFILL_REFERENCE_CONTEXT`` scales to the
-    chunk the execution profile will really use.
-
-    Returns 0 for checkpoints whose cache the generic formula cannot price —
-    MLA stores one latent per layer, and over-charging it by an order of
-    magnitude would refuse splits that work; the guard still prices those
-    through their profile, so the plan under-reserves them by that transient —
-    and when the dims are unreadable.
-    """
-
-    if _kv_cache_replicated_across_tp(config):
-        return 0
-    text_config = config.get("text_config")
-    layer_config = text_config if isinstance(text_config, dict) else config
-    heads = _config_int(layer_config, "num_attention_heads", 0)
-    kv_heads = _config_int(layer_config, "num_key_value_heads", heads)
-    if heads <= 0 or kv_heads <= 0:
-        return 0
-    head_dim = _config_int(layer_config, "head_dim", 0)
-    if head_dim <= 0:
-        hidden = _config_int(layer_config, "hidden_size", 0, maximum=1_000_000)
-        head_dim = hidden // heads if hidden and heads and hidden % heads == 0 else 0
-    if not 0 < head_dim <= 4096:
-        return 0
-    layers = _config_int(layer_config, "num_hidden_layers", 0)
-    if layers <= 0:
-        return 0
-    # Hybrid stacks only grow a cache in their attention layers, and the guard
-    # knows that because it classified them from the loaded cache.
-    layer_types = layer_config.get("layer_types")
-    kv_layers = layers
-    if isinstance(layer_types, list) and layer_types:
-        kv_layers = sum(1 for kind in layer_types if kind != "linear_attention")
-    if kv_layers <= 0:
-        return 0
-    try:
-        from ..memory_monitor import MemoryMonitor
-    except Exception:  # noqa: BLE001 - planning must not need the inference stack
-        return 0
-    monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
-    monitor.set_model_info(
-        num_layers=layers,
-        num_kv_heads=kv_heads,
-        head_dim=head_dim,
-        # Activations stay bf16/fp16 whatever the weights were quantised to.
-        dtype_size=2,
-        num_attention_heads=heads,
-        num_kv_cache_layers=kv_layers,
-        compute_dtype_size=2,
-    )
-    peak = monitor.estimate_prefill_peak_bytes(
-        _PREFILL_REFERENCE_CONTEXT, _PREFILL_REFERENCE_CHUNK
-    )
-    return -(-int(peak) // _PREFILL_REFERENCE_CONTEXT)
+# The measured prefill working set of the stage holding the SSD lookup table:
+# (chunk tokens, bytes above the loaded footprint). Qwen4-Exp PLE.
+#
+# Re-measured 2026-11-20 with the PLE prefill pool valve armed: oQ5e-mtp on one
+# M5 Max (128 GiB) at a 120 GiB wired limit, 26k prompt, kernel-ledger
+# footprint, every point BELOW the ceiling (the previous triple's 4096 row was
+# ceiling-limited, which was the review's objection). The valve removes the
+# shape-dependent Metal-pool accumulation that made the old envelope grow with
+# the chunk: 1024 7.25 -> 3.85, 2048 13.25 -> 5.40, 4096 16.25 -> 8.96 GiB,
+# flat above 4096 (unmeasured; the rank guard stays the request-time
+# authority). Because the fix removed the cause, splits the old envelope
+# refused (the pre-fix 0-8/0-9 cuts) may now fit — the intended effect of
+# removing the cause, not a relaxed safety rule.
+_TABLE_PREFILL_POINTS: tuple[tuple[int, int], ...] = (
+    (1024, int(3.848 * 1024**3)),
+    (2048, int(5.400 * 1024**3)),
+    (4096, int(8.958 * 1024**3)),
+)
 
 
 def _hybrid_kv_average(per_layer: int, config: dict[str, Any]) -> int:
@@ -1855,9 +1765,6 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         pipeline_stage_starts=_pipeline_stage_starts(config) if loadable else (),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(config),
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(config),
-        prefill_transient_bytes_per_context_token=(
-            _prefill_transient_bytes_per_context_token(config)
-        ),
         table_layer_ids=_qwen4_ple_layer_ids(config),
         tensor_parallel_ssd_layer_bytes=(
             tuple(ssd_sizes.get(index, 0) for index in expected_indices)
@@ -2367,17 +2274,29 @@ def _prefill_transient_bytes(
     context_tokens: int,
     workload_profile: ExecutionProfileName,
 ) -> int:
-    """Peak prefill transient this plan reserves on every stage.
+    """The generic per-stage prefill reservation — withdrawn, always 0.
 
-    A pipeline stage holds its own layers only, but the rank guard prices the
-    transient for the stage it runs (one attention chunk, not the model's
-    layers), so one number sized from the plan's chunk and context is the
-    quantity every stage must be able to hold.
+    The review rejected the generic price on two grounds: it charged every
+    stage the whole-model KV of the new tokens on top of the stage's own
+    ``kv_cache_bytes`` (a double charge that refused plans main admits, e.g.
+    gpt-oss-120b on two 36 GiB nodes at 65k), and its value depended on
+    process state: the sdpa256 tiled route registers at load, so a cold
+    planner priced a different plan than a warm server, and the remote
+    ``complete_model_layout`` subprocess is always cold. The review's
+    acceptance: leave other models' plans as they are on main.
+
+    Main reserves no generic prefill transient, and the runtime request guard
+    still prices the real transient at request time
+    (``MemoryMonitor.estimate_prefill_peak_bytes``), so withdrawing the plan
+    charge restores main's behavior without removing the protection. The one
+    plan reservation that stays is the measured working set of the stage
+    holding the SSD lookup table (``table_prefill_transient_bytes``) — the
+    stage where a live prefill OOM named the gap. The deprecated layout field
+    is kept for payload compatibility but never set by inspection and never
+    charged here.
     """
 
-    return model.prefill_transient_bytes(
-        context_tokens, _prefill_chunk_tokens(workload_profile)
-    )
+    return 0
 
 
 def allocate_layers_proportional(
