@@ -592,9 +592,13 @@ class CacheSettings:
 
 # Hot-tier eviction policies. "lru" evicts the least recently used entry.
 # "chain_aware_lru" only evicts entries no other hot entry builds on (leaves of
-# the prefix-chain forest; unreachable orphans first) and refuses to admit a
-# block when nothing else can be evicted, so a cached chain is never broken in
-# the middle.
+# the prefix-chain forest; orphans, whose parent has left the hot tier, first)
+# and refuses to admit a block when nothing else can be evicted, so a cached
+# chain is never broken in the middle. Refusals are reported as
+# hot_cache_admission_refusals.
+# The two differ for a single block larger than the whole hot tier: "lru"
+# keeps it as the tier's only entry (historical behavior), "chain_aware_lru"
+# refuses it. With SSD on, a refused block is still written to SSD.
 VALID_HOT_CACHE_EVICTION_POLICIES: tuple[str, ...] = ("lru", "chain_aware_lru")
 
 

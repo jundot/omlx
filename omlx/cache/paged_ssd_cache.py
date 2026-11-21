@@ -1902,8 +1902,10 @@ class PagedSSDCacheManager(CacheManager):
             hot_cache_eviction_policy: "lru" (default) or "chain_aware_lru".
                 The latter only evicts hot entries no other hot entry builds
                 on, orphans first, and refuses to admit a block rather than
-                break a cached chain. With a shared budget, the budget's
-                policy decides victims; this one supplies the predicates.
+                break a cached chain. A block larger than the whole tier is
+                refused too, where "lru" keeps it as the only entry. With a
+                shared budget, the budget's policy decides victims; this one
+                supplies the predicates.
             hot_cache_write_through: When True (and hot cache is enabled, not
                 hot_cache_only), every saved block is retained in the hot cache
                 AND enqueued for immediate SSD persistence. Combines RAM-speed
