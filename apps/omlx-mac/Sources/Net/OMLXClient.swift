@@ -436,6 +436,13 @@ final class OMLXClient: ObservableObject {
         ))
     }
 
+    /// Fetch the master API key once for an explicit copy/reveal action.
+    /// Polled GETs only report whether a key is set.
+    func revealApiKey() async throws -> String {
+        let response: RevealApiKeyResponse = try await postEmpty(AdminAPI.revealApiKey)
+        return response.apiKey
+    }
+
     @discardableResult
     func createSubKey(key: String, name: String) async throws -> CreateSubKeyResponse {
         try await post(AdminAPI.subKeys, body: CreateSubKeyRequest(key: key, name: name))

@@ -33,3 +33,8 @@ struct SetupApiKeyRequest: Encodable, Sendable {
     let apiKey: String
     let apiKeyConfirm: String
 }
+
+/// Response from `POST /admin/api/auth/api-key` — one-shot reveal for copy/show.
+struct RevealApiKeyResponse: Decodable, Sendable {
+    let apiKey: String
+}

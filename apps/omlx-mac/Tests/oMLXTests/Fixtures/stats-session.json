@@ -10,7 +10,7 @@
     "uptime_seconds": 1917.3,
     "host": "127.0.0.1",
     "port": 8964,
-    "api_key": "sk-omlx-EXAMPLE-KEY-REDACTED",
+    "api_key_set": true,
     "cli_prefix": "/Applications/oMLX.app/Contents/MacOS/omlx-cli",
     "engines": {
         "mlx-lm": {

@@ -57,21 +57,25 @@ private struct APIKeySection: View {
 }
 
 private struct APIKeyEditorRow: View {
-    var vm: SecurityScreenVM
+    @Bindable var vm: SecurityScreenVM
     let client: OMLXClient
 
+    /// Draft of a new key the user is typing. Starts empty; the stored key
+    /// is not loaded into this field (GET /global-settings no longer returns it).
     @State private var draft: String = ""
+    /// One-shot reveal of the stored key for the eye toggle. Never treated as dirty.
+    @State private var revealedStored: String = ""
     @State private var showKey: Bool = false
     @State private var copied: Bool = false
     @State private var saving: Bool = false
+    @State private var revealing: Bool = false
 
     @FocusState private var focused: Bool
 
     @Environment(\.omlxTheme) private var theme
     @Environment(AppServices.self) private var services
 
-    private var loaded: String { vm.apiKey ?? "" }
-    private var isDirty: Bool { draft != loaded }
+    private var isDirty: Bool { !draft.trimmingCharacters(in: .whitespaces).isEmpty }
     private var trimmed: String { draft.trimmingCharacters(in: .whitespaces) }
     /// Server-side rule: ≥ 4 printable chars, no whitespace. We mirror the
     /// admin route's `validate_api_key` so the Save button can't enable for
@@ -81,6 +85,20 @@ private struct APIKeyEditorRow: View {
             && trimmed.count >= 4
             && !draft.contains(where: { $0.isWhitespace })
             && !saving
+    }
+
+    private var fieldText: Binding<String> {
+        Binding(
+            get: {
+                if !draft.isEmpty { return draft }
+                if showKey { return revealedStored }
+                return ""
+            },
+            set: { newValue in
+                draft = newValue
+                revealedStored = ""
+            }
+        )
     }
 
     private var sublabel: String {
@@ -99,7 +117,7 @@ private struct APIKeyEditorRow: View {
                           comment: "Row label for the API key editor"),
             sublabel: sublabel, isLast: true) {
             HStack(spacing: 6) {
-                TextInput("security.api_key.row_label", text: $draft, placeholder: "sk-omlx-…", isSecure: !showKey, mono: true, width: .controlMedium)
+                TextInput("security.api_key.row_label", text: fieldText, placeholder: "sk-omlx-…", isSecure: !showKey, mono: true, width: .controlMedium)
                     .onSubmit { Task { await save() } }
                 iconButton(systemName: showKey ? "eye.slash" : "eye",
                            help: showKey
@@ -108,14 +126,16 @@ private struct APIKeyEditorRow: View {
                                           comment: "Tooltip on the eye button when the API key is visible")
                                 : String(localized: "security.api_key.show",
                                           defaultValue: "Show key",
-                                          comment: "Tooltip on the eye button when the API key is masked")) {
-                    showKey.toggle()
+                                          comment: "Tooltip on the eye button when the API key is masked"),
+                           disabled: revealing) {
+                    Task { await toggleShowKey() }
                 }
                 iconButton(systemName: "arrow.triangle.2.circlepath",
                            help: String(localized: "security.api_key.generate",
                                         defaultValue: "Generate a random key",
                                         comment: "Tooltip on the API key regenerate button")) {
                     draft = APIKeyGenerator.random()
+                    revealedStored = ""
                     showKey = true
                 }
                 iconButton(systemName: copied ? "checkmark" : "document.on.document",
@@ -123,8 +143,8 @@ private struct APIKeyEditorRow: View {
                                         defaultValue: "Copy to clipboard",
                                         comment: "Tooltip on the API key copy button"),
                            tint: copied ? theme.successText : theme.textSecondary,
-                           disabled: draft.isEmpty) {
-                    copyToClipboard()
+                           disabled: draft.isEmpty && !vm.apiKeySet) {
+                    Task { await copyToClipboard() }
                 }
                 if isDirty {
                     Button(saving
@@ -141,8 +161,12 @@ private struct APIKeyEditorRow: View {
                 }
             }
         }
-        .task(id: loaded) {
-            if !focused { draft = loaded }
+        .task(id: vm.apiKeySet) {
+            if !focused {
+                draft = ""
+                revealedStored = ""
+                showKey = false
+            }
         }
     }
 
@@ -166,11 +190,42 @@ private struct APIKeyEditorRow: View {
         .help(help)
     }
 
-    private func copyToClipboard() {
-        guard !draft.isEmpty else { return }
+    private func toggleShowKey() async {
+        if showKey {
+            showKey = false
+            revealedStored = ""
+            return
+        }
+        if draft.isEmpty && vm.apiKeySet && revealedStored.isEmpty {
+            revealing = true
+            defer { revealing = false }
+            do {
+                revealedStored = try await client.revealApiKey()
+            } catch {
+                vm.lastError = error.omlxDescription
+                return
+            }
+        }
+        showKey = true
+    }
+
+    private func copyToClipboard() async {
+        let value: String
+        if !draft.isEmpty {
+            value = draft
+        } else if vm.apiKeySet {
+            do {
+                value = try await client.revealApiKey()
+            } catch {
+                vm.lastError = error.omlxDescription
+                return
+            }
+        } else {
+            return
+        }
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(draft, forType: .string)
+        pb.setString(value, forType: .string)
         copied = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { copied = false }
     }
@@ -186,10 +241,10 @@ private struct APIKeyEditorRow: View {
             var updated = services.config
             updated.apiKey = next
             services.updateConfig(updated)
-            // Drop focus so the next `.task(id:)` mirror picks up the fresh
-            // loaded value without fighting an in-progress edit.
             focused = false
-            draft = next
+            draft = ""
+            revealedStored = ""
+            showKey = false
         }
     }
 
