@@ -84,6 +84,11 @@ class TextArgs:
             args.intermediate_size = int(params["moe_intermediate_size"])
         if "conv_kernel_size" in params:
             args.sconv_kernel_size = int(params["conv_kernel_size"])
+        if args.loop_config and "loop_num_passes" in params:
+            args.loop_config = {
+                **args.loop_config,
+                "num_passes": int(params["loop_num_passes"]),
+            }
         return args
 
     def is_sliding(self, i: int) -> bool:
@@ -110,7 +115,7 @@ class TextArgs:
             not 0 < core.start < core.stop <= n
             or core.start % block
             or core.stop % block
-            or passes < 2
+            or passes < 1
         ):
             # The message bank is the blocks one pass writes, so the core must
             # start and end on attention-residual block boundaries.
