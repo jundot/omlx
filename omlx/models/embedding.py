@@ -388,8 +388,24 @@ class MLXEmbeddingModel:
             "BertModel": "xlm_roberta",
             "BertForMaskedLM": "xlm_roberta",
             "Qwen2ForCausalLM": "qwen2_embedding",
+            "Qwen2Model": "qwen2_embedding",
         }
         module_name = native_arch_modules.get(arch)
+        if (
+            arch == "Qwen2Model"
+            and "auto_map" in config_dict
+            and "is_causal" not in config_dict
+        ):
+            # Custom modeling code (for example infly/inf-retriever-v1) may run
+            # the decoder bidirectionally without saying so in config.json, and
+            # the native adapter would silently default to causal attention.
+            logger.warning(
+                f"{self.model_name}: Qwen2Model with custom code (auto_map) "
+                "does not state its attention direction; skipping the native "
+                'Qwen2 adapter. Add "is_causal": true or false to config.json '
+                "to load it natively."
+            )
+            return False
         if module_name is None:
             logger.debug(
                 f"Architecture '{arch}' not natively supported for embedding, "
