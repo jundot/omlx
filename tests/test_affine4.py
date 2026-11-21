@@ -804,3 +804,187 @@ def test_trim_rows_keeps_each_row_through_filter_and_extend():
     batch.extend(Affine8KVCache.merge([joiner]))
     assert batch._row_ends is None
     assert same(0, references[2]) and same(1, references[0]) and same(2, joiner)
+
+
+def _long_affine8_cache(keys, kv_heads=4, chunk=2048, seed=0):
+    mx.random.seed(seed)
+    cache = Affine8KVCache()
+    for start in range(0, keys, chunk):
+        n = min(chunk, keys - start)
+        cache.update_and_fetch(
+            mx.random.normal((1, kv_heads, n, 256)).astype(mx.bfloat16),
+            mx.random.normal((1, kv_heads, n, 256)).astype(mx.bfloat16),
+        )
+    mx.eval(cache.state)
+    return cache
+
+
+@pytest.mark.parametrize("split", [1, 4])
+@pytest.mark.parametrize("keys,rows", [(4096, 1024), (6144, 2048)])
+def test_tile_prefill_matches_the_dequantize_route(monkeypatch, keys, rows, split):
+    require_tensor_ops()
+    monkeypatch.setattr(affine4, "_TILE_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_PREFILL_SPLIT", split)
+    monkeypatch.setattr(affine4, "_TILE_PREFILL_SPLIT_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_LAUNCHABLE", {})
+    cache = _long_affine8_cache(keys)
+    ks, vs = cache.state
+    q = mx.random.normal((1, 24, rows, 256)).astype(mx.bfloat16)
+
+    def run(on):
+        monkeypatch.setattr(affine4, "_tile_attention_available", lambda: on)
+        out = cache.attention(
+            q, keys_state=ks, values_state=vs, scale=256**-0.5, mask="causal"
+        )
+        return out.astype(mx.float32)
+
+    ref, out = run(False), run(True)
+    assert list(affine4._TILE_LAUNCHABLE.values()) == [True]
+    diff = mx.abs(out - ref)
+    assert out.shape == ref.shape
+    assert mx.max(diff).item() < 0.02 * mx.max(mx.abs(ref)).item() + 1e-3
+    assert mx.mean(diff).item() < 2e-3
+
+
+def test_tile_launch_error_turns_the_signature_off(monkeypatch):
+    require_tensor_ops()
+    from omlx.utils import affine8_tile_attention as tile
+
+    monkeypatch.setattr(affine4, "_TILE_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_LAUNCHABLE", {})
+    monkeypatch.setattr(affine4, "_tile_attention_available", lambda: True)
+    cache = _long_affine8_cache(2048)
+    ks, vs = cache.state
+    q = mx.random.normal((1, 24, 1024, 256)).astype(mx.bfloat16)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("no MPP headers")
+
+    monkeypatch.setattr(tile, "prefill", fail)
+    out = cache.attention(
+        q, keys_state=ks, values_state=vs, scale=256**-0.5, mask="causal"
+    )
+    assert out.shape == (1, 24, 1024, 256)
+    assert list(affine4._TILE_LAUNCHABLE.values()) == [False]
+
+
+def _verify_case(keys, rows, heads, kv_heads, seed):
+    cache = _long_affine8_cache(keys - rows, kv_heads=kv_heads, seed=seed)
+    k, v = cache.update_and_fetch(
+        mx.random.normal((1, kv_heads, rows, 256)).astype(mx.bfloat16),
+        mx.random.normal((1, kv_heads, rows, 256)).astype(mx.bfloat16),
+    )
+    q = mx.random.normal((1, heads, rows, 256)).astype(mx.bfloat16)
+    mx.eval(k, v, q)
+    return cache, k, v, q
+
+
+def _assert_close(out, ref):
+    out, ref = out.astype(mx.float32), ref.astype(mx.float32)
+    diff = mx.abs(out - ref)
+    assert out.shape == ref.shape
+    assert mx.max(diff).item() < 0.01 * mx.max(mx.abs(ref)).item() + 1e-3
+    assert mx.mean(diff).item() < 1e-3
+
+
+@pytest.mark.parametrize(
+    "heads,kv_heads,rows,keys",
+    [
+        (24, 4, 2, 4096),
+        (24, 4, 5, 5000),
+        (24, 4, 8, 4096),
+        (24, 4, 12, 5000),
+        (16, 2, 2, 4096),
+        (16, 2, 6, 5000),
+        (16, 2, 9, 4096),
+    ],
+)
+def test_tile_verify_matches_native_attention(monkeypatch, heads, kv_heads, rows, keys):
+    require_tensor_ops()
+    monkeypatch.setattr(affine4, "_TILE_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_VERIFY_TWO_TILE_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_LAUNCHABLE", {})
+    monkeypatch.setattr(affine4, "_tile_attention_available", lambda: True)
+    cache, k, v, q = _verify_case(keys, rows, heads, kv_heads, seed=rows)
+    ks, vs = cache._unwrap(k), cache._unwrap(v)
+    ref = affine4._native_attention(cache, q, ks, vs, 256**-0.5, "causal")
+    if ref is None:
+        pytest.skip("native attention does not take this shape")
+    out = cache.attention(
+        q, keys_state=k, values_state=v, scale=256**-0.5, mask="causal"
+    )
+    assert list(affine4._TILE_LAUNCHABLE.values()) == [True]
+    _assert_close(out, ref)
+
+
+@pytest.mark.parametrize("split", [3, 128])
+def test_tile_verify_splits_and_exact_size_states(monkeypatch, split):
+    """Uneven and empty splits (more splits than pages), over the cache views and
+    over states copied to exact-size buffers."""
+    require_tensor_ops()
+    from types import SimpleNamespace
+
+    from omlx.utils import affine8_tile_attention as tile
+
+    cache, k, v, q = _verify_case(5000, 8, 24, 4, seed=split)
+    ks, vs = cache._unwrap(k), cache._unwrap(v)
+    ref = affine4._native_attention(cache, q, ks, vs, 256**-0.5, "causal")
+    rq = cache.key_codec.prepare_queries(q)
+    tight = [
+        SimpleNamespace(indices=mx.array(s.indices) + 0, norms=mx.array(s.norms) + 0)
+        for s in (ks, vs)
+    ]
+    for keys_state, values_state in ((ks, vs), tight):
+        out = tile.verify(rq, keys_state, values_state, 256**-0.5, split=split)
+        _assert_close(cache.value_codec._rotate_inverse(out), ref)
+
+
+@pytest.mark.parametrize(
+    "rows,mask,keys,heads,kv_heads",
+    [
+        (1, "causal", 4096, 24, 4),  # one row: the decode kernels
+        (17, "causal", 4096, 24, 4),  # past the row limit
+        (8, None, 4096, 24, 4),  # not causal
+        (8, "causal", 512, 24, 4),  # short history
+        (4, "causal", 4096, 16, 4),  # a GQA group without numbers
+    ],
+)
+def test_tile_verify_falls_through(monkeypatch, rows, mask, keys, heads, kv_heads):
+    require_tensor_ops()
+    monkeypatch.setattr(affine4, "_TILE_MIN_KEYS", 1024)
+    cache, k, v, q = _verify_case(keys, rows, heads, kv_heads, seed=1)
+    ks, vs = cache._unwrap(k), cache._unwrap(v)
+    assert affine4._tile_verify_attention(cache, q, ks, vs, 256**-0.5, mask) is None
+
+
+@pytest.mark.parametrize("padding", [0, 3])
+def test_tile_verify_needs_no_left_padding(monkeypatch, padding):
+    require_tensor_ops()
+    monkeypatch.setattr(affine4, "_TILE_MIN_KEYS", 1024)
+    mx.random.seed(2)
+    cache = BatchAffine8KVCache([padding])
+    k, v = cache.update_and_fetch(
+        mx.random.normal((1, 4, 4096, 256)).astype(mx.bfloat16),
+        mx.random.normal((1, 4, 4096, 256)).astype(mx.bfloat16),
+    )
+    q = mx.random.normal((1, 24, 8, 256)).astype(mx.bfloat16)
+    ks, vs = cache._unwrap(k), cache._unwrap(v)
+    out = affine4._tile_verify_attention(cache, q, ks, vs, 256**-0.5, "causal")
+    assert (out is None) == bool(padding)
+
+
+@pytest.mark.parametrize(
+    "tokens,groups,cores,splits",
+    [
+        (16384, 4, 20, 16),  # pages bound
+        (131072, 4, 20, 40),  # cores bound
+        (131072, 4, 40, 64),  # the cap
+        (131072, 8, 20, 20),  # two row tiles
+        (131072, 4, None, 64),  # unknown core count
+        (512, 4, 20, 1),
+    ],
+)
+def test_tile_verify_splits_follow_pages_and_cores(tokens, groups, cores, splits):
+    from omlx.utils import affine8_tile_attention as tile
+
+    assert tile.verify_splits(tokens, groups, cores) == splits
