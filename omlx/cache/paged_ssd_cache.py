@@ -5644,6 +5644,9 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_max_bytes=self._effective_hot_cache_max_bytes(),
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
+                hot_cache_admission_refusals=self._stats[
+                    "hot_cache_admission_refusals"
+                ],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
                 hot_cache_promotion_failures=self._stats[
                     "hot_cache_promotion_failures"
@@ -5746,6 +5749,9 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_max_bytes=self._effective_hot_cache_max_bytes(),
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
+                hot_cache_admission_refusals=self._stats[
+                    "hot_cache_admission_refusals"
+                ],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
                 hot_cache_promotion_failures=self._stats[
                     "hot_cache_promotion_failures"

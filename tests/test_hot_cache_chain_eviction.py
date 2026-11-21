@@ -138,6 +138,9 @@ class TestOverCapacityChain:
             _put(mgr, key, parent)
         assert list(mgr._hot_cache) == [b"A6", b"A7", b"A8", b"A9"]
         assert mgr._stats["hot_cache_admission_refusals"] == 0
+        stats = mgr.get_stats()
+        assert stats.hot_cache_admission_refusals == 0
+        assert stats.hot_cache_evictions == 6
 
     def test_chain_aware_keeps_the_prefix_and_refuses_the_rest(self, tmp_path, budget):
         mgr = _manager(tmp_path, "chain_aware_lru", cap_entries=4, budget=budget)
@@ -145,6 +148,12 @@ class TestOverCapacityChain:
             _put(mgr, key, parent)
         assert list(mgr._hot_cache) == [b"A0", b"A1", b"A2", b"A3"]
         assert mgr._stats["hot_cache_admission_refusals"] == 6
+        # Reported in the stats (and so the admin API); every refusal is
+        # also counted as an eviction.
+        stats = mgr.get_stats()
+        assert stats.hot_cache_admission_refusals == 6
+        assert stats.hot_cache_evictions == 6
+        assert stats.to_dict()["hot_cache_admission_refusals"] == 6
 
     def test_lru_keeps_lone_oversized_entry(self, tmp_path, budget):
         mgr = _manager(tmp_path, "lru", cap_entries=1, budget=budget)
