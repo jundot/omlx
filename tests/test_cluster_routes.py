@@ -485,20 +485,25 @@ def test_cluster_plan_follows_the_saved_qwen4_ple_ssd_offload_setting(monkeypatc
     )
     monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
     monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
-    body = {
-        "model_path": "/models/qwen",
-        "nodes": [
-            {"node_id": "local", "capacity_bytes": 128 * gib, "reserve_bytes": 2 * gib}
+    # Upstream's API refactor retired POST /plan in favour of /autoconfigure
+    # (which needs 2+ hosts). The intent here is the planner's reading of the
+    # saved PLE switch, so drive the planner entry point directly.
+    request = routes.ClusterPlanRequest(
+        model_path="/models/qwen",
+        layer_count=4,
+        nodes=[
+            routes.ClusterPlanNodeRequest(
+                node_id="local", capacity_bytes=128 * gib, reserve_bytes=2 * gib
+            )
         ],
-    }
+    )
 
-    offloaded = _client().post("/admin/api/cluster/plan", json=body)
+    offloaded = routes._create_cluster_plan(request)
     saved["qwen"] = False
-    resident = _client().post("/admin/api/cluster/plan", json=body)
+    resident = routes._create_cluster_plan(request)
 
-    assert offloaded.status_code == resident.status_code == 200
-    assert offloaded.json()["assignments"][0]["ssd_weight_bytes"] == 3 * gib
-    assert resident.json()["assignments"][0]["ssd_weight_bytes"] == 0
+    assert offloaded.assignments[0].ssd_weight_bytes == 3 * gib
+    assert resident.assignments[0].ssd_weight_bytes == 0
 
 
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
