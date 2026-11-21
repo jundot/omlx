@@ -173,6 +173,27 @@ class TestManualRoPE:
         # Unrotated portion should be unchanged
         assert mx.allclose(result[..., dims:], x[..., dims:])
 
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+    def test_keeps_input_dtype(self, dtype):
+        # cos/sin are built in float32; a bf16/fp16 input must not come back
+        # float32, or the sparse-prefilled K cache is float32 and every
+        # decode activation after it is promoted.
+        from omlx.patches.specprefill import manual_rope
+
+        x = mx.random.normal((1, 4, 6, 64)).astype(dtype)
+        positions = mx.array([0, 3, 4, 9, 10, 11])
+        assert manual_rope(x, positions, dims=64).dtype == dtype
+        assert manual_rope(x, positions, dims=32).dtype == dtype
+
+    def test_contiguous_matches_fast_rope_in_bf16(self):
+        from omlx.patches.specprefill import manual_rope
+
+        x = mx.random.normal((1, 4, 8, 64)).astype(mx.bfloat16)
+        ref = mx.fast.rope(x, 64, traditional=False, base=10000.0, scale=1.0, offset=0)
+        out = manual_rope(x, mx.arange(8), dims=64, base=10000.0)
+        assert out.dtype == ref.dtype
+        assert mx.allclose(out.astype(mx.float32), ref.astype(mx.float32), atol=2e-2)
+
 
 class TestManualRopeWithFreqs:
     """Tests for manual_rope_with_freqs() — RoPE from a precomputed freq table."""
@@ -202,6 +223,15 @@ class TestManualRopeWithFreqs:
             out[..., j] = a * c - b * s
             out[..., j + half] = a * s + b * c
         return out
+
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+    def test_keeps_input_dtype(self, dtype):
+        from omlx.patches.specprefill import manual_rope_with_freqs
+
+        freqs = mx.arange(1, 33, dtype=mx.float32) * 1000.0
+        x = mx.random.normal((1, 2, 4, 64)).astype(dtype)
+        out = manual_rope_with_freqs(x, mx.arange(4), dims=64, freqs=freqs)
+        assert out.dtype == dtype
 
     def test_partial_rotary_matches_reference_rope(self):
         # The corrected fix must match the model's real rope: pair dim i with
@@ -620,6 +650,36 @@ class TestRoPEWrappers:
         x = mx.zeros((1, 4, 3, 64))
         result = wrapper(x, offset=mx.array(2))
         assert result.shape == x.shape
+
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+    def test_position_mapped_rope_keeps_input_dtype(self, dtype):
+        """A sparse prefill must not hand float32 keys to the KV cache."""
+        from omlx.patches.specprefill import _PositionMappedRoPE
+
+        class FakeRoPE:
+            dims = 64
+            base = 10000.0
+            scale = 1.0
+
+            def __call__(self, x, offset=0):
+                return x
+
+        positions = mx.array([0, 3, 4, 9, 10, 11])
+        wrapper = _PositionMappedRoPE(FakeRoPE(), positions, cache_start=0)
+        x = mx.random.normal((1, 4, 6, 64)).astype(dtype)
+        assert wrapper(x, offset=0).dtype == dtype
+
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+    def test_partial_rotary_contiguous_matches_fast_rope(self, dtype):
+        """dims < head_dim: the rotated slice matches mx.fast.rope, the rest passes."""
+        from omlx.patches.specprefill import manual_rope
+
+        x = mx.random.normal((1, 2, 8, 128)).astype(dtype)
+        ref = mx.fast.rope(x, 64, traditional=False, base=10000.0, scale=1.0, offset=0)
+        out = manual_rope(x, mx.arange(8), dims=64, base=10000.0)
+        assert out.dtype == ref.dtype
+        assert mx.allclose(out.astype(mx.float32), ref.astype(mx.float32), atol=0.1)
+        assert mx.array_equal(out[..., 64:], x[..., 64:])
 
     def test_offset_adjusted_rope_adds_offset(self):
         from omlx.patches.specprefill import _OffsetAdjustedRoPE
