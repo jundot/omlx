@@ -20,6 +20,7 @@ from typing import Any
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
+from mlx_lm.models.cache import RotatingKVCache
 from mlx_lm.utils import load_model
 
 from ...patches.inkling2 import model as inkling2
@@ -91,9 +92,10 @@ def _rows(kv: Any, since: int) -> tuple[mx.array, mx.array]:
 
     A sliding-window layer may keep a ring (``RotatingKVCache``) that holds
     only its newest rows, not in time order once it wraps; it sends the rows
-    it still holds.
+    it still holds. Helper caches are single-row ``make_cache`` caches, never
+    the batch classes.
     """
-    if not hasattr(kv, "_temporal_order"):
+    if not isinstance(kv, RotatingKVCache):
         return kv.keys[..., since : kv.offset, :], kv.values[..., since : kv.offset, :]
     keys, values = kv._temporal_order(kv.keys), kv._temporal_order(kv.values)
     n = min(kv.offset - since, keys.shape[2])
@@ -111,6 +113,34 @@ def _cache_state(i: int, item: Any, since: int) -> Arrays:
         if conv[slot] is not None:
             out[f"{i}.c{slot}"] = conv[slot]
     return out
+
+
+def _check_ring_prefix(i: int, kv: Any, keys: mx.array, offset: Any) -> None:
+    """Refuse a ring prefix (``<i>.off``) this side cannot hold exactly."""
+    if not isinstance(kv, RotatingKVCache):
+        # A full cache cannot stand in for rows a ring dropped.
+        raise ValueError(
+            f"Inkling 2 layer {i}: the prefix comes from a sliding-window "
+            "ring but this side keeps a full KV cache; set "
+            "OMLX_INKLING_SWA_CACHE the same on both Macs"
+        )
+    if not isinstance(offset, mx.array) or offset.size != 1 or offset.dtype != mx.int32:
+        raise ValueError(f"Inkling 2 layer {i}: {i}.off is not an int32 scalar")
+    rows, position = keys.shape[2], int(offset.item())
+    # Only a whole prefix carries a ring position, onto an empty layer.
+    if kv.offset or position <= rows:
+        raise ValueError(
+            f"Inkling 2 layer {i}: {i}.off {position} does not follow the "
+            f"{rows} rows sent onto position {kv.offset}"
+        )
+    if rows < kv.max_size:
+        # A larger ring here would hold fewer rows than its size past the
+        # point it wraps, which its in-place update cannot handle.
+        raise ValueError(
+            f"Inkling 2 layer {i}: {rows} ring rows cannot fill this side's "
+            f"{kv.max_size}-key ring; set OMLX_INKLING_SWA_CACHE_SIZE the same "
+            "on both Macs"
+        )
 
 
 class Inkling2Adapter(StageAdapter):
@@ -233,15 +263,15 @@ class Inkling2Adapter(StageAdapter):
         return None
 
     def apply_state(self, cache: list, k: int, state: Arrays) -> None:
+        # Check every layer before writing any, so a refusal leaves the cache
+        # untouched and the host prefills locally.
+        positions = set()
         for i in range(k):
-            if f"{i}.off" in state and not hasattr(cache[i][0], "_temporal_order"):
-                # A full cache cannot stand in for rows a ring dropped: refuse
-                # before writing anything, and the host prefills locally.
-                raise ValueError(
-                    f"Inkling 2 layer {i}: the prefix comes from a sliding-window "
-                    "ring but this side keeps a full KV cache; set "
-                    "OMLX_INKLING_SWA_CACHE the same on both Macs"
-                )
+            if f"{i}.off" in state:
+                _check_ring_prefix(i, cache[i][0], state[f"{i}.k"], state[f"{i}.off"])
+                positions.add(int(state[f"{i}.off"].item()))
+        if len(positions) > 1:
+            raise ValueError(f"Inkling 2 ring positions disagree: {sorted(positions)}")
         for i in range(k):
             kv, conv = cache[i][0], cache[i][1]
             keys = state[f"{i}.k"]

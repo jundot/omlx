@@ -2074,24 +2074,60 @@ def test_inkling2_ring_split_after_a_prefix_past_the_window(inkling2_ring):
     assert [c[0].offset for c in helper_cache] == [22] * 7
 
 
-def test_inkling2_full_cache_helper_refuses_a_wrapped_ring_prefix(
-    inkling2_ring, monkeypatch
-):
-    # A ring that dropped rows cannot seed a full cache: the helper must fail
-    # the job (the host then prefills locally) before writing anything.
+def _inkling2_wrapped_ring_prefix() -> dict:
+    """A 22-token prefix of the first 7 layers on rings of the 8-key window."""
     ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 22)))
     host = _inkling2()
     cache = host.make_cache()
     for chunk in _chunks(ids, [12, 10]):
         host(chunk, cache=cache)
-    state = INKLING2.prefix_state(cache, 7)
-    monkeypatch.setattr(inkling2_model, "_SWA_BOUNDED", False)
+    return INKLING2.prefix_state(cache, 7)
+
+
+def _inkling2_refuses(state: dict, match: str) -> None:
+    # The helper must fail the job (the host then prefills locally) before
+    # writing anything.
     helper = _inkling2()
     INKLING2.keep_first(helper, 7)
     helper_cache = helper.make_cache()
-    with pytest.raises(ValueError, match="OMLX_INKLING_SWA_CACHE"):
+    with pytest.raises(ValueError, match=match):
         INKLING2.load_prefix(helper_cache, state)
     assert [c[0].offset for c in helper_cache] == [0] * 7
+
+
+def test_inkling2_full_cache_helper_refuses_a_wrapped_ring_prefix(
+    inkling2_ring, monkeypatch
+):
+    # A ring that dropped rows cannot seed a full cache.
+    state = _inkling2_wrapped_ring_prefix()
+    monkeypatch.setattr(inkling2_model, "_SWA_BOUNDED", False)
+    _inkling2_refuses(state, "OMLX_INKLING_SWA_CACHE")
+
+
+def test_inkling2_larger_ring_helper_refuses_a_wrapped_ring_prefix(
+    inkling2_ring, monkeypatch
+):
+    # Nor a larger ring, which would hold fewer rows than its size.
+    state = _inkling2_wrapped_ring_prefix()
+    monkeypatch.setattr(inkling2_model, "_SWA_SIZE", 64)
+    _inkling2_refuses(state, "OMLX_INKLING_SWA_CACHE_SIZE")
+
+
+@pytest.mark.parametrize("bad", ["float", "int64", "vector", "too-small", "disagree"])
+def test_inkling2_ring_helper_refuses_a_malformed_ring_position(inkling2_ring, bad):
+    state = _inkling2_wrapped_ring_prefix()
+    rows = state["0.k"].shape[2]
+    if bad == "disagree":
+        state["1.off"] = mx.array(23, dtype=mx.int32)
+        _inkling2_refuses(state, r"ring positions disagree: \[22, 23\]")
+        return
+    state["0.off"] = {
+        "float": state["0.off"].astype(mx.float32),
+        "int64": state["0.off"].astype(mx.int64),
+        "vector": mx.array([22, 22], dtype=mx.int32),
+        "too-small": mx.array(rows, dtype=mx.int32),
+    }[bad]
+    _inkling2_refuses(state, r"layer 0: 0\.off")
 
 
 def test_inkling2_ring_scheduler_helper_prefill_matches_local(inkling2_ring):
