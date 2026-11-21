@@ -29,6 +29,7 @@ def _resolve_limit() -> int:
         uploads = max(
             server.max_audio_upload_bytes(),
             server.max_image_upload_bytes(),
+            server.max_video_upload_bytes(),
             integrations.markitdown_max_file_size_mb
             * integrations.markitdown_max_files_per_request
             * 1024**2,
