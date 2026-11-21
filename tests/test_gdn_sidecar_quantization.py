@@ -565,36 +565,41 @@ def _recurrent_extracted(recurrent) -> list[dict]:
     ]
 
 
-@pytest.mark.parametrize("mode", ["int8", "rht_int8", "rht_int16", "bf16"])
+@pytest.mark.parametrize("mode", ["fp32", "int8", "rht_int8", "rht_int16", "bf16"])
+@pytest.mark.parametrize("dim", [8, 12])
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
-def test_non_finite_source_is_refused_before_encoding(tmp_path, mode, bad):
+def test_non_finite_source_is_refused_before_encoding(tmp_path, mode, dim, bad):
     """A corrupt recurrent state must not become a well-formed sidecar.
 
-    NaN survives round/clip into an undefined int8 value while its row scale
-    can still look finite, so restore-side validation alone would not catch it.
+    This includes raw fp32 and the unsupported-width RHT fallback. NaN
+    survives round/clip into an undefined int8 value while its row scale can
+    still look finite, so restore-side validation alone would not catch it.
     """
     store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype=mode)
     try:
-        values = mx.arange(1, 1 + 2 * 8, dtype=mx.float32).reshape(1, 1, 2, 8)
+        values = mx.arange(1, 1 + 2 * dim, dtype=mx.float32).reshape(1, 1, 2, dim)
         poisoned = mx.concatenate(
             [
-                mx.full((1, 1, 1, 8), bad, dtype=mx.float32),
+                mx.full((1, 1, 1, dim), bad, dtype=mx.float32),
                 values[:, :, 1:, :],
             ],
             axis=2,
         )
         with pytest.raises(ValueError, match="non-finite GDN recurrent state"):
-            store._serialize_extracted(
-                _recurrent_extracted(poisoned), "poison", 2048
-            )
+            store._serialize_extracted(_recurrent_extracted(poisoned), "poison", 2048)
         assert store.gdn_encode_failures == 1
 
         # save() degrades the same failure to a safe miss, leaving no file.
         assert (
-            store.save("poison", 2048, [object()], lambda _s: (
-                _recurrent_extracted(poisoned),
-                None,
-            ))
+            store.save(
+                "poison",
+                2048,
+                [object()],
+                lambda _s: (
+                    _recurrent_extracted(poisoned),
+                    None,
+                ),
+            )
             is False
         )
         assert store.gdn_encode_failures == 2
@@ -603,7 +608,7 @@ def test_non_finite_source_is_refused_before_encoding(tmp_path, mode, bad):
         store.shutdown()
 
 
-@pytest.mark.parametrize("mode", ["int8", "rht_int8", "rht_int16"])
+@pytest.mark.parametrize("mode", ["fp32", "int8", "rht_int8", "rht_int16"])
 def test_non_finite_check_does_not_reject_extreme_finite_states(tmp_path, mode):
     """All-zero, subnormal and wide-dynamic-range rows stay encodable."""
     store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype=mode)
