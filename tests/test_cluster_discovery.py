@@ -160,11 +160,17 @@ def test_hello_codec_rejects_garbage():
 
 def test_wassup_codec_roundtrip():
     payload = encode_wassup(7, "node-1", 8000)
+    # The identity fallback carries the peer's name/caps/addrs so a Mac that
+    # joins without them is still labelled in the Cluster tab; a peer that sends
+    # none decodes to the empty values, never to a missing key.
     assert decode_wassup(payload) == {
         "nonce": 7,
         "node_id": "node-1",
         "http_port": 8000,
         "loopback_only": False,
+        "friendly_name": "",
+        "caps": {},
+        "addrs": [],
     }
     assert decode_wassup(encode_wassup(7, "node-1", 8000, True))["loopback_only"]
     # Older peers do not send the flag.
@@ -208,12 +214,16 @@ def test_hello_from_same_cluster_sets_multicast_ok_and_replies_wassup():
     assert service.multicast_ok is True
     assert len(sock.sent) == 1
     reply = decode_wassup(sock.sent[0][1] and sock.sent[0][0])
-    assert reply == {
-        "nonce": 123,
-        "node_id": "aaaa-node",
-        "http_port": 8000,
-        "loopback_only": False,
-    }
+    # The reply carries this Mac's identity fallback (name/caps/addrs) beside
+    # the codec fields, so the asking peer can label it without a second round
+    # trip; the four codec fields are what the wire contract fixes.
+    assert reply["nonce"] == 123
+    assert reply["node_id"] == "aaaa-node"
+    assert reply["http_port"] == 8000
+    assert reply["loopback_only"] is False
+    assert isinstance(reply["friendly_name"], str)
+    assert isinstance(reply["caps"], dict)
+    assert isinstance(reply["addrs"], list)
     assert sock.sent[0][1] == ("fe80::99", 53413)
 
 
