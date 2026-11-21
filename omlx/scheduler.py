@@ -4693,6 +4693,12 @@ class Scheduler:
 
             # Keep token and embedding slices aligned at the final prefill chunk.
             n_to_process = min(n_to_process, remaining)
+            capture_at = Scheduler._arm_tail_capture(
+                prompt_cache,
+                capture_at,
+                cache_tokens=cache_tokens,
+                n_tokens=n_to_process,
+            )
             if getattr(request, "benchmark_trace", False):
                 request.benchmark_prefill_chunks.append(int(n_to_process))
                 request.benchmark_requested_steps.append(int(prefill_step_size))
@@ -8568,7 +8574,8 @@ class Scheduler:
 
         Only the generation-prompt tail, only when the system prefix stop is
         behind, and not while MTP prompt priming tracks this request (it keeps
-        hidden states at the exact chunk end).
+        hidden states at the exact chunk end). Plans only:
+        ``_arm_tail_capture`` arms it once the chunk size is final.
         """
         if (
             tail_at is None
@@ -8588,9 +8595,37 @@ class Scheduler:
         # Every stateful cache must belong to a patched Gated DeltaNet layer.
         if not stateful or model_capture_layers(self.model) != len(stateful):
             return None
-        if not request_tail_capture(stateful, tail_at - cache_tokens):
+        if not all(type(c).__name__ == "ArraysCache" for c in stateful):
             return None
         return tail_at
+
+    @staticmethod
+    def _arm_tail_capture(
+        prompt_cache: list[Any],
+        capture_at: int | None,
+        *,
+        cache_tokens: int,
+        n_tokens: int,
+    ) -> int | None:
+        """Arm the planned capture once the chunk size is final.
+
+        Armed only after the memory guard, so a chunk that pauses for eviction
+        leaves no capture on the saved cache. None when the chunk no longer
+        passes the tail.
+        """
+        if (
+            capture_at is None
+            or not cache_tokens < capture_at < cache_tokens + n_tokens
+        ):
+            return None
+        stateful = [
+            c
+            for c in prompt_cache
+            if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
+        ]
+        if not request_tail_capture(stateful, capture_at - cache_tokens):
+            return None
+        return capture_at
 
     def _emit_prefill_tail_snapshot(
         self,

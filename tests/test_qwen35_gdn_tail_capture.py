@@ -11,7 +11,13 @@ lang = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
 vcache = pytest.importorskip("mlx_vlm.models.cache")
 
 from omlx.patches import qwen35_gdn_tail_capture as tail_capture  # noqa: E402
-from omlx.scheduler import Scheduler  # noqa: E402
+from omlx.request import Request, SamplingParams  # noqa: E402
+from omlx.scheduler import (  # noqa: E402
+    PrefillEvictionRequest,
+    Scheduler,
+    SchedulerConfig,
+    _PrefillEvictionNeeded,
+)
 
 
 def layer_cfg():
@@ -152,15 +158,73 @@ def test_scheduler_plans_a_capture_only_inside_the_chunk(layer, monkeypatch):
     kw = dict(cache_tokens=1000, n_tokens=32, system_at=None)
 
     assert sched._plan_tail_capture(request, [cache], tail_at=1026, **kw) == 1026
+    # Planning does not arm: the memory guard may still pause or shrink the chunk.
+    assert getattr(cache, "_omlx_capture_at", None) is None
+    assert (
+        Scheduler._arm_tail_capture([cache], 1026, cache_tokens=1000, n_tokens=32)
+        == 1026
+    )
     assert cache._omlx_capture_at == 26
+    cache._omlx_capture_at = None
+    # A chunk the guard shrank below the tail takes no capture.
+    assert (
+        Scheduler._arm_tail_capture([cache], 1026, cache_tokens=1000, n_tokens=26)
+        is None
+    )
+    assert getattr(cache, "_omlx_capture_at", None) is None
     assert sched._plan_tail_capture(request, [cache], tail_at=1032, **kw) is None
     assert sched._plan_tail_capture(request, [cache], tail_at=None, **kw) is None
-    assert sched._plan_tail_capture(
-        request, [cache], tail_at=1026, cache_tokens=1000, n_tokens=32, system_at=1010
-    ) is None
+    assert (
+        sched._plan_tail_capture(
+            request,
+            [cache],
+            tail_at=1026,
+            cache_tokens=1000,
+            n_tokens=32,
+            system_at=1010,
+        )
+        is None
+    )
     # MTP prompt priming tracks this request: keep the exact stop.
     ctx = types.SimpleNamespace(valid=True, request_id="r1")
-    monkeypatch.setattr(
-        "omlx.scheduler._mtp_priming._find_ctx", lambda model: ctx
-    )
+    monkeypatch.setattr("omlx.scheduler._mtp_priming._find_ctx", lambda model: ctx)
     assert sched._plan_tail_capture(request, [cache], tail_at=1026, **kw) is None
+
+
+def test_eviction_pause_leaves_no_capture_armed(layer, mock_tokenizer, monkeypatch):
+    """A chunk that pauses for eviction must not leave a capture on the saved
+    cache: the resumed chunk can have another size and the offset goes stale."""
+    sched = Scheduler(
+        model=_Model([layer]),
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(prefill_step_size=64),
+    )
+    prompt = list(range(100, 300))
+    request = Request(request_id="r1", prompt=prompt, sampling_params=SamplingParams())
+    request.prompt_token_ids = prompt
+    request.num_prompt_tokens = len(prompt)
+    request.remaining_tokens = prompt
+    cache = vcache.ArraysCache(size=2)
+    request.prompt_cache = [cache]
+    sched.requests[request.request_id] = request
+    monkeypatch.setattr(
+        sched, "_prefill_tail_plan", lambda *args, **kwargs: (40, False)
+    )
+    monkeypatch.setattr(sched, "_prefill_system_stop", lambda *args, **kwargs: None)
+    eviction = PrefillEvictionRequest(
+        request_id="r1",
+        model_id="m",
+        current_bytes=0,
+        target_cap_bytes=1,
+        predicted_transient_bytes=1,
+        requested_tokens=64,
+        reason="prefill_safety_cap",
+    )
+
+    def pause(*args, **kwargs):
+        raise _PrefillEvictionNeeded(eviction)
+
+    monkeypatch.setattr(sched, "_guard_prefill_chunk", pause)
+    with pytest.raises(_PrefillEvictionNeeded):
+        sched._do_external_prefill(request, prompt, request.prompt_cache)
+    assert getattr(cache, "_omlx_capture_at", None) is None
