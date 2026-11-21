@@ -18,6 +18,8 @@ import numpy as np
 from PIL import Image
 from transformers import PreTrainedTokenizerFast
 
+from .opener import install_generation_opener
+
 
 class Inkling2ImageProcessor:
     model_input_names = ["pixel_values", "image_grid_thw"]
@@ -92,6 +94,7 @@ class Inkling2Processor:
         self, tokenizer, image_processor=None, image_token="<|unused_200054|>"
     ):
         self.tokenizer = tokenizer
+        install_generation_opener(tokenizer)
         self.image_processor = image_processor or Inkling2ImageProcessor()
         self.image_token = image_token
         self.image_token_id = tokenizer.convert_tokens_to_ids(image_token)

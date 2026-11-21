@@ -12,7 +12,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -993,6 +993,11 @@ class _InklingChannelSplitter:
             self._channel = None
         return stream, visible
 
+    def open_block(self, marker: str) -> None:
+        """Enter the block ``marker`` opens without emitting anything for it."""
+        self._handle_marker(marker)
+        self._head = ""
+
     def feed(self, text: str) -> tuple[str, str]:
         if not text:
             return "", ""
@@ -1065,6 +1070,44 @@ class InklingOutputParserSession:
 
     def _decode_token(self, token_id: int) -> str:
         return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
+
+    def notify_prefilled_thought(self) -> None:
+        """The prompt ends inside a thinking block; the scheduler opens the span."""
+        self._splitter.open_block(_INKLING_CONTENT_THINKING)
+
+    def notify_prompt_tail(self, token_ids: Sequence[int]) -> None:
+        """Start inside the block the prompt left open.
+
+        A generation opener or a partial reply ends the prompt past a block
+        header the model would otherwise have written, so the first generated
+        token already belongs to that block. A thinking block is opened by
+        ``notify_prefilled_thought``; a bare header needs nothing, the model
+        writes the block's marker itself.
+        """
+        convert = getattr(self._tokenizer, "convert_tokens_to_ids", None)
+        if not callable(convert):
+            return
+        markers = {}
+        for marker in _INKLING_MARKERS:
+            token_id = convert(marker)
+            if isinstance(token_id, int) and token_id >= 0:
+                markers[token_id] = marker
+        tail: list[int] = []
+        for token_id in reversed(token_ids):
+            marker = markers.get(int(token_id))
+            if marker is None:
+                tail.append(int(token_id))
+                continue
+            if marker in (
+                _INKLING_CONTENT_TEXT,
+                _INKLING_CONTENT_XML,
+                _INKLING_CONTENT_TOOL_JSON,
+            ):
+                self._splitter.open_block(marker)
+                if marker == _INKLING_CONTENT_TOOL_JSON:
+                    # Tool calls are parsed from the raw text at finalize.
+                    self._raw_text = marker + self._tokenizer.decode(tail[::-1])
+            return
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
         if self._splitter.stopped:
