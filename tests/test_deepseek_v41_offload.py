@@ -919,6 +919,45 @@ def test_decode_lookup_advises_every_page_before_copying(tmp_path, monkeypatch):
         embed.close()
 
 
+def test_advise_bound_follows_the_tables_verify_batch(tmp_path, monkeypatch):
+    path = tmp_path / "bound.safetensors"
+    weights = np.arange(4096 * 16, dtype=np.uint32).reshape(4096, 16)
+    tensors = {"w": (weights, "U32")}
+    tensors |= {k: (np.ones((4096, 4), dtype=np.float16), "F16") for k in "sb"}
+    raw_safetensors(path, tensors)
+    events = []
+    advise = storage.TensorFile.advise_rows
+
+    def advised(self, key, rows):
+        events.append(int(np.asarray(rows).size))
+        return advise(self, key, rows)
+
+    monkeypatch.setattr(storage.TensorFile, "advise_rows", advised)
+    # A four-token verify block for a table with 24 hashes per token.
+    embed = storage.DiskEngramEmbedding(
+        path, "w", "s", bias_key="b", bits=4, group_size=32, advise_max_rows=96
+    )
+    try:
+        embed._read_rows(np.arange(96).reshape(1, -1))
+        assert events == [96, 96, 96]
+        events.clear()
+        # Wider gathers keep the I/O pool path.
+        embed._read_rows(np.arange(97).reshape(1, -1))
+        assert events == []
+    finally:
+        embed.close()
+
+
+def test_engram_advise_bound_comes_from_the_table_shape(converted):
+    model, _ = load(converted, engram_ssd_offload=True)
+    try:
+        embed = model.language_model.layers[1].engram.embed
+        # write_checkpoint's fixture: 2 heads x (4 - 1) hashes per token.
+        assert embed._advise_max_rows == 2 * (4 - 1) * storage.DECODE_ROWS
+    finally:
+        model.close()
+
+
 def test_wide_mixed_reads_only_read_rows_on_new_pages(tmp_path, monkeypatch):
     path = tmp_path / "mixed.safetensors"
     row_bytes = 519
@@ -943,10 +982,11 @@ def test_wide_mixed_reads_only_read_rows_on_new_pages(tmp_path, monkeypatch):
         actual, _ = reader.read("w", rows)
         np.testing.assert_array_equal(actual, raw[rows])
         assert calls == [(offset, offset + row_bytes)]
-        # Narrow reads, such as decode, copy every row from the mapping.
+        # Narrow reads, such as decode, copy every row from the mapping; the
+        # caller advised them, so it passes that decision down.
         calls.clear()
         narrow = np.array([2, 3000, 15])
-        actual, _ = reader.read("w", narrow)
+        actual, _ = reader.read("w", narrow, advised=True)
         np.testing.assert_array_equal(actual, raw[narrow])
         assert not calls
     finally:
