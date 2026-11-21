@@ -881,6 +881,84 @@ def launcher_version():
     return __version__
 
 
+class _DaemonInfo:
+    """A helper daemon's control channel that answers ``info`` from ``gpus``.
+
+    Only the probe is served. The host reads it through its own
+    ``agent.remote_info``, so a test drives the payload the wire produces —
+    ``budgets``, ``memory``, ``device`` — instead of a hand-built info dict.
+    """
+
+    def __init__(self, gpus):
+        self.gpus = gpus
+        self.listener = socket.create_server(("127.0.0.1", 0))
+
+        def one(sock):
+            try:
+                wire.recv(sock)
+                wire.authenticate(sock, agent._control_key(_KEY), server=True)
+                wire.send(
+                    sock,
+                    {"op": "hello", "v": agent.CONTROL_VERSION, "node_id": "node-1"},
+                )
+                while True:
+                    meta, _arrays = wire.recv(sock)
+                    if meta["op"] == "info":
+                        wire.send(
+                            sock,
+                            {
+                                "op": "ok",
+                                "version": launcher_version(),
+                                "data_protocol": wire.PROTOCOL,
+                                "contracts": {"deepseek_v41": DSV41.contract},
+                                "oqh": {"deepseek_v41": 1},
+                                "gpus": list(self.gpus),
+                                "disk_free": 1 << 40,
+                                "link_mbps": 1000,
+                            },
+                        )
+                    else:
+                        wire.send(sock, {"op": "ok"})
+            except (OSError, wire.ProtocolError):
+                pass
+            finally:
+                sock.close()
+
+        def accept():
+            while True:
+                try:
+                    sock, _ = self.listener.accept()
+                except OSError:
+                    return
+                threading.Thread(target=one, args=(sock,), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+
+    @property
+    def port(self):
+        return self.listener.getsockname()[1]
+
+
+class _DaemonLauncher(_FakeLauncher):
+    """A helper daemon: the probe runs the host's real transform, while files
+    and the launched helper stay the fakes above."""
+
+    incompatible = staticmethod(agent.incompatible)
+
+    def __init__(self, lm, daemon, **kw):
+        super().__init__(lm, **kw)
+        self.daemon = daemon
+        self.target = agent.AgentTarget(
+            "node-1", "Grace", "127.0.0.1", "ethernet", daemon.port, _KEY
+        )
+
+    def resolve_target(self, node_id):
+        return self.target
+
+    def remote_info(self, target, host=None):
+        return agent.remote_info(target, host=host)
+
+
 def _manager(fake, attached, speeds_path):
     return PrefillHelperManager(
         model_path="/models/x",
@@ -983,6 +1061,94 @@ def test_copy_time_left_follows_the_average_speed(monkeypatch):
     assert [status.get("seconds_left") for status in seen] == [None, 10, 0]
 
 
+# A DGX Spark's GPU: 121 GiB of unified memory, which it shares with the OS.
+_GB10 = {"name": "NVIDIA GB10", "total": 121 << 30}
+
+
+def test_a_helper_that_reports_no_gpus_is_not_armed_and_the_status_says_why(
+    tmp_path, monkeypatch
+):
+    """2026-11-20: ``nvidia-smi`` failed inside the helper's container and
+    ``gpus.gpus()`` returned []. The host turned that into a zero budget and
+    recorded "does not fit" as permanent: no session, prefill local, and no
+    warning naming the probe. It must refuse to arm, say why, and keep
+    retrying."""
+    monkeypatch.setattr(
+        agent, "get_node_identity", lambda: SimpleNamespace(node_id="studio")
+    )
+    attached = []
+    fake = _DaemonLauncher(None, _DaemonInfo([]))
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
+    manager.configure("node-1", 2)
+    status = _wait_state(manager, "offline", reason="no GPU devices")
+    assert fake.launched == [] and fake.copied == []
+    assert attached == []
+    assert "prefill stays on this Mac" in status["reason"]
+    manager.close()
+
+
+def test_a_zero_budget_probe_replans_when_the_helper_recovers(tmp_path, monkeypatch):
+    """A zero budget is the probe's answer, not a plan. When the probe
+    answers again the next attempt re-plans on its own — no Retry, no
+    restart. The 2026-11-20 container restart recovered NVML and the old
+    "does not fit" record still kept prefill local."""
+    monkeypatch.setattr(
+        agent, "get_node_identity", lambda: SimpleNamespace(node_id="studio")
+    )
+    monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (0.05,))
+    attached = []
+    daemon = _DaemonInfo([{**_GB10, "free": 0}])
+    fake = _DaemonLauncher(None, daemon)
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
+    manager.configure("node-1", 2)
+    _wait_state(manager, "offline", reason="no free GPU memory")
+    assert fake.launched == []
+    # NVML recovers (the container came back); the next probe has a budget.
+    daemon.gpus = [{**_GB10, "free": 60 << 30}]
+    status = _wait_state(manager, "ready", timeout=10)
+    assert status["held"] == 2
+    assert isinstance(attached[-1], PrefillHelperSession)
+    manager.close()
+
+
+def test_a_prep_whose_probe_finds_no_gpus_is_offline_not_an_error(monkeypatch):
+    """The pre-load preparation plans the copy, so it probes too. A probe
+    that finds no GPUs must leave it offline with the cause, not in the
+    "error" state a retry waits on the user past."""
+    monkeypatch.setattr(
+        agent, "get_node_identity", lambda: SimpleNamespace(node_id="studio")
+    )
+    fake = _DaemonLauncher(None, _DaemonInfo([]))
+    manager_module.prepare(
+        "/models/no-gpus", _PlanAdapter(), "node-1", 2, launcher=fake
+    )
+    prep = manager_module.file_prep("/models/no-gpus")
+    status = _wait_state(prep, "offline", reason="no GPU devices")
+    assert "prefill stays on this Mac" in status["reason"]
+    assert fake.copied == [] and fake.launched == [] and prep.launched is None
+    manager_module.prepare("/models/no-gpus", None, None, None)
+
+
+def test_a_prep_whose_probe_failed_is_replaced_not_reused(monkeypatch):
+    """Saving the same choice again re-plans a preparation whose probe
+    failed: the probe's answer does not outlive the probe."""
+    monkeypatch.setattr(
+        agent, "get_node_identity", lambda: SimpleNamespace(node_id="studio")
+    )
+    daemon = _DaemonInfo([])
+    fake = _DaemonLauncher(None, daemon)
+    manager_module.prepare("/models/retry", _PlanAdapter(), "node-1", 2, launcher=fake)
+    old = manager_module.file_prep("/models/retry")
+    _wait_state(old, "offline", reason="no GPU devices")
+    # NVML recovers; the same choice is saved again.
+    daemon.gpus = [{**_GB10, "free": 60 << 30}]
+    manager_module.prepare("/models/retry", _PlanAdapter(), "node-1", 2, launcher=fake)
+    new = manager_module.file_prep("/models/retry")
+    assert new is not old
+    assert _wait_state(new, "files_ready")["held"] == 2
+    manager_module.prepare("/models/retry", None, None, None)
+
+
 def test_a_helper_started_during_the_load_is_taken_over_not_started_twice(
     tmp_path,
 ):
@@ -1066,16 +1232,34 @@ def test_manager_blocks_what_a_retry_cannot_fix(tmp_path):
     manager = _manager(fake, attached, tmp_path / "speeds.json")
     manager.configure("node-1", None)
     _wait_state(manager, "error", reason="update it to")
-    fake.version, fake.budget = launcher_version(), 12 << 30
-    manager.retry()
-    _wait_state(manager, "error", reason="Not even one layer")
-    fake.budget = 60 << 30
+    fake.version, fake.budget = launcher_version(), 60 << 30
     manager.configure("node-1", 3)
     _wait_state(manager, "error", reason="At most 2 layers")
     fake.paired = False
     manager.configure("node-2", None)
     _wait_state(manager, "error", reason="not paired")
     assert attached == []
+    manager.close()
+
+
+def test_manager_retries_a_budget_that_does_not_fit(tmp_path, monkeypatch):
+    """A budget that does not fit is an answer about the probe, not a plan.
+
+    The helper's memory can change without the user acting (another session
+    ends, a model unloads), so the verdict is retried and re-planned rather
+    than kept until someone presses Retry.
+    """
+    monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (0.05,))
+    attached = []
+    fake = _FakeLauncher(None, budget=12 << 30)
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
+    manager.configure("node-1", None)
+    status = _wait_state(manager, "offline", reason="not even one layer fits")
+    assert "GiB of GPU memory free" in status["reason"]
+    assert attached == []
+    fake.budget = 60 << 30
+    status = _wait_state(manager, "ready", timeout=10)
+    assert status["held"] == 2
     manager.close()
 
 
@@ -1182,7 +1366,8 @@ def test_auto_starts_with_a_layer_fewer_after_running_out_of_memory(
     # Not even one layer: waits for the user instead of retrying.
     fake.fits = 0
     manager.configure("node-1", None)
-    _wait_state(manager, "error", reason="Not even one layer")
+    # Says it happened at launch, unlike the probe's "no room" answer.
+    _wait_state(manager, "error", reason="ran out of GPU memory at launch")
     manager.close()
 
 
@@ -1676,6 +1861,45 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch, caplog):
     info["version"] = agent.MIN_HELPER_VERSION
     version = helper_routes._check("n")["rows"][2]
     assert (version["status"], version["fix"]) == ("pass", "")
+
+
+def test_the_check_route_fails_the_memory_row_when_the_probe_finds_no_gpus(
+    monkeypatch,
+):
+    """A zero budget on the check page is the same answer the manager takes
+    as "prefill stays on this Mac": a green row would hide it."""
+    gib = 1 << 30
+    paired = {"n": {"friendly_name": "nvidia1"}}
+    registry = SimpleNamespace(get=paired.get, is_paired=paired.__contains__)
+    monkeypatch.setattr(helper_routes, "get_device_registry", lambda: registry)
+    monkeypatch.setattr(helper_routes, "forget_host", lambda node: None)
+    target = agent.AgentTarget(
+        "n", "nvidia1", "10.0.0.9", "ethernet", 7001, _KEY, speed_mbps=10000
+    )
+    info = {
+        "version": agent.MIN_HELPER_VERSION,
+        "data_protocol": wire.PROTOCOL,
+        "contracts": {"qwen4_exp": 1},
+        "budgets": [],
+        "disk_free": 1 << 40,
+        "link_mbps": 10000,
+    }
+    daemon = SimpleNamespace(
+        VIA=agent.VIA,
+        resolve_target=lambda node: target,
+        remote_info=lambda target, host=None: info,
+        incompatible=agent.incompatible,
+    )
+    monkeypatch.setattr(helper_routes, "transport_for", lambda node: daemon)
+    rows = {row["key"]: row for row in helper_routes._check("n")["rows"]}
+    assert rows["memory"]["status"] == "fail"
+    assert rows["memory"]["bytes"] == 0 and rows["memory"]["gpus"] == 0
+    assert "nvidia1 reports no GPU devices" in rows["memory"]["fix"]
+    # A helper that answers with memory keeps a green row and no fix.
+    info["budgets"] = [20 * gib]
+    rows = {row["key"]: row for row in helper_routes._check("n")["rows"]}
+    assert rows["memory"]["status"] == "pass" and rows["memory"]["bytes"] == 20 * gib
+    assert "fix" not in rows["memory"]
 
 
 # ---------------------------------------------------------------------------

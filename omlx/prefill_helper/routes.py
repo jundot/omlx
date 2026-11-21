@@ -31,6 +31,7 @@ from .manager import (
     fit_layers,
     helper_budget,
     prepare,
+    probe_cause,
     this_host,
     transport_for,
 )
@@ -217,6 +218,17 @@ def _check(node_id: str) -> dict:
     memory = {"key": "memory", "status": "pass", "bytes": sum(budgets)}
     if "budgets" in info:
         memory["gpus"] = len(budgets)
+    cause = probe_cause(target.name, budgets)
+    if cause is not None:
+        # No room to plan a split is a failure, not a pass: a green row here
+        # would hide the reason prefill runs on this Mac.
+        memory.update(
+            status="fail",
+            fix=(
+                f"{cause}. Check that the helper can see its GPU, and restart "
+                "it if it cannot; until then prefill runs on this Mac."
+            ),
+        )
     rows.append(memory)
     rows.append({"key": "disk", "status": "pass", "bytes": info.get("disk_free")})
     if "on_battery" in info:
