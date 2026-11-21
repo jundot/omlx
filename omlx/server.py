@@ -1083,6 +1083,13 @@ async def request_aborted_handler(request: FastAPIRequest, exc: RequestAbortedEr
     )
 
 
+def _queue_full_detail(exc: SchedulerQueueFullError) -> str:
+    return (
+        f"Scheduler waiting queue full ({exc.current_depth}/{exc.max_depth}). "
+        f"Try again shortly."
+    )
+
+
 @app.exception_handler(SchedulerQueueFullError)
 async def scheduler_queue_full_handler(
     request: FastAPIRequest, exc: SchedulerQueueFullError
@@ -1094,10 +1101,7 @@ async def scheduler_queue_full_handler(
         request.url.path,
         exc,
     )
-    detail = (
-        f"Scheduler waiting queue full ({exc.current_depth}/{exc.max_depth}). "
-        f"Try again shortly."
-    )
+    detail = _queue_full_detail(exc)
     if _is_api_route(request):
         content = _openai_error_body(detail, 503)
     else:
@@ -3284,6 +3288,25 @@ async def _with_json_keepalive(
                     e.detail, e.status_code, code=getattr(e, "code", None)
                 )
             )
+            return
+        except SchedulerQueueFullError as e:
+            # Admission can be rejected well after the grace period, e.g. while
+            # a cold model load is still in flight. Same 503 semantics as the
+            # pre-commit handler, minus the Retry-After header (the status line
+            # is already committed).
+            logger.warning("JSON keepalive request rejected (queue full): %s", e)
+            yield json.dumps(_openai_error_body(_queue_full_detail(e), 503))
+            return
+        except DistributedInferenceError as e:
+            logger.warning("JSON keepalive request rejected (distributed): %s", e)
+            yield json.dumps(_openai_error_body(str(e), 503))
+            return
+        except Exception as e:
+            # Parity with _with_sse_keepalive: anything else that escaped the
+            # task must still reach the client as a parseable body instead of
+            # a truncated 200 (which surfaces as IncompleteRead client-side).
+            logger.error("JSON keepalive request failed: %s", e)
+            yield json.dumps({"error": {"message": str(e), "type": "server_error"}})
             return
         if result is not None:
             yield result
