@@ -1,0 +1,24 @@
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -11,14 +11,17 @@
+ requires-python = ">=3.12"
+ dependencies = [
+   "mlx==0.32.4",
+-  "mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@c4c9c762cc797fd979fc98645f5db5112753bbe9",
+-  "transformers==5.23.0",
+-  "numpy==2.5.5",
++  "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d",
++  "transformers>=5.22.2,<5.23",
++  "numpy>=1.24,<2.4",
+   "pillow==13.0.0",
+   "safetensors==0.8.0",
+-  "torch==2.15.0",
+ ]
+ 
++[project.optional-dependencies]
++vision = ["torch==2.15.0"]
++reference = ["torch==2.15.0"]
++
+ [tool.setuptools.packages.find]
+ include = ["sensenova_mlx", "sensenova_mlx.data"]
+ namespaces = false
