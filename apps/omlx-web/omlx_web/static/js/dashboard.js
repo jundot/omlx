@@ -707,6 +707,9 @@
             // bench is running" banner + disables Start so the user doesn't
             // race a 409 on the server.
             benchOtherActive: null,
+            throughputWindowMs: 5 * 60 * 1000,
+            avgGenTps: 0,
+            avgPrefillTps: 0,
 
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
@@ -5008,6 +5011,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.stats = { ...this.stats, ...data };
+                        this.recordThroughputSample();
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -5030,6 +5034,28 @@
                 } catch (err) {
                     console.error('Failed to load stats:', err);
                 }
+            },
+
+            // Rolling average of combined throughput across all live streams.
+            // Only non-zero samples count so idle time doesn't dilute it.
+            recordThroughputSample() {
+                const now = Date.now();
+                let gen = 0;
+                let prefill = 0;
+                for (const m of (this.stats.active_models?.models || [])) {
+                    for (const g of (m.generating || [])) gen += g.tokens_per_second || 0;
+                    for (const p of (m.prefilling || [])) prefill += p.speed || 0;
+                }
+                const buf = this._throughputSamples || (this._throughputSamples = []);
+                if (gen > 0 || prefill > 0) buf.push({ t: now, gen, prefill });
+                const cutoff = now - this.throughputWindowMs;
+                while (buf.length && buf[0].t < cutoff) buf.shift();
+                const avg = (key) => {
+                    const xs = buf.filter(x => x[key] > 0);
+                    return xs.length ? xs.reduce((a, x) => a + x[key], 0) / xs.length : 0;
+                };
+                this.avgGenTps = avg('gen');
+                this.avgPrefillTps = avg('prefill');
             },
 
             async clearStats() {
