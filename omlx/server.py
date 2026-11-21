@@ -10042,6 +10042,10 @@ async def init_mcp(config_path: str):
 
 def main():
     """Run the server (use omlx CLI instead)."""
+    from .utils.happy_eyeballs import install as _install_happy_eyeballs
+
+    _install_happy_eyeballs()
+
     parser = argparse.ArgumentParser(
         description="oMLX multi-model serving for Apple Silicon",
         formatter_class=argparse.RawDescriptionHelpFormatter,

@@ -176,6 +176,10 @@ def serve_command(args):
     import os
     import uvicorn
 
+    from .utils.happy_eyeballs import install as _install_happy_eyeballs
+
+    _install_happy_eyeballs()
+
     from ._version import __version__
     from . import process_title
     from .integrations.base import bracket_host
