@@ -993,8 +993,8 @@ _LOOP_GMIX_SOURCE = """
         dg = simd_sum(dg);
         df = simd_sum(df);
         if (lane == 0) {
-            float g = metal::tanh(dg);
-            float f = metal::tanh(df);
+            float g = metal::tanh(metal::clamp(dg, -20.0f, 20.0f));
+            float f = metal::tanh(metal::clamp(df, -20.0f, 20.0f));
             size_t pos = ((size_t)n * ROWS + row) * H + h;
             out[pos] = (1.0f - f) * x[pos] + g * msg[pos];
         }
@@ -1007,8 +1007,8 @@ _TANH_MIX_SOURCE = """
     uint nr = idx / H;
     uint h = idx % H;
     size_t gbase = (size_t)nr * (2 * H);
-    float g = metal::tanh(float(gates[gbase + h]));
-    float f = metal::tanh(float(gates[gbase + H + h]));
+    float g = metal::tanh(metal::clamp(float(gates[gbase + h]), -20.0f, 20.0f));
+    float f = metal::tanh(metal::clamp(float(gates[gbase + H + h]), -20.0f, 20.0f));
     out[idx] = (1.0f - f) * x[idx] + g * msg[idx];
 """
 
@@ -1159,3 +1159,196 @@ def mix_messages_gpu(
         output_shapes=[(n, b, length, hidden)],
         output_dtypes=[mx.float32],
     )[0]
+
+
+# Fused expert activation (optional NVFP4 post_scale + interleaved de-interleave
+# + softcapped SwiGLU), weighted expert reduction (optional NVFP4 post_scale +
+# FP32 sum over top-k experts), and static depthwise causal conv (K=4) with
+# residual add and direct next-state output.
+_EXPERT_SWIGLU_SOURCE = """
+    uint idx = thread_position_in_grid.x;
+    if (idx >= M * I) return;
+    uint m = idx / I;
+    uint i = idx % I;
+    size_t base = (size_t)m * (2 * I) + 2 * i;
+    float g = float(y[base]);
+    float u = float(y[base + 1]);
+    if (HAS_SCALE) {
+        T sc = T(gscale[eidx[m]] * params[2]);
+        g = float(T(g * float(sc)));
+        u = float(T(u * float(sc)));
+    }
+    float gcap = params[0];
+    float ucap = params[1];
+    float eg = metal::exp(metal::clamp(-g, -80.0f, 80.0f));
+    float sig = (g < -80.0f) ? 0.0f : (1.0f / (1.0f + eg));
+    float tg = metal::tanh(metal::clamp(g / gcap, -20.0f, 20.0f)) * gcap;
+    float tu = metal::tanh(metal::clamp(u / ucap, -20.0f, 20.0f)) * ucap;
+    out[idx] = T(tg * sig * tu);
+"""
+
+_EXPERT_COMBINE_SOURCE = """
+    uint idx = thread_position_in_grid.x;
+    if (idx >= ROWS * H) return;
+    uint row = idx / H;
+    uint h = idx % H;
+    float acc = 0.0f;
+    for (uint k = 0; k < K; ++k) {
+        size_t rk = (size_t)row * K + k;
+        float w = weights[rk];
+        if (HAS_SCALE) {
+            w *= gscale[inds[rk]] * inv_denom[0];
+        }
+        acc += float(z[rk * H + h]) * w;
+    }
+    out[idx] = T(acc);
+"""
+
+_STATIC_CONV4_SOURCE = """
+    uint idx = thread_position_in_grid.x;
+    if (idx >= B * L * C) return;
+    uint c = idx % C;
+    uint bl = idx / C;
+    uint l = bl % L;
+    uint b = bl / L;
+    const device float* st = state + (size_t)b * 3 * C;
+    const device T* xb = x + (size_t)b * L * C;
+    const device WT* wp = w + (size_t)c * 4;
+    float x0 = (l >= 3) ? float(xb[(size_t)(l - 3) * C + c]) : st[(size_t)l * C + c];
+    float x1 = (l >= 2) ? float(xb[(size_t)(l - 2) * C + c]) : st[(size_t)(l + 1) * C + c];
+    float x2 = (l >= 1) ? float(xb[(size_t)(l - 1) * C + c]) : st[(size_t)(l + 2) * C + c];
+    float x3 = float(xb[(size_t)l * C + c]);
+    float conv = float(wp[0]) * x0 + float(wp[1]) * x1
+        + float(wp[2]) * x2 + float(wp[3]) * x3;
+    float y = (float(WT(conv)) + x3) * scale[0];
+    out[idx] = T(y);
+    if (L >= 3) {
+        if (l >= L - 3) {
+            next_state[((size_t)b * 3 + (l - (L - 3))) * C + c] = x3;
+        }
+    } else if (l == L - 1) {
+        device float* nst = next_state + (size_t)b * 3 * C;
+        if (L == 1) {
+            nst[0 * C + c] = st[1 * C + c];
+            nst[1 * C + c] = st[2 * C + c];
+            nst[2 * C + c] = x3;
+        } else {
+            nst[0 * C + c] = st[2 * C + c];
+            nst[1 * C + c] = x2;
+            nst[2 * C + c] = x3;
+        }
+    }
+"""
+
+_expert_swiglu_kernel = None
+_expert_combine_kernel = None
+_static_conv4_kernel = None
+_DUMMY_F32 = None
+
+
+def _dummy_f32() -> mx.array:
+    global _DUMMY_F32
+    if _DUMMY_F32 is None:
+        _DUMMY_F32 = mx.zeros((1,), dtype=mx.float32)
+    return _DUMMY_F32
+
+
+def expert_softcapped_swiglu(
+    y: mx.array,
+    idx: mx.array,
+    gscale: mx.array | None,
+    params: mx.array,
+) -> mx.array:
+    """Fused optional NVFP4 post-scale, de-interleave, and softcapped SwiGLU."""
+    global _expert_swiglu_kernel
+    if _expert_swiglu_kernel is None:
+        _expert_swiglu_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_expert_swiglu",
+            input_names=["y", "eidx", "gscale", "params"],
+            output_names=["out"],
+            source=_EXPERT_SWIGLU_SOURCE,
+        )
+    inter = y.shape[-1] // 2
+    m = idx.size
+    has_scale = 1 if gscale is not None else 0
+    return _expert_swiglu_kernel(
+        inputs=[y, idx.astype(mx.uint32), gscale if has_scale else _dummy_f32(), params],
+        template=[("T", y.dtype), ("M", m), ("I", inter), ("HAS_SCALE", has_scale)],
+        grid=(m * inter, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(*y.shape[:-1], inter)],
+        output_dtypes=[y.dtype],
+    )[0]
+
+
+def expert_weighted_combine(
+    z: mx.array,
+    inds: mx.array,
+    weights: mx.array,
+    gscale: mx.array | None,
+    inv_denom: mx.array,
+) -> mx.array:
+    """Fused optional NVFP4 post-scale and FP32 weighted reduction over top-k experts."""
+    global _expert_combine_kernel
+    if _expert_combine_kernel is None:
+        _expert_combine_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_expert_combine",
+            input_names=["z", "inds", "weights", "gscale", "inv_denom"],
+            output_names=["out"],
+            source=_EXPERT_COMBINE_SOURCE,
+        )
+    rows, top_k, hidden = z.shape
+    has_scale = 1 if gscale is not None else 0
+    return _expert_combine_kernel(
+        inputs=[
+            z,
+            inds.astype(mx.uint32),
+            weights.astype(mx.float32),
+            gscale if has_scale else _dummy_f32(),
+            inv_denom,
+        ],
+        template=[
+            ("T", z.dtype),
+            ("ROWS", rows),
+            ("H", hidden),
+            ("K", top_k),
+            ("HAS_SCALE", has_scale),
+        ],
+        grid=(rows * hidden, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, hidden)],
+        output_dtypes=[z.dtype],
+    )[0]
+
+
+def static_conv4_fused(
+    x: mx.array,
+    w: mx.array,
+    state: mx.array,
+    scale: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Fused K=4 depthwise causal conv, residual add, scale, and next state."""
+    global _static_conv4_kernel
+    if _static_conv4_kernel is None:
+        _static_conv4_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_static_conv4",
+            input_names=["x", "w", "state", "scale"],
+            output_names=["out", "next_state"],
+            source=_STATIC_CONV4_SOURCE,
+        )
+    b, length, channels = x.shape
+    out, next_state = _static_conv4_kernel(
+        inputs=[x, w, state.astype(mx.float32), scale],
+        template=[
+            ("T", x.dtype),
+            ("WT", w.dtype),
+            ("B", b),
+            ("L", length),
+            ("C", channels),
+        ],
+        grid=(b * length * channels, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(b, length, channels), (b, 3, channels)],
+        output_dtypes=[x.dtype, mx.float32],
+    )
+    return out, next_state

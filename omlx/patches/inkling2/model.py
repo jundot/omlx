@@ -280,6 +280,11 @@ class Inkling2Experts(nn.Module):
         self.w2 = ExpertProj(e, h, i, w2_spec)
         self._gcap = mx.array(args.mlp_gate_softcap, dtype=mx.float32)
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
+        self._inv_nvfp4 = mx.array([1.0 / _NVFP4_DENOMINATOR], dtype=mx.float32)
+        self._swiglu_params = mx.array(
+            [args.mlp_gate_softcap, args.mlp_up_softcap, 1.0 / _NVFP4_DENOMINATOR],
+            dtype=mx.float32,
+        )
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
         xe = mx.expand_dims(x, (-2, -3))
@@ -289,6 +294,17 @@ class Inkling2Experts(nn.Module):
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
         y = self.w13(xe, idx, do_sort)
+        if mx.default_device() == mx.gpu:
+            g13 = self.w13.global_scale if self.w13.mode == "nvfp4" else None
+            act = kernels.expert_softcapped_swiglu(y, idx, g13, self._swiglu_params)
+            z = self.w2(act, idx, do_sort)
+            if do_sort:
+                z = _scatter_unsort(z, inv, inds.shape)
+            z = z.squeeze(-2)
+            g2 = self.w2.global_scale if self.w2.mode == "nvfp4" else None
+            return kernels.expert_weighted_combine(
+                z, inds, weights, g2, self._inv_nvfp4
+            )
         s13 = self.w13.post_scale(idx)
         if s13 is not None:
             y = y * s13[..., None, None].astype(y.dtype)
@@ -369,14 +385,23 @@ def _mix_messages(x, message, down, gain_forget, down_t=None, gf_t=None):
     return (1.0 - forget) * x + gain * message
 
 
-def _static_conv(x, w, state, scale):
+def _static_conv(x, w, state, scale, scale_arr=None):
     """Depthwise causal conv (taps: ``w[:, K-1]`` is the current token).
 
-    Returns the output and the padded input window ``[state, x]``; its last
-    ``K - 1`` rows are the next state.
+    On GPU with K=4, returns ``(out, next_state, raw_x)`` from a single fused
+    Metal kernel without allocating the padded window ``[state, x]``. On CPU or
+    other kernel widths, returns ``(out, xp, None)``.
     """
-    xf = x.astype(mx.float32)
     k = w.shape[-1]
+    if k == 4 and mx.default_device() == mx.gpu:
+        sc = (
+            scale_arr
+            if scale_arr is not None
+            else mx.array([scale], dtype=mx.float32)
+        )
+        out, next_state = kernels.static_conv4_fused(x, w, state, sc)
+        return out, next_state, x
+    xf = x.astype(mx.float32)
     xp = mx.concatenate([state, xf], axis=1)
     length = xf.shape[1]
     out = w[:, 0] * xp[:, 0:length]
@@ -385,7 +410,7 @@ def _static_conv(x, w, state, scale):
     # The reference rounds the depthwise conv to the weight dtype before the
     # residual add.
     out = (out.astype(w.dtype).astype(mx.float32) + xf) * scale
-    return out.astype(x.dtype), xp
+    return out.astype(x.dtype), xp, None
 
 
 def _dynamic_conv(x, dyn, static_w, state, heads, scale):
@@ -474,6 +499,7 @@ class Inkling2Attention(nn.Module):
         self._r_clip = mx.array(args.rel_l2_clip_threshold, dtype=mx.float32)
         self._one = mx.array(1.0, dtype=mx.float32)
         self._sconv_scale = 1.0 / math.sqrt(self.conv_k + 1)
+        self._sconv_scale_arr = mx.array([self._sconv_scale], dtype=mx.float32)
         self._dconv_scale = 1.0 / math.sqrt(2 * self.conv_k + 1)
 
     def log_tau(self, kv, length: int):
@@ -509,8 +535,12 @@ class Inkling2Attention(nn.Module):
                 v = _linear_slice(self.in_proj, xv, c1, c2)
                 rgs = _linear_slice(self.in_proj, xq, c2, None)
                 r, gate, sink = mx.split(rgs, [c3 - c2, c4 - c2], axis=-1)
-            k, ks = _static_conv(k, self.k_conv, ks, self._sconv_scale)
-            v, vs = _static_conv(v, self.v_conv, vs, self._sconv_scale)
+            k, ks, rk = _static_conv(
+                k, self.k_conv, ks, self._sconv_scale, self._sconv_scale_arr
+            )
+            v, vs, rv = _static_conv(
+                v, self.v_conv, vs, self._sconv_scale, self._sconv_scale_arr
+            )
         else:
             q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
             kp = self.k_proj(xk)
@@ -531,6 +561,7 @@ class Inkling2Attention(nn.Module):
                 self.n_kv,
                 self._dconv_scale,
             )
+            rk = rv = None
         q = _l2_clip(
             q.reshape(b, length, self.n_heads, self.head_dim),
             self.q_scale,
@@ -548,7 +579,7 @@ class Inkling2Attention(nn.Module):
             q = (q.astype(mx.float32) * tau).astype(q.dtype)
             r = (r.astype(mx.float32) * tau).astype(r.dtype)
         rel = r @ self.rel_proj.astype(r.dtype)
-        return (
+        base_out = (
             q.transpose(0, 2, 1, 3),
             k.transpose(0, 2, 1, 3),
             v.transpose(0, 2, 1, 3),
@@ -558,6 +589,9 @@ class Inkling2Attention(nn.Module):
             ks,
             vs,
         )
+        if rk is not None:
+            return (*base_out, rk, rv)
+        return base_out
 
     def attend(self, q, k, v, rel, sink, kv, state=None):
         left_padding = None
@@ -630,6 +664,7 @@ class Inkling2Layer(nn.Module):
         self.attn_conv = mx.zeros((h, args.sconv_kernel_size))
         self.mlp_conv = mx.zeros((h, args.sconv_kernel_size))
         self._conv_scale = 1.0 / math.sqrt(args.sconv_kernel_size + 1)
+        self._conv_scale_arr = mx.array([self._conv_scale], dtype=mx.float32)
         self._conv_k = args.sconv_kernel_size
         # A weak proxy: compiled bound methods would make each layer a
         # reference cycle, so a released model would wait for the cyclic GC.
@@ -684,7 +719,9 @@ class Inkling2Layer(nn.Module):
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None, down_t=None, gf_t=None):
         a = self.attn.output(out, gate)
-        a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
+        a, s2, ra = _static_conv(
+            a, self.attn_conv, s2, self._conv_scale, self._conv_scale_arr
+        )
         if self.is_boundary:
             residual = a.astype(mx.float32)
         else:
@@ -700,8 +737,13 @@ class Inkling2Layer(nn.Module):
                 None if gf_t is None else gf_t[3:],
             )[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
-        m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
-        return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
+        m, s3, rm = _static_conv(
+            m, self.mlp_conv, s3, self._conv_scale, self._conv_scale_arr
+        )
+        out_h = (residual + m.astype(mx.float32)).astype(h.dtype)
+        if ra is not None:
+            return out_h, s2, s3, ra, rm
+        return out_h, s2, s3
 
     def __call__(self, h, blocks, cache=None, bank=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
@@ -726,24 +768,41 @@ class Inkling2Layer(nn.Module):
         down_t = gf_t = None
         if messages is not None and b * length <= kernels._LOOP_FUSED_MAX_ROWS:
             down_t, gf_t = self._packed_loop()
-        q, k, v, rel, gate, sink, ks, vs, h_n = pre(
-            h, blocks, states[0], states[1], tau, messages, down_t, gf_t
-        )
+        pre_out = pre(h, blocks, states[0], states[1], tau, messages, down_t, gf_t)
+        if len(pre_out) == 11:
+            q, k, v, rel, gate, sink, ks, vs, rk, rv, h_n = pre_out
+        else:
+            q, k, v, rel, gate, sink, ks, vs, h_n = pre_out
+            rk = rv = None
         out = self.attn.attend(q, k, v, rel, sink, kv, conv)
         if self.is_boundary:
             blocks.append(h_n)
-        h, s2, s3 = post(
+        post_out = post(
             out, gate, h, blocks, states[2], states[3], messages, down_t, gf_t
         )
+        if len(post_out) == 5:
+            h, s2, s3, ra, rm = post_out
+        else:
+            h, s2, s3 = post_out
+            ra = rm = None
         if conv is not None:
-            padded = (ks, vs, s2, s3)
-            if 1 < length <= _COMPILED_MAX_TOKENS:
+            next_states = (ks, vs, s2, s3)
+            raws = (rk, rv, ra, rm)
+            stash = 1 < length <= _COMPILED_MAX_TOKENS
+            if stash:
                 # Speculative verify rollback re-cuts the states from these.
-                conv._omlx_verify_xp = dict(enumerate(padded))
+                conv._omlx_verify_xp = {
+                    slot: ((states[slot], raw) if raw is not None else nxt)
+                    for slot, (nxt, raw) in enumerate(zip(next_states, raws))
+                }
             keep = self._conv_k - 1
-            for slot, window in enumerate(padded):
-                # A small copy, so the state does not pin the chunk's window.
-                conv[base + slot] = window[:, -keep:] * 1.0
+            for slot, (nxt, raw) in enumerate(zip(next_states, raws)):
+                if raw is not None:
+                    # Fused static_conv4 already wrote the exact (B, 3, C) next state.
+                    conv[base + slot] = nxt
+                else:
+                    # A small copy, so the state does not pin the chunk's window.
+                    conv[base + slot] = nxt[:, -keep:] * 1.0
         return h
 
 
@@ -975,7 +1034,19 @@ class Model(nn.Module):
                 return False
             base = windows.CONV if kv is None else 0
             for slot, xp in padded.items():
-                conv[base + slot] = xp[:, keep : keep + width] * 1.0
+                if isinstance(xp, tuple):
+                    prev_st, raw_x = xp
+                    if keep >= width:
+                        conv[base + slot] = raw_x[:, keep - width : keep].astype(
+                            mx.float32
+                        )
+                    else:
+                        conv[base + slot] = mx.concatenate(
+                            [prev_st[:, keep:], raw_x[:, :keep].astype(mx.float32)],
+                            axis=1,
+                        )
+                else:
+                    conv[base + slot] = xp[:, keep : keep + width] * 1.0
             conv._omlx_verify_xp = None
         return True
 
