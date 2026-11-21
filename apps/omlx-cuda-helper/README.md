@@ -138,7 +138,7 @@ The helper computes in the checkpoint's 16-bit float type like the Mac does, but
 
 - At most two GPUs per model.
 - INT8 Activation Prefill is not available on the helper.
-- A model's layers must fit in GPU memory: the number of layers the helper can take, and with it the speedup, is set by the GPU memory.
+- A model's layers must fit in GPU memory: the number of layers the helper can take, and with it the speedup, is set by the GPU memory. Qwen3.5-family checkpoints in affine quantization keep their weights packed when that holds more layers.
 - A long prompt's cache takes GPU memory too. When the next chunk would not fit, the helper drops its last layers one at a time and the Mac runs them from that chunk on. The helper loads them again while no prompt waits. On a GPU that shares the system RAM (DGX Spark) the limit is the RAM that was free when the helper loaded, less 16 GiB.
 
 ## Third-party code

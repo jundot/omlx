@@ -189,6 +189,13 @@ def test_an_integrated_gpu_holds_its_layers_in_system_ram(monkeypatch):
     assert gpus.memory_limit(spark) == spark["free"]
 
 
+def test_a_card_keeps_room_for_what_mlx_does_not_count():
+    a6000 = {"total": 48 << 30, "free": 47 << 30, "integrated": False}
+    rtx4090 = {"total": 24 << 30, "free": 23 << 30, "integrated": False}
+    assert abs(gpus.memory_limit(a6000) - int((48 << 30) * 0.95)) <= 1
+    assert gpus.memory_limit(rtx4090) == (24 << 30) - gpus.UNCOUNTED_BYTES
+
+
 def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
     pytest.importorskip("omlx")
     from omlx.prefill_helper import agent, launcher

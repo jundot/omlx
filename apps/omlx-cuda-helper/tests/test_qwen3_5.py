@@ -11,7 +11,7 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from omlx_cuda_helper import oqh, tensors  # noqa: E402
+from omlx_cuda_helper import checkpoint, oqh, supervisor, tensors  # noqa: E402
 from omlx_cuda_helper.families import qwen3_5  # noqa: E402
 from omlx_cuda_helper.families.qwen3_5.stage import load_stage  # noqa: E402
 
@@ -33,7 +33,7 @@ def _group(arrays, tag):
     return {n[len(tag) :]: v for n, v in arrays.items() if n.startswith(tag)}
 
 
-def _replay(bounds, capture=None):
+def _replay(bounds, capture=None, model=FIXTURE / "model"):
     """The fixture's chunks through stages cut at ``bounds``.
 
     Yields each chunk's index, the boundary at the end of every stage (by
@@ -44,10 +44,7 @@ def _replay(bounds, capture=None):
     k, sizes, skip = meta["layers"], meta["sizes"], meta["prefix_chunks"]
     assert meta["contract"] == qwen3_5.CONTRACT
     assert all(a >= qwen3_5.FIRST_STAGE_MIN for a in bounds[1:-1])
-    stages = [
-        load_stage(FIXTURE / "model", first, last)
-        for first, last in zip(bounds, bounds[1:])
-    ]
+    stages = [load_stage(model, first, last) for first, last in zip(bounds, bounds[1:])]
     for stage in stages:
         # A layer loaded again after a long prompt runs as at the first load.
         stage.drop_layer()
@@ -114,6 +111,165 @@ def test_stages_reproduce_the_contract_fixture(bounds):
 def test_weights_loaded_into_the_gpu_pool_give_the_same_stages(monkeypatch):
     monkeypatch.setattr(tensors, "weights_on_gpu", True)
     test_stages_reproduce_the_contract_fixture((0, 2, 5))
+
+
+def _quantized(folder, bits):
+    """The fixture model with its linears quantized to ``bits``, group 32."""
+    folder.mkdir()
+    weights = mx.load(str(FIXTURE / "model/model.safetensors"))
+    config = json.loads((FIXTURE / "model/config.json").read_text())
+    config["quantization"] = {"group_size": 32, "bits": bits, "mode": "affine"}
+    for name in [n for n in weights if "_proj" in n and n.endswith(".weight")]:
+        base = name.removesuffix(".weight")
+        weights[name], weights[f"{base}.scales"], weights[f"{base}.biases"] = (
+            mx.quantize(weights[name].astype(mx.bfloat16), 32, bits)
+        )
+    mx.save_safetensors(str(folder / "model.safetensors"), weights)
+    (folder / "config.json").write_text(json.dumps(config))
+    return folder
+
+
+@pytest.mark.parametrize("bits", [2, 3, 5, 6])
+def test_widened_codes_are_the_same_integers(bits):
+    weight = (mx.random.normal((96, 512), key=mx.random.key(bits)) * 0.02).astype(
+        mx.bfloat16
+    )
+    codes, scales, biases = mx.quantize(weight, 64, bits)
+    wide = tensors.widen(codes, bits)
+    one = mx.ones(scales.shape, mx.float32)
+    want = mx.dequantize(codes, one, one * 0, group_size=64, bits=bits)
+    got = mx.dequantize(wide, one, one * 0, group_size=64, bits=8)
+    assert mx.array_equal(got, want).item()
+    # On the CPU: CUDA's dequantize rounds differently at some widths.
+    cpu = {"group_size": 64, "stream": mx.cpu}
+    assert mx.array_equal(
+        mx.dequantize(wide, scales, biases, bits=8, **cpu),
+        mx.dequantize(codes, scales, biases, bits=bits, **cpu),
+    ).item()
+    # Only a stage that keeps its weights packed widens them.
+    arrays = {"w.weight": codes, "w.scales": scales, "w.biases": biases}
+    quant = {"group_size": 64, "bits": bits, "mode": "affine"}
+    assert tensors.Linear(arrays, "w", quant, dense=False).quant[2]["bits"] == bits
+
+
+def _linears(obj, depth=4, every=False):
+    """The packed ``Linear`` layers reachable from *obj*, or ``every`` one."""
+    if isinstance(obj, tensors.Linear):
+        return [obj] if obj.quant or every else []
+    if depth == 0:
+        return []
+    if isinstance(obj, (list, tuple)):
+        return [x for item in obj for x in _linears(item, depth - 1, every)]
+    if hasattr(obj, "__dict__"):
+        return [x for v in vars(obj).values() for x in _linears(v, depth - 1, every)]
+    return []
+
+
+@pytest.mark.parametrize("bits, widen", [(8, True), (5, True), (5, False)])
+def test_packed_weights_give_the_same_stages(tmp_path, monkeypatch, bits, widen):
+    model = _quantized(tmp_path / "model", bits)
+
+    def hidden():
+        return [
+            np.array(tensors.from_host(cuts[5]["h"]).astype(mx.float32))
+            for _, cuts, _, _ in _replay((0, 2, 5), model=model)
+        ]
+
+    unpacked = hidden()
+    monkeypatch.setattr(tensors, "packed_weights", True)
+    monkeypatch.setattr(tensors, "widen_codes", widen)
+    for want, got in zip(unpacked, hidden()):
+        assert np.linalg.norm(got - want) / np.linalg.norm(want) < 3e-2
+    files = checkpoint.memory_plan(model, qwen3_5.resident)[1]
+    packed = qwen3_5.plan(model, True, widen)[1]
+    assert (packed == files) is (bits == 8 or not widen)
+    assert all(f <= p < d for f, p, d in zip(files, packed, qwen3_5.plan(model)[1]))
+    held = {lin.quant[2]["bits"] for lin in _linears(load_stage(model, 0, 5))}
+    assert held == ({bits} if bits == 8 or not widen else {8})
+
+
+_MIXED = {
+    "mxfp4": {"group_size": 32, "bits": 4, "mode": "mxfp4"},
+    "mxfp8": {"group_size": 32, "bits": 8, "mode": "mxfp8"},
+    "nvfp4": {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+    "affine5": {"group_size": 32, "bits": 5, "mode": "affine"},
+}
+
+
+def _mixed(folder, mode):
+    """The fixture in affine 8-bit, with its full-attention q_proj and GDN
+    in_proj_qkv in ``_MIXED[mode]``."""
+    folder.mkdir()
+    weights = mx.load(str(FIXTURE / "model/model.safetensors"))
+    config = json.loads((FIXTURE / "model/config.json").read_text())
+    config["quantization"] = {"group_size": 32, "bits": 8, "mode": "affine"}
+    for name in [n for n in weights if "_proj" in n and n.endswith(".weight")]:
+        base = name.removesuffix(".weight")
+        quant = {"group_size": 32, "bits": 8, "mode": "affine"}
+        if base.endswith(("self_attn.q_proj", "linear_attn.in_proj_qkv")):
+            quant = config["quantization"][base] = _MIXED[mode]
+        # The floating point modes have no biases.
+        parts = mx.quantize(weights[name].astype(mx.bfloat16), **quant)
+        for suffix, part in zip(("weight", "scales", "biases"), parts):
+            weights[f"{base}.{suffix}"] = part
+    mx.save_safetensors(str(folder / "model.safetensors"), weights)
+    (folder / "config.json").write_text(json.dumps(config))
+    return folder
+
+
+@pytest.mark.parametrize("mode", list(_MIXED))
+def test_a_packed_stage_keeps_only_affine_linears_packed(tmp_path, monkeypatch, mode):
+    model = _mixed(tmp_path / "model", mode)
+    shared, dense = qwen3_5.plan(model)
+    small = qwen3_5.plan(model, True)[1]
+    free = [supervisor.RESERVE_BYTES + shared + sum(small[:5])]
+    fit = supervisor._fit
+    assert fit(shared, small, 6, free, 1)[0] > fit(shared, dense, 6, free, 1)[0]
+
+    def hidden():
+        return [
+            np.array(tensors.from_host(cuts[5]["h"]).astype(mx.float32))
+            for _, cuts, _, _ in _replay((0, 2, 5), model=model)
+        ]
+
+    unpacked = hidden()
+    monkeypatch.setattr(tensors, "packed_weights", True)
+    stage = load_stage(model, 0, 6)
+    for layer in stage.layers:
+        if not layer.linear:
+            layer.mixer.enable_kernels()
+    stage.warm(8)
+    stage.drop_layer()
+    stage.add_layer()
+    stage.warm(8)
+    floating = _MIXED[mode]["mode"] != "affine"
+    for layer in stage.layers:
+        overridden = layer.mixer.qkv if layer.linear else layer.mixer.q_proj
+        assert (overridden.quant is None) is floating
+        assert overridden.dtype == mx.bfloat16
+        assert layer.down.quant is not None
+    for want, got in zip(unpacked, hidden()):
+        assert np.linalg.norm(got - want) / np.linalg.norm(want) < 3e-2
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("mode", list(_MIXED))
+def test_the_plan_counts_what_a_mixed_stage_holds(tmp_path, monkeypatch, mode, packed):
+    model = _mixed(tmp_path / "model", mode)
+    monkeypatch.setattr(tensors, "packed_weights", packed)
+    files = checkpoint.memory_plan(model, qwen3_5.resident)[1]
+    planned = qwen3_5.plan(model, packed)[1]
+    index = checkpoint.tensors(model)
+    for i, layer in enumerate(load_stage(model, 0, 6).layers):
+        # Every linear of a layer, and nothing else, is named *_proj*.
+        on_file = sum(
+            t.nbytes
+            for name, t in index.items()
+            if checkpoint.layer_of(name) == i and "_proj" in name
+        )
+        linears = {id(lin): lin for lin in _linears(layer, every=True)}.values()
+        held = sum(p.nbytes for lin in linears for p in lin.parameters())
+        assert planned[i] - files[i] == held - on_file
 
 
 def test_a_stage_returns_the_layers_a_block_drafter_reads():
