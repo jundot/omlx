@@ -36,6 +36,7 @@ from test_scheduler_chunked_prefill import (
 from omlx.cluster.transport import HostInterfaces, InterfaceAddress
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
+from omlx.patches.inkling2 import model as inkling2_model
 from omlx.patches.mlx_lm_mtp import prompt_priming
 from omlx.patches.mlx_vlm_minimax_m3_compat import (
     apply_mlx_vlm_minimax_m3_compat_patch,
@@ -2039,9 +2040,23 @@ def test_inkling2_split_matches_whole_model(k, prefix):
     _split_matches(INKLING2, _inkling2, ids, [12, 10, 8], k, prefix, _inkling2_state)
 
 
-def test_inkling2_split_after_a_prefix_past_the_window():
-    # 22 prefix tokens: a sliding-window ring of 8 keys has dropped the oldest
-    # rows, so the prefix must carry each layer's position.
+@pytest.fixture
+def inkling2_ring(monkeypatch):
+    """Sliding-window visits keep a ring of the window (opt-in layout)."""
+    monkeypatch.setattr(inkling2_model, "_SWA_BOUNDED", True)
+    monkeypatch.setattr(inkling2_model, "_SWA_SIZE", 0)
+
+
+@pytest.mark.parametrize("k,prefix", [(1, 0), (5, 0), (6, 0), (7, 0), (11, 0), (7, 1)])
+def test_inkling2_ring_split_matches_whole_model(inkling2_ring, k, prefix):
+    # The ring of 8 keys wraps within the first chunk.
+    ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 30)))
+    _split_matches(INKLING2, _inkling2, ids, [12, 10, 8], k, prefix, _inkling2_state)
+
+
+def test_inkling2_ring_split_after_a_prefix_past_the_window(inkling2_ring):
+    # 22 prefix tokens: each sliding visit's ring has dropped the oldest rows,
+    # so the prefix carries its position; full attention (5) never does.
     ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 30)))
     _split_matches(INKLING2, _inkling2, ids, [12, 10, 8], 7, 2, _inkling2_state)
     host = _inkling2()
@@ -2049,15 +2064,29 @@ def test_inkling2_split_after_a_prefix_past_the_window():
     for chunk in _chunks(ids[:, :22], [12, 10]):
         host(chunk, cache=cache)
     state = INKLING2.prefix_state(cache, 7)
+    assert sorted(n for n in state if n.endswith(".off")) == [
+        f"{i}.off" for i in (0, 1, 2, 3, 4, 6)
+    ]
     helper = _inkling2()
     INKLING2.keep_first(helper, 7)
     helper_cache = helper.make_cache()
     INKLING2.load_prefix(helper_cache, state)
     assert [c[0].offset for c in helper_cache] == [22] * 7
-    for i in range(7):
-        kv = cache[i][0]
-        # Only a ring that dropped rows sends a position; a full cache never.
-        assert (f"{i}.off" in state) == (state[f"{i}.k"].shape[2] < kv.offset)
+
+
+def test_inkling2_ring_scheduler_helper_prefill_matches_local(inkling2_ring):
+    test_scheduler_family_helper_prefill_matches_local(
+        lambda: (_inkling2(), SimpleNamespace(model_type="inkling2")),
+        _inkling2,
+        INKLING2,
+        7,
+        _inkling2_state,
+    )
+
+
+def test_inkling2_ring_payload_matches_the_contract_fixture(inkling2_ring):
+    # The ring sends the same rows as a full cache: one wire contract.
+    test_payload_matches_the_contract_fixture("inkling2")
 
 
 @pytest.mark.parametrize(

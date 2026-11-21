@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -25,7 +26,13 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    BatchRotatingKVCache,
+    CacheList,
+    KVCache,
+    RotatingKVCache,
+)
 
 from . import kernels
 from .loader import sanitize_weights
@@ -35,6 +42,99 @@ _NVFP4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 _MXFP8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 # ModelOpt NVFP4 tensor scale: amax / (FP8 E4M3 max * FP4 E2M1 max).
 _NVFP4_DENOMINATOR = 448.0 * 6.0
+
+# Opt in (OMLX_INKLING_SWA_CACHE=1): sliding-window visits keep a ring of
+# their newest keys (RotatingKVCache) instead of the whole prompt, since they
+# only ever read the last ``sliding_window_size`` keys. Off by default: every
+# visit keeps a full KVCache. Speculative-verify rollback goes through
+# _trim_kv, since stock RotatingKVCache.trim is not exact once the ring wraps.
+_SWA_BOUNDED = os.environ.get("OMLX_INKLING_SWA_CACHE", "0") == "1"
+# Ring size for sliding visits; >= window (kernels read only the last `window`
+# keys, so extra slots are inert). oMLX aligns paged-cache blocks (and prefill
+# chunks) to this size, so 2048 keeps Inkling's >=2048-token blocks.
+_SWA_SIZE = int(os.environ.get("OMLX_INKLING_SWA_CACHE_SIZE", "0") or 0)
+
+
+def _temporal_kv(kv, k, v, window: int = 0, length: int = 0):
+    """Return k/v in temporal order (queries last), as the banded kernels need."""
+    if isinstance(kv, RotatingKVCache):
+        n, idx = k.shape[2], kv._idx
+        if length == 1 and window and kv.keep == 0 and idx < kv.offset and idx < n:
+            # Wrapped ring after a single-token write: the newest key is at
+            # idx - 1. Decode reads only the last `window` keys, so return just
+            # those: a zero-copy slice when they are contiguous, else one
+            # window-sized concat (never the whole ring).
+            if idx >= window:
+                return k[..., idx - window : idx, :], v[..., idx - window : idx, :]
+            tail = n - (window - idx)
+            return (
+                mx.concatenate([k[..., tail:, :], k[..., :idx, :]], axis=2),
+                mx.concatenate([v[..., tail:, :], v[..., :idx, :]], axis=2),
+            )
+        return kv._temporal_order(k), kv._temporal_order(v)
+    if isinstance(kv, BatchRotatingKVCache) and kv.rotated:
+        # In-place batched decode returns the raw ring. left_padding is kept in
+        # temporal coordinates (decremented per rotated step), so it stays
+        # valid for the kernel's `key_index >= left_padding` test after the roll.
+        return mx.roll(k, -kv._idx, axis=2), mx.roll(v, -kv._idx, axis=2)
+    return k, v
+
+
+def _trim_batch_rotating(kv, n: int) -> int:
+    if kv.keys is None or kv._offset < kv.max_size:
+        return kv.trim(n)  # still linear (growth phase): stock trim is exact
+    kv._temporal_order()  # linearise in place (also clears kv.rotated)
+    keys, values = kv.keys[..., : kv._idx, :], kv.values[..., : kv._idx, :]
+    n = min(int(n), kv._offset)
+    keep = keys.shape[2] - n
+    if keep < kv.max_size:
+        return 0
+    # Keep exactly the newest max_size keys: the invariant the in-place path
+    # expects (shape == _idx == max_size). Dropped head keys shift the
+    # temporal-coordinate left_padding, as stock trims do. Left unclamped like
+    # stock (per-step `left_padding -= S`); consumers treat <= 0 as no padding.
+    start = keep - kv.max_size
+    kv.keys, kv.values = keys[..., start:keep, :], values[..., start:keep, :]
+    kv.left_padding = kv.left_padding - start
+    kv._idx = kv.max_size
+    kv.rotated = False
+    kv._offset -= n
+    kv.offset = kv.offset - n
+    return n
+
+
+def _trim_kv(kv, n: int) -> int:
+    """Drop the newest ``n`` positions (speculative-verify rollback).
+
+    Stock ``RotatingKVCache.trim`` only moves ``_idx`` back, which is exact while
+    the buffer is still linear (offset < max_size) but corrupts temporal order
+    once it has wrapped. A verify chunk goes through the concat path, which
+    leaves the buffer linear with ``max_size - 1 + S`` keys, so the rejected
+    tail can be sliced off exactly while every later query still sees a full
+    window. Refuse (return 0) rather than drop history the window needs.
+    """
+    if n <= 0:
+        return 0
+    if isinstance(kv, BatchRotatingKVCache):
+        return _trim_batch_rotating(kv, n)
+    if (
+        not isinstance(kv, RotatingKVCache)
+        or kv.keys is None
+        or kv.offset < kv.max_size
+    ):
+        return kv.trim(n)
+    n = min(int(n), kv.offset)
+    keys = kv._temporal_order(kv.keys)
+    values = kv._temporal_order(kv.values)
+    keep = keys.shape[2] - n
+    if keep < kv.max_size:
+        return 0
+    # Keep exactly the newest max_size keys (shape == _idx == max_size).
+    start = keep - kv.max_size
+    kv.keys, kv.values = keys[..., start:keep, :], values[..., start:keep, :]
+    kv._idx = kv.max_size
+    kv.offset -= n
+    return n
 
 
 @dataclass
@@ -532,6 +632,9 @@ class Inkling2Attention(nn.Module):
     def attend(self, q, k, v, rel, sink, kv):
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
+            # Kernels index keys by distance from the end (queries are the last
+            # L keys), so a wrapped ring buffer must be unrolled.
+            k, v = _temporal_kv(kv, k, v, self.window, q.shape[2])
         left_padding = getattr(kv, "left_padding", None) if kv is not None else None
         return kernels.banded_sink_attention(
             q,
@@ -879,7 +982,7 @@ class Model(nn.Module):
         for entry in cache:
             kv, conv = entry[0], entry[1]
             windows = getattr(conv, "_omlx_verify_xp", None)
-            if windows is None or kv.trim(rejected) != rejected:
+            if windows is None or _trim_kv(kv, rejected) != rejected:
                 return False
             for slot, window in windows.items():
                 conv[slot] = window[:, keep : keep + width] * 1.0
@@ -899,9 +1002,25 @@ class Model(nn.Module):
     def make_cache(self):
         # One entry per layer visit: each loop pass keeps its own KV and conv
         # states.
-        return [
-            CacheList(KVCache(), ArraysCache(4)) for _ in range(self.model.num_visits)
-        ]
+        if not _SWA_BOUNDED:
+            return [
+                CacheList(KVCache(), ArraysCache(4))
+                for _ in range(self.model.num_visits)
+            ]
+        tm = self.model
+        if tm._core_start is None:
+            layer_ids = list(range(len(tm.layers)))
+        else:
+            layer_ids = [idx for idx, _ in tm._schedule]
+        caches = []
+        for idx in layer_ids:
+            attn = tm.layers[idx].attn
+            if attn.sliding:
+                kv = RotatingKVCache(max_size=max(attn.window, _SWA_SIZE), keep=0)
+            else:
+                kv = KVCache()
+            caches.append(CacheList(kv, ArraysCache(4)))
+        return caches
 
     def sanitize(self, weights: dict) -> dict:
         out, formats = sanitize_weights(self, weights)
