@@ -25,7 +25,13 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    BatchRotatingKVCache,
+    CacheList,
+    KVCache,
+    RotatingKVCache,
+)
 
 from . import kernels
 from .loader import sanitize_weights
@@ -532,6 +538,12 @@ class Inkling2Attention(nn.Module):
     def attend(self, q, k, v, rel, sink, kv):
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
+            # Relative logits index backward distance from the newest key, so
+            # rotating ring buffers must be restored to chronological order.
+            if isinstance(kv, RotatingKVCache):
+                k, v = kv._temporal_order(k), kv._temporal_order(v)
+            elif isinstance(kv, BatchRotatingKVCache) and kv.rotated:
+                k, v = mx.roll(k, -kv._idx, axis=2), mx.roll(v, -kv._idx, axis=2)
         left_padding = getattr(kv, "left_padding", None) if kv is not None else None
         return kernels.banded_sink_attention(
             q,
@@ -879,7 +891,24 @@ class Model(nn.Module):
         for entry in cache:
             kv, conv = entry[0], entry[1]
             windows = getattr(conv, "_omlx_verify_xp", None)
-            if windows is None or kv.trim(rejected) != rejected:
+            if windows is None:
+                return False
+            if isinstance(kv, RotatingKVCache):
+                if kv.offset < rejected:
+                    return False
+                if kv.keys is not None:
+                    k_ord = kv._temporal_order(kv.keys)
+                    v_ord = kv._temporal_order(kv.values)
+                    new_len = k_ord.shape[2] - rejected
+                    if new_len < 0:
+                        return False
+                    kv.keys = k_ord[..., :new_len, :]
+                    kv.values = v_ord[..., :new_len, :]
+                    kv._idx = new_len
+                else:
+                    kv._idx -= rejected
+                kv.offset -= rejected
+            elif kv.trim(rejected) != rejected:
                 return False
             for slot, window in windows.items():
                 conv[slot] = window[:, keep : keep + width] * 1.0
@@ -898,9 +927,19 @@ class Model(nn.Module):
 
     def make_cache(self):
         # One entry per layer visit: each loop pass keeps its own KV and conv
-        # states.
+        # states. Sliding-window visits use RotatingKVCache with extra headroom
+        # for speculative verify rollback so rejected tokens never evict live
+        # window entries.
+        args = self.args.text
+        sliding_cap = args.sliding_window_size + _COMPILED_MAX_TOKENS
         return [
-            CacheList(KVCache(), ArraysCache(4)) for _ in range(self.model.num_visits)
+            CacheList(
+                RotatingKVCache(max_size=sliding_cap, keep=0)
+                if args.is_sliding(idx)
+                else KVCache(),
+                ArraysCache(4),
+            )
+            for idx, _loop_pass in self.model._schedule
         ]
 
     def sanitize(self, weights: dict) -> dict:
