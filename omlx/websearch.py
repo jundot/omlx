@@ -10,11 +10,13 @@ API clients are unaffected.
 Providers:
 - duckduckgo (default): ddgs library, no credentials required. Note that
   ddgs performs HTTP through primp, which may not honor the proxy
-  environment variables applied from NetworkSettings; the brave and
-  searxng paths use httpx and inherit them.
+  environment variables applied from NetworkSettings; the brave,
+  searxng and keenable paths use httpx and inherit them.
 - brave: Brave Search API with a user-supplied subscription token.
 - searxng: an external SearXNG instance reachable via a base URL. The
   instance must have the JSON output format enabled.
+- keenable: Keenable search API. Works without credentials; an optional
+  API key only raises the rate limits.
 
 Every entry point returns a payload dict instead of raising: successes
 as {"ok": True, ...} and failures as {"ok": False, "error": {...}} so
@@ -36,7 +38,14 @@ from .api.markitdown import convert_html_to_markdown
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_PROVIDERS = ("ddgs", "ddgs_custom", "duckduckgo", "brave", "searxng")
+SUPPORTED_PROVIDERS = (
+    "ddgs",
+    "ddgs_custom",
+    "duckduckgo",
+    "brave",
+    "searxng",
+    "keenable",
+)
 
 # Text backends the pinned ddgs 9.14.1 actually registers (bing/google
 # exist as modules but are disabled in this version).
@@ -307,6 +316,50 @@ class SearXNGProvider(SearchProvider):
         ]
 
 
+class KeenableProvider(SearchProvider):
+    """Keenable search API. The key is optional and only lifts rate limits."""
+
+    name = "keenable"
+
+    ENDPOINT = "https://api.keenable.ai/v1/search"
+    PUBLIC_ENDPOINT = "https://api.keenable.ai/v1/search/public"
+    APP_TITLE = "oMLX"
+
+    def __init__(
+        self, api_key: str = "", transport: httpx.AsyncBaseTransport | None = None
+    ):
+        self._api_key = (api_key or "").strip()
+        self._transport = transport
+
+    async def search(self, query: str, max_results: int) -> list[dict[str, Any]]:
+        # The keyless endpoint requires the calling app's name in this header.
+        headers = {"X-Keenable-Title": self.APP_TITLE, "Accept": "application/json"}
+        endpoint = self.PUBLIC_ENDPOINT
+        if self._api_key:
+            headers["X-API-Key"] = self._api_key
+            endpoint = self.ENDPOINT
+        response = await _provider_request(
+            "POST",
+            endpoint,
+            headers=headers,
+            source="Keenable",
+            transport=self._transport,
+            json_body={"query": query, "max_results": max_results},
+        )
+        data = _parse_json(response, "Keenable")
+        rows = data.get("results") if isinstance(data, dict) else None
+        # Result text is in "snippet"; "description" comes back empty.
+        return [
+            {
+                "title": row.get("title"),
+                "url": row.get("url"),
+                "snippet": row.get("snippet"),
+            }
+            for row in (rows if isinstance(rows, list) else [])
+            if isinstance(row, dict)
+        ]
+
+
 async def _provider_get(
     url: str,
     params: dict[str, Any],
@@ -314,11 +367,27 @@ async def _provider_get(
     source: str,
     transport: httpx.AsyncBaseTransport | None,
 ) -> httpx.Response:
+    return await _provider_request(
+        "GET", url, headers, source, transport, params=params
+    )
+
+
+async def _provider_request(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    source: str,
+    transport: httpx.AsyncBaseTransport | None,
+    params: dict[str, Any] | None = None,
+    json_body: Any = None,
+) -> httpx.Response:
     async with httpx.AsyncClient(
         timeout=HTTP_TIMEOUT_SECONDS, transport=transport
     ) as client:
         try:
-            response = await client.get(url, params=params, headers=headers)
+            response = await client.request(
+                method, url, params=params, json=json_body, headers=headers
+            )
         except httpx.TimeoutException as exc:
             raise WebSearchError(
                 "provider_unavailable", f"{source} timed out."
@@ -364,6 +433,7 @@ def build_provider(
     brave_api_key: str = "",
     searxng_url: str = "",
     ddgs_backends: str = "",
+    keenable_api_key: str = "",
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> SearchProvider:
     """Build a provider from explicit values (settings or a pending form)."""
@@ -376,6 +446,8 @@ def build_provider(
         return BraveProvider(brave_api_key, transport=transport)
     if normalized == "searxng":
         return SearXNGProvider(searxng_url, transport=transport)
+    if normalized == "keenable":
+        return KeenableProvider(keenable_api_key, transport=transport)
     if normalized == "duckduckgo":
         return DdgsProvider("duckduckgo", "duckduckgo")
     if normalized == "ddgs_custom":
@@ -420,6 +492,7 @@ async def _search_with_provider(
     brave_api_key: str,
     searxng_url: str,
     ddgs_backends: str,
+    keenable_api_key: str,
     max_results: int,
     content_mode: str,
     content_max_chars: int,
@@ -437,6 +510,7 @@ async def _search_with_provider(
             brave_api_key=brave_api_key,
             searxng_url=searxng_url,
             ddgs_backends=ddgs_backends,
+            keenable_api_key=keenable_api_key,
             transport=transport,
         )
         rows = await provider.search(trimmed, max_results)
@@ -479,6 +553,7 @@ async def run_web_search(
         getattr(integrations, "web_search_brave_api_key", ""),
         getattr(integrations, "web_search_searxng_url", ""),
         getattr(integrations, "web_search_ddgs_backends", ""),
+        getattr(integrations, "web_search_keenable_api_key", ""),
         clamp_max_results(getattr(integrations, "web_search_max_results", None)),
         getattr(integrations, "web_search_content_mode", "snippet"),
         fetch_content_chars(integrations),
@@ -500,6 +575,7 @@ async def run_web_search_test(
     brave_api_key: str = "",
     searxng_url: str = "",
     ddgs_backends: str = "",
+    keenable_api_key: str = "",
     max_results: int = DEFAULT_MAX_RESULTS,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
@@ -514,6 +590,7 @@ async def run_web_search_test(
         brave_api_key,
         searxng_url,
         ddgs_backends,
+        keenable_api_key,
         clamp_max_results(max_results),
         "snippet",
         DEFAULT_FETCH_CONTENT_CHARS,

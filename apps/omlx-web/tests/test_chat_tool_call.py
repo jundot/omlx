@@ -409,6 +409,9 @@ class TestBuiltinWebToolDispatch:
         assert self.tools_active(True, {"provider": "ddgs"}) is True
         assert self.tools_active(True, {"provider": "duckduckgo"}) is True
 
+    def test_keenable_needs_no_key(self):
+        assert self.tools_active(True, {"provider": "keenable"}) is True
+
     def test_ddgs_custom_needs_backend_selection(self):
         settings = {"provider": "ddgs_custom", "ddgsBackendsSet": False}
         assert self.tools_active(True, settings) is False

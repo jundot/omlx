@@ -2,7 +2,7 @@
 """Tests for omlx/websearch.py and omlx/api/websearch_routes.py.
 
 Covers result sanitization, provider adapters (ddgs is monkeypatched,
-brave/searxng use httpx.MockTransport), backend selection for the ddgs
+brave/searxng/keenable use httpx.MockTransport), backend selection for the ddgs
 providers, the payload contract of run_web_search / run_fetch_url
 (including full-content mode and configurable truncation), the SSRF
 guard, and the /v1/web HTTP layer.
@@ -10,6 +10,8 @@ guard, and the /v1/web HTTP layer.
 
 from __future__ import annotations
 
+
+import json
 
 import httpx
 import pytest
@@ -21,6 +23,7 @@ from omlx.api import websearch_routes
 from omlx.settings import IntegrationSettings
 from omlx.websearch import (
     BraveProvider,
+    KeenableProvider,
     SearXNGProvider,
     WebSearchError,
     build_provider,
@@ -143,6 +146,8 @@ class TestBuildProvider:
     def test_known_providers(self):
         assert build_provider("brave", brave_api_key="k").name == "brave"
         assert build_provider("searxng", searxng_url="http://x").name == "searxng"
+        assert build_provider("keenable").name == "keenable"
+        assert build_provider("keenable", keenable_api_key="k").name == "keenable"
 
     def test_unknown_provider_raises(self):
         with pytest.raises(WebSearchError) as exc_info:
@@ -319,6 +324,84 @@ class TestSearXNGProvider:
         assert exc_info.value.code == "missing_api_key"
 
 
+class TestKeenableProvider:
+    @staticmethod
+    def _handler(seen):
+        def handler(request):
+            seen["method"] = request.method
+            seen["url"] = str(request.url)
+            seen["title"] = request.headers.get("X-Keenable-Title")
+            seen["key"] = request.headers.get("X-API-Key")
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "T",
+                            "url": "https://example.com/",
+                            "description": "",
+                            "snippet": "S",
+                        }
+                    ]
+                },
+            )
+
+        return handler
+
+    async def test_keyless_request_shape_and_parsing(self):
+        seen = {}
+        provider = KeenableProvider(
+            "", transport=httpx.MockTransport(self._handler(seen))
+        )
+        rows = await provider.search("mlx", 5)
+        assert seen["method"] == "POST"
+        assert seen["url"] == KeenableProvider.PUBLIC_ENDPOINT
+        assert seen["title"] == "oMLX"
+        assert seen["key"] is None
+        assert seen["body"] == {"query": "mlx", "max_results": 5}
+        assert rows == [
+            {"title": "T", "url": "https://example.com/", "snippet": "S"}
+        ]
+
+    async def test_key_switches_to_keyed_endpoint(self):
+        seen = {}
+        provider = KeenableProvider(
+            " key123 ", transport=httpx.MockTransport(self._handler(seen))
+        )
+        await provider.search("mlx", 3)
+        assert seen["url"] == KeenableProvider.ENDPOINT
+        assert seen["key"] == "key123"
+        assert seen["title"] == "oMLX"
+
+    @pytest.mark.parametrize(
+        "status,code",
+        [
+            (400, "request_failed"),
+            (401, "invalid_authentication"),
+            (429, "rate_limited"),
+            (503, "provider_unavailable"),
+        ],
+    )
+    async def test_http_status_mapping(self, status, code):
+        provider = KeenableProvider(
+            transport=httpx.MockTransport(lambda request: httpx.Response(status))
+        )
+        with pytest.raises(WebSearchError) as exc_info:
+            await provider.search("mlx", 3)
+        assert exc_info.value.code == code
+
+    async def test_malformed_json_maps_to_invalid_response(self):
+        provider = KeenableProvider(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, text="not json")
+            )
+        )
+        with pytest.raises(WebSearchError) as exc_info:
+            await provider.search("mlx", 3)
+        assert exc_info.value.code == "invalid_response"
+
+
 class TestRunWebSearch:
     async def test_blank_query_is_payload_error(self):
         payload = await run_web_search("   ", make_integrations())
@@ -345,6 +428,33 @@ class TestRunWebSearch:
         assert payload["ok"] is False
         assert payload["error"]["code"] == "missing_api_key"
         assert payload["error"]["user_action_required"] is True
+
+    async def test_keenable_works_without_key(self):
+        def handler(request):
+            assert "X-API-Key" not in request.headers
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "T",
+                            "url": "https://example.com/",
+                            "description": "",
+                            "snippet": "S" * 4000,
+                        }
+                    ]
+                },
+            )
+
+        payload = await run_web_search(
+            "mlx",
+            make_integrations(provider="keenable"),
+            transport=httpx.MockTransport(handler),
+        )
+        assert payload["ok"] is True
+        assert payload["provider"] == "keenable"
+        assert payload["results"][0]["url"] == "https://example.com/"
+        assert len(payload["results"][0]["snippet"]) == websearch.MAX_SNIPPET_CHARS
 
     async def test_unexpected_error_is_caught(self, monkeypatch):
         # Raise from the provider itself so the error bypasses
@@ -775,3 +885,19 @@ class TestAdminWebSearchTest:
         payload = response.json()
         assert payload["ok"] is False
         assert payload["error"]["code"] == "missing_api_key"
+
+    def test_pending_keenable_key_is_used(self, monkeypatch):
+        seen = {}
+
+        async def fake_search(self, query, max_results):
+            seen["key"] = self._api_key
+            return [{"title": "T", "url": "https://example.com/", "snippet": "S"}]
+
+        monkeypatch.setattr(websearch.KeenableProvider, "search", fake_search)
+        response = self._client().post(
+            "/admin/api/web-search/test",
+            json={"provider": "keenable", "keenable_api_key": "kn-key"},
+        )
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        assert seen["key"] == "kn-key"
