@@ -11,12 +11,15 @@
 - Looped checkpoints (``loop_config``) run the core layers several times per
   token. Every later pass restarts from the prelude output and reads the
   previous pass's blocks only through gated messages. Each layer visit owns
-  its cache entry, so caches and draft taps count visits, not layers.
+  its cache state, so caches and draft taps count visits, not layers.
+- A sliding visit caches only the keys its window can still reach
+  (``cache.py``); a full-attention visit caches every key.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -25,8 +28,9 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache
 
+from . import cache as windows
 from . import kernels
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
@@ -71,6 +75,9 @@ class TextArgs:
     # Per-layer expert carrier: "nvfp4", "mxfp8" or "affine" (oQ output).
     expert_formats: list | None = None
     loop_config: dict | None = None
+    # Unit-scale FP8 E4M3 KV cache: False (BF16), True/"all" (full + sliding),
+    # or "full" (8 full-attention visits only).
+    fp8_kv: str | bool = False
 
     @classmethod
     def from_dict(cls, params: dict) -> TextArgs:
@@ -80,7 +87,26 @@ class TextArgs:
             args.intermediate_size = int(params["moe_intermediate_size"])
         if "conv_kernel_size" in params:
             args.sconv_kernel_size = int(params["conv_kernel_size"])
+        if "fp8_kv" not in params:
+            env = os.environ.get("OMLX_INKLING2_FP8_KV", "").strip().lower()
+            if env in ("1", "true", "yes", "all"):
+                args.fp8_kv = "all"
+            elif env == "full":
+                args.fp8_kv = "full"
         return args
+
+    def uses_fp8_kv(self, layer_idx: int) -> bool:
+        mode = self.fp8_kv
+        if not mode:
+            return False
+        if isinstance(mode, str):
+            m = mode.strip().lower()
+            if m in ("", "0", "false", "no", "off"):
+                return False
+            if m == "full":
+                return not self.is_sliding(layer_idx)
+            return True
+        return True
 
     def is_sliding(self, i: int) -> bool:
         if self.layer_types is not None:
@@ -277,6 +303,11 @@ class Inkling2Experts(nn.Module):
         self.w2 = ExpertProj(e, h, i, w2_spec)
         self._gcap = mx.array(args.mlp_gate_softcap, dtype=mx.float32)
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
+        self._inv_nvfp4 = mx.array([1.0 / _NVFP4_DENOMINATOR], dtype=mx.float32)
+        self._swiglu_params = mx.array(
+            [args.mlp_gate_softcap, args.mlp_up_softcap, 1.0 / _NVFP4_DENOMINATOR],
+            dtype=mx.float32,
+        )
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
         xe = mx.expand_dims(x, (-2, -3))
@@ -286,6 +317,17 @@ class Inkling2Experts(nn.Module):
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
         y = self.w13(xe, idx, do_sort)
+        if mx.default_device() == mx.gpu:
+            g13 = self.w13.global_scale if self.w13.mode == "nvfp4" else None
+            act = kernels.expert_softcapped_swiglu(y, idx, g13, self._swiglu_params)
+            z = self.w2(act, idx, do_sort)
+            if do_sort:
+                z = _scatter_unsort(z, inv, inds.shape)
+            z = z.squeeze(-2)
+            g2 = self.w2.global_scale if self.w2.mode == "nvfp4" else None
+            return kernels.expert_weighted_combine(
+                z, inds, weights, g2, self._inv_nvfp4
+            )
         s13 = self.w13.post_scale(idx)
         if s13 is not None:
             y = y * s13[..., None, None].astype(y.dtype)
@@ -341,13 +383,15 @@ class AttnResQuery(nn.Module):
         return kernels.attn_res_mix(blocks, partial_n, self.query, self.scale)
 
 
-def _mix_messages(x, message, down, gain_forget):
+def _mix_messages(x, message, down, gain_forget, down_t=None, gf_t=None):
     """Loop controllers: ``(1 - tanh(forget)) * x + tanh(gain) * message``.
 
     ``x`` and ``message`` are [N, B, L, H] FP32, one row per controlled input.
     ``down`` is [N, 2, H, r] (the x and message halves) and ``gain_forget``
     [N, r, 2H], both FP32 copies of BF16 weights.
     """
+    if mx.default_device() == mx.gpu:
+        return kernels.mix_messages_gpu(x, message, down, gain_forget, down_t, gf_t)
     n, b, length, hidden = x.shape
     rows = b * length
     # Like the reference, the down projection takes BF16-rounded inputs,
@@ -364,14 +408,23 @@ def _mix_messages(x, message, down, gain_forget):
     return (1.0 - forget) * x + gain * message
 
 
-def _static_conv(x, w, state, scale):
+def _static_conv(x, w, state, scale, scale_arr=None):
     """Depthwise causal conv (taps: ``w[:, K-1]`` is the current token).
 
-    Returns the output and the padded input window ``[state, x]``; its last
-    ``K - 1`` rows are the next state.
+    On GPU with K=4, returns ``(out, next_state, raw_x)`` from a single fused
+    Metal kernel without allocating the padded window ``[state, x]``. On CPU or
+    other kernel widths, returns ``(out, xp, None)``.
     """
-    xf = x.astype(mx.float32)
     k = w.shape[-1]
+    if k == 4 and mx.default_device() == mx.gpu:
+        sc = (
+            scale_arr
+            if scale_arr is not None
+            else mx.array([scale], dtype=mx.float32)
+        )
+        out, next_state = kernels.static_conv4_fused(x, w, state, sc)
+        return out, next_state, x
+    xf = x.astype(mx.float32)
     xp = mx.concatenate([state, xf], axis=1)
     length = xf.shape[1]
     out = w[:, 0] * xp[:, 0:length]
@@ -380,7 +433,7 @@ def _static_conv(x, w, state, scale):
     # The reference rounds the depthwise conv to the weight dtype before the
     # residual add.
     out = (out.astype(w.dtype).astype(mx.float32) + xf) * scale
-    return out.astype(x.dtype), xp
+    return out.astype(x.dtype), xp, None
 
 
 def _dynamic_conv(x, dyn, static_w, state, heads, scale):
@@ -401,10 +454,33 @@ def _dynamic_conv(x, dyn, static_w, state, heads, scale):
     return out.astype(x.dtype), xp
 
 
+def _linear_slice(proj: nn.Module, x: mx.array, start: int, stop: int | None) -> mx.array:
+    """Apply rows ``[start:stop]`` of a Linear or QuantizedLinear without copying."""
+    if isinstance(proj, nn.QuantizedLinear):
+        biases = proj.get("biases")
+        y = mx.quantized_matmul(
+            x,
+            proj.weight[start:stop],
+            proj.scales[start:stop],
+            None if biases is None else biases[start:stop],
+            transpose=True,
+            group_size=proj.group_size,
+            bits=proj.bits,
+            mode=getattr(proj, "mode", "affine"),
+        )
+    else:
+        y = x @ proj.weight[start:stop].T
+    bias = proj.get("bias")
+    if bias is not None:
+        y = y + bias[start:stop]
+    return y
+
+
 class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
         self.sliding = args.is_sliding(layer_idx)
+        self.fp8_kv = args.uses_fp8_kv(layer_idx)
         self.head_dim = args.swa_head_dim if self.sliding else args.head_dim
         self.n_heads = (
             args.swa_num_attention_heads if self.sliding else args.num_attention_heads
@@ -447,6 +523,7 @@ class Inkling2Attention(nn.Module):
         self._r_clip = mx.array(args.rel_l2_clip_threshold, dtype=mx.float32)
         self._one = mx.array(1.0, dtype=mx.float32)
         self._sconv_scale = 1.0 / math.sqrt(self.conv_k + 1)
+        self._sconv_scale_arr = mx.array([self._sconv_scale], dtype=mx.float32)
         self._dconv_scale = 1.0 / math.sqrt(2 * self.conv_k + 1)
 
     def log_tau(self, kv, length: int):
@@ -454,6 +531,8 @@ class Inkling2Attention(nn.Module):
         if self.log_floor is None:
             return None
         offset = kv.offset if kv is not None else 0
+        if not isinstance(offset, mx.array) and int(offset) + length <= self.log_floor:
+            return None
         if isinstance(offset, mx.array):
             offset = offset.reshape(-1, 1)
         pos = mx.arange(length) + offset
@@ -471,16 +550,21 @@ class Inkling2Attention(nn.Module):
             if xk is None:
                 q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
             else:
-                # Looped passes give q, k and v their own inputs; one stacked
-                # projection serves all three.
-                pq, pk, pv = mx.split(
-                    self.in_proj(mx.concatenate([xq, xk, xv], axis=0)), 3, axis=0
-                )
-                q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
-                k = pk[..., self._cuts[0] : self._cuts[1]]
-                v = pv[..., self._cuts[1] : self._cuts[2]]
-            k, ks = _static_conv(k, self.k_conv, ks, self._sconv_scale)
-            v, vs = _static_conv(v, self.v_conv, vs, self._sconv_scale)
+                # Looped passes give q, k and v their own inputs; slice the
+                # packed projection into zero-copy row views so each row is
+                # multiplied by its own input once instead of 3x.
+                c0, c1, c2, c3, c4 = self._cuts
+                q = _linear_slice(self.in_proj, xq, 0, c0)
+                k = _linear_slice(self.in_proj, xk, c0, c1)
+                v = _linear_slice(self.in_proj, xv, c1, c2)
+                rgs = _linear_slice(self.in_proj, xq, c2, None)
+                r, gate, sink = mx.split(rgs, [c3 - c2, c4 - c2], axis=-1)
+            k, ks, rk = _static_conv(
+                k, self.k_conv, ks, self._sconv_scale, self._sconv_scale_arr
+            )
+            v, vs, rv = _static_conv(
+                v, self.v_conv, vs, self._sconv_scale, self._sconv_scale_arr
+            )
         else:
             q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
             kp = self.k_proj(xk)
@@ -501,6 +585,7 @@ class Inkling2Attention(nn.Module):
                 self.n_kv,
                 self._dconv_scale,
             )
+            rk = rv = None
         q = _l2_clip(
             q.reshape(b, length, self.n_heads, self.head_dim),
             self.q_scale,
@@ -518,7 +603,7 @@ class Inkling2Attention(nn.Module):
             q = (q.astype(mx.float32) * tau).astype(q.dtype)
             r = (r.astype(mx.float32) * tau).astype(r.dtype)
         rel = r @ self.rel_proj.astype(r.dtype)
-        return (
+        base_out = (
             q.transpose(0, 2, 1, 3),
             k.transpose(0, 2, 1, 3),
             v.transpose(0, 2, 1, 3),
@@ -528,11 +613,26 @@ class Inkling2Attention(nn.Module):
             ks,
             vs,
         )
+        if rk is not None:
+            return (*base_out, rk, rv)
+        return base_out
 
-    def attend(self, q, k, v, rel, sink, kv):
+    def attend(self, q, k, v, rel, sink, kv, state=None):
+        left_padding = None
+        use_fp8 = self.fp8_kv
+        if not use_fp8:
+            if kv is not None and getattr(kv, "keys", None) is not None:
+                use_fp8 = kv.keys.dtype == mx.uint8
+            elif state is not None and state.cache[windows.KEYS] is not None:
+                use_fp8 = state.cache[windows.KEYS].dtype == mx.uint8
+        if use_fp8:
+            k = kernels.fp8_e4m3_quantize(k)
+            v = kernels.fp8_e4m3_quantize(v)
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
-        left_padding = getattr(kv, "left_padding", None) if kv is not None else None
+            left_padding = getattr(kv, "left_padding", None)
+        elif state is not None:
+            k, v, left_padding = windows.append(state, k, v)
         return kernels.banded_sink_attention(
             q,
             k,
@@ -584,6 +684,7 @@ class Inkling2Layer(nn.Module):
             self.loop_message = AttnResQuery(h, 4)
             self.loop_down = mx.zeros((4, 2, h, rank), dtype=mx.float32)
             self.loop_gain_forget = mx.zeros((4, rank, 2 * h), dtype=mx.float32)
+            self._loop_packed = None
         self.attn = Inkling2Attention(args, layer_idx)
         self.mlp = Inkling2MoE(args, w13_spec, w2_spec)
         if self.sliding:
@@ -596,6 +697,7 @@ class Inkling2Layer(nn.Module):
         self.attn_conv = mx.zeros((h, args.sconv_kernel_size))
         self.mlp_conv = mx.zeros((h, args.sconv_kernel_size))
         self._conv_scale = 1.0 / math.sqrt(args.sconv_kernel_size + 1)
+        self._conv_scale_arr = mx.array([self._conv_scale], dtype=mx.float32)
         self._conv_k = args.sconv_kernel_size
         # A weak proxy: compiled bound methods would make each layer a
         # reference cycle, so a released model would wait for the cyclic GC.
@@ -603,7 +705,21 @@ class Inkling2Layer(nn.Module):
         self._pre_compiled = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
         self._post_compiled = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
 
-    def _pre(self, h, blocks, ks, vs, tau=None, messages=None):
+    def _packed_loop(self):
+        """Lazily pack transposed BF16 loop-controller weights outside mx.compile."""
+        if mx.default_device() != mx.gpu:
+            return None, None
+        packed = self._loop_packed
+        key = (id(self.loop_down), id(self.loop_gain_forget))
+        if packed is not None and packed[0] == key:
+            return packed[1], packed[2]
+        down_t, gf_t = kernels.pack_loop_controller(
+            self.loop_down, self.loop_gain_forget
+        )
+        self._loop_packed = (key, down_t, gf_t)
+        return down_t, gf_t
+
+    def _pre(self, h, blocks, ks, vs, tau=None, messages=None, down_t=None, gf_t=None):
         dtype = h.dtype
         h_n = _unit_rms(h.astype(mx.float32))
         if self.layer_idx == 0:
@@ -620,6 +736,8 @@ class Inkling2Layer(nn.Module):
                 messages[:, :, :3].transpose(2, 0, 1, 3),
                 self.loop_down[:3],
                 self.loop_gain_forget[:3],
+                None if down_t is None else down_t[:3],
+                None if gf_t is None else gf_t[:3],
             )
         if self.sliding and messages is None:
             xq = self.attn_norm(xq).astype(dtype)
@@ -632,9 +750,11 @@ class Inkling2Layer(nn.Module):
             xv = self.v_input_norm(xv).astype(dtype)
         return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
 
-    def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
+    def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None, down_t=None, gf_t=None):
         a = self.attn.output(out, gate)
-        a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
+        a, s2, ra = _static_conv(
+            a, self.attn_conv, s2, self._conv_scale, self._conv_scale_arr
+        )
         if self.is_boundary:
             residual = a.astype(mx.float32)
         else:
@@ -646,22 +766,30 @@ class Inkling2Layer(nn.Module):
                 messages[None, :, :, 3],
                 self.loop_down[3:],
                 self.loop_gain_forget[3:],
+                None if down_t is None else down_t[3:],
+                None if gf_t is None else gf_t[3:],
             )[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
-        m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
-        return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
+        m, s3, rm = _static_conv(
+            m, self.mlp_conv, s3, self._conv_scale, self._conv_scale_arr
+        )
+        out_h = (residual + m.astype(mx.float32)).astype(h.dtype)
+        if ra is not None:
+            return out_h, s2, s3, ra, rm
+        return out_h, s2, s3
 
     def __call__(self, h, blocks, cache=None, bank=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
         FP32 completed blocks; extended in place at a block boundary.
         ``bank``: the previous loop pass's ``(blocks, partial_n)`` messages."""
         b, length, hidden = h.shape
-        kv = cache[0] if cache is not None else None
-        conv = cache[1] if cache is not None else None
+        kv, conv = cache if cache is not None else (None, None)
+        # A sliding visit's state starts with its key and value windows.
+        base = windows.CONV if kv is None else 0
         dkv = self.attn.dkv
         states = []
         for slot, width in ((0, dkv), (1, dkv), (2, hidden), (3, hidden)):
-            s = conv[slot] if conv is not None else None
+            s = conv[base + slot] if conv is not None else None
             if s is None:
                 s = mx.zeros((b, self._conv_k - 1, width), dtype=mx.float32)
             states.append(s)
@@ -670,22 +798,44 @@ class Inkling2Layer(nn.Module):
         pre = self._pre_compiled if compiled else self._pre
         post = self._post_compiled if compiled else self._post
         messages = self.loop_message(*bank) if bank is not None else None
-        q, k, v, rel, gate, sink, ks, vs, h_n = pre(
-            h, blocks, states[0], states[1], tau, messages
-        )
-        out = self.attn.attend(q, k, v, rel, sink, kv)
+        down_t = gf_t = None
+        if messages is not None and b * length <= kernels._LOOP_FUSED_MAX_ROWS:
+            down_t, gf_t = self._packed_loop()
+        pre_out = pre(h, blocks, states[0], states[1], tau, messages, down_t, gf_t)
+        if len(pre_out) == 11:
+            q, k, v, rel, gate, sink, ks, vs, rk, rv, h_n = pre_out
+        else:
+            q, k, v, rel, gate, sink, ks, vs, h_n = pre_out
+            rk = rv = None
+        out = self.attn.attend(q, k, v, rel, sink, kv, conv)
         if self.is_boundary:
             blocks.append(h_n)
-        h, s2, s3 = post(out, gate, h, blocks, states[2], states[3], messages)
+        post_out = post(
+            out, gate, h, blocks, states[2], states[3], messages, down_t, gf_t
+        )
+        if len(post_out) == 5:
+            h, s2, s3, ra, rm = post_out
+        else:
+            h, s2, s3 = post_out
+            ra = rm = None
         if conv is not None:
-            windows = (ks, vs, s2, s3)
-            if 1 < length <= _COMPILED_MAX_TOKENS:
+            next_states = (ks, vs, s2, s3)
+            raws = (rk, rv, ra, rm)
+            stash = 1 < length <= _COMPILED_MAX_TOKENS
+            if stash:
                 # Speculative verify rollback re-cuts the states from these.
-                conv._omlx_verify_xp = dict(enumerate(windows))
+                conv._omlx_verify_xp = {
+                    slot: ((states[slot], raw) if raw is not None else nxt)
+                    for slot, (nxt, raw) in enumerate(zip(next_states, raws))
+                }
             keep = self._conv_k - 1
-            for slot, window in enumerate(windows):
-                # A small copy, so the state does not pin the chunk's window.
-                conv[slot] = window[:, -keep:] * 1.0
+            for slot, (nxt, raw) in enumerate(zip(next_states, raws)):
+                if raw is not None:
+                    # Fused static_conv4 already wrote the exact (B, 3, C) next state.
+                    conv[base + slot] = nxt
+                else:
+                    # A small copy, so the state does not pin the chunk's window.
+                    conv[base + slot] = nxt[:, -keep:] * 1.0
         return h
 
 
@@ -711,6 +861,39 @@ class Inkling2TextModel(nn.Module):
             return len(self.layers)
         return len(self._schedule)
 
+    def cache_layout(self) -> list[tuple[int | None, int]]:
+        """Where each layer visit's ``(KVCache, state)`` sit in a cache list.
+
+        A sliding visit has no ``KVCache``; its one entry holds everything.
+        """
+        layout, entry = [], 0
+        for idx, _ in self._schedule[: self.num_visits]:
+            if self.layers[idx].sliding:
+                layout.append((None, entry))
+                entry += 1
+            else:
+                layout.append((entry, entry + 1))
+                entry += 2
+        return layout
+
+    def visit_caches(self, cache: list) -> list[tuple]:
+        """``(KVCache or None, state)`` of every layer visit in ``cache``."""
+        layout = self.cache_layout()
+        entries = layout[-1][1] + 1 if layout else 0
+        if len(cache) != entries:
+            # A per-layer cache would silently skip the later loop passes.
+            raise ValueError(
+                f"Inkling 2 needs {entries} cache entries for its "
+                f"{len(layout)} layer visits, got {len(cache)}"
+            )
+        window = self.args.sliding_window_size
+        return [
+            (None, windows.ArraysCache.adopt(cache[state], window))
+            if kv is None
+            else (cache[kv], cache[state])
+            for kv, state in layout
+        ]
+
     def __call__(self, inputs, cache=None, input_embeddings=None, capture=None):
         """``capture`` maps draft feature ids to fill: ``i`` < num visits is
         the partial block sum entering layer visit ``i``; ``num visits`` is
@@ -719,17 +902,10 @@ class Inkling2TextModel(nn.Module):
             h = input_embeddings
         else:
             h = self.embed_norm(self.embed(inputs))
-        if cache is None:
-            cache = [None] * self.num_visits
-        elif len(cache) != self.num_visits:
-            # A per-layer cache would silently skip the later loop passes.
-            raise ValueError(
-                f"Inkling 2 needs one cache entry per layer visit "
-                f"({self.num_visits}), got {len(cache)}"
-            )
+        visits = [None] * self.num_visits if cache is None else self.visit_caches(cache)
         blocks: list = []
         prelude = bank = None
-        for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, cache)):
+        for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, visits)):
             if idx == self._core_start and prelude is None:
                 prelude = (h, list(blocks))
             elif idx == self._core_start:
@@ -751,6 +927,10 @@ class Inkling2TextModel(nn.Module):
 
 
 class Model(nn.Module):
+    # ``attend`` reads the keys and values a cache returns as dense arrays; a
+    # packed (TurboQuant or affine) cache hands back codes it cannot use.
+    dense_kv_attention = True
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -876,13 +1056,30 @@ class Model(nn.Module):
             return True
         keep = int(accepted) + 1
         width = self.args.text.sconv_kernel_size - 1
-        for entry in cache:
-            kv, conv = entry[0], entry[1]
-            windows = getattr(conv, "_omlx_verify_xp", None)
-            if windows is None or kv.trim(rejected) != rejected:
+        for kv, conv in self.model.visit_caches(cache):
+            padded = getattr(conv, "_omlx_verify_xp", None)
+            if padded is None:
                 return False
-            for slot, window in windows.items():
-                conv[slot] = window[:, keep : keep + width] * 1.0
+            if kv is None:
+                if not windows.trim(conv, rejected):
+                    return False
+            elif kv.trim(rejected) != rejected:
+                return False
+            base = windows.CONV if kv is None else 0
+            for slot, xp in padded.items():
+                if isinstance(xp, tuple):
+                    prev_st, raw_x = xp
+                    if keep >= width:
+                        conv[base + slot] = raw_x[:, keep - width : keep].astype(
+                            mx.float32
+                        )
+                    else:
+                        conv[base + slot] = mx.concatenate(
+                            [prev_st[:, keep:], raw_x[:, :keep].astype(mx.float32)],
+                            axis=1,
+                        )
+                else:
+                    conv[base + slot] = xp[:, keep : keep + width] * 1.0
             conv._omlx_verify_xp = None
         return True
 
@@ -897,11 +1094,33 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        # One entry per layer visit: each loop pass keeps its own KV and conv
-        # states.
-        return [
-            CacheList(KVCache(), ArraysCache(4)) for _ in range(self.model.num_visits)
-        ]
+        # Every layer visit, each loop pass included, keeps its own state: a
+        # sliding visit one entry with its key window and conv states, a
+        # full-attention visit a KVCache and its conv states.
+        window = self.args.text.sliding_window_size
+        cache = []
+        for kv, _ in self.model.cache_layout():
+            if kv is None:
+                cache.append(windows.ArraysCache(window=window))
+            else:
+                cache += [KVCache(), ArraysCache(4)]
+        return cache
+
+    def restore_cache(self, cache: list) -> list:
+        """Prefix-cache hook: restored sliding states become joinable again."""
+        self.model.visit_caches(cache)
+        return cache
+
+    def set_fp8_kv(self, mode: bool | str = True) -> None:
+        """Enable or disable unit-scale OCP FP8 E4M3 KV caching.
+
+        ``mode`` may be ``True``/``"all"`` (all 48 visits: <= 1.79 GB @ 98k),
+        ``"full"`` (8 full-attention visits only: <= 1.96 GB @ 98k), or
+        ``False`` (BF16).
+        """
+        self.args.text.fp8_kv = mode
+        for idx, layer in enumerate(self.model.layers):
+            layer.attn.fp8_kv = self.args.text.uses_fp8_kv(idx)
 
     def sanitize(self, weights: dict) -> dict:
         out, formats = sanitize_weights(self, weights)

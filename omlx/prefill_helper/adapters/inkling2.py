@@ -5,7 +5,8 @@ The layers exchange a partial block sum and the completed attention-residual
 blocks. The cut sends the partial sum ``h`` entering layer ``k`` and, as
 ``blk.<i>``, the partial sum entering each block boundary layer ``i`` below
 ``k``; each side normalizes those itself, as the boundary layer does. A
-layer's state is the K/V rows the chunk appended and its four conv windows.
+layer's state is the K/V rows the chunk appended and its four conv windows;
+a sliding layer keeps only the rows its window can still reach.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 from mlx_lm.utils import load_model
 
+from ...patches.inkling2 import cache as windows
 from ...patches.inkling2 import model as inkling2
 from ...utils.model_loading import maybe_apply_pre_load_patches
 from ..adapter import Arrays, Capture, HostArrays, StageAdapter
@@ -84,15 +86,25 @@ def _run_layers(
     return h, entered
 
 
-def _cache_state(i: int, item: Any, since: int) -> Arrays:
-    kv, conv = item[0], item[1]
-    out = {
-        f"{i}.k": kv.keys[..., since : kv.offset, :],
-        f"{i}.v": kv.values[..., since : kv.offset, :],
-    }
+def _cache_state(i: int, visit: tuple, rows: int | None) -> Arrays:
+    """Layer ``i``'s conv windows and its ``rows`` newest K/V rows (all it
+    holds when None)."""
+    kv, conv = visit
+    if kv is None:
+        base = windows.CONV
+        if rows is None:
+            keys, values = conv[windows.KEYS], conv[windows.VALUES]
+        else:
+            keys, values = windows.newest(conv, rows)
+    else:
+        base = 0
+        start = 0 if rows is None else kv.offset - rows
+        keys = kv.keys[..., start : kv.offset, :]
+        values = kv.values[..., start : kv.offset, :]
+    out = {f"{i}.k": keys, f"{i}.v": values}
     for slot in range(_CONV_SLOTS):
-        if conv[slot] is not None:
-            out[f"{i}.c{slot}"] = conv[slot]
+        if conv[base + slot] is not None:
+            out[f"{i}.c{slot}"] = conv[base + slot]
     return out
 
 
@@ -175,13 +187,13 @@ class Inkling2Adapter(StageAdapter):
         inputs: HostArrays | None = None,
         capture: Capture | None = None,
     ) -> tuple[Arrays, Arrays]:
-        before = [c[0].offset for c in cache]
+        visits = lm.model.visit_caches(cache)
         h = lm.model.embed_norm(lm.model.embed(tokens))
-        h, entered = _run_layers(h, [], _layers(lm), cache, capture=capture)
+        h, entered = _run_layers(h, [], _layers(lm), visits, capture=capture)
         boundary = {"h": h, **{f"blk.{i}": v for i, v in entered.items()}}
         state: Arrays = {}
-        for i, c in enumerate(cache):
-            state.update(_cache_state(i, c, before[i]))
+        for i, visit in enumerate(visits):
+            state.update(_cache_state(i, visit, tokens.shape[1]))
         mx.eval(
             list(boundary.values()),
             list(state.values()),
@@ -204,7 +216,8 @@ class Inkling2Adapter(StageAdapter):
         layers = _layers(lm)
         below = sorted(int(n[4:]) for n in boundary if n.startswith("blk."))
         blocks = [_unit_rms(boundary[f"blk.{i}"]) for i in below]
-        h, _ = _run_layers(boundary["h"], blocks, layers[k:], cache[k:], k, capture)
+        visits = lm.model.visit_caches(cache)[k:]
+        h, _ = _run_layers(boundary["h"], blocks, layers[k:], visits, k, capture)
         end = len(layers)
         if capture is not None and end in capture.layers:
             # The last draft tap is the final-norm output, of the kept rows
@@ -216,22 +229,26 @@ class Inkling2Adapter(StageAdapter):
         return None
 
     def apply_state(self, cache: list, k: int, state: Arrays) -> None:
-        for i in range(k):
-            kv, conv = cache[i][0], cache[i][1]
-            keys = state[f"{i}.k"]
-            if keys.shape[2]:
-                kv.update_and_fetch(keys, state[f"{i}.v"])
+        for i, (kv, conv) in enumerate(windows.visits(cache)[:k]):
+            keys = state.get(f"{i}.k")
+            if keys is not None and keys.shape[2]:
+                if kv is None:
+                    windows.append(conv, keys, state[f"{i}.v"])
+                else:
+                    kv.update_and_fetch(keys, state[f"{i}.v"])
+            base = windows.CONV if kv is None else 0
             for slot in range(_CONV_SLOTS):
                 value = state.get(f"{i}.c{slot}")
                 if value is not None:
-                    conv[slot] = value
+                    conv[base + slot] = value
 
     def prefix_state(self, cache: list, k: int) -> Arrays:
         state: Arrays = {}
-        for i in range(k):
-            state.update(_cache_state(i, cache[i], 0))
+        for i, visit in enumerate(windows.visits(cache)[:k]):
+            held = _cache_state(i, visit, None)
+            state.update({n: v for n, v in held.items() if v is not None})
         mx.eval(list(state.values()))
         return state
 
     def load_prefix(self, cache: list, state: Arrays) -> None:
-        self.apply_state(cache, len(cache), state)
+        self.apply_state(cache, len(windows.visits(cache)), state)

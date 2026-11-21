@@ -627,8 +627,185 @@ def test_inkling2_verify_rollback_matches_sequential_decode(dims):
     # Three of seven drafts accepted: the confirmed token plus three stay.
     assert model.mtp_partial_rollback(cache, 3, 7)
     got = model(ids[:, 24:25], cache=cache)
-    assert cache[0][0].offset == reference[0][0].offset == 25
+    full = next(c for c in cache if hasattr(c, "offset"))
+    assert full.offset == next(c for c in reference if hasattr(c, "offset")).offset == 25
     assert mx.abs(got[..., :300] - expected[..., :300]).max().item() < 1e-4
+
+
+def _bf16(model):
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    cast = model.cast_predicate
+    model.update(
+        tree_unflatten(
+            [
+                (k, v.astype(mx.bfloat16) if v.dtype == mx.float32 and cast(k) else v)
+                for k, v in tree_flatten(model.parameters())
+            ]
+        )
+    )
+    return model
+
+
+def _run_inkling2_steps(model, ids, steps):
+    """Prefill chunks, decode steps and verify blocks with a rollback."""
+    cache, outs, pos = model.make_cache(), [], 0
+    for step in steps:
+        if isinstance(step, int):
+            outs.append(model(ids[:, pos : pos + step], cache=cache)[:, -1])
+            pos += step
+        else:
+            block, accepted = step
+            out = model(
+                ids[:, pos : pos + block],
+                cache=cache,
+                return_hidden=True,
+                capture_layer_ids=[5],
+            )
+            assert model.mtp_partial_rollback(cache, accepted, block - 1)
+            outs.append(out.logits[:, : accepted + 1])
+            pos += accepted + 1
+        mx.eval(outs[-1], [c.state for c in cache])
+    return outs, cache
+
+
+@pytest.mark.parametrize("dims", [dict(formats=("mxfp8",) * 12), _TINY_LOOP])
+def test_inkling2_sliding_state_matches_a_cache_of_every_key(dims, monkeypatch):
+    # BF16 with chunks of 32 tokens or more runs the flash prefill kernel,
+    # whose tiles must not move when old keys are dropped.
+    from omlx.patches.inkling2 import cache as windows
+
+    window = 48
+    model = _bf16(_inkling2_tiny(sliding_window_size=window, rel_extent=window, **dims))
+    ids = mx.random.randint(0, 300, (1, 520))
+    steps = [200, 77, 33, 1, 1]
+    steps += [(8, 3), 1, (8, 7), (6, 0), 1] * 4
+    steps += [64, 1, (8, 2)]
+    got, cache = _run_inkling2_steps(model, ids, steps)
+
+    # The reference state never drops a key; attention still masks the window.
+    adopt = windows.ArraysCache.adopt.__func__
+    monkeypatch.setattr(
+        windows.ArraysCache,
+        "adopt",
+        classmethod(lambda cls, entry, window=None: adopt(cls, entry, 4096)),
+    )
+    expected, reference = _run_inkling2_steps(model, ids, steps)
+    for a, b in zip(got, expected):
+        assert mx.array_equal(a, b)
+    held = cache[0][windows.KEYS].shape[2]
+    assert window - 1 <= held < window + 16
+    assert reference[0][windows.KEYS].shape[2] == 440  # every token of the run
+
+
+def test_inkling2_sliding_state_stays_bounded_at_release_size():
+    # Inkling 2 Mini: 8 KV heads of 128, a 1,024-token window, 48 layer
+    # visits of which 40 slide. A KVCache per visit took 187.5 KB per token.
+    from omlx.patches.inkling2 import cache as windows
+
+    window, tokens, chunk = 1024, 98304, 2048
+    state = windows.ArraysCache(window=window)
+    keys = mx.zeros((1, 8, chunk, 128), dtype=mx.bfloat16)
+    for _ in range(tokens // chunk):
+        windows.append(state, keys, keys)
+        mx.eval(state.cache[windows.KEYS], state.cache[windows.VALUES])
+    one = mx.zeros((1, 8, 1, 128), dtype=mx.bfloat16)
+    for _ in range(3):
+        windows.append(state, one, one)
+    buffer = state.__dict__["_omlx_window"]
+    assert state.cache[windows.KEYS].shape[2] < window + 16
+    assert buffer.capacity <= 2 * window + 16
+    per_key = 2 * 8 * 128 * 2
+    sliding = 40 * buffer.capacity * per_key
+    full = 8 * (tokens + 256) * per_key
+    assert sliding + full < 4.5e9
+
+
+def test_inkling2_rows_with_different_windows_decode_together():
+    from omlx.patches.inkling2 import cache as windows
+
+    model = _inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOP)
+    ids = mx.random.randint(0, 300, (2, 60))
+    lengths = (41, 9)
+    alone, expected = [], []
+    for row, n in enumerate(lengths):
+        cache = model.make_cache()
+        model(ids[row : row + 1, :n], cache=cache)
+        alone.append(cache)
+        reference = model.make_cache()
+        model(ids[row : row + 1, :n], cache=reference)
+        steps = [
+            model(ids[row : row + 1, n + t : n + t + 1], cache=reference)[:, -1]
+            for t in range(4)
+        ]
+        expected.append(mx.stack(steps, axis=1))
+    # Join the way the batch generator does: KV rows left-padded, states
+    # extended in place.
+    joined = []
+    for a, b in zip(*alone):
+        if hasattr(a, "offset"):
+            joined.append(type(a).merge([a, b]))
+        else:
+            a.extend(b)
+            joined.append(a)
+    pads = joined[0][windows.PADDING].tolist()
+    assert pads[0] == 0 and pads[1] > 0
+    tokens = mx.stack(
+        [ids[row, n : n + 4] for row, n in enumerate(lengths)], axis=0
+    )
+    steps = [model(tokens[:, t : t + 1], cache=joined)[:, -1] for t in range(4)]
+    got = mx.stack(steps, axis=1)
+    for row in range(2):
+        diff = mx.abs(got[row, :, :300] - expected[row][0, :, :300]).max().item()
+        assert diff < 1e-3
+    # A row leaves the batch without the other row's padding.
+    short = [c.extract(1) for c in joined]
+    assert short[0][windows.KEYS].shape[2] == lengths[1] + 4
+    last = ids[1:2, lengths[1] + 4 : lengths[1] + 5]
+    reference = model.make_cache()
+    model(ids[1:2, : lengths[1] + 4], cache=reference)
+    diff = mx.abs(model(last, cache=short) - model(last, cache=reference))
+    assert diff[..., :300].max().item() < 1e-3
+
+
+def test_inkling2_restored_state_decodes_and_joins_like_the_live_one():
+    # The prefix cache rebuilds a sliding state as a plain ArraysCache inside
+    # oMLX's size wrapper, without the growth buffers.
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    from omlx.cache.type_handlers import SizedArraysCache
+
+    model = _inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOP)
+    ids = mx.random.randint(0, 300, (1, 50))
+    live = model.make_cache()
+    model(ids[:, :40], cache=live)
+    restored = []
+    for entry in live:
+        if isinstance(entry, KVCache):
+            copy = KVCache()
+            copy.state = entry.state
+        else:
+            plain = ArraysCache(len(entry.cache))
+            plain.cache = list(entry.cache)
+            copy = SizedArraysCache(plain, 40)
+        restored.append(copy)
+    restored = model.restore_cache(restored)
+    expected = [model(ids[:, 40:48], cache=live, return_hidden=True).logits]
+    assert model.mtp_partial_rollback(live, 2, 7)
+    got = [model(ids[:, 40:48], cache=restored, return_hidden=True).logits]
+    assert model.mtp_partial_rollback(restored, 2, 7)
+    for t in range(43, 46):
+        expected.append(model(ids[:, t : t + 1], cache=live))
+        got.append(model(ids[:, t : t + 1], cache=restored))
+    for a, b in zip(got, expected):
+        assert mx.array_equal(a, b)
+    # Another row joins the restored one.
+    other = model.make_cache()
+    model(ids[:, :7], cache=other)
+    for a, b in zip(restored, other):
+        if not isinstance(a, KVCache):
+            a.extend(b)
+            assert a.batch_size == 2
 
 
 def test_inkling2_fused_kernels_match_reference():
@@ -718,6 +895,42 @@ def test_inkling2_flash_attention_matches_masked_sdpa(
     assert diff.item() < 1e-2
 
 
+@pytest.mark.parametrize(
+    "batch, heads, kv_heads, length, keys, window, extent, left_padding",
+    [
+        (1, 24, 8, 3, 512, 1024, 1024, None),
+        (1, 24, 8, 8, 1024, 1024, 1024, None),
+        (2, 24, 8, 1, 600, 1024, 1024, [0, 37]),
+        (1, 6, 2, 4, 300, 0, 32, None),
+        (2, 6, 2, 3, 200, 0, 32, [0, 19]),
+    ],
+)
+def test_inkling2_gqa_flash_decode_matches_masked_sdpa(
+    batch, heads, kv_heads, length, keys, window, extent, left_padding
+):
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    dim = 128
+    mx.random.seed(13)
+    q = (mx.random.normal((batch, heads, length, dim)) * 0.25).astype(mx.bfloat16)
+    shape = (batch, kv_heads, keys + 32, dim)
+    kbuf = (mx.random.normal(shape) * 0.25).astype(mx.bfloat16)
+    vbuf = (mx.random.normal(shape) * 0.25).astype(mx.bfloat16)
+    k, v = kbuf[:, :, :keys], vbuf[:, :, :keys]
+    rel = (mx.random.normal((batch, length, heads, extent)) * 0.2).astype(mx.bfloat16)
+    sink = (mx.random.normal((batch, length, heads)) * 1.5).astype(mx.bfloat16)
+    lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
+    expected = kernels._masked_attention(q, k, v, rel, sink, dim**-0.5, window, lp)
+    got = kernels.gqa_flash_decode_attention(
+        q, k, v, rel, sink, scale=dim**-0.5, window=window, left_padding=lp
+    )
+    assert got.shape == expected.shape
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max().item()
+    assert diff < 1e-2
+
+
 def test_inkling2_masked_attention_holds_one_mask_block(monkeypatch):
     # NAX hosts run full-attention prefill through the masked path; at 64K
     # keys the masks of all query blocks once took 12 GiB together.
@@ -804,3 +1017,118 @@ def test_inkling2_vision_encodes_images_independently_and_splices_tokens():
     assert mx.allclose(embeds[0, 1:3], alone.astype(embeds.dtype))
     with pytest.raises(ValueError):
         model.embed_inputs(mx.array([[image, 1]]), second, [[1, 1, 2]])
+
+
+def test_inkling2_keeps_dense_kv_when_kv_quantization_is_on(mock_tokenizer):
+    """Its attention reads dense keys: a packed cache fails on the first forward."""
+    from omlx.scheduler import Scheduler
+
+    model = _inkling2_tiny()
+    scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+    scheduler._turboquant_kv_bits = 8.0
+    scheduler._turboquant_kv_scheme = "affine8"
+    assert not scheduler._turboquant_eligible(model.make_cache())
+
+
+
+
+def test_inkling2_fp8_kv_attention_model_and_98k_budget():
+    from mlx_lm.models.cache import KVCache
+
+    from omlx.patches.inkling2 import cache as windows
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+
+    # 1. Bit-exact OCP E4M3 round-trip across all 254 finite codes + overflow clamp.
+    codes = mx.array([c for c in range(256) if (c & 0x7F) != 0x7F], dtype=mx.uint8)
+    dec = kernels.fp8_e4m3_dequantize(codes, mx.float32)
+    reenc = kernels.fp8_e4m3_quantize(dec)
+    mx.eval(dec, reenc)
+    assert mx.array_equal(codes, reenc).item()
+    clamped = kernels.fp8_e4m3_quantize(mx.array([448.0, 900.0, -900.0], dtype=mx.float32))
+    assert clamped.tolist() == [0x7E, 0x7E, 0xFE]
+
+    # 2. Realistic L2-clipped K & unit-RMS V attention parity (decode, verify, prefill, batched).
+    mx.random.seed(29)
+    hq, hkv, d, r, s = 12, 4, 128, 32, 256
+    q_raw = mx.random.normal((2, hq, 64, d))
+    q = (q_raw / (mx.sqrt(mx.sum(q_raw * q_raw, axis=-1, keepdims=True)) + 1e-6) * 10.0).astype(
+        mx.bfloat16
+    )
+    k_raw = mx.random.normal((2, hkv, s, d))
+    k = (k_raw / (mx.sqrt(mx.sum(k_raw * k_raw, axis=-1, keepdims=True)) + 1e-6) * 10.0).astype(
+        mx.bfloat16
+    )
+    v = mx.fast.rms_norm(mx.random.normal((2, hkv, s, d)), None, 1e-6).astype(mx.bfloat16)
+    rel = (mx.random.normal((2, 64, hq, r)) * 0.2).astype(mx.bfloat16)
+    sink = (mx.random.normal((2, 64, hq)) * 1.0).astype(mx.bfloat16)
+    k8, v8 = kernels.fp8_e4m3_quantize(k), kernels.fp8_e4m3_quantize(v)
+    kdq, vdq = kernels.fp8_e4m3_dequantize(k8), kernels.fp8_e4m3_dequantize(v8)
+    lp = mx.array([0, 23], dtype=mx.int32)
+    for b, length, lp_arg in ((1, 1, None), (1, 3, None), (1, 64, None), (2, 1, lp)):
+        o_bf = kernels.banded_sink_attention(
+            q[:b, :, :length], k[:b], v[:b], rel[:b, :length], sink[:b, :length],
+            scale=d**-0.5, window=0, left_padding=lp_arg,
+        )
+        o_f8 = kernels.banded_sink_attention(
+            q[:b, :, :length], k8[:b], v8[:b], rel[:b, :length], sink[:b, :length],
+            scale=d**-0.5, window=0, left_padding=lp_arg,
+        )
+        o_dq = kernels.banded_sink_attention(
+            q[:b, :, :length], kdq[:b], vdq[:b], rel[:b, :length], sink[:b, :length],
+            scale=d**-0.5, window=0, left_padding=lp_arg,
+        )
+        mx.eval(o_bf, o_f8, o_dq)
+        a, b_arr, c_arr = (
+            o_bf.astype(mx.float32).reshape(-1),
+            o_f8.astype(mx.float32).reshape(-1),
+            o_dq.astype(mx.float32).reshape(-1),
+        )
+        cos = (mx.sum(a * b_arr) / (mx.sqrt(mx.sum(a * a)) * mx.sqrt(mx.sum(b_arr * b_arr)))).item()
+        assert cos > 0.998, f"b={b} L={length} cos={cos}"
+        assert mx.abs(b_arr - c_arr).max().item() < 1e-2
+
+    # 3. End-to-end model prefill, verify + rollback, and decode under fp8_kv="all".
+    model = _bf16(_inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOP))
+    ids = mx.random.randint(0, 300, (1, 48))
+    ref_cache = model.make_cache()
+    ref_pre = model(ids[:, :32], cache=ref_cache)[:, -1, :300]
+    ref_dec = model(ids[:, 32:33], cache=ref_cache)[:, -1, :300]
+
+    model.set_fp8_kv("all")
+    fp8_cache = model.make_cache()
+    got_pre = model(ids[:, :32], cache=fp8_cache)[:, -1, :300]
+    got_ver = model(ids[:, 32:36], cache=fp8_cache, return_hidden=True).logits[:, 0, :300]
+    assert model.mtp_partial_rollback(fp8_cache, 0, 3)
+    got_next = model(ids[:, 33:34], cache=fp8_cache)[:, -1, :300]
+    mx.eval(ref_pre, ref_dec, got_pre, got_ver, got_next)
+    for kv, conv in model.model.visit_caches(fp8_cache):
+        arr = kv.keys if kv is not None else conv[windows.KEYS]
+        assert arr.dtype == mx.uint8
+    for a, b_arr in ((ref_pre, got_pre), (ref_dec, got_ver)):
+        af, bf = a.astype(mx.float32).reshape(-1), b_arr.astype(mx.float32).reshape(-1)
+        cos = (mx.sum(af * bf) / (mx.sqrt(mx.sum(af * af)) * mx.sqrt(mx.sum(bf * bf)))).item()
+        assert cos > 0.99
+
+    # 4. Release-size 98k context KV memory budget proof (<= 1.85 GB).
+    window, tokens, chunk = 1024, 98304, 2048
+    state = windows.ArraysCache(window=window)
+    z = mx.zeros((1, 8, chunk, 128), dtype=mx.uint8)
+    for _ in range(tokens // chunk):
+        windows.append(state, z, z)
+        mx.eval(state.cache[windows.KEYS], state.cache[windows.VALUES])
+    one = mx.zeros((1, 8, 1, 128), dtype=mx.uint8)
+    for _ in range(3):
+        windows.append(state, one, one)
+    buf = state.__dict__["_omlx_window"]
+    full = KVCache()
+    full.keys = mx.zeros((1, 8, tokens + 256, 128), dtype=mx.uint8)
+    full.values = mx.zeros((1, 8, tokens + 256, 128), dtype=mx.uint8)
+    total_bytes = 8 * (full.keys.nbytes + full.values.nbytes) + 40 * (
+        buf.keys.nbytes + buf.values.nbytes
+    )
+    assert total_bytes <= 1.85e9, f"98k FP8 KV exceeded 1.85 GB: {total_bytes / 1e9:.3f} GB"
+
+
