@@ -895,6 +895,42 @@ def test_inkling2_flash_attention_matches_masked_sdpa(
     assert diff.item() < 1e-2
 
 
+@pytest.mark.parametrize(
+    "batch, heads, kv_heads, length, keys, window, extent, left_padding",
+    [
+        (1, 24, 8, 3, 512, 1024, 1024, None),
+        (1, 24, 8, 8, 1024, 1024, 1024, None),
+        (2, 24, 8, 1, 600, 1024, 1024, [0, 37]),
+        (1, 6, 2, 4, 300, 0, 32, None),
+        (2, 6, 2, 3, 200, 0, 32, [0, 19]),
+    ],
+)
+def test_inkling2_gqa_flash_decode_matches_masked_sdpa(
+    batch, heads, kv_heads, length, keys, window, extent, left_padding
+):
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    dim = 128
+    mx.random.seed(13)
+    q = (mx.random.normal((batch, heads, length, dim)) * 0.25).astype(mx.bfloat16)
+    shape = (batch, kv_heads, keys + 32, dim)
+    kbuf = (mx.random.normal(shape) * 0.25).astype(mx.bfloat16)
+    vbuf = (mx.random.normal(shape) * 0.25).astype(mx.bfloat16)
+    k, v = kbuf[:, :, :keys], vbuf[:, :, :keys]
+    rel = (mx.random.normal((batch, length, heads, extent)) * 0.2).astype(mx.bfloat16)
+    sink = (mx.random.normal((batch, length, heads)) * 1.5).astype(mx.bfloat16)
+    lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
+    expected = kernels._masked_attention(q, k, v, rel, sink, dim**-0.5, window, lp)
+    got = kernels.gqa_flash_decode_attention(
+        q, k, v, rel, sink, scale=dim**-0.5, window=window, left_padding=lp
+    )
+    assert got.shape == expected.shape
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max().item()
+    assert diff < 1e-2
+
+
 def test_inkling2_masked_attention_holds_one_mask_block(monkeypatch):
     # NAX hosts run full-attention prefill through the masked path; at 64K
     # keys the masks of all query blocks once took 12 GiB together.

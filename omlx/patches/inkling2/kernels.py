@@ -316,8 +316,345 @@ _FLASH_SOURCE = """
     }
 """
 _flash_kernel = None
-# Query blocks shorter than this keep the SDPA path (decode and verify).
+# Query blocks shorter than this keep the decode/verify path.
 _FLASH_MIN_QUERIES = 32
+
+
+# GQA-packed Split-K FlashDecoding kernel for short query blocks (1 <= L < 32:
+# speculative verify and multi-stream decode). Packs all ``G * L`` queries
+# sharing one KV head into rows ``0 .. G*L - 1`` so K and V are read once per
+# KV head via 16-byte loads without copying K/V for a dummy sink row or
+# materializing an additive mask.
+_GQA_DECODE_PART_SOURCE = """
+    constexpr int BK = 16;
+    constexpr int NT = NSG * 32;
+    constexpr float LOG2E = 1.4426950408889634f;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint sg = tid / 32;
+    const uint lane = tid % 32;
+    const int sp = threadgroup_position_in_grid.x;
+    const int hkv_qt = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+
+    const int L = dims[0];
+    const int S = dims[1];
+    const int NS = dims[2];
+    const int lp = dims[3 + b];
+
+    const int n_rows = G * L;
+    const int BQ = NSG * 8;
+    const int nqt = (n_rows + BQ - 1) / BQ;
+    const int hkv = hkv_qt / nqt;
+    const int qt = hkv_qt % nqt;
+
+    const short qid = lane / 4;
+    const short fm = (qid & 4) + ((lane / 2) % 4);
+    const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    const int packed_row = qt * BQ + int(sg) * 8 + fm;
+    const bool row_ok = packed_row < n_rows;
+    const int g_idx = row_ok ? (packed_row / L) : 0;
+    const int q_pos = row_ok ? (packed_row % L) : 0;
+    const int h = hkv * G + g_idx;
+    const int a_row = S - L + q_pos;
+    const float qscale = scale[0] * LOG2E;
+
+    const int a_first = S - L;
+    const int a_last = S - 1;
+    int lo = WINDOW > 0 ? max(0, a_first - WINDOW + 1) : 0;
+    lo = max(lo, lp);
+    const int nk = max(0, a_last + 1 - lo);
+    const int per_sp = ((nk + NS - 1) / NS + BK - 1) / BK * BK;
+    const int k_start = lo + sp * per_sp;
+    const int k_end = min(a_last + 1, k_start + per_sp);
+
+    constexpr int LDK = BK + 8;
+    constexpr int LDV = D + 8;
+    threadgroup half Ks[D * LDK];
+    threadgroup half Vs[BK * LDV];
+
+    simdgroup_half8x8 Qf[D / 8];
+    for (int db = 0; db < D / 8; ++db) {
+        float2 qv = float2(0.0f);
+        if (row_ok) {
+            const device T* qp = q + b * q_strides[0] + h * q_strides[1]
+                + q_pos * q_strides[2] + (db * 8 + fn) * q_strides[3];
+            qv = float2(float(qp[0]), float(qp[q_strides[3]]));
+        }
+        Qf[db].thread_elements()[0] = half(qv.x);
+        Qf[db].thread_elements()[1] = half(qv.y);
+    }
+    simdgroup_float8x8 Of[D / 8];
+    for (int db = 0; db < D / 8; ++db) {
+        Of[db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float m = (SINGLE && row_ok) ? float(sink[(b * L + q_pos) * HQ + h]) * LOG2E : -INFINITY;
+    float l = SINGLE ? 1.0f : 0.0f;
+    const device T* relp = rel + ((size_t)(b * L + q_pos) * HQ + h) * R;
+
+    const device T* kb_ptr = k + b * k_strides[0] + hkv * k_strides[1];
+    const device T* vb_ptr = v + b * v_strides[0] + hkv * v_strides[1];
+    const bool vec_kv = (k_strides[3] == 1 && v_strides[3] == 1
+        && (k_strides[2] % 8 == 0) && (v_strides[2] % 8 == 0));
+
+    for (int k0 = k_start; k0 < k_end; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (vec_kv) {
+            for (int c = int(tid); c < BK * D / 8; c += NT) {
+                const int r = c / (D / 8);
+                const int col = (c % (D / 8)) * 8;
+                const int key = k0 + r;
+                uint4 kw = uint4(0);
+                uint4 vw = uint4(0);
+                if (key < k_end) {
+                    kw = *(const device uint4*)(kb_ptr + key * k_strides[2] + col);
+                    vw = *(const device uint4*)(vb_ptr + key * v_strides[2] + col);
+                }
+                threadgroup half* kd = Ks + col * LDK + r;
+                threadgroup half* vd = Vs + r * LDV + col;
+                for (int j = 0; j < 4; ++j) {
+                    kd[(2 * j) * LDK] = half(as_type<float>(kw[j] << 16));
+                    kd[(2 * j + 1) * LDK] = half(as_type<float>(kw[j] & 0xFFFF0000u));
+                    vd[2 * j] = half(as_type<float>(vw[j] << 16));
+                    vd[2 * j + 1] = half(as_type<float>(vw[j] & 0xFFFF0000u));
+                }
+            }
+        } else {
+            for (int c = int(tid); c < BK * D; c += NT) {
+                const int r = c / D;
+                const int col = c % D;
+                const int key = k0 + r;
+                float kv = 0.0f;
+                float vv = 0.0f;
+                if (key < k_end) {
+                    kv = float(kb_ptr[key * k_strides[2] + col * k_strides[3]]);
+                    vv = float(vb_ptr[key * v_strides[2] + col * v_strides[3]]);
+                }
+                Ks[col * LDK + r] = half(kv);
+                Vs[r * LDV + col] = half(vv);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (qt * BQ + int(sg) * 8 >= n_rows) {
+            continue;
+        }
+
+        simdgroup_float8x8 Sf[BK / 8];
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            Sf[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int db = 0; db < D / 8; ++db) {
+                simdgroup_half8x8 Kt;
+                simdgroup_load(Kt, Ks + db * 8 * LDK + kb * 8, LDK);
+                simdgroup_multiply_accumulate(Sf[kb], Qf[db], Kt, Sf[kb]);
+            }
+        }
+
+        float rmax = -INFINITY;
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            for (int e = 0; e < 2; ++e) {
+                const int key = k0 + kb * 8 + fn + e;
+                const int d = a_row - key;
+                const bool vis = row_ok && key < k_end && d >= 0 && key >= lp
+                    && (WINDOW == 0 || d < WINDOW);
+                float s = Sf[kb].thread_elements()[e] * qscale;
+                if (vis) {
+                    if (d < R) {
+                        s += float(relp[d]) * LOG2E;
+                    }
+                } else {
+                    s = -INFINITY;
+                }
+                Sf[kb].thread_elements()[e] = s;
+                rmax = max(rmax, s);
+            }
+        }
+        rmax = max(rmax, simd_shuffle_xor(rmax, 1));
+        rmax = max(rmax, simd_shuffle_xor(rmax, 8));
+        const float m_new = max(m, rmax);
+        const float factor = (m == -INFINITY || m_new == -INFINITY)
+            ? 0.0f : fast::exp2(m - m_new);
+        float rsum = 0.0f;
+        simdgroup_half8x8 Pf[BK / 8];
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            for (int e = 0; e < 2; ++e) {
+                const float sv = Sf[kb].thread_elements()[e];
+                const float p = (sv == -INFINITY) ? 0.0f : fast::exp2(sv - m_new);
+                Pf[kb].thread_elements()[e] = half(p);
+                rsum += p;
+            }
+        }
+        rsum += simd_shuffle_xor(rsum, 1);
+        rsum += simd_shuffle_xor(rsum, 8);
+        l = l * factor + rsum;
+        m = m_new;
+        for (int db = 0; db < D / 8; ++db) {
+            Of[db].thread_elements()[0] *= factor;
+            Of[db].thread_elements()[1] *= factor;
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                simdgroup_half8x8 Vm;
+                simdgroup_load(Vm, Vs + kb * 8 * LDV + db * 8, LDV);
+                simdgroup_multiply_accumulate(Of[db], Pf[kb], Vm, Of[db]);
+            }
+        }
+    }
+
+    if (row_ok) {
+        if (SINGLE) {
+            const float inv = 1.0f / l;
+            size_t base_o = (((size_t)b * HQ + h) * L + q_pos) * D;
+            for (int db = 0; db < D / 8; ++db) {
+                out_o[base_o + db * 8 + fn] = OT(Of[db].thread_elements()[0] * inv);
+                out_o[base_o + db * 8 + fn + 1] = OT(Of[db].thread_elements()[1] * inv);
+            }
+        } else {
+            size_t base_ml = (((size_t)b * HQ + h) * L + q_pos) * NS + sp;
+            if (fn == 0) {
+                out_m[base_ml] = m;
+                out_l[base_ml] = l;
+            }
+            size_t base_o = base_ml * D;
+            for (int db = 0; db < D / 8; ++db) {
+                out_o[base_o + db * 8 + fn] = OT(Of[db].thread_elements()[0]);
+                out_o[base_o + db * 8 + fn + 1] = OT(Of[db].thread_elements()[1]);
+            }
+        }
+    }
+"""
+
+_GQA_DECODE_RED_SOURCE = """
+    constexpr float LOG2E = 1.4426950408889634f;
+    const uint lane = thread_index_in_simdgroup;
+    const int idx = threadgroup_position_in_grid.x;
+    const int q_pos = idx % L;
+    const int bh = idx / L;
+    const int h = bh % HQ;
+    const int b = bh / HQ;
+
+    constexpr int D4 = D / 32;
+    float m = float(sink[(b * L + q_pos) * HQ + h]) * LOG2E;
+    float l = 1.0f;
+    float ov[D4];
+    for (int i = 0; i < D4; ++i) ov[i] = 0.0f;
+
+    size_t ml_base = (size_t)idx * NS;
+    for (int sp = 0; sp < NS; ++sp) {
+        float lp = part_l[ml_base + sp];
+        if (lp == 0.0f) continue;
+        float mp = part_m[ml_base + sp];
+        float m_new = max(m, mp);
+        float a0 = fast::exp2(m - m_new);
+        float a1 = fast::exp2(mp - m_new);
+        l = l * a0 + lp * a1;
+        m = m_new;
+        const device float* pp = part_o + (ml_base + sp) * D;
+        for (int i = 0; i < D4; ++i) {
+            ov[i] = ov[i] * a0 + pp[int(lane) * D4 + i] * a1;
+        }
+    }
+    float inv = 1.0f / l;
+    device T* dst = out + (size_t)idx * D;
+    for (int i = 0; i < D4; ++i) {
+        dst[int(lane) * D4 + i] = T(ov[i] * inv);
+    }
+"""
+
+_gqa_decode_part_kernel = None
+_gqa_decode_red_kernel = None
+
+
+def gqa_flash_decode_attention(
+    q, k, v, rel, sink, *, scale, window, left_padding=None
+):
+    """Fused Split-K GQA-packed banded-sink attention for BF16 verify/decode."""
+    global _gqa_decode_part_kernel, _gqa_decode_red_kernel
+    b, hq, length, d = q.shape
+    hkv, s = k.shape[1], k.shape[2]
+    g = hq // hkv
+    r = rel.shape[-1]
+    if _gqa_decode_part_kernel is None:
+        _gqa_decode_part_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_gqa_decode_part",
+            input_names=["q", "k", "v", "rel", "sink", "dims", "scale"],
+            output_names=["out_o", "out_m", "out_l"],
+            source=_GQA_DECODE_PART_SOURCE,
+            ensure_row_contiguous=False,
+        )
+        _gqa_decode_red_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_gqa_decode_red",
+            input_names=["part_o", "part_m", "part_l", "sink"],
+            output_names=["out"],
+            source=_GQA_DECODE_RED_SOURCE,
+        )
+    n_rows = g * length
+    nsg = min(4, max(1, (n_rows + 7) // 8))
+    bq = nsg * 8
+    nqt = (n_rows + bq - 1) // bq
+    # Match bounded vs unbounded sliding caches identically: once keys drop,
+    # s >= window + length - 1 so nk_est is invariant to dropped prefix keys.
+    nk_est = min(s, window + length - 1) if window else s
+    base_tgs = b * hkv * nqt
+    ns = (
+        1
+        if nk_est <= 128
+        else min(
+            32,
+            max(1, min((nk_est + 63) // 64, (64 + base_tgs - 1) // base_tgs)),
+        )
+    )
+    if nk_est >= 512 and ns < 8 and base_tgs <= 16:
+        ns = 8
+    if nk_est >= 2048 and ns < 16 and base_tgs <= 16:
+        ns = 16
+    lp = (
+        left_padding.astype(mx.int32)
+        if left_padding is not None
+        else mx.zeros((b,), dtype=mx.int32)
+    )
+    dims = mx.concatenate([mx.array([length, s, ns], dtype=mx.int32), lp])
+    sc = mx.array([scale], dtype=mx.float32)
+    sink_f32 = mx.contiguous(sink.astype(mx.float32))
+    rel_c = mx.contiguous(rel)
+    tpl = [
+        ("T", q.dtype),
+        ("OT", q.dtype if ns == 1 else mx.float32),
+        ("D", d),
+        ("HQ", hq),
+        ("G", g),
+        ("R", r),
+        ("WINDOW", int(window)),
+        ("NSG", nsg),
+        ("SINGLE", 1 if ns == 1 else 0),
+    ]
+    nt = nsg * 32
+    if ns == 1:
+        out, _, _ = _gqa_decode_part_kernel(
+            inputs=[q, k, v, rel_c, sink_f32, dims, sc],
+            template=tpl,
+            grid=(nt, hkv * nqt, b),
+            threadgroup=(nt, 1, 1),
+            output_shapes=[(b, hq, length, d), (1,), (1,)],
+            output_dtypes=[q.dtype, mx.float32, mx.float32],
+        )
+        return out
+    po, pm, pl = _gqa_decode_part_kernel(
+        inputs=[q, k, v, rel_c, sink_f32, dims, sc],
+        template=tpl,
+        grid=(ns * nt, hkv * nqt, b),
+        threadgroup=(nt, 1, 1),
+        output_shapes=[
+            (b, hq, length, ns, d),
+            (b, hq, length, ns),
+            (b, hq, length, ns),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    return _gqa_decode_red_kernel(
+        inputs=[po, pm, pl, sink_f32],
+        template=[("T", q.dtype), ("D", d), ("HQ", hq), ("L", length), ("NS", ns)],
+        grid=(b * hq * length * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(b, hq, length, d)],
+        output_dtypes=[q.dtype],
+    )[0]
 
 
 def _use_flash(length: int, window: int) -> bool:
@@ -395,11 +732,21 @@ def banded_sink_attention(
     sink: [B, L, Hq] logits of a zero-value sink. ``window`` > 0 limits
     keys to d < window (sliding layers use window == R).
     """
-    b, length = q.shape[0], q.shape[2]
+    b, hq, length, d = q.shape
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
     if q.dtype == mx.bfloat16 and _use_flash(length, window):
         return flash_banded_attention(
+            q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
+        )
+    if (
+        q.dtype == mx.bfloat16
+        and length < _FLASH_MIN_QUERIES
+        and mx.default_device() == mx.gpu
+        and d % 32 == 0
+        and hq % k.shape[1] == 0
+    ):
+        return gqa_flash_decode_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )
     return _masked_attention(q, k, v, rel, sink, scale, window, left_padding)
