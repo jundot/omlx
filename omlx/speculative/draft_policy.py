@@ -3,7 +3,7 @@
 
 Each step the policy maximizes ``E[tokens committed] / T(step)`` over
 
-    none (k = 0) | suffix lookup with k <= its proposal | the drafter with k <= its block
+    none (k = 0) | suffix lookup, k <= its proposal | the drafter, k <= its block
 
 from running estimates of acceptance and a measured cost of a ``k + 1`` row
 verify pass. It only chooses which drafts are verified: the target checks every

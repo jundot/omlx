@@ -5209,18 +5209,19 @@ def _run_verify_cycle_chain(
                 was_warmup=was_warmup,
             )
         if policy is not None:
-            source = _draft_policy.Source
+            source = _draft_policy.Source.NONE
+            if copy_cycle:
+                source = _draft_policy.Source.LOOKUP
+            elif k:
+                source = _draft_policy.Source.DRAFTER
             policy.observe(
-                _draft_policy.Choice(
-                    source.LOOKUP if copy_cycle else source.DRAFTER if k else source.NONE,
-                    k,
-                    match=cycle_match,
-                ),
+                _draft_policy.Choice(source, k, match=cycle_match),
                 # What the target accepted, before commit clamps shortened it.
                 m_gpu,
                 cycle_ms if own_forward and not untimed and not keepalive else None,
                 conf=cycle_conf,
-                drafted=(k > 0 and not copy_cycle) or (copy_cycle and cycle_lookup_drafted),
+                # A lookup window whose block was drafted ahead paid for it too.
+                drafted=cycle_lookup_drafted if copy_cycle else k > 0,
             )
         if seed is not None:
             mx.random.seed(seed)

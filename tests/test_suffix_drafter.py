@@ -25,7 +25,10 @@ def _reference(hist, max_k, min_match=3, max_match=32, ways=4, long_order=8):
             if p >= cur:
                 continue
             length = 0
-            while length < max_match and length <= p and hist[p - length] == hist[cur - length]:
+            while (
+                length < min(max_match, p + 1)
+                and hist[p - length] == hist[cur - length]
+            ):
                 length += 1
             if length > best_len:
                 best_end, best_len = p, length

@@ -1286,7 +1286,9 @@ def _true_continuation(monkeypatch, prompt, expected, wrong_every=3):
 
 
 @pytest.mark.parametrize(
-    "fixed,rows", [(True, None), (False, None), (True, 16)], ids=["fixed", "adaptive", "wide"]
+    "fixed,rows",
+    [(True, None), (False, None), (True, 16)],
+    ids=["fixed", "adaptive", "wide"],
 )
 def test_lookup_and_drafter_windows_alternate_without_drift(monkeypatch, fixed, rows):
     """Lookup and DSpark windows in any order emit plain decoding's tokens,
