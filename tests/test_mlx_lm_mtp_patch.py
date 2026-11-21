@@ -20,6 +20,8 @@ from mlx_lm.generate_utils import BatchCounters
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.models import qwen3, qwen3_5
 from mlx_lm.models.cache import KVCache, make_prompt_cache
+from mlx_vlm.models import flint
+from mlx_vlm.models.flint.config import ModelConfig as FlintConfig
 from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
 from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
 
@@ -3909,6 +3911,34 @@ def _tiny_laguna(seed=0):
     return model
 
 
+def _tiny_flint(seed=0):
+    """Six-layer Flint target behind the VLM engine's adapter, as served;
+    its sliding window wraps within a test."""
+    from omlx.models.vlm import VLMModelAdapter
+
+    mx.random.seed(seed)
+    model = flint.Model(
+        FlintConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=64,
+            max_position_embeddings=512,
+            sliding_window=6,
+            layer_types=["full_attention"] + ["sliding_attention"] * 5,
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+        )
+    )
+    mx.eval(model.parameters())
+    return VLMModelAdapter(model)
+
+
 def _tiny_qwen35_text():
     assert qwen35_model.apply()
     mx.random.seed(1)
@@ -4019,20 +4049,23 @@ def test_text_targets_return_drafter_layer_captures(family, apply_drafter_target
     assert uids == (3,) and caps[0].shape[:2] == (1, 1)
 
 
-@pytest.mark.parametrize("make_target", [_tiny_qwen3, _tiny_laguna])
+@pytest.mark.parametrize("make_target", [_tiny_qwen3, _tiny_laguna, _tiny_flint])
 def test_plain_attention_target_drafts_like_plain_decode(
     monkeypatch, apply_drafter_target, make_target
 ):
-    """A Qwen3 or Laguna target with a DFlash2 drafter emits the plain decode
-    tokens, and rejected verify rows are trimmed from the KV caches, also
-    after Laguna's sliding window wraps."""
+    """A Qwen3, Laguna or Flint target with a DFlash2 drafter emits the plain
+    decode tokens, and rejected verify rows are trimmed from the KV caches,
+    also after Laguna's or Flint's sliding window wraps."""
     prompts, limits = [[1, 2, 3, 4]], [24]
     plain_model = make_target(seed=3)
     plain_model._omlx_mtp_decode_enabled = False
     expected, _ = generate(plain_model, prompts, limits)
 
     model = make_target(seed=3)
-    apply_drafter_target(model)
+    # The VLM engine runs Flint through its adapter: the hooks and the
+    # drafter go on the language model, the drafter binds the full model.
+    target = getattr(model, "_language_model", model)
+    apply_drafter_target(target)
     config = DFlash2Config.from_dict(
         {
             "model_type": "qwen3",
@@ -4070,18 +4103,18 @@ def test_plain_attention_target_drafts_like_plain_decode(
         ],
         strict=False,
     )
-    draft.bind(model)
+    draft.bind(getattr(model, "_vlm_model", model))
     drafter = dd.DFlashDrafter(draft, block_size=4, source_path="tiny", adaptive=False)
-    dd.attach_drafter(model, drafter)
-    assert model._omlx_mtp_multi_request is False
+    dd.attach_drafter(target, drafter)
+    assert target._omlx_mtp_multi_request is False
     trims = []
-    rollback = type(model).mtp_partial_rollback
+    rollback = type(target).mtp_partial_rollback
 
     def counted(self, cache, accepted, num_drafts):
         trims.append(num_drafts - accepted)
         return rollback(self, cache, accepted, num_drafts)
 
-    monkeypatch.setattr(type(model), "mtp_partial_rollback", counted)
+    monkeypatch.setattr(type(target), "mtp_partial_rollback", counted)
     output, _ = generate(model, prompts, limits)
     assert output == expected
     assert any(trim > 0 for trim in trims)

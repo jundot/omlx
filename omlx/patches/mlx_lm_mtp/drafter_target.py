@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Block-drafter hooks for plain-attention target models.
 
-Qwen3, Qwen3-MoE, Laguna and MiMo V2 (mlx-lm) and Muse Glimmer (mlx-vlm)
-checkpoints draft with DFlash on the batched engines. Their forward returns
+Qwen3, Qwen3-MoE, Laguna and MiMo V2 (mlx-lm) and Muse Glimmer and Flint
+(mlx-vlm) checkpoints draft with DFlash on the batched engines. Their forward returns
 logits only, so this patch lets one forward also return chosen decoder-layer
 outputs (prefill seeding and verify), feeds the drafter from ordinary
 one-token steps, and rolls a rejected verify back by trimming the KV caches.
