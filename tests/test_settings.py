@@ -311,8 +311,17 @@ class TestModelSettings:
             "model_dirs": ["/models"],
             "model_dir": "/models",
             "model_fallback": False,
+            "model_fallback_target": "default",
             "hide_helper_models": False,
         }
+
+    def test_model_fallback_target_roundtrip_and_validation(self):
+        """model_fallback_target round-trips; unknown values fall back to default."""
+        loaded = ModelSettings.from_dict({"model_fallback_target": "loaded"})
+        assert loaded.model_fallback_target == "loaded"
+        assert ModelSettings.from_dict(loaded.to_dict()).model_fallback_target == "loaded"
+        bad = ModelSettings.from_dict({"model_fallback_target": "bogus"})
+        assert bad.model_fallback_target == "default"
 
     def test_from_dict(self):
         """Test creation from dictionary."""

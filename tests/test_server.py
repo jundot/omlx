@@ -915,6 +915,64 @@ class TestModelFallback:
             await get_engine("unknown-model", EngineType.LLM)
         assert exc_info.value.status_code == 404
 
+    def _setup_loaded_pool(self, loaded):
+        """Pool where `loaded` maps model_id -> (model_type, size); default is not loaded."""
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+        pool.get_loaded_model_ids.return_value = list(loaded)
+        pool.get_entry.side_effect = lambda mid: (
+            MagicMock(model_type=loaded[mid][0], estimated_size=loaded[mid][1])
+            if mid in loaded
+            else None
+        )
+        engines = {mid: MagicMock(name=mid) for mid in [*loaded, "default-model"]}
+
+        async def mock_get_engine(model_id, **_kw):
+            if model_id in engines:
+                return engines[model_id]
+            raise ModelNotFoundError(model_id, list(engines))
+
+        pool.get_engine = AsyncMock(side_effect=mock_get_engine)
+        self._state.engine_pool = pool
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_fallback_loaded_prefers_largest_loaded_llm(self):
+        """target=loaded serves the largest loaded LLM, not the default."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = True
+        self._state.global_settings.model.model_fallback_target = "loaded"
+        self._state.default_model = "default-model"
+        pool = self._setup_loaded_pool(
+            {"small": ("llm", 10), "big": ("vlm", 100), "emb": ("embedding", 999)}
+        )
+
+        await get_engine("unknown-model", EngineType.LLM)
+        assert pool.get_engine.await_args_list[-1].args[0] == "big"
+
+    @pytest.mark.asyncio
+    async def test_fallback_loaded_uses_default_when_nothing_loaded(self):
+        """target=loaded falls back to the default model if nothing is loaded."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = True
+        self._state.global_settings.model.model_fallback_target = "loaded"
+        self._state.default_model = "default-model"
+        pool = self._setup_loaded_pool({})
+
+        await get_engine("unknown-model", EngineType.LLM)
+        assert pool.get_engine.await_args_list[-1].args[0] == "default-model"
+
+    @pytest.mark.asyncio
+    async def test_fallback_default_target_ignores_loaded(self):
+        """target=default keeps the original behavior even when others are loaded."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = True
+        self._state.default_model = "default-model"
+        pool = self._setup_loaded_pool({"big": ("llm", 100)})
+
+        await get_engine("unknown-model", EngineType.LLM)
+        assert pool.get_engine.await_args_list[-1].args[0] == "default-model"
+
     @pytest.mark.asyncio
     async def test_fallback_not_applied_to_embedding(self):
         """Fallback should not apply to embedding engine type."""

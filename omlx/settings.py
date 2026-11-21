@@ -281,6 +281,10 @@ class ModelSettings:
     model_dirs: list[str] = field(default_factory=list)  # [] means ~/.omlx/models
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
     model_fallback: bool = False  # Use default model when requested model not found
+    # Which model model_fallback serves: "default" (the default model) or
+    # "loaded" (the largest already-loaded LLM, avoiding a new model load;
+    # falls back to the default model when nothing is loaded).
+    model_fallback_target: Literal["default", "loaded"] = "default"
     hide_helper_models: bool = (
         False  # Hide dFlash/Assistant/Draft helper models from /v1/models
     )
@@ -319,6 +323,7 @@ class ModelSettings:
             "model_dirs": self.model_dirs,
             "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
             "model_fallback": self.model_fallback,
+            "model_fallback_target": self.model_fallback_target,
             "hide_helper_models": self.hide_helper_models,
         }
 
@@ -333,6 +338,11 @@ class ModelSettings:
             model_dirs=model_dirs,
             model_dir=data.get("model_dir"),
             model_fallback=data.get("model_fallback", False),
+            model_fallback_target=(
+                data.get("model_fallback_target")
+                if data.get("model_fallback_target") in ("default", "loaded")
+                else "default"
+            ),
             hide_helper_models=data.get("hide_helper_models", False),
         )
 
