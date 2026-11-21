@@ -6,19 +6,24 @@ a chain from its root, so the root is always the least recently used entry
 of the chain, and prefix matching stops at the first missing block. One
 eviction therefore makes the whole rest of the chain unreachable while it
 keeps occupying the hot tier. chain_aware_lru only evicts entries no other
-hot entry builds on (leaves), unreachable orphans first, and refuses to
-admit a block rather than break a chain.
+hot entry builds on (leaves), orphans (whose parent is no longer hot) first,
+and refuses to admit a block rather than break a chain.
 """
 
 from __future__ import annotations
 
 import random
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from omlx.cache.paged_ssd_cache import PagedSSDCacheManager, SharedHotCacheBudget
+from omlx.cache.paged_ssd_cache import (
+    PagedSSDCacheManager,
+    SharedHotCacheBudget,
+    _ChainLRUIndex,
+)
 from omlx.settings import GlobalSettings
 
 try:
@@ -189,8 +194,86 @@ def _check_invariants(mgr):
         if p is not None:
             expected_children[p] = expected_children.get(p, 0) + 1
     assert mgr._hot_children == expected_children
-    if mgr._hot_cache_budget is not None:
-        assert mgr._hot_cache_budget.total_bytes == mgr._hot_cache_total_bytes
+    index = mgr._hot_chain_index
+    if index is not None:
+        # The index shadows the hot tier: same keys, same LRU order.
+        assert sorted(index._ticks, key=index._ticks.get) == list(entries)
+    budget = mgr._hot_cache_budget
+    if budget is not None:
+        assert budget.total_bytes == mgr._hot_cache_total_bytes
+        if budget._chain_index is not None:
+            ticks = budget._chain_index._ticks
+            assert sorted(ticks, key=ticks.get) == list(budget._entries)
+
+
+# --- reference: the scan the index replaced ---------------------------------
+
+
+def _scan_local_victim(mgr, skip=None, skip_staging=False):
+    """chain_aware_lru's victim found by walking the hot tier in LRU order:
+    the oldest orphan, else the oldest leaf."""
+    skip = skip or set()
+    hot = mgr._hot_cache
+    first_leaf = None
+    for block_hash, entry in hot.items():
+        if block_hash in skip or (skip_staging and entry.get("staging")):
+            continue
+        parent = entry["block_metadata"].parent_hash
+        if parent is not None and parent not in hot:
+            return block_hash
+        if first_leaf is None and not mgr._hot_children.get(block_hash, 0):
+            first_leaf = block_hash
+    return first_leaf
+
+
+def _scan_budget_victim(budget, protected_hashes=None):
+    """The same walk over the shared budget's global LRU order. Victims
+    chosen earlier in a loop are already out of ``budget._entries``."""
+    protected_hashes = protected_hashes or set()
+    entries = budget._entries
+
+    def parent_key(key):
+        owner = entries[key].owner
+        if not owner._hot_chain_aware:
+            return None
+        parent = owner._hot_cache[key[1]]["block_metadata"].parent_hash
+        return None if parent is None else (key[0], parent)
+
+    parents = {key: parent_key(key) for key in entries}
+    has_child = {p for p in parents.values() if p is not None}
+    first_leaf = None
+    for key in entries:
+        if key[1] in protected_hashes:
+            continue
+        if parents[key] is not None and parents[key] not in entries:
+            return key
+        if first_leaf is None and key not in has_child:
+            first_leaf = key
+    return first_leaf
+
+
+def _compare_pickers_with_scan(mgr):
+    """Make every chain_aware_lru pick also run the reference scan and fail
+    on any difference."""
+    if mgr._hot_chain_index is not None and mgr._hot_cache_budget is None:
+        indexed = mgr._hot_pick_victim_locked
+
+        def local(skip=None, skip_staging=False):
+            got = indexed(skip=skip, skip_staging=skip_staging)
+            assert got == _scan_local_victim(mgr, skip, skip_staging)
+            return got
+
+        mgr._hot_pick_victim_locked = local
+    budget = mgr._hot_cache_budget
+    if budget is not None and budget._chain_index is not None:
+        indexed_budget = budget._pick_victim_locked
+
+        def shared(protected_hashes=None):
+            got = indexed_budget(protected_hashes)
+            assert got == _scan_budget_victim(budget, protected_hashes)
+            return got
+
+        budget._pick_victim_locked = shared
 
 
 @pytest.mark.parametrize("policy", ["lru", "chain_aware_lru"])
@@ -227,6 +310,7 @@ def test_random_operation_sequences(tmp_path, policy, budget):
             original(block_hash, entry)
 
         mgr._handle_hot_cache_eviction = checked
+        _compare_pickers_with_scan(mgr)
         keys: list[bytes] = []
         ops = []
         for step in range(150):
@@ -622,3 +706,86 @@ def test_ssd_on_every_block_stays_loadable(tmp_path, policy, write_through, budg
     for value, (key, _parent) in enumerate(chain):
         _assert_block_value(reopened, key, value)
     reopened.close()
+
+
+
+# --- _ChainLRUIndex: same victims as the scan, without scanning ----------------
+
+
+def _brute_force_pick(order, parents, skip):
+    first_leaf = None
+    for key in order:
+        if skip(key):
+            continue
+        parent = parents[key]
+        if parent is not None and parent not in order:
+            return key
+        if first_leaf is None and not any(parents[c] == key for c in order):
+            first_leaf = key
+    return first_leaf
+
+
+def test_chain_index_matches_brute_force():
+    """Random add/touch/remove/pick sequences, including missing parents,
+    self-parents, re-added parents and skipped keys."""
+    for seed in range(150):
+        rng = random.Random(seed)
+        index, order, parents = _ChainLRUIndex(), OrderedDict(), {}
+        names = [f"k{i}" for i in range(rng.choice([5, 12, 30]))]
+        for step in range(300):
+            op = rng.choices(["add", "touch", "remove", "pick"], [40, 25, 15, 30])[0]
+            key = rng.choice(names)
+            if op == "add":
+                parent = rng.choice(names + [None, None, "gone", key])
+                order.pop(key, None)
+                order[key] = True
+                parents[key] = parent
+                index.add(key, parent)
+            elif op == "touch" and key in order:
+                order.move_to_end(key)
+                index.touch(key)
+            elif op == "remove":
+                order.pop(key, None)
+                index.remove(key)
+            elif op == "pick":
+                protected = set(rng.sample(names, rng.randint(0, 3)))
+                skip = (lambda k: k in protected) if protected else None
+                want = _brute_force_pick(order, parents, skip or (lambda k: False))
+                got = index.pick(skip=skip)
+                assert got == want, f"seed={seed} step={step}"
+                if got is not None and rng.random() < 0.5:
+                    order.pop(got)
+                    index.remove(got)
+            assert len(index) == len(order)
+
+
+@pytest.mark.parametrize("budget_path", [False, True], ids=["local", "budget"])
+def test_victim_pick_does_not_scan_the_tier(tmp_path, monkeypatch, budget_path):
+    """One chain filling a 10,000-entry tier: its only leaf is the newest
+    entry, so a scan walked every entry on every admission. The index
+    examines a few heap items per pick, whatever the tier size."""
+    n = 10_000
+    mgr = _manager(tmp_path, "chain_aware_lru", cap_entries=n, budget=budget_path)
+    chain = _chain("c", n + 50)
+    for key, parent in chain[:n]:
+        _put(mgr, key, parent)
+    assert len(mgr._hot_cache) == n
+
+    examined = {"n": 0}
+    is_leaf = _ChainLRUIndex._is_leaf
+
+    def counting_is_leaf(self, key):
+        examined["n"] += 1
+        return is_leaf(self, key)
+
+    # Building the chain left one stale leaf item per entry (each block
+    # stopped being a leaf when its child arrived). The first pick drops them
+    # in one pass, once: amortized O(1) per entry. Count after that.
+    key, parent = chain[n]
+    _put(mgr, key, parent)
+    monkeypatch.setattr(_ChainLRUIndex, "_is_leaf", counting_is_leaf)
+    for key, parent in chain[n + 1 :]:
+        _put(mgr, key, parent)  # refused: the chain's prefix stays hot
+    assert list(mgr._hot_cache)[:3] == [b"c0", b"c1", b"c2"]
+    assert mgr._stats["hot_cache_admission_refusals"] == 50
+    assert examined["n"] < 49 * 20, examined["n"]

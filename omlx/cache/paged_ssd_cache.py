@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import hashlib
+import heapq
 import json
 import logging
 import os
@@ -1595,6 +1596,131 @@ class _HotCacheBudgetEntry:
     size_bytes: int
 
 
+class _ChainLRUIndex:
+    """chain_aware_lru's next victim without scanning the hot tier.
+
+    chain_aware_lru evicts the least recently used orphan (an entry whose
+    parent is not in the tier), or if there is none, the least recently used
+    leaf (an entry no other entry in the tier builds on). Finding them by
+    walking the tier in LRU order costs O(entries) per eviction; when one
+    chain fills the tier, its only leaf is the newest entry, so every admission
+    walks the whole tier.
+
+    This index gives each entry a tick for its LRU position and keeps two
+    min-heaps of (tick, key), one of orphans and one of leaves. Items go stale
+    when an entry is touched or removed, gains a child, or gets its parent
+    back. Stale items are dropped when they reach the top of a heap, so each
+    operation costs O(log entries) amortized.
+
+    It shadows one OrderedDict: call add() for an insert at the end, touch()
+    for move_to_end() and remove() for a pop, so tick order is that dict's
+    order. Keys are any hashable; a parent key of None means a chain root.
+    Not thread-safe: callers hold the lock that guards the OrderedDict.
+    """
+
+    __slots__ = ("_tick", "_ticks", "_parent", "_children", "_orphans", "_leaves")
+
+    def __init__(self) -> None:
+        self._tick = 0
+        self._ticks: dict[Any, int] = {}
+        self._parent: dict[Any, Any] = {}
+        # parent key -> keys in the index that build on it. A parent that has
+        # left the index keeps its entry while it still has children.
+        self._children: dict[Any, set] = {}
+        self._orphans: list[tuple[int, Any]] = []
+        self._leaves: list[tuple[int, Any]] = []
+
+    def __len__(self) -> int:
+        return len(self._ticks)
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self._ticks
+
+    def clear(self) -> None:
+        self._ticks.clear()
+        self._parent.clear()
+        self._children.clear()
+        self._orphans.clear()
+        self._leaves.clear()
+
+    def _is_orphan(self, key: Any) -> bool:
+        parent = self._parent.get(key)
+        return parent is not None and parent not in self._ticks
+
+    def _is_leaf(self, key: Any) -> bool:
+        return not self._children.get(key)
+
+    def _push(self, key: Any) -> None:
+        item = (self._ticks[key], key)
+        if self._is_orphan(key):
+            heapq.heappush(self._orphans, item)
+        if self._is_leaf(key):
+            heapq.heappush(self._leaves, item)
+        if len(self._orphans) + len(self._leaves) > 4 * len(self._ticks) + 64:
+            self._rebuild()
+
+    def _rebuild(self) -> None:
+        """Drop stale heap items (bounds memory when touches outpace picks)."""
+        self._orphans = [(t, k) for k, t in self._ticks.items() if self._is_orphan(k)]
+        self._leaves = [(t, k) for k, t in self._ticks.items() if self._is_leaf(k)]
+        heapq.heapify(self._orphans)
+        heapq.heapify(self._leaves)
+
+    def add(self, key: Any, parent: Any = None) -> None:
+        if key in self._ticks:
+            self.remove(key)
+        self._tick += 1
+        self._ticks[key] = self._tick
+        self._parent[key] = parent
+        if parent is not None:
+            # The parent stops being a leaf; its heap item is now stale.
+            self._children.setdefault(parent, set()).add(key)
+        # Children already in the index stop being orphans (stale too).
+        self._push(key)
+
+    def touch(self, key: Any) -> None:
+        if key in self._ticks:
+            self._tick += 1
+            self._ticks[key] = self._tick
+            self._push(key)
+
+    def remove(self, key: Any) -> None:
+        if self._ticks.pop(key, None) is None:
+            return
+        parent = self._parent.pop(key)
+        if parent is not None:
+            siblings = self._children.get(parent)
+            if siblings is not None:
+                siblings.discard(key)
+                if not siblings:
+                    del self._children[parent]
+                    if parent in self._ticks:
+                        self._push(parent)  # became a leaf
+        for child in self._children.get(key, ()):
+            self._push(child)  # became an orphan
+
+    def pick(self, skip: Any = None) -> Any:
+        """Oldest orphan, else oldest leaf, ignoring keys ``skip(key)`` is
+        true for. Does not remove it."""
+        for heap, holds in ((self._orphans, self._is_orphan), (self._leaves, self._is_leaf)):
+            skipped: list[tuple[int, Any]] = []
+            found = None
+            while heap:
+                tick, key = heap[0]
+                if self._ticks.get(key) != tick or not holds(key):
+                    heapq.heappop(heap)
+                elif skip is not None and skip(key):
+                    skipped.append(heapq.heappop(heap))
+                else:
+                    found = key
+                    break
+            for item in skipped:
+                heapq.heappush(heap, item)
+            if found is not None:
+                return found
+        return None
+
+
 def _normalize_hot_eviction_policy(policy: str) -> str:
     normalized = str(policy).strip().lower()
     if normalized not in VALID_HOT_CACHE_EVICTION_POLICIES:
@@ -1609,10 +1735,12 @@ class SharedHotCacheBudget:
     """Process-wide byte budget for hot cache entries across cache managers.
 
     Victims are chosen in global LRU order. Under ``chain_aware_lru`` an entry
-    is a candidate only if its owner reports it evictable (no hot child
-    builds on it), and entries the owner reports orphaned (parent no longer
-    hot, so unreachable) go first. The entry just being admitted can itself
-    be chosen; that is an admission refusal and is returned like any victim.
+    is a candidate only if no other entry of the same owner builds on it, and
+    orphans (entries whose parent is no longer in the budget) go first; a
+    ``_ChainLRUIndex`` over (owner, hash) keys finds them without scanning.
+    Owners pass each entry's parent to ``put``. The entry just being admitted
+    can itself be chosen; that is an admission refusal and is returned like
+    any victim.
     """
 
     def __init__(self, max_bytes: int, eviction_policy: str = "lru"):
@@ -1623,10 +1751,21 @@ class SharedHotCacheBudget:
         )
         self._total_bytes = 0
         self._lock = threading.RLock()
+        self._chain_index = (
+            _ChainLRUIndex() if self.eviction_policy == "chain_aware_lru" else None
+        )
 
     @staticmethod
     def _key(owner: Any, block_hash: bytes) -> tuple[int, bytes]:
         return (id(owner), block_hash)
+
+    def _pop_entry_locked(self, key: tuple[int, bytes]) -> _HotCacheBudgetEntry | None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+            if self._chain_index is not None:
+                self._chain_index.remove(key)
+        return entry
 
     @property
     def total_bytes(self) -> int:
@@ -1644,14 +1783,13 @@ class SharedHotCacheBudget:
             key = self._key(owner, block_hash)
             if key in self._entries:
                 self._entries.move_to_end(key)
+                if self._chain_index is not None:
+                    self._chain_index.touch(key)
 
     def forget(self, owner: Any, block_hash: bytes) -> None:
         """Remove one entry from budget accounting if present."""
         with self._lock:
-            key = self._key(owner, block_hash)
-            entry = self._entries.pop(key, None)
-            if entry is not None:
-                self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+            self._pop_entry_locked(self._key(owner, block_hash))
 
     def forget_owner(self, owner: Any) -> None:
         """Remove all entries owned by a cache manager."""
@@ -1659,8 +1797,7 @@ class SharedHotCacheBudget:
         with self._lock:
             keys = [key for key in self._entries if key[0] == owner_id]
             for key in keys:
-                entry = self._entries.pop(key)
-                self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+                self._pop_entry_locked(key)
 
     def clear_all_owners(self) -> int:
         """Clear the hot cache of every manager the budget still references.
@@ -1697,38 +1834,22 @@ class SharedHotCacheBudget:
     def _pick_victim_locked(
         self,
         protected_hashes: set[bytes] | None = None,
-        pending: dict[int, set[bytes]] | None = None,
     ) -> tuple[int, bytes] | None:
         """Return the key of the next entry to evict, or None. Caller holds _lock.
 
-        ``pending`` maps id(owner) -> hashes already chosen as victims in the
-        current loop. Owners drop victims only after the loop, so the chain
-        predicates must be told about them: otherwise a parent whose last
-        child was just chosen would still look protected.
+        Victims chosen earlier in the same loop are already out of the index,
+        so a parent whose last child was just chosen becomes a leaf, and that
+        child's own children become orphans, before the next pick.
         """
         protected_hashes = protected_hashes or set()
-        if self.eviction_policy != "chain_aware_lru":
+        if self._chain_index is None:
             for key, candidate in self._entries.items():
                 if candidate.block_hash not in protected_hashes:
                     return key
             return None
-        pending = pending or {}
-        first_leaf = None
-        for key, candidate in self._entries.items():
-            if candidate.block_hash in protected_hashes:
-                continue
-            owner = candidate.owner
-            owner_pending = pending.get(id(owner), set())
-            is_orphan = getattr(owner, "_hot_is_orphan", None)
-            if is_orphan is not None and is_orphan(candidate.block_hash, owner_pending):
-                return key
-            if first_leaf is None:
-                is_evictable = getattr(owner, "_hot_is_evictable", None)
-                if is_evictable is None or is_evictable(
-                    candidate.block_hash, owner_pending
-                ):
-                    first_leaf = key
-        return first_leaf
+        if not protected_hashes:
+            return self._chain_index.pick()
+        return self._chain_index.pick(skip=lambda key: key[1] in protected_hashes)
 
     def releasable_bytes(self, protected_hashes: set[bytes]) -> int:
         """Bytes ``shrink_to`` can free while keeping ``protected_hashes``.
@@ -1780,16 +1901,13 @@ class SharedHotCacheBudget:
         protected_hashes = protected_hashes or set()
         victims: list[tuple[Any, bytes, int]] = []
 
-        pending: dict[int, set[bytes]] = {}
         with self._lock:
             while self._total_bytes > target_bytes and self._entries:
-                victim_key = self._pick_victim_locked(protected_hashes, pending)
+                victim_key = self._pick_victim_locked(protected_hashes)
                 if victim_key is None:
                     break
 
-                victim = self._entries.pop(victim_key)
-                pending.setdefault(victim_key[0], set()).add(victim.block_hash)
-                self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
+                victim = self._pop_entry_locked(victim_key)
                 victims.append((victim.owner, victim.block_hash, victim.size_bytes))
 
         freed = 0
@@ -1801,16 +1919,23 @@ class SharedHotCacheBudget:
         return freed
 
     def put(
-        self, owner: Any, block_hash: bytes, size_bytes: int
+        self,
+        owner: Any,
+        block_hash: bytes,
+        size_bytes: int,
+        parent_hash: bytes | None = None,
     ) -> list[tuple[Any, bytes]]:
-        """Account an entry and return globally-evicted owners/block hashes."""
+        """Account an entry and return globally-evicted owners/block hashes.
+
+        ``parent_hash`` is the hot parent the entry builds on, under the same
+        owner; only chain_aware_lru uses it. An owner that does not track
+        chains passes None, so its entries are always leaves.
+        """
         victims: list[tuple[Any, bytes]] = []
         size_bytes = max(0, int(size_bytes))
         with self._lock:
             key = self._key(owner, block_hash)
-            old = self._entries.pop(key, None)
-            if old is not None:
-                self._total_bytes = max(0, self._total_bytes - old.size_bytes)
+            self._pop_entry_locked(key)
 
             self._entries[key] = _HotCacheBudgetEntry(
                 owner=owner,
@@ -1818,10 +1943,13 @@ class SharedHotCacheBudget:
                 size_bytes=size_bytes,
             )
             self._total_bytes += size_bytes
+            if self._chain_index is not None:
+                self._chain_index.add(
+                    key, None if parent_hash is None else self._key(owner, parent_hash)
+                )
 
-            pending: dict[int, set[bytes]] = {}
             while self._total_bytes > self.max_bytes and self._entries:
-                victim_key = self._pick_victim_locked(pending=pending)
+                victim_key = self._pick_victim_locked()
                 if victim_key is None:
                     break
                 if (
@@ -1831,9 +1959,7 @@ class SharedHotCacheBudget:
                 ):
                     # LRU keeps a lone oversized entry (historical behavior).
                     break
-                victim = self._entries.pop(victim_key)
-                pending.setdefault(victim_key[0], set()).add(victim.block_hash)
-                self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
+                victim = self._pop_entry_locked(victim_key)
                 victims.append((victim.owner, victim.block_hash))
                 if victim_key == key:
                     # Admission refused: nothing else could be evicted.
@@ -2047,8 +2173,18 @@ class PagedSSDCacheManager(CacheManager):
         )
         # parent block hash -> number of hot entries whose parent it is.
         # Maintained under _hot_cache_lock by _hot_link/_hot_unlink at every
-        # insertion/removal; read lock-free by the eviction predicates.
+        # insertion/removal.
         self._hot_children: dict[bytes, int] = {}
+        # chain_aware_lru without a shared budget: LRU-ordered orphan and leaf
+        # candidates of _hot_cache, kept in step with it by
+        # _hot_link/_hot_unlink and _hot_cache_get. With a shared budget the
+        # budget picks every victim from its own index, so none is kept here.
+        self._hot_chain_index: _ChainLRUIndex | None = (
+            _ChainLRUIndex()
+            if self._hot_eviction_policy == "chain_aware_lru"
+            and hot_cache_budget is None
+            else None
+        )
 
         # Track which block hashes are queued for background write
         self._pending_write_hashes: set = set()
@@ -2177,14 +2313,18 @@ class PagedSSDCacheManager(CacheManager):
         parent = getattr(meta, "parent_hash", None)
         return parent if isinstance(parent, (bytes, bytearray)) else None
 
-    def _hot_link(self, entry: dict) -> None:
+    def _hot_link(self, block_hash: bytes, entry: dict) -> None:
         """Count ``entry`` as a hot child of its parent. Caller holds the lock."""
         parent = self._hot_entry_parent(entry)
+        if self._hot_chain_index is not None:
+            self._hot_chain_index.add(block_hash, parent)
         if parent is not None:
             self._hot_children[parent] = self._hot_children.get(parent, 0) + 1
 
-    def _hot_unlink(self, entry: dict) -> None:
+    def _hot_unlink(self, block_hash: bytes, entry: dict) -> None:
         """Undo ``_hot_link`` for a removed entry. Caller holds the lock."""
+        if self._hot_chain_index is not None:
+            self._hot_chain_index.remove(block_hash)
         parent = self._hot_entry_parent(entry)
         if parent is None:
             return
@@ -2197,38 +2337,6 @@ class PagedSSDCacheManager(CacheManager):
     @property
     def _hot_chain_aware(self) -> bool:
         return self._hot_eviction_policy == "chain_aware_lru"
-
-    def _hot_is_evictable(
-        self, block_hash: bytes, pending: set[bytes] | frozenset = frozenset()
-    ) -> bool:
-        """True unless another hot entry builds on this one (chain-aware only).
-
-        ``pending`` holds entries already chosen for eviction but not yet
-        removed (shared-budget loop); children among them do not protect.
-        Lock-free reads: called by SharedHotCacheBudget while it holds its own
-        lock, which must not nest with _hot_cache_lock.
-        """
-        if not self._hot_chain_aware:
-            return True
-        children = self._hot_children.get(block_hash, 0)
-        if children and pending:
-            for victim in pending:
-                entry = self._hot_cache.get(victim)
-                if entry is not None and self._hot_entry_parent(entry) == block_hash:
-                    children -= 1
-        return children <= 0
-
-    def _hot_is_orphan(
-        self, block_hash: bytes, pending: set[bytes] | frozenset = frozenset()
-    ) -> bool:
-        """True if the entry's parent is no longer hot, so lookups cannot reach it."""
-        if not self._hot_chain_aware:
-            return False
-        entry = self._hot_cache.get(block_hash)
-        if entry is None:
-            return False
-        parent = self._hot_entry_parent(entry)
-        return parent is not None and (parent not in self._hot_cache or parent in pending)
 
     def _hot_pinned_hashes(self, protected_hashes: set[bytes]) -> set[bytes]:
         """Unprotected hot entries chain_aware_lru cannot evict while
@@ -2275,19 +2383,26 @@ class PagedSSDCacheManager(CacheManager):
         skip: set[bytes] | None = None,
         skip_staging: bool = False,
     ) -> bytes | None:
-        """Next local eviction victim in policy order. Caller holds the lock."""
+        """Next local eviction victim in policy order. Caller holds the lock.
+
+        Only used without a shared budget (the budget picks otherwise), so
+        under chain_aware_lru the index is always present here.
+        """
         skip = skip or set()
-        first_leaf = None
-        for block_hash, entry in self._hot_cache.items():
-            if block_hash in skip or (skip_staging and entry.get("staging")):
-                continue
-            if not self._hot_chain_aware:
+        index = self._hot_chain_index
+        if index is None:
+            for block_hash, entry in self._hot_cache.items():
+                if block_hash in skip or (skip_staging and entry.get("staging")):
+                    continue
                 return block_hash
-            if self._hot_is_orphan(block_hash):
-                return block_hash
-            if first_leaf is None and self._hot_is_evictable(block_hash):
-                first_leaf = block_hash
-        return first_leaf
+            return None
+        if not skip and not skip_staging:
+            return index.pick()
+        hot = self._hot_cache
+        return index.pick(
+            skip=lambda block_hash: block_hash in skip
+            or bool(skip_staging and hot[block_hash].get("staging"))
+        )
 
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
@@ -2314,12 +2429,19 @@ class PagedSSDCacheManager(CacheManager):
                 old = self._hot_cache.pop(block_hash, None)
                 if old is not None:
                     self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
-                    self._hot_unlink(old)
+                    self._hot_unlink(block_hash, old)
                 self._hot_cache[block_hash] = entry
                 self._hot_cache_total_bytes += entry_size
-                self._hot_link(entry)
+                self._hot_link(block_hash, entry)
 
-            victims = self._hot_cache_budget.put(self, block_hash, entry_size)
+            victims = self._hot_cache_budget.put(
+                self,
+                block_hash,
+                entry_size,
+                parent_hash=(
+                    self._hot_entry_parent(entry) if self._hot_chain_aware else None
+                ),
+            )
             for owner, victim_hash in victims:
                 evicted = owner._hot_cache_remove(victim_hash, update_budget=False)
                 if evicted is not None:
@@ -2333,7 +2455,7 @@ class PagedSSDCacheManager(CacheManager):
             if block_hash in self._hot_cache:
                 old = self._hot_cache.pop(block_hash)
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
-                self._hot_unlink(old)
+                self._hot_unlink(block_hash, old)
 
             # Insert first, then evict: under chain_aware_lru the new entry is
             # what protects its parent. The new entry is the most recently
@@ -2341,7 +2463,7 @@ class PagedSSDCacheManager(CacheManager):
             # it, as before); chain_aware_lru may refuse it.
             self._hot_cache[block_hash] = entry
             self._hot_cache_total_bytes += entry_size
-            self._hot_link(entry)
+            self._hot_link(block_hash, entry)
             while self._hot_cache_total_bytes > self._hot_cache_max_bytes:
                 victim_hash = self._hot_pick_victim_locked()
                 if victim_hash is None:
@@ -2350,7 +2472,7 @@ class PagedSSDCacheManager(CacheManager):
                     break
                 evicted = self._hot_cache.pop(victim_hash)
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(evicted)
-                self._hot_unlink(evicted)
+                self._hot_unlink(victim_hash, evicted)
                 evicted_entries.append((victim_hash, evicted))
                 if victim_hash == block_hash:
                     self._stats["hot_cache_admission_refusals"] += 1
@@ -2439,6 +2561,8 @@ class PagedSSDCacheManager(CacheManager):
         with self._hot_cache_lock:
             if block_hash in self._hot_cache:
                 self._hot_cache.move_to_end(block_hash)
+                if self._hot_chain_index is not None:
+                    self._hot_chain_index.touch(block_hash)
                 entry = self._hot_cache[block_hash]
             else:
                 return None
@@ -2459,7 +2583,7 @@ class PagedSSDCacheManager(CacheManager):
             old = self._hot_cache.pop(block_hash, None)
             if old:
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
-                self._hot_unlink(old)
+                self._hot_unlink(block_hash, old)
         if old is not None and update_budget and self._hot_cache_budget is not None:
             self._hot_cache_budget.forget(self, block_hash)
         return old
@@ -4197,9 +4321,9 @@ class PagedSSDCacheManager(CacheManager):
             with self._hot_cache_lock:
                 old_staging = self._hot_cache.pop(block_hash, None)
                 if old_staging is not None:
-                    self._hot_unlink(old_staging)
+                    self._hot_unlink(block_hash, old_staging)
                 self._hot_cache[block_hash] = cache_entry
-                self._hot_link(cache_entry)
+                self._hot_link(block_hash, cache_entry)
 
             # Track pending write
             with self._pending_write_hashes_lock:
@@ -5502,6 +5626,8 @@ class PagedSSDCacheManager(CacheManager):
             entries = list(self._hot_cache.items())
             self._hot_cache.clear()
             self._hot_children.clear()
+            if self._hot_chain_index is not None:
+                self._hot_chain_index.clear()
             self._hot_cache_total_bytes = 0
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
@@ -5552,7 +5678,7 @@ class PagedSSDCacheManager(CacheManager):
                     break
 
                 evicted = self._hot_cache.pop(victim_hash)
-                self._hot_unlink(evicted)
+                self._hot_unlink(victim_hash, evicted)
                 size = self._hot_cache_entry_size(evicted)
                 self._hot_cache_total_bytes = max(0, self._hot_cache_total_bytes - size)
                 evicted_entries.append((victim_hash, evicted, size))
@@ -5861,6 +5987,8 @@ class PagedSSDCacheManager(CacheManager):
         with self._hot_cache_lock:
             self._hot_cache.clear()
             self._hot_children.clear()
+            if self._hot_chain_index is not None:
+                self._hot_chain_index.clear()
             self._hot_cache_total_bytes = 0
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
