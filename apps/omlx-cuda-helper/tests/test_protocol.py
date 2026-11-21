@@ -157,7 +157,9 @@ def test_the_helper_reports_its_wired_links(monkeypatch):
         {"ifname": "enp7s0", "flags": ["UP", "NO-CARRIER"], "addr_info": []},
         {"ifname": "docker0", "flags": ["UP", "LOWER_UP"], "addr_info": []},
     ]
-    monkeypatch.setattr(gpus, "_run", lambda *command: json.dumps(addresses))
+    monkeypatch.setattr(
+        gpus, "_run", lambda *command: gpus.RunResult(json.dumps(addresses), 0, "")
+    )
     monkeypatch.setattr(gpus, "_speed", {"enp5s0": 1000, "enp6s0": 2500}.get)
     assert gpus.links() == [
         {
@@ -175,7 +177,7 @@ def test_the_helper_reports_its_wired_links(monkeypatch):
 def test_an_integrated_gpu_holds_its_layers_in_system_ram(monkeypatch):
     # nvidia-smi on a DGX Spark reports no memory for its GPU.
     rows = "0, NVIDIA GB10, [N/A], [N/A]\n1, NVIDIA RTX A6000, 49140, 48600\n"
-    monkeypatch.setattr(gpus, "_run", lambda *command: rows)
+    monkeypatch.setattr(gpus, "_run", lambda *command: gpus.RunResult(rows, 0, ""))
     monkeypatch.setattr(gpus, "memory", lambda: (128 << 30, 100 << 30))
     spark, card = gpus.gpus()
     # Its free memory leaves the OS 16 GiB, as the host's budget does.
@@ -200,7 +202,12 @@ def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
     state.save_host("studio", {"cluster_key": key.hex(), "name": "Studio"})
     gpu = {"name": "NVIDIA RTX A6000", "total": 48 << 30, "free": 48 << 30}
     monkeypatch.setattr(
-        gpus, "gpus", lambda only=None: [{"index": 0, **gpu}, {"index": 1, **gpu}]
+        gpus,
+        "probe",
+        lambda only=None: (
+            [{"index": 0, **gpu}, {"index": 1, **gpu}],
+            {"ok": True, "error": ""},
+        ),
     )
     cable = {"interface": "enp6s0", "ipv4": [], "link_local": "fe80::2", "mbps": 2500}
     monkeypatch.setattr(gpus, "links", lambda: [cable])
