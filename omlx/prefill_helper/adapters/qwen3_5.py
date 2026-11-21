@@ -57,6 +57,22 @@ def _language(lm: Any) -> Any:
     return sys.modules[type(lm.model).__module__]
 
 
+def _language_symbol(lm: Any, name: str) -> Any:
+    """A module-level symbol of the model's class, or of the first base that defines it.
+
+    A model type can live in its own module while its classes subclass another family's:
+    qwen3_5_moe's model classes extend qwen3_5's, so the mask builders they use are still
+    defined in qwen3_5's module.
+    """
+    for cls in type(lm.model).__mro__:
+        module = sys.modules.get(cls.__module__)
+        if module is not None and hasattr(module, name):
+            return getattr(module, name)
+    raise AttributeError(
+        f"{type(lm.model).__module__} and its bases define no {name!r}"
+    )
+
+
 def _yarn(lm: Any) -> bool:
     rope = getattr(lm.args, "rope_parameters", None) or {}
     return (rope.get("type") or rope.get("rope_type")) == "yarn"
@@ -111,7 +127,6 @@ def _run_layers(
     """``layers`` (global ids from ``first``) on the hidden state, with the
     masks and positions of the model-level forward. ``frequencies`` replace
     the rotary frequencies of the attention layers."""
-    language = _language(lm)
     pairs = list(zip(layers, cache))
     if frequencies is not None:
         for layer in layers:
@@ -121,10 +136,10 @@ def _run_layers(
     linear = next((c for layer, c in pairs if layer.is_linear), None)
     fa_mask = ssm_mask = positions = embeddings = None
     if linear is not None:
-        ssm_mask = language._create_qwen3_5_ssm_mask(h, linear)
+        ssm_mask = _language_symbol(lm, "_create_qwen3_5_ssm_mask")(h, linear)
     if attention is not None:
         layer, item = attention
-        fa_mask = language._create_qwen3_5_attention_mask(h, item)
+        fa_mask = _language_symbol(lm, "_create_qwen3_5_attention_mask")(h, item)
         # Text-only prefill: positions continue from the cache offset.
         positions = mx.arange(item.offset, item.offset + h.shape[1], dtype=mx.int32)
         positions = mx.broadcast_to(positions[None, None], (3, *h.shape[:2]))
@@ -156,7 +171,7 @@ def _cache_state(i: int, item: Any, since: int) -> Arrays:
 
 
 class Qwen35Adapter(StageAdapter):
-    model_types = ("qwen3_5",)
+    model_types = ("qwen3_5", "qwen3_5_moe")
     contract = 1
     captures_layers = True
 
