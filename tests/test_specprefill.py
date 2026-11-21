@@ -730,7 +730,7 @@ class TestRequestFields:
 class TestEngineCorePropagation:
     """Tests for SpecPrefill param propagation through AsyncEngineCore.add_request."""
 
-    def _make_engine_core(self, draft_model=None):
+    def _make_engine_core(self, draft_model=None, specprefill_auto_enabled=None):
         """Create a minimal EngineCore for testing add_request propagation."""
         from unittest.mock import AsyncMock, MagicMock
 
@@ -744,6 +744,8 @@ class TestEngineCorePropagation:
 
         mock_scheduler = MagicMock(spec=[])
         mock_scheduler._specprefill_draft_model = draft_model
+        if specprefill_auto_enabled is not None:
+            mock_scheduler._specprefill_auto_enabled = specprefill_auto_enabled
         core.scheduler = mock_scheduler
 
         mock_config = MagicMock(spec=[])
@@ -791,6 +793,50 @@ class TestEngineCorePropagation:
         req = core.scheduler.add_request.call_args[0][0]
         assert not hasattr(req, "_specprefill_threshold")
         assert not hasattr(req, "_specprefill_keep_pct")
+
+    @pytest.mark.asyncio
+    async def test_auto_disabled_keeps_loaded_drafter_idle(self):
+        """No per-request flag + auto-disabled model → request not marked."""
+        from omlx.request import SamplingParams
+
+        core = self._make_engine_core(
+            draft_model="/some/draft", specprefill_auto_enabled=False
+        )
+
+        await core.add_request(prompt=[1, 2, 3], sampling_params=SamplingParams())
+
+        req = core.scheduler.add_request.call_args[0][0]
+        assert not getattr(req, "_specprefill_enabled", False)
+
+    @pytest.mark.asyncio
+    async def test_auto_enabled_marks_request_by_default(self):
+        """No per-request flag + auto-enabled model → enabled by default."""
+        from omlx.request import SamplingParams
+
+        core = self._make_engine_core(
+            draft_model="/some/draft", specprefill_auto_enabled=True
+        )
+
+        await core.add_request(prompt=[1, 2, 3], sampling_params=SamplingParams())
+
+        req = core.scheduler.add_request.call_args[0][0]
+        assert req._specprefill_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_body_override_wins_over_auto_disabled(self):
+        """A request may opt into SpecPrefill on an auto-disabled model."""
+        from omlx.request import SamplingParams
+
+        core = self._make_engine_core(
+            draft_model="/some/draft", specprefill_auto_enabled=False
+        )
+
+        await core.add_request(
+            prompt=[1, 2, 3], sampling_params=SamplingParams(), specprefill=True
+        )
+
+        req = core.scheduler.add_request.call_args[0][0]
+        assert req._specprefill_enabled is True
 
 
 class TestRoPEReWrap:
