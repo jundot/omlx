@@ -804,3 +804,19 @@ def test_inkling2_vision_encodes_images_independently_and_splices_tokens():
     assert mx.allclose(embeds[0, 1:3], alone.astype(embeds.dtype))
     with pytest.raises(ValueError):
         model.embed_inputs(mx.array([[image, 1]]), second, [[1, 1, 2]])
+
+
+@pytest.mark.parametrize(
+    "kwargs, effort",
+    [
+        ({"enable_thinking": False}, "none"),
+        ({"reasoning_effort": "off", "enable_thinking": False}, "none"),
+        ({"enable_thinking": False, "reasoning_effort": "low"}, "low"),
+        ({"enable_thinking": True}, None),
+    ],
+)
+def test_inkling2_thinking_switch_reaches_the_template_effort(kwargs, effort):
+    from omlx.engine.vlm import _apply_template_thinking_mode
+
+    _apply_template_thinking_mode("inkling2_loop", kwargs)
+    assert kwargs.get("reasoning_effort") == effort
