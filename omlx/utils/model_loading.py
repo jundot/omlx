@@ -595,6 +595,9 @@ def maybe_apply_pre_load_patches(
                 "moe_expert_offload_resident_fraction": getattr(
                     model_settings, "moe_expert_offload_resident_fraction", 0.25
                 ),
+                "moe_expert_offload_mirrors": getattr(
+                    model_settings, "moe_expert_offload_mirrors", None
+                ),
                 **{
                     key: getattr(model_settings, key, False)
                     for key in (

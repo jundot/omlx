@@ -192,6 +192,19 @@ pricing. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
 checkpoint completeness, dense-model exclusion, API/runtime rejection, and
 PLE/Engram metadata after expert savings.
 
+`tests/test_moe_offload_timeline.py` covers the `OMLX_MOE_OFFLOAD_TIMELINE` trace:
+the JSON line fields, the off state, append and reset on flush, the dropped
+counter, and the spans a decode step, a cache hit, an over-capacity prefill
+call and a slow read record on a two-layer quantized fixture.
+
+`tests/test_moe_offload_mirror.py` covers `moe_expert_offload_mirrors`: the
+router's choices on a scripted clock (probes, backlog, expiry of an idle
+reading, bursts before any completion, failed reads) and its accounting under
+concurrent claims, the size and header comparison that refuses a mirror, the
+routed read on the bytes path and on the staging path with a stand-in pool, and
+a two-layer quantized fixture whose output is the same with two mirrors while
+all three copies serve bytes.
+
 # macOS port persistence tests
 
 Run the `AppConfigTests`, `ServerProcessIntegrationTests`, `ServerScreenVMStorageDiffTests`, `AppServicesPathTests`, and `MenubarControllerPortTests` targets with `xcodebuild test`. For process tests, set `TEST_RUNNER_OMLX_INTEGRATION=1`, `TEST_RUNNER_OMLX_PYTHON_OVERRIDE` to a Python interpreter with oMLX dependencies, `TEST_RUNNER_PYTHONPATH` to the repository root and `apps/omlx-web`, and `TEST_RUNNER_OMLX_BASE_PATH` to a fresh temporary directory so the test host does not start the user's configured server. Leave `TEST_RUNNER_OMLX_DEV_SERVER_SCRIPT` unset to exercise the real Python API and CLI with empty model directories. Setting it to `apps/omlx-mac/Scripts/dev_server.py` instead runs the lightweight process fixture.

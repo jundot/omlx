@@ -33,6 +33,7 @@ reassembled routes the way the model does when the kernel is unavailable.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from concurrent.futures import wait
 from pathlib import Path
 
@@ -367,7 +368,11 @@ def _iter_glm_switch_glus(model):
 
 
 def apply_glm_moe_expert_offload(
-    model, model_path: str | Path, resident_fraction: float = 0.25
+    model,
+    model_path: str | Path,
+    resident_fraction: float = 0.25,
+    *,
+    mirrors: Sequence[str | Path] = (),
 ) -> int:
     """Wrap every covered GLM SwitchGLU; returns the number wrapped.
 
@@ -382,7 +387,7 @@ def apply_glm_moe_expert_offload(
     if model_dir is None:
         return 0
     minimum = _minimum_experts(model_dir)
-    store = CheckpointExpertStore(model_dir)
+    store = CheckpointExpertStore(model_dir, mirrors)
     if not store:
         logger.warning("glm moe expert offload: no safetensors under %s", model_dir)
         return 0
