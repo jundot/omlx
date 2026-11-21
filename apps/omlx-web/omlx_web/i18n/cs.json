@@ -1320,7 +1320,7 @@
   "modal.model_settings.enable_thinking_default": "Používá se výchozí nastavení modelu",
   "modal.model_settings.enable_thinking_reset": "Obnovit výchozí nastavení modelu",
   "modal.model_settings.ssd_ngram_offload": "Přesun N-gramů na SSD",
-  "modal.model_settings.ssd_ngram_offload_hint": "Ponechá velkou tabulku N-gramů (Qwen4 PLE nebo DeepSeek V4.1 Engram) na SSD a čte jen potřebné řádky. Šetří paměť, ale rychlost závisí na čtení z SSD. Změna tohoto nastavení znovu načte model.",
+  "modal.model_settings.ssd_ngram_offload_hint": "Ponechá velkou tabulku N-gramů na SSD a čte jen potřebné řádky. Šetří paměť, ale rychlost závisí na čtení z SSD. Změna tohoto nastavení znovu načte model.",
   "modal.model_settings.ssd_ngram_offload_forced": "Vyžadováno, protože rezidentní načtení překračuje nastavený limit paměti modelu.",
   "modal.model_settings.deepseek_v41_ced_prefill": "Zrychlení CED prefilled (DeepSeek V4.1)",
   "modal.model_settings.deepseek_v41_ced_prefill_hint": "V testovaných konfiguracích zlepšuje rychlost prefillu přibližně o 74–79 %. Využívá architekturu modelu Causal Encoder–Decoder ke snížení výpočtu prefillu dekodéru.",

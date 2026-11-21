@@ -107,6 +107,7 @@ EXCLUDED_FROM_PROFILES = frozenset(
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
         "deepseek_v41_engram_ssd_offload",
+        "hy4_engram_ssd_offload",
         # Architecture-level prefill strategy; explicit per model.
         "deepseek_v41_ced_prefill_enabled",
         # Which other Mac helps depends on this setup, not on the model.

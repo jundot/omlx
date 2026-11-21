@@ -473,6 +473,7 @@ class ModelSettings:
     # fused one-row decode route, not only the oQe allow-list.
     qwen4_gdn_decode_wide_proj: bool = False
     deepseek_v41_engram_ssd_offload: bool = False
+    hy4_engram_ssd_offload: bool = False
     # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
