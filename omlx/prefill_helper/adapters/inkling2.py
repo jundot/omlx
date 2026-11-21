@@ -6,6 +6,8 @@ blocks. The cut sends the partial sum ``h`` entering layer ``k`` and, as
 ``blk.<i>``, the partial sum entering each block boundary layer ``i`` below
 ``k``; each side normalizes those itself, as the boundary layer does. A
 layer's state is the K/V rows the chunk appended and its four conv windows.
+A sliding-window ring that dropped older rows of a prefix also sends its
+position as ``<i>.off``.
 """
 
 from __future__ import annotations
@@ -84,12 +86,27 @@ def _run_layers(
     return h, entered
 
 
+def _rows(kv: Any, since: int) -> tuple[mx.array, mx.array]:
+    """The K/V rows from position ``since`` on, oldest first.
+
+    A sliding-window layer may keep a ring (``RotatingKVCache``) that holds
+    only its newest rows, not in time order once it wraps; it sends the rows
+    it still holds.
+    """
+    if not hasattr(kv, "_temporal_order"):
+        return kv.keys[..., since : kv.offset, :], kv.values[..., since : kv.offset, :]
+    keys, values = kv._temporal_order(kv.keys), kv._temporal_order(kv.values)
+    n = min(kv.offset - since, keys.shape[2])
+    return keys[..., keys.shape[2] - n :, :], values[..., values.shape[2] - n :, :]
+
+
 def _cache_state(i: int, item: Any, since: int) -> Arrays:
     kv, conv = item[0], item[1]
-    out = {
-        f"{i}.k": kv.keys[..., since : kv.offset, :],
-        f"{i}.v": kv.values[..., since : kv.offset, :],
-    }
+    keys, values = _rows(kv, since)
+    out = {f"{i}.k": keys, f"{i}.v": values}
+    if keys.shape[2] < kv.offset - since:
+        # A ring dropped the oldest rows: the position goes along with them.
+        out[f"{i}.off"] = mx.array(kv.offset, dtype=mx.int32)
     for slot in range(_CONV_SLOTS):
         if conv[slot] is not None:
             out[f"{i}.c{slot}"] = conv[slot]
@@ -225,6 +242,8 @@ class Inkling2Adapter(StageAdapter):
                 value = state.get(f"{i}.c{slot}")
                 if value is not None:
                     conv[slot] = value
+            if (offset := state.get(f"{i}.off")) is not None:
+                kv.offset = int(offset.item())
 
     def prefix_state(self, cache: list, k: int) -> Arrays:
         state: Arrays = {}

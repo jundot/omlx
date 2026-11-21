@@ -2039,6 +2039,27 @@ def test_inkling2_split_matches_whole_model(k, prefix):
     _split_matches(INKLING2, _inkling2, ids, [12, 10, 8], k, prefix, _inkling2_state)
 
 
+def test_inkling2_split_after_a_prefix_past_the_window():
+    # 22 prefix tokens: a sliding-window ring of 8 keys has dropped the oldest
+    # rows, so the prefix must carry each layer's position.
+    ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 30)))
+    _split_matches(INKLING2, _inkling2, ids, [12, 10, 8], 7, 2, _inkling2_state)
+    host = _inkling2()
+    cache = host.make_cache()
+    for chunk in _chunks(ids[:, :22], [12, 10]):
+        host(chunk, cache=cache)
+    state = INKLING2.prefix_state(cache, 7)
+    helper = _inkling2()
+    INKLING2.keep_first(helper, 7)
+    helper_cache = helper.make_cache()
+    INKLING2.load_prefix(helper_cache, state)
+    assert [c[0].offset for c in helper_cache] == [22] * 7
+    for i in range(7):
+        kv = cache[i][0]
+        # Only a ring that dropped rows sends a position; a full cache never.
+        assert (f"{i}.off" in state) == (state[f"{i}.k"].shape[2] < kv.offset)
+
+
 @pytest.mark.parametrize(
     "factory,make,adapter,k,state_of",
     [
