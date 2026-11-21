@@ -67,10 +67,15 @@ def test_lookup_acceptance_is_learned_per_match_length():
 
 
 def test_min_gain_and_margin_guard_the_switch():
-    # One draft accepted 70% of the time beats plain decoding by 2% here.
+    # One draft accepted 70% of the time beats plain decoding by 2% here: not
+    # enough to start drafting, enough to go on once the drafter runs.
     policy = _policy(position_prior=(0.7,), min_gain=0.05)
     assert policy.choose(drafter_k=1).source is Source.NONE
     assert _policy(position_prior=(0.7,), min_gain=0.0).choose(drafter_k=1).k == 1
+    policy.observe(Choice(Source.DRAFTER, 1), 1)
+    assert policy.choose(drafter_k=1).source is Source.DRAFTER
+    policy.observe(Choice(Source.NONE, 0), 0)
+    assert policy.choose(drafter_k=1).source is Source.NONE
     # The host's own depth stays, however weak, until a lookup beats it.
     held = policy.choose(drafter_k=2, drafter_window=2)
     assert (held.source, held.k) == (Source.DRAFTER, 2)
@@ -180,3 +185,33 @@ def test_joint_budget_spends_rows_where_drafts_survive():
     assert abs(rate(got, streams) - rate(best, streams)) < 1e-12
     # A gain under the guard is not worth leaving plain decoding for.
     assert allocate_batch_verify_budget([[0.6], [0.6]], cost, min_gain=0.5) == [0, 0]
+
+
+def test_fair_budget_does_not_starve_the_weaker_stream():
+    """The most tokens in total gives the quoting stream every row, and the
+    prose stream then commits one token per long pass: under its plain rate.
+    The fair budget keeps both streams above plain decoding."""
+
+    def cost(rows):
+        return M5_PRO[rows] if rows <= 4 else 54.7 + 8.1 * (rows - 4)
+
+    streams = [[0.95**i for i in range(1, 8)], [0.68, 0.47, 0.28, 0.18]]
+
+    def rates(counts):
+        ms = cost(2 + sum(counts))
+        return [(1 + sum(s[:k])) / ms for s, k in zip(streams, counts)]
+
+    plain = 1 / cost(2)
+    greedy = allocate_batch_verify_budget(streams, cost)
+    fair = allocate_batch_verify_budget(streams, cost, fair=True)
+    assert rates(greedy)[1] < 0.7 * plain
+    assert min(rates(fair)) > plain
+    assert fair[0] > fair[1] >= 1
+    # Of the allocations that keep both streams at plain decoding's rate or
+    # better, the fair one has the largest product of rates.
+    best = max(
+        (c for c in itertools.product(range(8), range(5)) if min(rates(c)) >= plain),
+        key=lambda c: rates(c)[0] * rates(c)[1],
+    )
+    assert rates(fair)[0] * rates(fair)[1] >= 0.999 * rates(best)[0] * rates(best)[1]
+    assert allocate_batch_verify_budget([[0.1], [0.1]], cost, fair=True) == [0, 0]

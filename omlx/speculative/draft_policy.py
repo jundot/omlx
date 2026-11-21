@@ -27,13 +27,16 @@ The design is Basalt's (``basalt/spec/controller`` and ``draft_policy``):
   ones that were, or from a prior shape. A drafter round also pays the
   drafter; that cost is learned as the difference to draft-free rounds of the
   same size, which is what a lookup round saves.
-- ``min_gain``: drafting must beat plain decoding by this much, or the step
-  runs plain. ``margin``: a lookup window must beat the drafter's by this much.
+- ``min_gain``: drafting must beat plain decoding by this much to start, or
+  the step runs plain; a drafter already running keeps running while it beats
+  plain at all (the estimates are noisy, and a parked drafter learns nothing).
+  ``margin``: a lookup window must beat the drafter's by this much.
 """
 
 from __future__ import annotations
 
 import enum
+import math
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence
 
@@ -234,6 +237,7 @@ class DraftPolicy:
         self._chance_ok = [0.0] * (len(_CHANCE_EDGES) + 1)
         self._chance_n = [0.0] * (len(_CHANCE_EDGES) + 1)
         self._plain_rounds = 0
+        self._drafting = False
 
     # --- estimates -------------------------------------------------------
 
@@ -345,10 +349,12 @@ class DraftPolicy:
                     best.tokens_per_ms,
                     probe=True,
                 )
+            # The gain needed to start drafting; none to keep on.
+            gain = 0.0 if self._drafting and conf is None else self.min_gain
             if (
                 fixed is not None
                 or best.probe
-                or best.tokens_per_ms >= baseline * (1.0 + self.min_gain)
+                or best.tokens_per_ms >= baseline * (1.0 + gain)
             ):
                 incumbent = best
             elif self._plain_rounds >= _REPROBE:
@@ -420,8 +426,11 @@ class DraftPolicy:
         self._costs.observe(k + 1, round_ms, bool(drafted))
         if k == 0 or choice.source is Source.NONE:
             self._plain_rounds += 1
+            self._drafting = False
             return
         self._plain_rounds = 0
+        if choice.source is Source.DRAFTER:
+            self._drafting = True
         if choice.source is Source.LOOKUP:
             b = lookup_bucket(choice.match)
             self._lookup_ok[b] = _LOOKUP_DECAY * self._lookup_ok[b] + accepted
@@ -452,6 +461,7 @@ def allocate_batch_verify_budget(
     cost_ms: Callable[[int], float],
     *,
     rectangular: bool = False,
+    fair: bool = False,
     min_gain: float = 0.0,
 ) -> List[int]:
     """Drafts to verify per stream when several streams share one verify pass.
@@ -467,6 +477,13 @@ def allocate_batch_verify_budget(
     largest survivals; ``R`` is then the count with the best rate.
     ``rectangular``: every stream must verify the same number of drafts (a
     verify pass that takes one window size).
+
+    ``fair``: the most tokens in total can starve a stream: every row another
+    stream verifies lengthens the pass for all, so a stream with weak drafts
+    next to one quoting its context falls below its plain-decoding rate. With
+    ``fair`` the product of the streams' rates is maximized instead (each
+    stream's share of the gain is proportional), among the allocations that
+    leave no stream slower than plain decoding.
     """
     streams = len(survivals)
     if not streams:
@@ -484,6 +501,8 @@ def allocate_batch_verify_budget(
         if best_rate < plain * (1.0 + min_gain):
             best_w = 0
         return [best_w] * streams
+    if fair:
+        return _fair_budget(survivals, cost_ms, min_gain)
     rows = sorted(
         ((s[j], j, i) for i, s in enumerate(survivals) for j in range(len(s))),
         key=lambda row: (-row[0], row[1], row[2]),
@@ -500,3 +519,33 @@ def allocate_batch_verify_budget(
         for _, _, i in rows[:best_r]:
             counts[i] += 1
     return counts
+
+
+def _fair_budget(survivals, cost_ms, min_gain: float) -> List[int]:
+    """Row counts maximizing ``sum(log(expected_i)) - streams * log(cost)``.
+
+    A stream's log expected tokens is concave in its rows, so rows are added
+    where the next one raises it most, and the best total is kept.
+    """
+    streams = len(survivals)
+    counts = [0] * streams
+    expected = [1.0] * streams
+    plain_ms = cost_ms(streams)
+    best_score = streams * (math.log1p(min_gain) - math.log(plain_ms))
+    best_counts = list(counts)
+    for total in range(streams + 1, streams + sum(len(s) for s in survivals) + 1):
+        _, i = max(
+            (math.log1p(s[counts[i]] / expected[i]), -i)
+            for i, s in enumerate(survivals)
+            if counts[i] < len(s)
+        )
+        i = -i
+        expected[i] += survivals[i][counts[i]]
+        counts[i] += 1
+        ms = cost_ms(total)
+        if min(expected) * plain_ms < ms:
+            continue  # a stream would commit slower than it does undrafted
+        score = sum(math.log(e) for e in expected) - streams * math.log(ms)
+        if score > best_score:
+            best_counts, best_score = list(counts), score
+    return best_counts
