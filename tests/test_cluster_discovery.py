@@ -1076,7 +1076,10 @@ def test_mdns_announce_publishes_spec_txt_record():
     assert info.properties["cl"] == "omlx"
     assert info.properties["ver"]
     caps = json.loads(info.properties["caps"])
-    assert set(caps) == {
+    # The identity fallback advertises the hardware facts a peer needs to label
+    # this Mac before it is paired, so the TXT record is a superset: these keys
+    # are the wire contract, further keys are additive.
+    assert set(caps) >= {
         "chip",
         "ram_gb",
         "backends",
