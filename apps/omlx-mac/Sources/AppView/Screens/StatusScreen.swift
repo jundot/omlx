@@ -18,6 +18,16 @@ struct StatusScreen: View {
     @State private var showingClearSsdCacheConfirm = false
     @State private var showingClearHotCacheConfirm = false
 
+    /// The server Mac to sample for the System block; nil samples this Mac.
+    private var remoteEndpoint: OMLXEndpoint? {
+        services.isRemoteBackend ? services.config.endpoint : nil
+    }
+
+    private struct StatusTaskKey: Equatable {
+        var scope: String
+        var remote: OMLXEndpoint?
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Same hero card the Server screen uses (omlx-screens.jsx:75
@@ -130,8 +140,8 @@ struct StatusScreen: View {
 
             FooterBar(error: vm.lastError)
         }
-        .task(id: vm.scope) {
-            await vm.start(client: services.client)
+        .task(id: StatusTaskKey(scope: vm.scope, remote: remoteEndpoint)) {
+            await vm.start(client: services.client, remote: remoteEndpoint)
         }
         .onDisappear { vm.stop() }
         .confirmationDialog(

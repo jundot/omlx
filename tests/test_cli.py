@@ -7,6 +7,7 @@ Note: Configuration validation tests are in test_config.py.
 """
 
 import argparse
+import functools
 import json
 import os
 import socket
@@ -20,6 +21,15 @@ import pytest
 from omlx._version import __version__
 from omlx.cli import _migrate_saved_network_auth
 from omlx.settings import GlobalSettings
+
+
+def _with_endpoint(settings):
+    """Give a duck-typed settings double the real client_endpoint resolver."""
+    settings.remote = SimpleNamespace(enabled=False, url="", api_key=None)
+    settings.client_endpoint = functools.partial(
+        GlobalSettings.client_endpoint, settings
+    )
+    return settings
 
 
 class TestCLIModule:
@@ -463,7 +473,10 @@ class TestLaunchCommandFunction:
         with (
             patch("requests.get", side_effect=[health_response, status_response]),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
         ):
             launch_command(args)
 
@@ -479,6 +492,185 @@ class TestLaunchCommandFunction:
         assert ctx.cross_session is False
         assert ctx.model_type == "vlm"
         assert ctx.extra_args == ()
+
+    @staticmethod
+    def _remote_settings(tmp_path, **remote):
+        from omlx.settings import RemoteSettings
+
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+        settings.auth.api_key = "local-key"
+        settings.remote = RemoteSettings(**remote)
+        return settings
+
+    @staticmethod
+    def _launch_args(**overrides):
+        defaults = {
+            "tool": "opencode",
+            "host": None,
+            "port": None,
+            "api_key": None,
+            "model": "m1",
+            "tools_profile": "coding",
+        }
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    @staticmethod
+    def _launch_integration():
+        integration = MagicMock()
+        integration.display_name = "OpenCode"
+        integration.is_installed.return_value = True
+        return integration
+
+    def test_launch_uses_remote_endpoint_and_key(self, tmp_path):
+        from omlx.cli import launch_command
+
+        integration = self._launch_integration()
+        settings = self._remote_settings(
+            tmp_path,
+            enabled=True,
+            url="https://studio.local:8443",
+            api_key="remote-key",
+        )
+        get = MagicMock()
+        get.return_value.ok = True
+        get.return_value.json.return_value = {"models": []}
+
+        with (
+            patch("requests.get", get),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(self._launch_args())
+
+        health_call = get.call_args_list[0]
+        assert health_call.args[0] == "https://studio.local:8443/health"
+        status_call = get.call_args_list[1]
+        assert status_call.args[0] == "https://studio.local:8443/v1/models/status"
+        assert status_call.kwargs["headers"] == {"Authorization": "Bearer remote-key"}
+        ctx = integration.launch.call_args.args[0]
+        assert (ctx.scheme, ctx.host, ctx.port) == ("https", "studio.local", 8443)
+        assert ctx.api_key == "remote-key"
+        assert ctx.base_url == "https://studio.local:8443"
+
+    def test_launch_cli_api_key_beats_remote_key(self, tmp_path):
+        from omlx.cli import launch_command
+
+        integration = self._launch_integration()
+        settings = self._remote_settings(
+            tmp_path, enabled=True, url="studio.local", api_key="remote-key"
+        )
+        get = MagicMock()
+        get.return_value.ok = True
+        get.return_value.json.return_value = {"models": []}
+
+        with (
+            patch("requests.get", get),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(self._launch_args(api_key="cli-key"))
+
+        assert integration.launch.call_args.args[0].api_key == "cli-key"
+
+    def test_launch_explicit_host_bypasses_remote(self, tmp_path):
+        from omlx.cli import launch_command
+
+        integration = self._launch_integration()
+        settings = self._remote_settings(
+            tmp_path, enabled=True, url="https://studio.local", api_key="remote-key"
+        )
+        get = MagicMock()
+        get.return_value.ok = True
+        get.return_value.json.return_value = {"models": []}
+
+        with (
+            patch("requests.get", get),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(self._launch_args(host="127.0.0.1"))
+
+        assert get.call_args_list[0].args[0] == "http://127.0.0.1:8000/health"
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.scheme == "http"
+        assert ctx.api_key == "local-key"
+
+    def test_launch_unreachable_remote_prints_remote_message(self, tmp_path, capsys):
+        from omlx.cli import launch_command
+
+        integration = self._launch_integration()
+        settings = self._remote_settings(
+            tmp_path, enabled=True, url="studio.local:9000"
+        )
+
+        with (
+            patch("requests.get", side_effect=OSError("down")),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
+        ):
+            launch_command(self._launch_args())
+
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "oMLX server is not reachable at http://studio.local:9000" in out
+        assert (
+            "Remote backend configured in settings (remote.url); "
+            "check the server on that Mac."
+        ) in out
+        assert "omlx start" not in out
+        integration.launch.assert_not_called()
+
+    def test_launch_unreachable_local_suggests_start(self, tmp_path, capsys):
+        from omlx.cli import launch_command
+
+        integration = self._launch_integration()
+        settings = self._remote_settings(tmp_path)
+
+        with (
+            patch("requests.get", side_effect=OSError("down")),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit),
+        ):
+            launch_command(self._launch_args())
+
+        out = capsys.readouterr().out
+        assert "not reachable at http://127.0.0.1:8000" in out
+        assert "Start the server first: omlx start" in out
+        assert "Remote backend" not in out
+
+    def test_launch_bad_remote_url_prints_error(self, tmp_path, capsys):
+        from omlx.cli import launch_command
+
+        integration = self._launch_integration()
+        settings = self._remote_settings(tmp_path, enabled=True, url="ftp://x")
+        get = MagicMock()
+
+        with (
+            patch("requests.get", get),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
+        ):
+            launch_command(self._launch_args())
+
+        assert exc.value.code == 1
+        assert "remote.url" in capsys.readouterr().out
+        get.assert_not_called()
+
+    def test_launch_help_says_host_port_bypass_remote(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "launch", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert "bypasses the remote backend" in " ".join(result.stdout.split())
 
     def test_launch_command_brackets_ipv6_host_in_urls(self):
         from omlx.cli import launch_command
@@ -520,7 +712,10 @@ class TestLaunchCommandFunction:
                 "requests.get", side_effect=[health_response, status_response]
             ) as mock_get,
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
         ):
             launch_command(args)
 
@@ -568,7 +763,10 @@ class TestLaunchCommandFunction:
         with (
             patch("requests.get", side_effect=[health_response, status_response]),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
         ):
             launch_command(args)
 
@@ -626,7 +824,10 @@ class TestLaunchCommandFunction:
             # /v1/models call must not happen.
             patch("requests.get", side_effect=[health_response, status_response]),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
         ):
             launch_command(args)
 
@@ -677,7 +878,10 @@ class TestLaunchCommandFunction:
         with (
             patch("requests.get", side_effect=[health_response, status_response]),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
         ):
             launch_command(args)
 
@@ -728,7 +932,10 @@ class TestLaunchCommandFunction:
         with (
             patch("requests.get", side_effect=[health_response, status_response]),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
         ):
             launch_command(args, extra_args=["--resume", "abc123"])
 
@@ -778,7 +985,10 @@ class TestLaunchCommandFunction:
         with (
             patch("requests.get", side_effect=[health_response, status_response]),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
             pytest.raises(SystemExit) as exc,
         ):
             launch_command(args)
@@ -835,7 +1045,10 @@ class TestLaunchCommandFunction:
         with (
             patch("requests.get", side_effect=[health_response, status_response]),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
             pytest.raises(SystemExit) as exc,
         ):
             launch_command(args)
@@ -897,7 +1110,10 @@ class TestLaunchCommandFunction:
                 side_effect=[health_response, status_response, models_response],
             ),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
             pytest.raises(SystemExit) as exc,
         ):
             launch_command(args)
@@ -961,7 +1177,10 @@ class TestLaunchCommandFunction:
                 side_effect=[health_response, status_map_response, models_response],
             ),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
         ):
             launch_command(args)
 
@@ -1013,7 +1232,10 @@ class TestLaunchCommandFunction:
         with (
             patch("requests.get", side_effect=[health_response, status_response]),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
         ):
             launch_command(args)
 
@@ -1045,7 +1267,10 @@ class TestLaunchCommandFunction:
         with (
             patch("requests.get", requests_get),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
             pytest.raises(SystemExit) as exc,
         ):
             launch_command(args)
@@ -1640,7 +1865,10 @@ class TestLaunchClaudeTierPrecedence:
                 side_effect=[health_response, status_response, models_response],
             ),
             patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
         ):
             launch_command(args)
         integration.launch.assert_called_once()
@@ -1730,7 +1958,10 @@ class TestLaunchClaudeTierPrecedence:
         )
         with (
             patch("requests.get", side_effect=responses),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch(
+                "omlx.settings.GlobalSettings.load",
+                return_value=_with_endpoint(settings),
+            ),
             patch("omlx.integrations.get_integration", return_value=integration),
             patch.object(integration, "is_installed", return_value=True),
             patch.object(integration, "select_model", return_value="picked-model"),

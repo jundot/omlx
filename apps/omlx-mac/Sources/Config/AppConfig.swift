@@ -51,6 +51,15 @@ struct AppConfig: Sendable, Equatable, Codable {
     var modelDirs: [String] = []
     /// HuggingFace endpoint override. Empty = default `huggingface.co`.
     var hfEndpoint: String
+    /// Remote backend. When `remoteEnabled`, every client feature of this
+    /// install (the screens, the menubar, Ask AI, `omlx launch`) talks to
+    /// the oMLX server at `remoteAddress` and no server runs on this Mac.
+    /// Stored in settings.json under `remote` (`enabled`, `url`, `api_key`)
+    /// so the CLI reads the same values; it is never sent to a server.
+    var remoteEnabled: Bool = false
+    /// `host`, `host:port`, or `http(s)://host[:port]`, as typed.
+    var remoteAddress: String = ""
+    var remoteAPIKey: String?
 
     init(
         bindAddress: String,
@@ -60,7 +69,10 @@ struct AppConfig: Sendable, Equatable, Codable {
         basePath: String,
         modelDir: String,
         modelDirs: [String]? = nil,
-        hfEndpoint: String
+        hfEndpoint: String,
+        remoteEnabled: Bool = false,
+        remoteAddress: String = "",
+        remoteAPIKey: String? = nil
     ) {
         self.bindAddress = bindAddress
         self.port = port
@@ -68,6 +80,9 @@ struct AppConfig: Sendable, Equatable, Codable {
         self.apiKey = apiKey
         self.basePath = basePath
         self.modelDir = modelDir
+        self.remoteEnabled = remoteEnabled
+        self.remoteAddress = remoteAddress
+        self.remoteAPIKey = Self.cleanedKey(remoteAPIKey)
         let cleanedModelDirs = (modelDirs ?? [modelDir]).filter {
             !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
@@ -156,7 +171,46 @@ struct AppConfig: Sendable, Equatable, Codable {
     }
 
     var baseURL: URL? {
-        Self.httpURL(host: host, port: port)
+        endpoint.baseURL
+    }
+
+    // MARK: - Effective endpoint
+
+    /// This install points at an oMLX server on another Mac.
+    var isRemote: Bool { remoteEnabled }
+
+    /// The remote backend's address, or nil when `remoteAddress` is not an
+    /// address (`OMLXEndpoint` parses `host`, `host:port`, `scheme://host[:port]`).
+    var remoteEndpoint: OMLXEndpoint? {
+        OMLXEndpoint(remoteAddress: remoteAddress, apiKey: remoteAPIKey)
+    }
+
+    /// The server this app talks to: the remote backend when one is enabled,
+    /// otherwise the server on this Mac. Every URL a screen, the menubar or
+    /// Ask AI builds should start here. An enabled remote whose address does
+    /// not parse stays remote (no URL can be built from it) rather than
+    /// quietly falling back to a local server that is not running.
+    var endpoint: OMLXEndpoint {
+        if remoteEnabled {
+            return remoteEndpoint ?? OMLXEndpoint(
+                scheme: "http", host: remoteAddress.trimmingCharacters(in: .whitespacesAndNewlines),
+                port: OMLXEndpoint.defaultPort, apiKey: remoteAPIKey, isRemote: true
+            )
+        }
+        return OMLXEndpoint(localServer: self)
+    }
+
+    func httpURL(path: String = "") -> URL? {
+        endpoint.httpURL(path: path)
+    }
+
+    func webSocketURL(path: String, query: [URLQueryItem] = []) -> URL? {
+        endpoint.webSocketURL(path: path, query: query)
+    }
+
+    static func cleanedKey(_ key: String?) -> String? {
+        let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func primaryBindHost(for bindAddress: String) -> String {
@@ -307,6 +361,9 @@ struct AppConfig: Sendable, Equatable, Codable {
                 c.modelDirs = [m]
             }
             if let hf = slice.hfEndpoint { c.hfEndpoint = hf }
+            if let enabled = slice.remoteEnabled { c.remoteEnabled = enabled }
+            if let address = slice.remoteAddress { c.remoteAddress = address }
+            c.remoteAPIKey = cleanedKey(slice.remoteAPIKey)
         }
 
         // Env overrides for non-path fields. basePath is already env-driven
@@ -315,6 +372,12 @@ struct AppConfig: Sendable, Equatable, Codable {
         if let h = env["OMLX_HOST"], !h.isEmpty { c.bindAddress = h }
         if let pStr = env["OMLX_PORT"], let p = Int(pStr) { c.port = p }
         if let k = env["OMLX_API_KEY"], !k.isEmpty { c.apiKey = k }
+        // Same names the CLI honours: a URL turns the remote backend on.
+        if let url = env["OMLX_REMOTE_URL"], !url.isEmpty {
+            c.remoteAddress = url
+            c.remoteEnabled = true
+        }
+        if let k = env["OMLX_REMOTE_API_KEY"], !k.isEmpty { c.remoteAPIKey = k }
         return c
     }
 
@@ -360,6 +423,11 @@ struct AppConfig: Sendable, Equatable, Codable {
         hf["endpoint"] = hfEndpoint
         json["huggingface"] = hf
 
+        json["remote"] = Self.remoteSlice(
+            existing: json["remote"] as? [String: Any],
+            enabled: remoteEnabled, address: remoteAddress, apiKey: remoteAPIKey
+        )
+
         if json["version"] == nil { json["version"] = "1.0" }
 
         let out = try JSONSerialization.data(
@@ -367,6 +435,46 @@ struct AppConfig: Sendable, Equatable, Codable {
             options: [.prettyPrinted]
         )
         try out.write(to: url, options: [.atomic])
+    }
+
+    /// The `remote` section as the CLI reads it (`omlx/settings.py`
+    /// `RemoteSettings`): `enabled`, `url`, `api_key`. Other keys in an
+    /// existing section are kept.
+    private static func remoteSlice(
+        existing: [String: Any]?, enabled: Bool, address: String, apiKey: String?
+    ) -> [String: Any] {
+        var remote = existing ?? [:]
+        remote["enabled"] = enabled
+        remote["url"] = address
+        remote["api_key"] = apiKey ?? ""
+        return remote
+    }
+
+    /// Update only the remote backend, preserving other settings. The
+    /// section is client-side, so this is safe whether or not a local
+    /// server is running; the server never writes it from its own state
+    /// except to carry it through unchanged.
+    static func saveRemoteBackend(
+        basePath: String, enabled: Bool, address: String, apiKey: String?
+    ) throws {
+        let url = settingsURL(basePath: basePath)
+        var json: [String: Any] = [:]
+        if FileManager.default.fileExists(atPath: url.path) {
+            let data = try Data(contentsOf: url)
+            guard let existing = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            json = existing
+        }
+        json["remote"] = remoteSlice(
+            existing: json["remote"] as? [String: Any],
+            enabled: enabled, address: address, apiKey: cleanedKey(apiKey)
+        )
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted])
+        try data.write(to: url, options: [.atomic])
     }
 
     /// Update only the endpoint while Python is stopped, preserving other settings.
@@ -404,6 +512,9 @@ struct AppConfig: Sendable, Equatable, Codable {
         var modelDirs: [String]?
         var modelDir: String?
         var hfEndpoint: String?
+        var remoteEnabled: Bool?
+        var remoteAddress: String?
+        var remoteAPIKey: String?
     }
 
     static func readSettingsForTests(basePath: String) throws -> ServerSettingsSlice {
@@ -421,6 +532,7 @@ struct AppConfig: Sendable, Equatable, Codable {
         let auth   = json["auth"]   as? [String: Any]
         let model  = json["model"]  as? [String: Any]
         let hf     = json["huggingface"] as? [String: Any]
+        let remote = json["remote"] as? [String: Any]
         // `host` remains the Python/admin settings key. `bind_address` is a
         // read-only compatibility fallback for builds that briefly wrote it.
         let bindAddr = server?["host"] as? String
@@ -432,7 +544,10 @@ struct AppConfig: Sendable, Equatable, Codable {
             apiKey: auth?["api_key"] as? String,
             modelDirs: model?["model_dirs"] as? [String],
             modelDir: model?["model_dir"] as? String,
-            hfEndpoint: hf?["endpoint"] as? String
+            hfEndpoint: hf?["endpoint"] as? String,
+            remoteEnabled: remote?["enabled"] as? Bool,
+            remoteAddress: remote?["url"] as? String,
+            remoteAPIKey: remote?["api_key"] as? String
         )
     }
 }

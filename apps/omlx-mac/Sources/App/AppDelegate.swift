@@ -33,6 +33,9 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var server: ServerProcess?
+    /// Watches the oMLX server on another Mac when this install points at
+    /// one; `server` stays nil in that mode.
+    private var remoteMonitor: RemoteBackendMonitor?
     private var menubar: MenubarController?
     private var controlServer: AppControlServer?
     let services = AppServices()
@@ -211,7 +214,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let config = AppConfig.load()
         services.updateConfig(config)
 
-        if AppConfig.hasExistingConfig {
+        if config.isRemote {
+            // This Mac uses the oMLX server on another Mac: nothing to
+            // spawn, and no first-run wizard either (the env alone can
+            // select a remote backend, so settings.json may not exist).
+            bootstrapRemote(config: config)
+            scheduleAccessoryPolicyFlip()
+        } else if AppConfig.hasExistingConfig {
             // Returning user. AppConfig.load() picks the highest-priority
             // file (`~/.omlx/settings.json` first, Library config.json
             // second) and stamps `config.source` so future saves route to
@@ -310,6 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) -> MenubarController {
         MenubarController(
             server: server,
+            remoteMonitor: remoteMonitor,
             config: config,
             updates: services.updates,
             lastError: lastError,
@@ -356,6 +366,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !anyVisible, NSApp.activationPolicy() != .accessory {
             NSApp.setActivationPolicy(.accessory)
         }
+    }
+
+    /// Remote backend: watch that server's health instead of running one,
+    /// and keep the menubar and the app view on it.
+    private func bootstrapRemote(config: AppConfig) {
+        let monitor = RemoteBackendMonitor(endpoint: config.remoteEndpoint)
+        self.remoteMonitor = monitor
+        services.bind(remoteMonitor: monitor)
+        self.menubar = makeMenubar(server: nil, config: config)
+        monitor.start()
     }
 
     private func bootstrapServer(config: AppConfig) {
@@ -629,7 +649,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 extension AppDelegate: AppControlHandling {
+    /// `omlx start/stop/restart/status` while this Mac uses a remote
+    /// backend: nothing runs here, so report that server's reachability
+    /// and refuse to start or stop it. The CLI waits on `state`, so a
+    /// reachable backend reads as "running" and anything else "stopped".
+    private func remoteControlResponse(_ command: AppControlServer.Command) async -> AppControlServer.Response {
+        await services.refreshRemoteBackend()
+        let endpoint = services.config.endpoint
+        let address = services.config.remoteEndpoint?.displayAddress ?? services.config.remoteAddress
+        let reachable = services.remoteState.isReachable
+        let condition: String
+        switch services.remoteState {
+        case .reachable:                   condition = "reachable"
+        case .unauthorized:                condition = "reachable, but the API key was rejected"
+        case .unreachable(let message):    condition = "unreachable (\(message))"
+        case .invalidAddress:              condition = "not a valid address"
+        case .checking, .idle:             condition = "being checked"
+        }
+        let state = reachable ? "running" : "stopped"
+        switch command {
+        case .status:
+            return AppControlServer.Response(
+                ok: true, status: "ok", state: state, pid: nil,
+                host: endpoint.host, port: endpoint.port,
+                message: "Remote backend \(address) is \(condition)."
+            )
+        case .start, .stop, .restart:
+            return AppControlServer.Response(
+                ok: false, status: "remote_backend", state: state, pid: nil,
+                host: endpoint.host, port: endpoint.port,
+                message: "This Mac uses the oMLX server at \(address) (\(condition)). "
+                    + "Start, stop and restart it on that Mac."
+            )
+        }
+    }
+
     func handleAppControl(_ command: AppControlServer.Command) async -> AppControlServer.Response {
+        if services.isRemoteBackend {
+            return await remoteControlResponse(command)
+        }
         guard let server else {
             return .failure(
                 status: "unavailable",
