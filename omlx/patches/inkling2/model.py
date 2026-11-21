@@ -28,6 +28,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import (
     ArraysCache,
+    BatchKVCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
@@ -81,59 +82,83 @@ def _temporal_kv(kv, k, v, window: int = 0, length: int = 0):
     return k, v
 
 
-def _trim_batch_rotating(kv, n: int) -> int:
+def _trim_batch_rotating(kv, n: int, dry_run: bool = False) -> int:
     if kv.keys is None or kv._offset < kv.max_size:
-        return kv.trim(n)  # still linear (growth phase): stock trim is exact
+        # Still linear (growth phase): stock trim is exact.
+        return min(kv._offset, int(n)) if dry_run else kv.trim(n)
+    n = min(int(n), kv._offset)
+    rows = kv.keys.shape[2] if kv.rotated else kv._idx  # rows once linearised
+    keep = rows - n
+    if keep < kv.max_size and rows != kv._offset:
+        return 0  # the head of the window is already gone
+    if dry_run:
+        return n
     kv._temporal_order()  # linearise in place (also clears kv.rotated)
     keys, values = kv.keys[..., : kv._idx, :], kv.values[..., : kv._idx, :]
-    n = min(int(n), kv._offset)
-    keep = keys.shape[2] - n
-    if keep < kv.max_size:
-        return 0
-    # Keep exactly the newest max_size keys: the invariant the in-place path
-    # expects (shape == _idx == max_size). Dropped head keys shift the
-    # temporal-coordinate left_padding, as stock trims do. Left unclamped like
-    # stock (per-step `left_padding -= S`); consumers treat <= 0 as no padding.
-    start = keep - kv.max_size
+    # Keep the newest min(keep, max_size) keys. keep >= max_size: exactly
+    # max_size (shape == _idx == max_size), the invariant the in-place path
+    # expects; dropped head keys shift the temporal-coordinate left_padding, as
+    # stock trims do (left unclamped like stock's per-step `left_padding -= S`;
+    # consumers treat <= 0 as no padding). keep < max_size: a verify chunk that
+    # crossed max_size from a linear buffer, nothing dropped yet, so rolling
+    # back returns the cache to its growth phase (_offset == _idx == keep).
+    start = max(keep - kv.max_size, 0)
     kv.keys, kv.values = keys[..., start:keep, :], values[..., start:keep, :]
     kv.left_padding = kv.left_padding - start
-    kv._idx = kv.max_size
+    kv._idx = keep - start
     kv.rotated = False
     kv._offset -= n
     kv.offset = kv.offset - n
     return n
 
 
-def _trim_kv(kv, n: int) -> int:
+def _trim_kv(kv, n: int, dry_run: bool = False) -> int:
     """Drop the newest ``n`` positions (speculative-verify rollback).
 
     Stock ``RotatingKVCache.trim`` only moves ``_idx`` back, which is exact while
     the buffer is still linear (offset < max_size) but corrupts temporal order
     once it has wrapped. A verify chunk goes through the concat path, which
-    leaves the buffer linear with ``max_size - 1 + S`` keys, so the rejected
-    tail can be sliced off exactly while every later query still sees a full
-    window. Refuse (return 0) rather than drop history the window needs.
+    leaves the buffer linear with ``max_size - 1 + S`` keys (all ``offset`` keys
+    if it crossed max_size from a linear buffer), so the rejected tail can be
+    sliced off exactly while every later query still sees a full window.
+    Refuse (return 0) rather than drop history the window needs.
+
+    ``dry_run`` returns what the trim would return without touching the cache
+    (stock caches: the stock ``min(available, n)``).
     """
     if n <= 0:
         return 0
     if isinstance(kv, BatchRotatingKVCache):
-        return _trim_batch_rotating(kv, n)
+        return _trim_batch_rotating(kv, n, dry_run)
     if (
         not isinstance(kv, RotatingKVCache)
         or kv.keys is None
         or kv.offset < kv.max_size
     ):
-        return kv.trim(n)
+        if not dry_run:
+            return kv.trim(n)
+        if isinstance(kv, BatchKVCache):
+            return min(kv._idx, int(n))
+        if isinstance(kv, (KVCache, RotatingKVCache)):
+            return min(kv.offset, int(n))
+        # Other caches (e.g. quantised ones): trust is_trimmable; the real trim's
+        # return is still checked, though a mismatch there leaves earlier layers
+        # trimmed, as before this pre-check existed.
+        return int(n) if kv.is_trimmable() else 0
     n = min(int(n), kv.offset)
-    keys = kv._temporal_order(kv.keys)
-    values = kv._temporal_order(kv.values)
+    keys = kv._temporal_order(kv.keys)  # lazy: a dry run only reads its shape
     keep = keys.shape[2] - n
-    if keep < kv.max_size:
-        return 0
-    # Keep exactly the newest max_size keys (shape == _idx == max_size).
-    start = keep - kv.max_size
+    if keep < kv.max_size and keys.shape[2] != kv.offset:
+        return 0  # the head of the window is already gone
+    if dry_run:
+        return n
+    values = kv._temporal_order(kv.values)
+    # Keep the newest min(keep, max_size) keys: exactly max_size once wrapped
+    # (shape == _idx == max_size); fewer only when nothing has been dropped,
+    # which puts the cache back in its growth phase (offset == _idx == keep).
+    start = max(keep - kv.max_size, 0)
     kv.keys, kv.values = keys[..., start:keep, :], values[..., start:keep, :]
-    kv._idx = kv.max_size
+    kv._idx = keep - start
     kv.offset -= n
     return n
 
@@ -980,11 +1005,18 @@ class Model(nn.Module):
             return True
         keep = int(accepted) + 1
         width = self.args.text.sconv_kernel_size - 1
+        # Check every layer first so a refusal leaves the whole cache untouched.
+        for entry in cache:
+            if (
+                getattr(entry[1], "_omlx_verify_xp", None) is None
+                or _trim_kv(entry[0], rejected, dry_run=True) != rejected
+            ):
+                return False
         for entry in cache:
             kv, conv = entry[0], entry[1]
-            windows = getattr(conv, "_omlx_verify_xp", None)
-            if windows is None or _trim_kv(kv, rejected) != rejected:
-                return False
+            windows = conv._omlx_verify_xp
+            if _trim_kv(kv, rejected) != rejected:
+                return False  # only a cache the dry run could not predict
             for slot, window in windows.items():
                 conv[slot] = window[:, keep : keep + width] * 1.0
             conv._omlx_verify_xp = None

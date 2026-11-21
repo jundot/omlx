@@ -3,13 +3,18 @@
 
 A sliding-window visit on a RotatingKVCache must attend exactly as on a full
 KVCache: through chunked prefill, the ring wrapping, single-token decode and
-speculative-verify rollback after the wrap.
+speculative-verify rollback before, across and after the wrap.
 """
 
 import mlx.core as mx
 import numpy as np
 import pytest
-from mlx_lm.models.cache import BatchRotatingKVCache, KVCache, RotatingKVCache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    BatchRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+)
 from test_inkling_vlm_mtp import _inkling2_tiny
 
 from omlx.patches.inkling2 import kernels
@@ -42,6 +47,14 @@ _PLANS = {
     + [_fwd(1)] * 300
     + [_fwd(4), _trim(1), _fwd(1), _fwd(4), _trim(3), _fwd(1), _fwd(5), _trim(0)] * 5
     + [_fwd(1)] * 20,
+    # A verify chunk that crosses max_size from a linear buffer, then has
+    # most of itself rejected: the rollback must return to the growth phase.
+    "verify-crosses-window": [_fwd(WINDOW - 2), _fwd(5), _trim(4)]
+    + [_fwd(1)] * 40
+    + [_fwd(4), _trim(3), _fwd(1)],
+    "verify-crosses-2x-window": [_fwd(2 * WINDOW - 2), _fwd(5), _trim(4)]
+    + [_fwd(1)] * 40
+    + [_fwd(4), _trim(3), _fwd(1)],
 }
 _RINGS = {
     "ring": lambda: RotatingKVCache(max_size=WINDOW, keep=0),
@@ -88,9 +101,9 @@ def test_ring_attends_as_the_full_cache(plan, ring):
         err = mx.abs(expected.astype(mx.float32) - actual.astype(mx.float32)).max()
         # bf16 rounding only: a wrong or missing key moves outputs by O(1).
         assert err.item() <= 1e-2, (step, op, n, full.offset)
-    if full.offset > rotating.max_size:
-        # The ring stayed bounded.
-        assert rotating.keys.shape[2] < full.offset
+    # The ring stayed bounded: at most what the concat path keeps.
+    chunk = max(n for op, n in _PLANS[plan] if op == "fwd")
+    assert rotating.keys.shape[2] <= rotating.max_size - 1 + chunk
 
 
 def test_trim_refuses_to_drop_history_the_window_needs():
@@ -98,8 +111,29 @@ def test_trim_refuses_to_drop_history_the_window_needs():
     for _ in range(WINDOW + 10):
         cache.update_and_fetch(*_inputs(1)[1:3])
     # A wrapped ring of exactly the window holds no spare keys.
+    assert _trim_kv(cache, 1, dry_run=True) == 0
     assert _trim_kv(cache, 1) == 0
     assert cache.offset == WINDOW + 10
+
+
+def test_rollback_refusal_leaves_every_layer_untouched():
+    lm = _inkling2_tiny()
+    # Layer 0 could roll back one rejected draft; layer 1 cannot.
+    ok = RotatingKVCache(max_size=WINDOW, keep=0)
+    ok.update_and_fetch(*_inputs(WINDOW + 20)[1:3])
+    ok.update_and_fetch(*_inputs(4)[1:3])
+    stuck = RotatingKVCache(max_size=WINDOW, keep=0)
+    for _ in range(WINDOW + 10):
+        stuck.update_and_fetch(*_inputs(1)[1:3])
+    cache = []
+    for kv in (ok, stuck):
+        conv = ArraysCache(4)
+        conv._omlx_verify_xp = {}
+        cache.append((kv, conv))
+    before = [(kv.offset, kv._idx, kv.keys.shape[2]) for kv, _ in cache]
+    assert lm.mtp_partial_rollback(cache, 2, 3) is False
+    assert [(kv.offset, kv._idx, kv.keys.shape[2]) for kv, _ in cache] == before
+    assert all(conv._omlx_verify_xp == {} for _, conv in cache)
 
 
 @pytest.mark.parametrize("bounded,size", [(False, 0), (True, 0), (True, 2048)])
