@@ -551,7 +551,7 @@
                          cluster plan: the plan keeps its own one action. -->
                     <div class="mt-3 rounded-lg border border-neutral-200 bg-white px-3 py-2"
                          x-show="assistantLocalRunVisible()" x-cloak
-                         data-cluster-v2-assistant-local-run>
+                         data-cluster-assistant-local-run>
                         <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">Run on this Mac</div>
                         <p class="text-caption text-neutral-500 mt-0.5">
                             This model fits on this Mac alone. Single-node inference skips the pipeline,
@@ -561,13 +561,13 @@
                             <button type="button" @click="runAssistantLocal()"
                                     :disabled="assistantRunning() || assistant.localRun.busy || !assistantLocalRunAvailable()"
                                     class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-40"
-                                    data-cluster-v2-assistant-local-run-button>
+                                    data-cluster-assistant-local-run-button>
                                 <i data-lucide="play" class="w-3 h-3"></i>
                                 <span>Run on this Mac</span>
                             </button>
                             <span class="text-caption text-neutral-500"
                                   x-show="assistant.localRun.state === 'ready'"
-                                  data-cluster-v2-assistant-local-run-ready>
+                                  data-cluster-assistant-local-run-ready>
                                 Running on this Mac
                             </span>
                             <!-- Stop/Unload: the job's own stop route unloads
@@ -579,13 +579,13 @@
                                     :disabled="assistant.localRun.stopping"
                                     x-show="assistantLocalRunStoppable()" x-cloak
                                     class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-neutral-800 bg-white border border-neutral-300 rounded-full hover:bg-neutral-50 disabled:opacity-40"
-                                    data-cluster-v2-assistant-local-run-stop>
+                                    data-cluster-assistant-local-run-stop>
                                 <i data-lucide="square" class="w-3 h-3"></i>
                                 <span x-text="assistant.localRun.stopping ? 'Stopping…' : 'Stop local run'"></span>
                             </button>
                             <span class="text-caption text-neutral-500"
                                   x-show="assistant.localRun.stopped" x-cloak
-                                  data-cluster-v2-assistant-local-run-stopped>
+                                  data-cluster-assistant-local-run-stopped>
                                 Stopped — this Mac no longer serves the model
                             </span>
                         </div>
@@ -595,33 +595,33 @@
                              spinner follows the job's own state. -->
                         <div class="mt-2 flex items-center gap-2 text-xs text-neutral-600"
                              x-show="assistantLocalRunBusy()" x-cloak
-                             data-cluster-v2-assistant-local-run-busy>
+                             data-cluster-assistant-local-run-busy>
                             <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                            <span data-cluster-v2-assistant-local-run-progress
+                            <span data-cluster-assistant-local-run-progress
                                   x-text="assistantLocalRunProgressLabel()"></span>
                         </div>
 
                         <!-- One refusal: the message and exactly one action. -->
                         <div class="mt-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-caption text-red-700"
                              x-show="assistant.localRun.error" x-cloak
-                             data-cluster-v2-assistant-local-run-error>
+                             data-cluster-assistant-local-run-error>
                             <p x-text="assistant.localRun.error"></p>
                             <button type="button"
                                     @click="assistantActionHandler(assistant.localRun.errorAction)"
                                     :disabled="assistant.busy"
                                     x-show="assistant.localRun.errorAction"
                                     class="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100 disabled:opacity-40"
-                                    data-cluster-v2-assistant-local-run-action
+                                    data-cluster-assistant-local-run-action
                                     x-text="assistantActionLabel(assistant.localRun.errorAction)"></button>
                         </div>
 
                         <!-- Honest warnings (e.g. the tuning preset outcome). -->
                         <div class="mt-2" x-show="assistant.localRun.warnings.length" x-cloak
-                             data-cluster-v2-assistant-local-run-warnings>
+                             data-cluster-assistant-local-run-warnings>
                             <template x-for="(warning, warningIndex) in assistant.localRun.warnings"
                                       :key="warningIndex">
                                 <p class="text-caption text-neutral-500"
-                                   data-cluster-v2-assistant-local-run-warning
+                                   data-cluster-assistant-local-run-warning
                                    x-text="warning.message"></p>
                             </template>
                         </div>
@@ -629,26 +629,26 @@
                         <!-- Ready only: this Mac's endpoint, the serving id and
                              the existing model-only chat link (Screen 5). -->
                         <div class="mt-2" x-show="assistantLocalEndpointUrl()" x-cloak
-                             data-cluster-v2-assistant-local-run-endpoint>
+                             data-cluster-assistant-local-run-endpoint>
                             <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">Local endpoint</div>
                             <a :href="assistantLocalEndpointUrl()"
                                class="text-xs font-semibold text-blue-700 break-all hover:underline"
-                               data-cluster-v2-assistant-local-run-endpoint-url
+                               data-cluster-assistant-local-run-endpoint-url
                                x-text="assistantLocalEndpointUrl()"></a>
                             <div class="mt-2 flex flex-wrap items-center gap-2">
                                 <button type="button" @click="openAssistantLocalChat()"
                                         class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800"
-                                        data-cluster-v2-assistant-local-run-open-chat>
+                                        data-cluster-assistant-local-run-open-chat>
                                     {{ t('cluster.assistant.open_chat') }}
                                     <i data-lucide="arrow-right" class="w-3 h-3"></i>
                                 </button>
                             </div>
                             <p class="mt-1.5 text-caption text-neutral-500">
                                 Serving <code class="font-mono break-all"
-                                             data-cluster-v2-assistant-local-run-model
+                                             data-cluster-assistant-local-run-model
                                              x-text="assistant.localRun.modelId"></code>
                                 at
-                                <span data-cluster-v2-assistant-local-run-context
+                                <span data-cluster-assistant-local-run-context
                                       x-text="(assistant.localRun.contextTokens || 0).toLocaleString() + ' tokens'"></span>.
                                 Stop local run unloads it from this Mac's engine.
                             </p>
@@ -660,7 +660,7 @@
                              Run on this Mac replays it. -->
                         <div class="mt-3 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2"
                              x-show="assistantLocalTunable() || assistant.localTune.busy || assistantLocalTuneRows().length || assistant.localTune.error"
-                             x-cloak data-cluster-v2-assistant-tune-local>
+                             x-cloak data-cluster-assistant-tune-local>
                             <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">Tune on this Mac</div>
                             <p class="text-caption text-neutral-500 mt-0.5">
                                 Sweeps the sampler and the MTP switch/depth with real completions, redeploying each MTP config locally. The winning config stays loaded and is saved for this model on this Mac; a later Run on this Mac replays it.
@@ -669,32 +669,32 @@
                                 <button type="button" @click="runAssistantTuneLocal()"
                                         :disabled="assistantRunning() || assistant.localTune.busy || !assistantLocalTunable()"
                                         class="inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-40"
-                                        data-cluster-v2-assistant-tune-local-button>
+                                        data-cluster-assistant-tune-local-button>
                                     <i data-lucide="sliders-horizontal" class="w-3 h-3"></i>
                                     <span>Tune on this Mac</span>
                                 </button>
                             </div>
                             <div class="mt-2 flex items-center gap-2 text-xs text-neutral-500"
                                  x-show="assistant.localTune.busy" x-cloak
-                                 data-cluster-v2-assistant-tune-local-busy>
+                                 data-cluster-assistant-tune-local-busy>
                                 <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                                <span data-cluster-v2-assistant-tune-local-progress
+                                <span data-cluster-assistant-tune-local-progress
                                       x-text="assistantLocalTuneProgressLabel()"></span>
                             </div>
                             <div class="mt-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-caption text-red-700"
                                  x-show="assistant.localTune.error" x-cloak
-                                 data-cluster-v2-assistant-tune-local-error>
+                                 data-cluster-assistant-tune-local-error>
                                 <p x-text="assistant.localTune.error"></p>
                                 <button type="button"
                                         @click="assistantActionHandler(assistant.localTune.errorAction)"
                                         :disabled="assistant.busy"
                                         x-show="assistant.localTune.errorAction"
                                         class="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100 disabled:opacity-40"
-                                        data-cluster-v2-assistant-tune-local-action
+                                        data-cluster-assistant-tune-local-action
                                         x-text="assistantActionLabel(assistant.localTune.errorAction)"></button>
                             </div>
                             <div class="mt-2" x-show="assistantLocalTuneRows().length"
-                                 data-cluster-v2-assistant-tune-local-rows>
+                                 data-cluster-assistant-tune-local-rows>
                                 <table class="w-full text-left text-caption">
                                     <thead>
                                         <tr class="text-neutral-400">
@@ -706,7 +706,7 @@
                                     <tbody>
                                         <template x-for="(row, rowIndex) in assistantLocalTuneRows()" :key="rowIndex">
                                             <tr class="border-t border-neutral-200"
-                                                data-cluster-v2-assistant-tune-local-row>
+                                                data-cluster-assistant-tune-local-row>
                                                 <td class="py-0.5 pr-2 font-mono" x-text="row.config"></td>
                                                 <td class="py-0.5 pr-2" x-text="assistantLocalTuneRateLabel(row)"></td>
                                                 <td class="py-0.5 text-neutral-500" x-text="row.error || ''"></td>
@@ -717,10 +717,10 @@
                             </div>
                             <div class="mt-2 rounded-lg border border-green-200 bg-green-50 px-2.5 py-2"
                                  x-show="assistant.localTune.best" x-cloak
-                                 data-cluster-v2-assistant-tune-local-best>
+                                 data-cluster-assistant-tune-local-best>
                                 <div class="text-caption font-bold uppercase tracking-wider text-green-700">Best measured config</div>
                                 <div class="mt-0.5 text-xs font-semibold text-neutral-900"
-                                     data-cluster-v2-assistant-tune-local-best-label
+                                     data-cluster-assistant-tune-local-best-label
                                      x-text="assistantLocalTuneBestLabel()"></div>
                                 <p class="text-caption text-neutral-600">
                                     The winning config is loaded now and saved for this model on this Mac.

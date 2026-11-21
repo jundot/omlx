@@ -6459,7 +6459,7 @@ function clusterWizard() {
                     return null;
                 }
                 await new Promise((resolve) =>
-                    setTimeout(resolve, CLUSTER_V2_POLL_MS),
+                    setTimeout(resolve, CLUSTER_POLL_MS),
                 );
             }
         },
@@ -6719,7 +6719,7 @@ function clusterWizard() {
                     return snapshot;
                 }
                 await new Promise((resolve) =>
-                    setTimeout(resolve, CLUSTER_V2_POLL_MS),
+                    setTimeout(resolve, CLUSTER_POLL_MS),
                 );
             }
         },

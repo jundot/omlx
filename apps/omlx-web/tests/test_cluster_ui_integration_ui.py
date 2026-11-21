@@ -3281,24 +3281,24 @@ def test_assistant_run_on_this_mac_failure_keeps_the_one_action():
 
 
 def test_assistant_local_run_markup_and_poll_are_declared_and_ready_gated():
-    template = (ROOT / "omlx_web/templates/dashboard/_cluster_v2.html").read_text()
-    javascript = (ROOT / "omlx_web/static/js/cluster_v2.js").read_text()
+    template = (ROOT / "omlx_web/templates/dashboard/_cluster.html").read_text()
+    javascript = (ROOT / "omlx_web/static/js/cluster.js").read_text()
 
     start = template.index("<!-- Run on this Mac: single-node inference")
     block = template[start : template.index("<!-- Search: the automatic", start)]
     for marker in (
-        "data-cluster-v2-assistant-local-run>",
-        "data-cluster-v2-assistant-local-run-button",
-        "data-cluster-v2-assistant-local-run-busy",
-        "data-cluster-v2-assistant-local-run-progress",
-        "data-cluster-v2-assistant-local-run-error",
-        "data-cluster-v2-assistant-local-run-action",
-        "data-cluster-v2-assistant-local-run-warning",
-        "data-cluster-v2-assistant-local-run-endpoint",
-        "data-cluster-v2-assistant-local-run-endpoint-url",
-        "data-cluster-v2-assistant-local-run-open-chat",
-        "data-cluster-v2-assistant-local-run-model",
-        "data-cluster-v2-assistant-local-run-context",
+        "data-cluster-assistant-local-run>",
+        "data-cluster-assistant-local-run-button",
+        "data-cluster-assistant-local-run-busy",
+        "data-cluster-assistant-local-run-progress",
+        "data-cluster-assistant-local-run-error",
+        "data-cluster-assistant-local-run-action",
+        "data-cluster-assistant-local-run-warning",
+        "data-cluster-assistant-local-run-endpoint",
+        "data-cluster-assistant-local-run-endpoint-url",
+        "data-cluster-assistant-local-run-open-chat",
+        "data-cluster-assistant-local-run-model",
+        "data-cluster-assistant-local-run-context",
     ):
         assert marker in block, marker
     # The button is only offered for this Mac's own single-node answer, and the
@@ -3710,16 +3710,16 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 
 def test_assistant_local_run_stop_markup_and_wiring_are_declared():
-    template = (ROOT / "omlx_web/templates/dashboard/_cluster_v2.html").read_text()
-    javascript = (ROOT / "omlx_web/static/js/cluster_v2.js").read_text()
+    template = (ROOT / "omlx_web/templates/dashboard/_cluster.html").read_text()
+    javascript = (ROOT / "omlx_web/static/js/cluster.js").read_text()
 
     start = template.index("<!-- Run on this Mac: single-node inference")
     block = template[start : template.index("<!-- Search: the automatic", start)]
     for marker in (
-        "data-cluster-v2-assistant-local-run-stop",
-        "data-cluster-v2-assistant-local-run-stopped",
-        "data-cluster-v2-assistant-local-run-busy",
-        "data-cluster-v2-assistant-local-run-progress",
+        "data-cluster-assistant-local-run-stop",
+        "data-cluster-assistant-local-run-stopped",
+        "data-cluster-assistant-local-run-busy",
+        "data-cluster-assistant-local-run-progress",
     ):
         assert marker in block, marker
     # One button, disabled while the stop is in flight, and only offered for a
@@ -3842,8 +3842,8 @@ def test_assistant_local_tune_posts_once_and_tracks_the_winner():
 
 
 def test_assistant_local_tune_markup_and_wiring_are_declared():
-    javascript = (ROOT / "omlx_web/static/js/cluster_v2.js").read_text()
-    template = (ROOT / "omlx_web/templates/dashboard/_cluster_v2.html").read_text()
+    javascript = (ROOT / "omlx_web/static/js/cluster.js").read_text()
+    template = (ROOT / "omlx_web/templates/dashboard/_cluster.html").read_text()
 
     assert "tuneLocal: '/admin/api/cluster/assistant/tune-local'" in javascript
     assert (
@@ -3858,10 +3858,10 @@ def test_assistant_local_tune_markup_and_wiring_are_declared():
     ):
         assert need in javascript, need
     for marker in (
-        "data-cluster-v2-assistant-tune-local",
-        "data-cluster-v2-assistant-tune-local-button",
-        "data-cluster-v2-assistant-tune-local-rows",
-        "data-cluster-v2-assistant-tune-local-best",
+        "data-cluster-assistant-tune-local",
+        "data-cluster-assistant-tune-local-button",
+        "data-cluster-assistant-tune-local-rows",
+        "data-cluster-assistant-tune-local-best",
     ):
         assert marker in template, marker
 
