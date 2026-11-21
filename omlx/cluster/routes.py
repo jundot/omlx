@@ -1090,6 +1090,25 @@ def _resolve_fabric(
     }
 
 
+@router.post("/plan")
+async def cluster_plan(request: ClusterPlanRequest):
+    """Plan explicit contiguous layers across rank-ordered node budgets.
+
+    The dashboard's one-click path is ``/autoconfigure``; this route is the
+    Cluster Assistant's remote-planning seam. When the elected coordinator is
+    another Mac, the assistant's origin asks that Mac to plan the placement it
+    would launch, so activation on the coordinator and the plan the user
+    approved are the same computation. It returns the signature with the plan,
+    which activation re-proves.
+    """
+
+    try:
+        plan = await asyncio.to_thread(_create_cluster_plan, request)
+    except (OSError, PlanningError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _plan_with_signature(plan.to_dict())
+
+
 @router.post("/autoconfigure")
 async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     """Build a complete cluster configuration from peers and a model.

@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for authenticated cluster admin route handlers."""
 
-import base64
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -586,6 +584,43 @@ def test_moe_offload_allows_deepseek_v41_with_mtp(tmp_path, monkeypatch):
     # and the loader is told to keep it resident while experts stream.
     assert layer_bytes == (gib,)
     assert calls == [(str(tmp_path), 0.5, True)]
+
+def test_the_assistant_remote_coordinator_has_a_plan_route(tmp_path, monkeypatch):
+    """The assistant's apply asks the coordinator to plan over HTTP.
+
+    When the elected coordinator is another Mac, the origin posts the plan
+    request there and gets the signed placement back. The dashboard moved to
+    ``/autoconfigure``; this route is the assistant seam and must exist.
+    """
+
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(gib,) * 8,
+            supports_pipeline=True,
+        ),
+    )
+    body = {
+        "model_path": str(tmp_path),
+        "layer_count": 8,
+        "nodes": [
+            {"node_id": "local", "capacity_bytes": 128 * gib, "reserve_bytes": 2 * gib}
+        ],
+    }
+
+    response = _client().post("/admin/api/cluster/plan", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["placement_signature"]
+    assert payload["assignments"][0]["node_id"] == "local"
+
 
 def test_cluster_plan_follows_the_saved_qwen4_ple_ssd_offload_setting(monkeypatch):
     """A Qwen4-Exp PLE table is the same planning problem as DeepSeek Engram.
