@@ -102,18 +102,22 @@ def test_trim_refuses_to_drop_history_the_window_needs():
     assert cache.offset == WINDOW + 10
 
 
-@pytest.mark.parametrize("bounded", [False, True])
-def test_make_cache_layout(monkeypatch, bounded):
+@pytest.mark.parametrize("bounded,size", [(False, 0), (True, 0), (True, 2048)])
+def test_make_cache_layout(monkeypatch, bounded, size):
     monkeypatch.setattr(inkling2_model, "_SWA_BOUNDED", bounded)
-    monkeypatch.setattr(inkling2_model, "_SWA_SIZE", 0)
+    monkeypatch.setattr(inkling2_model, "_SWA_SIZE", size)
     lm = _inkling2_tiny()
-    kinds = [type(entry[0]) for entry in lm.make_cache()]
+    cache = [entry[0] for entry in lm.make_cache()]
+    kinds = [type(kv) for kv in cache]
     if not bounded:
         assert set(kinds) == {KVCache}
         return
-    # Full attention at layers 5 and 11 of the tiny stack; the rest slide.
+    # Full attention at layers 5 and 11 of the tiny stack; the rest slide on
+    # a ring of the window (8 keys) or the larger size asked for.
     assert kinds[5] is kinds[11] is KVCache
     assert kinds.count(RotatingKVCache) == len(kinds) - 2
+    rings = {kv.max_size for kv in cache if isinstance(kv, RotatingKVCache)}
+    assert rings == {max(8, size)}
 
 
 def test_ring_model_matches_the_full_cache_model(monkeypatch):

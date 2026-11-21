@@ -49,10 +49,11 @@ _NVFP4_DENOMINATOR = 448.0 * 6.0
 # visit keeps a full KVCache. Speculative-verify rollback goes through
 # _trim_kv, since stock RotatingKVCache.trim is not exact once the ring wraps.
 _SWA_BOUNDED = os.environ.get("OMLX_INKLING_SWA_CACHE", "0") == "1"
-# Ring size for sliding visits; >= window (kernels read only the last `window`
-# keys, so extra slots are inert). oMLX aligns paged-cache blocks (and prefill
-# chunks) to this size, so 2048 keeps Inkling's >=2048-token blocks.
-_SWA_SIZE = int(os.environ.get("OMLX_INKLING_SWA_CACHE_SIZE", "0") or 0)
+# Ring size for sliding visits, at least the window (kernels read only the last
+# `window` keys, so extra slots are inert). oMLX aligns paged-cache blocks, and
+# so prefill chunks, to it: 2048 keeps the 2048-token blocks of a full cache,
+# for about 160 MiB more than a 1024-key ring on Inkling 2 Mini. 0 = window.
+_SWA_SIZE = int(os.environ.get("OMLX_INKLING_SWA_CACHE_SIZE", "2048") or 0)
 
 
 def _temporal_kv(kv, k, v, window: int = 0, length: int = 0):
