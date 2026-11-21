@@ -282,6 +282,9 @@ def test_cluster_mtp_runs_only_with_every_rank_in_its_role():
     def rank_zero(calls):
         return SimpleNamespace(
             language_model=SimpleNamespace(
+                # A proven family: the role vote is what this test pins, the
+                # family gate is covered in test_cluster_routes.py.
+                model_type="qwen4_exp",
                 _omlx_mtp_decode_enabled=True,
                 mtp=object(),
                 configure_mtp=calls.append,

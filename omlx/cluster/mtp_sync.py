@@ -12,6 +12,32 @@ from __future__ import annotations
 import os
 from typing import Any
 
+#: Families whose Lightning MTP chain is proven inside a cluster (a real
+#: deployment, not a plan). ``qwen4_exp``: live on 2026-11-20 (54.70 tok/s
+#: against 49.26 with MTP off). ``qwen3_5_moe``: proven in the same series.
+#:
+#: ``glm5_next`` stamps a chain marker of its own but deadlocks in a cluster:
+#: both ranks arm MTP, then rank 1 waits ~120 s inside ``_share_object`` while
+#: the canary never returns (two runs, identical). Until that handshake exists,
+#: cluster MTP is refused by name for the family instead of hanging.
+CLUSTER_MTP_FAMILIES = frozenset({"qwen4_exp", "qwen3_5_moe"})
+
+
+def cluster_mtp_family_supported(model_type: str | None) -> bool:
+    """Whether cluster Lightning MTP may arm for this architecture family.
+
+    A text-only load reports the family with a ``_text`` suffix
+    (``qwen4_exp_text``, ``glm5_next_text``), while the catalogue and the
+    planner use the bare name. Both spellings are the same architecture, so the
+    suffix is stripped before the lookup instead of refusing a proven family by
+    accident.
+    """
+
+    family = str(model_type or "").strip().lower()
+    if family.endswith("_text"):
+        family = family[: -len("_text")]
+    return family in CLUSTER_MTP_FAMILIES
+
 
 def _new_seed() -> int:
     return int.from_bytes(os.urandom(8), "little") >> 1
