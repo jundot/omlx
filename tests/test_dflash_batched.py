@@ -1339,6 +1339,9 @@ def test_lookup_and_drafter_windows_alternate_without_drift(monkeypatch, fixed):
         # Lookup windows were accepted whole, in part and not at all.
         assert {0} < {accepted for _, _, accepted in lookups}
         assert any(accepted == k for _, k, accepted in lookups)
+        # A lookup window keeps the width the policy gave it, whatever depth
+        # the drafter's controller is at (it parks at 0 here).
+        assert {k for _, k, _ in lookups} == {1, 2, 3, 4}
         shared = sorted(set(blocks) & set(reference))
         assert len(shared) >= (6 if fixed else 2)
         for fed in shared:
@@ -1363,7 +1366,9 @@ def test_stated_chances_size_the_drafter_window(monkeypatch):
     mlx_lm_mtp.set_mtp_active(True)
     try:
         expected, _ = generate(_tiny_inkling2(drafter=False), [prompt], [limit])
-        model = _tiny_inkling2()
+        # Adaptive: the depth controller sweeps down to 0 meanwhile, and the
+        # whole block is drafted all the same.
+        model = _tiny_inkling2(fixed=False)
         model._omlx_mtp_draft_policy = True
         model._omlx_mtp_draft_policy_state = policy = draft_policy.DraftPolicy(
             draft_policy.K_MAX, timed=False
@@ -1384,7 +1389,7 @@ def test_stated_chances_size_the_drafter_window(monkeypatch):
         # The whole block was drafted (4), and the first windows verify the two
         # drafts stated as sure. Random drafts rarely match, so the measured
         # rate of drafts stated at 0.99 falls and the window narrows.
-        assert widths[:2] == [2, 2] and widths[-1] < 2
+        assert widths[:7] == [2] * 7 and widths[-1] < 2
         assert policy.chance_rate(0.99) < 0.6
     finally:
         mlx_lm_mtp.set_mtp_active(previous)

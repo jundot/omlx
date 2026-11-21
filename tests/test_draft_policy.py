@@ -82,6 +82,13 @@ def test_min_gain_and_margin_guard_the_switch():
                 even.observe(Choice(Source.LOOKUP, 2, match=20), accepted)
         assert 0.70 < even.lookup_rate(20) < 0.73
         assert even.choose(lookup_k=2, match=20, drafter_k=2).source is source
+    # Nor does a lookup worth 2% over plain decoding, with no drafter to beat.
+    for min_gain, source in ((0.05, Source.NONE), (0.0, Source.LOOKUP)):
+        thin = _policy(min_gain=min_gain)
+        for _ in range(200):
+            for accepted in (1, 0):
+                thin.observe(Choice(Source.LOOKUP, 1, match=3), accepted)
+        assert thin.choose(lookup_k=2, match=3).source is source
     # With the drafter's block already made, the lookup saves nothing of it.
     saved = _policy(position_prior=(0.92,))
     assert saved.choose(lookup_k=3, match=20, drafter_k=3).source is Source.LOOKUP
