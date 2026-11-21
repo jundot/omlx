@@ -1285,13 +1285,16 @@ def _true_continuation(monkeypatch, prompt, expected, wrong_every=3):
     monkeypatch.setattr(suffix_drafter.SuffixDrafter, "propose", propose)
 
 
-@pytest.mark.parametrize("fixed", [True, False], ids=["fixed", "adaptive"])
-def test_lookup_and_drafter_windows_alternate_without_drift(monkeypatch, fixed):
+@pytest.mark.parametrize(
+    "fixed,rows", [(True, None), (False, None), (True, 16)], ids=["fixed", "adaptive", "wide"]
+)
+def test_lookup_and_drafter_windows_alternate_without_drift(monkeypatch, fixed, rows):
     """Lookup and DSpark windows in any order emit plain decoding's tokens,
     and the drafter then proposes the blocks it proposes when every window is
     its own: a lookup window (with its block already drafted, discarded, or
     never started) leaves no trace in the context ring, its positions or the
-    recurrent head's state."""
+    recurrent head's state. ``rows``: the target declares a verify wider than
+    the drafter's block, so lookup windows exceed it."""
     from test_mlx_lm_mtp_patch import generate
 
     from omlx.patches import mlx_lm_mtp
@@ -1305,6 +1308,8 @@ def test_lookup_and_drafter_windows_alternate_without_drift(monkeypatch, fixed):
 
         def run(script):
             model = _tiny_inkling2(fixed=fixed)
+            if rows:
+                model._omlx_mtp_max_verify_rows = rows
             drafter = model._omlx_drafter
             blocks = {}
             commit = drafter._commit_proposals
@@ -1329,21 +1334,25 @@ def test_lookup_and_drafter_windows_alternate_without_drift(monkeypatch, fixed):
         # Runs of both sources, so every hand-over happens: lookup after a
         # drafter window and after a lookup window, and back.
         pattern = [3, 4, 0, 2, 0, 0, 4, 4, 4, 0, 1, 0]
+        if rows:
+            pattern = [9, 15, 0, 7, 0, 0, 12, 15, 0, 5, 0]
         output, blocks, policy = run(lambda n: pattern[n % len(pattern)])
         assert output == expected
         source = draft_policy.Source
         lookups = [r for r in policy.rounds if r[0] is source.LOOKUP]
         drafts = [r for r in policy.rounds if r[0] is source.DRAFTER]
         # An adaptive drafter parks at depth 0 here: random drafts never match.
-        assert len(lookups) >= 6 and len(drafts) >= (6 if fixed else 3)
+        assert len(lookups) >= (4 if rows else 6)
+        assert len(drafts) >= (6 if fixed and not rows else 3)
         # Lookup windows were accepted whole, in part and not at all.
         assert {0} < {accepted for _, _, accepted in lookups}
         assert any(accepted == k for _, k, accepted in lookups)
         # A lookup window keeps the width the policy gave it, whatever depth
         # the drafter's controller is at (it parks at 0 here).
-        assert {k for _, k, _ in lookups} == {1, 2, 3, 4}
+        widths = {k for _, k, _ in lookups}
+        assert widths >= {9, 12, 15} if rows else widths == {1, 2, 3, 4}
         shared = sorted(set(blocks) & set(reference))
-        assert len(shared) >= (6 if fixed else 2)
+        assert len(shared) >= (6 if fixed and not rows else 2)
         for fed in shared:
             n = min(len(blocks[fed]), len(reference[fed]))
             assert blocks[fed][:n] == reference[fed][:n], fed

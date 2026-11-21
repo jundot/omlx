@@ -4638,12 +4638,18 @@ def _drafter_window(state: _MtpState) -> int:
 
 
 def _lookup_window(model: Any, state: _MtpState, drafter: Optional[Any]) -> int:
-    """Most lookup drafts one verify window of this target takes."""
+    """Most lookup drafts one verify window of this target takes.
+
+    A block drafter's target verifies its block size; one that declares a
+    wider verify (``_omlx_mtp_max_verify_rows``) takes lookup windows that wide.
+    """
+    cap = _max_verify_rows(model)
     if drafter is not None:
-        return int(drafter.depth)
+        if cap is None:
+            return int(drafter.depth)
+        return max(int(drafter.depth), min(cap - 1, _draft_policy.K_MAX))
     if _dspark_host(model) is not None:
         return int(state.depth)
-    cap = _max_verify_rows(model)
     if _row_exact_verify(model) and (cap is None or cap > _context_copy.MAX_COPY):
         return _context_copy.MAX_COPY
     return _context_copy._NARROW_COPY
@@ -4861,13 +4867,13 @@ def _run_verify_cycle_chain(
         and commit_cache is None
         and not defer_commit
     )
-    if (
-        can_predraft
-        and policy is not None
-        and copy_cycle
-        and _lookup_continues(gen_batch, state, policy, drafter, k)
-    ):
-        can_predraft = False
+    if can_predraft and policy is not None and copy_cycle:
+        # A window wider than the block would write past the ring's spare
+        # slots; one the lookup expects to follow needs no block at all.
+        if k > drafter.depth or _lookup_continues(
+            gen_batch, state, policy, drafter, k
+        ):
+            can_predraft = False
     predrafted = False
 
     if k == 0:
