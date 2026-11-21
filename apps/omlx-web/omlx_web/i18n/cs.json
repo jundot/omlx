@@ -2674,5 +2674,9 @@
   "settings.theme.contrast_low": "Below 4.5:1, the WCAG AA minimum for body text",
   "status.claude_code.copy_command_tooltip": "Kopírovat příkaz",
   "status.claude_code.section_label": "Claude Code s oMLX",
-  "status.layout.block.claude_code": "Claude Code"
+  "status.layout.block.claude_code": "Claude Code",
+  "cluster.levers.hint": "Context, table offload and expert offload are shown in the plan and applied on Start setup.",
+  "cluster.levers.title": "Resource levers",
+  "cluster.deploy.saved_at": "Saved {when}",
+  "cluster.deploy.status_saved_setup": "Saved cluster setup"
 }
