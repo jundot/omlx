@@ -542,3 +542,273 @@ def route_topk(logits: mx.array, bias: mx.array, top_k: int, route_scale: float)
         output_dtypes=[mx.uint32, mx.float32],
     )
     return inds, weights
+
+
+# Fused loop-controller kernels for ``_mix_messages``:
+# - ``_NORM_PAIR_SOURCE`` computes unit-RMS of ``x`` and ``msg``, rounds to
+#   BF16, and writes the stacked [N, 2, ROWS, H] array in either BF16 (small-M
+#   fused path) or FP32 (large-M GEMM path) in one pass.
+# - ``_LOOP_DOWN_SOURCE`` projects [N, 2, ROWS, H] BF16 against transposed
+#   ``down_t`` [N, 2, R, H] (BF16 or FP32), accumulating both halves in FP32
+#   and reading ``down_t`` once across all ``ROWS`` (exact chunk invariance).
+# - ``_LOOP_GMIX_SOURCE`` projects ``low`` [N, ROWS, R] BF16 against transposed
+#   ``gf_t`` [N, H, 2, R] (BF16 or FP32), applies ``tanh`` to gain/forget in
+#   registers, and writes ``(1 - forget) * x + gain * msg`` directly without
+#   materializing ``gates``.
+# - ``_TANH_MIX_SOURCE`` fuses ``tanh(gain/forget)`` + residual mix for the
+#   large-M GEMM path.
+_NORM_PAIR_SOURCE = """
+    uint row_idx = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint total_rows = N * ROWS;
+    uint is_msg = row_idx >= total_rows ? 1u : 0u;
+    uint nr = is_msg ? (row_idx - total_rows) : row_idx;
+    uint n = nr / ROWS;
+    uint r = nr % ROWS;
+    const device float* src = (is_msg ? msg : x) + (size_t)nr * H;
+    float ss = 0.0f;
+    for (uint h = tid; h < H; h += TG) {
+        float v = src[h];
+        ss += v * v;
+    }
+    threadgroup float red[TG / 32];
+    ss = simd_sum(ss);
+    if (lane == 0) red[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint i = 0; i < TG / 32; ++i) total += red[i];
+    float inv = metal::rsqrt(total / float(H) + 1e-6f);
+    device OT* dst = out + ((size_t)(n * 2 + is_msg) * ROWS + r) * H;
+    for (uint h = tid; h < H; h += TG) {
+        bfloat bv = bfloat(src[h] * inv);
+        dst[h] = OT(bv);
+    }
+"""
+
+_LOOP_DOWN_SOURCE = """
+    uint nr = threadgroup_position_in_grid.x;
+    uint lane = thread_index_in_simdgroup;
+    uint n = nr / R;
+    uint r = nr % R;
+    float acc[ROWS];
+    for (uint i = 0; i < ROWS; ++i) acc[i] = 0.0f;
+    for (uint part = 0; part < 2; ++part) {
+        const device WT* wp = down_t + ((size_t)(n * 2 + part) * R + r) * H;
+        const device bfloat* zp = z + (size_t)(n * 2 + part) * ROWS * H;
+        for (uint h = lane * 4; h < H; h += 128) {
+            float w0 = float(wp[h + 0]);
+            float w1 = float(wp[h + 1]);
+            float w2 = float(wp[h + 2]);
+            float w3 = float(wp[h + 3]);
+            for (uint row = 0; row < ROWS; ++row) {
+                const device bfloat* zr = zp + (size_t)row * H + h;
+                acc[row] += float(zr[0]) * w0 + float(zr[1]) * w1
+                    + float(zr[2]) * w2 + float(zr[3]) * w3;
+            }
+        }
+    }
+    for (uint row = 0; row < ROWS; ++row) {
+        float s = simd_sum(acc[row]);
+        if (lane == 0) {
+            low[((size_t)n * ROWS + row) * R + r] = bfloat(s);
+        }
+    }
+"""
+
+_LOOP_GMIX_SOURCE = """
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint nh = threadgroup_position_in_grid.x * 4 + sg;
+    if (nh >= N * H) return;
+    uint n = nh / H;
+    uint h = nh % H;
+    constexpr uint PER = (R + 31) / 32;
+    float wg[PER], wf[PER];
+    const device WT* gp = gf_t + ((size_t)nh * 2 + 0) * R;
+    const device WT* fp = gf_t + ((size_t)nh * 2 + 1) * R;
+    for (uint j = 0; j < PER; ++j) {
+        uint idx = lane + j * 32;
+        wg[j] = idx < R ? float(gp[idx]) : 0.0f;
+        wf[j] = idx < R ? float(fp[idx]) : 0.0f;
+    }
+    for (uint row = 0; row < ROWS; ++row) {
+        const device bfloat* lp = low + ((size_t)n * ROWS + row) * R;
+        float dg = 0.0f;
+        float df = 0.0f;
+        for (uint j = 0; j < PER; ++j) {
+            uint idx = lane + j * 32;
+            float lv = idx < R ? float(lp[idx]) : 0.0f;
+            dg += lv * wg[j];
+            df += lv * wf[j];
+        }
+        dg = simd_sum(dg);
+        df = simd_sum(df);
+        if (lane == 0) {
+            float g = metal::tanh(dg);
+            float f = metal::tanh(df);
+            size_t pos = ((size_t)n * ROWS + row) * H + h;
+            out[pos] = (1.0f - f) * x[pos] + g * msg[pos];
+        }
+    }
+"""
+
+_TANH_MIX_SOURCE = """
+    uint idx = thread_position_in_grid.x;
+    if (idx >= N * ROWS * H) return;
+    uint nr = idx / H;
+    uint h = idx % H;
+    size_t gbase = (size_t)nr * (2 * H);
+    float g = metal::tanh(float(gates[gbase + h]));
+    float f = metal::tanh(float(gates[gbase + H + h]));
+    out[idx] = (1.0f - f) * x[idx] + g * msg[idx];
+"""
+
+_norm_pair_kernel = None
+_loop_down_kernel = None
+_loop_gmix_kernel = None
+_tanh_mix_kernel = None
+_LOOP_FUSED_MAX_ROWS = 16
+
+
+def pack_loop_controller(down: mx.array, gain_forget: mx.array):
+    """Transpose loop controller weights for coalesced decode/verify reads.
+
+    Real checkpoints widen BF16 controller weights to FP32 at load; when the
+    values are exact BF16, pack as BF16 to halve memory bandwidth with zero
+    numerical loss.
+    """
+    n, _, h, r = down.shape
+    exact_bf16 = (
+        mx.array_equal(down.astype(mx.bfloat16).astype(mx.float32), down).item()
+        and mx.array_equal(
+            gain_forget.astype(mx.bfloat16).astype(mx.float32), gain_forget
+        ).item()
+    )
+    dtype = mx.bfloat16 if exact_bf16 else down.dtype
+    down_t = mx.contiguous(down.astype(dtype).transpose(0, 1, 3, 2))
+    gf_t = mx.contiguous(
+        gain_forget.astype(dtype).reshape(n, r, 2, h).transpose(0, 3, 2, 1)
+    )
+    mx.eval(down_t, gf_t)
+    return down_t, gf_t
+
+
+def mix_messages_gpu(
+    x: mx.array,
+    message: mx.array,
+    down: mx.array,
+    gain_forget: mx.array,
+    down_t: mx.array | None = None,
+    gf_t: mx.array | None = None,
+) -> mx.array:
+    """Fused GPU loop-controller message mixing; exact FP32 accumulation."""
+    global _norm_pair_kernel, _loop_down_kernel, _loop_gmix_kernel, _tanh_mix_kernel
+    n, b, length, hidden = x.shape
+    rows = b * length
+    rank = down.shape[-1]
+    if _norm_pair_kernel is None:
+        _norm_pair_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_norm_pair",
+            input_names=["x", "msg"],
+            output_names=["out"],
+            source=_NORM_PAIR_SOURCE,
+        )
+    if (
+        rows <= _LOOP_FUSED_MAX_ROWS
+        and hidden % 4 == 0
+        and down_t is not None
+        and gf_t is not None
+    ):
+        if _loop_down_kernel is None:
+            _loop_down_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_loop_down",
+                input_names=["z", "down_t"],
+                output_names=["low"],
+                source=_LOOP_DOWN_SOURCE,
+            )
+            _loop_gmix_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_loop_gmix",
+                input_names=["x", "msg", "low", "gf_t"],
+                output_names=["out"],
+                source=_LOOP_GMIX_SOURCE,
+            )
+        z = _norm_pair_kernel(
+            inputs=[x.astype(mx.float32), message.astype(mx.float32)],
+            template=[
+                ("OT", mx.bfloat16),
+                ("N", n),
+                ("ROWS", rows),
+                ("H", hidden),
+                ("TG", 256),
+            ],
+            grid=(2 * n * rows * 256, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(n, 2, rows, hidden)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+        low = _loop_down_kernel(
+            inputs=[z, down_t],
+            template=[
+                ("WT", down_t.dtype),
+                ("R", rank),
+                ("H", hidden),
+                ("ROWS", rows),
+            ],
+            grid=(n * rank * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(n, rows, rank)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+        return _loop_gmix_kernel(
+            inputs=[x.astype(mx.float32), message.astype(mx.float32), low, gf_t],
+            template=[
+                ("WT", gf_t.dtype),
+                ("N", n),
+                ("H", hidden),
+                ("R", rank),
+                ("ROWS", rows),
+            ],
+            grid=(((n * hidden + 3) // 4) * 128, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(n, b, length, hidden)],
+            output_dtypes=[mx.float32],
+        )[0]
+
+    # Large-M (prefill) path: keep exact FP32 GEMMs (chunk-invariant) while
+    # fusing norm+BF16-round and tanh+residual-mix into single-pass kernels.
+    if _tanh_mix_kernel is None:
+        _tanh_mix_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_tanh_mix",
+            input_names=["x", "msg", "gates"],
+            output_names=["out"],
+            source=_TANH_MIX_SOURCE,
+        )
+    xf = x.astype(mx.float32)
+    mf = message.astype(mx.float32)
+    z = _norm_pair_kernel(
+        inputs=[xf, mf],
+        template=[
+            ("OT", mx.float32),
+            ("N", n),
+            ("ROWS", rows),
+            ("H", hidden),
+            ("TG", 256),
+        ],
+        grid=(2 * n * rows * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(2 * n, rows, hidden)],
+        output_dtypes=[mx.float32],
+    )[0]
+    low = (z @ down.reshape(2 * n, hidden, rank)).reshape(n, 2, rows, rank).sum(axis=1)
+    low = low.astype(mx.bfloat16).astype(mx.float32)
+    gates = low @ gain_forget
+    return _tanh_mix_kernel(
+        inputs=[xf, mf, gates],
+        template=[("N", n), ("ROWS", rows), ("H", hidden)],
+        grid=(n * rows * hidden, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(n, b, length, hidden)],
+        output_dtypes=[mx.float32],
+    )[0]

@@ -344,13 +344,15 @@ class AttnResQuery(nn.Module):
         return kernels.attn_res_mix(blocks, partial_n, self.query, self.scale)
 
 
-def _mix_messages(x, message, down, gain_forget):
+def _mix_messages(x, message, down, gain_forget, down_t=None, gf_t=None):
     """Loop controllers: ``(1 - tanh(forget)) * x + tanh(gain) * message``.
 
     ``x`` and ``message`` are [N, B, L, H] FP32, one row per controlled input.
     ``down`` is [N, 2, H, r] (the x and message halves) and ``gain_forget``
     [N, r, 2H], both FP32 copies of BF16 weights.
     """
+    if mx.default_device() == mx.gpu:
+        return kernels.mix_messages_gpu(x, message, down, gain_forget, down_t, gf_t)
     n, b, length, hidden = x.shape
     rows = b * length
     # Like the reference, the down projection takes BF16-rounded inputs,
@@ -615,6 +617,7 @@ class Inkling2Layer(nn.Module):
             self.loop_message = AttnResQuery(h, 4)
             self.loop_down = mx.zeros((4, 2, h, rank), dtype=mx.float32)
             self.loop_gain_forget = mx.zeros((4, rank, 2 * h), dtype=mx.float32)
+            self._loop_packed = None
         self.attn = Inkling2Attention(args, layer_idx)
         self.mlp = Inkling2MoE(args, w13_spec, w2_spec)
         if self.sliding:
@@ -634,7 +637,21 @@ class Inkling2Layer(nn.Module):
         self._pre_compiled = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
         self._post_compiled = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
 
-    def _pre(self, h, blocks, ks, vs, tau=None, messages=None):
+    def _packed_loop(self):
+        """Lazily pack transposed BF16 loop-controller weights outside mx.compile."""
+        if mx.default_device() != mx.gpu:
+            return None, None
+        packed = self._loop_packed
+        key = (id(self.loop_down), id(self.loop_gain_forget))
+        if packed is not None and packed[0] == key:
+            return packed[1], packed[2]
+        down_t, gf_t = kernels.pack_loop_controller(
+            self.loop_down, self.loop_gain_forget
+        )
+        self._loop_packed = (key, down_t, gf_t)
+        return down_t, gf_t
+
+    def _pre(self, h, blocks, ks, vs, tau=None, messages=None, down_t=None, gf_t=None):
         dtype = h.dtype
         h_n = _unit_rms(h.astype(mx.float32))
         if self.layer_idx == 0:
@@ -651,6 +668,8 @@ class Inkling2Layer(nn.Module):
                 messages[:, :, :3].transpose(2, 0, 1, 3),
                 self.loop_down[:3],
                 self.loop_gain_forget[:3],
+                None if down_t is None else down_t[:3],
+                None if gf_t is None else gf_t[:3],
             )
         if self.sliding and messages is None:
             xq = self.attn_norm(xq).astype(dtype)
@@ -663,7 +682,7 @@ class Inkling2Layer(nn.Module):
             xv = self.v_input_norm(xv).astype(dtype)
         return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
 
-    def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
+    def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None, down_t=None, gf_t=None):
         a = self.attn.output(out, gate)
         a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
         if self.is_boundary:
@@ -677,6 +696,8 @@ class Inkling2Layer(nn.Module):
                 messages[None, :, :, 3],
                 self.loop_down[3:],
                 self.loop_gain_forget[3:],
+                None if down_t is None else down_t[3:],
+                None if gf_t is None else gf_t[3:],
             )[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
         m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
@@ -702,13 +723,18 @@ class Inkling2Layer(nn.Module):
         pre = self._pre_compiled if compiled else self._pre
         post = self._post_compiled if compiled else self._post
         messages = self.loop_message(*bank) if bank is not None else None
+        down_t = gf_t = None
+        if messages is not None and b * length <= kernels._LOOP_FUSED_MAX_ROWS:
+            down_t, gf_t = self._packed_loop()
         q, k, v, rel, gate, sink, ks, vs, h_n = pre(
-            h, blocks, states[0], states[1], tau, messages
+            h, blocks, states[0], states[1], tau, messages, down_t, gf_t
         )
         out = self.attn.attend(q, k, v, rel, sink, kv, conv)
         if self.is_boundary:
             blocks.append(h_n)
-        h, s2, s3 = post(out, gate, h, blocks, states[2], states[3], messages)
+        h, s2, s3 = post(
+            out, gate, h, blocks, states[2], states[3], messages, down_t, gf_t
+        )
         if conv is not None:
             padded = (ks, vs, s2, s3)
             if 1 < length <= _COMPILED_MAX_TOKENS:
