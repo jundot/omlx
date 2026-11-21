@@ -548,3 +548,68 @@ def test_over_capacity_chain_end_to_end(tmp_path, policy, expected_blocks):
     query = tokens + [9999]  # next turn: same history plus one new token
     assert _restorable_tokens(cache, "turn-2", query) == expected_blocks * BLOCK_SIZE
     ssd.close()
+
+
+def _save_valued_block(mgr, key: bytes, parent: bytes | None, value: int) -> None:
+    keys = mx.full((1, 2, BLOCK_SIZE, 8), float(value))
+    assert mgr.save_block(
+        block_hash=key,
+        cache_data=[(keys, keys)],
+        token_count=BLOCK_SIZE,
+        model_name="test-model",
+        layer_cache_types=["KVCache"],
+        layer_meta_states=[(str(BLOCK_SIZE),)],
+        parent_hash=parent,
+    )
+
+
+def _assert_block_value(mgr, key: bytes, value: int) -> None:
+    data = mgr.load_block(key)
+    assert data is not None, f"block {key!r} not loadable"
+    keys = data[0][0]
+    assert tuple(keys.shape) == (1, 2, BLOCK_SIZE, 8)
+    assert float(keys.reshape(-1)[0].item()) == float(value), f"block {key!r}"
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+@pytest.mark.parametrize("write_through", [False, True], ids=["write-back", "write-through"])
+@pytest.mark.parametrize("policy", ["lru", "chain_aware_lru"])
+def test_ssd_on_every_block_stays_loadable(tmp_path, policy, write_through, budget):
+    """SSD on, a 3-block tier and a 12-block chain: whatever the hot tier
+    evicts or refuses still reaches SSD, so every block loads with its own
+    payload, before and after a restart.
+
+    With write-through, a refused block is already queued for its SSD write;
+    _enqueue_ssd_write must see it in the pending buffers and return early.
+    """
+    def make():
+        probe_bytes = 2 * (2 * BLOCK_SIZE * 8 * 4)  # keys + values, float32
+        cap = int(3.5 * probe_bytes)
+        return PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=cap,
+            hot_cache_only=False,
+            hot_cache_write_through=write_through,
+            hot_cache_budget=(
+                SharedHotCacheBudget(cap, eviction_policy=policy) if budget else None
+            ),
+            hot_cache_eviction_policy=policy,
+        )
+
+    mgr = make()
+    chain = _chain("blk", 12)
+    for value, (key, parent) in enumerate(chain):
+        _save_valued_block(mgr, key, parent, value)
+    assert mgr._hot_cache_total_bytes <= mgr._hot_cache_max_bytes
+    assert len(mgr._hot_cache) < len(chain)  # the tier really was too small
+    if policy == "chain_aware_lru":
+        assert mgr._stats["hot_cache_admission_refusals"] > 0
+    for value, (key, _parent) in enumerate(chain):
+        _assert_block_value(mgr, key, value)
+    mgr.close()
+
+    reopened = make()
+    for value, (key, _parent) in enumerate(chain):
+        _assert_block_value(reopened, key, value)
+    reopened.close()
