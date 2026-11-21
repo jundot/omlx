@@ -1253,7 +1253,7 @@ def estimate_offload_admission_bytes(
             if kind == "deepseek_v41":
                 # V4.1 admission is owned by its own adapter's estimator.
                 return full_size
-            if kind == "qwen3_5_moe":
+            if kind in ("qwen3_5_moe", "mimo_v2", "mimo_v2_flash"):
                 from .moe_offload_compat import moe_offload_compatibility
 
                 if not moe_offload_compatibility(model_dir)[0]:
