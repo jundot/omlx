@@ -4119,6 +4119,9 @@ class Scheduler:
 
         if self._model_uses_mla():
             return False
+        if getattr(getattr(self, "model", None), "dense_kv_attention", False) is True:
+            # The model's own attention kernels read dense keys and values.
+            return False
         if (
             getattr(self, "_turboquant_kv_scheme", "turboquant")
             not in ("affine4", "affine8")

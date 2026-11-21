@@ -11,7 +11,9 @@
 - Looped checkpoints (``loop_config``) run the core layers several times per
   token. Every later pass restarts from the prelude output and reads the
   previous pass's blocks only through gated messages. Each layer visit owns
-  its cache entry, so caches and draft taps count visits, not layers.
+  its cache state, so caches and draft taps count visits, not layers.
+- A sliding visit caches only the keys its window can still reach
+  (``cache.py``); a full-attention visit caches every key.
 """
 
 from __future__ import annotations
@@ -25,8 +27,9 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache
 
+from . import cache as windows
 from . import kernels
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
@@ -529,10 +532,13 @@ class Inkling2Attention(nn.Module):
             vs,
         )
 
-    def attend(self, q, k, v, rel, sink, kv):
+    def attend(self, q, k, v, rel, sink, kv, state=None):
+        left_padding = None
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
-        left_padding = getattr(kv, "left_padding", None) if kv is not None else None
+            left_padding = getattr(kv, "left_padding", None)
+        elif state is not None:
+            k, v, left_padding = windows.append(state, k, v)
         return kernels.banded_sink_attention(
             q,
             k,
@@ -656,12 +662,13 @@ class Inkling2Layer(nn.Module):
         FP32 completed blocks; extended in place at a block boundary.
         ``bank``: the previous loop pass's ``(blocks, partial_n)`` messages."""
         b, length, hidden = h.shape
-        kv = cache[0] if cache is not None else None
-        conv = cache[1] if cache is not None else None
+        kv, conv = cache if cache is not None else (None, None)
+        # A sliding visit's state starts with its key and value windows.
+        base = windows.CONV if kv is None else 0
         dkv = self.attn.dkv
         states = []
         for slot, width in ((0, dkv), (1, dkv), (2, hidden), (3, hidden)):
-            s = conv[slot] if conv is not None else None
+            s = conv[base + slot] if conv is not None else None
             if s is None:
                 s = mx.zeros((b, self._conv_k - 1, width), dtype=mx.float32)
             states.append(s)
@@ -673,19 +680,19 @@ class Inkling2Layer(nn.Module):
         q, k, v, rel, gate, sink, ks, vs, h_n = pre(
             h, blocks, states[0], states[1], tau, messages
         )
-        out = self.attn.attend(q, k, v, rel, sink, kv)
+        out = self.attn.attend(q, k, v, rel, sink, kv, conv)
         if self.is_boundary:
             blocks.append(h_n)
         h, s2, s3 = post(out, gate, h, blocks, states[2], states[3], messages)
         if conv is not None:
-            windows = (ks, vs, s2, s3)
+            padded = (ks, vs, s2, s3)
             if 1 < length <= _COMPILED_MAX_TOKENS:
                 # Speculative verify rollback re-cuts the states from these.
-                conv._omlx_verify_xp = dict(enumerate(windows))
+                conv._omlx_verify_xp = dict(enumerate(padded))
             keep = self._conv_k - 1
-            for slot, window in enumerate(windows):
+            for slot, window in enumerate(padded):
                 # A small copy, so the state does not pin the chunk's window.
-                conv[slot] = window[:, -keep:] * 1.0
+                conv[base + slot] = window[:, -keep:] * 1.0
         return h
 
 
@@ -711,6 +718,39 @@ class Inkling2TextModel(nn.Module):
             return len(self.layers)
         return len(self._schedule)
 
+    def cache_layout(self) -> list[tuple[int | None, int]]:
+        """Where each layer visit's ``(KVCache, state)`` sit in a cache list.
+
+        A sliding visit has no ``KVCache``; its one entry holds everything.
+        """
+        layout, entry = [], 0
+        for idx, _ in self._schedule[: self.num_visits]:
+            if self.layers[idx].sliding:
+                layout.append((None, entry))
+                entry += 1
+            else:
+                layout.append((entry, entry + 1))
+                entry += 2
+        return layout
+
+    def visit_caches(self, cache: list) -> list[tuple]:
+        """``(KVCache or None, state)`` of every layer visit in ``cache``."""
+        layout = self.cache_layout()
+        entries = layout[-1][1] + 1 if layout else 0
+        if len(cache) != entries:
+            # A per-layer cache would silently skip the later loop passes.
+            raise ValueError(
+                f"Inkling 2 needs {entries} cache entries for its "
+                f"{len(layout)} layer visits, got {len(cache)}"
+            )
+        window = self.args.sliding_window_size
+        return [
+            (None, windows.ArraysCache.adopt(cache[state], window))
+            if kv is None
+            else (cache[kv], cache[state])
+            for kv, state in layout
+        ]
+
     def __call__(self, inputs, cache=None, input_embeddings=None, capture=None):
         """``capture`` maps draft feature ids to fill: ``i`` < num visits is
         the partial block sum entering layer visit ``i``; ``num visits`` is
@@ -719,17 +759,10 @@ class Inkling2TextModel(nn.Module):
             h = input_embeddings
         else:
             h = self.embed_norm(self.embed(inputs))
-        if cache is None:
-            cache = [None] * self.num_visits
-        elif len(cache) != self.num_visits:
-            # A per-layer cache would silently skip the later loop passes.
-            raise ValueError(
-                f"Inkling 2 needs one cache entry per layer visit "
-                f"({self.num_visits}), got {len(cache)}"
-            )
+        visits = [None] * self.num_visits if cache is None else self.visit_caches(cache)
         blocks: list = []
         prelude = bank = None
-        for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, cache)):
+        for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, visits)):
             if idx == self._core_start and prelude is None:
                 prelude = (h, list(blocks))
             elif idx == self._core_start:
@@ -751,6 +784,10 @@ class Inkling2TextModel(nn.Module):
 
 
 class Model(nn.Module):
+    # ``attend`` reads the keys and values a cache returns as dense arrays; a
+    # packed (TurboQuant or affine) cache hands back codes it cannot use.
+    dense_kv_attention = True
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -876,13 +913,18 @@ class Model(nn.Module):
             return True
         keep = int(accepted) + 1
         width = self.args.text.sconv_kernel_size - 1
-        for entry in cache:
-            kv, conv = entry[0], entry[1]
-            windows = getattr(conv, "_omlx_verify_xp", None)
-            if windows is None or kv.trim(rejected) != rejected:
+        for kv, conv in self.model.visit_caches(cache):
+            padded = getattr(conv, "_omlx_verify_xp", None)
+            if padded is None:
                 return False
-            for slot, window in windows.items():
-                conv[slot] = window[:, keep : keep + width] * 1.0
+            if kv is None:
+                if not windows.trim(conv, rejected):
+                    return False
+            elif kv.trim(rejected) != rejected:
+                return False
+            base = windows.CONV if kv is None else 0
+            for slot, xp in padded.items():
+                conv[base + slot] = xp[:, keep : keep + width] * 1.0
             conv._omlx_verify_xp = None
         return True
 
@@ -897,11 +939,22 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        # One entry per layer visit: each loop pass keeps its own KV and conv
-        # states.
-        return [
-            CacheList(KVCache(), ArraysCache(4)) for _ in range(self.model.num_visits)
-        ]
+        # Every layer visit, each loop pass included, keeps its own state: a
+        # sliding visit one entry with its key window and conv states, a
+        # full-attention visit a KVCache and its conv states.
+        window = self.args.text.sliding_window_size
+        cache = []
+        for kv, _ in self.model.cache_layout():
+            if kv is None:
+                cache.append(windows.ArraysCache(window=window))
+            else:
+                cache += [KVCache(), ArraysCache(4)]
+        return cache
+
+    def restore_cache(self, cache: list) -> list:
+        """Prefix-cache hook: restored sliding states become joinable again."""
+        self.model.visit_caches(cache)
+        return cache
 
     def sanitize(self, weights: dict) -> dict:
         out, formats = sanitize_weights(self, weights)
