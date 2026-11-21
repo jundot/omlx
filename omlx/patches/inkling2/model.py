@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import weakref
@@ -44,17 +45,37 @@ _MXFP8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 # ModelOpt NVFP4 tensor scale: amax / (FP8 E4M3 max * FP4 E2M1 max).
 _NVFP4_DENOMINATOR = 448.0 * 6.0
 
+logger = logging.getLogger(__name__)
+
+
 # Opt in (OMLX_INKLING_SWA_CACHE=1): sliding-window visits keep a ring of
 # their newest keys (RotatingKVCache) instead of the whole prompt, since they
 # only ever read the last ``sliding_window_size`` keys. Off by default: every
 # visit keeps a full KVCache. Speculative-verify rollback goes through
 # _trim_kv, since stock RotatingKVCache.trim is not exact once the ring wraps.
-_SWA_BOUNDED = os.environ.get("OMLX_INKLING_SWA_CACHE", "0") == "1"
-# Ring size for sliding visits, at least the window (kernels read only the last
-# `window` keys, so extra slots are inert). oMLX aligns paged-cache blocks, and
-# so prefill chunks, to it: 2048 keeps the 2048-token blocks of a full cache,
-# for about 160 MiB more than a 1024-key ring on Inkling 2 Mini. 0 = window.
-_SWA_SIZE = int(os.environ.get("OMLX_INKLING_SWA_CACHE_SIZE", "2048") or 0)
+def _env_swa() -> tuple[bool, int]:
+    on = os.environ.get("OMLX_INKLING_SWA_CACHE", "0").strip()
+    if on not in ("", "0", "1"):
+        logger.warning(
+            "OMLX_INKLING_SWA_CACHE=%r is not 0 or 1; keeping full caches", on
+        )
+    # Ring size for sliding visits, at least the window (kernels read only the
+    # last `window` keys, so extra slots are inert). oMLX aligns paged-cache
+    # blocks, and so prefill chunks, to it: 2048 keeps the 2048-token blocks of
+    # a full cache, for about 160 MiB more than a 1024-key ring on Inkling 2
+    # Mini. 0 = window.
+    raw = os.environ.get("OMLX_INKLING_SWA_CACHE_SIZE", "2048").strip()
+    try:
+        size = int(raw or 0)
+    except ValueError:
+        logger.warning(
+            "OMLX_INKLING_SWA_CACHE_SIZE=%r is not an integer; using 2048", raw
+        )
+        size = 2048
+    return on == "1", size
+
+
+_SWA_BOUNDED, _SWA_SIZE = _env_swa()
 
 
 def _temporal_kv(kv, k, v, window: int = 0, length: int = 0):

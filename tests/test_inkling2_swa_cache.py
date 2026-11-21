@@ -6,6 +6,8 @@ KVCache: through chunked prefill, the ring wrapping, single-token decode and
 speculative-verify rollback before, across and after the wrap.
 """
 
+import logging
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -134,6 +136,31 @@ def test_rollback_refusal_leaves_every_layer_untouched():
     assert lm.mtp_partial_rollback(cache, 2, 3) is False
     assert [(kv.offset, kv._idx, kv.keys.shape[2]) for kv, _ in cache] == before
     assert all(conv._omlx_verify_xp == {} for _, conv in cache)
+
+
+@pytest.mark.parametrize(
+    "on,size,expected,warnings",
+    [
+        (None, None, (False, 2048), 0),
+        ("1", "0", (True, 0), 0),
+        ("1", " 1024 ", (True, 1024), 0),
+        ("true", None, (False, 2048), 1),
+        ("1", "2k", (True, 2048), 1),
+    ],
+)
+def test_env_settings(monkeypatch, caplog, on, size, expected, warnings):
+    for name, value in (
+        ("OMLX_INKLING_SWA_CACHE", on),
+        ("OMLX_INKLING_SWA_CACHE_SIZE", size),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    with caplog.at_level(logging.WARNING, logger=inkling2_model.__name__):
+        assert inkling2_model._env_swa() == expected
+    ours = [r for r in caplog.records if r.name == inkling2_model.__name__]
+    assert len(ours) == warnings
 
 
 @pytest.mark.parametrize("bounded,size", [(False, 0), (True, 0), (True, 2048)])
