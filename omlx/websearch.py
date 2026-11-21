@@ -76,6 +76,13 @@ _HTML_CONTENT_TYPES = {"", "text/html", "application/xhtml+xml"}
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _USER_AGENT = "omlx-web/1.0"
 
+# Clash/Surge/sing-box fake-IP DNS maps public hosts into the RFC 2544
+# benchmarking range 198.18.0.0/16. Those addresses are non-global, so the
+# SSRF guard below would reject every full-page fetch and silently fall back
+# to snippets. Allow only that range; loopback, RFC1918, and link-local
+# addresses remain blocked.
+FAKE_IP_NETWORKS = (ipaddress.ip_network("198.18.0.0/16"),)
+
 
 class WebSearchError(Exception):
     """Tool failure carrying a stable error code the chat model can act on."""
@@ -555,7 +562,10 @@ async def _assert_public_host(host: str) -> None:
         mapped = getattr(ip, "ipv4_mapped", None)
         if mapped is not None:
             ip = mapped
-        if not ip.is_global:
+        if not ip.is_global and not any(
+            ip.version == network.version and ip in network
+            for network in FAKE_IP_NETWORKS
+        ):
             raise WebSearchError(
                 "invalid_arguments",
                 "Fetching private or local network addresses is not allowed.",

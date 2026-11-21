@@ -464,6 +464,21 @@ class TestSsrfGuard:
         monkeypatch.setattr(websearch, "_resolve_host", resolve)
         await websearch._assert_public_host("example.com")
 
+    async def test_fake_ip_address_allowed(self, monkeypatch):
+        async def resolve(host):
+            return ["198.18.0.1"]
+
+        monkeypatch.setattr(websearch, "_resolve_host", resolve)
+        await websearch._assert_public_host("example.com")
+
+    async def test_other_benchmark_range_blocked(self, monkeypatch):
+        async def resolve(host):
+            return ["198.19.0.1"]
+
+        monkeypatch.setattr(websearch, "_resolve_host", resolve)
+        with pytest.raises(WebSearchError):
+            await websearch._assert_public_host("example.com")
+
     async def test_unresolvable_host_is_request_failed(self, monkeypatch):
         import socket
 
