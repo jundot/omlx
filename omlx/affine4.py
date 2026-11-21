@@ -53,6 +53,121 @@ _FUSED_QUANTIZE_LAUNCHABLE = {}
 _DEQUANTIZE_LAUNCHABLE = {}
 
 
+# Attention of the last rows of a long affine8 history on the tensor ops
+# (omlx/utils/affine8_tile_attention.py). The first launch of each kernel
+# signature is evaluated; a launch error turns that signature off and the
+# current route runs instead.
+_TILE_MIN_KEYS = 16384
+# Prefill chunks over long histories run several threadgroups per tile.
+_TILE_PREFILL_SPLIT = 8
+_TILE_PREFILL_SPLIT_MIN_KEYS = 65536
+_TILE_LAUNCHABLE = {}
+
+
+@lru_cache(maxsize=1)
+def _nax_tensor_ops() -> bool:
+    if not _tensor_ops_available():
+        return False
+    try:
+        from .custom_kernels.nax import is_nax_available
+
+        return bool(is_nax_available())
+    except Exception:
+        return False
+
+
+def _tile_attention_available() -> bool:
+    return mx.default_device() == mx.gpu and _nax_tensor_ops()
+
+
+def _affine8_states(cache, keys_state, values_state):
+    """The affine8 states the tile reads, or None for other caches."""
+    if not (
+        isinstance(keys_state, TurboQuantMSEState)
+        and isinstance(values_state, TurboQuantMSEState)
+        and isinstance(cache.key_codec, Affine8Codec)
+        and isinstance(cache.value_codec, Affine8Codec)
+        and cache.key_codec.dim == 256
+        and cache.value_codec.dim == 256
+    ):
+        return None
+    ks, vs = keys_state, values_state
+    if (
+        ks.indices.ndim != 4
+        or ks.norms.ndim != 3
+        or ks.indices.dtype != mx.uint32
+        or vs.indices.dtype != mx.uint32
+        or int(ks.indices.shape[-1]) != 64
+        or vs.indices.shape != ks.indices.shape
+        or tuple(ks.norms.shape) != tuple(ks.indices.shape[:3])
+        or tuple(vs.norms.shape) != tuple(ks.norms.shape)
+        or ks.norms.dtype not in (mx.float16, mx.float32)
+        or vs.norms.dtype != ks.norms.dtype
+    ):
+        return None
+    return ks, vs
+
+
+def _tile_launch(signature, cache, queries, run):
+    """Runs ``run()`` (rotated fp32 output) and rotates it back; None when the
+    signature failed before or fails now."""
+    if _TILE_LAUNCHABLE.get(signature) is False:
+        return None
+    try:
+        output = cache.value_codec._rotate_inverse(run()).astype(queries.dtype)
+        if signature not in _TILE_LAUNCHABLE:
+            mx.eval(output)
+            _TILE_LAUNCHABLE[signature] = True
+            logger.info("Affine8 tile attention active (%s)", signature)
+        return output
+    except (RuntimeError, ValueError) as error:
+        if is_command_buffer_error(error):
+            raise
+        _TILE_LAUNCHABLE[signature] = False
+        logger.warning(
+            "Affine8 tile attention unavailable for %s; using the current route",
+            signature,
+        )
+        return None
+
+
+def _tile_prefill_attention(cache, queries, keys_state, values_state, scale):
+    """A causal prefill chunk (a multiple of 8 rows) at the end of a long
+    history, batch 1; None otherwise."""
+    states = _affine8_states(cache, keys_state, values_state)
+    if states is None:
+        return None
+    ks, vs = states
+    batch, heads, rows, _ = queries.shape
+    tokens = int(ks.indices.shape[-2])
+    kv_heads = int(ks.indices.shape[1])
+    if (
+        batch != 1
+        or heads % kv_heads
+        or (heads // kv_heads) * 8 > 48
+        or rows % 8
+        or rows > tokens
+        or tokens < _TILE_MIN_KEYS
+    ):
+        return None
+    from .utils import affine8_tile_attention as tile
+
+    split = _TILE_PREFILL_SPLIT if tokens >= _TILE_PREFILL_SPLIT_MIN_KEYS else 1
+
+    def run():
+        rotated_queries = cache.key_codec.prepare_queries(queries).astype(mx.bfloat16)
+        k = tile.prepare_kv(ks.indices, ks.norms)
+        v = tile.prepare_kv(vs.indices, vs.norms)
+        return tile.prefill(rotated_queries, k, v, scale, split=split)
+
+    output = _tile_launch(("prefill", heads // kv_heads, split), cache, queries, run)
+    if output is not None:
+        mx.eval(output)
+        output = mx.array(output)
+        mx.eval(output)
+    return output
+
+
 @cache
 def _dequantize_rotated_kernel(bits: int = _BITS):
     if not (hasattr(mx, "metal") and mx.metal.is_available()):
@@ -1408,6 +1523,16 @@ class Affine4KVCache(TurboQuantKVCache):
             and self.key_codec.dim in (64, 72, 80, 96, 128, 256)
             and (effective_mask is None or isinstance(effective_mask, str))
         ):
+            if (
+                sinks is None
+                and effective_mask == "causal"
+                and _tile_attention_available()
+            ):
+                output = _tile_prefill_attention(
+                    self, queries, keys_state, values_state, scale
+                )
+                if output is not None:
+                    return output
             # Attention sinks add one logit per head to the softmax denominator. They
             # do not depend on K/V, so the orthonormal rotation leaves them unchanged.
             fused_sinks = None if sinks is None else sinks.astype(mx.bfloat16)
