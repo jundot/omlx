@@ -1232,3 +1232,302 @@ def test_inkling2_predraft_reads_the_newest_committed_row():
         return blocks
 
     assert run(predraft=True) == run(predraft=False)
+
+
+# --- suffix lookup + draft policy in the verify loop -----------------------
+
+
+class _ScriptedPolicy:
+    """The real policy recording its rounds; ``script`` (round number -> lookup
+    drafts, 0 for the drafter) overrides the source of each window."""
+
+    def __new__(cls, script=None):
+        from omlx.speculative import draft_policy
+
+        class Scripted(draft_policy.DraftPolicy):
+            def choose(self, *, lookup_k=0, **kwargs):
+                choice = super().choose(lookup_k=lookup_k, **kwargs)
+                if not lookup_k or script is None:
+                    return choice
+                take = script(len(self.rounds))
+                if take <= 0:
+                    return super().choose(**kwargs)
+                return draft_policy.Choice(
+                    draft_policy.Source.LOOKUP, min(take, lookup_k)
+                )
+
+            def observe(self, choice, accepted, round_ms=None, **kwargs):
+                self.rounds.append((choice.source, choice.k, accepted))
+                super().observe(choice, accepted, round_ms, **kwargs)
+
+        policy = Scripted(draft_policy.K_MAX, timed=False)
+        policy.rounds = []
+        return policy
+
+
+def _true_continuation(monkeypatch, prompt, expected, wrong_every=3):
+    """Make the suffix lookup propose the real continuation, with one wrong
+    token at a position that moves from proposal to proposal (``wrong_every``
+    0: none wrong)."""
+    from omlx.speculative import suffix_drafter
+
+    calls = []
+
+    def propose(self, max_k=8):
+        done = len(self) - len(prompt)
+        tokens = list(expected[done : done + max_k])
+        calls.append(done)
+        wrong = len(calls) % wrong_every if wrong_every else len(tokens)
+        if wrong < len(tokens):
+            tokens[wrong] = (tokens[wrong] + 1) % 290
+        return tokens, (16 if tokens else 0)
+
+    monkeypatch.setattr(suffix_drafter.SuffixDrafter, "propose", propose)
+
+
+@pytest.mark.parametrize("fixed", [True, False], ids=["fixed", "adaptive"])
+def test_lookup_and_drafter_windows_alternate_without_drift(monkeypatch, fixed):
+    """Lookup and DSpark windows in any order emit plain decoding's tokens,
+    and the drafter then proposes the blocks it proposes when every window is
+    its own: a lookup window (with its block already drafted, discarded, or
+    never started) leaves no trace in the context ring, its positions or the
+    recurrent head's state."""
+    from test_mlx_lm_mtp_patch import generate
+
+    from omlx.patches import mlx_lm_mtp
+    from omlx.speculative import draft_policy
+
+    prompt, limit = [5, 9, 11, 40, 41, 42, 7, 9, 11, 40, 41], 72
+    previous = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    try:
+        expected, _ = generate(_tiny_inkling2(drafter=False), [prompt], [limit])
+
+        def run(script):
+            model = _tiny_inkling2(fixed=fixed)
+            drafter = model._omlx_drafter
+            blocks = {}
+            commit = drafter._commit_proposals
+
+            def record(state, tokens, accept_lps, conf=None):
+                commit(state, tokens, accept_lps, conf)
+                blocks[drafter._rows[state.uid].fed] = state.drafts.tolist()
+
+            drafter._commit_proposals = record
+            policy = None
+            if script is not None:
+                policy = _ScriptedPolicy(script)
+                model._omlx_mtp_draft_policy = True
+                model._omlx_mtp_draft_policy_state = policy
+            output, _ = generate(model, [prompt], [limit])
+            return output, blocks, policy
+
+        drafted_only, reference, _ = run(None)
+        assert drafted_only == expected and len(reference) > 8
+
+        _true_continuation(monkeypatch, prompt, expected[0])
+        # Runs of both sources, so every hand-over happens: lookup after a
+        # drafter window and after a lookup window, and back.
+        pattern = [3, 4, 0, 2, 0, 0, 4, 4, 4, 0, 1, 0]
+        output, blocks, policy = run(lambda n: pattern[n % len(pattern)])
+        assert output == expected
+        source = draft_policy.Source
+        lookups = [r for r in policy.rounds if r[0] is source.LOOKUP]
+        drafts = [r for r in policy.rounds if r[0] is source.DRAFTER]
+        # An adaptive drafter parks at depth 0 here: random drafts never match.
+        assert len(lookups) >= 6 and len(drafts) >= (6 if fixed else 3)
+        # Lookup windows were accepted whole, in part and not at all.
+        assert {0} < {accepted for _, _, accepted in lookups}
+        assert any(accepted == k for _, k, accepted in lookups)
+        shared = sorted(set(blocks) & set(reference))
+        assert len(shared) >= (6 if fixed else 2)
+        for fed in shared:
+            n = min(len(blocks[fed]), len(reference[fed]))
+            assert blocks[fed][:n] == reference[fed][:n], fed
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+def test_stated_chances_size_the_drafter_window(monkeypatch):
+    """A head that states each draft's chance gets the window those chances
+    buy (here two sure drafts of four), then loses it as the target rejects
+    drafts stated as sure; the output stays plain decoding's."""
+    from test_mlx_lm_mtp_patch import generate
+
+    from omlx.patches import mlx_lm_mtp
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+    from omlx.speculative import draft_policy
+
+    prompt, limit = [5, 9, 11, 40, 41, 42, 7, 9, 11, 40, 41], 40
+    previous = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    try:
+        expected, _ = generate(_tiny_inkling2(drafter=False), [prompt], [limit])
+        model = _tiny_inkling2()
+        model._omlx_mtp_draft_policy = True
+        model._omlx_mtp_draft_policy_state = policy = draft_policy.DraftPolicy(
+            draft_policy.K_MAX, timed=False
+        )
+        model._omlx_drafter.model.markov_head.block_confidence = lambda: mx.array(
+            [[0.99, 0.99, 0.02, 0.02]]
+        )
+        widths = []
+        clip = bg._clip_block_drafts
+
+        def clipped(state, limit):
+            widths.append(limit)
+            return clip(state, limit)
+
+        monkeypatch.setattr(bg, "_clip_block_drafts", clipped)
+        output, _ = generate(model, [prompt], [limit])
+        assert output == expected
+        # The whole block was drafted (4), and the first windows verify the two
+        # drafts stated as sure. Random drafts rarely match, so the measured
+        # rate of drafts stated at 0.99 falls and the window narrows.
+        assert widths[:2] == [2, 2] and widths[-1] < 2
+        assert policy.chance_rate(0.99) < 0.6
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+@pytest.mark.parametrize("target", ["inkling2", "qwen", "two rows"])
+def test_policy_windows_keep_greedy_output(target, monkeypatch):
+    """With the suffix lookup and the draft policy choosing every window, each
+    request emits plain decoding's tokens: a block drafter's singleton row, an
+    embedded MTP head (Qwen), and rows that share one verify forward."""
+    from test_mlx_lm_mtp_patch import _drafted_counting_model, _model, generate
+
+    from omlx.patches import mlx_lm_mtp
+    from omlx.speculative import draft_policy
+
+    if target == "inkling2":
+        # A periodic prompt, one whose reply settles into a loop, a novel one.
+        prompts = [
+            [7, 8, 9, 10] * 6,
+            [5, 9, 11, 40, 41, 42, 7, 9, 11, 40, 41],
+            list(range(60, 90)),
+        ]
+        limits, build = [48] * 3, _tiny_inkling2
+    elif target == "qwen":
+        prompts, limits = [[3, 4, 5, 6, 7, 8, 9, 10]], [48]
+
+        def build(drafter=True):
+            mx.random.seed(173)
+            model = _model("qwen")
+            mx.eval(model.parameters())
+            model._omlx_mtp_decode_enabled = drafter
+            return model
+
+    else:
+        # The counting model emits successors, so both replies quote their
+        # prompts; the table drafter's block is wrong from its second token.
+        prompts = [list(range(10, 30)) + [9], list(range(40, 56)) + [39]]
+        limits = [18, 14]
+
+        def build(drafter=True):
+            model = _drafted_counting_model(5, wrong_from=1)
+            model._omlx_mtp_decode_enabled = drafter
+            return model
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    try:
+        batches = [prompts] if target == "two rows" else [[p] for p in prompts]
+        sizes = [limits] if target == "two rows" else [[n] for n in limits]
+        lookups = accepted = 0
+        for batch, size in zip(batches, sizes):
+            expected, _ = generate(build(drafter=False), batch, size)
+            model = build()
+            host = getattr(model, "_language_model", model)
+            policy = _ScriptedPolicy()
+            host._omlx_mtp_draft_policy = True
+            host._omlx_mtp_draft_policy_state = policy
+            if target == "qwen":
+                _true_continuation(monkeypatch, batch[0], expected[0])
+            output, terminal = generate(model, batch, size)
+            assert output == expected
+            rounds = [r for r in policy.rounds if r[0] is draft_policy.Source.LOOKUP]
+            lookups += len(rounds)
+            accepted += sum(r[2] for r in rounds)
+            if target == "two rows":
+                # Lookup rows feed the drafter their committed rows all the same.
+                for uid in terminal:
+                    assert model._omlx_drafter.fed[uid] == len(output[uid])
+        assert lookups >= 3 and accepted >= 3
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+def test_shared_window_with_lookup_rows_follows_the_joint_budget():
+    """Rows sharing a verify forward take one window. With a lookup row among
+    them it is the width that pays over all rows: narrower when a drafter row
+    with weaker drafts must pay for every row of it, never past the shortest."""
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+    from omlx.speculative import draft_policy
+
+    def row(drafts, lookup):
+        return SimpleNamespace(
+            chain=True,
+            queue=[],
+            drafts=mx.arange(drafts, dtype=mx.uint32),
+            draft_lps=[],
+            draft_accept_lps=[],
+            copy_drafts=lookup,
+            lookup_match=20 if lookup else 0,
+        )
+
+    def width(rows, policy):
+        bg._clip_to_shared_window(rows, policy)
+        assert len({int(r.drafts.shape[0]) for r in rows}) == 1
+        return int(rows[0].drafts.shape[0])
+
+    policy = draft_policy.DraftPolicy(draft_policy.K_MAX, timed=False)
+    assert width([row(7, True), row(5, False)], None) == 5
+    quoting = width([row(7, True), row(7, True)], policy)
+    mixed = width([row(7, True), row(7, False)], policy)
+    assert 1 <= mixed < quoting < 7
+    # Lookups that keep being accepted earn the whole window.
+    for _ in range(50):
+        policy.observe(draft_policy.Choice(draft_policy.Source.LOOKUP, 7, match=20), 7)
+    assert width([row(7, True), row(6, True)], policy) == 6
+
+
+def test_a_lookup_stretch_runs_no_drafter_pass(monkeypatch):
+    """While window after window comes from the lookup and is accepted, the
+    drafter's forward does not run at all (not even ahead of the host's read
+    of the acceptance); the rows it missed reach it with its next block."""
+    from test_mlx_lm_mtp_patch import generate
+
+    from omlx.patches import mlx_lm_mtp
+
+    prompt, limit = [5, 9, 11, 40, 41, 42, 7, 9, 11, 40, 41], 60
+    previous = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    try:
+        expected, _ = generate(_tiny_inkling2(drafter=False), [prompt], [limit])
+        model = _tiny_inkling2()
+        drafter = model._omlx_drafter
+        # Every proposal is right; lookups run until round 10, then the drafter.
+        _true_continuation(monkeypatch, prompt, expected[0], wrong_every=0)
+        policy = _ScriptedPolicy(lambda n: 4 if n < 10 else 0)
+        model._omlx_mtp_draft_policy = True
+        model._omlx_mtp_draft_policy_state = policy
+        passes = []
+        forward = drafter._draft_batched
+
+        def counted(rows, **kwargs):
+            passes.append((len(policy.rounds), int(rows[0][2].shape[1])))
+            return forward(rows, **kwargs)
+
+        drafter._draft_batched = counted
+        output, _ = generate(model, [prompt], [limit])
+        assert output == expected
+        assert [r[1:] for r in policy.rounds[1:10]] == [(4, 4)] * 9
+        # One pass at activation and one before the first lookup's outcome was
+        # known; none during the stretch.
+        assert [n for n, _ in passes if n < 10] == [0, 0]
+        # The first block after it reads the rows the lookups committed: a
+        # whole context window of them, not one cycle's.
+        assert passes[2][0] == 10 and passes[2][1] >= drafter.ring_slots
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
