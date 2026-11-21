@@ -150,6 +150,10 @@ class DFlashDrafter:
         # A context copy that fills the block may replace the drafted block
         # (Lightning MTP's prompt lookup); the target still verifies it.
         self.context_copy = False
+        # Lightning MTP's draft policy sizes each verify window from the
+        # head's stated chance per draft, so every block position is drafted.
+        # Only a head with ``block_confidence`` states them.
+        self.confidence_windows = False
 
     @property
     def window(self) -> int:
@@ -166,16 +170,36 @@ class DFlashDrafter:
     def kind(self) -> str:
         return "dflash2" if hasattr(self.model, "candidate_selector") else "dflash"
 
+    def _block_confidence(self):
+        """The Markov head's hook for its last block's chances, or None.
+
+        ``markov_head.block_confidence()`` returns a lazy ``(rows, positions)``
+        array: the head's probability of each draft it just picked. A head
+        without the hook drafts as before.
+        """
+        hook = getattr(
+            getattr(self.model, "markov_head", None), "block_confidence", None
+        )
+        return hook if callable(hook) else None
+
+    # A drafter that sets ``state.draft_conf`` by its own means says so here.
+    states_chances = False
+
     def _proposal_count(self, state) -> int:
         """Drafts the row's depth controller asks to verify next."""
         count = min(self.depth, int(getattr(state, "depth", 0) or self.depth))
+        if self.confidence_windows and (
+            self.states_chances or self._block_confidence() is not None
+        ):
+            return count
         controller = getattr(state, "controller", None)
         if controller is not None:
             count = max(0, min(count, int(controller.cur)))
         return count
 
-    def _commit_proposals(self, state, tokens, accept_lps) -> None:
-        """Hand the row its drafts and their draft distributions."""
+    def _commit_proposals(self, state, tokens, accept_lps, conf=None) -> None:
+        """Hand the row its drafts, their draft distributions and, from a head
+        that states them, each draft's chance (``state.draft_conf``)."""
         if isinstance(tokens, list):
             # DSpark keeps one lazy token per position; only the prefix the
             # row's depth controller verifies next is evaluated.
@@ -186,9 +210,12 @@ class DFlashDrafter:
                 else mx.zeros((0,), dtype=mx.uint32)
             )
             accept_lps = accept_lps[:count]
+            if conf is not None:
+                conf = conf.reshape(-1)[:count]
         state.drafts = tokens.reshape(-1).astype(mx.uint32)
         state.draft_lps = []
         state.draft_accept_lps = accept_lps
+        state.draft_conf = conf if self.confidence_windows else None
 
     def _row(self, uid: Any) -> _RowContext:
         row = self._rows.get(uid)
@@ -431,6 +458,9 @@ class DFlashDrafter:
         ``committed[-1]`` is the newest committed token, which anchors the
         block. Writes ``state.drafts`` and clears the head-only logprob lists.
         """
+        if not jobs:
+            # Every row of the cycle took its window from the suffix lookup.
+            return
         rows = []
         for gen_batch, state, captured, committed, _prev_buf in jobs:
             row = self._row(state.uid)
@@ -459,8 +489,8 @@ class DFlashDrafter:
             proposals = self._draft_batched(rows)
         finally:
             set_verify_qmm_armed(False)
-        for (state, *_), (tokens, accept_lps) in zip(rows, proposals):
-            self._commit_proposals(state, tokens, accept_lps)
+        for (state, *_), proposal in zip(rows, proposals):
+            self._commit_proposals(state, *proposal)
             mx.async_eval(state.drafts)
         # Dispatch time shared across the rows; the GPU work overlaps the
         # next verify like the MTP head's async draft.
@@ -500,7 +530,7 @@ class DFlashDrafter:
         finally:
             set_verify_qmm_armed(False)
         self._predraft.unfed = [unfed]
-        tokens, accept_lps = proposals[0]
+        tokens, accept_lps, *_ = proposals[0]
         if isinstance(tokens, list):
             # The controller picks the next depth after this cycle. Start the
             # positions its current depth needs; adopting evaluates the rest
@@ -528,8 +558,7 @@ class DFlashDrafter:
         if row.end is not None:
             row.end += int(count)
         self._remember(row, pre.contexts[0][:, : pre.unfed[0] + int(count)])
-        tokens, accept_lps = pre.proposals[0]
-        self._commit_proposals(state, tokens, accept_lps)
+        self._commit_proposals(state, *pre.proposals[0])
 
     def discard_predraft(self) -> None:
         self._predraft = None
@@ -854,9 +883,23 @@ class DFlashDrafter:
             prepare = getattr(markov, "prepare_block", None)
             if prepare is not None:
                 # Recurrent Markov heads start each block from the newest
-                # committed context row.
-                prepare(draft_hidden, h_ctx, lengths, uids)
+                # committed context row. A predraft's context holds every
+                # verify row, and only ``counts`` of them commit: the head
+                # must not read the row of a draft the target rejected.
+                newest, held = h_ctx, lengths
+                if counts is not None:
+                    last = mx.concatenate(counts).astype(mx.int32) - 1
+                    newest = mx.take_along_axis(h_ctx, last[:, None, None], axis=1)
+                    held = [1] * batch
+                prepare(draft_hidden, newest, held, uids)
             proposals = selection.select_markov(markov, logits, anchors, samplers)
+            confidence = self._block_confidence()
+            if confidence is not None and self.confidence_windows:
+                chances = confidence()
+                proposals = [
+                    (tokens, accept_lps, chances[index])
+                    for index, (tokens, accept_lps) in enumerate(proposals)
+                ]
         elif selector is not None and selection.fused_select_eligible(
             selector, draft_hidden
         ):

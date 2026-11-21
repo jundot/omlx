@@ -17,6 +17,7 @@ import functools
 import inspect
 import logging
 import math
+import os
 import threading
 import time
 import weakref
@@ -27,6 +28,8 @@ from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from omlx.prefill_progress import get_prefill_tracker
+from omlx.speculative import draft_policy as _draft_policy
+from omlx.speculative.suffix_drafter import SuffixDrafter
 
 from . import cache_rollback as _rollback_mod
 from . import context_copy as _context_copy
@@ -966,6 +969,16 @@ class _MtpState:
     context_copy: Optional[Any] = None
     copy_drafts: bool = False
     copy_untimed: bool = False
+    # Draft policy (opt-in, ``_draft_policy_for``): the suffix-lookup index of
+    # this request, the match behind the pending lookup window, the tokens the
+    # lookup expects after that window, whether a drafter block was made for
+    # a window that then came from the lookup, and the drafter's stated chance
+    # per pending draft (a lazy array; None without a confidence head).
+    suffix: Optional[Any] = None
+    lookup_match: int = 0
+    lookup_tail: List[int] = field(default_factory=list)
+    lookup_drafted: bool = False
+    draft_conf: Optional[Any] = None
 
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
@@ -3245,7 +3258,12 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
         if not state.head_clone:
             _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
         committed_ids = [int(t) for t in committed.tolist()]
-        copied = _context_copy_drafts(gen_batch, state, committed_ids)
+        policy = _draft_policy_for(gen_batch.model)
+        copied = (
+            _context_copy_drafts(gen_batch, state, committed_ids)
+            if policy is None
+            else _policy_lookup(gen_batch, state, policy, committed_ids, None)
+        )
         depth = state.controller.cur if state.controller is not None else state.depth
         if copied or depth <= 0:
             _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf, depth=0 if copied else None)
@@ -3582,6 +3600,9 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
             state.queue.append(
                 (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
             )
+            # With the draft policy on, a head that states its drafts' chances
+            # drafts whole blocks from the first one.
+            drafter.confidence_windows = _draft_policy_for(gen_batch.model) is not None
             drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
             gen_batch._omlx_mtp_state = state
             return
@@ -3703,11 +3724,13 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
         for state in states:
             state.controller = None
             state.depth = requested
+    draft_policy = _draft_policy_for(gen_batch.model)
     if _drafter_for(gen_batch.model) is not None or _shared_verify_width(gen_batch.model):
         # Clip before grouping so rows that share a window verify together. A shared
         # verify host also drops drafts made deeper than the policy's (capped) depth.
         for state in states:
-            if state.chain:
+            # The draft policy sizes lookup windows; the rows' joint window follows.
+            if state.chain and not (draft_policy is not None and state.copy_drafts):
                 _clip_block_drafts(
                     state,
                     (
@@ -3716,7 +3739,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
                         else state.depth
                     ),
                 )
-    _clip_to_shared_window(states)
+    _clip_to_shared_window(states, draft_policy)
     sync = _cluster_mtp(gen_batch.model)
     started = time.perf_counter()
     try:
@@ -4222,24 +4245,50 @@ def _clip_block_drafts(state: _MtpState, limit: int) -> None:
         state.draft_accept_lps = list(q)[:limit]
 
 
-def _clip_to_shared_window(states: List[_MtpState]) -> None:
+def _clip_to_shared_window(
+    states: List[_MtpState], draft_policy: Optional[Any] = None
+) -> None:
     """Clip the rows verifying this cycle to their shortest proposal.
 
     A copied window can be longer than the head's drafts. Rows of different
     lengths verify per row from extracted caches, and merging those back copies
     the whole batch KV. A chain or copy prefix is still a complete proposal.
+
+    With a draft policy and a lookup window among the rows, the shared window
+    is the one with the most expected tokens per millisecond over all rows
+    (``allocate_batch_verify_budget``), at most the shortest proposal: a wide
+    window pays for every row, also for the rows whose drafts are unlikely.
     """
-    lengths = [
-        int(state.drafts.shape[0])
+    rows = [
+        state
         for state in states
         if state.chain and not state.queue and state.drafts is not None
     ]
-    if len(set(lengths)) < 2 or min(lengths) < 1:
+    lengths = [int(state.drafts.shape[0]) for state in rows]
+    if not lengths or min(lengths) < 1:
         return
     limit = min(lengths)
-    for state in states:
-        if state.chain and not state.queue and state.drafts is not None:
-            _clip_block_drafts(state, limit)
+    if draft_policy is not None and any(state.copy_drafts for state in rows):
+        survivals = [
+            (
+                draft_policy.lookup_survival(limit, state.lookup_match)
+                if state.copy_drafts
+                else draft_policy.drafter_survival(limit)
+            )
+            for state in rows
+        ]
+        # A window of at least one draft: plain batched steps are the batch
+        # policy's call, made from its own measurement of ordinary decode.
+        limit = max(
+            1,
+            _draft_policy.allocate_batch_verify_budget(
+                survivals, draft_policy.cost_ms, rectangular=True
+            )[0],
+        )
+    elif len(set(lengths)) < 2:
+        return
+    for state in rows:
+        _clip_block_drafts(state, limit)
 
 
 def _sparse_top_k(sampler) -> int:
@@ -4538,6 +4587,161 @@ def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
     return SparseDraftQ(ids, mx.zeros(ids.shape, dtype=mx.float32), vocab)
 
 
+_DRAFT_POLICY_ENV = "OMLX_MTP_DRAFT_POLICY"
+
+
+def _draft_policy_for(model: Any) -> Optional[Any]:
+    """The model's draft policy, or None while it is off (the default).
+
+    On with ``_omlx_mtp_draft_policy`` set on the model (False keeps it off),
+    else with ``OMLX_MTP_DRAFT_POLICY=1`` in the environment. With it, a
+    suffix lookup (``SuffixDrafter``) proposes windows next to the draft head,
+    and ``DraftPolicy`` takes the one with the most expected tokens per
+    millisecond; it replaces the context copy's fixed match thresholds. The
+    policy belongs to the model, so what it has learned about this machine's
+    costs and each source's acceptance carries over to the next request.
+    """
+    hosts = [
+        host
+        for host in (
+            model,
+            getattr(model, "_language_model", None),
+            getattr(model, "language_model", None),
+        )
+        if host is not None
+    ]
+    flag = None
+    for host in hosts:
+        # Only a real bool counts: a mock's dynamic attribute is not a setting.
+        flag = getattr(host, "_omlx_mtp_draft_policy", None)
+        if flag is True or flag is False:
+            break
+        flag = None
+    if flag is None:
+        flag = os.environ.get(_DRAFT_POLICY_ENV, "").strip().lower() in (
+            "1",
+            "true",
+            "on",
+        )
+    if not flag:
+        return None
+    policy = getattr(hosts[0], "_omlx_mtp_draft_policy_state", None)
+    if not isinstance(policy, _draft_policy.DraftPolicy):
+        policy = _draft_policy.DraftPolicy(_draft_policy.K_MAX)
+        hosts[0]._omlx_mtp_draft_policy_state = policy
+    return policy
+
+
+def _stated_chances(state: _MtpState) -> Optional[List[float]]:
+    """The draft head's chance per pending draft, read to the host (one sync).
+
+    ``state.draft_conf`` is a lazy array or a list of them, one per position.
+    """
+    import mlx.core as mx
+
+    conf = state.draft_conf
+    if conf is None:
+        return None
+    if isinstance(conf, (list, tuple)):
+        if not conf:
+            return None
+        conf = mx.concatenate([c.reshape(-1) for c in conf])
+    return [float(c) for c in conf.reshape(-1).tolist()]
+
+
+def _drafter_window(state: _MtpState) -> int:
+    """Drafts of the draft head the next verify takes (its depth controller's)."""
+    return int(state.controller.cur if state.controller is not None else state.depth)
+
+
+def _lookup_window(model: Any, state: _MtpState, drafter: Optional[Any]) -> int:
+    """Most lookup drafts one verify window of this target takes.
+
+    A block drafter's target verifies its block size; one that declares a
+    wider verify (``_omlx_mtp_max_verify_rows``) takes lookup windows that wide.
+    """
+    cap = _max_verify_rows(model)
+    if drafter is not None:
+        if cap is None:
+            return int(drafter.depth)
+        return max(int(drafter.depth), min(cap - 1, _draft_policy.K_MAX))
+    if _dspark_host(model) is not None:
+        return int(state.depth)
+    if _row_exact_verify(model) and (cap is None or cap > _context_copy.MAX_COPY):
+        return _context_copy.MAX_COPY
+    return _context_copy._NARROW_COPY
+
+
+def _policy_lookup(
+    gen_batch: Any,
+    state: _MtpState,
+    policy: Any,
+    committed_ids: List[int],
+    drafter: Optional[Any],
+    drafted: bool = False,
+) -> List[int]:
+    """The next window from the suffix lookup, when the draft policy takes it.
+
+    Like ``_context_copy_drafts`` the lookup is only another draft source: the
+    target verifies every token, greedy by equality and sampled against a
+    one-hot draft distribution. ``[]`` leaves the window to the draft head.
+    ``drafted``: the head's block for this window already exists.
+    """
+    if state.suffix is None:
+        state.suffix = SuffixDrafter()
+    suffix = state.suffix
+    state.copy_untimed = suffix.sync(gen_batch.tokens[0])
+    suffix.append(committed_ids)
+    state.lookup_tail = []
+    state.lookup_drafted = False
+    # The next cycle emits up to len(drafts) + 1 tokens after the queued ones.
+    room = gen_batch.max_tokens[0] - gen_batch._num_tokens[0] - len(committed_ids) - 1
+    cap = min(room, _lookup_window(gen_batch.model, state, drafter))
+    if cap < 1:
+        return []
+    # Twice the window: what follows it is the lookup's guess at the window after.
+    proposal, match = suffix.propose(2 * cap + 1)
+    if not proposal:
+        return []
+    depth = _drafter_window(state)
+    choice = policy.choose(
+        lookup_k=min(cap, len(proposal)),
+        match=match,
+        drafter_k=depth,
+        drafter_window=depth or None,
+        drafted=drafted,
+    )
+    if choice.source is not _draft_policy.Source.LOOKUP:
+        return []
+    state.lookup_match = match
+    state.lookup_tail = proposal[choice.k :]
+    state.lookup_drafted = drafted
+    return proposal[: choice.k]
+
+
+def _lookup_continues(
+    gen_batch: Any, state: _MtpState, policy: Any, drafter: Any, k: int
+) -> bool:
+    """Whether the window after this lookup window would be a lookup's too.
+
+    Asked before the host knows this window's outcome, assuming it is accepted
+    whole and the lookup's next token follows: then the draft head's block for
+    the next window would be thrown away, so it is not started.
+    """
+    tail = state.lookup_tail
+    if len(tail) < 2:
+        return False
+    depth = _drafter_window(state)
+    cap = _lookup_window(gen_batch.model, state, drafter)
+    choice = policy.choose(
+        lookup_k=min(cap, len(tail) - 1),
+        match=state.lookup_match + k + 1,
+        drafter_k=depth,
+        drafter_window=depth or None,
+    )
+    return choice.source is _draft_policy.Source.LOOKUP
+
+
 _MISSING_CYCLE_INPUTS = "chain cycle entered without next_main / drafts"
 
 
@@ -4598,16 +4802,31 @@ def _run_verify_cycle_chain(
     procs = _proc_list(gen_batch)
     is_greedy = _is_greedy(gen_batch)
     drafter = _drafter_for(gen_batch.model)
-    if drafter is not None and verify_result is None:
-        # A shared verify was already built from the drafts it was given.
-        _clip_block_drafts(
-            state,
-            state.controller.cur if state.controller is not None else state.depth,
-        )
+    policy = None if follower else _draft_policy_for(gen_batch.model)
+    # A shared verify was already built from the drafts it was given, and its
+    # time is the batch's, not this window's.
+    own_forward = verify_result is None
+    cycle_conf = None
+    if drafter is not None and own_forward and policy is not None:
+        if not state.copy_drafts:
+            cycle_conf = _stated_chances(state)
+        if cycle_conf:
+            # The head stated each draft's chance: the window is the one with
+            # the most expected tokens per millisecond for this block.
+            _clip_block_drafts(state, policy.window(cycle_conf) - 1)
+        elif not state.copy_drafts:
+            cycle_conf = None
+            _clip_block_drafts(state, _drafter_window(state))
+        # A lookup window was sized by the policy when it was proposed.
+    elif drafter is not None and own_forward:
+        _clip_block_drafts(state, _drafter_window(state))
     # Adaptive depth: the chain may have drafted fewer than state.depth
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
     copy_cycle = state.copy_drafts
+    cycle_match, cycle_lookup_drafted = state.lookup_match, state.lookup_drafted
+    if cycle_conf is not None:
+        cycle_conf = cycle_conf[:k]
     cycle_t0 = time.perf_counter()
 
     inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)
@@ -4667,6 +4886,13 @@ def _run_verify_cycle_chain(
         and commit_cache is None
         and not defer_commit
     )
+    if can_predraft and policy is not None and copy_cycle:
+        # A window wider than the block would write past the ring's spare
+        # slots; one the lookup expects to follow needs no block at all.
+        if k > drafter.depth or _lookup_continues(
+            gen_batch, state, policy, drafter, k
+        ):
+            can_predraft = False
     predrafted = False
 
     if k == 0:
@@ -4834,7 +5060,8 @@ def _run_verify_cycle_chain(
         state.stats.copy_cycles += 1
         state.stats.copy_drafted += k
         state.stats.copy_accepted += m
-        state.context_copy.observe(m, k)
+        if state.context_copy is not None:
+            state.context_copy.observe(m, k)
     else:
         # A batch policy can lower state.depth below the drafts a row holds.
         depth = max(state.depth, k)
@@ -4872,14 +5099,28 @@ def _run_verify_cycle_chain(
         if procs is not None:
             prev_buf = gen_batch._token_context[0].tokens
         state.copy_drafts = False
-        # A block drafter's row may verify a copy of a repeated stretch of the
-        # context instead of its block; only a copy that fills the block does.
+        state.draft_conf = None
         copied = []
-        if (
+        if policy is not None:
+            # Lookup or draft head, by expected tokens per millisecond. Rows of
+            # a batched embedded head decide in their own draft job.
+            if drafter is not None or draft_jobs is None:
+                copied = _policy_lookup(
+                    gen_batch,
+                    state,
+                    policy,
+                    committed_ids,
+                    drafter,
+                    drafted=drafter is not None and predrafted and m == m_gpu,
+                )
+        elif (
             drafter is not None
             and draft_jobs is None
             and getattr(drafter, "context_copy", False)
         ):
+            # A block drafter's row may verify a copy of a repeated stretch of
+            # the context instead of its block; only a copy that fills the
+            # block does.
             copied = _context_copy_drafts(
                 gen_batch, state, committed_ids, block=drafter.depth
             )
@@ -4897,7 +5138,8 @@ def _run_verify_cycle_chain(
             else:
                 draft_jobs.append(job)
         elif draft_jobs is None:
-            copied = _context_copy_drafts(gen_batch, state, committed_ids)
+            if policy is None:
+                copied = _context_copy_drafts(gen_batch, state, committed_ids)
             _chain_next_drafts(
                 gen_batch,
                 state,
@@ -4917,6 +5159,7 @@ def _run_verify_cycle_chain(
             state.draft_accept_lps = (
                 [] if is_greedy else _copy_draft_q(copied, combined_lp.shape[-1])
             )
+            state.draft_conf = None
             state.copy_drafts = True
         state.next_main = next_main
         state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
@@ -4961,6 +5204,13 @@ def _run_verify_cycle_chain(
             _materialize_mtp_boundary_emit(gen_batch, state)
             state.boundary_emit_pending = False
         untimed, state.copy_untimed = state.copy_untimed, False
+        cycle_ms = (
+            accept_ms
+            + (time.perf_counter() - finish_t0) * 1000
+            + verify_ms
+            + shared_commit_ms
+        )
+        keepalive = False
         if state.controller is not None and not copy_cycle:
             was_warmup = bool(state.controller._warmup)
             keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
@@ -4969,16 +5219,28 @@ def _run_verify_cycle_chain(
             state.controller.observe(
                 k,
                 m,
-                accept_ms
-                + (time.perf_counter() - finish_t0) * 1000
-                + verify_ms
-                + shared_commit_ms,
+                cycle_ms,
                 time_sample=not keepalive and not untimed,
             )
             _maybe_finish_mtp_reentry_probe(
                 gen_batch,
                 state,
                 was_warmup=was_warmup,
+            )
+        if policy is not None:
+            source = _draft_policy.Source.NONE
+            if copy_cycle:
+                source = _draft_policy.Source.LOOKUP
+            elif k:
+                source = _draft_policy.Source.DRAFTER
+            policy.observe(
+                _draft_policy.Choice(source, k, match=cycle_match),
+                # What the target accepted, before commit clamps shortened it.
+                m_gpu,
+                cycle_ms if own_forward and not untimed and not keepalive else None,
+                conf=cycle_conf,
+                # A lookup window whose block was drafted ahead paid for it too.
+                drafted=cycle_lookup_drafted if copy_cycle else k > 0,
             )
         if seed is not None:
             mx.random.seed(seed)
