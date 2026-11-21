@@ -15,12 +15,15 @@ mx = pytest.importorskip("mlx.core")
 import mlx.nn as nn  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 
+from omlx.api.systemone_models import SystemOneQuestion, SystemOneRequest  # noqa: E402
 from omlx.exceptions import InvalidRequestError  # noqa: E402
 from omlx.models import clef, d1, d3, decision, openjev  # noqa: E402
 from omlx.models.decision import (  # noqa: E402
     DecisionBackbone,
     DecisionContextLengthError,
     DecisionRequestError,
+    check_question_types,
+    check_state,
 )
 
 
@@ -927,6 +930,153 @@ def test_d1_rejects_media_instructions_and_videos():
                 "questions": {"q": {"type": "noul", "instructions": "?"}},
             }
         )
+
+
+BOX = {"cat": {"type": "box", "instructions": "Where is the cat?"}}
+IMAGE = ["data:image/png;base64,iVBORw0KGgo="]
+
+
+def _d1_model():
+    """A d1 wrapper with only what ``encode`` reaches for, no weights."""
+    from mlx_vlm.models.d1_lfm3_vl.api import SystemOneApi
+
+    requests = SystemOneApi()
+    requests.tokenizer = _CharTokenizer()
+    requests.state_style = "json_only"
+    model = d1.D1Model("unused")
+    model._requests = requests
+    return model
+
+
+def test_d1_box_questions_read_exactly_one_image(monkeypatch):
+    model = _d1_model()
+    monkeypatch.setattr(d1, "decode_images", lambda urls: [object()] * len(urls or ()))
+    with pytest.raises(DecisionRequestError, match="exactly one image"):
+        model.encode({"state": None, "questions": BOX})
+    with pytest.raises(DecisionRequestError, match="exactly one image"):
+        model.encode({"state": None, "questions": BOX, "images": IMAGE * 2})
+    # The picture a box reads is the whole state, so there is nothing to say.
+    plan = model.encode({"state": None, "questions": BOX, "images": IMAGE})
+    assert len(plan.images) == 1
+
+
+def test_d1_needs_a_state_or_an_image():
+    model = _d1_model()
+    noul = {"q": {"type": "noul", "instructions": "Is it urgent?"}}
+    with pytest.raises(DecisionRequestError, match="needs a state or an image"):
+        model.encode({"state": None, "questions": noul})
+    assert model.encode({"state": "", "questions": noul}).state == ""
+
+
+def test_d1_serves_a_number_estimate_but_not_a_pointer_read():
+    model = _d1_model()
+    estimate = {"q": {"type": "number", "instructions": "How many?", "range": [0, 10]}}
+    plan = model.encode({"state": "s", "questions": estimate})
+    assert plan.items["q"].type == "number"
+    for kind in ("text", "date", "number"):
+        read = {"q": {"type": kind, "instructions": "Which one?"}}
+        with pytest.raises(DecisionRequestError, match="positions of the state"):
+            model.encode({"state": {"a": "b"}, "questions": read})
+
+
+def test_d1_encode_ignores_the_nulls_of_the_other_question_fields(monkeypatch):
+    """Every field the schema answers with null, as the endpoint dumps it.
+
+    mlx-vlm reads a question by which keys it has, so a null ``max`` would read
+    as a ``max`` on a question that has no use for one.
+    """
+    model = _d1_model()
+    monkeypatch.setattr(d1, "decode_images", lambda urls: [object()] * len(urls or ()))
+    dumped = SystemOneQuestion.model_validate(
+        {"type": "boxes", "instructions": "Every cat.", "max": 4}
+    ).model_dump()
+    assert dumped["range"] is None and dumped["multiple"] is None
+    noul = SystemOneQuestion.model_validate(
+        {"type": "noul", "instructions": "Is it a cat?"}
+    ).model_dump()
+    plan = model.encode(
+        {"state": None, "questions": {"cats": dumped, "sure": noul}, "images": IMAGE}
+    )
+    assert plan.items["cats"].blocks == 4
+
+
+def test_round_answer_rounds_the_edges_of_a_box():
+    answer = {
+        "type": "box",
+        "box": {"top": 0.123456, "bottom": 0.481915, "left": 0.0, "right": 1.0},
+        "found": 0.987654,
+        "confidence": 0.50004,
+    }
+    out = d1.round_answer(answer)
+    assert out["box"] == {"top": 0.1235, "bottom": 0.4819, "left": 0.0, "right": 1.0}
+    assert out["found"] == 0.9877 and out["confidence"] == 0.5
+
+
+@pytest.mark.parametrize("kind", ["clef", "openjev", "d3"])
+def test_box_questions_name_the_family_that_cannot_answer_them(kind):
+    """Clef would read a box as a score and OpenJev as a noul."""
+    with pytest.raises(DecisionRequestError, match=f"{kind} models answer.*d1-2B"):
+        check_question_types(kind, BOX)
+    check_question_types("d1", BOX)
+    check_question_types(kind, {"q": {"type": "score", "instructions": "?"}})
+
+
+def test_only_d1_answers_with_no_state():
+    for kind in ("clef", "openjev", "d3"):
+        with pytest.raises(DecisionRequestError, match="cannot be null"):
+            check_state(kind, None)
+        check_state(kind, "a state")
+    check_state("d1", None)
+
+
+def test_a_picture_only_request_may_leave_the_state_out():
+    """A d1 request reads a picture with no state at all, and clients send that
+    by leaving the key out rather than by sending null."""
+    omitted = SystemOneRequest.model_validate(
+        {
+            "model": "d1-2B",
+            "images": IMAGE,
+            "questions": {"cat": {"type": "box", "instructions": "Where?"}},
+        }
+    )
+    explicit = SystemOneRequest.model_validate({**omitted.model_dump(), "state": None})
+    assert omitted.state is None and explicit.state is None
+    assert omitted.model_dump() == explicit.model_dump()
+
+    # The families that read a state refuse the same body themselves, because
+    # the schema no longer can.
+    for kind in ("clef", "openjev", "d3"):
+        with pytest.raises(DecisionRequestError, match="cannot be null"):
+            check_state(kind, omitted.state)
+
+
+def test_a_multiple_choice_needs_a_slot_per_option():
+    multiple = {
+        "topics": {"type": "choice", "multiple": True, "criteria": {"a": "A", "b": "B"}}
+    }
+    with pytest.raises(DecisionRequestError, match="one option"):
+        check_question_types("clef", multiple)
+    for kind in ("openjev", "d3"):
+        with pytest.raises(DecisionRequestError, match="one option"):
+            check_question_types(kind, multiple)
+    check_question_types("d1", multiple)
+
+
+def test_askable_drops_the_nulls_without_dropping_falsy_values():
+    questions = {
+        "q": {
+            "type": "choice",
+            "criteria": {"a": None},
+            "multiple": False,
+            "max": None,
+            "range": None,
+            "step": None,
+            "unit": None,
+        },
+    }
+    assert d1.askable(questions) == {
+        "q": {"type": "choice", "criteria": {"a": None}, "multiple": False}
+    }
 
 
 # --------------------------------------------------------------------------
