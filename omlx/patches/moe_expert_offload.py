@@ -54,6 +54,7 @@ from mlx_lm.models.switch_layers import (
 from ..custom_kernels.moe_staging import EXPERTS, MAX_BYTES, Staging
 from ..custom_kernels.moe_staging import NATIVE_AVAILABLE as STAGING_AVAILABLE
 from ..scheduler import _sync_and_clear_cache
+from . import moe_offload_timeline as _timeline
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +373,8 @@ class ExpertCache:
         self.floor = min(max(floor, 1), self.full_capacity)
         self.projs = _PROJS
         self.disk = disk
+        # Position among the wrapped layers, for the timeline only.
+        self.layer = -1
         self._staging = None
         self._slot_specs = {
             name: [
@@ -490,9 +493,33 @@ class ExpertCache:
                 out.append((name, 2, self.disk.plan(name, "biases", e)))
         return out
 
+    def _reader(self):
+        """The read for this thread's transport, timed when the timeline is on."""
+        read = self._staging.read if self._staging else CheckpointExpertStore.read
+        if not _timeline.ON:
+            return read
+        layer = self.layer
+
+        def timed(plan):
+            start = _timeline.now()
+            raw = read(plan)
+            _timeline.record("read", layer, plan.nbytes, start)
+            return raw
+
+        return timed
+
+    def _routes(self, idx: mx.array) -> list:
+        """Read the routes back from the device, which waits for the router."""
+        if not _timeline.ON:
+            return idx.reshape(-1).tolist()
+        start = _timeline.now()
+        ids = idx.reshape(-1).tolist()
+        _timeline.record("routing", self.layer, len(ids), start)
+        return ids
+
     def _submit(self, pool, e: int) -> list:
         """Start reading expert ``e``; a task per tensor keeps its reads parallel."""
-        read = self._staging.read if self._staging else CheckpointExpertStore.read
+        read = self._reader()
         return [
             (name, field, plan, pool.submit(read, plan))
             for name, field, plan in self._plans(e)
@@ -517,14 +544,17 @@ class ExpertCache:
     def _write(self, slot: int, payload: list) -> None:
         """Copy one expert's fetched bytes into ``slot``."""
         convert = self._staging.to_mx if self._staging else CheckpointExpertStore.to_mx
+        start = _timeline.now() if _timeline.ON else 0
         for name, field, plan, raw in payload:
             self.resident[name][field][slot] = convert(plan, raw)
+        if _timeline.ON:
+            _timeline.record("install", self.layer, len(payload), start)
 
     def _install(
         self, e: int, payload: list | None = None, protected=frozenset()
     ) -> int:
         if payload is None:
-            read = self._staging.read if self._staging else CheckpointExpertStore.read
+            read = self._reader()
             payload = [(n, f, pl, read(pl)) for n, f, pl in self._plans(e)]
         slot = self._reserve(protected)
         try:
@@ -547,7 +577,7 @@ class ExpertCache:
         """
         if self.warm:  # nothing can miss; skip it
             return
-        self._ensure_ids(idx.reshape(-1).tolist())
+        self._ensure_ids(self._routes(idx))
 
     def _bind_staging(self) -> None:
         staging = self.disk._store._staging
@@ -581,6 +611,7 @@ class ExpertCache:
         :meth:`OffloadSwitchGLU._forward_overlap`). Returns whether that
         happened. ``pending`` holds reads from :meth:`_read_ahead`.
         """
+        start = _timeline.now() if _timeline.ON else 0
         self._bind_staging()
         pending = dict(pending or {})
         needed = list(dict.fromkeys(int(e) for e in ids))
@@ -595,6 +626,8 @@ class ExpertCache:
         self.hits += len(needed) - len(misses)
         if not misses:
             _drain(pending)
+            if _timeline.ON:
+                _timeline.record("ensure", self.layer, 0, start)
             return False
         protected = frozenset(needed)
         pool = _io_pool()
@@ -633,7 +666,10 @@ class ExpertCache:
                     self._install(e, protected=protected)
                     continue
                 if keepalive is not None:
+                    waited = _timeline.now() if _timeline.ON else 0
                     keepalive.wait([f for _, _, _, f in group])
+                    if _timeline.ON:
+                        _timeline.record("keepalive", self.layer, len(group), waited)
                 if barrier is not None:
                     mx.eval(barrier)  # right before the first slot write
                     barrier = None
@@ -649,6 +685,8 @@ class ExpertCache:
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the
         # per-chunk eval in __call__, which is a different mechanism.
+        if _timeline.ON:
+            _timeline.record("ensure", self.layer, len(misses), start)
         return slow
 
     def qmm(
@@ -765,7 +803,7 @@ class OffloadSwitchGLU(nn.Module):
         instead of 0.5 ms per expert at 2.8 MB experts).
         """
         c = self.cache
-        flat = indices.reshape(-1).tolist()  # the sync
+        flat = c._routes(indices)  # the sync
         hit = [e in c.slot_of for e in flat]  # residency before any install
         hit_pos = [p for p, h in enumerate(hit) if h]
         flat_x = x.reshape(-1, x.shape[-1])
@@ -893,7 +931,10 @@ class OffloadSwitchGLU(nn.Module):
                     ahead = c._read_ahead(
                         np.unique(sorted_ids[s1:e1]).tolist(), _io_batch()
                     )
+                evaluated = _timeline.now() if _timeline.ON else 0
                 mx.eval(o)
+                if _timeline.ON:
+                    _timeline.record("eval", c.layer, n_routes, evaluated)
                 outs.append(o)
         finally:
             _drain(ahead)
@@ -902,6 +943,14 @@ class OffloadSwitchGLU(nn.Module):
         return mx.take(out, inverse, axis=0).reshape(-1, k, d_model)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        if not _timeline.ON:
+            return self._dispatch(x, indices)
+        start = _timeline.now()
+        out = self._dispatch(x, indices)
+        _timeline.record("layer", self.cache.layer, indices.size, start)
+        return out
+
+    def _dispatch(self, x: mx.array, indices: mx.array) -> mx.array:
         # A single _forward must have every expert it routes to resident AT
         # ONCE: a long prefill can route to more distinct experts than the
         # cache holds, in which case earlier installs would be evicted before
@@ -916,7 +965,7 @@ class OffloadSwitchGLU(nn.Module):
             raise ValueError("Expert cache capacity is smaller than routing top-k")
         if n_tok * k <= c.capacity or n_tok == 1:
             return self._forward(x, indices)
-        ids = flat_i.reshape(-1).tolist()
+        ids = c._routes(flat_i)
         if len(set(ids)) <= c.capacity:
             return self._forward(x, indices)
         flat_x = x.reshape(-1, x.shape[-1])
@@ -1141,7 +1190,7 @@ def apply_moe_expert_offload(
     wrapped += apply_deepseek_v4_moe_expert_offload(
         model, model_dir, resident_fraction, mtp_resident=mtp_resident
     )
-    total_bytes = resident_bytes = 0
+    total_bytes = resident_bytes = layers = 0
     staging_sizes = {}
     staging_requested = (
         kind == "qwen4_exp"
@@ -1177,6 +1226,8 @@ def apply_moe_expert_offload(
         total_bytes += layer_bytes
         resident_bytes += layer_bytes * capacity // n_experts
         new = OffloadSwitchGLU(glu, capacity, view, minimum)
+        new.cache.layer = layers
+        layers += 1
         # Keep children the model reads beside the projections (mlx-lm's Muse
         # Spark holds its post-expert norm on the experts module).
         for name, child in glu.children().items():
