@@ -194,6 +194,34 @@ def get_ple_runtime_mode() -> str:
     return _PLE_RUNTIME_MODE
 
 
+def _release_ple_prefill_pool(inputs) -> None:
+    """Release the Metal buffer pool between PLE-streaming prefill chunks.
+
+    Measured on REAP320-oQ3e / M2 Ultra 64 GiB, single-Mac PLE-SSD prefill:
+    shape-dependent intermediates accumulate in the pool — the first chunk
+    grows it to steady state and the tail chunk's different shape adds buffers
+    nothing reuses. Clearing at EVERY chunk boundary cut the peak footprint
+    42 % (chunk 1024) / 31 % (2048) AND the wall clock 7 % / 16 % — the pool
+    pressure costs more than the re-allocation. A pool-vs-live pressure gate
+    was tried and suppressed the valve, because the KV fill (active, already
+    priced by the plan) grows at the same rate as the pool.
+
+    Contained: PLE SSD mode only (a resident plan never clears), batch-1
+    prefill chunks of at least 64 tokens only (decode steps and MTP verify
+    windows never clear, so their intra-step reuse is untouched). The clear
+    runs at the NEXT chunk's entry; steady-state reuse within a chunk is
+    unaffected. ``clear_cache`` frees cached buffers only — it cannot change a
+    computed value.
+    """
+    if _PLE_RUNTIME_MODE != "mmap":
+        return
+    if inputs is None or getattr(inputs, "ndim", 0) != 2:
+        return
+    if inputs.shape[0] != 1 or inputs.shape[1] < 64:
+        return
+    mx.clear_cache()
+
+
 def _append_indexer_positions(
     cached: Optional[mx.array], position_ids: mx.array
 ) -> mx.array:
@@ -5151,6 +5179,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         return getattr(owner, "mtp", None) if owner is not None else None
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
+        _release_ple_prefill_pool(inputs)
         return_hidden = bool(kwargs.get("return_hidden", False))
         mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
         if mtp_capture:
