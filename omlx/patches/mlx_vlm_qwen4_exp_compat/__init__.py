@@ -69,8 +69,10 @@ def _patch_model_file_bypass() -> None:
     ``model_file=qwen4_exp.py`` exporting only ``ModelArgs``-style classes, so
     the load dies with ``module 'custom_model' has no attribute
     'ModelConfig'``. This patch's whole purpose is exposing
-    ``mlx_vlm.models.qwen4_exp``, so for that model type drop ``model_file``
-    and keep the registry resolution mlx-vlm 0.6.x used.
+    ``mlx_vlm.models.qwen4_exp``, so for that model type drop the stock
+    ``model_file`` and keep the registry resolution mlx-vlm 0.6.x used. A
+    checkpoint that ships its own architecture file keeps it; Trust Remote
+    Code gates that import (``ensure_model_code_trusted``).
     """
     import mlx_vlm.utils as utils
 
@@ -80,7 +82,8 @@ def _patch_model_file_bypass() -> None:
     original = utils.get_model_and_args
 
     def get_model_and_args(config, model_path=None):
-        if str(config.get("model_type", "")).lower() == "qwen4_exp":
+        stock = config.get("model_file", "qwen4_exp.py") == "qwen4_exp.py"
+        if str(config.get("model_type", "")).lower() == "qwen4_exp" and stock:
             config = {k: v for k, v in config.items() if k != "model_file"}
             return original(config, model_path=None)
         return original(config, model_path=model_path)
