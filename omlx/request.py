@@ -326,6 +326,7 @@ class Request:
     system_prefix_ids: Optional[List[int]] = None
     system_prefix_end: int = 0  # Token index where the shared system prefix ends
     junction_end: int = 0  # Where this prompt branches off a recent stored sequence
+    prompt_tail_end: int = 0  # Where the prefill's own tail snapshot was taken
 
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter

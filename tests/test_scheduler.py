@@ -3933,6 +3933,57 @@ class TestSchedulerBoundarySnapshots:
         assert 3 not in provider
         assert len(provider) == 0
 
+    def test_prompt_tail_behind_a_decode_boundary_is_stored_as_a_shared_tail(
+        self, mock_model, mock_tokenizer
+    ):
+        """A reply that crosses a block boundary leaves its prompt restorable."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        request = Request(
+            request_id="req-crossed",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(7))
+        request.prompt_tail_end = 6
+        scheduler.requests[request.request_id] = request
+        raw = {4: object(), 6: object(), 8: object()}
+        extracted = {tc: [{"state": (tc,)}] for tc in raw}
+
+        def extract(raw_cache):
+            for tc, obj in raw.items():
+                if raw_cache is obj:
+                    return extracted[tc], f"config-{tc}"
+            raise AssertionError("unexpected raw cache")
+
+        def stores(snapshots):
+            scheduler._boundary_cache_snapshots[request.request_id] = {
+                tc: raw[tc] for tc in snapshots
+            }
+            with (
+                patch.object(scheduler, "_extract_cache_states", side_effect=extract),
+                patch.object(
+                    scheduler,
+                    "_merge_boundary_with_full_cache",
+                    side_effect=lambda boundary, full: boundary,
+                ),
+            ):
+                tokens, _, _, provider = scheduler._get_boundary_store_override(
+                    request.request_id, list(range(10))
+                )
+                shared = scheduler._prepare_shared_tail_stores(request, [])
+            return (
+                len(tokens),
+                provider.tail_terminal_token_count,
+                [(len(st[0]), st[3].tail_terminal_token_count) for st in shared],
+            )
+
+        # The store ends on the boundary the reply crossed; the prompt's tail
+        # goes beside it.
+        assert stores((4, 6, 8)) == (8, None, [(6, 6)])
+        # A reply inside the block: the tail is the store's own terminal.
+        assert stores((4, 6)) == (6, 6, [])
+
     def test_cleanup_finished_pre_evals_intermediate_boundary_snapshots(
         self, mock_model, mock_tokenizer
     ):
