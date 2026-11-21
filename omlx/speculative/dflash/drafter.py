@@ -847,6 +847,14 @@ class DFlashDrafter:
         draft_hidden = model.norm(h) if anchor_slot else model.norm(h)[:, 1:]
         if wide:
             draft_hidden = draft_hidden.astype(dtype)
+        # When committing a Markov draft block, depth is already known: skip
+        # projecting tail positions through the full-vocab LM head.
+        if commit and markov is not None:
+            max_proposals = max(
+                (self._proposal_count(state) for state, *_ in rows), default=0
+            )
+            if 0 < max_proposals < draft_hidden.shape[1]:
+                draft_hidden = draft_hidden[:, :max_proposals]
         logits = model._logits(draft_hidden)
         samplers = [sampler for *_, sampler in rows]
         selector = getattr(model, "candidate_selector", None)
@@ -854,8 +862,15 @@ class DFlashDrafter:
             prepare = getattr(markov, "prepare_block", None)
             if prepare is not None:
                 # Recurrent Markov heads start each block from the newest
-                # committed context row.
-                prepare(draft_hidden, h_ctx, lengths, uids)
+                # committed context row. A predraft's context holds every
+                # verify row, and only ``counts`` of them commit: the head
+                # must not read the row of a draft the target rejected.
+                newest, held = h_ctx, lengths
+                if counts is not None:
+                    last = mx.concatenate(counts).astype(mx.int32) - 1
+                    newest = mx.take_along_axis(h_ctx, last[:, None, None], axis=1)
+                    held = [1] * batch
+                prepare(draft_hidden, newest, held, uids)
             proposals = selection.select_markov(markov, logits, anchors, samplers)
         elif selector is not None and selection.fused_select_eligible(
             selector, draft_hidden
