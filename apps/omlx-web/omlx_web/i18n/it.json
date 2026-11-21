@@ -1320,7 +1320,7 @@
   "modal.model_settings.enable_thinking_default": "Valore predefinito del modello",
   "modal.model_settings.enable_thinking_reset": "Ripristina predefinito del modello",
   "modal.model_settings.ssd_ngram_offload": "Offload N-gram su SSD",
-  "modal.model_settings.ssd_ngram_offload_hint": "Mantiene su SSD la grande tabella N-gram (Qwen4 PLE o DeepSeek V4.1 Engram) e legge solo le righe necessarie. Riduce l'uso di memoria, ma la velocità dipende dalle letture su SSD. La modifica di questa impostazione ricarica il modello.",
+  "modal.model_settings.ssd_ngram_offload_hint": "Mantiene su SSD la grande tabella N-gram e legge solo le righe necessarie. Riduce l'uso di memoria, ma la velocità dipende dalle letture su SSD. La modifica di questa impostazione ricarica il modello.",
   "modal.model_settings.ssd_ngram_offload_forced": "Obbligatorio: il caricamento residente in memoria supera il limite di memoria configurato per i modelli.",
   "modal.model_settings.deepseek_v41_ced_prefill": "Accelerazione prefill CED (DeepSeek V4.1)",
   "modal.model_settings.deepseek_v41_ced_prefill_hint": "Migliora la velocità del prefill di circa il 74–79% nelle configurazioni testate. Sfrutta l'architettura Causal Encoder–Decoder del modello per ridurre i calcoli di prefill del decoder.",

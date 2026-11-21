@@ -1320,7 +1320,7 @@
   "modal.model_settings.enable_thinking_default": "使用模型默认值",
   "modal.model_settings.enable_thinking_reset": "重置为模型默认值",
   "modal.model_settings.ssd_ngram_offload": "SSD N-gram 卸载",
-  "modal.model_settings.ssd_ngram_offload_hint": "将大型 N-gram 表（Qwen4 PLE 或 DeepSeek V4.1 Engram）保留在 SSD 上，只读取所需的行。可节省内存，但速度取决于 SSD 读取性能。更改此设置会重新加载模型。",
+  "modal.model_settings.ssd_ngram_offload_hint": "将大型 N-gram 表保留在 SSD 上，只读取所需的行。可节省内存，但速度取决于 SSD 读取性能。更改此设置会重新加载模型。",
   "modal.model_settings.ssd_ngram_offload_forced": "必需，因为常驻加载超出了配置的模型内存上限。",
   "modal.model_settings.deepseek_v41_ced_prefill": "CED 预填充加速（DeepSeek V4.1）",
   "modal.model_settings.deepseek_v41_ced_prefill_hint": "在测试配置下将预填充速度提升约 74–79%。利用模型的因果编码器–解码器（Causal Encoder–Decoder）架构减少解码器的预填充计算量。",

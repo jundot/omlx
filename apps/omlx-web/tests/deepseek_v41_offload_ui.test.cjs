@@ -21,18 +21,21 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
         assert.equal(init.method, 'PUT');
         return {ok: true, json: async () => ({})};
     };
-    // Qwen4 PLE and DeepSeek V4.1 Engram share the SSD N-gram row and its save rule.
+    // PLE and Engram use the same SSD N-gram control.
     for (const [key, modelType] of [['deepseek_v41_engram_ssd_offload', 'deepseek_v41'],
-                                    ['qwen4_ple_ssd_offload', 'qwen4_exp']]) {
-        for (const [forced, saved] of [[false,false], [false,true], [true,false], [true,true]]) {
+                                    ['qwen4_ple_ssd_offload', 'qwen4_exp'],
+                                    ['hy4_engram_ssd_offload', 'hy_v4_flash']]) {
+        const cases = [[false,false], [false,true]];
+        if (modelType !== 'hy_v4_flash') cases.push([true,false], [true,true]);
+        for (const [forced, saved] of cases) {
             const model = {id:modelType, config_model_type:modelType, [key+'_supported']:true, [key+'_forced']:forced};
             app.selectedModel = model;
             app.modelSettings = app.buildModelSettingsState(model, {[key]:saved});
             assert.equal(app.modelSettings[key], forced || saved);
-            assert.equal(app.modelSettings[key+'_forced'], forced);
+            assert.equal(!!app.modelSettings[key+'_forced'], forced);
             const html = fs.readFileSync(path.join(root,
                 'omlx_web/templates/dashboard/_modal_model_settings.html'), 'utf8');
-            const section = html.split('<!-- SSD N-gram Offload (Qwen4 PLE or DeepSeek V4.1 Engram) -->')[1]
+            const section = html.split('<!-- SSD N-gram Offload -->')[1]
                 .split('<!-- MoE Expert Offload -->')[0];
             const click = section.match(/@click="([^"]+)"/)[1];
             const disabled = section.match(/:disabled="([^"]+)"/)[1];

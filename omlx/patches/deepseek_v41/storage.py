@@ -343,8 +343,8 @@ def decode_array(raw, dtype):
     return mx.array(raw)
 
 
-def decode_rows(data, shape, bits, group_size, scaled):
-    """bf16 rows of shape ``shape + (dim,)`` from packed table rows.
+def decode_rows(data, shape, bits, group_size, scaled, *, preserve_dtype=False):
+    """Decode packed table rows into shape ``shape + (dim,)``.
 
     ``data`` holds ``(raw, dtype)`` for the weight, then scales and biases.
     """
@@ -363,7 +363,8 @@ def decode_rows(data, shape, bits, group_size, scaled):
         values = (values.reshape(values.shape[0], -1, 32) * scales[..., None]).reshape(
             values.shape
         )
-    return values.reshape(*shape, values.shape[-1]).astype(mx.bfloat16)
+    values = values.reshape(*shape, values.shape[-1])
+    return values if preserve_dtype else values.astype(mx.bfloat16)
 
 
 # Engram inputs of several requests with at most this many rows (batched decode, verify
@@ -400,6 +401,7 @@ class DiskEngramEmbedding(nn.Module):
         bias_key=None,
         bits=None,
         group_size=32,
+        preserve_dtype=False,
     ):
         super().__init__()
         self._lock = RLock()
@@ -415,6 +417,7 @@ class DiskEngramEmbedding(nn.Module):
             raise
         self._weight_key, self._scale_key = weight_key, scale_key
         self._bias_key, self._bits, self._group_size = bias_key, bits, group_size
+        self._preserve_dtype = preserve_dtype
         if (bits is None) != (bias_key is None) or (
             bits is not None and scale_key is None
         ):
@@ -503,7 +506,12 @@ class DiskEngramEmbedding(nn.Module):
         else:
             data = self._read_rows(host)
         return decode_rows(
-            data, host.shape, self._bits, self._group_size, self._scale_key is not None
+            data,
+            host.shape,
+            self._bits,
+            self._group_size,
+            self._scale_key is not None,
+            preserve_dtype=self._preserve_dtype,
         )
 
     def close(self):

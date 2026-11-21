@@ -9,6 +9,7 @@ import numpy as np
 
 from . import exact, indexing
 from .config import TextConfig
+from .engram_ssd import open_embedding
 from .rope import TrailingRoPE, rope_at, rotate, rotate_pairs
 
 _ROW_CHUNK = 256
@@ -236,9 +237,12 @@ class _Norm(nn.Module):
 
 
 class _Table(nn.Module):
-    def __init__(self, rows: int, width: int):
+    def __init__(self, layer: int, rows: int, width: int):
         super().__init__()
-        self.embedding = nn.Embedding(rows, width)
+        disk_embedding = open_embedding(layer)
+        self.embedding = (
+            nn.Embedding(rows, width) if disk_embedding is None else disk_embedding
+        )
 
 
 class Engram(nn.Module):
@@ -274,7 +278,7 @@ class Engram(nn.Module):
         width = (self.max_order - 1) * args.engram_n_embed_per_ngram
         d = args.hidden_size
         self.lookup_table = mx.zeros((args.engram_lookup_table_size,), dtype=mx.int32)
-        self.multi_head_embedding = _Table(sum(moduli), self.head_dim)
+        self.multi_head_embedding = _Table(layer_id, sum(moduli), self.head_dim)
         self.lookup_per_head_norms = [_Norm(self.head_dim) for _ in moduli]
         self.value_proj = nn.Linear(width, d)
         self.key_projs = [nn.Linear(width, d) for _ in range(self.hc_mult)]
