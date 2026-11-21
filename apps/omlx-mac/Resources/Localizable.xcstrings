@@ -14697,6 +14697,12 @@
             "value" : "Applications"
           }
         },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applicazioni"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14721,6 +14727,12 @@
             "value" : "Model and launcher command for each tool that talks to oMLX."
           }
         },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modello e comando di avvio per ogni strumento che comunica con oMLX."
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14740,6 +14752,12 @@
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        },
+        "it" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Claude Code"
@@ -14769,6 +14787,12 @@
             "value" : "Pick a tool to see its launcher command."
           }
         },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scegli uno strumento per vederne il comando di avvio."
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14791,6 +14815,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Default model"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modello predefinito"
           }
         },
         "zh-Hans" : {
