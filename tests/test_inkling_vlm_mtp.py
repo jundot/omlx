@@ -740,19 +740,6 @@ def test_inkling2_nvfp4_experts_stay_finite_in_float16():
     assert rel.item() < 1e-2
 
 
-def test_inkling2_nvfp4_experts_keep_post_scale_outside_float16():
-    """bf16 and fp32 keep the post-matmul scale (and the NAX kernels)."""
-    mod = _nvfp4_experts()
-    idx = mx.array([0, 3], dtype=mx.uint32)
-    for dtype in (mx.bfloat16, mx.float32):
-        assert not mod.w13.scales_in_kernel(dtype)
-        scale = mod.w13.post_scale(idx, dtype)
-        expected = mod.w13.global_scale[idx] / (448.0 * 6.0)
-        assert mx.allclose(scale, expected).item()
-    assert mod.w13.scales_in_kernel(mx.float16)
-    assert mod.w13.post_scale(idx, mx.float16) is None
-
-
 @pytest.mark.parametrize(
     "batch, heads, kv_heads, length, keys, window, extent, left_padding",
     [

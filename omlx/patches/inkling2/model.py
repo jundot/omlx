@@ -221,13 +221,9 @@ class ExpertProj(nn.Module):
 
     ``global_scale`` (NVFP4 only) is the per-expert tensor amax in MLX's
     convention; the source scale ``global_scale / (6 * 448)`` is applied after
-    the matmul so the packed codes and E4M3 block scales stay unchanged.
-
-    That scale is ~1e-4, so the unscaled matmul output is ~1e4 times the real
-    one and passes float16's range (65504) on ordinary prompts. With float16
-    activations ``gather_qmm`` applies ``global_scale`` inside the kernel
-    instead; other dtypes keep the post-matmul scale and the NAX kernels,
-    which take no global scale.
+    the matmul so the packed codes and E4M3 block scales stay unchanged. The
+    unscaled output is ~1e4 times the real one and overflows float16, so
+    float16 activations pass ``global_scale`` to ``gather_qmm`` instead.
     """
 
     def __init__(self, experts: int, out_dims: int, in_dims: int, spec: dict):
@@ -255,8 +251,6 @@ class ExpertProj(nn.Module):
         return self.mode == "nvfp4" and dtype == mx.float16
 
     def post_scale(self, idx, dtype):
-        """The per-row scale still to apply to the output of ``x`` in
-        ``dtype``, or None."""
         if self.mode != "nvfp4" or self.scales_in_kernel(dtype):
             return None
         return self.global_scale[idx] * (1.0 / _NVFP4_DENOMINATOR)
