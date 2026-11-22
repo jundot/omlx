@@ -2125,30 +2125,9 @@ class BlockAwarePrefixCache(CacheManager):
             except Exception:
                 continue
 
-        if max_seq_len > 0:
-            # A CacheList member with the whole sequence wins over the window,
-            # else a store after a restore slices new blocks from index 0.
-            list_seq_len = self._cache_list_seq_len(cache_data)
-            if list_seq_len > max_seq_len:
-                logger.debug(
-                    f"Cache seq_len resolved from CacheList sub-cache "
-                    f"({list_seq_len}) over the window ({max_seq_len})"
-                )
-                return list_seq_len
-            # Normal result for all-non-sliceable-KVCache models
-            # (e.g. DeepSeek V4 with RotatingKVCache + PoolingCache).
-            # Returns the sliding-window length, not a sequence length —
-            # callers that depend on full prefill length (continuity
-            # check, reconstruction concat) bypass this layer's
-            # contribution via the snapshot / is_last_block paths.
-            logger.debug(
-                f"Cache seq_len resolved from non-sliceable layer "
-                f"(window={max_seq_len})"
-            )
-            return max_seq_len
-
         # Step 3: CacheList fallback — check sub-states for seq_len
-        # This handles all-CacheList models (e.g., deepseek_v32)
+        # This handles all-CacheList models (e.g., deepseek_v32) and Hy4 Flash,
+        # whose CacheList layers hold the whole sequence next to a window.
         for layer_state in cache_data:
             if (
                 layer_state.get("cache_type") == "CacheList"
@@ -2161,26 +2140,22 @@ class BlockAwarePrefixCache(CacheManager):
                         if hasattr(sub_keys, "shape") and len(sub_keys.shape) == 4:
                             seq_len = sub_keys.shape[2]
                             logger.debug(f"Using CacheList sub-cache seq_len={seq_len}")
-                            return seq_len
+                            return max(seq_len, max_seq_len)
+
+        if max_seq_len > 0:
+            # Normal result for all-non-sliceable-KVCache models
+            # (e.g. DeepSeek V4 with RotatingKVCache + PoolingCache).
+            # Returns the sliding-window length, not a sequence length —
+            # callers that depend on full prefill length (continuity
+            # check, reconstruction concat) bypass this layer's
+            # contribution via the snapshot / is_last_block paths.
+            logger.debug(
+                f"Cache seq_len resolved from non-sliceable layer "
+                f"(window={max_seq_len})"
+            )
+            return max_seq_len
 
         return 0
-
-    @staticmethod
-    def _cache_list_seq_len(cache_data: list[dict[str, Any]]) -> int:
-        longest = 0
-        for layer_state in cache_data:
-            if (
-                layer_state.get("cache_type") != "CacheList"
-                and layer_state.get("class_name") != "CacheList"
-            ):
-                continue
-            for sub_state in layer_state.get("state", []):
-                if not isinstance(sub_state, (list, tuple)) or len(sub_state) < 2:
-                    continue
-                sub_keys = sub_state[0]
-                if hasattr(sub_keys, "shape") and len(sub_keys.shape) == 4:
-                    longest = max(longest, sub_keys.shape[2])
-        return longest
 
     def _discard_tail_block(
         self,

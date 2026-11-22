@@ -3033,8 +3033,6 @@ class TestPrefixCacheCacheList:
             },
         ]
 
-        # The window (512) would make a store after a restore use relative
-        # indices and slice new blocks from the start of the live cache.
         assert prefix_cache._get_cache_seq_len(cache_data) == 2048
 
     def test_extract_block_tensor_slice_cache_list_last_block(self, prefix_cache, mx):
