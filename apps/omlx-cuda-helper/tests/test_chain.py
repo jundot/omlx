@@ -24,7 +24,11 @@ from omlx_cuda_helper import families, gpus, tensors, wire, worker  # noqa: E402
 from omlx_cuda_helper.control import ControlServer  # noqa: E402
 from omlx_cuda_helper.files import ModelStore  # noqa: E402
 from omlx_cuda_helper.state import State  # noqa: E402
-from omlx_cuda_helper.supervisor import Supervisor, plan_stages  # noqa: E402
+from omlx_cuda_helper.supervisor import (  # noqa: E402
+    RESERVE_BYTES,
+    Supervisor,
+    plan_stages,
+)
 from omlx_cuda_helper.worker import (  # noqa: E402
     WINDOW,
     StageError,
@@ -335,6 +339,7 @@ def test_supervisor_runs_stage_processes_and_frees_them(tmp_path, monkeypatch):
     assert ready["hello"]["layers"] == 6 and ready["hello"]["contract"] == 7
     # The endpoint adds up what both stages hold.
     assert ready["hello"]["active_gib"] == 6.0
+    assert "--packed-weights" not in supervisor._session.procs[0].args
 
     sock = socket.create_connection(("127.0.0.1", ready["port"]), timeout=10)
     host = Upstream(sock, TOKEN)
@@ -346,6 +351,36 @@ def test_supervisor_runs_stage_processes_and_frees_them(tmp_path, monkeypatch):
     supervisor.stop(owner)
     assert supervisor.status() is None
     assert all(proc.poll() is not None for proc in procs)
+
+
+def test_supervisor_keeps_weights_packed_to_hold_more_layers(tmp_path, monkeypatch):
+    # 1 MiB shared, 1 MiB an unpacked layer, 512 KiB a packed one.
+    gpu = {
+        "index": 0,
+        "name": "GPU",
+        "total": 24 << 30,
+        "free": RESERVE_BYTES + (5 << 20),
+    }
+    monkeypatch.setattr(gpus, "gpus", lambda only=None: [gpu])
+    monkeypatch.setitem(
+        families.FAMILIES, "fake", families.Family(contract=7, module="fake_family")
+    )
+    worker = [sys.executable, str(Path(__file__).parent / "fake_worker.py")]
+    supervisor = Supervisor(None, tmp_path / "run", worker=worker)
+    owner = object()
+    ready = supervisor.start(
+        owner,
+        model_dir=str(tmp_path / "Model"),
+        model_type="fake",
+        layers=8,
+        warm_tokens=8,
+        host={"node_id": "studio", "name": "Studio"},
+        token=TOKEN,
+        bind="127.0.0.1",
+    )
+    assert ready["hello"]["layers"] == 8
+    assert "--packed-weights" in supervisor._session.procs[0].args
+    supervisor.stop(owner)
 
 
 def test_a_loading_session_ends_with_a_stop_or_with_its_host(tmp_path, monkeypatch):

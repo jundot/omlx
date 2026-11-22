@@ -85,6 +85,10 @@ def from_host(value: HostArray) -> mx.array:
 # GPU, WSL): weights then load on the GPU stream, into the GPU's memory pool.
 weights_on_gpu = False
 
+# Set by the worker when a family keeps its affine weights packed to hold more
+# layers.
+packed_weights = False
+
 
 def load(model_dir: str | Path, names: list[str]) -> dict[str, mx.array]:
     """The named tensors, lazy until evaluated. Each shard is opened once."""
@@ -164,6 +168,11 @@ class Linear:
         elif dtype is not None:
             weight = weight.astype(dtype)
         self.weight = weight
+
+    @property
+    def dtype(self) -> mx.Dtype:
+        """The dtype the layer computes in: the scales' for a packed weight."""
+        return self.weight.dtype if self.quant is None else self.quant[0].dtype
 
     def parameters(self) -> list[mx.array]:
         extra = [a for a in self.quant[:2] if a is not None] if self.quant else []

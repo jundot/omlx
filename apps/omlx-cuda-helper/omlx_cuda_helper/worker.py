@@ -560,6 +560,7 @@ def main(argv: list[str] | None = None) -> int:
         help="bytes a stage may hold before it drops layers or hands a prompt back",
     )
     parser.add_argument("--weights-on-gpu", action="store_true")
+    parser.add_argument("--packed-weights", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
@@ -576,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
     tensors.check_backend()
     tensors.limit_memory(args.memory_limit)
     tensors.weights_on_gpu = args.weights_on_gpu
+    tensors.packed_weights = args.packed_weights
     stage = families.stage_module(args.model_type).load_stage(
         args.model, args.first, args.last
     )
