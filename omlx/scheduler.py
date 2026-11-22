@@ -69,6 +69,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
+from .patches import moe_offload_timeline as _moe_offload_timeline
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import (
@@ -12020,6 +12021,16 @@ class Scheduler:
             request.num_prompt_tokens,
             request.num_output_tokens,
         )
+        if "copy_bytes" in now:
+            served = zip(now["copy_bytes"], start["copy_bytes"])
+            logger.info(
+                "MoE offload copies: request=%s served_mb=%s",
+                request.request_id,
+                [round((after - before) / 1e6, 1) for after, before in served],
+            )
+        timeline = _moe_offload_timeline.flush()
+        if timeline:
+            logger.info("MoE offload timeline: %s", timeline)
 
     def _log_vlm_mtp_stats(
         self, state: "_VLMMTPDecodeState", finish_reason: str

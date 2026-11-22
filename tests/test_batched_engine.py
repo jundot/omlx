@@ -1440,7 +1440,7 @@ class TestBatchedEngineMoeOffloadWiring:
             with pytest.raises(_Abort):
                 await engine.start()
 
-        assert seen["kwargs"] == {"mtp_resident": expected}
+        assert seen["kwargs"] == {"mtp_resident": expected, "mirrors": ()}
         assert seen["args"] == (
             "test-model",
             engine._model_settings.moe_expert_offload_resident_fraction,

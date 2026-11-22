@@ -2283,6 +2283,10 @@ class VLMBatchedEngine(BaseEngine):
                     mtp_resident=bool(
                         getattr(self._model_settings, "mtp_enabled", False)
                     ),
+                    mirrors=getattr(
+                        self._model_settings, "moe_expert_offload_mirrors", None
+                    )
+                    or (),
                 ),
                 self._vlm_model,
                 self._model_name,
