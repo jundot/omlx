@@ -29,6 +29,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, KVCache
 
+from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
 from . import kernels
 from .loader import sanitize_weights
@@ -224,7 +225,9 @@ class ExpertProj(nn.Module):
 
     ``global_scale`` (NVFP4 only) is the per-expert tensor amax in MLX's
     convention; the source scale ``global_scale / (6 * 448)`` is applied after
-    the matmul so the packed codes and E4M3 block scales stay unchanged.
+    the matmul so the packed codes and E4M3 block scales stay unchanged. The
+    unscaled output is ~1e4 times the real one and overflows float16, so
+    float16 activations pass ``global_scale`` to ``gather_qmm`` instead.
     """
 
     def __init__(self, experts: int, out_dims: int, in_dims: int, spec: dict):
@@ -248,12 +251,18 @@ class ExpertProj(nn.Module):
         # converted checkpoint here, which __init__ has applied.
         return self
 
-    def post_scale(self, idx):
-        if self.mode != "nvfp4":
+    def scales_in_kernel(self, dtype) -> bool:
+        return self.mode == "nvfp4" and dtype == mx.float16
+
+    def post_scale(self, idx, dtype):
+        if self.mode != "nvfp4" or self.scales_in_kernel(dtype):
             return None
         return self.global_scale[idx] * (1.0 / _NVFP4_DENOMINATOR)
 
     def __call__(self, x, idx, sorted_indices):
+        extra = {}
+        if self.scales_in_kernel(x.dtype):
+            extra["global_scale"] = self.global_scale
         return mx.gather_qmm(
             x,
             self.weight,
@@ -265,6 +274,7 @@ class ExpertProj(nn.Module):
             bits=self.bits,
             mode=self.mode,
             sorted_indices=sorted_indices,
+            **extra,
         )
 
 
@@ -283,13 +293,15 @@ class Inkling2Experts(nn.Module):
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
         xe = mx.expand_dims(x, (-2, -3))
-        do_sort = inds.size >= 64
+        # Sorting regroups the pairs by expert and changes their arithmetic;
+        # row-exact verify rows keep the per-pair gather of a decode step.
+        do_sort = inds.size >= 64 and not is_row_exact_armed()
         idx = inds
         inv = None
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
         y = self.w13(xe, idx, do_sort)
-        s13 = self.w13.post_scale(idx)
+        s13 = self.w13.post_scale(idx, xe.dtype)
         if s13 is not None:
             y = y * s13[..., None, None].astype(y.dtype)
         act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
@@ -297,7 +309,7 @@ class Inkling2Experts(nn.Module):
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
         z = z.squeeze(-2)
-        s2 = self.w2.post_scale(inds)
+        s2 = self.w2.post_scale(inds, act.dtype)
         if s2 is not None:
             weights = weights * s2
         out = mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
@@ -316,7 +328,7 @@ class Inkling2MoE(nn.Module):
         self.experts = Inkling2Experts(args, w13_spec, w2_spec)
 
     def route(self, x: mx.array):
-        logits = x.astype(mx.float32) @ self.router_weight.T
+        logits = _row_matmul(x.astype(mx.float32), self.router_weight.T)
         return kernels.route_topk(
             logits, self.router_bias, self.top_k, self.route_scale
         )
@@ -359,12 +371,22 @@ def _mix_messages(x, message, down, gain_forget):
     # dependent kernel, so prefill chunking would change the result.
     z = mx.stack([_unit_rms(x), _unit_rms(message)], axis=1)
     z = z.astype(mx.bfloat16).astype(mx.float32).reshape(2 * n, rows, hidden)
-    low = (z @ down.reshape(2 * n, hidden, -1)).reshape(n, 2, rows, -1).sum(axis=1)
+    low = _row_matmul(z, down.reshape(2 * n, hidden, -1))
+    low = low.reshape(n, 2, rows, -1).sum(axis=1)
     low = low.astype(mx.bfloat16).astype(mx.float32)
-    gates = (low @ gain_forget).reshape(n, b, length, 2 * hidden)
+    gates = _row_matmul(low, gain_forget).reshape(n, b, length, 2 * hidden)
     gain = mx.tanh(gates[..., :hidden])
     forget = mx.tanh(gates[..., hidden:])
     return (1.0 - forget) * x + gain * message
+
+
+def _row_matmul(x: mx.array, w: mx.array) -> mx.array:
+    """``x @ w``. Row-exact verify rows take one matmul each, as a decode step
+    does: a multi-row matmul switches kernels with the row count."""
+    rows = x.shape[-2]
+    if rows > 1 and is_row_exact_armed():
+        return mx.concatenate([x[..., r : r + 1, :] @ w for r in range(rows)], axis=-2)
+    return x @ w
 
 
 def _static_conv(x, w, state, scale):
@@ -404,6 +426,39 @@ def _dynamic_conv(x, dyn, static_w, state, heads, scale):
     return out.astype(x.dtype), xp
 
 
+def _project_slice(
+    proj: nn.Module, x: mx.array, start: int, end: int | None
+) -> mx.array:
+    """Output rows ``[start:end]`` of a bias-free Linear or QuantizedLinear."""
+    if type(proj) is nn.QuantizedLinear:
+        return _row_slice(proj, start, end)(x)
+    return x @ proj.weight[start:end].T
+
+
+def _row_slice(proj: nn.QuantizedLinear, start: int, end: int | None):
+    """A QuantizedLinear over output rows ``[start:end]`` of ``proj``.
+
+    Calling it rather than ``quantized_matmul`` lets the row-exact verify
+    patch of ``QuantizedLinear`` serve the slice. Cached per weight arrays.
+    """
+    source = (proj["weight"], proj["scales"])
+    cache = proj.__dict__.get("_omlx_row_slices")
+    if cache is None or any(a is not b for a, b in zip(cache[0], source)):
+        cache = (source, {})
+        object.__setattr__(proj, "_omlx_row_slices", cache)
+    sub = cache[1].get((start, end))
+    if sub is None:
+        sub = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+        nn.Module.__init__(sub)
+        sub.group_size, sub.bits, sub.mode = proj.group_size, proj.bits, proj.mode
+        sub.weight = proj.weight[start:end]
+        sub.scales = proj.scales[start:end]
+        if proj.get("biases") is not None:
+            sub.biases = proj.biases[start:end]
+        cache[1][(start, end)] = sub
+    return sub
+
+
 class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -432,6 +487,7 @@ class Inkling2Attention(nn.Module):
             self.in_proj = nn.Linear(h, sum(splits), bias=False)
             self.k_conv = mx.zeros((self.dkv, self.conv_k))
             self.v_conv = mx.zeros((self.dkv, self.conv_k))
+            self._tail_cuts = [dr, dr + dq]
         else:
             # q | r | gate | sink from the q input; k and v (plus their dynamic
             # conv taps) from their own attention-residual inputs.
@@ -473,9 +529,18 @@ class Inkling2Attention(nn.Module):
         if self.sliding:
             if xk is None:
                 q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
+            elif type(self.in_proj) in (nn.Linear, nn.QuantizedLinear):
+                # Looped passes give q, k and v their own inputs; project only
+                # the row slices of ``in_proj`` that each input uses.
+                c0, c1, c2 = self._cuts[:3]
+                q = _project_slice(self.in_proj, xq, 0, c0)
+                k = _project_slice(self.in_proj, xk, c0, c1)
+                v = _project_slice(self.in_proj, xv, c1, c2)
+                tail = _project_slice(self.in_proj, xq, c2, None)
+                r, gate, sink = mx.split(tail, self._tail_cuts, axis=-1)
             else:
-                # Looped passes give q, k and v their own inputs; one stacked
-                # projection serves all three.
+                # Wrapped projections (e.g. LoRALinear) fall back to the full
+                # stacked call so the wrapper's forward is preserved.
                 pq, pk, pv = mx.split(
                     self.in_proj(mx.concatenate([xq, xk, xv], axis=0)), 3, axis=0
                 )
@@ -608,6 +673,10 @@ class Inkling2Layer(nn.Module):
         layer = weakref.proxy(self)
         self._pre_compiled = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
         self._post_compiled = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
+        # The row-exact flag is read while tracing, so its rows get their own
+        # traces instead of reusing those of an unflagged forward of that width.
+        self._pre_exact = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
+        self._post_exact = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
 
     def _pre(self, h, blocks, ks, vs, tau=None, messages=None):
         dtype = h.dtype
@@ -674,8 +743,12 @@ class Inkling2Layer(nn.Module):
             states.append(s)
         tau = self.attn.log_tau(kv, length)
         compiled = length <= _COMPILED_MAX_TOKENS
-        pre = self._pre_compiled if compiled else self._pre
-        post = self._post_compiled if compiled else self._post
+        if compiled and length > 1 and is_row_exact_armed():
+            pre, post = self._pre_exact, self._post_exact
+        elif compiled:
+            pre, post = self._pre_compiled, self._post_compiled
+        else:
+            pre, post = self._pre, self._post
         messages = self.loop_message(*bank) if bank is not None else None
         q, k, v, rel, gate, sink, ks, vs, h_n = pre(
             h, blocks, states[0], states[1], tau, messages
@@ -807,6 +880,18 @@ class Model(nn.Module):
             self._vocab_bias = mx.where(
                 mx.arange(vocab) < unpadded, 0.0, -mx.inf
             ).astype(mx.float32)
+
+    @property
+    def _omlx_mtp_row_exact_verify(self) -> bool:
+        """Verify rows reproduce the serial decode rows only when every
+        projection they take is a QuantizedLinear (``row_exact_qmv``); a dense
+        multi-row matmul has its own arithmetic."""
+        linears = [self.lm_head]
+        for layer in self.model.layers:
+            attn = layer.attn
+            names = ("in_proj",) if attn.sliding else ("q_proj", "k_proj", "v_proj")
+            linears += [getattr(attn, name) for name in names] + [attn.o_proj]
+        return all(type(m) is nn.QuantizedLinear for m in linears)
 
     def logits_from_hidden(self, h):
         logits = self.lm_head(h).astype(mx.float32)
