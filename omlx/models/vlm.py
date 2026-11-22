@@ -241,6 +241,11 @@ class VLMModelAdapter(nn.Module):
         return "vlm"
 
     @property
+    def dense_kv_attention(self) -> bool:
+        """Whether the language model's attention reads dense keys and values."""
+        return getattr(self._language_model, "dense_kv_attention", False) is True
+
+    @property
     def supports_skip_lm_head(self) -> bool:
         """Whether the wrapped official language model has a cache-only pass."""
         return self.model_type in _SKIP_LOGITS_MODEL_TYPES

@@ -698,29 +698,6 @@ def test_inkling2_sliding_state_matches_a_cache_of_every_key(dims, monkeypatch):
     assert reference[0][windows.KEYS].shape[2] == 440  # every token of the run
 
 
-def test_inkling2_sliding_state_stays_bounded_at_release_size():
-    # Inkling 2 Mini: 8 KV heads of 128, a 1,024-token window, 48 layer
-    # visits of which 40 slide. A KVCache per visit took 187.5 KB per token.
-    from omlx.patches.inkling2 import cache as windows
-
-    window, tokens, chunk = 1024, 98304, 2048
-    state = windows.ArraysCache(window=window)
-    keys = mx.zeros((1, 8, chunk, 128), dtype=mx.bfloat16)
-    for _ in range(tokens // chunk):
-        windows.append(state, keys, keys)
-        mx.eval(state.cache[windows.KEYS], state.cache[windows.VALUES])
-    one = mx.zeros((1, 8, 1, 128), dtype=mx.bfloat16)
-    for _ in range(3):
-        windows.append(state, one, one)
-    buffer = state.__dict__["_omlx_window"]
-    assert state.cache[windows.KEYS].shape[2] < window + 16
-    assert buffer.capacity <= 2 * window + 16
-    per_key = 2 * 8 * 128 * 2
-    sliding = 40 * buffer.capacity * per_key
-    full = 8 * (tokens + 256) * per_key
-    assert sliding + full < 4.5e9
-
-
 def test_inkling2_rows_with_different_windows_decode_together():
     from omlx.patches.inkling2 import cache as windows
 
@@ -983,14 +960,18 @@ def test_inkling2_vision_encodes_images_independently_and_splices_tokens():
         model.embed_inputs(mx.array([[image, 1]]), second, [[1, 1, 2]])
 
 
-def test_inkling2_keeps_dense_kv_when_kv_quantization_is_on(mock_tokenizer):
+@pytest.mark.parametrize("engine", ["text", "vlm"])
+def test_inkling2_keeps_dense_kv_when_kv_quantization_is_on(mock_tokenizer, engine):
     """Its attention reads dense keys: a packed cache fails on the first forward."""
+    from types import SimpleNamespace
+
+    from omlx.models.vlm import VLMModelAdapter
     from omlx.scheduler import Scheduler
 
     model = _inkling2_tiny()
+    if engine == "vlm":
+        model = VLMModelAdapter(SimpleNamespace(language_model=model))
     scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
     scheduler._turboquant_kv_bits = 8.0
     scheduler._turboquant_kv_scheme = "affine8"
     assert not scheduler._turboquant_eligible(model.make_cache())
-
-

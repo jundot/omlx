@@ -15,8 +15,8 @@ A full-attention visit keeps a ``KVCache`` and a plain four-slot
 The state holds the ``window - 1`` keys the next token can still reach.
 Appending writes into a buffer with room to grow, so a decode step copies
 nothing; the buffer is re-cut once per ``window`` tokens. Keys are only ever
-dropped in whole attention tiles, which keeps the prefill kernel's tiles where
-a cache of every key would have them and the output bit-identical to it.
+dropped in whole attention tiles, so a single row's prefill tiles sit where a
+cache of every key would have them and its output is bit-identical to it.
 """
 
 from __future__ import annotations
