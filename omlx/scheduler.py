@@ -9454,7 +9454,9 @@ class Scheduler:
             if not isinstance(layer, dict):
                 continue
             class_name = str(layer.get("class_name") or "")
-            if class_name in _KNOWN_SLICEABLE_CACHE_TYPES:
+            if class_name in _KNOWN_SLICEABLE_CACHE_TYPES or (
+                Scheduler._is_kv_cachelist(layer)
+            ):
                 # Completion supplies a full cache. KV comes from paged
                 # blocks; serializing it here duplicates the entire prefix.
                 layer["state"] = ()
@@ -10150,9 +10152,23 @@ class Scheduler:
         return str(layer_state.get("cache_type") or "")
 
     @staticmethod
+    def _is_kv_cachelist(layer_state: dict[str, Any]) -> bool:
+        if layer_state.get("class_name") != "CacheList":
+            return False
+        meta = layer_state.get("meta_state")
+        names = meta[0] if isinstance(meta, (list, tuple)) and meta else None
+        return (
+            isinstance(names, (list, tuple))
+            and bool(names)
+            and all(name in ("KVCache", "BatchKVCache") for name in names)
+        )
+
+    @staticmethod
     def _is_sliceable_extracted_layer(layer_state: dict[str, Any]) -> bool:
         type_name = Scheduler._extracted_layer_type_name(layer_state)
         if type_name in _KNOWN_SLICEABLE_CACHE_TYPES:
+            return True
+        if Scheduler._is_kv_cachelist(layer_state):
             return True
 
         if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None and type_name:
