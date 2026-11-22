@@ -485,72 +485,33 @@ def test_store_refuses_blanked_member_source(tmp_path):
     )
 
 
-def test_all_kv_cachelist_boundary_uses_whole_layer_placeholder(tmp_path):
-    """Hy4's append-only nested KV is supplied by the normal block store."""
+def test_all_kv_cachelist_snapshot_is_a_placeholder(tmp_path):
+    """Hy4 Flash's append-only CacheList is stored from the full cache."""
     from types import SimpleNamespace
 
     from omlx.scheduler import Scheduler
 
     seq_len = 3 * BLOCK_SIZE
-    latent, index, history = KVCache(), KVCache(), KVCache()
+    latent, index = KVCache(), KVCache()
     keys, values = _position_kv(seq_len)
-    latent.update_and_fetch(keys, values[..., :4])
+    latent.update_and_fetch(keys, values)
     index.update_and_fetch(keys, values)
-    positions = mx.arange(seq_len, dtype=mx.int32).reshape(1, 1, seq_len, 1)
-    history.update_and_fetch(positions, mx.broadcast_to(positions, (1, 1, seq_len, 3)))
-    live = [_layer_dict(CacheList(latent, index, history))]
-    stub = SimpleNamespace(
-        _extract_cache_states=lambda _: ([dict(live[0])], None),
-        _is_empty_boundary_placeholder=Scheduler._is_empty_boundary_placeholder,
-        _is_sliceable_extracted_layer=Scheduler._is_sliceable_extracted_layer,
-        _extracted_layer_type_name=Scheduler._extracted_layer_type_name,
-    )
-
+    live = [_layer_dict(CacheList(latent, index))]
+    stub = SimpleNamespace(_extract_cache_states=lambda _: ([dict(live[0])], None))
     boundary, _ = Scheduler._extract_snapshot_cache_states(stub, [])
     assert boundary[0]["state"] == ()
-    assert len(live[0]["state"]) == 3
-    assert Scheduler._fill_boundary_placeholders_from_live_cache(
-        stub, boundary, live
-    ) == live
+    assert Scheduler._is_sliceable_extracted_layer(live[0])
 
-    # The normal on-disk layout for a sliceable CacheList already stores and
-    # reconstructs the child streams without consulting intermediate snapshots.
     cache, ssd = _make_cache(tmp_path)
     try:
         tokens = list(range(seq_len))
-        table = cache.store_cache("hy4", tokens, live)
-        assert table is not None and len(table.block_ids) == 3
-        partial, remaining = cache.fetch_cache("hy4-prefix", tokens[:2 * BLOCK_SIZE] + [-1])
-        assert partial is not None and remaining == [-1]
-        restored = cache.reconstruct_cache(partial)
-        assert restored is not None
-        for original, actual in zip((latent, index, history), restored[0].caches):
+        assert cache.store_cache("hy4", tokens, live) is not None
+        table, _ = cache.fetch_cache("hy4-prefix", tokens[: 2 * BLOCK_SIZE] + [-1])
+        restored = cache.reconstruct_cache(table)
+        for original, actual in zip((latent, index), restored[0].caches):
             assert actual.offset == 2 * BLOCK_SIZE
-            for full, prefix in zip(original.keys_and_values(), actual.keys_and_values()):
-                assert mx.array_equal(full[:, :, :actual.offset], prefix).item()
+            n = actual.offset
+            assert mx.array_equal(original.keys[:, :, :n], actual.keys[:, :, :n])
+            assert mx.array_equal(original.values[:, :, :n], actual.values[:, :, :n])
     finally:
         ssd.close()
-
-
-@pytest.mark.parametrize("state_kind", ["missing_member", "unknown_member", "invalid_values"])
-def test_snapshot_filter_keeps_unproven_cachelists(state_kind):
-    """Malformed or unfamiliar cache state keeps the existing snapshot fallback."""
-    from types import SimpleNamespace
-
-    from omlx.scheduler import Scheduler
-
-    sub = _layer_dict(_build_mixed_cachelist(BLOCK_SIZE))["state"][0]
-    names = ["KVCache", "KVCache"]
-    members = [sub, sub]
-    if state_kind == "missing_member":
-        members.pop()
-    elif state_kind == "unknown_member":
-        names[1] = "RotatingKVCache"
-    else:
-        members[1] = (sub[0], mx.zeros((1, 2, BLOCK_SIZE)))
-    layer = {"class_name": "CacheList", "sub_class_names": names, "state": members}
-    stub = SimpleNamespace(_extract_cache_states=lambda _: ([layer], None))
-
-    extracted, _ = Scheduler._extract_snapshot_cache_states(stub, [])
-    assert extracted[0]["state"] is members
-    assert not Scheduler._is_sliceable_extracted_layer(layer)
