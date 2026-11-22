@@ -6,6 +6,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
+from ..qwen35_verify_qmm import is_row_exact_armed
 
 # Upper bound on one additive mask block (elements) in the general attention
 # path; queries are split into sub-blocks so the mask stays below it.
@@ -412,6 +413,25 @@ def banded_sink_attention(
     b, length = q.shape[0], q.shape[2]
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
+    if b == 1 and left_padding is None and is_row_exact_armed():
+        # Row-exact verify: each row is the decode step of its token, over the
+        # keys up to its own position.
+        s = k.shape[2]
+        return mx.concatenate(
+            [
+                _decode_attention(
+                    q[:, :, r : r + 1],
+                    k[:, :, : s - length + 1 + r],
+                    v[:, :, : s - length + 1 + r],
+                    rel[:, r : r + 1],
+                    sink[:, r : r + 1],
+                    scale,
+                    window,
+                )
+                for r in range(length)
+            ],
+            axis=2,
+        )
     if q.dtype in (mx.bfloat16, mx.float16) and _use_flash(length, window):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding

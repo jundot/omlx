@@ -2025,9 +2025,10 @@ def _inkling2_contract():
 def _inkling2_state(cache):
     out = []
     for item in cache:
-        kv = item[0]
-        rows = [a[..., : kv.offset, :] for a in (kv.keys, kv.values)]
-        out += [*rows, *[a for a in item[1].cache if a is not None]]
+        if hasattr(item, "offset"):
+            out += [a[..., : item.offset, :] for a in (item.keys, item.values)]
+        else:
+            out += [a for a in item.cache if a is not None]
     return [np.asarray(a) for a in out]
 
 
