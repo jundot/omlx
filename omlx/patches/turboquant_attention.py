@@ -896,7 +896,14 @@ def _patch_vlm_target_verify_attention() -> None:
         from .mlx_vlm_mtp import qwen35_verify_attention
     except ImportError:
         return
-    if getattr(q35_lang, "_omlx_tq_target_verify_patched", False):
+    # A flag alone is not proof: another seam patch (padded-row, verify-split)
+    # applied afterwards installs its own wrapper on top, and the flag then
+    # still says "patched" while the hot path answers None for a TurboQuant
+    # cache. Only an identity match means this wrapper is still outermost.
+    if getattr(q35_lang, "_omlx_tq_target_verify_patched", False) and (
+        getattr(q35_lang, "_qwen3_5_left_padded_attention", None)
+        is getattr(q35_lang, "_omlx_tq_target_verify_wrapper", None)
+    ):
         return
     if getattr(q35_lang, "_qwen3_5_left_padded_attention", None) is None:
         return
@@ -963,7 +970,9 @@ def _patch_vlm_target_verify_attention() -> None:
         )
 
     q35_lang._qwen3_5_left_padded_attention = patched
-    q35_lang._omlx_tq_target_verify_original = original
+    q35_lang._omlx_tq_target_verify_wrapper = patched
+    if getattr(q35_lang, "_omlx_tq_target_verify_original", None) is None:
+        q35_lang._omlx_tq_target_verify_original = original
     q35_lang._omlx_tq_target_verify_patched = True
 
 
