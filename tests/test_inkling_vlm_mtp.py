@@ -691,22 +691,25 @@ def test_inkling2_affine_expert_carrier_matches_mlx_packing(bits):
         (2, 4, 1, 70, 90, 0, 32, [0, 13]),
     ],
 )
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_inkling2_flash_attention_matches_masked_sdpa(
-    batch, heads, kv_heads, length, keys, window, extent, left_padding
+    batch, heads, kv_heads, length, keys, window, extent, left_padding, dtype
 ):
     from omlx.patches.inkling2 import kernels
+
+    dtype = getattr(mx, dtype)
 
     if mx.default_device() != mx.gpu:
         pytest.skip("Metal kernel")
     dim = 128
-    q = (mx.random.normal((batch, heads, length, dim)) * 0.3).astype(mx.bfloat16)
+    q = (mx.random.normal((batch, heads, length, dim)) * 0.3).astype(dtype)
     # K/V as a strided slice of a larger cache buffer.
     shape = (batch, kv_heads, keys + 32, dim)
-    kbuf = (mx.random.normal(shape) * 0.3).astype(mx.bfloat16)
-    vbuf = mx.random.normal(shape).astype(mx.bfloat16)
+    kbuf = (mx.random.normal(shape) * 0.3).astype(dtype)
+    vbuf = mx.random.normal(shape).astype(dtype)
     k, v = kbuf[:, :, :keys], vbuf[:, :, :keys]
-    rel = mx.random.normal((batch, length, heads, extent)).astype(mx.bfloat16)
-    sink = (mx.random.normal((batch, length, heads)) * 2).astype(mx.bfloat16)
+    rel = mx.random.normal((batch, length, heads, extent)).astype(dtype)
+    sink = (mx.random.normal((batch, length, heads)) * 2).astype(dtype)
     lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
     args = (q, k, v, rel, sink)
     expected = kernels._masked_attention(*args, dim**-0.5, window, lp)
@@ -716,6 +719,36 @@ def test_inkling2_flash_attention_matches_masked_sdpa(
     assert got.shape == expected.shape
     diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
     assert diff.item() < 1e-2
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_banded_attention_routes_prefill_to_flash(monkeypatch, dtype):
+    """FP16 prefill blocks (M1/M2 Float16 Activations) take the flash kernel too."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    dtype = getattr(mx, dtype)
+    calls = []
+    real = kernels.flash_banded_attention
+    monkeypatch.setattr(
+        kernels,
+        "flash_banded_attention",
+        lambda *a, **k: calls.append(a[0].dtype) or real(*a, **k),
+    )
+    length, extent, heads, dim = 48, 16, 4, 128
+    q = (mx.random.normal((1, heads, length, dim)) * 0.3).astype(dtype)
+    k = (mx.random.normal((1, 2, length, dim)) * 0.3).astype(dtype)
+    v = mx.random.normal((1, 2, length, dim)).astype(dtype)
+    rel = mx.random.normal((1, length, heads, extent)).astype(dtype)
+    sink = mx.random.normal((1, length, heads)).astype(dtype)
+    out = kernels.banded_sink_attention(
+        q, k, v, rel, sink, scale=dim**-0.5, window=extent
+    )
+    ref = kernels._masked_attention(q, k, v, rel, sink, dim**-0.5, extent, None)
+    assert calls == [dtype]
+    assert out.dtype == dtype
+    assert mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max().item() < 1e-2
 
 
 def test_inkling2_masked_attention_holds_one_mask_block(monkeypatch):
