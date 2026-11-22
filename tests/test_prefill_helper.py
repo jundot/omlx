@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -33,6 +34,7 @@ from test_scheduler_chunked_prefill import (
     _tiny_vlm_adapter,
 )
 
+from omlx import scheduler as scheduler_module
 from omlx.cluster.transport import HostInterfaces, InterfaceAddress
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
@@ -49,7 +51,7 @@ from omlx.prefill_helper.adapters import adapter_for, adapter_for_model
 from omlx.prefill_helper.client import HelperClient, HelperError
 from omlx.prefill_helper.launcher import HelperTarget
 from omlx.prefill_helper.manager import PrefillHelperManager
-from omlx.prefill_helper.session import PrefillHelperSession
+from omlx.prefill_helper.session import MIN_TOKENS, PrefillHelperSession
 from omlx.prefill_helper.worker import WINDOW, HelperServer
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig
@@ -512,6 +514,110 @@ def test_scheduler_cancels_the_job_of_a_dropped_request():
     session.close()
     thread.join(10)
     listener.close()
+
+
+def _not_ready_scheduler(monkeypatch, state="copying"):
+    """A scheduler with a helper chosen for the model but none attached."""
+    monkeypatch.setattr(
+        scheduler_module,
+        "_prefill_helper_not_ready_last_warning",
+        float("-inf"),
+        raising=False,
+    )
+    sched = _scheduler(MagicMock(), 6)
+    retry = MagicMock()
+    sched._prefill_helper_retry = retry
+    sched._prefill_helper_status = lambda: {"state": state, "since": 0.0}
+    return sched, retry
+
+
+def _fake_session(accepts):
+    """An attached session that takes the prompts *accepts* allows."""
+    return SimpleNamespace(
+        adapter=SimpleNamespace(captures_layers=True),
+        accepts=accepts,
+        start=lambda *args: None,
+    )
+
+
+def test_a_long_request_in_the_not_ready_window_warns_once(monkeypatch, caplog):
+    tokens = list(range(3, 3 + MIN_TOKENS + 2))
+    sched, retry = _not_ready_scheduler(monkeypatch)
+    with caplog.at_level("DEBUG", logger=scheduler_module.__name__):
+        for rid in ("req-1", "req-2"):
+            request = _request(tokens, rid)
+            assert not Scheduler._start_helper_prefill(
+                sched, request, tokens, None, MagicMock(), None
+            )
+    # The request stays on this Mac, exactly as before the warning.
+    assert sched._prefill_helper is None
+    retry.assert_called()
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "Prefill Accelerator not ready (state: copying)" in warnings[0].getMessage()
+    assert "request req-1 started" in warnings[0].getMessage()
+    assert "prefills on this Mac alone" in warnings[0].getMessage()
+    # Inside the same window the next request logs at DEBUG, not WARNING.
+    firsts = [r for r in caplog.records if "request req-1 started" in r.getMessage()]
+    seconds = [r for r in caplog.records if "request req-2 started" in r.getMessage()]
+    assert [r.levelno for r in firsts] == [logging.WARNING]
+    assert [r.levelno for r in seconds] == [logging.DEBUG]
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "copying",
+        "offline",
+        "starting",
+        "needs_files",
+        "files_missing",
+        "error",
+        "reconnecting",
+    ],
+)
+def test_every_not_ready_state_warns(monkeypatch, caplog, state):
+    tokens = list(range(3, 3 + MIN_TOKENS + 2))
+    sched, _ = _not_ready_scheduler(monkeypatch, state)
+    with caplog.at_level("WARNING", logger=scheduler_module.__name__):
+        assert not Scheduler._start_helper_prefill(
+            sched, _request(tokens), tokens, None, MagicMock(), None
+        )
+    assert (
+        f"Prefill Accelerator not ready (state: {state}) when request req-1 started"
+        in caplog.text
+    )
+
+
+def test_the_not_ready_warning_stays_quiet_when_it_should(monkeypatch, caplog):
+    long_tokens = list(range(3, 3 + MIN_TOKENS + 2))
+    short_tokens = list(range(3, 26))
+    with caplog.at_level("DEBUG", logger=scheduler_module.__name__):
+        # A short prompt stays on this Mac by design: the accepts branch.
+        sched, _ = _not_ready_scheduler(monkeypatch)
+        assert not Scheduler._start_helper_prefill(
+            sched, _request(short_tokens), short_tokens, None, MagicMock(), None
+        )
+        # A helper is configured for this model but none is chosen, or the
+        # user stopped it: this Mac alone is what the settings ask for.
+        for state in ("off", "stopped"):
+            idle, _ = _not_ready_scheduler(monkeypatch, state)
+            assert not Scheduler._start_helper_prefill(
+                idle, _request(long_tokens), long_tokens, None, MagicMock(), None
+            )
+        # No status reader means no helper to name.
+        unknown, _ = _not_ready_scheduler(monkeypatch)
+        unknown._prefill_helper_status = None
+        assert not Scheduler._start_helper_prefill(
+            unknown, _request(long_tokens), long_tokens, None, MagicMock(), None
+        )
+        # An attached session that takes the prompt does not fall back at all.
+        ready = _scheduler(_model(tiny()), 6)
+        ready.attach_prefill_helper(_fake_session(lambda n: True))
+        assert Scheduler._start_helper_prefill(
+            ready, _request(short_tokens), short_tokens, None, MagicMock(), None
+        )
+    assert [r for r in caplog.records if "Prefill Accelerator" in r.getMessage()] == []
 
 
 def test_helper_grid_stops_at_blocks_and_tails():

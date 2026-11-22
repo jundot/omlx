@@ -2639,6 +2639,7 @@ class VLMBatchedEngine(BaseEngine):
                 chunk_tokens=scheduler._base_prefill_step_size(0, 1 << 30),
             )
             scheduler._prefill_helper_retry = self._prefill_helper.retry_if_offline
+            scheduler._prefill_helper_status = self._prefill_helper.status
             self.configure_prefill_helper(self._model_settings)
 
         # TurboQuant KV cache
