@@ -1465,7 +1465,7 @@
   "modal.model_settings.lightning_mtp_hint": "Drafts several tokens per step with the model's built-in MTP head.",
   "modal.model_settings.mtp_depth": "Adaptive max depth",
   "modal.model_settings.mtp_depth_hint": "Automatically adjusts the draft depth up to the selected maximum.",
-  "modal.model_settings.mtp_depth_adaptive": "3 tokens (Default)",
+  "modal.model_settings.mtp_depth_adaptive": "Model default",
   "modal.model_settings.mtp_depth_option": "{n} tokens",
   "modal.model_settings.mtp_conflict": "Disable DFlash and TurboQuant KV first — they patch the same path MTP relies on.",
   "modal.model_settings.mtp_conflict_dflash": "Disable DFlash first.",

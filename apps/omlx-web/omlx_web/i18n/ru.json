@@ -1465,7 +1465,7 @@
   "modal.model_settings.lightning_mtp_hint": "Использует встроенную MTP-голову модели для черновой генерации нескольких токенов за шаг.",
   "modal.model_settings.mtp_depth": "Adaptive max depth",
   "modal.model_settings.mtp_depth_hint": "Automatically adjusts the draft depth up to the selected maximum.",
-  "modal.model_settings.mtp_depth_adaptive": "3 tokens (Default)",
+  "modal.model_settings.mtp_depth_adaptive": "По умолчанию для модели",
   "modal.model_settings.mtp_depth_option": "{n} tokens",
   "modal.model_settings.mtp_conflict": "Сначала отключите DFlash и TurboQuant KV: они изменяют тот же путь, от которого зависит MTP.",
   "modal.model_settings.mtp_conflict_dflash": "Сначала отключите DFlash.",

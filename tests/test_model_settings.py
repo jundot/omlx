@@ -1043,6 +1043,39 @@ def test_old_a8_setting_names_still_load(tmp_path):
     assert rename_legacy_fields(both) == {"a8_prefill_enabled": False}
 
 
+@pytest.mark.parametrize(("version", "expected"), [(2, None), (SETTINGS_VERSION, 3)])
+def test_ui_default_mtp_depth_loads_as_the_model_default(tmp_path, version, expected):
+    """UIs before settings v3 saved depth 3 for "Default"; it loads unset so the
+    model's own ceiling applies, while a 3 saved since then is a real choice."""
+    depth = {"mtp_enabled": True, "mtp_adaptive_max_depth": 3}
+    models = {"m": depth, "deep": {**depth, "mtp_adaptive_max_depth": 5}}
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps({"version": version, "models": models})
+    )
+    record = {
+        "name": "p",
+        "display_name": "P",
+        "created_at": "2026-06-01T00:00:00+00:00",
+        "updated_at": "2026-06-01T00:00:00+00:00",
+        "settings": dict(depth),
+    }
+    store_version = 1 if version < SETTINGS_VERSION else 2
+    (tmp_path / "model_profiles.json").write_text(
+        json.dumps({"version": store_version, "profiles": {"m": {"p": record}}})
+    )
+    (tmp_path / "global_templates.json").write_text(
+        json.dumps({"version": store_version, "templates": {"t": record}})
+    )
+
+    manager = ModelSettingsManager(tmp_path)
+    assert manager.get_settings("m").mtp_adaptive_max_depth == expected
+    assert manager.get_settings("deep").mtp_adaptive_max_depth == 5
+    profile = manager.get_profile("m", "p")["settings"]
+    assert profile.get("mtp_adaptive_max_depth") == expected
+    template = manager.get_template("t")["settings"]
+    assert template.get("mtp_adaptive_max_depth") == expected
+
+
 def test_oq_a8_exposes_no_kernel_choice():
     """There is one kernel, so there is nothing for a user to pick.
 

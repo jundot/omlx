@@ -2347,8 +2347,8 @@
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     mtp_enabled: s.mtp_enabled || false,
-                    mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
-                        ? String(s.mtp_adaptive_max_depth) : '3',
+                    mtp_adaptive_max_depth: [3, 4, 5, 6, 7, 8].includes(s.mtp_adaptive_max_depth)
+                        ? String(s.mtp_adaptive_max_depth) : '',
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
@@ -3722,8 +3722,9 @@
                         ? (ms.dflash_verify_mode || 'adaptive')
                         : null,
                     mtp_enabled: !!ms.mtp_enabled,
-                    mtp_adaptive_max_depth: ms.mtp_enabled
-                        ? parseInt(ms.mtp_adaptive_max_depth || '3')
+                    // Empty -> the model's own default ceiling.
+                    mtp_adaptive_max_depth: ms.mtp_enabled && ms.mtp_adaptive_max_depth
+                        ? parseInt(ms.mtp_adaptive_max_depth)
                         : null,
                     mtp_fixed_depth: null,
                     qwen35_ane_prefill_shared_fraction: Number(ms.qwen35_ane_prefill_shared_fraction),
@@ -4109,7 +4110,7 @@
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
-                        this.modelSettings.mtp_adaptive_max_depth = '3';
+                        this.modelSettings.mtp_adaptive_max_depth = '';
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
