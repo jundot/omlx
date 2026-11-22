@@ -961,6 +961,7 @@ class BlockAwarePrefixCache(CacheManager):
         _store_exact_terminal: bool = False,
         _store_tail_terminal: bool = False,
         _store_shared_tail: bool = False,
+        should_stop: Callable[[], bool] | None = None,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -1386,6 +1387,19 @@ class BlockAwarePrefixCache(CacheManager):
                         )
                         tail_in_table = True
                     continue
+
+            # A caller that runs this store on a deadline (the memory-pressure
+            # requeue) can stop it between blocks. Nothing is allocated for
+            # this block yet, so this ends the store exactly like a failed
+            # allocation below: the blocks stored so far stay a valid prefix.
+            if should_stop is not None and should_stop():
+                logger.info(
+                    "Stopping prefix store for %s at %d tokens: the caller asked "
+                    "to stop",
+                    request_id,
+                    global_start,
+                )
+                break
 
             # Allocate new block
             if first_new_block_idx is None:
