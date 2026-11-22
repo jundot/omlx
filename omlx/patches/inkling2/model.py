@@ -222,6 +222,12 @@ class ExpertProj(nn.Module):
     ``global_scale`` (NVFP4 only) is the per-expert tensor amax in MLX's
     convention; the source scale ``global_scale / (6 * 448)`` is applied after
     the matmul so the packed codes and E4M3 block scales stay unchanged.
+
+    That scale is ~1e-4, so the unscaled matmul output is ~1e4 times the real
+    one and passes float16's range (65504) on ordinary prompts. With float16
+    activations ``gather_qmm`` applies ``global_scale`` inside the kernel
+    instead; other dtypes keep the post-matmul scale and the NAX kernels,
+    which take no global scale.
     """
 
     def __init__(self, experts: int, out_dims: int, in_dims: int, spec: dict):
@@ -245,12 +251,20 @@ class ExpertProj(nn.Module):
         # converted checkpoint here, which __init__ has applied.
         return self
 
-    def post_scale(self, idx):
-        if self.mode != "nvfp4":
+    def scales_in_kernel(self, dtype) -> bool:
+        return self.mode == "nvfp4" and dtype == mx.float16
+
+    def post_scale(self, idx, dtype):
+        """The per-row scale still to apply to the output of ``x`` in
+        ``dtype``, or None."""
+        if self.mode != "nvfp4" or self.scales_in_kernel(dtype):
             return None
         return self.global_scale[idx] * (1.0 / _NVFP4_DENOMINATOR)
 
     def __call__(self, x, idx, sorted_indices):
+        extra = {}
+        if self.scales_in_kernel(x.dtype):
+            extra["global_scale"] = self.global_scale
         return mx.gather_qmm(
             x,
             self.weight,
@@ -262,6 +276,7 @@ class ExpertProj(nn.Module):
             bits=self.bits,
             mode=self.mode,
             sorted_indices=sorted_indices,
+            **extra,
         )
 
 
@@ -286,7 +301,7 @@ class Inkling2Experts(nn.Module):
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
         y = self.w13(xe, idx, do_sort)
-        s13 = self.w13.post_scale(idx)
+        s13 = self.w13.post_scale(idx, xe.dtype)
         if s13 is not None:
             y = y * s13[..., None, None].astype(y.dtype)
         act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
@@ -294,7 +309,7 @@ class Inkling2Experts(nn.Module):
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
         z = z.squeeze(-2)
-        s2 = self.w2.post_scale(inds)
+        s2 = self.w2.post_scale(inds, act.dtype)
         if s2 is not None:
             weights = weights * s2
         out = mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
