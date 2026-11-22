@@ -302,6 +302,24 @@ def _apply_hy_v4_reasoning_mode(
         template_kwargs["reasoning_effort"] = "no_think"
 
 
+def _apply_inkling2_reasoning_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Map oMLX thinking switches to Inkling 2's reasoning_effort.
+
+    The template reads only the effort. Without this ``enable_thinking=False``
+    thinks at the default effort, and ``"off"`` raises in the template and is
+    retried as ``"low"``.
+    """
+    if model_type not in INKLING2_MODEL_TYPES:
+        return
+    effort = template_kwargs.get("reasoning_effort")
+    off = isinstance(effort, str) and effort.strip().lower() in ("off", "no_think")
+    if off or (effort is None and template_kwargs.get("enable_thinking") is False):
+        template_kwargs["reasoning_effort"] = "none"
+
+
 def _apply_template_thinking_mode(
     model_type: str | None,
     template_kwargs: dict[str, Any],
@@ -309,6 +327,7 @@ def _apply_template_thinking_mode(
     """Translate oMLX thinking switches into model-specific template kwargs."""
     _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
     _apply_hy_v4_reasoning_mode(model_type, template_kwargs)
+    _apply_inkling2_reasoning_mode(model_type, template_kwargs)
 
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
