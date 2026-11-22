@@ -404,10 +404,10 @@ def _dynamic_conv(x, dyn, static_w, state, heads, scale):
 def _project_slice(
     proj: nn.Module, x: mx.array, start: int, end: int | None
 ) -> mx.array:
-    """Apply rows ``[start:end]`` of a plain Linear or QuantizedLinear."""
+    """Output rows ``[start:end]`` of a bias-free Linear or QuantizedLinear."""
     if type(proj) is nn.QuantizedLinear:
         biases = proj.get("biases")
-        out = mx.quantized_matmul(
+        return mx.quantized_matmul(
             x,
             proj.weight[start:end],
             scales=proj.scales[start:end],
@@ -417,13 +417,7 @@ def _project_slice(
             bits=proj.bits,
             mode=proj.mode,
         )
-        if "bias" in proj:
-            out = out + proj.bias[start:end]
-        return out
-    w = proj.weight[start:end]
-    if "bias" in proj:
-        return mx.addmm(proj.bias[start:end], x, w.T)
-    return x @ w.T
+    return x @ proj.weight[start:end].T
 
 
 class Inkling2Attention(nn.Module):
@@ -499,7 +493,7 @@ class Inkling2Attention(nn.Module):
             elif type(self.in_proj) in (nn.Linear, nn.QuantizedLinear):
                 # Looped passes give q, k and v their own inputs; project only
                 # the row slices of ``in_proj`` that each input uses.
-                c0, c1, c2 = self._cuts[0], self._cuts[1], self._cuts[2]
+                c0, c1, c2 = self._cuts[:3]
                 q = _project_slice(self.in_proj, xq, 0, c0)
                 k = _project_slice(self.in_proj, xk, c0, c1)
                 v = _project_slice(self.in_proj, xv, c1, c2)
