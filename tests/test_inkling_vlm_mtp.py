@@ -958,22 +958,25 @@ def test_inkling2_nvfp4_experts_stay_finite_in_float16():
         (2, 4, 1, 70, 90, 0, 32, [0, 13]),
     ],
 )
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_inkling2_flash_attention_matches_masked_sdpa(
-    batch, heads, kv_heads, length, keys, window, extent, left_padding
+    batch, heads, kv_heads, length, keys, window, extent, left_padding, dtype
 ):
     from omlx.patches.inkling2 import kernels
+
+    dtype = getattr(mx, dtype)
 
     if mx.default_device() != mx.gpu:
         pytest.skip("Metal kernel")
     dim = 128
-    q = (mx.random.normal((batch, heads, length, dim)) * 0.3).astype(mx.bfloat16)
+    q = (mx.random.normal((batch, heads, length, dim)) * 0.3).astype(dtype)
     # K/V as a strided slice of a larger cache buffer.
     shape = (batch, kv_heads, keys + 32, dim)
-    kbuf = (mx.random.normal(shape) * 0.3).astype(mx.bfloat16)
-    vbuf = mx.random.normal(shape).astype(mx.bfloat16)
+    kbuf = (mx.random.normal(shape) * 0.3).astype(dtype)
+    vbuf = mx.random.normal(shape).astype(dtype)
     k, v = kbuf[:, :, :keys], vbuf[:, :, :keys]
-    rel = mx.random.normal((batch, length, heads, extent)).astype(mx.bfloat16)
-    sink = (mx.random.normal((batch, length, heads)) * 2).astype(mx.bfloat16)
+    rel = mx.random.normal((batch, length, heads, extent)).astype(dtype)
+    sink = (mx.random.normal((batch, length, heads)) * 2).astype(dtype)
     lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
     args = (q, k, v, rel, sink)
     expected = kernels._masked_attention(*args, dim**-0.5, window, lp)
