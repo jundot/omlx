@@ -9,7 +9,8 @@ import numpy as np
 
 from . import exact, indexing
 from .config import TextConfig
-from .rope import TrailingRoPE, rope_at, rotate, rotate_pairs
+from .rope import Positions, TrailingRoPE, rope_at, rotate, rotate_pairs
+from .prefill_windows import window_width
 
 _ROW_CHUNK = 256
 _FP8_MAX = 448.0
@@ -109,6 +110,9 @@ class CompressedIndexer(nn.Module):
     def __call__(
         self, x, qr, mask, cache, offset=0, positions=None
     ) -> mx.array | list | None:
+        width = window_width()
+        if width and x.shape[0] == 1 and x.shape[1] > width and cache is not None:
+            return self._prefill_windows(x, qr, mask, cache, offset, positions, width)
         if exact.block(x):
             # Per-row selections (None below the top-k) of a verify block.
             return [
@@ -180,6 +184,39 @@ class CompressedIndexer(nn.Module):
             out.append((picks[..., None] + expand).flatten(-2))
         indices = out[0] if len(out) == 1 else mx.concatenate(out, axis=1)
         return indices[:, None].astype(mx.int32)
+
+    def _prefill_windows(self, x, qr, mask, cache, offset, positions, width):
+        before = int(cache.offset)
+        length = x.shape[1]
+        total = before + length
+        blocks = []
+        for start in range(0, length, width):
+            end = min(start + width, length)
+            local_positions = None
+            if positions is not None:
+                local_positions = Positions(
+                    positions.planes[..., start:end],
+                    positions.general,
+                    positions.section,
+                )
+                local_positions.history = positions.history
+            pick = self(
+                x[:, start:end],
+                qr[:, start:end],
+                None if mask is None else mask[..., start:end, : before + end],
+                cache,
+                offset + start,
+                local_positions,
+            )
+            if total > self.topk:
+                if pick is None:
+                    # These early queries use the dense path. Fill their slots
+                    # only to keep the combined index tensor aligned.
+                    pick = mx.full(
+                        (1, 1, end - start, self.topk), total, dtype=mx.int32
+                    )
+                blocks.append(pick)
+        return mx.concatenate(blocks, axis=2) if blocks else None
 
     def _native_select(self, q, groups, w, own, valid, keep):
         """(groups [B, L, keep], usable mask) on the sparse_index kernels.
