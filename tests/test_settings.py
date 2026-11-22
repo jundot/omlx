@@ -2194,6 +2194,39 @@ class TestGlobalSettings:
             assert persisted.auth.api_key == "stored-key"
             assert persisted.cache.enabled is True
 
+    def test_save_cli_overrides_reports_changed_settings(self):
+        """A flag that changes settings.json is reported, a repeated one is not."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            stored = GlobalSettings(base_path=base_path)
+            stored.cache.enabled = True
+            stored.save()
+
+            args = Namespace(no_cache=True, port=stored.server.port)
+            runtime = GlobalSettings.load(base_path=base_path, cli_args=args)
+
+            changes = runtime.save_cli_overrides(args)
+            assert "cache.enabled: True -> False" in changes
+            # --no-cache also turns off settings derived from it; the port
+            # matches the saved value and must not be listed.
+            assert all(change.startswith("cache.") for change in changes)
+            assert GlobalSettings.load(base_path=base_path).cache.enabled is False
+            # The same flags on the next start change nothing in the file.
+            assert runtime.save_cli_overrides(args) == []
+
+    def test_save_cli_overrides_hides_network_values(self):
+        """Proxy URLs can carry credentials, so only the key is reported."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            GlobalSettings(base_path=base_path).save()
+
+            args = Namespace(http_proxy="http://user:secret@proxy.example:8080")
+            runtime = GlobalSettings.load(base_path=base_path, cli_args=args)
+
+            assert runtime.save_cli_overrides(args) == [
+                "network.http_proxy: (value hidden)"
+            ]
+
     def test_cli_override_initial_cache_blocks(self):
         """Test CLI override for initial_cache_blocks."""
         with tempfile.TemporaryDirectory() as tmpdir:

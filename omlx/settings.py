@@ -1097,6 +1097,33 @@ class IntegrationSettings:
         )
 
 
+# Sections whose values can carry credentials (API keys, proxy URLs with
+# user:password). Changes there are reported by name only.
+_SETTING_CHANGE_HIDDEN_SECTIONS = frozenset({"auth", "network"})
+
+
+def _describe_setting_changes(
+    before: dict[str, Any], after: dict[str, Any]
+) -> list[str]:
+    """List the ``section.key: old -> new`` differences between two settings dumps."""
+    changes: list[str] = []
+    for section, values in after.items():
+        if not isinstance(values, dict):
+            continue
+        previous = before.get(section)
+        if not isinstance(previous, dict):
+            previous = {}
+        for key, value in values.items():
+            old = previous.get(key)
+            if old == value:
+                continue
+            if section in _SETTING_CHANGE_HIDDEN_SECTIONS:
+                changes.append(f"{section}.{key}: (value hidden)")
+            else:
+                changes.append(f"{section}.{key}: {old!r} -> {value!r}")
+    return changes
+
+
 @dataclass
 class GlobalSettings:
     """
@@ -1646,14 +1673,22 @@ class GlobalSettings:
             temp_file.unlink(missing_ok=True)
             raise
 
-    def save_cli_overrides(self, args: Any) -> None:
-        """Persist explicit non-secret CLI configuration without freezing env state."""
+    def save_cli_overrides(self, args: Any) -> list[str]:
+        """Persist explicit non-secret CLI configuration without freezing env state.
+
+        Returns one ``section.key: old -> new`` line for each value this call
+        changed in settings.json. Those values outlive the process, so the
+        caller reports them instead of saving silently (#3828).
+        """
         persisted = type(self)(base_path=self.base_path)
         settings_file = self.base_path / "settings.json"
         if settings_file.exists():
             persisted._load_from_file(settings_file)
+        before = persisted.to_dict()
         persisted._apply_cli_overrides(args, include_api_key=False)
+        changes = _describe_setting_changes(before, persisted.to_dict())
         persisted.save()
+        return changes
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""

@@ -294,9 +294,10 @@ def serve_command(args):
         sys.exit(1)
 
     # Save CLI args to settings.json if non-default values provided
+    saved_overrides: list[str] = []
     if _has_cli_overrides(args):
         try:
-            settings.save_cli_overrides(args)
+            saved_overrides = settings.save_cli_overrides(args)
             print("Saved CLI arguments to settings.json")
         except Exception as e:
             print(f"Warning: Failed to save settings: {e}")
@@ -310,6 +311,13 @@ def serve_command(args):
         retention_days=settings.logging.retention_days,
     )
     print(f"Log directory: {log_dir}")
+    # The flags were saved before file logging existed. Report the values they
+    # changed now, so the lines reach server.log as well as the console (#3828).
+    for change in saved_overrides:
+        logging.getLogger("omlx.cli").info(
+            "CLI flag changed a saved setting, it also applies to future runs: %s",
+            change,
+        )
 
     # Enable native crash diagnostics (SIGABRT, SIGSEGV, SIGFPE, SIGBUS).
     # On Metal/MLX crashes (#511, #520), this dumps all Python thread
