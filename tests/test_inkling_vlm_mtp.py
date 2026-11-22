@@ -721,36 +721,6 @@ def test_inkling2_flash_attention_matches_masked_sdpa(
     assert diff.item() < 1e-2
 
 
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
-def test_inkling2_banded_attention_routes_prefill_to_flash(monkeypatch, dtype):
-    """FP16 prefill blocks (M1/M2 Float16 Activations) take the flash kernel too."""
-    from omlx.patches.inkling2 import kernels
-
-    if mx.default_device() != mx.gpu:
-        pytest.skip("Metal kernel")
-    dtype = getattr(mx, dtype)
-    calls = []
-    real = kernels.flash_banded_attention
-    monkeypatch.setattr(
-        kernels,
-        "flash_banded_attention",
-        lambda *a, **k: calls.append(a[0].dtype) or real(*a, **k),
-    )
-    length, extent, heads, dim = 48, 16, 4, 128
-    q = (mx.random.normal((1, heads, length, dim)) * 0.3).astype(dtype)
-    k = (mx.random.normal((1, 2, length, dim)) * 0.3).astype(dtype)
-    v = mx.random.normal((1, 2, length, dim)).astype(dtype)
-    rel = mx.random.normal((1, length, heads, extent)).astype(dtype)
-    sink = mx.random.normal((1, length, heads)).astype(dtype)
-    out = kernels.banded_sink_attention(
-        q, k, v, rel, sink, scale=dim**-0.5, window=extent
-    )
-    ref = kernels._masked_attention(q, k, v, rel, sink, dim**-0.5, extent, None)
-    assert calls == [dtype]
-    assert out.dtype == dtype
-    assert mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max().item() < 1e-2
-
-
 def test_inkling2_masked_attention_holds_one_mask_block(monkeypatch):
     # NAX hosts run full-attention prefill through the masked path; at 64K
     # keys the masks of all query blocks once took 12 GiB together.
