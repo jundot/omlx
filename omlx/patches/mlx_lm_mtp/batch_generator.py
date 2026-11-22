@@ -222,6 +222,8 @@ def apply() -> bool:
                         if state is not None:
                             with _spec_command_buffers(model):
                                 return _mtp_next(self, state)
+                        if emitted is not None:
+                            _reconcile_early_first_token_to_standard(self)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
                         active = getattr(self, "_omlx_mtp_state", None)
@@ -235,6 +237,8 @@ def apply() -> bool:
                                     delattr(self, "_omlx_mtp_park_state")
                                 except AttributeError:
                                     pass
+                        elif emitted is not None:
+                            _reconcile_early_first_token_to_standard(self)
                         _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
@@ -264,6 +268,8 @@ def apply() -> bool:
             _drop_mtp_batch_state(self, "extend-reconciled")
             _drop_mtp_batch_state(batch, "donor-extended")
 
+            if getattr(self, "_omlx_first_token_emitted", None) is not None:
+                _reconcile_early_first_token_to_standard(self)
             host_state = getattr(self, "_omlx_mtp_state", None)
             if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
                 # A shared batch that a finishing row just filtered to this
@@ -296,6 +302,7 @@ def apply() -> bool:
             result = original_filter(self, keep, *args, **kwargs)
             _prompt_priming.release_uids(self.model, set(old_uids) - set(self.uids))
             _release_drafter_uids(self.model, set(old_uids) - set(self.uids))
+            _drop_invalid_early_first_token(self)
             _drop_invalid_mtp_state(self, "filter", log_empty=True)
             _drop_invalid_mtp_batch_state(
                 self,
@@ -1556,14 +1563,53 @@ def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:
         return False
 
 
-def _early_first_emit(gen_batch: Any) -> Optional[List[Any]]:
-    """Stream the token sampled from the prompt before the drafter starts.
+def _drop_invalid_early_first_token(gen_batch: Any) -> None:
+    """Clear a pending early first-token marker when its row is no longer sole owner."""
+    emitted = getattr(gen_batch, "_omlx_first_token_emitted", None)
+    if emitted is None:
+        return
+    uids = getattr(gen_batch, "uids", None)
+    if not uids or tuple(uids) != (emitted[0],):
+        try:
+            delattr(gen_batch, "_omlx_first_token_emitted")
+        except AttributeError:
+            pass
 
-    ``_post_init_mtp`` runs one more backbone forward and the first draft
-    before it emits that token, which adds both to the time to the first
-    token. Emit it now; the next call runs the init and drops the token
-    from the init queue. While the token is pending the batch counts as
-    MTP-active, so no prompt merges between the two calls.
+
+def _reconcile_early_first_token_to_standard(gen_batch: Any) -> None:
+    """Advance ``gen_batch`` past an already-streamed first token before standard decode.
+
+    ``_early_first_emit`` streamed ``_next_tokens[0]`` and appended it to
+    ``gen_batch.tokens[0]`` without feeding it into ``prompt_cache``. If the
+    follow-up call cannot enter MTP (fallback or direct ``extend``), run one
+    standard ``_step()`` so ``prompt_cache`` and ``_next_tokens`` advance to
+    token 1 without duplicating token 0 in ``gen_batch.tokens[0]``.
+    """
+    emitted = getattr(gen_batch, "_omlx_first_token_emitted", None)
+    if emitted is None:
+        return
+    try:
+        delattr(gen_batch, "_omlx_first_token_emitted")
+    except AttributeError:
+        pass
+    uids = getattr(gen_batch, "uids", None)
+    if not uids or tuple(uids) != (emitted[0],) or gen_batch._next_tokens is None:
+        return
+    saved_len = len(gen_batch.tokens[0])
+    gen_batch._step()
+    if len(gen_batch.tokens[0]) > saved_len:
+        del gen_batch.tokens[0][saved_len:]
+
+
+def _early_first_emit(gen_batch: Any) -> Optional[List[Any]]:
+    """Stream the prompt-sampled first token before MTP init and first draft.
+
+    ``_post_init_mtp`` runs an extra 1-token backbone forward, prompt-priming
+    fold, and the initial MTP head / block-drafter chain before emitting the
+    token already sampled from the prompt. Emit that token on the first
+    ``next()`` call; the next call runs ``_post_init_mtp`` as before and drops
+    the already-emitted token from ``state.queue``. While the token is pending
+    the batch counts as MTP-active, so no prompt merges between the two calls.
     """
     if getattr(gen_batch, "_omlx_mtp_state", None) is not None:
         return None
@@ -1573,10 +1619,13 @@ def _early_first_emit(gen_batch: Any) -> Optional[List[Any]]:
         return None
     if _mtp_park_state_for_batch(gen_batch) is not None:
         return None
-    if (
-        _cluster_mtp(gen_batch.model) is not None
-        or _drafter_for(gen_batch.model) is None
-    ):
+    if _cluster_mtp(gen_batch.model) is not None:
+        return None
+    # If token 0 lands directly on a cache block boundary, let _post_init_mtp
+    # feed main_tok into prompt_cache before emission so scheduler boundary
+    # snapshot capture sees an aligned cache.
+    align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
+    if align > 0 and (len(gen_batch.tokens[0]) + 1) % align == 0:
         return None
     main_tok = _ensure_uint32(gen_batch._next_tokens)
     token_id = int(main_tok.tolist()[0])
@@ -1591,7 +1640,10 @@ def _take_early_first_token(gen_batch: Any, state: Optional[_MtpState]) -> None:
     emitted = getattr(gen_batch, "_omlx_first_token_emitted", None)
     if emitted is None:
         return
-    delattr(gen_batch, "_omlx_first_token_emitted")
+    try:
+        delattr(gen_batch, "_omlx_first_token_emitted")
+    except AttributeError:
+        pass
     if state is None or not state.queue:
         return
     token_id, _lp, source = state.queue[0]
