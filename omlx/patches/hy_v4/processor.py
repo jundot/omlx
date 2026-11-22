@@ -243,8 +243,7 @@ class HyV4Processor:
             kwargs.pop(key, None)
         tokenizer = AutoTokenizer.from_pretrained(path, **kwargs)
         load_chat_template(tokenizer, path)
-        # This VLM uses a raw HF tokenizer, so mlx-lm's Hy3 marker inference
-        # doesn't run. Expose the pair for detecting a prompt-opened block.
+        # A raw HF tokenizer skips mlx-lm's think marker inference.
         start, end = "<think:opensource>", "</think:opensource>"
         vocab = tokenizer.get_vocab()
         if start in vocab and end in vocab:

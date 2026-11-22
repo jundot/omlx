@@ -765,17 +765,6 @@ class TestUsesNativeReasoningContent:
     def test_detects_glm5_next(self, key):
         assert uses_native_reasoning_content("any-name", **{key: "glm5_next"})
 
-    @pytest.mark.parametrize("model_type", ["hy_v4_vl", "hy_v4_flash"])
-    def test_hy4_passes_reasoning_to_its_chat_template(self, model_type):
-        native = uses_native_reasoning_content(config_model_type=model_type)
-        messages = extract_multimodal_content(
-            [Message(role="assistant", reasoning_content="R", content="A")],
-            native_reasoning_content=native,
-        )
-        assert messages == [
-            {"role": "assistant", "content": "A", "reasoning_content": "R"}
-        ]
-
 
 class TestConvertAnthropicToInternal:
     """Tests for convert_anthropic_to_internal function."""

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import zlib
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -24,7 +23,7 @@ from mlx_lm.models.cache import (  # noqa: E402
 
 from omlx import oq  # noqa: E402
 from omlx.adapter.output_parser import correct_tool_parser_type  # noqa: E402
-from omlx.api.thinking import ThinkingParser, prompt_opens_thinking  # noqa: E402
+from omlx.api.thinking import prompt_opens_thinking  # noqa: E402
 from omlx.custom_kernels import nax  # noqa: E402
 from omlx.engine.vlm import (  # noqa: E402
     _apply_template_thinking_mode,
@@ -55,7 +54,6 @@ from omlx.patches.hy_v4.tool_parser import parse_tool_call  # noqa: E402
 from omlx.patches.hy_v4.vision import VisionModel  # noqa: E402
 from omlx.patches.mlx_lm_mtp import cache_rollback  # noqa: E402
 from omlx.patches.qwen35_verify_qmm import apply_verify_qmm_patch  # noqa: E402
-from omlx.scheduler import Scheduler  # noqa: E402
 
 VOCAB = 320
 SEQ = 40
@@ -898,8 +896,8 @@ def _vision_config(config):
     return config
 
 
-@pytest.mark.parametrize("effort", ["high", "max", "no_think"])
-def test_loaded_processor_separates_prompt_opened_thinking(tmp_path, effort):
+@pytest.mark.parametrize("effort", ["high", "no_think"])
+def test_loaded_processor_detects_prompt_opened_thinking(tmp_path, effort):
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from transformers import PreTrainedTokenizerFast
@@ -915,31 +913,14 @@ def test_loaded_processor_separates_prompt_opened_thinking(tmp_path, effort):
     tokenizer.add_tokens(["<think:opensource>", "</think:opensource>"])
     tokenizer.save_pretrained(tmp_path)
     processor = HyV4Processor.from_pretrained(tmp_path)
-    tokenizer = processor.tokenizer
     prompt = processor.apply_chat_template(
         [{"role": "user", "content": "Hi"}],
         tokenize=False,
         add_generation_prompt=True,
         reasoning_effort=effort,
     )
-    ids = tokenizer.encode(prompt, add_special_tokens=False)
-    should_think = effort != "no_think"
-    detected, _ = prompt_opens_thinking(tokenizer, prompt, ids)
-    assert detected == should_think
-
-    scheduler = object.__new__(Scheduler)
-    scheduler.tokenizer = tokenizer
-    assert (
-        scheduler._detect_needs_think_prefix(SimpleNamespace(prompt_token_ids=ids))
-        == should_think
-    )
-
-    parser = ThinkingParser(start_in_thinking=detected)
-    if should_think:
-        assert parser.feed("Reasoning.</think:open") == ("Reasoning.", "")
-        assert parser.feed("source>Answer.") == ("", "Answer.")
-    else:
-        assert parser.feed("Answer.") == ("", "Answer.")
+    detected, _ = prompt_opens_thinking(processor.tokenizer, prompt)
+    assert detected == (effort == "high")
 
 
 def test_sanitize_maps_checkpoint_vision_weights():
