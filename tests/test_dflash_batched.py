@@ -1158,7 +1158,7 @@ def test_fp16_drafter_survives_activations_past_fp16_range():
     assert got == reference
 
 
-def _tiny_inkling2(drafter=True, fixed=True):
+def _tiny_inkling2():
     """Tiny Inkling 2 target with its DSpark drafter (recurrent Markov head)."""
     from test_inkling_vlm_mtp import _inkling2_tiny
 
@@ -1170,9 +1170,6 @@ def _tiny_inkling2(drafter=True, fixed=True):
 
     model = _inkling2_tiny()
     mx.eval(model.parameters())
-    if not drafter:
-        model._omlx_mtp_decode_enabled = False
-        return model
     config = Inkling2DSparkConfig(
         hidden_size=128,
         num_hidden_layers=2,
@@ -1201,7 +1198,7 @@ def _tiny_inkling2(drafter=True, fixed=True):
         strict=False,
     )
     draft.bind(model)
-    dd.attach_drafter(model, wrap_inkling2_dspark(draft, "tiny", fixed=fixed))
+    dd.attach_drafter(model, wrap_inkling2_dspark(draft, "tiny", fixed=True))
     return model
 
 
