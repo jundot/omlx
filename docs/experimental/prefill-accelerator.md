@@ -15,6 +15,7 @@ It suits a large model that fits on one Mac with fast memory (good for decoding)
 | Qwen3.8 Flash-Next | `qwen4_exp` | PLE rows are read on this Mac and sent with each chunk |
 | MiniMax M3 / M3.1 | `minimax_m3_vl` | Works with the DSpark drafter |
 | Qwen3.8 27B (Qwen3.5 architecture) | `qwen3_5` | Checkpoints served by the VLM engine. With a context window above the native one, prompts stay on this Mac when the helper holds an attention layer |
+| Qwen3.6 35B-A3B (Qwen3.5 MoE architecture) | `qwen3_5_moe` | Checkpoints served by the VLM engine. The feed-forward blocks are routed experts; the rest of the layer is the Qwen3.5 stack |
 | Inkling 2 Small | `inkling2` | Checkpoints served by the VLM engine; prompts with images stay on this Mac. Works with the DSpark drafter |
 
 Measured on an M3 Ultra (512 GB) with an M5 Max over Thunderbolt 5, for a 64K-token prompt:

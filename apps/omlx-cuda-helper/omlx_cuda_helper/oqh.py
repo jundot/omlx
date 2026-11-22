@@ -22,16 +22,13 @@ import mlx.core as mx
 import numpy as np
 
 from .checkpoint import OQH_SIGNS as SIGNS
+from .checkpoint import is_oqh as is_oqh
 
 logger = logging.getLogger(__name__)
 
 # Widest code the host folds the row scale into the affine group scale; wider
 # codes keep unit scales and multiply the output by the row scale.
 FOLD_MAX_BITS = 5
-
-
-def is_oqh(weights: dict[str, Any], prefix: str) -> bool:
-    return f"{prefix}.{SIGNS}" in weights
 
 
 def bits_of(weights: dict[str, Any], prefix: str) -> int:

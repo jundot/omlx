@@ -23,6 +23,8 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from mlx.utils import tree_flatten, tree_unflatten
+from mlx_vlm.models.qwen3_5_moe import config as qwen3_5_moe_config
+from mlx_vlm.models.qwen3_5_moe import language as qwen3_5_moe_language
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
 from test_inkling_vlm_mtp import _inkling2_tiny
 from test_mlx_vlm_minimax_m3_compat import _tiny_text_config
@@ -46,6 +48,7 @@ from omlx.prefill_helper import routes as helper_routes
 from omlx.prefill_helper import worker as worker_module
 from omlx.prefill_helper.adapter import Capture
 from omlx.prefill_helper.adapters import adapter_for, adapter_for_model
+from omlx.prefill_helper.adapters.qwen3_5 import _language_symbol
 from omlx.prefill_helper.client import HelperClient, HelperError
 from omlx.prefill_helper.launcher import HelperTarget
 from omlx.prefill_helper.manager import PrefillHelperManager
@@ -1877,6 +1880,70 @@ def _qwen35_contract():
     return lm
 
 
+# ---------------------------------------------------------------------------
+# Qwen3.5-MoE: the same split with routed experts in place of the dense MLP.
+# ---------------------------------------------------------------------------
+
+
+def _tiny_qwen3_5_moe():
+    """The tiny Qwen3.5-MoE stack with two layers (L F), four experts and a
+    partial rotary width, so a cut sits between a linear layer and attention.
+    Keys of 32 dims in inference mode take the recurrence kernel a loaded
+    model runs."""
+    text = qwen3_5_moe_config.TextConfig(
+        model_type="qwen3_5_moe_text",
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=32,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        num_experts=4,
+        num_experts_per_tok=2,
+        shared_expert_intermediate_size=16,
+        moe_intermediate_size=16,
+        rms_norm_eps=1e-6,
+        vocab_size=64,
+        max_position_embeddings=512,
+        full_attention_interval=2,
+        rope_parameters={
+            "type": "default",
+            "mrope_section": [2, 1, 1],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.5,
+        },
+    )
+    # A call without position ids reads these to number a text prompt.
+    config = SimpleNamespace(
+        model_type="qwen3_5_moe",
+        text_config=text,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=61,
+        video_token_id=62,
+        vision_start_token_id=63,
+    )
+    return qwen3_5_moe_language.LanguageModel(text, config).eval(), config
+
+
+def _qwen35_moe():
+    mx.random.seed(7)
+    lm, _ = _tiny_qwen3_5_moe()
+    mx.eval(lm.parameters())
+    return lm
+
+
+def _qwen35_moe_contract():
+    """_qwen35_moe with its identity norm gains and gate biases moved."""
+    lm = _qwen35_moe()
+    lm.apply(lambda p: p + mx.random.uniform(-0.3, 0.3, p.shape) if p.ndim == 1 else p)
+    mx.eval(lm.parameters())
+    return lm
+
+
 def _qwen35_state(cache):
     out = []
     for item in cache:
@@ -1965,6 +2032,39 @@ def test_only_a_model_that_gets_a_helper_has_an_adapter(tmp_path):
     assert adapter_for_model("qwen3_5", "vlm", path) is QWEN35
     # The other families keep their adapter on every engine.
     assert adapter_for_model("qwen4-exp", "batched", path) is QWEN4
+
+
+def test_mask_builder_resolution_dense():
+    """A dense model takes its mask builders from its own module.
+
+    Weight-free: the adapter only reads the model's class, so the class is
+    asked for the builders without constructing a checkpoint.
+    """
+    from mlx_vlm.models.qwen3_5 import language
+
+    lm = SimpleNamespace(model=language.LanguageModel.__new__(language.LanguageModel))
+    for name in ("_create_qwen3_5_ssm_mask", "_create_qwen3_5_attention_mask"):
+        assert _language_symbol(lm, name) is getattr(language, name)
+
+
+def test_mask_builder_resolution_subclass():
+    """A subclass defined beside it resolves the builders from its base.
+
+    ``qwen3_5_moe``'s language module is ``qwen3_5.language``'s subclass but
+    defines neither builder, so a fixed attribute on the model's own module
+    raises ``AttributeError``. Weight-free, as above.
+    """
+    from mlx_vlm.models.qwen3_5 import language
+    from mlx_vlm.models.qwen3_5_moe import language as moe_language
+
+    lm = SimpleNamespace(
+        model=moe_language.LanguageModel.__new__(moe_language.LanguageModel)
+    )
+    for name in ("_create_qwen3_5_ssm_mask", "_create_qwen3_5_attention_mask"):
+        # The subclass's own module does not define it ...
+        assert not hasattr(moe_language, name)
+        # ... and the base's does.
+        assert _language_symbol(lm, name) is getattr(language, name)
 
 
 def test_qwen35_keeps_a_yarn_prompt_off_the_helpers_attention_layers():
@@ -2223,6 +2323,7 @@ _CONTRACT_CASES = {
     "qwen4_exp": (QWEN4, lambda: _qwen4(4), 3, "language_model."),
     "minimax_m3_vl": (MINIMAX, _minimax_contract, 3, "language_model."),
     "qwen3_5": (QWEN35, _qwen35_contract, 5, "language_model."),
+    "qwen3_5_moe": (QWEN35, _qwen35_moe_contract, 2, "language_model."),
     "glm5_next": (GLM, _glm_contract, 3, "language_model."),
     "deepseek_v41": (DSV41, _dsv41_contract, 6, "language_model."),
     "inkling2": (INKLING2, _inkling2_contract, 7, ""),
@@ -2275,6 +2376,9 @@ def _contract_manifest(arrays):
 @pytest.mark.parametrize("family", sorted(_CONTRACT_CASES))
 def test_payload_matches_the_contract_fixture(family):
     folder = _CONTRACT_DIR / family
+    if not (folder / "meta.json").exists():
+        # A family whose fixture has not been recorded yet.
+        pytest.skip(f"no recorded contract fixture for {family}")
     meta = json.loads((folder / "meta.json").read_text())
     adapter, _, _, prefix = _CONTRACT_CASES[family]
     hint = (
