@@ -682,6 +682,64 @@ def test_inkling2_affine_expert_carrier_matches_mlx_packing(bits):
     assert proj.weight.shape == packed.shape
 
 
+def _nvfp4_experts(experts=4, hidden=128, inter=64):
+    """NVFP4 routed experts whose unscaled matmul outputs pass float16's
+    range while the scaled outputs stay small, as in Inkling 2 Mini."""
+    from omlx.patches.inkling2 import model as inkling2
+
+    args = inkling2.TextArgs(
+        hidden_size=hidden,
+        intermediate_size=inter,
+        n_routed_experts=experts,
+        num_experts_per_tok=2,
+    )
+    spec = inkling2.expert_quant_spec("nvfp4")
+    mod = inkling2.Inkling2Experts(args, spec, spec)
+    rng = np.random.default_rng(0)
+    for proj, out_dims, in_dims in (
+        (mod.w13, 2 * inter, hidden),
+        (mod.w2, hidden, inter),
+    ):
+        codes, scales, amaxes = [], [], []
+        for _ in range(experts):
+            w = mx.array(
+                (0.1 + 0.02 * rng.standard_normal((out_dims, in_dims))).astype(
+                    np.float32
+                )
+            )
+            amax = mx.abs(w).max()
+            q, s = mx.quantize(w, mode="nvfp4", global_scale=amax)
+            codes.append(q)
+            scales.append(s)
+            amaxes.append(amax)
+        proj.weight = mx.stack(codes)
+        proj.scales = mx.stack(scales)
+        proj.global_scale = mx.stack(amaxes).astype(mx.float32)
+    return mod
+
+
+def test_inkling2_nvfp4_experts_stay_finite_in_float16():
+    if mx.default_device() != mx.gpu:
+        pytest.skip("gather_qmm global_scale runs on the GPU")
+    mod = _nvfp4_experts()
+    tokens = 64  # >= 64 routed rows takes the sorted gather path too
+    x = mx.full((tokens, 128), 3.0) + mx.random.normal(
+        (tokens, 128), key=mx.random.key(1)
+    )
+    inds = mx.random.randint(0, 4, (tokens, 2), key=mx.random.key(2)).astype(mx.uint32)
+    weights = mx.full((tokens, 2), 0.5)
+
+    expected = mod(x.astype(mx.float32), inds, weights)
+    got = mod(x.astype(mx.float16), inds, weights)
+    mx.eval(expected, got)
+
+    # Unscaled, the first projection is ~128 * 3 * 2688 ~ 1e6.
+    assert mx.abs(expected).max().item() < 65504
+    assert mx.isfinite(got).all().item()
+    rel = mx.abs(got.astype(mx.float32) - expected).max() / mx.abs(expected).max()
+    assert rel.item() < 1e-2
+
+
 @pytest.mark.parametrize(
     "batch, heads, kv_heads, length, keys, window, extent, left_padding",
     [
