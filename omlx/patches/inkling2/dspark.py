@@ -361,6 +361,7 @@ def wrap_inkling2_dspark(
     )
     if depth:
         drafter.depth = max(1, min(drafter.depth, int(depth)))
+    drafter.context_copy = True
     return drafter
 
 

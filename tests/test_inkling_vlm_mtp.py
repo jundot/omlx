@@ -609,10 +609,13 @@ def test_inkling2_loop_model_type_uses_inkling2(tmp_path):
     assert bundled_inkling2_dspark_path(tmp_path) is not None
 
 
+# 15 drafts: the widest window the model declares (a verbatim context copy).
+@pytest.mark.parametrize("drafts", [7, 15])
 @pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
-def test_inkling2_verify_rollback_matches_sequential_decode(dims):
+def test_inkling2_verify_rollback_matches_sequential_decode(dims, drafts):
     model = _inkling2_tiny(**dims)
-    ids = mx.random.randint(0, 300, (1, 30))
+    assert drafts + 1 <= model._omlx_mtp_max_verify_rows
+    ids = mx.random.randint(0, 300, (1, 40))
     reference = model.make_cache()
     model(ids[:, :20], cache=reference)
     for t in range(20, 24):
@@ -621,11 +624,14 @@ def test_inkling2_verify_rollback_matches_sequential_decode(dims):
     cache = model.make_cache()
     model(ids[:, :20], cache=cache)
     out = model(
-        ids[:, 20:28], cache=cache, return_hidden=True, capture_layer_ids=[5, 12]
+        ids[:, 20 : 21 + drafts],
+        cache=cache,
+        return_hidden=True,
+        capture_layer_ids=[5, 12],
     )
-    assert [h.shape for h in out.hidden_states] == [(1, 8, 128)] * 3
-    # Three of seven drafts accepted: the confirmed token plus three stay.
-    assert model.mtp_partial_rollback(cache, 3, 7)
+    assert [h.shape for h in out.hidden_states] == [(1, drafts + 1, 128)] * 3
+    # Three drafts accepted: the confirmed token plus three stay.
+    assert model.mtp_partial_rollback(cache, 3, drafts)
     got = model(ids[:, 24:25], cache=cache)
     full = next(c for c in cache if hasattr(c, "offset"))
     assert full.offset == next(c for c in reference if hasattr(c, "offset")).offset == 25

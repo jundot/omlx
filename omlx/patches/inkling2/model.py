@@ -860,6 +860,9 @@ class Model(nn.Module):
     # ``attend`` reads the keys and values a cache returns as dense arrays; a
     # packed (TurboQuant or affine) cache hands back codes it cannot use.
     dense_kv_attention = True
+    # Verify windows up to the compiled width keep the compiled forward, and
+    # mtp_partial_rollback recuts the conv tails for any rejected count.
+    _omlx_mtp_max_verify_rows = _COMPILED_MAX_TOKENS
 
     def __init__(self, args: ModelArgs):
         super().__init__()
