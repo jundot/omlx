@@ -2928,6 +2928,23 @@ class EnginePool:
             )
             admission_kind = "local shard" if deployment is not None else "model"
 
+            # This Mac may also run a service that keeps models resident on the
+            # GPU. Ask it to release memory before the admission maths below
+            # concludes the model cannot fit, so a user-issued load succeeds
+            # without stopping the other service by hand.
+            try:
+                from .peer_handoff import release_peer_memory
+
+                if release_peer_memory(model_id, needed_bytes=admission_size):
+                    logger.warning(
+                        "Resident peer released memory for %r; continuing admission",
+                        model_id,
+                    )
+            except Exception:
+                logger.warning(
+                    "Peer memory handoff failed; using normal admission",
+                    exc_info=True,
+                )
             ceiling = self._current_ceiling()
             best_effort = False
             if ceiling <= 0:
