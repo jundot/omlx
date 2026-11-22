@@ -69,6 +69,10 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
+from .patches.inkling2 import INKLING2_MODEL_TYPES
+from .patches.inkling2.kernels import (
+    prefill_mask_elements as inkling2_prefill_mask_elements,
+)
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import (
@@ -16940,23 +16944,16 @@ class Scheduler:
                 self._fixed_state_measure_armed = arrays_cache_layers > 0
 
                 # Inkling builds its banded relative-position bias as a full
-                # [H, LQ, S] tensor before SDPA; register the transient so
-                # prefill admission prices it (cleared for other models —
-                # the registry is process-wide across model swaps).
-                try:
-                    from .memory_monitor import register_attention_bias_transient
-
-                    model_type = str(getattr(self.model, "model_type", "") or "")
-                    register_attention_bias_transient(
-                        base_dtype_size
-                        if model_type in ("inkling", "inkling_mm_model")
-                        else None
-                    )
-                except Exception:
-                    logger.debug(
-                        "attention-bias transient registration failed",
-                        exc_info=True,
-                    )
+                # [H, LQ, S] tensor before SDPA, Inkling 2 in bounded blocks.
+                model_type = str(getattr(self.model, "model_type", "") or "")
+                mask_elements = None
+                if model_type in INKLING2_MODEL_TYPES:
+                    mask_elements = inkling2_prefill_mask_elements()
+                full_bias = model_type in ("inkling", "inkling_mm_model")
+                self.memory_monitor.set_attention_bias_transient(
+                    base_dtype_size if full_bias or mask_elements else None,
+                    mask_elements,
+                )
                 logger.debug(
                     f"Model info for memory estimation: "
                     f"layers={num_layers} ({num_kv_cache_layers} KVCache, "

@@ -346,6 +346,11 @@ def _use_flash(length: int, window: int) -> bool:
     return bool(window) or not is_nax_available()
 
 
+def prefill_mask_elements() -> int | None:
+    """Mask elements one full-attention prefill call holds, None on flash."""
+    return None if _use_flash(_FLASH_MIN_QUERIES, 0) else _MASK_BUDGET
+
+
 def flash_banded_attention(q, k, v, rel, sink, *, scale, window, left_padding=None):
     """``banded_sink_attention`` for BF16/FP16 prefill blocks; same arguments and result."""
     global _flash_kernel
