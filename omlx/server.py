@@ -8020,21 +8020,17 @@ async def create_anthropic_message(
         f"max_tokens={request.max_tokens}"
     )
 
-    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
-        raise HTTPException(
-            status_code=503,
-            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
-        )
-
-    # Claude Code's built-in WebSearch uses Anthropic's server-side
-    # web_search_20250305 tool. Fulfil that nested request with the search
-    # provider configured in Settings -> Integrations -> Web Search instead
-    # of dropping the tool in the conversion layer.
     web_search_response = await maybe_handle_anthropic_web_search(
         request, _server_state.global_settings
     )
     if web_search_response is not None:
         return web_search_response
+
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
 
     lease = _LLMEngineLease()
     try:
