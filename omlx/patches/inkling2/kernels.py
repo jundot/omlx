@@ -806,8 +806,352 @@ _FLASH_SOURCE = """
     }
 """
 _flash_kernel = None
-# Query blocks shorter than this keep the SDPA path (decode and verify).
+# Query blocks shorter than this take the decode kernel or the SDPA path.
 _FLASH_MIN_QUERIES = 32
+
+
+# FlashDecoding for decode-sized query blocks (decode steps, batched decode
+# and speculative verify): the bias band, the window and the sink are applied
+# in the kernel, so no mask is built and K/V are read in place, once for the
+# queries of all heads that share a KV head.
+#
+# A query's keys are addressed by backward distance d from the query itself
+# and cut into chunks of CHUNK distances; one threadgroup reduces one chunk
+# of one (row, position, KV head) in 16-key tiles to an unnormalized partial
+# (max m, weight l, output o). A second kernel folds the partials into the
+# sink, nearest chunk first. The tiling therefore depends only on how many
+# keys the query sees: not on the block length, the batch, the left padding
+# or where the keys sit in the cache buffer. A verify row, a batched row and
+# the serial decode step of the same token run the same arithmetic.
+_DECODE_PART_SOURCE = """
+    constexpr int BK = 16;
+    constexpr int NT = NSG * 32;
+    constexpr float LOG2E = 1.4426950408889634f;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint sg = tid / 32;
+    const uint lane = tid % 32;
+    const int chunk = threadgroup_position_in_grid.x;
+    const int gy = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+    const int L = dims[0];
+    const int S = dims[1];
+    const int NS = dims[2];
+    const int lp = dims[3 + b];
+    const int pos = gy % L;
+    const int hk = gy / L;
+    const short qid = lane / 4;
+    const short fm = (qid & 4) + ((lane / 2) % 4);
+    const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    // The G query heads of this KV head are the rows of the tile.
+    const int g = int(sg) * 8 + fm;
+    const bool row_ok = g < G;
+    const int h = hk * G + (row_ok ? g : 0);
+    // Index of the query's own key, and the number of keys it sees.
+    const int a = S - L + pos;
+    int nk = a + 1 - lp;
+    if (WINDOW > 0) {
+        nk = min(nk, WINDOW);
+    }
+    const int d_begin = chunk * CHUNK;
+    const int d_end = min(d_begin + CHUNK, nk);
+    const float qscale = scale[0] * LOG2E;
+
+    // As in the prefill kernel: tiles staged in half (exact for FP16 and for
+    // the BF16 values attention sees), K transposed, both padded.
+    constexpr int LDK = BK + 8;
+    constexpr int LDV = D + 8;
+    threadgroup half Ks[D * LDK];
+    threadgroup half Vs[BK * LDV];
+
+    simdgroup_half8x8 Qf[D / 8];
+    for (int db = 0; db < D / 8; ++db) {
+        float2 qv = float2(0.0f);
+        if (row_ok) {
+            const device T* qp = q + b * q_strides[0] + h * q_strides[1]
+                + pos * q_strides[2] + (db * 8 + fn) * q_strides[3];
+            qv = float2(float(qp[0]), float(qp[q_strides[3]]));
+        }
+        Qf[db].thread_elements()[0] = half(qv.x);
+        Qf[db].thread_elements()[1] = half(qv.y);
+    }
+    simdgroup_float8x8 Of[D / 8];
+    for (int db = 0; db < D / 8; ++db) {
+        Of[db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float m = 0.0f;
+    float l = 0.0f;
+    const device T* relp = rel + ((size_t)(b * L + pos) * HQ + h) * R;
+    const device T* kb_ptr = k + b * k_strides[0] + hk * k_strides[1];
+    const device T* vb_ptr = v + b * v_strides[0] + hk * v_strides[1];
+    const bool vec_kv = k_strides[3] == 1 && v_strides[3] == 1;
+
+    // Slot r of a tile is the key at distance d0 + r.
+    for (int d0 = d_begin; d0 < d_end; d0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (vec_kv) {
+            for (int c = tid; c < BK * D / 8; c += NT) {
+                const int r = c / (D / 8);
+                const int col = (c % (D / 8)) * 8;
+                uint4 kw = uint4(0);
+                uint4 vw = uint4(0);
+                if (d0 + r < d_end) {
+                    const int key = a - d0 - r;
+                    kw = *(const device uint4*)(kb_ptr + key * k_strides[2] + col);
+                    vw = *(const device uint4*)(vb_ptr + key * v_strides[2] + col);
+                }
+                threadgroup half* kd = Ks + col * LDK + r;
+                threadgroup half* vd = Vs + r * LDV + col;
+                if (IS_BF16) {
+                    for (int j = 0; j < 4; ++j) {
+                        kd[(2 * j) * LDK] = half(as_type<float>(kw[j] << 16));
+                        kd[(2 * j + 1) * LDK] = half(as_type<float>(kw[j] & 0xFFFF0000u));
+                        vd[2 * j] = half(as_type<float>(vw[j] << 16));
+                        vd[2 * j + 1] = half(as_type<float>(vw[j] & 0xFFFF0000u));
+                    }
+                } else {
+                    for (int j = 0; j < 4; ++j) {
+                        const half2 k2 = as_type<half2>(kw[j]);
+                        const half2 v2 = as_type<half2>(vw[j]);
+                        kd[(2 * j) * LDK] = k2.x;
+                        kd[(2 * j + 1) * LDK] = k2.y;
+                        vd[2 * j] = v2.x;
+                        vd[2 * j + 1] = v2.y;
+                    }
+                }
+            }
+        } else {
+            for (int c = tid; c < BK * D; c += NT) {
+                const int r = c / D;
+                const int col = c % D;
+                float kv = 0.0f;
+                float vv = 0.0f;
+                if (d0 + r < d_end) {
+                    const int key = a - d0 - r;
+                    kv = float(kb_ptr[key * k_strides[2] + col * k_strides[3]]);
+                    vv = float(vb_ptr[key * v_strides[2] + col * v_strides[3]]);
+                }
+                Ks[col * LDK + r] = half(kv);
+                Vs[r * LDV + col] = half(vv);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (int(sg) * 8 >= G) {
+            continue;
+        }
+
+        simdgroup_float8x8 Sf[BK / 8];
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            Sf[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int db = 0; db < D / 8; ++db) {
+                simdgroup_half8x8 Kt;
+                simdgroup_load(Kt, Ks + db * 8 * LDK + kb * 8, LDK);
+                simdgroup_multiply_accumulate(Sf[kb], Qf[db], Kt, Sf[kb]);
+            }
+        }
+
+        // Every tile holds a visible key (d0 < d_end), so rmax is a score.
+        float sc[BK / 4];
+        float rmax = -FLT_MAX;
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            for (int e = 0; e < 2; ++e) {
+                const int d = d0 + kb * 8 + fn + e;
+                float s = Sf[kb].thread_elements()[e] * qscale;
+                if (d < R) {
+                    s += float(relp[d]) * LOG2E;
+                }
+                sc[kb * 2 + e] = s;
+                if (d < d_end) {
+                    rmax = max(rmax, s);
+                }
+            }
+        }
+        rmax = max(rmax, simd_shuffle_xor(rmax, 1));
+        rmax = max(rmax, simd_shuffle_xor(rmax, 8));
+        const bool first = d0 == d_begin;
+        const float m_new = first ? rmax : max(m, rmax);
+        const float factor = first ? 0.0f : precise::exp2(m - m_new);
+        float rsum = 0.0f;
+        simdgroup_half8x8 Pf[BK / 8];
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            for (int e = 0; e < 2; ++e) {
+                const int d = d0 + kb * 8 + fn + e;
+                const float p = d < d_end
+                    ? precise::exp2(sc[kb * 2 + e] - m_new) : 0.0f;
+                Pf[kb].thread_elements()[e] = half(p);
+                rsum += p;
+            }
+        }
+        rsum += simd_shuffle_xor(rsum, 1);
+        rsum += simd_shuffle_xor(rsum, 8);
+        l = l * factor + rsum;
+        m = m_new;
+        for (int db = 0; db < D / 8; ++db) {
+            Of[db].thread_elements()[0] *= factor;
+            Of[db].thread_elements()[1] *= factor;
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                simdgroup_half8x8 Vm;
+                simdgroup_load(Vm, Vs + kb * 8 * LDV + db * 8, LDV);
+                simdgroup_multiply_accumulate(Of[db], Pf[kb], Vm, Of[db]);
+            }
+        }
+    }
+
+    if (row_ok) {
+        // A chunk past the query's keys leaves l == 0 and is skipped.
+        const size_t slot = (((size_t)b * HQ + h) * L + pos) * NS + chunk;
+        if (fn == 0) {
+            part_m[slot] = m;
+            part_l[slot] = l;
+        }
+        device float* op = part_o + slot * D;
+        for (int db = 0; db < D / 8; ++db) {
+            op[db * 8 + fn] = Of[db].thread_elements()[0];
+            op[db * 8 + fn + 1] = Of[db].thread_elements()[1];
+        }
+    }
+"""
+
+# One simdgroup per query: the online softmax over its chunk partials,
+# starting from the zero-value sink.
+_DECODE_FOLD_SOURCE = """
+    constexpr float LOG2E = 1.4426950408889634f;
+    const uint lane = thread_index_in_simdgroup;
+    const int row = threadgroup_position_in_grid.x;
+    const int pos = row % L;
+    const int h = (row / L) % HQ;
+    const int b = row / (L * HQ);
+    constexpr int PER = (D + 31) / 32;
+    float m = float(sink[(b * L + pos) * HQ + h]) * LOG2E;
+    float l = 1.0f;
+    float o[PER];
+    for (int i = 0; i < PER; ++i) {
+        o[i] = 0.0f;
+    }
+    const size_t base = (size_t)row * NS;
+    for (int c = 0; c < NS; ++c) {
+        const float lc = part_l[base + c];
+        if (!(lc > 0.0f)) {
+            continue;
+        }
+        const float mc = part_m[base + c];
+        const float m_new = max(m, mc);
+        const float f0 = precise::exp2(m - m_new);
+        const float f1 = precise::exp2(mc - m_new);
+        const float l0 = l * f0;
+        const float l1 = lc * f1;
+        l = l0 + l1;
+        m = m_new;
+        const device float* po = part_o + (base + c) * D;
+        for (int i = 0; i < PER; ++i) {
+            const int e = int(lane) + 32 * i;
+            if (e < D) {
+                const float o0 = o[i] * f0;
+                const float o1 = po[e] * f1;
+                o[i] = o0 + o1;
+            }
+        }
+    }
+    const float inv = 1.0f / l;
+    for (int i = 0; i < PER; ++i) {
+        const int e = int(lane) + 32 * i;
+        if (e < D) {
+            out[(size_t)row * D + e] = T(o[i] * inv);
+        }
+    }
+"""
+_decode_kernels = None
+# Distances per chunk of the decode kernel. A constant: the chunk layout must
+# not depend on the call (see _DECODE_PART_SOURCE).
+_DECODE_CHUNK = 1024
+# Simdgroups staging one tile (the first ones also run the queries).
+_DECODE_STAGERS = 2
+
+
+def _use_flash_decode(q, k) -> bool:
+    """BF16/FP16 queries on the GPU whose head layout fits the decode kernel."""
+    return (
+        q.dtype in (mx.bfloat16, mx.float16)
+        and mx.default_device() == mx.gpu
+        and q.shape[-1] % 8 == 0
+        and q.shape[1] % k.shape[1] == 0
+    )
+
+
+def gqa_flash_decode_attention(
+    q, k, v, rel, sink, *, scale, window, left_padding=None
+):
+    """``banded_sink_attention`` for decode-sized BF16/FP16 query blocks.
+
+    Each query row has the bits of its own one-row call: of the serial decode
+    step for its token, and of the same row decoded alone.
+    """
+    global _decode_kernels
+    b, hq, length, d = q.shape
+    hkv, s = k.shape[1], k.shape[2]
+    g = hq // hkv
+    if _decode_kernels is None:
+        _decode_kernels = (
+            mx.fast.metal_kernel(
+                name="omlx_inkling2_flash_decode_part",
+                input_names=["q", "k", "v", "rel", "dims", "scale"],
+                output_names=["part_o", "part_m", "part_l"],
+                source=_DECODE_PART_SOURCE,
+                ensure_row_contiguous=False,
+            ),
+            mx.fast.metal_kernel(
+                name="omlx_inkling2_flash_decode_fold",
+                input_names=["part_o", "part_m", "part_l", "sink"],
+                output_names=["out"],
+                source=_DECODE_FOLD_SOURCE,
+            ),
+        )
+    part, fold = _decode_kernels
+    reach = min(s, window) if window else s
+    ns = max(1, -(-reach // _DECODE_CHUNK))
+    nsg = max(-(-g // 8), _DECODE_STAGERS)
+    lp = (
+        left_padding.astype(mx.int32)
+        if left_padding is not None
+        else mx.zeros((b,), dtype=mx.int32)
+    )
+    dims = mx.concatenate([mx.array([length, s, ns], dtype=mx.int32), lp])
+    part_o, part_m, part_l = part(
+        inputs=[
+            q,
+            k,
+            v,
+            mx.contiguous(rel),
+            dims,
+            mx.array([scale], dtype=mx.float32),
+        ],
+        template=[
+            ("T", q.dtype),
+            ("IS_BF16", q.dtype == mx.bfloat16),
+            ("D", d),
+            ("HQ", hq),
+            ("G", g),
+            ("R", rel.shape[-1]),
+            ("WINDOW", int(window)),
+            ("CHUNK", _DECODE_CHUNK),
+            ("NSG", nsg),
+        ],
+        grid=(ns * nsg * 32, hkv * length, b),
+        threadgroup=(nsg * 32, 1, 1),
+        output_shapes=[
+            (b, hq, length, ns, d),
+            (b, hq, length, ns),
+            (b, hq, length, ns),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    return fold(
+        inputs=[part_o, part_m, part_l, mx.contiguous(sink.astype(mx.float32))],
+        template=[("T", q.dtype), ("D", d), ("HQ", hq), ("L", length), ("NS", ns)],
+        grid=(b * hq * length * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(b, hq, length, d)],
+        output_dtypes=[q.dtype],
+    )[0]
 
 
 def _use_flash(length: int, window: int) -> bool:
@@ -892,9 +1236,16 @@ def banded_sink_attention(
     keys to d < window (sliding layers use window == R).
     """
     b, length = q.shape[0], q.shape[2]
+    row_exact = b == 1 and left_padding is None and is_row_exact_armed()
+    if (length < _FLASH_MIN_QUERIES or row_exact) and _use_flash_decode(q, k):
+        # Decode steps, batched decode and verify blocks; its rows are those
+        # of one-row calls, so a row-exact verify needs no other path.
+        return gqa_flash_decode_attention(
+            q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
+        )
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
-    if b == 1 and left_padding is None and is_row_exact_armed():
+    if row_exact:
         # Row-exact verify: each row is the decode step of its token, over the
         # keys up to its own position.
         fused = verify_attention.rows_attention(

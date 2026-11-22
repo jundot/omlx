@@ -1446,3 +1446,117 @@ def test_inkling2_varloop_single_pass_and_dspark_visit_guard(tmp_path):
             json.dumps({"model_type": "inkling2_loop", "text_config": override_text, "mtp_config": mtp})
         )
         assert bundled_inkling2_dspark_path(tmp_path) is None
+
+
+def _decode_attention_case(batch, heads, kv_heads, length, keys, extent, dtype, dim=64):
+    mx.random.seed(3)
+    q = (mx.random.normal((batch, heads, length, dim)) * 0.3).astype(dtype)
+    # K/V as a slice of a larger cache buffer, as the caches hand them over.
+    shape = (batch, kv_heads, keys + 40, dim)
+    k = (mx.random.normal(shape) * 0.3).astype(dtype)[:, :, 7 : 7 + keys]
+    v = mx.random.normal(shape).astype(dtype)[:, :, 7 : 7 + keys]
+    rel = mx.random.normal((batch, length, heads, extent)).astype(dtype)
+    sink = (mx.random.normal((batch, length, heads)) * 2).astype(dtype)
+    return q, k, v, rel, sink
+
+
+@pytest.mark.parametrize(
+    "batch, heads, kv_heads, length, keys, window, extent, left_padding",
+    [
+        (1, 6, 2, 1, 1, 0, 32, None),
+        (1, 6, 2, 1, 300, 0, 32, None),
+        (1, 6, 2, 1, 300, 32, 32, None),
+        (1, 6, 2, 8, 300, 0, 32, None),
+        (1, 6, 2, 5, 300, 32, 32, None),
+        (1, 6, 2, 3, 20, 32, 32, None),
+        (2, 6, 2, 1, 300, 0, 32, [0, 113]),
+        (2, 6, 2, 1, 90, 32, 32, [0, 70]),
+        (2, 6, 2, 4, 300, 0, 32, [41, 0]),
+        (1, 12, 1, 2, 300, 0, 32, None),
+    ],
+)
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_flash_decode_matches_masked_sdpa(
+    batch,
+    heads,
+    kv_heads,
+    length,
+    keys,
+    window,
+    extent,
+    left_padding,
+    dtype,
+    monkeypatch,
+):
+    """Decode steps, batched decode and verify blocks; 300 keys are five
+    chunks of 64, and 12 heads on one KV head fill two simdgroups."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    monkeypatch.setattr(kernels, "_DECODE_CHUNK", 64)
+    args = _decode_attention_case(
+        batch, heads, kv_heads, length, keys, extent, getattr(mx, dtype)
+    )
+    lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
+    scale = args[0].shape[-1] ** -0.5
+    expected = kernels._masked_attention(*args, scale, window, lp)
+    got = kernels.banded_sink_attention(
+        *args, scale=scale, window=window, left_padding=lp
+    )
+    assert got.shape == expected.shape and got.dtype == expected.dtype
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
+    assert diff.item() < 1e-2
+    if batch == 1 and length == 1:
+        step = kernels._decode_attention(*args, scale, window)
+        diff = mx.abs(got.astype(mx.float32) - step.astype(mx.float32)).max()
+        assert diff.item() < 1e-2
+    # Keys strided in the head dimension take the scalar staging loop.
+    q, k, v, rel, sink = args
+    wide = mx.repeat(k, 2, axis=-1)[..., ::2], mx.repeat(v, 2, axis=-1)[..., ::2]
+    strided = kernels.gqa_flash_decode_attention(
+        q, *wide, rel, sink, scale=scale, window=window, left_padding=lp
+    )
+    assert mx.array_equal(strided, got)
+
+
+@pytest.mark.parametrize("window", [0, 32])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_flash_decode_rows_have_the_bits_of_one_row_calls(
+    window, dtype, monkeypatch
+):
+    """Each row of a left-padded batch of verify blocks is the serial decode
+    step of its token: one query over that row's own keys, alone."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    monkeypatch.setattr(kernels, "_DECODE_CHUNK", 64)
+    length, keys, pads = 8, 300, [0, 113]
+    q, k, v, rel, sink = _decode_attention_case(
+        2, 6, 2, length, keys, 32, getattr(mx, dtype)
+    )
+    scale = q.shape[-1] ** -0.5
+    block = kernels.banded_sink_attention(
+        q,
+        k,
+        v,
+        rel,
+        sink,
+        scale=scale,
+        window=window,
+        left_padding=mx.array(pads, dtype=mx.int32),
+    )
+    for row, pad in enumerate(pads):
+        for pos in range(length):
+            end = keys - length + 1 + pos
+            step = kernels.banded_sink_attention(
+                q[row : row + 1, :, pos : pos + 1],
+                k[row : row + 1, :, pad:end],
+                v[row : row + 1, :, pad:end],
+                rel[row : row + 1, pos : pos + 1],
+                sink[row : row + 1, pos : pos + 1],
+                scale=scale,
+                window=window,
+            )
+            assert mx.array_equal(block[row : row + 1, :, pos : pos + 1], step)
