@@ -23,7 +23,6 @@ from ...oqh.modules import exact_rows as oqh_exact_rows
 from ..deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
 from ..glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
 from . import exact, indexing
-from .prefill_windows import window_width
 from . import kernels as hc_kernels
 from .config import TextConfig
 from .flash import CompressedIndexer
@@ -260,15 +259,6 @@ class Router(nn.Module):
         self._scale = args.routed_scaling_factor
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
-        width = window_width()
-        if width and x.ndim == 2 and x.shape[0] > width:
-            ids, weights = zip(
-                *(self._route(x[i : i + width]) for i in range(0, x.shape[0], width))
-            )
-            return mx.concatenate(ids), mx.concatenate(weights)
-        return self._route(x)
-
-    def _route(self, x: mx.array) -> tuple[mx.array, mx.array]:
         weight_t = self.weight.astype(mx.float32).T
         if exact.block(x):
             logits = exact.rowwise(lambda r: r.astype(mx.float32) @ weight_t, x)
@@ -796,39 +786,6 @@ class Attention(nn.Module):
         return self.unembed_out(out)
 
     def _prefill(self, q_nope, q_pe, latent, k_pe, topk, mask, sinks):
-        width = window_width()
-        length = q_nope.shape[2]
-        if not width or length <= width:
-            return self._prefill_window(q_nope, q_pe, latent, k_pe, topk, mask, sinks)
-
-        # Use the same sparse/dense crossover, KV extent and mask as the
-        # original forward at each storage boundary.
-        before = latent.shape[2] - length
-        blocks = []
-        for start in range(0, length, width):
-            end = min(start + width, length)
-            last_key = before + end
-            first_key = max(0, before + start - self.window + 1) if self.window else 0
-            indices = None
-            if topk is not None and last_key > self.index_module.topk:
-                indices = topk[..., start:end, :]
-            local_mask = (
-                None if mask is None else mask[..., start:end, first_key:last_key]
-            )
-            blocks.append(
-                self._prefill_window(
-                    q_nope[:, :, start:end],
-                    q_pe[:, :, start:end],
-                    latent[:, :, first_key:last_key],
-                    k_pe[:, :, first_key:last_key],
-                    indices,
-                    local_mask,
-                    sinks,
-                )
-            )
-        return mx.concatenate(blocks, axis=2)
-
-    def _prefill_window(self, q_nope, q_pe, latent, k_pe, topk, mask, sinks):
         if topk is not None:
             out = self._sparse_kernel(q_nope, q_pe, latent, k_pe, topk)
             if out is not None:
