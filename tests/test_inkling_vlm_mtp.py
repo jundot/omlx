@@ -631,6 +631,55 @@ def test_inkling2_verify_rollback_matches_sequential_decode(dims):
     assert mx.abs(got[..., :300] - expected[..., :300]).max().item() < 1e-4
 
 
+@pytest.mark.parametrize("width", [8, 16])
+@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
+def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width):
+    """With its projections quantized, each verify row has the bits of the
+    serial decode step for its token, also when an unflagged forward of the
+    verify width traced the compiled layers first."""
+    import mlx.nn as nn
+
+    from omlx.patches.qwen35_verify_qmm import (
+        apply_verify_qmm_patch,
+        set_verify_qmm_armed,
+    )
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("row-exact projections run on the GPU")
+    apply_verify_qmm_patch()
+    # Eight experts a token, so an 8-row block routes the 64 pairs that the
+    # gather would otherwise sort.
+    model = _inkling2_tiny(num_experts_per_tok=8, **dims)
+    assert not model._omlx_mtp_row_exact_verify
+    nn.quantize(
+        model,
+        group_size=64,
+        bits=8,
+        class_predicate=lambda _, m: isinstance(m, nn.Linear),
+    )
+    assert model._omlx_mtp_row_exact_verify
+    ids = mx.random.randint(0, 300, (1, 40 + width))
+    model(ids[:, :width], cache=model.make_cache())
+
+    def prefilled():
+        cache = model.make_cache()
+        model(ids[:, :40], cache=cache)
+        return cache
+
+    cache = prefilled()
+    serial = [
+        model(ids[:, t : t + 1], cache=cache)[0, -1] for t in range(40, 40 + width)
+    ]
+    cache = prefilled()
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        block = model(ids[:, 40 : 40 + width], cache=cache)[0]
+    finally:
+        set_verify_qmm_armed(False)
+    for row, expected in enumerate(serial):
+        assert mx.array_equal(block[row], expected)
+
+
 def test_inkling2_fused_kernels_match_reference():
     from omlx.patches.inkling2 import kernels
 
