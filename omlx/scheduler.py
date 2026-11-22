@@ -3401,6 +3401,9 @@ class Scheduler:
             floor = int(getattr(self, "_qwen35_prefill_floor", 0) or 0)
             if floor > hi and floor % window_size == 0:
                 lo = hi = floor
+        elif getattr(self.model, "model_type", None) == "hy_v4_flash":
+            # Top-16-of-512 routing leaves ~16 rows per expert at 512 tokens.
+            lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
