@@ -1346,6 +1346,38 @@ def test_chunk_backpressure_holds_mlx_at_the_peak_target(monkeypatch):
     assert calls == [20 * _GB + Scheduler._CHUNK_BACKPRESSURE_FLOOR_BYTES, None]
 
 
+def test_chunk_backpressure_keeps_growth_outside_mlx_free(monkeypatch):
+    """Growth outside MLX that peaked mid-chunk lowers later chunks' MLX limit."""
+    calls = []
+    monkeypatch.setattr(
+        sched_mod, "set_chunk_memory_limit", lambda owner, limit: calls.append(limit)
+    )
+    monkeypatch.setattr(sched_mod, "get_phys_footprint", lambda: 21 * _GB)
+    monkeypatch.setattr(sched_mod, "get_graphics_footprint", lambda: 20 * _GB)
+    monkeypatch.setattr(sched_mod, "reset_interval_max_phys_footprint", lambda: None)
+    ns = _throttle_ctx(current=30 * _GB, hard=50 * _GB)
+    ns._prefill_memory_guard = True
+    ns._last_mlx_active_memory_bytes = 20 * _GB
+    ns._current_usage_bytes = lambda **_: 30 * _GB
+    first_limit = 20 * _GB + Scheduler._prefill_peak_target(ns) - 30 * _GB
+
+    # MLX filled its limit and the footprint peaked 0.7 GB above it plus the
+    # 1 GB already outside MLX when the chunk started.
+    growth = 700 * 1024**2
+    peak = first_limit + _GB + growth
+    monkeypatch.setattr(sched_mod, "get_interval_max_phys_footprint", lambda: peak)
+    with Scheduler._chunk_backpressure(ns):
+        pass
+    assert calls == [first_limit, None], f"{calls!r}"
+
+    # A chunk that peaks lower does not shrink the margin.
+    calls.clear()
+    monkeypatch.setattr(sched_mod, "get_interval_max_phys_footprint", lambda: 0)
+    with Scheduler._chunk_backpressure(ns):
+        pass
+    assert calls == [first_limit - growth, None], f"{calls!r}"
+
+
 def _filled_caches():
     from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
 

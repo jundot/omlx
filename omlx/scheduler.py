@@ -128,7 +128,12 @@ from .utils.metal_sync import (
     set_chunk_memory_limit,
     unreleased_graphics_bytes,
 )
-from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
+from .utils.proc_memory import (
+    get_graphics_footprint,
+    get_interval_max_phys_footprint,
+    get_phys_footprint,
+    reset_interval_max_phys_footprint,
+)
 from .utils.sampling import make_no_repeat_ngram_processor, select_logprobs
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.sampling import make_shared_sampler as omlx_make_shared_sampler
@@ -6335,6 +6340,14 @@ class Scheduler:
         The guard sizes a chunk from a prediction. If the chunk needs more,
         MLX waits for in-flight command buffers to retire before it encodes
         further ops, so the chunk runs slower instead of crossing the target.
+
+        The limit binds only MLX, and MLX fills its pool up to it, so the
+        footprint lands at the limit plus whatever grew outside MLX during the
+        chunk. That growth peaks mid-chunk and is gone by the chunk boundary
+        (oQ8e at step 2048: 0.73 GB at each boundary, 1.40 GB mid-chunk, which
+        crossed the enforcer's hard watermark 0.57 GB above the target). The
+        kernel's interval peak catches it, and later chunks keep the largest
+        growth seen out of the MLX limit.
         """
         target = (
             Scheduler._prefill_peak_target(self)
@@ -6345,12 +6358,33 @@ class Scheduler:
             yield
             return
         current = self._current_usage_bytes(include_pool=False)
-        headroom = max(target - current, Scheduler._CHUNK_BACKPRESSURE_FLOOR_BYTES)
-        set_chunk_memory_limit(id(self), self._last_mlx_active_memory_bytes + headroom)
+        outside_growth = getattr(self, "_chunk_outside_mlx_growth_bytes", 0)
+        headroom = max(
+            target - current - outside_growth,
+            Scheduler._CHUNK_BACKPRESSURE_FLOOR_BYTES,
+        )
+        mlx_limit = self._last_mlx_active_memory_bytes + headroom
+        outside_at_start = max(0, get_phys_footprint() - get_graphics_footprint())
+        reset_interval_max_phys_footprint()
+        set_chunk_memory_limit(id(self), mlx_limit)
         try:
             yield
         finally:
             set_chunk_memory_limit(id(self), None)
+            peak = get_interval_max_phys_footprint()
+            # MLX stays under its limit, so the rest of the peak grew outside
+            # MLX. A chunk that did not fill the limit understates the growth;
+            # keeping the largest seen covers the chunks that do.
+            growth = peak - mlx_limit - outside_at_start
+            if peak > 0 and growth > outside_growth:
+                self._chunk_outside_mlx_growth_bytes = growth
+                logger.info(
+                    "Prefill chunk grew %.2fGB outside MLX's limit "
+                    "(peak=%.2fGB, mlx_limit=%.2fGB); later chunks keep it free",
+                    growth / 1e9,
+                    peak / 1e9,
+                    mlx_limit / 1e9,
+                )
 
     @staticmethod
     def _chunk_memory_sample() -> tuple[int, int, int]:
