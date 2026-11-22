@@ -4258,6 +4258,10 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         cumulative_hashes = image_hash_prefixes(images)
+        if model_type == QWEN4_EXP_MODEL_TYPE:
+            # 0.8.0 and 0.8.1 stored Qwen4 image KV without the h/w MRoPE axes.
+            # A new image key keeps those cached blocks from being restored.
+            cumulative_hashes = [f"{h}:mrope-hw" for h in cumulative_hashes]
 
         # Normalize audio to numpy float32 arrays expected by processor.
         # Request-facing string paths are rejected before this point; remaining
