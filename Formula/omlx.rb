@@ -1,8 +1,8 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.8.2.tar.gz"
-  sha256 "286a4106aa39815a1dd2b3b0935e736c363e461b071573581f7c4da2dfee2cdc"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.8.3.tar.gz"
+  sha256 "ccc4939f6ee9ec57a56b8b26333d1e5c0f5b4723d8165ba33cb87832ddac01ac"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
