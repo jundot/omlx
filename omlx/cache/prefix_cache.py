@@ -2126,12 +2126,8 @@ class BlockAwarePrefixCache(CacheManager):
                 continue
 
         if max_seq_len > 0:
-            # A CacheList member that holds the whole sequence must win over
-            # a RotatingKVCache window. hy_v4_flash has CacheList layers
-            # (sparse attention) beside RotatingKVCache layers and no plain
-            # KVCache layer; with the window length here, a store after a
-            # prefix restore slices the new blocks from the start of the
-            # live cache.
+            # A CacheList member with the whole sequence wins over the window,
+            # else a store after a restore slices new blocks from index 0.
             list_seq_len = self._cache_list_seq_len(cache_data)
             if list_seq_len > max_seq_len:
                 logger.debug(
@@ -2171,7 +2167,6 @@ class BlockAwarePrefixCache(CacheManager):
 
     @staticmethod
     def _cache_list_seq_len(cache_data: list[dict[str, Any]]) -> int:
-        """Longest sequence dimension among the 4D sub-states of CacheList layers."""
         longest = 0
         for layer_state in cache_data:
             if (
