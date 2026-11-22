@@ -1146,6 +1146,22 @@ def test_inkling2_loop_projection_slices_match_the_stacked_call(
             assert mx.abs(g.astype(mx.float32) - e.astype(mx.float32)).max() < 1e-5
 
 
+@pytest.mark.parametrize(
+    "kwargs, effort",
+    [
+        ({"enable_thinking": False}, "none"),
+        ({"reasoning_effort": "off", "enable_thinking": False}, "none"),
+        ({"enable_thinking": False, "reasoning_effort": "low"}, "low"),
+        ({"enable_thinking": True}, None),
+    ],
+)
+def test_inkling2_thinking_switch_reaches_the_template_effort(kwargs, effort):
+    from omlx.engine.vlm import _apply_template_thinking_mode
+
+    _apply_template_thinking_mode("inkling2_loop", kwargs)
+    assert kwargs.get("reasoning_effort") == effort
+
+
 @pytest.mark.parametrize("engine", ["text", "vlm"])
 def test_inkling2_keeps_dense_kv_when_kv_quantization_is_on(mock_tokenizer, engine):
     """Its attention reads dense keys: a packed cache fails on the first forward."""
