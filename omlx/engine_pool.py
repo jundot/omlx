@@ -648,6 +648,17 @@ class EnginePool:
                 if v41_offload
                 else v41_estimate.resident_bytes
             )
+        if (
+            entry.engine_type == "vlm"
+            and entry.config_model_type == "hy_v4_flash"
+            and getattr(runtime_settings, "hy4_engram_ssd_offload", False)
+        ):
+            from .patches.hy_v4.engram_ssd import plan_engram_ssd
+
+            # Discovery charges the same 5% allowance on the table payload as
+            # on other weights. Keep the allowance on the resident remainder.
+            removed = plan_engram_ssd(entry.model_path).table_bytes
+            base = min(base, max(0, entry.estimated_size - int(removed * 1.05)))
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -1336,6 +1347,11 @@ class EnginePool:
                 entry, settings
             )
             add("deepseek_v41_engram_ssd_offload", v41_offload)
+            if entry.config_model_type == "hy_v4_flash":
+                add(
+                    "hy4_engram_ssd_offload",
+                    bool(data.get("hy4_engram_ssd_offload", False)),
+                )
             add(
                 "deepseek_v41_ced_prefill_enabled",
                 ced_prefill_on(settings),
@@ -4181,6 +4197,11 @@ class EnginePool:
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
             )
+            hy4_engram_on_ssd = entry.config_model_type == "hy_v4_flash" and getattr(
+                model_settings, "hy4_engram_ssd_offload", False
+            )
+            if hy4_engram_on_ssd and effective_type != "vlm":
+                raise ValueError("Hy4 Engram SSD offload requires the VLM engine")
             if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
@@ -4379,6 +4400,8 @@ class EnginePool:
                 if isinstance(engine, SplashEngine):
                     # start() already stopped Splash; its error carries the
                     # tail of the Splash log. There is no MLX fallback.
+                    raise
+                if hy4_engram_on_ssd:
                     raise
                 if force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't

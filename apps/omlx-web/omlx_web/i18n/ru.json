@@ -1320,7 +1320,7 @@
   "modal.model_settings.enable_thinking_default": "Использовать значение модели по умолчанию",
   "modal.model_settings.enable_thinking_reset": "Сбросить к значению модели по умолчанию",
   "modal.model_settings.ssd_ngram_offload": "Выгрузка N-gram на SSD",
-  "modal.model_settings.ssd_ngram_offload_hint": "Хранит большую таблицу N-gram (Qwen4 PLE или DeepSeek V4.1 Engram) на SSD и читает только нужные строки. Экономит память, но скорость зависит от чтения с SSD. При изменении этой настройки модель перезагружается.",
+  "modal.model_settings.ssd_ngram_offload_hint": "Хранит большую таблицу N-gram на SSD и читает только нужные строки. Экономит память, но скорость зависит от чтения с SSD. При изменении этой настройки модель перезагружается.",
   "modal.model_settings.ssd_ngram_offload_forced": "Required because resident loading exceeds the configured model-memory limit.",
   "modal.model_settings.deepseek_v41_ced_prefill": "CED Prefill Acceleration (DeepSeek V4.1)",
   "modal.model_settings.deepseek_v41_ced_prefill_hint": "Ускоряет префилл примерно на 74–79 % в протестированных конфигурациях. Использует архитектуру Causal Encoder–Decoder модели, чтобы сократить вычисления префилла декодера.",

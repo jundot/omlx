@@ -2288,6 +2288,8 @@
                         model?.deepseek_v41_engram_ssd_offload_supported === true,
                     deepseek_v41_engram_ssd_offload_forced:
                         model?.deepseek_v41_engram_ssd_offload_forced === true,
+                    hy4_engram_ssd_offload: s.hy4_engram_ssd_offload === true,
+                    hy4_engram_ssd_offload_supported: model?.hy4_engram_ssd_offload_supported === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     enableGpuPowerLimit: !!(s.gpu_power_limit_w),
@@ -3448,6 +3450,7 @@
                 if (this.modelSettings.deepseek_v41_engram_ssd_offload_supported) {
                     return 'deepseek_v41_engram_ssd_offload';
                 }
+                if (this.modelSettings.hy4_engram_ssd_offload_supported) return 'hy4_engram_ssd_offload';
                 return null;
             },
 
@@ -3633,6 +3636,7 @@
                         ms.deepseek_v41_engram_ssd_offload_forced
                             ? !!ms.deepseek_v41_engram_ssd_offload_requested
                             : !!ms.deepseek_v41_engram_ssd_offload,
+                    hy4_engram_ssd_offload: !!ms.hy4_engram_ssd_offload,
                     thinking_budget_enabled: ms.enableThinkingBudget,
                     thinking_budget_tokens: ms.enableThinkingBudget
                         ? (ms.thinking_budget_tokens || null)

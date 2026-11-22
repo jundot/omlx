@@ -2145,6 +2145,19 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
+                if model_type == "hy_v4_flash" and getattr(
+                    self._model_settings, "hy4_engram_ssd_offload", False
+                ):
+                    from ..patches.hy_v4.engram_ssd import load
+
+                    return load(
+                        self._model_name,
+                        trust_remote_code=self._trust_remote_code,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
+                        ),
+                    )
+
                 if model_type == "deepseek_v41":
                     from ..patches.deepseek_v41.loading import load
 
@@ -3093,6 +3106,10 @@ class VLMBatchedEngine(BaseEngine):
 
         if engine:
             await engine.stop()
+
+        engram = getattr(self._vlm_model, "_omlx_engram_ssd", None)
+        if engram is not None:
+            engram.close()
 
         if self._vision_cache is not None:
             try:

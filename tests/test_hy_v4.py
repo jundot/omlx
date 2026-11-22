@@ -153,6 +153,56 @@ def _ids(seed, n=SEQ):
     return np.random.default_rng(seed).integers(10, VOCAB - 20, size=n)
 
 
+@pytest.mark.parametrize("affine", [False, True])
+def test_engram_ssd_matches_resident(tmp_path, monkeypatch, affine):
+    from mlx_vlm import utils
+
+    from omlx.patches.hy_v4 import apply_patch
+    from omlx.patches.hy_v4.engram_ssd import load, plan_engram_ssd
+
+    apply_patch()
+    config = _flash_config()
+    config["text_config"]["engram_n_embed_per_ngram"] = 64
+    weights = dict(tree_flatten(_model(config).parameters()))
+    recipe = {"bits": 4, "group_size": 32, "mode": "affine"}
+    index = {}
+    for i, (key, value) in enumerate(list(weights.items())):
+        if not key.endswith(".multi_head_embedding.embedding.weight"):
+            continue
+        tensors = {key: value.astype(mx.bfloat16)}
+        if affine:
+            prefix = key.removesuffix(".weight")
+            packed, scales, biases = mx.quantize(tensors[key], **recipe)
+            tensors = {key: packed}
+            tensors.update({f"{prefix}.scales": scales, f"{prefix}.biases": biases})
+            config.setdefault("quantization", dict(recipe))[prefix] = dict(recipe)
+        shard = f"table-{i}.safetensors"
+        mx.save_safetensors(str(tmp_path / shard), tensors, metadata={"format": "mlx"})
+        index.update(dict.fromkeys(tensors, shard))
+        del weights[key]
+    mx.save_safetensors(
+        str(tmp_path / "backbone.safetensors"), weights, metadata={"format": "mlx"}
+    )
+    index.update(dict.fromkeys(weights, "backbone.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": index})
+    )
+    monkeypatch.setattr(utils, "load_processor", lambda *a, **k: object())
+    monkeypatch.setattr(utils, "load_image_processor", lambda *a, **k: None)
+
+    resident, _ = utils.load(tmp_path)
+    expected = _run(resident, _ids(3), [24, 9, 7])
+    model, _ = load(tmp_path)
+    try:
+        params = dict(tree_flatten(model.parameters()))
+        skipped = plan_engram_ssd(tmp_path).skipped.values()
+        assert not any(k in params for keys in skipped for k in keys)
+        np.testing.assert_array_equal(expected, _run(model, _ids(3), [24, 9, 7]))
+    finally:
+        model._omlx_engram_ssd.close()
+
+
 def _run(model, ids, chunks):
     cache = model.make_cache()
     outs, start = [], 0
