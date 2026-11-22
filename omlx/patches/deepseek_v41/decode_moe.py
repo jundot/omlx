@@ -349,19 +349,42 @@ inline void affine_codes8(const device uchar* p, thread float* q) {
         }
     }
 }
+// The codes one lane reads per step in aff8_rows / aff8_rows_nb: 16 at 2 bits (one uint32), else 8.
+template <int BITS>
+constexpr int aff_lane_codes() { return BITS == 2 ? 16 : 8; }
+// 2- and 4-bit codes are read in place, as MLX's qdot does: q[j] = code j * 2^(BITS * j), masked
+// but not shifted down, against x pre-scaled by aff_unit<BITS>(j) = 2^-(BITS * j). Scaling by a
+// power of two is exact in fp32 (no under- or overflow at these magnitudes), so each product
+// q[j] * x[j] is code * x bit for bit. These rows kernels are bound by code decoding at 2 bits
+// (~690 GB/s, against ~950 GB/s at 4 and 8 bits), so a shift per code and, at 2 bits, half the
+// per-step loads and loop work (16 codes per lane) are what they spend less on.
+template <int BITS>
+inline float aff_unit(int j) { return (BITS == 2 || BITS == 4) ? as_type<float>(uint(127 - BITS * j) << 23) : 1.0f; }
+template <int BITS>
+inline void affine_codes_lane(const device uchar* p, thread float* q) {
+    constexpr uint MASK = (1u << BITS) - 1u;
+    if (BITS == 2 || BITS == 4) {
+        const uint v = *reinterpret_cast<const device uint*>(p);
+        for (int j = 0; j < aff_lane_codes<BITS>(); ++j) q[j] = float(v & (MASK << (BITS * j)));
+    } else {
+        affine_codes8<BITS>(p, q);
+    }
+}
 template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff8_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* acc) {
-    static_assert(K % GS == 0 && GS % 8 == 0, "K must be a multiple of whole 8-value groups");
+    constexpr int N = aff_lane_codes<BITS>();
+    static_assert(K % GS == 0 && GS % N == 0, "K must be a multiple of whole lane steps");
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
-    for (uint k = lane * 8; k < uint(K); k += 256) {
-        float xv[8], xs = 0.0f;
-        for (int i = 0; i < 8; ++i) { xv[i] = float(x[k + i]); xs += xv[i]; }
+    for (uint k = lane * N; k < uint(K); k += 32 * N) {
+        float xv[N], xs = 0.0f;
+        for (int i = 0; i < N; ++i) { xv[i] = float(x[k + i]); xs += xv[i]; }
+        for (int i = 0; i < N; ++i) xv[i] *= aff_unit<BITS>(i);
         for (int r = 0; r < ROWS; ++r) {
             const auto wr = reinterpret_cast<const device uchar*>(w + size_t(row0 + r) * (K * BITS / 32)) + k * BITS / 8;
-            float q[8];
-            affine_codes8<BITS>(wr, q);
+            float q[N];
+            affine_codes_lane<BITS>(wr, q);
             float a = 0.0f;
-            for (int j = 0; j < 8; ++j) a = fma(q[j], xv[j], a);
+            for (int j = 0; j < N; ++j) a = fma(q[j], xv[j], a);
             const size_t g = size_t(row0 + r) * (K / GS) + k / GS;
             acc[r] = fma(float(s[g]), a, fma(float(b[g]), xs, acc[r]));
         }
@@ -371,24 +394,26 @@ inline void aff8_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* ac
 // aff8_rows for NB vectors sharing each weight decode; per vector the arithmetic is aff8_rows'.
 template <int K, int ROWS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff8_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thread float* acc) {
-    static_assert(K % GS == 0 && GS % 8 == 0, "K must be a multiple of whole 8-value groups");
+    constexpr int N = aff_lane_codes<BITS>();
+    static_assert(K % GS == 0 && GS % N == 0, "K must be a multiple of whole lane steps");
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
-    for (uint k = lane * 8; k < uint(K); k += 256) {
-        float q[ROWS][8], sc[ROWS], bi[ROWS];
+    for (uint k = lane * N; k < uint(K); k += 32 * N) {
+        float q[ROWS][N], sc[ROWS], bi[ROWS];
         for (int r = 0; r < ROWS; ++r) {
             const auto wr = reinterpret_cast<const device uchar*>(w + size_t(row0 + r) * (K * BITS / 32)) + k * BITS / 8;
-            affine_codes8<BITS>(wr, q[r]);
+            affine_codes_lane<BITS>(wr, q[r]);
             const size_t g = size_t(row0 + r) * (K / GS) + k / GS;
             sc[r] = float(s[g]);
             bi[r] = float(b[g]);
         }
         for (int v = 0; v < NB; ++v) {
             const auto xb = x + size_t(v) * XS + k;
-            float xv[8], xs = 0.0f;
-            for (int i = 0; i < 8; ++i) { xv[i] = float(xb[i]); xs += xv[i]; }
+            float xv[N], xs = 0.0f;
+            for (int i = 0; i < N; ++i) { xv[i] = float(xb[i]); xs += xv[i]; }
+            for (int i = 0; i < N; ++i) xv[i] *= aff_unit<BITS>(i);
             for (int r = 0; r < ROWS; ++r) {
                 float a = 0.0f;
-                for (int j = 0; j < 8; ++j) a = fma(q[r][j], xv[j], a);
+                for (int j = 0; j < N; ++j) a = fma(q[r][j], xv[j], a);
                 acc[r * NB + v] = fma(sc[r], a, fma(bi[r], xs, acc[r * NB + v]));
             }
         }
