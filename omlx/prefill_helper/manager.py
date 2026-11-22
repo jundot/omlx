@@ -104,8 +104,8 @@ def helper_budget(info: dict) -> list[int]:
 
 
 def helper_reserve(info: dict) -> int:
-    """Bytes the helper keeps free on each GPU besides its layers."""
-    # A helper daemon plans its stages with its own reserve and reports it.
+    """Bytes the helper keeps free on each GPU besides its layers; a helper
+    daemon reports the reserve it plans its stages with."""
     reserve = info.get("reserve")
     return _RESERVE_BYTES if reserve is None else int(reserve)
 
