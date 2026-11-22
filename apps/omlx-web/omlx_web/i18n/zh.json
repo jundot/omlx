@@ -1475,7 +1475,7 @@
   "modal.model_settings.vlm_mtp": "VLM MTP",
   "modal.model_settings.vlm_mtp_hint": "使用 mlx-vlm 提供的外部草稿模型（Gemma 4 assistant 或 Qwen MTP），而非内置的 Lightning MTP 草稿头。",
   "modal.model_settings.vlm_mtp_conflict": "请先关闭 DFlash / SpecPrefill / MTP / TurboQuant KV — VLM MTP 独占推测解码路径。",
-  "modal.model_settings.vlm_mtp_processor_conflict": "请先清除重复惩罚/存在惩罚、思考 Token 限制和引导语法 — VLM MTP 无法应用逐请求的 logits 处理器。",
+  "modal.model_settings.vlm_mtp_processor_conflict": "请先清除重复惩罚/存在惩罚和引导语法 — VLM MTP 无法应用逐请求的 logits 处理器。思考预算仍可使用。",
   "modal.model_settings.vlm_mtp_processor_locked": "VLM MTP 启用时锁定——此设置需要逐请求的 logits 处理器，而 VLM MTP 无法应用。",
   "modal.model_settings.vlm_mtp_draft_model": "草稿模型",
   "modal.model_settings.vlm_mtp_draft_model_placeholder": "选择助手草稿模型或 MTP 草稿模型…",
