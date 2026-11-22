@@ -245,10 +245,17 @@ class PrefillTransientTracker:
         wider = [width for width in widths if width >= n_tokens]
         if n_tokens > 0 and wider:
             nearest = min(wider)
-            charge = min(
-                charge,
-                max(bytes_ for width, bytes_ in widths.items() if width <= nearest),
-            )
+            cap = max(bytes_ for width, bytes_ in widths.items() if width <= nearest)
+            if nearest > n_tokens and min(widths) > n_tokens:
+                # Only wider chunks were measured, so their whole overhead
+                # would land on this chunk: after 4096-token chunks, a 32-token
+                # floor chunk was charged 6 GB and a 100K prompt was rejected
+                # 4K tokens in with 5 GB of the cap unused. Growth is sublinear in width, and cube-root
+                # scaling stays above each pair of the figures above (2048 to
+                # 32 tokens: 244 MB charged, 139 MB measured), so it applies
+                # until a chunk this narrow is measured.
+                cap = int(cap * (n_tokens / nearest) ** (1 / 3))
+            charge = min(charge, cap)
         return charge
 
     def predict(
