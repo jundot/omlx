@@ -804,3 +804,82 @@ def test_inkling2_vision_encodes_images_independently_and_splices_tokens():
     assert mx.allclose(embeds[0, 1:3], alone.astype(embeds.dtype))
     with pytest.raises(ValueError):
         model.embed_inputs(mx.array([[image, 1]]), second, [[1, 1, 2]])
+
+
+@pytest.mark.parametrize(
+    "quant",
+    [
+        None,
+        {"group_size": 64, "bits": 8},
+        {"group_size": 64, "bits": 4},
+        {"group_size": 32, "bits": 8, "mode": "mxfp8"},
+        {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+    ],
+    ids=["bf16", "affine8", "affine4", "mxfp8", "nvfp4"],
+)
+def test_inkling2_loop_projection_slices_match_the_stacked_call(
+    strict_math_device, quant
+):
+    """Later loop passes project q, k and v through their own rows of
+    ``in_proj``; a wrapped projection keeps the stacked call."""
+    import mlx.nn as nn
+
+    from omlx.patches.inkling2.model import Inkling2Attention, TextArgs
+
+    args = TextArgs(
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        swa_num_attention_heads=4,
+        swa_num_key_value_heads=2,
+        swa_head_dim=32,
+        sliding_window_size=8,
+        rel_extent=8,
+        d_rel=8,
+        local_layer_ids=[0],
+    )
+    attn = Inkling2Attention(args, layer_idx=0)
+    mx.random.seed(11)
+    attn.update(
+        {
+            name: (mx.random.normal(getattr(attn, name).shape) * 0.1 + offset).astype(
+                mx.bfloat16
+            )
+            for name, offset in (
+                ("k_conv", 0.0),
+                ("v_conv", 0.0),
+                ("q_scale", 1.0),
+                ("r_scale", 1.0),
+                ("rel_proj", 0.0),
+            )
+        }
+    )
+    attn.in_proj.weight = (mx.random.normal(attn.in_proj.weight.shape) * 0.05).astype(
+        mx.bfloat16
+    )
+    if quant is not None:
+        attn.in_proj = nn.QuantizedLinear.from_linear(attn.in_proj, **quant)
+
+    class Wrapped(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        def __call__(self, x):
+            return self.inner(x)
+
+    sliced, stacked = attn.in_proj, Wrapped(attn.in_proj)
+    for batch, length in ((1, 1), (2, 5), (1, 20)):
+        xq, xk, xv = (
+            (mx.random.normal((batch, length, 128)) * 0.2).astype(mx.bfloat16)
+            for _ in range(3)
+        )
+        state = mx.random.normal((batch, args.sconv_kernel_size - 1, attn.dkv)) * 0.1
+        attn.in_proj = sliced
+        got = attn.project(xq, xk, xv, state, state, None)
+        attn.in_proj = stacked
+        expected = attn.project(xq, xk, xv, state, state, None)
+        for g, e in zip(got, expected):
+            assert mx.abs(g.astype(mx.float32) - e.astype(mx.float32)).max() < 1e-5
