@@ -17,6 +17,7 @@ from typing import Any
 from . import CONTROL_VERSION, DATA_PROTOCOL, __version__, checkpoint, gpus, wire
 from .files import FileError, ModelStore
 from .state import State
+from .supervisor import RESERVE_BYTES
 
 logger = logging.getLogger("omlx_cuda_helper.control")
 
@@ -163,6 +164,7 @@ class ControlServer:
                 "contracts": self.contracts,
                 "oqh": self.oqh,
                 "gpus": gpus.gpus(self.gpu_indices),
+                "reserve": RESERVE_BYTES,
                 "ram": total,
                 "ram_available": available,
                 "disk_free": gpus.disk_free(self.store.root),

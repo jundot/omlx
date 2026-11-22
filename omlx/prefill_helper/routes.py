@@ -30,6 +30,7 @@ from .manager import (
     file_prep,
     fit_layers,
     helper_budget,
+    helper_reserve,
     prepare,
     this_host,
     transport_for,
@@ -109,7 +110,9 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
         return {**row, "online": False, "reason": str(error)}
     shared, per_layer = adapter.memory_plan(model_path)
     limit = adapter.split_limit(len(per_layer))
-    held = fit_layers(shared, per_layer, helper_budget(info), limit)
+    held = fit_layers(
+        shared, per_layer, helper_budget(info), limit, helper_reserve(info)
+    )
     lending = info.get("lending")
     if lending:
         lending = {

@@ -335,6 +335,7 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
         "oqh": info.get("oqh") or {},
         "budgets": budgets,
         "budget": sum(budgets),
+        "reserve": info.get("reserve"),
         "memory": sum(int(gpu["total"]) for gpu in gpus),
         "integrated": any(gpu.get("integrated") for gpu in gpus),
         "device": device,

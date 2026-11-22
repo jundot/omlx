@@ -1678,6 +1678,27 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch, caplog):
     assert (version["status"], version["fix"]) == ("pass", "")
 
 
+def test_a_helper_daemon_is_planned_with_the_room_it_keeps(monkeypatch):
+    gib = 1 << 30
+    adapter = SimpleNamespace(
+        memory_plan=lambda path: (2 * gib, [gib] * 40), split_limit=lambda n: n - 1
+    )
+    info = {"budgets": [24 * gib], "reserve": 6 * gib}
+    daemon = SimpleNamespace(
+        resolve_target=lambda node: SimpleNamespace(link="ethernet"),
+        remote_info=lambda target: info,
+        incompatible=lambda *args: None,
+    )
+    monkeypatch.setattr(helper_routes, "transport_for", lambda node: daemon)
+    device = {"node_id": "n", "friendly_name": "nvidia1"}
+    assert helper_routes._candidate(device, "/m", adapter)["layers_fit"] == 16
+    assert manager_module.held_layers(adapter, "/m", info, "nvidia1") == 16
+    # An older helper does not say, so this Mac keeps its own 8 GiB.
+    del info["reserve"]
+    assert helper_routes._candidate(device, "/m", adapter)["layers_fit"] == 14
+    assert manager_module.held_layers(adapter, "/m", info, "nvidia1") == 14
+
+
 # ---------------------------------------------------------------------------
 # GLM-5.3: KDA and sparse-attention layers on either side of the cut.
 # ---------------------------------------------------------------------------
