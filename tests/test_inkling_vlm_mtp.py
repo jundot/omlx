@@ -2179,3 +2179,303 @@ def test_inkling2_long_context_verify_rows_match_serial_decode(monkeypatch):
     assert calls
     for row, expected in enumerate(serial):
         assert mx.array_equal(block[row], expected)
+
+
+# ---------------------------------------------------------------------------
+# Inkling 2 FP8 KV cache (the ``inkling2_fp8_kv`` model setting).
+# ---------------------------------------------------------------------------
+
+
+def _cos(a, b):
+    a, b = a.astype(mx.float32).reshape(-1), b.astype(mx.float32).reshape(-1)
+    return (mx.sum(a * b) / mx.sqrt(mx.sum(a * a) * mx.sum(b * b))).item()
+
+
+def test_inkling2_fp8_codec_is_exact_e4m3_on_gpu_and_cpu():
+    from omlx.patches.inkling2 import kernels
+
+    # Every finite code survives a round trip, in each activation dtype.
+    codes = mx.array([c for c in range(256) if c & 0x7F != 0x7F], dtype=mx.uint8)
+    assert codes.size == 254
+    for dtype in (mx.float32, mx.bfloat16, mx.float16):
+        values = kernels.fp8_dequantize(codes, dtype)
+        assert mx.array_equal(values, kernels.fp8_dequantize_reference(codes, dtype))
+        assert mx.array_equal(kernels.fp8_quantize(values), codes)
+    values = np.asarray(kernels.fp8_dequantize(codes, mx.float32))
+    assert values.max() == 448.0 and np.abs(values[values != 0]).min() == 2.0**-9
+
+    # Rounding: random magnitudes, every midpoint between neighbours (ties to
+    # even), saturation and non-finite inputs; the kernel and the MLX ops agree
+    # and pick the nearest code.
+    mx.random.seed(11)
+    grid = np.sort(np.unique(np.abs(values)))
+    mids = mx.array((grid[1:] + grid[:-1]) / 2)
+    x = mx.concatenate(
+        [mx.random.normal((2048,)) * s for s in (0.002, 0.05, 1.0, 40.0, 500.0)]
+        + [mids, -mids, mx.array([448.0, 900.0, -900.0, float("inf"), float("nan")])]
+    )
+    got = kernels.fp8_quantize(x)
+    assert mx.array_equal(got, kernels.fp8_quantize_reference(x))
+    assert got[-5:].tolist() == [0x7E, 0x7E, 0xFE, 0x7E, 0]
+    finite = np.clip(np.asarray(x[:-2]), -448.0, 448.0)
+    error = np.abs(finite - np.asarray(kernels.fp8_dequantize(got[:-2], mx.float32)))
+    assert np.array_equal(error, np.abs(finite[:, None] - values[None]).min(axis=1))
+    even = np.asarray(kernels.fp8_quantize(mids))
+    assert not (even[np.asarray(mids) < 448.0] & 1).any()
+
+    # Head-major views of [B, L, H, D] projections are read in place.
+    y = mx.random.normal((2, 5, 3, 32)).astype(mx.bfloat16).transpose(0, 2, 1, 3)
+    assert mx.array_equal(kernels.fp8_quantize(y), kernels.fp8_quantize_reference(y))
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize(
+    "hq,hkv,d,r,s,window",
+    [(12, 4, 128, 32, 700, 0), (48, 8, 128, 64, 2500, 0), (4, 2, 32, 16, 90, 16)],
+    ids=["full", "full-long", "sliding"],
+)
+def test_inkling2_fp8_attention_matches_dense_attention(dtype, hq, hkv, d, r, s, window):
+    """Decode, verify and prefill rows over FP8 K/V equal FP32 attention over
+    the decoded K/V up to the output rounding, and stay close to attention
+    over the unquantized K/V."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    mx.random.seed(29)
+
+    def clipped(shape):
+        x = mx.random.normal(shape)
+        return (x / mx.sqrt(mx.sum(x * x, axis=-1, keepdims=True)) * 10).astype(dtype)
+
+    def f32(x):
+        return x.astype(mx.float32)
+
+    q, k = clipped((2, hq, 64, d)), clipped((2, hkv, s, d))
+    v = mx.fast.rms_norm(mx.random.normal((2, hkv, s, d)), None, 1e-6).astype(dtype)
+    rel = (mx.random.normal((2, 64, hq, r)) * 0.2).astype(dtype)
+    sink = mx.random.normal((2, 64, hq)).astype(dtype)
+    k8, v8 = kernels.fp8_quantize(k), kernels.fp8_quantize(v)
+    kd, vd = kernels.fp8_dequantize(k8, mx.float32), kernels.fp8_dequantize(v8, mx.float32)
+    pad = mx.array([0, 23], dtype=mx.int32)
+    cases = ((1, 1, None), (1, 5, None), (1, 64, None), (2, 1, pad), (2, 40, pad))
+    for b, length, left_padding in cases:
+        qb, relb, sinkb = q[:b, :, :length], rel[:b, :length], sink[:b, :length]
+        tail = (f32(relb), f32(sinkb), d**-0.5, window, left_padding)
+        got = kernels.banded_sink_attention(
+            qb, k8[:b], v8[:b], relb, sinkb,
+            scale=d**-0.5, window=window, left_padding=left_padding,
+        )
+        decoded = kernels._masked_attention(f32(qb), kd[:b], vd[:b], *tail)
+        dense = kernels._masked_attention(f32(qb), f32(k[:b]), f32(v[:b]), *tail)
+        assert got.dtype == dtype and got.shape == decoded.shape
+        bound = 5e-3 * max(1.0, mx.abs(decoded).max().item())
+        assert mx.abs(f32(got) - decoded).max().item() < bound, (b, length)
+        assert _cos(got, dense) > 0.995, (b, length)
+
+
+@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
+@pytest.mark.parametrize("mode", ["full", "all"])
+def test_inkling2_fp8_kv_cache_holds_codes_through_rollback_restore_and_merge(
+    mode, dims
+):
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    from omlx.cache.paged_ssd_cache import (
+        _extract_tensor_bytes,
+        _restore_tensor_from_bytes,
+    )
+    from omlx.cache.type_handlers import SizedArraysCache
+    from omlx.patches.inkling2 import cache as windows
+
+    model = _bf16(_inkling2_tiny(sliding_window_size=16, rel_extent=16, **dims))
+    ids = mx.random.randint(0, 300, (1, 64))
+    # A flash prefill chunk, a short one, decode steps and a verify rollback.
+    steps, pos = [40, 6, 1, (8, 2), 1, 1], 52
+    exact, exact_cache = _run_inkling2_steps(model, ids, steps)
+
+    def restored(source):
+        # The way the SSD cache rebuilds a cache, tensors through their bytes.
+        out = []
+        for entry in source:
+            if isinstance(entry, KVCache):
+                copy = KVCache()
+                keys, values, *rest = entry.state
+                copy.state = [
+                    _restore_tensor_from_bytes(*_extract_tensor_bytes(keys)),
+                    _restore_tensor_from_bytes(*_extract_tensor_bytes(values)),
+                    *rest,
+                ]
+            else:
+                plain = ArraysCache(len(entry.cache))
+                plain.cache = list(entry.cache)
+                copy = SizedArraysCache(plain, pos)
+            out.append(copy)
+        return model.restore_cache(out)
+
+    exact_copy = restored(exact_cache)
+    exact_next = model(ids[:, pos : pos + 8], cache=exact_cache)
+    model.set_fp8_kv(mode)
+    got, cache = _run_inkling2_steps(model, ids, steps)
+    for a, b in zip(got, exact):
+        # Lossy, and a tiny random model amplifies it; the kernels' numerics
+        # are held by the attention test above.
+        assert _cos(a[..., :300], b[..., :300]) > 0.85
+
+    # Only the visits the mode names hold codes, and half the bytes.
+    visits = model.model.visit_caches(cache)
+    held = [kv.keys if kv is not None else state[windows.KEYS] for kv, state in visits]
+    assert [a.dtype == mx.uint8 for a in held] == [
+        kv is not None or mode == "all" for kv, _ in visits
+    ]
+    full = [(c.keys, e.keys) for c, e in zip(cache, exact_cache) if type(c) is KVCache]
+    assert all(2 * c.nbytes == e.nbytes for c, e in full)
+
+    # A restored cache continues bit for bit. So does an exact one, although
+    # the setting is on: held keys keep their format.
+    again = restored(cache)
+    expected = model(ids[:, pos : pos + 8], cache=cache)
+    assert mx.array_equal(model(ids[:, pos : pos + 8], cache=again), expected)
+    assert mx.array_equal(model(ids[:, pos : pos + 8], cache=exact_copy), exact_next)
+
+    # Rows of different lengths join the way the batch generator joins them
+    # and decode as they do alone.
+    lengths, alone, expected = (41, 9), [], []
+    for n in lengths:
+        alone.append(model.make_cache())
+        model(ids[:, :n], cache=alone[-1])
+        reference = model.make_cache()
+        model(ids[:, :n], cache=reference)
+        expected.append(model(ids[:, n : n + 1], cache=reference)[0, -1, :300])
+    joined = []
+    for a, b in zip(*alone):
+        if hasattr(a, "offset"):
+            joined.append(type(a).merge([a, b]))
+        else:
+            a.extend(b)
+            joined.append(a)
+    tokens = mx.stack([ids[0, n] for n in lengths])[:, None]
+    got = model(tokens, cache=joined)[:, -1, :300]
+    for row in range(2):
+        # A batch takes the flash decode kernel on the layers that stay
+        # dense; it rounds apart from the one-row step within that kernel's
+        # own bound, with the setting off as well.
+        assert mx.abs(got[row] - expected[row]).max().item() < 1e-2
+
+
+def test_inkling2_fp8_kv_row_exact_verify_rows_match_serial_decode():
+    import mlx.nn as nn
+
+    from omlx.patches.qwen35_verify_qmm import (
+        apply_verify_qmm_patch,
+        set_verify_qmm_armed,
+    )
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("row-exact projections run on the GPU")
+    apply_verify_qmm_patch()
+    model = _inkling2_tiny(num_experts_per_tok=8, **_TINY_LOOP)
+    nn.quantize(
+        model,
+        group_size=64,
+        bits=8,
+        class_predicate=lambda _, m: isinstance(m, nn.Linear),
+    )
+    model.set_fp8_kv("all")
+    ids = mx.random.randint(0, 300, (1, 48))
+
+    def prefilled():
+        cache = model.make_cache()
+        model(ids[:, :40], cache=cache)
+        return cache
+
+    cache = prefilled()
+    serial = [model(ids[:, t : t + 1], cache=cache)[0, -1] for t in range(40, 48)]
+    cache = prefilled()
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        block = model(ids[:, 40:48], cache=cache)[0]
+    finally:
+        set_verify_qmm_armed(False)
+    for row, expected in enumerate(serial):
+        assert mx.array_equal(block[row], expected)
+
+
+def test_inkling2_fp8_kv_setting_is_validated_saved_and_reloads_the_engine(tmp_path):
+    from test_engine_pool import _make_pool
+
+    from omlx.engine_pool import EngineEntry
+    from omlx.model_settings import ModelSettings, ModelSettingsManager
+
+    assert ModelSettings().inkling2_fp8_kv == "off"
+    for bad in ("on", True, None, "FULL"):
+        with pytest.raises(ValueError, match="inkling2_fp8_kv"):
+            ModelSettings(inkling2_fp8_kv=bad)
+    manager = ModelSettingsManager(tmp_path)
+    manager.set_settings("inkling", ModelSettings(inkling2_fp8_kv="full"))
+    saved = ModelSettingsManager(tmp_path).get_settings("inkling")
+    assert saved.inkling2_fp8_kv == "full"
+    # A profile carries it like any other setting.
+    manager.save_profile("inkling", "fp8", "FP8", None, {"inkling2_fp8_kv": "all"})
+    assert manager.apply_profile("inkling", "fp8").inkling2_fp8_kv == "all"
+
+    # The cache format is fixed at load: a change reloads an Inkling 2 engine
+    # and no other.
+    pool = _make_pool(ceiling=500)
+    for model_id, model_type in (("inkling", "inkling2_loop"), ("other", "qwen3_5")):
+        pool._entries[model_id] = EngineEntry(
+            model_id=model_id,
+            model_path=str(tmp_path),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type=model_type,
+            estimated_size=100,
+        )
+    signatures = {
+        (model_id, mode): pool._engine_runtime_signature(
+            model_id, ModelSettings(inkling2_fp8_kv=mode)
+        )
+        for model_id in ("inkling", "other")
+        for mode in ("off", "full", "all")
+    }
+    assert len({signatures["inkling", mode] for mode in ("off", "full", "all")}) == 3
+    assert dict(signatures["inkling", "all"])["inkling2_fp8_kv"] == "'all'"
+    assert len({signatures["other", mode] for mode in ("off", "full", "all")}) == 1
+
+
+@pytest.mark.parametrize("engine", ["text", "vlm"])
+def test_inkling2_fp8_kv_setting_reaches_the_model_estimate_and_ssd_signature(
+    mock_tokenizer, engine
+):
+    from types import SimpleNamespace
+
+    from omlx.models.vlm import VLMModelAdapter
+    from omlx.scheduler import Scheduler
+
+    inkling = model = _inkling2_tiny()
+    if engine == "vlm":
+        model = VLMModelAdapter(SimpleNamespace(language_model=inkling))
+    scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+    signed = []
+    scheduler.paged_ssd_cache_manager = SimpleNamespace(
+        set_expected_layer_signature=lambda *a, **kw: signed.append(kw["numerics"]),
+        invalidate_stale_layer_signature=lambda: None,
+    )
+    monitor = scheduler.memory_monitor
+    exact = monitor.estimate_prompt_kv_bytes(4096)
+    assert monitor._dtype_size == 2 and scheduler._ssd_numerics() is None
+
+    scheduler.set_inkling2_fp8_kv("full")
+    assert [layer.attn.fp8_kv for layer in inkling.layers] == [
+        not layer.sliding for layer in inkling.layers
+    ]
+    # Half the bytes for the full-attention keys and values, during prefill too.
+    assert monitor._dtype_size == 1 and monitor._prefill_dtype_size == 1
+    assert monitor.estimate_prompt_kv_bytes(4096) * 2 == exact
+    # Blocks written in one mode are never restored into another.
+    assert signed == ["inkling2-fp8-kv-full"]
+    scheduler.set_inkling2_fp8_kv("all")
+    assert all(layer.attn.fp8_kv for layer in inkling.layers)
+    assert signed[-1] == "inkling2-fp8-kv-all"
+    with pytest.raises(ValueError, match="FP8 KV mode"):
+        scheduler.set_inkling2_fp8_kv("on")

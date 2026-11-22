@@ -22,6 +22,7 @@ from mlx.utils import tree_flatten
 from mlx_lm.utils import load_model
 
 from ...patches.inkling2 import cache as windows
+from ...patches.inkling2 import kernels
 from ...patches.inkling2 import model as inkling2
 from ...utils.model_loading import maybe_apply_pre_load_patches
 from ..adapter import Arrays, Capture, HostArrays, StageAdapter
@@ -101,6 +102,11 @@ def _cache_state(i: int, visit: tuple, rows: int | None) -> Arrays:
         start = 0 if rows is None else kv.offset - rows
         keys = kv.keys[..., start : kv.offset, :]
         values = kv.values[..., start : kv.offset, :]
+    if keys is not None and keys.dtype == mx.uint8:
+        # An FP8 KV cache: the helper computes with dense keys and values.
+        dense = getattr(conv, "_omlx_fp8_kv", None) or mx.bfloat16
+        keys = kernels.fp8_dequantize(keys, dense)
+        values = kernels.fp8_dequantize(values, dense)
     out = {f"{i}.k": keys, f"{i}.v": values}
     for slot in range(_CONV_SLOTS):
         if conv[base + slot] is not None:
@@ -232,10 +238,15 @@ class Inkling2Adapter(StageAdapter):
         for i, (kv, conv) in enumerate(windows.visits(cache)[:k]):
             keys = state.get(f"{i}.k")
             if keys is not None and keys.shape[2]:
+                values = state[f"{i}.v"]
+                if windows.stores_fp8(kv, conv):
+                    # The helper sends dense rows; this cache holds FP8 codes.
+                    keys = kernels.fp8_quantize(keys)
+                    values = kernels.fp8_quantize(values)
                 if kv is None:
-                    windows.append(conv, keys, state[f"{i}.v"])
+                    windows.append(conv, keys, values)
                 else:
-                    kv.update_and_fetch(keys, state[f"{i}.v"])
+                    kv.update_and_fetch(keys, values)
             base = windows.CONV if kv is None else 0
             for slot in range(_CONV_SLOTS):
                 value = state.get(f"{i}.c{slot}")

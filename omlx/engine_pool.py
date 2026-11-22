@@ -81,6 +81,7 @@ from .model_settings import (
     ced_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
+    inkling2_fp8_kv_mode,
     specprefill_draft,
     validate_ane_prefill,
 )
@@ -1360,6 +1361,9 @@ class EnginePool:
                 "deepseek_v41_ced_prefill_enabled",
                 ced_prefill_on(settings),
             )
+            # The KV cache format is fixed when the model is loaded.
+            if entry.config_model_type in INKLING2_MODEL_TYPES:
+                add("inkling2_fp8_kv", inkling2_fp8_kv_mode(data))
             factor = yarn_factor(
                 entry.config_model_type,
                 entry.model_context_length,
@@ -4669,6 +4673,24 @@ class EnginePool:
                         )
                     else:
                         engine.set_dflash_drafter(drafter)
+
+            # Inkling 2 FP8 KV cache: set on the loaded model before its
+            # first request, so every cache it makes holds one format.
+            fp8_kv = inkling2_fp8_kv_mode(model_settings)
+            if fp8_kv != "off" and entry.config_model_type in INKLING2_MODEL_TYPES:
+                set_fp8_kv = getattr(
+                    self._resolve_scheduler_from_engine(engine),
+                    "set_inkling2_fp8_kv",
+                    None,
+                )
+                if callable(set_fp8_kv):
+                    set_fp8_kv(fp8_kv)
+                    logger.info(f"Inkling 2 FP8 KV cache for {model_id}: {fp8_kv}")
+                else:
+                    logger.warning(
+                        f"Inkling 2 FP8 KV cache is not available on this "
+                        f"engine for {model_id}; the cache stays exact"
+                    )
 
             # Inkling 2 bundles its DSpark draft as mtp.safetensors.
             if (

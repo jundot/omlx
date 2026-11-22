@@ -264,6 +264,19 @@ def newest(state, count: int):
     )
 
 
+def stores_fp8(kv, state) -> bool:
+    """Whether a visit caches its keys and values as FP8 codes.
+
+    The keys it already holds decide, so FP8 codes and dense keys never share
+    a buffer; an empty visit follows its model's setting, which
+    ``visit_caches`` leaves on the state as the dense dtype.
+    """
+    held = kv.keys if kv is not None else state.cache[KEYS]
+    if held is not None:
+        return held.dtype == mx.uint8
+    return getattr(state, "_omlx_fp8_kv", None) is not None
+
+
 def visits(cache: list) -> list[tuple]:
     """``(KVCache or None, state)`` of each layer visit, read off the entries."""
     out, entry = [], 0

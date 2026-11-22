@@ -16910,6 +16910,13 @@ class Scheduler:
                 else:
                     dtype_size = tq_dtype_size
 
+            # Inkling 2's FP8 KV setting: a full-attention visit holds one
+            # byte per element from its first prefill chunk on. The sliding
+            # windows are fixed state, measured from a live cache.
+            fp8_kv = self._inkling2_fp8_kv() != "off"
+            if fp8_kv:
+                dtype_size = 1
+
             kv_bytes_per_token = None
             if estimate_qwen4_exp_kv_bytes_per_token is not None:
                 kv_bytes_per_token = estimate_qwen4_exp_kv_bytes_per_token(
@@ -16961,7 +16968,7 @@ class Scheduler:
                     # Affine caches stay packed throughout prefill.
                     prefill_dtype_size=(
                         dtype_size
-                        if affine_prefill
+                        if affine_prefill or fp8_kv
                         else base_dtype_size + dtype_size
                         if dtype_size != base_dtype_size
                         else None
@@ -17100,6 +17107,35 @@ class Scheduler:
         # them (#2045).
         return layer_cache_types, float(self._turboquant_kv_bits), cachelist_subtypes
 
+    def _inkling2_model(self) -> Any:
+        """The Inkling 2 model behind ``self.model`` (the VLM engine wraps it)."""
+        return getattr(self.model, "_language_model", None) or self.model
+
+    def _inkling2_fp8_kv(self) -> str:
+        """The loaded Inkling 2 model's FP8 KV mode; "off" for other models."""
+        mode = getattr(self._inkling2_model(), "fp8_kv", "off")
+        return mode if mode in ("full", "all") else "off"
+
+    def set_inkling2_fp8_kv(self, mode: str) -> None:
+        """Set the Inkling 2 KV cache format (the ``inkling2_fp8_kv`` model
+        setting) before the first request, then redo what was sized and
+        signed for the exact cache: the KV memory estimate and the SSD
+        cache signature."""
+        self._inkling2_model().set_fp8_kv(mode)
+        self._set_model_info_for_monitor()
+        self.refresh_ssd_layer_signature()
+
+    def _ssd_numerics(self) -> str | None:
+        """The numerics revision of the blocks this model writes. FP8 KV
+        blocks carry their mode, so they are never restored into an exact
+        cache or the other way round."""
+        numerics = numerics_revision_for_model(self.model)
+        mode = self._inkling2_fp8_kv()
+        if mode == "off":
+            return numerics
+        tag = f"inkling2-fp8-kv-{mode}"
+        return f"{numerics},{tag}" if numerics else tag
+
     def refresh_ssd_layer_signature(self) -> list[str] | None:
         """Set the SSD manager's live layer signature before prefix lookup."""
         manager = self.paged_ssd_cache_manager
@@ -17124,7 +17160,7 @@ class Scheduler:
                     layer_cache_types,
                     turboquant_kv_bits=turboquant_kv_bits,
                     cachelist_subtypes=cachelist_subtypes,
-                    numerics=numerics_revision_for_model(self.model),
+                    numerics=self._ssd_numerics(),
                 )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)
