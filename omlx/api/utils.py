@@ -29,6 +29,9 @@ _NATIVE_REASONING_MODEL_TYPES = {
     "k2_horizon",
     # GLM-5.3's chat template renders history reasoning_content into <think> blocks.
     "glm5_next",
+    # Hy4 templates apply their own native markers and history-retention policy.
+    "hy_v4_vl",
+    "hy_v4_flash",
 }
 
 

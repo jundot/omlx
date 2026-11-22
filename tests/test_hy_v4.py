@@ -23,6 +23,7 @@ from mlx_lm.models.cache import (  # noqa: E402
 
 from omlx import oq  # noqa: E402
 from omlx.adapter.output_parser import correct_tool_parser_type  # noqa: E402
+from omlx.api.thinking import prompt_opens_thinking  # noqa: E402
 from omlx.custom_kernels import nax  # noqa: E402
 from omlx.engine.vlm import (  # noqa: E402
     _apply_template_thinking_mode,
@@ -893,6 +894,33 @@ def _vision_config(config):
     config.update(image_token_id=_IMAGE_ID, video_token_id=_IMAGE_ID + 1)
     config["vision_config"] = dict(_TINY_VISION, out_hidden_size=128)
     return config
+
+
+@pytest.mark.parametrize("effort", ["high", "no_think"])
+def test_loaded_processor_detects_prompt_opened_thinking(tmp_path, effort):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0, "prompt": 1}, "[UNK]")),
+        unk_token="[UNK]",
+        chat_template=(
+            "prompt<think:opensource>"
+            "{% if reasoning_effort == 'no_think' %}</think:opensource>{% endif %}"
+        ),
+    )
+    tokenizer.add_tokens(["<think:opensource>", "</think:opensource>"])
+    tokenizer.save_pretrained(tmp_path)
+    processor = HyV4Processor.from_pretrained(tmp_path)
+    prompt = processor.apply_chat_template(
+        [{"role": "user", "content": "Hi"}],
+        tokenize=False,
+        add_generation_prompt=True,
+        reasoning_effort=effort,
+    )
+    detected, _ = prompt_opens_thinking(processor.tokenizer, prompt)
+    assert detected == (effort == "high")
 
 
 def test_sanitize_maps_checkpoint_vision_weights():
