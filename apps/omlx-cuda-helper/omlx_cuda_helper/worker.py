@@ -561,7 +561,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--weights-on-gpu", action="store_true")
     parser.add_argument("--packed-weights", action="store_true")
-    parser.add_argument("--native-widths", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
@@ -579,7 +578,6 @@ def main(argv: list[str] | None = None) -> int:
     tensors.limit_memory(args.memory_limit)
     tensors.weights_on_gpu = args.weights_on_gpu
     tensors.packed_weights = args.packed_weights
-    tensors.widen_codes = not args.native_widths
     stage = families.stage_module(args.model_type).load_stage(
         args.model, args.first, args.last
     )

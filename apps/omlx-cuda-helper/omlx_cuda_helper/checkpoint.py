@@ -103,9 +103,6 @@ def packable(quant: dict[str, Any] | None) -> bool:
     return quant is not None and quant.get("mode", "affine") == "affine"
 
 
-# Code widths MLX's pipelined CUDA kernel takes; other widths run slower.
-PACKED_BITS = (4, 8)
-
 # oQh tensors (see ``oqh``): the input rotation signs name an oQh linear.
 OQH_SIGNS = "oqh_signs"
 OQH_VERSION = 1

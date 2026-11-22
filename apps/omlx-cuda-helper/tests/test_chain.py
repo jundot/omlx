@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import importlib
 import queue
 import shutil
 import socket
@@ -354,24 +353,18 @@ def test_supervisor_runs_stage_processes_and_frees_them(tmp_path, monkeypatch):
     assert all(proc.poll() is not None for proc in procs)
 
 
-@pytest.mark.parametrize(
-    "free_mib, native, native_widths", [(5, 1 << 19, False), (4, 3 << 17, True)]
-)
-def test_supervisor_keeps_weights_packed_to_hold_more_layers(
-    tmp_path, monkeypatch, free_mib, native, native_widths
-):
-    # 1 MiB shared, 1 MiB an unpacked layer, 512 KiB a widened one.
+def test_supervisor_keeps_weights_packed_to_hold_more_layers(tmp_path, monkeypatch):
+    # 1 MiB shared, 1 MiB an unpacked layer, 512 KiB a packed one.
     gpu = {
         "index": 0,
         "name": "GPU",
         "total": 24 << 30,
-        "free": RESERVE_BYTES + (free_mib << 20),
+        "free": RESERVE_BYTES + (5 << 20),
     }
     monkeypatch.setattr(gpus, "gpus", lambda only=None: [gpu])
     monkeypatch.setitem(
         families.FAMILIES, "fake", families.Family(contract=7, module="fake_family")
     )
-    monkeypatch.setattr(importlib.import_module("fake_family"), "NATIVE_BYTES", native)
     worker = [sys.executable, str(Path(__file__).parent / "fake_worker.py")]
     supervisor = Supervisor(None, tmp_path / "run", worker=worker)
     owner = object()
@@ -386,9 +379,7 @@ def test_supervisor_keeps_weights_packed_to_hold_more_layers(
         bind="127.0.0.1",
     )
     assert ready["hello"]["layers"] == 8
-    args = supervisor._session.procs[0].args
-    assert "--packed-weights" in args
-    assert ("--native-widths" in args) is native_widths
+    assert "--packed-weights" in supervisor._session.procs[0].args
     supervisor.stop(owner)
 
 

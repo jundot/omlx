@@ -86,9 +86,8 @@ def from_host(value: HostArray) -> mx.array:
 weights_on_gpu = False
 
 # Set by the worker when a family keeps its affine weights packed to hold more
-# layers, and cleared when widening their codes would hold fewer.
+# layers.
 packed_weights = False
-widen_codes = True
 
 
 def load(model_dir: str | Path, names: list[str]) -> dict[str, mx.array]:
@@ -130,20 +129,11 @@ def unpack(
     return mx.dequantize(weight, scales, mode=mode, dtype=dtype or mx.bfloat16, **sizes)
 
 
-def widen(weight: mx.array, bits: int) -> mx.array:
-    """Packed codes of ``bits`` each as 8-bit codes: the same integers, so the
-    same scales and biases rebuild the same weight."""
-    k = weight.shape[-1] * 32 // bits
-    unit = mx.ones((*weight.shape[:-1], k // 32), mx.float32)
-    codes = mx.dequantize(weight, unit, unit * 0, group_size=32, bits=bits)
-    return mx.contiguous(codes.astype(mx.uint8)).view(mx.uint32)
-
-
 class Linear:
     """A bias-free linear layer from a dense or a quantized weight.
 
     ``dense=True`` unpacks a quantized weight at load: the dense product is
-    a little faster on CUDA and costs the unpacked bytes of GPU memory.
+    about twice as fast on CUDA and costs the unpacked bytes of GPU memory.
     """
 
     def __init__(
@@ -174,14 +164,6 @@ class Linear:
             if dense:
                 weight = unpack(weight, scales, biases, quant, dtype)
             else:
-                if quant is None:
-                    raise ValueError(f"{prefix} is quantized without settings")
-                if (
-                    packed_weights
-                    and widen_codes
-                    and quant["bits"] not in checkpoint.PACKED_BITS
-                ):
-                    weight, quant = widen(weight, quant["bits"]), {**quant, "bits": 8}
                 self.quant = (scales, biases, quant)
         elif dtype is not None:
             weight = weight.astype(dtype)

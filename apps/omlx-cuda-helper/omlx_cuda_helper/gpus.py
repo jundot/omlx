@@ -75,7 +75,7 @@ def memory_limit(gpu: dict[str, Any]) -> int:
     On an integrated GPU that is the free RAM its layers were planned with.
     """
     if gpu.get("integrated"):
-        return int(gpu["free"])
+        return gpu["free"]
     total = int(gpu["total"])
     return total - max(int(total * 0.05), UNCOUNTED_BYTES)
 
