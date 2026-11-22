@@ -34,7 +34,7 @@ from .. import row_exact_gemv
 from ..moe_verify_gather import pair_order
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
-from . import kernels, loopcd, verify_experts
+from . import fused, kernels, loopcd, verify_experts
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -42,6 +42,11 @@ _NVFP4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 _MXFP8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 # ModelOpt NVFP4 tensor scale: amax / (FP8 E4M3 max * FP4 E2M1 max).
 _NVFP4_DENOMINATOR = 448.0 * 6.0
+# Full-attention decode and verify over at least this many keys run
+# ``fused.long_decode_attention``; shorter contexts keep MLX's SDPA and its
+# bits. On an M5 Pro the kernel is level with SDPA at 16-32K keys and ahead
+# from 48K (one decode row 27.6 -> 26.7 ms at 48K, 39.9 -> 34.7 ms at 100K).
+_LONG_ATTENTION_MIN_KEYS = 32768
 
 
 @dataclass
@@ -835,6 +840,10 @@ class Inkling2Attention(nn.Module):
             left_padding = getattr(kv, "left_padding", None)
         elif state is not None:
             k, v, left_padding = windows.append(state, k, v)
+        if not self.window:
+            out = self._long_attention(q, k, v, rel, sink, left_padding)
+            if out is not None:
+                return out
         return kernels.banded_sink_attention(
             q,
             k,
@@ -845,6 +854,52 @@ class Inkling2Attention(nn.Module):
             window=self.window,
             left_padding=left_padding,
         )
+
+    def _long_attention(self, q, k, v, rel, sink, left_padding):
+        """Full-attention decode/verify over a long context, or None.
+
+        A row-exact verify row takes the path its own decode step took: rows
+        whose step saw fewer than ``_LONG_ATTENTION_MIN_KEYS`` keys run alone
+        through ``banded_sink_attention``; the others share the fused kernel,
+        whose result for a row does not depend on the rows after it.
+        """
+        length, s = q.shape[2], k.shape[2]
+        if (
+            length > _COMPILED_MAX_TOKENS
+            or s < _LONG_ATTENTION_MIN_KEYS
+            or not fused.long_attention_supported(q, k, v)
+        ):
+            return None
+        first = s - length + 1  # keys of the first row's decode step
+        below = _LONG_ATTENTION_MIN_KEYS - first
+        if below <= 0 or not is_row_exact_armed():
+            return fused.long_decode_attention(
+                q, k, v, rel, sink, scale=self.scale, left_padding=left_padding
+            )
+        outs = [
+            kernels.banded_sink_attention(
+                q[:, :, r : r + 1],
+                k[:, :, : first + r],
+                v[:, :, : first + r],
+                rel[:, r : r + 1],
+                sink[:, r : r + 1],
+                scale=self.scale,
+                left_padding=left_padding,
+            )
+            for r in range(below)
+        ]
+        outs.append(
+            fused.long_decode_attention(
+                q[:, :, below:],
+                k,
+                v,
+                rel[:, below:],
+                sink[:, below:],
+                scale=self.scale,
+                left_padding=left_padding,
+            )
+        )
+        return mx.concatenate(outs, axis=2)
 
     def output(self, out, gate):
         b, _, length, _ = out.shape
