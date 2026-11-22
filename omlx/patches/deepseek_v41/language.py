@@ -274,46 +274,49 @@ class Indexer(nn.Module):
         ).astype(x.dtype).astype(mx.float32)
         return q, weights
 
-    def __call__(self, x, qr, latent, cache, shared, start, ratio, latent_start=None, query=None):
-        """query: this call's queries() result when the caller computed it (batched decode)."""
+    def update_keys(self, latent, cache, shared, start, end, ratio, dtype, latent_start=None):
+        """A kv-source layer's index keys of the rows start..end (cache[3], shared["index_k"]);
+        latent: their compressed rows (None when none completes)."""
+        c = self._config
+        if self._layer not in c.kv_source_layers:
+            return
+        # CED keeps the query path on the tail while the key path still
+        # spans the full chunk; latent_start marks that wider key origin.
+        kv_start = start if latent_start is None else int(latent_start)
+        kv_end = (
+            end
+            if latent_start is None
+            else kv_start + (0 if latent is None else latent.shape[1])
+        )
+        previous = cache[3]
+        previous = (
+            previous[:, : kv_start // ratio]
+            if previous is not None
+            else pack_activation(mx.zeros((1, 0, c.index_head_dim), dtype), bits=4)
+        )
+        if latent is not None:
+            pos = range(kv_start // ratio * ratio, kv_end // ratio * ratio, ratio)
+            key = pack_activation(
+                rope(self.k_norm(self.wk(latent)), pos, c, True), bits=4
+            )
+            previous = growth.append(cache, 3, previous, key, kv_start // ratio)
+        shared["index_k"] = cache[3] = previous
+
+    def candidate_rows(self, blocks):
+        """The candidate key ids [1, L, n * block] of candidate blocks [1, L, n] (-1 stays -1)."""
+        c = self._config
+        candidates = blocks[..., None] * c.candidate_block_size + mx.arange(
+            c.candidate_block_size
+        )
+        return mx.where(blocks[..., None] >= 0, candidates, -1).reshape(
+            1, blocks.shape[1], blocks.shape[-1] * c.candidate_block_size
+        )
+
+    def select(self, q, weights, shared, start, ratio):
+        """The selected compressed indices of the queries() rows q / weights from start."""
         c, layer = self._config, self._layer
-        end = start + x.shape[1]
-        if layer in c.kv_source_layers:
-            # CED keeps the query path on the tail while the key path still
-            # spans the full chunk; latent_start marks that wider key origin.
-            kv_start = start if latent_start is None else int(latent_start)
-            kv_end = (
-                end
-                if latent_start is None
-                else kv_start + (0 if latent is None else latent.shape[1])
-            )
-            previous = cache[3]
-            previous = (
-                previous[:, : kv_start // ratio]
-                if previous is not None
-                else pack_activation(
-                    mx.zeros((1, 0, c.index_head_dim), x.dtype), bits=4
-                )
-            )
-            if latent is not None:
-                pos = range(kv_start // ratio * ratio, kv_end // ratio * ratio, ratio)
-                key = pack_activation(
-                    rope(self.k_norm(self.wk(latent)), pos, c, True), bits=4
-                )
-                previous = growth.append(cache, 3, previous, key, kv_start // ratio)
-            shared["index_k"] = cache[3] = previous
         key = shared["index_k"]
-        q, weights = query if query is not None else self.queries(x, qr, range(start, end))
-        candidates = None
-        if 0 <= c.candidate_source_layer < layer:
-            blocks = shared["candidates"]
-            candidates = blocks[..., None] * c.candidate_block_size + mx.arange(
-                c.candidate_block_size
-            )
-            candidates = mx.where(blocks[..., None] >= 0, candidates, -1).reshape(
-                1, x.shape[1], blocks.shape[-1] * c.candidate_block_size
-            )
-        if candidates is None:
+        if not 0 <= c.candidate_source_layer < layer:
             idx, blocks = packed_index_topk(
                 q,
                 key,
@@ -329,15 +332,22 @@ class Indexer(nn.Module):
             if layer == c.candidate_source_layer:
                 shared["candidates"] = blocks
             return idx
+        candidates = self.candidate_rows(shared["candidates"])
         scores = packed_index_scores(q, key, weights, start, ratio, candidates)
         count = min(c.index_topk, scores.shape[-1])
-        if x.shape[1] <= 8:
+        if q.shape[1] <= 8:
             return index_select(scores, count, candidates)
         order = mx.argsort(-scores, axis=-1)[..., :count].astype(mx.int32)
         valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
         idx = mx.take_along_axis(candidates, order, -1)
         # Keep chronological order; invalid slots are masked by attention.
         return mx.sort(mx.where(valid, idx, -1), axis=-1)
+
+    def __call__(self, x, qr, latent, cache, shared, start, ratio, latent_start=None):
+        end = start + x.shape[1]
+        self.update_keys(latent, cache, shared, start, end, ratio, x.dtype, latent_start)
+        q, weights = self.queries(x, qr, range(start, end))
+        return self.select(q, weights, shared, start, ratio)
 
 
 class Attention(nn.Module):
