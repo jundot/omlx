@@ -48,6 +48,7 @@ def _fresh_seams(monkeypatch):
     monkeypatch.setattr(mod, "_PATCHED", False)
     monkeypatch.setattr(split, "_PATCHED", False, raising=False)
     monkeypatch.setattr(q35, "_omlx_verify_attention", False, raising=False)
+    monkeypatch.setattr(q35, "_omlx_tq_target_verify_patched", False, raising=False)
     return mod, split
 
 
