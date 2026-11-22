@@ -580,7 +580,6 @@ class SwitchGLU(nn.Module):
             and _nax_prefers_stock(idx.size)
             and all(
                 isinstance(proj, QuantizedSwitchLinear)
-                and proj.bits in (2, 3, 4, 8)
                 and proj._has_affine_metadata_dtype(x.dtype)
                 for proj in (self.gate_proj, self.up_proj)
             )

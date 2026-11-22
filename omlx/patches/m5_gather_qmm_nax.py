@@ -108,8 +108,6 @@ from typing import NamedTuple, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..custom_kernels.nax import is_nax_available
-
 logger = logging.getLogger(__name__)
 
 # Output tile width and column simdgroups (fixed; the Metal source assumes
@@ -2127,16 +2125,12 @@ def split_affine_swiglu(x, gate, up, indices, row_map, limit, *, bits, group_siz
     w, _, _ = gate
     min_rows_per_expert = 4 if bits == 3 else 16
     if (
-        not is_nax_available()
-        or group_size not in _SPLIT_AFFINE_GROUPS.get(bits, ())
+        group_size not in _SPLIT_AFFINE_GROUPS.get(bits, ())
         or limit is None
         or not math.isfinite(limit)
         or w.ndim != 3
-        or w.shape[0] == 0
-        or indices.size < 16
-        or indices.size // w.shape[0] < min_rows_per_expert
+        or indices.size // max(w.shape[0], 1) < min_rows_per_expert
         or x.shape[-1] % 64
-        or w.shape[1] % 32
         or up[0].shape != w.shape
     ):
         return None
