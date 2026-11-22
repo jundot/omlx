@@ -9451,9 +9451,11 @@ class Scheduler:
             if not isinstance(layer, dict):
                 continue
             class_name = str(layer.get("class_name") or "")
-            if class_name in _KNOWN_SLICEABLE_CACHE_TYPES:
-                # Completion supplies a full cache. KV comes from paged
-                # blocks; serializing it here duplicates the entire prefix.
+            if class_name in _KNOWN_SLICEABLE_CACHE_TYPES or (
+                class_name == "CacheList" and Scheduler._is_sliceable_cachelist(layer)
+            ):
+                # The normal block store slices the full KV at completion,
+                # including CacheList layers made entirely of append-only KV.
                 layer["state"] = ()
                 continue
             if class_name != "CacheList":
@@ -10147,10 +10149,41 @@ class Scheduler:
         return str(layer_state.get("cache_type") or "")
 
     @staticmethod
+    def _is_sliceable_cachelist(layer_state: dict[str, Any]) -> bool:
+        """A composite of append-only 4D KV streams needs no boundary copy."""
+        state = layer_state.get("state")
+        if not isinstance(state, list) or not state:
+            return False
+
+        names = layer_state.get("sub_class_names")
+        if not names:
+            meta = layer_state.get("meta_state")
+            if isinstance(meta, (list, tuple)) and meta:
+                names = meta[0]
+        if not isinstance(names, (list, tuple)) or len(names) != len(state):
+            return False
+
+        for name, member in zip(names, state):
+            if name not in ("KVCache", "BatchKVCache"):
+                return False
+            if not isinstance(member, (tuple, list)) or len(member) < 2:
+                return False
+            keys, values = member[:2]
+            key_shape = getattr(keys, "shape", ())
+            value_shape = getattr(values, "shape", ())
+            if len(key_shape) != 4 or len(value_shape) != 4:
+                return False
+            if key_shape[:3] != value_shape[:3]:
+                return False
+        return True
+
+    @staticmethod
     def _is_sliceable_extracted_layer(layer_state: dict[str, Any]) -> bool:
         type_name = Scheduler._extracted_layer_type_name(layer_state)
         if type_name in _KNOWN_SLICEABLE_CACHE_TYPES:
             return True
+        if type_name == "CacheList":
+            return Scheduler._is_sliceable_cachelist(layer_state)
 
         if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None and type_name:
             try:
