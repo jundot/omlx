@@ -1465,7 +1465,7 @@
   "modal.model_settings.lightning_mtp_hint": "Erzeugt mithilfe des integrierten MTP-Kopfs des Modells mehrere Token-Vorschläge pro Schritt.",
   "modal.model_settings.mtp_depth": "Adaptive maximale Tiefe",
   "modal.model_settings.mtp_depth_hint": "Passt die Vorschlagstiefe automatisch bis zum gewählten Maximum an.",
-  "modal.model_settings.mtp_depth_adaptive": "3 Token (Standard)",
+  "modal.model_settings.mtp_depth_adaptive": "Modellstandard",
   "modal.model_settings.mtp_depth_option": "{n} Token",
   "modal.model_settings.mtp_conflict": "Deaktivieren Sie zuerst DFlash und TurboQuant KV – diese ändern den gleichen Pfad, auf den MTP angewiesen ist.",
   "modal.model_settings.mtp_conflict_dflash": "Deaktivieren Sie zuerst DFlash.",

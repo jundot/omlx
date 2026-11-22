@@ -189,9 +189,9 @@ final class ModelSettingsScreenVM {
 
     static var mtpDepthOptions: [(String, String)] {
         let adaptive = String(localized: "settings.acceleration.mtp.depth.adaptive",
-                              defaultValue: "3 tokens (Default)",
-                              comment: "Default Lightning MTP adaptive maximum draft depth")
-        return [("3", adaptive)] + (4...6).map { depth in
+                              defaultValue: "Model default",
+                              comment: "Lightning MTP depth option that keeps the model's own default maximum")
+        return [("", adaptive)] + (3...8).map { depth in
             ("\(depth)", String(localized: "settings.acceleration.mtp.depth.option",
                                 defaultValue: "\(depth) tokens",
                                 comment: "Lightning MTP depth option; placeholder is the maximum draft token count"))
@@ -402,7 +402,7 @@ final class ModelSettingsScreenVM {
     // Experimental: native MTP
     var mtpEnabled: Bool = false
     /// Empty = adaptive depth.
-    var mtpAdaptiveMaxDepth: String = "3"
+    var mtpAdaptiveMaxDepth: String = ""
 
     // Experimental: VLM MTP (assistant-drafter speculative decoding for VLMs).
     // Block size is held as a string for the editor; empty = mlx-vlm default.
@@ -838,7 +838,7 @@ final class ModelSettingsScreenVM {
                 self.dflashDraftWindowSize = s?.dflashDraftWindowSize.map(String.init) ?? ""
                 self.dflashBlockSize = s?.dflashBlockSize.map(String.init) ?? ""
                 self.mtpEnabled = s?.mtpEnabled ?? false
-                self.mtpAdaptiveMaxDepth = s?.mtpAdaptiveMaxDepth.flatMap { (3...6).contains($0) ? String($0) : nil } ?? "3"
+                self.mtpAdaptiveMaxDepth = s?.mtpAdaptiveMaxDepth.flatMap { (3...8).contains($0) ? String($0) : nil } ?? ""
                 self.vlmMtpEnabled = s?.vlmMtpEnabled ?? false
                 self.vlmMtpDraftModel = s?.vlmMtpDraftModel ?? ""
                 self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
@@ -1098,7 +1098,7 @@ final class ModelSettingsScreenVM {
         case .dflashBlockSize:         patch.dflashBlockSize = Int(dflashBlockSize)
         case .mtpEnabled, .mtpAdaptiveMaxDepth:
             patch.mtpEnabled = mtpEnabled
-            patch.mtpAdaptiveMaxDepth = Int(mtpAdaptiveMaxDepth) ?? 3
+            patch.mtpAdaptiveMaxDepth = .some(Int(mtpAdaptiveMaxDepth))
             patch.mtpFixedDepth = .some(nil)
         case .vlmMtpEnabled:           patch.vlmMtpEnabled = vlmMtpEnabled
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel

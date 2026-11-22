@@ -1465,7 +1465,7 @@
   "modal.model_settings.lightning_mtp_hint": "Navrhuje několik tokenů pro krok pomocí vestavěné hlavy MTP modelu.",
   "modal.model_settings.mtp_depth": "Adaptivní maximální hloubka",
   "modal.model_settings.mtp_depth_hint": "Automaticky přizpůsobuje hloubku draftu až po vybrané maximum.",
-  "modal.model_settings.mtp_depth_adaptive": "3 tokeny (výchozí)",
+  "modal.model_settings.mtp_depth_adaptive": "Výchozí pro model",
   "modal.model_settings.mtp_depth_option": "{n} tok.",
   "modal.model_settings.mtp_conflict": "Nejprve vypněte DFlash a TurboQuant KV - zásahují do stejné cesty, na které MTP stojí.",
   "modal.model_settings.mtp_conflict_dflash": "Nejprve vypněte DFlash.",
