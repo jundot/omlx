@@ -751,6 +751,10 @@ class Inkling2TextModel(nn.Module):
 
 
 class Model(nn.Module):
+    # Verify windows up to the compiled width keep the compiled forward, and
+    # mtp_partial_rollback recuts the conv tails for any rejected count.
+    _omlx_mtp_max_verify_rows = _COMPILED_MAX_TOKENS
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
