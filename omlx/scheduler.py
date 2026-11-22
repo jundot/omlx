@@ -22,7 +22,7 @@ import time
 from array import array
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -688,6 +688,7 @@ class _PrefillChunkPlan:
     started: float
     # The prefill helper ran the first layers (the time is only this Mac's).
     helper: bool = False
+    merge_boundaries: bool = False
 
 
 @dataclass
@@ -1934,6 +1935,7 @@ def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_
 
 
 _HY_V4_PREFILL_FLOOR = 4096
+_HY4_FLASH_SNAPSHOT_PREFILL_LIMIT = 2048
 
 
 def _glm5_next_prefill_floor() -> int:
@@ -4676,12 +4678,20 @@ class Scheduler:
             if processed_tokens == 0:
                 Scheduler._clear_cache(self)
 
-            # Boundary-limited step size
-            if boundary_enabled and block_size > 0:
-                n_to_process = clamp_prefill_chunk_to_boundary(
-                    n_to_process,
-                    cache_tokens=base_size + processed_tokens,
-                    block_size=block_size,
+            cache_tokens = base_size + processed_tokens
+            n_to_process, merge_windows = Scheduler._prefill_boundary_candidate(
+                self,
+                n_to_process,
+                cache_tokens,
+                block_size,
+                boundary_enabled,
+                prompt_cache,
+                allow_wide=embeds_array is None
+                and (processed_tokens > 0 or not minimum_prefix),
+            )
+            if merge_windows:
+                prefill_step_size = min(
+                    prefill_step_size, _HY4_FLASH_SNAPSHOT_PREFILL_LIMIT
                 )
             # Stop once more at each tail position so its state is captured.
             for stop_at in (system_at, tail_at):
@@ -4735,6 +4745,10 @@ class Scheduler:
                 request._prefill_resumed = True
                 raise
 
+            if merge_windows:
+                n_to_process, merge_windows = Scheduler._whole_prefill_blocks(
+                    n_to_process, block_size
+                )
             # Keep token and embedding slices aligned at the final prefill chunk.
             n_to_process = min(n_to_process, remaining)
             if getattr(request, "benchmark_trace", False):
@@ -4832,11 +4846,12 @@ class Scheduler:
                     first_chunk=processed_tokens == 0,
                 )
                 _bind_prefill_prompt_ids(self.model, request)
-                prefill_out = prefill_model(
-                    input_arr[:, :n_to_process],
-                    cache=prompt_cache,
-                    **model_kwargs,
-                )
+                with Scheduler._prefill_window_context(merge_windows, block_size):
+                    prefill_out = prefill_model(
+                        input_arr[:, :n_to_process],
+                        cache=prompt_cache,
+                        **model_kwargs,
+                    )
                 if capture_from is not None:
                     self._dflash_seed_prefill(
                         request, prefill_out, capture_from, chunk_start + capture_from
@@ -4897,6 +4912,16 @@ class Scheduler:
             # Boundary snapshot emission
             if boundary_enabled:
                 total_tokens = base_size + processed_tokens
+                if merge_windows:
+                    Scheduler._emit_intermediate_prefill_boundaries(
+                        self,
+                        request,
+                        prompt_cache,
+                        total_tokens - n_to_process,
+                        total_tokens,
+                        block_size,
+                        emitted_boundaries,
+                    )
                 if should_emit_prefill_boundary(
                     total_tokens=total_tokens,
                     block_size=block_size,
@@ -7339,12 +7364,19 @@ class Scheduler:
                 return plan
             # The helper left; this chunk is planned locally below.
 
-        # Clamp to the next block boundary so boundary snapshots fire exactly.
-        if state.boundary_enabled and state.block_size > 0:
-            n = clamp_prefill_chunk_to_boundary(
-                n,
-                cache_tokens=state.base_size + state.tokens_processed,
-                block_size=state.block_size,
+        cache_tokens = state.base_size + state.tokens_processed
+        n, merge_windows = Scheduler._prefill_boundary_candidate(
+            self,
+            n,
+            cache_tokens,
+            state.block_size,
+            state.boundary_enabled,
+            state.cache,
+            allow_wide=guarded and limit is None and state.helper is None,
+        )
+        if merge_windows:
+            prefill_step_size = min(
+                prefill_step_size, _HY4_FLASH_SNAPSHOT_PREFILL_LIMIT
             )
         # Stop once more at each tail position so its state is captured.
         cache_tokens = state.base_size + state.tokens_processed
@@ -7389,6 +7421,8 @@ class Scheduler:
                 loop_label="chunked_step",
                 request_id=state.request.request_id,
             )
+        if merge_windows:
+            n, merge_windows = Scheduler._whole_prefill_blocks(n, state.block_size)
         # Count only tokens actually passed to the model.
         n = min(n, remaining)
         return _PrefillChunkPlan(
@@ -7399,6 +7433,7 @@ class Scheduler:
             qwen4_accounting=qwen4_accounting,
             throttled=n < min(unthrottled, remaining),
             started=started,
+            merge_boundaries=merge_windows,
         )
 
     def _run_prefill_chunks(self, plans: list[_PrefillChunkPlan]) -> list[bool]:
@@ -7626,7 +7661,8 @@ class Scheduler:
             first_chunk=state.tokens_processed == 0,
         )
         _bind_prefill_prompt_ids(self.model, state.request)
-        prefill_out = prefill_model(chunk, cache=state.cache, **chunk_kwargs)
+        with Scheduler._prefill_window_context(plan.merge_boundaries, state.block_size):
+            prefill_out = prefill_model(chunk, cache=state.cache, **chunk_kwargs)
         if capture_from is not None:
             self._dflash_seed_prefill(
                 state.request, prefill_out, capture_from, chunk_start + capture_from
@@ -7662,6 +7698,16 @@ class Scheduler:
         if state.boundary_enabled:
             total_tokens = state.base_size + state.tokens_processed
             rid = state.request.request_id
+            if plan.merge_boundaries:
+                Scheduler._emit_intermediate_prefill_boundaries(
+                    self,
+                    state.request,
+                    state.cache,
+                    total_tokens - plan.tokens,
+                    total_tokens,
+                    state.block_size,
+                    state.emitted_boundaries,
+                )
             if should_emit_prefill_boundary(
                 total_tokens=total_tokens,
                 block_size=state.block_size,
@@ -8525,6 +8571,100 @@ class Scheduler:
             # No earlier boundary exists inside the indivisible image prefix.
             return token_count
         return block_size
+
+    @staticmethod
+    def _prefill_window_context(merge_boundaries: bool, block_size: int):
+        if not merge_boundaries:
+            return nullcontext()
+
+        from .patches.hy_v4.prefill_windows import prefill_windows
+
+        return prefill_windows(block_size)
+
+    def _prefill_boundary_candidate(
+        self, tokens, cache_tokens, block_size, boundary_enabled, cache, *, allow_wide
+    ):
+        """Size a forward before the shared memory guard and retain snapshot semantics."""
+        if not boundary_enabled or block_size <= 0:
+            return tokens, False
+        if allow_wide and tokens >= 2 * block_size and cache_tokens % block_size == 0:
+            model_type = str(
+                getattr(self.model, "model_type", "")
+                or getattr(getattr(self.model, "config", None), "model_type", "")
+            )
+            if (
+                model_type == "hy_v4_flash"
+                and block_size == 512
+                and any(type(c) is _MLXRotatingKVCache for c in cache)
+                and all(
+                    (
+                        type(c) is _MLXRotatingKVCache
+                        and c.keep == 0
+                        and c.max_size == block_size
+                    )
+                    or (
+                        type(c).__name__ == "CacheList"
+                        and all(type(member) is _MLXKVCache for member in c.caches)
+                    )
+                    for c in cache
+                )
+            ):
+                return min(tokens, _HY4_FLASH_SNAPSHOT_PREFILL_LIMIT), True
+        return clamp_prefill_chunk_to_boundary(
+            tokens, cache_tokens=cache_tokens, block_size=block_size
+        ), False
+
+    @staticmethod
+    def _whole_prefill_blocks(tokens: int, block_size: int) -> tuple[int, bool]:
+        # Preserve the numerical shape of whole windows; process partials separately.
+        whole = tokens // block_size * block_size
+        return (
+            (whole, True)
+            if whole >= 2 * block_size
+            else (min(tokens, block_size), False)
+        )
+
+    def _emit_intermediate_prefill_boundaries(
+        self, request, cache, before, after, block_size, emitted
+    ):
+        first = (before // block_size + 1) * block_size
+        for boundary in range(first, after, block_size):
+            historical = self._hy4_rotating_window_at(cache, after, boundary)
+            self._emit_prefill_boundary_snapshot(request, historical, boundary)
+            emitted[request.request_id] = boundary
+        if first < after:
+            logger.info(
+                "Hy4 wide prefill: forward %d tokens, kept earlier SSD boundaries",
+                after - before,
+            )
+
+    def _hy4_rotating_window_at(self, prompt_cache, after: int, boundary: int):
+        """Recreate a window skipped by one append on the chronological array."""
+        historical = []
+        with mx.stream(self._stream):
+            for cache in prompt_cache:
+                if type(cache) is not _MLXRotatingKVCache:
+                    historical.append(cache)
+                    continue
+                if cache.offset != after or cache._idx != cache.keys.shape[2]:
+                    raise RuntimeError(
+                        "Hy4 boundary reconstruction requires chronological KV"
+                    )
+                end = cache._idx - (after - boundary)
+                width = min(cache.max_size, boundary)
+                if end < width:
+                    raise RuntimeError("Missing rows for the Hy4 rotating boundary")
+                window = _MLXRotatingKVCache(max_size=cache.max_size, keep=0)
+                window.state = (
+                    cache.keys[:, :, end - width : end],
+                    cache.values[:, :, end - width : end],
+                    boundary,
+                    0,
+                    cache.max_size,
+                    width,
+                )
+                historical.append(window)
+        return historical
 
     def _emit_prefill_boundary_snapshot(
         self,
