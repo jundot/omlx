@@ -1345,3 +1345,43 @@ def test_inkling2_keeps_dense_kv_when_kv_quantization_is_on(mock_tokenizer, engi
     scheduler._turboquant_kv_bits = 8.0
     scheduler._turboquant_kv_scheme = "affine8"
     assert not scheduler._turboquant_eligible(model.make_cache())
+
+
+def test_inkling2_varloop_single_pass_and_dspark_visit_guard(tmp_path):
+    from omlx.patches.inkling2.dspark import bundled_inkling2_dspark_path
+
+    # TML-d24-varloop-research supports num_passes=1..5 and text_config.loop_num_passes.
+    model = _inkling2_tiny(
+        formats=("mxfp8",) * 18,
+        loop_config=dict(core_start=6, core_end=12, num_passes=3, gate_rank=8, is_varloop=True),
+        loop_num_passes=1,
+    )
+    assert model.model.num_visits == 18
+    assert hasattr(model.layers[6], "loop_down")
+    ids = mx.random.randint(0, 300, (1, 10))
+    full = model(ids)[..., :300]
+    cache = model.make_cache()
+    model(ids[:, :7], cache=cache)
+    step = model(ids[:, 7:8], cache=cache)[:, -1, :300]
+    assert mx.abs(full[:, 7] - step).max().item() < 1e-3
+
+    # DSpark's target_layer_ids=[5, 23, 41, 48] are calibrated for 48 visits (3 passes);
+    # bundled_inkling2_dspark_path must skip the drafter when loop_num_passes != 3.
+    (tmp_path / "mtp.safetensors").touch()
+    base_text = {
+        "num_hidden_layers": 24,
+        "n_layers_per_attn_res_block": 6,
+        "loop_config": {"core_start": 6, "core_end": 18, "num_passes": 3, "gate_rank": 64, "is_varloop": True},
+    }
+    mtp = {"markov_head_type": "rnn_hidden", "target_layer_ids": [5, 23, 41, 48]}
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "inkling2_loop", "text_config": base_text, "mtp_config": mtp})
+    )
+    assert bundled_inkling2_dspark_path(tmp_path) is not None
+
+    for passes in (1, 2, 5):
+        override_text = {**base_text, "loop_num_passes": passes}
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "inkling2_loop", "text_config": override_text, "mtp_config": mtp})
+        )
+        assert bundled_inkling2_dspark_path(tmp_path) is None
