@@ -25,6 +25,14 @@ from omlx_web import routes as webui
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests/ui/fixtures/cluster"
 
+# Copy assertions read the catalogue the wizard itself resolves through
+# ``window.t`` (the harness loads this same file), so a rewording cannot drift
+# the test away from the UI — it did once: the eyebrow was moved onto
+# ``cluster.deploy.status_saved_setup`` while the test still spelled the old
+# literal.
+CATALOGUE = json.loads((ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8"))
+SAVED_SETUP_EYEBROW = CATALOGUE["cluster.deploy.status_saved_setup"]
+
 TEMPLATE = "omlx_web/templates/dashboard/_cluster.html"
 JAVASCRIPT = "omlx_web/static/js/cluster.js"
 DASHBOARD = "omlx_web/templates/dashboard.html"
@@ -4996,12 +5004,13 @@ process.stdout.write(JSON.stringify({{
 """
     )
 
-    assert result["without"]["eyebrow"] == "Saved setup"
+    assert result["without"]["eyebrow"] == SAVED_SETUP_EYEBROW
+    assert "configured" not in result["without"]["eyebrow"].lower()
     assert result["without"]["label"] == "Not loaded"
     assert "no model weights are resident" in result["without"]["detail"]
     assert "Saved" not in result["without"]["detail"].replace("saved,", "")
 
-    assert result["stamped"]["eyebrow"] == "Saved setup"
+    assert result["stamped"]["eyebrow"] == SAVED_SETUP_EYEBROW
     assert result["stamped"]["label"] == "Not loaded"
     # The age line carries the formatted moment, not a promise about activity.
     assert result["stamped"]["detail"].startswith(
