@@ -1047,11 +1047,7 @@ def maybe_apply_pre_load_patches(
                 # a 4-row one on dense Qwen, so depth 4 pays there.
                 set_mtp_depth(4)
             elif model_type == "deepseek_v41":
-                # DSpark drafts a whole block per cycle (dspark_block_size, 5 on
-                # the 1017 checkpoints). Drafts 4 and 5 are accepted ~94% / ~87%
-                # of the time on code, so a ceiling of 3 left speed on the table
-                # (oQ2e, M5 Ultra: single stream +6-11%, 2 streams +3-5%); the
-                # controller still settles shallow on low-accept content.
+                # DSpark drafts a whole dspark_block_size block per cycle.
                 block = (text_config or config).get("dspark_block_size")
                 set_mtp_depth(int(block) if block else 3)
             else:

@@ -228,7 +228,7 @@ inline oqh_bias<BITS, S> oqh_biases(S s) { return {s}; }
 // multi-vector helpers give a vector the same value.
 template <int BITS>
 constexpr int aff_terms16() {
-    static_assert(BITS == 3 || BITS == 5, "other widths are read with shifts (aff8_rows)");
+    static_assert(BITS == 3 || BITS == 5, "other widths are read by aff8_rows");
     return BITS == 3 ? 20 : 24;
 }
 template <int BITS, typename X>
@@ -317,8 +317,8 @@ inline void aff16_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thr
     }
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
 }
-// Affine weights read with shifts, 8 contiguous values per lane per step (rows at 2, 4, 6 or 8
-// bits, matrix tiles at every width). q[j] = code of value j of the 8 values starting at byte p.
+// Affine weights read with shifts, 8 contiguous values per lane per step (rows at 6 or 8 bits,
+// matrix tiles at every width). q[j] = code of value j of the 8 values starting at byte p.
 template <int BITS>
 inline void affine_codes8(const device uchar* p, thread float* q) {
     constexpr uint MASK = (1u << BITS) - 1u;
@@ -352,12 +352,8 @@ inline void affine_codes8(const device uchar* p, thread float* q) {
 // The codes one lane reads per step in aff8_rows / aff8_rows_nb: 16 at 2 bits (one uint32), else 8.
 template <int BITS>
 constexpr int aff_lane_codes() { return BITS == 2 ? 16 : 8; }
-// 2- and 4-bit codes are read in place, as MLX's qdot does: q[j] = code j * 2^(BITS * j), masked
-// but not shifted down, against x pre-scaled by aff_unit<BITS>(j) = 2^-(BITS * j). Scaling by a
-// power of two is exact in fp32 (no under- or overflow at these magnitudes), so each product
-// q[j] * x[j] is code * x bit for bit. These rows kernels are bound by code decoding at 2 bits
-// (~690 GB/s, against ~950 GB/s at 4 and 8 bits), so a shift per code and, at 2 bits, half the
-// per-step loads and loop work (16 codes per lane) are what they spend less on.
+// 2- and 4-bit codes are masked in place, as MLX's qdot does: q[j] = code j * 2^(BITS * j), against x
+// pre-scaled by aff_unit<BITS>(j) = 2^-(BITS * j). Power-of-two scaling is exact, so q[j] * x[j] = code * x.
 template <int BITS>
 inline float aff_unit(int j) { return (BITS == 2 || BITS == 4) ? as_type<float>(uint(127 - BITS * j) << 23) : 1.0f; }
 template <int BITS>

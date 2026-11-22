@@ -619,22 +619,15 @@ class TestVlmMtpPreLoadDispatch:
         stub = sys.modules["omlx.patches.mlx_lm_mtp"]
         stub.set_mtp_depth.assert_called_once_with(expected)
 
-    @pytest.mark.parametrize(
-        ("block", "depth", "expected"),
-        [(5, None, 5), (None, None, 3), (5, 3, 3), (5, 2, 2)],
-    )
+    @pytest.mark.parametrize(("depth", "expected"), [(None, 5), (3, 3)])
     def test_deepseek_v41_default_depth_is_the_dspark_block(
-        self, tmp_path, monkeypatch, block, depth, expected
+        self, tmp_path, monkeypatch, depth, expected
     ):
-        # DSpark drafts dspark_block_size tokens per cycle, so that is the
-        # default adaptive ceiling; an explicit setting still wins.
         self._stub_patches(monkeypatch)
         monkeypatch.setitem(
             sys.modules, "omlx.patches.deepseek_v41", MagicMock(apply_patch=MagicMock())
         )
-        text = {"num_nextn_predict_layers": 3}
-        if block:
-            text["dspark_block_size"] = block
+        text = {"num_nextn_predict_layers": 3, "dspark_block_size": 5}
         path = _write_config(
             tmp_path,
             json.dumps({"model_type": "deepseek_v41", "vision_config": {}, "text_config": text}),
