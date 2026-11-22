@@ -210,9 +210,10 @@ def split_attention(q, window, pooled, wi, ci, sink, cos, sin, c):
         output_shapes=[(h * d,)], output_dtypes=[mx.float32])[0]
 
 
-def compress_index(att, x, qr, cache, shared, start, c):
+def compress_index(att, x, qr, cache, shared, start, c, query=None):
     """Compressor and indexer bookkeeping of one request at `start` (the compressed part of
-    Attention.__call__). Returns its compressed rows and selected compressed indices."""
+    Attention.__call__). Returns its compressed rows and selected compressed indices.
+    query: the indexer's queries() for this token, when the caller computed it."""
     layer = att._layer
     ratio = c.compress_ratios[layer]
     if not ratio:
@@ -225,7 +226,7 @@ def compress_index(att, x, qr, cache, shared, start, c):
             cache[2] = pack_activation(mx.zeros((1, 0, c.head_dim), x.dtype), bits=4, group_size=16, e4m3_scale=True)
         shared["kv"] = cache[2][:, : start // ratio]
     if layer in c.index_source_layers:
-        shared["idx"] = att.indexer(x3, qr.reshape(1, 1, -1), latent, cache, shared, start, ratio)
+        shared["idx"] = att.indexer(x3, qr.reshape(1, 1, -1), latent, cache, shared, start, ratio, query=query)
     if latent is not None:
         from .language import rope
 
@@ -550,8 +551,14 @@ def batched_attention(att, q, packed, x, qr, caches, shareds, starts, cos, sin, 
     parts = None
     if c.compress_ratios[att._layer]:
         xs, qrs = mx.split(x, b_n), mx.split(qr, b_n)
-        parts = [compress_index(att, xs[r].reshape(-1), qrs[r].reshape(-1), caches[r], shareds[r], starts[r], c)
-                 for r in range(b_n)]
+        queries = [None] * b_n
+        if att._layer in c.index_source_layers:
+            # One indexer query projection / RoPE / act quant for the batch: per row the
+            # values of the request alone (each projection row is its own GEMV).
+            q_all, w_all = att.indexer.queries(x[None], qr[None], list(starts))
+            queries = [(q_all[:, r : r + 1], w_all[:, r : r + 1]) for r in range(b_n)]
+        parts = [compress_index(att, xs[r].reshape(-1), qrs[r].reshape(-1), caches[r], shareds[r], starts[r], c,
+                                queries[r]) for r in range(b_n)]
     return window_attention_bq(att, q, win, parts, shareds[0], cos, sin, c)
 
 

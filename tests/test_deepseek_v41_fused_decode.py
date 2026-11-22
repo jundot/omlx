@@ -257,12 +257,36 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
         plan.close()
 
 
+@pytest.mark.parametrize("positions", [[5, 5], [5, 5, 5], [3, 10, 4], [9, 2], [7]])
+def test_rope_table_rows_follow_explicit_positions(positions):
+    """Batched decode RoPEs one position per request: repeated and irregular positions
+    (three of them once read as arange arguments) give each row its position's angles."""
+    from omlx.patches.deepseek_v41.language import _rope_positions, _rope_table
+
+    params = (64, 10000.0, 0, 1.0, 32, 1)
+    cos, sin = _rope_table(params, _rope_positions(positions))
+    for row, pos in enumerate(positions):
+        c1, s1 = _rope_table(params, _rope_positions(range(pos, pos + 1)))
+        assert mx.array_equal(cos[row], c1[0]).item() and mx.array_equal(sin[row], s1[0]).item()
+
+
+# Prompt lengths of the B requests: positions in an arithmetic run, all equal (one RoPE
+# position repeated) and irregular (an explicit position per row).
+LENGTHS = {
+    "stepped": lambda b: [13 + 2 * r for r in range(b)],
+    "equal": lambda b: [14] * b,
+    "irregular": lambda b: [13 + (r * r * 7) % 11 for r in range(b)],
+}
+
+
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-@pytest.mark.parametrize("batch", [3, 8, 17])   # odd: a tile lane holds half a vector pair
-def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
+@pytest.mark.parametrize("batch,lengths", [(3, "stepped"), (8, "stepped"), (17, "stepped"),   # odd: a tile lane holds half a vector pair
+                                           (3, "irregular"), (4, "equal"), (8, "irregular")])
+def test_batched_decode_matches_single_requests(monkeypatch, batch, lengths, fmt):
     """On the row kernels (below decode_moe.MMA_MIN_BATCH requests without the drafter), B
     single-token requests through decode_block_nb give each request the logits it gets
-    decoding alone (per-request arithmetic is the single-request kernels')."""
+    decoding alone (per-request arithmetic is the single-request kernels'; the indexer
+    queries of the batch are one projection whose rows are those GEMVs)."""
     from omlx.patches.deepseek_v41 import decode_moe
     from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 
@@ -288,7 +312,7 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
 
     monkeypatch.setattr(decode_fused, "batched_attention", counted_attention)
     rng = np.random.default_rng(11)
-    prompts = [rng.integers(3, 60, 13 + 2 * r).tolist() for r in range(batch)]   # different lengths
+    prompts = [rng.integers(3, 60, n).tolist() for n in LENGTHS[lengths](batch)]
     singles, rows = [], []
     for p in prompts:
         for target in (singles, rows):

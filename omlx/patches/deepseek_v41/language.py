@@ -116,12 +116,15 @@ def _rope_freqs_cached(d, base, original_seq_len, factor, beta_fast, beta_slow):
 
 
 def _rope_positions(positions):
-    if isinstance(positions, range):
+    """The _rope_table key of positions: (start, stop, step) of an arithmetic run with a
+    nonzero step, else ("at", *positions) (e.g. batched decode rows, which may repeat)."""
+    if isinstance(positions, range) and positions.step:
         return positions.start, positions.stop, positions.step
-    values = np.asarray(positions, np.int64).reshape(-1)  # host sync; callers pass ranges
-    if len(values) > 1 and np.all(np.diff(values) == values[1] - values[0]):
-        return int(values[0]), int(values[-1]) + int(values[1] - values[0]), int(values[1] - values[0])
-    return tuple(int(v) for v in values)
+    values = np.asarray(positions, np.int64).reshape(-1)  # host sync unless a list or range
+    step = int(values[1] - values[0]) if len(values) > 1 else 0
+    if step and np.all(np.diff(values) == step):
+        return int(values[0]), int(values[-1]) + step, step
+    return ("at", *(int(v) for v in values))
 
 
 @lru_cache(maxsize=32)   # a decode step or verify block needs one range per RoPE variant
@@ -131,7 +134,7 @@ def _rope_table(params, key):
     value lies within ~2^-29 relative of an fp32 midpoint. Computed once per position range
     and shared by every layer of the step."""
     freqs = _rope_freqs(*params)
-    pos = np.arange(*key) if len(key) == 3 else np.array(key)
+    pos = np.array(key[1:]) if key[0] == "at" else np.arange(*key)
     angles = (pos.astype(np.float32)[:, None] * freqs[None, :]).astype(np.float32).astype(np.float64)
     return mx.array(np.cos(angles).astype(np.float32)), mx.array(np.sin(angles).astype(np.float32))
 
@@ -256,7 +259,23 @@ class Indexer(nn.Module):
             self.k_norm = RMSNorm(c.index_head_dim, c.norm_eps)
         self._config, self._layer = c, layer
 
-    def __call__(self, x, qr, latent, cache, shared, start, ratio, latent_start=None):
+    def queries(self, x, qr, positions):
+        """The scoring query (RoPE'd, 4-bit act quant, [1, L, H, D]) and head weights
+        ([1, L, H] fp32) of the rows of x [1, L, dim] / qr [1, L, q_lora] at positions (a
+        range, or one position per row: B decode requests at once give each row the
+        values it gets alone)."""
+        c = self._config
+        q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
+        q = quantize_activation(rope(q, positions, c, True), bits=4)
+        # Reference: weights_proj(x) * scale is a tensor of the activation dtype (bf16).
+        weights = (
+            self.weights_proj(x)
+            * mx.array(c.index_head_dim**-0.5 * c.index_n_heads**-0.5, mx.float32)
+        ).astype(x.dtype).astype(mx.float32)
+        return q, weights
+
+    def __call__(self, x, qr, latent, cache, shared, start, ratio, latent_start=None, query=None):
+        """query: this call's queries() result when the caller computed it (batched decode)."""
         c, layer = self._config, self._layer
         end = start + x.shape[1]
         if layer in c.kv_source_layers:
@@ -284,13 +303,7 @@ class Indexer(nn.Module):
                 previous = growth.append(cache, 3, previous, key, kv_start // ratio)
             shared["index_k"] = cache[3] = previous
         key = shared["index_k"]
-        q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
-        q = quantize_activation(rope(q, range(start, end), c, True), bits=4)
-        # Reference: weights_proj(x) * scale is a tensor of the activation dtype (bf16).
-        weights = (
-            self.weights_proj(x)
-            * mx.array(c.index_head_dim**-0.5 * c.index_n_heads**-0.5, mx.float32)
-        ).astype(x.dtype).astype(mx.float32)
+        q, weights = query if query is not None else self.queries(x, qr, range(start, end))
         candidates = None
         if 0 <= c.candidate_source_layer < layer:
             blocks = shared["candidates"]
