@@ -2126,7 +2126,7 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
-                if model_type in ("hy_v4_flash", "hy_v4_vl") and getattr(
+                if model_type == "hy_v4_flash" and getattr(
                     self._model_settings, "hy4_engram_ssd_offload", False
                 ):
                     from ..patches.hy_v4.engram_ssd import load

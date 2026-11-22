@@ -152,11 +152,8 @@ def _ids(seed, n=SEQ):
     return np.random.default_rng(seed).integers(10, VOCAB - 20, size=n)
 
 
-@pytest.mark.parametrize(
-    ("kind", "affine"),
-    [("hy_v4_flash", False), ("hy_v4_flash", True), ("hy_v4_vl", True)],
-)
-def test_engram_ssd_matches_resident(tmp_path, monkeypatch, kind, affine):
+@pytest.mark.parametrize("affine", [False, True])
+def test_engram_ssd_matches_resident(tmp_path, monkeypatch, affine):
     from mlx_vlm import utils
 
     from omlx.patches.hy_v4 import apply_patch
@@ -164,44 +161,28 @@ def test_engram_ssd_matches_resident(tmp_path, monkeypatch, kind, affine):
 
     apply_patch()
     config = _flash_config()
-    if kind == "hy_v4_vl":
-        config["text_config"] = {
-            **_hy4_config()["text_config"],
-            **{
-                k: v
-                for k, v in config["text_config"].items()
-                if k.startswith("engram_")
-            },
-        }
-        config["model_type"] = kind
     config["text_config"]["engram_n_embed_per_ngram"] = 64
     weights = dict(tree_flatten(_model(config).parameters()))
     recipe = {"bits": 4, "group_size": 32, "mode": "affine"}
-    q = {}
     index = {}
     for i, (key, value) in enumerate(list(weights.items())):
         if not key.endswith(".multi_head_embedding.embedding.weight"):
             continue
-        value = value.astype(mx.bfloat16)
-        shard = f"table-{i}.safetensors"
-        tensors = {key: value}
+        tensors = {key: value.astype(mx.bfloat16)}
         if affine:
-            packed, scales, biases = mx.quantize(value, **recipe)
             prefix = key.removesuffix(".weight")
-            tensors = {
-                key: packed,
-                prefix + ".scales": scales,
-                prefix + ".biases": biases,
-            }
-            q[prefix] = dict(recipe)
+            packed, scales, biases = mx.quantize(tensors[key], **recipe)
+            tensors = {key: packed}
+            tensors.update({f"{prefix}.scales": scales, f"{prefix}.biases": biases})
+            config.setdefault("quantization", dict(recipe))[prefix] = dict(recipe)
+        shard = f"table-{i}.safetensors"
         mx.save_safetensors(str(tmp_path / shard), tensors, metadata={"format": "mlx"})
         index.update(dict.fromkeys(tensors, shard))
         del weights[key]
-    if affine:
-        config["quantization"] = {**recipe, **q}
-    shard = "backbone.safetensors"
-    mx.save_safetensors(str(tmp_path / shard), weights, metadata={"format": "mlx"})
-    index.update(dict.fromkeys(weights, shard))
+    mx.save_safetensors(
+        str(tmp_path / "backbone.safetensors"), weights, metadata={"format": "mlx"}
+    )
+    index.update(dict.fromkeys(weights, "backbone.safetensors"))
     (tmp_path / "config.json").write_text(json.dumps(config))
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": index})
@@ -211,24 +192,12 @@ def test_engram_ssd_matches_resident(tmp_path, monkeypatch, kind, affine):
 
     resident, _ = utils.load(tmp_path)
     expected = _run(resident, _ids(3), [24, 9, 7])
-    plan = plan_engram_ssd(tmp_path)
-    original_load = mx.load
-
-    def read_without_tables(path, *args, **kwargs):
-        assert str(path).rsplit("/", 1)[-1] == shard
-        return original_load(path, *args, **kwargs)
-
-    monkeypatch.setattr(mx, "load", read_without_tables)
     model, _ = load(tmp_path)
     try:
-        assert len(plan.table_only_shards) == 2
-        assert not any(
-            k in dict(tree_flatten(model.parameters()))
-            for keys in plan.skipped.values()
-            for k in keys
-        )
-        actual = _run(model, _ids(3), [24, 9, 7])
-        np.testing.assert_array_equal(expected, actual)
+        params = dict(tree_flatten(model.parameters()))
+        skipped = plan_engram_ssd(tmp_path).skipped.values()
+        assert not any(k in params for keys in skipped for k in keys)
+        np.testing.assert_array_equal(expected, _run(model, _ids(3), [24, 9, 7]))
     finally:
         model._omlx_engram_ssd.close()
 

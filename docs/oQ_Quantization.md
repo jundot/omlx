@@ -127,11 +127,6 @@ Writing the quantized model needs little memory because tensors are read and wri
 - If the model does not fit in about 75% of the available memory, oQ makes a temporary 4-bit copy on disk, calibrates on that copy and deletes it afterwards. This needs extra free disk space while it runs.
 - MiniMax M3 and Qwen4-Exp models calibrate one layer at a time instead.
 
-Hy4-family checkpoints with BF16 or affine-quantized Engram tables can use
-**SSD N-gram Offload** in Model Settings. The VLM engine reads the required
-table rows directly from the model's Safetensors and supports vision and
-Lightning MTP.
-
 ## Supported models
 
 oQ works with models that mlx-lm or mlx-vlm can load, including MoE and vision-language models. The source must be the original checkpoint:

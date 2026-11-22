@@ -3444,7 +3444,7 @@
                 }
             },
 
-            // Each model exposes at most one n-gram table offload option.
+            // Qwen4 PLE and DeepSeek V4.1 Engram share one row; a model supports at most one.
             ssdNgramOffloadKey() {
                 if (this.modelSettings.qwen4_ple_ssd_offload_supported) return 'qwen4_ple_ssd_offload';
                 if (this.modelSettings.deepseek_v41_engram_ssd_offload_supported) {

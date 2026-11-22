@@ -2614,7 +2614,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         deepseek_v41_engram_ssd_offload_supported = False
         hy4_engram_ssd_offload_supported = False
-        if model_info.get("config_model_type") in ("hy_v4_flash", "hy_v4_vl"):
+        if model_info.get("config_model_type") == "hy_v4_flash":
             from ..patches.hy_v4.engram_ssd import plan_engram_ssd
 
             try:
@@ -3266,15 +3266,8 @@ async def update_model_settings(
     if "hy4_engram_ssd_offload" in sent:
         current_settings.hy4_engram_ssd_offload = bool(
             request.hy4_engram_ssd_offload
-            and entry.config_model_type in ("hy_v4_flash", "hy_v4_vl")
+            and entry.config_model_type == "hy_v4_flash"
         )
-        if current_settings.hy4_engram_ssd_offload:
-            from ..patches.hy_v4.engram_ssd import plan_engram_ssd
-
-            try:
-                plan_engram_ssd(entry.model_path)
-            except (KeyError, OSError, TypeError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False

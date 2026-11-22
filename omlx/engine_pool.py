@@ -650,7 +650,7 @@ class EnginePool:
             )
         if (
             entry.engine_type == "vlm"
-            and entry.config_model_type in ("hy_v4_flash", "hy_v4_vl")
+            and entry.config_model_type == "hy_v4_flash"
             and getattr(runtime_settings, "hy4_engram_ssd_offload", False)
         ):
             from .patches.hy_v4.engram_ssd import plan_engram_ssd
@@ -1347,7 +1347,7 @@ class EnginePool:
                 entry, settings
             )
             add("deepseek_v41_engram_ssd_offload", v41_offload)
-            if entry.config_model_type in ("hy_v4_flash", "hy_v4_vl"):
+            if entry.config_model_type == "hy_v4_flash":
                 add(
                     "hy4_engram_ssd_offload",
                     bool(data.get("hy4_engram_ssd_offload", False)),
@@ -4197,10 +4197,9 @@ class EnginePool:
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
             )
-            hy4_engram_on_ssd = entry.config_model_type in (
-                "hy_v4_flash",
-                "hy_v4_vl",
-            ) and getattr(model_settings, "hy4_engram_ssd_offload", False)
+            hy4_engram_on_ssd = entry.config_model_type == "hy_v4_flash" and getattr(
+                model_settings, "hy4_engram_ssd_offload", False
+            )
             if hy4_engram_on_ssd and effective_type != "vlm":
                 raise ValueError("Hy4 Engram SSD offload requires the VLM engine")
             if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
