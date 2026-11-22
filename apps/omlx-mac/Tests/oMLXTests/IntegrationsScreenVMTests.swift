@@ -313,10 +313,8 @@ final class IntegrationsScreenVMTests: XCTestCase {
         )
 
         vm.claudeMode = "cloud"
-        XCTAssertEqual(
-            try await vm.claudeEnvRecipeForCopy(client: client),
-            vm.claudeEnvRecipeDisplay
-        )
+        let cloudCopy = try await vm.claudeEnvRecipeForCopy(client: client)
+        XCTAssertEqual(cloudCopy, vm.claudeEnvRecipeDisplay)
     }
 }
 
