@@ -533,6 +533,8 @@ def _hermetic_metal_release_accounting(monkeypatch):
         module = sys.modules.get(name)
         if module is not None and hasattr(module, "get_graphics_footprint"):
             monkeypatch.setattr(module, "get_graphics_footprint", lambda: 0)
+        if module is not None and hasattr(module, "get_graphics_footprint_compressed"):
+            monkeypatch.setattr(module, "get_graphics_footprint_compressed", lambda: 0)
     metal_sync = sys.modules.get("omlx.utils.metal_sync")
     if metal_sync is not None:
         metal_sync._residuals.clear()
