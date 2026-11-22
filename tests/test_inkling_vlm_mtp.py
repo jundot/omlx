@@ -901,12 +901,16 @@ def test_inkling2_fused_kernels_match_reference():
 
 def _assert_bits(fn, reference, args, **kw):
     """``fn`` matches ``reference`` bit for bit: eager, as prefill chunks ran
-    it, and in BF16/FP16 also compiled, as decode and verify rows ran it. In
-    FP32 a compiled MLX graph may fuse a multiply-add the eager ops round
-    twice, so there only the eager arithmetic is the reference."""
+    it, and in BF16/FP16 also compiled at decode and verify lengths, as those
+    rows ran it. A compiled MLX graph is not a reference elsewhere: in FP32,
+    and at prefill lengths on some GPUs (M2), it can round differently from
+    the eager ops."""
+    from omlx.patches.inkling2.model import _COMPILED_MAX_TOKENS
+
     got = fn(*args, **kw)
     expected = [reference(*args, **kw)]
-    if kw.get("dtype", args[0].dtype) != mx.float32:
+    low_precision = kw.get("dtype", args[0].dtype) != mx.float32
+    if low_precision and args[0].shape[1] <= _COMPILED_MAX_TOKENS:
         expected.append(mx.compile(lambda *a: reference(*a, **kw))(*args))
     for ref in expected:
         for a, b in zip(got, ref):
