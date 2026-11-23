@@ -24,6 +24,7 @@ the weights; it replaces ``quantized_matmul`` bit for bit.
 from __future__ import annotations
 
 import logging
+import os
 from functools import cache
 
 import mlx.core as mx
@@ -469,17 +470,29 @@ def _launch_geometry(
     bits: int, fast: bool, n: int, rows: int, k: int
 ) -> tuple[int, int]:
     """(rows per threadgroup, output columns per simdgroup) for one launch."""
-    if (n + 2 * _RPS - 1) // (2 * _RPS) < _SHARED_ROWS_MIN_TILES:
+    min_tiles = int(
+        os.environ.get("OMLX_ROW_EXACT_MIN_TILES", str(_SHARED_ROWS_MIN_TILES))
+    )
+    if (n + 2 * _RPS - 1) // (2 * _RPS) < min_tiles:
         return 1, _RPS
-    limit = _ROW_VALUES_BUDGET // _values_per_thread(bits, fast)
+    budget = int(
+        os.environ.get("OMLX_ROW_EXACT_VALUES_BUDGET", str(_ROW_VALUES_BUDGET))
+    )
+    limit = max(1, budget // _values_per_thread(bits, fast))
     rows_per_group = next(
         (d for d in range(min(rows, limit), 1, -1) if rows % d == 0), 1
     )
     if (
         rows_per_group == 1
-        and bits == 8
         and fast
-        and n * k >= _PADDED_ROWS_MIN_WEIGHT_BYTES
+        and (
+            (bits == 8 and n * k >= _PADDED_ROWS_MIN_WEIGHT_BYTES)
+            or (
+                budget > _ROW_VALUES_BUDGET
+                and limit >= 2
+                and n * k * bits // 8 >= 64 * 1024 * 1024
+            )
+        )
     ):
         rows_per_group = min(rows, limit)
     return rows_per_group, _RPS
@@ -506,7 +519,11 @@ class _Plan:
         rows_per_group, rps = _launch_geometry(bits, fast, n, rows, k)
         self.padding = -rows % rows_per_group
         padded_rows = rows + self.padding
-        self.kernel = _kernel(bits, int(linear.group_size), fast)
+        unrolled = (
+            os.environ.get("OMLX_ROW_EXACT_UNROLL", "0") == "1"
+            and fast
+            and unrolled_tile_ok(bits, rps, rows_per_group)
+        )
         self.template = [
             ("T", x.dtype),
             ("K_SIZE", k),
@@ -522,6 +539,51 @@ class _Plan:
         self.output_shapes = [(padded_rows, n)]
         self.output_dtypes = [x.dtype]
         self.bias = "bias" in linear
+        if unrolled:
+            kern_u = _kernel(bits, int(linear.group_size), fast, unrolled=True)
+            shape = (
+                "single",
+                bits,
+                int(linear.group_size),
+                fast,
+                k,
+                n,
+                rows,
+                rows_per_group,
+                rps,
+                x.dtype,
+            )
+
+            def _probe(px):
+                if self.padding:
+                    px = mx.pad(px, [(0, self.padding), (0, 0)])
+                out = kern_u(
+                    inputs=[px, linear.weight, linear.scales, linear.biases],
+                    template=self.template,
+                    grid=self.grid,
+                    threadgroup=(32, 2, 1),
+                    output_shapes=self.output_shapes,
+                    output_dtypes=self.output_dtypes,
+                )[0]
+                return [out[:rows] if self.padding else out]
+
+            if unrolled_tile_verified(
+                shape,
+                _probe,
+                [(linear.weight, linear.scales, linear.biases)],
+                bits,
+                int(linear.group_size),
+                rows,
+                k,
+                x.dtype,
+            ):
+                self.kernel = kern_u
+            else:
+                self.kernel = _kernel(
+                    bits, int(linear.group_size), fast, unrolled=False
+                )
+        else:
+            self.kernel = _kernel(bits, int(linear.group_size), fast, unrolled=False)
 
 
 def _plan(linear: nn.QuantizedLinear, x: mx.array, rows: int) -> _Plan | None:

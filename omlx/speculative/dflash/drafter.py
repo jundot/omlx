@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
@@ -847,6 +848,17 @@ class DFlashDrafter:
         draft_hidden = model.norm(h) if anchor_slot else model.norm(h)[:, 1:]
         if wide:
             draft_hidden = draft_hidden.astype(dtype)
+        if os.environ.get("OMLX_DFLASH_SLICE_LOGITS", "0") == "1":
+            needed = (
+                self.depth
+                if not self.adaptive
+                else max(
+                    (self._proposal_count(state) for state, *_ in rows),
+                    default=self.depth,
+                )
+            )
+            if 0 < needed < draft_hidden.shape[1]:
+                draft_hidden = draft_hidden[:, :needed]
         logits = model._logits(draft_hidden)
         samplers = [sampler for *_, sampler in rows]
         selector = getattr(model, "candidate_selector", None)
