@@ -145,7 +145,10 @@ class ModelArgs(BaseModelArgs):
         )
 
 
-def _unit_rms(x: mx.array, eps: float = 1e-6) -> mx.array:
+_UNIT_EPS = 1e-6
+
+
+def _unit_rms(x: mx.array, eps: float = _UNIT_EPS) -> mx.array:
     return mx.fast.rms_norm(x, None, eps)
 
 
@@ -176,6 +179,25 @@ def _keep_fp32_weight(norm: nn.Module) -> None:
         copy = weight.astype(mx.float32)
         mx.eval(copy)
         object.__setattr__(norm, "_omlx_fp32_weight", (weight, copy))
+
+
+def _fp32_norm_stack(owner: nn.Module, norms, tag: str) -> mx.array | None:
+    """The FP32 weight copies of ``norms`` stacked [N, H], or None. Built outside
+    compiled traces and cached on ``owner``."""
+    copies = []
+    for norm in norms:
+        held = norm.__dict__.get("_omlx_fp32_weight")
+        if held is None or held[0] is not norm.weight:
+            return None
+        copies.append(held[1])
+    attr = f"_omlx_norm_stack_{tag}"
+    cached = owner.__dict__.get(attr)
+    if cached is None or any(a is not b for a, b in zip(cached[0], copies)):
+        stacked = mx.stack(copies)
+        mx.eval(stacked)
+        cached = (tuple(copies), stacked)
+        object.__setattr__(owner, attr, cached)
+    return cached[1]
 
 
 def _norm(norm: nn.Module, x: mx.array) -> mx.array:
@@ -369,6 +391,11 @@ class Inkling2Experts(nn.Module):
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
         """FP32 sum of the routed expert outputs; the caller rounds it to the
         activation dtype (the MLP conv kernel does, on read)."""
+        return moe_sum(*self.unreduced(x, inds, weights))
+
+    def unreduced(self, x: mx.array, inds: mx.array, weights: mx.array):
+        """The routed expert outputs [N, K, H] and their FP32 weights [N, K]
+        (NVFP4 tensor scale included), before ``moe_sum``."""
         xe = mx.expand_dims(x, (-2, -3))
         # Sorting regroups the pairs by expert and changes their arithmetic;
         # row-exact verify rows keep the per-pair gather of a decode step.
@@ -391,7 +418,12 @@ class Inkling2Experts(nn.Module):
         s2 = self.w2.post_scale(inds, act.dtype)
         if s2 is not None:
             weights = weights * s2
-        return mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
+        return z, weights
+
+
+def moe_sum(z: mx.array, weights: mx.array) -> mx.array:
+    """FP32 weighted sum of expert outputs over their axis (-2)."""
+    return mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
 
 
 class Inkling2MoE(nn.Module):
@@ -405,18 +437,28 @@ class Inkling2MoE(nn.Module):
         self.router_bias = mx.zeros((args.n_routed_experts,), dtype=mx.float32)
         self.experts = Inkling2Experts(args, w13_spec, w2_spec)
 
-    def route(self, x: mx.array):
-        logits = _row_matmul(x.astype(mx.float32), self.router_weight.T)
+    def route(self, x: mx.array, x32: mx.array | None = None):
+        if x32 is None:
+            x32 = x.astype(mx.float32)
+        logits = _row_matmul(x32, self.router_weight.T)
         return kernels.route_topk(
             logits, self.router_bias, self.top_k, self.route_scale
         )
 
-    def __call__(self, x: mx.array) -> mx.array:
-        """FP32 output, not yet rounded to ``x``'s dtype (see ``Inkling2Experts``)."""
+    def __call__(self, x: mx.array, x32: mx.array | None = None) -> mx.array:
+        """FP32 output, not yet rounded to ``x``'s dtype (see ``Inkling2Experts``).
+        ``x32``, when given, is ``x.astype(float32)`` already computed."""
+        return moe_sum(*self.unreduced(x, x32))
+
+    def unreduced(self, x: mx.array, x32: mx.array | None = None):
+        """Expert outputs [..., K, H] and weights [..., K] before their sum."""
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
-        inds, w = self.route(flat)
-        return self.experts(flat, inds, w).reshape(shape)
+        if x32 is not None:
+            x32 = x32.reshape(-1, shape[-1])
+        inds, w = self.route(flat, x32)
+        z, w = self.experts.unreduced(flat, inds, w)
+        return z.reshape(*shape[:-1], *z.shape[-2:]), w.reshape(*shape[:-1], -1)
 
 
 class AttnResQuery(nn.Module):
@@ -457,6 +499,28 @@ def _mix_messages(x, message, down, gain_forget):
     gain = mx.tanh(gates[..., :hidden])
     forget = mx.tanh(gates[..., hidden:])
     return (1.0 - forget) * x + gain * message
+
+
+def _part(x: mx.array, i: int) -> mx.array:
+    """``x[i]`` as a slice view: integer indexing of an axis runs a gather."""
+    return x[i : i + 1].squeeze(0)
+
+
+def _mix_messages_normed(
+    mixed, messages, m0, n, down, gain_forget, norm_w, norm_eps, dtype, want_f32=False
+):
+    """``_mix_messages`` and the following RMSNorm and cast, with the steps
+    around its matmuls in kernels; None to fall back. Input i is query i of
+    ``mixed`` (or query 0) and message ``m0 + i``. Returns [n, B, L, H]."""
+    if norm_w is None or not kernels.loop_messages_supported(mixed, messages):
+        return None
+    hidden = mixed.shape[-1]
+    z = kernels.loop_message_inputs(mixed, messages, m0, n)
+    low = _row_matmul(z, down.reshape(2 * n, hidden, -1))
+    gates = _row_matmul(kernels.loop_message_low(low), gain_forget)
+    return kernels.loop_message_outputs(
+        gates, mixed, messages, m0, n, norm_w, norm_eps, dtype, want_f32
+    )
 
 
 def _row_matmul(x: mx.array, w: mx.array) -> mx.array:
@@ -619,6 +683,22 @@ class Inkling2Attention(nn.Module):
                 self._dconv_scale,
                 out_dtype=mx.float32,
             )
+        fused = kernels.qkv_post(
+            q,
+            k,
+            v,
+            r,
+            self.q_scale,
+            self.r_scale,
+            self._qk_clip,
+            self._r_clip,
+            tau,
+            self.n_heads,
+            self.n_kv,
+        )
+        if fused is not None:
+            q, k, v, r = fused
+            return self._head_major(q, k, v, r, gate, sink, ks, vs)
         q = _l2_clip(
             q.reshape(b, length, self.n_heads, self.head_dim),
             self.q_scale,
@@ -636,6 +716,9 @@ class Inkling2Attention(nn.Module):
         if tau is not None:
             q = (q.astype(mx.float32) * tau).astype(q.dtype)
             r = (r.astype(mx.float32) * tau).astype(r.dtype)
+        return self._head_major(q, k, v, r, gate, sink, ks, vs)
+
+    def _head_major(self, q, k, v, r, gate, sink, ks, vs):
         rel = r @ self.rel_proj.astype(r.dtype)
         return (
             q.transpose(0, 2, 1, 3),
@@ -715,6 +798,7 @@ class Inkling2Layer(nn.Module):
             self.k_input_norm = nn.RMSNorm(h, eps=eps)
             self.v_input_norm = nn.RMSNorm(h, eps=eps)
         self.mlp_norm = nn.RMSNorm(h, eps=eps)
+        self._norm_eps = eps
         self.attn_conv = mx.zeros((h, args.sconv_kernel_size))
         self.mlp_conv = mx.zeros((h, args.sconv_kernel_size))
         self._conv_scale = 1.0 / math.sqrt(args.sconv_kernel_size + 1)
@@ -731,15 +815,51 @@ class Inkling2Layer(nn.Module):
 
     def _pre(self, h, blocks, ks, vs, tau=None, messages=None):
         dtype = h.dtype
-        h_n = _unit_rms(h.astype(mx.float32))
+        attn_w = self._omlx_norm_w[0]
+        fused = None
+        if self.layer_idx > 0:
+            fused = kernels.attn_res_fused(
+                blocks,
+                h,
+                self.attn_input.query,
+                self.attn_input.scale,
+                unit_eps=_UNIT_EPS,
+                norm_weight=attn_w if messages is None else None,
+                norm_eps=self._norm_eps,
+                out_dtype=dtype,
+                want_partial=True,
+            )
+        if fused is not None:
+            mixed, h_n = fused
+            if messages is None and attn_w is not None:
+                parts = [_part(mixed, i) for i in range(mixed.shape[0])]
+                xq, xk, xv = (parts[0], None, None) if self.sliding else parts
+                return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
+        else:
+            h_n = _unit_rms(h.astype(mx.float32))
+            if self.layer_idx > 0:
+                mixed = self.attn_input(blocks, h_n)
+        if messages is not None:
+            normed = _mix_messages_normed(
+                mixed[:, :, : 1 if self.sliding else 3],
+                messages,
+                0,
+                3,
+                self.loop_down[:3],
+                self.loop_gain_forget[:3],
+                attn_w,
+                self._norm_eps,
+                dtype,
+            )
+            if normed is not None:
+                xq, xk, xv = (_part(normed[0], i) for i in range(3))
+                return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
         if self.layer_idx == 0:
             xq = xk = xv = h
+        elif self.sliding:
+            xq = xk = xv = mixed[:, :, 0]
         else:
-            mixed = self.attn_input(blocks, h_n)
-            if self.sliding:
-                xq = xk = xv = mixed[:, :, 0]
-            else:
-                xq, xk, xv = mixed[:, :, 0], mixed[:, :, 1], mixed[:, :, 2]
+            xq, xk, xv = mixed[:, :, 0], mixed[:, :, 1], mixed[:, :, 2]
         if messages is not None:
             xq, xk, xv = _mix_messages(
                 mx.stack([xq, xk, xv]),
@@ -770,18 +890,64 @@ class Inkling2Layer(nn.Module):
             residual=None if self.is_boundary else h,
             out_dtype=mx.float32,
         )
-        y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
-        if messages is not None:
-            y = _mix_messages(
-                y[None],
-                messages[None, :, :, 3],
-                self.loop_down[3:],
-                self.loop_gain_forget[3:],
-            ).squeeze(0)
-        m = self.mlp(_norm(self.mlp_norm, y).astype(h.dtype))
-        h, s3 = kernels.short_conv(
-            m, self.mlp_conv, s3, self._conv_scale, residual=residual, dtype=h.dtype
+        norm_w = None if messages is not None else self._omlx_norm_w[1]
+        fused = kernels.attn_res_fused(
+            mlp_blocks,
+            residual,
+            self.mlp_input.query,
+            self.mlp_input.scale,
+            unit_eps=_UNIT_EPS,
+            norm_weight=norm_w,
+            norm_eps=self.mlp_norm.eps,
+            out_dtype=h.dtype,
+            want_f32=True,
         )
+        if fused is not None and norm_w is not None:
+            x, x32 = _part(fused[0], 0), _part(fused[1], 0)
+        else:
+            if fused is not None:
+                y = fused[0][:, :, 0]
+            else:
+                y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
+            normed = None
+            if messages is not None:
+                normed = _mix_messages_normed(
+                    fused[0] if fused is not None else y[:, :, None],
+                    messages,
+                    3,
+                    1,
+                    self.loop_down[3:],
+                    self.loop_gain_forget[3:],
+                    self._omlx_norm_w[1],
+                    self.mlp_norm.eps,
+                    h.dtype,
+                    want_f32=True,
+                )
+            if normed is not None:
+                x, x32 = _part(normed[0], 0), _part(normed[1], 0)
+            else:
+                if messages is not None:
+                    y = _mix_messages(
+                        y[None],
+                        messages[None, :, :, 3],
+                        self.loop_down[3:],
+                        self.loop_gain_forget[3:],
+                    ).squeeze(0)
+                x, x32 = _norm(self.mlp_norm, y).astype(h.dtype), None
+        z, zw = self.mlp.unreduced(x, x32)
+        conv = kernels.moe_short_conv(
+            z, zw, self.mlp_conv, s3, self._conv_scale, residual, h.dtype
+        )
+        if conv is None:
+            conv = kernels.short_conv(
+                moe_sum(z, zw),
+                self.mlp_conv,
+                s3,
+                self._conv_scale,
+                residual=residual,
+                dtype=h.dtype,
+            )
+        h, s3 = conv
         return h, s2, s3
 
     def __call__(self, h, blocks, cache=None, bank=None, tau=None):
@@ -810,6 +976,14 @@ class Inkling2Layer(nn.Module):
             norms += (self.mlp_norm,)
         for norm in norms:
             _keep_fp32_weight(norm)
+        object.__setattr__(
+            self,
+            "_omlx_norm_w",
+            (
+                _fp32_norm_stack(self, norms[:-1], "attn"),
+                _fp32_norm_stack(self, norms[-1:], "mlp"),
+            ),
+        )
         compiled = length <= _COMPILED_MAX_TOKENS
         if compiled and length > 1 and is_row_exact_armed():
             pre, post = self._pre_exact, self._post_exact
@@ -930,9 +1104,25 @@ class Inkling2TextModel(nn.Module):
                 bank=bank if loop_pass else None,
                 tau=None if layer.sliding else tau,
             )
-        x = self.final_input(blocks, _unit_rms(h.astype(mx.float32)))[:, :, 0]
         _keep_fp32_weight(self.norm)
-        out = _norm(self.norm, x).astype(h.dtype)
+        norm_w = _fp32_norm_stack(self, (self.norm,), "final")
+        fused = None
+        if norm_w is not None:
+            fused = kernels.attn_res_fused(
+                blocks,
+                h,
+                self.final_input.query,
+                self.final_input.scale,
+                unit_eps=_UNIT_EPS,
+                norm_weight=norm_w,
+                norm_eps=self.norm.eps,
+                out_dtype=h.dtype,
+            )
+        if fused is not None:
+            out = _part(fused[0], 0)
+        else:
+            x = self.final_input(blocks, _unit_rms(h.astype(mx.float32)))[:, :, 0]
+            out = _norm(self.norm, x).astype(h.dtype)
         if capture is not None and self.num_visits in capture:
             capture[self.num_visits] = out
         return out
