@@ -248,6 +248,27 @@ async def test_resent_embedding_audio_settings_keep_loaded_engine():
     pool._unload_engine.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_inkling2_fp8_kv_is_persisted_cleared_and_validated():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "inkling2_loop"
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(inkling2_fp8_kv="full")
+    )
+    assert settings.inkling2_fp8_kv == "full"
+    assert result["settings"]["inkling2_fp8_kv"] == "full"
+    # null clears it to the default.
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(inkling2_fp8_kv=None)
+    )
+    assert settings.inkling2_fp8_kv == "off"
+    for bad in ("on", "FULL", ""):
+        with pytest.raises(ValueError, match="inkling2_fp8_kv"):
+            admin_routes.ModelSettingsRequest(inkling2_fp8_kv=bad)
+
+
 def test_embedding_audio_length_must_be_positive():
     with pytest.raises(ValueError):
         admin_routes.ModelSettingsRequest(embedding_audio_max_seconds=0)

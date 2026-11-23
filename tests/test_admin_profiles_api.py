@@ -201,6 +201,46 @@ class TestProfileRoutes:
         assert r.json()["settings"]["turboquant_kv_scheme"] == scheme
         assert mgr.get_settings("model-a").turboquant_kv_bits == bits
 
+    @pytest.mark.parametrize("mode", ["off", "full", "all"])
+    def test_whole_settings_profile_roundtrip_carries_inkling2_fp8_kv(
+        self, client, mode
+    ):
+        """The dashboard saves a profile from the model's whole settings, which
+        always hold ``inkling2_fp8_kv``: "off" for every other model."""
+        from dataclasses import asdict
+
+        c, mgr = client
+        r = c.put(
+            "/admin/api/models/model-a/settings", json={"inkling2_fp8_kv": mode}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["inkling2_fp8_kv"] == mode
+        assert mgr.get_settings("model-a").inkling2_fp8_kv == mode
+
+        settings = asdict(mgr.get_settings("model-a"))
+        r = c.post("/admin/api/models/model-a/profiles", json={
+            "name": "whole", "display_name": "Whole", "settings": settings,
+        })
+        assert r.status_code == 200, r.text
+        assert r.json()["profile"]["settings"]["inkling2_fp8_kv"] == mode
+        r = c.put("/admin/api/models/model-a/profiles/whole", json={
+            "display_name": "Whole v2", "settings": settings,
+        })
+        assert r.status_code == 200, r.text
+        assert r.json()["profile"]["settings"]["inkling2_fp8_kv"] == mode
+
+        for path, send in (
+            ("/admin/api/models/model-a/settings", c.put),
+            ("/admin/api/models/model-a/profiles", c.post),
+        ):
+            bad = {"inkling2_fp8_kv": "on"}
+            if send is c.post:
+                bad = {"name": "bad", "display_name": "Bad", "settings": bad}
+            r = send(path, json=bad)
+            assert r.status_code in (400, 422), r.text
+            assert "inkling2_fp8_kv" in r.text
+        assert mgr.get_settings("model-a").inkling2_fp8_kv == mode
+
     def test_invalid_kv_profile_does_not_persist(self, client):
         c, mgr = client
         settings = {"turboquant_kv_scheme": "affine8", "turboquant_kv_bits": 4}

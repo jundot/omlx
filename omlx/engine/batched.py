@@ -810,6 +810,7 @@ class BatchedEngine(BaseEngine):
                     self._model_settings, "turboquant_skip_last", True
                 )
                 scheduler._set_model_info_for_monitor()
+        scheduler.apply_inkling2_fp8_kv_setting(self._model_settings)
         scheduler.refresh_ssd_layer_signature()
 
         draft_path = specprefill_draft(self._model_settings)

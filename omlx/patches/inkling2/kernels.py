@@ -1802,6 +1802,8 @@ def _use_fp8_kernels(q, k) -> bool:
         and d % 32 == 0
         and hq % hkv == 0
         and hq // hkv <= _FP8_DECODE_MAX_GROUP
+        # threadgroup float to[NSG][G][D] is 16 * G * D bytes of a 32 KB limit
+        and (hq // hkv) * d <= 1024
     )
 
 

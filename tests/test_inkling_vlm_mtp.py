@@ -2479,3 +2479,73 @@ def test_inkling2_fp8_kv_setting_reaches_the_model_estimate_and_ssd_signature(
     assert signed[-1] == "inkling2-fp8-kv-all"
     with pytest.raises(ValueError, match="FP8 KV mode"):
         scheduler.set_inkling2_fp8_kv("on")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["text", "vlm"])
+async def test_inkling2_fp8_kv_ssd_blocks_survive_a_reload_in_the_same_mode(
+    tmp_path, mock_tokenizer, kind
+):
+    """The engine sets the FP8 mode before it signs the SSD cache: signed as
+    "off" first, a reload swept every FP8 block the last session saved."""
+    from unittest.mock import patch
+
+    import mlx.nn as nn
+
+    from omlx.engine.batched import BatchedEngine
+    from omlx.engine.vlm import VLMBatchedEngine
+    from omlx.model_settings import ModelSettings
+    from omlx.scheduler import SchedulerConfig
+
+    model_dir, ssd_dir = tmp_path / "model", tmp_path / "ssd"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type": "inkling2_loop"}')
+
+    def load_model():
+        # Built by the loader, on the thread that evaluates it.
+        model = _inkling2_tiny()
+        if kind == "vlm":
+            vlm = nn.Module()
+            vlm.language_model = model
+            return vlm
+        return model
+
+    async def session(mode):
+        engine = (VLMBatchedEngine if kind == "vlm" else BatchedEngine)(
+            model_name=str(model_dir),
+            scheduler_config=SchedulerConfig(
+                model_name="inkling2-test", paged_ssd_cache_dir=str(ssd_dir)
+            ),
+            model_settings=ModelSettings(inkling2_fp8_kv=mode),
+        )
+        with (
+            patch("omlx.engine.batched.get_tokenizer_config", return_value={}),
+            patch("omlx.utils.model_loading.maybe_apply_pre_load_patches"),
+            patch(
+                "omlx.utils.model_loading.maybe_load_custom_quantization",
+                side_effect=lambda *a, **kw: (load_model(), mock_tokenizer),
+            ),
+            patch(
+                "omlx.utils.model_loading.apply_post_load_transforms",
+                side_effect=lambda model, settings: model,
+            ),
+        ):
+            await engine.start()
+        return engine, engine._engine.engine.scheduler
+
+    block = b"\x5a" * 32
+    engine, scheduler = await session("full")
+    manager = scheduler.paged_ssd_cache_manager
+    layer_types = scheduler._infer_live_layer_cache_types()[0]
+    codes = mx.zeros((1, 2, 8, 16), dtype=mx.uint8)
+    assert manager.save_block(
+        block, [(codes, codes)] * len(layer_types), 8, "inkling2-test", layer_types
+    )
+    await engine.stop()
+
+    for mode, kept in (("full", True), ("off", False), ("all", False), ("full", True)):
+        engine, scheduler = await session(mode)
+        manager = scheduler.paged_ssd_cache_manager
+        assert manager.has_block(block) is kept, mode
+        assert (manager.load_block(block) is not None) is kept, mode
+        await engine.stop()

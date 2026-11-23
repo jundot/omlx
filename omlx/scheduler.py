@@ -69,6 +69,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
+from .model_settings import inkling2_fp8_kv_mode
 from .patches.inkling2 import INKLING2_MODEL_TYPES
 from .patches.inkling2.kernels import (
     prefill_mask_elements as inkling2_prefill_mask_elements,
@@ -17124,6 +17125,19 @@ class Scheduler:
         self._inkling2_model().set_fp8_kv(mode)
         self._set_model_info_for_monitor()
         self.refresh_ssd_layer_signature()
+
+    def apply_inkling2_fp8_kv_setting(self, model_settings: Any) -> None:
+        """Apply the ``inkling2_fp8_kv`` model setting at engine load. Both
+        engines call this before they sign the SSD cache: a signature taken
+        while the model still reads "off" drops every FP8 block saved by the
+        last session."""
+        mode = inkling2_fp8_kv_mode(model_settings)
+        if mode == "off":
+            return
+        if not callable(getattr(self._inkling2_model(), "set_fp8_kv", None)):
+            return
+        self.set_inkling2_fp8_kv(mode)
+        logger.info(f"Inkling 2 FP8 KV cache for {self.config.model_name}: {mode}")
 
     def _ssd_numerics(self) -> str | None:
         """The numerics revision of the blocks this model writes. FP8 KV
