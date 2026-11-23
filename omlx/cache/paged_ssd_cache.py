@@ -1809,6 +1809,9 @@ class SharedHotCacheBudget:
         return victims
 
 
+_PATH_KEY_CACHE_LIMIT = 16384
+
+
 @dataclass
 class _SSDBudgetEntry:
     """One on-disk file as seen by the shared SSD budget."""
@@ -1878,6 +1881,7 @@ class SharedSSDBudget:
             _resolved_cache_path(cache_dir) if cache_dir is not None else None
         )
         self._entries: dict[Path, _SSDBudgetEntry] = {}
+        self._path_keys: dict[str, Path] = {}
         self._total_bytes = 0
         self._detached = 0
         self._lock = threading.Lock()
@@ -1915,6 +1919,24 @@ class SharedSSDBudget:
                 format_bytes(max_bytes),
                 format_bytes(chosen),
             )
+
+    def _resolve(self, path: Path | str) -> Path:
+        """Resolve a path once per spelling.
+
+        Charge, release and the eviction broadcast all revisit the same files,
+        and ``Path.resolve()`` walks symlinks with a syscall per component.
+        Caching the mapping keeps an eviction-heavy startup trim linear; the
+        cache is bounded and cleared wholesale when it fills up.
+        """
+        raw = str(path)
+        key = self._path_keys.get(raw)
+        if key is not None:
+            return key
+        key = _resolved_cache_path(path)
+        if len(self._path_keys) >= _PATH_KEY_CACHE_LIMIT:
+            self._path_keys.clear()
+        self._path_keys[raw] = key
+        return key
 
     def register(self, manager: Any) -> None:
         ref = self._owner_ref(manager)
@@ -1984,7 +2006,7 @@ class SharedSSDBudget:
         instead of double counting it, and re-homes a detached entry (owner
         already gone) to the manager that can now see the file.
         """
-        key = _resolved_cache_path(path)
+        key = self._resolve(path)
         size_bytes = max(0, int(size_bytes))
         if last_access is None:
             last_access = time.time()
@@ -2011,7 +2033,7 @@ class SharedSSDBudget:
                 self._detached = max(0, self._detached - 1)
 
     def release(self, path: Path | str) -> None:
-        key = _resolved_cache_path(path)
+        key = self._resolve(path)
         with self._lock:
             entry = self._entries.pop(key, None)
             if entry is None:
@@ -2035,7 +2057,7 @@ class SharedSSDBudget:
         files, and a per-entry ``Path.resolve()`` made that quadratic in
         syscalls).
         """
-        key = _resolved_cache_path(path)
+        key = self._resolve(path)
         with self._lock:
             entry = self._entries.pop(key, None)
             if entry is not None:
@@ -2073,7 +2095,7 @@ class SharedSSDBudget:
         eviction is actually needed, so the save path pays no O(N) merge.
         """
         target_bytes = max(0, int(target_bytes))
-        protected = {_resolved_cache_path(p) for p in (protected_paths or ())}
+        protected = {self._resolve(p) for p in (protected_paths or ())}
         skipped: set[Path] = set()
         evicted = 0
         while True:
@@ -2131,7 +2153,7 @@ class SharedSSDBudget:
             if candidate is None:
                 continue
             last_access, rank, metadata = candidate
-            key = _resolved_cache_path(metadata.file_path)
+            key = self._resolve(metadata.file_path)
             if key in protected:
                 continue
             order = (last_access, rank, str(key))
