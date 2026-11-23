@@ -3003,9 +3003,11 @@ class PagedSSDCacheManager(CacheManager):
         """Scan cache directory for existing files and build the compatible index.
 
         Only blocks compatible with the currently loaded model/layout are
-        indexed. Incompatible blocks are left on disk so a shared SSD cache
-        directory can safely serve multiple loaded models without one model's
-        startup scan deleting another model's cache.
+        indexed for reuse. Incompatible blocks stay on disk and are tracked
+        solely by the shared SSD budget: one model's startup scan must not
+        delete another loaded model's blocks unless the whole directory is
+        over the shared limit, in which case the globally oldest files are
+        evicted.
         """
         logger.info(f"Scanning SSD cache directory: {self._cache_dir}")
 
