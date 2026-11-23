@@ -1120,6 +1120,367 @@ _DECODE_SLIDING_CHUNK = 128
 # Simdgroups staging one tile (the first ones also run the queries).
 _DECODE_STAGERS = 2
 
+# Single-row BF16/FP16 verify blocks (L <= 8, not row-exact): one 8x8 MMA tile
+# carries all L query rows at once, so K and V stream once per split instead of
+# once per row or through an [L, S] additive mask.
+_MMA_VERIFY_MAX_QUERIES = 8
+_MMA_VERIFY_PART_SOURCE = """
+    constexpr int BK = 16;
+    constexpr int NT = GQA * 32;
+    constexpr float LOG2E = 1.4426950408889634f;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint g = tid / 32;
+    const uint lane = tid % 32;
+    const int split = (int)threadgroup_position_in_grid.x;
+    const int hk = (int)threadgroup_position_in_grid.y;
+    const int b = (int)threadgroup_position_in_grid.z;
+    const int h = hk * GQA + (int)g;
+    const int L = dims[0];
+    const int S = dims[1];
+    const int num_splits = dims[2];
+    const int lp = dims[3 + b];
+    const short qid = lane / 4;
+    const short fm = (qid & 4) + ((lane / 2) % 4);
+    const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    const int row = fm;
+    const bool row_ok = row < L;
+    const int a_row = S - L + row;
+    const float qscale = scale[0] * LOG2E;
+    const int a_first = S - L;
+    const int a_last = S - 1;
+    int lo = (WINDOW > 0) ? max(0, a_first - WINDOW + 1) : 0;
+    lo = max(lo, lp);
+    const int total_keys = max(0, a_last + 1 - lo);
+    const int keys_per_split =
+        ((total_keys + num_splits - 1) / num_splits + BK - 1) / BK * BK;
+    const int k_start = lo + split * keys_per_split;
+    const int k_end = min(a_last + 1, k_start + keys_per_split);
+    constexpr int LDK = BK + 8;
+    constexpr int LDV = D + 8;
+    threadgroup half Ks[D * LDK];
+    threadgroup half Vs[BK * LDV];
+    simdgroup_half8x8 Qf[D / 8];
+    const device T* q_base = q + (size_t)b * q_strides[0]
+        + (size_t)h * q_strides[1]
+        + (size_t)(row_ok ? row : 0) * q_strides[2];
+    for (int db = 0; db < D / 8; ++db) {
+        float2 qv = float2(0.0f);
+        if (row_ok) {
+            const device T* qp = q_base + (size_t)(db * 8 + fn) * q_strides[3];
+            qv = float2(float(qp[0]), float(qp[q_strides[3]]));
+        }
+        Qf[db].thread_elements()[0] = half(qv.x);
+        Qf[db].thread_elements()[1] = half(qv.y);
+    }
+    simdgroup_float8x8 Of[D / 8];
+    for (int db = 0; db < D / 8; ++db) {
+        Of[db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    if (split == 0 && row_ok) {
+        m = float(sink[((size_t)b * L + row) * HQ + h]) * LOG2E;
+        l = 1.0f;
+    }
+    const auto relp =
+        rel + (((size_t)b * L + (row_ok ? row : 0)) * HQ + h) * R;
+    const device T* kb_ptr =
+        k + (size_t)b * k_strides[0] + (size_t)hk * k_strides[1];
+    const device T* vb_ptr =
+        v + (size_t)b * v_strides[0] + (size_t)hk * v_strides[1];
+    const bool vec_kv = (k_strides[3] == 1 && v_strides[3] == 1
+        && (uintptr_t(kb_ptr) & 15) == 0 && (uintptr_t(vb_ptr) & 15) == 0
+        && (k_strides[2] & 7) == 0 && (v_strides[2] & 7) == 0);
+    for (int k0 = k_start; k0 < k_end; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (vec_kv) {
+            for (int c = (int)tid; c < BK * D / 8; c += NT) {
+                const int r = c / (D / 8);
+                const int col = (c % (D / 8)) * 8;
+                const int key = k0 + r;
+                uint4 kw = uint4(0), vw = uint4(0);
+                if (key < k_end) {
+                    kw = *(const device uint4*)(kb_ptr + (size_t)key * k_strides[2] + col);
+                    vw = *(const device uint4*)(vb_ptr + (size_t)key * v_strides[2] + col);
+                }
+                threadgroup half* kd = Ks + col * LDK + r;
+                threadgroup half* vd = Vs + r * LDV + col;
+                for (int j = 0; j < 4; ++j) {
+                    if (IS_BF16) {
+                        kd[(2 * j) * LDK] = half(as_type<float>(kw[j] << 16));
+                        kd[(2 * j + 1) * LDK] = half(as_type<float>(kw[j] & 0xFFFF0000u));
+                        vd[2 * j] = half(as_type<float>(vw[j] << 16));
+                        vd[2 * j + 1] = half(as_type<float>(vw[j] & 0xFFFF0000u));
+                    } else {
+                        half2 kh = as_type<half2>(kw[j]);
+                        half2 vh = as_type<half2>(vw[j]);
+                        kd[(2 * j) * LDK] = kh.x;
+                        kd[(2 * j + 1) * LDK] = kh.y;
+                        vd[2 * j] = vh.x;
+                        vd[2 * j + 1] = vh.y;
+                    }
+                }
+            }
+        } else {
+            for (int c = (int)tid; c < BK * D; c += NT) {
+                const int r = c / D;
+                const int col = c % D;
+                const int key = k0 + r;
+                float kv = 0.0f, vv = 0.0f;
+                if (key < k_end) {
+                    kv = float(kb_ptr[(size_t)key * k_strides[2] + (size_t)col * k_strides[3]]);
+                    vv = float(vb_ptr[(size_t)key * v_strides[2] + (size_t)col * v_strides[3]]);
+                }
+                Ks[col * LDK + r] = half(kv);
+                Vs[r * LDV + col] = half(vv);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 Sf[BK / 8];
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            Sf[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int db = 0; db < D / 8; ++db) {
+                simdgroup_half8x8 Kt;
+                simdgroup_load(Kt, Ks + db * 8 * LDK + kb * 8, LDK);
+                simdgroup_multiply_accumulate(Sf[kb], Qf[db], Kt, Sf[kb]);
+            }
+        }
+        float rmax = -INFINITY;
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            for (int e = 0; e < 2; ++e) {
+                const int key = k0 + kb * 8 + fn + e;
+                const int d = a_row - key;
+                const bool vis = row_ok && key < k_end && d >= 0 && key >= lp
+                    && (WINDOW == 0 || d < WINDOW);
+                float s = Sf[kb].thread_elements()[e] * qscale;
+                if (vis) {
+                    if (d < R) s += float(relp[d]) * LOG2E;
+                } else {
+                    s = -INFINITY;
+                }
+                Sf[kb].thread_elements()[e] = s;
+                rmax = max(rmax, s);
+            }
+        }
+        rmax = max(rmax, simd_shuffle_xor(rmax, 1));
+        rmax = max(rmax, simd_shuffle_xor(rmax, 8));
+        const float m_new = max(m, rmax);
+        const float factor =
+            (m == -INFINITY || m_new == -INFINITY) ? 0.0f : fast::exp2(m - m_new);
+        float rsum = 0.0f;
+        simdgroup_half8x8 Pf[BK / 8];
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            for (int e = 0; e < 2; ++e) {
+                const float sv = Sf[kb].thread_elements()[e];
+                const float p = (sv == -INFINITY) ? 0.0f : fast::exp2(sv - m_new);
+                Pf[kb].thread_elements()[e] = half(p);
+                rsum += p;
+            }
+        }
+        rsum += simd_shuffle_xor(rsum, 1);
+        rsum += simd_shuffle_xor(rsum, 8);
+        l = l * factor + rsum;
+        m = m_new;
+        for (int db = 0; db < D / 8; ++db) {
+            Of[db].thread_elements()[0] *= factor;
+            Of[db].thread_elements()[1] *= factor;
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                simdgroup_half8x8 Vm;
+                simdgroup_load(Vm, Vs + kb * 8 * LDV + db * 8, LDV);
+                simdgroup_multiply_accumulate(Of[db], Pf[kb], Vm, Of[db]);
+            }
+        }
+    }
+    if (row_ok) {
+        size_t base = (((size_t)b * HQ + h) * L + row) * num_splits + split;
+        device float* op = part_o + base * D;
+        for (int db = 0; db < D / 8; ++db) {
+            op[db * 8 + fn] = Of[db].thread_elements()[0];
+            op[db * 8 + fn + 1] = Of[db].thread_elements()[1];
+        }
+        if (fn == 0) {
+            part_ml[base * 2 + 0] = m;
+            part_ml[base * 2 + 1] = l;
+        }
+    }
+"""
+
+_MMA_VERIFY_FOLD_SOURCE = """
+    constexpr int PER = (D + 31) / 32;
+    const uint lane = thread_index_in_simdgroup;
+    const int row = (int)threadgroup_position_in_grid.x;
+    const int num_splits = dims[0];
+    const size_t base = (size_t)row * num_splits;
+    float m_max = -INFINITY;
+    for (int s = 0; s < num_splits; ++s) {
+        m_max = max(m_max, part_ml[(base + s) * 2 + 0]);
+    }
+    float o_acc[PER];
+    for (int i = 0; i < PER; ++i) {
+        o_acc[i] = 0.0f;
+    }
+    float l_acc = 0.0f;
+    for (int s = 0; s < num_splits; ++s) {
+        const float ls = part_ml[(base + s) * 2 + 1];
+        if (ls > 0.0f) {
+            const float w = precise::exp2(part_ml[(base + s) * 2 + 0] - m_max);
+            l_acc += ls * w;
+            const auto op = part_o + (base + s) * D;
+            for (int i = 0; i < PER; ++i) {
+                const int e = (int)lane + 32 * i;
+                if (e < D) {
+                    o_acc[i] += op[e] * w;
+                }
+            }
+        }
+    }
+    const float inv = (l_acc > 0.0f) ? (1.0f / l_acc) : 0.0f;
+    device T* outp = out + (size_t)row * D;
+    for (int i = 0; i < PER; ++i) {
+        const int e = (int)lane + 32 * i;
+        if (e < D) {
+            outp[e] = T(o_acc[i] * inv);
+        }
+    }
+"""
+_mma_verify_kernels = None
+
+
+def _get_mma_verify_kernels():
+    global _mma_verify_kernels
+    if _mma_verify_kernels is None:
+        _mma_verify_kernels = (
+            mx.fast.metal_kernel(
+                name="omlx_inkling2_mma_verify_part",
+                input_names=["q", "k", "v", "rel", "sink", "dims", "scale"],
+                output_names=["part_o", "part_ml"],
+                source=_MMA_VERIFY_PART_SOURCE,
+                ensure_row_contiguous=False,
+            ),
+            mx.fast.metal_kernel(
+                name="omlx_inkling2_mma_verify_fold",
+                input_names=["part_o", "part_ml", "dims"],
+                output_names=["out"],
+                source=_MMA_VERIFY_FOLD_SOURCE,
+            ),
+        )
+    return _mma_verify_kernels
+
+
+def _use_mma_verify(q, k, v, rel, window: int = 0) -> bool:
+    """BF16/FP16 single-row verify blocks whose GQA and head dim fit the kernel."""
+    hq, hkv, d = q.shape[1], k.shape[1], q.shape[-1]
+    if (
+        q.dtype not in (mx.bfloat16, mx.float16)
+        or k.dtype != q.dtype
+        or v.dtype != q.dtype
+        or rel.dtype != q.dtype
+        or mx.default_device() != mx.gpu
+        or d <= 0
+        or d % 8 != 0
+        or k.shape[-1] != d
+        or v.shape[-1] != d
+        or k.shape[2] <= 0
+        or hq % hkv != 0
+    ):
+        return False
+    gqa = hq // hkv
+    # Ks [D, 24] + Vs [16, D + 8] in half must fit Metal's 32 KB threadgroup limit.
+    if 80 * d + 256 > 32768 or gqa * 32 > 1024:
+        return False
+    part, _ = _get_mma_verify_kernels()
+    r = rel.shape[-1]
+
+    def probe():
+        z = mx.zeros((1, hq, 2, d), dtype=q.dtype)
+        zk = mx.zeros((1, hkv, 2, d), dtype=q.dtype)
+        return part(
+            inputs=[
+                z,
+                zk,
+                zk,
+                mx.zeros((1, 2, hq, r), dtype=q.dtype),
+                mx.zeros((1, 2, hq), dtype=q.dtype),
+                mx.array([2, 2, 1, 0], dtype=mx.int32),
+                mx.array([1.0], dtype=mx.float32),
+            ],
+            template=[
+                ("T", q.dtype),
+                ("IS_BF16", q.dtype == mx.bfloat16),
+                ("D", d),
+                ("HQ", hq),
+                ("GQA", gqa),
+                ("R", r),
+                ("WINDOW", int(window)),
+            ],
+            grid=(gqa * 32, hkv, 1),
+            threadgroup=(gqa * 32, 1, 1),
+            output_shapes=[(1, hq, 2, 1, d), (1, hq, 2, 1, 2)],
+            output_dtypes=[mx.float32, mx.float32],
+        )
+
+    return _fits_threadgroup(("mma_verify", gqa, d, q.dtype, bool(window)), probe)
+
+
+def mma_verify_attention(q, k, v, rel, sink, *, scale, window=0, left_padding=None):
+    """``banded_sink_attention`` for BF16/FP16 verify blocks (L <= 8)."""
+    b, hq, length, d = q.shape
+    hkv, s = k.shape[1], k.shape[2]
+    if not 1 <= length <= _MMA_VERIFY_MAX_QUERIES:
+        raise ValueError(
+            f"mma_verify_attention supports 1..{_MMA_VERIFY_MAX_QUERIES} queries, got {length}"
+        )
+    if d <= 0 or d % 8 != 0 or hq % hkv != 0:
+        raise ValueError(
+            f"mma_verify_attention requires D % 8 == 0 and Hq % Hkv == 0, got D={d}, Hq={hq}, Hkv={hkv}"
+        )
+    gqa = hq // hkv
+    part, fold = _get_mma_verify_kernels()
+    eff_s = min(s, window + length - 1) if window else s
+    target_tgs = 64 if eff_s <= 1024 else 128
+    num_splits = max(1, min(32, max(target_tgs // hkv, 1), (eff_s + 63) // 64))
+    lp = (
+        left_padding.astype(mx.int32)
+        if left_padding is not None
+        else mx.zeros((b,), dtype=mx.int32)
+    )
+    dims = mx.concatenate([mx.array([length, s, num_splits], dtype=mx.int32), lp])
+    part_o, part_ml = part(
+        inputs=[
+            q,
+            k,
+            v,
+            mx.contiguous(rel),
+            mx.contiguous(sink),
+            dims,
+            mx.array([scale], dtype=mx.float32),
+        ],
+        template=[
+            ("T", q.dtype),
+            ("IS_BF16", q.dtype == mx.bfloat16),
+            ("D", d),
+            ("HQ", hq),
+            ("GQA", gqa),
+            ("R", rel.shape[-1]),
+            ("WINDOW", int(window)),
+        ],
+        grid=(num_splits * gqa * 32, hkv, b),
+        threadgroup=(gqa * 32, 1, 1),
+        output_shapes=[
+            (b, hq, length, num_splits, d),
+            (b, hq, length, num_splits, 2),
+        ],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return fold(
+        inputs=[part_o, part_ml, mx.array([num_splits], dtype=mx.int32)],
+        template=[("T", q.dtype), ("D", d)],
+        grid=(b * hq * length * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(b, hq, length, d)],
+        output_dtypes=[q.dtype],
+    )[0]
+
 
 def _use_flash_decode(q, k) -> bool:
     """BF16/FP16 queries on the GPU whose head layout fits the decode kernel."""
@@ -1323,6 +1684,13 @@ def banded_sink_attention(
             for r in range(length)
         ]
         return mx.concatenate(rows, axis=1).transpose(0, 2, 1, 3)
+    if (
+        b == 1
+        and 2 <= length <= _MMA_VERIFY_MAX_QUERIES
+        and left_padding is None
+        and _use_mma_verify(q, k, v, rel, window)
+    ):
+        return mma_verify_attention(q, k, v, rel, sink, scale=scale, window=window)
     if q.dtype in (mx.bfloat16, mx.float16) and _use_flash(length, window):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
