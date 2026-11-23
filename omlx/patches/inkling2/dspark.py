@@ -45,6 +45,17 @@ def bundled_inkling2_dspark_path(model_path: str | Path) -> Path | None:
         return None
     if mtp.get("markov_head_type") != "rnn_hidden":
         return None
+    text_cfg = config.get("text_config")
+    target_ids = mtp.get("target_layer_ids")
+    if isinstance(text_cfg, dict) and target_ids:
+        from .model import TextArgs
+
+        try:
+            num_visits = len(TextArgs.from_dict(text_cfg).layer_schedule())
+        except (KeyError, TypeError, ValueError):
+            return None
+        if max(int(i) for i in target_ids) != num_visits:
+            return None
     return weights
 
 
@@ -361,6 +372,7 @@ def wrap_inkling2_dspark(
     )
     if depth:
         drafter.depth = max(1, min(drafter.depth, int(depth)))
+    drafter.context_copy = True
     return drafter
 
 

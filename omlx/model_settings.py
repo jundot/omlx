@@ -32,7 +32,7 @@ from .model_profiles import (
 logger = logging.getLogger(__name__)
 
 # Current settings file format version
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 
 # The Lightning MTP runtime clamps deeper requests to this global ceiling.
 # Keep API validation and runtime normalization on the same contract.
@@ -276,8 +276,19 @@ def ced_prefill_on(settings: Any) -> bool:
     return _setting(settings, "deepseek_v41_ced_prefill_enabled") is not False
 
 
-PROFILES_VERSION = 1
-TEMPLATES_VERSION = 1
+PROFILES_VERSION = 2
+TEMPLATES_VERSION = 2
+
+
+def _drop_ui_default_mtp_depth(settings: dict) -> bool:
+    """Drop the mtp_adaptive_max_depth 3 that the UIs saved for "Default" before
+    settings v3 and profiles / templates v2, so the model's own default applies."""
+    if settings.get("mtp_adaptive_max_depth") != 3:
+        return False
+    del settings["mtp_adaptive_max_depth"]
+    return True
+
+
 _LEGACY_TURBOQUANT_PROFILE_FIELDS = frozenset(
     {"turboquant_kv_enabled", "turboquant_kv_bits"}
 )
@@ -473,6 +484,7 @@ class ModelSettings:
     # fused one-row decode route, not only the oQe allow-list.
     qwen4_gdn_decode_wide_proj: bool = False
     deepseek_v41_engram_ssd_offload: bool = False
+    hy4_engram_ssd_offload: bool = False
     # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
@@ -915,9 +927,12 @@ class ModelSettingsManager:
             # Load model settings
             models_data = data.get("models", {})
             self._settings = {}
+            ui_default_depth = isinstance(version, int) and version < 3
 
             for model_id, model_data in models_data.items():
                 model_data = rename_legacy_fields(model_data)
+                if ui_default_depth:
+                    _drop_ui_default_mtp_depth(model_data)
                 # Settings saved before the vlm_mtp exclusivity rule may
                 # combine vlm_mtp_enabled with processor-backed settings;
                 # __post_init__ would raise and the except below would drop
@@ -1193,6 +1208,7 @@ class ModelSettingsManager:
                     f"Profiles file version {version} differs from current {PROFILES_VERSION}"
                 )
             self._profiles = data.get("profiles", {}) or {}
+            ui_default_depth = isinstance(version, int) and version < 2
             # Migration: strip ttl_seconds from existing profile settings and
             # add api_name for exposed-model IDs without changing internal keys.
             changed = False
@@ -1210,6 +1226,8 @@ class ModelSettingsManager:
                         del settings["ttl_seconds"]
                         changed = True
                         model_changed = True
+                    if settings and ui_default_depth:
+                        changed |= _drop_ui_default_mtp_depth(settings)
                     if settings and settings.keys() & RENAMED_FIELDS.keys():
                         profile["settings"] = settings = rename_legacy_fields(settings)
                         changed = True
@@ -1752,9 +1770,11 @@ class ModelSettingsManager:
         overlay = filter_profile_fields(profile_settings)
         merged.update(overlay)
         # A profile that sets the Lightning MTP toggle also owns the depth
-        # choice; no fixed depth there selects adaptive depth.
-        if "mtp_enabled" in overlay and "mtp_fixed_depth" not in overlay:
-            merged["mtp_fixed_depth"] = None
+        # choice; a depth it leaves out is adaptive up to the model default.
+        if "mtp_enabled" in overlay:
+            for key in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
+                if key not in overlay:
+                    merged[key] = None
         merged["active_profile_name"] = name
         if settings_sanitizer is not None:
             settings_sanitizer(merged)
@@ -1855,11 +1875,14 @@ class ModelSettingsManager:
                     f"Templates file version {version} differs from current {TEMPLATES_VERSION}"
                 )
             self._templates = data.get("templates", {}) or {}
+            ui_default_depth = isinstance(version, int) and version < 2
             # Migration: strip ttl_seconds from existing template settings
             for name, template in self._templates.items():
                 settings = template.get("settings")
                 if settings and "ttl_seconds" in settings:
                     del settings["ttl_seconds"]
+                if settings and ui_default_depth:
+                    _drop_ui_default_mtp_depth(settings)
         except Exception as e:
             logger.error(f"Failed to load templates file: {e}")
             self._templates = {}

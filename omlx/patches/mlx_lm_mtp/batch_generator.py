@@ -4504,15 +4504,20 @@ def _context_copy_drafts(
     so the Leviathan/Chen rule keeps the sampled distribution exact. Either
     way any draft source leaves the output distribution unchanged. Returns
     ``[]`` when the MTP head should draft instead. With ``block``, only a copy
-    of exactly that many tokens replaces the drafter's block.
+    of exactly that many tokens replaces the drafter's block, except a
+    verbatim copy on a target with 16-row windows, which may run past it.
     """
     if state.context_copy is None:
-        # A wide copy verifies MAX_COPY + 1 rows, so it must fit the target's
-        # verify cap (GLM-5.3's indexer pool rolls back at most 8 rows).
+        # A wide copy verifies MAX_COPY + 1 rows. A declared verify cap decides
+        # (GLM-5.3's indexer pool rolls back at most 8 rows, Inkling 2 verifies
+        # 16); without one only row-exact targets cover 16-row windows.
         cap = _max_verify_rows(gen_batch.model)
         state.context_copy = _context_copy.ContextCopy(
-            wide_window=_row_exact_verify(gen_batch.model)
-            and (cap is None or cap > _context_copy.MAX_COPY)
+            wide_window=(
+                cap > _context_copy.MAX_COPY
+                if cap is not None
+                else _row_exact_verify(gen_batch.model)
+            )
         )
     copier = state.context_copy
     state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)
@@ -4526,7 +4531,12 @@ def _context_copy_drafts(
         block = state.depth
     if block is None:
         return copier.propose(room)
-    copied = copier.propose(min(room, block))
+    if copier.wide_window:
+        copied = copier.propose(min(room, block), wide_limit=room)
+        if len(copied) > block:
+            return copied
+    else:
+        copied = copier.propose(min(room, block))
     return copied if len(copied) == block else []
 
 
@@ -4598,8 +4608,13 @@ def _run_verify_cycle_chain(
     procs = _proc_list(gen_batch)
     is_greedy = _is_greedy(gen_batch)
     drafter = _drafter_for(gen_batch.model)
-    if drafter is not None and verify_result is None:
-        # A shared verify was already built from the drafts it was given.
+    if (
+        drafter is not None
+        and verify_result is None
+        and not (state.copy_drafts and int(state.drafts.shape[0]) > drafter.depth)
+    ):
+        # A shared verify was already built from the drafts it was given. A
+        # copy longer than the block is not the drafter's block to clip.
         _clip_block_drafts(
             state,
             state.controller.cur if state.controller is not None else state.depth,

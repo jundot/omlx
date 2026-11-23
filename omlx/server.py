@@ -94,6 +94,7 @@ from .api.anthropic_utils import (
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
+from .api.anthropic_web_search import maybe_handle_anthropic_web_search
 from .api.body_limit import RequestBodySizeLimitMiddleware
 from .api.embedding_models import (
     EmbeddingData,
@@ -8018,6 +8019,12 @@ async def create_anthropic_message(
         f"messages={len(request.messages)}, stream={request.stream}, "
         f"max_tokens={request.max_tokens}"
     )
+
+    web_search_response = await maybe_handle_anthropic_web_search(
+        request, _server_state.global_settings
+    )
+    if web_search_response is not None:
+        return web_search_response
 
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(

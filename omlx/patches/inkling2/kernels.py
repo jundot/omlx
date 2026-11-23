@@ -6,6 +6,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
+from ..qwen35_verify_qmm import is_row_exact_armed
 
 # Upper bound on one additive mask block (elements) in the general attention
 # path; queries are split into sub-blocks so the mask stays below it.
@@ -141,7 +142,8 @@ def _decode_attention(q, k, v, rel, sink, scale, window):
 
 
 # Flash attention with the relative-bias band and per-query sinks, for
-# prefill-sized BF16 query blocks. One threadgroup runs 32 queries of one head
+# prefill-sized BF16 or FP16 query blocks (FP16 after the M1/M2 activation
+# recast). One threadgroup runs 32 queries of one head
 # in four simdgroups (8 rows each) over 16-key tiles staged in half. Scores
 # live in the log2 domain; each row's online softmax starts from its sink
 # logit, so the zero-value sink is exact without an extra key.
@@ -169,9 +171,9 @@ _FLASH_SOURCE = """
     const int a_row = S - L + row;
     const float qscale = scale[0] * LOG2E;
 
-    // Q, K and V are BF16 values within half's range (L2-clipped q/k,
-    // unit-RMS v), so staging them in half is exact; scores accumulate in
-    // FP32 and the softmax scale is applied there. K is stored transposed
+    // Q, K and V are FP16, or BF16 values within half's range (L2-clipped
+    // q/k, unit-RMS v), so staging them in half is exact; scores accumulate
+    // in FP32 and the softmax scale is applied there. K is stored transposed
     // and both tiles are padded by 16 bytes per row against bank conflicts.
     constexpr int LDK = BK + 8;
     constexpr int LDV = D + 8;
@@ -209,7 +211,7 @@ _FLASH_SOURCE = """
     for (int k0 = k_begin; k0 <= a_last; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (vec_kv) {
-            // 8 BF16 values (16 bytes) per load.
+            // 8 BF16 or FP16 values (16 bytes) per load.
             for (int c = tid; c < BK * D / 8; c += NT) {
                 const int r = c / (D / 8);
                 const int col = (c % (D / 8)) * 8;
@@ -222,11 +224,23 @@ _FLASH_SOURCE = """
                 }
                 threadgroup half* kd = Ks + col * LDK + r;
                 threadgroup half* vd = Vs + r * LDV + col;
-                for (int j = 0; j < 4; ++j) {
-                    kd[(2 * j) * LDK] = half(as_type<float>(kw[j] << 16));
-                    kd[(2 * j + 1) * LDK] = half(as_type<float>(kw[j] & 0xFFFF0000u));
-                    vd[2 * j] = half(as_type<float>(vw[j] << 16));
-                    vd[2 * j + 1] = half(as_type<float>(vw[j] & 0xFFFF0000u));
+                if (IS_BF16) {
+                    for (int j = 0; j < 4; ++j) {
+                        kd[(2 * j) * LDK] = half(as_type<float>(kw[j] << 16));
+                        kd[(2 * j + 1) * LDK] = half(as_type<float>(kw[j] & 0xFFFF0000u));
+                        vd[2 * j] = half(as_type<float>(vw[j] << 16));
+                        vd[2 * j + 1] = half(as_type<float>(vw[j] & 0xFFFF0000u));
+                    }
+                } else {
+                    // FP16 activations (M1/M2 recast): the words already hold halves.
+                    for (int j = 0; j < 4; ++j) {
+                        const half2 k2 = as_type<half2>(kw[j]);
+                        const half2 v2 = as_type<half2>(vw[j]);
+                        kd[(2 * j) * LDK] = k2.x;
+                        kd[(2 * j + 1) * LDK] = k2.y;
+                        vd[2 * j] = v2.x;
+                        vd[2 * j + 1] = v2.y;
+                    }
                 }
             }
         } else {
@@ -332,8 +346,13 @@ def _use_flash(length: int, window: int) -> bool:
     return bool(window) or not is_nax_available()
 
 
+def prefill_mask_elements() -> int | None:
+    """Mask elements one full-attention prefill call holds, None on flash."""
+    return None if _use_flash(_FLASH_MIN_QUERIES, 0) else _MASK_BUDGET
+
+
 def flash_banded_attention(q, k, v, rel, sink, *, scale, window, left_padding=None):
-    """``banded_sink_attention`` for BF16 prefill blocks; same arguments and result."""
+    """``banded_sink_attention`` for BF16/FP16 prefill blocks; same arguments and result."""
     global _flash_kernel
     b, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
@@ -363,6 +382,7 @@ def flash_banded_attention(q, k, v, rel, sink, *, scale, window, left_padding=No
         ],
         template=[
             ("T", q.dtype),
+            ("IS_BF16", q.dtype == mx.bfloat16),
             ("D", d),
             ("HQ", hq),
             ("HKV", hkv),
@@ -398,7 +418,25 @@ def banded_sink_attention(
     b, length = q.shape[0], q.shape[2]
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
-    if q.dtype == mx.bfloat16 and _use_flash(length, window):
+    if b == 1 and left_padding is None and is_row_exact_armed():
+        # Row-exact verify: each row is the decode step of its token, over the
+        # keys up to its own position. The rows are joined as [B, L, H, D], so
+        # the output projection reads them without a transpose copy.
+        s = k.shape[2]
+        rows = [
+            _decode_attention(
+                q[:, :, r : r + 1],
+                k[:, :, : s - length + 1 + r],
+                v[:, :, : s - length + 1 + r],
+                rel[:, r : r + 1],
+                sink[:, r : r + 1],
+                scale,
+                window,
+            ).transpose(0, 2, 1, 3)
+            for r in range(length)
+        ]
+        return mx.concatenate(rows, axis=1).transpose(0, 2, 1, 3)
+    if q.dtype in (mx.bfloat16, mx.float16) and _use_flash(length, window):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )
@@ -542,3 +580,244 @@ def route_topk(logits: mx.array, bias: mx.array, top_k: int, route_scale: float)
         output_dtypes=[mx.uint32, mx.float32],
     )
     return inds, weights
+
+
+_SHORT_CONV_HEADER = """
+// Row i of the padded window [state, x], x rounded to T; the state has p rows.
+template <typename T, typename S, typename X>
+inline float omlx_inkling2_padded(
+    const device S* srow,
+    int64_t ss,
+    const device X* xrow,
+    int64_t xs,
+    int p,
+    int i) {
+    return i < p ? float(srow[i * ss]) : float(T(xrow[(i - p) * xs]));
+}
+"""
+
+# One thread per (channel, padded row, batch row) of the window [state, x].
+# Rows below K - 1 only copy the state; the others also compute their token.
+# Each product and sum is its own statement, in the order and precision of
+# short_conv_reference: a fused multiply-add would change the bits.
+_SHORT_CONV_SOURCE = """
+    constexpr int P = K - 1;
+    const int c = thread_position_in_grid.x;
+    const int y = thread_position_in_grid.y;
+    const int b = thread_position_in_grid.z;
+    const int L = x_shape[1];
+    const int C = x_shape[2];
+    const device S* srow = state + b * state_strides[0] + c * state_strides[2];
+    const device X* xrow = x + b * x_strides[0] + c * x_strides[2];
+    const int64_t ss = state_strides[1];
+    const int64_t xs = x_strides[1];
+    const float own = omlx_inkling2_padded<T>(srow, ss, xrow, xs, P, y);
+    xp[((size_t)b * (P + L) + y) * C + c] = own;
+    if (y < P) {
+        return;
+    }
+    const device W* wrow = w + c * w_strides[0];
+    const int t = y - P;
+    float acc = float(wrow[0]) * omlx_inkling2_padded<T>(srow, ss, xrow, xs, P, t);
+    for (int j = 1; j < K; ++j) {
+        const float tap = float(wrow[j * w_strides[1]]);
+        const float term = tap * omlx_inkling2_padded<T>(srow, ss, xrow, xs, P, t + j);
+        acc = acc + term;
+    }
+    // Rounded to the weight dtype before the residual add, as the reference.
+    const float conv = float(W(acc));
+    const float res = conv + own;
+    const float o = res * scale[0];
+    // The result in T, then the caller's residual add and cast.
+    float v = float(T(o));
+    if (HAS_RESIDUAL) {
+        v = float(residual[b * residual_strides[0] + t * residual_strides[1]
+                           + c * residual_strides[2]]) + v;
+    }
+    out[((size_t)b * L + t) * C + c] = O(v);
+"""
+_short_conv_kernel = None
+
+
+def short_conv_reference(x, w, state, scale, residual=None, out_dtype=None, dtype=None):
+    """``short_conv`` as MLX ops (CPU path and test reference)."""
+    x = x.astype(dtype or x.dtype)
+    xf = x.astype(mx.float32)
+    k = w.shape[-1]
+    xp = mx.concatenate([state, xf], axis=1)
+    length = xf.shape[1]
+    out = w[:, 0] * xp[:, 0:length]
+    for j in range(1, k):
+        out = out + w[:, j] * xp[:, j : j + length]
+    # The reference rounds the depthwise conv to the weight dtype before the
+    # residual add.
+    out = (out.astype(w.dtype).astype(mx.float32) + xf) * scale
+    out = out.astype(x.dtype)
+    if residual is not None:
+        out = residual.astype(mx.float32) + out.astype(mx.float32)
+    return out.astype(out_dtype or x.dtype), xp
+
+
+def short_conv(
+    x: mx.array,
+    w: mx.array,
+    state: mx.array,
+    scale: float,
+    residual: mx.array | None = None,
+    out_dtype=None,
+    dtype=None,
+):
+    """Depthwise causal conv with residual (taps: ``w[:, K-1]`` is the current
+    token), as one kernel.
+
+    ``x``: [B, L, C], read as ``dtype`` (the activation dtype, default
+    ``x.dtype``); ``w``: [C, K]; ``state``: [B, K-1, C], the previous K-1
+    inputs. The output is ``(x + conv) * scale`` in ``dtype``; given a
+    ``residual`` [B, L, C], it is then added to the residual in FP32. Either
+    way it is returned cast to ``out_dtype`` (default ``dtype``), with the
+    FP32 padded window ``[state, x]``, whose last K-1 rows are the next
+    state. Strided inputs are read in place.
+    """
+    global _short_conv_kernel
+    dtype = dtype or x.dtype
+    out_dtype = out_dtype or dtype
+    if mx.default_device() != mx.gpu:
+        return short_conv_reference(x, w, state, scale, residual, out_dtype, dtype)
+    if _short_conv_kernel is None:
+        _short_conv_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_short_conv",
+            input_names=["x", "w", "state", "residual", "scale"],
+            output_names=["out", "xp"],
+            header=_SHORT_CONV_HEADER,
+            source=_SHORT_CONV_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    b, length, channels = x.shape
+    k = w.shape[-1]
+    has_residual = residual is not None
+    # Without a residual, x is bound in its place and never read.
+    residual = residual if has_residual else x
+    out, xp = _short_conv_kernel(
+        inputs=[x, w, state, residual, mx.array([scale], dtype=mx.float32)],
+        template=[
+            ("T", dtype),
+            ("X", x.dtype),
+            ("W", w.dtype),
+            ("S", state.dtype),
+            ("O", out_dtype),
+            ("K", k),
+            ("HAS_RESIDUAL", has_residual),
+        ],
+        grid=(channels, length + k - 1, b),
+        threadgroup=(min(channels, 256), 1, 1),
+        output_shapes=[(b, length, channels), (b, length + k - 1, channels)],
+        output_dtypes=[out_dtype, mx.float32],
+    )
+    return out, xp
+
+
+# The full-attention k/v conv: per-token taps static_w[lag] + dyn[head, lag],
+# laid out like _SHORT_CONV_SOURCE, with the sum over lags newest first and
+# no rounding before the residual add, as dynamic_conv_reference.
+_DYNAMIC_CONV_SOURCE = """
+    constexpr int P = K - 1;
+    const int c = thread_position_in_grid.x;
+    const int y = thread_position_in_grid.y;
+    const int b = thread_position_in_grid.z;
+    const int L = x_shape[1];
+    const int C = x_shape[2];
+    const device S* srow = state + b * state_strides[0] + c * state_strides[2];
+    const device T* xrow = x + b * x_strides[0] + c * x_strides[2];
+    const int64_t ss = state_strides[1];
+    const int64_t xs = x_strides[1];
+    const float own = omlx_inkling2_padded<T>(srow, ss, xrow, xs, P, y);
+    xp[((size_t)b * (P + L) + y) * C + c] = own;
+    if (y < P) {
+        return;
+    }
+    const int t = y - P;
+    const int head = c / (C / H);
+    const auto drow = dyn + b * dyn_strides[0] + t * dyn_strides[1]
+        + head * K * dyn_strides[2];
+    float acc = 0.0f;
+    for (int lag = 0; lag < K; ++lag) {
+        const float sw = float(static_w[lag * static_w_strides[0]
+                                        + c * static_w_strides[1]]);
+        const float tap = sw + float(drow[lag * dyn_strides[2]]);
+        const float term = omlx_inkling2_padded<T>(srow, ss, xrow, xs, P, y - lag)
+            * tap;
+        acc = lag == 0 ? term : acc + term;
+    }
+    const float res = acc + own;
+    const float o = res * scale[0];
+    out[((size_t)b * L + t) * C + c] = O(float(T(o)));
+"""
+_dynamic_conv_kernel = None
+
+
+def dynamic_conv_reference(x, dyn, static_w, state, heads, scale, out_dtype=None):
+    """``dynamic_conv`` as MLX ops (CPU path and test reference)."""
+    xf = x.astype(mx.float32)
+    b, length, c = xf.shape
+    k = static_w.shape[0]
+    xp = mx.concatenate([state, xf], axis=1)
+    dyn = dyn.astype(mx.float32).reshape(b, length, heads, 1, k)
+    out = None
+    for lag in range(k):
+        start = k - 1 - lag
+        window = xp[:, start : start + length].reshape(b, length, heads, c // heads)
+        # A slice, not static_w[lag]: integer indexing is a gather kernel.
+        tap = static_w[lag : lag + 1].reshape(heads, c // heads) + dyn[..., lag]
+        term = window * tap
+        out = term if out is None else out + term
+    out = (out.reshape(b, length, c) + xf) * scale
+    return out.astype(x.dtype).astype(out_dtype or x.dtype), xp
+
+
+def dynamic_conv(
+    x: mx.array,
+    dyn: mx.array,
+    static_w: mx.array,
+    state: mx.array,
+    heads: int,
+    scale: float,
+    out_dtype=None,
+):
+    """Depthwise causal conv with per-token taps ``static_w[lag] + dyn[head,
+    lag]`` and residual, as one kernel (full-attention k and v).
+
+    ``x``: [B, L, C]; ``dyn``: [B, L, heads * K]; ``static_w``: [K, C], lag 0
+    the current token; ``state``: [B, K-1, C]. Returns ``(x + conv) * scale``
+    rounded to ``x``'s dtype, cast to ``out_dtype`` (default ``x.dtype``),
+    and the FP32 padded window ``[state, x]``.
+    """
+    global _dynamic_conv_kernel
+    out_dtype = out_dtype or x.dtype
+    if mx.default_device() != mx.gpu:
+        return dynamic_conv_reference(x, dyn, static_w, state, heads, scale, out_dtype)
+    if _dynamic_conv_kernel is None:
+        _dynamic_conv_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_dynamic_conv",
+            input_names=["x", "dyn", "static_w", "state", "scale"],
+            output_names=["out", "xp"],
+            header=_SHORT_CONV_HEADER,
+            source=_DYNAMIC_CONV_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    b, length, channels = x.shape
+    k = static_w.shape[0]
+    out, xp = _dynamic_conv_kernel(
+        inputs=[x, dyn, static_w, state, mx.array([scale], dtype=mx.float32)],
+        template=[
+            ("T", x.dtype),
+            ("S", state.dtype),
+            ("O", out_dtype),
+            ("K", k),
+            ("H", heads),
+        ],
+        grid=(channels, length + k - 1, b),
+        threadgroup=(min(channels, 256), 1, 1),
+        output_shapes=[(b, length, channels), (b, length + k - 1, channels)],
+        output_dtypes=[out_dtype, mx.float32],
+    )
+    return out, xp

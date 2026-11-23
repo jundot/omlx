@@ -35393,37 +35393,37 @@
       }
     },
     "settings.acceleration.mtp.depth.adaptive" : {
-      "comment" : "Default Lightning MTP adaptive maximum draft depth",
+      "comment" : "Lightning MTP depth option that keeps the model's own default maximum",
       "extractionState" : "manual",
       "localizations" : {
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 Token (Standard)"
+            "value" : "Modellstandard"
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "Model default"
           }
         },
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 token (predefinito)"
+            "value" : "Predefinito del modello"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "По умолчанию для модели"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "模型默认"
           }
         }
       }

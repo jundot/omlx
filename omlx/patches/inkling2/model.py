@@ -11,7 +11,9 @@
 - Looped checkpoints (``loop_config``) run the core layers several times per
   token. Every later pass restarts from the prelude output and reads the
   previous pass's blocks only through gated messages. Each layer visit owns
-  its cache entry, so caches and draft taps count visits, not layers.
+  its cache state, so caches and draft taps count visits, not layers.
+- A sliding visit caches only the keys its window can still reach
+  (``cache.py``); a full-attention visit caches every key.
 """
 
 from __future__ import annotations
@@ -24,9 +26,12 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx_lm.models.base import BaseModelArgs
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache
 
+from ..qwen35_verify_qmm import is_row_exact_armed
+from . import cache as windows
 from . import kernels
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
@@ -80,6 +85,11 @@ class TextArgs:
             args.intermediate_size = int(params["moe_intermediate_size"])
         if "conv_kernel_size" in params:
             args.sconv_kernel_size = int(params["conv_kernel_size"])
+        if args.loop_config and "loop_num_passes" in params:
+            args.loop_config = {
+                **args.loop_config,
+                "num_passes": int(params["loop_num_passes"]),
+            }
         return args
 
     def is_sliding(self, i: int) -> bool:
@@ -106,7 +116,7 @@ class TextArgs:
             not 0 < core.start < core.stop <= n
             or core.start % block
             or core.stop % block
-            or passes < 2
+            or passes < 1
         ):
             # The message bank is the blocks one pass writes, so the core must
             # start and end on attention-residual block boundaries.
@@ -143,6 +153,41 @@ def _softcap(x: mx.array, cap: float) -> mx.array:
     return mx.tanh(x / cap) * cap
 
 
+def _logit_tail(logits: mx.array, cap: float, bias: mx.array | None) -> mx.array:
+    logits = _softcap(logits.astype(mx.float32), cap)
+    return logits if bias is None else logits + bias
+
+
+_logit_tail_compiled = mx.compile(_logit_tail)
+
+
+def _keep_fp32_weight(norm: nn.Module) -> None:
+    """Keep an FP32 copy of an RMSNorm weight for ``_norm``.
+
+    The copy lives outside the parameter tree, so it is never saved, loaded
+    or quantized, and is rebuilt when the weight is replaced. Call it outside
+    compiled traces: the copy must be a materialized array.
+    """
+    if type(norm) is not nn.RMSNorm:
+        return
+    weight = norm.weight
+    held = norm.__dict__.get("_omlx_fp32_weight")
+    if held is None or held[0] is not weight:
+        copy = weight.astype(mx.float32)
+        mx.eval(copy)
+        object.__setattr__(norm, "_omlx_fp32_weight", (weight, copy))
+
+
+def _norm(norm: nn.Module, x: mx.array) -> mx.array:
+    """``norm(x)``. An FP32 input takes the weight's FP32 copy: rms_norm would
+    cast a BF16 weight to FP32 on every call, a kernel each time, for the
+    same values. Other inputs keep the weight's dtype in the arithmetic."""
+    held = norm.__dict__.get("_omlx_fp32_weight")
+    if x.dtype == mx.float32 and held is not None and held[0] is norm.weight:
+        return mx.fast.rms_norm(x, held[1], norm.eps)
+    return norm(x)
+
+
 @mx.compile
 def _l2_clip(x: mx.array, scale: mx.array, threshold: mx.array) -> mx.array:
     xf = x.astype(mx.float32) * scale
@@ -151,8 +196,19 @@ def _l2_clip(x: mx.array, scale: mx.array, threshold: mx.array) -> mx.array:
 
 
 @mx.compile
-def _softcapped_swiglu(gate: mx.array, up: mx.array, gcap: mx.array, ucap: mx.array):
+def _softcapped_swiglu(
+    gate: mx.array,
+    up: mx.array,
+    gcap: mx.array,
+    ucap: mx.array,
+    scale: mx.array | None = None,
+):
     dtype = gate.dtype
+    if scale is not None:
+        # The NVFP4 tensor scale, in the matmul output's dtype; applying it
+        # here fuses it into this kernel.
+        gate = gate * scale
+        up = up * scale
     gate = gate.astype(mx.float32)
     up = up.astype(mx.float32)
     out = mx.tanh(gate / gcap) * gcap * mx.sigmoid(gate) * (mx.tanh(up / ucap) * ucap)
@@ -169,6 +225,27 @@ def _gather_sort(x, indices):
 
 def _scatter_unsort(x, inv_order, shape):
     return mx.unflatten(x[inv_order], 0, shape)
+
+
+_LHS_INDICES: dict = {}
+
+
+def _lhs_indices(batch_shape: tuple, rhs_shape: tuple) -> mx.array:
+    """The lhs indices ``gather_qmm`` defaults to (an arange over the batch of
+    ``x``, broadcast against the rhs indices) as a constant array; left to
+    ``gather_qmm`` they cost an arange kernel per call.
+
+    Built from host data, so a compiled trace may keep it. The shapes are
+    those of unsorted (decode and verify) rows, so the cache stays small.
+    """
+    key = (tuple(batch_shape), tuple(rhs_shape))
+    lhs = _LHS_INDICES.get(key)
+    if lhs is None:
+        rows = np.arange(math.prod(batch_shape), dtype=np.uint32)
+        shape = np.broadcast_shapes(tuple(batch_shape), tuple(rhs_shape))
+        rows = np.broadcast_to(rows.reshape(batch_shape), shape)
+        lhs = _LHS_INDICES[key] = mx.array(np.ascontiguousarray(rows))
+    return lhs
 
 
 def expert_quant_spec(fmt) -> dict:
@@ -221,7 +298,9 @@ class ExpertProj(nn.Module):
 
     ``global_scale`` (NVFP4 only) is the per-expert tensor amax in MLX's
     convention; the source scale ``global_scale / (6 * 448)`` is applied after
-    the matmul so the packed codes and E4M3 block scales stay unchanged.
+    the matmul so the packed codes and E4M3 block scales stay unchanged. The
+    unscaled output is ~1e4 times the real one and overflows float16, so
+    float16 activations pass ``global_scale`` to ``gather_qmm`` instead.
     """
 
     def __init__(self, experts: int, out_dims: int, in_dims: int, spec: dict):
@@ -245,12 +324,20 @@ class ExpertProj(nn.Module):
         # converted checkpoint here, which __init__ has applied.
         return self
 
-    def post_scale(self, idx):
-        if self.mode != "nvfp4":
+    def scales_in_kernel(self, dtype) -> bool:
+        return self.mode == "nvfp4" and dtype == mx.float16
+
+    def post_scale(self, idx, dtype):
+        if self.mode != "nvfp4" or self.scales_in_kernel(dtype):
             return None
         return self.global_scale[idx] * (1.0 / _NVFP4_DENOMINATOR)
 
     def __call__(self, x, idx, sorted_indices):
+        extra = {}
+        if self.scales_in_kernel(x.dtype):
+            extra["global_scale"] = self.global_scale
+        if not sorted_indices:
+            extra["lhs_indices"] = _lhs_indices(x.shape[:-2], idx.shape)
         return mx.gather_qmm(
             x,
             self.weight,
@@ -262,6 +349,7 @@ class ExpertProj(nn.Module):
             bits=self.bits,
             mode=self.mode,
             sorted_indices=sorted_indices,
+            **extra,
         )
 
 
@@ -279,26 +367,31 @@ class Inkling2Experts(nn.Module):
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
+        """FP32 sum of the routed expert outputs; the caller rounds it to the
+        activation dtype (the MLP conv kernel does, on read)."""
         xe = mx.expand_dims(x, (-2, -3))
-        do_sort = inds.size >= 64
+        # Sorting regroups the pairs by expert and changes their arithmetic;
+        # row-exact verify rows keep the per-pair gather of a decode step.
+        do_sort = inds.size >= 64 and not is_row_exact_armed()
         idx = inds
         inv = None
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
         y = self.w13(xe, idx, do_sort)
-        s13 = self.w13.post_scale(idx)
+        s13 = self.w13.post_scale(idx, xe.dtype)
         if s13 is not None:
-            y = y * s13[..., None, None].astype(y.dtype)
-        act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
+            s13 = s13[..., None, None].astype(y.dtype)
+        act = _softcapped_swiglu(
+            y[..., 0::2], y[..., 1::2], self._gcap, self._ucap, s13
+        )
         z = self.w2(act, idx, do_sort)
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
         z = z.squeeze(-2)
-        s2 = self.w2.post_scale(inds)
+        s2 = self.w2.post_scale(inds, act.dtype)
         if s2 is not None:
             weights = weights * s2
-        out = mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
-        return out.astype(x.dtype)
+        return mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
 
 
 class Inkling2MoE(nn.Module):
@@ -313,12 +406,13 @@ class Inkling2MoE(nn.Module):
         self.experts = Inkling2Experts(args, w13_spec, w2_spec)
 
     def route(self, x: mx.array):
-        logits = x.astype(mx.float32) @ self.router_weight.T
+        logits = _row_matmul(x.astype(mx.float32), self.router_weight.T)
         return kernels.route_topk(
             logits, self.router_bias, self.top_k, self.route_scale
         )
 
     def __call__(self, x: mx.array) -> mx.array:
+        """FP32 output, not yet rounded to ``x``'s dtype (see ``Inkling2Experts``)."""
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
         inds, w = self.route(flat)
@@ -356,49 +450,60 @@ def _mix_messages(x, message, down, gain_forget):
     # dependent kernel, so prefill chunking would change the result.
     z = mx.stack([_unit_rms(x), _unit_rms(message)], axis=1)
     z = z.astype(mx.bfloat16).astype(mx.float32).reshape(2 * n, rows, hidden)
-    low = (z @ down.reshape(2 * n, hidden, -1)).reshape(n, 2, rows, -1).sum(axis=1)
+    low = _row_matmul(z, down.reshape(2 * n, hidden, -1))
+    low = low.reshape(n, 2, rows, -1).sum(axis=1)
     low = low.astype(mx.bfloat16).astype(mx.float32)
-    gates = (low @ gain_forget).reshape(n, b, length, 2 * hidden)
+    gates = _row_matmul(low, gain_forget).reshape(n, b, length, 2 * hidden)
     gain = mx.tanh(gates[..., :hidden])
     forget = mx.tanh(gates[..., hidden:])
     return (1.0 - forget) * x + gain * message
 
 
-def _static_conv(x, w, state, scale):
-    """Depthwise causal conv (taps: ``w[:, K-1]`` is the current token).
+def _row_matmul(x: mx.array, w: mx.array) -> mx.array:
+    """``x @ w``. Row-exact verify rows take one matmul each, as a decode step
+    does: a multi-row matmul switches kernels with the row count."""
+    rows = x.shape[-2]
+    if rows > 1 and is_row_exact_armed():
+        # One single-row product per row in a batch: with a stride-0 weight
+        # batch MLX keeps the one-row kernel instead of folding the rows into
+        # a multi-row matmul.
+        batch = mx.broadcast_shapes(x.shape[:-2], w.shape[:-2])
+        wb = mx.broadcast_to(w[..., None, :, :], (*batch, rows, *w.shape[-2:]))
+        return (x[..., :, None, :] @ wb).squeeze(-2)
+    return x @ w
 
-    Returns the output and the padded input window ``[state, x]``; its last
-    ``K - 1`` rows are the next state.
+
+def _project_slice(
+    proj: nn.Module, x: mx.array, start: int, end: int | None
+) -> mx.array:
+    """Output rows ``[start:end]`` of a bias-free Linear or QuantizedLinear."""
+    if type(proj) is nn.QuantizedLinear:
+        return _row_slice(proj, start, end)(x)
+    return x @ proj.weight[start:end].T
+
+
+def _row_slice(proj: nn.QuantizedLinear, start: int, end: int | None):
+    """A QuantizedLinear over output rows ``[start:end]`` of ``proj``.
+
+    Calling it rather than ``quantized_matmul`` lets the row-exact verify
+    patch of ``QuantizedLinear`` serve the slice. Cached per weight arrays.
     """
-    xf = x.astype(mx.float32)
-    k = w.shape[-1]
-    xp = mx.concatenate([state, xf], axis=1)
-    length = xf.shape[1]
-    out = w[:, 0] * xp[:, 0:length]
-    for j in range(1, k):
-        out = out + w[:, j] * xp[:, j : j + length]
-    # The reference rounds the depthwise conv to the weight dtype before the
-    # residual add.
-    out = (out.astype(w.dtype).astype(mx.float32) + xf) * scale
-    return out.astype(x.dtype), xp
-
-
-def _dynamic_conv(x, dyn, static_w, state, heads, scale):
-    """Per-token taps ``static_w[lag] + dyn[head, lag]`` over k/v channels."""
-    xf = x.astype(mx.float32)
-    b, length, c = xf.shape
-    k = static_w.shape[0]
-    xp = mx.concatenate([state, xf], axis=1)
-    dyn = dyn.astype(mx.float32).reshape(b, length, heads, 1, k)
-    out = None
-    for lag in range(k):
-        start = k - 1 - lag
-        window = xp[:, start : start + length].reshape(b, length, heads, c // heads)
-        tap = static_w[lag].reshape(heads, c // heads) + dyn[..., lag]
-        term = window * tap
-        out = term if out is None else out + term
-    out = (out.reshape(b, length, c) + xf) * scale
-    return out.astype(x.dtype), xp
+    source = (proj["weight"], proj["scales"])
+    cache = proj.__dict__.get("_omlx_row_slices")
+    if cache is None or any(a is not b for a, b in zip(cache[0], source)):
+        cache = (source, {})
+        object.__setattr__(proj, "_omlx_row_slices", cache)
+    sub = cache[1].get((start, end))
+    if sub is None:
+        sub = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+        nn.Module.__init__(sub)
+        sub.group_size, sub.bits, sub.mode = proj.group_size, proj.bits, proj.mode
+        sub.weight = proj.weight[start:end]
+        sub.scales = proj.scales[start:end]
+        if proj.get("biases") is not None:
+            sub.biases = proj.biases[start:end]
+        cache[1][(start, end)] = sub
+    return sub
 
 
 class Inkling2Attention(nn.Module):
@@ -429,6 +534,7 @@ class Inkling2Attention(nn.Module):
             self.in_proj = nn.Linear(h, sum(splits), bias=False)
             self.k_conv = mx.zeros((self.dkv, self.conv_k))
             self.v_conv = mx.zeros((self.dkv, self.conv_k))
+            self._tail_cuts = [dr, dr + dq]
         else:
             # q | r | gate | sink from the q input; k and v (plus their dynamic
             # conv taps) from their own attention-residual inputs.
@@ -470,22 +576,33 @@ class Inkling2Attention(nn.Module):
         if self.sliding:
             if xk is None:
                 q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
+            elif type(self.in_proj) in (nn.Linear, nn.QuantizedLinear):
+                # Looped passes give q, k and v their own inputs; project only
+                # the row slices of ``in_proj`` that each input uses.
+                c0, c1, c2 = self._cuts[:3]
+                q = _project_slice(self.in_proj, xq, 0, c0)
+                k = _project_slice(self.in_proj, xk, c0, c1)
+                v = _project_slice(self.in_proj, xv, c1, c2)
+                tail = _project_slice(self.in_proj, xq, c2, None)
+                r, gate, sink = mx.split(tail, self._tail_cuts, axis=-1)
             else:
-                # Looped passes give q, k and v their own inputs; one stacked
-                # projection serves all three.
+                # Wrapped projections (e.g. LoRALinear) fall back to the full
+                # stacked call so the wrapper's forward is preserved.
                 pq, pk, pv = mx.split(
                     self.in_proj(mx.concatenate([xq, xk, xv], axis=0)), 3, axis=0
                 )
                 q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
                 k = pk[..., self._cuts[0] : self._cuts[1]]
                 v = pv[..., self._cuts[1] : self._cuts[2]]
-            k, ks = _static_conv(k, self.k_conv, ks, self._sconv_scale)
-            v, vs = _static_conv(v, self.v_conv, vs, self._sconv_scale)
+            k, ks = kernels.short_conv(k, self.k_conv, ks, self._sconv_scale)
+            v, vs = kernels.short_conv(
+                v, self.v_conv, vs, self._sconv_scale, out_dtype=mx.float32
+            )
         else:
             q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
             kp = self.k_proj(xk)
             vp = self.v_proj(xv)
-            k, ks = _dynamic_conv(
+            k, ks = kernels.dynamic_conv(
                 kp[..., :dkv],
                 kp[..., dkv:],
                 self.k_static,
@@ -493,13 +610,14 @@ class Inkling2Attention(nn.Module):
                 self.n_kv,
                 self._dconv_scale,
             )
-            v, vs = _dynamic_conv(
+            v, vs = kernels.dynamic_conv(
                 vp[..., :dkv],
                 vp[..., dkv:],
                 self.v_static,
                 vs,
                 self.n_kv,
                 self._dconv_scale,
+                out_dtype=mx.float32,
             )
         q = _l2_clip(
             q.reshape(b, length, self.n_heads, self.head_dim),
@@ -509,7 +627,8 @@ class Inkling2Attention(nn.Module):
         k = _l2_clip(
             k.reshape(b, length, self.n_kv, self.head_dim), self._one, self._qk_clip
         )
-        v = _unit_rms(v.reshape(b, length, self.n_kv, self.head_dim).astype(mx.float32))
+        # The convs hand v over in FP32 (rounded to the activation dtype first).
+        v = _unit_rms(v.reshape(b, length, self.n_kv, self.head_dim))
         v = v.astype(xq.dtype)
         r = _l2_clip(
             r.reshape(b, length, self.n_heads, self.d_rel), self.r_scale, self._r_clip
@@ -529,10 +648,13 @@ class Inkling2Attention(nn.Module):
             vs,
         )
 
-    def attend(self, q, k, v, rel, sink, kv):
+    def attend(self, q, k, v, rel, sink, kv, state=None):
+        left_padding = None
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
-        left_padding = getattr(kv, "left_padding", None) if kv is not None else None
+            left_padding = getattr(kv, "left_padding", None)
+        elif state is not None:
+            k, v, left_padding = windows.append(state, k, v)
         return kernels.banded_sink_attention(
             q,
             k,
@@ -602,6 +724,10 @@ class Inkling2Layer(nn.Module):
         layer = weakref.proxy(self)
         self._pre_compiled = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
         self._post_compiled = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
+        # The row-exact flag is read while tracing, so its rows get their own
+        # traces instead of reusing those of an unflagged forward of that width.
+        self._pre_exact = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
+        self._post_exact = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
 
     def _pre(self, h, blocks, ks, vs, tau=None, messages=None):
         dtype = h.dtype
@@ -622,23 +748,28 @@ class Inkling2Layer(nn.Module):
                 self.loop_gain_forget[:3],
             )
         if self.sliding and messages is None:
-            xq = self.attn_norm(xq).astype(dtype)
+            xq = _norm(self.attn_norm, xq).astype(dtype)
             xk = xv = None
         elif self.sliding:
-            xq, xk, xv = (self.attn_norm(x).astype(dtype) for x in (xq, xk, xv))
+            xq, xk, xv = (_norm(self.attn_norm, x).astype(dtype) for x in (xq, xk, xv))
         else:
-            xq = self.q_input_norm(xq).astype(dtype)
-            xk = self.k_input_norm(xk).astype(dtype)
-            xv = self.v_input_norm(xv).astype(dtype)
+            xq = _norm(self.q_input_norm, xq).astype(dtype)
+            xk = _norm(self.k_input_norm, xk).astype(dtype)
+            xv = _norm(self.v_input_norm, xv).astype(dtype)
         return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
         a = self.attn.output(out, gate)
-        a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
-        if self.is_boundary:
-            residual = a.astype(mx.float32)
-        else:
-            residual = h.astype(mx.float32) + a.astype(mx.float32)
+        # The conv kernels also do the FP32 residual adds: the attention
+        # output joins h (off a block boundary), the MLP output the residual.
+        residual, s2 = kernels.short_conv(
+            a,
+            self.attn_conv,
+            s2,
+            self._conv_scale,
+            residual=None if self.is_boundary else h,
+            out_dtype=mx.float32,
+        )
         y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
         if messages is not None:
             y = _mix_messages(
@@ -646,46 +777,65 @@ class Inkling2Layer(nn.Module):
                 messages[None, :, :, 3],
                 self.loop_down[3:],
                 self.loop_gain_forget[3:],
-            )[0]
-        m = self.mlp(self.mlp_norm(y).astype(h.dtype))
-        m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
-        return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
+            ).squeeze(0)
+        m = self.mlp(_norm(self.mlp_norm, y).astype(h.dtype))
+        h, s3 = kernels.short_conv(
+            m, self.mlp_conv, s3, self._conv_scale, residual=residual, dtype=h.dtype
+        )
+        return h, s2, s3
 
-    def __call__(self, h, blocks, cache=None, bank=None):
+    def __call__(self, h, blocks, cache=None, bank=None, tau=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
         FP32 completed blocks; extended in place at a block boundary.
-        ``bank``: the previous loop pass's ``(blocks, partial_n)`` messages."""
+        ``bank``: the previous loop pass's ``(blocks, partial_n)`` messages.
+        ``tau``: a full-attention visit's log scaling of these positions, when
+        the caller shares one across visits."""
         b, length, hidden = h.shape
-        kv = cache[0] if cache is not None else None
-        conv = cache[1] if cache is not None else None
+        kv, conv = cache if cache is not None else (None, None)
+        # A sliding visit's state starts with its key and value windows.
+        base = windows.CONV if kv is None else 0
         dkv = self.attn.dkv
         states = []
         for slot, width in ((0, dkv), (1, dkv), (2, hidden), (3, hidden)):
-            s = conv[slot] if conv is not None else None
+            s = conv[base + slot] if conv is not None else None
             if s is None:
                 s = mx.zeros((b, self._conv_k - 1, width), dtype=mx.float32)
             states.append(s)
-        tau = self.attn.log_tau(kv, length)
+        if tau is None:
+            tau = self.attn.log_tau(kv, length)
+        if self.sliding:
+            norms = (self.attn_norm, self.mlp_norm)
+        else:
+            norms = (self.q_input_norm, self.k_input_norm, self.v_input_norm)
+            norms += (self.mlp_norm,)
+        for norm in norms:
+            _keep_fp32_weight(norm)
         compiled = length <= _COMPILED_MAX_TOKENS
-        pre = self._pre_compiled if compiled else self._pre
-        post = self._post_compiled if compiled else self._post
+        if compiled and length > 1 and is_row_exact_armed():
+            pre, post = self._pre_exact, self._post_exact
+        elif compiled:
+            pre, post = self._pre_compiled, self._post_compiled
+        else:
+            pre, post = self._pre, self._post
         messages = self.loop_message(*bank) if bank is not None else None
         q, k, v, rel, gate, sink, ks, vs, h_n = pre(
             h, blocks, states[0], states[1], tau, messages
         )
-        out = self.attn.attend(q, k, v, rel, sink, kv)
+        out = self.attn.attend(q, k, v, rel, sink, kv, conv)
         if self.is_boundary:
             blocks.append(h_n)
         h, s2, s3 = post(out, gate, h, blocks, states[2], states[3], messages)
         if conv is not None:
-            windows = (ks, vs, s2, s3)
+            padded = (ks, vs, s2, s3)
             if 1 < length <= _COMPILED_MAX_TOKENS:
                 # Speculative verify rollback re-cuts the states from these.
-                conv._omlx_verify_xp = dict(enumerate(windows))
+                conv._omlx_verify_xp = dict(enumerate(padded))
             keep = self._conv_k - 1
-            for slot, window in enumerate(windows):
-                # A small copy, so the state does not pin the chunk's window.
-                conv[slot] = window[:, -keep:] * 1.0
+            for slot, window in enumerate(padded):
+                tail = window[:, -keep:]
+                # A prefill chunk's tail is copied, so the state does not pin
+                # the chunk's window; a decode or verify window is a few rows.
+                conv[base + slot] = tail if compiled else tail * 1.0
         return h
 
 
@@ -711,6 +861,39 @@ class Inkling2TextModel(nn.Module):
             return len(self.layers)
         return len(self._schedule)
 
+    def cache_layout(self) -> list[tuple[int | None, int]]:
+        """Where each layer visit's ``(KVCache, state)`` sit in a cache list.
+
+        A sliding visit has no ``KVCache``; its one entry holds everything.
+        """
+        layout, entry = [], 0
+        for idx, _ in self._schedule[: self.num_visits]:
+            if self.layers[idx].sliding:
+                layout.append((None, entry))
+                entry += 1
+            else:
+                layout.append((entry, entry + 1))
+                entry += 2
+        return layout
+
+    def visit_caches(self, cache: list) -> list[tuple]:
+        """``(KVCache or None, state)`` of every layer visit in ``cache``."""
+        layout = self.cache_layout()
+        entries = layout[-1][1] + 1 if layout else 0
+        if len(cache) != entries:
+            # A per-layer cache would silently skip the later loop passes.
+            raise ValueError(
+                f"Inkling 2 needs {entries} cache entries for its "
+                f"{len(layout)} layer visits, got {len(cache)}"
+            )
+        window = self.args.sliding_window_size
+        return [
+            (None, windows.ArraysCache.adopt(cache[state], window))
+            if kv is None
+            else (cache[kv], cache[state])
+            for kv, state in layout
+        ]
+
     def __call__(self, inputs, cache=None, input_embeddings=None, capture=None):
         """``capture`` maps draft feature ids to fill: ``i`` < num visits is
         the partial block sum entering layer visit ``i``; ``num visits`` is
@@ -719,17 +902,11 @@ class Inkling2TextModel(nn.Module):
             h = input_embeddings
         else:
             h = self.embed_norm(self.embed(inputs))
-        if cache is None:
-            cache = [None] * self.num_visits
-        elif len(cache) != self.num_visits:
-            # A per-layer cache would silently skip the later loop passes.
-            raise ValueError(
-                f"Inkling 2 needs one cache entry per layer visit "
-                f"({self.num_visits}), got {len(cache)}"
-            )
+        visits = [None] * self.num_visits if cache is None else self.visit_caches(cache)
         blocks: list = []
-        prelude = bank = None
-        for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, cache)):
+        prelude = bank = tau = None
+        for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, visits)):
+            layer = self.layers[idx]
             if idx == self._core_start and prelude is None:
                 prelude = (h, list(blocks))
             elif idx == self._core_start:
@@ -742,15 +919,33 @@ class Inkling2TextModel(nn.Module):
                 h, blocks = prelude[0], list(prelude[1])
             if capture is not None and visit in capture:
                 capture[visit] = h
-            h = self.layers[idx](h, blocks, cache=c, bank=bank if loop_pass else None)
+            if not layer.sliding and tau is None:
+                # The full-attention visits hold the same positions, so they
+                # share one log scaling.
+                tau = layer.attn.log_tau(c[0] if c is not None else None, h.shape[1])
+            h = layer(
+                h,
+                blocks,
+                cache=c,
+                bank=bank if loop_pass else None,
+                tau=None if layer.sliding else tau,
+            )
         x = self.final_input(blocks, _unit_rms(h.astype(mx.float32)))[:, :, 0]
-        out = self.norm(x).astype(h.dtype)
+        _keep_fp32_weight(self.norm)
+        out = _norm(self.norm, x).astype(h.dtype)
         if capture is not None and self.num_visits in capture:
             capture[self.num_visits] = out
         return out
 
 
 class Model(nn.Module):
+    # ``attend`` reads the keys and values a cache returns as dense arrays; a
+    # packed (TurboQuant or affine) cache hands back codes it cannot use.
+    dense_kv_attention = True
+    # Verify windows up to the compiled width keep the compiled forward, and
+    # mtp_partial_rollback recuts the conv tails for any rejected count.
+    _omlx_mtp_max_verify_rows = _COMPILED_MAX_TOKENS
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -771,12 +966,24 @@ class Model(nn.Module):
                 mx.arange(vocab) < unpadded, 0.0, -mx.inf
             ).astype(mx.float32)
 
+    @property
+    def _omlx_mtp_row_exact_verify(self) -> bool:
+        """Verify rows reproduce the serial decode rows only when every
+        projection they take is a QuantizedLinear (``row_exact_qmv``); a dense
+        multi-row matmul has its own arithmetic."""
+        linears = [self.lm_head]
+        for layer in self.model.layers:
+            attn = layer.attn
+            names = ("in_proj",) if attn.sliding else ("q_proj", "k_proj", "v_proj")
+            linears += [getattr(attn, name) for name in names] + [attn.o_proj]
+        return all(type(m) is nn.QuantizedLinear for m in linears)
+
     def logits_from_hidden(self, h):
-        logits = self.lm_head(h).astype(mx.float32)
-        logits = _softcap(logits, self._softcap)
-        if self._vocab_bias is not None:
-            logits = logits + self._vocab_bias
-        return logits
+        # Decode and verify rows run the cast, softcap and vocab bias as one
+        # kernel; longer prefill chunks stay eager, like the layers.
+        compiled = h.shape[-2] <= _COMPILED_MAX_TOKENS
+        tail = _logit_tail_compiled if compiled else _logit_tail
+        return tail(self.lm_head(h), self._softcap, self._vocab_bias)
 
     def encode_image(self, pixel_values: mx.array, image_grid_thw) -> mx.array:
         """Image-token embeddings for the processor's pixel blocks."""
@@ -876,13 +1083,19 @@ class Model(nn.Module):
             return True
         keep = int(accepted) + 1
         width = self.args.text.sconv_kernel_size - 1
-        for entry in cache:
-            kv, conv = entry[0], entry[1]
-            windows = getattr(conv, "_omlx_verify_xp", None)
-            if windows is None or kv.trim(rejected) != rejected:
+        for kv, conv in self.model.visit_caches(cache):
+            padded = getattr(conv, "_omlx_verify_xp", None)
+            if padded is None:
                 return False
-            for slot, window in windows.items():
-                conv[slot] = window[:, keep : keep + width] * 1.0
+            if kv is None:
+                if not windows.trim(conv, rejected):
+                    return False
+            elif kv.trim(rejected) != rejected:
+                return False
+            base = windows.CONV if kv is None else 0
+            for slot, xp in padded.items():
+                # A verify window is a few rows, so the state may stay a view.
+                conv[base + slot] = xp[:, keep : keep + width]
             conv._omlx_verify_xp = None
         return True
 
@@ -897,11 +1110,22 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        # One entry per layer visit: each loop pass keeps its own KV and conv
-        # states.
-        return [
-            CacheList(KVCache(), ArraysCache(4)) for _ in range(self.model.num_visits)
-        ]
+        # Every layer visit, each loop pass included, keeps its own state: a
+        # sliding visit one entry with its key window and conv states, a
+        # full-attention visit a KVCache and its conv states.
+        window = self.args.text.sliding_window_size
+        cache = []
+        for kv, _ in self.model.cache_layout():
+            if kv is None:
+                cache.append(windows.ArraysCache(window=window))
+            else:
+                cache += [KVCache(), ArraysCache(4)]
+        return cache
+
+    def restore_cache(self, cache: list) -> list:
+        """Prefix-cache hook: restored sliding states become joinable again."""
+        self.model.visit_caches(cache)
+        return cache
 
     def sanitize(self, weights: dict) -> dict:
         out, formats = sanitize_weights(self, weights)
