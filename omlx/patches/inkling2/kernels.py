@@ -7,6 +7,7 @@ import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
 from ..qwen35_verify_qmm import is_row_exact_armed
+from . import verify_attention
 
 # Upper bound on one additive mask block (elements) in the general attention
 # path; queries are split into sub-blocks so the mask stays below it.
@@ -895,8 +896,14 @@ def banded_sink_attention(
         return _decode_attention(q, k, v, rel, sink, scale, window)
     if b == 1 and left_padding is None and is_row_exact_armed():
         # Row-exact verify: each row is the decode step of its token, over the
-        # keys up to its own position. The rows are joined as [B, L, H, D], so
-        # the output projection reads them without a transpose copy.
+        # keys up to its own position.
+        fused = verify_attention.rows_attention(
+            q, k, v, rel, sink, scale=scale, window=window
+        )
+        if fused is not None:
+            return fused
+        # The rows are joined as [B, L, H, D], so the output projection reads
+        # them without a transpose copy.
         s = k.shape[2]
         rows = [
             _decode_attention(
