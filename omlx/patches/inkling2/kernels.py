@@ -806,12 +806,13 @@ _FLASH_SOURCE = """
     }
 """
 _flash_kernel = None
-# Shorter query blocks take the decode kernel when batched, else SDPA.
+# Shorter query blocks take the decode kernel when batched or left-padded,
+# else SDPA.
 _FLASH_MIN_QUERIES = 32
 
 
-# FlashDecoding for batched decode-sized query blocks (decode steps and
-# verify): the bias band, the window and the sink are applied in the kernel,
+# FlashDecoding for batched or left-padded decode-sized query blocks (decode
+# steps and verify): the bias band, the window and the sink are applied in the kernel,
 # so no mask is built and K/V are read in place. One threadgroup reduces one
 # chunk of CHUNK backward distances of one (row, position, KV head) to a
 # partial, and a second kernel folds the partials into the sink, nearest chunk
@@ -1084,8 +1085,8 @@ def _use_flash_decode(q, k) -> bool:
 
 
 def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_padding=None):
-    """``banded_sink_attention`` for batched decode-sized BF16/FP16 query
-    blocks. Each row has the bits of the same row run alone."""
+    """``banded_sink_attention`` for batched or left-padded decode-sized
+    BF16/FP16 query blocks. Each row has the bits of the same row run alone."""
     global _decode_kernels
     b, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
@@ -1236,7 +1237,13 @@ def banded_sink_attention(
     keys to d < window (sliding layers use window == R).
     """
     b, length = q.shape[0], q.shape[2]
-    if b > 1 and length < _FLASH_MIN_QUERIES and _use_flash_decode(q, k):
+    if (
+        (b > 1 or left_padding is not None)
+        and length < _FLASH_MIN_QUERIES
+        and _use_flash_decode(q, k)
+    ):
+        # Batches, and a row left alone in a batch cache: the kernel reads
+        # left_padding itself instead of masking every cached key.
         return gqa_flash_decode_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )

@@ -1556,6 +1556,40 @@ def test_inkling2_flash_decode_rows_have_the_bits_of_one_row_calls(
             assert mx.array_equal(block[row : row + 1, :, pos : pos + 1], step)
 
 
+
+@pytest.mark.parametrize("length", [1, 4])
+@pytest.mark.parametrize("window, pad", [(0, 0), (0, 7), (32, 0), (32, 280)])
+def test_inkling2_left_padded_row_takes_the_decode_kernel(
+    length, window, pad, monkeypatch
+):
+    """A row left alone in a batch cache keeps its left_padding. Its decode
+    steps and verify blocks take the decode kernel, not the masked path."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    _small_decode_chunks(monkeypatch, kernels)
+    args = _decode_attention_case(1, 6, 2, length, 300, 32, mx.bfloat16)
+    lp = mx.array([pad], dtype=mx.int32)
+    scale = args[0].shape[-1] ** -0.5
+    expected = kernels._masked_attention(*args, scale, window, lp)
+
+    def no_masked(*a, **kw):
+        raise AssertionError("a left-padded row took the masked path")
+
+    monkeypatch.setattr(kernels, "_masked_attention", no_masked)
+    got = kernels.banded_sink_attention(
+        *args, scale=scale, window=window, left_padding=lp
+    )
+    assert mx.array_equal(
+        got,
+        kernels.gqa_flash_decode_attention(
+            *args, scale=scale, window=window, left_padding=lp
+        ),
+    )
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
+    assert diff.item() < 1e-2
+
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_inkling2_flash_decode_guards_wide_heads_and_unaligned_keys(dtype):
     """A head too wide for the kernel's threadgroup memory falls back instead
