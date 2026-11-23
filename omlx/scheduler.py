@@ -136,6 +136,7 @@ from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
 from .utils.sampling import make_no_repeat_ngram_processor, select_logprobs
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.sampling import make_shared_sampler as omlx_make_shared_sampler
+from .utils.sampling import seed_request_stream
 from .utils.tokenizer import create_streaming_detokenizer
 
 
@@ -7760,10 +7761,8 @@ class Scheduler:
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
         """
         # A requeued row keeps the random stream it was already sampling from.
-        if request.sampling_params.seed is not None and not _request_count(
-            request, "requeued_output_tokens"
-        ):
-            mx.random.seed(request.sampling_params.seed)
+        if not _request_count(request, "requeued_output_tokens"):
+            seed_request_stream(request.sampling_params.seed)
 
         # #2219: both chunked-completion paths (inline first chunk and
         # _advance_chunked_prefills) funnel through here, but external VLM MTP
@@ -14272,10 +14271,8 @@ class Scheduler:
             # Set random seed for reproducible generation (best-effort).
             # This affects global MLX random state, so concurrent requests
             # may interfere. Matches OpenAI's best-effort seed semantics.
-            if request.sampling_params.seed is not None and not _request_count(
-                request, "requeued_output_tokens"
-            ):
-                mx.random.seed(request.sampling_params.seed)
+            if not _request_count(request, "requeued_output_tokens"):
+                seed_request_stream(request.sampling_params.seed)
 
             # TurboQuant KV is quantized at the end of _do_external_prefill
             # (fp16 prefill → quantize once); _merge_caches() turns the per
