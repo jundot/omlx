@@ -385,3 +385,31 @@ def test_grouped_tiles_fall_back_when_this_gpu_gets_the_unrolled_tile_wrong(monk
     for linear, observed in zip(linears, outputs):
         assert _bit_equal(observed, _serial(linear, x))
     assert list(row_exact_qmv._UNROLLED_VERDICTS.values()) == [False]
+
+
+def test_4bit_budget_and_min_tiles_stay_bit_exact(monkeypatch):
+    # Default budget caps 4-bit qmv_fast at rows_per_group=2, falling back to 1
+    # for rows=3 on a 201K-vocab lm_head. Raising budget to 80 enables 1-pass
+    # rows_per_group=3; lowering min_tiles to 256 enables 1-pass attn widths.
+    assert row_exact_qmv._launch_geometry(4, True, 201024, 3, 2560)[0] == 1
+    monkeypatch.setenv("OMLX_ROW_EXACT_VALUES_BUDGET", "80")
+    monkeypatch.setenv("OMLX_ROW_EXACT_MIN_TILES", "256")
+    monkeypatch.setenv("OMLX_ROW_EXACT_UNROLL", "1")
+    assert row_exact_qmv._launch_geometry(4, True, 201024, 3, 2560)[0] == 3
+    assert row_exact_qmv._launch_geometry(4, True, 4096, 3, 2560)[0] == 3
+
+    linear = _linear(2560, 4096, 4, 64, seed=42)
+    x = mx.random.normal((1, 3, 2560)).astype(mx.bfloat16)
+    assert _bit_equal(row_exact_qmv.quantized_linear(linear, x), _serial(linear, x))
+
+
+def test_verify_route_falls_through_when_sg8_skipped_on_nax(monkeypatch):
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: True)
+    monkeypatch.setattr(qwen35_verify_qmm, "_m1_route", lambda *a, **kw: None)
+    monkeypatch.setattr(qwen35_verify_qmm, "sg8_eligible", lambda *a, **kw: True)
+    monkeypatch.setattr(qwen35_verify_qmm, "skinny_eligible", lambda *a, **kw: False)
+    monkeypatch.setattr(qwen35_verify_qmm, "mma_eligible", lambda *a, **kw: False)
+    monkeypatch.setattr(qwen35_verify_qmm, "vk_eligible", lambda *a, **kw: True)
+    route = qwen35_verify_qmm._verify_route(4, 2560, 201024, 4, 64, mx.bfloat16)
+    assert route == "vk"
+

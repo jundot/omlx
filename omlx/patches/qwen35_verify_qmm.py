@@ -1578,9 +1578,10 @@ def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
     m1 = _m1_route(rows, K, N, bits, group_size, dtype)
     if m1:
         return m1
-    if sg8_eligible(rows, K, N, bits, group_size, dtype):
-        if rows >= _SG8_SINGLE_MIN_ROWS_NAX or not is_nax_available():
-            return "sg8"
+    if sg8_eligible(rows, K, N, bits, group_size, dtype) and (
+        rows >= _SG8_SINGLE_MIN_ROWS_NAX or not is_nax_available()
+    ):
+        return "sg8"
     if skinny_eligible(rows, K, N, bits, group_size, dtype):
         return "skinny"
     if mma_eligible(rows, K, N, bits, group_size, dtype):
