@@ -2414,6 +2414,10 @@ class Scheduler:
         # Requeues promised to the enforcer that the inference thread has not
         # carried out, per request; at the cap the enforcer aborts instead.
         self._memory_requeue_stalls: dict[str, int] = {}
+        # How many requests step() is storing and requeueing right now, else 0.
+        # A poll that lands then is being served: it is answered with this
+        # count, because the queues it would read are being emptied.
+        self._memory_requeue_running_count: int = 0
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
@@ -12510,6 +12514,12 @@ class Scheduler:
         requeued, or 0 when they cannot all be kept, in which case the caller
         aborts as before. Only flags and GIL-atomic reads happen here.
         """
+        running_requeue = self._memory_requeue_running_count
+        if running_requeue:
+            # step() is carrying the last ask out right now. The live queues
+            # are being moved to waiting, so reading them here would answer 0
+            # and the enforcer would abort the requests being requeued.
+            return running_requeue
         try:
             live = [*self.running.values(), *self.prefilling]
         except RuntimeError:  # The inference thread changed a queue mid-read.
@@ -15797,6 +15807,13 @@ class Scheduler:
         return 0
 
     def _process_pending_memory_requeue(self) -> None:
+        """Carry out a pending memory requeue at the start of step()."""
+        try:
+            self._store_and_requeue_live()
+        finally:
+            self._memory_requeue_running_count = 0
+
+    def _store_and_requeue_live(self) -> None:
         """Store every live request to the paged SSD cache and requeue it.
 
         Runs at the start of step() on the inference thread. The batch is
@@ -15830,6 +15847,9 @@ class Scheduler:
                 )
                 return
 
+        # Committed: polls are answered with this count from here until
+        # _process_pending_memory_requeue() resets it, after the cache clear.
+        self._memory_requeue_running_count = len(live)
         started = time.perf_counter()
         _safe_sync_stream(self._stream)
         kept: list[str] = []
@@ -16502,6 +16522,7 @@ class Scheduler:
         self._generation_overflow_recovery_ids.clear()
         self._memory_requeue_ids.clear()
         self._memory_requeue_stalls.clear()
+        self._memory_requeue_running_count = 0
         self._pending_memory_requeue = False
         # Async store_cache bookkeeping. shutdown() drains these before us,
         # but clear here too so reset() is safe to call standalone (e.g. tests

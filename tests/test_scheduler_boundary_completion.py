@@ -857,3 +857,96 @@ def test_memory_requeue_flag_never_drained_gives_up(mock_tokenizer, tmp_path):
     finally:
         scheduler.shutdown()
         scheduler.batch_generator = None
+
+
+def test_memory_requeue_poll_during_a_normal_step_is_kept(
+    mock_tokenizer, tmp_path, monkeypatch
+):
+    """A step() with no requeue to carry out must not swallow the poll."""
+    _, scheduler, _ = _chunked_scheduler_rig(mock_tokenizer, tmp_path, "gdn")
+    try:
+        _running_pair(scheduler, ["a", "b"])
+        real_process = Scheduler._process_pending_memory_requeue
+        seen = []
+
+        def poll_inside_step(self):
+            if not seen:
+                seen.append(
+                    (
+                        scheduler._memory_requeue_running_count,
+                        scheduler.request_memory_requeue(),
+                        scheduler._pending_memory_requeue,
+                    )
+                )
+            return real_process(self)
+
+        monkeypatch.setattr(
+            Scheduler, "_process_pending_memory_requeue", poll_inside_step
+        )
+        scheduler.step()
+        assert seen == [(0, 2, True)]
+    finally:
+        scheduler.shutdown()
+        scheduler.batch_generator = None
+
+
+def test_memory_requeue_polls_during_the_store_are_not_stalls(
+    mock_tokenizer, tmp_path, monkeypatch
+):
+    """Polls that land while step() is storing must not turn the requeue into an abort."""
+    _, scheduler, _ = _chunked_scheduler_rig(mock_tokenizer, tmp_path, "gdn")
+    try:
+        rows = _running_pair(scheduler, ["a", "b"])
+        real_store = Scheduler._store_for_memory_requeue
+        during = []
+
+        def slow_store(self, request, *args, **kwargs):
+            # The enforcer polls once a second; a store outlasts several polls.
+            during.extend(scheduler.request_memory_requeue() for _ in range(6))
+            return real_store(self, request, *args, **kwargs)
+
+        monkeypatch.setattr(Scheduler, "_store_for_memory_requeue", slow_store)
+        assert scheduler.request_memory_requeue() == 2
+        scheduler.step()
+        assert during == [2] * 12
+        assert [row.memory_requeues for row in rows] == [1, 1]
+        # The served ask leaves no second requeue queued behind it.
+        assert scheduler._pending_memory_requeue is False
+        assert scheduler._memory_requeue_running_count == 0
+    finally:
+        scheduler.shutdown()
+        scheduler.batch_generator = None
+
+
+def test_memory_requeue_polls_during_detach_and_clear_cache_do_not_return_zero(
+    mock_tokenizer, tmp_path, monkeypatch
+):
+    """A poll after the rows moved to waiting must not answer 0.
+
+    The enforcer aborts every request on 0, which would end the requests the
+    requeue has just stored.
+    """
+    _, scheduler, _ = _chunked_scheduler_rig(mock_tokenizer, tmp_path, "gdn")
+    try:
+        rows = _running_pair(scheduler, ["a", "b"])
+        real_clear = Scheduler._clear_cache
+        during = []
+
+        def slow_clear(self):
+            if scheduler._memory_requeue_ids and not during:
+                # Detached: nothing is running, both rows wait for re-admission.
+                assert not self.running and not self.prefilling
+                assert len(self.waiting) == 2
+                during.extend(scheduler.request_memory_requeue() for _ in range(6))
+                assert scheduler._pending_memory_requeue is False
+            return real_clear(self)
+
+        monkeypatch.setattr(Scheduler, "_clear_cache", slow_clear)
+        assert scheduler.request_memory_requeue() == 2
+        scheduler.step()
+        assert during == [2] * 6
+        assert [row.memory_requeues for row in rows] == [1, 1]
+        assert scheduler._memory_requeue_running_count == 0
+    finally:
+        scheduler.shutdown()
+        scheduler.batch_generator = None
