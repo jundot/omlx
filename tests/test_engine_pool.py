@@ -2613,6 +2613,114 @@ class TestEnginePoolAsync:
         shutdown_executor.assert_called_once_with()
 
 
+class _GatedStopEngine:
+    """Fake engine whose stop() parks until the test releases it."""
+
+    def __init__(self, release: asyncio.Event, error: Exception | None = None):
+        self.release = release
+        self.error = error
+        self.stop_calls = 0
+        self.deployment = None
+
+    async def stop(self, **kwargs):
+        self.stop_calls += 1
+        await self.release.wait()
+        if self.error is not None:
+            raise self.error
+
+    def has_active_requests(self):
+        return False
+
+
+async def _yield_until(predicate, attempts: int = 200) -> None:
+    for _ in range(attempts):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition was never reached")
+
+
+class TestUnloadEngineCoalescing:
+    """Concurrent _unload_engine callers share one teardown task."""
+
+    @pytest.fixture
+    def coalescing_pool(self, small_mock_model_dir):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_concurrent_unload_shares_teardown(self, coalescing_pool):
+        pool = coalescing_pool
+        entry = pool._entries["model-a"]
+        release = asyncio.Event()
+        engine = _GatedStopEngine(release)
+        entry.engine = engine
+        pool._current_model_memory = entry.estimated_size
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+        ):
+            mock_mx.get_active_memory.return_value = 0
+            first = asyncio.create_task(pool._unload_engine("model-a"))
+            await _yield_until(lambda: engine.stop_calls == 1)
+            assert "model-a" in pool._unloading_models
+            assert "model-a" in pool._unload_tasks
+
+            second = asyncio.create_task(pool._unload_engine("model-a"))
+            # Both callers are parked on the same shielded teardown task.
+            await _yield_until(lambda: len(pool._unload_tasks) == 1)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert engine.stop_calls == 1
+            assert not first.done()
+            assert not second.done()
+            assert "model-a" in pool._unloading_models
+
+            release.set()
+            await asyncio.gather(first, second)
+
+        assert engine.stop_calls == 1
+        assert pool._unload_tasks == {}
+        assert pool._unloading_models == set()
+        assert entry.engine is None
+
+    @pytest.mark.asyncio
+    async def test_concurrent_unload_shares_teardown_exception(
+        self, coalescing_pool
+    ):
+        pool = coalescing_pool
+        entry = pool._entries["model-a"]
+        release = asyncio.Event()
+        error = RuntimeError("distributed teardown failed")
+        engine = _GatedStopEngine(release, error=error)
+        # A distributed stop() failure is re-raised by _stop_and_unload_engine.
+        engine.deployment = _deployment(entry.model_path)
+        entry.engine = engine
+
+        with patch(
+            "omlx.engine_pool.get_phys_footprint", return_value=0
+        ):
+            first = asyncio.create_task(pool._unload_engine("model-a"))
+            await _yield_until(lambda: engine.stop_calls == 1)
+            second = asyncio.create_task(pool._unload_engine("model-a"))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert engine.stop_calls == 1
+
+            release.set()
+            results = await asyncio.gather(first, second, return_exceptions=True)
+
+        assert results == [error, error]
+        assert all(result is error for result in results)
+        assert engine.stop_calls == 1
+        assert pool._unload_tasks == {}
+        assert pool._unloading_models == set()
+        # A failed distributed teardown keeps the engine registered for retry.
+        assert entry.engine is engine
+
+
 class TestEnginePoolEviction:
     """Tests for memory-based eviction."""
 

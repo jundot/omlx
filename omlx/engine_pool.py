@@ -485,6 +485,8 @@ class EnginePool:
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
         self._unloading_models: set[str] = set()
+        # Coalesces concurrent teardown callers onto one shielded task.
+        self._unload_tasks: dict[str, asyncio.Task[None]] = {}
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
@@ -3835,14 +3837,31 @@ class EnginePool:
         return False
 
     async def _unload_engine(self, model_id: str, *, local_only: bool = False) -> None:
-        if model_id in self._unloading_models:
-            raise ModelBusyError(model_id, "unload while teardown is in progress")
+        task = self._unload_tasks.get(model_id)
+        if task is not None:
+            # Another caller owns this teardown. Wait for it rather than
+            # failing, so a concurrent benchmark/load observes the clean
+            # engine instead of racing a stopped one; cancellation shields
+            # the shared task exactly like the creator path.
+            cancelled = False
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            task.result()
+            if cancelled:
+                raise asyncio.CancelledError
+            return
+
         self._unloading_models.add(model_id)
         task = asyncio.create_task(
             self._stop_and_unload_engine(
                 model_id, **({"local_only": True} if local_only else {})
             )
         )
+        # Register before the first await so concurrent callers coalesce.
+        self._unload_tasks[model_id] = task
         cancelled = False
         try:
             while not task.done():
@@ -3852,6 +3871,10 @@ class EnginePool:
                     cancelled = True
             task.result()
         finally:
+            # Only the creator retires the shared task and admission marker,
+            # after completion, so waiters still see teardown in progress.
+            if self._unload_tasks.get(model_id) is task:
+                self._unload_tasks.pop(model_id, None)
             self._unloading_models.discard(model_id)
         if cancelled:
             raise asyncio.CancelledError
