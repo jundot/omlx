@@ -598,7 +598,8 @@ def loop_message_outputs(
     )
 
 
-def _decode_attention(q, k, v, rel, sink, scale, window):
+def _decode_attention(q, k, v, rel, sink, scale, window, left_padding=None):
+    """One decode step of one row as a single SDPA call."""
     s = k.shape[2]
     lo = max(0, s - window) if window else 0
     if lo:
@@ -612,6 +613,10 @@ def _decode_attention(q, k, v, rel, sink, scale, window):
     if n < sv:
         tail = mx.concatenate([mx.zeros((hq, sv - n), dtype=tail.dtype), tail], -1)
     mask = tail.reshape(1, hq, 1, sv).astype(q.dtype)
+    if left_padding is not None:
+        # Built on the GPU: reading the padding back would sync every step.
+        pad = (lo + mx.arange(sv)) < left_padding.astype(mx.int32)[0]
+        mask = mx.where(pad.reshape(1, 1, 1, sv), mx.array(-mx.inf, q.dtype), mask)
     return mx.fast.scaled_dot_product_attention(
         q, k, v, scale=scale, mask=mask, sinks=sink[0, 0].astype(q.dtype)
     )
@@ -883,7 +888,11 @@ _DECODE_PART_SOURCE = """
     const device T* relp = rel + ((size_t)(b * L + pos) * HQ + h) * R;
     const device T* kb_ptr = k + b * k_strides[0] + hk * k_strides[1];
     const device T* vb_ptr = v + b * v_strides[0] + hk * v_strides[1];
-    const bool vec_kv = k_strides[3] == 1 && v_strides[3] == 1;
+    // The vector load reads 16 bytes at a 16-byte address: a view whose rows
+    // or base sit elsewhere takes the scalar loop.
+    const bool vec_kv = k_strides[3] == 1 && v_strides[3] == 1
+        && (k_strides[2] & 7) == 0 && (v_strides[2] & 7) == 0
+        && (uintptr_t(kb_ptr) & 15) == 0 && (uintptr_t(vb_ptr) & 15) == 0;
 
     // Slot r of a tile is the key at distance d0 + r.
     for (int d0 = d_begin; d0 < d_end; d0 += BK) {
@@ -1084,6 +1093,9 @@ def _use_flash_decode(q, k) -> bool:
         q.dtype in (mx.bfloat16, mx.float16)
         and mx.default_device() == mx.gpu
         and q.shape[-1] % 8 == 0
+        # Bytes of the staged K and V tiles, within Metal's 32 KB of
+        # threadgroup memory (head dimensions up to 400).
+        and 80 * q.shape[-1] + 256 <= 32768
         and q.shape[1] % k.shape[1] == 0
     )
 
@@ -1248,7 +1260,7 @@ def banded_sink_attention(
     """
     b, length = q.shape[0], q.shape[2]
     s = k.shape[2]
-    single = b == 1 and left_padding is None
+    single = b == 1
     row_exact = single and is_row_exact_armed()
     # Leading rows of the block that stay on SDPA.
     sdpa_rows = length
@@ -1257,7 +1269,8 @@ def banded_sink_attention(
         if single and (length == 1 or row_exact):
             # A decode step, or a verify block whose rows must have the bits
             # of their tokens' decode steps: the path depends only on the
-            # row's own key count, which grows by one per row.
+            # row's own key count, which grows by one per row. Left padding
+            # only lowers that count, so the bound holds without reading it.
             sdpa_rows = length
             if not window:
                 sdpa_rows = max(0, min(length, _DECODE_MIN_KEYS - (s - length + 1)))
@@ -1278,18 +1291,20 @@ def banded_sink_attention(
             if not sdpa_rows:
                 return tail
     if single and length == 1:
-        return _decode_attention(q, k, v, rel, sink, scale, window)
+        return _decode_attention(q, k, v, rel, sink, scale, window, left_padding)
     if row_exact:
         # Row-exact verify: each row is the decode step of its token, over the
         # keys up to its own position. The leading ``sdpa_rows`` rows are SDPA
-        # decode steps, which one launch computes with the same bits.
-        if sdpa_rows == length:
+        # decode steps, which one launch computes with the same bits when no
+        # key is padded.
+        fused = None
+        if left_padding is None and sdpa_rows == length:
             fused = verify_attention.rows_attention(
                 q, k, v, rel, sink, scale=scale, window=window
             )
             if fused is not None:
                 return fused
-        else:
+        elif left_padding is None:
             fused = verify_attention.rows_attention(
                 q[:, :, :sdpa_rows],
                 k[:, :, : s - length + sdpa_rows],
@@ -1313,6 +1328,7 @@ def banded_sink_attention(
                     sink[:, r : r + 1],
                     scale,
                     window,
+                    left_padding,
                 ).transpose(0, 2, 1, 3)
                 for r in range(sdpa_rows)
             ]

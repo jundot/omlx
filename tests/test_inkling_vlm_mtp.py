@@ -1618,3 +1618,165 @@ def test_inkling2_row_exact_block_rows_are_their_decode_steps(
             window=window,
         )
         assert mx.array_equal(block[:, :, pos : pos + 1], step)
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_decode_steps_take_the_path_their_key_count_picks(
+    dtype, monkeypatch
+):
+    """One row's decode step stays on SDPA in a sliding layer and below
+    _DECODE_MIN_KEYS keys, with or without left padding, and a row-exact
+    verify block splits at the row whose step reaches the kernel."""
+    from omlx.patches.inkling2 import kernels
+    from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    _small_decode_chunks(monkeypatch, kernels)
+    min_keys = 296
+    monkeypatch.setattr(kernels, "_DECODE_MIN_KEYS", min_keys)
+    calls = []
+    sdpa, flash = kernels._decode_attention, kernels.gqa_flash_decode_attention
+
+    def spy(name, fn):
+        def wrapped(q, *args, **kw):
+            calls.append((name, q))
+            return fn(q, *args, **kw)
+
+        monkeypatch.setattr(kernels, fn.__name__, wrapped)
+
+    spy("sdpa", sdpa)
+    spy("flash", flash)
+
+    def route(length, keys, window, pad=None, row_exact=False):
+        del calls[:]
+        args = _decode_attention_case(
+            1, 6, 2, length, keys, 32, getattr(mx, dtype)
+        )
+        scale = args[0].shape[-1] ** -0.5
+        lp = None if pad is None else mx.array([pad], dtype=mx.int32)
+        set_verify_qmm_armed(row_exact, row_exact=row_exact)
+        try:
+            out = kernels.banded_sink_attention(
+                *args, scale=scale, window=window, left_padding=lp
+            )
+            mx.eval(out)
+        finally:
+            set_verify_qmm_armed(False)
+        expected = kernels._masked_attention(*args, scale, window, lp)
+        diff = mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+        assert diff.max().item() < 1e-2  # NaN fails the comparison too
+        return args[0], out, [(name, q.shape[2]) for name, q in calls]
+
+    assert route(1, 300, 32)[2] == [("sdpa", 1)]
+    assert route(1, min_keys - 1, 0)[2] == [("sdpa", 1)]
+    assert route(1, min_keys, 0)[2] == [("flash", 1)]
+    # Rows of 292 to 299 keys: four SDPA steps, then one kernel call.
+    q, _, routed = route(8, min_keys + 3, 0, row_exact=True)
+    assert routed == [("flash", 4)] + [("sdpa", 1)] * 4
+    assert mx.array_equal(calls[0][1], q[:, :, 4:])
+    # Left padding: none, some, inside the window, and over every key, where
+    # the sink alone is left and the output is zero.
+    for window in (0, 32):
+        for pad in (0, 5, 280, min_keys - 1, min_keys + 9):
+            _, out, routed = route(1, min_keys - 1, window, pad=pad)
+            assert routed == [("sdpa", 1)]
+            if pad >= min_keys - 1:
+                assert not mx.any(out).item()
+    assert route(1, min_keys, 0, pad=0)[2] == [("flash", 1)]
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_flash_decode_guards_wide_heads_and_unaligned_keys(dtype):
+    """A head too wide for the kernel's threadgroup memory falls back instead
+    of failing to load, and K/V views whose rows or base are off the 16-byte
+    grid of the vector load have the bits of their contiguous copies."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    dt = getattr(mx, dtype)
+    wide = _decode_attention_case(2, 2, 1, 1, 40, 32, dt, dim=512)
+    assert not kernels._use_flash_decode(wide[0], wide[1])
+    scale = 512**-0.5
+    assert mx.array_equal(
+        kernels.banded_sink_attention(*wide, scale=scale),
+        kernels._masked_attention(*wide, scale, 0, None),
+    )
+
+    q, _, _, rel, sink = _decode_attention_case(1, 6, 2, 1, 300, 32, dt)
+    scale = q.shape[-1] ** -0.5
+    # (buffer width, first row, first column): unaligned rows, unaligned base.
+    for width, row, col in ((71, 8, 0), (72, 7, 1)):
+        shape = (1, 2, 344, width)
+        view = (slice(None), slice(None), slice(row, row + 300), slice(col, col + 64))
+        k = (mx.random.normal(shape) * 0.3).astype(dt)[view]
+        v = mx.random.normal(shape).astype(dt)[view]
+        got = kernels.gqa_flash_decode_attention(
+            q, k, v, rel, sink, scale=scale, window=0
+        )
+        packed = kernels.gqa_flash_decode_attention(
+            q, mx.contiguous(k), mx.contiguous(v), rel, sink, scale=scale, window=0
+        )
+        assert mx.array_equal(got, packed)
+        expected = kernels._masked_attention(q, k, v, rel, sink, scale, 0, None)
+        diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+        assert diff.max().item() < 1e-2
+
+
+def test_inkling2_row_exact_straddling_uses_fused_head_and_flash_tail(monkeypatch):
+    """When a row-exact verify block straddles _DECODE_MIN_KEYS above the
+    fused-verify threshold, the leading SDPA rows take rows_attention in one
+    launch and the trailing rows take gqa_flash_decode_attention, keeping the
+    exact bits of each row's one-row decode step."""
+    from omlx.patches.inkling2 import kernels, verify_attention
+    from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    keys, length, min_keys = 4104, 8, 4101
+    args = _decode_attention_case(1, 6, 2, length, keys, 32, mx.bfloat16)
+    scale = args[0].shape[-1] ** -0.5
+
+    events = []
+    real_rows = verify_attention.rows_attention
+    real_flash = kernels.gqa_flash_decode_attention
+
+    def spy_rows(q, k, v, rel, sink, **kw):
+        out = real_rows(q, k, v, rel, sink, **kw)
+        events.append(("rows_attention", int(q.shape[2]), out is not None))
+        return out
+
+    def spy_flash(q, k, v, rel, sink, **kw):
+        events.append(("flash_decode", int(q.shape[2]), int(k.shape[2])))
+        return real_flash(q, k, v, rel, sink, **kw)
+
+    monkeypatch.setattr(kernels, "_DECODE_MIN_KEYS", min_keys)
+    monkeypatch.setattr(verify_attention, "rows_attention", spy_rows)
+    monkeypatch.setattr(kernels, "gqa_flash_decode_attention", spy_flash)
+
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        got = kernels.banded_sink_attention(*args, scale=scale, window=0)
+        mx.eval(got)
+    finally:
+        set_verify_qmm_armed(False)
+
+    assert events == [("flash_decode", 4, keys), ("rows_attention", 4, True)]
+
+    q, k, v, rel, sink = args
+    single_rows = []
+    for r in range(length):
+        step_out = kernels.banded_sink_attention(
+            q[:, :, r : r + 1],
+            k[:, :, : keys - length + 1 + r],
+            v[:, :, : keys - length + 1 + r],
+            rel[:, r : r + 1],
+            sink[:, r : r + 1],
+            scale=scale,
+            window=0,
+        )
+        single_rows.append(step_out)
+    expected = mx.concatenate(single_rows, axis=2)
+    mx.eval(expected)
+    assert mx.array_equal(got, expected)
