@@ -110,6 +110,12 @@ def helper_reserve(info: dict) -> int:
     return _RESERVE_BYTES if reserve is None else int(reserve)
 
 
+def no_gpu(info: dict, name: str) -> str:
+    """Why a helper daemon that answers has no GPU left."""
+    error = info.get("gpu_error")
+    return f"{name} lost its GPU, restart its helper" + (f": {error}" if error else "")
+
+
 def copy_plan(size: int, free: int, copies: list[dict]) -> dict:
     """How to fit *size* bytes of model files on the helper Mac.
 
@@ -170,9 +176,11 @@ def held_layers(
     """Layers the helper holds: as many as fit, or the fixed number."""
     shared, per_layer = adapter.memory_plan(model_path)
     limit = adapter.split_limit(len(per_layer))
-    held = fit_layers(
-        shared, per_layer, helper_budget(info), limit, helper_reserve(info)
-    )
+    budgets = helper_budget(info)
+    if not budgets:
+        # A helper daemon starts only with a GPU, so a lost one may come back.
+        raise UnreachableError(no_gpu(info, name))
+    held = fit_layers(shared, per_layer, budgets, limit, helper_reserve(info))
     if fixed is not None:
         if fixed > limit:
             raise _PermanentError(
